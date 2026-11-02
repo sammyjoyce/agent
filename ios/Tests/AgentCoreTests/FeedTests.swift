@@ -177,7 +177,7 @@ private func row(
     ])
   #expect(
     receipts["send:C"] == [
-      Receipt(lane: work, status: .notSent), Receipt(lane: personal, status: .placed),
+      Receipt(lane: work, status: .unknown), Receipt(lane: personal, status: .placed),
     ])
   #expect(
     receipts["send:D"] == [
@@ -751,5 +751,140 @@ func anEditedFeedbackKeepsItsScreenshotWithItsCoordinatorThroughRestore() async 
     try await Task.sleep(for: .milliseconds(300))
     #expect(await personalFixture.uploaded(restored.id) == nil)
     #expect(await submits(personalFixture).isEmpty)
+  }
+}
+
+/// Each coordinator caps its own send records. After 2000 later Sends to Personal alone,
+/// Personal's record of an old message to both is gone while Work's stays. Load earlier brings
+/// the message back, and nothing may say Personal did not get it.
+@Test(.timeLimit(.minutes(1)))
+func aRecipientWhoseRecordWasCappedIsNeverShownAsNotSent() async throws {
+  let workFixture = FixtureCoordinator()
+  let personalFixture = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(workFixture)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personalFixture)
+  defer { personalListener.cancel() }
+  let (workDirectory, workRoot) = temporaryProfile()
+  defer { try? FileManager.default.removeItem(at: workRoot) }
+  let (personalDirectory, personalRoot) = temporaryProfile()
+  defer { try? FileManager.default.removeItem(at: personalRoot) }
+  let work = workDirectory.profile
+  let personal = personalDirectory.profile
+  let both = [work, personal]
+  var workLedger = Ledger()
+  workLedger.sends["send-old"] = .init(inputID: "w-old-input", entryID: "w-old", recipients: both)
+  workLedger.entries["w-today"] = .init(receivedAt: 5000)
+  try writePrivately(JSONEncoder().encode(workLedger), to: workDirectory.ledger)
+  var personalLedger = Ledger()
+  personalLedger.sends["send-old"] = .init(
+    inputID: "p-old-input", entryID: "p-old", recipients: both)
+  for index in 0..<2000 {
+    personalLedger.entries["p-\(index)"] = .init(
+      receivedAt: 200 + Double(index), sendID: "send-p\(index)")
+    personalLedger.sends["send-p\(index)"] = .init(
+      inputID: "p-input-\(index)", entryID: "p-\(index)", recipients: [personal])
+  }
+  try writePrivately(JSONEncoder().encode(personalLedger), to: personalDirectory.ledger)
+  func reply(_ entry: String, role: HistoryRole = .final, _ text: String) -> HistoryMessage {
+    HistoryMessage(continuation: false, entryId: entry, finalChunk: true, role: role, text: text)
+  }
+  func page(_ messages: [HistoryMessage], next: String?) -> NativeEventHistory {
+    .init(messages: messages, nextCursor: next, pageComplete: true)
+  }
+  await workFixture.replyToHistory(
+    initial: page([reply("w-today", "A Work reply")], next: "older"),
+    pages: ["older": page([reply("w-old", role: .user, "Flying to Lisbon")], next: nil)])
+  await personalFixture.replyToHistory(
+    initial: page([reply("p-1999", role: .user, "Tagged 1999")], next: "older"),
+    pages: ["older": page([reply("p-old", role: .user, "Flying to Lisbon")], next: nil)])
+  func until(
+    _ session: CoordinatorSession, _ predicate: @Sendable (ChatSnapshot) -> Bool
+  ) async throws -> ChatSnapshot {
+    for await snapshot in session.updates where predicate(snapshot) { return snapshot }
+    throw ConnectionError.closed
+  }
+  let stamps = StampSource()
+  let workSession = CoordinatorSession(
+    directory: workDirectory, address: try CoordinatorAddress(host: "100.64.1.2"),
+    pin: workFixture.id, stamps: stamps, transport: loopback(workPort))
+  let personalSession = CoordinatorSession(
+    directory: personalDirectory, address: try CoordinatorAddress(host: "100.64.1.2"),
+    pin: personalFixture.id, stamps: stamps, transport: loopback(personalPort))
+  await workSession.connect()
+  await personalSession.connect()
+  _ = try await until(workSession) { $0.connection == .connected }
+  _ = try await until(personalSession) { $0.connection == .connected }
+  #expect(await personalSession.submit("One more for Personal"))
+  _ = try await until(personalSession) { snapshot in
+    snapshot.connection == .connected
+      && snapshot.sends.values.filter { $0.recipients == [personal] && $0.delivery == nil }.count
+        >= 2000
+      && !snapshot.sends.values.contains { $0.delivery != nil }
+  }
+  let saved = try JSONDecoder().decode(
+    Ledger.self, from: Data(contentsOf: personalDirectory.ledger))
+  #expect(saved.sends["send-old"] == nil, "Personal's cap dropped its record of the old message")
+  await workSession.loadEarlier()
+  await personalSession.loadEarlier()
+  let workSnapshot = try await until(workSession) { $0.rows.contains { $0.entryID == "w-old" } }
+  let personalSnapshot = try await until(personalSession) {
+    $0.rows.contains { $0.entryID == "p-old" }
+  }
+  let old = Feed.merge([(work, workSnapshot), (personal, personalSnapshot)]).filter {
+    $0.row.text == "Flying to Lisbon"
+  }
+  // Personal's copy lost its send ID with the record, so the two copies cannot fold.
+  #expect(
+    old.first { $0.id == "send:send-old" }?.receipts
+      == [Receipt(lane: work, status: .placed), Receipt(lane: personal, status: .unknown)],
+    "Personal placed it, so its status is unknown, never not sent")
+  #expect(old.allSatisfy { $0.id == "send:send-old" || $0.receipts.isEmpty })
+  await workSession.disconnect()
+  await personalSession.disconnect()
+  await workFixture.stop()
+  await personalFixture.stop()
+}
+
+/// Removing and adding Personal again gives it a new identity. An earlier message to both must
+/// still read as sent to both, never as a tagged `@Work` Send.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aMessageToBothKeepsItsRecipientsAfterOneIsRemovedAndAddedAgain() async throws {
+  try await withTwoFixtures { coordinators, _, _, _ in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    @MainActor func bothConnected() async throws {
+      try await eventually("both connected") {
+        chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+      }
+    }
+    let broadcast = "Flying to Lisbon, offline until 6"
+    chat.draft = broadcast
+    await chat.send()
+    try await eventually("the broadcast placed at both") {
+      chat.rows.first { $0.row.text == broadcast }?.receipts
+        == [Receipt(lane: work, status: .placed), Receipt(lane: personal, status: .placed)]
+    }
+    try await bothConnected()
+    let tagged = "Invented note for Work only"
+    chat.recipient = work
+    chat.draft = tagged
+    await chat.send()
+    try await eventually("the tagged Send placed") {
+      chat.rows.first { $0.row.text == tagged }?.receipts == [Receipt(lane: work, status: .placed)]
+    }
+    try await bothConnected()
+    try await coordinators.remove(personal)
+    try await coordinators.add(
+      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+    try await bothConnected()
+    let broadcastRow = try #require(chat.rows.first { $0.row.text == broadcast })
+    let taggedRow = try #require(chat.rows.first { $0.row.text == tagged })
+    #expect(
+      broadcastRow.receipts
+        == [Receipt(lane: work, status: .placed), Receipt(lane: personal, status: .unknown)],
+      "Everyone it was sent to, the removed Personal included")
+    #expect(broadcastRow.receipts != taggedRow.receipts)
+    #expect(taggedRow.receipts == [Receipt(lane: work, status: .placed)])
   }
 }

@@ -86,8 +86,9 @@ Mode if requested, then Run.
   uses complete file protection and is excluded from backup. History stays in
   memory; there is no separate phone conversation database. For its newest 2000
   entries, each coordinator's `Ledger.json` keeps the entry ID, the time this
-  phone received it and the send ID. It never holds message text. It has the
-  same protection, and it keeps the order you saw across a relaunch.
+  phone received it and the send ID. For its newest 2000 Sends, it keeps the
+  recipients and the time each was queued. It never holds message text. It has
+  the same protection, and it keeps the order you saw across a relaunch.
 - With two or more coordinators, one feed shows them all, ordered by when this
   phone received each entry. Each coordinator's replies start with its name in
   its color. Typing `@` offers the saved names. A chosen name, or `@Name`

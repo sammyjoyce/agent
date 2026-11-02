@@ -899,20 +899,22 @@ struct MessageRow: View {
       ShareLink(item: model.row.text) { Label("Share text", systemImage: "square.and.arrow.up") }
     }
   }
-  /// Who a Send went to once every recipient has it, else each recipient's own state with its
-  /// own Check or Restore.
+  /// Who a Send went to while no recipient is pending, else each recipient's own state with its
+  /// own Check or Restore. A recipient that is no longer saved reads as a removed coordinator.
   @ViewBuilder private var receipt: some View {
-    let names = model.receipts.map { badges[$0.lane]?.name ?? "Coordinator" }
-    if model.receipts.allSatisfy({ $0.status == .placed }) {
+    let names = model.receipts.map { badges[$0.lane]?.name ?? "a removed coordinator" }
+    if model.receipts.allSatisfy({ $0.status == .placed || $0.status == .unknown }) {
       Text("To \(joinedNames(names))").font(.caption.weight(.medium)).foregroundStyle(.secondary)
     } else {
       ForEach(model.receipts, id: \.lane) { receipt in
-        let badge = badges[receipt.lane] ?? CoordinatorBadge(name: "Coordinator", color: .secondary)
+        let badge =
+          badges[receipt.lane]
+          ?? CoordinatorBadge(name: "A removed coordinator", color: .secondary)
         let state: Text =
           switch receipt.status {
           case .placed: Text(" \(badge.name) · Delivered")
           case .pending(let delivery, _): Text(" \(badge.name) · \(delivery.rawValue)")
-          case .notSent: Text(" Not sent to \(badge.name)")
+          case .unknown: Text(" \(badge.name)")
           }
         (Text(Image(systemName: "circle.fill")).font(.system(size: 7)).foregroundStyle(badge.color)
           + state)

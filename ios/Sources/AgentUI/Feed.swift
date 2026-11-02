@@ -100,8 +100,9 @@ struct Receipt: Equatable {
   enum Status: Equatable {
     case placed
     case pending(Delivery, inputID: String?)
-    /// Addressed, but this coordinator holds no record of it.
-    case notSent
+    /// Addressed, but this phone holds no record of it there: its record was capped or
+    /// withdrawn, or the coordinator is no longer saved. It may well have been placed.
+    case unknown
   }
   let lane: ProfileID
   let status: Status
@@ -112,7 +113,7 @@ struct FeedRow: Equatable {
   let id: String
   let lane: ProfileID
   let row: ChatRow
-  /// For a Send's row: every recipient, in profile order.
+  /// For a Send's row: everyone the Send was addressed to, in its own order.
   let receipts: [Receipt]
 }
 
@@ -153,13 +154,12 @@ enum Feed {
   ) -> [Receipt] {
     guard let addressed = lanes.lazy.compactMap({ $0.snapshot.sends[send]?.recipients }).first
     else { return [] }
-    return lanes.filter { addressed.contains($0.id) }.map { lane in
-      guard let record = lane.snapshot.sends[send] else {
-        return Receipt(lane: lane.id, status: .notSent)
-      }
-      guard let delivery = record.delivery else { return Receipt(lane: lane.id, status: .placed) }
+    return addressed.map { id in
+      guard let lane = lanes.first(where: { $0.id == id }), let record = lane.snapshot.sends[send]
+      else { return Receipt(lane: id, status: .unknown) }
+      guard let delivery = record.delivery else { return Receipt(lane: id, status: .placed) }
       let input = lane.snapshot.rows.first { $0.sendID == send && $0.delivery != nil }?.inputID
-      return Receipt(lane: lane.id, status: .pending(delivery, inputID: input))
+      return Receipt(lane: id, status: .pending(delivery, inputID: input))
     }
   }
 }

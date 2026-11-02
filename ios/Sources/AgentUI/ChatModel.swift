@@ -13,7 +13,7 @@ final class RowModel: Identifiable {
   var row: ChatRow
   /// The coordinator the row came from. nil only for rows seeded without a feed.
   var lane: ProfileID?
-  /// For a Send's row: every recipient's status, in profile order.
+  /// For a Send's row: everyone it was addressed to, each with its status.
   var receipts: [Receipt] = []
   init(_ row: ChatRow) {
     id = row.id

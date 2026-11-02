@@ -194,7 +194,7 @@ func twoCoordinatorFeedRoutesOnlyToAddressedCoordinators() async throws {
   func answered(_ receipt: Receipt) -> Bool {
     switch receipt.status {
     case .placed, .pending(.uncertain, _), .pending(.rejected, _): true
-    case .pending(.sending, _), .pending(.saved, _), .notSent: false
+    case .pending(.sending, _), .pending(.saved, _), .unknown: false
     }
   }
   func repoint(_ name: String) async throws {

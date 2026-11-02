@@ -186,7 +186,9 @@ func aQueuedInputKeepsItsQueueTimeAcrossRelaunchAndPlacement() async throws {
     #expect(ledger.entries[entry] == Ledger.Entry(receivedAt: item.queuedAt, sendID: "send-1"))
     #expect(
       ledger.sends["send-1"]
-        == Ledger.Send(inputID: staged.inputID, entryID: entry, recipients: [directory.profile]))
+        == Ledger.Send(
+          inputID: staged.inputID, entryID: entry, recipients: [directory.profile],
+          queuedAt: item.queuedAt))
     await second.disconnect()
 
     await fixture.replyToHistory(
@@ -370,12 +372,13 @@ func aStageCutOffByDisconnectLeavesNothingInTheProfile() async throws {
     {"entries":{"entry-1":{"received_at":1762100000.25,"send_id":"S1"},\
     "entry-2":{"received_at":1762100001.5}},"sends":{"S1":{"input_id":\
     "11111111-1111-4111-8111-111111111111","entry_id":"entry-1","recipients":\
-    ["AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"]}}}
+    ["AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"],"queued_at":1762100000.25}}}
     """
   let saved = try JSONDecoder().decode(Ledger.self, from: Data(ledger.utf8))
   #expect(saved.entries["entry-1"] == Ledger.Entry(receivedAt: 1_762_100_000.25, sendID: "S1"))
   #expect(saved.entries["entry-2"] == Ledger.Entry(receivedAt: 1_762_100_001.5))
-  #expect(saved.sends["S1"]?.entryID == "entry-1")
+  #expect(
+    saved.sends["S1"]?.entryID == "entry-1" && saved.sends["S1"]?.queuedAt == 1_762_100_000.25)
   #expect(saved.sends["S1"]?.recipients == Array(item.recipients.prefix(1)))
   #expect(try JSONDecoder().decode(Ledger.self, from: JSONEncoder().encode(saved)) == saved)
 }
@@ -443,6 +446,29 @@ private final class TestClock: Sendable {
     #expect(ledger.entries["entry-\(pruned)"] == nil && ledger.sends["send-\(pruned)"] == nil)
   }
   #expect(ledger.entries["entry-3"] != nil && ledger.sends["send-3"] != nil)
+}
+
+/// A settled `/feedback` has no entry. The time it was queued, kept in its saved record, still
+/// ranks it among the newest.
+@Test func theLedgerKeepsTheNewestSendsByWhenEachWasQueued() throws {
+  var entries: [String: Any] = [:]
+  var sends: [String: Any] = [
+    "send-feedback": ["input_id": "input-feedback", "recipients": [String](), "queued_at": 2000.0]
+  ]
+  for index in 0..<2000 {
+    entries["entry-\(index)"] = ["received_at": Double(index)]
+    sends["send-\(index)"] = [
+      "input_id": "input-\(index)", "entry_id": "entry-\(index)", "recipients": [String](),
+      "queued_at": Double(index),
+    ]
+  }
+  var ledger = try JSONDecoder().decode(
+    Ledger.self,
+    from: JSONSerialization.data(withJSONObject: ["entries": entries, "sends": sends]))
+  ledger.prune(keeping: [])
+  #expect(ledger.sends.count == 2000)
+  #expect(ledger.sends["send-feedback"] != nil, "The newest send stays")
+  #expect(ledger.sends["send-0"] == nil, "The oldest send goes")
 }
 
 @Test(.timeLimit(.minutes(1)))

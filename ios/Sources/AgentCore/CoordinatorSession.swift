@@ -930,7 +930,7 @@ public actor CoordinatorSession {
       ledger.entries[entryID] = Ledger.Entry(receivedAt: item.queuedAt, sendID: item.sendID)
     }
     ledger.sends[item.sendID] = Ledger.Send(
-      inputID: inputID, entryID: entryID, recipients: item.recipients)
+      inputID: inputID, entryID: entryID, recipients: item.recipients, queuedAt: item.queuedAt)
     guard saveLedger() else {
       snapshot.error = "This phone could not record a delivered message. It stays queued."
       return

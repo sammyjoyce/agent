@@ -56,10 +56,14 @@ struct Ledger: Codable, Equatable, Sendable {
     /// nil for feedback, which is acknowledged without an entry.
     var entryID: String?
     var recipients: [ProfileID]
+    /// When the Send was queued, which ranks it for the cap. nil in records saved before it was
+    /// kept, which rank by their entry.
+    var queuedAt: TimeInterval?
     enum CodingKeys: String, CodingKey {
       case recipients
       case inputID = "input_id"
       case entryID = "entry_id"
+      case queuedAt = "queued_at"
     }
   }
 
@@ -79,7 +83,7 @@ struct Ledger: Codable, Equatable, Sendable {
     if sends.count > limit {
       let entries = entries
       func stamp(_ send: Send) -> TimeInterval {
-        send.entryID.flatMap { entries[$0]?.receivedAt } ?? -.infinity
+        send.queuedAt ?? send.entryID.flatMap { entries[$0]?.receivedAt } ?? -.infinity
       }
       let oldest = sends.filter {
         !shownInputs.contains($0.value.inputID) && !shownEntries.contains($0.value.entryID ?? "")
