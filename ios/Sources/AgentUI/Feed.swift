@@ -50,6 +50,12 @@ enum Addressing: Equatable {
           guard !word.isEmpty else { return .blocked("Choose a coordinator") }
           let named = named(word)
           guard let match = named.first, named.count == 1 else {
+            // A tag still being typed that starts a saved name is not an error yet.
+            if named.isEmpty, word.endIndex == draft.endIndex,
+              coordinators.contains(where: { $0.name.lowercased().hasPrefix(word.lowercased()) })
+            {
+              return .blocked("Choose a coordinator")
+            }
             return .blocked(
               named.isEmpty
                 ? "No coordinator named \(word)" : "More than one coordinator is named \(word)")
