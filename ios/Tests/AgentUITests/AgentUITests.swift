@@ -79,26 +79,26 @@ final class AgentUITests: XCTestCase {
   func testConnectionLabelsAndAddressValidation() {
     let app = launch()
     capture("connection-before-editing", app: app)
-    let connect = app.buttons["Connect"]
-    XCTAssertFalse(connect.isEnabled)
-    XCTAssertFalse(app.buttons["Disconnect"].isEnabled)
+    let save = app.buttons["Save"]
+    XCTAssertFalse(save.isEnabled)
     let address = app.descendants(matching: .any).matching(identifier: "coordinatorAddress")
       .firstMatch
     let port = app.textFields["coordinatorPort"]
     replace(address, with: "192.0.2.1")
-    XCTAssertFalse(connect.isEnabled)
+    XCTAssertFalse(save.isEnabled)
     replace(address, with: "100.64.1.2")
-    XCTAssertTrue(connect.isEnabled)
+    XCTAssertTrue(save.isEnabled)
+    XCTAssertTrue(app.staticTexts["Name"].exists)
     XCTAssertTrue(app.staticTexts["Tailscale address"].exists)
     XCTAssertTrue(app.staticTexts["Port"].exists)
     capture("connection-persistent-labels", app: app)
     replace(port, with: "0")
-    XCTAssertFalse(connect.isEnabled)
+    XCTAssertFalse(save.isEnabled)
     replace(port, with: "43187")
-    XCTAssertTrue(connect.isEnabled)
-    // Never submit the invented address or retain it for an automatic reconnect.
+    XCTAssertTrue(save.isEnabled)
+    // Never submit the invented address. Closing the sheet discards unsaved fields.
     replace(address, with: "")
-    XCTAssertFalse(connect.isEnabled)
+    XCTAssertFalse(save.isEnabled)
   }
 
   func testOfflineDraftAndDeliveryControls() {

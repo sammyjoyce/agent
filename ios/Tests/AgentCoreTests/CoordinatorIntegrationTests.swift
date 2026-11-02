@@ -30,13 +30,24 @@ func nativeClientReconcilesAgainstTheProductionCoordinator() async throws {
   let restart = URL(filePath: try #require(environment["AGENT_E2E_RESTART_REQUEST"]))
   let reconnecting = URL(filePath: try #require(environment["AGENT_E2E_RECONNECTING"]))
   let draft = "Keep this unsent composer draft across the service restart."
-  let outbox = directory.appending(path: "native-pending.json")
+  // The coordinator persists its ID in the state directory beside its socket.
+  let pin = try #require(
+    CoordinatorID(
+      wire: String(
+        contentsOf: URL(filePath: socket).deletingLastPathComponent().appending(
+          path: "coordinator-id"), encoding: .utf8)))
+  let profile = ProfileDirectory(
+    ProfileID(), applicationSupport: directory.appending(path: "native"),
+    caches: directory.appending(path: "native"))
+  let outbox = profile.outbox
   let input = NativeRequestSubmit(inputId: inputID, mode: .steer, text: text)
+  try FileManager.default.createDirectory(
+    at: outbox.deletingLastPathComponent(), withIntermediateDirectories: true)
   try JSONEncoder().encode([input]).write(to: outbox, options: .atomic)
   let trace = NativeConnectionTrace()
   let session = CoordinatorSession(
-    outboxURL: outbox,
-    connectTransport: { _ in
+    directory: profile, address: try CoordinatorAddress(host: "100.64.1.2"), pin: pin,
+    transport: CoordinatorTransport { _ in
       let connection = NWConnection(to: .unix(path: socket), using: .tcp)
       connection.stateUpdateHandler = { state in
         let text = String(describing: state)
@@ -67,9 +78,8 @@ func nativeClientReconcilesAgainstTheProductionCoordinator() async throws {
     }
   }
   do {
-    let address = try CoordinatorAddress(host: "100.64.1.2")
     for _ in 0..<2 {
-      await session.connect(address)
+      await session.connect()
       var connected = false
       for await snapshot in session.updates {
         if snapshot.rows.contains(where: { $0.entryID == entryID }) {
@@ -84,7 +94,8 @@ func nativeClientReconcilesAgainstTheProductionCoordinator() async throws {
       #expect(connected)
       await session.disconnect()
     }
-    await model.connect(session: session, address: address)
+    model.attach(Lane(id: profile.profile, session: session, hold: LegacyHold(profile)))
+    await model.setActive(true)
     try await waitFor("connected before service restart") { model.connection == .connected }
     try verifySavedInput(model.rows.map(\.row))
     model.draft = draft
@@ -99,9 +110,9 @@ func nativeClientReconcilesAgainstTheProductionCoordinator() async throws {
     try verifySavedInput(model.rows.map(\.row))
     #expect(model.draft == draft)
     #expect(model.error == nil)
-    await model.stop()
+    await model.detach(profile.profile)
   } catch {
-    await model.stop()
+    await model.detach(profile.profile)
     await session.disconnect()
     throw error
   }

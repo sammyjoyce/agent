@@ -77,34 +77,15 @@ private func connected(_ session: CoordinatorSession) async throws {
 private func withGatedPreviewCoordinator(
   _ body: @Sendable (CoordinatorSession, PreviewConnectionGate) async throws -> Void
 ) async throws {
-  let parameters = NWParameters.tcp
-  parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
-  let listener = try NWListener(using: parameters)
-  let ready = AsyncThrowingStream<Void, any Error>.makeStream()
   let fixture = FixtureCoordinator()
   let gate = PreviewConnectionGate()
-  listener.stateUpdateHandler = { state in
-    if case .ready = state { ready.continuation.yield(()) }
-    if case .failed(let error) = state { ready.continuation.finish(throwing: error) }
-  }
-  listener.newConnectionHandler = { socket in
-    Task {
-      do { try await fixture.accept(socket) } catch ConnectionError.closed {
-        // Cancelled lookups close their connection before sending a command.
-      } catch let error as NWError where error == .posix(.ECANCELED) {
-        // Network.framework can report the same owned cancellation directly.
-      } catch { Issue.record(error) }
-    }
-  }
-  listener.start(queue: .global())
+  let (listener, port) = try await listen(fixture)
   defer { listener.cancel() }
-  for try await _ in ready.stream { break }
-  let port = try #require(listener.port)
-  let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-  defer { try? FileManager.default.removeItem(at: directory) }
+  let (directory, root) = temporaryProfile()
+  defer { try? FileManager.default.removeItem(at: root) }
   let session = CoordinatorSession(
-    outboxURL: directory.appending(path: "pending.json"),
-    connectTransport: { _ in
+    directory: directory, address: try CoordinatorAddress(host: "100.64.1.2"), pin: fixture.id,
+    transport: CoordinatorTransport { _ in
       let delayed = await gate.enter()
       let socket = NWConnection(host: .ipv4(.loopback), port: port, using: .tcp)
       if delayed {
@@ -132,11 +113,10 @@ func previewCapacityIncludesPendingLookupsAndCancellationReleasesTheirOwnedConne
   async throws
 {
   try await withGatedPreviewCoordinator { session, gate in
-    let address = try CoordinatorAddress(host: "100.64.1.2")
     let reference = AttachmentRef(
       id: UUID().uuidString, mediaType: "text/plain", name: "Evidence.txt",
       sha256: String(repeating: "0", count: 64), sizeBytes: 0)
-    await session.connect(address)
+    await session.connect()
     try await connected(session)
     await gate.hold()
     let requests = (0..<40).map { _ in
@@ -160,7 +140,7 @@ func previewCapacityIncludesPendingLookupsAndCancellationReleasesTheirOwnedConne
     #expect(released.succeeded == 0)
 
     // A new connection generation can use capacity returned by the cancelled previews.
-    await session.connect(address)
+    await session.connect()
     try await connected(session)
     await gate.hold()
     let next = Task {

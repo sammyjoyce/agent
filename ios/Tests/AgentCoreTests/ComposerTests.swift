@@ -108,19 +108,20 @@ func attachmentOnlyAdmissionPreservesFilesAddedWhileTheOriginalIsSaving() async 
 
 @MainActor private func connectModelThenRelease(_ session: CoordinatorSession) async throws {
   let model = ChatModel()
-  await model.connect(session: session, address: try CoordinatorAddress(host: "100.64.1.2"))
+  model.attach(lane(session))
+  await model.setActive(true)
   while model.connection != .connected { try await Task.sleep(for: .milliseconds(1)) }
 }
 
 @Test(.timeLimit(.minutes(1)))
-func viewLifetimeCancellationAndModelDestructionBothCloseTheirSockets() async throws {
+func detachAndModelDestructionBothCloseTheirSockets() async throws {
   try await withCoordinator { session, fixture, _ in
     let model = await MainActor.run { ChatModel() }
-    await model.connect(session: session, address: try CoordinatorAddress(host: "100.64.1.2"))
-    let lifetime = Task { await model.runUntilCancelled() }
+    let lane = lane(session)
+    await model.attach(lane)
+    await model.setActive(true)
     while await model.connection != .connected { try await Task.sleep(for: .milliseconds(1)) }
-    lifetime.cancel()
-    await lifetime.value
+    await model.detach(lane.id)
     for await _ in fixture.closedObservations { break }
     #expect(await model.connection == .disconnected)
     #expect(await session.submit("No orphaned observer") == false)

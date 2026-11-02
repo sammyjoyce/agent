@@ -69,6 +69,7 @@ final class HistoryInteractionTests: XCTestCase {
     let port = try await peer.start()
     let app = XCUIApplication()
     app.launchEnvironment["AGENT_INTERACTION_PORT"] = String(port)
+    app.launchEnvironment["AGENT_INTERACTION_COORDINATOR"] = peer.coordinator.uuidString
     app.launchArguments += ["-notificationsEnabled", "NO"]
     app.launch()
     defer { app.terminate() }
@@ -161,6 +162,8 @@ final class HistoryInteractionTests: XCTestCase {
 // Shared DEBUG app fixture, real screen/session and an owned NDJSON loopback
 // peer. Replies are released by assertions instead of elapsed time.
 private actor InteractionPeer {
+  /// The ID this peer answers `identify` with. The app pins it.
+  nonisolated let coordinator = UUID()
   private var listener: NWListener?
   private var sockets: [UUID: NWConnection] = [:]
   private var initial: NativeEventHistory?
@@ -227,11 +230,13 @@ private actor InteractionPeer {
     }
     do {
       var data = Data()
-      while !data.contains(10) { data.append(try await receive(socket)) }
-      let end = try XCTUnwrap(data.firstIndex(of: 10))
-      let command = try JSONDecoder().decode(NativeCommand.self, from: data.prefix(upTo: end))
-      guard case .native(let command) = command else { return }
-      switch command.request {
+      var request = try await read(socket, &data)
+      if case .identify = request {
+        try await emit(
+          .identity(.init(coordinatorId: coordinator.uuidString.lowercased())), to: socket)
+        request = try await read(socket, &data)
+      }
+      switch request {
       case .observe:
         observer = socket
         try await emit(
@@ -251,6 +256,14 @@ private actor InteractionPeer {
     } catch {
       // Client cancellation owns closing both observers and history requests.
     }
+  }
+  private func read(_ socket: NWConnection, _ data: inout Data) async throws -> NativeRequest {
+    while !data.contains(10) { data.append(try await receive(socket)) }
+    let end = try XCTUnwrap(data.firstIndex(of: 10))
+    let command = try JSONDecoder().decode(NativeCommand.self, from: data.prefix(upTo: end))
+    data.removeSubrange(...end)
+    guard case .native(let value) = command else { throw CocoaError(.fileReadUnknown) }
+    return value.request
   }
   private func receive(_ socket: NWConnection) async throws -> Data {
     try await withCheckedThrowingContinuation { continuation in

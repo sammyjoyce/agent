@@ -19,11 +19,14 @@ authenticated NDJSON-over-Tailscale service.
    Tagged devices require their own pinned node identity. Tailnet network policy
    must also permit the coordinator port. See [trust configuration](../docs/setup.md#trust).
 4. Enter the coordinator's full MagicDNS name (`machine.example.ts.net`) and
-   port, normally `43187`, in Connection. Numeric Tailscale IPv4 addresses also
-   work. Each connection resolves the name again and pins a validated tailnet
-   address, so IP changes do not require editing the setting. Ordinary LAN
-   addresses and IPv6 addresses are unsupported. Transport binds the active
-   point-to-point interface's Tailscale IPv4 source address.
+   port, normally `43187`, in Connection, then **Save**. Numeric Tailscale IPv4
+   addresses also work. Save asks the address which coordinator answers and
+   remembers that coordinator. If the address does not answer, Save keeps
+   nothing. The optional name defaults to the first label of the MagicDNS name. Each connection resolves the name
+   again and pins a validated tailnet address, so IP changes do not require
+   editing the setting. Ordinary LAN addresses and IPv6 addresses are
+   unsupported. Transport binds the active point-to-point interface's Tailscale
+   IPv4 source address.
 
 ## Install on an iPhone
 
@@ -75,15 +78,24 @@ Mode if requested, then Run.
 - Slash parsing and execution use the shared Rust command parser and backend
   handlers. The phone menu lists only supported controls. `/resume` remains a
   TUI-only saved-conversation view; it never starts work from this app.
-- Messages and feedback, including immutable attachment copies, are saved to a
-  per-endpoint outbox before transmission. On iOS it
+- Messages and feedback, including immutable attachment copies, are saved to the
+  saved coordinator's own outbox before transmission. On iOS it
   uses complete file protection and is excluded from backup. History stays in
   memory; there is no separate phone conversation database.
-- Transient network loss reconnects automatically. Disconnect, suspension and
-  view removal release owned connections. Returning reconnects and reconciles
+- Every connection first asks for the coordinator's ID and writes nothing else
+  unless the ID matches the saved one. A coordinator too old to answer shows
+  "Update the coordinator". If the address now answers as a different
+  coordinator, the queue stays on the phone. Both cases keep retrying.
+- Transient network loss reconnects automatically. Suspension releases owned
+  connections. Returning reconnects and reconciles
   the original input IDs. Uncertain writes are never automatically replayed.
   **Check / retry** retains the same ID;
-  terminal rejection retains the original until **Restore to composer**.
+  terminal rejection retains the original. **Restore to composer** copies it,
+  and the app removes the original only after you send the restored message.
+- The top of the chat holds messages that a build without saved coordinators
+  queued. That build never recorded their coordinator, so they may already have
+  been delivered. The app never sends them. **Restore to composer** makes a new
+  message for you to send, and **Discard** deletes one.
 - Do not restore an uncertain submission as a new message to bypass checking its
   original ID. Coordinator admission may already have succeeded.
 - Use the **+** menu for files, photos, commands and delivery mode, or drop files

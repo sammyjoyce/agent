@@ -10,11 +10,18 @@ import UniformTypeIdentifiers
 public struct MainChatView: View {
   @State private var model: ChatModel
   @State private var activityExpansion = ActivityExpansion()
-  private let managesConnection: Bool
+  private let coordinators: Coordinators?
   private let detailLoader: ToolDetailsLoader?
   private let initialScrollTarget: String?
   private let notifications: AppNotifications?
   @State private var settings = false
+  // The form edits a copy. Save stores nothing until it has probed the address.
+  @State private var name = ""
+  @State private var host = ""
+  @State private var port = "43187"
+  @State private var formError: String?
+  @State private var saving = false
+  @State private var removal: Int?
   @State private var followsLatest = true
   @State private var userScrolling = false
   @State private var atTop = false
@@ -27,17 +34,15 @@ public struct MainChatView: View {
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var capture = AppScreenshot()
   #endif
-  @AppStorage("coordinatorAddress") private var host = ""
-  @AppStorage("coordinatorPort") private var port = "43187"
   @AppStorage(AppAppearance.preferenceKey) private var appearance = AppAppearance.system
   @Environment(\.scenePhase) private var scenePhase
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.colorScheme) private var colorScheme
   @Environment(\.displayScale) private var displayScale
 
-  public init(notifications: AppNotifications? = nil) {
-    _model = State(initialValue: ChatModel())
-    managesConnection = true
+  public init(notifications: AppNotifications) {
+    _model = State(initialValue: notifications.coordinators.chat)
+    coordinators = notifications.coordinators
     detailLoader = nil
     initialScrollTarget = nil
     self.notifications = notifications
@@ -50,7 +55,7 @@ public struct MainChatView: View {
   ) {
     _model = State(initialValue: model)
     _activityExpansion = State(initialValue: expansion)
-    managesConnection = false
+    coordinators = nil
     detailLoader = details
     self.initialScrollTarget = initialScrollTarget
     notifications = nil
@@ -59,21 +64,25 @@ public struct MainChatView: View {
   public var body: some View {
     NavigationStack {
       VStack(spacing: 0) {
-        if model.connection == .connecting || model.connection == .reconnecting {
+        if let status = connectionStatus {
           HStack(spacing: 8) {
             ProgressView().controlSize(.mini)
-            Text(model.connection.label).font(.footnote).foregroundStyle(.secondary)
+            Text(status).font(.footnote).foregroundStyle(.secondary)
           }
           .frame(maxWidth: .infinity, alignment: .leading)
           .padding(.horizontal, 16).padding(.vertical, 8)
         }
         transcript
-        if let error = model.error {
-          Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal).padding(
-              .vertical, 8
-            )
-            .accessibilityLabel("Error. \(error)")
+        if let error = unpaired.flatMap({ coordinators?.pairingError[$0.id] }) ?? model.error {
+          HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
+              .frame(maxWidth: .infinity, alignment: .leading)
+              .accessibilityLabel("Error. \(error)")
+            if unpaired != nil || model.connection != .connected {
+              Button("Try again") { tryAgain() }.font(.callout)
+            }
+          }
+          .padding(.horizontal).padding(.vertical, 8)
         }
       }
       .background(.background)
@@ -125,27 +134,16 @@ public struct MainChatView: View {
         }
       #endif
       .task {
-        guard managesConnection else { return }
-        // Keep the SwiftUI-owned task alive. Cancellation on removal
-        // tears down both the UI subscription and its network owner.
-        if host.isEmpty { settings = true } else { await model.connect(host: host, port: port) }
-        await model.runUntilCancelled()
+        // With nothing saved, start on the Add form.
+        if coordinators?.profiles.isEmpty == true { settings = true }
       }
       .onChange(of: scenePhase) { _, phase in
         notifications?.mainVisible = phase == .active && !settings
-        if managesConnection { Task { await model.setActive(phase == .active) } }
       }
       .onAppear { notifications?.mainVisible = scenePhase == .active && !settings }
       .onDisappear { notifications?.mainVisible = false }
       .onChange(of: settings) { _, presented in
         notifications?.mainVisible = scenePhase == .active && !presented
-      }
-      .onChange(of: model.connection) { _, state in
-        if state == .connected, let registration = notifications?.registration {
-          Task { await model.connectNotifications(registration) }
-        } else {
-          notifications?.registration.disconnect()
-        }
       }
       .onChange(of: notifications?.openedTarget) { _, target in
         if target != nil {
@@ -156,6 +154,22 @@ public struct MainChatView: View {
     }
     .preferredColorScheme(appearance.colorScheme)
   }
+  /// A saved profile that is not paired yet. It shows its held messages and takes no sends.
+  private var unpaired: CoordinatorProfile? { coordinators?.profiles.first { $0.pin == nil } }
+  private var connectionStatus: String? {
+    if let unpaired, coordinators?.pairingError[unpaired.id] == nil {
+      return ConnectionState.connecting.label
+    }
+    return model.connection == .connecting || model.connection == .reconnecting
+      ? model.connection.label : nil
+  }
+  private func tryAgain() {
+    if let unpaired, let coordinators {
+      coordinators.retryPairing(unpaired.id)
+    } else {
+      Task { await model.reconnect() }
+    }
+  }
   private var transcript: some View {
     let items = model.transcriptItems
     return ScrollViewReader { scroll in
@@ -164,9 +178,18 @@ public struct MainChatView: View {
           // Pagination is section structure, not transcript content. Keep
           // one lazy layout so explicit row targets remain discoverable.
           Section {
-            if model.rows.isEmpty {
+            if model.rows.isEmpty && model.held.isEmpty {
               Text("No messages yet").font(.callout).foregroundStyle(.primary)
                 .frame(maxWidth: .infinity).padding(.vertical, 32)
+            }
+            if let heldError = model.heldError {
+              Text(heldError).font(.callout).foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            ForEach(model.held) { message in
+              HeldMessageRow(
+                message: message, restore: { Task { await model.restoreHeld(message) } },
+                discard: { Task { await model.discardHeld(message) } })
             }
             ForEach(items) { item in
               Group {
@@ -413,6 +436,13 @@ public struct MainChatView: View {
           .pickerStyle(.menu).tint(.primary).accessibilityIdentifier("appearancePicker")
         }
         Section {
+          LabeledContent("Name") {
+            TextField("", text: $name, prompt: Text("Optional"))
+              #if os(iOS)
+                .textInputAutocapitalization(.never)
+              #endif
+              .autocorrectionDisabled().accessibilityIdentifier("coordinatorName")
+          }
           VStack(alignment: .leading, spacing: 8) {
             Text("Tailscale address").font(.subheadline)
             TextField("", text: $host, prompt: Text("machine.example.ts.net"), axis: .vertical)
@@ -431,18 +461,27 @@ public struct MainChatView: View {
               .accessibilityIdentifier("coordinatorPort")
           }
         }
-        if let error = model.error { Text(error).foregroundStyle(.red) }
-        Button("Connect") {
-          Task {
-            await model.connect(host: host, port: port)
-            if model.error == nil { settings = false }
+        if let error = coordinators?.failure ?? formError ?? model.error {
+          Text(error).foregroundStyle(.red)
+        }
+        Button("Save") { Task { await save() } }.disabled(!canSave)
+        if let profile = coordinators?.profiles.first {
+          Button("Remove coordinator", role: .destructive) {
+            Task { removal = await coordinators?.removalCount(profile.id) }
           }
-        }.disabled(!validAddress)
-        Button("Disconnect", role: .destructive) {
-          Task { await model.stop() }
-          settings = false
-        }.disabled(model.connection == .disconnected)
+          .disabled(saving)
+          .confirmationDialog(
+            "Remove \(profile.name.description)?",
+            isPresented: Binding(get: { removal != nil }, set: { if !$0 { removal = nil } }),
+            titleVisibility: .visible
+          ) {
+            Button("Remove", role: .destructive) { Task { await remove(profile.id) } }
+          } message: {
+            Text(removalMessage)
+          }
+        }
         if let registration = notifications?.registration {
+          let channel = coordinators?.profiles.first.map { registration.status($0.id) }
           Section {
             Toggle(
               "Main-chat updates",
@@ -452,18 +491,18 @@ public struct MainChatView: View {
               )
             )
             .disabled(registration.busy)
-            if let error = registration.error {
+            if let error = registration.error ?? channel?.error {
               Text(error).font(.footnote).foregroundStyle(.primary)
-              if !registration.enabled, registration.registered {
+              if !registration.enabled, channel?.registered == true {
                 Button("Retry removing this device") {
                   Task { await registration.setEnabled(false) }
                 }.disabled(registration.busy)
               }
             } else if model.connection != .connected {
               Text("Connect to the coordinator to receive updates.").font(.footnote)
-            } else if !registration.configured {
+            } else if channel?.configured != true {
               Text("APNs setup is required on the coordinator.").font(.footnote)
-            } else if registration.enabled, !registration.registered {
+            } else if registration.enabled, channel?.registered != true {
               Text("Waiting for this device's Apple registration.").font(.footnote)
             }
           } header: {
@@ -477,13 +516,86 @@ public struct MainChatView: View {
           Button("Done") { settings = false }.accessibilityIdentifier("dismissConnection")
         }
       }
+      .onAppear { loadForm() }
     }
   }
-  private var validAddress: Bool {
-    guard let port = UInt16(port) else { return false }
-    return
-      (try? CoordinatorAddress(
-        host: host.trimmingCharacters(in: .whitespacesAndNewlines), port: port)) != nil
+  private var formAddress: CoordinatorAddress? {
+    UInt16(port).flatMap {
+      try? CoordinatorAddress(host: host.trimmingCharacters(in: .whitespacesAndNewlines), port: $0)
+    }
+  }
+  private var canSave: Bool {
+    guard !saving, let address = formAddress else { return false }
+    guard let profile = coordinators?.profiles.first else { return true }
+    return profile.address != address || profile.name.description != name
+  }
+  private var removalMessage: String {
+    switch removal ?? 0 {
+    case 0: "No queued messages are on this phone."
+    case 1: "This deletes 1 queued message on this phone."
+    case let count: "This deletes \(count) queued messages on this phone."
+    }
+  }
+  private func loadForm() {
+    let profile = coordinators?.profiles.first
+    name = profile?.name.description ?? ""
+    host = profile?.address.host ?? ""
+    port = String(profile?.address.port ?? 43187)
+    formError = nil
+  }
+  private func save() async {
+    guard let coordinators, let address = formAddress else { return }
+    saving = true
+    defer { saving = false }
+    do {
+      let typed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+      let tag = typed.isEmpty ? TagName(defaultFor: address) : try TagName(typed)
+      if let profile = coordinators.profiles.first {
+        try await coordinators.update(profile.id, name: tag, address: address)
+      } else {
+        try await coordinators.add(name: tag, address: address)
+      }
+      settings = false
+    } catch { formError = error.localizedDescription }
+  }
+  private func remove(_ id: ProfileID) async {
+    do {
+      try await coordinators?.remove(id)
+      loadForm()
+    } catch { formError = error.localizedDescription }
+  }
+}
+
+/// A message queued before the update. It has no transport. It leaves only by Restore, as a
+/// new message the user sends, or by Discard.
+private struct HeldMessageRow: View {
+  let message: HeldMessage
+  let restore: () -> Void
+  let discard: () -> Void
+
+  var body: some View {
+    VStack(alignment: .trailing, spacing: 8) {
+      VStack(alignment: .leading, spacing: 8) {
+        Text(message.item.text).textSelection(.enabled)
+          .fixedSize(horizontal: false, vertical: true)
+        ForEach(message.item.attachments, id: \.id) { reference in
+          AttachmentLabel(reference: reference)
+        }
+      }
+      .padding(14)
+      .background(
+        Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+      Label("Held from before the update. It may already have been delivered.", systemImage: "tray")
+        .font(.caption.weight(.medium)).fixedSize(horizontal: false, vertical: true)
+      HStack(spacing: 16) {
+        Button("Restore to composer", systemImage: "arrow.uturn.backward", action: restore)
+        Button("Discard", systemImage: "trash", role: .destructive, action: discard)
+      }
+      .font(.callout).buttonStyle(.plain).frame(minHeight: 44)
+    }
+    .padding(.leading, 32)
+    .frame(maxWidth: .infinity, alignment: .trailing)
+    .accessibilityElement(children: .contain).accessibilityLabel("Held message")
   }
 }
 

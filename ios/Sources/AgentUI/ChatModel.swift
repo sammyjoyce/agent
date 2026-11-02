@@ -1,5 +1,4 @@
 import AgentCore
-import CryptoKit
 import Foundation
 import Observation
 
@@ -18,6 +17,29 @@ final class RowModel: Identifiable {
   }
 }
 
+/// One saved coordinator in the feed. `session` is nil until the profile is paired. Its
+/// messages held from before the update show either way.
+struct Lane {
+  let id: ProfileID
+  let session: CoordinatorSession?
+  let hold: LegacyHold
+}
+
+struct HeldMessage: Identifiable, Equatable {
+  let lane: ProfileID
+  let item: LegacyItem
+  var id: String { item.id }
+}
+
+/// Where the composer's restored draft came from. The source stays queued or held until
+/// the draft is admitted, so a draft lost before Send loses nothing.
+struct RestoredSource: Equatable {
+  enum Kind { case live, legacy }
+  let lane: ProfileID
+  let item: String
+  let kind: Kind
+}
+
 @MainActor @Observable
 final class ChatModel {
   var rows: [RowModel] = [] {
@@ -33,8 +55,11 @@ final class ChatModel {
   var includesLatest = true
   var error: String?
   var revision = 0
-  var draft = ""
-  var attachments: [LocalAttachment] = []
+  var draft = "" { didSet { forgetClearedSource() } }
+  var attachments: [LocalAttachment] = [] { didSet { forgetClearedSource() } }
+  private(set) var held: [HeldMessage] = []
+  private(set) var heldError: String?
+  private(set) var restoredFrom: RestoredSource?
   var previewURL: URL?
   private(set) var preparingAttachments = false
   var mode: InputMode = .steer
@@ -44,85 +69,91 @@ final class ChatModel {
     @Sendable (String, InputMode, [LocalAttachment]) async -> Bool
   @ObservationIgnored private var draftStore: AttachmentStore?
   @ObservationIgnored private var feedbackScreenshotID: String?
+  @ObservationIgnored private let registration: NotificationRegistration?
+  @ObservationIgnored private(set) var lanes: [Lane] = []
+  @ObservationIgnored private var observations: [ProfileID: Task<Void, Never>] = [:]
 
   init(
-    draftStore: AttachmentStore? = nil,
+    draftStore: AttachmentStore? = nil, registration: NotificationRegistration? = nil,
     admit: @escaping @Sendable (String, InputMode, [LocalAttachment]) async -> Bool = { _, _, _ in
       false
     }
   ) {
     self.draftStore = draftStore
+    self.registration = registration
     self.admit = admit
   }
   deinit {
-    observation?.cancel()
-    let ownedSession = session
-    Task { await ownedSession?.disconnect() }
+    for observation in observations.values { observation.cancel() }
+    let sessions = lanes.compactMap(\.session)
+    Task { for session in sessions { await session.disconnect() } }
   }
-  @ObservationIgnored private var session: CoordinatorSession?
-  @ObservationIgnored private var observation: Task<Void, Never>?
-  @ObservationIgnored private var address: CoordinatorAddress?
-  @ObservationIgnored private var active = true
+  // shortcut: rows do not carry their lane yet, so row actions use the one paired lane.
+  // Route each row to its own lane once the feed merges lanes.
+  private var session: CoordinatorSession? { lanes.first { $0.session != nil }?.session }
 
-  func connect(host: String, port: String) async {
-    do {
-      guard let port = UInt16(port) else { throw ConnectionError.invalidAddress }
-      let address = try CoordinatorAddress(
-        host: host.trimmingCharacters(in: .whitespacesAndNewlines), port: port)
-      let generation = UUID()
-      await stop(generation: generation)
-      guard self.generation == generation, !Task.isCancelled else { return }
-      self.address = address
-      let key = SHA256.hash(data: Data("\(address.host):\(address.port)".utf8)).map {
-        String(format: "%02x", $0)
-      }.joined()
-      let directory = try FileManager.default.url(
-        for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-      let session = CoordinatorSession(
-        outboxURL: directory.appending(path: "Agent/Outbox/\(key)/pending.json"))
-      guard self.generation == generation else { return }
-      await connect(session: session, address: address)
-    } catch { self.error = error.localizedDescription }
+  /// Adds a saved coordinator's lane, or replaces an unpaired lane with its paired one.
+  /// A lane whose session was live must be detached first, so two sessions never share
+  /// an outbox. Connecting is `setActive`'s job.
+  func attach(_ lane: Lane) {
+    observations.removeValue(forKey: lane.id)?.cancel()
+    if let index = lanes.firstIndex(where: { $0.id == lane.id }) {
+      lanes[index] = lane
+    } else {
+      lanes.append(lane)
+    }
+    if let session = lane.session {
+      admit = { text, mode, files in await session.submit(text, mode: mode, files: files) }
+      rows = []
+      error = nil
+      observations[lane.id] = observe(session, lane: lane.id)
+    }
+    Task { await loadHeld(lane) }
   }
-  func connect(session: CoordinatorSession, address: CoordinatorAddress) async {
-    self.address = address
-    self.session = session
-    admit = { text, mode, files in await session.submit(text, mode: mode, files: files) }
-    rows = []
-    error = nil
-    observation = Task { [weak self] in
+
+  /// Stops sends to the lane and quiesces its session before returning, so nothing writes
+  /// to the profile's directory afterwards.
+  func detach(_ id: ProfileID) async {
+    guard let index = lanes.firstIndex(where: { $0.id == id }) else { return }
+    let lane = lanes.remove(at: index)
+    observations.removeValue(forKey: id)?.cancel()
+    registration?.disconnect(id)
+    held.removeAll { $0.lane == id }
+    if lane.session != nil {
+      generation = UUID()
+      admit = { _, _, _ in false }
+      apply(ChatSnapshot())
+    }
+    await lane.session?.disconnect()
+  }
+
+  func setActive(_ active: Bool) async {
+    for session in lanes.compactMap(\.session) {
+      if active { await session.connect() } else { await session.disconnect() }
+    }
+  }
+
+  /// "Try again": reconnects now instead of waiting out the backoff.
+  func reconnect() async { await session?.connect() }
+
+  private func observe(_ session: CoordinatorSession, lane id: ProfileID) -> Task<Void, Never> {
+    Task { [weak self] in
+      var connected = false
       for await update in session.updates {
-        guard !Task.isCancelled else { return }
-        self?.apply(update)
+        guard !Task.isCancelled, let self else { return }
+        self.apply(update)
+        guard (update.connection == .connected) != connected else { continue }
+        connected.toggle()
+        // Only this lane's own session carries its installation ID.
+        if !connected {
+          self.registration?.disconnect(id)
+        } else if let registration = self.registration {
+          Task { await registration.connect(session.notificationChannel) }
+        }
       }
     }
-    if active { await session.connect(address) }
   }
-  func runUntilCancelled() async {
-    let lifetime = AsyncStream<Void> { _ in }
-    for await _ in lifetime {}
-    await stop()
-  }
-  func stop() async { await stop(generation: UUID()) }
-  private func stop(generation: UUID) async {
-    self.generation = generation
-    observation?.cancel()
-    observation = nil
-    let ownedSession = session
-    session = nil
-    connection = .disconnected
-    admit = { _, _, _ in false }
-    await ownedSession?.disconnect()
-  }
-  func setActive(_ active: Bool) async {
-    self.active = active
-    guard let session, let address else { return }
-    if active { await session.connect(address) } else { await session.disconnect() }
-  }
-  func connectNotifications(_ registration: NotificationRegistration) async {
-    guard let session else { return }
-    await registration.connect { request in try await session.notifications(request) }
-  }
+
   var canSend: Bool {
     !admitting && !preparingAttachments && connection == .connected
       && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
@@ -136,6 +167,7 @@ final class ChatModel {
     let mode = mode
     let generation = generation
     let admit = admit
+    let source = restoredFrom
     var files = attachments
     do {
       if text.split(whereSeparator: \.isWhitespace).first == "/feedback",
@@ -169,24 +201,78 @@ final class ChatModel {
       if let store = draftStore {
         for file in files { try? await store.remove(file) }
       }
+      if let source { await remove(source) }
     }
   }
   func restore(_ id: String) async {
-    guard !admitting, draft.isEmpty, attachments.isEmpty else {
-      error = "Send or clear the current draft before restoring another message."
+    guard readyToRestore() else { return }
+    do {
+      let store = try attachmentStore()
+      guard let lane = lanes.first(where: { $0.session != nil }),
+        let restored = await lane.session?.restore(id, to: store)
+      else { return }
+      fill(restored, from: RestoredSource(lane: lane.id, item: id, kind: .live))
+    } catch { self.error = error.localizedDescription }
+  }
+  func restoreHeld(_ message: HeldMessage) async {
+    guard readyToRestore(), let lane = lanes.first(where: { $0.id == message.lane }) else {
       return
     }
     do {
-      let store = try attachmentStore()
-      guard let restored = await session?.restore(id, to: store) else { return }
-      draft = restored.text + (draft.isEmpty ? "" : "\n\n" + draft)
-      attachments.insert(contentsOf: restored.attachments, at: 0)
-      mode = restored.mode
-      if restored.text.split(whereSeparator: \.isWhitespace).first == "/feedback" {
-        feedbackScreenshotID =
-          restored.attachments.last(where: { $0.reference.name == "Feedback.png" })?.id
-      }
+      guard let restored = try await lane.hold.restore(message.id, to: attachmentStore())
+      else { return }
+      fill(restored, from: RestoredSource(lane: lane.id, item: message.id, kind: .legacy))
     } catch { self.error = error.localizedDescription }
+  }
+  func discardHeld(_ message: HeldMessage) async {
+    guard let lane = lanes.first(where: { $0.id == message.lane }) else { return }
+    do { try await lane.hold.discard(message.id) } catch { self.error = error.localizedDescription }
+    await loadHeld(lane)
+  }
+  private func readyToRestore() -> Bool {
+    guard !admitting, draft.isEmpty, attachments.isEmpty else {
+      error = "Send or clear the current draft before restoring another message."
+      return false
+    }
+    return true
+  }
+  private func fill(_ restored: RestoredDraft, from source: RestoredSource) {
+    draft = restored.text
+    attachments = restored.attachments
+    mode = restored.mode
+    if restored.text.split(whereSeparator: \.isWhitespace).first == "/feedback" {
+      feedbackScreenshotID =
+        restored.attachments.last(where: { $0.reference.name == "Feedback.png" })?.id
+    }
+    restoredFrom = source
+  }
+  private func forgetClearedSource() {
+    if draft.isEmpty && attachments.isEmpty { restoredFrom = nil }
+  }
+  /// Runs after the restored draft was admitted. A lane removed meanwhile took its
+  /// source with it.
+  private func remove(_ source: RestoredSource) async {
+    if restoredFrom == source { restoredFrom = nil }
+    guard let lane = lanes.first(where: { $0.id == source.lane }) else { return }
+    switch source.kind {
+    case .live: await lane.session?.discard(source.item)
+    case .legacy:
+      do { try await lane.hold.discard(source.item) } catch {
+        self.error = error.localizedDescription
+      }
+      await loadHeld(lane)
+    }
+  }
+  private func loadHeld(_ lane: Lane) async {
+    do {
+      let items = try await lane.hold.items()
+      guard lanes.contains(where: { $0.id == lane.id }) else { return }
+      held = held.filter { $0.lane != lane.id } + items.map { HeldMessage(lane: lane.id, item: $0) }
+      heldError = nil
+    } catch {
+      heldError =
+        "Messages held from before the update could not be read. They stay on this phone."
+    }
   }
   private func attachmentStore() throws -> AttachmentStore {
     if let draftStore { return draftStore }

@@ -4,6 +4,7 @@ import Network
 import Testing
 
 @testable import AgentCore
+@testable import AgentUI
 
 func send(_ data: Data, on connection: NWConnection) async throws {
   try await withCheckedThrowingContinuation {
@@ -17,6 +18,8 @@ func send(_ data: Data, on connection: NWConnection) async throws {
 }
 
 actor FixtureCoordinator {
+  /// What this fixture answers `identify` with. Sessions pass it as their pin.
+  nonisolated let id = CoordinatorID(UUID())
   nonisolated let closedObservations: AsyncStream<Void>
   nonisolated let closedToolLookups: AsyncStream<Void>
   private let closedContinuation: AsyncStream<Void>.Continuation
@@ -81,6 +84,15 @@ actor FixtureCoordinator {
     release = nil
   }
   private var sockets: [NWConnection] = []
+  private var requests: [NativeRequest] = []
+  private var dropsIdentify = false
+  /// Every request any socket carried, in arrival order.
+  func received() -> [NativeRequest] { requests }
+  /// Behaves like a coordinator built before identities. It closes on `identify` without a frame.
+  func dropIdentify(_ drops: Bool = true) { dropsIdentify = drops }
+  func emitOnObserver(_ event: NativeEvent) async throws {
+    try await emit(event, on: #require(observer))
+  }
   private var submissions: [NativeRequestSubmit] = []
   private var files: [String: Data] = [:]
   private var uploads = 0
@@ -119,7 +131,14 @@ actor FixtureCoordinator {
       let command = try JSONDecoder().decode(NativeCommand.self, from: bytes.prefix(upTo: end))
       bytes.removeSubrange(...end)
       guard case .native(let value) = command else { return }
+      requests.append(value.request)
       switch value.request {
+      case .identify:
+        if dropsIdentify {
+          socket.cancel()
+          return
+        }
+        try await emit(.identity(.init(coordinatorId: "\(id.uuid)".lowercased())), on: socket)
       case .notifications(let request):
         notificationRequests.append(request.request)
         notificationObserved.continuation.yield(())
@@ -258,14 +277,12 @@ actor FixtureCoordinator {
   }
 }
 
-func withCoordinator(
-  _ body: @Sendable (CoordinatorSession, FixtureCoordinator, URL) async throws -> Void
-) async throws {
+/// Serves `fixture` on a loopback port until the listener is cancelled.
+func listen(_ fixture: FixtureCoordinator) async throws -> (NWListener, NWEndpoint.Port) {
   let parameters = NWParameters.tcp
   parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
   let listener = try NWListener(using: parameters)
   let ready = AsyncThrowingStream<Void, any Error>.makeStream()
-  let fixture = FixtureCoordinator()
   listener.stateUpdateHandler = { state in
     if case .ready = state { ready.continuation.yield(()) }
     if case .failed(let error) = state { ready.continuation.finish(throwing: error) }
@@ -285,19 +302,44 @@ func withCoordinator(
     }
   }
   listener.start(queue: .global())
-  defer { listener.cancel() }
   for try await _ in ready.stream { break }
-  let port = try #require(listener.port)
-  let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-  let outbox = directory.appending(path: "outbox.json")
-  defer { try? FileManager.default.removeItem(at: directory) }
+  return (listener, try #require(listener.port))
+}
+
+func loopback(_ port: NWEndpoint.Port) -> CoordinatorTransport {
+  CoordinatorTransport { _ in
+    LineConnection(connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+  }
+}
+
+/// A profile directory under a fresh temporary root, removed by the caller.
+func temporaryProfile() -> (ProfileDirectory, URL) {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  return (ProfileDirectory(ProfileID(), applicationSupport: root, caches: root), root)
+}
+
+/// The feed lane of `session`, holding nothing from before the update.
+func lane(_ session: CoordinatorSession) -> Lane {
+  let empty = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  return Lane(
+    id: session.profile, session: session,
+    hold: LegacyHold(
+      ProfileDirectory(session.profile, applicationSupport: empty, caches: empty)))
+}
+
+func withCoordinator(
+  _ body: @Sendable (CoordinatorSession, FixtureCoordinator, URL) async throws -> Void
+) async throws {
+  let fixture = FixtureCoordinator()
+  let (listener, port) = try await listen(fixture)
+  defer { listener.cancel() }
+  let (directory, root) = temporaryProfile()
+  defer { try? FileManager.default.removeItem(at: root) }
   let session = CoordinatorSession(
-    outboxURL: outbox,
-    connectTransport: { _ in
-      LineConnection(connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
-    })
+    directory: directory, address: try CoordinatorAddress(host: "100.64.1.2"), pin: fixture.id,
+    transport: loopback(port))
   do {
-    try await body(session, fixture, outbox)
+    try await body(session, fixture, directory.outbox)
     await session.disconnect()
     await fixture.stop()
   } catch {
