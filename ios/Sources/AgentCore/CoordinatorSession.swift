@@ -959,12 +959,18 @@ public actor CoordinatorSession {
   private func publish() {
     let queued = Dictionary(
       pending.map { ($0.request.inputId, $0) }, uniquingKeysWith: { first, _ in first })
+    // A settled send outlives its entry's stamp, and feedback settles with no entry at all.
+    let sentInputs = Dictionary(
+      ledger.sends.map { ($1.inputID, $0) }, uniquingKeysWith: { first, _ in first })
+    let sentEntries = Dictionary(
+      ledger.sends.compactMap { id, send in send.entryID.map { ($0, id) } },
+      uniquingKeysWith: { first, _ in first })
     snapshot.rows = transcript.rows.map { row in
       var row = row
       row.receivedAt = rowStamps[row.id].map(Date.init(timeIntervalSince1970:))
       row.sendID =
-        row.inputID.flatMap { queued[$0]?.sendID }
-        ?? row.entryID.flatMap { ledger.entries[$0]?.sendID }
+        row.inputID.flatMap { queued[$0]?.sendID ?? sentInputs[$0] }
+        ?? row.entryID.flatMap { ledger.entries[$0]?.sendID ?? sentEntries[$0] }
       return row
     }
     snapshot.sends = ledger.sends.mapValues { SendStatus(recipients: $0.recipients, delivery: nil) }

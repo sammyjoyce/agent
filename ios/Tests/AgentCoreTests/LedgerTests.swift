@@ -277,6 +277,45 @@ func aSendStillReportsAfterItsRowLeavesTheWindow() async throws {
 }
 
 @Test(.timeLimit(.minutes(1)))
+func anOlderSendKeepsItsSendIDAfterItsEntryLeavesTheCappedLedger() async throws {
+  try await withProfile { fixture, directory, launch in
+    let first = try await launch()
+    await first.connect()
+    _ = try await until(first) { $0.connection == .connected }
+    let recipients = [directory.profile, ProfileID()]
+    let staged = try #require(
+      await first.stage("To both", sendID: "send-old", recipients: recipients))
+    await first.start(staged)
+    let placed = try await until(first) {
+      $0.rows.contains { $0.sendID == "send-old" && $0.entryID != nil && $0.delivery == nil }
+    }
+    let entry = try #require(placed.rows.first { $0.sendID == "send-old" }?.entryID)
+    await first.disconnect()
+    var ledger = try savedLedger(directory)
+    let newest = try #require(ledger.entries.values.map(\.receivedAt).max())
+    for index in 0..<2000 {
+      ledger.entries["later-\(index)"] = Ledger.Entry(receivedAt: newest + 1 + Double(index))
+    }
+    try writePrivately(JSONEncoder().encode(ledger), to: directory.ledger)
+    await fixture.replyToHistory(
+      initial: .init(
+        messages: [reply("today", "A reply from today")], nextCursor: "older", pageComplete: true),
+      pages: [
+        "older": .init(
+          messages: [reply(entry, role: .user, "To both")], nextCursor: nil, pageComplete: true)
+      ])
+    let second = try await launch()
+    await second.connect()
+    _ = try await until(second) { $0.rows.contains { $0.entryID == "today" } }
+    #expect(try savedLedger(directory).entries[entry] == nil, "Its entry left the capped ledger")
+    await second.loadEarlier()
+    let older = try await until(second) { $0.rows.contains { $0.entryID == entry } }
+    #expect(older.rows.first { $0.entryID == entry }?.sendID == "send-old")
+    #expect(older.sends["send-old"] == SendStatus(recipients: recipients, delivery: nil))
+  }
+}
+
+@Test(.timeLimit(.minutes(1)))
 func aStageCutOffByDisconnectLeavesNothingInTheProfile() async throws {
   try await withCoordinator { session, fixture, outbox in
     await session.connect()

@@ -322,6 +322,27 @@ func anUntaggedSendReachesBothCoordinatorsAndATaggedOneOnlyItsOwn() async throws
 }
 
 @MainActor @Test(.timeLimit(.minutes(1)))
+func aFeedbackToBothStaysOneBubbleWithEachRecipientsStatusOnceSettled() async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, _ in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    chat.draft = "/feedback The invented text is clipped"
+    await chat.send()
+    try await eventually("both settled") {
+      (await workFixture.count(), await personalFixture.count()) == (1, 1)
+        && chat.snapshots.values.allSatisfy {
+          $0.sends.count == 1 && $0.sends.values.allSatisfy { $0.delivery == nil }
+        }
+    }
+    let users = chat.rows.filter { $0.row.role == .user }
+    #expect(users.count == 1)
+    #expect(
+      users.first?.receipts
+        == [Receipt(lane: work, status: .placed), Receipt(lane: personal, status: .placed)])
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
 func aRefusedStageLeavesNothingQueuedAnywhereAndKeepsTheDraft() async throws {
   try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
     let (work, personal) = try await addWorkAndPersonal(coordinators)
