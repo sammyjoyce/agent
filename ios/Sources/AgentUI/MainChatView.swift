@@ -512,7 +512,9 @@ public struct MainChatView: View {
         RoundedRectangle(cornerRadius: 26).strokeBorder(.primary.opacity(0.12), lineWidth: 0.5)
       }
       if model.multiple {
-        let blocked = if case .blocked = model.addressing { true } else { false }
+        // With the picker open the tag is still being typed, which is not an error.
+        let blocked =
+          if case .blocked = model.addressing, model.pickerMatches.isEmpty { true } else { false }
         Text(model.recipientLine).font(.footnote)
           .foregroundStyle(blocked ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
           .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12)
