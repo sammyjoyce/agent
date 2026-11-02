@@ -182,7 +182,12 @@ func twoCoordinatorFeedRoutesOnlyToAddressedCoordinators() async throws {
     }
   }
   /// Writes to the composer one character at a time, as the text field does.
-  func type(_ text: String) { for character in text { chat.draft.append(character) } }
+  func type(_ text: String) {
+    for character in text {
+      chat.draft.append(character)
+      chat.promoteTypedTag()
+    }
+  }
   func bubbles(_ text: String) -> [RowModel] {
     chat.rows.filter { $0.row.role == .user && $0.row.text == text }
   }

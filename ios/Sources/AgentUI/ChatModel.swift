@@ -77,7 +77,7 @@ final class ChatModel {
   /// The one coordinator the draft goes to, or nil for every paired one. While it is set, the
   /// draft is never read for tags.
   var recipient: ProfileID?
-  var draft = "" { didSet { draftChanged() } }
+  var draft = "" { didSet { forgetClearedSource() } }
   var attachments: [LocalAttachment] = [] { didSet { forgetClearedSource() } }
   private(set) var held: [HeldMessage] = []
   private(set) var heldError: String?
@@ -224,9 +224,8 @@ final class ChatModel {
   }
 
   /// A complete leading tag followed by a space becomes the chip, and the text after it is
-  /// never read for tags.
-  private func draftChanged() {
-    forgetClearedSource()
+  /// never read for tags. The composer calls this after each edit.
+  func promoteTypedTag() {
     guard multiple, recipient == nil, draft.first == "@" else { return }
     let word = draft.dropFirst().prefix { !$0.isWhitespace }
     let named = profiles.filter { $0.name.description.lowercased() == word.lowercased() }

@@ -302,8 +302,10 @@ func anUntaggedSendReachesBothCoordinatorsAndATaggedOneOnlyItsOwn() async throws
     }
 
     chat.draft = "@Work "
+    chat.promoteTypedTag()
     #expect(chat.recipient == work && chat.draft.isEmpty, "A typed tag becomes the chip")
     chat.draft = "@Personal rotate the staging deploy key"
+    chat.promoteTypedTag()
     #expect(chat.recipientLine == "To Work", "Text after the chip is never routed")
     await chat.send()
     #expect(chat.recipient == nil && chat.draft.isEmpty)

@@ -471,6 +471,8 @@ public struct MainChatView: View {
           axis: .vertical
         )
         .lineLimit(1...6).textFieldStyle(.plain).padding(.vertical, 11).padding(.horizontal, 2)
+        // The field drops a rewrite made inside its own write, so the tag moves after it.
+        .onChange(of: model.draft) { model.promoteTypedTag() }
         .accessibilityLabel("Message the coordinator").accessibilityIdentifier(
           "Message the coordinator")
         Button {
