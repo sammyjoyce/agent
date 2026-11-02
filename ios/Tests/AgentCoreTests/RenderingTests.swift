@@ -667,7 +667,7 @@
         #expect(model.rows.filter { $0.row.text == broadcast }.count == 1, "The broadcast folds")
         #expect(TranscriptItem.runStarts(model.transcriptItems).count == 5)
         #expect(model.recipientLine == "To Work")
-        for scheme in [ColorScheme.light, .dark] {
+        func render(_ scheme: ColorScheme) async throws -> CGImage {
           let dimensions = CGSize(width: 390, height: 844)
           let host = UIHostingController(
             rootView: MainChatView(model: model).environment(\.colorScheme, scheme))
@@ -698,10 +698,13 @@
           let format = UIGraphicsImageRendererFormat()
           format.scale = 1
           format.preferredRange = .standard
-          let image = try #require(
+          return try #require(
             UIGraphicsImageRenderer(size: dimensions, format: format).image { _ in
               #expect(host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true))
             }.cgImage)
+        }
+        for scheme in [ColorScheme.light, .dark] {
+          let image = try await render(scheme)
           try requireVisibleContent(image)
           if scheme == .light {
             #expect(try pixels(near: (0.11, 0.31, 0.85), in: image) > 20, "Work's blue label")
@@ -709,6 +712,17 @@
           }
           Attachment.record(image, named: "two-coordinator-feed-\(scheme)", as: .png)
         }
+
+        let systemRed = (1.0, 0.23, 0.19)
+        model.recipient = nil
+        model.draft = "@"
+        #expect(model.recipientLine == "Choose a coordinator" && !model.pickerMatches.isEmpty)
+        let picking = try await render(.light)
+        Attachment.record(picking, named: "two-coordinator-picker-hint", as: .png)
+        #expect(try pixels(near: systemRed, in: picking) == 0, "An open picker is not an error")
+        model.draft = "@Nobody check the invented report"
+        let unknown = try await render(.light)
+        #expect(try pixels(near: systemRed, in: unknown) > 0, "An unknown tag is an error")
       }
 
       @MainActor @Test func accessibilityTextSizeExpandsMessageLayout() async throws {
