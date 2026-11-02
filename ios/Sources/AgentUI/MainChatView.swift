@@ -681,7 +681,7 @@ private struct CoordinatorForm: View {
   @State private var port = "43187"
   @State private var formError: String?
   @State private var saving = false
-  @State private var removal: Int?
+  @State private var removal: String?
   @Environment(\.dismiss) private var dismiss
 
   init(coordinators: Coordinators, profile: CoordinatorProfile?, pushed: Bool) {
@@ -728,7 +728,7 @@ private struct CoordinatorForm: View {
       .onChange(of: profile?.id) { load() }
     if let profile {
       Button("Remove coordinator", role: .destructive) {
-        Task { removal = await coordinators.removalCount(profile.id) }
+        Task { removal = await coordinators.removalMessage(profile.id) }
       }
       .disabled(saving)
       .confirmationDialog(
@@ -738,7 +738,7 @@ private struct CoordinatorForm: View {
       ) {
         Button("Remove", role: .destructive) { Task { await remove(profile.id) } }
       } message: {
-        Text(removalMessage)
+        Text(removal ?? "")
       }
     }
   }
@@ -751,13 +751,6 @@ private struct CoordinatorForm: View {
     guard !saving, let address = formAddress else { return false }
     guard let profile else { return true }
     return profile.address != address || profile.name.description != name
-  }
-  private var removalMessage: String {
-    switch removal ?? 0 {
-    case 0: "No queued messages are on this phone."
-    case 1: "This deletes 1 queued message on this phone."
-    case let count: "This deletes \(count) queued messages on this phone."
-    }
   }
   private func load() {
     name = profile?.name.description ?? ""

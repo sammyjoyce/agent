@@ -333,9 +333,11 @@ public actor CoordinatorSession {
   }
 
   /// Items in the on-device outbox, read from disk so a session that never connected counts too.
-  public func queuedCount() -> Int {
-    (try? JSONDecoder().decode([OutboxItem].self, from: Data(contentsOf: outboxURL)))?.count
-      ?? pending.count
+  /// A missing outbox holds nothing. An unreadable one throws.
+  public func queuedCount() throws -> Int {
+    do {
+      return try JSONDecoder().decode([OutboxItem].self, from: Data(contentsOf: outboxURL)).count
+    } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return 0 }
   }
   public func loadEarlier(anchorID: String? = nil) async {
     guard let cursor = snapshot.olderCursor else { return }

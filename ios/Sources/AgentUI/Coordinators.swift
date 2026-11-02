@@ -144,12 +144,21 @@ public final class Coordinators {
     if active { await chat.lanes.first { $0.id == id }?.session?.connect() }
   }
 
-  /// How many messages Remove deletes on this phone, queued plus held.
-  func removalCount(_ id: ProfileID) async -> Int {
-    guard let lane = chat.lanes.first(where: { $0.id == id }) else { return 0 }
-    let queued = await lane.session?.queuedCount() ?? 0
-    let held = (try? await lane.hold.items().count) ?? 0
-    return queued + held
+  /// Remove's confirmation: how many messages it deletes on this phone, queued plus held. A
+  /// queue that cannot be read is never counted as empty.
+  func removalMessage(_ id: ProfileID) async -> String {
+    let lane = chat.lanes.first { $0.id == id }
+    do {
+      let queued = try await lane?.session?.queuedCount() ?? 0
+      let held = try await lane?.hold.items().count ?? 0
+      return switch queued + held {
+      case 0: "No queued messages are on this phone."
+      case 1: "This deletes 1 queued message on this phone."
+      case let count: "This deletes \(count) queued messages on this phone."
+      }
+    } catch {
+      return "Queued messages on this phone could not be read. Removing deletes them."
+    }
   }
 
   /// Withdraws alerts while the coordinator can still be reached, quiesces the lane, saves

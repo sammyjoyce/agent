@@ -359,7 +359,9 @@ func removeCountsQueuedAndHeldMessagesAndDeletesOnlyAfterSaving() async throws {
   try await eventually("a rejected live item") {
     chat.rows.contains { $0.row.delivery == .rejected }
   }
-  #expect(await coordinators.removalCount(profile.id) == 3)
+  #expect(
+    await coordinators.removalMessage(profile.id)
+      == "This deletes 3 queued messages on this phone.")
   let agent = install.support.appending(path: "Agent")
   let directory = install.directory(profile)
   try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: agent.path)
@@ -378,6 +380,41 @@ func removeCountsQueuedAndHeldMessagesAndDeletesOnlyAfterSaving() async throws {
     await fixture.notificationControls().contains(
       .unregister(.init(installationId: "\(profile.id)"))), "Alerts are withdrawn first")
   await coordinators.setActive(false)
+  await fixture.stop()
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func removeNeverCallsAnUnreadableQueueEmpty() async throws {
+  let fixture = FixtureCoordinator()
+  let (listener, port) = try await listen(fixture)
+  defer { listener.cancel() }
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "remove-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: loopback(port))
+  try await coordinators.add(name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2"))
+  let id = try #require(coordinators.profiles.first?.id)
+  let directory = ProfileDirectory(id, applicationSupport: root, caches: root)
+  let unreadable = "Queued messages on this phone could not be read. Removing deletes them."
+  #expect(await coordinators.removalMessage(id) == "No queued messages are on this phone.")
+  try writePrivately(Data("not an outbox".utf8), to: directory.outbox)
+  let outbox = await coordinators.removalMessage(id)
+  #expect(outbox == unreadable, "An unreadable outbox")
+  try FileManager.default.removeItem(at: directory.outbox)
+  let held = directory.legacy.appending(path: "pending.json")
+  try writePrivately(
+    JSONEncoder().encode([
+      NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: "Invented held note")
+    ]), to: held)
+  try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: held.path)
+  let hold = await coordinators.removalMessage(id)
+  #expect(hold == unreadable, "An unreadable hold")
+  try await coordinators.remove(id)
+  #expect(!FileManager.default.fileExists(atPath: directory.root.path))
   await fixture.stop()
 }
 
