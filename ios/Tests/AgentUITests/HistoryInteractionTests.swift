@@ -19,8 +19,9 @@ import XCTest
 
 @MainActor
 final class ComposerInteractionTests: XCTestCase {
-  // Typed through the keyboard into the real field, where a model-level draft cannot reach.
-  func testATypedTagBecomesTheRecipientAndNeverReachesTheWire() async throws {
+  private func launchWithWorkAndPersonal() async throws -> (
+    app: XCUIApplication, work: InteractionPeer, personal: InteractionPeer
+  ) {
     continueAfterFailure = false
     executionTimeAllowance = 120
     let work = InteractionPeer()
@@ -38,17 +39,26 @@ final class ComposerInteractionTests: XCTestCase {
       .map { $0.coordinator.uuidString }.joined(separator: ",")
     app.launchArguments += ["-notificationsEnabled", "NO"]
     app.launch()
-    defer { app.terminate() }
     XCTAssertTrue(app.staticTexts["To Work and Personal"].waitForExistence(timeout: 10))
+    return (app, work, personal)
+  }
+  private func isEmpty(_ field: XCUIElement) -> Bool {
+    let value = field.value as? String
+    return value == nil || value == "" || value == field.placeholderValue
+  }
+
+  // Typed through the keyboard into the real field, where a model-level draft cannot reach.
+  func testATypedTagBecomesTheRecipientAndNeverReachesTheWire() async throws {
+    let (app, work, personal) = try await launchWithWorkAndPersonal()
+    defer { app.terminate() }
     let composer = app.descendants(matching: .any).matching(identifier: "Message the coordinator")
       .firstMatch
     composer.tap()
     composer.typeText("@Work ")
     XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3), "The typed tag is the chip")
-    let value = composer.value as? String
     XCTAssertTrue(
-      value == nil || value == "" || value == composer.placeholderValue,
-      "The typed tag left the field, which shows \(value ?? "nil")")
+      isEmpty(composer),
+      "The typed tag left the field, which shows \(composer.value as? String ?? "nil")")
     let text = "Anything urgent this morning?"
     composer.typeText(text)
     app.buttons["Send message"].tap()
@@ -57,6 +67,34 @@ final class ComposerInteractionTests: XCTestCase {
     let toPersonal = await personal.submits()
     XCTAssertEqual(toWork, [text], "Work receives the text without its tag")
     XCTAssertEqual(toPersonal, [], "Personal receives nothing")
+  }
+
+  // The keyboard's inline prediction completes "airport", so the last key leaves the text as it
+  // was. A field still showing sent text would send it again, untagged, with the next key.
+  func testSendEmptiesTheFieldWhenTheLastKeyFinishedAnInlinePrediction() async throws {
+    let (app, work, personal) = try await launchWithWorkAndPersonal()
+    defer { app.terminate() }
+    let composer = app.descendants(matching: .any).matching(identifier: "Message the coordinator")
+      .firstMatch
+    composer.tap()
+    let text = "Book a taxi to the airport"
+    // typeText gets no inline prediction, so this taps the keys as a person does.
+    for character in text {
+      let name = character == " " ? "space" : String(character)
+      let key = app.keyboards.keys[name]
+      if key.exists { key.tap() } else { app.keyboards.keys[name.lowercased()].tap() }
+    }
+    app.buttons["Send message"].tap()
+    try await eventually {
+      let toWork = await work.submits()
+      let toPersonal = await personal.submits()
+      return toWork == [text] && toPersonal == [text]
+    }
+    XCTAssertTrue(
+      isEmpty(composer),
+      "The field kept the sent text: \(composer.value as? String ?? "nil")")
+    composer.typeText("x")
+    XCTAssertEqual(composer.value as? String, "x", "The next key starts a new draft")
   }
 }
 
