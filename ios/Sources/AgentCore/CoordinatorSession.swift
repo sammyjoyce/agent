@@ -84,8 +84,10 @@ public actor CoordinatorSession {
   private var actionConnections: [UUID: VerifiedConnection] = [:]
   private var previewRequests: Set<UUID> = []
   private var pending: [OutboxItem] = []
-  /// Staged inputs `start` has not taken yet. Only these can be unstaged.
-  private var unstarted: Set<String> = []
+  private enum Unsent { case staged, waiting }
+  /// Durable inputs this process staged that have not left the phone. Only a staged one can be
+  /// unstaged. A started one waits for this lane to connect, then sends once.
+  private var unsent: [String: Unsent] = [:]
   private var attemptedInputs: Set<String> = []
   private var generation = UUID()
   private var flush: Task<Void, Never>?
@@ -138,8 +140,11 @@ public actor CoordinatorSession {
     if let newest = pending.map(\.queuedAt).max() { stamps.seed(newest) }
     // The outbox belongs to this profile and every socket proves its pinned coordinator,
     // so these IDs reach only the coordinator they were queued for.
-    attemptedInputs.formUnion(pending.map(\.request.inputId))
-    for item in pending { transcript.pending(item.request, delivery: .uncertain) }
+    for item in pending {
+      let mayHaveLeft = unsent[item.request.inputId] == nil
+      if mayHaveLeft { attemptedInputs.insert(item.request.inputId) }
+      transcript.pending(item.request, delivery: mayHaveLeft ? .uncertain : .sending)
+    }
     stampRows()
     snapshot.error = nil
     observation = Task { [weak self] in await self?.observe(generation: generation) }
@@ -161,7 +166,9 @@ public actor CoordinatorSession {
     snapshot.connection = .disconnected
     snapshot.busy = false
     snapshot.loadingHistory = false
-    for item in pending { transcript.delivery(item.request.inputId, .uncertain) }
+    for item in pending where unsent[item.request.inputId] == nil {
+      transcript.delivery(item.request.inputId, .uncertain)
+    }
     publish()
     for connection in ownedConnections { await connection.close() }
   }
@@ -251,18 +258,24 @@ public actor CoordinatorSession {
       publish()
       return nil
     }
-    unstarted.insert(request.inputId)
+    unsent[request.inputId] = .staged
     transcript.pending(request, delivery: .sending)
     stampRows()
     return StagedInput(inputID: request.inputId, sendID: sendID, profile: profile, control: nil)
   }
 
-  /// Sends a staged input on this coordinator's own verified socket. One that cannot leave
-  /// now stays queued as unconfirmed, for Check.
+  /// Sends a staged input on this coordinator's own verified socket. While this lane is not
+  /// connected, a durable one waits and goes once it connects. One this session is too busy to
+  /// send stays queued as unconfirmed, for Check.
   public func start(_ staged: StagedInput) {
     guard staged.profile == profile else { return }
     if staged.control == nil {
-      guard unstarted.remove(staged.inputID) != nil else { return }
+      guard unsent[staged.inputID] == .staged else { return }
+      guard snapshot.connection == .connected else {
+        unsent[staged.inputID] = .waiting
+        return
+      }
+      unsent[staged.inputID] = nil
     }
     guard actions.count < 32, snapshot.connection == .connected else {
       if staged.control == nil {
@@ -283,12 +296,12 @@ public actor CoordinatorSession {
   /// Withdraws a staged input that never started: its outbox item, its row, and the stored
   /// files no other item uses.
   public func unstage(_ staged: StagedInput) async {
-    guard staged.profile == profile, unstarted.contains(staged.inputID) else { return }
+    guard staged.profile == profile, unsent[staged.inputID] == .staged else { return }
     guard let removal = acknowledge(staged.inputID) else {
       publish()
       return
     }
-    unstarted.remove(staged.inputID)
+    unsent[staged.inputID] = nil
     transcript.removeInput(staged.inputID)
     publish()
     await removal.value
@@ -298,7 +311,7 @@ public actor CoordinatorSession {
     guard actions.count < 32, snapshot.connection == .connected,
       let item = pending.first(where: { $0.request.inputId == inputID })
     else { return }
-    unstarted.remove(inputID)
+    unsent[inputID] = nil
     transcript.delivery(inputID, .sending)
     perform(.submit(item.request), inputID: inputID)
     publish()
@@ -472,6 +485,10 @@ public actor CoordinatorSession {
             snapshot.connection = .connected
             snapshot.error = nil
             identityFailure = nil
+            for item in pending where unsent[item.request.inputId] == .waiting {
+              unsent[item.request.inputId] = nil
+              perform(.submit(item.request), inputID: item.request.inputId)
+            }
           }
           if case .done = event { throw ConnectionError.closed }
           consume(event)
@@ -481,7 +498,9 @@ public actor CoordinatorSession {
         await stream?.close()
         guard !Task.isCancelled, self.generation == generation else { return }
         connection = nil
-        for item in pending { transcript.delivery(item.request.inputId, .uncertain) }
+        for item in pending where unsent[item.request.inputId] == nil {
+          transcript.delivery(item.request.inputId, .uncertain)
+        }
         snapshot.busy = false
         guard ConnectionError.shouldReconnect(after: error) else {
           let stoppedGeneration = UUID()
