@@ -980,11 +980,6 @@ struct MessageRow: View {
   }
   private var content: some View {
     VStack(alignment: .leading, spacing: 8) {
-      if isUser, model.receipts.count == 1, let lane = model.receipts.first?.lane,
-        let badge = badges[lane]
-      {
-        Text("@\(badge.name)").fontWeight(.semibold).foregroundStyle(badge.color)
-      }
       if showsHeader {
         Label(title, systemImage: symbol).font(.caption.weight(.semibold)).foregroundStyle(
           .secondary)
@@ -1000,7 +995,7 @@ struct MessageRow: View {
           Text(presentation.activityTitle()).font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
         }
-        RichMessage(blocks: model.row.blocks)
+        RichMessage(blocks: blocks)
       }
       ForEach(model.row.attachments, id: \.id) { reference in
         Button {
@@ -1011,6 +1006,19 @@ struct MessageRow: View {
         .buttonStyle(.plain).accessibilityHint("Download and preview attachment")
       }
     }
+  }
+  /// The row's text, led by the tag of the one coordinator a tagged Send went to.
+  private var blocks: [RichBlock] {
+    guard isUser, model.receipts.count == 1, let lane = model.receipts.first?.lane,
+      let badge = badges[lane]
+    else { return model.row.blocks }
+    var tag = AttributedString("@\(badge.name) ")
+    tag.foregroundColor = badge.color
+    tag.font = .body.weight(.semibold)
+    guard case .prose(let text)? = model.row.blocks.first else {
+      return [.prose(tag)] + model.row.blocks
+    }
+    return [.prose(tag + text)] + model.row.blocks.dropFirst()
   }
   private var title: String {
     switch model.row.role {
