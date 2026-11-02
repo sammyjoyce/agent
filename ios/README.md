@@ -81,7 +81,10 @@ Mode if requested, then Run.
 - Messages and feedback, including immutable attachment copies, are saved to the
   saved coordinator's own outbox before transmission. On iOS it
   uses complete file protection and is excluded from backup. History stays in
-  memory; there is no separate phone conversation database.
+  memory; there is no separate phone conversation database. For its newest 2000
+  entries, each coordinator's `Ledger.json` keeps the entry ID, the time this
+  phone received it and the send ID. It never holds message text. It has the
+  same protection, and it keeps the order you saw across a relaunch.
 - Every connection first asks for the coordinator's ID and writes nothing else
   unless the ID matches the saved one. A coordinator too old to answer shows
   "Update the coordinator". If the address now answers as a different

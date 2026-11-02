@@ -178,7 +178,7 @@ private actor ReconnectCoordinator {
   defer { try? FileManager.default.removeItem(at: root) }
   let session = CoordinatorSession(
     directory: directory, address: try CoordinatorAddress(host: "100.64.1.2"), pin: fixture.id,
-    transport: loopback(port))
+    stamps: StampSource(), transport: loopback(port))
   let model = ChatModel()
   model.attach(Lane(id: directory.profile, session: session, hold: LegacyHold(directory)))
   await model.setActive(true)
@@ -238,9 +238,7 @@ func lostActionReplyReconnectsAndReconcilesWithoutResendingOrClearingNewTyping()
     let original = try #require(model.rows.first(where: { $0.row.role == .user }))
     let originalID = original.id
     let submitted = try #require(await fixture.submitted().first)
-    let pending = try JSONDecoder().decode(
-      [NativeRequestSubmit].self, from: Data(contentsOf: outbox))
-    #expect(pending == [submitted])
+    #expect(try queuedRequests(outbox) == [submitted])
     try await waitForReconnectFixture { await fixture.observedIDs().count == 2 }
     #expect(await fixture.observedIDs().last == [submitted.inputId])
     #expect(await fixture.submitted().count == 1)
@@ -255,8 +253,7 @@ func lostActionReplyReconnectsAndReconcilesWithoutResendingOrClearingNewTyping()
     #expect(model.rows.map(\.id) == [originalID])
     #expect(model.rows.map(\.row.text) == [submitted.text])
     #expect(await fixture.submitted().count == 1)
-    #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
+    #expect(try queuedRequests(outbox).isEmpty)
   }
 }
 

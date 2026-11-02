@@ -41,12 +41,11 @@ func nativeClientReconcilesAgainstTheProductionCoordinator() async throws {
     caches: directory.appending(path: "native"))
   let outbox = profile.outbox
   let input = NativeRequestSubmit(inputId: inputID, mode: .steer, text: text)
-  try FileManager.default.createDirectory(
-    at: outbox.deletingLastPathComponent(), withIntermediateDirectories: true)
-  try JSONEncoder().encode([input]).write(to: outbox, options: .atomic)
+  try saveOutbox([input], in: profile)
   let trace = NativeConnectionTrace()
   let session = CoordinatorSession(
     directory: profile, address: try CoordinatorAddress(host: "100.64.1.2"), pin: pin,
+    stamps: StampSource(),
     transport: CoordinatorTransport { _ in
       let connection = NWConnection(to: .unix(path: socket), using: .tcp)
       connection.stateUpdateHandler = { state in
@@ -60,9 +59,7 @@ func nativeClientReconcilesAgainstTheProductionCoordinator() async throws {
     #expect(rows.filter { $0.text == text }.map(\.entryID) == [entryID])
     #expect(rows.filter { $0.role == .user }.count == 1)
     #expect(rows.allSatisfy { $0.delivery == nil })
-    #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox))
-        .isEmpty)
+    #expect(try queuedRequests(outbox).isEmpty)
   }
   func waitFor(_ description: String, _ predicate: () -> Bool) async throws {
     let deadline = ContinuousClock.now + .seconds(20)

@@ -28,13 +28,33 @@ public struct ChatSnapshot: Sendable {
   public var loadingHistory = false
   public var includesLatest = true
   public var error: String?
+  /// Every Send this coordinator holds, from its outbox and ledger rather than the loaded
+  /// rows, so a Send whose row left the window still reports.
+  public var sends: [String: SendStatus] = [:]
   public init() {}
+}
+
+/// One coordinator's part in a Send.
+public struct SendStatus: Sendable, Equatable {
+  /// Everyone the Send was addressed to.
+  public let recipients: [ProfileID]
+  /// nil once this coordinator placed it.
+  public let delivery: Delivery?
 }
 
 public struct RestoredDraft: Sendable {
   public let text: String
   public let mode: InputMode
   public let attachments: [LocalAttachment]
+}
+
+/// An input `stage` saved, waiting for `start` or `unstage` on the same session.
+public struct StagedInput: Sendable, Equatable {
+  public let inputID: String
+  public let sendID: String
+  let profile: ProfileID
+  /// A control command is not durable, so it waits here instead of in the outbox.
+  let control: NativeRequestSubmit?
 }
 
 /// Owns all network work, decoding, rendering preparation and the on-device outbox.
@@ -63,24 +83,40 @@ public actor CoordinatorSession {
   private var latestRowID: String?
   private var actionConnections: [UUID: VerifiedConnection] = [:]
   private var previewRequests: Set<UUID> = []
-  private var pending: [NativeRequestSubmit] = []
+  private var pending: [OutboxItem] = []
+  /// Staged inputs `start` has not taken yet. Only these can be unstaged.
+  private var unstarted: Set<String> = []
   private var attemptedInputs: Set<String> = []
   private var generation = UUID()
   private var flush: Task<Void, Never>?
   private let outboxURL: URL
   private let attachments: AttachmentStore
   private let previews: AttachmentStore
+  private let stamps: StampSource
+  private let ledgerURL: URL
+  private var ledger: Ledger
+  /// Each visible row's receive stamp, kept by row ID so a row that changes key keeps it.
+  private var rowStamps: [String: TimeInterval] = [:]
 
   /// Every socket reaches `address` and must name `pin`. A profile without a pin has no session.
+  /// Every session in the process shares `stamps`.
   public init(
     directory: ProfileDirectory, address: CoordinatorAddress, pin: CoordinatorID,
-    transport: CoordinatorTransport = .tailnet
+    stamps: StampSource, transport: CoordinatorTransport = .tailnet
   ) {
     profile = directory.profile
     dialer = CoordinatorDialer(address: address, pin: pin, transport: transport)
     outboxURL = directory.outbox
     attachments = AttachmentStore(directory: directory.outboxAttachments)
     previews = AttachmentStore(directory: directory.previews)
+    self.stamps = stamps
+    ledgerURL = directory.ledger
+    // Loaded before any session connects, so every saved stamp seeds the shared source. A
+    // missing or unreadable ledger only loses receive order, so it never blocks the session.
+    ledger =
+      (try? JSONDecoder().decode(Ledger.self, from: Data(contentsOf: directory.ledger)))
+      ?? Ledger()
+    if let newest = ledger.entries.values.map(\.receivedAt).max() { stamps.seed(newest) }
     let pair = AsyncStream<ChatSnapshot>.makeStream(bufferingPolicy: .bufferingNewest(1))
     updates = pair.stream
     continuation = pair.continuation
@@ -92,18 +128,19 @@ public actor CoordinatorSession {
     guard self.generation == generation else { return }
     identityFailure = nil
     do {
-      pending = try JSONDecoder().decode(
-        [NativeRequestSubmit].self, from: Data(contentsOf: outboxURL))
+      pending = try JSONDecoder().decode([OutboxItem].self, from: Data(contentsOf: outboxURL))
     } catch let error as CocoaError where error.code == .fileReadNoSuchFile { pending = [] } catch {
       snapshot.error =
         "The saved outbox could not be read. It was preserved; no messages were replayed."
       publish()
       return
     }
+    if let newest = pending.map(\.queuedAt).max() { stamps.seed(newest) }
     // The outbox belongs to this profile and every socket proves its pinned coordinator,
     // so these IDs reach only the coordinator they were queued for.
-    attemptedInputs.formUnion(pending.map(\.inputId))
-    for request in pending { transcript.pending(request, delivery: .uncertain) }
+    attemptedInputs.formUnion(pending.map(\.request.inputId))
+    for item in pending { transcript.pending(item.request, delivery: .uncertain) }
+    stampRows()
     snapshot.error = nil
     observation = Task { [weak self] in await self?.observe(generation: generation) }
   }
@@ -124,28 +161,44 @@ public actor CoordinatorSession {
     snapshot.connection = .disconnected
     snapshot.busy = false
     snapshot.loadingHistory = false
-    for request in pending { transcript.delivery(request.inputId, .uncertain) }
+    for item in pending { transcript.delivery(item.request.inputId, .uncertain) }
     publish()
     for connection in ownedConnections { await connection.close() }
   }
 
+  /// Stages and starts at once, addressed to this coordinator alone.
   @discardableResult public func submit(
     _ text: String, mode: InputMode = .steer, files: [LocalAttachment] = []
   ) async -> Bool {
+    guard
+      let staged = await stage(
+        text, mode: mode, files: files, sendID: UUID().uuidString, recipients: [profile])
+    else { return false }
+    start(staged)
+    return true
+  }
+
+  /// Validates the input, copies `files` into this coordinator's outbox and saves the item
+  /// there. Nothing leaves the phone until `start`. Returns nil, with any reason in the
+  /// snapshot's error, when this coordinator cannot take it.
+  public func stage(
+    _ text: String, mode: InputMode = .steer, files: [LocalAttachment] = [], sendID: String,
+    recipients: [ProfileID]
+  ) async -> StagedInput? {
     guard actions.count < 32, snapshot.connection == .connected,
       !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !files.isEmpty
-    else { return false }
+    else { return nil }
     guard text.utf8.count <= 65536 else {
       snapshot.error = "Messages must be at most 64 KiB."
       publish()
-      return false
+      return nil
     }
     guard files.count <= AttachmentLimits.maximumCount,
       Set(files.map(\.id)).count == files.count
     else {
       snapshot.error = AttachmentError.tooMany.localizedDescription
       publish()
-      return false
+      return nil
     }
     let feedback = text.split(whereSeparator: \.isWhitespace).first == "/feedback"
     let control =
@@ -154,61 +207,108 @@ public actor CoordinatorSession {
     guard files.isEmpty || !control || feedback else {
       snapshot.error = "Files can be sent with messages or /feedback."
       publish()
-      return false
+      return nil
     }
     let generation = generation
+    var adopted: [AttachmentRef] = []
     do {
       for file in files {
         // A quiesced session writes nothing more into its directory.
-        guard self.generation == generation else { return false }
-        _ = try await attachments.adopt(file)
+        guard self.generation == generation else { break }
+        adopted.append(try await attachments.adopt(file).reference)
       }
     } catch {
+      await removeFiles(adopted).value
       snapshot.error = error.localizedDescription
       publish()
-      return false
+      return nil
     }
     guard self.generation == generation, snapshot.connection == .connected, actions.count < 32
     else {
-      return false
+      await removeFiles(adopted).value
+      return nil
     }
     let request = NativeRequestSubmit(
       attachments: files.isEmpty && !feedback ? nil : files.map(\.reference),
       inputId: UUID().uuidString, mode: mode, text: text)
-    let durable = !control || feedback
-    if durable {
-      guard pending.count < 32 else {
-        snapshot.error = "Resolve pending messages before sending more."
+    guard !control || feedback else {
+      return StagedInput(
+        inputID: request.inputId, sendID: sendID, profile: profile, control: request)
+    }
+    guard pending.count < 32 else {
+      await removeFiles(adopted).value
+      snapshot.error = "Resolve pending messages before sending more."
+      publish()
+      return nil
+    }
+    pending.append(
+      OutboxItem(
+        request: request, sendID: sendID, recipients: recipients, queuedAt: stamps.next()))
+    do { try saveOutbox() } catch {
+      pending.removeLast()
+      await removeFiles(adopted).value
+      snapshot.error = "The on-device outbox could not be saved. Nothing was sent."
+      publish()
+      return nil
+    }
+    unstarted.insert(request.inputId)
+    transcript.pending(request, delivery: .sending)
+    stampRows()
+    return StagedInput(inputID: request.inputId, sendID: sendID, profile: profile, control: nil)
+  }
+
+  /// Sends a staged input on this coordinator's own verified socket. One that cannot leave
+  /// now stays queued as unconfirmed, for Check.
+  public func start(_ staged: StagedInput) {
+    guard staged.profile == profile else { return }
+    if staged.control == nil {
+      guard unstarted.remove(staged.inputID) != nil else { return }
+    }
+    guard actions.count < 32, snapshot.connection == .connected else {
+      if staged.control == nil {
+        transcript.delivery(staged.inputID, .uncertain)
         publish()
-        return false
       }
-      pending.append(request)
-      do { try saveOutbox() } catch {
-        pending.removeLast()
-        snapshot.error = "The on-device outbox could not be saved. Nothing was sent."
-        publish()
-        return false
-      }
-      transcript.pending(request, delivery: .sending)
+      return
+    }
+    if let control = staged.control {
+      perform(.submit(control))
+    } else if let item = pending.first(where: { $0.request.inputId == staged.inputID }) {
+      perform(.submit(item.request), inputID: staged.inputID)
     }
     snapshot.error = nil
-    perform(.submit(request), inputID: durable ? request.inputId : nil)
     publish()
-    return true
+  }
+
+  /// Withdraws a staged input that never started: its outbox item, its row, and the stored
+  /// files no other item uses.
+  public func unstage(_ staged: StagedInput) async {
+    guard staged.profile == profile, unstarted.contains(staged.inputID) else { return }
+    guard let removal = acknowledge(staged.inputID) else {
+      publish()
+      return
+    }
+    unstarted.remove(staged.inputID)
+    transcript.removeInput(staged.inputID)
+    publish()
+    await removal.value
   }
 
   public func retry(_ inputID: String) {
     guard actions.count < 32, snapshot.connection == .connected,
-      let request = pending.first(where: { $0.inputId == inputID })
+      let item = pending.first(where: { $0.request.inputId == inputID })
     else { return }
+    unstarted.remove(inputID)
     transcript.delivery(inputID, .sending)
-    perform(.submit(request), inputID: inputID)
+    perform(.submit(item.request), inputID: inputID)
     publish()
   }
   /// Copies a queued item into a draft. The item stays queued until `discard`, so a draft
   /// lost before it is sent loses nothing.
   public func restore(_ inputID: String, to draftStore: AttachmentStore) async -> RestoredDraft? {
-    guard let request = pending.first(where: { $0.inputId == inputID }) else { return nil }
+    guard let request = pending.first(where: { $0.request.inputId == inputID })?.request else {
+      return nil
+    }
     var files: [LocalAttachment] = []
     do {
       for reference in request.attachments ?? [] {
@@ -227,15 +327,15 @@ public actor CoordinatorSession {
 
   /// Removes a restored item once its copy was admitted, with files no other item uses.
   public func discard(_ inputID: String) {
-    guard pending.contains(where: { $0.inputId == inputID }) else { return }
+    guard pending.contains(where: { $0.request.inputId == inputID }) else { return }
     acknowledge(inputID)
     publish()
   }
 
   /// Items in the on-device outbox, read from disk so a session that never connected counts too.
   public func queuedCount() -> Int {
-    (try? JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outboxURL)))?
-      .count ?? pending.count
+    (try? JSONDecoder().decode([OutboxItem].self, from: Data(contentsOf: outboxURL)))?.count
+      ?? pending.count
   }
   public func loadEarlier(anchorID: String? = nil) async {
     guard let cursor = snapshot.olderCursor else { return }
@@ -350,7 +450,7 @@ public actor CoordinatorSession {
         connection = opened
         let stream = opened
         var ready = false
-        try await timedSend(stream, .observe(.init(inputIds: pending.map(\.inputId))))
+        try await timedSend(stream, .observe(.init(inputIds: pending.map(\.request.inputId))))
         while !Task.isCancelled {
           let event =
             try await (snapshot.connection == .connected ? stream.next() : timedNext(stream))
@@ -379,7 +479,7 @@ public actor CoordinatorSession {
         await stream?.close()
         guard !Task.isCancelled, self.generation == generation else { return }
         connection = nil
-        for request in pending { transcript.delivery(request.inputId, .uncertain) }
+        for item in pending { transcript.delivery(item.request.inputId, .uncertain) }
         snapshot.busy = false
         guard ConnectionError.shouldReconnect(after: error) else {
           let stoppedGeneration = UUID()
@@ -488,7 +588,7 @@ public actor CoordinatorSession {
         case .failure:
           failed = true
           consume(event, historyRequestID: id)
-          if let inputID, pending.contains(where: { $0.inputId == inputID }) {
+          if let inputID, pending.contains(where: { $0.request.inputId == inputID }) {
             transcript.delivery(inputID, .uncertain)
           }
         default: consume(event, historyRequestID: id)
@@ -501,7 +601,7 @@ public actor CoordinatorSession {
     } catch {
       failed = true
       if self.generation == generation && !Task.isCancelled {
-        if let inputID, pending.contains(where: { $0.inputId == inputID }) {
+        if let inputID, pending.contains(where: { $0.request.inputId == inputID }) {
           transcript.delivery(inputID, attemptedInputs.contains(inputID) ? .uncertain : .rejected)
         }
         if ConnectionError.shouldReconnect(after: error) {
@@ -713,6 +813,7 @@ public actor CoordinatorSession {
   }
   private func consume(_ event: NativeEvent, historyRequestID: UUID? = nil) {
     let previousTail = transcript.lastReceivedRowID
+    let streaming = transcript.streamingRowID
     switch event {
     case .commands(let value): snapshot.commands = value.commands
     case .ready(let value):
@@ -755,11 +856,11 @@ public actor CoordinatorSession {
     case .accepted(let value): transcript.delivery(value.inputId, .saved)
     case .placed(let value):
       transcript.delivery(value.inputId, .saved, entryID: value.entryId)
-      acknowledge(value.inputId)
+      settle(value.inputId, entryID: value.entryId)
     case .feedbackReady(let value):
       transcript.delivery(value.inputId, .saved)
       transcript.notice("Feedback saved. Repair task: \(value.receipt.taskId)")
-      acknowledge(value.inputId)
+      settle(value.inputId, entryID: nil)
     case .rejected(let value):
       transcript.delivery(value.inputId, .rejected)
       // Keep the original on disk until the user explicitly restores it.
@@ -781,6 +882,66 @@ public actor CoordinatorSession {
       }
     default: break
     }
+    stampRows(replacing: streaming)
+  }
+
+  /// Stamps rows as the events that create them are consumed, never at publication, so the
+  /// coalescing delay cannot reorder coordinators. A saved stamp wins, a pending input keeps
+  /// its queue time, and a row that changes key keeps its stamp. When an event replaces the
+  /// `replacing` streamed row, its first new row inherits that row's stamp.
+  private func stampRows(replacing streamed: String? = nil) {
+    let rows = transcript.unpreparedRows
+    let queued = Dictionary(
+      pending.map { ($0.request.inputId, $0.queuedAt) }, uniquingKeysWith: { first, _ in first })
+    var inherited = streamed.flatMap { id in rows.contains { $0.id == id } ? nil : rowStamps[id] }
+    let known = rows.map { row -> TimeInterval? in
+      if let entry = row.entryID, let saved = ledger.entries[entry] { return saved.receivedAt }
+      if row.entryID == nil, let input = row.inputID, let queuedAt = queued[input] {
+        return queuedAt
+      }
+      if let stamp = rowStamps[row.id] { return stamp }
+      let stamp = inherited
+      inherited = nil
+      return stamp
+    }
+    let assigned = Ledger.receiveStamps(
+      keys: rows.map { $0.entryID ?? $0.id }, known: known, next: stamps.next)
+    var added = false
+    for (row, stamp) in zip(rows, assigned) {
+      guard let entry = row.entryID, ledger.entries[entry] == nil else { continue }
+      ledger.entries[entry] = Ledger.Entry(receivedAt: stamp)
+      added = true
+    }
+    rowStamps = Dictionary(
+      zip(rows.map(\.id), assigned), uniquingKeysWith: { first, _ in first })
+    // shortcut: rewrites the whole ledger for each event that adds an entry, so debounce the
+    // writes that are not placements if profiling shows the I/O.
+    if added { saveLedger() }
+  }
+
+  /// Records a durable input's send, and its entry's stamp once placed, before the outbox lets
+  /// it go. If the record cannot be saved the item stays queued, and the next reconciliation
+  /// repeats this.
+  private func settle(_ inputID: String, entryID: String?) {
+    guard let item = pending.first(where: { $0.request.inputId == inputID }) else { return }
+    if let entryID {
+      ledger.entries[entryID] = Ledger.Entry(receivedAt: item.queuedAt, sendID: item.sendID)
+    }
+    ledger.sends[item.sendID] = Ledger.Send(
+      inputID: inputID, entryID: entryID, recipients: item.recipients)
+    guard saveLedger() else {
+      snapshot.error = "This phone could not record a delivered message. It stays queued."
+      return
+    }
+    acknowledge(inputID)
+  }
+
+  @discardableResult private func saveLedger() -> Bool {
+    ledger.prune(keeping: transcript.unpreparedRows)
+    do {
+      try writePrivately(JSONEncoder().encode(ledger), to: ledgerURL)
+      return true
+    } catch { return false }
   }
   private func schedulePublish() {
     guard flush == nil else { return }
@@ -794,7 +955,22 @@ public actor CoordinatorSession {
     publish()
   }
   private func publish() {
-    snapshot.rows = transcript.rows
+    let queued = Dictionary(
+      pending.map { ($0.request.inputId, $0) }, uniquingKeysWith: { first, _ in first })
+    snapshot.rows = transcript.rows.map { row in
+      var row = row
+      row.receivedAt = rowStamps[row.id].map(Date.init(timeIntervalSince1970:))
+      row.sendID =
+        row.inputID.flatMap { queued[$0]?.sendID }
+        ?? row.entryID.flatMap { ledger.entries[$0]?.sendID }
+      return row
+    }
+    snapshot.sends = ledger.sends.mapValues { SendStatus(recipients: $0.recipients, delivery: nil) }
+    for item in pending where snapshot.sends[item.sendID] == nil {
+      let row = snapshot.rows.first { $0.inputID == item.request.inputId }
+      snapshot.sends[item.sendID] = SendStatus(
+        recipients: item.recipients, delivery: row?.delivery ?? .uncertain)
+    }
     // New replies do not fill a gap left by paging. Only a fresh recent page
     // can restore the complete latest window.
     if let latestRowID, !snapshot.rows.contains(where: { $0.id == latestRowID }) {
@@ -802,24 +978,31 @@ public actor CoordinatorSession {
     }
     continuation.yield(snapshot)
   }
-  @discardableResult private func acknowledge(_ inputID: String) -> Bool {
+  /// Removes an item from the outbox. Returns the removal of its files, or nil when the outbox
+  /// could not be saved and the item stays.
+  @discardableResult private func acknowledge(_ inputID: String) -> Task<Void, Never>? {
     let previous = pending
-    let completed = pending.filter { $0.inputId == inputID }.flatMap { $0.attachments ?? [] }
-    pending.removeAll { $0.inputId == inputID }
+    let completed = pending.filter { $0.request.inputId == inputID }.flatMap {
+      $0.request.attachments ?? []
+    }
+    pending.removeAll { $0.request.inputId == inputID }
     do { try saveOutbox() } catch {
       pending = previous
       snapshot.error = "The saved outbox could not be updated. Original files were preserved."
-      return false
+      return nil
     }
     attemptedInputs.remove(inputID)
-    let retained = Set(pending.flatMap { $0.attachments ?? [] }.map(\.id))
+    return removeFiles(completed)
+  }
+  /// Deletes stored copies that no queued item still uses.
+  private func removeFiles(_ references: [AttachmentRef]) -> Task<Void, Never> {
+    let retained = Set(pending.flatMap { $0.request.attachments ?? [] }.map(\.id))
     let store = attachments
-    Task {
-      for reference in completed where !retained.contains(reference.id) {
+    return Task {
+      for reference in references where !retained.contains(reference.id) {
         if let file = try? await store.local(reference) { try? await store.remove(file) }
       }
     }
-    return true
   }
   private func saveOutbox() throws {
     try writePrivately(JSONEncoder().encode(pending), to: outboxURL)

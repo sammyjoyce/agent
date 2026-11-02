@@ -85,6 +85,7 @@ private func withGatedPreviewCoordinator(
   defer { try? FileManager.default.removeItem(at: root) }
   let session = CoordinatorSession(
     directory: directory, address: try CoordinatorAddress(host: "100.64.1.2"), pin: fixture.id,
+    stamps: StampSource(),
     transport: CoordinatorTransport { _ in
       let delayed = await gate.enter()
       let socket = NWConnection(host: .ipv4(.loopback), port: port, using: .tcp)

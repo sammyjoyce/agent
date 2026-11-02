@@ -312,6 +312,21 @@ func loopback(_ port: NWEndpoint.Port) -> CoordinatorTransport {
   }
 }
 
+/// The requests in a profile's live outbox, in queue order.
+func queuedRequests(_ outbox: URL) throws -> [NativeRequestSubmit] {
+  try JSONDecoder().decode([OutboxItem].self, from: Data(contentsOf: outbox)).map(\.request)
+}
+
+/// Saves `requests` in the profile's outbox, each a Send to it alone from an earlier launch.
+func saveOutbox(_ requests: [NativeRequestSubmit], in directory: ProfileDirectory) throws {
+  let items = requests.map {
+    OutboxItem(
+      request: $0, sendID: UUID().uuidString, recipients: [directory.profile],
+      queuedAt: Date().timeIntervalSince1970)
+  }
+  try writePrivately(JSONEncoder().encode(items), to: directory.outbox)
+}
+
 /// A profile directory under a fresh temporary root, removed by the caller.
 func temporaryProfile() -> (ProfileDirectory, URL) {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
@@ -337,7 +352,7 @@ func withCoordinator(
   defer { try? FileManager.default.removeItem(at: root) }
   let session = CoordinatorSession(
     directory: directory, address: try CoordinatorAddress(host: "100.64.1.2"), pin: fixture.id,
-    transport: loopback(port))
+    stamps: StampSource(), transport: loopback(port))
   do {
     try await body(session, fixture, directory.outbox)
     await session.disconnect()

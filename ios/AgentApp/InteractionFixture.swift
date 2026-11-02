@@ -34,7 +34,7 @@
           do {
             let session = CoordinatorSession(
               directory: directory, address: try CoordinatorAddress(host: "100.64.1.2"),
-              pin: coordinator,
+              pin: coordinator, stamps: StampSource(),
               transport: CoordinatorTransport { _ in
                 LineConnection(
                   connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))

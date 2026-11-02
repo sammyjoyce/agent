@@ -17,6 +17,8 @@ public final class Coordinators {
   @ObservationIgnored private let caches: URL
   @ObservationIgnored private let transport: CoordinatorTransport
   @ObservationIgnored private let registration: NotificationRegistration?
+  /// One per process, so every coordinator's rows share one receive order.
+  @ObservationIgnored private let stamps = StampSource()
   @ObservationIgnored private var active = false
   @ObservationIgnored private var pairing: [ProfileID: Task<Void, Never>] = [:]
 
@@ -178,7 +180,8 @@ public final class Coordinators {
       id: profile.id,
       session: profile.pin.map {
         CoordinatorSession(
-          directory: directory, address: profile.address, pin: $0, transport: transport)
+          directory: directory, address: profile.address, pin: $0, stamps: stamps,
+          transport: transport)
       },
       hold: hold ?? LegacyHold(directory))
   }

@@ -144,6 +144,7 @@ public struct ProfileDirectory: Sendable {
 
   var outbox: URL { root.appending(path: "Outbox/pending.json") }
   var outboxAttachments: URL { root.appending(path: "Outbox/Attachments") }
+  var ledger: URL { root.appending(path: "Ledger.json") }
   /// The quarantined single-address queue. Only `LegacyHold` reads it.
   var legacy: URL { root.appending(path: "Legacy") }
   var previews: URL { cache.appending(path: "Previews") }

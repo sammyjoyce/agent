@@ -18,10 +18,6 @@ private func snapshot(
   throw ConnectionError.closed
 }
 
-private func queued(_ outbox: URL) throws -> [NativeRequestSubmit] {
-  try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox))
-}
-
 /// Two coordinators behind one re-pointable name. The session is pinned to the first. The
 /// body gets both fixtures, the route, both ports and the session's directory.
 private func withRepointedName(
@@ -41,9 +37,10 @@ private func withRepointedName(
   let route = Route(rightPort)
   let (directory, root) = temporaryProfile()
   defer { try? FileManager.default.removeItem(at: root) }
-  if !queue.isEmpty { try writePrivately(JSONEncoder().encode(queue), to: directory.outbox) }
+  if !queue.isEmpty { try saveOutbox(queue, in: directory) }
   let session = CoordinatorSession(
     directory: directory, address: try CoordinatorAddress(host: "100.64.1.2"), pin: right.id,
+    stamps: StampSource(),
     transport: CoordinatorTransport { _ in
       LineConnection(
         connection: NWConnection(host: .ipv4(.loopback), port: await route.port, using: .tcp))
@@ -147,7 +144,7 @@ func aNameThatReturnsToItsCoordinatorReconnectsAndReconciles() async throws {
       $0.connection == .connected && $0.rows.contains { $0.inputID == id && $0.delivery == nil }
     }
     #expect(recovered.error == nil)
-    #expect(try queued(directory.outbox).isEmpty)
+    #expect(try queuedRequests(directory.outbox).isEmpty)
     #expect(await right.count() == 1, "Reconciliation never resends")
     #expect(await right.received().contains(.observe(.init(inputIds: [id]))))
     #expect(await wrong.received().allSatisfy { $0 == .identify })
@@ -163,10 +160,11 @@ func aCoordinatorWithoutIdentitiesFailsClosed() async throws {
   let (directory, root) = temporaryProfile()
   defer { try? FileManager.default.removeItem(at: root) }
   let held = NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: "Queued text")
-  try writePrivately(JSONEncoder().encode([held]), to: directory.outbox)
+  try saveOutbox([held], in: directory)
   let address = try CoordinatorAddress(host: "100.64.1.2")
   let session = CoordinatorSession(
-    directory: directory, address: address, pin: CoordinatorID(UUID()), transport: loopback(port))
+    directory: directory, address: address, pin: CoordinatorID(UUID()), stamps: StampSource(),
+    transport: loopback(port))
   await session.connect()
   let refused = try await snapshot(session) { $0.error != nil }
   await session.disconnect()
@@ -178,7 +176,7 @@ func aCoordinatorWithoutIdentitiesFailsClosed() async throws {
   let reached = await fixture.received()
   #expect(!reached.isEmpty)
   #expect(reached.allSatisfy { $0 == .identify }, "Nothing follows an unanswered identify")
-  #expect(try queued(directory.outbox) == [held])
+  #expect(try queuedRequests(directory.outbox) == [held])
   await fixture.stop()
 }
 

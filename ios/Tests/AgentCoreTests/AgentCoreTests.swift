@@ -376,7 +376,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     #expect(uncertain.rows.last?.attachments == [file.reference])
     #expect(await fixture.uploadCount() == 2)
     #expect(await fixture.uploaded(file.id) == bytes)
-    let saved = try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox))
+    let saved = try queuedRequests(outbox)
     #expect(saved.first?.attachments == [file.reference])
     // The pending copy has its own lifetime, independent of the picker/draft copy.
     try await store.remove(file)
@@ -395,7 +395,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     _ = try await until(session) { $0.connection == .connected && $0.rows.last?.delivery == nil }
     #expect(await fixture.count() == 1)
     #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
+      try queuedRequests(outbox).isEmpty)
   }
 }
 
@@ -415,7 +415,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     }
     #expect(result.rows.first(where: { $0.role == .user })?.delivery == .saved)
     #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
+      try queuedRequests(outbox).isEmpty)
   }
 }
 
@@ -446,11 +446,11 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     try await store.remove(restoredFile)
     #expect(!FileManager.default.fileExists(atPath: restoredFile.url.path))
     #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox))
+      try queuedRequests(outbox)
         .map(\.inputId) == [id], "Restore copies; the original stays until its copy is admitted")
     await session.discard(id)
     #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
+      try queuedRequests(outbox).isEmpty)
   }
 }
 
@@ -470,7 +470,7 @@ private func until(_ session: CoordinatorSession, _ predicate: @Sendable (ChatSn
     #expect(await session.submit("Keep this original") == true)
     let uncertain = try await until(session) { $0.rows.contains { $0.delivery == .uncertain } }
     let id = try #require(uncertain.rows.first(where: { $0.delivery == .uncertain })?.inputID)
-    let saved = try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox))
+    let saved = try queuedRequests(outbox)
     #expect(saved.map(\.inputId) == [id])
     #expect(await fixture.count() == 1, "An uncertain write must not be replayed automatically")
   }

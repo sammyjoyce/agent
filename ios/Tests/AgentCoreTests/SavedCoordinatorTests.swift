@@ -123,10 +123,6 @@ private struct Crash: Error {}
   }
 }
 
-private func queued(_ outbox: URL) throws -> [NativeRequestSubmit] {
-  try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox))
-}
-
 @MainActor @Test
 func migrationQuarantinesTheLastQueueIntoAnUnpairedProfileShownAtOnce() async throws {
   let install = try await LegacyInstall(host: "studio.example-tailnet.ts.net")
@@ -395,7 +391,7 @@ func restoreCopiesARejectedItemAndRemovesItOnlyOnceTheCopyIsAdmitted() async thr
   defer { try? FileManager.default.removeItem(at: root) }
   let session = CoordinatorSession(
     directory: directory, address: try CoordinatorAddress(host: "100.64.1.2"), pin: fixture.id,
-    transport: loopback(port))
+    stamps: StampSource(), transport: loopback(port))
   let chat = ChatModel(draftStore: AttachmentStore(directory: root.appending(path: "Drafts")))
   chat.attach(Lane(id: directory.profile, session: session, hold: LegacyHold(directory)))
   await chat.setActive(true)
@@ -404,16 +400,17 @@ func restoreCopiesARejectedItemAndRemovesItOnlyOnceTheCopyIsAdmitted() async thr
   await chat.attach(data: Data("bytes".utf8), name: "Notes.txt", mediaType: "text/plain")
   await chat.send()
   try await eventually("rejected") { chat.rows.contains { $0.row.delivery == .rejected } }
-  let original = try #require(try queued(directory.outbox).first)
+  let original = try #require(try queuedRequests(directory.outbox).first)
   await chat.restore(original.inputId)
   #expect(chat.draft == "Needs a second try")
-  #expect(try queued(directory.outbox) == [original], "Restore copies")
+  #expect(try queuedRequests(directory.outbox) == [original], "Restore copies")
   chat.draft = ""
   for file in chat.attachments { await chat.removeAttachment(file) }
-  #expect(try queued(directory.outbox) == [original], "Clearing the draft keeps the source")
+  #expect(
+    try queuedRequests(directory.outbox) == [original], "Clearing the draft keeps the source")
   await chat.restore(original.inputId)
   await chat.send()
-  let after = try queued(directory.outbox)
+  let after = try queuedRequests(directory.outbox)
   #expect(after.count == 1 && after.first?.inputId != original.inputId)
   await chat.detach(directory.profile)
   await fixture.stop()
