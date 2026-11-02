@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Network
 import Testing
@@ -113,4 +114,177 @@ func nativeClientReconcilesAgainstTheProductionCoordinator() async throws {
     await session.disconnect()
     throw error
   }
+}
+
+// The two-coordinator runner starts Work and Personal behind recording proxies, serves the
+// work lane's re-point requests, and checks what each coordinator received once this exits.
+@Test(
+  .enabled(if: ProcessInfo.processInfo.environment["AGENT_E2E_WORK_SOCKET"] != nil),
+  .timeLimit(.minutes(2)))
+@MainActor
+func twoCoordinatorFeedRoutesOnlyToAddressedCoordinators() async throws {
+  let environment = ProcessInfo.processInfo.environment
+  func required(_ name: String) throws -> String {
+    try #require(environment[name], "\(name) is set")
+  }
+  let directory = URL(filePath: try required("AGENT_E2E_DIRECTORY"))
+  let support = directory.appending(path: "Application Support")
+  let caches = directory.appending(path: "Caches")
+  let legacyInput = try required("AGENT_E2E_LEGACY_INPUT")
+  let legacyText = try required("AGENT_E2E_LEGACY_TEXT")
+  let tagged = try required("AGENT_E2E_TAGGED_TEXT")
+  let broadcast = try required("AGENT_E2E_BROADCAST_TEXT")
+  let afterRepoint = "Invented note written after the re-point."
+  let workPin = try #require(CoordinatorID(wire: required("AGENT_E2E_WORK_ID")))
+  let personalPin = try #require(CoordinatorID(wire: required("AGENT_E2E_PERSONAL_ID")))
+  let repointRequest = URL(filePath: try required("AGENT_E2E_REPOINT_REQUEST"))
+  let repointAck = URL(filePath: try required("AGENT_E2E_REPOINT_ACK"))
+  let workAddress = try CoordinatorAddress(host: "100.64.10.1")
+  let personalAddress = try CoordinatorAddress(host: "100.64.20.1")
+  let sockets = [
+    workAddress.host: try required("AGENT_E2E_WORK_SOCKET"),
+    personalAddress.host: try required("AGENT_E2E_PERSONAL_SOCKET"),
+  ]
+
+  // The single-address build kept its address in defaults and its queue under sha256("host:port").
+  let suite = "two-coordinator-e2e-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  defaults.set(workAddress.host, forKey: "coordinatorAddress")
+  let key = SHA256.hash(data: Data("\(workAddress.host):\(workAddress.port)".utf8)).map {
+    String(format: "%02x", $0)
+  }.joined()
+  let legacyQueue = support.appending(path: "Agent/Outbox/\(key)")
+  try FileManager.default.createDirectory(at: legacyQueue, withIntermediateDirectories: true)
+  try JSONEncoder().encode([
+    NativeRequestSubmit(inputId: legacyInput, mode: .steer, text: legacyText)
+  ])
+  .write(to: legacyQueue.appending(path: "pending.json"))
+
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: support, caches: caches,
+    transport: CoordinatorTransport { address in
+      guard let socket = sockets[address.host] else { throw ConnectionError.invalidAddress }
+      return LineConnection(connection: NWConnection(to: .unix(path: socket), using: .tcp))
+    })
+  let chat = coordinators.chat
+  func lanes() -> String {
+    coordinators.profiles.map {
+      "\($0.name): \(chat.snapshots[$0.id]?.connection.label ?? "no session"), \(chat.snapshots[$0.id]?.error ?? "no error")"
+    }.joined(separator: "; ")
+  }
+  func eventually(_ description: String, _ predicate: () -> Bool) async throws {
+    let deadline = ContinuousClock.now + .seconds(20)
+    while !predicate() {
+      try #require(
+        ContinuousClock.now < deadline, "Timed out waiting for \(description). \(lanes())")
+      try await Task.sleep(for: .milliseconds(10))
+    }
+  }
+  /// Writes to the composer one character at a time, as the text field does.
+  func type(_ text: String) { for character in text { chat.draft.append(character) } }
+  func bubbles(_ text: String) -> [RowModel] {
+    chat.rows.filter { $0.row.role == .user && $0.row.text == text }
+  }
+  func answered(_ receipt: Receipt) -> Bool {
+    switch receipt.status {
+    case .placed, .pending(.uncertain, _), .pending(.rejected, _): true
+    case .pending(.sending, _), .pending(.saved, _), .notSent: false
+    }
+  }
+  func repoint(_ name: String) async throws {
+    try Data(name.utf8).write(to: repointRequest, options: .atomic)
+    try await eventually("the work lane pointed at \(name)") {
+      (try? String(contentsOf: repointAck, encoding: .utf8)) == name
+    }
+    try FileManager.default.removeItem(at: repointAck)
+  }
+
+  let migrated = try #require(coordinators.profiles.first)
+  #expect(coordinators.profiles.count == 1 && migrated.pin == nil)
+  try await eventually("the pre-update queue held") { chat.held.count == 1 }
+  #expect(chat.held.map(\.id) == [legacyInput] && chat.held.first?.item.text == legacyText)
+  await coordinators.setActive(true)
+  try await eventually("the migrated profile paired and connected") {
+    chat.connection == .connected
+  }
+  #expect(coordinators.profiles.first?.pin == workPin)
+  #expect(chat.held.map(\.id) == [legacyInput], "Pairing leaves the pre-update queue held")
+  let work = migrated.id
+  try await coordinators.update(work, name: TagName("Work"), address: workAddress)
+  try await coordinators.add(name: TagName("Personal"), address: personalAddress)
+  let personal = try #require(coordinators.profiles.last?.id)
+  #expect(coordinators.profiles.map(\.name.description) == ["Work", "Personal"])
+  #expect(coordinators.profiles.last?.pin == personalPin)
+  try await eventually("both lanes connected") {
+    [work, personal].allSatisfy { chat.snapshots[$0]?.connection == .connected }
+  }
+
+  type("@Work ")
+  #expect(chat.recipient == work && chat.draft.isEmpty, "A typed tag becomes the chip")
+  #expect(chat.recipient.map(chat.name) == "Work", "The chip says Work")
+  type(tagged)
+  #expect(chat.recipientLine == "To Work")
+  await chat.send()
+  #expect(chat.draft.isEmpty && chat.recipient == nil, "The @Work message was admitted")
+  try await eventually("Work answering the @Work submit") {
+    bubbles(tagged).count == 1 && bubbles(tagged)[0].receipts.map(\.lane) == [work]
+      && bubbles(tagged)[0].receipts.allSatisfy(answered)
+  }
+
+  type(broadcast)
+  #expect(chat.recipient == nil)
+  #expect(chat.recipientLine == "To Work and Personal")
+  await chat.send()
+  #expect(chat.draft.isEmpty, "The untagged message was admitted")
+  try await eventually("both coordinators answering the untagged submit") {
+    bubbles(broadcast).count == 1
+      && bubbles(broadcast)[0].receipts.map(\.lane) == [work, personal]
+      && bubbles(broadcast)[0].receipts.allSatisfy(answered)
+  }
+  #expect(bubbles(broadcast).first?.id.hasPrefix("send:") == true, "One folded bubble")
+
+  func namesDifferentCoordinator() -> Bool {
+    chat.snapshots[work]?.error?.hasPrefix(
+      "This address now answers as a different coordinator.") == true
+  }
+  try await repoint("personal")
+  try await eventually("Work's lane dropping its re-pointed socket") {
+    chat.snapshots[work]?.connection != .connected
+  }
+  // A lane that skipped its pin check would reconnect instead. Going on lets the proxies
+  // record what the retry and the send below would then carry.
+  try await eventually("Work's lane dialing the re-pointed address") {
+    namesDifferentCoordinator() || chat.snapshots[work]?.connection == .connected
+  }
+  let retried = try #require(
+    bubbles(tagged).first?.receipts.compactMap { receipt -> String? in
+      if case .pending(.uncertain, let id?) = receipt.status { id } else { nil }
+    }.first, "The @Work row offers Check / retry")
+  await chat.retry(retried)
+  type("@Work ")
+  type(afterRepoint)
+  #expect(chat.recipientLine == "Work is not connected")
+  await chat.send()
+  #expect(chat.draft == afterRepoint && chat.recipient == work, "The new @Work message stays")
+  let workOutbox = ProfileDirectory(work, applicationSupport: support, caches: caches).outbox
+  #expect(try queuedRequests(workOutbox).allSatisfy { $0.text != afterRepoint })
+  #expect(
+    bubbles(tagged).first?.receipts
+      == [Receipt(lane: work, status: .pending(.uncertain, inputID: retried))],
+    "The retried row is still unconfirmed")
+  #expect(namesDifferentCoordinator(), "Work's lane names a different coordinator")
+  #expect(chat.snapshots[work]?.error?.contains("held on this phone") == true)
+  #expect(chat.snapshots[personal]?.connection == .connected)
+  try await repoint("work")
+  try await eventually("Work reconnected") { chat.snapshots[work]?.connection == .connected }
+
+  chat.recipient = nil
+  chat.draft = ""
+  let held = try #require(chat.held.first)
+  await chat.restoreHeld(held)
+  #expect(chat.recipient == work, "A held message restores to the coordinator it was held for")
+  #expect(chat.recipientLine == "To Work")
+  #expect(chat.draft == legacyText)
+  await coordinators.setActive(false)
 }
