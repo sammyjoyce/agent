@@ -452,29 +452,34 @@ public struct MainChatView: View {
         }
         .tint(.primary).accessibilityLabel("Add attachments or commands")
         .accessibilityIdentifier("composerMenu")
-        if model.multiple, let recipient = model.recipient {
-          let badge = badge(recipient)
-          Button {
-            model.recipient = nil
-          } label: {
-            HStack(spacing: 3) {
-              Text("@\(badge.name)").fontWeight(.semibold)
-              Image(systemName: "xmark.circle.fill").font(.caption)
+        // Top-aligned, so a wrapping draft's first line stays beside the chip.
+        HStack(alignment: .top, spacing: 4) {
+          if model.multiple, let recipient = model.recipient {
+            let badge = badge(recipient)
+            Button {
+              model.recipient = nil
+            } label: {
+              HStack(spacing: 3) {
+                Text("@\(badge.name)").fontWeight(.semibold)
+                Image(systemName: "xmark.circle.fill").font(.caption)
+              }
+              // The field's vertical padding, so the chip's text shares its first line.
+              .padding(.vertical, 11).foregroundStyle(badge.color).frame(minHeight: 44)
+              .contentShape(Rectangle())
             }
-            .foregroundStyle(badge.color).frame(minHeight: 44).contentShape(Rectangle())
+            .buttonStyle(.plain).accessibilityLabel("To \(badge.name)")
+            .accessibilityHint("Removes the recipient, so the message goes to every coordinator.")
           }
-          .buttonStyle(.plain).accessibilityLabel("To \(badge.name)")
-          .accessibilityHint("Removes the recipient, so the message goes to every coordinator.")
+          TextField(
+            model.mode == .steer ? "Message Agent" : "Queue a follow-up", text: $model.draft,
+            axis: .vertical
+          )
+          .lineLimit(1...6).textFieldStyle(.plain).padding(.vertical, 11).padding(.horizontal, 2)
+          // The field drops a rewrite made inside its own write, so the tag moves after it.
+          .onChange(of: model.draft) { model.promoteTypedTag() }
+          .accessibilityLabel("Message the coordinator").accessibilityIdentifier(
+            "Message the coordinator")
         }
-        TextField(
-          model.mode == .steer ? "Message Agent" : "Queue a follow-up", text: $model.draft,
-          axis: .vertical
-        )
-        .lineLimit(1...6).textFieldStyle(.plain).padding(.vertical, 11).padding(.horizontal, 2)
-        // The field drops a rewrite made inside its own write, so the tag moves after it.
-        .onChange(of: model.draft) { model.promoteTypedTag() }
-        .accessibilityLabel("Message the coordinator").accessibilityIdentifier(
-          "Message the coordinator")
         Button {
           let stop = showsStop
           Task {
