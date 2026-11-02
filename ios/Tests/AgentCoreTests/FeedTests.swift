@@ -455,6 +455,34 @@ func aScreenshotKeptFromOneCoordinatorIsRefusedOnceASecondIsSaved() async throws
 }
 
 @MainActor @Test(.timeLimit(.minutes(1)))
+func anAutomaticScreenshotNeverGoesToACoordinatorItWasNotCapturedWith() async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+    try await coordinators.add(
+      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    let chat = coordinators.chat
+    let work = try #require(coordinators.profiles.first?.id)
+    try await eventually("Work connected") { chat.connection == .connected }
+    try await withReadOnlyProfile(ProfileDirectory(work, applicationSupport: root, caches: root)) {
+      chat.draft = "/feedback The invented Work reply is clipped"
+      await chat.send(screenshot: { Data("Invented Work feed".utf8) })
+    }
+    let screenshot = try #require(chat.attachments.first)
+    try await coordinators.add(
+      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+    try await coordinators.remove(work)
+    try await eventually("Personal connected") { chat.connection == .connected }
+    await chat.send()
+    #expect(chat.error?.hasPrefix("Remove the automatic screenshot") == true)
+    await chat.removeAttachment(screenshot)
+    await chat.send()
+    try await eventually("Personal's feedback") { await personalFixture.count() > 0 }
+    #expect(await submits(personalFixture).map { $0.attachments ?? [] } == [[]])
+    #expect(await personalFixture.uploaded(screenshot.id) == nil)
+    #expect(await workFixture.count() == 0)
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
 func toolDetailsGoToTheRowsOwnCoordinatorWhenCallIDsCollide() async throws {
   try await withTwoFixtures { coordinators, workFixture, personalFixture, _ in
     let (_, personal) = try await addWorkAndPersonal(coordinators)
