@@ -368,10 +368,9 @@ final class ChatModel {
     draft = restored.text
     attachments = restored.attachments
     mode = restored.mode
-    if restored.text.split(whereSeparator: \.isWhitespace).first == "/feedback" {
-      feedbackScreenshot = restored.attachments.last { $0.reference.name == "Feedback.png" }
-        .map { ($0.id, source.lane) }
-    }
+    // The text may have been edited since capture, so only the file's name marks a screenshot.
+    feedbackScreenshot = restored.attachments.last { $0.reference.name == "Feedback.png" }
+      .map { ($0.id, source.lane) }
     restoredFrom = source
   }
   private func forgetClearedSource() {

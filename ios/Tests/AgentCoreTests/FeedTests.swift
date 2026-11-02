@@ -714,3 +714,42 @@ func removeRefusesATypedTagAndNothingNamingARemovedCoordinatorSends() async thro
     #expect(atPersonal.isEmpty, "Personal received \(atPersonal.map(\.text))")
   }
 }
+
+/// Deleting `/feedback` from the text does not make its automatic screenshot a chosen file. A
+/// restore still knows which coordinator's feed it shows.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func anEditedFeedbackKeepsItsScreenshotWithItsCoordinatorThroughRestore() async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+    try await coordinators.add(
+      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    let chat = coordinators.chat
+    let work = try #require(coordinators.profiles.first?.id)
+    try await eventually("Work connected") { chat.connection == .connected }
+    let directory = ProfileDirectory(work, applicationSupport: root, caches: root)
+    try await withReadOnlyProfile(directory) {
+      chat.draft = "/feedback The invented Work feed is clipped"
+      await chat.send(screenshot: { Data("Invented private Work screenshot bytes".utf8) })
+    }
+    #expect(chat.attachments.map(\.reference.name) == ["Feedback.png"])
+    await workFixture.refuseUploads()
+    chat.draft = "The invented Work feed is clipped"
+    await chat.send()
+    try await eventually("the edited message rejected at Work") {
+      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+    }
+    let queued = try #require(try queuedRequests(directory.outbox).first)
+    try await coordinators.add(
+      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+    try await eventually("both connected") {
+      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+    }
+    await chat.restore(queued.inputId)
+    let restored = try #require(chat.attachments.first)
+    chat.recipient = nil
+    await chat.send()
+    #expect(chat.error?.hasPrefix("Remove the automatic screenshot") == true)
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(await personalFixture.uploaded(restored.id) == nil)
+    #expect(await submits(personalFixture).isEmpty)
+  }
+}
