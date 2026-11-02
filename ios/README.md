@@ -27,6 +27,9 @@ authenticated NDJSON-over-Tailscale service.
    editing the setting. Ordinary LAN addresses and IPv6 addresses are
    unsupported. Transport binds the active point-to-point interface's Tailscale
    IPv4 source address.
+5. To use another coordinator too, choose **Add coordinator** in Connection.
+   Names must differ, ignoring case, and an address that answers as a
+   coordinator already saved is refused.
 
 ## Install on an iPhone
 
@@ -85,6 +88,16 @@ Mode if requested, then Run.
   entries, each coordinator's `Ledger.json` keeps the entry ID, the time this
   phone received it and the send ID. It never holds message text. It has the
   same protection, and it keeps the order you saw across a relaunch.
+- With two or more coordinators, one feed shows them all, ordered by when this
+  phone received each entry. Each coordinator's replies start with its name in
+  its color. Typing `@` offers the saved names. A chosen name, or `@Name`
+  followed by a space, becomes a chip in the composer, and the message goes to
+  that coordinator only. Without a chip the message goes to every paired
+  coordinator. The line under the field names the recipients, or says why
+  Send is blocked, before you send. A message to several coordinators is saved
+  in each one's outbox under its own input ID before any of them is sent. If
+  one refuses it, none keeps it and the draft stays. Its bubble shows each
+  coordinator's delivery with its own **Check / retry** or **Restore**.
 - Every connection first asks for the coordinator's ID and writes nothing else
   unless the ID matches the saved one. A coordinator too old to answer shows
   "Update the coordinator". If the address now answers as a different
@@ -94,7 +107,8 @@ Mode if requested, then Run.
   the original input IDs. Uncertain writes are never automatically replayed.
   **Check / retry** retains the same ID;
   terminal rejection retains the original. **Restore to composer** copies it,
-  and the app removes the original only after you send the restored message.
+  addressed to its own coordinator, and the app removes the original only
+  after you send the restored message.
 - The top of the chat holds messages that a build without saved coordinators
   queued. That build never recorded their coordinator, so they may already have
   been delivered. The app never sends them. **Restore to composer** makes a new
@@ -108,6 +122,9 @@ Mode if requested, then Run.
   downloaded and verified only when opening a preview.
 - `/feedback` captures the current app window before sending and includes it
   with the report. Failed admission keeps that exact screenshot for retry.
+  With more than one coordinator saved nothing is captured, because the feed
+  shows every coordinator's conversation, and a kept screenshot must be
+  removed before sending.
   Pi's existing adapter handles model image input; other files remain available
   to agent tools on the execution host. No provider requests originate on iOS.
 

@@ -327,6 +327,20 @@ func saveOutbox(_ requests: [NativeRequestSubmit], in directory: ProfileDirector
   try writePrivately(JSONEncoder().encode(items), to: directory.outbox)
 }
 
+/// Makes the profile's directory read-only, so the next stage cannot save, until `body` ends.
+@MainActor func withReadOnlyProfile(
+  _ directory: ProfileDirectory, _ body: () async throws -> Void
+) async throws {
+  try FileManager.default.createDirectory(at: directory.root, withIntermediateDirectories: true)
+  try FileManager.default.setAttributes(
+    [.posixPermissions: 0o500], ofItemAtPath: directory.root.path)
+  defer {
+    try? FileManager.default.setAttributes(
+      [.posixPermissions: 0o700], ofItemAtPath: directory.root.path)
+  }
+  try await body()
+}
+
 /// A profile directory under a fresh temporary root, removed by the caller.
 func temporaryProfile() -> (ProfileDirectory, URL) {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)

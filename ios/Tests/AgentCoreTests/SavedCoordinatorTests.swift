@@ -311,7 +311,7 @@ func anAddressEditIsProbedAgainstThePinBeforeAnythingIsSaved() async throws {
     name: work, address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
   try await eventually("connected") { coordinators.chat.connection == .connected }
   let id = try #require(coordinators.profiles.first?.id)
-  await #expect(throws: (any Error).self, "This version keeps one coordinator") {
+  await #expect(throws: ProfileError.duplicateCoordinator(savedAs: "Work")) {
     try await coordinators.add(
       name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4003))
   }
@@ -414,4 +414,53 @@ func restoreCopiesARejectedItemAndRemovesItOnlyOnceTheCopyIsAdmitted() async thr
   #expect(after.count == 1 && after.first?.inputId != original.inputId)
   await chat.detach(directory.profile)
   await fixture.stop()
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aHeldMessageStartingWithAnotherNameRestoresToItsOwnCoordinatorAsTyped() async throws {
+  let install = try await LegacyInstall()
+  defer { install.remove() }
+  let migrated = FixtureCoordinator()
+  let personal = FixtureCoordinator()
+  let (migratedListener, migratedPort) = try await listen(migrated)
+  defer { migratedListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personal)
+  defer { personalListener.cancel() }
+  let routes: [UInt16: NWEndpoint.Port] = [install.address.port: migratedPort, 4002: personalPort]
+  let coordinators = Coordinators(
+    registration: nil, defaults: install.defaults, applicationSupport: install.support,
+    caches: install.caches,
+    transport: CoordinatorTransport { address in
+      LineConnection(
+        connection: NWConnection(host: .ipv4(.loopback), port: routes[address.port]!, using: .tcp))
+    })
+  let chat = coordinators.chat
+  let profile = try #require(coordinators.profiles.first)
+  await coordinators.setActive(true)
+  try await eventually("the migrated profile paired") { chat.connection == .connected }
+  try await coordinators.add(
+    name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+  try await eventually("both connected") {
+    chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+  }
+  let held = try #require(chat.held.first { $0.item.text.hasPrefix("@Personal") })
+  await chat.restoreHeld(held)
+  #expect(chat.recipient == profile.id, "Restore addresses the profile the queue was held for")
+  #expect(chat.draft == held.item.text)
+  #expect(chat.recipientLine == "To \(profile.name.description)")
+  await chat.send()
+  try await eventually("the restored message at its own coordinator") {
+    await migrated.count() == 1
+  }
+  let submitted = await migrated.received().compactMap {
+    if case .submit(let input) = $0 { input } else { nil }
+  }
+  #expect(submitted.map(\.text) == [held.item.text])
+  #expect(await personal.count() == 0)
+  try await eventually("the held source removed after admission") {
+    !chat.held.contains { $0.id == held.id }
+  }
+  await coordinators.setActive(false)
+  await migrated.stop()
+  await personal.stop()
 }

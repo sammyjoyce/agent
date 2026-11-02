@@ -86,7 +86,11 @@ final class HistoryInteractionTests: XCTestCase {
       transcript.swipeDown(velocity: .fast)
     }
     try await eventually { await peer.cursors() == ["one"] }
-    let group = app.buttons["activity:tool:call-75"]
+    // Feed row IDs carry the coordinator's profile ID: `activity:<profile>/tool:call-75`.
+    let group = app.buttons.matching(
+      NSPredicate(
+        format: "identifier BEGINSWITH 'activity:' AND identifier ENDSWITH '/tool:call-75'")
+    ).firstMatch
     XCTAssertTrue(group.waitForExistence(timeout: 3))
     XCTAssertTrue(group.isHittable)
     let anchor = group.frame

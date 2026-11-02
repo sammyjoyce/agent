@@ -11,9 +11,24 @@ import Observation
 final class RowModel: Identifiable {
   let id: String
   var row: ChatRow
+  /// The coordinator the row came from. nil only for rows seeded without a feed.
+  var lane: ProfileID?
+  /// For a Send's row: every recipient's status, in profile order.
+  var receipts: [Receipt] = []
   init(_ row: ChatRow) {
     id = row.id
     self.row = row
+  }
+  init(_ feed: FeedRow) {
+    id = feed.id
+    row = feed.row
+    lane = feed.lane
+    receipts = feed.receipts
+  }
+  func update(_ feed: FeedRow) {
+    if row != feed.row { row = feed.row }
+    if lane != feed.lane { lane = feed.lane }
+    if receipts != feed.receipts { receipts = feed.receipts }
   }
 }
 
@@ -40,6 +55,7 @@ struct RestoredSource: Equatable {
   let kind: Kind
 }
 
+/// The one feed and the one composer for every saved coordinator.
 @MainActor @Observable
 final class ChatModel {
   var rows: [RowModel] = [] {
@@ -55,42 +71,48 @@ final class ChatModel {
   var includesLatest = true
   var error: String?
   var revision = 0
-  var draft = "" { didSet { forgetClearedSource() } }
+  /// Saved coordinators in order, kept by `Coordinators`. Names, colors and the feed's lane
+  /// order come from here.
+  var profiles: [CoordinatorProfile] = []
+  /// The one coordinator the draft goes to, or nil for every paired one. While it is set, the
+  /// draft is never read for tags.
+  var recipient: ProfileID?
+  var draft = "" { didSet { draftChanged() } }
   var attachments: [LocalAttachment] = [] { didSet { forgetClearedSource() } }
   private(set) var held: [HeldMessage] = []
   private(set) var heldError: String?
   private(set) var restoredFrom: RestoredSource?
+  /// Each lane's latest published state.
+  private(set) var snapshots: [ProfileID: ChatSnapshot] = [:]
   var previewURL: URL?
   private(set) var preparingAttachments = false
   var mode: InputMode = .steer
   private(set) var admitting = false
-  @ObservationIgnored private var generation = UUID()
-  @ObservationIgnored private var admit:
-    @Sendable (String, InputMode, [LocalAttachment]) async -> Bool
   @ObservationIgnored private var draftStore: AttachmentStore?
   @ObservationIgnored private var feedbackScreenshotID: String?
   @ObservationIgnored private let registration: NotificationRegistration?
   @ObservationIgnored private(set) var lanes: [Lane] = []
   @ObservationIgnored private var observations: [ProfileID: Task<Void, Never>] = [:]
 
-  init(
-    draftStore: AttachmentStore? = nil, registration: NotificationRegistration? = nil,
-    admit: @escaping @Sendable (String, InputMode, [LocalAttachment]) async -> Bool = { _, _, _ in
-      false
-    }
-  ) {
+  init(draftStore: AttachmentStore? = nil, registration: NotificationRegistration? = nil) {
     self.draftStore = draftStore
     self.registration = registration
-    self.admit = admit
   }
   deinit {
     for observation in observations.values { observation.cancel() }
     let sessions = lanes.compactMap(\.session)
     Task { for session in sessions { await session.disconnect() } }
   }
-  // shortcut: rows do not carry their lane yet, so row actions use the one paired lane.
-  // Route each row to its own lane once the feed merges lanes.
-  private var session: CoordinatorSession? { lanes.first { $0.session != nil }?.session }
+
+  /// True with two or more saved coordinators, when the feed names them and the composer
+  /// addresses them.
+  var multiple: Bool { profiles.count > 1 }
+
+  func name(_ id: ProfileID) -> String {
+    profiles.first { $0.id == id }?.name.description ?? "Coordinator"
+  }
+
+  func paired(_ id: ProfileID) -> Bool { lanes.first { $0.id == id }?.session != nil }
 
   /// Adds a saved coordinator's lane, or replaces an unpaired lane with its paired one.
   /// A lane whose session was live must be detached first, so two sessions never share
@@ -100,12 +122,15 @@ final class ChatModel {
     if let index = lanes.firstIndex(where: { $0.id == lane.id }) {
       lanes[index] = lane
     } else {
-      lanes.append(lane)
+      // Lanes keep profile order, the feed's tiebreak between equal receive times.
+      let rank = { (id: ProfileID) in self.profiles.firstIndex { $0.id == id } ?? .max }
+      lanes.insert(
+        lane, at: lanes.firstIndex { rank($0.id) > rank(lane.id) } ?? lanes.endIndex)
     }
     if let session = lane.session {
-      admit = { text, mode, files in await session.submit(text, mode: mode, files: files) }
-      rows = []
-      error = nil
+      snapshots[lane.id] = nil
+      if !multiple { error = nil }
+      refresh()
       observations[lane.id] = observe(session, lane: lane.id)
     }
     Task { await loadHeld(lane) }
@@ -120,9 +145,9 @@ final class ChatModel {
     registration?.disconnect(id)
     held.removeAll { $0.lane == id }
     if lane.session != nil {
-      generation = UUID()
-      admit = { _, _, _ in false }
-      apply(ChatSnapshot())
+      snapshots[id] = nil
+      if !multiple { error = nil }
+      refresh()
     }
     await lane.session?.disconnect()
   }
@@ -133,15 +158,20 @@ final class ChatModel {
     }
   }
 
-  /// "Try again": reconnects now instead of waiting out the backoff.
-  func reconnect() async { await session?.connect() }
+  /// "Try again": reconnects now instead of waiting out the backoff, one lane or every lane
+  /// that is not connected.
+  func reconnect(_ id: ProfileID? = nil) async {
+    for lane in lanes where id == lane.id || (id == nil && !connected(lane.id)) {
+      await lane.session?.connect()
+    }
+  }
 
   private func observe(_ session: CoordinatorSession, lane id: ProfileID) -> Task<Void, Never> {
     Task { [weak self] in
       var connected = false
       for await update in session.updates {
         guard !Task.isCancelled, let self else { return }
-        self.apply(update)
+        self.apply(update, lane: id)
         guard (update.connection == .connected) != connected else { continue }
         connected.toggle()
         // Only this lane's own session carries its installation ID.
@@ -154,23 +184,78 @@ final class ChatModel {
     }
   }
 
-  var canSend: Bool {
-    !admitting && !preparingAttachments && connection == .connected
-      && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
+  private func connected(_ id: ProfileID) -> Bool { snapshots[id]?.connection == .connected }
+
+  // MARK: - Addressing
+
+  /// Who Send reaches with the current draft, or why it is blocked.
+  var addressing: Addressing {
+    address(draft, hasAttachments: !attachments.isEmpty, chip: recipient)
   }
+
+  private func address(_ text: String, hasAttachments: Bool, chip: ProfileID?) -> Addressing {
+    Addressing.parse(
+      text, hasAttachments: hasAttachments, chip: chip,
+      among: lanes.map {
+        .init(
+          id: $0.id, name: name($0.id), paired: $0.session != nil, connected: connected($0.id))
+      })
+  }
+
+  /// The line under the composer with two or more saved coordinators.
+  var recipientLine: String {
+    switch addressing {
+    case .to(let ids, _), .empty(let ids): "To " + joinedNames(ids.map(name))
+    case .blocked(let reason): reason
+    }
+  }
+
+  /// Saved coordinators matching an `@` still being typed, for the picker above the composer.
+  var pickerMatches: [CoordinatorProfile] {
+    guard multiple, recipient == nil, draft.first == "@", !draft.contains(where: \.isWhitespace)
+    else { return [] }
+    let typed = draft.dropFirst().lowercased()
+    return profiles.filter { $0.name.description.lowercased().hasPrefix(typed) }
+  }
+
+  func choose(_ id: ProfileID) {
+    recipient = id
+    draft = ""
+  }
+
+  /// A complete leading tag followed by a space becomes the chip, and the text after it is
+  /// never read for tags.
+  private func draftChanged() {
+    forgetClearedSource()
+    guard multiple, recipient == nil, draft.first == "@" else { return }
+    let word = draft.dropFirst().prefix { !$0.isWhitespace }
+    let named = profiles.filter { $0.name.description.lowercased() == word.lowercased() }
+    guard word.endIndex < draft.endIndex, let match = named.first, named.count == 1 else { return }
+    recipient = match.id
+    draft = String(draft[draft.index(after: word.endIndex)...])
+  }
+
+  // MARK: - Send
+
+  var canSend: Bool {
+    guard !admitting, !preparingAttachments, case .to = addressing else { return false }
+    return true
+  }
+
+  /// Saves the message in every recipient's outbox before any of them starts, so a refusal
+  /// leaves nothing queued anywhere and the draft untouched.
   func send(screenshot: (@MainActor () throws -> Data)? = nil) async {
-    guard canSend
-    else { return }
+    guard canSend else { return }
     admitting = true
     defer { admitting = false }
     let text = draft
     let mode = mode
-    let generation = generation
-    let admit = admit
     let source = restoredFrom
+    let chip = recipient
     var files = attachments
     do {
-      if text.split(whereSeparator: \.isWhitespace).first == "/feedback",
+      // With two coordinators, a screenshot of the feed would show one's conversation to the other.
+      if profiles.count == 1, text.split(whereSeparator: \.isWhitespace).first == "/feedback",
         feedbackScreenshotID == nil, let screenshot
       {
         guard files.count < AttachmentLimits.maximumCount else { throw AttachmentError.tooMany }
@@ -178,10 +263,6 @@ final class ChatModel {
         let data = try screenshot()
         let file = try await attachmentStore().stage(
           data: data, name: "Feedback.png", mediaType: "image/png")
-        guard self.generation == generation else {
-          try? await draftStore?.remove(file)
-          return
-        }
         attachments.append(file)
         files.append(file)
         feedbackScreenshotID = file.id
@@ -190,28 +271,60 @@ final class ChatModel {
       self.error = error.localizedDescription
       return
     }
-    guard self.generation == generation else { return }
-    // Keep the draft until the owned actor has validated and saved the input.
-    // Failures also remain available in the input row for copy/retry.
-    if await admit(text, mode, files), self.generation == generation {
-      if draft == text { draft = "" }
-      let sentIDs = Set(files.map(\.id))
-      attachments.removeAll { sentIDs.contains($0.id) }
-      if let id = feedbackScreenshotID, sentIDs.contains(id) { feedbackScreenshotID = nil }
-      if let store = draftStore {
-        for file in files { try? await store.remove(file) }
-      }
-      if let source { await remove(source) }
+    if profiles.count > 1, let id = feedbackScreenshotID, files.contains(where: { $0.id == id }) {
+      error =
+        "Remove the automatic screenshot before sending. With more than one coordinator it could show one coordinator's messages to another."
+      return
     }
+    guard
+      case .to(let recipients, let body) = address(
+        text, hasAttachments: !files.isEmpty, chip: chip)
+    else { return }
+    let sendID = UUID().uuidString
+    var staged: [(session: CoordinatorSession, input: StagedInput)] = []
+    for id in recipients {
+      guard let session = lanes.first(where: { $0.id == id })?.session,
+        let input = await session.stage(
+          body, mode: mode, files: files, sendID: sendID, recipients: recipients)
+      else {
+        for item in staged where attached(item.session) { await item.session.unstage(item.input) }
+        if multiple { error = "Nothing was sent. \(name(id)) did not take the message." }
+        return
+      }
+      staged.append((session, input))
+    }
+    // A lane detached meanwhile keeps its saved item for its own profile to resolve.
+    for item in staged where attached(item.session) { await item.session.start(item.input) }
+    error = nil
+    if draft == text {
+      draft = ""
+      if recipient == chip { recipient = nil }
+    }
+    let sentIDs = Set(files.map(\.id))
+    attachments.removeAll { sentIDs.contains($0.id) }
+    if let id = feedbackScreenshotID, sentIDs.contains(id) { feedbackScreenshotID = nil }
+    if let store = draftStore {
+      for file in files { try? await store.remove(file) }
+    }
+    if let source { await remove(source) }
   }
-  func restore(_ id: String) async {
+
+  private func attached(_ session: CoordinatorSession) -> Bool {
+    lanes.contains { $0.session === session }
+  }
+
+  // MARK: - Restore
+
+  /// Copies a queued input into the composer, addressed to its own coordinator, with its text
+  /// as it was. The input stays queued until the copy is admitted.
+  func restore(_ inputID: String) async {
     guard readyToRestore() else { return }
     do {
       let store = try attachmentStore()
-      guard let lane = lanes.first(where: { $0.session != nil }),
-        let restored = await lane.session?.restore(id, to: store)
+      guard let lane = lane(holding: inputID),
+        let restored = await lane.session?.restore(inputID, to: store)
       else { return }
-      fill(restored, from: RestoredSource(lane: lane.id, item: id, kind: .live))
+      fill(restored, from: RestoredSource(lane: lane.id, item: inputID, kind: .live))
     } catch { self.error = error.localizedDescription }
   }
   func restoreHeld(_ message: HeldMessage) async {
@@ -237,6 +350,7 @@ final class ChatModel {
     return true
   }
   private func fill(_ restored: RestoredDraft, from source: RestoredSource) {
+    recipient = source.lane
     draft = restored.text
     attachments = restored.attachments
     mode = restored.mode
@@ -274,6 +388,9 @@ final class ChatModel {
         "Messages held from before the update could not be read. They stay on this phone."
     }
   }
+
+  // MARK: - Attachments
+
   private func attachmentStore() throws -> AttachmentStore {
     if let draftStore { return draftStore }
     let directory = try FileManager.default.url(
@@ -328,30 +445,73 @@ final class ChatModel {
     if feedbackScreenshotID == file.id { feedbackScreenshotID = nil }
     try? await draftStore?.remove(file)
   }
-  func preview(_ reference: AttachmentRef) async {
-    do { previewURL = try await session?.preview(reference) } catch {
+
+  // MARK: - Row actions, each routed to the row's own coordinator
+
+  /// The lane whose outbox holds `inputID`. Every input ID is minted for one coordinator.
+  private func lane(holding inputID: String) -> Lane? {
+    lanes.first { lane in snapshots[lane.id]?.rows.contains { $0.inputID == inputID } == true }
+  }
+  private func session(_ lane: ProfileID?) -> CoordinatorSession? {
+    lanes.first { $0.id == lane }?.session
+  }
+  func preview(_ reference: AttachmentRef, lane: ProfileID?) async {
+    guard let session = session(lane) else { return }
+    do { previewURL = try await session.preview(reference) } catch {
       self.error = error.localizedDescription
     }
   }
-  func retry(_ id: String) async { await session?.retry(id) }
-  func toolDetails(for row: ChatRow) async throws -> ToolDetails {
-    guard let entryID = row.entryID, let tool = row.tool, let session else {
+  func retry(_ inputID: String) async { await lane(holding: inputID)?.session?.retry(inputID) }
+  func toolDetails(for row: ChatRow, lane: ProfileID?) async throws -> ToolDetails {
+    guard let entryID = row.entryID, let tool = row.tool, let session = session(lane) else {
       throw ConnectionError.closed
     }
     return try await session.toolDetails(entryID: entryID, callID: tool.callId)
   }
-  func history(anchorID: String?) async { await session?.loadEarlier(anchorID: anchorID) }
-  func latestHistory() async { await session?.loadLatest() }
-  func interrupt() async { await session?.interrupt() }
-  private func apply(_ update: ChatSnapshot) {
+  /// Every coordinator with older history loads a page. The one holding `anchorID` keeps
+  /// that row in its window.
+  func history(anchorID: String?) async {
+    let anchor = rows.first { $0.id == anchorID }
+    let pages = lanes.compactMap { lane in
+      lane.session.map { ($0, anchor?.lane == lane.id ? anchor?.row.id : nil) }
+    }
+    await withTaskGroup(of: Void.self) { group in
+      for (session, rowID) in pages {
+        group.addTask { await session.loadEarlier(anchorID: rowID) }
+      }
+    }
+  }
+  func latestHistory() async {
+    let sessions = lanes.compactMap(\.session)
+    await withTaskGroup(of: Void.self) { group in
+      for session in sessions { group.addTask { await session.loadLatest() } }
+    }
+  }
+  /// Stop response stops every coordinator that is working.
+  func interrupt() async {
+    for lane in lanes where snapshots[lane.id]?.busy == true { await lane.session?.interrupt() }
+  }
+
+  // MARK: - Feed
+
+  func apply(_ update: ChatSnapshot, lane id: ProfileID) {
+    snapshots[id] = update
+    // With several coordinators each lane's error shows on its own line instead.
+    if !multiple { error = update.error }
+    refresh()
+  }
+
+  /// Rebuilds the feed and the composer's view of the coordinators from every lane's state.
+  private func refresh() {
+    let states = lanes.compactMap { lane in
+      snapshots[lane.id].map { (id: lane.id, snapshot: $0) }
+    }
     let existing = Dictionary(
       rows.map { ($0.id, $0) }, uniquingKeysWith: { original, _ in original })
-    let next = update.rows.map { row -> RowModel in
-      if let model = existing[row.id] {
-        if model.row != row { model.row = row }
-        return model
-      }
-      return RowModel(row)
+    let next = Feed.merge(states).map { row -> RowModel in
+      guard let model = existing[row.id] else { return RowModel(row) }
+      model.update(row)
+      return model
     }
     if rows.map(\.id) != next.map(\.id) {
       rows = next
@@ -359,13 +519,17 @@ final class ChatModel {
       transcriptItems = TranscriptItem.grouped(rows, preserving: transcriptItems)
     }
     revision &+= 1
-    connection = update.connection
-    model = update.model
-    busy = update.busy
-    commands = update.commands
-    canLoadEarlier = update.olderCursor != nil
-    loadingHistory = update.loadingHistory
-    includesLatest = update.includesLatest
-    error = update.error
+    let all = states.map(\.snapshot)
+    connection =
+      [ConnectionState.connected, .reconnecting, .connecting].first { state in
+        all.contains { $0.connection == state }
+      } ?? .disconnected
+    model = all.first?.model ?? "Main conversation"
+    busy = all.contains(where: \.busy)
+    var usages: Set<String> = []
+    commands = all.flatMap(\.commands).filter { usages.insert($0.usage).inserted }
+    canLoadEarlier = all.contains { $0.olderCursor != nil }
+    loadingHistory = all.contains(where: \.loadingHistory)
+    includesLatest = all.allSatisfy(\.includesLatest)
   }
 }

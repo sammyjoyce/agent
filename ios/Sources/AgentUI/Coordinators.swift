@@ -7,7 +7,12 @@ import Observation
 /// second iPad window cannot build a second session over the same outbox.
 @MainActor @Observable
 public final class Coordinators {
-  private(set) var profiles: [CoordinatorProfile] = []
+  /// Saved coordinators in order. The feed keeps the one copy, so its names and lane order
+  /// never disagree with `profiles.json`.
+  private(set) var profiles: [CoordinatorProfile] {
+    get { chat.profiles }
+    set { chat.profiles = newValue }
+  }
   /// Why an unpaired profile is not paired yet.
   private(set) var pairingError: [ProfileID: String] = [:]
   /// Saved coordinators could not be loaded. Nothing is written over them.
@@ -101,12 +106,13 @@ public final class Coordinators {
     }
   }
 
-  /// Probes before saving, so the saved profile is already pinned.
+  /// Probes before saving, so the saved profile is already pinned. A name another coordinator
+  /// has, or a coordinator already saved, is refused.
   func add(name: TagName, address: CoordinatorAddress) async throws {
-    guard profiles.isEmpty else { throw OneCoordinator() }
     try CoordinatorProfile.checkName(name, for: nil, in: profiles)
     let found = try await identifyCoordinator(at: address, transport: transport)
-    guard profiles.isEmpty else { throw OneCoordinator() }
+    // Another add or edit may have saved while the probe was out.
+    try CoordinatorProfile.checkName(name, for: nil, in: profiles)
     let profile = CoordinatorProfile(name: name, address: address)
     var next = profiles + [profile]
     _ = try CoordinatorProfile.admit(found, for: profile.id, in: &next)
@@ -164,6 +170,7 @@ public final class Coordinators {
     }
     profiles.removeAll { $0.id == id }
     pairingError[id] = nil
+    if chat.recipient == id { chat.recipient = nil }
     try directory(id).remove()
   }
 
@@ -283,10 +290,6 @@ extension Coordinators {
     values.isExcludedFromBackup = true
     try excluded.setResourceValues(values)
   }
-}
-
-private struct OneCoordinator: LocalizedError {
-  var errorDescription: String? { "This version keeps one coordinator. Edit or remove it first." }
 }
 
 private struct SaveRefused: LocalizedError {

@@ -564,6 +564,153 @@
         }
       }
 
+      /// How many pixels are within `tolerance` of `color` on every channel.
+      private func pixels(near color: (Double, Double, Double), in image: CGImage) throws -> Int {
+        var bytes = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        try bytes.withUnsafeMutableBytes { buffer in
+          let context = try #require(
+            CGContext(
+              data: buffer.baseAddress, width: image.width, height: image.height,
+              bitsPerComponent: 8, bytesPerRow: image.width * 4,
+              space: CGColorSpaceCreateDeviceRGB(),
+              bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+                | CGBitmapInfo.byteOrder32Big.rawValue))
+          context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        }
+        let target = [color.0, color.1, color.2].map { $0 * 255 }
+        return stride(from: 0, to: bytes.count, by: 4).filter { offset in
+          (0..<3).allSatisfy { abs(Double(bytes[offset + $0]) - target[$0]) < 16 }
+        }.count
+      }
+
+      @MainActor @Test func twoCoordinatorFeedNamesEachCoordinatorAndFoldsABroadcast() async throws
+      {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = CoordinatorProfile(
+          name: try TagName("Work"), address: try CoordinatorAddress(host: "100.64.1.2", port: 4001)
+        )
+        let personal = CoordinatorProfile(
+          name: try TagName("Personal"),
+          address: try CoordinatorAddress(host: "100.64.1.2", port: 4002))
+        let model = ChatModel()
+        model.profiles = [work, personal]
+        // Sessions that never connect stand in for the paired coordinators.
+        for profile in [work, personal] {
+          let directory = ProfileDirectory(profile.id, applicationSupport: root, caches: root)
+          model.attach(
+            Lane(
+              id: profile.id,
+              session: CoordinatorSession(
+                directory: directory, address: profile.address, pin: CoordinatorID(UUID()),
+                stamps: StampSource()),
+              hold: LegacyHold(directory)))
+        }
+        func message(_ id: String, _ role: HistoryRole, _ text: String, tool: ToolHistory? = nil)
+          -> HistoryMessage
+        {
+          .init(
+            continuation: false, entryId: id, finalChunk: true, role: role, text: text, tool: tool)
+        }
+        func stamped(_ rows: [ChatRow], _ times: [TimeInterval], sends: [Int: String]) -> [ChatRow]
+        {
+          zip(rows.indices, zip(rows, times)).map { index, pair in
+            var row = pair.0
+            row.receivedAt = Date(timeIntervalSince1970: pair.1)
+            row.sendID = sends[index]
+            return row
+          }
+        }
+        let broadcast = "Flying to Lisbon, offline until 6"
+        var workTranscript = Transcript()
+        for item in [
+          message("w1", .final, "The nightly build finished. Two flaky tests were retried."),
+          message("w2", .user, "Rotate the staging deploy key"),
+          message(
+            "w3", .tool, "rotate-key staging",
+            tool: .init(callId: "rotate", name: "exec", status: .finished)),
+          message("w4", .final, "Rotated. The old key is revoked."),
+          message("w5", .user, broadcast),
+          message("w6", .final, "Noted. I'll hold the release review."),
+        ] {
+          workTranscript.message(item)
+        }
+        var fromWork = ChatSnapshot()
+        fromWork.connection = .connected
+        fromWork.rows = stamped(workTranscript.rows, [1, 3, 4, 5, 6, 8], sends: [1: "A", 4: "B"])
+        fromWork.sends = [
+          "A": .init(recipients: [work.id], delivery: nil),
+          "B": .init(recipients: [work.id, personal.id], delivery: nil),
+        ]
+        var personalTranscript = Transcript()
+        personalTranscript.message(
+          message("p1", .final, "Your 9:40 flight to Lisbon moved to gate B12."))
+        personalTranscript.pending(
+          .init(inputId: "personal-lisbon", mode: .steer, text: broadcast), delivery: .uncertain)
+        personalTranscript.message(
+          message("p2", .final, "Safe flight. Your boarding pass is in Wallet."))
+        var fromPersonal = ChatSnapshot()
+        fromPersonal.connection = .connected
+        fromPersonal.rows = stamped(personalTranscript.rows, [2, 6.001, 9], sends: [1: "B"])
+        fromPersonal.sends = ["B": .init(recipients: [work.id, personal.id], delivery: .uncertain)]
+        model.apply(fromWork, lane: work.id)
+        model.apply(fromPersonal, lane: personal.id)
+        model.recipient = work.id
+        model.draft = "Check the release checklist"
+
+        #expect(
+          model.rows.first { $0.id == "send:B" }?.receipts == [
+            Receipt(lane: work.id, status: .placed),
+            Receipt(lane: personal.id, status: .pending(.uncertain, inputID: "personal-lisbon")),
+          ])
+        #expect(model.rows.first { $0.id == "send:A" }?.receipts.count == 1)
+        #expect(model.rows.filter { $0.row.text == broadcast }.count == 1, "The broadcast folds")
+        #expect(TranscriptItem.runStarts(model.transcriptItems).count == 5)
+        #expect(model.recipientLine == "To Work")
+        for scheme in [ColorScheme.light, .dark] {
+          let dimensions = CGSize(width: 390, height: 844)
+          let host = UIHostingController(
+            rootView: MainChatView(model: model).environment(\.colorScheme, scheme))
+          let scene = try #require(
+            UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+          let previousWindow = scene.windows.first(where: \.isKeyWindow)
+          let window = UIWindow(windowScene: scene)
+          window.overrideUserInterfaceStyle = scheme == .dark ? .dark : .light
+          let container = UIViewController()
+          window.rootViewController = container
+          window.makeKeyAndVisible()
+          defer {
+            window.isHidden = true
+            host.willMove(toParent: nil)
+            host.view.removeFromSuperview()
+            host.removeFromParent()
+            window.rootViewController = nil
+            previousWindow?.makeKey()
+          }
+          window.layoutIfNeeded()
+          container.addChild(host)
+          container.view.addSubview(host.view)
+          host.view.frame = CGRect(origin: .zero, size: dimensions)
+          host.didMove(toParent: container)
+          host.view.layoutIfNeeded()
+          try await Task.sleep(for: .milliseconds(100))
+          host.view.layoutIfNeeded()
+          let format = UIGraphicsImageRendererFormat()
+          format.scale = 1
+          format.preferredRange = .standard
+          let image = try #require(
+            UIGraphicsImageRenderer(size: dimensions, format: format).image { _ in
+              #expect(host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true))
+            }.cgImage)
+          try requireVisibleContent(image)
+          if scheme == .light {
+            #expect(try pixels(near: (0.11, 0.31, 0.85), in: image) > 20, "Work's blue label")
+            #expect(try pixels(near: (0.76, 0.25, 0.05), in: image) > 20, "Personal's orange label")
+          }
+          Attachment.record(image, named: "two-coordinator-feed-\(scheme)", as: .png)
+        }
+      }
+
       @MainActor @Test func accessibilityTextSizeExpandsMessageLayout() async throws {
         var transcript = Transcript()
         transcript.message(
