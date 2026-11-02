@@ -3,22 +3,65 @@ import Network
 import UIKit
 import XCTest
 
+@MainActor private func eventually(
+  file: StaticString = #filePath, line: UInt = #line,
+  _ predicate: () async throws -> Bool
+) async throws {
+  let deadline = ContinuousClock.now + .seconds(5)
+  while try await !predicate() {
+    guard ContinuousClock.now < deadline else {
+      XCTFail("Expected interaction state did not arrive", file: file, line: line)
+      return
+    }
+    try await Task.sleep(for: .milliseconds(20))
+  }
+}
+
+@MainActor
+final class ComposerInteractionTests: XCTestCase {
+  // Typed through the keyboard into the real field, where a model-level draft cannot reach.
+  func testATypedTagBecomesTheRecipientAndNeverReachesTheWire() async throws {
+    continueAfterFailure = false
+    executionTimeAllowance = 120
+    let work = InteractionPeer()
+    let personal = InteractionPeer()
+    var ports: [String] = []
+    for peer in [work, personal] {
+      addTeardownBlock { await peer.stop() }
+      let empty = NativeEventHistory(messages: [], nextCursor: nil, pageComplete: true)
+      await peer.history(initial: empty, pages: [:], latest: empty)
+      ports.append(String(try await peer.start()))
+    }
+    let app = XCUIApplication()
+    app.launchEnvironment["AGENT_INTERACTION_PORT"] = ports.joined(separator: ",")
+    app.launchEnvironment["AGENT_INTERACTION_COORDINATOR"] = [work, personal]
+      .map { $0.coordinator.uuidString }.joined(separator: ",")
+    app.launchArguments += ["-notificationsEnabled", "NO"]
+    app.launch()
+    defer { app.terminate() }
+    XCTAssertTrue(app.staticTexts["To Work and Personal"].waitForExistence(timeout: 10))
+    let composer = app.descendants(matching: .any).matching(identifier: "Message the coordinator")
+      .firstMatch
+    composer.tap()
+    composer.typeText("@Work ")
+    XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3), "The typed tag is the chip")
+    let value = composer.value as? String
+    XCTAssertTrue(
+      value == nil || value == "" || value == composer.placeholderValue,
+      "The typed tag left the field, which shows \(value ?? "nil")")
+    let text = "Anything urgent this morning?"
+    composer.typeText(text)
+    app.buttons["Send message"].tap()
+    try await eventually { await work.submits() == [text] }
+    let toWork = await work.submits()
+    let toPersonal = await personal.submits()
+    XCTAssertEqual(toWork, [text], "Work receives the text without its tag")
+    XCTAssertEqual(toPersonal, [], "Personal receives nothing")
+  }
+}
+
 @MainActor
 final class HistoryInteractionTests: XCTestCase {
-  private func eventually(
-    file: StaticString = #filePath, line: UInt = #line,
-    _ predicate: () async throws -> Bool
-  ) async throws {
-    let deadline = ContinuousClock.now + .seconds(5)
-    while try await !predicate() {
-      guard ContinuousClock.now < deadline else {
-        XCTFail("Expected history navigation state did not arrive", file: file, line: line)
-        return
-      }
-      try await Task.sleep(for: .milliseconds(20))
-    }
-  }
-
   func testTopPagingPreservesVisibleGroupAndLatestReloadsTheActualTail() async throws {
     continueAfterFailure = false
     executionTimeAllowance = 120
@@ -175,6 +218,7 @@ private actor InteractionPeer {
   private var latest: NativeEventHistory?
   private var observer: NWConnection?
   private var requests: [String] = []
+  private var submitted: [String] = []
   private var held: Set<String> = []
   private var releases: [String: CheckedContinuation<Void, Never>] = [:]
 
@@ -186,6 +230,7 @@ private actor InteractionPeer {
     self.latest = latest
   }
   func cursors() -> [String] { requests }
+  func submits() -> [String] { submitted }
   func beginReply(_ text: String) async throws {
     try await emit(.textDelta(.init(text: text)), to: XCTUnwrap(observer))
   }
@@ -253,6 +298,9 @@ private actor InteractionPeer {
         if held.contains(cursor) { await withCheckedContinuation { releases[cursor] = $0 } }
         try await emit(
           .history(try XCTUnwrap(request.cursor == nil ? latest : pages[cursor])), to: socket)
+        try await emit(.done, to: socket)
+      case .submit(let request):
+        submitted.append(request.text)
         try await emit(.done, to: socket)
       default: try await emit(.done, to: socket)
       }
