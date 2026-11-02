@@ -379,6 +379,40 @@ func restoreAddressesTheSourceCoordinatorAndKeepsItsTextLiteral() async throws {
 }
 
 @MainActor @Test(.timeLimit(.minutes(1)))
+func removeRefusesWhileTheDraftIsAddressedToOrRestoredFromThatCoordinator() async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    await workFixture.refuseUploads()
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let workOutbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    chat.recipient = work
+    chat.draft = "Invented Q3 numbers for the Work board"
+    await chat.attach(data: Data("bytes".utf8), name: "Payroll.txt", mediaType: "text/plain")
+    await chat.send()
+    try await eventually("rejected by Work") {
+      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+    }
+    let original = try #require(try queuedRequests(workOutbox).first)
+    await chat.restore(original.inputId)
+    #expect(chat.recipientLine == "To Work")
+    for chip in [work, nil] {
+      chat.recipient = chip
+      do {
+        try await coordinators.remove(work)
+        Issue.record("Remove went ahead with a draft from Work, chip \(String(describing: chip))")
+      } catch {
+        #expect(error.localizedDescription == "Send or clear the draft for Work first.")
+      }
+      #expect(coordinators.profiles.map(\.id) == [work, personal])
+    }
+    chat.draft = ""
+    for file in chat.attachments { await chat.removeAttachment(file) }
+    try await coordinators.remove(work)
+    #expect(coordinators.profiles.map(\.id) == [personal], "A cleared draft lets Remove go ahead")
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
 func aScreenshotKeptFromOneCoordinatorIsRefusedOnceASecondIsSaved() async throws {
   try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
     try await coordinators.add(
