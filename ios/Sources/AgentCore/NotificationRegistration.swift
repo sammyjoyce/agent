@@ -133,10 +133,12 @@ public final class NotificationRegistration {
 
   /// Removes the profile's installation over its live channel, if any, then forgets it.
   public func forget(_ profile: ProfileID) async {
-    links[profile]?.enrollment = nil
+    // A new link generation stops an in-flight connect, and a forgotten channel status stops a
+    // new token, from enrolling after the withdrawal.
+    if let link = links[profile] { links[profile] = Link(channel: link.channel) }
+    channels[profile] = nil
     try? await unregister(profile)
     links[profile] = nil
-    channels[profile] = nil
     controls[profile] = nil
   }
 

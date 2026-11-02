@@ -353,6 +353,86 @@ func notificationChannelsKeepInstallationsApartAndOptOutReachesEveryChannel() as
   }
 }
 
+/// Remove withdraws a coordinator's alerts while its connect still waits for the status
+/// answer. That connect must not enroll after the withdrawal.
+@Test(.timeLimit(.minutes(1))) @MainActor
+func notificationForgetDuringAnInflightConnectEnrollsNothingAfterIt() async throws {
+  let profile = ProfileID()
+  let coordinator = HeldControls()
+  let registration = NotificationRegistration(
+    enabled: true, permission: { true }, register: {}, save: { _ in })
+  await registration.received(token: String(repeating: "ab", count: 32))
+  await coordinator.hold()
+  let connect = Task {
+    await registration.connect(
+      NotificationChannel(installation: profile) { await coordinator.exchange($0) })
+  }
+  while await coordinator.sent.isEmpty { await Task.yield() }
+  let release = Task { await coordinator.open() }
+  await registration.forget(profile)
+  await release.value
+  await connect.value
+  let sent = await coordinator.sent
+  let registered = await coordinator.registered
+  let installation = "\(profile)"
+  #expect(
+    sent == [
+      .status(.init(installationId: installation)),
+      .unregister(.init(installationId: installation)),
+    ])
+  #expect(!registered)
+}
+
+/// A device token that arrives while Remove's withdrawal is out must not enroll either.
+@Test(.timeLimit(.minutes(1))) @MainActor
+func notificationATokenDuringForgetEnrollsNothingAfterIt() async throws {
+  let profile = ProfileID()
+  let coordinator = HeldControls()
+  let registration = NotificationRegistration(
+    enabled: true, permission: { true }, register: {}, save: { _ in })
+  await registration.connect(
+    NotificationChannel(installation: profile) { await coordinator.exchange($0) })
+  await coordinator.hold()
+  let forget = Task { await registration.forget(profile) }
+  while await coordinator.sent.count < 2 { await Task.yield() }
+  let release = Task { await coordinator.open() }
+  await registration.received(token: String(repeating: "ab", count: 32))
+  await release.value
+  await forget.value
+  let sent = await coordinator.sent
+  let registered = await coordinator.registered
+  let installation = "\(profile)"
+  #expect(
+    sent == [
+      .status(.init(installationId: installation)),
+      .unregister(.init(installationId: installation)),
+    ])
+  #expect(!registered)
+}
+
+/// One coordinator's notification controls. After `hold`, the next request waits for `open`.
+private actor HeldControls {
+  private(set) var sent: [NotificationRequest] = []
+  private(set) var registered = false
+  private var holding = false
+  private var release: CheckedContinuation<Void, Never>?
+  func hold() { holding = true }
+  func open() {
+    release?.resume()
+    release = nil
+  }
+  func exchange(_ request: NotificationRequest) async -> NotificationStatus {
+    sent.append(request)
+    if holding {
+      holding = false
+      await withCheckedContinuation { release = $0 }
+    }
+    if case .register = request { registered = true }
+    if case .unregister = request { registered = false }
+    return .init(configured: true, registered: registered)
+  }
+}
+
 @MainActor
 private final class ChannelLog {
   var sent: [ProfileID: [NotificationRequest]] = [:]
