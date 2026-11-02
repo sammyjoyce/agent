@@ -410,6 +410,31 @@ func notificationATokenDuringForgetEnrollsNothingAfterIt() async throws {
   #expect(!registered)
 }
 
+/// `ChatModel` starts each lane's connect untracked, so one can begin after Remove's withdrawal
+/// finished. It must enroll nothing.
+@Test(.timeLimit(.minutes(1))) @MainActor
+func notificationAConnectStartingAfterForgetEnrollsNothing() async {
+  var violations = 0
+  for _ in 0..<10 {
+    let profile = ProfileID()
+    let coordinator = HeldControls()
+    let registration = NotificationRegistration(
+      enabled: true, permission: { true }, register: {}, save: { _ in })
+    await registration.received(token: String(repeating: "ab", count: 32))
+    let connect = Task {
+      await registration.connect(
+        NotificationChannel(installation: profile) { await coordinator.exchange($0) })
+    }
+    await registration.forget(profile)
+    await connect.value
+    if await coordinator.sent.contains(where: { if case .register = $0 { true } else { false } }) {
+      violations += 1
+    }
+    #expect(!registration.status(profile).registered)
+  }
+  #expect(violations == 0, "A connect after forget registered in \(violations) of 10 runs")
+}
+
 /// One coordinator's notification controls. After `hold`, the next request waits for `open`.
 private actor HeldControls {
   private(set) var sent: [NotificationRequest] = []

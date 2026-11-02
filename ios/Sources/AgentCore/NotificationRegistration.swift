@@ -38,6 +38,9 @@ public final class NotificationRegistration {
     var enrollment: Enrollment?
   }
   @ObservationIgnored private var links: [ProfileID: Link] = [:]
+  /// Profiles whose installation Remove withdrew. Profile IDs are never reused, so none of
+  /// these connects or enrolls again.
+  @ObservationIgnored private var forgotten: Set<ProfileID> = []
   /// Outlives links, so a request from an earlier connection still orders before later ones.
   @ObservationIgnored private var controls: [ProfileID: Task<NotificationStatus, any Error>] = [:]
   @ObservationIgnored private var authorization = Authorization.unchecked
@@ -74,6 +77,7 @@ public final class NotificationRegistration {
 
   public func connect(_ channel: NotificationChannel) async {
     let profile = channel.installation
+    guard !forgotten.contains(profile) else { return }
     let link = Link(channel: channel)
     links[profile] = link
     channels[profile, default: ChannelStatus()].configured = false
@@ -133,9 +137,8 @@ public final class NotificationRegistration {
 
   /// Removes the profile's installation over its live channel, if any, then forgets it.
   public func forget(_ profile: ProfileID) async {
-    // A new link generation stops an in-flight connect, and a forgotten channel status stops a
-    // new token, from enrolling after the withdrawal.
-    if let link = links[profile] { links[profile] = Link(channel: link.channel) }
+    forgotten.insert(profile)
+    // Without a configured status, a token arriving during the withdrawal skips this profile.
     channels[profile] = nil
     try? await unregister(profile)
     links[profile] = nil
@@ -164,7 +167,7 @@ public final class NotificationRegistration {
   }
 
   private func current(_ profile: ProfileID, _ link: Link) -> Bool {
-    links[profile]?.generation == link.generation
+    !forgotten.contains(profile) && links[profile]?.generation == link.generation
   }
 
   private func enrollLinked(_ token: String) async {
