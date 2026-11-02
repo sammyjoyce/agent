@@ -174,9 +174,8 @@ async function writeAtomically(path: string, text: string): Promise<void> {
 
 /** Runs one phone against both coordinators through fresh recording proxies, serving its re-point requests. */
 async function throughProxies(coordinators: Record<Name, Coordinator>, directory: string, phone: Phone,
-  signal: AbortSignal): Promise<ProxyLog> {
+  signal: AbortSignal, log: ProxyLog): Promise<void> {
   await mkdir(join(directory, "phone"), { recursive: true, mode: 0o700 });
-  const log: ProxyLog = { sent: [], answers: [] };
   const contract: PhoneContract = {
     AGENT_E2E_WORK_SOCKET: join(directory, "work-lane.sock"), AGENT_E2E_PERSONAL_SOCKET: join(directory, "personal-lane.sock"),
     AGENT_E2E_WORK_ID: coordinators.work.id, AGENT_E2E_PERSONAL_ID: coordinators.personal.id,
@@ -204,7 +203,6 @@ async function throughProxies(coordinators: Record<Name, Coordinator>, directory
       await sleep(10);
     }
     await running;
-    return log;
   } finally {
     stopPhone.abort();
     await running.catch(() => {});
@@ -358,8 +356,13 @@ test("two production coordinators behind recording proxies", { timeout: 300_000 
     assert.notEqual(coordinators.work.id, coordinators.personal.id);
     t.diagnostic(`work answers ${coordinators.work.id}, personal answers ${coordinators.personal.id}`);
     const run = async (t: TestContext, label: string, phone: Phone) => {
-      const log = await throughProxies(coordinators, join(directory, label), phone, t.signal);
-      for (const line of summarize(log)) t.diagnostic(line);
+      const log: ProxyLog = { sent: [], answers: [] };
+      try {
+        await throughProxies(coordinators, join(directory, label), phone, t.signal, log);
+      } finally {
+        // A phone that failed still shows what each coordinator received and which invariants broke.
+        for (const line of [...summarize(log), ...Object.values(violations(log))]) t.diagnostic(line);
+      }
       return log;
     };
 
@@ -383,7 +386,6 @@ test("two production coordinators behind recording proxies", { timeout: 300_000 
     for (const [fault, expected] of controls) {
       await t.test(`negative control: a stand-in that ${fault} breaks invariant ${Object.keys(expected).join(" and ")}`, async (t) => {
         const broken = violations(await run(t, fault, standInPhone(fault)));
-        for (const message of Object.values(broken)) t.diagnostic(message);
         assert.deepEqual(Object.keys(broken), Object.keys(expected));
         for (const [invariant, pattern] of Object.entries(expected)) assert.match(broken[Number(invariant)] ?? "", pattern);
       });
