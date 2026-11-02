@@ -510,3 +510,53 @@ func stagingSendsNothingAndUnstagingLeavesNoTrace() async throws {
     #expect(submitted == [again.inputID])
   }
 }
+
+enum LaneReturn: Sendable { case reconnect, foreground }
+
+@Test(.timeLimit(.minutes(1)), arguments: [LaneReturn.reconnect, .foreground])
+func aStagedInputWhoseLaneDropsBeforeStartIsSentOnceItsLaneReturns(_ lane: LaneReturn)
+  async throws
+{
+  try await withCoordinator { session, fixture, outbox in
+    await session.connect()
+    _ = try await until(session) { $0.connection == .connected }
+    let staged = try #require(
+      await session.stage(
+        "Landing at 6, call me", sendID: "send-6", recipients: [session.profile]))
+    func expectWaiting(_ snapshot: ChatSnapshot) async {
+      #expect(
+        snapshot.rows.first { $0.inputID == staged.inputID }?.delivery == .sending,
+        "It never left the phone, so it is not unconfirmed")
+      #expect(snapshot.sends["send-6"]?.delivery == .sending)
+      #expect(await fixture.count() == 0)
+    }
+    // The lane cannot connect again until the snapshot is released.
+    await fixture.holdSnapshot()
+    try await fixture.emitOnObserver(.done)
+    _ = try await until(session) { $0.connection == .reconnecting }
+    await session.start(staged)
+    switch lane {
+    case .reconnect:
+      await expectWaiting(try await until(session) { $0.connection == .reconnecting })
+    case .foreground:
+      await session.disconnect()
+      await expectWaiting(try await until(session) { $0.connection == .disconnected })
+      await session.connect()
+      await expectWaiting(try await until(session) { $0.connection == .connecting })
+    }
+    await fixture.releaseSnapshot()
+    let entry = "placed-\(staged.inputID)"
+    try await eventually("the waiting input placed") {
+      try queuedRequests(outbox).isEmpty
+    }
+    let placed = try await until(session) {
+      $0.connection == .connected && $0.rows.contains { $0.entryID == entry && $0.delivery == nil }
+    }
+    #expect(placed.sends["send-6"] == SendStatus(recipients: [session.profile], delivery: nil))
+    let submitted = await fixture.received().compactMap {
+      if case .submit(let input) = $0 { input } else { nil }
+    }
+    #expect(submitted.map(\.inputId) == [staged.inputID], "Sent once, under its own input ID")
+    #expect(submitted.map(\.text) == ["Landing at 6, call me"])
+  }
+}
