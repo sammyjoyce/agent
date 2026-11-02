@@ -130,6 +130,8 @@ public final class Coordinators {
     let found =
       before.address == address
       ? nil : try await identifyCoordinator(at: address, transport: transport)
+    // Another add or edit may have saved while the probe was out.
+    try CoordinatorProfile.checkName(name, for: id, in: profiles)
     var next = profiles
     guard let index = next.firstIndex(where: { $0.id == id }) else { return }
     next[index].name = name

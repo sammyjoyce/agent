@@ -336,6 +336,69 @@ func anAddressEditIsProbedAgainstThePinBeforeAnythingIsSaved() async throws {
   await wrong.stop()
 }
 
+/// Holds the first dial until `open`, standing in for a slow address probe.
+private actor ProbeGate {
+  private(set) var waiting = false
+  private var opened = false
+  private var release: CheckedContinuation<Void, Never>?
+  func pass() async {
+    guard !opened else { return }
+    waiting = true
+    await withCheckedContinuation { release = $0 }
+  }
+  func open() {
+    opened = true
+    release?.resume()
+    release = nil
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func anEditRechecksItsNameAfterTheAddressProbe() async throws {
+  let work = FixtureCoordinator()
+  let personal = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(work)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personal)
+  defer { personalListener.cancel() }
+  let routes: [UInt16: NWEndpoint.Port] = [4001: workPort, 4002: personalPort, 4003: workPort]
+  let gate = ProbeGate()
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "edit-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: CoordinatorTransport { address in
+      if address.port == 4003 { await gate.pass() }
+      return LineConnection(
+        connection: NWConnection(host: .ipv4(.loopback), port: routes[address.port]!, using: .tcp))
+    })
+  try await coordinators.add(
+    name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+  try await coordinators.add(
+    name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+  let (workID, personalID) = (coordinators.profiles[0].id, coordinators.profiles[1].id)
+  let edit = Task {
+    try await coordinators.update(
+      workID, name: TagName("Shared"), address: CoordinatorAddress(host: "100.64.1.2", port: 4003))
+  }
+  try await eventually("Work's probe held") { await gate.waiting }
+  try await coordinators.update(
+    personalID, name: TagName("Shared"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002)
+  )
+  await gate.open()
+  await #expect(throws: ProfileError.duplicateName("Shared")) { try await edit.value }
+  struct Saved: Decodable { let profiles: [CoordinatorProfile] }
+  let saved = try JSONDecoder().decode(
+    Saved.self, from: Data(contentsOf: root.appending(path: "Agent/profiles.json")))
+  #expect(saved.profiles.map(\.name.description) == ["Work", "Shared"])
+  #expect(coordinators.profiles.map(\.address.port) == [4001, 4002])
+  await work.stop()
+  await personal.stop()
+}
+
 @MainActor @Test(.timeLimit(.minutes(1)))
 func removeCountsQueuedAndHeldMessagesAndDeletesOnlyAfterSaving() async throws {
   let install = try await LegacyInstall()
