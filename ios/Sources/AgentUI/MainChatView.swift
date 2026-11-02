@@ -454,7 +454,7 @@ public struct MainChatView: View {
         .accessibilityIdentifier("composerMenu")
         // Top-aligned, so a wrapping draft's first line stays beside the chip.
         HStack(alignment: .top, spacing: 4) {
-          if model.multiple, let recipient = model.recipient {
+          if let recipient = model.recipient {
             let badge = badge(recipient)
             Button {
               model.recipient = nil
@@ -516,7 +516,7 @@ public struct MainChatView: View {
       .overlay {
         RoundedRectangle(cornerRadius: 26).strokeBorder(.primary.opacity(0.12), lineWidth: 0.5)
       }
-      if model.multiple {
+      if model.multiple || !model.removed.isEmpty {
         // With the picker open the tag is still being typed, which is not an error.
         let blocked =
           if case .blocked = model.addressing, model.pickerMatches.isEmpty { true } else { false }

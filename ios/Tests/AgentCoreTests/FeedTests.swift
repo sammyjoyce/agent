@@ -78,7 +78,11 @@ import Testing
         .blocked("Work and Personal are not connected")
       ),
       ("@Wrok hi", false, nil, [saved(work, "Work")], .to([work], body: "@Wrok hi")),
-      ("@Work hi", false, personal, [saved(work, "Work")], .to([work], body: "@Work hi")),
+      ("@Work hi", false, work, [saved(work, "Work")], .to([work], body: "@Work hi")),
+      (
+        "@Work hi", false, personal, [saved(work, "Work")],
+        .blocked("Choose who receives this message")
+      ),
       ("hi", false, nil, [], .blocked("No coordinator is paired yet")),
     ]
   for item in cases {
@@ -86,6 +90,34 @@ import Testing
       Addressing.parse(
         item.draft, hasAttachments: item.files, chip: item.chip, among: item.saved)
         == item.expected, "\(item.draft.debugDescription) with \(item.saved.map(\.name))")
+  }
+  // Personal was removed. A coordinator added again under its name is a new one.
+  let readded = ProfileID()
+  let removedCases:
+    [(draft: String, chip: ProfileID?, saved: [Addressing.Coordinator], expected: Addressing)] = [
+      ("hi", personal, [saved(work, "Work")], .blocked("Personal was removed")),
+      (
+        "hi", personal, [saved(work, "Work"), saved(work1, "Work-1")],
+        .blocked("Personal was removed")
+      ),
+      ("@Personal hi", nil, [saved(work, "Work")], .blocked("Personal was removed")),
+      (
+        "@Work @personal hi", nil, [saved(work, "Work"), saved(work1, "Work-1")],
+        .blocked("Personal was removed")
+      ),
+      ("@Personal hi", work, [saved(work, "Work")], .to([work], body: "@Personal hi")),
+      ("hi @Personal", nil, [saved(work, "Work")], .to([work], body: "hi @Personal")),
+      (
+        "@Personal hi", nil, [saved(work, "Work"), saved(readded, "Personal")],
+        .to([readded], body: "hi")
+      ),
+    ]
+  for item in removedCases {
+    #expect(
+      Addressing.parse(
+        item.draft, hasAttachments: false, chip: item.chip, among: item.saved,
+        removed: [personal: "Personal"]) == item.expected,
+      "\(item.draft.debugDescription) with \(item.saved.map(\.name))")
   }
 }
 
@@ -189,9 +221,29 @@ private func row(
     "Each coordinator is named where its run starts, and again after your message")
 }
 
+/// Holds the next dial to Work's port once armed, as a slow tailnet would.
+private actor DialGate {
+  private var armed = false
+  private(set) var waiting = false
+  private var release: CheckedContinuation<Void, Never>?
+  func arm() { armed = true }
+  func pass() async {
+    guard armed else { return }
+    armed = false
+    waiting = true
+    await withCheckedContinuation { release = $0 }
+  }
+  func open() {
+    armed = false
+    release?.resume()
+    release = nil
+  }
+}
+
 /// Two loopback coordinators at ports 4001 and 4002 of one invented address, and a fresh
 /// `Coordinators` with nothing saved, as the app builds it.
 @MainActor private func withTwoFixtures(
+  registration: NotificationRegistration? = nil, holdingWork gate: DialGate? = nil,
   _ body: (Coordinators, FixtureCoordinator, FixtureCoordinator, URL) async throws -> Void
 ) async throws {
   let first = FixtureCoordinator()
@@ -207,20 +259,23 @@ private func row(
   let defaults = try #require(UserDefaults(suiteName: suite))
   defer { defaults.removePersistentDomain(forName: suite) }
   let coordinators = Coordinators(
-    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    registration: registration, defaults: defaults, applicationSupport: root, caches: root,
     transport: CoordinatorTransport { address in
-      LineConnection(
+      if address.port == 4001 { await gate?.pass() }
+      return LineConnection(
         connection: NWConnection(host: .ipv4(.loopback), port: routes[address.port]!, using: .tcp))
     })
   await coordinators.setActive(true)
   do {
     try await body(coordinators, first, second, root)
   } catch {
+    await gate?.open()
     await coordinators.setActive(false)
     await first.stop()
     await second.stop()
     throw error
   }
+  await gate?.open()
   await coordinators.setActive(false)
   await first.stop()
   await second.stop()
@@ -517,5 +572,145 @@ func toolDetailsGoToTheRowsOwnCoordinatorWhenCallIDsCollide() async throws {
     #expect(try await coordinators.chat.toolDetails(for: row, lane: personal) == details)
     #expect(await personalFixture.toolLookups() == [.init(callId: "shared", entryId: "7")])
     #expect(await workFixture.toolLookups().isEmpty)
+  }
+}
+
+/// Remove withdraws Work's alerts over the network before it deletes anything. Meanwhile a
+/// second window, or this one after Done, restores, chooses or tags Work. None of that may
+/// become a draft that reaches Personal once Work is gone.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func nothingRestoredChosenOrTaggedDuringRemoveReachesTheOtherCoordinator() async throws {
+  let registration = NotificationRegistration(
+    enabled: false, permission: { true }, register: {}, save: { _ in })
+  let gate = DialGate()
+  try await withTwoFixtures(registration: registration, holdingWork: gate) {
+    coordinators, workFixture, personalFixture, root in
+    await workFixture.refuseUploads()
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    try await eventually("Work's alert channel linked") { registration.status(work).configured }
+    let workDirectory = ProfileDirectory(work, applicationSupport: root, caches: root)
+    chat.recipient = work
+    chat.draft = "Invented Q3 payroll numbers for the Work board"
+    await chat.attach(
+      data: Data("invented payroll".utf8), name: "Payroll.txt", mediaType: "text/plain")
+    await chat.send()
+    try await eventually("rejected by Work") {
+      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+    }
+    let queued = try #require(try queuedRequests(workDirectory.outbox).first)
+    try writePrivately(
+      JSONEncoder().encode([
+        NativeRequestSubmit(inputId: "held-1", mode: .steer, text: "Invented Work-only held text")
+      ]), to: workDirectory.legacy.appending(path: "pending.json"))
+    let hold = try #require(chat.lanes.first { $0.id == work }?.hold)
+    let held = HeldMessage(lane: work, item: try #require(try await hold.items().first))
+
+    await gate.arm()
+    let removal = Task { try await coordinators.remove(work) }
+    try await eventually("Remove waiting on Work's alert withdrawal") { await gate.waiting }
+    chat.draft = "@Wo"
+    #expect(chat.pickerMatches.isEmpty, "Work is not offered while it is removed")
+    chat.choose(work)
+    #expect(chat.recipient == nil)
+    chat.draft = "@Work see the invented payroll"
+    chat.promoteTypedTag()
+    #expect(!chat.canSend && chat.recipientLine == "Work was removed")
+    chat.recipient = nil
+    chat.draft = ""
+    await chat.restoreHeld(held)
+    await chat.restore(queued.inputId)
+    #expect(chat.draft.isEmpty && chat.attachments.isEmpty, "Restore refuses while Work is removed")
+    await gate.open()
+    try await removal.value
+    #expect(coordinators.profiles.map(\.id) == [personal])
+    await chat.send()
+    try await Task.sleep(for: .seconds(1))
+    let atPersonal = await submits(personalFixture)
+    #expect(atPersonal.isEmpty, "Personal received \(atPersonal.map(\.text))")
+  }
+}
+
+/// A restore that passed its checks before Remove started fills the composer after Work is
+/// marked. Clearing the chip later must not make Work's message sendable to Personal.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aMessageRestoredFromARemovedCoordinatorStaysBlockedUnderAnyAddress() async throws {
+  let registration = NotificationRegistration(
+    enabled: false, permission: { true }, register: {}, save: { _ in })
+  let gate = DialGate()
+  try await withTwoFixtures(registration: registration, holdingWork: gate) {
+    coordinators, workFixture, personalFixture, root in
+    await workFixture.refuseUploads()
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    try await eventually("Work's alert channel linked") { registration.status(work).configured }
+    chat.recipient = work
+    chat.draft = "Invented Q3 payroll numbers for the Work board"
+    await chat.attach(
+      data: Data("invented payroll".utf8), name: "Payroll.txt", mediaType: "text/plain")
+    await chat.send()
+    try await eventually("rejected by Work") {
+      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+    }
+    let workOutbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let queued = try #require(try queuedRequests(workOutbox).first)
+    await gate.arm()
+    // Both start on the main actor in this order, so the restore resumes after Remove's mark.
+    let restoring = Task { @MainActor in await chat.restore(queued.inputId) }
+    let removal = Task { @MainActor in try await coordinators.remove(work) }
+    await restoring.value
+    #expect(chat.draft == queued.text && chat.recipient == work)
+    try await eventually("Remove waiting on Work's alert withdrawal") { await gate.waiting }
+    await gate.open()
+    try await removal.value
+    #expect(coordinators.profiles.map(\.id) == [personal])
+    for chip in [work, nil] {
+      chat.recipient = chip
+      #expect(chat.addressing == .blocked("Work was removed"))
+      await chat.send()
+    }
+    try await Task.sleep(for: .milliseconds(500))
+    let atPersonal = await submits(personalFixture)
+    #expect(atPersonal.isEmpty, "Personal received \(atPersonal.map(\.text))")
+  }
+}
+
+/// A typed `@Work` that has not become the chip addresses Work too. Remove refuses it. Once Work
+/// is gone, no tag or chip naming Work sends, even with one coordinator left.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func removeRefusesATypedTagAndNothingNamingARemovedCoordinatorSends() async throws {
+  try await withTwoFixtures { coordinators, _, personalFixture, _ in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    chat.draft = "@Work"
+    chat.promoteTypedTag()
+    await chat.attach(
+      data: Data("invented board minutes".utf8), name: "Board-minutes.txt",
+      mediaType: "text/plain")
+    #expect(chat.recipient == nil && chat.recipientLine == "To Work")
+    do {
+      try await coordinators.remove(work)
+      Issue.record("Remove went ahead with a draft tagged @Work")
+    } catch {
+      #expect(error.localizedDescription == "Send or clear the draft for Work first.")
+    }
+    #expect(coordinators.profiles.map(\.id) == [work, personal])
+    chat.draft = ""
+    for file in chat.attachments { await chat.removeAttachment(file) }
+    try await coordinators.remove(work)
+    #expect(coordinators.profiles.map(\.id) == [personal])
+    let drafts: [(chip: ProfileID?, text: String)] = [
+      (nil, "@Work see the invented board minutes"), (work, "Invented board minutes"),
+    ]
+    for draft in drafts {
+      chat.recipient = draft.chip
+      chat.draft = draft.text
+      #expect(chat.addressing == .blocked("Work was removed"), "\(draft.text)")
+      await chat.send()
+      #expect(chat.draft == draft.text, "Send keeps a draft for a removed coordinator")
+    }
+    try await Task.sleep(for: .milliseconds(500))
+    let atPersonal = await submits(personalFixture)
+    #expect(atPersonal.isEmpty, "Personal received \(atPersonal.map(\.text))")
   }
 }

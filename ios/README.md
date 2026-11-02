@@ -98,6 +98,10 @@ Mode if requested, then Run.
   in each one's outbox under its own input ID before any of them is sent. If
   one refuses it, none keeps it and the draft stays. Its bubble shows each
   coordinator's delivery with its own **Check / retry** or **Restore**.
+- Remove refuses while the draft is addressed to that coordinator or restored
+  from it. Until the app quits, a chip or `@Name` for a removed coordinator, or
+  a message restored from one, blocks Send, so nothing meant for it goes to
+  another coordinator.
 - Every connection first asks for the coordinator's ID and writes nothing else
   unless the ID matches the saved one. A coordinator too old to answer shows
   "Update the coordinator". If the address now answers as a different

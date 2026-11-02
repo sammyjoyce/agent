@@ -77,6 +77,9 @@ final class ChatModel {
   /// The one coordinator the draft goes to, or nil for every paired one. While it is set, the
   /// draft is never read for tags.
   var recipient: ProfileID?
+  /// Coordinators removed in this process, or being removed, by the name they had. Nothing
+  /// addresses one again, and profile IDs are never reused.
+  var removed: [ProfileID: String] = [:]
   var draft = "" { didSet { forgetClearedSource() } }
   var attachments: [LocalAttachment] = [] { didSet { forgetClearedSource() } }
   private(set) var held: [HeldMessage] = []
@@ -110,7 +113,7 @@ final class ChatModel {
   var multiple: Bool { profiles.count > 1 }
 
   func name(_ id: ProfileID) -> String {
-    profiles.first { $0.id == id }?.name.description ?? "Coordinator"
+    profiles.first { $0.id == id }?.name.description ?? removed[id] ?? "Coordinator"
   }
 
   func paired(_ id: ProfileID) -> Bool { lanes.first { $0.id == id }?.session != nil }
@@ -195,15 +198,19 @@ final class ChatModel {
   }
 
   private func address(_ text: String, hasAttachments: Bool, chip: ProfileID?) -> Addressing {
-    Addressing.parse(
+    // A restored message stays its source's under any chip, so a removed source blocks it.
+    if let source = restoredFrom?.lane, let name = removed[source] {
+      return .blocked("\(name) was removed")
+    }
+    return Addressing.parse(
       text, hasAttachments: hasAttachments, chip: chip,
-      among: lanes.map {
+      among: lanes.filter { removed[$0.id] == nil }.map {
         .init(
           id: $0.id, name: name($0.id), paired: $0.session != nil, connected: connected($0.id))
-      })
+      }, removed: removed)
   }
 
-  /// The line under the composer with two or more saved coordinators.
+  /// The line under the composer with two or more saved coordinators, or once one was removed.
   var recipientLine: String {
     switch addressing {
     case .to(let ids, _), .empty(let ids): "To " + joinedNames(ids.map(name))
@@ -216,10 +223,13 @@ final class ChatModel {
     guard multiple, recipient == nil, draft.first == "@", !draft.contains(where: \.isWhitespace)
     else { return [] }
     let typed = draft.dropFirst().lowercased()
-    return profiles.filter { $0.name.description.lowercased().hasPrefix(typed) }
+    return profiles.filter {
+      removed[$0.id] == nil && $0.name.description.lowercased().hasPrefix(typed)
+    }
   }
 
   func choose(_ id: ProfileID) {
+    guard removed[id] == nil else { return }
     recipient = id
     draft = ""
   }
@@ -321,19 +331,16 @@ final class ChatModel {
   /// Copies a queued input into the composer, addressed to its own coordinator, with its text
   /// as it was. The input stays queued until the copy is admitted.
   func restore(_ inputID: String) async {
-    guard readyToRestore() else { return }
+    guard let lane = lane(holding: inputID), readyToRestore(from: lane.id) else { return }
     do {
       let store = try attachmentStore()
-      guard let lane = lane(holding: inputID),
-        let restored = await lane.session?.restore(inputID, to: store)
-      else { return }
+      guard let restored = await lane.session?.restore(inputID, to: store) else { return }
       fill(restored, from: RestoredSource(lane: lane.id, item: inputID, kind: .live))
     } catch { self.error = error.localizedDescription }
   }
   func restoreHeld(_ message: HeldMessage) async {
-    guard readyToRestore(), let lane = lanes.first(where: { $0.id == message.lane }) else {
-      return
-    }
+    guard let lane = lanes.first(where: { $0.id == message.lane }), readyToRestore(from: lane.id)
+    else { return }
     do {
       guard let restored = try await lane.hold.restore(message.id, to: attachmentStore())
       else { return }
@@ -345,7 +352,11 @@ final class ChatModel {
     do { try await lane.hold.discard(message.id) } catch { self.error = error.localizedDescription }
     await loadHeld(lane)
   }
-  private func readyToRestore() -> Bool {
+  private func readyToRestore(from lane: ProfileID) -> Bool {
+    if let name = removed[lane] {
+      error = "\(name) is being removed."
+      return false
+    }
     guard !admitting, draft.isEmpty, attachments.isEmpty else {
       error = "Send or clear the current draft before restoring another message."
       return false

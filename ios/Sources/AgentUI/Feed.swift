@@ -20,32 +20,44 @@ enum Addressing: Equatable {
   /// With two or more saved coordinators, `chip` names the one recipient and the text is
   /// literal. Without a chip, leading `@Name` tags pick the recipients and are not sent, and
   /// no tag means every paired coordinator. With one saved coordinator the text goes as typed.
+  /// A chip naming no saved coordinator, or a tag naming a `removed` one, blocks Send however
+  /// many are saved, so a draft for a removed coordinator never reaches another.
   static func parse(
-    _ draft: String, hasAttachments: Bool, chip: ProfileID?, among coordinators: [Coordinator]
+    _ draft: String, hasAttachments: Bool, chip: ProfileID?, among coordinators: [Coordinator],
+    removed: [ProfileID: String] = [:]
   ) -> Addressing {
+    let (tags, rest) = leadingTags(draft)
+    func named(_ word: Substring) -> [Coordinator] {
+      coordinators.filter { $0.name.lowercased() == word.lowercased() }
+    }
+    if let chip, !coordinators.contains(where: { $0.id == chip }) {
+      return .blocked(
+        removed[chip].map { "\($0) was removed" } ?? "Choose who receives this message")
+    }
+    for word in tags where chip == nil && named(word).isEmpty {
+      if let name = removed.values.first(where: { $0.lowercased() == word.lowercased() }) {
+        return .blocked("\(name) was removed")
+      }
+    }
     var recipients = coordinators.filter(\.paired)
     var body = Substring(draft)
     if coordinators.count > 1 {
       if let chip {
-        guard let chosen = coordinators.first(where: { $0.id == chip }) else {
-          return .blocked("Choose who receives this message")
-        }
-        recipients = [chosen]
-      } else {
+        recipients = coordinators.filter { $0.id == chip }
+      } else if !tags.isEmpty {
         var tagged: Set<ProfileID> = []
-        while body.first == "@" {
-          let word = body.dropFirst().prefix { !$0.isWhitespace }
+        for word in tags {
           guard !word.isEmpty else { return .blocked("Choose a coordinator") }
-          let named = coordinators.filter { $0.name.lowercased() == word.lowercased() }
+          let named = named(word)
           guard let match = named.first, named.count == 1 else {
             return .blocked(
               named.isEmpty
                 ? "No coordinator named \(word)" : "More than one coordinator is named \(word)")
           }
           tagged.insert(match.id)
-          body = body[word.endIndex...].drop(while: \.isWhitespace)
         }
-        if !tagged.isEmpty { recipients = coordinators.filter { tagged.contains($0.id) } }
+        recipients = coordinators.filter { tagged.contains($0.id) }
+        body = rest
       }
       if let unpaired = recipients.first(where: { !$0.paired }) {
         return .blocked("\(unpaired.name) is not paired yet")
@@ -61,6 +73,18 @@ enum Addressing: Equatable {
       return .empty(ids)
     }
     return .to(ids, body: String(body))
+  }
+
+  /// The draft's leading `@Name` words, and the text after them.
+  static func leadingTags(_ draft: String) -> (tags: [Substring], body: Substring) {
+    var tags: [Substring] = []
+    var body = Substring(draft)
+    while body.first == "@" {
+      let word = body.dropFirst().prefix { !$0.isWhitespace }
+      tags.append(word)
+      body = body[word.endIndex...].drop(while: \.isWhitespace)
+    }
+    return (tags, body)
   }
 }
 

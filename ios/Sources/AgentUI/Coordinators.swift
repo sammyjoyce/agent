@@ -165,12 +165,18 @@ public final class Coordinators {
 
   /// Withdraws alerts while the coordinator can still be reached, quiesces the lane, saves
   /// `profiles.json`, and only then deletes the profile's files. Refuses while the draft is
-  /// addressed to or restored from it, so that draft never reaches another coordinator unseen.
+  /// addressed to or restored from it. From its first step nothing can address it again, so a
+  /// draft for it never reaches another coordinator.
   func remove(_ id: ProfileID) async throws {
     guard let profile = profiles.first(where: { $0.id == id }) else { return }
-    guard chat.recipient != id, chat.restoredFrom?.lane != id else {
-      throw SaveRefused(message: "Send or clear the draft for \(profile.name) first.")
+    let name = profile.name.description
+    let tagged =
+      chat.recipient == nil
+      && Addressing.leadingTags(chat.draft).tags.contains { $0.lowercased() == name.lowercased() }
+    guard chat.recipient != id, chat.restoredFrom?.lane != id, !tagged else {
+      throw SaveRefused(message: "Send or clear the draft for \(name) first.")
     }
+    chat.removed[id] = name
     await registration?.forget(id)
     let hold = chat.lanes.first { $0.id == id }?.hold
     await chat.detach(id)
@@ -178,6 +184,7 @@ public final class Coordinators {
     do {
       try save(profiles.filter { $0.id != id })
     } catch {
+      chat.removed[id] = nil
       chat.attach(lane(profile, hold: hold))
       if active, profile.pin == nil { retryPairing(id) }
       if active { await chat.lanes.first { $0.id == id }?.session?.connect() }
@@ -185,7 +192,6 @@ public final class Coordinators {
     }
     profiles.removeAll { $0.id == id }
     pairingError[id] = nil
-    if chat.recipient == id { chat.recipient = nil }
     try directory(id).remove()
   }
 
