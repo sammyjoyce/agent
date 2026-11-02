@@ -470,9 +470,12 @@ public struct MainChatView: View {
             .buttonStyle(.plain).accessibilityLabel("To \(badge.name)")
             .accessibilityHint("Removes the recipient, so the message goes to every coordinator.")
           }
+          // A key that leaves the text as it was, such as one finishing an inline prediction,
+          // gets no field update, and SwiftUI then drops the next change made in code, such as
+          // Send's clear. A new binding each render gives the field that update.
           TextField(
-            model.mode == .steer ? "Message Agent" : "Queue a follow-up", text: $model.draft,
-            axis: .vertical
+            model.mode == .steer ? "Message Agent" : "Queue a follow-up",
+            text: Binding(get: { model.draft }, set: { model.draft = $0 }), axis: .vertical
           )
           .lineLimit(1...6).textFieldStyle(.plain).padding(.vertical, 11).padding(.horizontal, 2)
           // The field drops a rewrite made inside its own write, so the tag moves after it.
