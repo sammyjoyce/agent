@@ -256,7 +256,8 @@ final class ChatModel {
 
   /// Saved coordinators matching an `@` still being typed, for the picker above the composer.
   var pickerMatches: [CoordinatorProfile] {
-    guard multiple, recipient == nil, draft.first == "@", !draft.contains(where: \.isWhitespace)
+    guard addressesByName, recipient == nil, draft.first == "@",
+      !draft.contains(where: \.isWhitespace)
     else { return [] }
     let typed = draft.dropFirst().lowercased()
     return profiles.filter {
@@ -273,7 +274,7 @@ final class ChatModel {
   /// A complete leading tag followed by a space becomes the chip, and the text after it is
   /// never read for tags. The composer calls this after each edit.
   func promoteTypedTag() {
-    guard multiple, recipient == nil, draft.first == "@" else { return }
+    guard addressesByName, recipient == nil, draft.first == "@" else { return }
     let word = draft.dropFirst().prefix { !$0.isWhitespace }
     let named = profiles.filter { $0.name.description.lowercased() == word.lowercased() }
     guard word.endIndex < draft.endIndex, let match = named.first, named.count == 1 else { return }

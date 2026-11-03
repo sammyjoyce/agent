@@ -438,6 +438,44 @@ func anUntaggedSendReachesBothCoordinatorsAndATaggedOneOnlyItsOwn() async throws
   }
 }
 
+/// With one coordinator saved and none removed, a typed `@Work ` is text, as on `main`. With one
+/// left after a removal, the composer names recipients, as with two. Typing `@W` offers Work, and
+/// `@Work ` becomes the chip, so the draft shows what Send delivers.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aTypedTagAfterARemovalBecomesTheChip() async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, _ in
+    try await coordinators.add(
+      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    let work = try #require(coordinators.profiles.first?.id)
+    let chat = coordinators.chat
+    try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
+    chat.draft = "@W"
+    #expect(chat.pickerMatches.isEmpty, "With one coordinator saved nothing is offered")
+    chat.draft = "@Work "
+    chat.promoteTypedTag()
+    #expect(chat.recipient == nil && chat.draft == "@Work ", "The tag stays text")
+    chat.draft = ""
+    try await coordinators.add(
+      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+    try await coordinators.remove(try #require(coordinators.profiles.last?.id))
+    chat.draft = "@W"
+    print("IF6-T4 picker for @W: \(chat.pickerMatches.map(\.name.description))")
+    #expect(chat.pickerMatches.map(\.id) == [work], "Typing @W offers Work")
+    chat.draft = "@Work "
+    chat.promoteTypedTag()
+    print(
+      "IF6-T4 after @Work: recipient=\(chat.recipient.map(chat.name) ?? "none") draft=\(chat.draft.debugDescription) line=\(chat.recipientLine)"
+    )
+    #expect(chat.recipient == work, "The typed tag did not become the chip")
+    #expect(chat.draft.isEmpty)
+    #expect(chat.shownChip == work && chat.recipientLine == "To Work")
+    chat.draft = "Invented: the venue is booked"
+    await chat.send()
+    try await eventually("Work got it") { await workFixture.count() == 1 }
+    #expect(await submits(workFixture).map(\.text) == ["Invented: the venue is booked"])
+  }
+}
+
 @MainActor @Test(.timeLimit(.minutes(1)))
 func aFeedbackToBothStaysOneBubbleWithEachRecipientsStatusOnceSettled() async throws {
   try await withTwoFixtures { coordinators, workFixture, personalFixture, _ in

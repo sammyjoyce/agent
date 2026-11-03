@@ -95,7 +95,9 @@ Mode if requested, then Run.
   followed by a space, becomes a chip in the composer, and the message goes to
   that coordinator only. Without a chip the message goes to every paired
   coordinator. The line under the field names the recipients, or says why
-  Send is blocked, before you send. A message to several coordinators is saved
+  Send is blocked, before you send. After a removal the composer keeps working
+  this way with one coordinator left, until the app quits.
+  A message to several coordinators is saved
   in each one's outbox under its own input ID before any of them is sent. If
   one refuses it, none keeps it and the draft stays. Its bubble reads "To Work
   and Personal" once every recipient has it. Otherwise it shows each
