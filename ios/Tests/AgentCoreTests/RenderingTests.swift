@@ -957,6 +957,75 @@
         }
       }
 
+      /// "@Work " typed before an existing draft becomes the chip. Undo then never removes text the
+      /// user did not just insert, so the draft stays whole, and Undo and Redo keep working for what
+      /// the user types next.
+      @MainActor @Test func undoAfterATagBecomesTheChipKeepsTheDraft() async throws {
+        try await withComposer { model, box, work in
+          let field = box.draft
+          field.insertText("Existing invented note")
+          try await Task.sleep(for: .milliseconds(200))
+          field.selectedRange = NSRange(location: 0, length: 0)
+          field.insertText("@Work ")
+          try await Task.sleep(for: .milliseconds(300))
+          let undo = try #require(field.undoManager)
+          print(
+            "IF8-W3 after the tag: canUndo=\(undo.canUndo) text=\(model.draft.debugDescription) chip=\(model.recipient.map(model.name) ?? "none")"
+          )
+          undo.undo()
+          try await Task.sleep(for: .milliseconds(300))
+          print(
+            "IF8-W3 undone: text=\(model.draft.debugDescription) chip=\(model.recipient.map(model.name) ?? "none")"
+          )
+          #expect(model.draft == "Existing invented note")
+          undo.redo()
+          try await Task.sleep(for: .milliseconds(300))
+          print(
+            "IF8-W3 redone: text=\(model.draft.debugDescription) chip=\(model.recipient.map(model.name) ?? "none")"
+          )
+          #expect(model.draft == "Existing invented note" && model.recipient == work.id)
+          field.selectedRange = NSRange(location: field.text.utf16.count, length: 0)
+          field.insertText(" today")
+          try await Task.sleep(for: .milliseconds(200))
+          undo.undo()
+          try await Task.sleep(for: .milliseconds(200))
+          let undone = model.draft
+          undo.redo()
+          try await Task.sleep(for: .milliseconds(200))
+          print(
+            "IF8-W3 typed next: undone=\(undone.debugDescription) redone=\(model.draft.debugDescription)"
+          )
+          #expect(undone == "Existing invented note", "Undo of what the user typed next")
+          #expect(model.draft == "Existing invented note today", "Redo of what the user typed next")
+        }
+      }
+
+      /// Ordinary Undo and Redo work in the field, and text an input method is still composing
+      /// survives an update of the model.
+      @MainActor @Test func ordinaryUndoAndMarkedTextSurviveModelUpdates() async throws {
+        try await withComposer { model, box, _ in
+          let field = box.draft
+          field.insertText("Invented")
+          try await Task.sleep(for: .milliseconds(200))
+          let undo = try #require(field.undoManager)
+          undo.undo()
+          try await Task.sleep(for: .milliseconds(200))
+          #expect(model.draft.isEmpty)
+          undo.redo()
+          try await Task.sleep(for: .milliseconds(200))
+          #expect(model.draft == "Invented")
+          field.selectedRange = NSRange(location: field.text.utf16.count, length: 0)
+          field.setMarkedText("\u{4EEE}", selectedRange: NSRange(location: 1, length: 0))
+          try await Task.sleep(for: .milliseconds(200))
+          print(
+            "IF8-W3 input method: text=\(model.draft.debugDescription) marked=\(field.markedTextRange != nil)"
+          )
+          #expect(field.markedTextRange != nil)
+          field.unmarkText()
+          #expect(model.draft == "Invented\u{4EEE}")
+        }
+      }
+
       /// Restores a message held for Work, with `text`, into the hosted composer.
       @MainActor private func restoreHeld(
         _ text: String, model: ChatModel, work: CoordinatorProfile

@@ -39,6 +39,9 @@
         let selection = Self.selection(view.selectedRange, from: view.text, to: text)
         view.text = text
         view.selectedRange = selection
+        // The field's undo actions were recorded against the text it had. Applied to this one they
+        // would change characters the user did not just type, such as a body after a promoted tag.
+        view.undoManager?.removeAllActions()
       }
       view.placeholder.text = placeholder
       view.placeholder.isHidden = !text.isEmpty
