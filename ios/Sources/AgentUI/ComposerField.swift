@@ -2,43 +2,50 @@
   import SwiftUI
   import UIKit
 
-  /// The composer's draft. Its first line starts `indent` points in, after the chip laid over
-  /// its top leading corner, and wrapped lines start at its leading edge. SwiftUI's text field
-  /// can only wrap the draft in a column beside the chip.
+  /// The composer's draft, with the recipient chip on its first line like a word typed there.
+  /// Wrapped lines start at the field's leading edge, under the chip. SwiftUI's text field can
+  /// only wrap the draft in a column beside the chip.
   struct ComposerField: UIViewRepresentable {
+    /// The coordinator the chip names, in its color.
+    struct Chip: Equatable {
+      let name: String
+      let color: UIColor
+    }
     static let inset = UIEdgeInsets(top: 11, left: 2, bottom: 11, right: 2)
     static let maximumLines: CGFloat = 6
     let text: String
     let placeholder: String
-    let indent: CGFloat
+    let chip: Chip?
     let edit: (String) -> Void
-    /// The draft's vertical scroll once it passes six lines, so the chip can move with it.
-    let scroll: (CGFloat) -> Void
+    let removeChip: () -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    func makeUIView(context: Context) -> DraftView {
-      let view = DraftView()
-      view.delegate = context.coordinator
-      view.accessibilityLabel = "Message the coordinator"
-      view.accessibilityIdentifier = "Message the coordinator"
-      return view
+    func makeUIView(context: Context) -> DraftBox {
+      let box = DraftBox()
+      let coordinator = context.coordinator
+      box.draft.delegate = coordinator
+      box.remove = { [weak coordinator] in coordinator?.field?.removeChip() }
+      return box
     }
 
-    func updateUIView(_ view: DraftView, context: Context) {
+    func updateUIView(_ box: DraftBox, context: Context) {
       context.coordinator.field = self
+      let view = box.draft
       // The view keeps its own text, so a change made in code, such as Send's clear, is
       // applied here whatever the keyboard last did.
       if view.text != text { view.text = text }
       view.placeholder.text = placeholder
       view.placeholder.isHidden = !text.isEmpty
-      view.indent = indent
+      box.chip = chip
     }
 
-    func sizeThatFits(_ proposal: ProposedViewSize, uiView view: DraftView, context: Context)
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView box: DraftBox, context: Context)
       -> CGSize?
     {
       guard let width = proposal.width, width.isFinite else { return nil }
+      box.fitChip(width: width)
+      let view = box.draft
       let fitting = view.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude)).height
       let limit =
         (view.font?.lineHeight ?? 0) * Self.maximumLines + Self.inset.top + Self.inset.bottom
@@ -46,17 +53,120 @@
       return CGSize(width: width, height: min(fitting, limit))
     }
 
-    final class DraftView: UITextView {
-      let placeholder = UILabel()
-      var indent: CGFloat = 0 {
+    /// The draft and its chip in one box that clips them, so the chip takes a tap only where it is
+    /// drawn: on the first line, inside the field.
+    final class DraftBox: UIView {
+      let draft = DraftView()
+      private let button = UIButton(configuration: .plain())
+      private var titleSize: CGFloat = 0
+      var remove: () -> Void = {}
+      var chip: Chip? {
         didSet {
-          guard indent != oldValue else { return }
-          let line = font?.lineHeight ?? 0
-          // Any line fragment this rect touches starts after it. Half a line touches only
-          // the first.
-          textContainer.exclusionPaths =
-            indent > 0
-            ? [UIBezierPath(rect: CGRect(x: 0, y: 0, width: indent, height: line / 2))] : []
+          guard chip != oldValue else { return }
+          titleSize = 0
+          button.isHidden = chip == nil
+          button.accessibilityLabel = chip.map { "To \($0.name)" }
+          // VoiceOver can remove the recipient from the draft, even with the chip scrolled away.
+          draft.accessibilityCustomActions =
+            chip == nil
+            ? nil
+            : [
+              UIAccessibilityCustomAction(name: "Remove recipient") { [weak self] _ in
+                self?.remove()
+                return true
+              }
+            ]
+          setNeedsLayout()
+        }
+      }
+
+      init() {
+        super.init(frame: .zero)
+        clipsToBounds = true
+        addSubview(draft)
+        addSubview(button)
+        button.isHidden = true
+        button.accessibilityHint =
+          "Removes the recipient, so the message goes to every coordinator."
+        button.addAction(UIAction { [weak self] _ in self?.remove() }, for: .primaryActionTriggered)
+      }
+      required init?(coder: NSCoder) { return nil }
+
+      /// Sizes the chip to one line of the draft. A chip that leaves a third of the line beside it
+      /// shares the first line with the draft. A wider one takes the first line, truncating a name
+      /// too long for it, and the draft starts under it.
+      func fitChip(width: CGFloat) {
+        guard let chip, let font = draft.font else {
+          draft.chipRoom = .none
+          return
+        }
+        if titleSize != font.pointSize {
+          titleSize = font.pointSize
+          var configuration = UIButton.Configuration.plain()
+          configuration.contentInsets = .zero
+          configuration.imagePlacement = .trailing
+          configuration.imagePadding = 3
+          configuration.image = UIImage(systemName: "xmark.circle.fill")
+          configuration.preferredSymbolConfigurationForImage = .init(textStyle: .caption1)
+          configuration.baseForegroundColor = chip.color
+          configuration.titleLineBreakMode = .byTruncatingTail
+          configuration.attributedTitle = AttributedString(
+            "@\(chip.name)",
+            attributes: AttributeContainer([
+              .font: UIFont.systemFont(ofSize: font.pointSize, weight: .semibold)
+            ]))
+          button.configuration = configuration
+        }
+        let line = width - ComposerField.inset.left - ComposerField.inset.right
+        let natural = button.intrinsicContentSize.width
+        if natural + 4 <= line * 2 / 3 {
+          button.bounds.size = CGSize(width: natural, height: font.lineHeight)
+          draft.chipRoom = .beside(natural + 4)
+        } else {
+          button.bounds.size = CGSize(width: min(natural, line), height: font.lineHeight)
+          draft.chipRoom = .above(font.lineHeight)
+        }
+      }
+
+      override func layoutSubviews() {
+        super.layoutSubviews()
+        draft.frame = bounds
+        fitChip(width: bounds.width)
+        button.frame.origin = CGPoint(
+          x: ComposerField.inset.left, y: ComposerField.inset.top - draft.contentOffset.y)
+        // VoiceOver reads the recipient, then the draft. It reaches the chip only while all of
+        // it shows, so its frame never lies over the feed.
+        accessibilityElements =
+          chip != nil && bounds.contains(button.frame) ? [button, draft] : [draft]
+      }
+    }
+
+    final class DraftView: UITextView {
+      /// The room the chip takes from the draft.
+      enum ChipRoom: Equatable {
+        case none
+        /// The first line starts this far in, after the chip.
+        case beside(CGFloat)
+        /// The chip takes a first line this tall, and the draft starts under it.
+        case above(CGFloat)
+      }
+      let placeholder = UILabel()
+      var chipRoom = ChipRoom.none {
+        didSet {
+          guard chipRoom != oldValue else { return }
+          textContainerInset = ComposerField.inset
+          textContainer.exclusionPaths = []
+          switch chipRoom {
+          case .none: break
+          case .beside(let indent):
+            // Any line fragment this rect touches starts after it. Half a line touches only
+            // the first. TextKit ignores a rect that leaves the line no room, hence `above`.
+            let line = font?.lineHeight ?? 0
+            textContainer.exclusionPaths = [
+              UIBezierPath(rect: CGRect(x: 0, y: 0, width: indent, height: line / 2))
+            ]
+          case .above(let height): textContainerInset.top += height
+          }
           setNeedsLayout()
         }
       }
@@ -75,6 +185,8 @@
         placeholder.textColor = .placeholderText
         placeholder.isAccessibilityElement = false
         addSubview(placeholder)
+        accessibilityLabel = "Message the coordinator"
+        accessibilityIdentifier = "Message the coordinator"
       }
       required init?(coder: NSCoder) { return nil }
 
@@ -116,6 +228,7 @@
 
       override func layoutSubviews() {
         super.layoutSubviews()
+        let indent = if case .beside(let indent) = chipRoom { indent } else { CGFloat(0) }
         let leading = textContainerInset.left + indent
         placeholder.frame = CGRect(
           x: leading, y: textContainerInset.top,
@@ -127,7 +240,8 @@
     @MainActor final class Coordinator: NSObject, UITextViewDelegate {
       var field: ComposerField?
       func textViewDidChange(_ view: UITextView) { field?.edit(view.text) }
-      func scrollViewDidScroll(_ view: UIScrollView) { field?.scroll(view.contentOffset.y) }
+      /// The chip moves with the first line.
+      func scrollViewDidScroll(_ view: UIScrollView) { view.superview?.setNeedsLayout() }
     }
   }
 #endif

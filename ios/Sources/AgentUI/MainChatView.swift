@@ -24,8 +24,6 @@ public struct MainChatView: View {
   @State private var historyRequest: HistoryNavigation?
   @State private var importingFiles = false
   #if os(iOS)
-    @State private var chipWidth: CGFloat = 0
-    @State private var draftScroll: CGFloat = 0
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var capture = AppScreenshot()
   #endif
@@ -531,42 +529,33 @@ public struct MainChatView: View {
     model.mode == .steer ? "Message Agent" : "Queue a follow-up"
   }
   #if os(iOS)
-    /// The draft with the chip over the start of its first line, like a word typed there.
-    @ViewBuilder private var draftField: some View {
-      let indent = model.recipient == nil ? 0 : chipWidth + 4
+    /// The draft with the chip on its first line, like a word typed there.
+    private var draftField: some View {
       ComposerField(
-        text: model.draft, placeholder: placeholder, indent: indent, edit: { model.draft = $0 },
-        scroll: { draftScroll = $0 }
-      )
-      .overlay(alignment: .topLeading) {
-        if let recipient = model.recipient {
-          chip(recipient)
-            .onGeometryChange(for: CGFloat.self, of: \.size.width) { chipWidth = $0 }
-            .padding(.leading, ComposerField.inset.left).offset(y: -draftScroll)
-            // Read first, as it is seen first: the recipient, then the draft.
-            .accessibilitySortPriority(1)
+        text: model.draft, placeholder: placeholder,
+        chip: model.recipient.map {
+          let badge = badge($0)
+          return .init(name: badge.name, color: UIColor(badge.color))
+        }, edit: { model.draft = $0 }, removeChip: { model.recipient = nil })
+    }
+  #else
+    private func chip(_ recipient: ProfileID) -> some View {
+      let badge = badge(recipient)
+      return Button {
+        model.recipient = nil
+      } label: {
+        HStack(spacing: 3) {
+          Text("@\(badge.name)").fontWeight(.semibold)
+          Image(systemName: "xmark.circle.fill").font(.caption)
         }
+        // The field's vertical padding, so the chip's text shares its first line.
+        .padding(.vertical, 11).foregroundStyle(badge.color).frame(minHeight: 44)
+        .contentShape(Rectangle())
       }
-      .clipped()
-      .accessibilityElement(children: .contain)
+      .buttonStyle(.plain).accessibilityLabel("To \(badge.name)")
+      .accessibilityHint("Removes the recipient, so the message goes to every coordinator.")
     }
   #endif
-  private func chip(_ recipient: ProfileID) -> some View {
-    let badge = badge(recipient)
-    return Button {
-      model.recipient = nil
-    } label: {
-      HStack(spacing: 3) {
-        Text("@\(badge.name)").fontWeight(.semibold)
-        Image(systemName: "xmark.circle.fill").font(.caption)
-      }
-      // The field's vertical padding, so the chip's text shares its first line.
-      .padding(.vertical, 11).foregroundStyle(badge.color).frame(minHeight: 44)
-      .contentShape(Rectangle())
-    }
-    .buttonStyle(.plain).accessibilityLabel("To \(badge.name)")
-    .accessibilityHint("Removes the recipient, so the message goes to every coordinator.")
-  }
   /// Saved names matching an `@` being typed. Choosing one sets the composer's recipient.
   private var picker: some View {
     VStack(alignment: .leading, spacing: 0) {

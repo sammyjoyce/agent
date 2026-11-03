@@ -19,7 +19,9 @@ import XCTest
 
 @MainActor
 final class ComposerInteractionTests: XCTestCase {
-  private func launchWithWorkAndPersonal(workHistory: [HistoryMessage] = []) async throws -> (
+  private func launchWithWorkAndPersonal(
+    workHistory: [HistoryMessage] = [], largestText: Bool = false
+  ) async throws -> (
     app: XCUIApplication, work: InteractionPeer, personal: InteractionPeer
   ) {
     continueAfterFailure = false
@@ -38,6 +40,11 @@ final class ComposerInteractionTests: XCTestCase {
     app.launchEnvironment["AGENT_INTERACTION_COORDINATOR"] = [work, personal]
       .map { $0.coordinator.uuidString }.joined(separator: ",")
     app.launchArguments += ["-notificationsEnabled", "NO"]
+    if largestText {
+      app.launchArguments += [
+        "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL",
+      ]
+    }
     app.launch()
     XCTAssertTrue(app.staticTexts["To Work and Personal"].waitForExistence(timeout: 10))
     return (app, work, personal)
@@ -96,6 +103,110 @@ final class ComposerInteractionTests: XCTestCase {
       "The field kept the sent text: \(composer.value as? String ?? "nil")")
     composer.typeText("x")
     XCTAssertEqual(composer.value as? String, "x", "The next key starts a new draft")
+  }
+
+  // At the largest text size, a tap on the draft's second line, under the chip, places the cursor.
+  // The draft stays Personal's, and Send reaches Personal alone.
+  func testATapOnDraftTextUnderTheChipKeepsTheRecipientAtTheLargestTextSize() async throws {
+    let (app, work, personal) = try await launchWithWorkAndPersonal(largestText: true)
+    defer { app.terminate() }
+    let composer = app.textViews["Message the coordinator"]
+    composer.tap()
+    composer.typeText("@Personal ")
+    XCTAssertTrue(app.buttons["To Personal"].waitForExistence(timeout: 3))
+    composer.typeText("Synthetic note")
+    app.buttons["Connection"].tap()
+    app.buttons["Done"].tap()
+    composer.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 30, dy: 100)).tap()
+    let retained = app.buttons["To Personal"].exists
+    app.buttons["Send message"].tap()
+    try await eventually { await personal.submits().count == 1 }
+    let sentToWork = await work.submits()
+    XCTAssertTrue(retained, "Tapping visible draft text removed its recipient")
+    XCTAssertEqual(sentToWork, [])
+  }
+
+  // Wrapped lines start under the chip. A tap on the second line there places the cursor, as a
+  // tap on the same line beyond the chip does, and the recipient stays.
+  func testATapOnTheSecondLineUnderTheChipKeepsTheRecipient() async throws {
+    let (app, _, _) = try await launchWithWorkAndPersonal()
+    defer { app.terminate() }
+    let composer = app.descendants(matching: .any).matching(identifier: "Message the coordinator")
+      .firstMatch
+    composer.tap()
+    composer.typeText("@Work ")
+    XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3), "The typed tag is the chip")
+    composer.typeText(
+      "wrapping words for the second line and the third line of this draft message here")
+    XCTAssertTrue(app.buttons["To Work"].exists)
+    composer.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
+      .withOffset(CGVector(dx: 200, dy: 38)).tap()
+    XCTAssertTrue(app.buttons["To Work"].exists, "Control tap beyond the chip removed it")
+    composer.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
+      .withOffset(CGVector(dx: 10, dy: 38)).tap()
+    XCTAssertTrue(
+      app.buttons["To Work"].exists, "Tapping the second draft line removed the recipient chip")
+    XCTAssertFalse(
+      app.staticTexts["To Work and Personal"].exists,
+      "The draft now goes to both coordinators after tapping its second line")
+  }
+
+  // A draft taller than six lines scrolls its first line, and the chip with it, out of the field.
+  // A tap on the feed where the chip was keeps the recipient, and the chip comes back with the
+  // first line.
+  func testATapOnTheFeedOverAScrolledChipKeepsTheRecipient() async throws {
+    let (app, _, _) = try await launchWithWorkAndPersonal()
+    defer { app.terminate() }
+    let composer = app.descendants(matching: .any).matching(identifier: "Message the coordinator")
+      .firstMatch
+    let line = app.staticTexts["recipientLine"]
+    composer.tap()
+    composer.typeText("@Work ")
+    XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3))
+    composer.typeText("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight")
+    try await Task.sleep(for: .seconds(2))
+    let field = composer.frame
+    app.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
+      .withOffset(CGVector(dx: field.minX + 39, dy: field.minY - 30)).tap()
+    XCTAssertEqual(
+      line.label, "To Work", "Tapping the transcript over the scrolled-off chip removed it")
+    composer.swipeDown()
+    XCTAssertTrue(
+      app.buttons["To Work"].isHittable,
+      "Scrolling the draft to the top did not bring the chip back")
+  }
+
+  // The same with Work's feed long enough to scroll: one tap on the feed 100 points above a tall
+  // draft keeps the recipient, and Send reaches Work alone.
+  func testATapOnTheFeedAboveATallDraftKeepsTheRecipientAndPersonalGetsNothing() async throws {
+    let replies = (1...10).map {
+      HistoryMessage(
+        continuation: false, entryId: "reply-\($0)", finalChunk: true, role: .final,
+        text: "Invented Work reply \($0), long enough to fill a line of the feed.")
+    }
+    let (app, work, personal) = try await launchWithWorkAndPersonal(workHistory: replies)
+    defer { app.terminate() }
+    let composer = app.descendants(matching: .any).matching(identifier: "Message the coordinator")
+      .firstMatch
+    let line = app.staticTexts["recipientLine"]
+    composer.tap()
+    composer.typeText("@Work ")
+    XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3))
+    composer.typeText(
+      (1...10).map { "Invented line \($0) for Work only" }.joined(separator: "\n"))
+    try await Task.sleep(for: .milliseconds(500))
+    // Hides the keyboard, so the layout holds still while the tap lands.
+    app.scrollViews["transcript"].swipeDown()
+    try await Task.sleep(for: .seconds(1))
+    let field = composer.frame
+    app.coordinate(withNormalizedOffset: .zero)
+      .withOffset(CGVector(dx: field.minX + 39, dy: field.minY - 100)).tap()
+    try await Task.sleep(for: .milliseconds(500))
+    XCTAssertEqual(line.label, "To Work", "A tap outside the composer kept the recipient")
+    app.buttons["Send message"].tap()
+    try await eventually { await work.submits().count == 1 }
+    let toPersonal = await personal.submits()
+    XCTAssertEqual(toPersonal, [], "Personal receives nothing composed for Work")
   }
 
   // The chip is read before the draft, as it is seen: the recipient, then the message.
