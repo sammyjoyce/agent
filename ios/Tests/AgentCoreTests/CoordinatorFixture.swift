@@ -451,15 +451,16 @@ func loopback(_ port: NWEndpoint.Port) -> CoordinatorTransport {
   }
 }
 
-/// The requests in a profile's live outbox, in queue order. The file is a bare array until a
+/// The items in a profile's live outbox, in queue order. The file is a bare array until a
 /// composer's receipt is saved beside the items.
-func queuedRequests(_ outbox: URL) throws -> [NativeRequestSubmit] {
+func queuedItems(_ outbox: URL) throws -> [OutboxItem] {
   struct Record: Decodable { let pending: [OutboxItem] }
   let data = try Data(contentsOf: outbox)
-  if let items = try? JSONDecoder().decode([OutboxItem].self, from: data) {
-    return items.map(\.request)
-  }
-  return try JSONDecoder().decode(Record.self, from: data).pending.map(\.request)
+  if let items = try? JSONDecoder().decode([OutboxItem].self, from: data) { return items }
+  return try JSONDecoder().decode(Record.self, from: data).pending
+}
+func queuedRequests(_ outbox: URL) throws -> [NativeRequestSubmit] {
+  try queuedItems(outbox).map(\.request)
 }
 
 /// Saves `requests` in the profile's outbox, each a Send to it alone from an earlier launch.

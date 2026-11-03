@@ -145,9 +145,23 @@ public struct ProfileDirectory: Sendable {
   var outbox: URL { root.appending(path: "Outbox/pending.json") }
   var outboxAttachments: URL { root.appending(path: "Outbox/Attachments") }
   var ledger: URL { root.appending(path: "Ledger.json") }
-  /// The quarantined single-address queue. Only `LegacyHold` reads it.
+  /// The quarantined single-address queue. No session reads it. `LegacyHold` restores and
+  /// discards its messages.
   var legacy: URL { root.appending(path: "Legacy") }
+  var legacyQueue: URL { legacy.appending(path: "pending.json") }
   var previews: URL { cache.appending(path: "Previews") }
+
+  /// How many messages Remove deletes on this phone, queued in the outbox or held from before the
+  /// update, read from disk. A missing file holds none. An unreadable one throws, so it is never
+  /// counted as empty.
+  public func queuedMessages() throws -> Int {
+    func count<Item: Decodable>(_: Item.Type, in file: URL) throws -> Int {
+      do {
+        return try savedQueue(Item.self, from: Data(contentsOf: file)).count
+      } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return 0 }
+    }
+    return try count(OutboxItem.self, in: outbox) + count(NativeRequestSubmit.self, in: legacyQueue)
+  }
 
   /// Deletes everything the phone keeps for this profile. Call only after its session is
   /// retired and `profiles.json` no longer lists it.
@@ -216,7 +230,7 @@ public actor LegacyHold {
   private let attachments: AttachmentStore
 
   public init(_ directory: ProfileDirectory) {
-    file = directory.legacy.appending(path: "pending.json")
+    file = directory.legacyQueue
     attachments = AttachmentStore(directory: directory.legacy.appending(path: "Attachments"))
   }
 
@@ -255,17 +269,21 @@ public actor LegacyHold {
     }
   }
 
-  /// The single-address build saved a bare array, and its later releases an object that also
-  /// holds their composer's receipts, which nothing here reads.
   private func load() throws -> [HeldInput] {
-    struct Outbox: Decodable { let pending: [HeldInput] }
     do {
-      let data = try Data(contentsOf: file)
-      if let inputs = try? JSONDecoder().decode([HeldInput].self, from: data) { return inputs }
-      return try JSONDecoder().decode(Outbox.self, from: data).pending
+      return try savedQueue(HeldInput.self, from: Data(contentsOf: file))
     } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [] }
   }
 }
+
+/// The items of a queue file. It is a bare array, or, once a composer receipt was saved beside
+/// the queue, an object that holds the array as `pending`. The single-address build's later
+/// releases wrote the object form too.
+private func savedQueue<Item: Decodable>(_: Item.Type, from data: Data) throws -> [Item] {
+  if let items = try? JSONDecoder().decode([Item].self, from: data) { return items }
+  return try JSONDecoder().decode(SavedQueue<Item>.self, from: data).pending
+}
+private struct SavedQueue<Item: Decodable>: Decodable { let pending: [Item] }
 
 /// Atomic, readable only by this app, excluded from backup.
 func writePrivately(_ data: Data, to url: URL) throws {

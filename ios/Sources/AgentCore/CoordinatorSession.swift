@@ -183,13 +183,12 @@ public actor CoordinatorSession {
   private var retired = false
   private var generation = UUID()
   private var flush: Task<Void, Never>?
-  public nonisolated let outboxURL: URL
+  private let directory: ProfileDirectory
+  public nonisolated var outboxURL: URL { directory.outbox }
   private let attachments: AttachmentStore
   private let previews: AttachmentStore
   private let inspectedConversation: SavedConversation?
-  private let directory: ProfileDirectory
   private let stamps: StampSource
-  private let ledgerURL: URL
   private var ledger: Ledger
   /// Each visible row's receive stamp, kept by row ID so a row that changes key keeps it.
   private var rowStamps: [String: TimeInterval] = [:]
@@ -220,11 +219,9 @@ public actor CoordinatorSession {
     profile = directory.profile
     self.dialer = dialer
     inspectedConversation = conversation
-    outboxURL = directory.outbox
     attachments = AttachmentStore(directory: directory.outboxAttachments)
     previews = AttachmentStore(directory: directory.previews)
     self.stamps = stamps
-    ledgerURL = directory.ledger
     // Loaded before any session connects, so every saved stamp seeds the shared source. A
     // missing or unreadable ledger only loses receive order and send records, so it never
     // blocks the session. An inspection leaves the ledger to the profile's own session.
@@ -565,12 +562,13 @@ public actor CoordinatorSession {
     return .committed
   }
 
-  /// Removes a restored item once its copy was admitted, with files no other item uses, and
-  /// records it withdrawn. That holds only while the coordinator's latest word is a refusal, so an
-  /// item written again or accepted since stays queued and reconciles as any other. An address
-  /// edit, a reconnect or a cancelled Check / retry in between changes nothing. An attempt that has
-  /// not written it is cancelled. A coordinator may still place an input it refused, so the
-  /// withdrawn input stays watched, and its record follows what the coordinator reports.
+  /// Removes a refused item, once a Send carried its restored copy unchanged or the user discarded
+  /// it, with files no other item uses, and records it withdrawn. That holds only while the
+  /// coordinator's latest word is a refusal, so an item written again or accepted since stays
+  /// queued and reconciles as any other. An address edit, a reconnect or a cancelled Check / retry
+  /// in between changes nothing. An attempt that has not written it is cancelled. A coordinator
+  /// may still place an input it refused, so the withdrawn input stays watched, and its record
+  /// follows what the coordinator reports.
   public func discard(_ inputID: String) {
     guard let item = pending.first(where: { $0.request.inputId == inputID }), item.refused == true
     else { return }
@@ -586,13 +584,6 @@ public actor CoordinatorSession {
     publish()
   }
 
-  /// Items in the on-device outbox, read from disk so a session that never connected counts too.
-  /// A missing outbox holds nothing. An unreadable one throws.
-  public func queuedCount() throws -> Int {
-    do {
-      return try Self.readOutbox(outboxURL).pending.count
-    } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return 0 }
-  }
   public func loadEarlier(anchorID: String? = nil) async {
     guard let cursor = snapshot.olderCursor else { return }
     await loadHistory(.earlier(cursor: cursor, anchorID: anchorID ?? transcript.rows.first?.id))
@@ -805,11 +796,15 @@ public actor CoordinatorSession {
   private func noteIdentityFailure(_ error: any Error) {
     switch error as? ConnectionError {
     case .wrongCoordinator:
+      // Counted as Remove's confirmation counts, since the banner sends the user to Remove.
       let held =
-        pending.count == 1
-        ? "1 queued message is" : "\(pending.count) queued messages are"
+        switch try? directory.queuedMessages() {
+        case nil: "Queued messages on this phone could not be read."
+        case 1: "1 queued message is held on this phone."
+        case let count?: "\(count) queued messages are held on this phone."
+        }
       identityFailure =
-        "This address now answers as a different coordinator. \(held) held on this phone. Remove it and add it again."
+        "This address now answers as a different coordinator. \(held) Remove it and add it again."
     case .unidentifiedCoordinator: identityFailure = ConnectionError.describe(error)
     default: break
     }
@@ -1474,7 +1469,7 @@ public actor CoordinatorSession {
     guard !retired, inspectedConversation == nil else { return false }
     ledger.prune(keeping: transcript.unpreparedRows)
     do {
-      try writePrivately(JSONEncoder().encode(ledger), to: ledgerURL)
+      try writePrivately(JSONEncoder().encode(ledger), to: directory.ledger)
       return true
     } catch { return false }
   }
@@ -1523,9 +1518,10 @@ public actor CoordinatorSession {
     }
     continuation.yield(snapshot)
   }
-  /// How a queued item this session is not sending reads until its coordinator answers about it
-  /// again: Saved once the coordinator accepted it, refused while a refusal is its latest word, and
-  /// otherwise unconfirmed, for Check / retry.
+  /// How a queued item that may have left the phone reads until its coordinator answers about it.
+  /// Once the coordinator accepted it, it reads Saved. While a refusal is the coordinator's latest
+  /// word it stays refused, so Restore and Discard stay offered. Otherwise it is unconfirmed, for
+  /// Check / retry.
   private func unanswered(_ item: OutboxItem) -> Delivery {
     item.accepted == true ? .saved : item.refused == true ? .rejected : .uncertain
   }

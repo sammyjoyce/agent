@@ -41,19 +41,38 @@ struct Lane {
   let hold: LegacyHold
 }
 
+/// A tag typed at the start of the draft that became the chip. The draft went from `typed` to
+/// `rest`, which lost the tag and its space from the start.
+struct Promotion: Equatable {
+  let typed: String
+  let rest: String
+}
+
 struct HeldMessage: Identifiable, Equatable {
   let lane: ProfileID
   let item: LegacyItem
   var id: String { item.id }
 }
 
-/// Where the composer's restored draft came from. The source stays queued or held until
-/// the draft is admitted, so a draft lost before Send loses nothing.
+/// Where the composer's restored draft came from, and what Restore put in it. The source stays
+/// queued or held until a Send carries that content unchanged, or the user discards it, so nothing
+/// the user did not send is lost.
 struct RestoredSource: Equatable {
   enum Kind { case live, legacy }
   let lane: ProfileID
   let item: String
   let kind: Kind
+  let text: String
+  /// The IDs of the file copies Restore put in the composer.
+  let files: Set<String>
+
+  /// True when a Send of `body` with `sent` files carries this content unchanged, meaning the same
+  /// text, ignoring surrounding whitespace, and every file Restore put in the composer.
+  func isCarried(by body: String, files sent: [LocalAttachment]) -> Bool {
+    body.trimmingCharacters(in: .whitespacesAndNewlines)
+      == text.trimmingCharacters(in: .whitespacesAndNewlines)
+      && files.isSubset(of: sent.map(\.id))
+  }
 }
 
 /// The one feed and the one composer for every saved coordinator.
@@ -110,13 +129,15 @@ final class ChatModel {
   /// The one coordinator the draft goes to, or nil for every paired one. While it is set, the
   /// draft is never read for tags.
   var recipient: ProfileID?
+  /// The latest tag that became the chip, so the composer moves the caret back by exactly what
+  /// the draft lost.
+  private(set) var promotion: Promotion?
   /// Coordinators removed in this process, or being removed, by the name they had. Nothing
   /// addresses one again, and profile IDs are never reused.
   var removed: [ProfileID: String] = [:]
   var draft = "" {
     didSet {
       draftRevision &+= 1
-      draftBeforeEdit = oldValue
       forgetClearedSource()
       scheduleDraftSave()
       if !changingDraft, oldValue.isEmpty != draft.isEmpty { logComposer(.edited) }
@@ -125,8 +146,6 @@ final class ChatModel {
   /// Counts every change to the draft, so a Send that went clears the recipient only when nothing
   /// was typed since its tap.
   @ObservationIgnored private var draftRevision = 0
-  /// The draft before its latest change, so a restored draft promotes only a tag just typed.
-  @ObservationIgnored private var draftBeforeEdit = ""
   var attachments: [LocalAttachment] = [] {
     didSet {
       forgetClearedSource()
@@ -584,17 +603,17 @@ final class ChatModel {
   }
 
   /// A complete leading tag followed by a space becomes the chip, and the text after it is
-  /// never read for tags. The composer calls this after each edit. In a restored draft only a tag
-  /// the user just finished typing at its start counts, never the restored text's own.
+  /// never read for tags. The composer calls this after each edit. A restored draft's text is
+  /// literal for good, so no tag in it ever becomes the chip.
   func promoteTypedTag() {
-    guard addressesByName, recipient == nil, draft.first == "@" else { return }
+    guard addressesByName, recipient == nil, restoredFrom == nil, draft.first == "@" else { return }
     let word = draft.dropFirst().prefix { !$0.isWhitespace }
     let named = profiles.filter { $0.name.description.lowercased() == word.lowercased() }
     guard word.endIndex < draft.endIndex, let match = named.first, named.count == 1 else { return }
-    let tag = draft[...word.endIndex]
-    guard restoredFrom == nil || !draftBeforeEdit.hasPrefix(tag) else { return }
     recipient = match.id
+    let typed = draft
     draft = String(draft[draft.index(after: word.endIndex)...])
+    promotion = Promotion(typed: typed, rest: draft)
   }
 
   // MARK: - Send
@@ -719,7 +738,9 @@ final class ChatModel {
       for id in sentIDs { screenshotOwners[id] = nil }
       retiredDraftFiles.append(contentsOf: files)
       _ = await saveDraft()
-      if let source { await remove(source) }
+      guard let source else { return }
+      if restoredFrom == source { restoredFrom = nil }
+      if source.isCarried(by: body, files: files) { await remove(source) }
     }
   }
 
@@ -834,7 +855,7 @@ final class ChatModel {
   // MARK: - Restore
 
   /// Copies a queued input into the composer, addressed to its own coordinator, with its text
-  /// as it was. The input stays queued until the copy is admitted.
+  /// as it was. The input stays queued until a Send carries the copy unchanged.
   func restore(_ inputID: String) async {
     guard let lane = lane(holding: inputID), readyToRestore(from: lane.id) else { return }
     preparingAttachments = true
@@ -842,7 +863,7 @@ final class ChatModel {
     do {
       let store = try attachmentStore()
       guard let restored = await lane.session?.restore(inputID, to: store) else { return }
-      await fill(restored, from: RestoredSource(lane: lane.id, item: inputID, kind: .live), store)
+      await fill(restored, from: lane.id, item: inputID, kind: .live, store)
     } catch { failure = error.localizedDescription }
   }
   func restoreHeld(_ message: HeldMessage) async {
@@ -853,8 +874,7 @@ final class ChatModel {
     do {
       let store = try attachmentStore()
       guard let restored = try await lane.hold.restore(message.id, to: store) else { return }
-      await fill(
-        restored, from: RestoredSource(lane: lane.id, item: message.id, kind: .legacy), store)
+      await fill(restored, from: lane.id, item: message.id, kind: .legacy, store)
     } catch { failure = error.localizedDescription }
   }
   func discardHeld(_ message: HeldMessage) async {
@@ -881,9 +901,10 @@ final class ChatModel {
   /// as on `main`. What the user addressed to another coordinator meanwhile stays as it is, since
   /// the restored message stays its source's, and the copies go.
   private func fill(
-    _ restored: RestoredDraft, from source: RestoredSource, _ store: AttachmentStore
+    _ restored: RestoredDraft, from lane: ProfileID, item: String, kind: RestoredSource.Kind,
+    _ store: AttachmentStore
   ) async {
-    guard (draft.isEmpty && attachments.isEmpty) || recipient == nil || recipient == source.lane
+    guard (draft.isEmpty && attachments.isEmpty) || recipient == nil || recipient == lane
     else {
       failure = "Send or clear the current draft before restoring another message."
       for file in restored.attachments { try? await store.remove(file) }
@@ -894,11 +915,13 @@ final class ChatModel {
     mode = restored.mode
     // The text may have been edited since capture, so only the file's name marks a screenshot.
     for file in restored.attachments where file.reference.name == "Feedback.png" {
-      screenshotOwners[file.id] = source.lane
+      screenshotOwners[file.id] = lane
     }
-    restoredFrom = source
+    restoredFrom = RestoredSource(
+      lane: lane, item: item, kind: kind, text: restored.text,
+      files: Set(restored.attachments.map(\.id)))
     // Last, since an empty restored text clears the draft above, which drops an undrawn recipient.
-    recipient = source.lane
+    recipient = lane
     // The original stays queued or held until a Send carries this copy, so the copy is made
     // durable here and a relaunch keeps it.
     _ = await saveDraft()
@@ -910,10 +933,9 @@ final class ChatModel {
     // Only Restore sets a recipient no chip shows, so it goes with the draft it was set for.
     if !addressesByName { recipient = nil }
   }
-  /// Runs after the restored draft was admitted. A lane removed meanwhile took its
+  /// Runs once a Send carried the source's content unchanged. A lane removed meanwhile took its
   /// source with it.
   private func remove(_ source: RestoredSource) async {
-    if restoredFrom == source { restoredFrom = nil }
     guard let lane = lanes.first(where: { $0.id == source.lane }) else { return }
     switch source.kind {
     case .live: await lane.session?.discard(source.item)
@@ -1038,6 +1060,10 @@ final class ChatModel {
     }
   }
   func retry(_ inputID: String) async { await lane(holding: inputID)?.session?.retry(inputID) }
+  /// Discard on a refused row. Its original leaves the outbox and is recorded withdrawn.
+  func discard(_ inputID: String) async {
+    await lane(holding: inputID)?.session?.discard(inputID)
+  }
   func toolDetails(for row: ChatRow, lane: ProfileID?) async throws -> ToolDetails {
     guard let entryID = row.entryID, let tool = row.tool, let session = session(lane) else {
       throw ConnectionError.closed
