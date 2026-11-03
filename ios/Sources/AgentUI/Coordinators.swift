@@ -24,7 +24,6 @@ public final class Coordinators {
   @ObservationIgnored private let registration: NotificationRegistration?
   /// One per process, so every coordinator's rows share one receive order.
   @ObservationIgnored private let stamps = StampSource()
-  @ObservationIgnored private var active = false
   @ObservationIgnored private var pairing: [ProfileID: Task<Void, Never>] = [:]
   /// Alert withdrawals `profiles.json` keeps until a coordinator confirms them.
   @ObservationIgnored private var withdrawals: [PendingWithdrawal] = []
@@ -69,14 +68,13 @@ public final class Coordinators {
   /// pairing with backoff, and each unconfirmed alert withdrawal is sent again. Everything
   /// stops when the app is not active.
   public func setActive(_ active: Bool) async {
-    self.active = active
     if !active {
       for task in Array(pairing.values) + Array(withdrawing.values) { task.cancel() }
       pairing = [:]
       withdrawing = [:]
     }
     await chat.setActive(active)
-    guard self.active else { return }
+    guard chat.active else { return }
     for profile in profiles where profile.pin == nil { retryPairing(profile.id) }
     for withdrawal in withdrawals { retry(withdrawal) }
   }
@@ -101,7 +99,7 @@ public final class Coordinators {
     pairing[id] = Task { [weak self] in
       var attempt = 0
       while !Task.isCancelled {
-        guard let self, self.active, await !self.pair(id) else { return }
+        guard let self, self.chat.active, await !self.pair(id) else { return }
         attempt = min(attempt + 1, 5)
         try? await Task.sleep(for: .seconds(1 << attempt))
       }
@@ -142,7 +140,7 @@ public final class Coordinators {
       try save(next)
       profiles = next
       chat.attach(lane(next[next.count - 1]))
-      if active { await chat.lanes.first { $0.id == profile.id }?.session?.connect() }
+      if chat.active { await chat.lanes.first { $0.id == profile.id }?.session?.connect() }
     }
   }
 
@@ -165,7 +163,7 @@ public final class Coordinators {
       let hold = chat.lanes.first { $0.id == id }?.hold
       await chat.detach(id)
       chat.attach(lane(next[index], hold: hold))
-      if active { await chat.lanes.first { $0.id == id }?.session?.connect() }
+      if chat.active { await chat.lanes.first { $0.id == id }?.session?.connect() }
     }
   }
 
@@ -252,7 +250,7 @@ public final class Coordinators {
   private func start(_ id: ProfileID) async {
     guard let profile = profiles.first(where: { $0.id == id }) else { return }
     chat.attach(lane(profile, hold: chat.lanes.first { $0.id == id }?.hold))
-    if active { await chat.lanes.first { $0.id == id }?.session?.connect() }
+    if chat.active { await chat.lanes.first { $0.id == id }?.session?.connect() }
   }
 
   /// The one place a session is built. Only a pinned profile gets one.

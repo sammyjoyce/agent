@@ -2057,3 +2057,65 @@ func aSendWhoseAddressChangesWhileItsDialIsPendingIsNamedOnlyIfLost(saved: Int, 
     }
   }
 }
+
+// MARK: - Overlapping lifecycle changes end where the last one asked
+
+/// The app starts each scene-phase change as its own task, so an older change can finish after a
+/// newer one. An inactive change overlapped by an active one leaves both lanes connected, so a
+/// message to both can be sent.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func anInactiveChangeOverlappedByAnActiveOneLeavesEveryLaneConnected() async throws {
+  try await withTwoFixtures { coordinators, _, _, _ in
+    _ = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    @MainActor func connected() -> Int {
+      chat.snapshots.values.filter { $0.connection == .connected }.count
+    }
+    var stranded: [Int] = []
+    for attempt in 0..<20 {
+      await coordinators.setActive(true)
+      try await eventually("both connected before the overlap") { connected() == 2 }
+      let inactive = Task { @MainActor in await coordinators.setActive(false) }
+      let active = Task { @MainActor in await coordinators.setActive(true) }
+      await inactive.value
+      await active.value
+      try await Task.sleep(for: .milliseconds(150))
+      if chat.snapshots.values.contains(where: { $0.connection == .disconnected }) {
+        stranded.append(attempt)
+      }
+    }
+    print("IF5-S2-A stranded=\(stranded) / 20")
+    #expect(stranded.isEmpty)
+    try await eventually("both connected") { connected() == 2 }
+    chat.draft = "Invented question for both coordinators"
+    #expect(chat.canSend && chat.recipientLine == "To Work and Personal")
+  }
+}
+
+/// The reverse: inactive, active and inactive again, overlapping, leave no lane live.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func anActiveChangeOverlappedByAnInactiveOneLeavesNoLaneLive() async throws {
+  try await withTwoFixtures { coordinators, _, _, _ in
+    _ = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    var revived: [Int] = []
+    for attempt in 0..<20 {
+      await coordinators.setActive(true)
+      try await eventually("both connected before the overlap") {
+        chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+      }
+      let first = Task { @MainActor in await coordinators.setActive(false) }
+      let active = Task { @MainActor in await coordinators.setActive(true) }
+      let last = Task { @MainActor in await coordinators.setActive(false) }
+      await first.value
+      await active.value
+      await last.value
+      try await Task.sleep(for: .milliseconds(100))
+      if chat.snapshots.values.contains(where: { $0.connection != .disconnected }) {
+        revived.append(attempt)
+      }
+    }
+    print("IF5-S2-B revived=\(revived) / 20")
+    #expect(revived.isEmpty)
+  }
+}

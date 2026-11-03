@@ -96,6 +96,8 @@ final class ChatModel {
   /// coordinator it was captured for.
   @ObservationIgnored private var screenshotOwners: [String: ProfileID] = [:]
   @ObservationIgnored private let registration: NotificationRegistration?
+  /// Whether the latest `setActive` asked for the app to be active.
+  @ObservationIgnored private(set) var active = false
   @ObservationIgnored private(set) var lanes: [Lane] = []
   @ObservationIgnored private var observations: [ProfileID: Task<Void, Never>] = [:]
 
@@ -163,11 +165,14 @@ final class ChatModel {
     report(cancelled.compactMap { input in missed(id, input, .retired).map { (id, input, $0) } })
   }
 
-  /// Reads each lane again after every await, so a lane detached meanwhile is skipped.
+  /// Connects every lane while the app is active and disconnects every lane while it is not. Each
+  /// step reads the latest request and the lanes again after every await, so an older call that
+  /// finishes last never undoes a newer one, and a lane detached meanwhile is skipped.
   func setActive(_ active: Bool) async {
+    self.active = active
     for id in lanes.map(\.id) {
       guard let session = lanes.first(where: { $0.id == id })?.session else { continue }
-      if active { await session.connect() } else { await session.disconnect() }
+      if self.active { await session.connect() } else { await session.disconnect() }
     }
   }
 
