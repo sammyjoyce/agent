@@ -551,7 +551,8 @@ public struct MainChatView: View {
         chip: model.shownChip.map {
           let badge = badge($0)
           return .init(name: badge.name, color: UIColor(badge.color))
-        }, promotion: model.promotion, edit: { model.draft = $0 },
+        }, promotion: model.promotion, restoredFrom: model.restoredFrom,
+        edit: { model.edit($0, restoredFrom: $1) },
         removeChip: { model.recipient = nil })
     }
   #else

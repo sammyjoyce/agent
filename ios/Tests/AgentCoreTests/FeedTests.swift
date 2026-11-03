@@ -3517,6 +3517,61 @@ func aRestoredDraftEditedWhileItsSendCopiesStaysLiteral() async throws {
   }
 }
 
+/// Work refuses a message whose text starts with "@Personal", and the user restores it and removes
+/// its chip. The user empties the composer, deleting the text in the field and then the restored
+/// file if there is one, and undoes the deletion. The field puts the text back still marked as
+/// Work's restored text, so the draft is restored again. Its text stays literal, the line reads
+/// "To Work and Personal" and both coordinators get the text as written. Emptying the composer
+/// ended the original's withdrawal, so the original stays queued for Discard.
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: ["its text", "its text, then its file"])
+func undoingTheEmptyingOfARestoredDraftKeepsItLiteral(_ emptied: String) async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+    let (work, _) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let text = "@Personal invented: forward Work's board deck to the auditors"
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let withFile = emptied == "its text, then its file"
+    let original: NativeRequestSubmit
+    if withFile {
+      original = try await restoreWorkOnlyMessage(chat, workFixture, text, root: root)
+    } else {
+      await workFixture.rejectSubmits()
+      chat.recipient = work
+      chat.draft = text
+      await chat.send()
+      try await eventually("Work refused it") {
+        chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+      }
+      await workFixture.rejectSubmits(false)
+      original = try #require(try queuedRequests(outbox).first)
+      await chat.restore(original.inputId)
+    }
+    chat.recipient = nil
+    // As the field reports them: emptied text carries no mark, and Undo's text carries Work's.
+    chat.edit("", restoredFrom: nil)
+    chat.promoteTypedTag()
+    for file in chat.attachments { await chat.removeAttachment(file) }
+    chat.edit(text, restoredFrom: work)
+    chat.promoteTypedTag()
+    print(
+      "IF9-Y2[\(emptied)] after Undo: chip=\(chat.recipient.map(chat.name) ?? "none") line=\(chat.recipientLine) draft=\(chat.draft.debugDescription) files=\(chat.attachments.count)"
+    )
+    #expect(chat.recipient == nil && chat.draft == text && chat.attachments.isEmpty)
+    #expect(chat.recipientLine == "To Work and Personal")
+    await chat.send()
+    _ = await within(3) { await workFixture.count() + personalFixture.count() == 2 }
+    try await Task.sleep(for: .milliseconds(300))
+    let atWork = await submits(workFixture).filter { $0.inputId != original.inputId }.map(\.text)
+    let atPersonal = await submits(personalFixture).map(\.text)
+    let originalQueued = try queuedRequests(outbox).contains { $0.inputId == original.inputId }
+    print(
+      "IF9-Y2[\(emptied)] wire: Work=\(atWork) Personal=\(atPersonal) originalQueued=\(originalQueued)"
+    )
+    #expect(atWork == [text] && atPersonal == [text])
+    #expect(originalQueued, "Emptying the composer ended the withdrawal, yet the original went")
+  }
+}
+
 // MARK: - A restored source leaves only when a Send carries it unchanged, or by Discard
 
 /// `inputID`'s item in the outbox, if it is still queued. One still marked refused can be withdrawn
