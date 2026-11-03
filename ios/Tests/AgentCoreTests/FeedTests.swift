@@ -1276,7 +1276,7 @@ func anActivationDuringRemoveNeverSendsTheMessageRemoveDeletes() async throws {
     await session.disconnect()
     #expect(await session.start(staged) == .started)
     #expect(
-      await coordinators.removalMessage(personal)
+      coordinators.removalMessage(personal)
         == "This deletes 1 queued message on this phone.")
     let activating = Task { @MainActor in await coordinators.setActive(true) }
     let removing = Task { @MainActor in try await coordinators.remove(personal) }
@@ -2100,7 +2100,7 @@ func whatRemoveCutOffStaysNamedUntilTheNextSendWithOneCoordinatorLeft() async th
     let (work, personal) = try await addWorkAndPersonal(coordinators)
     let chat = coordinators.chat
     await personalFixture.refuseUploads()
-    print("IF6-T3 Remove's confirmation: \(await coordinators.removalMessage(work))")
+    print("IF6-T3 Remove's confirmation: \(coordinators.removalMessage(work))")
     await workFixture.holdNextIdentity()
     chat.draft = "Invented: the shared holiday budget"
     await chat.attach(

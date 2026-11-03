@@ -772,7 +772,7 @@ private struct CoordinatorForm: View {
       .onChange(of: profile?.id) { load() }
     if let profile {
       Button("Remove coordinator", role: .destructive) {
-        Task { removal = await coordinators.removalMessage(profile.id) }
+        removal = coordinators.removalMessage(profile.id)
       }
       .disabled(saving)
       .confirmationDialog(

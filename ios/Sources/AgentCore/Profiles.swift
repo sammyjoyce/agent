@@ -145,9 +145,23 @@ public struct ProfileDirectory: Sendable {
   var outbox: URL { root.appending(path: "Outbox/pending.json") }
   var outboxAttachments: URL { root.appending(path: "Outbox/Attachments") }
   var ledger: URL { root.appending(path: "Ledger.json") }
-  /// The quarantined single-address queue. Only `LegacyHold` reads it.
+  /// The quarantined single-address queue. No session reads it. `LegacyHold` restores and
+  /// discards its messages.
   var legacy: URL { root.appending(path: "Legacy") }
+  var legacyQueue: URL { legacy.appending(path: "pending.json") }
   var previews: URL { cache.appending(path: "Previews") }
+
+  /// How many messages Remove deletes on this phone, queued in the outbox or held from before the
+  /// update, read from disk. A missing file holds none. An unreadable one throws, so it is never
+  /// counted as empty.
+  public func queuedMessages() throws -> Int {
+    func count<Item: Decodable>(_: Item.Type, in file: URL) throws -> Int {
+      do {
+        return try JSONDecoder().decode([Item].self, from: Data(contentsOf: file)).count
+      } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return 0 }
+    }
+    return try count(OutboxItem.self, in: outbox) + count(NativeRequestSubmit.self, in: legacyQueue)
+  }
 
   /// Deletes everything the phone keeps for this profile. Call only after its session is
   /// retired and `profiles.json` no longer lists it.
@@ -193,7 +207,7 @@ public actor LegacyHold {
   private let attachments: AttachmentStore
 
   public init(_ directory: ProfileDirectory) {
-    file = directory.legacy.appending(path: "pending.json")
+    file = directory.legacyQueue
     attachments = AttachmentStore(directory: directory.legacy.appending(path: "Attachments"))
   }
 

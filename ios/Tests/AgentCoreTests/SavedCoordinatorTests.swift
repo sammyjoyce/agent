@@ -429,7 +429,7 @@ func removeCountsQueuedAndHeldMessagesAndDeletesOnlyAfterSaving() async throws {
     chat.rows.contains { $0.row.delivery == .rejected }
   }
   #expect(
-    await coordinators.removalMessage(profile.id)
+    coordinators.removalMessage(profile.id)
       == "This deletes 3 queued messages on this phone.")
   let agent = install.support.appending(path: "Agent")
   let directory = install.directory(profile)
@@ -483,6 +483,96 @@ func removeCountsQueuedAndHeldMessagesAndDeletesOnlyAfterSaving() async throws {
   #expect(!FileManager.default.fileExists(atPath: removed.cache.path))
 }
 
+/// Where the migrated address leads. Once Work is reinstalled it answers as another coordinator.
+private actor Reinstall {
+  private(set) var done = false
+  func now() { done = true }
+}
+
+/// The single-address build left one queued message for Work, so it is held, and Work pairs. With
+/// `queued`, Work also refuses a new message, which stays in its outbox. Work is then reinstalled,
+/// so its address answers as another coordinator. The lane's banner counts what Remove deletes on
+/// this phone, as Remove's confirmation does: queued plus held.
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true])
+func aReinstalledCoordinatorsBannerCountsWhatRemoveDeletes(queued: Bool) async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let support = root.appending(path: "Support")
+  let suite = "reinstalled-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  defaults.set("100.64.1.2", forKey: "coordinatorAddress")
+  defaults.set("4001", forKey: "coordinatorPort")
+  let old = LegacyInstall.outbox(support, "100.64.1.2", 4001)
+  try FileManager.default.createDirectory(at: old, withIntermediateDirectories: true)
+  try JSONEncoder().encode([
+    NativeRequestSubmit(
+      inputId: UUID().uuidString, mode: .steer, text: "Invented: book the van for Saturday")
+  ]).write(to: old.appending(path: "pending.json"))
+  let original = FixtureCoordinator()
+  let reinstalled = FixtureCoordinator()
+  let (originalListener, originalPort) = try await listen(original)
+  defer { originalListener.cancel() }
+  let (reinstalledListener, reinstalledPort) = try await listen(reinstalled)
+  defer { reinstalledListener.cancel() }
+  let reinstall = Reinstall()
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: support,
+    caches: root.appending(path: "Caches"),
+    transport: CoordinatorTransport { _ in
+      let port = await reinstall.done ? reinstalledPort : originalPort
+      return LineConnection(
+        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+    })
+  let chat = coordinators.chat
+  let work = try #require(coordinators.profiles.first?.id)
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await original.stop()
+    await reinstalled.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("Work paired and connected") {
+      chat.snapshots[work]?.connection == .connected
+    }
+    try await eventually("the held message shows") { !chat.held.isEmpty }
+    if queued {
+      await original.rejectSubmits()
+      chat.draft = "Invented: and the trailer"
+      await chat.send()
+      try await eventually("Work refused it") {
+        chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+      }
+    }
+    await reinstall.now()
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    try await eventually("the identity failure") {
+      chat.snapshots[work]?.error?.contains("different coordinator") == true
+    }
+    let banner = chat.snapshots[work]?.error ?? "nil"
+    let confirmation = coordinators.removalMessage(work)
+    print("IF8-W5[queued=\(queued)] held=\(chat.held.count) banner=\(banner)")
+    print("IF8-W5[queued=\(queued)] Remove's confirmation: \(confirmation)")
+    let count = queued ? "2 queued messages are" : "1 queued message is"
+    #expect(banner.contains("\(count) held"), "The banner and Remove disagree")
+    #expect(
+      banner
+        == "This address now answers as a different coordinator. \(count) held on this phone. Remove it and add it again."
+    )
+    #expect(
+      confirmation
+        == (queued
+          ? "This deletes 2 queued messages on this phone."
+          : "This deletes 1 queued message on this phone."))
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
 @MainActor @Test(.timeLimit(.minutes(1)))
 func removeNeverCallsAnUnreadableQueueEmpty() async throws {
   let fixture = FixtureCoordinator()
@@ -500,9 +590,9 @@ func removeNeverCallsAnUnreadableQueueEmpty() async throws {
   let id = try #require(coordinators.profiles.first?.id)
   let directory = ProfileDirectory(id, applicationSupport: root, caches: root)
   let unreadable = "Queued messages on this phone could not be read. Removing deletes them."
-  #expect(await coordinators.removalMessage(id) == "No queued messages are on this phone.")
+  #expect(coordinators.removalMessage(id) == "No queued messages are on this phone.")
   try writePrivately(Data("not an outbox".utf8), to: directory.outbox)
-  let outbox = await coordinators.removalMessage(id)
+  let outbox = coordinators.removalMessage(id)
   #expect(outbox == unreadable, "An unreadable outbox")
   try FileManager.default.removeItem(at: directory.outbox)
   let held = directory.legacy.appending(path: "pending.json")
@@ -511,7 +601,7 @@ func removeNeverCallsAnUnreadableQueueEmpty() async throws {
       NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: "Invented held note")
     ]), to: held)
   try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: held.path)
-  let hold = await coordinators.removalMessage(id)
+  let hold = coordinators.removalMessage(id)
   #expect(hold == unreadable, "An unreadable hold")
   try await coordinators.remove(id)
   #expect(!FileManager.default.fileExists(atPath: directory.root.path))

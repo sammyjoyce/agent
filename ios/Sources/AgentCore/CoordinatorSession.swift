@@ -140,11 +140,10 @@ public actor CoordinatorSession {
   private var retired = false
   private var generation = UUID()
   private var flush: Task<Void, Never>?
-  private let outboxURL: URL
+  private let directory: ProfileDirectory
   private let attachments: AttachmentStore
   private let previews: AttachmentStore
   private let stamps: StampSource
-  private let ledgerURL: URL
   private var ledger: Ledger
   /// Each visible row's receive stamp, kept by row ID so a row that changes key keeps it.
   private var rowStamps: [String: TimeInterval] = [:]
@@ -157,11 +156,10 @@ public actor CoordinatorSession {
   ) {
     profile = directory.profile
     dialer = CoordinatorDialer(address: address, pin: pin, transport: transport)
-    outboxURL = directory.outbox
+    self.directory = directory
     attachments = AttachmentStore(directory: directory.outboxAttachments)
     previews = AttachmentStore(directory: directory.previews)
     self.stamps = stamps
-    ledgerURL = directory.ledger
     // Loaded before any session connects, so every saved stamp seeds the shared source. A
     // missing or unreadable ledger only loses receive order and send records, so it never
     // blocks the session.
@@ -182,7 +180,8 @@ public actor CoordinatorSession {
     identityFailure = nil
     if !loaded {
       do {
-        pending = try JSONDecoder().decode([OutboxItem].self, from: Data(contentsOf: outboxURL))
+        pending = try JSONDecoder().decode(
+          [OutboxItem].self, from: Data(contentsOf: directory.outbox))
       } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
         pending = []
       } catch {
@@ -435,13 +434,6 @@ public actor CoordinatorSession {
     publish()
   }
 
-  /// Items in the on-device outbox, read from disk so a session that never connected counts too.
-  /// A missing outbox holds nothing. An unreadable one throws.
-  public func queuedCount() throws -> Int {
-    do {
-      return try JSONDecoder().decode([OutboxItem].self, from: Data(contentsOf: outboxURL)).count
-    } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return 0 }
-  }
   public func loadEarlier(anchorID: String? = nil) async {
     guard let cursor = snapshot.olderCursor else { return }
     await loadHistory(.earlier(cursor: cursor, anchorID: anchorID ?? transcript.rows.first?.id))
@@ -612,11 +604,15 @@ public actor CoordinatorSession {
   private func noteIdentityFailure(_ error: any Error) {
     switch error as? ConnectionError {
     case .wrongCoordinator:
+      // Counted as Remove's confirmation counts, since the banner sends the user to Remove.
       let held =
-        pending.count == 1
-        ? "1 queued message is" : "\(pending.count) queued messages are"
+        switch try? directory.queuedMessages() {
+        case nil: "Queued messages on this phone could not be read."
+        case 1: "1 queued message is held on this phone."
+        case let count?: "\(count) queued messages are held on this phone."
+        }
       identityFailure =
-        "This address now answers as a different coordinator. \(held) held on this phone. Remove it and add it again."
+        "This address now answers as a different coordinator. \(held) Remove it and add it again."
     case .unidentifiedCoordinator: identityFailure = ConnectionError.describe(error)
     default: break
     }
@@ -1086,7 +1082,7 @@ public actor CoordinatorSession {
     guard !retired else { return false }
     ledger.prune(keeping: transcript.unpreparedRows)
     do {
-      try writePrivately(JSONEncoder().encode(ledger), to: ledgerURL)
+      try writePrivately(JSONEncoder().encode(ledger), to: directory.ledger)
       return true
     } catch { return false }
   }
@@ -1190,6 +1186,6 @@ public actor CoordinatorSession {
   }
   private func saveOutbox() throws {
     guard !retired else { throw CancellationError() }
-    try writePrivately(JSONEncoder().encode(pending), to: outboxURL)
+    try writePrivately(JSONEncoder().encode(pending), to: directory.outbox)
   }
 }
