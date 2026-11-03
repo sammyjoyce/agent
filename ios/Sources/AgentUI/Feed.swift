@@ -17,11 +17,11 @@ enum Addressing: Equatable {
     let connected: Bool
   }
 
-  /// With two or more saved coordinators, `chip` names the one recipient and the text is
-  /// literal. Without a chip, leading `@Name` tags pick the recipients and are not sent, and
-  /// no tag means every paired coordinator. With one saved coordinator the text goes as typed.
-  /// A chip naming no saved coordinator, or a tag naming a `removed` one, blocks Send however
-  /// many are saved, so a draft for a removed coordinator never reaches another.
+  /// With two or more saved coordinators, or one once another was `removed`, `chip` names the
+  /// one recipient and the text is literal. Without a chip, leading `@Name` tags pick the
+  /// recipients and are not sent, a tag naming no saved coordinator blocks Send, and no tag
+  /// means every paired coordinator. With one saved coordinator and none removed the text goes
+  /// as typed. A chip naming no saved coordinator blocks Send however many are saved.
   static func parse(
     _ draft: String, hasAttachments: Bool, chip: ProfileID?, among coordinators: [Coordinator],
     removed: [ProfileID: String] = [:]
@@ -34,14 +34,9 @@ enum Addressing: Equatable {
       return .blocked(
         removed[chip].map { "\($0) was removed" } ?? "Choose who receives this message")
     }
-    for word in tags where chip == nil && named(word).isEmpty {
-      if let name = removed.values.first(where: { $0.lowercased() == word.lowercased() }) {
-        return .blocked("\(name) was removed")
-      }
-    }
     var recipients = coordinators.filter(\.paired)
     var body = Substring(draft)
-    if coordinators.count > 1 {
+    if coordinators.count > 1 || !removed.isEmpty {
       if let chip {
         recipients = coordinators.filter { $0.id == chip }
       } else if !tags.isEmpty {

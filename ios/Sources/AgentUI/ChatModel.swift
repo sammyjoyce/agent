@@ -120,8 +120,9 @@ final class ChatModel {
 
   /// Adds a saved coordinator's lane, or replaces an unpaired lane with its paired one.
   /// A lane whose session was live must be detached first, so two sessions never share
-  /// an outbox. Connecting is `setActive`'s job.
+  /// an outbox. A removed coordinator gets none. Connecting is `setActive`'s job.
   func attach(_ lane: Lane) {
+    guard removed[lane.id] == nil else { return }
     observations.removeValue(forKey: lane.id)?.cancel()
     if let index = lanes.firstIndex(where: { $0.id == lane.id }) {
       lanes[index] = lane
@@ -195,6 +196,15 @@ final class ChatModel {
   /// Who Send reaches with the current draft, or why it is blocked.
   var addressing: Addressing {
     address(draft, hasAttachments: !attachments.isEmpty, chip: recipient)
+  }
+
+  /// True while the draft is the coordinator's: chosen as the chip, restored from it, or led
+  /// by a typed tag with its name.
+  func addresses(_ id: ProfileID) -> Bool {
+    if recipient == id || restoredFrom?.lane == id { return true }
+    guard recipient == nil, let name = profiles.first(where: { $0.id == id })?.name.description
+    else { return false }
+    return Addressing.leadingTags(draft).tags.contains { $0.lowercased() == name.lowercased() }
   }
 
   private func address(_ text: String, hasAttachments: Bool, chip: ProfileID?) -> Addressing {

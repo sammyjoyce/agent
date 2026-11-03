@@ -103,11 +103,14 @@ import Testing
         "hi", personal, [saved(work, "Work"), saved(work1, "Work-1")],
         .blocked("Personal was removed")
       ),
-      ("@Personal hi", nil, [saved(work, "Work")], .blocked("Personal was removed")),
+      ("@Personal hi", nil, [saved(work, "Work")], .blocked("No coordinator named Personal")),
       (
         "@Work @personal hi", nil, [saved(work, "Work"), saved(work1, "Work-1")],
-        .blocked("Personal was removed")
+        .blocked("No coordinator named personal")
       ),
+      ("@Job hi", nil, [saved(work, "Work")], .blocked("No coordinator named Job")),
+      ("@Work hi", nil, [saved(work, "Work")], .to([work], body: "hi")),
+      ("hi", nil, [saved(work, "Work")], .to([work], body: "hi")),
       ("@Personal hi", work, [saved(work, "Work")], .to([work], body: "@Personal hi")),
       ("hi @Personal", nil, [saved(work, "Work")], .to([work], body: "hi @Personal")),
       (
@@ -243,10 +246,17 @@ private actor DialGate {
   }
 }
 
-/// Two loopback coordinators at ports 4001 and 4002 of one invented address, and a fresh
-/// `Coordinators` with nothing saved, as the app builds it.
+/// Where Work's addresses lead. A test can point them at Personal, as a moved name would.
+private actor WorkRoute {
+  private(set) var answersAsPersonal = false
+  func point(atPersonal value: Bool) { answersAsPersonal = value }
+}
+
+/// Two loopback coordinators, Personal at port 4002 of an invented address and Work at any
+/// other address, and a fresh `Coordinators` with nothing saved, as the app builds it.
 @MainActor private func withTwoFixtures(
   registration: NotificationRegistration? = nil, holdingWork gate: DialGate? = nil,
+  route: WorkRoute? = nil,
   _ body: (Coordinators, FixtureCoordinator, FixtureCoordinator, URL) async throws -> Void
 ) async throws {
   let first = FixtureCoordinator()
@@ -255,7 +265,6 @@ private actor DialGate {
   defer { firstListener.cancel() }
   let (secondListener, secondPort) = try await listen(second)
   defer { secondListener.cancel() }
-  let routes: [UInt16: NWEndpoint.Port] = [4001: firstPort, 4002: secondPort]
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
   let suite = "feed-\(UUID())"
@@ -265,8 +274,11 @@ private actor DialGate {
     registration: registration, defaults: defaults, applicationSupport: root, caches: root,
     transport: CoordinatorTransport { address in
       if address.port == 4001 { await gate?.pass() }
+      let repointed = await route?.answersAsPersonal == true
+      let personal = address.port == 4002 || repointed
       return LineConnection(
-        connection: NWConnection(host: .ipv4(.loopback), port: routes[address.port]!, using: .tcp))
+        connection: NWConnection(
+          host: .ipv4(.loopback), port: personal ? secondPort : firstPort, using: .tcp))
     })
   await coordinators.setActive(true)
   do {
@@ -354,9 +366,12 @@ func anUntaggedSendReachesBothCoordinatorsAndATaggedOneOnlyItsOwn() async throws
     let folded = try #require(chat.rows.first { $0.row.role == .user })
     #expect(folded.id.hasPrefix("send:"))
     #expect(folded.receipts.map(\.lane) == [work, personal])
-    // The fixture closes each submit's socket after `accepted`, so both lanes reconnect.
-    try await eventually("both reconnected") {
-      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+    // The fixture closes each submit's socket after `accepted`, so both lanes reconnect after a
+    // backoff, and only that observe reports `placed`.
+    try await eventually("both placed it and reconnected") {
+      chat.rows.first { $0.row.role == .user }?.receipts
+        == [Receipt(lane: work, status: .placed), Receipt(lane: personal, status: .placed)]
+        && chat.snapshots.values.filter { $0.connection == .connected }.count == 2
     }
 
     chat.draft = "@Work "
@@ -702,13 +717,14 @@ func removeRefusesATypedTagAndNothingNamingARemovedCoordinatorSends() async thro
     for file in chat.attachments { await chat.removeAttachment(file) }
     try await coordinators.remove(work)
     #expect(coordinators.profiles.map(\.id) == [personal])
-    let drafts: [(chip: ProfileID?, text: String)] = [
-      (nil, "@Work see the invented board minutes"), (work, "Invented board minutes"),
+    let drafts: [(chip: ProfileID?, text: String, blocked: String)] = [
+      (nil, "@Work see the invented board minutes", "No coordinator named Work"),
+      (work, "Invented board minutes", "Work was removed"),
     ]
     for draft in drafts {
       chat.recipient = draft.chip
       chat.draft = draft.text
-      #expect(chat.addressing == .blocked("Work was removed"), "\(draft.text)")
+      #expect(chat.addressing == .blocked(draft.blocked), "\(draft.text)")
       await chat.send()
       #expect(chat.draft == draft.text, "Send keeps a draft for a removed coordinator")
     }
@@ -890,4 +906,240 @@ func aMessageToBothKeepsItsRecipientsAfterOneIsRemovedAndAddedAgain() async thro
     #expect(broadcastRow.receipts != taggedRow.receipts)
     #expect(taggedRow.receipts == [Receipt(lane: work, status: .placed)])
   }
+}
+
+// MARK: - Profile mutations run one at a time, and Remove commits before it withdraws
+
+/// An address edit swaps Work's session, and Remove starts while the old lane is detached and
+/// the new one is not attached yet. Remove waits for the edit, so Work keeps no lane, no row and
+/// no directory. Tests run in parallel on the main actor, so an iteration can miss that window
+/// and then removes Work after the edit.
+@MainActor @Test(.timeLimit(.minutes(2)))
+func anEditAndARemoveOfOneCoordinatorRunOneAfterTheOther() async throws {
+  var overlapped = 0
+  for _ in 0..<20 {
+    try await withTwoFixtures { coordinators, workFixture, _, root in
+      let (work, personal) = try await addWorkAndPersonal(coordinators)
+      let chat = coordinators.chat
+      await workFixture.replyToHistory(
+        initial: .init(
+          messages: [
+            .init(
+              continuation: false, entryId: "work-entry", finalChunk: true, role: .final,
+              text: "Invented private Work-only reply")
+          ], pageComplete: true), pages: [:])
+      var editFinished = false
+      let editing = Task { @MainActor in
+        defer { editFinished = true }
+        try await coordinators.update(
+          work, name: TagName("Office"), address: CoordinatorAddress(host: "100.64.1.3", port: 4001)
+        )
+      }
+      while !editFinished && chat.lanes.contains(where: { $0.id == work }) { await Task.yield() }
+      if !chat.lanes.contains(where: { $0.id == work }) { overlapped += 1 }
+      try await coordinators.remove(work)
+      try await editing.value
+      try await Task.sleep(for: .milliseconds(150))
+      let directory = ProfileDirectory(work, applicationSupport: root, caches: root)
+      #expect(coordinators.profiles.map(\.id) == [personal])
+      #expect(chat.lanes.map(\.id) == [personal], "A removed coordinator has no lane")
+      #expect(!chat.rows.contains { $0.lane == work }, "No row of the removed coordinator shows")
+      #expect(!FileManager.default.fileExists(atPath: directory.ledger.path))
+      #expect(!FileManager.default.fileExists(atPath: directory.root.path))
+    }
+  }
+  #expect(overlapped > 0, "Remove started while the edit had Work's lane detached")
+}
+
+/// The same edit and Remove, then `/feedback` with Personal alone saved. The automatic
+/// screenshot shows the feed at Send, so that feed must hold nothing of Work.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aFeedbackScreenshotAfterAnEditAndRemoveShowsOnlyTheCoordinatorLeft() async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, _ in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let workOnly = "Invented private Work-only board minutes"
+    await workFixture.replyToHistory(
+      initial: .init(
+        messages: [
+          .init(
+            continuation: false, entryId: "private-work", finalChunk: true, role: .final,
+            text: workOnly)
+        ], pageComplete: true), pages: [:])
+    var editFinished = false
+    let editing = Task { @MainActor in
+      defer { editFinished = true }
+      try await coordinators.update(
+        work, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.3", port: 4001))
+    }
+    while !editFinished && chat.lanes.contains(where: { $0.id == work }) { await Task.yield() }
+    try #require(
+      !chat.lanes.contains { $0.id == work }, "Remove starts while the edit has Work detached")
+    try await coordinators.remove(work)
+    try await editing.value
+    try await Task.sleep(for: .milliseconds(500))
+    #expect(coordinators.profiles.map(\.id) == [personal])
+    var shown: [String]?
+    chat.draft = "/feedback The visible reply is clipped"
+    // Stands in for the window capture: the bytes are the feed's rows at Send.
+    await chat.send(screenshot: {
+      shown = chat.rows.map(\.row.text)
+      return Data((shown ?? []).joined(separator: "\n").utf8)
+    })
+    try await eventually("Personal's feedback") { await personalFixture.count() == 1 }
+    let request = try #require(await submits(personalFixture).first)
+    let screenshot = try #require(request.attachments?.first)
+    let uploaded = try #require(await personalFixture.uploaded(screenshot.id))
+    #expect(shown?.contains(workOnly) == false, "The screenshot showed Work's removed conversation")
+    #expect(
+      !String(decoding: uploaded, as: UTF8.self).contains(workOnly),
+      "Personal received Work's removed conversation")
+    #expect(await workFixture.count() == 0)
+  }
+}
+
+/// A draft tagged `@Work` keeps that word when Work is renamed Job. Removing Job goes ahead, and
+/// with Personal alone left the tag still names no saved coordinator, so Send stays blocked.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aTagForARenamedCoordinatorStaysBlockedOnceItIsRemoved() async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, _ in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    chat.draft = "@Work"
+    chat.promoteTypedTag()
+    await chat.attach(
+      data: Data("invented board minutes".utf8), name: "Board-minutes.txt",
+      mediaType: "text/plain")
+    #expect(chat.recipient == nil && chat.recipientLine == "To Work")
+    try await coordinators.update(
+      work, name: TagName("Job"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    #expect(chat.addressing == .blocked("No coordinator named Work"))
+    try await coordinators.remove(work)
+    #expect(coordinators.profiles.map(\.id) == [personal])
+    #expect(chat.addressing == .blocked("No coordinator named Work"))
+    #expect(!chat.canSend)
+    await chat.send()
+    try await Task.sleep(for: .seconds(1))
+    let atPersonal = await submits(personalFixture)
+    #expect(atPersonal.isEmpty, "Personal received \(atPersonal.map(\.text))")
+    #expect(await personalFixture.uploadCount() == 0, "Personal received Work's file")
+    #expect(await workFixture.count() == 0)
+  }
+}
+
+/// Remove withdraws nothing until `profiles.json` is saved without the coordinator. When that
+/// save fails, the coordinator stays as it was, its alerts included.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRemoveThatCannotSaveLeavesTheCoordinatorAndItsAlertsAsTheyWere() async throws {
+  let registration = NotificationRegistration(
+    enabled: true, permission: { true }, register: {}, save: { _ in })
+  await registration.start()
+  await registration.received(token: String(repeating: "ab", count: 32))
+  try await withTwoFixtures(registration: registration) { coordinators, workFixture, _, root in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    try await eventually("both enrolled") {
+      registration.status(work).registered && registration.status(personal).registered
+    }
+    let agent = root.appending(path: "Agent")
+    try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: agent.path)
+    var refusal: String?
+    do { try await coordinators.remove(work) } catch { refusal = error.localizedDescription }
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: agent.path)
+    #expect(refusal != nil, "The failed save is reported")
+    #expect(coordinators.profiles.map(\.id) == [work, personal])
+    #expect(chat.lanes.map(\.id) == [work, personal])
+    #expect(chat.addressing == .empty([work, personal]), "Work is addressable again")
+    #expect(chat.snapshots[work]?.connection == .connected)
+    #expect(registration.status(work) == .init(configured: true, registered: true))
+    let withdrawal = NotificationRequest.unregister(.init(installationId: "\(work)"))
+    #expect(!(await workFixture.notificationControls()).contains(withdrawal), "Nothing withdrawn")
+    let status = NotificationRequest.status(.init(installationId: "\(work)"))
+    await chat.reconnect(work)
+    try await eventually("Work's alerts linked again after the reconnect") {
+      await workFixture.notificationControls().filter { $0 == status }.count == 2
+        && registration.status(work).configured
+    }
+    await registration.setEnabled(false)
+    await registration.setEnabled(true)
+    await registration.received(token: String(repeating: "cd", count: 32))
+    try await eventually("Work enrolled again") { registration.status(work).registered }
+    #expect(registration.status(work).error == nil, "\(registration.status(work).error ?? "")")
+  }
+}
+
+/// The installation IDs of the alert withdrawals `profiles.json` keeps.
+private func savedWithdrawals(_ root: URL) throws -> [String] {
+  let saved = try JSONSerialization.jsonObject(
+    with: Data(contentsOf: root.appending(path: "Agent/profiles.json")))
+  let withdrawals = (saved as? [String: Any])?["withdrawals"] as? [[String: Any]] ?? []
+  return withdrawals.compactMap { $0["installation"] as? String }
+}
+
+/// The coordinator loses Remove's withdrawal before applying it. Remove still completes, and
+/// `profiles.json` keeps the withdrawal until an activation sends it again and it is confirmed.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aWithdrawalItsCoordinatorNeverConfirmedIsSentAgainOnTheNextActivation() async throws {
+  let registration = NotificationRegistration(
+    enabled: true, permission: { true }, register: {}, save: { _ in })
+  await registration.start()
+  await registration.received(token: String(repeating: "ab", count: 32))
+  try await withTwoFixtures(registration: registration) { coordinators, workFixture, _, root in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    try await eventually("Work enrolled") { registration.status(work).registered }
+    await workFixture.dropNextNotificationRemoval()
+    try await coordinators.remove(work)
+    #expect(coordinators.profiles.map(\.id) == [personal])
+    let directory = ProfileDirectory(work, applicationSupport: root, caches: root)
+    #expect(!FileManager.default.fileExists(atPath: directory.root.path))
+    let withdrawal = NotificationRequest.unregister(.init(installationId: "\(work)"))
+    #expect(await workFixture.notificationControls().filter { $0 == withdrawal }.count == 1)
+    #expect(await workFixture.holdsRegistration(), "The lost withdrawal was never applied")
+    #expect(try savedWithdrawals(root) == ["\(work)"], "profiles.json keeps it unconfirmed")
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    try await eventually("the withdrawal confirmed") {
+      (try? savedWithdrawals(root))?.isEmpty == true
+    }
+    #expect(await workFixture.notificationControls().filter { $0 == withdrawal }.count == 2)
+    #expect(!(await workFixture.holdsRegistration()), "Work no longer holds this device")
+  }
+}
+
+/// A pending withdrawal whose address now answers as another coordinator is dropped: that
+/// coordinator never held the registration, and it never sees the removed installation ID.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aPendingWithdrawalIsDroppedOnceItsAddressAnswersAsAnotherCoordinator() async throws {
+  let registration = NotificationRegistration(
+    enabled: true, permission: { true }, register: {}, save: { _ in })
+  await registration.start()
+  await registration.received(token: String(repeating: "ab", count: 32))
+  let route = WorkRoute()
+  try await withTwoFixtures(registration: registration, route: route) {
+    coordinators, workFixture, personalFixture, root in
+    let (work, _) = try await addWorkAndPersonal(coordinators)
+    try await eventually("Work enrolled") { registration.status(work).registered }
+    await workFixture.dropNextNotificationRemoval()
+    try await coordinators.remove(work)
+    #expect(try savedWithdrawals(root) == ["\(work)"])
+    await coordinators.setActive(false)
+    await route.point(atPersonal: true)
+    let before = await personalFixture.received().count
+    await coordinators.setActive(true)
+    try await eventually("the withdrawal dropped") {
+      (try? savedWithdrawals(root))?.isEmpty == true
+    }
+    let seen = await personalFixture.received().dropFirst(before)
+    #expect(!seen.contains { "\($0)".contains("\(work)") }, "Personal saw Work's installation ID")
+  }
+}
+
+/// Nothing can attach a lane for a coordinator once Remove has marked it.
+@MainActor @Test func aRemovedCoordinatorsLaneIsNeverAttachedAgain() {
+  let (directory, root) = temporaryProfile()
+  defer { try? FileManager.default.removeItem(at: root) }
+  let chat = ChatModel()
+  chat.removed[directory.profile] = "Work"
+  chat.attach(Lane(id: directory.profile, session: nil, hold: LegacyHold(directory)))
+  #expect(chat.lanes.isEmpty)
 }

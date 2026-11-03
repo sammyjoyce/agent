@@ -99,10 +99,16 @@ Mode if requested, then Run.
   in each one's outbox under its own input ID before any of them is sent. If
   one refuses it, none keeps it and the draft stays. Its bubble shows each
   coordinator's delivery with its own **Check / retry** or **Restore**.
-- Remove refuses while the draft is addressed to that coordinator or restored
-  from it. Until the app quits, a chip or `@Name` for a removed coordinator, or
-  a message restored from one, blocks Send, so nothing meant for it goes to
-  another coordinator.
+- Adding, editing, pairing and removing coordinators run one at a time. Remove
+  refuses while the draft is addressed to that coordinator or restored from it.
+  It saves `profiles.json` without the coordinator, and with a record of its
+  alert withdrawal, before it withdraws alerts or deletes anything, so a failed
+  save leaves the coordinator as it was. A withdrawal its coordinator has not
+  confirmed is sent again each time the app becomes active. Each launch deletes
+  the files of every coordinator `profiles.json` no longer lists. Until the app
+  quits, a chip for a removed coordinator, a message restored from one, or a
+  leading `@Name` that names no saved coordinator blocks Send, with one
+  coordinator left too, so nothing meant for it goes to another coordinator.
 - Every connection first asks for the coordinator's ID and writes nothing else
   unless the ID matches the saved one. A coordinator too old to answer shows
   "Update the coordinator". If the address now answers as a different

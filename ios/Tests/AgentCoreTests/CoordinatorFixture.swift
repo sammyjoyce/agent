@@ -70,6 +70,8 @@ actor FixtureCoordinator {
   }
   func toolLookups() -> [NativeRequestToolDetails] { toolRequests }
   func notificationControls() -> [NotificationRequest] { notificationRequests }
+  /// Whether this coordinator holds a device registration, as its last applied control left it.
+  func holdsRegistration() -> Bool { notificationsRegistered }
   func dropNextNotificationRemoval() { dropNotificationRemoval = true }
   func holdNotificationRegistration() { notificationsHeld = true }
   func releaseNotificationRegistration() {

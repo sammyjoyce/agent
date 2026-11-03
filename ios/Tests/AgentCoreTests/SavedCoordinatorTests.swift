@@ -159,7 +159,8 @@ func migrationResumesAfterACrashAtEveryStepWithACustomPort(_ step: Coordinators.
     #expect(!FileManager.default.fileExists(atPath: profile.appending(path: "Outbox").path))
   }
   let resumed = try Coordinators.migrate(
-    defaults: install.defaults, applicationSupport: install.support, caches: install.caches)
+    defaults: install.defaults, applicationSupport: install.support, caches: install.caches
+  ).profiles
   try install.expectMigrated(resumed)
   #expect(resumed.first?.address.port == 4123)
 }
@@ -170,7 +171,7 @@ func migrationResumesAfterACrashAtEveryStepWithACustomPort(_ step: Coordinators.
   let profile = try #require(
     try Coordinators.migrate(
       defaults: install.defaults, applicationSupport: install.support, caches: install.caches
-    ).first)
+    ).profiles.first)
   let hold = LegacyHold(install.directory(profile))
   #expect(try await hold.items().map(\.id) == install.queued.map(\.inputId))
   let drafts = AttachmentStore(directory: install.support.appending(path: "Agent/Drafts"))
@@ -353,8 +354,10 @@ private actor ProbeGate {
   }
 }
 
+/// Two edits to one name run in turn. The first saves, and the second finds the name taken, so
+/// no two coordinators are ever saved under one name.
 @MainActor @Test(.timeLimit(.minutes(1)))
-func anEditRechecksItsNameAfterTheAddressProbe() async throws {
+func twoEditsToOneNameRunInTurnAndOnlyTheFirstSaves() async throws {
   let work = FixtureCoordinator()
   let personal = FixtureCoordinator()
   let (workListener, workPort) = try await listen(work)
@@ -385,16 +388,19 @@ func anEditRechecksItsNameAfterTheAddressProbe() async throws {
       workID, name: TagName("Shared"), address: CoordinatorAddress(host: "100.64.1.2", port: 4003))
   }
   try await eventually("Work's probe held") { await gate.waiting }
-  try await coordinators.update(
-    personalID, name: TagName("Shared"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002)
-  )
+  let second = Task {
+    try await coordinators.update(
+      personalID, name: TagName("Shared"),
+      address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+  }
   await gate.open()
-  await #expect(throws: ProfileError.duplicateName("Shared")) { try await edit.value }
+  try await edit.value
+  await #expect(throws: ProfileError.duplicateName("Shared")) { try await second.value }
   struct Saved: Decodable { let profiles: [CoordinatorProfile] }
   let saved = try JSONDecoder().decode(
     Saved.self, from: Data(contentsOf: root.appending(path: "Agent/profiles.json")))
-  #expect(saved.profiles.map(\.name.description) == ["Work", "Shared"])
-  #expect(coordinators.profiles.map(\.address.port) == [4001, 4002])
+  #expect(saved.profiles.map(\.name.description) == ["Shared", "Personal"])
+  #expect(coordinators.profiles.map(\.address.port) == [4003, 4002])
   await work.stop()
   await personal.stop()
 }
@@ -441,9 +447,40 @@ func removeCountsQueuedAndHeldMessagesAndDeletesOnlyAfterSaving() async throws {
   #expect(!FileManager.default.fileExists(atPath: directory.cache.path))
   #expect(
     await fixture.notificationControls().contains(
-      .unregister(.init(installationId: "\(profile.id)"))), "Alerts are withdrawn first")
+      .unregister(.init(installationId: "\(profile.id)"))), "Alerts are withdrawn")
   await coordinators.setActive(false)
   await fixture.stop()
+}
+
+/// A Remove that stopped after saving leaves its files. The next launch deletes every profile
+/// directory `profiles.json` does not list, and keeps the ones it lists.
+@MainActor @Test func launchDeletesTheFilesOfEveryProfileThatIsNoLongerSaved() throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let caches = root.appending(path: "Caches")
+  let suite = "launch-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let saved = CoordinatorProfile(
+    name: try TagName("Work"), address: try CoordinatorAddress(host: "100.64.1.2"))
+  struct Saved: Encodable { let profiles: [CoordinatorProfile] }
+  try writePrivately(
+    JSONEncoder().encode(Saved(profiles: [saved])),
+    to: root.appending(path: "Agent/profiles.json"))
+  let kept = ProfileDirectory(saved.id, applicationSupport: root, caches: caches)
+  let removed = ProfileDirectory(ProfileID(), applicationSupport: root, caches: caches)
+  for directory in [kept, removed] {
+    try writePrivately(Data("{}".utf8), to: directory.ledger)
+    try writePrivately(Data("preview".utf8), to: directory.previews.appending(path: "A.png"))
+  }
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: caches,
+    transport: .tailnet)
+  #expect(coordinators.profiles.map(\.id) == [saved.id])
+  #expect(FileManager.default.fileExists(atPath: kept.ledger.path))
+  #expect(FileManager.default.fileExists(atPath: kept.previews.path))
+  #expect(!FileManager.default.fileExists(atPath: removed.root.path))
+  #expect(!FileManager.default.fileExists(atPath: removed.cache.path))
 }
 
 @MainActor @Test(.timeLimit(.minutes(1)))

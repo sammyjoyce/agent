@@ -135,14 +135,20 @@ public final class NotificationRegistration {
     }
   }
 
-  /// Removes the profile's installation over its live channel, if any, then forgets it.
-  public func forget(_ profile: ProfileID) async {
+  /// Removes the profile's installation over its live channel, if any, then forgets it. True
+  /// once its coordinator confirmed it holds no registration for it.
+  @discardableResult public func forget(_ profile: ProfileID) async -> Bool {
     forgotten.insert(profile)
     // Without a configured status, a token arriving during the withdrawal skips this profile.
     channels[profile] = nil
-    try? await unregister(profile)
-    links[profile] = nil
-    controls[profile] = nil
+    defer {
+      links[profile] = nil
+      controls[profile] = nil
+    }
+    let withdrawal = try? await request(
+      .unregister(.init(installationId: "\(profile)")), on: profile
+    ).value
+    return withdrawal?.registered == false
   }
 
   public func received(token: String) async {
@@ -253,6 +259,38 @@ public final class NotificationRegistration {
 
   private func removalError(_ error: any Error) -> String {
     "Notification removal is unconfirmed. Reconnect or retry removing this device. \(error.localizedDescription)"
+  }
+}
+
+/// An alert withdrawal that Remove saved before withdrawing. It outlives the profile, so it
+/// keeps the address and pin that reach that profile's coordinator alone.
+public struct PendingWithdrawal: Codable, Sendable, Equatable {
+  public let installation: ProfileID
+  public let address: CoordinatorAddress
+  public let pin: CoordinatorID
+
+  public init(installation: ProfileID, address: CoordinatorAddress, pin: CoordinatorID) {
+    self.installation = installation
+    self.address = address
+    self.pin = pin
+  }
+
+  /// Withdraws the installation over one socket that proves the pin. True once the coordinator
+  /// confirmed it holds no registration for it.
+  public func send(transport: CoordinatorTransport) async throws -> Bool {
+    let stream = try await CoordinatorDialer(address: address, pin: pin, transport: transport)
+      .open()
+    do {
+      try await timedSend(
+        stream,
+        .notifications(.init(request: .unregister(.init(installationId: "\(installation)")))))
+      let status = try await notificationStatus(on: stream)
+      await stream.close()
+      return !status.registered
+    } catch {
+      await stream.close()
+      throw error
+    }
   }
 }
 

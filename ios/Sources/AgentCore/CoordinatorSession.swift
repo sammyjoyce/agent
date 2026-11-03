@@ -17,6 +17,23 @@ private struct CoordinatorRejection: LocalizedError {
   var errorDescription: String? { message }
 }
 
+/// A notification control's answer: one status, then `done`.
+func notificationStatus(on stream: VerifiedConnection) async throws -> NotificationStatus {
+  var status: NotificationStatus?
+  while true {
+    switch try await timedNext(stream) {
+    case .notifications(let value):
+      guard status == nil else { throw ConnectionError.incompleteFrame }
+      status = value.status
+    case .done:
+      guard let status else { throw ConnectionError.incompleteFrame }
+      return status
+    case .failure(let value): throw CoordinatorRejection(message: value.message)
+    default: throw ConnectionError.incompleteFrame
+    }
+  }
+}
+
 public struct ChatSnapshot: Sendable {
   public var rows: [ChatRow] = []
   public var connection: ConnectionState = .disconnected
@@ -717,22 +734,10 @@ public actor CoordinatorSession {
     actionConnections[id] = stream
     do {
       try await timedSend(stream, .notifications(.init(request: request)))
-      var status: NotificationStatus?
-      while true {
-        let event = try await timedNext(stream)
-        guard self.generation == generation, !Task.isCancelled else { throw CancellationError() }
-        switch event {
-        case .notifications(let value):
-          guard status == nil else { throw ConnectionError.incompleteFrame }
-          status = value.status
-        case .done:
-          guard let status else { throw ConnectionError.incompleteFrame }
-          await actionConnections.removeValue(forKey: id)?.close()
-          return status
-        case .failure(let value): throw CoordinatorRejection(message: value.message)
-        default: throw ConnectionError.incompleteFrame
-        }
-      }
+      let status = try await notificationStatus(on: stream)
+      guard self.generation == generation, !Task.isCancelled else { throw CancellationError() }
+      await actionConnections.removeValue(forKey: id)?.close()
+      return status
     } catch {
       await actionConnections.removeValue(forKey: id)?.close()
       throw error

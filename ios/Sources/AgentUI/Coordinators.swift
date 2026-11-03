@@ -26,6 +26,12 @@ public final class Coordinators {
   @ObservationIgnored private let stamps = StampSource()
   @ObservationIgnored private var active = false
   @ObservationIgnored private var pairing: [ProfileID: Task<Void, Never>] = [:]
+  /// Alert withdrawals `profiles.json` keeps until a coordinator confirms them.
+  @ObservationIgnored private var withdrawals: [PendingWithdrawal] = []
+  @ObservationIgnored private var withdrawing: [ProfileID: Task<Void, Never>] = [:]
+  /// True while a profile mutation runs. The ones waiting their turn, in call order.
+  @ObservationIgnored private var mutating = false
+  @ObservationIgnored private var waiting: [CheckedContinuation<Void, Never>] = []
 
   convenience init(registration: NotificationRegistration?, defaults: UserDefaults) {
     self.init(
@@ -47,8 +53,11 @@ public final class Coordinators {
       draftStore: AttachmentStore(directory: applicationSupport.appending(path: "Agent/Drafts")),
       registration: registration)
     do {
-      profiles = try Self.migrate(
+      let saved = try Self.migrate(
         defaults: defaults, applicationSupport: applicationSupport, caches: caches)
+      profiles = saved.profiles
+      withdrawals = saved.withdrawals
+      Self.removeUnlisted(saved.profiles, applicationSupport: applicationSupport, caches: caches)
     } catch {
       failure =
         "Saved coordinators could not be loaded. Nothing was changed. Reopen Agent to try again. \(error.localizedDescription)"
@@ -56,17 +65,34 @@ public final class Coordinators {
     for profile in profiles { chat.attach(lane(profile)) }
   }
 
-  /// Every paired coordinator stays connected while the app is active, and unpaired ones
-  /// keep pairing with backoff. Everything stops when the app is not active.
+  /// Every paired coordinator stays connected while the app is active, unpaired ones keep
+  /// pairing with backoff, and each unconfirmed alert withdrawal is sent again. Everything
+  /// stops when the app is not active.
   public func setActive(_ active: Bool) async {
     self.active = active
     if !active {
-      for task in pairing.values { task.cancel() }
+      for task in Array(pairing.values) + Array(withdrawing.values) { task.cancel() }
       pairing = [:]
+      withdrawing = [:]
     }
     await chat.setActive(active)
     guard self.active else { return }
     for profile in profiles where profile.pin == nil { retryPairing(profile.id) }
+    for withdrawal in withdrawals { retry(withdrawal) }
+  }
+
+  /// Runs add, edit, pairing and removal one at a time in call order, so none of them sees
+  /// another half done and every `profiles.json` save starts from the last one.
+  private func serially<T>(_ mutation: () async throws -> T) async rethrows -> T {
+    if mutating {
+      await withCheckedContinuation { waiting.append($0) }
+    } else {
+      mutating = true
+    }
+    defer {
+      if waiting.isEmpty { mutating = false } else { waiting.removeFirst().resume() }
+    }
+    return try await mutation()
   }
 
   /// Pairs now, then with the sessions' backoff until paired or inactive.
@@ -84,66 +110,63 @@ public final class Coordinators {
 
   /// One attempt: probe, admit, save, then build the session. True once nothing is left to pair.
   private func pair(_ id: ProfileID) async -> Bool {
-    guard let profile = profiles.first(where: { $0.id == id }), profile.pin == nil else {
-      return true
-    }
-    do {
-      let found = try await identifyCoordinator(at: profile.address, transport: transport)
-      // An edit or removal while the probe was out decides instead.
-      guard profiles.first(where: { $0.id == id })?.address == profile.address else {
+    await serially {
+      guard !Task.isCancelled, let profile = profiles.first(where: { $0.id == id }),
+        profile.pin == nil
+      else { return true }
+      do {
+        let found = try await identifyCoordinator(at: profile.address, transport: transport)
+        var next = profiles
+        guard try CoordinatorProfile.admit(found, for: id, in: &next) else { return true }
+        try save(next)
+        profiles = next
+        pairingError[id] = nil
+        await start(id)
+        return true
+      } catch {
+        if !Task.isCancelled { pairingError[id] = error.localizedDescription }
         return false
       }
-      var next = profiles
-      guard try CoordinatorProfile.admit(found, for: id, in: &next) else { return true }
-      try save(next)
-      profiles = next
-      pairingError[id] = nil
-      await start(id)
-      return true
-    } catch {
-      if !Task.isCancelled { pairingError[id] = error.localizedDescription }
-      return false
     }
   }
 
   /// Probes before saving, so the saved profile is already pinned. A name another coordinator
   /// has, or a coordinator already saved, is refused.
   func add(name: TagName, address: CoordinatorAddress) async throws {
-    try CoordinatorProfile.checkName(name, for: nil, in: profiles)
-    let found = try await identifyCoordinator(at: address, transport: transport)
-    // Another add or edit may have saved while the probe was out.
-    try CoordinatorProfile.checkName(name, for: nil, in: profiles)
-    let profile = CoordinatorProfile(name: name, address: address)
-    var next = profiles + [profile]
-    _ = try CoordinatorProfile.admit(found, for: profile.id, in: &next)
-    try save(next)
-    profiles = next
-    chat.attach(lane(next[next.count - 1]))
-    if active { await chat.lanes.first { $0.id == profile.id }?.session?.connect() }
+    try await serially {
+      try CoordinatorProfile.checkName(name, for: nil, in: profiles)
+      let found = try await identifyCoordinator(at: address, transport: transport)
+      let profile = CoordinatorProfile(name: name, address: address)
+      var next = profiles + [profile]
+      _ = try CoordinatorProfile.admit(found, for: profile.id, in: &next)
+      try save(next)
+      profiles = next
+      chat.attach(lane(next[next.count - 1]))
+      if active { await chat.lanes.first { $0.id == profile.id }?.session?.connect() }
+    }
   }
 
   /// Probes a new address against the pin before saving anything. A different coordinator
   /// saves nothing. An unpaired profile pairs at the new address.
   func update(_ id: ProfileID, name: TagName, address: CoordinatorAddress) async throws {
-    guard let before = profiles.first(where: { $0.id == id }) else { return }
-    try CoordinatorProfile.checkName(name, for: id, in: profiles)
-    let found =
-      before.address == address
-      ? nil : try await identifyCoordinator(at: address, transport: transport)
-    // Another add or edit may have saved while the probe was out.
-    try CoordinatorProfile.checkName(name, for: id, in: profiles)
-    var next = profiles
-    guard let index = next.firstIndex(where: { $0.id == id }) else { return }
-    next[index].name = name
-    next[index].address = address
-    if let found { _ = try CoordinatorProfile.admit(found, for: id, in: &next) }
-    try save(next)
-    profiles = next
-    guard found != nil, next[index].pin != nil else { return }
-    let hold = chat.lanes.first { $0.id == id }?.hold
-    await chat.detach(id)
-    chat.attach(lane(next[index], hold: hold))
-    if active { await chat.lanes.first { $0.id == id }?.session?.connect() }
+    try await serially {
+      guard let index = profiles.firstIndex(where: { $0.id == id }) else { return }
+      try CoordinatorProfile.checkName(name, for: id, in: profiles)
+      let found =
+        profiles[index].address == address
+        ? nil : try await identifyCoordinator(at: address, transport: transport)
+      var next = profiles
+      next[index].name = name
+      next[index].address = address
+      if let found { _ = try CoordinatorProfile.admit(found, for: id, in: &next) }
+      try save(next)
+      profiles = next
+      guard found != nil, next[index].pin != nil else { return }
+      let hold = chat.lanes.first { $0.id == id }?.hold
+      await chat.detach(id)
+      chat.attach(lane(next[index], hold: hold))
+      if active { await chat.lanes.first { $0.id == id }?.session?.connect() }
+    }
   }
 
   /// Remove's confirmation: how many messages it deletes on this phone, queued plus held. A
@@ -163,36 +186,67 @@ public final class Coordinators {
     }
   }
 
-  /// Withdraws alerts while the coordinator can still be reached, quiesces the lane, saves
-  /// `profiles.json`, and only then deletes the profile's files. Refuses while the draft is
-  /// addressed to or restored from it. From its first step nothing can address it again, so a
-  /// draft for it never reaches another coordinator.
+  /// Refuses while the draft is addressed to or restored from the coordinator. Otherwise marks
+  /// it removed, with no await since the check, so nothing addresses it again. Then saves
+  /// `profiles.json` without it and with its pending alert withdrawal in one write, and a failed
+  /// save changes nothing else. Only then withdraws alerts over the still-attached session,
+  /// quiesces the lane and deletes the profile's files.
   func remove(_ id: ProfileID) async throws {
-    guard let profile = profiles.first(where: { $0.id == id }) else { return }
-    let name = profile.name.description
-    let tagged =
-      chat.recipient == nil
-      && Addressing.leadingTags(chat.draft).tags.contains { $0.lowercased() == name.lowercased() }
-    guard chat.recipient != id, chat.restoredFrom?.lane != id, !tagged else {
-      throw SaveRefused(message: "Send or clear the draft for \(name) first.")
+    try await serially {
+      guard let profile = profiles.first(where: { $0.id == id }) else { return }
+      let name = profile.name.description
+      guard !chat.addresses(id) else {
+        throw SaveRefused(message: "Send or clear the draft for \(name) first.")
+      }
+      chat.removed[id] = name
+      let remaining = profiles.filter { $0.id != id }
+      var pending = withdrawals
+      // Only a paired profile ever had a session to enroll alerts over.
+      if let pin = profile.pin {
+        pending.append(PendingWithdrawal(installation: id, address: profile.address, pin: pin))
+      }
+      do {
+        try save(remaining, withdrawals: pending)
+      } catch {
+        chat.removed[id] = nil
+        throw error
+      }
+      withdrawals = pending
+      if await registration?.forget(id) == true { confirmWithdrawal(id, saved: remaining) }
+      await chat.detach(id)
+      pairing.removeValue(forKey: id)?.cancel()
+      profiles = remaining
+      pairingError[id] = nil
+      try directory(id).remove()
     }
-    chat.removed[id] = name
-    await registration?.forget(id)
-    let hold = chat.lanes.first { $0.id == id }?.hold
-    await chat.detach(id)
-    pairing.removeValue(forKey: id)?.cancel()
-    do {
-      try save(profiles.filter { $0.id != id })
-    } catch {
-      chat.removed[id] = nil
-      chat.attach(lane(profile, hold: hold))
-      if active, profile.pin == nil { retryPairing(id) }
-      if active { await chat.lanes.first { $0.id == id }?.session?.connect() }
-      throw error
+  }
+
+  /// Sends a saved withdrawal again over a socket that proves its pin. The record goes once the
+  /// coordinator confirms, or once the address answers as another coordinator, which never
+  /// held this registration.
+  private func retry(_ withdrawal: PendingWithdrawal) {
+    let id = withdrawal.installation
+    withdrawing.removeValue(forKey: id)?.cancel()
+    withdrawing[id] = Task { [weak self, transport] in
+      let confirmed: Bool
+      do {
+        confirmed = try await withdrawal.send(transport: transport)
+      } catch ConnectionError.wrongCoordinator {
+        confirmed = true
+      } catch {
+        confirmed = false
+      }
+      guard confirmed, let self else { return }
+      await self.serially { self.confirmWithdrawal(id, saved: self.profiles) }
     }
-    profiles.removeAll { $0.id == id }
-    pairingError[id] = nil
-    try directory(id).remove()
+  }
+
+  /// Drops a confirmed withdrawal's record. If that save fails the record stays, and the next
+  /// activation finds nothing left to withdraw.
+  private func confirmWithdrawal(_ id: ProfileID, saved profiles: [CoordinatorProfile]) {
+    let rest = withdrawals.filter { $0.installation != id }
+    do { try save(profiles, withdrawals: rest) } catch { return }
+    withdrawals = rest
   }
 
   private func start(_ id: ProfileID) async {
@@ -218,18 +272,36 @@ public final class Coordinators {
     ProfileDirectory(id, applicationSupport: applicationSupport, caches: caches)
   }
 
-  /// Callers save first and assign `profiles` after, so memory never runs ahead of disk.
-  private func save(_ profiles: [CoordinatorProfile]) throws {
+  /// Callers save first and assign after, so memory never runs ahead of disk.
+  private func save(
+    _ profiles: [CoordinatorProfile], withdrawals: [PendingWithdrawal]? = nil
+  ) throws {
     if let failure { throw SaveRefused(message: failure) }
-    try Self.save(profiles, applicationSupport: applicationSupport)
+    try Self.save(
+      SavedProfiles(profiles: profiles, withdrawals: withdrawals ?? self.withdrawals),
+      applicationSupport: applicationSupport)
   }
 }
 
 // MARK: - profiles.json and migration
 
 extension Coordinators {
-  private struct SavedProfiles: Codable {
+  /// What `profiles.json` holds.
+  struct SavedProfiles: Codable, Equatable {
     var profiles: [CoordinatorProfile]
+    /// Alert withdrawals Remove saved that no coordinator has confirmed yet.
+    var withdrawals: [PendingWithdrawal]
+
+    init(profiles: [CoordinatorProfile], withdrawals: [PendingWithdrawal] = []) {
+      self.profiles = profiles
+      self.withdrawals = withdrawals
+    }
+    init(from decoder: any Decoder) throws {
+      let container = try decoder.container(keyedBy: CodingKeys.self)
+      profiles = try container.decode([CoordinatorProfile].self, forKey: .profiles)
+      withdrawals =
+        try container.decodeIfPresent([PendingWithdrawal].self, forKey: .withdrawals) ?? []
+    }
   }
 
   /// Checkpoints after which a test can stop a migration, standing in for a crash.
@@ -241,12 +313,12 @@ extension Coordinators {
   static func migrate(
     defaults: UserDefaults, applicationSupport: URL, caches: URL,
     crash: (MigrationStep) throws -> Void = { _ in }
-  ) throws -> [CoordinatorProfile] {
-    var profiles = try load(applicationSupport: applicationSupport)
+  ) throws -> SavedProfiles {
+    var saved = try load(applicationSupport: applicationSupport)
     guard let host = defaults.string(forKey: "coordinatorAddress") else {
       defaults.removeObject(forKey: "coordinatorPort")
       defaults.removeObject(forKey: "notificationInstallationID")
-      return profiles
+      return saved
     }
     let port = defaults.string(forKey: "coordinatorPort") ?? "43187"
     if let port = UInt16(port.trimmingCharacters(in: .whitespacesAndNewlines)),
@@ -255,12 +327,12 @@ extension Coordinators {
     {
       // Saved before the move, so a quarantined queue always has a profile pointing at it.
       let profile: CoordinatorProfile
-      if let existing = profiles.first(where: { $0.address == address }) {
+      if let existing = saved.profiles.first(where: { $0.address == address }) {
         profile = existing
       } else {
         profile = CoordinatorProfile(name: TagName(defaultFor: address), address: address)
-        profiles.append(profile)
-        try save(profiles, applicationSupport: applicationSupport)
+        saved.profiles.append(profile)
+        try save(saved, applicationSupport: applicationSupport)
       }
       try crash(.profileSaved)
       try quarantineLegacyOutbox(
@@ -277,28 +349,46 @@ extension Coordinators {
     try crash(.markerRemoved)
     defaults.removeObject(forKey: "coordinatorPort")
     defaults.removeObject(forKey: "notificationInstallationID")
-    return profiles
+    return saved
+  }
+
+  /// Deletes every profile directory `profiles.json` does not list, such as the files of a
+  /// Remove that stopped after its save. Anything left is deleted at the next launch.
+  private static func removeUnlisted(
+    _ profiles: [CoordinatorProfile], applicationSupport: URL, caches: URL
+  ) {
+    let listed = Set(profiles.map(\.id.description))
+    let files = FileManager.default
+    for base in [applicationSupport, caches] {
+      let parent = base.appending(path: "Agent/Profiles")
+      let directories =
+        (try? files.contentsOfDirectory(at: parent, includingPropertiesForKeys: nil)) ?? []
+      for directory in directories where !listed.contains(directory.lastPathComponent) {
+        try? files.removeItem(at: directory)
+      }
+    }
   }
 
   private static func url(_ applicationSupport: URL) -> URL {
     applicationSupport.appending(path: "Agent/profiles.json")
   }
 
-  private static func load(applicationSupport: URL) throws -> [CoordinatorProfile] {
+  private static func load(applicationSupport: URL) throws -> SavedProfiles {
     do {
       return try JSONDecoder().decode(
-        SavedProfiles.self, from: Data(contentsOf: url(applicationSupport))
-      ).profiles
-    } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [] }
+        SavedProfiles.self, from: Data(contentsOf: url(applicationSupport)))
+    } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+      return SavedProfiles(profiles: [])
+    }
   }
 
   /// Readable after first unlock, so a launch while locked still knows its coordinators.
-  private static func save(_ profiles: [CoordinatorProfile], applicationSupport: URL) throws {
+  private static func save(_ saved: SavedProfiles, applicationSupport: URL) throws {
     let url = url(applicationSupport)
     try FileManager.default.createDirectory(
       at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
       attributes: [.posixPermissions: 0o700])
-    let data = try JSONEncoder().encode(SavedProfiles(profiles: profiles))
+    let data = try JSONEncoder().encode(saved)
     #if os(iOS)
       try data.write(
         to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])

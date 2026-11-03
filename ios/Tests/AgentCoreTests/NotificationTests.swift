@@ -398,7 +398,7 @@ func notificationATokenDuringForgetEnrollsNothingAfterIt() async throws {
   let release = Task { await coordinator.open() }
   await registration.received(token: String(repeating: "ab", count: 32))
   await release.value
-  await forget.value
+  #expect(await forget.value, "The coordinator confirmed the withdrawal")
   let sent = await coordinator.sent
   let registered = await coordinator.registered
   let installation = "\(profile)"
@@ -433,6 +433,28 @@ func notificationAConnectStartingAfterForgetEnrollsNothing() async {
     #expect(!registration.status(profile).registered)
   }
   #expect(violations == 0, "A connect after forget registered in \(violations) of 10 runs")
+}
+
+/// The withdrawal's reply is lost before the coordinator applies it. `forget` must say so, so
+/// Remove keeps the withdrawal to send again.
+@Test @MainActor
+func notificationForgetReportsAWithdrawalItsCoordinatorNeverConfirmed() async {
+  let profile = ProfileID()
+  let log = ChannelLog()
+  let registration = NotificationRegistration(
+    enabled: true, permission: { true }, register: {}, save: { _ in })
+  await registration.received(token: String(repeating: "ab", count: 32))
+  await registration.connect(
+    NotificationChannel(installation: profile) { request in
+      await log.record(request, on: profile)
+      if case .unregister = request { throw ConnectionError.closed }
+      return .init(configured: true, registered: true)
+    })
+  #expect(registration.status(profile).registered)
+  #expect(await registration.forget(profile) == false)
+  #expect(log.sent[profile]?.last == .unregister(.init(installationId: "\(profile)")))
+  let unlinked = ProfileID()
+  #expect(await registration.forget(unlinked) == false, "No channel confirms nothing")
 }
 
 /// One coordinator's notification controls. After `hold`, the next request waits for `open`.
