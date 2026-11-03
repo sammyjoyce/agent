@@ -1119,7 +1119,8 @@ public actor CoordinatorSession {
     case .idle:
       snapshot.busy = false
       transcript.idle()
-    case .attachment, .toolDetails, .conversations, .notifications, .disconnect, .done: break
+    case .attachment, .toolDetails, .conversations, .notifications, .disconnect, .done, .identity:
+      break
     }
     switch event {
     case .message, .answer, .textDelta, .activity, .notice, .placed:

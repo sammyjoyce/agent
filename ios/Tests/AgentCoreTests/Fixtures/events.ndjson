@@ -524,3 +524,4 @@
 {"type":"notifications","status":{"configured":true,"registered":false}}
 {"type":"notifications","status":{"configured":false,"registered":true}}
 {"type":"done"}
+{"type":"identity","coordinator_id":"example"}

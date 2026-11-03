@@ -80,6 +80,10 @@ pub enum NativeRequest {
     Notifications {
         request: crate::notifications::NotificationRequest,
     },
+    // Valid only as a connection's first frame; `service::handle` answers it
+    // itself. Old coordinators close without a frame, which clients treat as
+    // unidentified.
+    Identify,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -237,6 +241,10 @@ pub enum NativeEvent {
         status: crate::notifications::NotificationStatus,
     },
     Done,
+    // Older apps fail on unknown events, but they never send `Identify`.
+    Identity {
+        coordinator_id: String,
+    },
 }
 
 pub enum Operation {
@@ -329,6 +337,9 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
             }
         }
         NativeRequest::Interrupt => RuntimeCommand::MainInterrupt,
+        NativeRequest::Identify => {
+            anyhow::bail!("Identify must be the first request on a connection")
+        }
         NativeRequest::Notifications { request } => {
             request.validate()?;
             RuntimeCommand::Notifications { request }
