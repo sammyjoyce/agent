@@ -40,6 +40,13 @@ struct Lane {
   let hold: LegacyHold
 }
 
+/// A tag typed at the start of the draft that became the chip. The draft went from `typed` to
+/// `rest`, which lost the tag and its space from the start.
+struct Promotion: Equatable {
+  let typed: String
+  let rest: String
+}
+
 struct HeldMessage: Identifiable, Equatable {
   let lane: ProfileID
   let item: LegacyItem
@@ -98,6 +105,9 @@ final class ChatModel {
   /// The one coordinator the draft goes to, or nil for every paired one. While it is set, the
   /// draft is never read for tags.
   var recipient: ProfileID?
+  /// The latest tag that became the chip, so the composer moves the caret back by exactly what
+  /// the draft lost.
+  private(set) var promotion: Promotion?
   /// Coordinators removed in this process, or being removed, by the name they had. Nothing
   /// addresses one again, and profile IDs are never reused.
   var removed: [ProfileID: String] = [:]
@@ -295,7 +305,9 @@ final class ChatModel {
     let named = profiles.filter { $0.name.description.lowercased() == word.lowercased() }
     guard word.endIndex < draft.endIndex, let match = named.first, named.count == 1 else { return }
     recipient = match.id
+    let typed = draft
     draft = String(draft[draft.index(after: word.endIndex)...])
+    promotion = Promotion(typed: typed, rest: draft)
   }
 
   // MARK: - Send

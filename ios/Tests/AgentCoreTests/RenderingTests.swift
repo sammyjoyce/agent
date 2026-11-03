@@ -957,6 +957,33 @@
         }
       }
 
+      /// The draft's text already starts with "@Work", and the user types "@Work " before it. The
+      /// typed tag becomes the chip, and the caret moves back by exactly the tag the draft lost, so
+      /// it stays before the old "@Work" and the next key lands where the user typed.
+      @MainActor @Test func aTagTypedBeforeTheSameTagLeavesTheCaretAtTheEdit() async throws {
+        try await withComposer { model, box, work in
+          let field = box.draft
+          let original = "@Work invented quotation"
+          model.recipient = work.id
+          model.draft = original
+          try await Task.sleep(for: .milliseconds(250))
+          model.recipient = nil
+          try await Task.sleep(for: .milliseconds(200))
+          field.selectedRange = NSRange(location: 0, length: 0)
+          field.insertText("@Work ")
+          try await Task.sleep(for: .milliseconds(300))
+          print(
+            "IF8-W4 after the tag: text=\(field.text.debugDescription) selection=\(field.selectedRange) chip=\(model.recipient.map(model.name) ?? "none")"
+          )
+          #expect(model.recipient == work.id && field.text == original)
+          #expect(field.selectedRange == NSRange(location: 0, length: 0))
+          field.insertText("Prefix ")
+          try await Task.sleep(for: .milliseconds(200))
+          print("IF8-W4 next key: \(model.draft.debugDescription)")
+          #expect(model.draft == "Prefix " + original)
+        }
+      }
+
       /// "@Work " typed before an existing draft becomes the chip. Undo then never removes text the
       /// user did not just insert, so the draft stays whole, and Undo and Redo keep working for what
       /// the user types next.
