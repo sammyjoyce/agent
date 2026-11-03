@@ -229,6 +229,56 @@ final class ComposerInteractionTests: XCTestCase {
     XCTAssertEqual(composer.value as? String, "Invented oneX line")
   }
 
+  // Work refuses a message to it alone whose text starts with @Personal, and the user restores it.
+  // The chip's ⓧ makes it a message to both, as its hint says, and the restored text stays
+  // literal: one more key promotes nothing, and each coordinator gets the text as it was.
+  func testARestoredTagTextStaysLiteralOnceItsChipIsRemoved() async throws {
+    let (app, work, personal) = try await launchWithWorkAndPersonal()
+    defer { app.terminate() }
+    continueAfterFailure = true
+    await work.rejectSubmits(true)
+    let composer = app.textViews["Message the coordinator"]
+    let line = app.staticTexts["recipientLine"]
+    composer.tap()
+    composer.typeText("@Work ")
+    XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3))
+    let text = "@Personal invented: forward the deck to the auditors"
+    composer.typeText(text)
+    app.buttons["Send message"].tap()
+    let restore = app.buttons["Restore Work's copy to composer"]
+    XCTAssertTrue(restore.waitForExistence(timeout: 10))
+    await work.rejectSubmits(false)
+    restore.tap()
+    XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3))
+    app.buttons["To Work"].tap()
+    let afterRemoval = line.label
+    composer.typeText(".")
+    try await Task.sleep(for: .milliseconds(500))
+    let personalChip = app.buttons["To Personal"].exists
+    print(
+      "IF7-V4[ui] after the chip's ⓧ: line=\(afterRemoval) after one more key: personalChip=\(personalChip) value=\(composer.value as? String ?? "nil") line=\(line.label)"
+    )
+    XCTAssertEqual(afterRemoval, "To Work and Personal")
+    XCTAssertFalse(personalChip, "The restored text became Personal's chip")
+    XCTAssertEqual(composer.value as? String, text + ".")
+    XCTAssertEqual(line.label, "To Work and Personal")
+    // After typeText the keyboard moves the composer. A tap before it settles can miss Send.
+    let send = app.buttons["Send message"]
+    try await Task.sleep(for: .seconds(1))
+    XCTAssertTrue(send.isHittable)
+    send.tap()
+    try await eventually {
+      let toWork = await work.submits()
+      let toPersonal = await personal.submits()
+      return toWork.count == 1 && toPersonal.count == 1
+    }
+    let toWork = await work.submits()
+    let toPersonal = await personal.submits()
+    print("IF7-V4[ui] Work received \(toWork) Personal received \(toPersonal)")
+    XCTAssertEqual(toWork, [text + "."])
+    XCTAssertEqual(toPersonal, [text + "."])
+  }
+
   // Wrapped lines start under the chip. A tap on the second line there places the cursor, as a
   // tap on the same line beyond the chip does, and the recipient stays.
   func testATapOnTheSecondLineUnderTheChipKeepsTheRecipient() async throws {

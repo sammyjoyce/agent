@@ -94,8 +94,10 @@ Mode if requested, then Run.
   its color. Typing `@` offers the saved names. A chosen name, or `@Name`
   followed by a space, becomes a chip in the composer, and the message goes to
   that coordinator only. Without a chip the message goes to every paired
-  coordinator. The line under the field names the recipients, or says why
-  Send is blocked, before you send. After a removal the composer keeps working
+  coordinator. A restored message's text is never read for tags, so removing
+  its chip sends it to every coordinator as it is, and only a tag you type at
+  its start becomes a chip. The line under the field names the recipients, or
+  says why Send is blocked, before you send. After a removal the composer keeps working
   this way with one coordinator left, until the app quits.
   A message to several coordinators is saved
   in each one's outbox under its own input ID before any of them is sent. If

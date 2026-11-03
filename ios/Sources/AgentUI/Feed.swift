@@ -20,11 +20,13 @@ enum Addressing: Equatable {
   /// With two or more saved coordinators, or one once another was `removed`, `chip` names the
   /// one recipient and the text is literal. Without a chip, leading `@Name` tags pick the
   /// recipients and are not sent, a tag naming no saved coordinator blocks Send, and no tag
-  /// means every paired coordinator. With one saved coordinator and none removed the text goes
-  /// as typed. A chip naming no saved coordinator blocks Send however many are saved.
+  /// means every paired coordinator. A `literal` text, such as a restored message, is never read
+  /// for tags, so without a chip it goes to every paired coordinator as it is. With one saved
+  /// coordinator and none removed the text goes as typed. A chip naming no saved coordinator
+  /// blocks Send however many are saved.
   static func parse(
-    _ draft: String, hasAttachments: Bool, chip: ProfileID?, among coordinators: [Coordinator],
-    removed: [ProfileID: String] = [:]
+    _ draft: String, hasAttachments: Bool, chip: ProfileID?, literal: Bool = false,
+    among coordinators: [Coordinator], removed: [ProfileID: String] = [:]
   ) -> Addressing {
     let (tags, rest) = leadingTags(draft)
     func named(_ word: Substring) -> [Coordinator] {
@@ -39,7 +41,7 @@ enum Addressing: Equatable {
     if coordinators.count > 1 || !removed.isEmpty {
       if let chip {
         recipients = coordinators.filter { $0.id == chip }
-      } else if !tags.isEmpty {
+      } else if !literal, !tags.isEmpty {
         var tagged: Set<ProfileID> = []
         for word in tags {
           guard !word.isEmpty else { return .blocked("Choose a coordinator") }

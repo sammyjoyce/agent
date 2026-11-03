@@ -3309,3 +3309,96 @@ func restoreLeavesADraftAddressedElsewhereMeanwhileAlone() async throws {
     #expect(try queuedRequests(outbox).contains { $0.inputId == original.inputId })
   }
 }
+
+// MARK: - A restored draft's text is never a tag
+
+/// Sends `text` with a file to Work alone, which refuses the file, and restores it. Returns
+/// Work's original.
+@MainActor private func restoreWorkOnlyMessage(
+  _ chat: ChatModel, _ workFixture: FixtureCoordinator, _ text: String, root: URL
+) async throws -> NativeRequestSubmit {
+  let work = try #require(chat.profiles.first?.id)
+  await workFixture.refuseUploads()
+  chat.recipient = work
+  chat.draft = text
+  await chat.attach(
+    data: Data("Invented: Work board deck".utf8), name: "Deck.txt", mediaType: "text/plain")
+  await chat.send()
+  try await eventually("Work refused it") {
+    chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+  }
+  let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+  let original = try #require(try queuedRequests(outbox).first)
+  await chat.restore(original.inputId)
+  return original
+}
+
+private let restoredTagTexts = [
+  "@Personal invented: forward Work's board deck to the auditors", "@Pers",
+]
+
+/// Work refuses a message the user sent it alone, whose text starts with a tag, and the user
+/// restores it. The chip's ⓧ makes it a message to every coordinator, as the ⓧ's hint says, and
+/// the restored text stays literal. The line reads "To Work and Personal", no picker opens, a key
+/// typed at its end promotes nothing, and each coordinator gets the text as it was.
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: restoredTagTexts)
+func aRestoredDraftsTextStaysLiteralOnceItsChipIsRemoved(_ text: String) async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let original = try await restoreWorkOnlyMessage(chat, workFixture, text, root: root)
+    let tag = text == "@Pers" ? "lone tag" : "tag and text"
+    print(
+      "IF7-V4[\(tag)] restored: chip=\(chat.shownChip.map(chat.name) ?? "none") line=\(chat.recipientLine)"
+    )
+    // The chip's ⓧ, whose hint reads "Removes the recipient, so the message goes to every
+    // coordinator."
+    chat.recipient = nil
+    print(
+      "IF7-V4[\(tag)] after the chip's ⓧ: line=\(chat.recipientLine) picker=\(chat.pickerMatches.map(\.name.description))"
+    )
+    #expect(chat.recipientLine == "To Work and Personal")
+    #expect(chat.pickerMatches.isEmpty, "The picker offers to replace the restored text")
+    #expect(!chat.addresses(personal), "A tag in Work's restored text holds Personal's Remove")
+    chat.draft += "."
+    chat.promoteTypedTag()
+    print(
+      "IF7-V4[\(tag)] after one more key: chip=\(chat.recipient.map(chat.name) ?? "none") line=\(chat.recipientLine) draft=\(chat.draft.debugDescription)"
+    )
+    #expect(chat.recipient == nil && chat.draft == text + ".")
+    #expect(chat.addressing == .to([work, personal], body: text + "."))
+    await workFixture.acceptUploads()
+    await chat.send()
+    _ = await within(3) { await workFixture.count() + personalFixture.count() == 2 }
+    let workGot = await submits(workFixture).map(\.text)
+    let personalGot = await submits(personalFixture)
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    print(
+      "IF7-V4[\(tag)] Work received \(workGot) Personal received \(personalGot.map(\.text)) files=\(personalGot.flatMap { $0.attachments ?? [] }.map(\.name)) Work's original queued=\(try queuedRequests(outbox).contains { $0.inputId == original.inputId })"
+    )
+    #expect(personalGot.isEmpty || !workGot.isEmpty, "Only Personal got Work's restored message")
+    #expect(workGot == [text + "."] && personalGot.map(\.text) == [text + "."])
+  }
+}
+
+/// The same restored draft. After the chip's ⓧ the user types "@Work " at its start, and that tag
+/// still becomes the chip, with the restored text after it, literal.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aTagTypedAtTheStartOfARestoredDraftStillBecomesTheChip() async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    let (work, _) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let text = "@Personal invented: forward Work's board deck to the auditors"
+    _ = try await restoreWorkOnlyMessage(chat, workFixture, text, root: root)
+    chat.recipient = nil
+    for (offset, character) in "@Work ".enumerated() {
+      chat.draft.insert(character, at: chat.draft.index(chat.draft.startIndex, offsetBy: offset))
+      chat.promoteTypedTag()
+    }
+    print(
+      "IF7-V4[typed at the start] chip=\(chat.recipient.map(chat.name) ?? "none") line=\(chat.recipientLine) draft=\(chat.draft.debugDescription)"
+    )
+    #expect(chat.recipient == work && chat.draft == text)
+    #expect(chat.recipientLine == "To Work" && chat.addressing == .to([work], body: text))
+  }
+}

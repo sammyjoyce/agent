@@ -89,7 +89,14 @@ final class ChatModel {
   /// Coordinators removed in this process, or being removed, by the name they had. Nothing
   /// addresses one again, and profile IDs are never reused.
   var removed: [ProfileID: String] = [:]
-  var draft = "" { didSet { forgetClearedSource() } }
+  var draft = "" {
+    didSet {
+      draftBeforeEdit = oldValue
+      forgetClearedSource()
+    }
+  }
+  /// The draft before its latest change, so a restored draft promotes only a tag just typed.
+  @ObservationIgnored private var draftBeforeEdit = ""
   var attachments: [LocalAttachment] = [] { didSet { forgetClearedSource() } }
   private(set) var held: [HeldMessage] = []
   private(set) var heldError: String?
@@ -228,7 +235,8 @@ final class ChatModel {
   /// by a typed tag with its name.
   func addresses(_ id: ProfileID) -> Bool {
     if recipient == id || restoredFrom?.lane == id { return true }
-    guard recipient == nil, let name = profiles.first(where: { $0.id == id })?.name.description
+    guard recipient == nil, restoredFrom == nil,
+      let name = profiles.first(where: { $0.id == id })?.name.description
     else { return false }
     return Addressing.leadingTags(draft).tags.contains { $0.lowercased() == name.lowercased() }
   }
@@ -238,8 +246,9 @@ final class ChatModel {
     if let source = restoredFrom?.lane, let name = removed[source] {
       return .blocked("\(name) was removed")
     }
+    // A restored message's text is never a tag, whatever its chip (DESIGN-REVIEW A2).
     return Addressing.parse(
-      text, hasAttachments: hasAttachments, chip: chip,
+      text, hasAttachments: hasAttachments, chip: chip, literal: restoredFrom != nil,
       among: lanes.filter { removed[$0.id] == nil }.map {
         .init(
           id: $0.id, name: name($0.id), paired: $0.session != nil, connected: connected($0.id))
@@ -254,9 +263,10 @@ final class ChatModel {
     }
   }
 
-  /// Saved coordinators matching an `@` still being typed, for the picker above the composer.
+  /// Saved coordinators matching an `@` still being typed, for the picker above the composer. A
+  /// restored draft offers none, since choosing one replaces the draft.
   var pickerMatches: [CoordinatorProfile] {
-    guard addressesByName, recipient == nil, draft.first == "@",
+    guard addressesByName, recipient == nil, restoredFrom == nil, draft.first == "@",
       !draft.contains(where: \.isWhitespace)
     else { return [] }
     let typed = draft.dropFirst().lowercased()
@@ -272,12 +282,15 @@ final class ChatModel {
   }
 
   /// A complete leading tag followed by a space becomes the chip, and the text after it is
-  /// never read for tags. The composer calls this after each edit.
+  /// never read for tags. The composer calls this after each edit. In a restored draft only a tag
+  /// the user just finished typing at its start counts, never the restored text's own.
   func promoteTypedTag() {
     guard addressesByName, recipient == nil, draft.first == "@" else { return }
     let word = draft.dropFirst().prefix { !$0.isWhitespace }
     let named = profiles.filter { $0.name.description.lowercased() == word.lowercased() }
     guard word.endIndex < draft.endIndex, let match = named.first, named.count == 1 else { return }
+    let tag = draft[...word.endIndex]
+    guard restoredFrom == nil || !draftBeforeEdit.hasPrefix(tag) else { return }
     recipient = match.id
     draft = String(draft[draft.index(after: word.endIndex)...])
   }
