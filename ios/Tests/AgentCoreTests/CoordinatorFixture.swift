@@ -88,6 +88,17 @@ actor FixtureCoordinator {
   private var sockets: [NWConnection] = []
   private var requests: [NativeRequest] = []
   private var dropsIdentify = false
+  private var holdsIdentity = false
+  /// Set once an `identify` arrived and its answer was held.
+  private(set) var identityHeld = false
+  private var identityRelease: CheckedContinuation<Void, Never>?
+  /// Holds the answer to the next `identify` until `releaseIdentity`, as a slow proof would.
+  func holdNextIdentity() { holdsIdentity = true }
+  func releaseIdentity() {
+    holdsIdentity = false
+    identityRelease?.resume()
+    identityRelease = nil
+  }
   /// Every request any socket carried, in arrival order.
   func received() -> [NativeRequest] { requests }
   /// Behaves like a coordinator built before identities. It closes on `identify` without a frame.
@@ -106,6 +117,7 @@ actor FixtureCoordinator {
   func count() -> Int { submissions.count }
   func stop() {
     releaseHistory()
+    releaseIdentity()
     for socket in sockets { socket.cancel() }
     sockets = []
   }
@@ -137,6 +149,11 @@ actor FixtureCoordinator {
       requests.append(value.request)
       switch value.request {
       case .identify:
+        if holdsIdentity {
+          holdsIdentity = false
+          identityHeld = true
+          await withCheckedContinuation { identityRelease = $0 }
+        }
         if dropsIdentify {
           socket.cancel()
           return

@@ -112,6 +112,9 @@ final class ChatModel {
   /// True with two or more saved coordinators, when the feed names them and the composer
   /// addresses them.
   var multiple: Bool { profiles.count > 1 }
+  /// True while the composer names who gets the draft: with two or more saved coordinators, or
+  /// once one was removed. With one saved and none removed it works as on `main`.
+  var addressesByName: Bool { multiple || !removed.isEmpty }
 
   func name(_ id: ProfileID) -> String {
     profiles.first { $0.id == id }?.name.description ?? removed[id] ?? "Coordinator"
@@ -135,7 +138,6 @@ final class ChatModel {
     }
     if let session = lane.session {
       snapshots[lane.id] = nil
-      if !multiple { error = nil }
       refresh()
       observations[lane.id] = observe(session, lane: lane.id)
     }
@@ -143,19 +145,22 @@ final class ChatModel {
   }
 
   /// Retires the lane's session, then drops the lane. Every session that is not in a lane is
-  /// retired, so nothing connects, sends or writes the profile's directory through it again.
+  /// retired, so nothing connects, sends or writes the profile's directory through it again. The
+  /// composer names what the retirement cancelled before it left the phone.
   func detach(_ id: ProfileID) async {
-    await lanes.first { $0.id == id }?.session?.retire()
-    guard let index = lanes.firstIndex(where: { $0.id == id }) else { return }
-    let lane = lanes.remove(at: index)
-    observations.removeValue(forKey: id)?.cancel()
-    registration?.disconnect(id)
-    held.removeAll { $0.lane == id }
-    if lane.session != nil {
-      snapshots[id] = nil
-      if !multiple { error = nil }
-      refresh()
+    let cancelled = await lanes.first { $0.id == id }?.session?.retire() ?? []
+    if let index = lanes.firstIndex(where: { $0.id == id }) {
+      let lane = lanes.remove(at: index)
+      observations.removeValue(forKey: id)?.cancel()
+      registration?.disconnect(id)
+      held.removeAll { $0.lane == id }
+      if lane.session != nil {
+        snapshots[id] = nil
+        if !multiple { error = nil }
+        refresh()
+      }
     }
+    report(cancelled.compactMap { input in missed(id, input, .retired).map { (id, input, $0) } })
   }
 
   /// Reads each lane again after every await, so a lane detached meanwhile is skipped.
@@ -306,6 +311,8 @@ final class ChatModel {
       return
     }
     let sendID = UUID().uuidString
+    // Cleared before staging, so what a retirement cancels during this Send stays named.
+    error = nil
     var staged: [(id: ProfileID, session: CoordinatorSession, input: StagedInput)] = []
     for id in recipients {
       guard let session = lanes.first(where: { $0.id == id })?.session,
@@ -313,34 +320,26 @@ final class ChatModel {
           body, mode: mode, files: files, sendID: sendID, recipients: recipients)
       else {
         for item in staged { await item.session.unstage(item.input) }
-        if multiple { error = "Nothing was sent. \(name(id)) did not take the message." }
+        // With one coordinator saved and none removed, its own reason is the composer's error.
+        if removed[id] != nil {
+          report("Nothing was sent. " + Missed.removed.sentence([name(id)], "this message"))
+        } else if addressesByName {
+          report("Nothing was sent. \(name(id)) did not take the message.")
+        }
         return
       }
       staged.append((id, session, input))
     }
-    // The session of a lane detached meanwhile is retired, so it sends nothing. Its durable item
-    // stays queued for its profile, and a control it did not send is named with the others.
-    var missed: [ProfileID] = []
+    var misses: [(ProfileID, StagedInput, Missed)] = []
     for item in staged {
-      if await !item.session.start(item.input) { missed.append(item.id) }
-    }
-    error = nil
-    if !missed.isEmpty {
-      let command = body.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? body
-      let gone = missed.filter { removed[$0] != nil }
-      let offline = missed.filter { removed[$0] == nil }
-      func missedBy(_ ids: [ProfileID], _ one: String, _ many: String) -> String? {
-        ids.isEmpty
-          ? nil
-          : "\(joinedNames(ids.map(name))) did not get \(command). \(ids.count == 1 ? one : many)"
+      let outcome = await item.session.start(item.input)
+      if let why = missed(item.id, item.input, outcome) {
+        misses.append((item.id, item.input, why))
       }
-      error = [
-        missedBy(offline, "It is not connected.", "They are not connected."),
-        missedBy(gone, "It was removed.", "They were removed."),
-      ].compactMap { $0 }.joined(separator: " ")
-      // Nothing went, so the draft stays for another try.
-      guard missed.count < staged.count else { return }
     }
+    report(misses)
+    // Nothing went, so the draft stays for another try.
+    guard misses.count < staged.count else { return }
     if draft == text {
       draft = ""
       if recipient == chip { recipient = nil }
@@ -352,6 +351,53 @@ final class ChatModel {
       for file in files { try? await store.remove(file) }
     }
     if let source { await remove(source) }
+  }
+
+  /// Why a coordinator did not get an input of a Send.
+  private enum Missed {
+    case notConnected, removed, readdressed
+
+    /// "Work did not get /status. It was removed."
+    func sentence(_ names: [String], _ what: String) -> String {
+      let one = names.count == 1
+      let reason =
+        switch self {
+        case .notConnected: one ? "It is not connected." : "They are not connected."
+        case .removed: one ? "It was removed." : "They were removed."
+        case .readdressed: one ? "Its address changed." : "Their addresses changed."
+        }
+      return "\(joinedNames(names)) did not get \(what). \(reason)"
+    }
+  }
+
+  /// Why `lane` did not get `input`, or nil if it did or still will. A retired session's durable
+  /// input stays in its outbox, which an address edit keeps for the new session and Remove deletes.
+  private func missed(_ lane: ProfileID, _ input: StagedInput, _ outcome: StartOutcome) -> Missed? {
+    switch outcome {
+    case .started: nil
+    case .notSent: .notConnected
+    case .retired where removed[lane] != nil: .removed
+    case .retired: input.command == nil ? nil : .readdressed
+    }
+  }
+
+  /// Names each coordinator that did not get an input, and why, after what the composer already
+  /// says. A control is named by its command, anything else as "this message".
+  private func report(_ misses: [(lane: ProfileID, input: StagedInput, why: Missed)]) {
+    var groups: [(why: Missed, what: String, names: [String])] = []
+    for miss in misses {
+      let name = name(miss.lane)
+      let what = miss.input.command ?? "this message"
+      if let index = groups.firstIndex(where: { $0.why == miss.why && $0.what == what }) {
+        if !groups[index].names.contains(name) { groups[index].names.append(name) }
+      } else {
+        groups.append((miss.why, what, [name]))
+      }
+    }
+    for group in groups { report(group.why.sentence(group.names, group.what)) }
+  }
+  private func report(_ sentence: String) {
+    error = error.map { "\($0) \(sentence)" } ?? sentence
   }
 
   // MARK: - Restore

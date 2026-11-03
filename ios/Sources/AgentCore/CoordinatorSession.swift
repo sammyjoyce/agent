@@ -78,6 +78,21 @@ public struct StagedInput: Sendable, Equatable {
   let profile: ProfileID
   /// A control command is not durable, so it waits here instead of in the outbox.
   let control: NativeRequestSubmit?
+  /// A control's command, such as `/status`, or nil for an input the outbox keeps.
+  public var command: String? {
+    control.map { $0.text.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? $0.text }
+  }
+}
+
+/// What `start` did with a staged input.
+public enum StartOutcome: Sendable, Equatable {
+  /// It is on its way. A durable one may instead wait in the outbox for this lane or for Check.
+  case started
+  /// A control that cannot go now. It is saved nowhere, so it is not sent at all.
+  case notSent
+  /// This session was retired first and sent nothing. A durable input stays in the outbox, for the
+  /// profile's next session or for Remove to delete.
+  case retired
 }
 
 /// Owns all network work, decoding, rendering preparation and the on-device outbox.
@@ -111,6 +126,8 @@ public actor CoordinatorSession {
   /// Durable inputs this process staged that have not left the phone. Only a staged one can be
   /// unstaged. A started one waits for this lane to connect, then sends once.
   private var unsent: [String: Unsent] = [:]
+  /// Started inputs whose exchange has not written them to the coordinator yet, by action.
+  private var unwritten: [(action: UUID, input: StagedInput)] = []
   private var attemptedInputs: Set<String> = []
   /// Set for good by `retire`. A retired session never connects, sends or writes again.
   private var retired = false
@@ -181,10 +198,19 @@ public actor CoordinatorSession {
 
   /// Ends this session when its lane leaves the feed, before its profile's files may be deleted.
   /// It disconnects, and whoever still holds it, it never connects, sends or writes its
-  /// directory again.
-  public func retire() async {
+  /// directory again. Returns, once, the started inputs it cancels before they left the phone:
+  /// durable ones waiting for this lane, and any an exchange had not written yet. A staged input
+  /// that was not started is its sender's to report, since `start` then answers `.retired`.
+  @discardableResult public func retire() async -> [StagedInput] {
+    guard !retired else { return [] }
     retired = true
+    let waiting = pending.filter { unsent[$0.request.inputId] == .waiting }.map { staged($0) }
+    let cancelled = waiting + unwritten.map(\.input)
     await disconnect()
+    return cancelled
+  }
+  private func staged(_ item: OutboxItem) -> StagedInput {
+    StagedInput(inputID: item.request.inputId, sendID: item.sendID, profile: profile, control: nil)
   }
   private func disconnect(generation: UUID) async {
     self.generation = generation
@@ -194,6 +220,7 @@ public actor CoordinatorSession {
     flush = nil
     for action in actions.values { action.cancel() }
     actions = [:]
+    unwritten = []
     historyAction = nil
     let ownedConnections = Array(actionConnections.values) + [connection].compactMap { $0 }
     actionConnections = [:]
@@ -301,34 +328,32 @@ public actor CoordinatorSession {
 
   /// Sends a staged input on this coordinator's own verified socket. While this lane is not
   /// connected, a durable one waits and goes once it connects. One this session is too busy to
-  /// send stays queued as unconfirmed, for Check. A control is saved nowhere, so one that cannot
-  /// go now is not sent at all, and this returns false. A retired session sends nothing, and a
-  /// durable input stays in the outbox for the profile's next session or for Remove to delete.
-  @discardableResult public func start(_ staged: StagedInput) -> Bool {
-    guard staged.profile == profile else { return false }
-    guard !retired else { return staged.control == nil }
+  /// send stays queued as unconfirmed, for Check.
+  @discardableResult public func start(_ staged: StagedInput) -> StartOutcome {
+    guard staged.profile == profile else { return .notSent }
+    guard !retired else { return .retired }
     if staged.control == nil {
-      guard unsent[staged.inputID] == .staged else { return true }
+      guard unsent[staged.inputID] == .staged else { return .started }
       guard snapshot.connection == .connected else {
         unsent[staged.inputID] = .waiting
-        return true
+        return .started
       }
       unsent[staged.inputID] = nil
     }
     guard actions.count < 32, snapshot.connection == .connected else {
-      guard staged.control == nil else { return false }
+      guard staged.control == nil else { return .notSent }
       transcript.delivery(staged.inputID, .uncertain)
       publish()
-      return true
+      return .started
     }
     if let control = staged.control {
-      perform(.submit(control))
+      perform(.submit(control), sending: staged)
     } else if let item = pending.first(where: { $0.request.inputId == staged.inputID }) {
-      perform(.submit(item.request), inputID: staged.inputID)
+      perform(.submit(item.request), inputID: staged.inputID, sending: staged)
     }
     snapshot.error = nil
     publish()
-    return true
+    return .started
   }
 
   /// Withdraws a staged input that never started: its outbox item, its row, and the stored
@@ -530,7 +555,7 @@ public actor CoordinatorSession {
             identityFailure = nil
             for item in pending where unsent[item.request.inputId] == .waiting {
               unsent[item.request.inputId] = nil
-              perform(.submit(item.request), inputID: item.request.inputId)
+              perform(.submit(item.request), inputID: item.request.inputId, sending: staged(item))
             }
           }
           if case .done = event { throw ConnectionError.closed }
@@ -574,9 +599,13 @@ public actor CoordinatorSession {
     default: break
     }
   }
-  private func perform(_ request: NativeRequest, inputID: String? = nil) {
+  /// Runs `request` on its own socket. `sending` is the started input it writes, if any.
+  private func perform(
+    _ request: NativeRequest, inputID: String? = nil, sending: StagedInput? = nil
+  ) {
     let id = UUID()
     let generation = generation
+    if let sending { unwritten.append((id, sending)) }
     actions[id] = Task { [weak self] in
       _ = await self?.exchange(
         id: id, request: request, inputID: inputID, generation: generation)
@@ -614,6 +643,7 @@ public actor CoordinatorSession {
     var failed = false
     defer {
       if historyAction?.id != id { actions.removeValue(forKey: id) }
+      unwritten.removeAll { $0.action == id }
       transcript.abandonHistory(id)
     }
     do {
@@ -633,6 +663,7 @@ public actor CoordinatorSession {
       try Task.checkCancellation()
       guard self.generation == generation else { throw CancellationError() }
       if let inputID { attemptedInputs.insert(inputID) }
+      unwritten.removeAll { $0.action == id }
       try await timedSend(stream, request)
       while !Task.isCancelled {
         let event = try await timedNext(stream)

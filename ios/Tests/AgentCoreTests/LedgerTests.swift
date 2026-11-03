@@ -541,6 +541,7 @@ func stagingSendsNothingAndUnstagingLeavesNoTrace() async throws {
 
 /// Remove retires a session before it deletes the profile's files. Whoever still holds the
 /// session, it never connects, sends a waiting input or a control, or writes the directory again.
+/// Retiring returns, once, the started input it cancelled before it left the phone.
 @Test(.timeLimit(.minutes(1)))
 func aRetiredSessionNeverConnectsSendsOrWritesAgain() async throws {
   try await withProfile { fixture, directory, launch in
@@ -553,14 +554,15 @@ func aRetiredSessionNeverConnectsSendsOrWritesAgain() async throws {
     let control = try #require(
       await session.stage("/status", sendID: "send-9", recipients: [directory.profile]))
     await session.disconnect()
-    #expect(await session.start(waiting), "It waits for its lane to connect")
-    await session.retire()
+    #expect(await session.start(waiting) == .started, "It waits for its lane to connect")
+    #expect(await session.retire() == [waiting])
+    #expect(await session.retire().isEmpty, "Once")
     let requests = await fixture.received().count
     await session.connect()
     try await Task.sleep(for: .seconds(1))
     #expect(await fixture.received().count == requests, "Nothing dials the coordinator again")
-    #expect(await session.start(control) == false, "A control it did not send is reported")
-    #expect(await session.start(waiting), "Only a control is reported")
+    #expect(await session.start(control) == .retired, "Its sender names what it did not send")
+    #expect(await session.start(waiting) == .retired)
     try directory.remove()
     #expect(
       await session.stage("Invented: one more", sendID: "send-10", recipients: [directory.profile])

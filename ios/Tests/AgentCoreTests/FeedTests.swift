@@ -1235,7 +1235,7 @@ func anActivationDuringRemoveNeverSendsTheMessageRemoveDeletes() async throws {
     let staged = try #require(
       await session.stage(text, sendID: UUID().uuidString, recipients: [personal]))
     await session.disconnect()
-    #expect(await session.start(staged))
+    #expect(await session.start(staged) == .started)
     #expect(
       await coordinators.removalMessage(personal)
         == "This deletes 1 queued message on this phone.")
@@ -1919,5 +1919,141 @@ func aControlDuringRemoveNamesTheRemovedCoordinatorItSkipped() async throws {
     #expect(chat.draft.isEmpty, "Personal got it")
     let outbox = ProfileDirectory(personal, applicationSupport: root, caches: root).outbox
     #expect((try? queuedRequests(outbox))?.isEmpty ?? true, "A control is never queued")
+  }
+}
+
+// MARK: - A retired session's Send inputs that never left the phone are named
+
+/// A message to both while Work is removed. Both start on the main actor in this order, so Remove
+/// retires Work's session between Work's stage and its start, and deletes Work's copy with its
+/// profile. If Work got nothing, the composer says so and why.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aMessageDuringRemoveNamesTheRemovedCoordinatorItDidNotReach() async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, _ in
+    let (work, _) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let text = "Invented: ship the quarterly report"
+    chat.draft = text
+    let sending = Task { @MainActor in await chat.send() }
+    let removing = Task { @MainActor in try await coordinators.remove(work) }
+    await sending.value
+    try await removing.value
+    try await Task.sleep(for: .milliseconds(300))
+    let atWork = await submits(workFixture).map(\.text)
+    let atPersonal = await submits(personalFixture).map(\.text)
+    print(
+      "IF5-S1-A Work=\(atWork) Personal=\(atPersonal) error=\(chat.error ?? "nil") draft=\(chat.draft.debugDescription)"
+    )
+    #expect(atPersonal == [text])
+    if atWork.isEmpty {
+      #expect(
+        chat.error == "Work did not get this message. It was removed.",
+        "Work got nothing, and the error says \(chat.error ?? "nothing")")
+    }
+  }
+}
+
+/// The same race removing Personal, the second recipient. Remove can finish before Personal's
+/// stage, and then nothing is sent. The composer says so and names Personal, though only one
+/// coordinator is left.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aMessageDuringRemoveOfItsSecondRecipientNamesIt() async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, _ in
+    let (_, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let text = "Invented: water the plants on Friday"
+    chat.draft = text
+    let sending = Task { @MainActor in await chat.send() }
+    let removing = Task { @MainActor in try await coordinators.remove(personal) }
+    await sending.value
+    try await removing.value
+    try await Task.sleep(for: .milliseconds(300))
+    let atWork = await submits(workFixture).map(\.text)
+    let atPersonal = await submits(personalFixture).map(\.text)
+    print(
+      "IF5-S1-B Work=\(atWork) Personal=\(atPersonal) error=\(chat.error ?? "nil") draft=\(chat.draft.debugDescription)"
+    )
+    if atPersonal.isEmpty {
+      #expect(
+        chat.error?.contains("Personal did not get this message. It was removed.") == true,
+        "Personal got nothing, and the error says \(chat.error ?? "nothing")")
+    }
+    if atWork.isEmpty {
+      #expect(chat.error == "Nothing was sent. Personal did not get this message. It was removed.")
+      #expect(chat.draft == text, "Nothing went, so the draft stays")
+    }
+  }
+}
+
+/// A Send to both whose socket to Work is still proving Work's identity when Remove retires Work's
+/// session. Personal got it, and the composer names what Work did not get.
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: ["/status", "Invented: renew the lease"])
+func aSendRemovedDuringItsIdentityProofNamesTheCoordinatorItDidNotReach(_ draft: String)
+  async throws
+{
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, _ in
+    let (work, _) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    await workFixture.holdNextIdentity()
+    chat.draft = draft
+    await chat.send()
+    try await eventually("Work's socket waiting for its identity") {
+      await workFixture.identityHeld
+    }
+    try await eventually("Personal got it") { await personalFixture.count() == 1 }
+    try await coordinators.remove(work)
+    await workFixture.releaseIdentity()
+    try await Task.sleep(for: .milliseconds(350))
+    print("IF5-S1-C draft=\(draft) error=\(chat.error ?? "nil")")
+    #expect(await submits(workFixture).isEmpty)
+    #expect(await submits(personalFixture).map(\.text) == [draft])
+    #expect(
+      chat.error
+        == (draft == "/status"
+          ? "Work did not get /status. It was removed."
+          : "Work did not get this message. It was removed."))
+    #expect(chat.draft.isEmpty, "Personal got it")
+  }
+}
+
+/// A Send whose dial to Work is still pending when an edit of Work's address retires Work's
+/// session, with one coordinator saved or two. A control is lost, so the composer names it. A
+/// message stays in Work's outbox for the new session, as any message does, and nothing is said.
+@MainActor
+@Test(
+  .timeLimit(.minutes(1)), arguments: [1, 2], ["/status", "Invented: renew the lease"])
+func aSendWhoseAddressChangesWhileItsDialIsPendingIsNamedOnlyIfLost(saved: Int, draft: String)
+  async throws
+{
+  let gate = DialGate()
+  try await withTwoFixtures(holdingWork: gate) { coordinators, workFixture, personalFixture, root in
+    let work: ProfileID
+    if saved == 2 {
+      work = try await addWorkAndPersonal(coordinators).work
+    } else {
+      try await coordinators.add(
+        name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+      work = try #require(coordinators.profiles.first?.id)
+      try await eventually("Work connected") { coordinators.chat.connection == .connected }
+    }
+    let chat = coordinators.chat
+    await gate.arm()
+    chat.draft = draft
+    await chat.send()
+    try await eventually("Work's dial held") { await gate.waiting }
+    try await coordinators.update(
+      work, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.3", port: 4003))
+    await gate.open()
+    try await Task.sleep(for: .milliseconds(350))
+    print("IF5-S1-D saved=\(saved) draft=\(draft) error=\(chat.error ?? "nil")")
+    #expect(await submits(workFixture).isEmpty)
+    #expect(await submits(personalFixture).map(\.text) == (saved == 2 ? [draft] : []))
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    if draft == "/status" {
+      #expect(chat.error == "Work did not get /status. Its address changed.")
+    } else {
+      #expect(chat.error == nil)
+      #expect(try queuedRequests(outbox).map(\.text) == [draft], "Kept for the new session")
+    }
   }
 }
