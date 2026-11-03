@@ -137,9 +137,10 @@ Mode if requested, then Run.
 - `/feedback` captures the current app window before sending and includes it
   with the report. Failed admission keeps that exact screenshot for retry.
   With more than one coordinator saved nothing is captured, because the feed
-  shows every coordinator's conversation. A kept screenshot, or a restored
-  `Feedback.png` whatever its text says, is sent only while the coordinator it
-  shows is the one saved; otherwise it must be removed before sending.
+  shows every coordinator's conversation. A kept screenshot, or any restored
+  `Feedback.png` whatever its text says, belongs to the coordinator it came from
+  and is sent to that coordinator alone; otherwise it must be removed before
+  sending.
   Pi's existing adapter handles model image input; other files remain available
   to agent tools on the execution host. No provider requests originate on iOS.
 

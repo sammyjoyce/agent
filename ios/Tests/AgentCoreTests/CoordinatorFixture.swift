@@ -100,6 +100,7 @@ actor FixtureCoordinator {
   private var uploads = 0
   private var rejectUploads = false
   func refuseUploads() { rejectUploads = true }
+  func acceptUploads() { rejectUploads = false }
   func uploadCount() -> Int { uploads }
   func uploaded(_ id: String) -> Data? { files[id] }
   func count() -> Int { submissions.count }

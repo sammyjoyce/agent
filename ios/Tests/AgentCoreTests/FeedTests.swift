@@ -1293,3 +1293,87 @@ func aCopyRestoredFromPersonalAndSentToWorkLeavesTheOriginalNotSentToPersonal() 
     #expect(await personalFixture.uploadCount() == 0)
   }
 }
+
+// MARK: - Each file that may show a coordinator's feed is owned by that coordinator
+
+/// A kept automatic screenshot and a chosen file share the name `Feedback.png`. After a restore,
+/// removing the chosen one leaves the screenshot owned by Work, so it never goes to Personal.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aSecondFileNamedFeedbackPngNeverClearsTheScreenshotsOwner() async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+    try await coordinators.add(
+      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    let work = try #require(coordinators.profiles.first?.id)
+    let chat = coordinators.chat
+    try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
+    let directory = ProfileDirectory(work, applicationSupport: root, caches: root)
+    let privateImage = Data("Invented private Work screenshot bytes".utf8)
+    try await withReadOnlyProfile(directory) {
+      chat.draft = "/feedback The Work feed is clipped"
+      await chat.send(screenshot: { privateImage })
+    }
+    try #require(chat.attachments.count == 1)
+    await chat.attach(
+      data: Data("Invented manually attached reference picture".utf8), name: "Feedback.png",
+      mediaType: "image/png")
+    await workFixture.refuseUploads()
+    await chat.send()
+    try await eventually("Work refused the upload") {
+      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+    }
+    let queued = try #require(try queuedRequests(directory.outbox).first)
+    try #require(queued.attachments?.count == 2)
+    try await coordinators.add(
+      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+    try await eventually("both connected") {
+      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+    }
+    await chat.restore(queued.inputId)
+    let automatic = try #require(chat.attachments.first)
+    let chosen = try #require(chat.attachments.last)
+    #expect(try Data(contentsOf: automatic.url) == privateImage)
+    await chat.removeAttachment(chosen)
+    chat.recipient = nil
+    await chat.send()
+    #expect(chat.error?.hasPrefix("Remove the automatic screenshot") == true)
+    try await Task.sleep(for: .milliseconds(350))
+    let atPersonal = await submits(personalFixture)
+    #expect(atPersonal.isEmpty, "Personal received \(atPersonal.map(\.text))")
+    #expect(await personalFixture.uploaded(automatic.id) != privateImage)
+  }
+}
+
+/// A restored `Feedback.png` belongs to the coordinator it came from. Sent to that coordinator
+/// alone it goes, since no other coordinator sees it. Sent to both it is refused.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRestoredFeedbackPngGoesToTheCoordinatorItCameFromAlone() async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+    await workFixture.refuseUploads()
+    let (work, _) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let workDirectory = ProfileDirectory(work, applicationSupport: root, caches: root)
+    chat.recipient = work
+    chat.draft = "Invented ordinary note, not feedback"
+    await chat.attach(
+      data: Data("invented user file bytes".utf8), name: "Feedback.png", mediaType: "image/png")
+    await chat.send()
+    try await eventually("rejected by Work") {
+      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+    }
+    let queued = try #require(try queuedRequests(workDirectory.outbox).first)
+    await chat.restore(queued.inputId)
+    #expect(chat.recipient == work && chat.recipientLine == "To Work")
+    chat.recipient = nil
+    await chat.send()
+    #expect(chat.error?.hasPrefix("Remove the automatic screenshot") == true, "Not to both")
+    chat.recipient = work
+    chat.error = nil
+    await workFixture.acceptUploads()
+    await chat.send()
+    #expect(chat.error == nil)
+    #expect(chat.draft.isEmpty && chat.attachments.isEmpty)
+    try await eventually("Work's copy") { await workFixture.count() == 1 }
+    #expect(await submits(personalFixture).isEmpty)
+    #expect(await personalFixture.uploadCount() == 0)
+  }
+}

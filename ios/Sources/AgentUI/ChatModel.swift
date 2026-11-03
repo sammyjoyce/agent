@@ -92,8 +92,9 @@ final class ChatModel {
   var mode: InputMode = .steer
   private(set) var admitting = false
   @ObservationIgnored private var draftStore: AttachmentStore?
-  /// The draft's automatic screenshot and the one coordinator whose feed it shows.
-  @ObservationIgnored private var feedbackScreenshot: (id: String, profile: ProfileID)?
+  /// Draft files that may show a coordinator's feed, by attachment ID, each with the one
+  /// coordinator it was captured for.
+  @ObservationIgnored private var screenshotOwners: [String: ProfileID] = [:]
   @ObservationIgnored private let registration: NotificationRegistration?
   @ObservationIgnored private(set) var lanes: [Lane] = []
   @ObservationIgnored private var observations: [ProfileID: Task<Void, Never>] = [:]
@@ -275,9 +276,9 @@ final class ChatModel {
     var files = attachments
     do {
       // With two coordinators, a screenshot of the feed would show one's conversation to the other.
-      if profiles.count == 1, let shown = profiles.first?.id,
+      if profiles.count == 1, let shown = profiles.first?.id, lanes.allSatisfy({ $0.id == shown }),
         text.split(whereSeparator: \.isWhitespace).first == "/feedback",
-        feedbackScreenshot == nil, let screenshot
+        !files.contains(where: { screenshotOwners[$0.id] != nil }), let screenshot
       {
         guard files.count < AttachmentLimits.maximumCount else { throw AttachmentError.tooMany }
         // Capture before the composer changes. A failed admission retains this exact image.
@@ -286,23 +287,22 @@ final class ChatModel {
           data: data, name: "Feedback.png", mediaType: "image/png")
         attachments.append(file)
         files.append(file)
-        feedbackScreenshot = (file.id, shown)
+        screenshotOwners[file.id] = shown
       }
     } catch {
       self.error = error.localizedDescription
-      return
-    }
-    if let shot = feedbackScreenshot, files.contains(where: { $0.id == shot.id }),
-      profiles.map(\.id) != [shot.profile]
-    {
-      error =
-        "Remove the automatic screenshot before sending. It could show one coordinator's messages to another."
       return
     }
     guard
       case .to(let recipients, let body) = address(
         text, hasAttachments: !files.isEmpty, chip: chip)
     else { return }
+    // A file that may show one coordinator's feed goes to that coordinator alone.
+    guard files.compactMap({ screenshotOwners[$0.id] }).allSatisfy({ recipients == [$0] }) else {
+      error =
+        "Remove the automatic screenshot before sending. It could show one coordinator's messages to another."
+      return
+    }
     let sendID = UUID().uuidString
     var staged: [(session: CoordinatorSession, input: StagedInput)] = []
     for id in recipients {
@@ -325,7 +325,7 @@ final class ChatModel {
     }
     let sentIDs = Set(files.map(\.id))
     attachments.removeAll { sentIDs.contains($0.id) }
-    if let shot = feedbackScreenshot, sentIDs.contains(shot.id) { feedbackScreenshot = nil }
+    for id in sentIDs { screenshotOwners[id] = nil }
     if let store = draftStore {
       for file in files { try? await store.remove(file) }
     }
@@ -379,8 +379,9 @@ final class ChatModel {
     attachments = restored.attachments
     mode = restored.mode
     // The text may have been edited since capture, so only the file's name marks a screenshot.
-    feedbackScreenshot = restored.attachments.last { $0.reference.name == "Feedback.png" }
-      .map { ($0.id, source.lane) }
+    for file in restored.attachments where file.reference.name == "Feedback.png" {
+      screenshotOwners[file.id] = source.lane
+    }
     restoredFrom = source
   }
   private func forgetClearedSource() {
@@ -465,7 +466,7 @@ final class ChatModel {
   func removeAttachment(_ file: LocalAttachment) async {
     guard !admitting else { return }
     attachments.removeAll { $0.id == file.id }
-    if feedbackScreenshot?.id == file.id { feedbackScreenshot = nil }
+    screenshotOwners[file.id] = nil
     try? await draftStore?.remove(file)
   }
 
