@@ -16,6 +16,8 @@
     let text: String
     let placeholder: String
     let chip: Chip?
+    /// The latest tag that became the chip.
+    let promotion: Promotion?
     let edit: (String) -> Void
     let removeChip: () -> Void
 
@@ -34,31 +36,54 @@
       let view = box.draft
       // The view keeps its own text, so a change made in code, such as Send's clear, is
       // applied here whatever the keyboard last did. The caret keeps its place in the text
-      // around the change, so a tag that became the chip leaves it where the user typed.
+      // around the change. A promoted tag's change is the range the model removed, since the
+      // text alone cannot say which of two equal tags went.
       if view.text != text {
-        let selection = Self.selection(view.selectedRange, from: view.text, to: text)
+        let change =
+          if let promotion, promotion.typed == view.text, promotion.rest == text {
+            (
+              range: NSRange(
+                location: 0, length: promotion.typed.utf16.count - promotion.rest.utf16.count),
+              length: 0
+            )
+          } else {
+            Self.change(from: view.text, to: text)
+          }
+        let selection = Self.selection(
+          view.selectedRange, replacing: change.range, with: change.length)
         view.text = text
         view.selectedRange = selection
+        // The field's undo actions were recorded against the text it had. Applied to this one they
+        // would change characters the user did not just type, such as a body after a promoted tag.
+        view.undoManager?.removeAllActions()
       }
       view.placeholder.text = placeholder
       view.placeholder.isHidden = !text.isEmpty
       box.chip = chip
     }
 
-    /// Where `range` in `old` falls once the text becomes `new`: text before the change and after
-    /// it keeps its place, and a position inside the change goes to its end.
-    static func selection(_ range: NSRange, from old: String, to new: String) -> NSRange {
+    /// The range of `old` a change replaced, and the UTF-16 length of what replaced it, read from
+    /// the text as the part between the longest prefix and suffix `old` and `new` share.
+    static func change(from old: String, to new: String) -> (range: NSRange, length: Int) {
       let head = zip(old, new).prefix { $0 == $1 }.count
       let tail = zip(old.reversed(), new.reversed()).prefix { $0 == $1 }.prefix(
         min(old.count, new.count) - head
       ).count
-      let kept = old.prefix(head).utf16.count
+      let start = old.prefix(head).utf16.count
       let oldEnd = old.utf16.count - old.suffix(tail).utf16.count
       let newEnd = new.utf16.count - new.suffix(tail).utf16.count
+      return (NSRange(location: start, length: oldEnd - start), newEnd - start)
+    }
+
+    /// Where `range` falls once `changed` is replaced by `length` UTF-16 units. Text before and
+    /// after the change keeps its place, and a position inside the change goes to its end.
+    static func selection(_ range: NSRange, replacing changed: NSRange, with length: Int)
+      -> NSRange
+    {
       func moved(_ location: Int) -> Int {
-        if location < kept { return location }
-        if location >= oldEnd { return location - oldEnd + newEnd }
-        return newEnd
+        if location < changed.location { return location }
+        if location >= NSMaxRange(changed) { return location - changed.length + length }
+        return changed.location + length
       }
       let start = moved(range.location)
       return NSRange(location: start, length: max(0, moved(NSMaxRange(range)) - start))
