@@ -413,12 +413,13 @@ public actor CoordinatorSession {
     return RestoredDraft(text: request.text, mode: request.mode, attachments: files)
   }
 
-  /// Removes a restored item once its copy was admitted, with files no other item uses, and
-  /// records it withdrawn. That holds only while the coordinator's latest word is a refusal, so an
-  /// item written again or accepted since stays queued and reconciles as any other. An address
-  /// edit, a reconnect or a cancelled Check / retry in between changes nothing. An attempt that has
-  /// not written it is cancelled. A coordinator may still place an input it refused, so the
-  /// withdrawn input stays watched, and its record follows what the coordinator reports.
+  /// Removes a refused item, once a Send carried its restored copy unchanged or the user discarded
+  /// it, with files no other item uses, and records it withdrawn. That holds only while the
+  /// coordinator's latest word is a refusal, so an item written again or accepted since stays
+  /// queued and reconciles as any other. An address edit, a reconnect or a cancelled Check / retry
+  /// in between changes nothing. An attempt that has not written it is cancelled. A coordinator
+  /// may still place an input it refused, so the withdrawn input stays watched, and its record
+  /// follows what the coordinator reports.
   public func discard(_ inputID: String) {
     guard let item = pending.first(where: { $0.request.inputId == inputID }), item.refused == true
     else { return }

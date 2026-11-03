@@ -398,6 +398,7 @@ public struct MainChatView: View {
       MessageRow(
         model: row, retry: { id in Task { await model.retry(id) } },
         restore: { id in Task { await model.restore(id) } },
+        discard: { id in Task { await model.discard(id) } },
         preview: { file in Task { await model.preview(file, lane: row.lane) } },
         badges: badges)
     case .activity(let group):
@@ -844,8 +845,8 @@ private let coordinatorPalette: [(light: Color, dark: Color)] = [
   (Color(red: 0.49, green: 0.13, blue: 0.81), Color(red: 0.75, green: 0.52, blue: 0.99)),
 ]
 
-/// A message queued before the update. It has no transport. It leaves only by Restore, as a
-/// new message the user sends, or by Discard.
+/// A message queued before the update. It has no transport. It leaves only when the user sends its
+/// restored copy unchanged, or by Discard.
 private struct HeldMessageRow: View {
   let message: HeldMessage
   let restore: () -> Void
@@ -865,15 +866,39 @@ private struct HeldMessageRow: View {
         Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
       Label("Held from before the update. It may already have been delivered.", systemImage: "tray")
         .font(.caption.weight(.medium)).fixedSize(horizontal: false, vertical: true)
-      HStack(spacing: 16) {
-        Button("Restore to composer", systemImage: "arrow.uturn.backward", action: restore)
-        Button("Discard", systemImage: "trash", role: .destructive, action: discard)
-      }
-      .font(.callout).buttonStyle(.plain).frame(minHeight: 44)
+      RestoreAndDiscard(restore: restore, discard: discard)
     }
     .padding(.leading, 32)
     .frame(maxWidth: .infinity, alignment: .trailing)
     .accessibilityElement(children: .contain).accessibilityLabel("Held message")
+  }
+}
+
+/// Restore and Discard for a message that did not reach its coordinator. They share a line when
+/// they fit and stack otherwise, so neither is cut off at large text sizes.
+private struct RestoreAndDiscard: View {
+  let restore: () -> Void
+  let discard: () -> Void
+  /// The coordinator whose copy the buttons act on, named for VoiceOver with two or more.
+  var name: String?
+
+  var body: some View {
+    ViewThatFits(in: .horizontal) {
+      HStack(spacing: 16) { buttons }
+      VStack(alignment: .trailing, spacing: 0) { buttons }
+    }
+    .font(.callout).buttonStyle(.plain)
+  }
+  @ViewBuilder private var buttons: some View {
+    Button(action: restore) {
+      Label("Restore to composer", systemImage: "arrow.uturn.backward")
+        .lineLimit(nil).fixedSize(horizontal: false, vertical: true).frame(minHeight: 44)
+    }
+    .accessibilityLabel(name.map { "Restore \($0)'s copy to composer" } ?? "Restore to composer")
+    Button(role: .destructive, action: discard) {
+      Label("Discard", systemImage: "trash").frame(minHeight: 44)
+    }
+    .accessibilityLabel(name.map { "Discard \($0)'s copy" } ?? "Discard")
   }
 }
 
@@ -899,6 +924,7 @@ struct MessageRow: View {
   let model: RowModel
   let retry: (String) -> Void
   let restore: (String) -> Void
+  let discard: (String) -> Void
   let preview: (AttachmentRef) -> Void
   /// Names and colors with two or more coordinators. Empty draws the one-coordinator row.
   let badges: [ProfileID: CoordinatorBadge]
@@ -907,12 +933,13 @@ struct MessageRow: View {
 
   init(
     model: RowModel, retry: @escaping (String) -> Void, restore: @escaping (String) -> Void,
-    preview: @escaping (AttachmentRef) -> Void = { _ in },
+    discard: @escaping (String) -> Void, preview: @escaping (AttachmentRef) -> Void = { _ in },
     badges: [ProfileID: CoordinatorBadge] = [:]
   ) {
     self.model = model
     self.retry = retry
     self.restore = restore
+    self.discard = discard
     self.preview = preview
     self.badges = badges
   }
@@ -942,7 +969,8 @@ struct MessageRow: View {
     }
   }
   /// Who a Send went to once every recipient placed it, else each recipient's own state with its
-  /// own Check or Restore. A recipient that is no longer saved reads as a removed coordinator.
+  /// own Check, or Restore and Discard. A recipient that is no longer saved reads as a removed
+  /// coordinator.
   @ViewBuilder private var receipt: some View {
     let names = model.receipts.map { badges[$0.lane]?.name ?? "a removed coordinator" }
     if let summary = Receipt.summary(model.receipts, names: names) {
@@ -967,13 +995,7 @@ struct MessageRow: View {
           .accessibilityHint(
             "Checks the original message ID and retries without creating another message.")
         case .pending(.rejected, let id?):
-          Button {
-            restore(id)
-          } label: {
-            Label("Restore to composer", systemImage: "arrow.uturn.backward").frame(minHeight: 44)
-          }
-          .font(.callout).buttonStyle(.plain)
-          .accessibilityLabel("Restore \(badge.name)'s copy to composer")
+          RestoreAndDiscard(restore: { restore(id) }, discard: { discard(id) }, name: badge.name)
         default: EmptyView()
         }
       }
@@ -997,12 +1019,7 @@ struct MessageRow: View {
         "Checks the original message ID and retries without creating another message.")
     }
     if model.row.delivery == .rejected, let id = model.row.inputID {
-      Button {
-        restore(id)
-      } label: {
-        Label("Restore to composer", systemImage: "arrow.uturn.backward")
-          .lineLimit(nil).fixedSize(horizontal: false, vertical: true).frame(minHeight: 44)
-      }.font(.callout).buttonStyle(.plain)
+      RestoreAndDiscard(restore: { restore(id) }, discard: { discard(id) })
     }
   }
   private var isUser: Bool { model.row.role == .user }

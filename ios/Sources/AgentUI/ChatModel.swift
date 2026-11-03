@@ -46,13 +46,25 @@ struct HeldMessage: Identifiable, Equatable {
   var id: String { item.id }
 }
 
-/// Where the composer's restored draft came from. The source stays queued or held until
-/// the draft is admitted, so a draft lost before Send loses nothing.
+/// Where the composer's restored draft came from, and what Restore put in it. The source stays
+/// queued or held until a Send carries that content unchanged, or the user discards it, so nothing
+/// the user did not send is lost.
 struct RestoredSource: Equatable {
   enum Kind { case live, legacy }
   let lane: ProfileID
   let item: String
   let kind: Kind
+  let text: String
+  /// The IDs of the file copies Restore put in the composer.
+  let files: Set<String>
+
+  /// True when a Send of `body` with `sent` files carries this content unchanged, meaning the same
+  /// text, ignoring surrounding whitespace, and every file Restore put in the composer.
+  func isCarried(by body: String, files sent: [LocalAttachment]) -> Bool {
+    body.trimmingCharacters(in: .whitespacesAndNewlines)
+      == text.trimmingCharacters(in: .whitespacesAndNewlines)
+      && files.isSubset(of: sent.map(\.id))
+  }
 }
 
 /// The one feed and the one composer for every saved coordinator.
@@ -383,7 +395,9 @@ final class ChatModel {
     if let store = draftStore {
       for file in files { try? await store.remove(file) }
     }
-    if let source { await remove(source) }
+    guard let source else { return }
+    if restoredFrom == source { restoredFrom = nil }
+    if source.isCarried(by: body, files: files) { await remove(source) }
   }
 
   /// Why a coordinator did not get an input of a Send.
@@ -434,13 +448,13 @@ final class ChatModel {
   // MARK: - Restore
 
   /// Copies a queued input into the composer, addressed to its own coordinator, with its text
-  /// as it was. The input stays queued until the copy is admitted.
+  /// as it was. The input stays queued until a Send carries the copy unchanged.
   func restore(_ inputID: String) async {
     guard let lane = lane(holding: inputID), readyToRestore(from: lane.id) else { return }
     do {
       let store = try attachmentStore()
       guard let restored = await lane.session?.restore(inputID, to: store) else { return }
-      await fill(restored, from: RestoredSource(lane: lane.id, item: inputID, kind: .live), store)
+      await fill(restored, from: lane.id, item: inputID, kind: .live, store)
     } catch { failure = error.localizedDescription }
   }
   func restoreHeld(_ message: HeldMessage) async {
@@ -449,8 +463,7 @@ final class ChatModel {
     do {
       let store = try attachmentStore()
       guard let restored = try await lane.hold.restore(message.id, to: store) else { return }
-      await fill(
-        restored, from: RestoredSource(lane: lane.id, item: message.id, kind: .legacy), store)
+      await fill(restored, from: lane.id, item: message.id, kind: .legacy, store)
     } catch { failure = error.localizedDescription }
   }
   func discardHeld(_ message: HeldMessage) async {
@@ -473,9 +486,10 @@ final class ChatModel {
   /// as on `main`. What the user addressed to another coordinator meanwhile stays as it is, since
   /// the restored message stays its source's, and the copies go.
   private func fill(
-    _ restored: RestoredDraft, from source: RestoredSource, _ store: AttachmentStore
+    _ restored: RestoredDraft, from lane: ProfileID, item: String, kind: RestoredSource.Kind,
+    _ store: AttachmentStore
   ) async {
-    guard (draft.isEmpty && attachments.isEmpty) || recipient == nil || recipient == source.lane
+    guard (draft.isEmpty && attachments.isEmpty) || recipient == nil || recipient == lane
     else {
       failure = "Send or clear the current draft before restoring another message."
       for file in restored.attachments { try? await store.remove(file) }
@@ -486,11 +500,13 @@ final class ChatModel {
     mode = restored.mode
     // The text may have been edited since capture, so only the file's name marks a screenshot.
     for file in restored.attachments where file.reference.name == "Feedback.png" {
-      screenshotOwners[file.id] = source.lane
+      screenshotOwners[file.id] = lane
     }
-    restoredFrom = source
+    restoredFrom = RestoredSource(
+      lane: lane, item: item, kind: kind, text: restored.text,
+      files: Set(restored.attachments.map(\.id)))
     // Last, since an empty restored text clears the draft above, which drops an undrawn recipient.
-    recipient = source.lane
+    recipient = lane
   }
   private func forgetClearedSource() {
     guard draft.isEmpty && attachments.isEmpty else { return }
@@ -498,10 +514,9 @@ final class ChatModel {
     // Only Restore sets a recipient no chip shows, so it goes with the draft it was set for.
     if !addressesByName { recipient = nil }
   }
-  /// Runs after the restored draft was admitted. A lane removed meanwhile took its
+  /// Runs once a Send carried the source's content unchanged. A lane removed meanwhile took its
   /// source with it.
   private func remove(_ source: RestoredSource) async {
-    if restoredFrom == source { restoredFrom = nil }
     guard let lane = lanes.first(where: { $0.id == source.lane }) else { return }
     switch source.kind {
     case .live: await lane.session?.discard(source.item)
@@ -597,6 +612,10 @@ final class ChatModel {
     }
   }
   func retry(_ inputID: String) async { await lane(holding: inputID)?.session?.retry(inputID) }
+  /// Discard on a refused row. Its original leaves the outbox and is recorded withdrawn.
+  func discard(_ inputID: String) async {
+    await lane(holding: inputID)?.session?.discard(inputID)
+  }
   func toolDetails(for row: ChatRow, lane: ProfileID?) async throws -> ToolDetails {
     guard let entryID = row.entryID, let tool = row.tool, let session = session(lane) else {
       throw ConnectionError.closed

@@ -30,12 +30,12 @@
                   ActivityExpansion(groups: [group.id], items: Set(group.rows.map(\.id)))),
                 details: { row in .unavailable(.init(callId: row.tool?.callId ?? "")) })
             case .message(let model):
-              MessageRow(model: model, retry: { _ in }, restore: { _ in })
+              MessageRow(model: model, retry: { _ in }, restore: { _ in }, discard: { _ in })
             }
           }
         } else {
           ForEach(models) { model in
-            MessageRow(model: model, retry: { _ in }, restore: { _ in })
+            MessageRow(model: model, retry: { _ in }, restore: { _ in }, discard: { _ in })
           }
         }
         if let inspection {
