@@ -120,19 +120,20 @@ required for sharing on a phone; an unsigned build does not establish that.
   followed by a space, becomes a chip in the composer, and the message goes to
   that coordinator only. Without a chip the message goes to every paired
   coordinator. A restored message's text is never read for tags, so removing
-  its chip sends it to every coordinator as it is, and only a tag you type at
-  its start becomes a chip. The line under the field names the recipients, or
+  its chip sends it to every coordinator as it is. A tag you type in it stays
+  text, and the picker does not open. The line under the field names the recipients, or
   says why Send is blocked, before you send. After a removal the composer keeps working
   this way with one coordinator left, until the app quits.
   A message to several coordinators is saved
   in each one's outbox under its own input ID before any of them is sent. If
   one refuses it, none keeps it and the draft stays. Its bubble reads "To Work
   and Personal" once every recipient has it. Otherwise it shows each
-  coordinator's delivery with its own **Check / retry** or **Restore**. A
+  coordinator's delivery with its own **Check / retry**, or **Restore** and
+  **Discard**. A
   coordinator with no record of it on this phone reads "Status unknown". The
-  bubble reads "Not sent to Personal" only after you restore Personal's copy and
-  send it, which withdraws the original from Personal's queue. If Personal
-  later reports that it kept the original after all, the bubble reads
+  bubble reads "Not sent to Personal" only after you discard Personal's copy, or
+  restore it and send it unchanged, which withdraws the original from Personal's
+  queue. If Personal later reports that it kept the original after all, the bubble reads
   "Personal · Sent", then "Personal · Delivered" once it is placed.
   Commands are never queued, so one a coordinator did not get because its
   connection dropped, or because you removed it meanwhile, is named under the
@@ -174,9 +175,14 @@ required for sharing on a phone; an unsigned build does not establish that.
   addressed to its own coordinator. Text you type or files you attach while it
   copies the files stay, after the restored message. If you pick another
   coordinator meanwhile, Restore leaves your draft alone. The app removes the
-  original only after you send the restored message, and only while its
-  coordinator still refuses it. The refusal is saved with the queued message until it is sent
-  again, so a reconnect, an address edit or a relaunch keeps it. If the phone
+  original only when you send the restored message unchanged, with the same text
+  and every restored file, and only while its coordinator still refuses it. If
+  you send something else instead, the original stays and still needs
+  attention, and **Discard** removes it. The refusal is saved with the queued
+  message until it is sent again, so after a reconnect, an address edit or a
+  relaunch the message still needs attention, with **Restore** and **Discard**
+  rather than **Check / retry**, until its coordinator reports it accepted or
+  placed. If the phone
   cannot save it, the app still follows the coordinator's latest word until it
   quits. A **Check / retry** of the original that has not left the phone when
   you send the copy is cancelled. Each connection asks the coordinator about
@@ -197,9 +203,10 @@ required for sharing on a phone; an unsigned build does not establish that.
 - The top of the chat holds messages that a build without saved coordinators
   queued. That build never recorded their coordinator, so they may already have
   been delivered. The app never sends them. **Restore to composer** makes a new
-  message for you to send, and **Discard** deletes one. A held message the
-  earlier build saw its coordinator accept offers only **Discard**, since a
-  restored copy would send it twice.
+  message for you to send, and **Discard** deletes one. A held message leaves
+  the hold only when you send its restored copy unchanged, or discard it. A held
+  message the earlier build saw its coordinator accept offers only **Discard**,
+  since a restored copy would send it twice.
 - Do not restore an uncertain submission as a new message to bypass checking its
   original ID. Coordinator admission may already have succeeded.
 - Use the **+** menu for files, photos, commands and delivery mode, or drop files

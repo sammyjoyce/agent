@@ -30,12 +30,12 @@
                   ActivityExpansion(groups: [group.id], items: Set(group.rows.map(\.id)))),
                 details: { row in .unavailable(.init(callId: row.tool?.callId ?? "")) })
             case .message(let model):
-              MessageRow(model: model, retry: { _ in }, restore: { _ in })
+              MessageRow(model: model, retry: { _ in }, restore: { _ in }, discard: { _ in })
             }
           }
         } else {
           ForEach(models) { model in
-            MessageRow(model: model, retry: { _ in }, restore: { _ in })
+            MessageRow(model: model, retry: { _ in }, restore: { _ in }, discard: { _ in })
           }
         }
         if let inspection {
@@ -1009,6 +1009,142 @@
           try await Task.sleep(for: .milliseconds(200))
           print("IF7-V2[caret] next edit=\(model.draft.debugDescription)")
           #expect(model.draft == "Prefix Existing invented note")
+        }
+      }
+
+      /// The draft's text already starts with "@Work", and the user types "@Work " before it. The
+      /// typed tag becomes the chip, and the caret moves back by exactly the tag the draft lost, so
+      /// it stays before the old "@Work" and the next key lands where the user typed.
+      @MainActor @Test func aTagTypedBeforeTheSameTagLeavesTheCaretAtTheEdit() async throws {
+        try await withComposer { model, box, work in
+          let field = box.draft
+          let original = "@Work invented quotation"
+          model.recipient = work.id
+          model.draft = original
+          try await Task.sleep(for: .milliseconds(250))
+          model.recipient = nil
+          try await Task.sleep(for: .milliseconds(200))
+          field.selectedRange = NSRange(location: 0, length: 0)
+          field.insertText("@Work ")
+          try await Task.sleep(for: .milliseconds(300))
+          print(
+            "IF8-W4 after the tag: text=\(field.text.debugDescription) selection=\(field.selectedRange) chip=\(model.recipient.map(model.name) ?? "none")"
+          )
+          #expect(model.recipient == work.id && field.text == original)
+          #expect(field.selectedRange == NSRange(location: 0, length: 0))
+          field.insertText("Prefix ")
+          try await Task.sleep(for: .milliseconds(200))
+          print("IF8-W4 next key: \(model.draft.debugDescription)")
+          #expect(model.draft == "Prefix " + original)
+        }
+      }
+
+      /// "@Work " typed before an existing draft becomes the chip. Undo then never removes text the
+      /// user did not just insert, so the draft stays whole, and Undo and Redo keep working for what
+      /// the user types next.
+      @MainActor @Test func undoAfterATagBecomesTheChipKeepsTheDraft() async throws {
+        try await withComposer { model, box, work in
+          let field = box.draft
+          field.insertText("Existing invented note")
+          try await Task.sleep(for: .milliseconds(200))
+          field.selectedRange = NSRange(location: 0, length: 0)
+          field.insertText("@Work ")
+          try await Task.sleep(for: .milliseconds(300))
+          let undo = try #require(field.undoManager)
+          print(
+            "IF8-W3 after the tag: canUndo=\(undo.canUndo) text=\(model.draft.debugDescription) chip=\(model.recipient.map(model.name) ?? "none")"
+          )
+          undo.undo()
+          try await Task.sleep(for: .milliseconds(300))
+          print(
+            "IF8-W3 undone: text=\(model.draft.debugDescription) chip=\(model.recipient.map(model.name) ?? "none")"
+          )
+          #expect(model.draft == "Existing invented note")
+          undo.redo()
+          try await Task.sleep(for: .milliseconds(300))
+          print(
+            "IF8-W3 redone: text=\(model.draft.debugDescription) chip=\(model.recipient.map(model.name) ?? "none")"
+          )
+          #expect(model.draft == "Existing invented note" && model.recipient == work.id)
+          field.selectedRange = NSRange(location: field.text.utf16.count, length: 0)
+          field.insertText(" today")
+          try await Task.sleep(for: .milliseconds(200))
+          undo.undo()
+          try await Task.sleep(for: .milliseconds(200))
+          let undone = model.draft
+          undo.redo()
+          try await Task.sleep(for: .milliseconds(200))
+          print(
+            "IF8-W3 typed next: undone=\(undone.debugDescription) redone=\(model.draft.debugDescription)"
+          )
+          #expect(undone == "Existing invented note", "Undo of what the user typed next")
+          #expect(model.draft == "Existing invented note today", "Redo of what the user typed next")
+        }
+      }
+
+      /// Ordinary Undo and Redo work in the field, and text an input method is still composing
+      /// survives an update of the model.
+      @MainActor @Test func ordinaryUndoAndMarkedTextSurviveModelUpdates() async throws {
+        try await withComposer { model, box, _ in
+          let field = box.draft
+          field.insertText("Invented")
+          try await Task.sleep(for: .milliseconds(200))
+          let undo = try #require(field.undoManager)
+          undo.undo()
+          try await Task.sleep(for: .milliseconds(200))
+          #expect(model.draft.isEmpty)
+          undo.redo()
+          try await Task.sleep(for: .milliseconds(200))
+          #expect(model.draft == "Invented")
+          field.selectedRange = NSRange(location: field.text.utf16.count, length: 0)
+          field.setMarkedText("\u{4EEE}", selectedRange: NSRange(location: 1, length: 0))
+          try await Task.sleep(for: .milliseconds(200))
+          print(
+            "IF8-W3 input method: text=\(model.draft.debugDescription) marked=\(field.markedTextRange != nil)"
+          )
+          #expect(field.markedTextRange != nil)
+          field.unmarkText()
+          #expect(model.draft == "Invented\u{4EEE}")
+        }
+      }
+
+      /// Restores a message held for Work, with `text`, into the hosted composer.
+      @MainActor private func restoreHeld(
+        _ text: String, model: ChatModel, work: CoordinatorProfile
+      ) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = ProfileDirectory(work.id, applicationSupport: root, caches: root)
+        try writePrivately(
+          JSONEncoder().encode([
+            NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: text)
+          ]), to: directory.legacy.appending(path: "pending.json"))
+        let hold = LegacyHold(directory)
+        model.attach(Lane(id: work.id, session: nil, hold: hold))
+        let item = try #require(try await hold.items().first)
+        await model.restoreHeld(HeldMessage(lane: work.id, item: item))
+        try await Task.sleep(for: .milliseconds(250))
+      }
+
+      /// A message held for Work is restored. Its text is a heading line, then "@Personal …". After
+      /// the chip's ⓧ the user selects the heading in the field and deletes it. The tag now at the
+      /// start is the restored text's own, so it stays text and no chip appears.
+      @MainActor @Test func deletingARestoredHeadingInTheFieldPromotesNothing() async throws {
+        try await withComposer { model, box, work in
+          let field = box.draft
+          let heading = "Invented memo heading\n"
+          let body = "@Personal invented quotation"
+          try await restoreHeld(heading + body, model: model, work: work)
+          model.recipient = nil
+          try await Task.sleep(for: .milliseconds(200))
+          field.selectedRange = NSRange(location: 0, length: heading.utf16.count)
+          field.deleteBackward()
+          try await Task.sleep(for: .milliseconds(300))
+          print(
+            "IF8-W2[field] deleting the selected heading: text=\(model.draft.debugDescription) chip=\(model.recipient.map(model.name) ?? "none")"
+          )
+          #expect(model.recipient == nil)
+          #expect(model.draft == body)
         }
       }
 

@@ -163,12 +163,9 @@ public final class Coordinators {
 
   /// Remove's confirmation: how many messages it deletes on this phone, queued plus held. A
   /// queue that cannot be read is never counted as empty.
-  func removalMessage(_ id: ProfileID) async -> String {
-    let lane = chat.lanes.first { $0.id == id }
+  func removalMessage(_ id: ProfileID) -> String {
     do {
-      let queued = try await lane?.session?.queuedCount() ?? 0
-      let held = try await lane?.hold.items().count ?? 0
-      return switch queued + held {
+      return switch try directory(id).queuedMessages() {
       case 0: "No queued messages are on this phone."
       case 1: "This deletes 1 queued message on this phone."
       case let count: "This deletes \(count) queued messages on this phone."
