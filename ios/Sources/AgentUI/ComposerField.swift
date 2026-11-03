@@ -85,6 +85,35 @@
         set { super.accessibilityValue = newValue }
       }
 
+      // A hardware keyboard's Return ends editing, as the text field before it did, once no
+      // input method is composing. The on-screen return key never arrives as a press, so it
+      // still inserts a newline. A swallowed press never reaches UIKit, its release included.
+      private var swallowed: Set<UIPress> = []
+      override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let returns = markedTextRange == nil ? presses.filter(Self.isReturn) : []
+        guard !returns.isEmpty else { return super.pressesBegan(presses, with: event) }
+        swallowed.formUnion(returns)
+        resignFirstResponder()
+        let others = presses.subtracting(returns)
+        if !others.isEmpty { super.pressesBegan(others, with: event) }
+      }
+      override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let others = release(presses)
+        if !others.isEmpty { super.pressesEnded(others, with: event) }
+      }
+      override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let others = release(presses)
+        if !others.isEmpty { super.pressesCancelled(others, with: event) }
+      }
+      private func release(_ presses: Set<UIPress>) -> Set<UIPress> {
+        defer { swallowed.subtract(presses) }
+        return presses.subtracting(swallowed)
+      }
+      private static func isReturn(_ press: UIPress) -> Bool {
+        guard let key = press.key, key.keyCode == .keyboardReturnOrEnter else { return false }
+        return key.modifierFlags.isDisjoint(with: [.shift, .control, .alternate, .command])
+      }
+
       override func layoutSubviews() {
         super.layoutSubviews()
         let leading = textContainerInset.left + indent
