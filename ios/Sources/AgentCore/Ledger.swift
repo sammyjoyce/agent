@@ -69,8 +69,9 @@ struct Ledger: Codable, Equatable, Sendable {
 
   var entries: [String: Entry] = [:]
   var sends: [String: Send] = [:]
-  /// The newest queue time among the sends the cap dropped. A send no newer than this with no
-  /// record here may have been dropped, so this phone cannot say it was never sent.
+  /// The newest queue time among the sends the cap dropped, or the load time of a ledger that
+  /// could not be read. A send no newer than this with no record here may have been dropped, so
+  /// this phone cannot say it was never sent.
   var sendsPrunedThrough: TimeInterval?
 
   enum CodingKeys: String, CodingKey {

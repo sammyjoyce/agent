@@ -48,8 +48,8 @@ public struct ChatSnapshot: Sendable {
   /// Every Send this coordinator holds, from its outbox and ledger rather than the loaded
   /// rows, so a Send whose row left the window still reports.
   public var sends: [String: SendStatus] = [:]
-  /// How far this coordinator's send cap reached. A Send queued no later than this that `sends`
-  /// lacks may have been dropped by the cap.
+  /// How far this coordinator's send records may be missing, from its cap or an unreadable
+  /// ledger. A Send queued no later than this that `sends` lacks may have been dropped.
   public var sendsPrunedThrough: TimeInterval?
   public init() {}
 }
@@ -143,9 +143,14 @@ public actor CoordinatorSession {
     ledgerURL = directory.ledger
     // Loaded before any session connects, so every saved stamp seeds the shared source. A
     // missing or unreadable ledger only loses receive order, so it never blocks the session.
-    ledger =
-      (try? JSONDecoder().decode(Ledger.self, from: Data(contentsOf: directory.ledger)))
-      ?? Ledger()
+    do {
+      ledger = try JSONDecoder().decode(Ledger.self, from: Data(contentsOf: directory.ledger))
+    } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+      ledger = Ledger()
+    } catch {
+      // Its send records are lost as if the cap dropped them, and the mark outlives the rewrite.
+      ledger = Ledger(sendsPrunedThrough: stamps.next())
+    }
     if let newest = ledger.entries.values.map(\.receivedAt).max() { stamps.seed(newest) }
     let pair = AsyncStream<ChatSnapshot>.makeStream(bufferingPolicy: .bufferingNewest(1))
     updates = pair.stream
