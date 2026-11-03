@@ -284,7 +284,9 @@ function standInPhone(fault: Fault): Phone {
 
 async function swiftTest(args: string[], home: string, env: Record<string, string>, signal: AbortSignal): Promise<string> {
   const project = fileURLToPath(new URL("../../../ios", import.meta.url));
-  const scratch = fileURLToPath(new URL("../../../target/native-client-integration", import.meta.url));
+  // Its own build folder: `node --test` runs this file beside coordinator-observation-e2e,
+  // and two SwiftPM builds in one folder fail on its locked build database.
+  const scratch = fileURLToPath(new URL("../../../target/two-coordinator-feed-integration", import.meta.url));
   const child = spawn("/usr/bin/xcrun", ["--sdk", "macosx", "swift", "test", ...args,
     "--package-path", project, "--scratch-path", scratch], {
     detached: true, stdio: ["ignore", "pipe", "pipe"],
