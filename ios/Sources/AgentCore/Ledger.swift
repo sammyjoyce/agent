@@ -28,7 +28,7 @@ struct OutboxItem: Codable, Equatable, Sendable {
   var request: NativeRequestSubmit
   /// Shared by every coordinator's item for one Send. It never leaves the phone.
   var sendID: String
-  /// Everyone the Send was addressed to, so a coordinator with no item reads as not sent.
+  /// Everyone the Send was addressed to, so each coordinator's record names them all.
   var recipients: [ProfileID]
   /// The pending row's receive stamp. It moves to the entry once placed.
   var queuedAt: TimeInterval
@@ -53,14 +53,17 @@ struct Ledger: Codable, Equatable, Sendable {
   }
   struct Send: Codable, Equatable, Sendable {
     var inputID: String
-    /// nil for feedback, which is acknowledged without an entry.
+    /// nil for feedback, which is acknowledged without an entry, and for a withdrawn send.
     var entryID: String?
     var recipients: [ProfileID]
     /// When the Send was queued, which ranks it for the cap. nil in records saved before it was
     /// kept, which rank by their entry.
     var queuedAt: TimeInterval?
+    /// true once its queued item was removed because the user sent a restored copy instead, so
+    /// this coordinator never placed it. Absent from the record of a placed send.
+    var withdrawn: Bool?
     enum CodingKeys: String, CodingKey {
-      case recipients
+      case recipients, withdrawn
       case inputID = "input_id"
       case entryID = "entry_id"
       case queuedAt = "queued_at"
@@ -69,15 +72,6 @@ struct Ledger: Codable, Equatable, Sendable {
 
   var entries: [String: Entry] = [:]
   var sends: [String: Send] = [:]
-  /// The newest queue time among the sends the cap dropped, or the load time of a ledger that
-  /// could not be read. A send no newer than this with no record here may have been dropped, so
-  /// this phone cannot say it was never sent.
-  var sendsPrunedThrough: TimeInterval?
-
-  enum CodingKeys: String, CodingKey {
-    case entries, sends
-    case sendsPrunedThrough = "sends_pruned_through"
-  }
 
   /// Keeps the 2000 newest of each map and everything `rows` still shows.
   mutating func prune(keeping rows: [ChatRow]) {
@@ -97,11 +91,7 @@ struct Ledger: Codable, Equatable, Sendable {
       let oldest = sends.filter {
         !shownInputs.contains($0.value.inputID) && !shownEntries.contains($0.value.entryID ?? "")
       }.sorted { stamp($0.value) < stamp($1.value) }.prefix(sends.count - limit)
-      for (id, send) in oldest {
-        sends[id] = nil
-        let dropped = stamp(send)
-        if dropped.isFinite { sendsPrunedThrough = max(sendsPrunedThrough ?? dropped, dropped) }
-      }
+      for (id, _) in oldest { sends[id] = nil }
     }
   }
 

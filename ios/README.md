@@ -100,8 +100,9 @@ Mode if requested, then Run.
   one refuses it, none keeps it and the draft stays. Its bubble reads "To Work
   and Personal" once every recipient has it. Otherwise it shows each
   coordinator's delivery with its own **Check / retry** or **Restore**. A
-  coordinator that holds no record of it reads "Not sent to Personal", unless its
-  2000-send cap may have dropped that record, when it reads "Status unknown".
+  coordinator with no record of it on this phone reads "Status unknown". The
+  bubble reads "Not sent to Personal" only after you restore Personal's copy and
+  send it, which withdraws the original from Personal's queue.
   Commands are never queued, so one a coordinator did not get because its
   connection dropped is named under the feed ("Work did not get /status"). If
   no coordinator got it, the draft stays.

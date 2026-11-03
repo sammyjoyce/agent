@@ -639,8 +639,8 @@
         fromWork.connection = .connected
         fromWork.rows = stamped(workTranscript.rows, [1, 3, 4, 5, 6, 8], sends: [1: "A", 4: "B"])
         fromWork.sends = [
-          "A": .init(recipients: [work.id], delivery: nil),
-          "B": .init(recipients: [work.id, personal.id], delivery: nil),
+          "A": .init(recipients: [work.id], progress: .placed),
+          "B": .init(recipients: [work.id, personal.id], progress: .placed),
         ]
         var personalTranscript = Transcript()
         personalTranscript.message(
@@ -652,7 +652,9 @@
         var fromPersonal = ChatSnapshot()
         fromPersonal.connection = .connected
         fromPersonal.rows = stamped(personalTranscript.rows, [2, 6.001, 9], sends: [1: "B"])
-        fromPersonal.sends = ["B": .init(recipients: [work.id, personal.id], delivery: .uncertain)]
+        fromPersonal.sends = [
+          "B": .init(recipients: [work.id, personal.id], progress: .pending(.uncertain))
+        ]
         model.apply(fromWork, lane: work.id)
         model.apply(fromPersonal, lane: personal.id)
         model.recipient = work.id

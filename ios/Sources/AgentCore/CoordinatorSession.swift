@@ -48,26 +48,21 @@ public struct ChatSnapshot: Sendable {
   /// Every Send this coordinator holds, from its outbox and ledger rather than the loaded
   /// rows, so a Send whose row left the window still reports.
   public var sends: [String: SendStatus] = [:]
-  /// How far this coordinator's send records may be missing, from its cap or an unreadable
-  /// ledger. A Send queued no later than this that `sends` lacks may have been dropped.
-  public var sendsPrunedThrough: TimeInterval?
   public init() {}
 }
 
-/// One coordinator's part in a Send.
+/// One coordinator's part in a Send, from a record this phone holds.
 public struct SendStatus: Sendable, Equatable {
+  public enum Progress: Sendable, Equatable {
+    /// Still in this coordinator's outbox.
+    case pending(Delivery)
+    case placed
+    /// Its queued item was removed because the user sent a restored copy instead.
+    case withdrawn
+  }
   /// Everyone the Send was addressed to.
   public let recipients: [ProfileID]
-  /// nil once this coordinator placed it.
-  public let delivery: Delivery?
-  /// When this coordinator's copy was queued. nil in a record saved before it was kept.
-  public let queuedAt: TimeInterval?
-
-  init(recipients: [ProfileID], delivery: Delivery?, queuedAt: TimeInterval? = nil) {
-    self.recipients = recipients
-    self.delivery = delivery
-    self.queuedAt = queuedAt
-  }
+  public let progress: Progress
 }
 
 public struct RestoredDraft: Sendable {
@@ -142,15 +137,11 @@ public actor CoordinatorSession {
     self.stamps = stamps
     ledgerURL = directory.ledger
     // Loaded before any session connects, so every saved stamp seeds the shared source. A
-    // missing or unreadable ledger only loses receive order, so it never blocks the session.
-    do {
-      ledger = try JSONDecoder().decode(Ledger.self, from: Data(contentsOf: directory.ledger))
-    } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-      ledger = Ledger()
-    } catch {
-      // Its send records are lost as if the cap dropped them, and the mark outlives the rewrite.
-      ledger = Ledger(sendsPrunedThrough: stamps.next())
-    }
+    // missing or unreadable ledger only loses receive order and send records, so it never
+    // blocks the session.
+    ledger =
+      (try? JSONDecoder().decode(Ledger.self, from: Data(contentsOf: directory.ledger)))
+      ?? Ledger()
     if let newest = ledger.entries.values.map(\.receivedAt).max() { stamps.seed(newest) }
     let pair = AsyncStream<ChatSnapshot>.makeStream(bufferingPolicy: .bufferingNewest(1))
     updates = pair.stream
@@ -372,10 +363,15 @@ public actor CoordinatorSession {
     return RestoredDraft(text: request.text, mode: request.mode, attachments: files)
   }
 
-  /// Removes a restored item once its copy was admitted, with files no other item uses.
+  /// Removes a restored item once its copy was admitted, with files no other item uses, and
+  /// records that this coordinator never placed it.
   public func discard(_ inputID: String) {
-    guard pending.contains(where: { $0.request.inputId == inputID }) else { return }
-    acknowledge(inputID)
+    guard let item = pending.first(where: { $0.request.inputId == inputID }) else { return }
+    if acknowledge(inputID) != nil {
+      ledger.sends[item.sendID] = Ledger.Send(
+        inputID: inputID, recipients: item.recipients, queuedAt: item.queuedAt, withdrawn: true)
+      saveLedger()
+    }
     publish()
   }
 
@@ -1015,15 +1011,13 @@ public actor CoordinatorSession {
       return row
     }
     snapshot.sends = ledger.sends.mapValues {
-      SendStatus(recipients: $0.recipients, delivery: nil, queuedAt: $0.queuedAt)
+      SendStatus(recipients: $0.recipients, progress: $0.withdrawn == true ? .withdrawn : .placed)
     }
     for item in pending where snapshot.sends[item.sendID] == nil {
       let row = snapshot.rows.first { $0.inputID == item.request.inputId }
       snapshot.sends[item.sendID] = SendStatus(
-        recipients: item.recipients, delivery: row?.delivery ?? .uncertain,
-        queuedAt: item.queuedAt)
+        recipients: item.recipients, progress: .pending(row?.delivery ?? .uncertain))
     }
-    snapshot.sendsPrunedThrough = ledger.sendsPrunedThrough
     // New replies do not fill a gap left by paging. Only a fresh recent page
     // can restore the complete latest window.
     if let latestRowID, !snapshot.rows.contains(where: { $0.id == latestRowID }) {

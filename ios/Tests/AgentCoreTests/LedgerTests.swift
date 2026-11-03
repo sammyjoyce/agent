@@ -163,9 +163,8 @@ func aQueuedInputKeepsItsQueueTimeAcrossRelaunchAndPlacement() async throws {
     #expect(pending.receivedAt == queuedAt)
     #expect(pending.sendID == "send-1")
     #expect(
-      relaunched.sends["send-1"]?.outcome
-        == SendStatus(recipients: [directory.profile], delivery: .uncertain))
-    #expect(relaunched.sends["send-1"]?.queuedAt == item.queuedAt)
+      relaunched.sends["send-1"]
+        == SendStatus(recipients: [directory.profile], progress: .pending(.uncertain)))
     await second.retry(staged.inputID)
     let entry = "placed-\(staged.inputID)"
     let placed = try await until(second) {
@@ -175,8 +174,7 @@ func aQueuedInputKeepsItsQueueTimeAcrossRelaunchAndPlacement() async throws {
     #expect(row.receivedAt == queuedAt, "The queue time moved to the entry")
     #expect(row.sendID == "send-1")
     #expect(
-      placed.sends["send-1"]?.outcome == SendStatus(recipients: [directory.profile], delivery: nil))
-    #expect(placed.sends["send-1"]?.queuedAt == item.queuedAt, "The record keeps its queue time")
+      placed.sends["send-1"] == SendStatus(recipients: [directory.profile], progress: .placed))
     #expect(try queuedRequests(directory.outbox).isEmpty)
     let ledger = try savedLedger(directory)
     #expect(
@@ -234,6 +232,33 @@ func aPlacementStaysQueuedUntilItsRecordIsSaved() async throws {
   }
 }
 
+/// A restored item is discarded once its copy was sent instead. The ledger keeps that the item was
+/// withdrawn, after the outbox lets it go and across a relaunch, so its Send reads not sent here.
+@Test(.timeLimit(.minutes(1)))
+func aDiscardedItemIsRecordedAsWithdrawnAcrossARelaunch() async throws {
+  try await withProfile { fixture, directory, launch in
+    let first = try await launch()
+    await first.connect()
+    _ = try await until(first) { $0.connection == .connected }
+    let recipients = [directory.profile, ProfileID()]
+    let staged = try #require(
+      await first.stage(
+        "Invented: the spare key is under the mat", sendID: "send-7", recipients: recipients))
+    await first.discard(staged.inputID)
+    let withdrawn = SendStatus(recipients: recipients, progress: .withdrawn)
+    _ = try await until(first) { $0.sends["send-7"] == withdrawn }
+    #expect(try queuedRequests(directory.outbox).isEmpty)
+    #expect(try savedLedger(directory).sends["send-7"]?.withdrawn == true)
+    await first.disconnect()
+
+    let second = try await launch()
+    await second.connect()
+    let relaunched = try await until(second) { $0.connection == .connected }
+    #expect(relaunched.sends["send-7"] == withdrawn)
+    #expect(await fixture.count() == 0, "A withdrawn item never left the phone")
+  }
+}
+
 @Test func unseenRowsFillFromNeighboursAndNeverReorderACoordinator() {
   var clock = 100.0
   func next() -> TimeInterval {
@@ -270,14 +295,14 @@ func aSendStillReportsAfterItsRowLeavesTheWindow() async throws {
     let placed = try await until(session) {
       $0.rows.contains { $0.sendID == "send-2" && $0.entryID != nil && $0.delivery == nil }
     }
-    #expect(placed.sends["send-2"]?.outcome == SendStatus(recipients: recipients, delivery: nil))
+    #expect(placed.sends["send-2"] == SendStatus(recipients: recipients, progress: .placed))
     await fixture.replyToLatest(
       .init(messages: [reply("newer", "A newer page")], pageComplete: true))
     await session.loadLatest()
     let evicted = try await until(session) {
       $0.rows.contains { $0.entryID == "newer" } && !$0.rows.contains { $0.sendID == "send-2" }
     }
-    #expect(evicted.sends["send-2"]?.outcome == SendStatus(recipients: recipients, delivery: nil))
+    #expect(evicted.sends["send-2"] == SendStatus(recipients: recipients, progress: .placed))
   }
 }
 
@@ -316,7 +341,7 @@ func anOlderSendKeepsItsSendIDAfterItsEntryLeavesTheCappedLedger() async throws 
     await second.loadEarlier()
     let older = try await until(second) { $0.rows.contains { $0.entryID == entry } }
     #expect(older.rows.first { $0.entryID == entry }?.sendID == "send-old")
-    #expect(older.sends["send-old"]?.outcome == SendStatus(recipients: recipients, delivery: nil))
+    #expect(older.sends["send-old"] == SendStatus(recipients: recipients, progress: .placed))
   }
 }
 
@@ -472,9 +497,6 @@ private final class TestClock: Sendable {
   #expect(ledger.sends.count == 2000)
   #expect(ledger.sends["send-feedback"] != nil, "The newest send stays")
   #expect(ledger.sends["send-0"] == nil, "The oldest send goes")
-  #expect(ledger.sendsPrunedThrough == 0, "It keeps how far the cap reached")
-  let saved = try JSONSerialization.jsonObject(with: JSONEncoder().encode(ledger))
-  #expect((saved as? [String: Any])?["sends_pruned_through"] as? Double == 0)
 }
 
 @Test(.timeLimit(.minutes(1)))
@@ -533,7 +555,7 @@ func aStagedInputWhoseLaneDropsBeforeStartIsSentOnceItsLaneReturns(_ lane: LaneR
       #expect(
         snapshot.rows.first { $0.inputID == staged.inputID }?.delivery == .sending,
         "It never left the phone, so it is not unconfirmed")
-      #expect(snapshot.sends["send-6"]?.delivery == .sending)
+      #expect(snapshot.sends["send-6"]?.progress == .pending(.sending))
       #expect(await fixture.count() == 0)
     }
     // The lane cannot connect again until the snapshot is released.
@@ -558,17 +580,11 @@ func aStagedInputWhoseLaneDropsBeforeStartIsSentOnceItsLaneReturns(_ lane: LaneR
     let placed = try await until(session) {
       $0.connection == .connected && $0.rows.contains { $0.entryID == entry && $0.delivery == nil }
     }
-    #expect(
-      placed.sends["send-6"]?.outcome == SendStatus(recipients: [session.profile], delivery: nil))
+    #expect(placed.sends["send-6"] == SendStatus(recipients: [session.profile], progress: .placed))
     let submitted = await fixture.received().compactMap {
       if case .submit(let input) = $0 { input } else { nil }
     }
     #expect(submitted.map(\.inputId) == [staged.inputID], "Sent once, under its own input ID")
     #expect(submitted.map(\.text) == ["Landing at 6, call me"])
   }
-}
-
-extension SendStatus {
-  /// Who the Send was addressed to and how far this coordinator got, without its queue time.
-  fileprivate var outcome: SendStatus { SendStatus(recipients: recipients, delivery: delivery) }
 }

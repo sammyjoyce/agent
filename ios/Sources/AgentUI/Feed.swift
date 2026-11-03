@@ -101,11 +101,11 @@ struct Receipt: Equatable {
   enum Status: Equatable {
     case placed
     case pending(Delivery, inputID: String?)
-    /// Its coordinator holds no record of it and never dropped one this new, so it never left
-    /// this phone for that coordinator (DESIGN-REVIEW A3).
+    /// Its coordinator's record says its item was withdrawn when the user sent a restored copy
+    /// instead, so it never got this Send.
     case notSent
-    /// This phone cannot tell: that coordinator's cap may have dropped the record, or the
-    /// coordinator is no longer saved.
+    /// This phone holds no record of it there: the record was never written, was capped or could
+    /// not be read, or the coordinator is no longer saved.
     case unknown
   }
   let lane: ProfileID
@@ -175,18 +175,15 @@ enum Feed {
       return []
     }
     return addressed.recipients.map { id in
-      guard let lane = lanes.first(where: { $0.id == id }) else {
-        return Receipt(lane: id, status: .unknown)
+      guard let lane = lanes.first(where: { $0.id == id }), let record = lane.snapshot.sends[send]
+      else { return Receipt(lane: id, status: .unknown) }
+      switch record.progress {
+      case .placed: return Receipt(lane: id, status: .placed)
+      case .withdrawn: return Receipt(lane: id, status: .notSent)
+      case .pending(let delivery):
+        let input = lane.snapshot.rows.first { $0.sendID == send && $0.delivery != nil }?.inputID
+        return Receipt(lane: id, status: .pending(delivery, inputID: input))
       }
-      guard let record = lane.snapshot.sends[send] else {
-        guard let queued = addressed.queuedAt,
-          queued > lane.snapshot.sendsPrunedThrough ?? -.infinity
-        else { return Receipt(lane: id, status: .unknown) }
-        return Receipt(lane: id, status: .notSent)
-      }
-      guard let delivery = record.delivery else { return Receipt(lane: id, status: .placed) }
-      let input = lane.snapshot.rows.first { $0.sendID == send && $0.delivery != nil }?.inputID
-      return Receipt(lane: id, status: .pending(delivery, inputID: input))
     }
   }
 }
