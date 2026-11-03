@@ -33,11 +33,35 @@
       context.coordinator.field = self
       let view = box.draft
       // The view keeps its own text, so a change made in code, such as Send's clear, is
-      // applied here whatever the keyboard last did.
-      if view.text != text { view.text = text }
+      // applied here whatever the keyboard last did. The caret keeps its place in the text
+      // around the change, so a tag that became the chip leaves it where the user typed.
+      if view.text != text {
+        let selection = Self.selection(view.selectedRange, from: view.text, to: text)
+        view.text = text
+        view.selectedRange = selection
+      }
       view.placeholder.text = placeholder
       view.placeholder.isHidden = !text.isEmpty
       box.chip = chip
+    }
+
+    /// Where `range` in `old` falls once the text becomes `new`: text before the change and after
+    /// it keeps its place, and a position inside the change goes to its end.
+    static func selection(_ range: NSRange, from old: String, to new: String) -> NSRange {
+      let head = zip(old, new).prefix { $0 == $1 }.count
+      let tail = zip(old.reversed(), new.reversed()).prefix { $0 == $1 }.prefix(
+        min(old.count, new.count) - head
+      ).count
+      let kept = old.prefix(head).utf16.count
+      let oldEnd = old.utf16.count - old.suffix(tail).utf16.count
+      let newEnd = new.utf16.count - new.suffix(tail).utf16.count
+      func moved(_ location: Int) -> Int {
+        if location < kept { return location }
+        if location >= oldEnd { return location - oldEnd + newEnd }
+        return newEnd
+      }
+      let start = moved(range.location)
+      return NSRange(location: start, length: max(0, moved(NSMaxRange(range)) - start))
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize, uiView box: DraftBox, context: Context)
@@ -166,6 +190,12 @@
               UIBezierPath(rect: CGRect(x: 0, y: 0, width: indent, height: line / 2))
             ]
           case .above(let height): textContainerInset.top += height
+          }
+          // TextKit moves the lines for the new room but keeps drawing them where they were until
+          // the text changes, so taps and the caret would miss what is drawn.
+          if let layout = textLayoutManager {
+            layout.invalidateLayout(for: layout.documentRange)
+            layout.textViewportLayoutController.layoutViewport()
           }
           setNeedsLayout()
         }

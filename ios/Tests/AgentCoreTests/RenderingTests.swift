@@ -887,6 +887,161 @@
         #expect(model.recipient == nil)
       }
 
+      /// The feed and composer of a model with Work and Personal saved, in a key window, with the
+      /// composer's field focused.
+      @MainActor private func withComposer(
+        _ body:
+          @MainActor (ChatModel, ComposerField.DraftBox, CoordinatorProfile)
+          async throws -> Void
+      ) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = CoordinatorProfile(
+          name: try TagName("Work"), address: try CoordinatorAddress(host: "100.64.1.2"))
+        let personal = CoordinatorProfile(
+          name: try TagName("Personal"), address: try CoordinatorAddress(host: "100.64.1.3"))
+        let model = ChatModel()
+        model.profiles = [work, personal]
+        for profile in model.profiles {
+          let directory = ProfileDirectory(profile.id, applicationSupport: root, caches: root)
+          model.attach(Lane(id: profile.id, session: nil, hold: LegacyHold(directory)))
+        }
+        // The ink check reads dark text, whatever appearance an earlier test left the app in.
+        let defaults = UserDefaults.standard
+        let appearance = defaults.object(forKey: AppAppearance.preferenceKey)
+        defaults.set(AppAppearance.light.rawValue, forKey: AppAppearance.preferenceKey)
+        defer { defaults.set(appearance, forKey: AppAppearance.preferenceKey) }
+        let host = UIHostingController(rootView: MainChatView(model: model))
+        let scene = try #require(
+          UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let previousWindow = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer {
+          window.isHidden = true
+          window.rootViewController = nil
+          previousWindow?.makeKey()
+        }
+        window.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(300))
+        host.view.layoutIfNeeded()
+        func boxes(_ view: UIView) -> [ComposerField.DraftBox] {
+          (view as? ComposerField.DraftBox).map { [$0] } ?? view.subviews.flatMap(boxes)
+        }
+        let box = try #require(boxes(host.view).first)
+        box.draft.becomeFirstResponder()
+        try await Task.sleep(for: .milliseconds(200))
+        try await body(model, box, work)
+      }
+
+      /// "@Work " typed before an existing draft becomes the chip, and the caret stays at the edit,
+      /// moved back by the tag the text lost, so the next word lands where the user was typing.
+      @MainActor @Test func aTagTypedBeforeTheDraftLeavesTheCaretAtTheEdit() async throws {
+        try await withComposer { model, box, work in
+          let field = box.draft
+          model.draft = "Existing invented note"
+          try await Task.sleep(for: .milliseconds(200))
+          field.selectedRange = NSRange(location: 0, length: 0)
+          field.insertText("@Work ")
+          try await Task.sleep(for: .milliseconds(300))
+          print(
+            "IF7-V2[caret] after the tag: text=\(field.text.debugDescription) selection=\(field.selectedRange) recipient=\(model.recipient.map(model.name) ?? "nil")"
+          )
+          #expect(model.recipient == work.id && field.text == "Existing invented note")
+          #expect(field.selectedRange == NSRange(location: 0, length: 0))
+          field.insertText("Prefix ")
+          try await Task.sleep(for: .milliseconds(200))
+          print("IF7-V2[caret] next edit=\(model.draft.debugDescription)")
+          #expect(model.draft == "Prefix Existing invented note")
+        }
+      }
+
+      /// The user types a line after the chip and its ⓧ removes the chip. Then the user types more,
+      /// and the chip comes back. Each time the chip comes or goes, the draft is drawn at once where
+      /// its layout puts it, at the field's leading edge without the chip and after it with one, so
+      /// the caret and taps land on what is drawn.
+      @MainActor @Test func theDraftIsDrawnWhereItsLayoutPutsItWhenTheChipComesOrGoes()
+        async throws
+      {
+        try await withComposer { model, box, work in
+          let field = box.draft
+          model.recipient = work.id
+          try await Task.sleep(for: .milliseconds(200))
+          field.insertText("Invented one line")
+          try await Task.sleep(for: .milliseconds(300))
+          /// The leftmost and rightmost dark pixels of the first line as the field draws it.
+          func drawn() throws -> (minX: CGFloat, maxX: CGFloat) {
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 1
+            let image = UIGraphicsImageRenderer(bounds: field.bounds, format: format).image { _ in
+              field.drawHierarchy(in: field.bounds, afterScreenUpdates: true)
+            }
+            let cg = try #require(image.cgImage)
+            var pixels = [UInt8](repeating: 0, count: cg.width * cg.height * 4)
+            let context = try #require(
+              CGContext(
+                data: &pixels, width: cg.width, height: cg.height, bitsPerComponent: 8,
+                bytesPerRow: cg.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+            context.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
+            let top = Int(field.textContainerInset.top)
+            let bottom = min(cg.height, top + Int(try #require(field.font).lineHeight))
+            var span = (minX: CGFloat.infinity, maxX: -CGFloat.infinity)
+            for y in top..<bottom {
+              for x in 0..<cg.width {
+                let pixel = (y * cg.width + x) * 4
+                let rgb = Int(pixels[pixel]) + Int(pixels[pixel + 1]) + Int(pixels[pixel + 2])
+                if pixels[pixel + 3] > 128 && rgb < 330 {
+                  span = (min(span.minX, CGFloat(x)), max(span.maxX, CGFloat(x)))
+                }
+              }
+            }
+            return span
+          }
+          /// Where TextKit puts the first line, which is where a tap or the caret finds it.
+          func laidOut() throws -> CGFloat {
+            let layout = try #require(field.textLayoutManager)
+            var starts: [CGFloat] = []
+            layout.enumerateTextLayoutFragments(
+              from: layout.documentRange.location, options: [.ensuresLayout]
+            ) { fragment in
+              starts += fragment.textLineFragments.map {
+                field.textContainerInset.left + fragment.layoutFragmentFrame.minX
+                  + $0.typographicBounds.minX
+              }
+              return false
+            }
+            return try #require(starts.first)
+          }
+          let steps: [(String, ProfileID?, String)] = [
+            ("with the chip", work.id, ""), ("chip removed", nil, ""),
+            ("typed without the chip", nil, " two"), ("chip back", work.id, ""),
+          ]
+          for (step, chip, typed) in steps {
+            if !typed.isEmpty { field.insertText(typed) }
+            model.recipient = chip
+            try await Task.sleep(for: .milliseconds(100))
+            box.window?.layoutIfNeeded()
+            let line = try laidOut()
+            let ink = try drawn()
+            let end = field.caretRect(for: field.endOfDocument).midX
+            print(
+              "IF7-V2[draw] \(step): line x=\(line) drawn=\(ink.minX)...\(ink.maxX) caret at end=\(end)"
+            )
+            #expect(abs(ink.minX - line) < 4, "\(step): the first line is drawn where taps find it")
+            #expect(abs(ink.maxX - end) < 4, "\(step): the caret is drawn after the last letter")
+            if chip == nil && typed.isEmpty {
+              let edge = ComposerField.inset.left
+              #expect(abs(line - edge) < 0.5, "The first line keeps the chip's room")
+              #expect(
+                abs(field.caretRect(for: field.beginningOfDocument).midX - edge) < 0.5,
+                "The caret keeps the chip's room")
+            }
+          }
+        }
+      }
+
       @MainActor @Test func accessibilityTextSizeExpandsMessageLayout() async throws {
         var transcript = Transcript()
         transcript.message(

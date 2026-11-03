@@ -54,6 +54,56 @@ final class ComposerInteractionTests: XCTestCase {
     let value = field.value as? String
     return value == nil || value == "" || value == "Message Agent"
   }
+  /// Where the field draws its one line of text, in points from its leading edge: the leftmost and
+  /// rightmost gray pixels in a screenshot that stand out from the field's background, in either
+  /// appearance. A chip's name and the caret are colored, so neither counts.
+  private func drawnLine(_ app: XCUIApplication, _ field: XCUIElement) throws
+    -> ClosedRange<CGFloat>
+  {
+    let image = try XCTUnwrap(app.screenshot().image.cgImage)
+    let scale = CGFloat(image.width) / app.frame.width
+    var pixels = [UInt8](repeating: 0, count: image.width * image.height * 4)
+    let context = try XCTUnwrap(
+      CGContext(
+        data: &pixels, width: image.width, height: image.height, bitsPerComponent: 8,
+        bytesPerRow: image.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+    context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+    let frame = field.frame
+    func color(_ x: Int, _ y: Int) -> [Int] {
+      let pixel = (y * image.width + x) * 4
+      return pixels[pixel..<pixel + 3].map(Int.init)
+    }
+    // The one line of text ends well before the field's trailing edge.
+    let background = color(Int((frame.maxX - 8) * scale), Int(frame.midY * scale)).reduce(0, +)
+    var columns: [Int] = []
+    for y in Int((frame.minY + 2) * scale)..<Int((frame.maxY - 2) * scale) {
+      for x in Int(frame.minX * scale)..<Int(frame.maxX * scale) {
+        let rgb = color(x, y)
+        let gray = (rgb.max() ?? 0) - (rgb.min() ?? 0) < 40
+        if gray && abs(rgb.reduce(0, +) - background) > 300 { columns.append(x) }
+      }
+    }
+    let first = try XCTUnwrap(columns.min(), "The field draws no text")
+    let last = try XCTUnwrap(columns.max())
+    return (CGFloat(first) / scale - frame.minX)...(CGFloat(last) / scale - frame.minX)
+  }
+  /// Double-taps the middle of `word` where the field draws it, after `prefix`, in its one line of
+  /// `text`. That selects the word TextKit has there.
+  private func doubleTap(
+    _ word: String, after prefix: String, of text: String, in field: XCUIElement,
+    _ app: XCUIApplication
+  ) throws {
+    let drawn = try drawnLine(app, field)
+    let font = UIFont.preferredFont(forTextStyle: .body)
+    func width(_ string: String) -> CGFloat {
+      (string as NSString).size(withAttributes: [.font: font]).width
+    }
+    let middle = (width(prefix) + width(word) / 2) / width(text)
+    let x = drawn.lowerBound + (drawn.upperBound - drawn.lowerBound) * middle
+    field.coordinate(withNormalizedOffset: .zero)
+      .withOffset(CGVector(dx: x, dy: field.frame.height / 2)).doubleTap()
+  }
 
   // Typed through the keyboard into the real field, where a model-level draft cannot reach.
   func testATypedTagBecomesTheRecipientAndNeverReachesTheWire() async throws {
@@ -124,6 +174,59 @@ final class ComposerInteractionTests: XCTestCase {
     let sentToWork = await work.submits()
     XCTAssertTrue(retained, "Tapping visible draft text removed its recipient")
     XCTAssertEqual(sentToWork, [])
+  }
+
+  // A line typed after a typed tag's chip, then the chip's ⓧ. The line is drawn at the field's
+  // leading edge, where taps find it, so a double tap on the drawn word "one" selects it and the
+  // next keys replace it there.
+  func testATapOnADrawnWordOnceTheChipIsGoneEditsThere() async throws {
+    let (app, _, _) = try await launchWithWorkAndPersonal()
+    defer { app.terminate() }
+    continueAfterFailure = true
+    let composer = app.textViews["Message the coordinator"]
+    composer.tap()
+    composer.typeText("@Work ")
+    XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3))
+    let text = "Invented one line"
+    composer.typeText(text)
+    app.buttons["To Work"].tap()
+    XCTAssertTrue(app.staticTexts["To Work and Personal"].waitForExistence(timeout: 3))
+    try await Task.sleep(for: .seconds(1))
+    let drawn = try drawnLine(app, composer)
+    try doubleTap("one", after: "Invented ", of: text, in: composer, app)
+    composer.typeText("oneX")
+    print("IF7-V2[typed] drawn=\(drawn) after the edit: \(composer.value as? String ?? "nil")")
+    XCTAssertLessThan(drawn.lowerBound, 8, "The line is drawn where the chip was")
+    XCTAssertEqual(composer.value as? String, "Invented oneX line")
+  }
+
+  // The same after Restore, which sets the chip and the text in code.
+  func testATapOnADrawnWordOnceARestoredChipIsGoneEditsThere() async throws {
+    let (app, work, _) = try await launchWithWorkAndPersonal()
+    defer { app.terminate() }
+    continueAfterFailure = true
+    await work.rejectSubmits(true)
+    let composer = app.textViews["Message the coordinator"]
+    composer.tap()
+    composer.typeText("@Work ")
+    XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3))
+    let text = "Invented one line"
+    composer.typeText(text)
+    app.buttons["Send message"].tap()
+    let restore = app.buttons["Restore Work's copy to composer"]
+    XCTAssertTrue(restore.waitForExistence(timeout: 10))
+    await work.rejectSubmits(false)
+    restore.tap()
+    XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3))
+    app.buttons["To Work"].tap()
+    XCTAssertTrue(app.staticTexts["To Work and Personal"].waitForExistence(timeout: 3))
+    try await Task.sleep(for: .seconds(1))
+    let drawn = try drawnLine(app, composer)
+    try doubleTap("one", after: "Invented ", of: text, in: composer, app)
+    composer.typeText("oneX")
+    print("IF7-V2[restored] drawn=\(drawn) after the edit: \(composer.value as? String ?? "nil")")
+    XCTAssertLessThan(drawn.lowerBound, 8, "The line is drawn where the chip was")
+    XCTAssertEqual(composer.value as? String, "Invented oneX line")
   }
 
   // Wrapped lines start under the chip. A tap on the second line there places the cursor, as a
