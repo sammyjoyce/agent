@@ -1245,6 +1245,86 @@ func aMessageToBothStagedOnlyAtWorkBeforeAKillReadsNotSentToPersonal() async thr
   await personalFixture.stop()
 }
 
+/// Personal places its copy of a message to both while Work's copy still waits in Work's outbox.
+/// Then Personal's `Ledger.json` becomes unreadable, so its record of the message is gone. The
+/// phone cannot know Personal never got it, at the next launch or at the one after Personal's
+/// session has written the ledger again, so the bubble must never read "Not sent to Personal".
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aMessageToBothReadsUnknownAtACoordinatorWhoseLedgerCouldNotBeRead() async throws {
+  let workFixture = FixtureCoordinator()
+  let personalFixture = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(workFixture)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personalFixture)
+  defer { personalListener.cancel() }
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "unreadable-ledger-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  @MainActor func launch() -> Coordinators {
+    Coordinators(
+      registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+      transport: CoordinatorTransport { address in
+        LineConnection(
+          connection: NWConnection(
+            host: .ipv4(.loopback), port: address.port == 4002 ? personalPort : workPort,
+            using: .tcp))
+      })
+  }
+  let before = launch()
+  await before.setActive(true)
+  let (work, personal) = try await addWorkAndPersonal(before)
+  let text = "Invented: the plumber comes Thursday at 9"
+  let send = UUID().uuidString
+  let workSession = try #require(before.chat.lanes.first { $0.id == work }?.session)
+  let personalSession = try #require(before.chat.lanes.first { $0.id == personal }?.session)
+  _ = try #require(await workSession.stage(text, sendID: send, recipients: [work, personal]))
+  let atPersonal = try #require(
+    await personalSession.stage(text, sendID: send, recipients: [work, personal]))
+  await personalSession.start(atPersonal)
+  try await eventually("Personal placed it") {
+    before.chat.rows.first { $0.id == "send:\(send)" }?.receipts.last?.status == .placed
+  }
+  await before.setActive(false)
+  #expect(await submits(personalFixture).map(\.text) == [text])
+  await personalFixture.replyToHistory(
+    initial: .init(
+      messages: [
+        HistoryMessage(
+          continuation: false, entryId: "placed-\(atPersonal.inputID)", finalChunk: true,
+          role: .user, text: text)
+      ], nextCursor: nil, pageComplete: true),
+    pages: [:])
+  let ledger = ProfileDirectory(personal, applicationSupport: root, caches: root).ledger
+  try Data("not a ledger".utf8).write(to: ledger)
+
+  for relaunch in ["with the unreadable ledger", "after Personal saved its ledger again"] {
+    let after = launch()
+    await after.setActive(true)
+    let chat = after.chat
+    try await eventually("both connected \(relaunch)") {
+      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+    }
+    try await eventually("Personal's history loaded \(relaunch)") {
+      chat.snapshots[personal]?.rows.contains { $0.text == text } == true
+    }
+    let bubble = try #require(chat.rows.first { $0.id == "send:\(send)" })
+    #expect(bubble.receipts.map(\.lane) == [work, personal])
+    #expect(bubble.receipts.last?.status == .unknown, "Personal \(relaunch)")
+    #expect(
+      bubble.receipts.last.map { $0.line("Personal") } == "Personal · Status unknown",
+      "Personal \(relaunch)")
+    await after.setActive(false)
+    #expect(
+      (try? JSONDecoder().decode(Ledger.self, from: Data(contentsOf: ledger))) != nil,
+      "Personal's session wrote its ledger again \(relaunch)")
+  }
+  #expect(await submits(personalFixture).map(\.text) == [text], "Nothing was sent again")
+  await workFixture.stop()
+  await personalFixture.stop()
+}
+
 /// Personal refuses its copy of a message to both. Restoring that copy and sending it to Work
 /// instead discards Personal's original, so Personal never placed the message, and the original
 /// bubble must not read "To Work and Personal".
