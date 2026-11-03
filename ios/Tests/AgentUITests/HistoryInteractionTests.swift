@@ -19,7 +19,7 @@ import XCTest
 
 @MainActor
 final class ComposerInteractionTests: XCTestCase {
-  private func launchWithWorkAndPersonal() async throws -> (
+  private func launchWithWorkAndPersonal(workHistory: [HistoryMessage] = []) async throws -> (
     app: XCUIApplication, work: InteractionPeer, personal: InteractionPeer
   ) {
     continueAfterFailure = false
@@ -27,10 +27,10 @@ final class ComposerInteractionTests: XCTestCase {
     let work = InteractionPeer()
     let personal = InteractionPeer()
     var ports: [String] = []
-    for peer in [work, personal] {
+    for (peer, messages) in [(work, workHistory), (personal, [])] {
       addTeardownBlock { await peer.stop() }
-      let empty = NativeEventHistory(messages: [], nextCursor: nil, pageComplete: true)
-      await peer.history(initial: empty, pages: [:], latest: empty)
+      let history = NativeEventHistory(messages: messages, nextCursor: nil, pageComplete: true)
+      await peer.history(initial: history, pages: [:], latest: history)
       ports.append(String(try await peer.start()))
     }
     let app = XCUIApplication()
@@ -95,6 +95,36 @@ final class ComposerInteractionTests: XCTestCase {
       "The field kept the sent text: \(composer.value as? String ?? "nil")")
     composer.typeText("x")
     XCTAssertEqual(composer.value as? String, "x", "The next key starts a new draft")
+  }
+
+  // A person's scroll while the whole feed fits picks the first row as the reading position.
+  // Replies then grow the feed past the screen, and the app follows them to the bottom.
+  func testOpeningThePickerKeepsTheNewestRepliesInView() async throws {
+    let first = "The first question in this conversation."
+    let (app, work, _) = try await launchWithWorkAndPersonal(workHistory: [
+      .init(continuation: false, entryId: "first", finalChunk: true, role: .user, text: first)
+    ])
+    defer { app.terminate() }
+    let composer = app.descendants(matching: .any).matching(identifier: "Message the coordinator")
+      .firstMatch
+    composer.tap()
+    app.scrollViews["transcript"].swipeUp()
+    var newest = ""
+    for index in 1...12 {
+      newest = "Reply \(index) from Work, long enough to fill a line of the feed."
+      try await work.reply(newest, id: "reply-\(index)")
+      XCTAssertTrue(app.staticTexts[newest].waitForExistence(timeout: 5))
+    }
+    XCTAssertTrue(app.staticTexts[newest].isHittable, "The feed follows the newest reply")
+    XCTAssertFalse(app.staticTexts[first].isHittable, "The feed is longer than the screen")
+    // typeText hides and restores the keyboard, which moves the feed on its own.
+    app.keyboards.keys["more"].tap()
+    app.keyboards.keys["@"].tap()
+    XCTAssertTrue(app.buttons["Send to Work"].waitForExistence(timeout: 3))
+    XCTAssertTrue(
+      app.staticTexts[newest].isHittable, "Opening the picker scrolled away from the newest reply")
+    XCTAssertFalse(
+      app.staticTexts[first].isHittable, "Opening the picker scrolled back to the first row")
   }
 }
 
