@@ -117,6 +117,10 @@ final class ChatModel {
   /// True while the composer names who gets the draft: with two or more saved coordinators, or
   /// once one was removed. With one saved and none removed it works as on `main`.
   var addressesByName: Bool { multiple || !removed.isEmpty }
+  /// The chip the composer draws: the recipient while the composer names recipients. With one
+  /// coordinator saved and none removed none is drawn, as on `main`, though a restored draft keeps
+  /// its recipient, so it stays its source's when another coordinator is added.
+  var shownChip: ProfileID? { addressesByName ? recipient : nil }
 
   func name(_ id: ProfileID) -> String {
     profiles.first { $0.id == id }?.name.description ?? removed[id] ?? "Coordinator"
@@ -443,7 +447,6 @@ final class ChatModel {
     return true
   }
   private func fill(_ restored: RestoredDraft, from source: RestoredSource) {
-    recipient = addressesByName ? source.lane : nil
     draft = restored.text
     attachments = restored.attachments
     mode = restored.mode
@@ -452,9 +455,14 @@ final class ChatModel {
       screenshotOwners[file.id] = source.lane
     }
     restoredFrom = source
+    // Last, since an empty restored text clears the draft above, which drops an undrawn recipient.
+    recipient = source.lane
   }
   private func forgetClearedSource() {
-    if draft.isEmpty && attachments.isEmpty { restoredFrom = nil }
+    guard draft.isEmpty && attachments.isEmpty else { return }
+    restoredFrom = nil
+    // Only Restore sets a recipient no chip shows, so it goes with the draft it was set for.
+    if !addressesByName { recipient = nil }
   }
   /// Runs after the restored draft was admitted. A lane removed meanwhile took its
   /// source with it.

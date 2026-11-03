@@ -469,7 +469,7 @@ public struct MainChatView: View {
           #else
             // Top-aligned, so a wrapping draft's first line stays beside the chip.
             HStack(alignment: .top, spacing: 4) {
-              if let recipient = model.recipient { chip(recipient) }
+              if let recipient = model.shownChip { chip(recipient) }
               // A key that leaves the text as it was, such as one finishing an inline
               // prediction, gets no field update, and SwiftUI then drops the next change made in
               // code, such as Send's clear. A new binding each render gives the field that update.
@@ -542,7 +542,7 @@ public struct MainChatView: View {
     private var draftField: some View {
       ComposerField(
         text: model.draft, placeholder: placeholder,
-        chip: model.recipient.map {
+        chip: model.shownChip.map {
           let badge = badge($0)
           return .init(name: badge.name, color: UIColor(badge.color))
         }, edit: { model.draft = $0 }, removeChip: { model.recipient = nil })

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Network
 import Testing
@@ -2313,11 +2314,12 @@ func withOneCoordinatorARestoredAndResentOriginalReadsNotSent() async throws {
   }
 }
 
-/// With one coordinator saved, Restore fills the draft and its files with no chip, as on `main`,
-/// and the text goes as typed. Once another coordinator was removed the composer names recipients
-/// again, so the restored draft keeps its chip and its text stays literal.
+/// With one coordinator saved, Restore fills the draft and its files and binds them to their
+/// coordinator, with no chip drawn, as on `main`, and the text goes as typed. A cleared draft
+/// leaves no recipient behind. Once another coordinator was removed the composer names recipients
+/// again, so the restored draft shows its chip and its text stays literal.
 @MainActor @Test(.timeLimit(.minutes(1)))
-func restoreSetsAChipOnlyWhileTheComposerNamesRecipients() async throws {
+func restoreDrawsAChipOnlyWhileTheComposerNamesRecipients() async throws {
   try await withTwoFixtures { coordinators, workFixture, _, root in
     await workFixture.refuseUploads()
     try await coordinators.add(
@@ -2333,17 +2335,230 @@ func restoreSetsAChipOnlyWhileTheComposerNamesRecipients() async throws {
     let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
     let original = try #require(try queuedRequests(outbox).first)
     await chat.restore(original.inputId)
-    #expect(chat.recipient == nil, "With one coordinator saved, Restore shows no chip")
+    #expect(chat.recipient == work, "Restore binds the draft to its coordinator")
+    #expect(chat.shownChip == nil, "With one coordinator saved, Restore shows no chip")
     #expect(chat.draft == text && chat.attachments.count == 1)
     #expect(chat.addressing == .to([work], body: text))
     chat.draft = ""
     for file in chat.attachments { await chat.removeAttachment(file) }
+    #expect(chat.recipient == nil, "A cleared restored draft binds nothing")
 
     try await coordinators.add(
       name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
     try await coordinators.remove(try #require(coordinators.profiles.last?.id))
     await chat.restore(original.inputId)
-    #expect(chat.recipient == work, "Once one was removed, Restore shows its chip")
+    #expect(chat.shownChip == work, "Once one was removed, Restore shows its chip")
     #expect(chat.addressing == .to([work], body: text))
   }
+}
+
+// MARK: - A restored or held message stays its source's when a coordinator is added
+
+/// Work refuses a message with a file while it is the only coordinator saved, and the user
+/// restores it. The draft is bound to Work, with no chip drawn. The user adds Personal before
+/// tapping Send. Then the chip shows, the line reads "To Work", and the text is never read for
+/// tags, so Work alone gets it and Personal gets nothing.
+@MainActor private func restoreWithOneCoordinatorThenAddPersonal(_ text: String, _ tag: String)
+  async throws
+{
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+    await workFixture.refuseUploads()
+    try await coordinators.add(
+      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    let work = try #require(coordinators.profiles.first?.id)
+    let chat = coordinators.chat
+    try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
+    chat.draft = text
+    await chat.attach(
+      data: Data("Invented: Work's quarterly numbers".utf8), name: "Numbers.txt",
+      mediaType: "text/plain")
+    await chat.send()
+    try await eventually("Work refused it") { chat.rows.contains { $0.row.delivery == .rejected } }
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let original = try #require(try queuedRequests(outbox).first)
+    await chat.restore(original.inputId)
+    print(
+      "IF6-T1[\(tag)] restored with one coordinator: recipient=\(chat.recipient.map(chat.name) ?? "none") chip=\(chat.shownChip.map(chat.name) ?? "none") draft=\(chat.draft)"
+    )
+    #expect(chat.recipient == work, "Restore binds the draft to Work")
+    #expect(chat.shownChip == nil, "With one coordinator saved no chip is drawn")
+    #expect(chat.draft == text && chat.attachments.map(\.reference.name) == ["Numbers.txt"])
+    try await coordinators.add(
+      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+    try await eventually("both connected") {
+      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+    }
+    await workFixture.acceptUploads()
+    print(
+      "IF6-T1[\(tag)] after Add Personal: chip=\(chat.shownChip.map(chat.name) ?? "none") recipientLine=\(chat.recipientLine) canSend=\(chat.canSend)"
+    )
+    #expect(chat.shownChip == work && chat.recipientLine == "To Work")
+    #expect(chat.addressing == .to([work], body: text), "The restored text stays literal")
+    await chat.send()
+    try await eventually("a submit arrived") {
+      await workFixture.count() + personalFixture.count() >= 1
+    }
+    try await Task.sleep(for: .milliseconds(500))
+    let workGot = await submits(workFixture).map(\.text)
+    let personalGot = await submits(personalFixture)
+    let personalChunks = await personalFixture.uploadCount()
+    print(
+      "IF6-T1[\(tag)] Work received \(workGot) Personal received \(personalGot.map(\.text)) files=\(personalGot.flatMap { $0.attachments ?? [] }.map(\.name)) uploadChunks=\(personalChunks)"
+    )
+    #expect(personalGot.isEmpty, "A message restored from Work's queue reached Personal")
+    #expect(personalChunks == 0, "Work's file reached Personal")
+    #expect(workGot == [text], "Work gets the restored text as it was")
+    #expect(
+      try !queuedRequests(outbox).contains { $0.inputId == original.inputId },
+      "The original leaves Work's outbox once its copy was admitted")
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aMessageRestoredWithOneCoordinatorStaysItsOnceAnotherIsAdded() async throws {
+  try await restoreWithOneCoordinatorThenAddPersonal(
+    "Invented: the board deck for Thursday", "untagged")
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRestoredTextNamingAnotherCoordinatorStaysLiteralOnceItIsAdded() async throws {
+  try await restoreWithOneCoordinatorThenAddPersonal(
+    "@Personal gets the invented numbers next week", "at-personal")
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRestoredFileWithNoTextStaysItsSourcesOnceAnotherIsAdded() async throws {
+  try await restoreWithOneCoordinatorThenAddPersonal("", "file only")
+}
+
+/// A message held from before the update is restored while its migrated coordinator is the only
+/// one saved. The user adds Personal, then taps Send. Legacy Restore addresses the migrated
+/// profile, so Work alone gets it.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aHeldMessageRestoredWithOneCoordinatorStaysItsOnceAnotherIsAdded() async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+    try await coordinators.add(
+      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    let work = try #require(coordinators.profiles.first?.id)
+    let chat = coordinators.chat
+    try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
+    let text = "Invented: Work's held reorg memo"
+    let directory = ProfileDirectory(work, applicationSupport: root, caches: root)
+    try FileManager.default.createDirectory(at: directory.legacy, withIntermediateDirectories: true)
+    try writePrivately(
+      JSONEncoder().encode([NativeRequestSubmit(inputId: "held-1", mode: .steer, text: text)]),
+      to: directory.legacy.appending(path: "pending.json"))
+    let hold = try #require(chat.lanes.first { $0.id == work }?.hold)
+    let held = HeldMessage(lane: work, item: try #require(try await hold.items().first))
+    await chat.restoreHeld(held)
+    print(
+      "IF6-T1[legacy] restored with one coordinator: recipient=\(chat.recipient.map(chat.name) ?? "none") chip=\(chat.shownChip.map(chat.name) ?? "none") draft=\(chat.draft)"
+    )
+    #expect(chat.recipient == work && chat.shownChip == nil && chat.draft == text)
+    try await coordinators.add(
+      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+    try await eventually("both connected") {
+      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+    }
+    print("IF6-T1[legacy] after Add Personal: recipientLine=\(chat.recipientLine)")
+    #expect(chat.shownChip == work && chat.recipientLine == "To Work")
+    await chat.send()
+    try await eventually("a submit arrived") {
+      await workFixture.count() + personalFixture.count() >= 1
+    }
+    try await Task.sleep(for: .milliseconds(500))
+    let workGot = await submits(workFixture).map(\.text)
+    let personalGot = await submits(personalFixture).map(\.text)
+    let left = try await hold.items().map(\.id)
+    print("IF6-T1[legacy] Work received \(workGot) Personal received \(personalGot) held=\(left)")
+    #expect(personalGot.isEmpty, "A message held for Work reached Personal")
+    #expect(workGot == [text])
+    #expect(left.isEmpty, "The held message leaves its hold once its copy was admitted")
+  }
+}
+
+/// The single-address build left a queue for a coordinator that is not updated yet, so the
+/// migrated profile stays unpaired. The user restores its held message, then adds Personal, which
+/// is up to date. The message stays the migrated coordinator's: Send is blocked because it is not
+/// paired, and the message stays in its hold.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aHeldMessageOfAnUnpairedCoordinatorStaysItsOnceAnotherIsAdded() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let support = root.appending(path: "Support")
+  let suite = "unpaired-held-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  defaults.set("100.64.1.2", forKey: "coordinatorAddress")
+  defaults.set("4001", forKey: "coordinatorPort")
+  let key = SHA256.hash(data: Data("100.64.1.2:4001".utf8)).map { String(format: "%02x", $0) }
+    .joined()
+  let old = support.appending(path: "Agent/Outbox/\(key)")
+  let attachment = try await AttachmentStore(directory: old.appending(path: "Attachments"))
+    .stage(
+      data: Data("Invented Work salary bands".utf8), name: "Bands.txt", mediaType: "text/plain"
+    )
+    .reference
+  let text = "Invented: draft the Work salary review"
+  try JSONEncoder().encode([
+    NativeRequestSubmit(
+      attachments: [attachment], inputId: UUID().uuidString, mode: .steer, text: text)
+  ]).write(to: old.appending(path: "pending.json"))
+  let oldCoordinator = FixtureCoordinator()
+  await oldCoordinator.dropIdentify()
+  let personalFixture = FixtureCoordinator()
+  let (oldListener, oldPort) = try await listen(oldCoordinator)
+  defer { oldListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personalFixture)
+  defer { personalListener.cancel() }
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: support,
+    caches: root.appending(path: "Caches"),
+    transport: CoordinatorTransport { address in
+      LineConnection(
+        connection: NWConnection(
+          host: .ipv4(.loopback), port: address.port == 4002 ? personalPort : oldPort,
+          using: .tcp))
+    })
+  let chat = coordinators.chat
+  let migrated = try #require(coordinators.profiles.first)
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await oldCoordinator.stop()
+    await personalFixture.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("the held message shows") { !chat.held.isEmpty }
+    try await eventually("pairing refused") { coordinators.pairingError[migrated.id] != nil }
+    await chat.restoreHeld(try #require(chat.held.first))
+    print(
+      "IF6-T1[unpaired] restored: recipient=\(chat.recipient.map(chat.name) ?? "none") chip=\(chat.shownChip.map(chat.name) ?? "none") draft=\(chat.draft) files=\(chat.attachments.map(\.reference.name)) canSend=\(chat.canSend)"
+    )
+    #expect(chat.recipient == migrated.id && chat.shownChip == nil && !chat.canSend)
+    try await coordinators.add(
+      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+    let personal = try #require(coordinators.profiles.last?.id)
+    try await eventually("Personal connected") {
+      chat.snapshots[personal]?.connection == .connected
+    }
+    print(
+      "IF6-T1[unpaired] after Add Personal: recipientLine=\(chat.recipientLine) canSend=\(chat.canSend)"
+    )
+    #expect(chat.shownChip == migrated.id)
+    #expect(chat.recipientLine == "\(migrated.name) is not paired yet" && !chat.canSend)
+    await chat.send()
+    try await Task.sleep(for: .milliseconds(500))
+    let got = await submits(personalFixture)
+    print(
+      "IF6-T1[unpaired] Personal received \(got.map(\.text)) files=\(got.flatMap { $0.attachments ?? [] }.map(\.name)) held=\(chat.held.map(\.item.text))"
+    )
+    #expect(got.isEmpty, "A message held for the migrated coordinator reached Personal")
+    #expect(await personalFixture.uploadCount() == 0)
+    #expect(chat.held.map(\.item.text) == [text], "It stays in its hold")
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
 }
