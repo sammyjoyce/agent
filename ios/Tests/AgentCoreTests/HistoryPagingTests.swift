@@ -26,7 +26,7 @@ func earlierHistoryCoalescesActivityPagesAndKeepsOneOwnerAcrossOtherControls() a
         "four": page("not-requested", role: .final, next: nil),
       ])
     await fixture.holdHistory("one")
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     for await update in session.updates where update.connection == .connected { break }
     let first = Task { await session.loadEarlier() }
     for await _ in fixture.observedHistory { break }
@@ -53,7 +53,7 @@ func earlierHistoryCancellationReleasesOwnershipWithoutAdvancing() async throws 
       initial: page("latest", role: .final, next: "one"),
       pages: ["one": page("earlier-user", role: .user, next: nil)])
     await fixture.holdHistory("one")
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     for await update in session.updates where update.connection == .connected { break }
     let loading = Task { await session.loadEarlier() }
     for await _ in fixture.observedHistory { break }
@@ -84,7 +84,7 @@ func earlierHistoryStopsAtTheBatchBoundAndRejectsRepeatedCursors() async throws 
         })
       await fixture.replyToHistory(
         initial: page("latest", role: .final, next: "page-1"), pages: pages)
-      await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+      await session.connect()
       for await update in session.updates where update.connection == .connected { break }
       await session.loadEarlier()
       for await update in session.updates
@@ -119,7 +119,7 @@ func earlierHistoryRespectsRowAndTextBatchLimits(largeText: Bool) async throws {
       })
     await fixture.replyToHistory(
       initial: page("latest", role: .final, next: "page-1"), pages: pages)
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     for await update in session.updates where update.connection == .connected { break }
     await session.loadEarlier()
     for await update in session.updates
@@ -156,7 +156,7 @@ func latestHistoryReplacesAnOlderWindowAndKeepsConcurrentLiveMessages() async th
       })
     await fixture.replyToHistory(
       initial: .init(messages: recent, nextCursor: "page-1", pageComplete: true), pages: pages)
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     for await update in session.updates where update.connection == .connected { break }
     await session.loadEarlier()
     for await update in session.updates
@@ -219,7 +219,7 @@ func latestHistoryCancelsAnOlderPageBeforeRefreshing() async throws {
       ])
     await fixture.holdHistory("one")
     await fixture.replyToLatest(page("new-latest", role: .final, next: "new-older"))
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     for await update in session.updates where update.connection == .connected { break }
     let earlier = Task { await session.loadEarlier() }
     for await _ in fixture.observedHistory { break }

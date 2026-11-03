@@ -22,7 +22,7 @@ private func recordedTool(status: ToolStatus = .finished, callID: String = "tool
 }
 
 private func connectForToolDetails(_ session: CoordinatorSession) async throws {
-  await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+  await session.connect()
   for await snapshot in session.updates where snapshot.connection == .connected { return }
   throw ConnectionError.closed
 }

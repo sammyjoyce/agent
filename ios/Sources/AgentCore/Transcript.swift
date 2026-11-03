@@ -5,6 +5,8 @@ public enum Delivery: String, Sendable, Equatable {
   case saved = "Saved"
   case uncertain = "Delivery unconfirmed"
   case rejected = "Needs attention"
+  /// Its queued item was withdrawn because the user sent a restored copy instead.
+  case withdrawn = "Not sent"
 }
 
 public struct ChatRow: Identifiable, Sendable, Equatable {
@@ -18,6 +20,11 @@ public struct ChatRow: Identifiable, Sendable, Equatable {
   public var delivery: Delivery?
   public var inputID: String?
   public var attachments: [AttachmentRef]
+  /// When this phone received the row. The owning session sets it, and it never decreases in
+  /// that session's row order.
+  public var receivedAt: Date?
+  /// The Send this user row belongs to, shared with other coordinators' rows of one message.
+  public var sendID: String?
 
   init(
     id: String, entryID: String? = nil, role: HistoryRole, text: String, tool: ToolHistory? = nil,
@@ -54,6 +61,11 @@ struct Transcript: Sendable {
       return storage
     }
   }
+
+  /// Rows in order without preparing their text, for bookkeeping between publications.
+  var unpreparedRows: [ChatRow] { storage }
+  /// The row streamed text grows until its entry replaces it.
+  var streamingRowID: String? { responseID }
 
   private mutating func append(_ row: ChatRow) {
     storage.append(row)
@@ -93,6 +105,9 @@ struct Transcript: Sendable {
         id: "input:\(request.inputId)", role: .user, text: request.text, delivery: delivery,
         inputID: request.inputId, attachments: request.attachments ?? []))
     bound()
+  }
+  mutating func removeInput(_ id: String) {
+    storage.removeAll { $0.inputID == id && $0.entryID == nil }
   }
   mutating func delivery(_ id: String, _ state: Delivery, entryID: String? = nil) {
     guard let index = storage.firstIndex(where: { $0.inputID == id }) else { return }
