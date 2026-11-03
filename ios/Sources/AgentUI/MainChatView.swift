@@ -68,9 +68,7 @@ public struct MainChatView: View {
           .padding(.horizontal, 16).padding(.vertical, 8)
         }
         transcript
-        if let error = model.multiple
-          ? model.error : unpaired.flatMap({ coordinators?.pairingError[$0.id] }) ?? model.error
-        {
+        if let error = composerError {
           HStack(alignment: .firstTextBaseline, spacing: 12) {
             Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
               .frame(maxWidth: .infinity, alignment: .leading)
@@ -115,7 +113,7 @@ public struct MainChatView: View {
       ) { result in
         switch result {
         case .success(let urls): Task { await model.attach(urls: urls) }
-        case .failure(let error): model.error = error.localizedDescription
+        case .failure(let error): model.failure = error.localizedDescription
         }
       }
       .dropDestination(for: URL.self) { urls, _ in
@@ -157,6 +155,13 @@ public struct MainChatView: View {
   }
   /// A saved profile that is not paired yet. It shows its held messages and takes no sends.
   private var unpaired: CoordinatorProfile? { coordinators?.profiles.first { $0.pin == nil } }
+  /// The error under the feed. With one coordinator saved, an unpaired one's pairing error stands
+  /// in for the composer's latest failure, after what the composer reported.
+  private var composerError: String? {
+    guard !model.multiple, let pairing = unpaired.flatMap({ coordinators?.pairingError[$0.id] })
+    else { return model.error }
+    return (model.reports + [pairing]).joined(separator: " ")
+  }
   private var connectionStatus: String? {
     if let unpaired, coordinators?.pairingError[unpaired.id] == nil {
       return ConnectionState.connecting.label

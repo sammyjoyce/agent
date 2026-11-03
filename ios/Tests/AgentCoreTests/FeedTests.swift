@@ -1847,7 +1847,7 @@ func aRestoredFeedbackPngGoesToTheCoordinatorItCameFromAlone() async throws {
     await chat.send()
     #expect(chat.error?.hasPrefix("Remove the automatic screenshot") == true, "Not to both")
     chat.recipient = work
-    chat.error = nil
+    chat.failure = nil
     await workFixture.acceptUploads()
     await chat.send()
     #expect(chat.error == nil)
@@ -2056,6 +2056,61 @@ func aSendWhoseAddressChangesWhileItsDialIsPendingIsNamedOnlyIfLost(saved: Int, 
       #expect(chat.error == nil)
       #expect(try queuedRequests(outbox).map(\.text) == [draft], "Kept for the new session")
     }
+  }
+}
+
+/// A message to both whose socket to Work is still proving Work's identity when Remove takes Work,
+/// while Personal refuses its copy. One coordinator is left, so Personal's errors show in the
+/// composer. What Remove cut off stays named beside them, and beside any other failure, until the
+/// next Send.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func whatRemoveCutOffStaysNamedUntilTheNextSendWithOneCoordinatorLeft() async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, _ in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    await personalFixture.refuseUploads()
+    print("IF6-T3 Remove's confirmation: \(await coordinators.removalMessage(work))")
+    await workFixture.holdNextIdentity()
+    chat.draft = "Invented: the shared holiday budget"
+    await chat.attach(
+      data: Data("invented budget".utf8), name: "Budget.txt", mediaType: "text/plain")
+    await chat.send()
+    try await eventually("Work's socket waiting for its identity") {
+      await workFixture.identityHeld
+    }
+    try await eventually("Personal refused its copy") { chat.snapshots[personal]?.error != nil }
+    print(
+      "IF6-T3 before Remove: composer error=\(chat.error ?? "nil") Personal lane=\(chat.snapshots[personal]?.error ?? "nil")"
+    )
+    try await coordinators.remove(work)
+    await workFixture.releaseIdentity()
+    print("IF6-T3 Remove returned: composer error=\(chat.error ?? "nil")")
+    let report = "Work did not get this message. It was removed."
+    #expect(chat.error?.hasPrefix(report) == true)
+    try await personalFixture.liveMessage(
+      HistoryMessage(
+        continuation: false, entryId: "if6-reply", finalChunk: true, role: .assistant,
+        text: "Invented: noted."))
+    try await eventually("Personal's reply") {
+      chat.rows.contains { $0.row.text == "Invented: noted." }
+    }
+    print("IF6-T3 after Personal's next reply: composer error=\(chat.error ?? "nil")")
+    #expect(chat.error == "\(report) Attachment storage is full")
+    let refused = try #require(
+      chat.snapshots[personal]?.rows.first { $0.delivery == .rejected }?.inputID)
+    chat.draft = "Invented: a draft in progress"
+    await chat.restore(refused)
+    print("IF6-T3 after a refused Restore: composer error=\(chat.error ?? "nil")")
+    #expect(
+      chat.error
+        == "\(report) Send or clear the current draft before restoring another message.")
+    await personalFixture.acceptUploads()
+    await chat.send()
+    try await eventually("Personal got the next message") {
+      await submits(personalFixture).contains { $0.text == "Invented: a draft in progress" }
+    }
+    print("IF6-T3 after the next Send: composer error=\(chat.error ?? "nil")")
+    #expect(chat.error?.contains(report) != true, "The next Send clears the report")
   }
 }
 

@@ -58,7 +58,7 @@
             let lifetime = AsyncStream<Void> { _ in }
             for await _ in lifetime {}
             for profile in profiles { await model.detach(profile.id) }
-          } catch { model.error = error.localizedDescription }
+          } catch { model.failure = error.localizedDescription }
         }
     }
   }

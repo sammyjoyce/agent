@@ -106,7 +106,8 @@ Mode if requested, then Run.
   Commands are never queued, so one a coordinator did not get because its
   connection dropped, or because you removed it meanwhile, is named under the
   feed ("Work did not get /status. It was removed."). If no coordinator got it,
-  the draft stays.
+  the draft stays. That note stays until your next Send, beside any other
+  error, with one coordinator left too.
 - Adding, editing, pairing and removing coordinators run one at a time. Remove
   refuses while the draft is addressed to that coordinator or restored from it.
   It saves `profiles.json` without the coordinator, and with a record of its

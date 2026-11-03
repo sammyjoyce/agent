@@ -69,7 +69,16 @@ final class ChatModel {
   var canLoadEarlier = false
   var loadingHistory = false
   var includesLatest = true
-  var error: String?
+  /// What the composer shows under the feed: what it reported since the last Send, then the latest
+  /// failure.
+  var error: String? {
+    let parts = reports + [failure].compactMap { $0 }
+    return parts.isEmpty ? nil : parts.joined(separator: " ")
+  }
+  /// Who did not get the last Send, and why. Only the next Send clears it.
+  private(set) var reports: [String] = []
+  /// The latest failure: the composer's own, or, with one coordinator, that coordinator's error.
+  var failure: String?
   var revision = 0
   /// Saved coordinators in order, kept by `Coordinators`. Names, colors and the feed's lane
   /// order come from here.
@@ -162,7 +171,7 @@ final class ChatModel {
       held.removeAll { $0.lane == id }
       if lane.session != nil {
         snapshots[id] = nil
-        if !multiple { error = nil }
+        if !multiple { failure = nil }
         refresh()
       }
     }
@@ -306,7 +315,7 @@ final class ChatModel {
         screenshotOwners[file.id] = shown
       }
     } catch {
-      self.error = error.localizedDescription
+      failure = error.localizedDescription
       return
     }
     guard
@@ -315,13 +324,14 @@ final class ChatModel {
     else { return }
     // A file that may show one coordinator's feed goes to that coordinator alone.
     guard files.compactMap({ screenshotOwners[$0.id] }).allSatisfy({ recipients == [$0] }) else {
-      error =
+      failure =
         "Remove the automatic screenshot before sending. It could show one coordinator's messages to another."
       return
     }
     let sendID = UUID().uuidString
     // Cleared before staging, so what a retirement cancels during this Send stays named.
-    error = nil
+    failure = nil
+    reports = []
     var staged: [(id: ProfileID, session: CoordinatorSession, input: StagedInput)] = []
     for id in recipients {
       guard let session = lanes.first(where: { $0.id == id })?.session,
@@ -391,7 +401,7 @@ final class ChatModel {
   }
 
   /// Names each coordinator that did not get an input, and why, after what the composer already
-  /// says. A control is named by its command, anything else as "this message".
+  /// reported. A control is named by its command, anything else as "this message".
   private func report(_ misses: [(lane: ProfileID, input: StagedInput, why: Missed)]) {
     var groups: [(why: Missed, what: String, names: [String])] = []
     for miss in misses {
@@ -405,9 +415,7 @@ final class ChatModel {
     }
     for group in groups { report(group.why.sentence(group.names, group.what)) }
   }
-  private func report(_ sentence: String) {
-    error = error.map { "\($0) \(sentence)" } ?? sentence
-  }
+  private func report(_ sentence: String) { reports.append(sentence) }
 
   // MARK: - Restore
 
@@ -419,7 +427,7 @@ final class ChatModel {
       let store = try attachmentStore()
       guard let restored = await lane.session?.restore(inputID, to: store) else { return }
       fill(restored, from: RestoredSource(lane: lane.id, item: inputID, kind: .live))
-    } catch { self.error = error.localizedDescription }
+    } catch { failure = error.localizedDescription }
   }
   func restoreHeld(_ message: HeldMessage) async {
     guard let lane = lanes.first(where: { $0.id == message.lane }), readyToRestore(from: lane.id)
@@ -428,20 +436,20 @@ final class ChatModel {
       guard let restored = try await lane.hold.restore(message.id, to: attachmentStore())
       else { return }
       fill(restored, from: RestoredSource(lane: lane.id, item: message.id, kind: .legacy))
-    } catch { self.error = error.localizedDescription }
+    } catch { failure = error.localizedDescription }
   }
   func discardHeld(_ message: HeldMessage) async {
     guard let lane = lanes.first(where: { $0.id == message.lane }) else { return }
-    do { try await lane.hold.discard(message.id) } catch { self.error = error.localizedDescription }
+    do { try await lane.hold.discard(message.id) } catch { failure = error.localizedDescription }
     await loadHeld(lane)
   }
   private func readyToRestore(from lane: ProfileID) -> Bool {
     if let name = removed[lane] {
-      error = "\(name) is being removed."
+      failure = "\(name) is being removed."
       return false
     }
     guard !admitting, draft.isEmpty, attachments.isEmpty else {
-      error = "Send or clear the current draft before restoring another message."
+      failure = "Send or clear the current draft before restoring another message."
       return false
     }
     return true
@@ -473,7 +481,7 @@ final class ChatModel {
     case .live: await lane.session?.discard(source.item)
     case .legacy:
       do { try await lane.hold.discard(source.item) } catch {
-        self.error = error.localizedDescription
+        failure = error.localizedDescription
       }
       await loadHeld(lane)
     }
@@ -514,7 +522,7 @@ final class ChatModel {
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         attachments.append(try await store.stage(url: url))
       }
-    } catch { self.error = error.localizedDescription }
+    } catch { failure = error.localizedDescription }
   }
   func attach(data: Data, name: String, mediaType: String) async {
     do {
@@ -525,7 +533,7 @@ final class ChatModel {
         throw AttachmentError.tooMany
       }
       attachments.append(file)
-    } catch { self.error = error.localizedDescription }
+    } catch { failure = error.localizedDescription }
   }
   #if os(iOS)
     func attach(photo: PhotosPickerItem) async {
@@ -537,7 +545,7 @@ final class ChatModel {
           throw AttachmentError.invalidFile
         }
         await attach(data: image.data, name: "Photo.jpg", mediaType: "image/jpeg")
-      } catch { self.error = error.localizedDescription }
+      } catch { failure = error.localizedDescription }
     }
   #endif
   func removeAttachment(_ file: LocalAttachment) async {
@@ -559,7 +567,7 @@ final class ChatModel {
   func preview(_ reference: AttachmentRef, lane: ProfileID?) async {
     guard let session = session(lane) else { return }
     do { previewURL = try await session.preview(reference) } catch {
-      self.error = error.localizedDescription
+      failure = error.localizedDescription
     }
   }
   func retry(_ inputID: String) async { await lane(holding: inputID)?.session?.retry(inputID) }
@@ -597,8 +605,8 @@ final class ChatModel {
 
   func apply(_ update: ChatSnapshot, lane id: ProfileID) {
     // With several coordinators each lane's error shows on its own line instead. With one, an
-    // update that neither has nor clears an error leaves the composer's own error in place.
-    if !multiple, update.error != nil || snapshots[id]?.error != nil { error = update.error }
+    // update that neither has nor clears an error leaves the composer's own failure in place.
+    if !multiple, update.error != nil || snapshots[id]?.error != nil { failure = update.error }
     snapshots[id] = update
     refresh()
   }
