@@ -1331,7 +1331,7 @@ func anActivationDuringRemoveNeverSendsTheMessageRemoveDeletes() async throws {
     await session.disconnect()
     #expect(await session.start(staged) == .started)
     #expect(
-      await coordinators.removalMessage(personal)
+      coordinators.removalMessage(personal)
         == "This deletes 1 queued message on this phone.")
     let activating = Task { @MainActor in await coordinators.setActive(true) }
     let removing = Task { @MainActor in try await coordinators.remove(personal) }
@@ -1818,12 +1818,11 @@ func aRecipientWhoseLedgerCouldNotBeReadReadsUnknownAfterTheClockMovedBack() asy
   await personalPeer.stop()
 }
 
-/// Personal refuses its copy of a message to both. Restoring that copy and sending it to Work
-/// instead discards Personal's original, so Personal never placed the message, and the original
-/// bubble must not read "To Work and Personal".
+/// Personal refuses its copy of a message to both, and the user discards it. Personal never placed
+/// the message, so the bubble must not read "To Work and Personal".
 @MainActor @Test(.timeLimit(.minutes(1)))
-func aCopyRestoredFromPersonalAndSentToWorkLeavesTheOriginalNotSentToPersonal() async throws {
-  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+func aCopyDiscardedAtPersonalLeavesTheOriginalNotSentToPersonal() async throws {
+  try await withTwoFixtures { coordinators, _, personalFixture, root in
     await personalFixture.refuseUploads()
     let (work, personal) = try await addWorkAndPersonal(coordinators)
     let chat = coordinators.chat
@@ -1845,13 +1844,7 @@ func aCopyRestoredFromPersonalAndSentToWorkLeavesTheOriginalNotSentToPersonal() 
     try await eventually("both connected") {
       chat.snapshots.values.filter { $0.connection == .connected }.count == 2
     }
-    await chat.restore(try #require(rejected))
-    chat.recipient = nil
-    chat.draft = "@Work " + chat.draft
-    chat.promoteTypedTag()
-    #expect(chat.recipient == work && chat.recipientLine == "To Work")
-    await chat.send()
-    try await eventually("the copy at Work") { await workFixture.count() == 2 }
+    await chat.discard(try #require(rejected))
     let personalOutbox = ProfileDirectory(personal, applicationSupport: root, caches: root).outbox
     try await eventually("Personal's original withdrawn") {
       (try? queuedRequests(personalOutbox))?.isEmpty == true
@@ -2162,7 +2155,7 @@ func whatRemoveCutOffStaysNamedUntilTheNextSendWithOneCoordinatorLeft() async th
     let (work, personal) = try await addWorkAndPersonal(coordinators)
     let chat = coordinators.chat
     await personalFixture.refuseUploads()
-    print("IF6-T3 Remove's confirmation: \(await coordinators.removalMessage(work))")
+    print("IF6-T3 Remove's confirmation: \(coordinators.removalMessage(work))")
     await workFixture.holdNextIdentity()
     chat.draft = "Invented: the shared holiday budget"
     await chat.attach(
@@ -3436,24 +3429,474 @@ func aRestoredDraftsTextStaysLiteralOnceItsChipIsRemoved(_ text: String) async t
   }
 }
 
-/// The same restored draft. After the chip's ⓧ the user types "@Work " at its start, and that tag
-/// still becomes the chip, with the restored text after it, literal.
+/// The same restored draft. After the chip's ⓧ the user types "@Work " at its start. A restored
+/// draft's text is literal for good, so the typed tag stays text, the picker stays closed, and the
+/// draft goes to every coordinator as written.
 @MainActor @Test(.timeLimit(.minutes(1)))
-func aTagTypedAtTheStartOfARestoredDraftStillBecomesTheChip() async throws {
+func aTagTypedAtTheStartOfARestoredDraftStaysLiteral() async throws {
   try await withTwoFixtures { coordinators, workFixture, _, root in
-    let (work, _) = try await addWorkAndPersonal(coordinators)
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
     let chat = coordinators.chat
     let text = "@Personal invented: forward Work's board deck to the auditors"
     _ = try await restoreWorkOnlyMessage(chat, workFixture, text, root: root)
     chat.recipient = nil
+    var offered: [String] = []
     for (offset, character) in "@Work ".enumerated() {
       chat.draft.insert(character, at: chat.draft.index(chat.draft.startIndex, offsetBy: offset))
       chat.promoteTypedTag()
+      offered += chat.pickerMatches.map(\.name.description)
     }
     print(
-      "IF7-V4[typed at the start] chip=\(chat.recipient.map(chat.name) ?? "none") line=\(chat.recipientLine) draft=\(chat.draft.debugDescription)"
+      "IF8-W2[typed at the start] chip=\(chat.recipient.map(chat.name) ?? "none") picker=\(offered) line=\(chat.recipientLine) draft=\(chat.draft.debugDescription)"
     )
-    #expect(chat.recipient == work && chat.draft == text)
-    #expect(chat.recipientLine == "To Work" && chat.addressing == .to([work], body: text))
+    #expect(chat.recipient == nil && chat.draft == "@Work " + text)
+    #expect(offered.isEmpty, "The picker opened over a restored draft")
+    #expect(chat.recipientLine == "To Work and Personal")
+    #expect(chat.addressing == .to([work, personal], body: "@Work " + text))
+  }
+}
+
+/// Work refuses a message whose text is a heading line, then "@Personal …", and the user restores
+/// it and removes its chip. Deleting the heading leaves "@Personal " at the start, but it is the
+/// restored text's own, so it stays literal. Both coordinators get the text and the file as they
+/// are, and nothing becomes Personal's alone.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func deletingARestoredDraftsHeadingPromotesNothing() async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let heading = "Invented memo heading\n"
+    let body = "@Personal invented quotation from Work's meeting"
+    _ = try await restoreWorkOnlyMessage(chat, workFixture, heading + body, root: root)
+    chat.recipient = nil
+    print(
+      "IF8-W2[heading] before deletion: \(chat.recipientLine), text=\(chat.draft.debugDescription)")
+    chat.draft.removeFirst(heading.count)
+    chat.promoteTypedTag()
+    print(
+      "IF8-W2[heading] after deleting it: \(chat.recipientLine), text=\(chat.draft.debugDescription), chip=\(chat.recipient.map(chat.name) ?? "none")"
+    )
+    #expect(chat.recipient == nil)
+    #expect(chat.addressing == .to([work, personal], body: body))
+    await workFixture.acceptUploads()
+    await chat.send()
+    try await eventually("Personal got it") { await personalFixture.count() == 1 }
+    _ = await within(3) { await workFixture.count() == 1 }
+    let atWork = await submits(workFixture)
+    let atPersonal = await submits(personalFixture)
+    print(
+      "IF8-W2[heading] wire: Work=\(atWork.map(\.text)) Personal=\(atPersonal.map(\.text)) files=\(atWork.flatMap { $0.attachments ?? [] }.map(\.name)) \(atPersonal.flatMap { $0.attachments ?? [] }.map(\.name))"
+    )
+    #expect(atWork.map(\.text) == [body] && atPersonal.map(\.text) == [body])
+    #expect(atWork.flatMap { $0.attachments ?? [] }.map(\.name) == ["Deck.txt"])
+    #expect(atPersonal.flatMap { $0.attachments ?? [] }.map(\.name) == ["Deck.txt"])
+  }
+}
+
+/// The user removes a restored draft's chip, deletes the "@" of its leading "@Personal" and types
+/// it again, one edit each, as the field reports them. The tag is still the restored text's own,
+/// so the draft stays literal and goes to both coordinators as written.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func retypingTheAtSignOfARestoredTagPromotesNothing() async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let text = "@Personal invented: forward Work's board deck to the auditors"
+    _ = try await restoreWorkOnlyMessage(chat, workFixture, text, root: root)
+    chat.recipient = nil
+    chat.draft.removeFirst()
+    chat.promoteTypedTag()
+    chat.draft.insert("@", at: chat.draft.startIndex)
+    chat.promoteTypedTag()
+    print(
+      "IF8-W2[retyped @] chip=\(chat.recipient.map(chat.name) ?? "none") line=\(chat.recipientLine) draft=\(chat.draft.debugDescription)"
+    )
+    #expect(chat.recipient == nil, "One retyped @ promoted Work's restored text to a chip")
+    #expect(chat.draft == text, "The restored text changed")
+    #expect(chat.addressing == .to([work, personal], body: text))
+  }
+}
+
+// MARK: - A restored source leaves only when a Send carries it unchanged, or by Discard
+
+/// `inputID`'s item in the outbox, if it is still queued. One still marked refused can be withdrawn
+/// by Discard or by a Send that carries its restored copy unchanged.
+private func queuedItem(_ outbox: URL, _ inputID: String) throws -> OutboxItem? {
+  try JSONDecoder().decode([OutboxItem].self, from: Data(contentsOf: outbox)).first {
+    $0.request.inputId == inputID
+  }
+}
+
+@MainActor private func addWork(_ coordinators: Coordinators) async throws -> ProfileID {
+  try await coordinators.add(
+    name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+  let work = try #require(coordinators.profiles.first?.id)
+  try await eventually("Work connected") {
+    coordinators.chat.snapshots[work]?.connection == .connected
+  }
+  return work
+}
+
+/// Work refuses a message, and the user restores it. /status from the Commands menu replaces the
+/// draft, and Send delivers /status. The restored message never went, so its original stays
+/// queued, reads "Needs attention" and can be restored again.
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: ["one coordinator", "two coordinators"])
+func aCommandSentOverARestoredDraftKeepsTheOriginalQueued(_ setup: String) async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    let work =
+      setup == "two coordinators"
+      ? try await addWorkAndPersonal(coordinators).work : try await addWork(coordinators)
+    let chat = coordinators.chat
+    await workFixture.rejectSubmits()
+    let text = "Invented: renew the greenhouse lease before Friday"
+    chat.recipient = setup == "two coordinators" ? work : nil
+    chat.draft = text
+    await chat.send()
+    try await eventually("Work refused it") {
+      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+    }
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let original = try #require(try queuedRequests(outbox).first)
+    await chat.restore(original.inputId)
+    await workFixture.rejectSubmits(false)
+    // What the Commands menu's /status button does.
+    chat.draft = "/status "
+    chat.promoteTypedTag()
+    await chat.send()
+    try await eventually("Work got /status") {
+      await submits(workFixture).contains { $0.text.hasPrefix("/status") }
+    }
+    try await Task.sleep(for: .milliseconds(300))
+    let kept = try queuedItem(outbox, original.inputId)
+    let stillQueued = kept != nil
+    let row = chat.snapshots[work]?.rows.first { $0.inputID == original.inputId }
+    let got = await submits(workFixture)
+    print(
+      "IF8-W1[\(setup)] Work received \(got.map(\.text)) originalQueued=\(stillQueued) refused=\(kept?.refused == true) originalRow=\(row?.delivery?.rawValue ?? "gone") observations=\(await observes(workFixture)) draft=\(chat.draft.debugDescription)"
+    )
+    let textAnywhere =
+      stillQueued || chat.draft.contains("greenhouse")
+      || got.contains { $0.text == text && $0.inputId != original.inputId }
+    #expect(textAnywhere, "The restored message is neither queued, in the draft nor sent")
+    #expect(stillQueued, "The original left the outbox, though its text was never sent")
+    #expect(kept?.refused == true, "The original is no longer withdrawable by Discard")
+    #expect(row?.delivery == .rejected, "The original no longer needs attention")
+    await chat.restore(original.inputId)
+    #expect(chat.draft == text, "The original can be restored again")
+  }
+}
+
+/// A message held from before the update is restored, and /status from the Commands menu replaces
+/// the draft. Send delivers /status, and the held message stays in its hold.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aHeldMessageStaysHeldWhenACommandIsSentOverItsRestoredDraft() async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    let work = try await addWork(coordinators)
+    let chat = coordinators.chat
+    let text = "Invented: Work's held reorg memo"
+    let directory = ProfileDirectory(work, applicationSupport: root, caches: root)
+    try FileManager.default.createDirectory(at: directory.legacy, withIntermediateDirectories: true)
+    try writePrivately(
+      JSONEncoder().encode([NativeRequestSubmit(inputId: "held-1", mode: .steer, text: text)]),
+      to: directory.legacy.appending(path: "pending.json"))
+    let hold = try #require(chat.lanes.first { $0.id == work }?.hold)
+    let held = HeldMessage(lane: work, item: try #require(try await hold.items().first))
+    await chat.restoreHeld(held)
+    chat.draft = "/status "
+    chat.promoteTypedTag()
+    await chat.send()
+    try await eventually("Work got /status") {
+      await submits(workFixture).contains { $0.text.hasPrefix("/status") }
+    }
+    try await Task.sleep(for: .milliseconds(300))
+    let left = try await hold.items()
+    print(
+      "IF8-W1[held] Work received \(await submits(workFixture).map(\.text)) held=\(left.map(\.text)) draft=\(chat.draft.debugDescription)"
+    )
+    #expect(!left.isEmpty || chat.draft.contains("reorg"), "The held message is gone unsent")
+    #expect(left.map(\.text) == [text], "The held message stays in its hold")
+  }
+}
+
+/// Work refuses a message with a file, and the user restores it. /feedback from the Commands menu
+/// replaces the restored text, and the user describes a problem. Send delivers the feedback with
+/// the file, but the restored text never went, so the original stays queued.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aFeedbackSentOverARestoredDraftKeepsTheOriginalQueued() async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    let work = try await addWork(coordinators)
+    let chat = coordinators.chat
+    await workFixture.refuseUploads()
+    let text = "Invented: here is the signed greenhouse lease, please file it"
+    chat.draft = text
+    await chat.attach(data: Data("invented lease".utf8), name: "Lease.txt", mediaType: "text/plain")
+    await chat.send()
+    try await eventually("Work refused it") {
+      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+    }
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let original = try #require(try queuedRequests(outbox).first)
+    await chat.restore(original.inputId)
+    await workFixture.acceptUploads()
+    chat.draft = "/feedback "
+    chat.draft += "the upload button looks wrong"
+    await chat.send()
+    try await eventually("Work got the feedback") {
+      await submits(workFixture).contains { $0.text.hasPrefix("/feedback") }
+    }
+    try await Task.sleep(for: .milliseconds(300))
+    let kept = try queuedItem(outbox, original.inputId)
+    let stillQueued = kept != nil
+    let got = await submits(workFixture)
+    print(
+      "IF8-W1[feedback] Work received \(got.map(\.text)) files=\(got.map { ($0.attachments ?? []).map(\.name) }) originalQueued=\(stillQueued) refused=\(kept?.refused == true) draft=\(chat.draft.debugDescription)"
+    )
+    #expect(
+      stillQueued || got.contains { $0.text == text && $0.inputId != original.inputId },
+      "The restored text is neither queued nor sent")
+    #expect(stillQueued, "The original left the outbox, though its text was never sent")
+    #expect(kept?.refused == true, "The original is no longer withdrawable by Discard")
+  }
+}
+
+/// Work refuses a message, and the user restores it, selects all of its text and types another
+/// message over it. The first key replaces the selection, so the draft is never empty. Send
+/// delivers the new message, and the original stays queued, needing attention.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRestoredTextReplacedInOneEditKeepsTheOriginalQueued() async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    let work = try await addWork(coordinators)
+    let chat = coordinators.chat
+    await workFixture.rejectSubmits()
+    let text = "Invented: renew the greenhouse lease before Friday"
+    chat.draft = text
+    await chat.send()
+    try await eventually("Work refused it") {
+      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+    }
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let original = try #require(try queuedRequests(outbox).first)
+    await chat.restore(original.inputId)
+    await workFixture.rejectSubmits(false)
+    chat.draft = "I"
+    chat.draft += "nvented: what time is the standup tomorrow?"
+    await chat.send()
+    try await eventually("Work got the new message") {
+      await submits(workFixture).contains { $0.text.contains("standup") }
+    }
+    try await Task.sleep(for: .milliseconds(300))
+    let kept = try queuedItem(outbox, original.inputId)
+    let stillQueued = kept != nil
+    let row = chat.snapshots[work]?.rows.first { $0.inputID == original.inputId }
+    print(
+      "IF8-W1[replaced] Work received \(await submits(workFixture).map(\.text)) originalQueued=\(stillQueued) refused=\(kept?.refused == true) originalRow=\(row?.delivery?.rawValue ?? "gone")"
+    )
+    #expect(stillQueued, "The restored message is neither queued nor sent")
+    #expect(kept?.refused == true, "The original is no longer withdrawable by Discard")
+    #expect(row?.delivery == .rejected, "The original no longer needs attention")
+  }
+}
+
+/// Work refuses a message with a file, and the user restores it. Send withdraws the original only
+/// when it carries the restored content unchanged, meaning the same text, ignoring surrounding
+/// whitespace, and every restored file, with or without another file. A word added or the restored
+/// file removed leaves the original queued, needing attention.
+@MainActor
+@Test(
+  .timeLimit(.minutes(1)),
+  arguments: [
+    "unchanged", "surrounding whitespace", "a file added", "a word added", "its file removed",
+  ])
+func aRestoredOriginalIsWithdrawnOnlyWhenItsContentIsSentUnchanged(_ edit: String) async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    let work = try await addWork(coordinators)
+    let chat = coordinators.chat
+    await workFixture.refuseUploads()
+    let text = "Invented: the signed greenhouse lease"
+    chat.draft = text
+    await chat.attach(data: Data("invented lease".utf8), name: "Lease.txt", mediaType: "text/plain")
+    await chat.send()
+    try await eventually("Work refused it") {
+      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+    }
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let original = try #require(try queuedRequests(outbox).first)
+    await chat.restore(original.inputId)
+    switch edit {
+    case "surrounding whitespace": chat.draft = "  " + chat.draft + "\n"
+    case "a file added":
+      await chat.attach(
+        data: Data("invented receipt".utf8), name: "Receipt.txt", mediaType: "text/plain")
+    case "a word added": chat.draft += " today"
+    case "its file removed": await chat.removeAttachment(try #require(chat.attachments.first))
+    default: break
+    }
+    await workFixture.acceptUploads()
+    await chat.send()
+    try await eventually("the copy at Work") { await workFixture.count() == 1 }
+    try await Task.sleep(for: .milliseconds(300))
+    let kept = try queuedItem(outbox, original.inputId)
+    let row = chat.snapshots[work]?.rows.first { $0.inputID == original.inputId }?.delivery
+    let withdrawn = ["unchanged", "surrounding whitespace", "a file added"].contains(edit)
+    print(
+      "IF8-W1[\(edit)] Work received \(await submits(workFixture).map(\.text)) originalQueued=\(kept != nil) refused=\(kept?.refused == true) originalRow=\(row?.rawValue ?? "gone")"
+    )
+    if withdrawn {
+      #expect(
+        kept == nil && row == .withdrawn, "The restored message went, so its original is withdrawn")
+    } else {
+      #expect(kept?.refused == true, "The original left the outbox, though it was never sent")
+      #expect(row == .rejected, "The original no longer needs attention")
+    }
+  }
+}
+
+/// The user restores a refused original, replaces it with another note and sends that, so the
+/// original stays queued. Discard on its row then removes it and its files and records it
+/// withdrawn. It reads "Not sent", and nothing is left to restore.
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: ["one coordinator", "two coordinators"])
+func discardRemovesARefusedOriginalAndRecordsItWithdrawn(_ setup: String) async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+    let chat = coordinators.chat
+    let lane: ProfileID
+    let fixture: FixtureCoordinator
+    var bubble: String?
+    if setup == "two coordinators" {
+      lane = try await addWorkAndPersonal(coordinators).personal
+      fixture = personalFixture
+      await fixture.refuseUploads()
+      bubble = try await sendToBothRefusedByPersonal(chat, "Invented: the signed lease for both")
+        .bubble
+    } else {
+      lane = try await addWork(coordinators)
+      fixture = workFixture
+      await fixture.refuseUploads()
+      chat.draft = "Invented: the signed lease"
+      await chat.attach(
+        data: Data("invented lease".utf8), name: "Lease.txt", mediaType: "text/plain")
+      await chat.send()
+      try await eventually("Work refused it") {
+        chat.snapshots[lane]?.rows.contains { $0.delivery == .rejected } == true
+      }
+    }
+    let directory = ProfileDirectory(lane, applicationSupport: root, caches: root)
+    let item = try #require(
+      try JSONDecoder().decode([OutboxItem].self, from: Data(contentsOf: directory.outbox)).first)
+    let source = item.request.inputId
+    @MainActor func lines() -> [String] {
+      (chat.rows.first { $0.id == bubble }?.receipts ?? []).map { $0.line(chat.name($0.lane)) }
+    }
+    await chat.restore(source)
+    chat.draft = "Invented: a different note instead"
+    for file in chat.attachments { await chat.removeAttachment(file) }
+    await fixture.acceptUploads()
+    await chat.send()
+    try await eventually("the new note arrived") {
+      await submits(fixture).contains { $0.text.contains("different note") }
+    }
+    #expect(
+      try queuedRequests(directory.outbox).contains { $0.inputId == source },
+      "The original was replaced, not sent, so it stays")
+    await chat.discard(source)
+    try await eventually("the original reads Not sent") {
+      chat.snapshots[lane]?.rows.first { $0.inputID == source }?.delivery == .withdrawn
+    }
+    let files =
+      (try? FileManager.default.contentsOfDirectory(atPath: directory.outboxAttachments.path)) ?? []
+    let ledger = try JSONDecoder().decode(Ledger.self, from: Data(contentsOf: directory.ledger))
+    print(
+      "IF8-W1[discard, \(setup)] queued=\(try queuedRequests(directory.outbox).map(\.inputId)) files=\(files) withdrawn=\(ledger.sends[item.sendID]?.withdrawn == true) lines=\(lines())"
+    )
+    #expect(try !queuedRequests(directory.outbox).contains { $0.inputId == source })
+    #expect(files.isEmpty, "The original's files stay on the phone")
+    #expect(ledger.sends[item.sendID]?.withdrawn == true, "Discard records it withdrawn")
+    #expect(chat.snapshots[lane]?.sends[item.sendID]?.progress == .withdrawn)
+    if bubble != nil { #expect(lines() == ["Work · Delivered", "Not sent to Personal"]) }
+    await chat.restore(source)
+    #expect(chat.draft.isEmpty && chat.attachments.isEmpty, "Nothing is left to restore")
+    #expect(!(await submits(fixture)).contains { $0.inputId == source })
+  }
+}
+
+// MARK: - A refused original needs attention until its coordinator says otherwise
+
+/// Work refuses a message. Its row reads "Needs attention", with Restore and Discard rather than
+/// Check / retry, while the app is in the background and once it comes back, since the refusal is
+/// still Work's latest word. Discard then withdraws it.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRefusedOriginalStillNeedsAttentionOnceTheAppComesBack() async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    let work = try await addWork(coordinators)
+    let chat = coordinators.chat
+    await workFixture.rejectSubmits()
+    chat.draft = "Invented: renew the greenhouse lease before Friday"
+    await chat.send()
+    try await eventually("Work refused it") {
+      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+    }
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let original = try #require(try queuedRequests(outbox).first)
+    @MainActor func row() -> Delivery? {
+      chat.snapshots[work]?.rows.first { $0.inputID == original.inputId }?.delivery
+    }
+    let observed = await observes(workFixture)
+    await coordinators.setActive(false)
+    try await eventually("Work disconnected") {
+      chat.snapshots[work]?.connection == .disconnected
+    }
+    let away = row()
+    await coordinators.setActive(true)
+    try await eventually("Work observed again") {
+      await observes(workFixture) > observed && chat.snapshots[work]?.connection == .connected
+    }
+    try await Task.sleep(for: .milliseconds(300))
+    print(
+      "IF8-W1b[background] before=rejected away=\(away?.rawValue ?? "gone") back=\(row()?.rawValue ?? "gone")"
+    )
+    #expect(away == .rejected, "In the background the refused original reads Delivery unconfirmed")
+    #expect(row() == .rejected, "Back active the refused original reads Delivery unconfirmed")
+    await chat.discard(original.inputId)
+    try await eventually("the original reads Not sent") { row() == .withdrawn }
+    #expect(try queuedItem(outbox, original.inputId) == nil)
+  }
+}
+
+/// Work rejects a message but keeps it, as a coordinator whose turn ended while saving it does.
+/// Its row needs attention. Back from the background, Work reports it accepted, so the row reads
+/// Saved, and once Work places it the message reads delivered and leaves the outbox.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRefusedOriginalItsCoordinatorKeptReadsDeliveredOncePlaced() async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    let work = try await addWork(coordinators)
+    let chat = coordinators.chat
+    await workFixture.holdPlacements()
+    await workFixture.rejectNextSubmitButKeepIt()
+    chat.draft = "Invented: the gate code changed to 4410"
+    await chat.send()
+    try await eventually("Work rejected it") {
+      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+    }
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let item = try #require(
+      try JSONDecoder().decode([OutboxItem].self, from: Data(contentsOf: outbox)).first)
+    let source = item.request.inputId
+    @MainActor func row() -> ChatRow? { chat.snapshots[work]?.rows.first { $0.inputID == source } }
+    await coordinators.setActive(false)
+    try await eventually("Work disconnected") {
+      chat.snapshots[work]?.connection == .disconnected
+    }
+    let away = row()?.delivery
+    await coordinators.setActive(true)
+    try await eventually("Work reports it accepted") { row()?.delivery == .saved }
+    try await workFixture.finishTurn()
+    try await eventually("Work placed it") {
+      row()?.entryID != nil && (try? queuedItem(outbox, source)) == nil
+    }
+    print(
+      "IF8-W1b[kept] away=\(away?.rawValue ?? "gone") placed: delivery=\(row()?.delivery?.rawValue ?? "nil") entry=\(row()?.entryID ?? "nil") send=\(String(describing: chat.snapshots[work]?.sends[item.sendID]?.progress))"
+    )
+    #expect(away == .rejected)
+    #expect(row()?.delivery == nil, "A placed message shows no delivery problem")
+    #expect(chat.snapshots[work]?.sends[item.sendID]?.progress == .placed)
   }
 }
