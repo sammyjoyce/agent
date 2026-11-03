@@ -10,6 +10,7 @@ enum ReconnectBehavior: Sendable {
 }
 
 private actor ReconnectCoordinator {
+  nonisolated let id = CoordinatorID(UUID())
   private let behavior: ReconnectBehavior
   private var sockets: [UUID: NWConnection] = [:]
   private var observers: Set<UUID> = []
@@ -76,11 +77,13 @@ private actor ReconnectCoordinator {
     socket.start(queue: .global())
     do {
       var data = Data()
-      while !data.contains(10) { data.append(try await receive(socket)) }
-      let end = try #require(data.firstIndex(of: 10))
-      let command = try JSONDecoder().decode(NativeCommand.self, from: data.prefix(upTo: end))
-      guard case .native(let command) = command else { return }
-      switch command.request {
+      var request = try await read(socket, &data)
+      if case .identify = request {
+        try await emit(
+          .identity(.init(coordinatorId: "\(self.id.uuid)".lowercased())), to: socket)
+        request = try await read(socket, &data)
+      }
+      switch request {
       case .observe(let request):
         observers.insert(id)
         observations.append(request.inputIds)
@@ -156,6 +159,14 @@ private actor ReconnectCoordinator {
       }
     }
   }
+  private func read(_ socket: NWConnection, _ data: inout Data) async throws -> NativeRequest {
+    while !data.contains(10) { data.append(try await receive(socket)) }
+    let end = try #require(data.firstIndex(of: 10))
+    let command = try JSONDecoder().decode(NativeCommand.self, from: data.prefix(upTo: end))
+    data.removeSubrange(...end)
+    guard case .native(let value) = command else { throw ConnectionError.closed }
+    return value.request
+  }
   private func receive(_ socket: NWConnection) async throws -> Data {
     try await withCheckedThrowingContinuation { continuation in
       socket.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, complete, error in
@@ -197,8 +208,7 @@ private actor ReconnectCoordinator {
 
 @MainActor private func withReconnectCoordinator(
   _ behavior: ReconnectBehavior,
-  _ body: (ChatModel, ReconnectCoordinator, URL, @Sendable () -> CoordinatorSession) async throws ->
-    Void
+  _ body: (ChatModel, ReconnectCoordinator, URL, @MainActor () async -> Void) async throws -> Void
 ) async throws {
   let parameters = NWParameters.tcp
   parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
@@ -214,26 +224,33 @@ private actor ReconnectCoordinator {
   defer { listener.cancel() }
   for try await _ in ready.stream { break }
   let port = try #require(listener.port)
-  let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-  defer { try? FileManager.default.removeItem(at: directory) }
-  let outbox = directory.appending(path: "pending.json")
-  let makeSession: @Sendable () -> CoordinatorSession = {
-    CoordinatorSession(
-      outboxURL: outbox,
-      connectTransport: { _ in
-        LineConnection(connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
-      })
+  let (directory, root) = temporaryProfile()
+  defer { try? FileManager.default.removeItem(at: root) }
+  let address = try CoordinatorAddress(host: "100.64.1.2")
+  let lane = {
+    Lane(
+      id: directory.profile,
+      session: CoordinatorSession(
+        directory: directory, address: address, pin: fixture.id, stamps: StampSource(),
+        transport: loopback(port)),
+      hold: LegacyHold(directory))
   }
-  let session = makeSession()
   let model = ChatModel()
-  await model.connect(session: session, address: try CoordinatorAddress(host: "100.64.1.2"))
+  model.attach(lane())
+  await model.setActive(true)
+  // A relaunch: the profile's next session reads the same outbox and ledger.
+  let reopen: @MainActor () async -> Void = {
+    await model.detach(directory.profile)
+    model.attach(lane())
+    await model.setActive(true)
+  }
   do {
-    try await body(model, fixture, outbox, makeSession)
-    await model.stop()
+    try await body(model, fixture, directory.outbox, reopen)
+    await model.detach(directory.profile)
     await fixture.stop()
     #expect(await fixture.errors().isEmpty)
   } catch {
-    await model.stop()
+    await model.detach(directory.profile)
     await fixture.stop()
     throw error
   }
@@ -246,17 +263,14 @@ private enum AcknowledgementReconnect: Sendable { case suspension, sessionReopen
 private func acknowledgedInputsRemainSavedAcrossClientLifecycleAndCannotBeResubmitted(
   _ reconnect: AcknowledgementReconnect
 ) async throws {
-  try await withReconnectCoordinator(.acknowledged) { model, fixture, outbox, makeSession in
+  try await withReconnectCoordinator(.acknowledged) { model, fixture, outbox, reopen in
     try await waitForReconnectState { model.connection == .connected }
     model.draft = "Continue the supplier drawing review"
     await model.send()
     try await waitForReconnectState { model.rows.first?.row.delivery == .saved }
     let input = try #require(await fixture.submitted().first)
     let originalID = try #require(model.rows.first?.id)
-    #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)) == [
-        input
-      ])
+    #expect(try queuedRequests(outbox) == [input])
     switch reconnect {
     case .suspension:
       await model.setActive(false)
@@ -264,9 +278,7 @@ private func acknowledgedInputsRemainSavedAcrossClientLifecycleAndCannotBeResubm
         model.rows.first?.row.delivery == .saved, "Suspension cannot undo coordinator admission")
       await model.setActive(true)
     case .sessionReopen:
-      await model.stop()
-      await model.connect(
-        session: makeSession(), address: try CoordinatorAddress(host: "100.64.1.2"))
+      await reopen()
     }
     try await waitForReconnectFixture { await fixture.observedIDs().count == 2 }
     try await waitForReconnectState { model.connection == .connected }
@@ -277,10 +289,7 @@ private func acknowledgedInputsRemainSavedAcrossClientLifecycleAndCannotBeResubm
     await model.restore(input.inputId)
     #expect(model.draft.isEmpty, "A stale restore action cannot recreate an accepted input")
     #expect(model.attachments.isEmpty)
-    #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)) == [
-        input
-      ])
+    #expect(try queuedRequests(outbox) == [input])
     await model.retry(input.inputId)
     try await Task.sleep(for: .milliseconds(100))
     #expect(
@@ -303,7 +312,7 @@ private func admittedInputWorkReconcilesAfterReopenWithoutBecomingADeliveryError
 )
   async throws
 {
-  try await withReconnectCoordinator(.acknowledged) { model, fixture, _, makeSession in
+  try await withReconnectCoordinator(.acknowledged) { model, fixture, _, reopen in
     try await waitForReconnectState { model.connection == .connected }
     await fixture.describeWork(work)
     model.draft = "Review the connector drawing"
@@ -314,8 +323,7 @@ private func admittedInputWorkReconcilesAfterReopenWithoutBecomingADeliveryError
     #expect(!work.label.isEmpty)
     if case .completed = work { #expect(work.label == "Completed") }
     if case .blocked = work { #expect(work.label.hasPrefix("Processing paused")) }
-    await model.stop()
-    await model.connect(session: makeSession(), address: try CoordinatorAddress(host: "100.64.1.2"))
+    await reopen()
     try await waitForReconnectState {
       model.connection == .connected && model.rows.first?.row.work == work
     }
@@ -407,8 +415,10 @@ private func sourceCoverageShowsOneTransientWarningAndClearsWithoutChangingHisto
         .ready(.init(conversationId: "fixture-root", model: "coverage-\(checkedAt)")))
       try await fixture.observerEvent(.idle)
       try await waitForReconnectState { model.model == "coverage-\(checkedAt)" && !model.busy }
-      #expect(model.sourceWarning == "Source checks incomplete: Gmail unavailable")
-      #expect(model.sources == states, "Retain per-account errors, healthy sources and check times")
+      #expect(model.sourceReports.map(\.warning) == ["Source checks incomplete: Gmail unavailable"])
+      #expect(
+        model.sourceReports.map(\.states) == [states],
+        "Retain per-account errors, healthy sources and check times")
       #expect(model.rows.isEmpty)
       #expect(model.error == nil)
     }
@@ -417,17 +427,21 @@ private func sourceCoverageShowsOneTransientWarningAndClearsWithoutChangingHisto
     try await fixture.observerEvent(
       .ready(.init(conversationId: "fixture-root", model: "coverage-3")))
     try await waitForReconnectState { model.model == "coverage-3" }
-    #expect(model.sourceWarning == "Source checks incomplete: Gmail partial")
-    #expect(model.sources == [state(.partial(.init(message: "private-diagnostic")), 3)])
+    #expect(model.sourceReports.map(\.warning) == ["Source checks incomplete: Gmail partial"])
+    #expect(
+      model.sourceReports.map(\.states) == [
+        [state(.partial(.init(message: "private-diagnostic")), 3)]
+      ])
     for (index, coverage) in [SourceCoverage.more, .complete].enumerated() {
       try await fixture.observerEvent(.sources(.init(sources: [state(coverage, index + 4)])))
       try await fixture.observerEvent(
         .ready(.init(conversationId: "fixture-root", model: "healthy-\(index)")))
       try await fixture.observerEvent(.idle)
       try await waitForReconnectState { model.model == "healthy-\(index)" && !model.busy }
-      #expect(model.sourceWarning == nil)
+      #expect(model.sourceReports.map(\.warning) == [nil])
       #expect(
-        model.sources == [state(coverage, index + 4)], "Recovered coverage replaces old errors")
+        model.sourceReports.map(\.states) == [[state(coverage, index + 4)]],
+        "Recovered coverage replaces old errors")
     }
     #expect(model.rows.isEmpty)
     #expect(model.error == nil)
@@ -475,9 +489,7 @@ func acknowledgedActionReplyReconnectsAndReconcilesWithoutResendingOrClearingNew
       original.row.delivery == .saved, "A lost action socket cannot undo the accepted receipt")
     let originalID = original.id
     let submitted = try #require(await fixture.submitted().first)
-    let pending = try JSONDecoder().decode(
-      [NativeRequestSubmit].self, from: Data(contentsOf: outbox))
-    #expect(pending == [submitted])
+    #expect(try queuedRequests(outbox) == [submitted])
     try await waitForReconnectFixture { await fixture.observedIDs().count == 2 }
     #expect(await fixture.observedIDs().last == [submitted.inputId])
     #expect(await fixture.submitted().count == 1)
@@ -492,27 +504,22 @@ func acknowledgedActionReplyReconnectsAndReconcilesWithoutResendingOrClearingNew
     #expect(model.rows.map(\.id) == [originalID])
     #expect(model.rows.map(\.row.text) == [submitted.text])
     #expect(await fixture.submitted().count == 1)
-    #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
+    #expect(try queuedRequests(outbox).isEmpty)
   }
 }
 
-enum ReconnectStop: Sendable { case disconnect, background, cancellation }
+enum ReconnectStop: Sendable { case detach, background }
 
 @MainActor
-@Test(.timeLimit(.minutes(1)), arguments: [ReconnectStop.disconnect, .background, .cancellation])
+@Test(.timeLimit(.minutes(1)), arguments: [ReconnectStop.detach, .background])
 func stoppingDuringReconnectClosesSocketsAndCancelsTheBackoff(_ stop: ReconnectStop) async throws {
   try await withReconnectCoordinator(.close) { model, fixture, _ in
     model.draft = "An unsent draft"
     try await waitForReconnectState { model.connection == .reconnecting }
     let attempts = await fixture.observedIDs().count
     switch stop {
-    case .disconnect: await model.stop()
+    case .detach: await model.detach(try #require(model.lanes.first).id)
     case .background: await model.setActive(false)
-    case .cancellation:
-      let lifetime = Task { await model.runUntilCancelled() }
-      lifetime.cancel()
-      await lifetime.value
     }
     try await waitForReconnectFixture { await fixture.activeSockets() == 0 }
     try await Task.sleep(for: .milliseconds(2300))

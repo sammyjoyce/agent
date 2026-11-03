@@ -372,15 +372,14 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
       directory: outbox.deletingLastPathComponent().appending(path: "Drafts"))
     let bytes = Data(repeating: 42, count: AttachmentLimits.chunkBytes + 17)
     let file = try await store.stage(data: bytes, name: "Notes.txt", mediaType: "text/plain")
-    let address = try CoordinatorAddress(host: "100.64.1.2")
-    await session.connect(address)
+    await session.connect()
     _ = try await until(session) { $0.connection == .connected }
     #expect(await session.submit("", files: [file]))
     let acknowledged = try await until(session) { $0.rows.contains { $0.delivery == .saved } }
     #expect(acknowledged.rows.last?.attachments == [file.reference])
     #expect(await fixture.uploadCount() == 2)
     #expect(await fixture.uploaded(file.id) == bytes)
-    let saved = try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox))
+    let saved = try queuedRequests(outbox)
     #expect(saved.first?.attachments == [file.reference])
     // The pending copy has its own lifetime, independent of the picker/draft copy.
     try await store.remove(file)
@@ -395,11 +394,11 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     #expect(await session.submit("/help", files: [file]) == false)
     #expect(await fixture.count() == 1, "A rejected control must not admit or clear its files")
     await session.disconnect()
-    await session.connect(address)
+    await session.connect()
     _ = try await until(session) { $0.connection == .connected && $0.rows.last?.delivery == nil }
     #expect(await fixture.count() == 1)
     #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
+      try queuedRequests(outbox).isEmpty)
   }
 }
 
@@ -411,7 +410,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
       directory: outbox.deletingLastPathComponent().appending(path: "Drafts"))
     let file = try await store.stage(
       data: Data([1, 2, 3]), name: "Feedback.png", mediaType: "image/png")
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     _ = try await until(session) { $0.connection == .connected }
     #expect(await session.submit("/feedback Fix this", files: [file]))
     let result = try await until(session) {
@@ -419,7 +418,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     }
     #expect(result.rows.first(where: { $0.role == .user })?.delivery == .saved)
     #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
+      try queuedRequests(outbox).isEmpty)
   }
 }
 
@@ -432,7 +431,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     let bytes = Data("Keep this file".utf8)
     let file = try await store.stage(data: bytes, name: "Notes.txt", mediaType: "text/plain")
     await fixture.refuseUploads()
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     _ = try await until(session) { $0.connection == .connected }
     #expect(await session.submit("Fix this", files: [file]))
     let rejected = try await until(session) { $0.rows.last?.delivery == .rejected }
@@ -450,7 +449,11 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     try await store.remove(restoredFile)
     #expect(!FileManager.default.fileExists(atPath: restoredFile.url.path))
     #expect(
-      try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox)).isEmpty)
+      try queuedRequests(outbox)
+        .map(\.inputId) == [id], "Restore copies; the original stays until its copy is admitted")
+    await session.discard(id)
+    #expect(
+      try queuedRequests(outbox).isEmpty)
   }
 }
 
@@ -465,14 +468,13 @@ private func until(_ session: CoordinatorSession, _ predicate: @Sendable (ChatSn
   async throws
 {
   try await withCoordinator { session, fixture, outbox in
-    let address = try CoordinatorAddress(host: "100.64.1.2")
     await fixture.loseInputAcknowledgements()
-    await session.connect(address)
+    await session.connect()
     _ = try await until(session) { $0.connection == .connected }
     #expect(await session.submit("Keep this original") == true)
     let uncertain = try await until(session) { $0.rows.contains { $0.delivery == .uncertain } }
     let id = try #require(uncertain.rows.first(where: { $0.delivery == .uncertain })?.inputID)
-    let saved = try JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: outbox))
+    let saved = try queuedRequests(outbox)
     #expect(saved.map(\.inputId) == [id])
     #expect(await fixture.count() == 1, "An uncertain write must not be replayed automatically")
   }
@@ -532,7 +534,7 @@ private func until(_ session: CoordinatorSession, _ predicate: @Sendable (ChatSn
 {
   try await withCoordinator { session, fixture, _ in
     await fixture.holdSnapshot()
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     _ = try await until(session) { $0.conversationID != nil && $0.connection == .connecting }
     #expect(await session.submit("Too early") == false)
     await fixture.releaseSnapshot()

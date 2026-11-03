@@ -27,6 +27,41 @@ if [[ "$phase" != simulator ]]; then
   find "$native_dir/AgentApp" "$native_dir/Sources" "$native_dir/Tests" \
     -name '*.swift' ! -name Generated.swift -print0 \
     | xargs -0 xcrun swift-format lint --strict
+
+  # Access control is the identity gate. In a copy of the package, an AgentCore file
+  # other than Connection.swift must fail on each line below; without it the copy builds.
+  boundary="$run_dir/boundary"
+  mkdir "$boundary"
+  cp -R "$native_dir/Package.swift" "$native_dir/Sources" "$native_dir/Tests" "$boundary/"
+  violation="$boundary/Sources/AgentCore/BoundaryViolation.swift"
+  cat > "$violation" <<'SWIFT'
+func dialWithoutIdentity(_ address: CoordinatorAddress) async throws {
+  _ = try await LineConnection(address: address)
+}
+func forgeVerifiedSocket(_ line: LineConnection) { _ = VerifiedConnection(line: line) }
+func sessionWithoutPin(_ directory: ProfileDirectory, _ address: CoordinatorAddress) {
+  _ = CoordinatorSession(directory: directory, address: address, transport: .tailnet)
+}
+SWIFT
+  if swift build --package-path "$boundary" --scratch-path "$run_dir/boundary-build" 2>&1 \
+    | sed $'s/\e\\[[0-9;]*m//g' > "$run_dir/boundary.log"; then
+    printf 'Identity boundary violations compiled\n' >&2
+    exit 1
+  fi
+  for line in 2 4 6; do
+    if ! grep -q "BoundaryViolation.swift:$line:[0-9]*: error" "$run_dir/boundary.log"; then
+      printf 'Identity boundary line %s compiled:\n' "$line" >&2
+      cat "$run_dir/boundary.log" >&2
+      exit 1
+    fi
+  done
+  rm "$violation"
+  if ! swift build --package-path "$boundary" --scratch-path "$run_dir/boundary-build" \
+    > "$run_dir/boundary-clean.log" 2>&1; then
+    cat "$run_dir/boundary-clean.log" >&2
+    exit 1
+  fi
+  printf 'Identity boundary: 3 violations refused; the package builds without them\n'
   mkdir "$run_dir/macos-rendered"
   swift test --package-path "$native_dir" --scratch-path "$run_dir/macos" \
     --attachments-path "$run_dir/macos-rendered"

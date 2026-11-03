@@ -4,6 +4,8 @@ import SwiftUI
 @main
 struct AgentApp: App {
   @UIApplicationDelegateAdaptor(AppNotifications.self) private var notifications
+  // App-level phase aggregates every scene, so a second iPad window cannot fight the first.
+  @Environment(\.scenePhase) private var scenePhase
   var body: some Scene {
     WindowGroup {
       #if DEBUG
@@ -15,6 +17,9 @@ struct AgentApp: App {
       #else
         MainChatView(notifications: notifications)
       #endif
+    }
+    .onChange(of: scenePhase, initial: true) { _, phase in
+      Task { await notifications.coordinators.setActive(phase == .active) }
     }
   }
 }
