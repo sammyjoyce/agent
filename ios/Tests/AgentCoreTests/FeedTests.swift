@@ -2269,3 +2269,46 @@ func aRestoredSourceTheCoordinatorAcceptsBeforeItsCopyIsSentStaysQueued() async 
     #expect(lines() == ["Work · Delivered", "Personal · Saved"])
   }
 }
+
+// MARK: - With one coordinator, a withdrawn original reads not sent
+
+/// One coordinator refuses a file, so the message needs attention. The user restores it and sends
+/// the copy once uploads work. The original is withdrawn, so its row reads "Not sent" and no longer
+/// offers Restore, before and after the app goes inactive and active.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func withOneCoordinatorARestoredAndResentOriginalReadsNotSent() async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    await workFixture.refuseUploads()
+    try await coordinators.add(
+      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    let work = try #require(coordinators.profiles.first?.id)
+    let chat = coordinators.chat
+    try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
+    #expect(!chat.multiple)
+    chat.draft = "Invented: the plumber's quote, attached"
+    await chat.attach(data: Data("invented quote".utf8), name: "Quote.txt", mediaType: "text/plain")
+    await chat.send()
+    try await eventually("rejected") { chat.rows.contains { $0.row.delivery == .rejected } }
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let original = try #require(try queuedRequests(outbox).first)
+    await chat.restore(original.inputId)
+    await workFixture.acceptUploads()
+    await chat.send()
+    try await eventually("the copy at Work and the original out of the outbox") {
+      await workFixture.count() == 1
+        && (try? queuedRequests(outbox))?.contains { $0.inputId == original.inputId } == false
+    }
+    @MainActor func originalRow() -> ChatRow? {
+      chat.rows.first { $0.row.inputID == original.inputId }?.row
+    }
+    print("IF5-S4 original row delivery=\(originalRow()?.delivery?.rawValue ?? "gone")")
+    #expect(originalRow().map { $0.delivery != .rejected } ?? true, "It still needs attention")
+    #expect(originalRow()?.delivery?.rawValue == "Not sent")
+    await chat.restore(original.inputId)
+    #expect(chat.draft.isEmpty && chat.attachments.isEmpty, "Nothing is left to restore")
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    try await eventually("Work reconnected") { chat.snapshots[work]?.connection == .connected }
+    #expect(originalRow()?.delivery?.rawValue == "Not sent")
+  }
+}

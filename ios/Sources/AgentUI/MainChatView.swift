@@ -1075,6 +1075,7 @@ extension Delivery {
     case .saved: "checkmark.circle"
     case .uncertain: "questionmark.circle"
     case .rejected: "exclamationmark.triangle"
+    case .withdrawn: "xmark.circle"
     }
   }
 }

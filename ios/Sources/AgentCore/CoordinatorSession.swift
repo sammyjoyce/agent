@@ -412,6 +412,7 @@ public actor CoordinatorSession {
       let item = pending.first(where: { $0.request.inputId == inputID })
     else { return }
     if acknowledge(inputID) != nil {
+      transcript.delivery(inputID, .withdrawn)
       ledger.sends[item.sendID] = Ledger.Send(
         inputID: inputID, recipients: item.recipients, queuedAt: item.queuedAt, withdrawn: true)
       saveLedger()

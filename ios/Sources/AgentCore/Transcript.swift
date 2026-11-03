@@ -5,6 +5,8 @@ public enum Delivery: String, Sendable, Equatable {
   case saved = "Saved"
   case uncertain = "Delivery unconfirmed"
   case rejected = "Needs attention"
+  /// Its queued item was withdrawn because the user sent a restored copy instead.
+  case withdrawn = "Not sent"
 }
 
 public struct ChatRow: Identifiable, Sendable, Equatable {

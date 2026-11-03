@@ -437,6 +437,52 @@ final class HistoryInteractionTests: XCTestCase {
   }
 }
 
+@MainActor
+final class RestoreInteractionTests: XCTestCase {
+  // One saved coordinator refuses a message. The user restores it and sends the copy once the
+  // coordinator takes messages again.
+  func testARefusedMessageRestoredAndResentWithOneCoordinator() async throws {
+    continueAfterFailure = true
+    executionTimeAllowance = 120
+    let work = InteractionPeer()
+    addTeardownBlock { await work.stop() }
+    let empty = NativeEventHistory(messages: [], nextCursor: nil, pageComplete: true)
+    await work.history(initial: empty, pages: [:], latest: empty)
+    let port = try await work.start()
+    await work.rejectSubmits(true)
+    let app = XCUIApplication()
+    app.launchEnvironment["AGENT_INTERACTION_PORT"] = String(port)
+    app.launchEnvironment["AGENT_INTERACTION_COORDINATOR"] = work.coordinator.uuidString
+    app.launchArguments += ["-notificationsEnabled", "NO"]
+    app.launch()
+    defer { app.terminate() }
+    let composer = app.descendants(matching: .any).matching(identifier: "Message the coordinator")
+      .firstMatch
+    let send = app.buttons["Send message"]
+    XCTAssertTrue(composer.waitForExistence(timeout: 10))
+    composer.tap()
+    let text = "Invented: water the plants on Friday"
+    composer.typeText(text)
+    XCTAssertTrue(send.wait(for: \.isEnabled, toEqual: true, timeout: 10))
+    send.tap()
+    let restore = app.buttons["Restore to composer"]
+    XCTAssertTrue(restore.waitForExistence(timeout: 10), "The refused message offers Restore")
+    XCTAssertTrue(app.staticTexts["Needs attention"].exists)
+    restore.tap()
+    try await eventually { composer.value as? String == text }
+    await work.rejectSubmits(false)
+    send.tap()
+    try await eventually { await work.submits() == [text] }
+    XCTAssertTrue(app.staticTexts["Not sent"].waitForExistence(timeout: 5), "The original")
+    XCTAssertFalse(app.staticTexts["Needs attention"].exists, "The resent message needs attention")
+    XCTAssertFalse(restore.exists, "Restore is offered for a message already sent again")
+    let resent = XCTAttachment(screenshot: app.screenshot())
+    resent.name = "restored-and-resent-with-one-coordinator"
+    resent.lifetime = .keepAlways
+    add(resent)
+  }
+}
+
 // Shared DEBUG app fixture, real screen/session and an owned NDJSON loopback
 // peer. Replies are released by assertions instead of elapsed time.
 private actor InteractionPeer {
@@ -452,6 +498,7 @@ private actor InteractionPeer {
   private var submitted: [String] = []
   private var held: Set<String> = []
   private var releases: [String: CheckedContinuation<Void, Never>] = [:]
+  private var rejecting = false
 
   func history(
     initial: NativeEventHistory, pages: [String: NativeEventHistory], latest: NativeEventHistory
@@ -462,6 +509,8 @@ private actor InteractionPeer {
   }
   func cursors() -> [String] { requests }
   func submits() -> [String] { submitted }
+  /// Rejects each submit while set, as a coordinator that cannot take a message does.
+  func rejectSubmits(_ value: Bool) { rejecting = value }
   func beginReply(_ text: String) async throws {
     try await emit(.textDelta(.init(text: text)), to: XCTUnwrap(observer))
   }
@@ -531,7 +580,14 @@ private actor InteractionPeer {
           .history(try XCTUnwrap(request.cursor == nil ? latest : pages[cursor])), to: socket)
         try await emit(.done, to: socket)
       case .submit(let request):
-        submitted.append(request.text)
+        if rejecting {
+          try await emit(
+            .rejected(
+              .init(inputId: request.inputId, message: "Invented: the coordinator is busy")),
+            to: socket)
+        } else {
+          submitted.append(request.text)
+        }
         try await emit(.done, to: socket)
       default: try await emit(.done, to: socket)
       }
