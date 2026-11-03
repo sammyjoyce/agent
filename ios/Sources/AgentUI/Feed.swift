@@ -102,7 +102,7 @@ struct Receipt: Equatable {
     case placed
     case pending(Delivery, inputID: String?)
     /// Its coordinator's record says its item was withdrawn when the user sent a restored copy
-    /// instead, so it never got this Send.
+    /// instead, and the coordinator refused it.
     case notSent
     /// This phone holds no record of it there: the record was never written, was capped or could
     /// not be read, or the coordinator is no longer saved.
@@ -180,6 +180,7 @@ enum Feed {
       switch record.progress {
       case .placed: return Receipt(lane: id, status: .placed)
       case .withdrawn: return Receipt(lane: id, status: .notSent)
+      case .held: return Receipt(lane: id, status: .pending(.saved, inputID: nil))
       case .pending(let delivery):
         let input = lane.snapshot.rows.first { $0.sendID == send && $0.delivery != nil }?.inputID
         return Receipt(lane: id, status: .pending(delivery, inputID: input))

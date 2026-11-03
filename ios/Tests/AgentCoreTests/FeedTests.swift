@@ -2964,3 +2964,241 @@ func aHeldMessageOfAnUnpairedCoordinatorStaysItsOnceAnotherIsAdded() async throw
   }
   await stop()
 }
+
+// MARK: - A recipient's status follows its coordinator's latest word
+
+/// Personal rejects its copy of a message to both but keeps it, and the user restores that copy.
+/// Back active, Personal reports the original accepted, or placed once its turn ended, while this
+/// phone cannot save its outbox or its ledger. Sending the restored copy once storage works again
+/// never withdraws an original Personal holds. It stays queued and reads Saved, or reads Delivered.
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true], [false, true])
+func anAcknowledgementThisPhoneCouldNotSaveStillKeepsTheOriginal(placed: Bool, storageFails: Bool)
+  async throws
+{
+  try await withTwoFixtures { coordinators, _, personalFixture, root in
+    await personalFixture.holdPlacements()
+    await personalFixture.rejectNextSubmitButKeepIt()
+    let (_, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let text = "Invented: renew the greenhouse lease"
+    chat.draft = text
+    await chat.send()
+    try await eventually("Personal rejected the original") {
+      chat.snapshots[personal]?.rows.contains { $0.delivery == .rejected } == true
+    }
+    let directory = ProfileDirectory(personal, applicationSupport: root, caches: root)
+    let original = try #require(try queuedRequests(directory.outbox).first)
+    await chat.restore(original.inputId)
+    // A placement writes the ledger in the profile's folder, an acceptance the outbox in its own.
+    let blocked = placed ? directory.root : directory.outbox.deletingLastPathComponent()
+    if storageFails {
+      try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: blocked.path)
+    }
+    defer {
+      try? FileManager.default.setAttributes(
+        [.posixPermissions: 0o700], ofItemAtPath: blocked.path)
+    }
+    await coordinators.setActive(false)
+    if placed { try await personalFixture.finishTurn() }
+    await coordinators.setActive(true)
+    try await eventually("Personal acknowledged the original") {
+      guard chat.snapshots[personal]?.connection == .connected else { return false }
+      if placed {
+        return chat.snapshots[personal]?.sends.values.contains { $0.progress == .placed } == true
+      }
+      return chat.snapshots[personal]?.rows.contains {
+        $0.inputID == original.inputId && $0.delivery == .saved
+      } == true
+    }
+    let saved = try JSONDecoder().decode(
+      [OutboxItem].self, from: Data(contentsOf: directory.outbox))
+    print(
+      "IF7-V1[placed=\(placed) storageFails=\(storageFails)] acknowledged: refusedOnDisk=\(saved.first?.refused == true)"
+    )
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: blocked.path)
+    await chat.send()
+    try await eventually("the copy at Personal") { await personalFixture.count() == 2 }
+    try await Task.sleep(for: .milliseconds(200))
+    let bubble = try #require(chat.rows.first { $0.row.text == text && $0.receipts.count == 2 })
+    let lines = bubble.receipts.map { $0.line(chat.name($0.lane)) }
+    let stillQueued = try queuedRequests(directory.outbox).contains {
+      $0.inputId == original.inputId
+    }
+    print(
+      "IF7-V1[placed=\(placed) storageFails=\(storageFails)] after the copy: originalQueued=\(stillQueued) \(lines)"
+    )
+    #expect(!lines.contains("Not sent to Personal"), "Personal acknowledged the original")
+    if !placed { #expect(stillQueued, "The accepted original must remain queued until placed") }
+    #expect(lines == ["Work · Delivered", placed ? "Personal · Delivered" : "Personal · Saved"])
+  }
+}
+
+/// Personal rejects its copy of a message to both while this phone cannot save its outbox, and the
+/// user restores it. The phone still holds that refusal, through a trip to the background too, so
+/// sending the restored copy withdraws the original and its Check / retry sends nothing.
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true], [false, true])
+func aRefusalThisPhoneCouldNotSaveStillWithdrawsTheOriginal(
+  storageFails: Bool, backgrounded: Bool
+) async throws {
+  try await withTwoFixtures { coordinators, _, personalFixture, root in
+    let (_, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    await personalFixture.rejectSubmits()
+    await personalFixture.holdNextIdentity()
+    chat.draft = "Invented: cancel the garden service"
+    await chat.send()
+    try await eventually("Personal's identity held") { await personalFixture.identityHeld }
+    let directory = ProfileDirectory(personal, applicationSupport: root, caches: root)
+    let original = try #require(try queuedRequests(directory.outbox).first)
+    let blocked = directory.outbox.deletingLastPathComponent()
+    if storageFails {
+      try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: blocked.path)
+    }
+    defer {
+      try? FileManager.default.setAttributes(
+        [.posixPermissions: 0o700], ofItemAtPath: blocked.path)
+    }
+    await personalFixture.releaseIdentity()
+    try await eventually("Personal refused the original") {
+      chat.snapshots[personal]?.rows.contains {
+        $0.inputID == original.inputId && $0.delivery == .rejected
+      } == true
+    }
+    let refusedOnDisk =
+      try JSONDecoder().decode([OutboxItem].self, from: Data(contentsOf: directory.outbox)).first?
+      .refused == true
+    await chat.restore(original.inputId)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: blocked.path)
+    if backgrounded {
+      await coordinators.setActive(false)
+      await coordinators.setActive(true)
+      try await eventually("both connected again") {
+        chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+      }
+    }
+    await personalFixture.rejectSubmits(false)
+    await chat.send()
+    try await eventually("the restored copy at Personal") { await personalFixture.count() == 1 }
+    let originalQueued = try queuedRequests(directory.outbox).contains {
+      $0.inputId == original.inputId
+    }
+    try await eventually("Personal connected after the copy") {
+      chat.snapshots[personal]?.connection == .connected
+        && chat.snapshots[personal]?.rows.contains {
+          $0.inputID == original.inputId && $0.delivery != .sending
+        } == true
+    }
+    await chat.retry(original.inputId)
+    try await Task.sleep(for: .milliseconds(500))
+    print(
+      "IF7-V1[storageFails=\(storageFails) backgrounded=\(backgrounded)] refusedOnDisk=\(refusedOnDisk) originalQueuedAfterRestoreSend=\(originalQueued) PersonalKept=\(await personalFixture.count())"
+    )
+    #expect(!originalQueued, "The original stayed queued after its copy was sent")
+    #expect(await personalFixture.count() == 1, "Personal got the message twice")
+  }
+}
+
+/// Sends `text` to both while Personal is busy. Personal rejects its copy but keeps it, as a
+/// coordinator whose turn ended while saving it does. Returns that copy and the Send's bubble.
+@MainActor private func sendToBothKeptByPersonal(_ chat: ChatModel, _ text: String) async throws
+  -> (source: String, bubble: String)
+{
+  chat.draft = text
+  await chat.send()
+  var rejected: String?
+  try await eventually("Work placed it and Personal rejected it") {
+    let receipts = chat.rows.first { $0.row.text == text }?.receipts ?? []
+    guard receipts.first?.status == .placed, receipts.count == 2,
+      case .pending(.rejected, let id?) = receipts[1].status
+    else { return false }
+    rejected = id
+    return true
+  }
+  return (try #require(rejected), try #require(chat.rows.first { $0.row.text == text }?.id))
+}
+
+/// The user restores Personal's kept copy and sends the restored draft at once, so the original
+/// is withdrawn. When Personal's turn ends it places what it kept. The bubble then reads Delivered
+/// there, never "Not sent to Personal". Personal holding the text twice is the coordinator's doing.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aWithdrawnOriginalItsCoordinatorPlacesLaterReadsDelivered() async throws {
+  try await withTwoFixtures { coordinators, _, personalFixture, root in
+    await personalFixture.holdPlacements()
+    await personalFixture.rejectNextSubmitButKeepIt()
+    let (_, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let (source, bubble) = try await sendToBothKeptByPersonal(
+      chat, "Invented R7: the gate code changed to 4410")
+    @MainActor func lines() -> [String] {
+      (chat.rows.first { $0.id == bubble }?.receipts ?? []).map { $0.line(chat.name($0.lane)) }
+    }
+    await chat.restore(source)
+    await chat.send()
+    try await eventually("the copy reached Personal") { await personalFixture.count() == 2 }
+    try await Task.sleep(for: .milliseconds(300))
+    let outbox = ProfileDirectory(personal, applicationSupport: root, caches: root).outbox
+    let originalQueued = try queuedRequests(outbox).contains { $0.inputId == source }
+    print("IF7-V1[placed later] after the copy: \(lines()) originalQueued=\(originalQueued)")
+    try await personalFixture.finishTurn()
+    _ = await within(3) { lines() == ["Work · Delivered", "Personal · Delivered"] }
+    let placed = await personalFixture.placedInputs()
+    print(
+      "IF7-V1[placed later] once Personal placed it: \(lines()) sourcePlaced=\(placed.contains(source))"
+    )
+    #expect(!originalQueued)
+    #expect(
+      lines() != ["Work · Delivered", "Not sent to Personal"] || !placed.contains(source),
+      "The bubble reads Not sent to Personal for an input Personal placed")
+    #expect(lines() == ["Work · Delivered", "Personal · Delivered"])
+  }
+}
+
+/// The same original withdrawn while Personal still holds it unplaced. A refusal heard about it
+/// afterwards changes nothing and is no error. Personal's next observation includes it, so once
+/// the app comes back the bubble reads Saved there, and Delivered once Personal places it.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aWithdrawnOriginalItsCoordinatorStillHoldsReadsSavedThenDelivered() async throws {
+  try await withTwoFixtures { coordinators, _, personalFixture, _ in
+    await personalFixture.holdPlacements()
+    await personalFixture.rejectNextSubmitButKeepIt()
+    let (_, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let (source, bubble) = try await sendToBothKeptByPersonal(
+      chat, "Invented: the hedge trimming is on Tuesday")
+    @MainActor func lines() -> [String] {
+      (chat.rows.first { $0.id == bubble }?.receipts ?? []).map { $0.line(chat.name($0.lane)) }
+    }
+    await chat.restore(source)
+    await chat.send()
+    try await eventually("the original withdrawn") {
+      lines() == ["Work · Delivered", "Not sent to Personal"]
+    }
+    try await personalFixture.emitOnObserver(
+      .rejected(.init(inputId: source, message: "Invented: this saved input was stopped")))
+    try await Task.sleep(for: .milliseconds(300))
+    let row = chat.snapshots[personal]?.rows.first { $0.inputID == source }?.delivery
+    print(
+      "IF7-V1[held] after a later refusal: \(lines()) row=\(row?.rawValue ?? "gone") error=\(chat.snapshots[personal]?.error ?? "nil")"
+    )
+    #expect(lines() == ["Work · Delivered", "Not sent to Personal"])
+    #expect(row == .withdrawn, "A withdrawn original offers no Restore")
+    #expect(chat.snapshots[personal]?.error == nil)
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    try await eventually("both connected again") {
+      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+    }
+    let observed: [[String]] = await personalFixture.received().compactMap {
+      if case .observe(let request) = $0 { request.inputIds } else { nil }
+    }
+    let watched = observed.last ?? []
+    _ = await within(3) { lines() == ["Work · Delivered", "Personal · Saved"] }
+    print("IF7-V1[held] back active: \(lines()) watched=\(watched.contains(source))")
+    #expect(watched.contains(source), "Personal's observation leaves out the withdrawn original")
+    #expect(lines() == ["Work · Delivered", "Personal · Saved"])
+    try await personalFixture.finishTurn()
+    _ = await within(3) { lines() == ["Work · Delivered", "Personal · Delivered"] }
+    print("IF7-V1[held] once Personal placed it: \(lines())")
+    #expect(lines() == ["Work · Delivered", "Personal · Delivered"])
+  }
+}

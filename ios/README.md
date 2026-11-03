@@ -104,7 +104,9 @@ Mode if requested, then Run.
   coordinator's delivery with its own **Check / retry** or **Restore**. A
   coordinator with no record of it on this phone reads "Status unknown". The
   bubble reads "Not sent to Personal" only after you restore Personal's copy and
-  send it, which withdraws the original from Personal's queue.
+  send it, which withdraws the original from Personal's queue. If Personal
+  later reports that it kept the original after all, the bubble reads
+  "Personal · Saved", then "Personal · Delivered" once it is placed.
   Commands are never queued, so one a coordinator did not get because its
   connection dropped, or because you removed it meanwhile, is named under the
   feed ("Work did not get /status. It was removed."). If no coordinator got it,
@@ -132,9 +134,11 @@ Mode if requested, then Run.
   addressed to its own coordinator, and the app removes the original only
   after you send the restored message, and only while its coordinator still
   refuses it. The refusal is saved with the queued message until it is sent
-  again, so a reconnect, an address edit or a relaunch keeps it. A
-  **Check / retry** of the original that has not left the phone when you send
-  the copy is cancelled.
+  again, so a reconnect, an address edit or a relaunch keeps it. If the phone
+  cannot save it, the app still follows the coordinator's latest word until it
+  quits. A **Check / retry** of the original that has not left the phone when
+  you send the copy is cancelled. Each connection asks the coordinator about
+  every queued message and the newest withdrawn originals, 32 in all.
 - The top of the chat holds messages that a build without saved coordinators
   queued. That build never recorded their coordinator, so they may already have
   been delivered. The app never sends them. **Restore to composer** makes a new

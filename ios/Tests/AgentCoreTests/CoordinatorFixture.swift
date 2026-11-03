@@ -138,12 +138,19 @@ actor FixtureCoordinator {
   /// Rejects the next submit but keeps it, as a coordinator whose turn ended while saving it does.
   /// Observing reports it as the turn left it.
   func rejectNextSubmitButKeepIt() { keepsNextRejected = true }
-  /// The turn ends, and every submit it held is placed in order.
+  /// The turn ends, and every submit it held is placed in order. Each placement goes to the socket
+  /// that sent the submit while the phone keeps it open. A kept input's socket closed with its
+  /// rejection, so its placement goes to the observer, as a coordinator tells every observer.
   func finishTurn() async throws {
     busy = false
-    for case (let input, let socket?) in unplaced {
-      try await emit(.placed(.init(entryId: "placed-\(input)", inputId: input)), on: socket)
-      try await emit(.done, on: socket)
+    for (input, socket) in unplaced {
+      let placed = NativeEvent.placed(.init(entryId: "placed-\(input)", inputId: input))
+      if let socket {
+        try? await emit(placed, on: socket)
+        try? await emit(.done, on: socket)
+      } else if let observer {
+        try? await emit(placed, on: observer)
+      }
     }
     unplaced = []
   }
@@ -263,6 +270,7 @@ actor FixtureCoordinator {
             continuation.resume()
           }
         }
+        if observer === socket { observer = nil }
         closedContinuation.yield(())
         return
       case .submit(let request):

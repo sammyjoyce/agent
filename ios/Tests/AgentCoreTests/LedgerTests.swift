@@ -312,6 +312,35 @@ func aRefusalSavedWithTheQueuedItemStillWithdrawsItAfterARelaunch() async throws
   }
 }
 
+/// A coordinator may still place an input it refused, so each withdrawn input stays watched. The
+/// observation carries every queued input, then the newest withdrawn ones, up to the coordinator's
+/// cap of 32.
+@Test(.timeLimit(.minutes(1)))
+func theObservationWatchesTheNewestWithdrawnInputsUpToTheCap() async throws {
+  try await withProfile { fixture, directory, launch in
+    let queued = (1...3).map {
+      NativeRequestSubmit(inputId: "queued-\($0)", mode: .steer, text: "Invented note \($0)")
+    }
+    try saveOutbox(queued, in: directory)
+    var ledger = Ledger()
+    for index in 1...40 {
+      ledger.sends["send-\(index)"] = Ledger.Send(
+        inputID: "withdrawn-\(index)", recipients: [directory.profile],
+        queuedAt: TimeInterval(index), withdrawn: true)
+    }
+    try writePrivately(JSONEncoder().encode(ledger), to: directory.ledger)
+    let session = try await launch()
+    await session.connect()
+    _ = try await until(session) { $0.connection == .connected }
+    let observed = await fixture.received().compactMap {
+      if case .observe(let request) = $0 { request.inputIds } else { nil }
+    }
+    print("IF7-V1[watch] observed \(observed.last?.count ?? 0) IDs: \(observed.last ?? [])")
+    #expect(
+      observed.last == queued.map(\.inputId) + (12...40).reversed().map { "withdrawn-\($0)" })
+  }
+}
+
 @Test func unseenRowsFillFromNeighboursAndNeverReorderACoordinator() {
   var clock = 100.0
   func next() -> TimeInterval {

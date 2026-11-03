@@ -57,8 +57,11 @@ public struct SendStatus: Sendable, Equatable {
     /// Still in this coordinator's outbox.
     case pending(Delivery)
     case placed
-    /// Its queued item was removed because the user sent a restored copy instead.
+    /// Its queued item was removed because the user sent a restored copy instead, and the
+    /// coordinator refused it.
     case withdrawn
+    /// Its queued item was withdrawn, but the coordinator reports holding it. It may still place it.
+    case held
   }
   /// Everyone the Send was addressed to.
   public let recipients: [ProfileID]
@@ -122,6 +125,9 @@ public actor CoordinatorSession {
   private var actionConnections: [UUID: VerifiedConnection] = [:]
   private var previewRequests: Set<UUID> = []
   private var pending: [OutboxItem] = []
+  /// The outbox is read once per session. Its items then hold the coordinator's latest word even
+  /// when a save fails.
+  private var loaded = false
   private enum Unsent { case staged, waiting }
   /// Durable inputs this process staged that have not left the phone. Only a staged one can be
   /// unstaged. A started one waits for this lane to connect, then sends once.
@@ -174,13 +180,18 @@ public actor CoordinatorSession {
     await disconnect(generation: generation)
     guard self.generation == generation else { return }
     identityFailure = nil
-    do {
-      pending = try JSONDecoder().decode([OutboxItem].self, from: Data(contentsOf: outboxURL))
-    } catch let error as CocoaError where error.code == .fileReadNoSuchFile { pending = [] } catch {
-      snapshot.error =
-        "The saved outbox could not be read. It was preserved; no messages were replayed."
-      publish()
-      return
+    if !loaded {
+      do {
+        pending = try JSONDecoder().decode([OutboxItem].self, from: Data(contentsOf: outboxURL))
+      } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+        pending = []
+      } catch {
+        snapshot.error =
+          "The saved outbox could not be read. It was preserved; no messages were replayed."
+        publish()
+        return
+      }
+      loaded = true
     }
     if let newest = pending.map(\.queuedAt).max() { stamps.seed(newest) }
     // The outbox belongs to this profile and every socket proves its pinned coordinator,
@@ -403,10 +414,11 @@ public actor CoordinatorSession {
   }
 
   /// Removes a restored item once its copy was admitted, with files no other item uses, and
-  /// records that this coordinator never placed it. That holds only while the outbox records the
-  /// coordinator's refusal, so an item written again or accepted since stays queued and reconciles
-  /// as any other. The record outlives sessions, so an address edit, a reconnect or a cancelled
-  /// Check / retry in between changes nothing. An attempt that has not written it is cancelled.
+  /// records it withdrawn. That holds only while the coordinator's latest word is a refusal, so an
+  /// item written again or accepted since stays queued and reconciles as any other. An address
+  /// edit, a reconnect or a cancelled Check / retry in between changes nothing. An attempt that has
+  /// not written it is cancelled. A coordinator may still place an input it refused, so the
+  /// withdrawn input stays watched, and its record follows what the coordinator reports.
   public func discard(_ inputID: String) {
     guard let item = pending.first(where: { $0.request.inputId == inputID }), item.refused == true
     else { return }
@@ -542,7 +554,7 @@ public actor CoordinatorSession {
         connection = opened
         let stream = opened
         var ready = false
-        try await timedSend(stream, .observe(.init(inputIds: pending.map(\.request.inputId))))
+        try await timedSend(stream, .observe(.init(inputIds: watched)))
         while !Task.isCancelled {
           let event =
             try await (snapshot.connection == .connected ? stream.next() : timedNext(stream))
@@ -672,8 +684,8 @@ public actor CoordinatorSession {
       try Task.checkCancellation()
       guard self.generation == generation else { throw CancellationError() }
       if let inputID {
-        // Saved before the write, so the outbox never keeps a refusal once the input may have left.
-        try mark(inputID, refused: false)
+        // Cleared before the write, so a refusal never stands once the input may have left.
+        mark(inputID, refused: false)
         attemptedInputs.insert(inputID)
       }
       unwritten.removeAll { $0.action == id }
@@ -712,7 +724,7 @@ public actor CoordinatorSession {
         if let inputID, pending.contains(where: { $0.request.inputId == inputID }) {
           let mayHaveLeft = attemptedInputs.contains(inputID)
           transcript.delivery(inputID, mayHaveLeft ? .uncertain : .rejected)
-          if !mayHaveLeft { try? mark(inputID, refused: true) }
+          if !mayHaveLeft { mark(inputID, refused: true) }
         }
         if ConnectionError.shouldReconnect(after: error) {
           snapshot.connection = .reconnecting
@@ -952,21 +964,27 @@ public actor CoordinatorSession {
       snapshot.busy = true
       transcript.activity(value.activity)
     case .accepted(let value):
-      try? mark(value.inputId, refused: false)
+      mark(value.inputId, refused: false)
       transcript.delivery(value.inputId, .saved)
     case .placed(let value):
+      mark(value.inputId, refused: false)
       transcript.delivery(value.inputId, .saved, entryID: value.entryId)
       settle(value.inputId, entryID: value.entryId)
     case .feedbackReady(let value):
+      mark(value.inputId, refused: false)
       transcript.delivery(value.inputId, .saved)
       transcript.notice("Feedback saved. Repair task: \(value.receipt.taskId)")
       settle(value.inputId, entryID: nil)
     case .rejected(let value):
-      try? mark(value.inputId, refused: true)
-      transcript.delivery(value.inputId, .rejected)
-      // Keep the original on disk until the user explicitly restores it.
-      // Rejections are not proof that a queued durable input never existed.
-      snapshot.error = value.message
+      if mark(value.inputId, refused: true) == .withdrawn {
+        // The user already sent its copy, so this refusal needs nothing more.
+        transcript.delivery(value.inputId, .withdrawn)
+      } else {
+        transcript.delivery(value.inputId, .rejected)
+        // Keep the original on disk until the user explicitly restores it.
+        // Rejections are not proof that a queued durable input never existed.
+        snapshot.error = value.message
+      }
     case .notice(let value): transcript.notice(value.text)
     case .failure(let value):
       snapshot.error = value.message
@@ -1022,19 +1040,45 @@ public actor CoordinatorSession {
 
   /// Records a durable input's send, and its entry's stamp once placed, before the outbox lets
   /// it go. If the record cannot be saved the item stays queued, and the next reconciliation
-  /// repeats this.
+  /// repeats this. A withdrawn input the coordinator placed anyway becomes a placed send.
   private func settle(_ inputID: String, entryID: String?) {
-    guard let item = pending.first(where: { $0.request.inputId == inputID }) else { return }
-    if let entryID {
-      ledger.entries[entryID] = Ledger.Entry(receivedAt: item.queuedAt, sendID: item.sendID)
+    if let item = pending.first(where: { $0.request.inputId == inputID }) {
+      record(
+        inputID, entryID: entryID, sendID: item.sendID, recipients: item.recipients,
+        queuedAt: item.queuedAt)
+      guard saveLedger() else {
+        snapshot.error = "This phone could not record a delivered message. It stays queued."
+        return
+      }
+      acknowledge(inputID)
+    } else if let sendID = withdrawal(of: inputID), let send = ledger.sends[sendID] {
+      record(
+        inputID, entryID: entryID, sendID: sendID, recipients: send.recipients,
+        queuedAt: send.queuedAt)
+      saveLedger()
     }
-    ledger.sends[item.sendID] = Ledger.Send(
-      inputID: inputID, entryID: entryID, recipients: item.recipients, queuedAt: item.queuedAt)
-    guard saveLedger() else {
-      snapshot.error = "This phone could not record a delivered message. It stays queued."
-      return
+  }
+  private func record(
+    _ inputID: String, entryID: String?, sendID: String, recipients: [ProfileID],
+    queuedAt: TimeInterval?
+  ) {
+    if let entryID, let queuedAt {
+      ledger.entries[entryID] = Ledger.Entry(receivedAt: queuedAt, sendID: sendID)
     }
-    acknowledge(inputID)
+    ledger.sends[sendID] = Ledger.Send(
+      inputID: inputID, entryID: entryID, recipients: recipients, queuedAt: queuedAt)
+  }
+  /// The send ID of the ledger's record of a withdrawn input.
+  private func withdrawal(of inputID: String) -> String? {
+    ledger.sends.first { $0.value.inputID == inputID && $0.value.withdrawn == true }?.key
+  }
+  /// Every queued input, then the newest withdrawn ones, which the coordinator may still hold or
+  /// place, up to the 32 IDs a coordinator observes.
+  private var watched: [String] {
+    let queued = pending.map(\.request.inputId)
+    let withdrawn = ledger.sends.values.filter { $0.withdrawn == true }
+      .sorted { ($0.queuedAt ?? -.infinity) > ($1.queuedAt ?? -.infinity) }
+    return queued + withdrawn.prefix(max(0, 32 - queued.count)).map(\.inputID)
   }
 
   @discardableResult private func saveLedger() -> Bool {
@@ -1073,8 +1117,10 @@ public actor CoordinatorSession {
         ?? row.entryID.flatMap { ledger.entries[$0]?.sendID ?? sentEntries[$0] }
       return row
     }
-    snapshot.sends = ledger.sends.mapValues {
-      SendStatus(recipients: $0.recipients, progress: $0.withdrawn == true ? .withdrawn : .placed)
+    snapshot.sends = ledger.sends.mapValues { send in
+      let progress: SendStatus.Progress =
+        send.withdrawn != true ? .placed : send.held == true ? .held : .withdrawn
+      return SendStatus(recipients: send.recipients, progress: progress)
     }
     for item in pending where snapshot.sends[item.sendID] == nil {
       let row = snapshot.rows.first { $0.inputID == item.request.inputId }
@@ -1088,18 +1134,26 @@ public actor CoordinatorSession {
     }
     continuation.yield(snapshot)
   }
-  /// Records in the outbox whether the coordinator refuses a queued input. When the outbox cannot
-  /// be saved the item stays as it was.
-  private func mark(_ inputID: String, refused: Bool) throws {
-    guard let index = pending.firstIndex(where: { $0.request.inputId == inputID }),
-      (pending[index].refused == true) != refused
-    else { return }
-    let previous = pending[index].refused
-    pending[index].refused = refused ? true : nil
-    do { try saveOutbox() } catch {
-      pending[index].refused = previous
-      throw error
+  /// Where this phone keeps an input it sent: queued in the outbox, or withdrawn in the ledger.
+  private enum Kept { case queued, withdrawn }
+  /// Records the coordinator's latest word on whether it refuses an input: on its outbox item while
+  /// queued, or on its withdrawn send, which reads Saved while the coordinator holds it. The word
+  /// stands in memory when the file cannot be saved, and the next save carries it. Returns where
+  /// the input is kept, if anywhere.
+  @discardableResult private func mark(_ inputID: String, refused: Bool) -> Kept? {
+    if let index = pending.firstIndex(where: { $0.request.inputId == inputID }) {
+      if (pending[index].refused == true) != refused {
+        pending[index].refused = refused ? true : nil
+        try? saveOutbox()
+      }
+      return .queued
     }
+    guard let sendID = withdrawal(of: inputID) else { return nil }
+    if (ledger.sends[sendID]?.held == true) == refused {
+      ledger.sends[sendID]?.held = refused ? nil : true
+      saveLedger()
+    }
+    return .withdrawn
   }
   /// Removes an item from the outbox. Returns the removal of its files, or nil when the outbox
   /// could not be saved and the item stays.

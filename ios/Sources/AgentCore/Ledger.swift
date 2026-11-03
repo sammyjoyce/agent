@@ -34,7 +34,7 @@ struct OutboxItem: Codable, Equatable, Sendable {
   var queuedAt: TimeInterval
   /// true once the coordinator rejected this input, or an attempt failed before it was ever written,
   /// as when its upload was refused. It stays until its submit is written again or the coordinator
-  /// reports it accepted. Absent otherwise. Only a refused item may be withdrawn.
+  /// reports it accepted or placed. Absent otherwise. Only a refused item may be withdrawn.
   var refused: Bool?
 
   enum CodingKeys: String, CodingKey {
@@ -63,11 +63,13 @@ struct Ledger: Codable, Equatable, Sendable {
     /// When the Send was queued, which ranks it for the cap. nil in records saved before it was
     /// kept, which rank by their entry.
     var queuedAt: TimeInterval?
-    /// true once its queued item was removed because the user sent a restored copy instead, so
-    /// this coordinator never placed it. Absent from the record of a placed send.
+    /// true once its queued item was removed because the user sent a restored copy instead. Absent
+    /// once the coordinator placed it.
     var withdrawn: Bool?
+    /// true while the coordinator reports holding a withdrawn input anyway. It may still place it.
+    var held: Bool?
     enum CodingKeys: String, CodingKey {
-      case recipients, withdrawn
+      case recipients, withdrawn, held
       case inputID = "input_id"
       case entryID = "entry_id"
       case queuedAt = "queued_at"
