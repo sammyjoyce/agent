@@ -275,6 +275,63 @@ final class AgentUITests: XCTestCase {
     }
   }
 
+  /// What VoiceOver says for each element, moving forward from the screen's first one, up to and
+  /// including the first that `stop` matches. Utterances are cut at 64 characters.
+  @available(iOS 27.0, *)
+  private func spokenThrough(_ stop: (String) -> Bool) throws -> [String] {
+    let voiceOver = try enableVoiceOver()
+    defer { try? voiceOver.disable() }
+    var spoken: [String] = []
+    for _ in 0..<20 {
+      let utterance = try voiceOver.moveForward().utterance
+      spoken.append(utterance)
+      if stop(utterance) { return spoken }
+    }
+    XCTFail("VoiceOver never reached the element: \(spoken)")
+    return spoken
+  }
+
+  /// A stopped test skips `defer`, so a teardown block turns VoiceOver off for the next test.
+  @available(iOS 27.0, *)
+  private func enableVoiceOver() throws -> XCUIVoiceOverService {
+    let voiceOver = XCUIDevice.shared.voiceOverService
+    addTeardownBlock { @MainActor in try? XCUIDevice.shared.voiceOverService.disable() }
+    try voiceOver.enable()
+    return voiceOver
+  }
+
+  // VoiceOver reads the composer as the text field before it did: its label, then its
+  // placeholder while the draft is empty, then the draft once there is one.
+  func testVoiceOverReadsTheComposersPlaceholderAndDraft() throws {
+    guard #available(iOS 27.0, *) else { throw XCTSkip("VoiceOver automation needs iOS 27") }
+    let app = launch()
+    defer { app.terminate() }
+    app.buttons["Done"].tap()
+    let composer = app.descendants(matching: .any).matching(identifier: "Message the coordinator")
+      .firstMatch
+    XCTAssertTrue(composer.waitForExistence(timeout: 5))
+    let reachesComposer = { (utterance: String) in utterance.contains("Message the coordinator") }
+    let steer = try spokenThrough(reachesComposer)
+    XCTAssertTrue(
+      steer.last?.hasPrefix("Message the coordinator Message Agent Text field") == true,
+      "\(steer)")
+    XCTAssertTrue(
+      steer.dropLast().last?.hasPrefix("Add attachments or commands") == true,
+      "The placeholder is not a stop of its own: \(steer)")
+    app.buttons["composerMenu"].tap()
+    app.buttons["Follow-up"].tap()
+    let followUp = try spokenThrough(reachesComposer)
+    XCTAssertTrue(
+      followUp.last?.hasPrefix("Message the coordinator Queue a follow-up Text field") == true,
+      "\(followUp)")
+    composer.tap()
+    composer.typeText("Abc")
+    let voiceOver = try enableVoiceOver()
+    defer { try? voiceOver.disable() }
+    let typed = try voiceOver.currentSpeech().utterance
+    XCTAssertTrue(typed.contains("Message the coordinator Text field Is editing Abc"), typed)
+  }
+
   func testConnectionAndEmptyMainAccessibility() throws {
     let previous = XCUIDevice.shared.appearance
     defer { XCUIDevice.shared.appearance = previous }

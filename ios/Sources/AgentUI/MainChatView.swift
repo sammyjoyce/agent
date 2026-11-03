@@ -543,9 +543,12 @@ public struct MainChatView: View {
           chip(recipient)
             .onGeometryChange(for: CGFloat.self, of: \.size.width) { chipWidth = $0 }
             .padding(.leading, ComposerField.inset.left).offset(y: -draftScroll)
+            // Read first, as it is seen first: the recipient, then the draft.
+            .accessibilitySortPriority(1)
         }
       }
       .clipped()
+      .accessibilityElement(children: .contain)
     }
   #endif
   private func chip(_ recipient: ProfileID) -> some View {

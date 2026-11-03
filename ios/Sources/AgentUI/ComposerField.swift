@@ -73,9 +73,17 @@
         placeholder.font = font
         placeholder.adjustsFontForContentSizeCategory = true
         placeholder.textColor = .placeholderText
+        placeholder.isAccessibilityElement = false
         addSubview(placeholder)
       }
       required init?(coder: NSCoder) { return nil }
+
+      /// An empty draft reads its placeholder, as the text field before it did. A text view has
+      /// no placeholder of its own to report.
+      override var accessibilityValue: String? {
+        get { text.isEmpty ? placeholder.text : super.accessibilityValue }
+        set { super.accessibilityValue = newValue }
+      }
 
       override func layoutSubviews() {
         super.layoutSubviews()

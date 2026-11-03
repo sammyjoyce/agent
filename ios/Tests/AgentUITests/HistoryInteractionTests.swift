@@ -42,9 +42,10 @@ final class ComposerInteractionTests: XCTestCase {
     XCTAssertTrue(app.staticTexts["To Work and Personal"].waitForExistence(timeout: 10))
     return (app, work, personal)
   }
+  /// An empty draft reports its placeholder as its value, which is what VoiceOver reads.
   private func isEmpty(_ field: XCUIElement) -> Bool {
     let value = field.value as? String
-    return value == nil || value == "" || value == field.placeholderValue
+    return value == nil || value == "" || value == "Message Agent"
   }
 
   // Typed through the keyboard into the real field, where a model-level draft cannot reach.
@@ -95,6 +96,30 @@ final class ComposerInteractionTests: XCTestCase {
       "The field kept the sent text: \(composer.value as? String ?? "nil")")
     composer.typeText("x")
     XCTAssertEqual(composer.value as? String, "x", "The next key starts a new draft")
+  }
+
+  // The chip is read before the draft, as it is seen: the recipient, then the message.
+  func testVoiceOverReadsTheRecipientChipBeforeTheDraft() async throws {
+    guard #available(iOS 27.0, *) else { throw XCTSkip("VoiceOver automation needs iOS 27") }
+    let (app, _, _) = try await launchWithWorkAndPersonal()
+    defer { app.terminate() }
+    let composer = app.descendants(matching: .any).matching(identifier: "Message the coordinator")
+      .firstMatch
+    composer.tap()
+    composer.typeText("@Work ")
+    XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3))
+    let voiceOver = XCUIDevice.shared.voiceOverService
+    // A stopped test skips `defer`, so a teardown block turns VoiceOver off for the next test.
+    addTeardownBlock { @MainActor in try? XCUIDevice.shared.voiceOverService.disable() }
+    try voiceOver.enable()
+    defer { try? voiceOver.disable() }
+    let field = try voiceOver.currentSpeech().utterance
+    XCTAssertTrue(
+      field.contains("Message the coordinator Text field Is editing Message Agen"), field)
+    let before = try voiceOver.moveBackward().utterance
+    XCTAssertTrue(before.hasPrefix("To Work Button"), before)
+    let first = try voiceOver.moveBackward().utterance
+    XCTAssertTrue(first.hasPrefix("Add attachments or commands"), first)
   }
 
   // A person's scroll while the whole feed fits picks the first row as the reading position.
