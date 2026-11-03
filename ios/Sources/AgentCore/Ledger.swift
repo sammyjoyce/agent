@@ -69,6 +69,14 @@ struct Ledger: Codable, Equatable, Sendable {
 
   var entries: [String: Entry] = [:]
   var sends: [String: Send] = [:]
+  /// The newest queue time among the sends the cap dropped. A send no newer than this with no
+  /// record here may have been dropped, so this phone cannot say it was never sent.
+  var sendsPrunedThrough: TimeInterval?
+
+  enum CodingKeys: String, CodingKey {
+    case entries, sends
+    case sendsPrunedThrough = "sends_pruned_through"
+  }
 
   /// Keeps the 2000 newest of each map and everything `rows` still shows.
   mutating func prune(keeping rows: [ChatRow]) {
@@ -88,7 +96,11 @@ struct Ledger: Codable, Equatable, Sendable {
       let oldest = sends.filter {
         !shownInputs.contains($0.value.inputID) && !shownEntries.contains($0.value.entryID ?? "")
       }.sorted { stamp($0.value) < stamp($1.value) }.prefix(sends.count - limit)
-      for (id, _) in oldest { sends[id] = nil }
+      for (id, send) in oldest {
+        sends[id] = nil
+        let dropped = stamp(send)
+        if dropped.isFinite { sendsPrunedThrough = max(sendsPrunedThrough ?? dropped, dropped) }
+      }
     }
   }
 

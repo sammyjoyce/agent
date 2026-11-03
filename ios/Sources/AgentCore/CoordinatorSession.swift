@@ -48,6 +48,9 @@ public struct ChatSnapshot: Sendable {
   /// Every Send this coordinator holds, from its outbox and ledger rather than the loaded
   /// rows, so a Send whose row left the window still reports.
   public var sends: [String: SendStatus] = [:]
+  /// How far this coordinator's send cap reached. A Send queued no later than this that `sends`
+  /// lacks may have been dropped by the cap.
+  public var sendsPrunedThrough: TimeInterval?
   public init() {}
 }
 
@@ -57,6 +60,14 @@ public struct SendStatus: Sendable, Equatable {
   public let recipients: [ProfileID]
   /// nil once this coordinator placed it.
   public let delivery: Delivery?
+  /// When this coordinator's copy was queued. nil in a record saved before it was kept.
+  public let queuedAt: TimeInterval?
+
+  init(recipients: [ProfileID], delivery: Delivery?, queuedAt: TimeInterval? = nil) {
+    self.recipients = recipients
+    self.delivery = delivery
+    self.queuedAt = queuedAt
+  }
 }
 
 public struct RestoredDraft: Sendable {
@@ -997,12 +1008,16 @@ public actor CoordinatorSession {
         ?? row.entryID.flatMap { ledger.entries[$0]?.sendID ?? sentEntries[$0] }
       return row
     }
-    snapshot.sends = ledger.sends.mapValues { SendStatus(recipients: $0.recipients, delivery: nil) }
+    snapshot.sends = ledger.sends.mapValues {
+      SendStatus(recipients: $0.recipients, delivery: nil, queuedAt: $0.queuedAt)
+    }
     for item in pending where snapshot.sends[item.sendID] == nil {
       let row = snapshot.rows.first { $0.inputID == item.request.inputId }
       snapshot.sends[item.sendID] = SendStatus(
-        recipients: item.recipients, delivery: row?.delivery ?? .uncertain)
+        recipients: item.recipients, delivery: row?.delivery ?? .uncertain,
+        queuedAt: item.queuedAt)
     }
+    snapshot.sendsPrunedThrough = ledger.sendsPrunedThrough
     // New replies do not fill a gap left by paging. Only a fresh recent page
     // can restore the complete latest window.
     if let latestRowID, !snapshot.rows.contains(where: { $0.id == latestRowID }) {

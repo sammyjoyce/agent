@@ -195,6 +195,42 @@ private func row(
     feed.filter { $0.lane == personal }.map(\.row.id) == ["entry:p1:0", "entry:p2:0", "input:pc"])
 }
 
+/// A recipient lane with no record of a Send never got it, unless that lane's cap dropped a record
+/// at least as new, when this phone cannot know. A recipient no longer saved is unknown too.
+@Test func aRecipientWithNoRecordReadsNotSentUnlessItsCapMayHaveDroppedIt() {
+  let work = ProfileID()
+  let personal = ProfileID()
+  let removed = ProfileID()
+  var fromWork = ChatSnapshot()
+  fromWork.rows = [
+    row("input:old", .user, at: 1, send: "old", input: "old"),
+    row("input:new", .user, at: 3, send: "new", input: "new"),
+    row("input:gone", .user, at: 4, send: "gone", input: "gone"),
+  ]
+  fromWork.sends = [
+    "old": .init(recipients: [work, personal], delivery: nil, queuedAt: 1),
+    "new": .init(recipients: [work, personal], delivery: nil, queuedAt: 3),
+    "gone": .init(recipients: [work, removed], delivery: nil, queuedAt: 4),
+  ]
+  var fromPersonal = ChatSnapshot()
+  fromPersonal.sendsPrunedThrough = 2
+  let feed = Feed.merge([(work, fromWork), (personal, fromPersonal)])
+  let receipts = Dictionary(uniqueKeysWithValues: feed.map { ($0.id, $0.receipts) })
+  let placed = Receipt(lane: work, status: .placed)
+  #expect(receipts["send:old"] == [placed, Receipt(lane: personal, status: .unknown)])
+  #expect(receipts["send:new"] == [placed, Receipt(lane: personal, status: .notSent)])
+  #expect(receipts["send:gone"] == [placed, Receipt(lane: removed, status: .unknown)])
+  let names = ["Work", "Personal"]
+  #expect(Receipt.summary([placed, placed], names: names) == "To Work and Personal")
+  for status in [Receipt.Status.unknown, .notSent, .pending(.uncertain, inputID: "p")] {
+    #expect(
+      Receipt.summary([placed, Receipt(lane: personal, status: status)], names: names) == nil)
+  }
+  #expect(Receipt(lane: personal, status: .notSent).line("Personal") == "Not sent to Personal")
+  #expect(Receipt(lane: personal, status: .unknown).line("Personal") == "Personal · Status unknown")
+  #expect(placed.line("Work") == "Work · Delivered")
+}
+
 @MainActor @Test func activityGroupsNeverSpanTwoCoordinatorsAndEachRunIsNamed() {
   let work = ProfileID()
   let personal = ProfileID()
@@ -1142,4 +1178,118 @@ func aPendingWithdrawalIsDroppedOnceItsAddressAnswersAsAnotherCoordinator() asyn
   chat.removed[directory.profile] = "Work"
   chat.attach(Lane(id: directory.profile, session: nil, hold: LegacyHold(directory)))
   #expect(chat.lanes.isEmpty)
+}
+
+// MARK: - A recipient with no record reads as not sent, unless its cap may have dropped it
+
+/// DESIGN-REVIEW A3. The app dies between Work's stage and Personal's stage of one message to
+/// both, so only Work's outbox holds it. After the relaunch and Check, Personal never got it, and
+/// the bubble must say so instead of "To Work and Personal".
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aMessageToBothStagedOnlyAtWorkBeforeAKillReadsNotSentToPersonal() async throws {
+  let workFixture = FixtureCoordinator()
+  let personalFixture = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(workFixture)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personalFixture)
+  defer { personalListener.cancel() }
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "kill-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  @MainActor func launch() -> Coordinators {
+    Coordinators(
+      registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+      transport: CoordinatorTransport { address in
+        LineConnection(
+          connection: NWConnection(
+            host: .ipv4(.loopback), port: address.port == 4002 ? personalPort : workPort,
+            using: .tcp))
+      })
+  }
+  let before = launch()
+  await before.setActive(true)
+  let (work, personal) = try await addWorkAndPersonal(before)
+  let text = "Invented: dinner moved to 8, tell the sitter"
+  // Send's first stage, as `ChatModel.send` makes it, and then the process stops.
+  let session = try #require(before.chat.lanes.first { $0.id == work }?.session)
+  let staged = try #require(
+    await session.stage(text, sendID: UUID().uuidString, recipients: [work, personal]))
+  await before.setActive(false)
+
+  let after = launch()
+  await after.setActive(true)
+  let chat = after.chat
+  try await eventually("both connected after the relaunch") {
+    chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+  }
+  try await eventually("the message's bubble") { chat.rows.contains { $0.row.text == text } }
+  await chat.retry(staged.inputID)
+  try await eventually("Work placed it") {
+    chat.rows.first { $0.row.text == text }?.receipts.first?.status == .placed
+  }
+  let bubble = try #require(chat.rows.first { $0.row.text == text })
+  #expect(
+    bubble.receipts
+      == [Receipt(lane: work, status: .placed), Receipt(lane: personal, status: .notSent)])
+  #expect(Receipt.summary(bubble.receipts, names: ["Work", "Personal"]) == nil)
+  #expect(
+    bubble.receipts.map { $0.line($0.lane == work ? "Work" : "Personal") } == [
+      "Work · Delivered", "Not sent to Personal",
+    ])
+  #expect(await submits(personalFixture).isEmpty)
+  #expect(await submits(workFixture).map(\.text) == [text])
+  await after.setActive(false)
+  await workFixture.stop()
+  await personalFixture.stop()
+}
+
+/// Personal refuses its copy of a message to both. Restoring that copy and sending it to Work
+/// instead discards Personal's original, so Personal never placed the message, and the original
+/// bubble must not read "To Work and Personal".
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aCopyRestoredFromPersonalAndSentToWorkLeavesTheOriginalNotSentToPersonal() async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+    await personalFixture.refuseUploads()
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let text = "Invented: the signed lease for both of you"
+    chat.draft = text
+    await chat.attach(data: Data("invented lease".utf8), name: "Lease.txt", mediaType: "text/plain")
+    await chat.send()
+    var rejected: String?
+    try await eventually("Work placed it and Personal refused it") {
+      let receipts = chat.rows.first { $0.row.text == text }?.receipts ?? []
+      guard receipts.first?.status == .placed, receipts.count == 2,
+        case .pending(.rejected, let id?) = receipts[1].status
+      else { return false }
+      rejected = id
+      return true
+    }
+    let original = try #require(chat.rows.first { $0.row.text == text })
+    let send = String(original.id.dropFirst("send:".count))
+    try await eventually("both connected") {
+      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+    }
+    await chat.restore(try #require(rejected))
+    chat.recipient = nil
+    chat.draft = "@Work " + chat.draft
+    chat.promoteTypedTag()
+    #expect(chat.recipient == work && chat.recipientLine == "To Work")
+    await chat.send()
+    try await eventually("the copy at Work") { await workFixture.count() == 2 }
+    let personalOutbox = ProfileDirectory(personal, applicationSupport: root, caches: root).outbox
+    try await eventually("Personal's original discarded") {
+      (try? queuedRequests(personalOutbox))?.isEmpty == true
+        && chat.snapshots[personal]?.sends[send] == nil
+    }
+    let bubble = try #require(chat.rows.first { $0.id == original.id })
+    #expect(
+      bubble.receipts
+        == [Receipt(lane: work, status: .placed), Receipt(lane: personal, status: .notSent)])
+    #expect(Receipt.summary(bubble.receipts, names: ["Work", "Personal"]) == nil)
+    #expect(await submits(personalFixture).isEmpty)
+    #expect(await personalFixture.uploadCount() == 0)
+  }
 }

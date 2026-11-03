@@ -97,8 +97,11 @@ Mode if requested, then Run.
   coordinator. The line under the field names the recipients, or says why
   Send is blocked, before you send. A message to several coordinators is saved
   in each one's outbox under its own input ID before any of them is sent. If
-  one refuses it, none keeps it and the draft stays. Its bubble shows each
-  coordinator's delivery with its own **Check / retry** or **Restore**.
+  one refuses it, none keeps it and the draft stays. Its bubble reads "To Work
+  and Personal" once every recipient has it. Otherwise it shows each
+  coordinator's delivery with its own **Check / retry** or **Restore**. A
+  coordinator that holds no record of it reads "Not sent to Personal", unless its
+  2000-send cap may have dropped that record, when it reads "Status unknown".
 - Adding, editing, pairing and removing coordinators run one at a time. Remove
   refuses while the draft is addressed to that coordinator or restored from it.
   It saves `profiles.json` without the coordinator, and with a record of its
