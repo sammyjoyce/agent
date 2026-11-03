@@ -141,8 +141,10 @@ Mode if requested, then Run.
   and every restored file, and only while its coordinator still refuses it. If
   you send something else instead, the original stays and still needs
   attention, and **Discard** removes it. The refusal is saved with the queued
-  message until it is sent again, so a reconnect, an address edit or a relaunch
-  keeps it. If the phone
+  message until it is sent again, so after a reconnect, an address edit or a
+  relaunch the message still needs attention, with **Restore** and **Discard**
+  rather than **Check / retry**, until its coordinator reports it accepted or
+  placed. If the phone
   cannot save it, the app still follows the coordinator's latest word until it
   quits. A **Check / retry** of the original that has not left the phone when
   you send the copy is cancelled. Each connection asks the coordinator about

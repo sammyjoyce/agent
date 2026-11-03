@@ -199,7 +199,7 @@ public actor CoordinatorSession {
     for item in pending {
       let mayHaveLeft = unsent[item.request.inputId] == nil
       if mayHaveLeft { attemptedInputs.insert(item.request.inputId) }
-      transcript.pending(item.request, delivery: mayHaveLeft ? .uncertain : .sending)
+      transcript.pending(item.request, delivery: mayHaveLeft ? unanswered(item) : .sending)
     }
     stampRows()
     snapshot.error = nil
@@ -241,7 +241,7 @@ public actor CoordinatorSession {
     snapshot.busy = false
     snapshot.loadingHistory = false
     for item in pending where unsent[item.request.inputId] == nil {
-      transcript.delivery(item.request.inputId, .uncertain)
+      transcript.delivery(item.request.inputId, unanswered(item))
     }
     publish()
     for connection in ownedConnections { await connection.close() }
@@ -589,7 +589,7 @@ public actor CoordinatorSession {
         guard !Task.isCancelled, self.generation == generation else { return }
         connection = nil
         for item in pending where unsent[item.request.inputId] == nil {
-          transcript.delivery(item.request.inputId, .uncertain)
+          transcript.delivery(item.request.inputId, unanswered(item))
         }
         snapshot.busy = false
         guard ConnectionError.shouldReconnect(after: error) else {
@@ -1134,6 +1134,12 @@ public actor CoordinatorSession {
       snapshot.includesLatest = false
     }
     continuation.yield(snapshot)
+  }
+  /// How a queued item that may have left the phone reads until its coordinator answers about it.
+  /// While a refusal is the coordinator's latest word it stays refused, so Restore and Discard stay
+  /// offered. Otherwise it is unconfirmed, for Check / retry.
+  private func unanswered(_ item: OutboxItem) -> Delivery {
+    item.refused == true ? .rejected : .uncertain
   }
   /// Where this phone keeps an input it sent: queued in the outbox, or withdrawn in the ledger.
   private enum Kept { case queued, withdrawn }

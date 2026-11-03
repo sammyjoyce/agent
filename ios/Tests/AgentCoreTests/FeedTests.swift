@@ -3466,7 +3466,7 @@ func aCommandSentOverARestoredDraftKeepsTheOriginalQueued(_ setup: String) async
     #expect(textAnywhere, "The restored message is neither queued, in the draft nor sent")
     #expect(stillQueued, "The original left the outbox, though its text was never sent")
     #expect(kept?.refused == true, "The original is no longer withdrawable by Discard")
-    #expect(row != nil && row?.delivery != .withdrawn, "The original reads Not sent")
+    #expect(row?.delivery == .rejected, "The original no longer needs attention")
     await chat.restore(original.inputId)
     #expect(chat.draft == text, "The original can be restored again")
   }
@@ -3579,7 +3579,7 @@ func aRestoredTextReplacedInOneEditKeepsTheOriginalQueued() async throws {
     )
     #expect(stillQueued, "The restored message is neither queued nor sent")
     #expect(kept?.refused == true, "The original is no longer withdrawable by Discard")
-    #expect(row != nil && row?.delivery != .withdrawn, "The original reads Not sent")
+    #expect(row?.delivery == .rejected, "The original no longer needs attention")
   }
 }
 
@@ -3632,7 +3632,7 @@ func aRestoredOriginalIsWithdrawnOnlyWhenItsContentIsSentUnchanged(_ edit: Strin
         kept == nil && row == .withdrawn, "The restored message went, so its original is withdrawn")
     } else {
       #expect(kept?.refused == true, "The original left the outbox, though it was never sent")
-      #expect(row != nil && row != .withdrawn, "The original reads Not sent")
+      #expect(row == .rejected, "The original no longer needs attention")
     }
   }
 }
@@ -3701,5 +3701,88 @@ func discardRemovesARefusedOriginalAndRecordsItWithdrawn(_ setup: String) async 
     await chat.restore(source)
     #expect(chat.draft.isEmpty && chat.attachments.isEmpty, "Nothing is left to restore")
     #expect(!(await submits(fixture)).contains { $0.inputId == source })
+  }
+}
+
+// MARK: - A refused original needs attention until its coordinator says otherwise
+
+/// Work refuses a message. Its row reads "Needs attention", with Restore and Discard rather than
+/// Check / retry, while the app is in the background and once it comes back, since the refusal is
+/// still Work's latest word. Discard then withdraws it.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRefusedOriginalStillNeedsAttentionOnceTheAppComesBack() async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    let work = try await addWork(coordinators)
+    let chat = coordinators.chat
+    await workFixture.rejectSubmits()
+    chat.draft = "Invented: renew the greenhouse lease before Friday"
+    await chat.send()
+    try await eventually("Work refused it") {
+      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+    }
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let original = try #require(try queuedRequests(outbox).first)
+    @MainActor func row() -> Delivery? {
+      chat.snapshots[work]?.rows.first { $0.inputID == original.inputId }?.delivery
+    }
+    let observed = await observes(workFixture)
+    await coordinators.setActive(false)
+    try await eventually("Work disconnected") {
+      chat.snapshots[work]?.connection == .disconnected
+    }
+    let away = row()
+    await coordinators.setActive(true)
+    try await eventually("Work observed again") {
+      await observes(workFixture) > observed && chat.snapshots[work]?.connection == .connected
+    }
+    try await Task.sleep(for: .milliseconds(300))
+    print(
+      "IF8-W1b[background] before=rejected away=\(away?.rawValue ?? "gone") back=\(row()?.rawValue ?? "gone")"
+    )
+    #expect(away == .rejected, "In the background the refused original reads Delivery unconfirmed")
+    #expect(row() == .rejected, "Back active the refused original reads Delivery unconfirmed")
+    await chat.discard(original.inputId)
+    try await eventually("the original reads Not sent") { row() == .withdrawn }
+    #expect(try queuedItem(outbox, original.inputId) == nil)
+  }
+}
+
+/// Work rejects a message but keeps it, as a coordinator whose turn ended while saving it does.
+/// Its row needs attention. Back from the background, Work reports it accepted, so the row reads
+/// Saved, and once Work places it the message reads delivered and leaves the outbox.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRefusedOriginalItsCoordinatorKeptReadsDeliveredOncePlaced() async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    let work = try await addWork(coordinators)
+    let chat = coordinators.chat
+    await workFixture.holdPlacements()
+    await workFixture.rejectNextSubmitButKeepIt()
+    chat.draft = "Invented: the gate code changed to 4410"
+    await chat.send()
+    try await eventually("Work rejected it") {
+      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+    }
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let item = try #require(
+      try JSONDecoder().decode([OutboxItem].self, from: Data(contentsOf: outbox)).first)
+    let source = item.request.inputId
+    @MainActor func row() -> ChatRow? { chat.snapshots[work]?.rows.first { $0.inputID == source } }
+    await coordinators.setActive(false)
+    try await eventually("Work disconnected") {
+      chat.snapshots[work]?.connection == .disconnected
+    }
+    let away = row()?.delivery
+    await coordinators.setActive(true)
+    try await eventually("Work reports it accepted") { row()?.delivery == .saved }
+    try await workFixture.finishTurn()
+    try await eventually("Work placed it") {
+      row()?.entryID != nil && (try? queuedItem(outbox, source)) == nil
+    }
+    print(
+      "IF8-W1b[kept] away=\(away?.rawValue ?? "gone") placed: delivery=\(row()?.delivery?.rawValue ?? "nil") entry=\(row()?.entryID ?? "nil") send=\(String(describing: chat.snapshots[work]?.sends[item.sendID]?.progress))"
+    )
+    #expect(away == .rejected)
+    #expect(row()?.delivery == nil, "A placed message shows no delivery problem")
+    #expect(chat.snapshots[work]?.sends[item.sendID]?.progress == .placed)
   }
 }

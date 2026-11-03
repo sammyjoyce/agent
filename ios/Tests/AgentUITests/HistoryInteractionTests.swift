@@ -741,6 +741,54 @@ final class RestoreInteractionTests: XCTestCase {
     discarded.lifetime = .keepAlways
     add(discarded)
   }
+
+  // One saved coordinator refuses a message, so it needs attention, with Restore and Discard. The
+  // connection drops and comes back. The coordinator still holds no copy, so its refusal is its
+  // latest word, and the message still needs attention, with no Check / retry. Discard removes it.
+  func testARefusedMessageStillNeedsAttentionAfterAReconnect() async throws {
+    continueAfterFailure = true
+    executionTimeAllowance = 120
+    let work = InteractionPeer()
+    addTeardownBlock { await work.stop() }
+    let empty = NativeEventHistory(messages: [], nextCursor: nil, pageComplete: true)
+    await work.history(initial: empty, pages: [:], latest: empty)
+    let port = try await work.start()
+    await work.rejectSubmits(true)
+    let app = XCUIApplication()
+    app.launchEnvironment["AGENT_INTERACTION_PORT"] = String(port)
+    app.launchEnvironment["AGENT_INTERACTION_COORDINATOR"] = work.coordinator.uuidString
+    app.launchArguments += ["-notificationsEnabled", "NO"]
+    app.launch()
+    defer { app.terminate() }
+    let composer = app.descendants(matching: .any).matching(identifier: "Message the coordinator")
+      .firstMatch
+    let send = app.buttons["Send message"]
+    XCTAssertTrue(composer.waitForExistence(timeout: 10))
+    composer.tap()
+    composer.typeText("Invented: water the plants on Friday")
+    XCTAssertTrue(send.wait(for: \.isEnabled, toEqual: true, timeout: 10))
+    send.tap()
+    XCTAssertTrue(app.staticTexts["Needs attention"].waitForExistence(timeout: 10))
+    await work.dropObserver()
+    try await eventually { await work.observations() >= 2 }
+    try await Task.sleep(for: .seconds(1))
+    let needsAttention = app.staticTexts["Needs attention"].exists
+    let checkRetry = app.buttons["Check / retry"].exists
+    print(
+      "IF8-W1b[ui] after the reconnect: observations=\(await work.observations()) needsAttention=\(needsAttention) unconfirmed=\(app.staticTexts["Delivery unconfirmed"].exists) restore=\(app.buttons["Restore to composer"].exists) discard=\(app.buttons["Discard"].exists) checkRetry=\(checkRetry)"
+    )
+    let reconnected = XCTAttachment(screenshot: app.screenshot())
+    reconnected.name = "refused-original-after-a-reconnect"
+    reconnected.lifetime = .keepAlways
+    add(reconnected)
+    XCTAssertTrue(needsAttention, "The refused message reads as unconfirmed after a reconnect")
+    XCTAssertTrue(app.buttons["Restore to composer"].exists)
+    XCTAssertFalse(checkRetry, "Check / retry would send a message its coordinator refused")
+    let discard = app.buttons["Discard"]
+    XCTAssertTrue(discard.exists)
+    discard.tap()
+    XCTAssertTrue(app.staticTexts["Not sent"].waitForExistence(timeout: 5))
+  }
 }
 
 // Shared DEBUG app fixture, real screen/session and an owned NDJSON loopback
@@ -760,6 +808,7 @@ private actor InteractionPeer {
   private var releases: [String: CheckedContinuation<Void, Never>] = [:]
   private var rejecting = false
   private var announced: [SlashCommand] = []
+  private var observed = 0
 
   func history(
     initial: NativeEventHistory, pages: [String: NativeEventHistory], latest: NativeEventHistory
@@ -774,6 +823,10 @@ private actor InteractionPeer {
   func rejectSubmits(_ value: Bool) { rejecting = value }
   /// The commands each observation announces, as a coordinator's `commands` frame does.
   func announce(_ commands: [SlashCommand]) { announced = commands }
+  /// How many observations the app has opened.
+  func observations() -> Int { observed }
+  /// Closes the app's observation, as a dropped network does.
+  func dropObserver() { observer?.cancel() }
   func beginReply(_ text: String) async throws {
     try await emit(.textDelta(.init(text: text)), to: XCTUnwrap(observer))
   }
@@ -831,6 +884,7 @@ private actor InteractionPeer {
       switch request {
       case .observe:
         observer = socket
+        observed += 1
         if !announced.isEmpty {
           try await emit(.commands(.init(commands: announced)), to: socket)
         }
