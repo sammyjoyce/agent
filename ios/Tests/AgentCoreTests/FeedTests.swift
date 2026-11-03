@@ -1377,3 +1377,43 @@ func aRestoredFeedbackPngGoesToTheCoordinatorItCameFromAlone() async throws {
     #expect(await personalFixture.uploadCount() == 0)
   }
 }
+
+// MARK: - A control a coordinator did not get says so by name
+
+/// A control command is not saved, so it never waits for a lane (DESIGN-REVIEW #8). When Work's
+/// lane drops between the stage and the start, Work does not get it, and the composer names
+/// Work. When no recipient got it, the draft stays for another try.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aControlACoordinatorDidNotGetNamesItInTheError() async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, _ in
+    let (work, _) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let session = try #require(chat.lanes.first { $0.id == work }?.session)
+    @MainActor func sendWhileWorkDrops() async throws {
+      // Both start on the main actor in this order, so Work drops after its stage.
+      let sending = Task { @MainActor in await chat.send() }
+      let dropping = Task { @MainActor in await session.disconnect() }
+      await sending.value
+      await dropping.value
+      await session.connect()
+      try await eventually("both connected again") {
+        chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+      }
+    }
+    chat.draft = "/status"
+    try await sendWhileWorkDrops()
+    try await Task.sleep(for: .milliseconds(250))
+    #expect(await submits(personalFixture).map(\.text) == ["/status"])
+    #expect(await submits(workFixture).isEmpty, "A control is never sent later")
+    #expect(chat.error == "Work did not get /status. It is not connected.")
+    #expect(chat.draft.isEmpty, "Personal got it")
+
+    chat.recipient = work
+    chat.draft = "/status"
+    try await sendWhileWorkDrops()
+    try await Task.sleep(for: .milliseconds(250))
+    #expect(await submits(workFixture).isEmpty)
+    #expect(chat.error == "Work did not get /status. It is not connected.")
+    #expect(chat.draft == "/status" && chat.recipient == work, "Nothing went, so the draft stays")
+  }
+}

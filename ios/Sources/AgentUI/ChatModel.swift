@@ -304,7 +304,7 @@ final class ChatModel {
       return
     }
     let sendID = UUID().uuidString
-    var staged: [(session: CoordinatorSession, input: StagedInput)] = []
+    var staged: [(id: ProfileID, session: CoordinatorSession, input: StagedInput)] = []
     for id in recipients {
       guard let session = lanes.first(where: { $0.id == id })?.session,
         let input = await session.stage(
@@ -314,11 +314,21 @@ final class ChatModel {
         if multiple { error = "Nothing was sent. \(name(id)) did not take the message." }
         return
       }
-      staged.append((session, input))
+      staged.append((id, session, input))
     }
     // A lane detached meanwhile keeps its saved item for its own profile to resolve.
-    for item in staged where attached(item.session) { await item.session.start(item.input) }
+    var missed: [ProfileID] = []
+    for item in staged where attached(item.session) {
+      if await !item.session.start(item.input) { missed.append(item.id) }
+    }
     error = nil
+    if !missed.isEmpty {
+      let command = body.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? body
+      error =
+        "\(joinedNames(missed.map(name))) did not get \(command). \(missed.count == 1 ? "It is" : "They are") not connected."
+      // Nothing went, so the draft stays for another try.
+      guard missed.count < staged.count else { return }
+    }
     if draft == text {
       draft = ""
       if recipient == chip { recipient = nil }

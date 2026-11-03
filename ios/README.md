@@ -102,6 +102,9 @@ Mode if requested, then Run.
   coordinator's delivery with its own **Check / retry** or **Restore**. A
   coordinator that holds no record of it reads "Not sent to Personal", unless its
   2000-send cap may have dropped that record, when it reads "Status unknown".
+  Commands are never queued, so one a coordinator did not get because its
+  connection dropped is named under the feed ("Work did not get /status"). If
+  no coordinator got it, the draft stays.
 - Adding, editing, pairing and removing coordinators run one at a time. Remove
   refuses while the draft is addressed to that coordinator or restored from it.
   It saves `profiles.json` without the coordinator, and with a record of its

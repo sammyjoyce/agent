@@ -294,23 +294,23 @@ public actor CoordinatorSession {
 
   /// Sends a staged input on this coordinator's own verified socket. While this lane is not
   /// connected, a durable one waits and goes once it connects. One this session is too busy to
-  /// send stays queued as unconfirmed, for Check.
-  public func start(_ staged: StagedInput) {
-    guard staged.profile == profile else { return }
+  /// send stays queued as unconfirmed, for Check. A control is saved nowhere, so one that cannot
+  /// go now is not sent at all, and this returns false.
+  @discardableResult public func start(_ staged: StagedInput) -> Bool {
+    guard staged.profile == profile else { return false }
     if staged.control == nil {
-      guard unsent[staged.inputID] == .staged else { return }
+      guard unsent[staged.inputID] == .staged else { return true }
       guard snapshot.connection == .connected else {
         unsent[staged.inputID] = .waiting
-        return
+        return true
       }
       unsent[staged.inputID] = nil
     }
     guard actions.count < 32, snapshot.connection == .connected else {
-      if staged.control == nil {
-        transcript.delivery(staged.inputID, .uncertain)
-        publish()
-      }
-      return
+      guard staged.control == nil else { return false }
+      transcript.delivery(staged.inputID, .uncertain)
+      publish()
+      return true
     }
     if let control = staged.control {
       perform(.submit(control))
@@ -319,6 +319,7 @@ public actor CoordinatorSession {
     }
     snapshot.error = nil
     publish()
+    return true
   }
 
   /// Withdraws a staged input that never started: its outbox item, its row, and the stored
