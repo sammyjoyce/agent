@@ -2312,3 +2312,38 @@ func withOneCoordinatorARestoredAndResentOriginalReadsNotSent() async throws {
     #expect(originalRow()?.delivery?.rawValue == "Not sent")
   }
 }
+
+/// With one coordinator saved, Restore fills the draft and its files with no chip, as on `main`,
+/// and the text goes as typed. Once another coordinator was removed the composer names recipients
+/// again, so the restored draft keeps its chip and its text stays literal.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func restoreSetsAChipOnlyWhileTheComposerNamesRecipients() async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    await workFixture.refuseUploads()
+    try await coordinators.add(
+      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    let work = try #require(coordinators.profiles.first?.id)
+    let chat = coordinators.chat
+    try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
+    let text = "@Personal is copied on the invented lease"
+    chat.draft = text
+    await chat.attach(data: Data("invented lease".utf8), name: "Lease.txt", mediaType: "text/plain")
+    await chat.send()
+    try await eventually("rejected") { chat.rows.contains { $0.row.delivery == .rejected } }
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let original = try #require(try queuedRequests(outbox).first)
+    await chat.restore(original.inputId)
+    #expect(chat.recipient == nil, "With one coordinator saved, Restore shows no chip")
+    #expect(chat.draft == text && chat.attachments.count == 1)
+    #expect(chat.addressing == .to([work], body: text))
+    chat.draft = ""
+    for file in chat.attachments { await chat.removeAttachment(file) }
+
+    try await coordinators.add(
+      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+    try await coordinators.remove(try #require(coordinators.profiles.last?.id))
+    await chat.restore(original.inputId)
+    #expect(chat.recipient == work, "Once one was removed, Restore shows its chip")
+    #expect(chat.addressing == .to([work], body: text))
+  }
+}

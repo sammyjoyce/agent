@@ -470,6 +470,12 @@ final class RestoreInteractionTests: XCTestCase {
     XCTAssertTrue(app.staticTexts["Needs attention"].exists)
     restore.tap()
     try await eventually { composer.value as? String == text }
+    XCTAssertFalse(app.buttons["To Work"].exists, "With one coordinator the composer shows no chip")
+    XCTAssertFalse(app.staticTexts["recipientLine"].exists)
+    let restored = XCTAttachment(screenshot: app.screenshot())
+    restored.name = "restored-with-one-coordinator"
+    restored.lifetime = .keepAlways
+    add(restored)
     await work.rejectSubmits(false)
     send.tap()
     try await eventually { await work.submits() == [text] }

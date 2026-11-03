@@ -522,7 +522,7 @@ public struct MainChatView: View {
       .overlay {
         RoundedRectangle(cornerRadius: 26).strokeBorder(.primary.opacity(0.12), lineWidth: 0.5)
       }
-      if model.multiple || !model.removed.isEmpty {
+      if model.addressesByName {
         // With the picker open the tag is still being typed, which is not an error.
         let blocked =
           if case .blocked = model.addressing, model.pickerMatches.isEmpty { true } else { false }

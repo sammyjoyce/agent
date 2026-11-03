@@ -443,7 +443,7 @@ final class ChatModel {
     return true
   }
   private func fill(_ restored: RestoredDraft, from source: RestoredSource) {
-    recipient = source.lane
+    recipient = addressesByName ? source.lane : nil
     draft = restored.text
     attachments = restored.attachments
     mode = restored.mode
