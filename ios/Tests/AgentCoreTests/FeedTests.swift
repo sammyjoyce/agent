@@ -3202,3 +3202,110 @@ func aWithdrawnOriginalItsCoordinatorStillHoldsReadsSavedThenDelivered() async t
     #expect(lines() == ["Work · Delivered", "Personal · Delivered"])
   }
 }
+
+// MARK: - Restore keeps what the user added while it copied the files
+
+/// Work, the only coordinator, refuses a message with large files, and the user taps Restore.
+/// While the phone copies the files into the draft, the user types or attaches a file. Restore
+/// then puts the restored text before what was typed, with a blank line between, and its files
+/// before the one attached, as on `main`. Nothing the user put in the composer is dropped.
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: ["typed", "attached", "typed-eight-files"])
+func restoreKeepsWhatTheUserAddedWhileItCopied(_ what: String) async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    await workFixture.refuseUploads()
+    try await coordinators.add(
+      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    let work = try #require(coordinators.profiles.first?.id)
+    let chat = coordinators.chat
+    try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
+    let count = what == "typed" ? 1 : 8
+    let big = Data(repeating: 0x41, count: (count == 8 ? 16 : 12) * 1024 * 1024)
+    let restoredText = "Invented: the scanned lease"
+    let names = (0..<count).map { $0 == 0 ? "Lease.pdf" : "Lease\($0).pdf" }
+    chat.draft = restoredText
+    for name in names {
+      await chat.attach(data: big, name: name, mediaType: "application/pdf")
+    }
+    await chat.send()
+    try await eventually("Work refused it") { chat.rows.contains { $0.row.delivery == .rejected } }
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let original = try #require(try queuedRequests(outbox).first)
+    let restoring = Task { @MainActor in await chat.restore(original.inputId) }
+    await Task.yield()
+    let stillCopying = chat.restoredFrom == nil && chat.draft.isEmpty
+    let typed = "Invented: also tell the landlord the boiler is fixed"
+    if what.hasPrefix("typed") {
+      chat.draft = typed
+    } else {
+      await chat.attach(
+        data: Data("invented receipt".utf8), name: "Receipt.txt", mediaType: "text/plain")
+    }
+    let filledFirst = chat.restoredFrom != nil
+    await restoring.value
+    print(
+      "IF7-V3[\(what)] copying when the user acted=\(stillCopying) filled first=\(filledFirst) draft=\(chat.draft.debugDescription) files=\(chat.attachments.map(\.reference.name)) error=\(chat.error ?? "nil")"
+    )
+    #expect(stillCopying && !filledFirst, "The user acted after Restore filled the composer")
+    if what.hasPrefix("typed") {
+      #expect(chat.draft.contains("boiler"), "The text the user typed is gone")
+      #expect(chat.draft == restoredText + "\n\n" + typed)
+      #expect(chat.attachments.map(\.reference.name) == names)
+    } else {
+      #expect(
+        chat.attachments.map(\.reference.name).contains("Receipt.txt"),
+        "The file the user attached is gone")
+      #expect(chat.draft == restoredText)
+      #expect(chat.attachments.map(\.reference.name) == names + ["Receipt.txt"])
+    }
+    #expect(chat.recipient == work)
+  }
+}
+
+/// With Work and Personal saved, the user taps Restore on Work's refused message, then picks
+/// Personal and types while the phone copies the files. Restore never puts a note for Personal into
+/// Work's restored message, nor Work's message under Personal. The composer keeps what the user
+/// added, Restore says why it did not fill it, its copies go, and Work's original stays queued.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func restoreLeavesADraftAddressedElsewhereMeanwhileAlone() async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    await workFixture.refuseUploads()
+    let big = Data(repeating: 0x42, count: 16 * 1024 * 1024)
+    chat.recipient = work
+    chat.draft = "Invented: Work's scanned contracts"
+    for index in 0..<8 {
+      await chat.attach(data: big, name: "Contract\(index).pdf", mediaType: "application/pdf")
+    }
+    await chat.send()
+    try await eventually("Work refused it") {
+      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+    }
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let original = try #require(try queuedRequests(outbox).first)
+    let drafts = root.appending(path: "Agent/Drafts")
+    let draftFiles = { (try? FileManager.default.contentsOfDirectory(atPath: drafts.path)) ?? [] }
+    let before = draftFiles().count
+    let restoring = Task { @MainActor in await chat.restore(original.inputId) }
+    await Task.yield()
+    let stillCopying = chat.restoredFrom == nil
+    chat.choose(personal)
+    let note = "Invented: a note for Personal only"
+    chat.draft = note
+    await restoring.value
+    print(
+      "IF7-V3[elsewhere] copying=\(stillCopying) chip=\(chat.recipient.map(chat.name) ?? "none") draft=\(chat.draft.debugDescription) files=\(chat.attachments.map(\.reference.name)) error=\(chat.error ?? "nil") draft files \(before)->\(draftFiles().count)"
+    )
+    #expect(stillCopying, "The user acted after Restore filled the composer")
+    #expect(chat.recipient == personal && chat.draft == note && chat.attachments.isEmpty)
+    #expect(chat.error == "Send or clear the current draft before restoring another message.")
+    #expect(draftFiles().count == before, "Restore left its copies in the drafts folder")
+    await workFixture.acceptUploads()
+    await chat.send()
+    try await eventually("Personal got the note") { await personalFixture.count() == 1 }
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(await submits(personalFixture).map(\.text) == [note])
+    #expect(await workFixture.count() == 0, "Work got the note meant for Personal")
+    #expect(try queuedRequests(outbox).contains { $0.inputId == original.inputId })
+  }
+}

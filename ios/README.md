@@ -131,9 +131,11 @@ Mode if requested, then Run.
   the original input IDs. Uncertain writes are never automatically replayed.
   **Check / retry** retains the same ID;
   terminal rejection retains the original. **Restore to composer** copies it,
-  addressed to its own coordinator, and the app removes the original only
-  after you send the restored message, and only while its coordinator still
-  refuses it. The refusal is saved with the queued message until it is sent
+  addressed to its own coordinator. Text you type or files you attach while it
+  copies the files stay, after the restored message. If you pick another
+  coordinator meanwhile, Restore leaves your draft alone. The app removes the
+  original only after you send the restored message, and only while its
+  coordinator still refuses it. The refusal is saved with the queued message until it is sent
   again, so a reconnect, an address edit or a relaunch keeps it. If the phone
   cannot save it, the app still follows the coordinator's latest word until it
   quits. A **Check / retry** of the original that has not left the phone when

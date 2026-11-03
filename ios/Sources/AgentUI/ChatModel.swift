@@ -427,16 +427,17 @@ final class ChatModel {
     do {
       let store = try attachmentStore()
       guard let restored = await lane.session?.restore(inputID, to: store) else { return }
-      fill(restored, from: RestoredSource(lane: lane.id, item: inputID, kind: .live))
+      await fill(restored, from: RestoredSource(lane: lane.id, item: inputID, kind: .live), store)
     } catch { failure = error.localizedDescription }
   }
   func restoreHeld(_ message: HeldMessage) async {
     guard let lane = lanes.first(where: { $0.id == message.lane }), readyToRestore(from: lane.id)
     else { return }
     do {
-      guard let restored = try await lane.hold.restore(message.id, to: attachmentStore())
-      else { return }
-      fill(restored, from: RestoredSource(lane: lane.id, item: message.id, kind: .legacy))
+      let store = try attachmentStore()
+      guard let restored = try await lane.hold.restore(message.id, to: store) else { return }
+      await fill(
+        restored, from: RestoredSource(lane: lane.id, item: message.id, kind: .legacy), store)
     } catch { failure = error.localizedDescription }
   }
   func discardHeld(_ message: HeldMessage) async {
@@ -455,9 +456,20 @@ final class ChatModel {
     }
     return true
   }
-  private func fill(_ restored: RestoredDraft, from source: RestoredSource) {
-    draft = restored.text
-    attachments = restored.attachments
+  /// Puts the restored message before what the user typed or attached while its files were copied,
+  /// as on `main`. What the user addressed to another coordinator meanwhile stays as it is, since
+  /// the restored message stays its source's, and the copies go.
+  private func fill(
+    _ restored: RestoredDraft, from source: RestoredSource, _ store: AttachmentStore
+  ) async {
+    guard (draft.isEmpty && attachments.isEmpty) || recipient == nil || recipient == source.lane
+    else {
+      failure = "Send or clear the current draft before restoring another message."
+      for file in restored.attachments { try? await store.remove(file) }
+      return
+    }
+    draft = restored.text + (draft.isEmpty ? "" : "\n\n" + draft)
+    attachments.insert(contentsOf: restored.attachments, at: 0)
     mode = restored.mode
     // The text may have been edited since capture, so only the file's name marks a screenshot.
     for file in restored.attachments where file.reference.name == "Feedback.png" {
