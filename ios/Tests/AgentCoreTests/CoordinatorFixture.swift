@@ -115,6 +115,30 @@ actor FixtureCoordinator {
   func uploadCount() -> Int { uploads }
   func uploaded(_ id: String) -> Data? { files[id] }
   func count() -> Int { submissions.count }
+  private var busy = false
+  /// Submits the busy turn has not placed, each with the socket still waiting for it.
+  private var unplaced: [(input: String, socket: NWConnection?)] = []
+  private var keepsNextRejected = false
+  /// From now on accepts each submit at once and places it only at `finishTurn`, as a coordinator
+  /// busy with a turn does with a follow-up.
+  func holdPlacements() { busy = true }
+  /// Rejects the next submit but keeps it, as a coordinator whose turn ended while saving it does.
+  /// Observing reports it as the turn left it.
+  func rejectNextSubmitButKeepIt() { keepsNextRejected = true }
+  /// The turn ends, and every submit it held is placed in order.
+  func finishTurn() async throws {
+    busy = false
+    for case (let input, let socket?) in unplaced {
+      try await emit(.placed(.init(entryId: "placed-\(input)", inputId: input)), on: socket)
+      try await emit(.done, on: socket)
+    }
+    unplaced = []
+  }
+  /// The input IDs of every submit placed so far.
+  func placedInputs() -> [String] { placedSubmits.map(\.inputId) }
+  private var placedSubmits: [NativeRequestSubmit] {
+    submissions.filter { submit in !unplaced.contains { $0.input == submit.inputId } }
+  }
   func stop() {
     releaseHistory()
     releaseIdentity()
@@ -202,7 +226,8 @@ actor FixtureCoordinator {
         try await emit(
           .ready(.init(conversationId: "fixture-root", model: "fixture/model")), on: socket)
         if delaySnapshot { await withCheckedContinuation { release = $0 } }
-        let messages = submissions.filter { request.inputIds.contains($0.inputId) }.map { input in
+        let placed = placedSubmits
+        let messages = placed.filter { request.inputIds.contains($0.inputId) }.map { input in
           HistoryMessage(
             attachments: input.attachments, continuation: false, entryId: "placed-\(input.inputId)",
             finalChunk: true, role: .user,
@@ -210,7 +235,9 @@ actor FixtureCoordinator {
         }
         for input in submissions where request.inputIds.contains(input.inputId) {
           try await emit(
-            .placed(.init(entryId: "placed-\(input.inputId)", inputId: input.inputId)), on: socket)
+            placed.contains(input)
+              ? .placed(.init(entryId: "placed-\(input.inputId)", inputId: input.inputId))
+              : .accepted(.init(inputId: input.inputId)), on: socket)
         }
         try await emit(
           .history(
@@ -226,6 +253,18 @@ actor FixtureCoordinator {
         return
       case .submit(let request):
         submissions.append(request)
+        if keepsNextRejected {
+          keepsNextRejected = false
+          if busy { unplaced.append((request.inputId, nil)) }
+          try await emit(
+            .rejected(
+              .init(
+                inputId: request.inputId,
+                message: "The turn ended while this input was being saved; its original is retained"
+              )), on: socket)
+          try await emit(.done, on: socket)
+          return
+        }
         if request.text.hasPrefix("/feedback ") {
           try await emit(
             .feedbackReady(
@@ -239,6 +278,10 @@ actor FixtureCoordinator {
           return
         }
         try await emit(.accepted(.init(inputId: request.inputId)), on: socket)
+        if busy {
+          unplaced.append((request.inputId, socket))
+          return
+        }
         socket.send(
           content: nil, contentContext: .finalMessage, isComplete: true, completion: .idempotent)
         return

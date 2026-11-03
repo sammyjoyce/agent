@@ -232,8 +232,9 @@ func aPlacementStaysQueuedUntilItsRecordIsSaved() async throws {
   }
 }
 
-/// A restored item is discarded once its copy was sent instead. The ledger keeps that the item was
-/// withdrawn, after the outbox lets it go and across a relaunch, so its Send reads not sent here.
+/// A restored item, which its coordinator refused, is discarded once its copy was sent instead. The
+/// ledger keeps that the item was withdrawn, after the outbox lets it go and across a relaunch, so
+/// its Send reads not sent here.
 @Test(.timeLimit(.minutes(1)))
 func aDiscardedItemIsRecordedAsWithdrawnAcrossARelaunch() async throws {
   try await withProfile { fixture, directory, launch in
@@ -241,9 +242,20 @@ func aDiscardedItemIsRecordedAsWithdrawnAcrossARelaunch() async throws {
     await first.connect()
     _ = try await until(first) { $0.connection == .connected }
     let recipients = [directory.profile, ProfileID()]
+    let drafts = AttachmentStore(
+      directory: FileManager.default.temporaryDirectory.appending(path: UUID().uuidString))
+    let file = try await drafts.stage(
+      data: Data("Invented key photo".utf8), name: "Key.txt", mediaType: "text/plain")
+    defer { try? FileManager.default.removeItem(at: file.url.deletingLastPathComponent()) }
+    await fixture.refuseUploads()
     let staged = try #require(
       await first.stage(
-        "Invented: the spare key is under the mat", sendID: "send-7", recipients: recipients))
+        "Invented: the spare key is under the mat", files: [file], sendID: "send-7",
+        recipients: recipients))
+    await first.start(staged)
+    _ = try await until(first) {
+      $0.rows.contains { $0.inputID == staged.inputID && $0.delivery == .rejected }
+    }
     await first.discard(staged.inputID)
     let withdrawn = SendStatus(recipients: recipients, progress: .withdrawn)
     _ = try await until(first) { $0.sends["send-7"] == withdrawn }

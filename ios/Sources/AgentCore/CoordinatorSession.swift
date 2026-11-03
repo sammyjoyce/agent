@@ -128,6 +128,9 @@ public actor CoordinatorSession {
   private var unsent: [String: Unsent] = [:]
   /// Started inputs whose exchange has not written them to the coordinator yet, by action.
   private var unwritten: [(action: UUID, input: StagedInput)] = []
+  /// Queued inputs the coordinator refused, until one is sent again or accepted. Only these may be
+  /// withdrawn.
+  private var refused: Set<String> = []
   private var attemptedInputs: Set<String> = []
   /// Set for good by `retire`. A retired session never connects, sends or writes again.
   private var retired = false
@@ -402,9 +405,12 @@ public actor CoordinatorSession {
   }
 
   /// Removes a restored item once its copy was admitted, with files no other item uses, and
-  /// records that this coordinator never placed it.
+  /// records that this coordinator never placed it. That holds only while the coordinator refuses
+  /// it, so an item sent again or accepted since stays queued and reconciles as any other.
   public func discard(_ inputID: String) {
-    guard let item = pending.first(where: { $0.request.inputId == inputID }) else { return }
+    guard refused.contains(inputID),
+      let item = pending.first(where: { $0.request.inputId == inputID })
+    else { return }
     if acknowledge(inputID) != nil {
       ledger.sends[item.sendID] = Ledger.Send(
         inputID: inputID, recipients: item.recipients, queuedAt: item.queuedAt, withdrawn: true)
@@ -606,6 +612,7 @@ public actor CoordinatorSession {
     let id = UUID()
     let generation = generation
     if let sending { unwritten.append((id, sending)) }
+    if let inputID { refused.remove(inputID) }
     actions[id] = Task { [weak self] in
       _ = await self?.exchange(
         id: id, request: request, inputID: inputID, generation: generation)
@@ -697,7 +704,9 @@ public actor CoordinatorSession {
       failed = true
       if self.generation == generation && !Task.isCancelled {
         if let inputID, pending.contains(where: { $0.request.inputId == inputID }) {
-          transcript.delivery(inputID, attemptedInputs.contains(inputID) ? .uncertain : .rejected)
+          let mayHaveLeft = attemptedInputs.contains(inputID)
+          transcript.delivery(inputID, mayHaveLeft ? .uncertain : .rejected)
+          if !mayHaveLeft { refused.insert(inputID) }
         }
         if ConnectionError.shouldReconnect(after: error) {
           snapshot.connection = .reconnecting
@@ -936,7 +945,9 @@ public actor CoordinatorSession {
     case .activity(let value):
       snapshot.busy = true
       transcript.activity(value.activity)
-    case .accepted(let value): transcript.delivery(value.inputId, .saved)
+    case .accepted(let value):
+      refused.remove(value.inputId)
+      transcript.delivery(value.inputId, .saved)
     case .placed(let value):
       transcript.delivery(value.inputId, .saved, entryID: value.entryId)
       settle(value.inputId, entryID: value.entryId)
@@ -945,6 +956,9 @@ public actor CoordinatorSession {
       transcript.notice("Feedback saved. Repair task: \(value.receipt.taskId)")
       settle(value.inputId, entryID: nil)
     case .rejected(let value):
+      if pending.contains(where: { $0.request.inputId == value.inputId }) {
+        refused.insert(value.inputId)
+      }
       transcript.delivery(value.inputId, .rejected)
       // Keep the original on disk until the user explicitly restores it.
       // Rejections are not proof that a queued durable input never existed.

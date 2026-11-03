@@ -2119,3 +2119,153 @@ func anActiveChangeOverlappedByAnInactiveOneLeavesNoLaneLive() async throws {
     #expect(revived.isEmpty)
   }
 }
+
+// MARK: - A restored source is withdrawn only while its coordinator still refuses it
+
+/// Sends `text` with a file to both. Work places it and Personal refuses the file. Returns
+/// Personal's refused input and the Send's bubble.
+@MainActor private func sendToBothRefusedByPersonal(_ chat: ChatModel, _ text: String)
+  async throws -> (source: String, bubble: String)
+{
+  chat.draft = text
+  await chat.attach(data: Data("invented lease".utf8), name: "Lease.txt", mediaType: "text/plain")
+  await chat.send()
+  var rejected: String?
+  try await eventually("Work placed it and Personal refused it") {
+    let receipts = chat.rows.first { $0.row.text == text }?.receipts ?? []
+    guard receipts.first?.status == .placed, receipts.count == 2,
+      case .pending(.rejected, let id?) = receipts[1].status
+    else { return false }
+    rejected = id
+    return true
+  }
+  return (try #require(rejected), try #require(chat.rows.first { $0.row.text == text }?.id))
+}
+
+/// Personal is busy with a turn, so a follow-up waits there as Saved until the turn ends. Personal
+/// refuses its copy of a message to both, and the user restores it. After the app goes inactive and
+/// active, Check / retry gets the original Saved, and then the user sends the restored draft. The
+/// original left the phone again, so it is never recorded withdrawn, and once Personal places it
+/// the bubble reads Delivered there.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRestoredSourceSavedAgainBeforeItsCopyIsSentReadsDeliveredOncePlaced() async throws {
+  try await withTwoFixtures { coordinators, _, personalFixture, _ in
+    await personalFixture.refuseUploads()
+    await personalFixture.holdPlacements()
+    let (_, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    chat.mode = .followUp
+    let (source, bubble) = try await sendToBothRefusedByPersonal(
+      chat, "Invented: after this, book the boiler service")
+    @MainActor func lines() -> [String] {
+      (chat.rows.first { $0.id == bubble }?.receipts ?? []).map { $0.line(chat.name($0.lane)) }
+    }
+    @MainActor func connected() -> Int {
+      chat.snapshots.values.filter { $0.connection == .connected }.count
+    }
+    try await eventually("both connected") { connected() == 2 }
+    await chat.restore(source)
+    #expect(chat.recipientLine == "To Personal")
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    try await eventually("both connected again") { connected() == 2 }
+    await personalFixture.acceptUploads()
+    await chat.retry(source)
+    try await eventually("Personal saved the original") { lines().contains("Personal · Saved") }
+    await chat.send()
+    try await personalFixture.finishTurn()
+    try await eventually("Personal placed the original and the copy") {
+      await personalFixture.placedInputs().count == 2
+        && chat.snapshots[personal]?.sends.values.allSatisfy {
+          if case .pending = $0.progress { false } else { true }
+        } == true
+    }
+    let placed = await personalFixture.placedInputs()
+    print("IF5-S3-A placed=\(placed.map { $0.prefix(8) }) source=\(source.prefix(8)) \(lines())")
+    #expect(!(placed.contains(source) && lines().contains("Not sent to Personal")))
+    #expect(lines() == ["Work · Delivered", "Personal · Delivered"])
+  }
+}
+
+/// The same with Check / retry and Send tapped one after the other, at a coordinator that places
+/// each message at once.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRestoredSourceRetriedAsItsCopyIsSentReadsDeliveredOncePlaced() async throws {
+  try await withTwoFixtures { coordinators, _, personalFixture, _ in
+    await personalFixture.refuseUploads()
+    let (_, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let (source, bubble) = try await sendToBothRefusedByPersonal(
+      chat, "Invented: the signed lease for both of you")
+    let send = String(bubble.dropFirst("send:".count))
+    @MainActor func lines() -> [String] {
+      (chat.rows.first { $0.id == bubble }?.receipts ?? []).map { $0.line(chat.name($0.lane)) }
+    }
+    @MainActor func connected() -> Int {
+      chat.snapshots.values.filter { $0.connection == .connected }.count
+    }
+    try await eventually("both connected") { connected() == 2 }
+    await chat.restore(source)
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    try await eventually("both connected again") { connected() == 2 }
+    await personalFixture.acceptUploads()
+    await chat.retry(source)
+    await chat.send()
+    try await eventually("Personal placed or withdrew the original") {
+      let progress = chat.snapshots[personal]?.sends[send]?.progress
+      return await personalFixture.count() == 2 && (progress == .placed || progress == .withdrawn)
+    }
+    let atPersonal = await submits(personalFixture).map(\.inputId)
+    print(
+      "IF5-S3-B Personal got=\(atPersonal.map { $0.prefix(8) }) source=\(source.prefix(8)) \(lines())"
+    )
+    #expect(!(atPersonal.contains(source) && lines().contains("Not sent to Personal")))
+    #expect(lines() == ["Work · Delivered", "Personal · Delivered"])
+  }
+}
+
+/// Personal rejects its copy of a message to both but keeps it, as a coordinator whose turn ended
+/// while saving it does, and the user restores that copy. When the app comes back, Personal reports
+/// the original accepted. Sending the restored draft then leaves the original queued to reconcile,
+/// and nothing records it withdrawn.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRestoredSourceTheCoordinatorAcceptsBeforeItsCopyIsSentStaysQueued() async throws {
+  try await withTwoFixtures { coordinators, _, personalFixture, root in
+    await personalFixture.holdPlacements()
+    await personalFixture.rejectNextSubmitButKeepIt()
+    let (_, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let text = "Invented: the gate code changed to 4410"
+    chat.draft = text
+    await chat.send()
+    var rejected: String?
+    try await eventually("Work placed it and Personal rejected it") {
+      let receipts = chat.rows.first { $0.row.text == text }?.receipts ?? []
+      guard receipts.first?.status == .placed, receipts.count == 2,
+        case .pending(.rejected, let id?) = receipts[1].status
+      else { return false }
+      rejected = id
+      return true
+    }
+    let source = try #require(rejected)
+    let bubble = try #require(chat.rows.first { $0.row.text == text }?.id)
+    let send = String(bubble.dropFirst("send:".count))
+    @MainActor func lines() -> [String] {
+      (chat.rows.first { $0.id == bubble }?.receipts ?? []).map { $0.line(chat.name($0.lane)) }
+    }
+    await chat.restore(source)
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    try await eventually("Personal reports the original accepted") {
+      lines().contains("Personal · Saved")
+    }
+    await chat.send()
+    try await eventually("the copy at Personal") { await personalFixture.count() == 2 }
+    let outbox = ProfileDirectory(personal, applicationSupport: root, caches: root).outbox
+    print("IF5-S3-C \(lines()) record=\(String(describing: chat.snapshots[personal]?.sends[send]))")
+    #expect(try queuedRequests(outbox).contains { $0.inputId == source }, "Still queued")
+    #expect(chat.snapshots[personal]?.sends[send]?.progress == .pending(.saved))
+    #expect(lines() == ["Work · Delivered", "Personal · Saved"])
+  }
+}
