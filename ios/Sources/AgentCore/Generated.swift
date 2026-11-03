@@ -893,6 +893,16 @@ public struct NativeEventNotifications: Codable, Sendable, Equatable {
     }
 }
 
+public struct NativeEventIdentity: Codable, Sendable, Equatable {
+    public var `coordinatorId`: String
+    public init(`coordinatorId`: String) {
+        self.`coordinatorId` = `coordinatorId`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `coordinatorId` = "coordinator_id"
+    }
+}
+
 public enum NativeEvent: Codable, Sendable, Equatable {
     case `feedbackReady`(NativeEventFeedbackReady)
     case `attachment`(NativeEventAttachment)
@@ -914,6 +924,7 @@ public enum NativeEvent: Codable, Sendable, Equatable {
     case `disconnect`
     case `notifications`(NativeEventNotifications)
     case `done`
+    case `identity`(NativeEventIdentity)
     enum CodingKeys: String, CodingKey { case type }
     public init(from decoder: any Decoder) throws {
         let tag = try decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .type)
@@ -938,6 +949,7 @@ public enum NativeEvent: Codable, Sendable, Equatable {
         case "disconnect": self = .`disconnect`
         case "notifications": self = .`notifications`(try NativeEventNotifications(from: decoder))
         case "done": self = .`done`
+        case "identity": self = .`identity`(try NativeEventIdentity(from: decoder))
         default: throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unsupported protocol event: \(tag)"))
         }
     }
@@ -1001,6 +1013,9 @@ public enum NativeEvent: Codable, Sendable, Equatable {
             try value.encode(to: encoder)
         case .`done`:
             try tag.encode("done", forKey: .type)
+        case .`identity`(let value):
+            try tag.encode("identity", forKey: .type)
+            try value.encode(to: encoder)
         }
     }
 }
@@ -1088,6 +1103,7 @@ public enum NativeRequest: Codable, Sendable, Equatable {
     case `toolDetails`(NativeRequestToolDetails)
     case `interrupt`
     case `notifications`(NativeRequestNotifications)
+    case `identify`
     enum CodingKeys: String, CodingKey { case type }
     public init(from decoder: any Decoder) throws {
         let tag = try decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .type)
@@ -1099,6 +1115,7 @@ public enum NativeRequest: Codable, Sendable, Equatable {
         case "tool_details": self = .`toolDetails`(try NativeRequestToolDetails(from: decoder))
         case "interrupt": self = .`interrupt`
         case "notifications": self = .`notifications`(try NativeRequestNotifications(from: decoder))
+        case "identify": self = .`identify`
         default: throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unsupported protocol event: \(tag)"))
         }
     }
@@ -1125,6 +1142,8 @@ public enum NativeRequest: Codable, Sendable, Equatable {
         case .`notifications`(let value):
             try tag.encode("notifications", forKey: .type)
             try value.encode(to: encoder)
+        case .`identify`:
+            try tag.encode("identify", forKey: .type)
         }
     }
 }
