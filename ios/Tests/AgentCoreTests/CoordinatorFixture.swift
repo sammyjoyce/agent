@@ -112,6 +112,19 @@ actor FixtureCoordinator {
   private var rejectUploads = false
   func refuseUploads() { rejectUploads = true }
   func acceptUploads() { rejectUploads = false }
+  private var rejectsSubmits = false
+  /// Rejects each submit once read, as a coordinator refusing an input does, and keeps nothing.
+  func rejectSubmits(_ rejects: Bool = true) { rejectsSubmits = rejects }
+  private var holdsSubmitReply = false
+  private var submitReplyRelease: CheckedContinuation<Void, Never>?
+  /// Keeps the next submit and holds its answer until `releaseSubmitReply`, as a slow coordinator
+  /// does after the write.
+  func holdNextSubmitReply() { holdsSubmitReply = true }
+  func releaseSubmitReply() {
+    holdsSubmitReply = false
+    submitReplyRelease?.resume()
+    submitReplyRelease = nil
+  }
   func uploadCount() -> Int { uploads }
   func uploaded(_ id: String) -> Data? { files[id] }
   func count() -> Int { submissions.count }
@@ -142,6 +155,7 @@ actor FixtureCoordinator {
   func stop() {
     releaseHistory()
     releaseIdentity()
+    releaseSubmitReply()
     for socket in sockets { socket.cancel() }
     sockets = []
   }
@@ -252,7 +266,20 @@ actor FixtureCoordinator {
         closedContinuation.yield(())
         return
       case .submit(let request):
+        if rejectsSubmits {
+          try await emit(
+            .rejected(
+              .init(
+                inputId: request.inputId, message: "Invented: the coordinator refused this input")
+            ), on: socket)
+          try await emit(.done, on: socket)
+          return
+        }
         submissions.append(request)
+        if holdsSubmitReply {
+          holdsSubmitReply = false
+          await withCheckedContinuation { submitReplyRelease = $0 }
+        }
         if keepsNextRejected {
           keepsNextRejected = false
           if busy { unplaced.append((request.inputId, nil)) }

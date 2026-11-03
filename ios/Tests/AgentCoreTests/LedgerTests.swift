@@ -271,6 +271,47 @@ func aDiscardedItemIsRecordedAsWithdrawnAcrossARelaunch() async throws {
   }
 }
 
+/// The coordinator's refusal is saved with the queued item. After a relaunch, Check / retry that
+/// is refused again before its submit is written keeps it, so sending the restored copy still
+/// withdraws the original, and nothing sends it again.
+@Test(.timeLimit(.minutes(1)))
+func aRefusalSavedWithTheQueuedItemStillWithdrawsItAfterARelaunch() async throws {
+  try await withProfile { fixture, directory, launch in
+    let first = try await launch()
+    await first.connect()
+    _ = try await until(first) { $0.connection == .connected }
+    let drafts = AttachmentStore(
+      directory: FileManager.default.temporaryDirectory.appending(path: UUID().uuidString))
+    let file = try await drafts.stage(
+      data: Data("Invented boarding pass".utf8), name: "Pass.txt", mediaType: "text/plain")
+    defer { try? FileManager.default.removeItem(at: file.url.deletingLastPathComponent()) }
+    await fixture.refuseUploads()
+    let staged = try #require(
+      await first.stage(
+        "Invented: the boarding pass for Friday", files: [file], sendID: "send-11",
+        recipients: [directory.profile]))
+    await first.start(staged)
+    _ = try await until(first) {
+      $0.rows.contains { $0.inputID == staged.inputID && $0.delivery == .rejected }
+    }
+    await first.disconnect()
+
+    let second = try await launch()
+    await second.connect()
+    _ = try await until(second) { $0.connection == .connected }
+    await second.retry(staged.inputID)
+    _ = try await until(second) { $0.error == "Attachment storage is full" }
+    #expect(await fixture.count() == 0, "The retry never wrote its submit")
+    await second.discard(staged.inputID)
+    #expect(try outboxItems(directory.outbox).isEmpty)
+    #expect(try savedLedger(directory).sends["send-11"]?.withdrawn == true)
+    await fixture.acceptUploads()
+    await second.retry(staged.inputID)
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(await fixture.count() == 0, "A withdrawn item never left the phone")
+  }
+}
+
 @Test func unseenRowsFillFromNeighboursAndNeverReorderACoordinator() {
   var clock = 100.0
   func next() -> TimeInterval {

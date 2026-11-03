@@ -126,11 +126,9 @@ public actor CoordinatorSession {
   /// Durable inputs this process staged that have not left the phone. Only a staged one can be
   /// unstaged. A started one waits for this lane to connect, then sends once.
   private var unsent: [String: Unsent] = [:]
-  /// Started inputs whose exchange has not written them to the coordinator yet, by action.
-  private var unwritten: [(action: UUID, input: StagedInput)] = []
-  /// Queued inputs the coordinator refused, until one is sent again or accepted. Only these may be
-  /// withdrawn.
-  private var refused: Set<String> = []
+  /// Exchanges that have not written their input to the coordinator yet, by action. `started` is
+  /// the input a Send started, and nil for Check / retry of a queued one.
+  private var unwritten: [(action: UUID, inputID: String, started: StagedInput?)] = []
   private var attemptedInputs: Set<String> = []
   /// Set for good by `retire`. A retired session never connects, sends or writes again.
   private var retired = false
@@ -208,7 +206,7 @@ public actor CoordinatorSession {
     guard !retired else { return [] }
     retired = true
     let waiting = pending.filter { unsent[$0.request.inputId] == .waiting }.map { staged($0) }
-    let cancelled = waiting + unwritten.map(\.input)
+    let cancelled = waiting + unwritten.compactMap(\.started)
     await disconnect()
     return cancelled
   }
@@ -405,13 +403,17 @@ public actor CoordinatorSession {
   }
 
   /// Removes a restored item once its copy was admitted, with files no other item uses, and
-  /// records that this coordinator never placed it. That holds only while the coordinator refuses
-  /// it, so an item sent again or accepted since stays queued and reconciles as any other.
+  /// records that this coordinator never placed it. That holds only while the outbox records the
+  /// coordinator's refusal, so an item written again or accepted since stays queued and reconciles
+  /// as any other. The record outlives sessions, so an address edit, a reconnect or a cancelled
+  /// Check / retry in between changes nothing. An attempt that has not written it is cancelled.
   public func discard(_ inputID: String) {
-    guard refused.contains(inputID),
-      let item = pending.first(where: { $0.request.inputId == inputID })
+    guard let item = pending.first(where: { $0.request.inputId == inputID }), item.refused == true
     else { return }
     if acknowledge(inputID) != nil {
+      for attempt in unwritten where attempt.inputID == inputID {
+        actions[attempt.action]?.cancel()
+      }
       transcript.delivery(inputID, .withdrawn)
       ledger.sends[item.sendID] = Ledger.Send(
         inputID: inputID, recipients: item.recipients, queuedAt: item.queuedAt, withdrawn: true)
@@ -612,8 +614,7 @@ public actor CoordinatorSession {
   ) {
     let id = UUID()
     let generation = generation
-    if let sending { unwritten.append((id, sending)) }
-    if let inputID { refused.remove(inputID) }
+    if let written = sending?.inputID ?? inputID { unwritten.append((id, written, sending)) }
     actions[id] = Task { [weak self] in
       _ = await self?.exchange(
         id: id, request: request, inputID: inputID, generation: generation)
@@ -670,7 +671,11 @@ public actor CoordinatorSession {
       }
       try Task.checkCancellation()
       guard self.generation == generation else { throw CancellationError() }
-      if let inputID { attemptedInputs.insert(inputID) }
+      if let inputID {
+        // Saved before the write, so the outbox never keeps a refusal once the input may have left.
+        try mark(inputID, refused: false)
+        attemptedInputs.insert(inputID)
+      }
       unwritten.removeAll { $0.action == id }
       try await timedSend(stream, request)
       while !Task.isCancelled {
@@ -707,7 +712,7 @@ public actor CoordinatorSession {
         if let inputID, pending.contains(where: { $0.request.inputId == inputID }) {
           let mayHaveLeft = attemptedInputs.contains(inputID)
           transcript.delivery(inputID, mayHaveLeft ? .uncertain : .rejected)
-          if !mayHaveLeft { refused.insert(inputID) }
+          if !mayHaveLeft { try? mark(inputID, refused: true) }
         }
         if ConnectionError.shouldReconnect(after: error) {
           snapshot.connection = .reconnecting
@@ -947,7 +952,7 @@ public actor CoordinatorSession {
       snapshot.busy = true
       transcript.activity(value.activity)
     case .accepted(let value):
-      refused.remove(value.inputId)
+      try? mark(value.inputId, refused: false)
       transcript.delivery(value.inputId, .saved)
     case .placed(let value):
       transcript.delivery(value.inputId, .saved, entryID: value.entryId)
@@ -957,9 +962,7 @@ public actor CoordinatorSession {
       transcript.notice("Feedback saved. Repair task: \(value.receipt.taskId)")
       settle(value.inputId, entryID: nil)
     case .rejected(let value):
-      if pending.contains(where: { $0.request.inputId == value.inputId }) {
-        refused.insert(value.inputId)
-      }
+      try? mark(value.inputId, refused: true)
       transcript.delivery(value.inputId, .rejected)
       // Keep the original on disk until the user explicitly restores it.
       // Rejections are not proof that a queued durable input never existed.
@@ -1084,6 +1087,19 @@ public actor CoordinatorSession {
       snapshot.includesLatest = false
     }
     continuation.yield(snapshot)
+  }
+  /// Records in the outbox whether the coordinator refuses a queued input. When the outbox cannot
+  /// be saved the item stays as it was.
+  private func mark(_ inputID: String, refused: Bool) throws {
+    guard let index = pending.firstIndex(where: { $0.request.inputId == inputID }),
+      (pending[index].refused == true) != refused
+    else { return }
+    let previous = pending[index].refused
+    pending[index].refused = refused ? true : nil
+    do { try saveOutbox() } catch {
+      pending[index].refused = previous
+      throw error
+    }
   }
   /// Removes an item from the outbox. Returns the removal of its files, or nil when the outbox
   /// could not be saved and the item stays.

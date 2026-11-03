@@ -127,7 +127,11 @@ Mode if requested, then Run.
   **Check / retry** retains the same ID;
   terminal rejection retains the original. **Restore to composer** copies it,
   addressed to its own coordinator, and the app removes the original only
-  after you send the restored message.
+  after you send the restored message, and only while its coordinator still
+  refuses it. The refusal is saved with the queued message until it is sent
+  again, so a reconnect, an address edit or a relaunch keeps it. A
+  **Check / retry** of the original that has not left the phone when you send
+  the copy is cancelled.
 - The top of the chat holds messages that a build without saved coordinators
   queued. That build never recorded their coordinator, so they may already have
   been delivered. The app never sends them. **Restore to composer** makes a new

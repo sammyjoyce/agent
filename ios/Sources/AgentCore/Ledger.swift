@@ -32,9 +32,13 @@ struct OutboxItem: Codable, Equatable, Sendable {
   var recipients: [ProfileID]
   /// The pending row's receive stamp. It moves to the entry once placed.
   var queuedAt: TimeInterval
+  /// true once the coordinator rejected this input, or an attempt failed before it was ever written,
+  /// as when its upload was refused. It stays until its submit is written again or the coordinator
+  /// reports it accepted. Absent otherwise. Only a refused item may be withdrawn.
+  var refused: Bool?
 
   enum CodingKeys: String, CodingKey {
-    case request, recipients
+    case request, recipients, refused
     case sendID = "send_id"
     case queuedAt = "queued_at"
   }

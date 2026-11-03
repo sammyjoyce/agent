@@ -2189,7 +2189,9 @@ func aRestoredSourceSavedAgainBeforeItsCopyIsSentReadsDeliveredOncePlaced() asyn
 }
 
 /// The same with Check / retry and Send tapped one after the other, at a coordinator that places
-/// each message at once.
+/// each message at once. A retry that wrote the original before its copy was admitted gets it
+/// placed, and it reads Delivered. One that had not written it is cancelled when the copy withdraws
+/// the original, which then reads not sent and never reaches Personal.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func aRestoredSourceRetriedAsItsCopyIsSentReadsDeliveredOncePlaced() async throws {
   try await withTwoFixtures { coordinators, _, personalFixture, _ in
@@ -2215,14 +2217,22 @@ func aRestoredSourceRetriedAsItsCopyIsSentReadsDeliveredOncePlaced() async throw
     await chat.send()
     try await eventually("Personal placed or withdrew the original") {
       let progress = chat.snapshots[personal]?.sends[send]?.progress
-      return await personalFixture.count() == 2 && (progress == .placed || progress == .withdrawn)
+      let submitted = await personalFixture.count()
+      return progress == .placed && submitted == 2 || progress == .withdrawn && submitted >= 1
     }
+    try await Task.sleep(for: .milliseconds(300))
     let atPersonal = await submits(personalFixture).map(\.inputId)
     print(
       "IF5-S3-B Personal got=\(atPersonal.map { $0.prefix(8) }) source=\(source.prefix(8)) \(lines())"
     )
     #expect(!(atPersonal.contains(source) && lines().contains("Not sent to Personal")))
-    #expect(lines() == ["Work · Delivered", "Personal · Delivered"])
+    if atPersonal.contains(source) {
+      #expect(lines() == ["Work · Delivered", "Personal · Delivered"])
+      #expect(atPersonal.count == 2)
+    } else {
+      #expect(lines() == ["Work · Delivered", "Not sent to Personal"])
+      #expect(atPersonal.count == 1, "Only the copy reached Personal")
+    }
   }
 }
 
@@ -2268,6 +2278,305 @@ func aRestoredSourceTheCoordinatorAcceptsBeforeItsCopyIsSentStaysQueued() async 
     #expect(try queuedRequests(outbox).contains { $0.inputId == source }, "Still queued")
     #expect(chat.snapshots[personal]?.sends[send]?.progress == .pending(.saved))
     #expect(lines() == ["Work · Delivered", "Personal · Saved"])
+  }
+}
+
+// MARK: - The outbox keeps a coordinator's refusal until the input is written again
+
+/// Waits up to `seconds` for `predicate`, without failing. Returns whether it held.
+@MainActor private func within(_ seconds: Double, _ predicate: () async -> Bool) async -> Bool {
+  let deadline = ContinuousClock.now + .seconds(seconds)
+  while ContinuousClock.now < deadline {
+    if await predicate() { return true }
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  return await predicate()
+}
+
+/// Work refuses a message to it alone, and the user restores it. An edit of Work's address, to the
+/// same coordinator, builds Work a new session before the restored copy is sent. The original is
+/// withdrawn all the same, so its Check / retry never sends the message a second time.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRestoredSourceIsWithdrawnAfterAnAddressEditOnceItsCopyIsSent() async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    await workFixture.refuseUploads()
+    let (work, _) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let text = "Invented: the signed contractor agreement"
+    chat.recipient = work
+    chat.draft = text
+    await chat.attach(
+      data: Data("invented agreement".utf8), name: "Agreement.txt", mediaType: "text/plain")
+    await chat.send()
+    try await eventually("Work refused it") {
+      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+    }
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let original = try #require(try queuedRequests(outbox).first)
+    await chat.restore(original.inputId)
+    #expect(chat.recipientLine == "To Work")
+    try await coordinators.update(
+      work, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.3", port: 4001))
+    try await eventually("Work reconnected") { chat.snapshots[work]?.connection == .connected }
+    @MainActor func lines() -> [String] {
+      chat.rows.filter { $0.row.role == .user && $0.row.text == text }.map { row in
+        let which = row.row.inputID == original.inputId ? "original" : "copy"
+        let status =
+          row.receipts.isEmpty
+          ? row.row.delivery?.rawValue ?? "nil"
+          : row.receipts.map { $0.line(chat.name($0.lane)) }.joined(separator: ", ")
+        return "\(which): \(status)"
+      }
+    }
+    print("IF6-T2[edit] after the address edit: \(lines())")
+    await workFixture.acceptUploads()
+    await chat.send()
+    try await eventually("the copy left") { await workFixture.count() >= 1 }
+    try await Task.sleep(for: .milliseconds(300))
+    let stillQueued = try queuedRequests(outbox).contains { $0.inputId == original.inputId }
+    print("IF6-T2[edit] after sending the copy: originalStillQueued=\(stillQueued) \(lines())")
+    #expect(!stillQueued, "The original stayed queued after its copy was sent")
+    try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
+    await chat.retry(original.inputId)
+    _ = await within(3) { await workFixture.count() >= 2 }
+    let got = await submits(workFixture)
+    print(
+      "IF6-T2[edit] after the original's Check / retry: Work received \(got.map(\.text)) \(lines())"
+    )
+    #expect(got.map(\.text) == [text], "Work got the restored message twice")
+    #expect(lines().contains("original: Not sent to Work"))
+  }
+}
+
+/// The same with one coordinator saved. The withdrawn original reads "Not sent" and offers no
+/// Check / retry.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func withOneCoordinatorARestoredSourceIsWithdrawnAfterAnAddressEdit() async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    await workFixture.refuseUploads()
+    try await coordinators.add(
+      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    let work = try #require(coordinators.profiles.first?.id)
+    let chat = coordinators.chat
+    try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
+    let text = "Invented: renew the parking permit"
+    chat.draft = text
+    await chat.attach(
+      data: Data("invented permit".utf8), name: "Permit.txt", mediaType: "text/plain")
+    await chat.send()
+    try await eventually("Work refused it") { chat.rows.contains { $0.row.delivery == .rejected } }
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let original = try #require(try queuedRequests(outbox).first)
+    await chat.restore(original.inputId)
+    try await coordinators.update(
+      work, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.3", port: 4001))
+    try await eventually("Work reconnected") { chat.snapshots[work]?.connection == .connected }
+    await workFixture.acceptUploads()
+    await chat.send()
+    try await eventually("the copy left") { await workFixture.count() >= 1 }
+    try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
+    @MainActor func originalRow() -> ChatRow? {
+      chat.rows.first { $0.row.inputID == original.inputId }?.row
+    }
+    print(
+      "IF6-T2[edit, one] after sending the copy: original row=\(originalRow()?.delivery?.rawValue ?? "gone")"
+    )
+    #expect(originalRow()?.delivery?.rawValue == "Not sent", "No Check / retry is offered")
+    #expect(try !queuedRequests(outbox).contains { $0.inputId == original.inputId })
+    await chat.retry(original.inputId)
+    _ = await within(3) { await workFixture.count() >= 2 }
+    let got = await submits(workFixture).map(\.text)
+    print("IF6-T2[edit, one] after the original's Check / retry: Work received \(got)")
+    #expect(got == [text], "Work got the restored message twice")
+  }
+}
+
+/// Work refuses a message, and the user restores it. After the app goes inactive and active, Check
+/// / retry of the original is refused again during its upload, so its submit is never written.
+/// Sending the restored copy then withdraws the original, so Work gets the message once.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRestoredSourceRefusedAgainOnRetryIsWithdrawnOnceItsCopyIsSent() async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    await workFixture.refuseUploads()
+    try await coordinators.add(
+      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    let work = try #require(coordinators.profiles.first?.id)
+    let chat = coordinators.chat
+    try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
+    let text = "Invented: the gas bill"
+    chat.draft = text
+    await chat.attach(data: Data("invented bill".utf8), name: "Bill.txt", mediaType: "text/plain")
+    await chat.send()
+    try await eventually("Work refused it") { chat.rows.contains { $0.row.delivery == .rejected } }
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let original = try #require(try queuedRequests(outbox).first)
+    @MainActor func originalRow() -> String {
+      chat.rows.first { $0.row.inputID == original.inputId }?.row.delivery?.rawValue ?? "gone"
+    }
+    await chat.restore(original.inputId)
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    try await eventually("Work reconnected") { chat.snapshots[work]?.connection == .connected }
+    await chat.retry(original.inputId)
+    try await eventually("the retry refused again") {
+      chat.snapshots[work]?.error == "Attachment storage is full" && originalRow() != "Sending"
+    }
+    try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
+    print("IF6-T2[refused again] after Check / retry: original row=\(originalRow())")
+    #expect(await workFixture.count() == 0, "The retry never wrote its submit")
+    await workFixture.acceptUploads()
+    await chat.send()
+    try await eventually("the copy left") { await workFixture.count() >= 1 }
+    let row = originalRow()
+    let stillQueued = try queuedRequests(outbox).contains { $0.inputId == original.inputId }
+    print("IF6-T2[refused again] after sending the copy: original row=\(row) queued=\(stillQueued)")
+    #expect(row == "Not sent")
+    #expect(!stillQueued, "The original stayed queued after its copy was sent")
+    try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
+    await chat.retry(original.inputId)
+    _ = await within(3) { await workFixture.count() >= 2 }
+    let got = await submits(workFixture).map(\.text)
+    print("IF6-T2[refused again] after the original's Check / retry: Work received \(got)")
+    #expect(got == [text], "Work got the restored message twice")
+  }
+}
+
+/// Personal refuses its copy of a message to both, and the user restores it. Check / retry of the
+/// original is cancelled by a trip to the background while it proves Personal's identity, so it
+/// writes nothing. Back active, the user sends the restored copy. The original is withdrawn, so
+/// nothing left on the phone can send Personal the text again.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRestoredSourceWhoseRetryWasCancelledIsWithdrawnOnceItsCopyIsSent() async throws {
+  try await withTwoFixtures { coordinators, _, personalFixture, root in
+    await personalFixture.refuseUploads()
+    let (_, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let text = "Invented: the gate code changed to 4410"
+    let (source, bubble) = try await sendToBothRefusedByPersonal(chat, text)
+    @MainActor func lines() -> [String] {
+      (chat.rows.first { $0.id == bubble }?.receipts ?? []).map { $0.line(chat.name($0.lane)) }
+    }
+    @MainActor func connected() -> Int {
+      chat.snapshots.values.filter { $0.connection == .connected }.count
+    }
+    try await eventually("both connected") { connected() == 2 }
+    await chat.restore(source)
+    await personalFixture.holdNextIdentity()
+    await chat.retry(source)
+    try await eventually("Personal's socket waiting for its identity") {
+      await personalFixture.identityHeld
+    }
+    await coordinators.setActive(false)
+    await personalFixture.releaseIdentity()
+    await coordinators.setActive(true)
+    try await eventually("both connected again") { connected() == 2 }
+    await personalFixture.acceptUploads()
+    await chat.send()
+    try await eventually("the copy at Personal") { await personalFixture.count() == 1 }
+    try await Task.sleep(for: .milliseconds(300))
+    let outbox = ProfileDirectory(personal, applicationSupport: root, caches: root).outbox
+    let stillQueued = try queuedRequests(outbox).contains { $0.inputId == source }
+    print("IF6-T2[cancelled] lines=\(lines()) originalStillQueued=\(stillQueued)")
+    #expect(!stillQueued, "The original stayed queued after its copy was sent")
+    #expect(lines() == ["Work · Delivered", "Not sent to Personal"])
+    await chat.retry(source)
+    let session = try #require(chat.lanes.first { $0.id == personal }?.session)
+    await session.retry(source)
+    _ = await within(3) { await personalFixture.count() >= 2 }
+    let atPersonal = await submits(personalFixture).map(\.text)
+    print("IF6-T2[cancelled] after Check / retry: Personal received \(atPersonal)")
+    #expect(atPersonal == [text], "Personal got the same text again")
+  }
+}
+
+/// Sends `text` to both. Work places it and Personal rejects it. Returns Personal's rejected input
+/// and the Send's bubble.
+@MainActor private func sendToBothRejectedByPersonal(
+  _ chat: ChatModel, _ personalFixture: FixtureCoordinator, _ text: String
+) async throws -> (source: String, bubble: String) {
+  await personalFixture.rejectSubmits()
+  chat.draft = text
+  await chat.send()
+  var rejected: String?
+  try await eventually("Work placed it and Personal rejected it") {
+    let receipts = chat.rows.first { $0.row.text == text }?.receipts ?? []
+    guard receipts.first?.status == .placed, receipts.count == 2,
+      case .pending(.rejected, let id?) = receipts[1].status
+    else { return false }
+    rejected = id
+    return true
+  }
+  await personalFixture.rejectSubmits(false)
+  return (try #require(rejected), try #require(chat.rows.first { $0.row.text == text }?.id))
+}
+
+/// Check / retry of a restored original is still proving Personal's identity when the user sends
+/// the restored copy. The copy wins: the original is withdrawn, and the retry never writes it.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRestoredSourceRetriedButNotYetWrittenIsWithdrawnOnceItsCopyIsSent() async throws {
+  try await withTwoFixtures { coordinators, _, personalFixture, root in
+    let (_, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let (source, bubble) = try await sendToBothRejectedByPersonal(
+      chat, personalFixture, "Invented: the plumber comes at noon")
+    @MainActor func lines() -> [String] {
+      (chat.rows.first { $0.id == bubble }?.receipts ?? []).map { $0.line(chat.name($0.lane)) }
+    }
+    await chat.restore(source)
+    await personalFixture.holdNextIdentity()
+    await chat.retry(source)
+    try await eventually("Personal's socket waiting for its identity") {
+      await personalFixture.identityHeld
+    }
+    await chat.send()
+    try await eventually("the copy at Personal") { await personalFixture.count() == 1 }
+    await personalFixture.releaseIdentity()
+    _ = await within(3) { await personalFixture.count() >= 2 }
+    let outbox = ProfileDirectory(personal, applicationSupport: root, caches: root).outbox
+    let stillQueued = try queuedRequests(outbox).contains { $0.inputId == source }
+    let writes = await submits(personalFixture).filter { $0.inputId == source }.count
+    print(
+      "IF6-T2[in flight] lines=\(lines()) originalStillQueued=\(stillQueued) writes of the original=\(writes) kept at Personal=\(await personalFixture.count())"
+    )
+    #expect(writes == 1, "The retry wrote the withdrawn original again")
+    #expect(await personalFixture.count() == 1, "Only the copy reached Personal")
+    #expect(!stillQueued)
+    #expect(lines() == ["Work · Delivered", "Not sent to Personal"])
+  }
+}
+
+/// Check / retry writes the restored original again, and Personal is slow to answer. The user sends
+/// the restored copy meanwhile. Personal may hold the original now, so it stays queued until
+/// Personal answers, and the bubble never reads "Not sent to Personal".
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRestoredSourceWrittenAgainStaysQueuedUntilItsCoordinatorAnswers() async throws {
+  try await withTwoFixtures { coordinators, _, personalFixture, root in
+    let (_, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let (source, bubble) = try await sendToBothRejectedByPersonal(
+      chat, personalFixture, "Invented: the boiler service is on Monday")
+    @MainActor func lines() -> [String] {
+      (chat.rows.first { $0.id == bubble }?.receipts ?? []).map { $0.line(chat.name($0.lane)) }
+    }
+    await chat.restore(source)
+    await personalFixture.holdNextSubmitReply()
+    await chat.retry(source)
+    try await eventually("Personal received the original again") {
+      await personalFixture.count() == 1
+    }
+    await chat.send()
+    let outbox = ProfileDirectory(personal, applicationSupport: root, caches: root).outbox
+    let stillQueued = try queuedRequests(outbox).contains { $0.inputId == source }
+    print("IF6-T2[written] after sending the copy: originalStillQueued=\(stillQueued) \(lines())")
+    #expect(stillQueued, "Personal may hold the original, so it was withdrawn too early")
+    #expect(!lines().contains("Not sent to Personal"))
+    await personalFixture.releaseSubmitReply()
+    try await eventually("Personal's answer about the original") {
+      lines() == ["Work · Delivered", "Personal · Saved"]
+        || lines() == ["Work · Delivered", "Personal · Delivered"]
+    }
+    print("IF6-T2[written] once Personal answered: \(lines())")
+    #expect(await personalFixture.count() == 2)
   }
 }
 
