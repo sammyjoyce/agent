@@ -24,6 +24,8 @@ public struct MainChatView: View {
   @State private var historyRequest: HistoryNavigation?
   @State private var importingFiles = false
   #if os(iOS)
+    @State private var chipWidth: CGFloat = 0
+    @State private var draftScroll: CGFloat = 0
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var capture = AppScreenshot()
   #endif
@@ -454,37 +456,29 @@ public struct MainChatView: View {
         }
         .tint(.primary).accessibilityLabel("Add attachments or commands")
         .accessibilityIdentifier("composerMenu")
-        // Top-aligned, so a wrapping draft's first line stays beside the chip.
-        HStack(alignment: .top, spacing: 4) {
-          if let recipient = model.recipient {
-            let badge = badge(recipient)
-            Button {
-              model.recipient = nil
-            } label: {
-              HStack(spacing: 3) {
-                Text("@\(badge.name)").fontWeight(.semibold)
-                Image(systemName: "xmark.circle.fill").font(.caption)
-              }
-              // The field's vertical padding, so the chip's text shares its first line.
-              .padding(.vertical, 11).foregroundStyle(badge.color).frame(minHeight: 44)
-              .contentShape(Rectangle())
+        Group {
+          #if os(iOS)
+            draftField
+          #else
+            // Top-aligned, so a wrapping draft's first line stays beside the chip.
+            HStack(alignment: .top, spacing: 4) {
+              if let recipient = model.recipient { chip(recipient) }
+              // A key that leaves the text as it was, such as one finishing an inline
+              // prediction, gets no field update, and SwiftUI then drops the next change made in
+              // code, such as Send's clear. A new binding each render gives the field that update.
+              TextField(
+                placeholder, text: Binding(get: { model.draft }, set: { model.draft = $0 }),
+                axis: .vertical
+              )
+              .lineLimit(1...6).textFieldStyle(.plain).padding(.vertical, 11)
+              .padding(.horizontal, 2)
+              .accessibilityLabel("Message the coordinator").accessibilityIdentifier(
+                "Message the coordinator")
             }
-            .buttonStyle(.plain).accessibilityLabel("To \(badge.name)")
-            .accessibilityHint("Removes the recipient, so the message goes to every coordinator.")
-          }
-          // A key that leaves the text as it was, such as one finishing an inline prediction,
-          // gets no field update, and SwiftUI then drops the next change made in code, such as
-          // Send's clear. A new binding each render gives the field that update.
-          TextField(
-            model.mode == .steer ? "Message Agent" : "Queue a follow-up",
-            text: Binding(get: { model.draft }, set: { model.draft = $0 }), axis: .vertical
-          )
-          .lineLimit(1...6).textFieldStyle(.plain).padding(.vertical, 11).padding(.horizontal, 2)
-          // The field drops a rewrite made inside its own write, so the tag moves after it.
-          .onChange(of: model.draft) { model.promoteTypedTag() }
-          .accessibilityLabel("Message the coordinator").accessibilityIdentifier(
-            "Message the coordinator")
+          #endif
         }
+        // The field drops a rewrite made inside its own write, so the tag moves after it.
+        .onChange(of: model.draft) { model.promoteTypedTag() }
         Button {
           let stop = showsStop
           Task {
@@ -532,6 +526,43 @@ public struct MainChatView: View {
       }
     }
     .padding(.horizontal, 12).padding(.vertical, 8).background(.background)
+  }
+  private var placeholder: String {
+    model.mode == .steer ? "Message Agent" : "Queue a follow-up"
+  }
+  #if os(iOS)
+    /// The draft with the chip over the start of its first line, like a word typed there.
+    @ViewBuilder private var draftField: some View {
+      let indent = model.recipient == nil ? 0 : chipWidth + 4
+      ComposerField(
+        text: model.draft, placeholder: placeholder, indent: indent, edit: { model.draft = $0 },
+        scroll: { draftScroll = $0 }
+      )
+      .overlay(alignment: .topLeading) {
+        if let recipient = model.recipient {
+          chip(recipient)
+            .onGeometryChange(for: CGFloat.self, of: \.size.width) { chipWidth = $0 }
+            .padding(.leading, ComposerField.inset.left).offset(y: -draftScroll)
+        }
+      }
+      .clipped()
+    }
+  #endif
+  private func chip(_ recipient: ProfileID) -> some View {
+    let badge = badge(recipient)
+    return Button {
+      model.recipient = nil
+    } label: {
+      HStack(spacing: 3) {
+        Text("@\(badge.name)").fontWeight(.semibold)
+        Image(systemName: "xmark.circle.fill").font(.caption)
+      }
+      // The field's vertical padding, so the chip's text shares its first line.
+      .padding(.vertical, 11).foregroundStyle(badge.color).frame(minHeight: 44)
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain).accessibilityLabel("To \(badge.name)")
+    .accessibilityHint("Removes the recipient, so the message goes to every coordinator.")
   }
   /// Saved names matching an `@` being typed. Choosing one sets the composer's recipient.
   private var picker: some View {
