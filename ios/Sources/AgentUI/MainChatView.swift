@@ -301,7 +301,9 @@ public struct MainChatView: View {
       .defaultScrollAnchor(initialScrollTarget == nil ? .bottom : .top, for: .initialOffset)
       .scrollPosition(
         id: Binding(
-          get: { visibleItem },
+          // Following the latest, code scrolls without updating this binding, so a row here would
+          // be out of date. Opening the picker reapplies it and would scroll back to that row.
+          get: { followsLatest ? nil : visibleItem },
           set: { item in
             // Structural controls have no transcript row ID. Keep the real
             // reading anchor when a paging control temporarily leads.
