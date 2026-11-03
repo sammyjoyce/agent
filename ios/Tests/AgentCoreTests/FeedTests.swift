@@ -1896,3 +1896,28 @@ func aControlACoordinatorDidNotGetNamesItInTheError() async throws {
     #expect(chat.draft == "/status" && chat.recipient == work, "Nothing went, so the draft stays")
   }
 }
+
+/// A control to both while Work is removed. Both start on the main actor in this order. Work did
+/// not get it, so the error says so and why, and nothing keeps the control to send later.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aControlDuringRemoveNamesTheRemovedCoordinatorItSkipped() async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    chat.draft = "/status"
+    let sending = Task { @MainActor in await chat.send() }
+    let removing = Task { @MainActor in try await coordinators.remove(work) }
+    await sending.value
+    try await removing.value
+    try await Task.sleep(for: .milliseconds(300))
+    let sentToWork = await submits(workFixture).map(\.text)
+    #expect(await submits(personalFixture).map(\.text) == ["/status"])
+    #expect(
+      sentToWork.isEmpty
+        ? chat.error == "Work did not get /status. It was removed." : chat.error == nil,
+      "Work got \(sentToWork), and the error says \(chat.error ?? "nothing")")
+    #expect(chat.draft.isEmpty, "Personal got it")
+    let outbox = ProfileDirectory(personal, applicationSupport: root, caches: root).outbox
+    #expect((try? queuedRequests(outbox))?.isEmpty ?? true, "A control is never queued")
+  }
+}

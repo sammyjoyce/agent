@@ -312,22 +312,32 @@ final class ChatModel {
         let input = await session.stage(
           body, mode: mode, files: files, sendID: sendID, recipients: recipients)
       else {
-        for item in staged where attached(item.session) { await item.session.unstage(item.input) }
+        for item in staged { await item.session.unstage(item.input) }
         if multiple { error = "Nothing was sent. \(name(id)) did not take the message." }
         return
       }
       staged.append((id, session, input))
     }
-    // A lane detached meanwhile keeps its saved item for its own profile to resolve.
+    // The session of a lane detached meanwhile is retired, so it sends nothing. Its durable item
+    // stays queued for its profile, and a control it did not send is named with the others.
     var missed: [ProfileID] = []
-    for item in staged where attached(item.session) {
+    for item in staged {
       if await !item.session.start(item.input) { missed.append(item.id) }
     }
     error = nil
     if !missed.isEmpty {
       let command = body.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? body
-      error =
-        "\(joinedNames(missed.map(name))) did not get \(command). \(missed.count == 1 ? "It is" : "They are") not connected."
+      let gone = missed.filter { removed[$0] != nil }
+      let offline = missed.filter { removed[$0] == nil }
+      func missedBy(_ ids: [ProfileID], _ one: String, _ many: String) -> String? {
+        ids.isEmpty
+          ? nil
+          : "\(joinedNames(ids.map(name))) did not get \(command). \(ids.count == 1 ? one : many)"
+      }
+      error = [
+        missedBy(offline, "It is not connected.", "They are not connected."),
+        missedBy(gone, "It was removed.", "They were removed."),
+      ].compactMap { $0 }.joined(separator: " ")
       // Nothing went, so the draft stays for another try.
       guard missed.count < staged.count else { return }
     }
@@ -342,10 +352,6 @@ final class ChatModel {
       for file in files { try? await store.remove(file) }
     }
     if let source { await remove(source) }
-  }
-
-  private func attached(_ session: CoordinatorSession) -> Bool {
-    lanes.contains { $0.session === session }
   }
 
   // MARK: - Restore
@@ -531,9 +537,10 @@ final class ChatModel {
   // MARK: - Feed
 
   func apply(_ update: ChatSnapshot, lane id: ProfileID) {
+    // With several coordinators each lane's error shows on its own line instead. With one, an
+    // update that neither has nor clears an error leaves the composer's own error in place.
+    if !multiple, update.error != nil || snapshots[id]?.error != nil { error = update.error }
     snapshots[id] = update
-    // With several coordinators each lane's error shows on its own line instead.
-    if !multiple { error = update.error }
     refresh()
   }
 
