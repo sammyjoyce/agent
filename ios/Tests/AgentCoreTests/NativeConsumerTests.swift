@@ -20,7 +20,7 @@ func settingsUseMainControlAndKeepDefaultLegacyExtraHighFastAndEffectiveUnknownD
         ],
         conversationId: "fixture-root", model: configured), effective: nil)
     await fixture.replyToSettings(settings)
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     for await update in session.updates where update.connection == .connected { break }
     let read = try await session.settings()
     #expect(read == settings)
@@ -47,7 +47,7 @@ func settingsUseMainControlAndKeepDefaultLegacyExtraHighFastAndEffectiveUnknownD
 @Test(.timeLimit(.minutes(1)))
 func legacySettingsAreUnavailableWithoutSendingAnyFallbackComposerInput() async throws {
   try await withCoordinator { session, fixture, _ in
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     for await update in session.updates where update.connection == .connected { break }
     await #expect(throws: (any Error).self) { try await session.settings() }
     #expect(await fixture.settingsControls().isEmpty)
@@ -94,7 +94,7 @@ func legacySettingsAreUnavailableWithoutSendingAnyFallbackComposerInput() async 
 func cancellingASettingsReadClosesItsOwnedSocketWithoutDisconnectingTheObserver() async throws {
   try await withCoordinator { session, fixture, _ in
     await fixture.advertiseSettings(true)
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     for await update in session.updates where update.connection == .connected { break }
     let read = Task { try await session.settings() }
     for await _ in fixture.observedSettings { break }
@@ -115,7 +115,7 @@ func settingsForAnotherConversationCannotReplaceTheMainSelection() async throws 
           catalog: [],
           conversationId: "another-conversation",
           model: .init(fast: false, modelId: "model", provider: .openai))))
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     for await update in session.updates where update.connection == .connected { break }
     await #expect(throws: (any Error).self) { try await session.settings() }
     #expect(await fixture.count() == 0)

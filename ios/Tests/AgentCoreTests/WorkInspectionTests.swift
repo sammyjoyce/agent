@@ -239,9 +239,13 @@ private func inspectionJob(
     }
 
     @MainActor @Test func nativeSourceErrorAndToolInputDetailsRemainInspectable() async throws {
+      let (directory, root) = temporaryProfile()
+      defer { try? FileManager.default.removeItem(at: root) }
       let model = ChatModel()
-      model.connection = .connected
-      model.sources = [
+      model.attach(Lane(id: directory.profile, session: nil, hold: LegacyHold(directory)))
+      var checks = ChatSnapshot()
+      checks.connection = .connected
+      checks.sources = [
         .init(
           checkedAt: 1_798_797_600_000,
           coverage: .unavailable(
@@ -253,6 +257,7 @@ private func inspectionJob(
           checkedAt: 1_798_797_600_010, coverage: .complete,
           source: .init(account: "example-account", provider: "google")),
       ]
+      model.apply(checks, lane: directory.profile)
       try await Self.captureWork(
         NavigationStack { SourceDetailsView(model: model) }, name: "sources-actionable-error")
       struct Input: Encodable {
@@ -292,7 +297,8 @@ private func inspectionJob(
               model: .init(
                 fast: false, modelId: "example-model", provider: .openai, reasoning: .high))))
         let model = await MainActor.run { ChatModel() }
-        await model.connect(session: session, address: try CoordinatorAddress(host: "100.64.1.2"))
+        await model.attach(lane(session))
+        await model.setActive(true)
         // Readiness uses the session's handshake budget, not a rendering deadline.
         let deadline = ContinuousClock.now + .seconds(30)
         while await model.connection != .connected, ContinuousClock.now < deadline {
@@ -306,7 +312,7 @@ private func inspectionJob(
           NavigationStack { ConversationSettingsView(model: model) },
           name: "connected-conversation-settings")
         #expect(await fixture.count() == 0)
-        await model.stop()
+        await model.detach(session.profile)
       }
     }
   }

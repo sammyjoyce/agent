@@ -62,11 +62,35 @@ public struct CoordinatorAddress: Sendable, Equatable {
   }
 }
 
+extension CoordinatorAddress: Codable {
+  private enum CodingKeys: String, CodingKey { case host, port }
+  // A stored address that no longer validates fails to load instead of dialing.
+  public init(from decoder: any Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    try self.init(
+      host: container.decode(String.self, forKey: .host),
+      port: container.decode(UInt16.self, forKey: .port))
+  }
+  public func encode(to encoder: any Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(host, forKey: .host)
+    try container.encode(port, forKey: .port)
+  }
+}
+
 public enum ConnectionError: Error, LocalizedError, Sendable {
   case invalidAddress, dnsUnavailable, vpnUnavailable, frameTooLarge, incompleteFrame, closed,
     timedOut
+  /// The socket closed or answered something other than `identity`, as a coordinator built
+  /// before identities does.
+  case unidentifiedCoordinator
+  /// The socket named a coordinator other than the profile's pin.
+  case wrongCoordinator
   public var errorDescription: String? {
     switch self {
+    case .unidentifiedCoordinator: "Update the coordinator to use it with this app."
+    case .wrongCoordinator:
+      "This address now answers as a different coordinator. Remove it and add it again."
     case .vpnUnavailable:
       "Connect Tailscale first. No active point-to-point interface has a Tailscale IPv4 address."
     case .invalidAddress: "Enter a Tailscale IPv4 address or full MagicDNS name and port."
@@ -98,7 +122,9 @@ public enum ConnectionError: Error, LocalizedError, Sendable {
     }
     if let error = error as? ConnectionError {
       switch error {
-      case .closed, .timedOut, .incompleteFrame, .dnsUnavailable, .vpnUnavailable: return true
+      case .closed, .timedOut, .incompleteFrame, .dnsUnavailable, .vpnUnavailable,
+        .unidentifiedCoordinator, .wrongCoordinator:
+        return true
       case .invalidAddress, .frameTooLarge: return false
       }
     }
@@ -109,6 +135,126 @@ public enum ConnectionError: Error, LocalizedError, Sendable {
       }
     }
     return false
+  }
+}
+
+/// How sockets reach an address. Only `CoordinatorDialer` and the pairing probe use one,
+/// and both write `identify` before anything else.
+public struct CoordinatorTransport: Sendable {
+  fileprivate let connect: @Sendable (CoordinatorAddress) async throws -> LineConnection
+  init(connect: @escaping @Sendable (CoordinatorAddress) async throws -> LineConnection) {
+    self.connect = connect
+  }
+  public static let tailnet = CoordinatorTransport { try await LineConnection(address: $0) }
+}
+
+/// The only way a session gets a socket a request can use. Address and pin are fixed, so no
+/// caller can widen what counts as the right coordinator.
+struct CoordinatorDialer: Sendable {
+  let address: CoordinatorAddress
+  let pin: CoordinatorID
+  private let transport: CoordinatorTransport
+
+  init(address: CoordinatorAddress, pin: CoordinatorID, transport: CoordinatorTransport) {
+    self.address = address
+    self.pin = pin
+    self.transport = transport
+  }
+
+  /// Each call resolves the name again, so each socket proves its coordinator before the
+  /// phone writes an input ID, text, attachment byte or installation ID on it.
+  func open() async throws -> VerifiedConnection {
+    let line = try await transport.connect(address)
+    do {
+      guard try await identify(line) == pin else { throw ConnectionError.wrongCoordinator }
+      return VerifiedConnection(line: line)
+    } catch {
+      await line.close()
+      throw error
+    }
+  }
+}
+
+/// Pairing probe, the only way a pin is learned. Writes only `identify`, then closes. It
+/// returns no connection, so nothing can follow the answer.
+public func identifyCoordinator(
+  at address: CoordinatorAddress, transport: CoordinatorTransport = .tailnet
+) async throws -> CoordinatorID {
+  let line = try await transport.connect(address)
+  do {
+    let found = try await identify(line)
+    await line.close()
+    return found
+  } catch {
+    await line.close()
+    throw error
+  }
+}
+
+private func identify(_ line: LineConnection) async throws -> CoordinatorID {
+  let event: NativeEvent
+  do {
+    try await timedSend(line, .identify)
+    event = try await timedNext(line)
+  } catch ConnectionError.closed {
+    // A coordinator built before identities drops the socket without a frame.
+    throw ConnectionError.unidentifiedCoordinator
+  } catch is DecodingError { throw ConnectionError.unidentifiedCoordinator }
+  guard case .identity(let identity) = event,
+    let found = CoordinatorID(wire: identity.coordinatorId)
+  else { throw ConnectionError.unidentifiedCoordinator }
+  return found
+}
+
+/// A socket whose coordinator equals the dialer's pin. Only `CoordinatorDialer.open()`
+/// constructs one, and the session's send paths accept nothing else.
+struct VerifiedConnection: Sendable {
+  fileprivate let line: LineConnection
+  func send(_ request: NativeRequest) async throws { try await line.send(request) }
+  func next() async throws -> NativeEvent { try verified(await line.next()) }
+  func close() async { await line.close() }
+}
+
+/// Writes one frame, closing the connection if it is not written within 15 seconds.
+func timedSend(_ connection: VerifiedConnection, _ request: NativeRequest) async throws {
+  try await timedSend(connection.line, request)
+}
+
+/// Reads one frame, failing after 30 seconds.
+func timedNext(_ connection: VerifiedConnection) async throws -> NativeEvent {
+  try verified(await timedNext(connection.line))
+}
+
+/// `identity` answers only the dialer's `identify`. Anywhere else the peer is not speaking
+/// this protocol, so the socket fails closed.
+private func verified(_ event: NativeEvent) throws -> NativeEvent {
+  if case .identity = event { throw ConnectionError.unidentifiedCoordinator }
+  return event
+}
+
+private func timedNext(_ connection: LineConnection) async throws -> NativeEvent {
+  try await withThrowingTaskGroup(of: NativeEvent.self) { group in
+    group.addTask { try await connection.next() }
+    group.addTask {
+      try await Task.sleep(for: .seconds(30))
+      throw ConnectionError.timedOut
+    }
+    defer { group.cancelAll() }
+    guard let event = try await group.next() else { throw ConnectionError.closed }
+    return event
+  }
+}
+
+private func timedSend(_ connection: LineConnection, _ request: NativeRequest) async throws {
+  try await withThrowingTaskGroup(of: Void.self) { group in
+    group.addTask { try await connection.send(request) }
+    group.addTask {
+      try await Task.sleep(for: .seconds(15))
+      await connection.close()
+      throw ConnectionError.timedOut
+    }
+    defer { group.cancelAll() }
+    try await group.next()
   }
 }
 
@@ -131,7 +277,7 @@ actor LineConnection {
   }
   static let maximumFrameBytes = 4 * 1024 * 1024
 
-  init(address: CoordinatorAddress) async throws {
+  fileprivate init(address: CoordinatorAddress) async throws {
     guard let port = NWEndpoint.Port(rawValue: address.port) else {
       throw ConnectionError.invalidAddress
     }

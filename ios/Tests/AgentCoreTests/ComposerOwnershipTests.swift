@@ -21,6 +21,26 @@ private actor ComposerOwnershipGate {
   }
 }
 
+/// The lane's latest snapshot in `model` once it satisfies `predicate`. The model is the one
+/// reader of its session's updates.
+@MainActor private func snapshot(
+  of session: CoordinatorSession, in model: ChatModel, where predicate: (ChatSnapshot) -> Bool
+) async throws -> ChatSnapshot {
+  let deadline = ContinuousClock.now + .seconds(8)
+  while true {
+    if let snapshot = model.snapshots[session.profile], predicate(snapshot) { return snapshot }
+    guard ContinuousClock.now < deadline else { throw ConnectionError.timedOut }
+    try await Task.sleep(for: .milliseconds(5))
+  }
+}
+
+/// Attaches `session` as `model`'s only coordinator and waits for it to connect.
+@MainActor private func connect(_ model: ChatModel, to session: CoordinatorSession) async throws {
+  model.attach(lane(session))
+  await model.setActive(true)
+  _ = try await snapshot(of: session, in: model) { $0.connection == .connected }
+}
+
 enum ComposerOwnershipStage: CaseIterable, Sendable {
   case admitted, accepted, placed, retired, liveRetry, relocated
 }
@@ -35,8 +55,6 @@ func admittedComposerOwnershipSurvivesFailedCheckpointAndColdRestore(
       await fixture.loseInputAcknowledgements()
     }
     if stage == .retired { await fixture.refuseUploads() }
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
-    for await update in session.updates where update.connection == .connected { break }
     let root = outbox.deletingLastPathComponent()
     let directory = root.appending(path: "Composer")
     let url = directory.appending(path: "draft.json")
@@ -44,18 +62,13 @@ func admittedComposerOwnershipSurvivesFailedCheckpointAndColdRestore(
     let gate = ComposerOwnershipGate()
     let model = await MainActor.run {
       ChatModel(
-        draftStore: files, persistence: ComposerDraftStore(url: url), outboxURL: outbox,
-        admit: { text, mode, files, composer in
-          let admitted = await session.submit(text, mode: mode, files: files, composer: composer)
-          return await gate.wait(after: admitted)
-        })
+        draftStore: files, persistence: ComposerDraftStore(url: url),
+        admit: { deliver in await gate.wait(after: await deliver()) })
     }
     await model.restoreDraft()
+    try await connect(model, to: session)
     let original = "Two different drafts can contain this exact same text."
-    await MainActor.run {
-      model.connection = .connected
-      model.draft = original
-    }
+    await MainActor.run { model.draft = original }
     await model.attach(
       data: Data("Original file".utf8), name: "Original.txt", mediaType: "text/plain")
     try #require(await model.saveDraft())
@@ -65,14 +78,13 @@ func admittedComposerOwnershipSurvivesFailedCheckpointAndColdRestore(
       try #require(admitted)
       break
     }
-    let input = try #require(savedInputs(at: outbox).first)
+    let input = try #require(queuedRequests(outbox).first)
     #expect(input.text == original)
     switch stage {
     case .admitted, .liveRetry, .relocated: break
     case .accepted:
-      for await update in session.updates
-      where update.rows.contains(where: { $0.inputID == input.inputId && $0.delivery == .saved }) {
-        break
+      _ = try await snapshot(of: session, in: model) {
+        $0.rows.contains { $0.inputID == input.inputId && $0.delivery == .saved }
       }
     case .placed:
       let deadline = ContinuousClock.now + .seconds(8)
@@ -80,19 +92,15 @@ func admittedComposerOwnershipSurvivesFailedCheckpointAndColdRestore(
         try #require(ContinuousClock.now < deadline)
         try await Task.sleep(for: .milliseconds(5))
       }
-      await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
-      for await update in session.updates
-      where update.connection == .connected
-        && update.rows.contains(where: { $0.entryID == "placed-\(input.inputId)" })
-      {
-        break
+      await session.connect()
+      _ = try await snapshot(of: session, in: model) {
+        $0.connection == .connected
+          && $0.rows.contains { $0.entryID == "placed-\(input.inputId)" }
       }
-      #expect(try savedInputs(at: outbox).isEmpty)
+      #expect(try queuedRequests(outbox).isEmpty)
     case .retired:
-      for await update in session.updates
-      where update.rows.contains(where: { $0.inputID == input.inputId && $0.delivery == .rejected })
-      {
-        break
+      _ = try await snapshot(of: session, in: model) {
+        $0.rows.contains { $0.inputID == input.inputId && $0.delivery == .rejected }
       }
       let recoveredFiles = AttachmentStore(directory: root.appending(path: "RecoveredFiles"))
       let recovered = try #require(await session.restore(input.inputId, to: recoveredFiles))
@@ -101,7 +109,7 @@ func admittedComposerOwnershipSurvivesFailedCheckpointAndColdRestore(
           text: recovered.text, mode: recovered.mode, attachments: recovered.attachments),
         revision: 1)
       #expect(await session.commitRestoration(recovered) == .committed)
-      #expect(try savedInputs(at: outbox).isEmpty)
+      #expect(try queuedRequests(outbox).isEmpty)
     }
     let newText = newTyping ? original : ""
     if newTyping {
@@ -149,11 +157,18 @@ func admittedComposerOwnershipSurvivesFailedCheckpointAndColdRestore(
     if stage == .liveRetry {
       cold = model
     } else {
+      let elsewhere = coldRoot.appending(path: "OtherEndpoint")
+      let other = CoordinatorSession(
+        directory: ProfileDirectory(ProfileID(), applicationSupport: elsewhere, caches: elsewhere),
+        address: try CoordinatorAddress(host: "100.64.1.3"), pin: CoordinatorID(UUID()),
+        stamps: StampSource(),
+        transport: CoordinatorTransport { _ in throw ConnectionError.closed })
       cold = await MainActor.run {
-        ChatModel(
+        let cold = ChatModel(
           draftStore: coldFiles,
-          persistence: ComposerDraftStore(url: coldDirectory.appending(path: "draft.json")),
-          outboxURL: coldRoot.appending(path: "OtherEndpoint/outbox.json"))
+          persistence: ComposerDraftStore(url: coldDirectory.appending(path: "draft.json")))
+        cold.attach(lane(other))
+        return cold
       }
       await cold.restoreDraft()
     }
@@ -183,24 +198,16 @@ func failedInitialComposerOrOutboxPersistenceDoesNotClaimTheDraft(
   outboxFailure: Bool, control: Bool
 ) async throws {
   try await withCoordinator { session, fixture, outbox in
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
-    for await update in session.updates where update.connection == .connected { break }
     let directory = outbox.deletingLastPathComponent().appending(path: "Composer")
     let url = directory.appending(path: "draft.json")
     let files = AttachmentStore(directory: directory.appending(path: "Files"))
     let model = await MainActor.run {
-      ChatModel(
-        draftStore: files, persistence: ComposerDraftStore(url: url), outboxURL: outbox,
-        admit: { text, mode, files, composer in
-          await session.submit(text, mode: mode, files: files, composer: composer)
-        })
+      ChatModel(draftStore: files, persistence: ComposerDraftStore(url: url))
     }
     await model.restoreDraft()
+    try await connect(model, to: session)
     let text = control ? "/status" : "Keep this unadmitted note."
-    await MainActor.run {
-      model.connection = .connected
-      model.draft = text
-    }
+    await MainActor.run { model.draft = text }
     if !control {
       await model.attach(data: Data("Keep file".utf8), name: "Keep.txt", mediaType: "text/plain")
     }
@@ -236,26 +243,18 @@ func failedInitialComposerOrOutboxPersistenceDoesNotClaimTheDraft(
 @MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true])
 func acceptedSlashControlDoesNotReturnFromAFailedComposerCheckpoint(newTyping: Bool) async throws {
   try await withCoordinator { session, fixture, outbox in
-    let address = try CoordinatorAddress(host: "100.64.1.2")
-    await session.connect(address)
-    for await update in session.updates where update.connection == .connected { break }
     let directory = outbox.deletingLastPathComponent().appending(path: "Composer")
     let url = directory.appending(path: "draft.json")
     let files = AttachmentStore(directory: directory.appending(path: "Files"))
     let gate = ComposerOwnershipGate()
     let model = await MainActor.run {
       ChatModel(
-        draftStore: files, persistence: ComposerDraftStore(url: url), outboxURL: outbox,
-        admit: { text, mode, files, composer in
-          let admitted = await session.submit(text, mode: mode, files: files, composer: composer)
-          return await gate.wait(after: admitted)
-        })
+        draftStore: files, persistence: ComposerDraftStore(url: url),
+        admit: { deliver in await gate.wait(after: await deliver()) })
     }
     await model.restoreDraft()
-    await MainActor.run {
-      model.connection = .connected
-      model.draft = "/status"
-    }
+    try await connect(model, to: session)
+    await MainActor.run { model.draft = "/status" }
     let sending = Task { await model.send() }
     for await admitted in gate.entered.stream {
       try #require(admitted)
@@ -292,13 +291,13 @@ func acceptedSlashControlDoesNotReturnFromAFailedComposerCheckpoint(newTyping: B
       #expect(try Data(contentsOf: file.url) == Data("New note".utf8))
     }
     if FileManager.default.fileExists(atPath: outbox.path) {
-      #expect(try savedInputs(at: outbox).isEmpty, "Controls must not enter the replayable queue")
+      #expect(try queuedRequests(outbox).isEmpty, "Controls must not enter the replayable queue")
     }
-    await session.connect(address)
-    for await update in session.updates where update.connection == .connected {
-      #expect(update.rows.isEmpty)
-      break
-    }
+    await session.disconnect()
+    _ = try await snapshot(of: session, in: model) { $0.connection == .disconnected }
+    await session.connect()
+    let reconnected = try await snapshot(of: session, in: model) { $0.connection == .connected }
+    #expect(reconnected.rows.isEmpty)
     #expect(await fixture.count() == 1, "Reconnection must not submit the control again")
   }
 }

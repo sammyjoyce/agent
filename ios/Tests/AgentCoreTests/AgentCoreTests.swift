@@ -399,8 +399,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
       directory: outbox.deletingLastPathComponent().appending(path: "Drafts"))
     let bytes = Data(repeating: 42, count: AttachmentLimits.chunkBytes + 17)
     let file = try await store.stage(data: bytes, name: "Notes.txt", mediaType: "text/plain")
-    let address = try CoordinatorAddress(host: "100.64.1.2")
-    await session.connect(address)
+    await session.connect()
     _ = try await until(session) { $0.connection == .connected }
     #expect(await session.submit("", files: [file]))
     let acknowledged = try await until(session) { $0.rows.contains { $0.delivery == .saved } }
@@ -408,7 +407,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     let inputID = try #require(acknowledged.rows.last?.inputID)
     #expect(await fixture.uploadCount() == 2)
     #expect(await fixture.uploaded(file.id) == bytes)
-    let saved = try savedInputs(at: outbox)
+    let saved = try queuedRequests(outbox)
     #expect(saved.first?.attachments == [file.reference])
     // The pending copy has its own lifetime, independent of the picker/draft copy.
     try await store.remove(file)
@@ -423,7 +422,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     #expect(await session.submit("/help", files: [file]) == false)
     #expect(await fixture.count() == 1, "A rejected control must not admit or clear its files")
     await session.disconnect()
-    await session.connect(address)
+    await session.connect()
     _ = try await until(session) {
       $0.connection == .connected
         && $0.rows.last?.entryID == "placed-\(inputID)"
@@ -431,7 +430,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     }
     #expect(await fixture.count() == 1)
     #expect(
-      try savedInputs(at: outbox).isEmpty)
+      try queuedRequests(outbox).isEmpty)
   }
 }
 
@@ -443,7 +442,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
       directory: outbox.deletingLastPathComponent().appending(path: "Drafts"))
     let file = try await store.stage(
       data: Data([1, 2, 3]), name: "Feedback.png", mediaType: "image/png")
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     _ = try await until(session) { $0.connection == .connected }
     #expect(await session.submit("/feedback Fix this", files: [file]))
     let result = try await until(session) {
@@ -451,7 +450,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     }
     #expect(result.rows.first(where: { $0.role == .user })?.delivery == .saved)
     #expect(
-      try savedInputs(at: outbox).isEmpty)
+      try queuedRequests(outbox).isEmpty)
   }
 }
 
@@ -464,7 +463,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     let bytes = Data("Keep this file".utf8)
     let file = try await store.stage(data: bytes, name: "Notes.txt", mediaType: "text/plain")
     await fixture.refuseUploads()
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     _ = try await until(session) { $0.connection == .connected }
     try await fixture.liveMessage(
       .init(
@@ -484,6 +483,9 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
       restoredFile.url.deletingLastPathComponent().deletingLastPathComponent()
         == file.url.deletingLastPathComponent().deletingLastPathComponent())
     #expect(try Data(contentsOf: restoredFile.url) == bytes)
+    #expect(
+      try queuedRequests(outbox)
+        .map(\.inputId) == [id], "Restore copies; the original stays until its copy is admitted")
     let draftURL = outbox.deletingLastPathComponent().appending(path: "composer.json")
     let persistence = ComposerDraftStore(url: draftURL)
     let empty = try await persistence.load(from: store)
@@ -502,7 +504,7 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     try await store.remove(restoredFile)
     #expect(!FileManager.default.fileExists(atPath: restoredFile.url.path))
     #expect(
-      try savedInputs(at: outbox).isEmpty)
+      try queuedRequests(outbox).isEmpty)
   }
 }
 
@@ -514,7 +516,7 @@ func restorationPreparationKeepsTheOriginalOutboxUntilTheReplacementIsDurable() 
     let file = try await store.stage(
       data: Data("Original bytes".utf8), name: "Original.txt", mediaType: "text/plain")
     await fixture.refuseUploads()
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     _ = try await until(session) { $0.connection == .connected }
     #expect(await session.submit("Restore this original", files: [file]))
     let rejected = try await until(session) { $0.rows.last?.delivery == .rejected }
@@ -542,7 +544,7 @@ func failedRestorationRemovesPartialCopiesAndPreservesTheOriginalOutbox() async 
     let second = try await store.stage(
       data: Data("Second".utf8), name: "Second.txt", mediaType: "text/plain")
     await fixture.refuseUploads()
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     _ = try await until(session) { $0.connection == .connected }
     #expect(await session.submit("Keep the original", files: [first, second]))
     let rejected = try await until(session) { $0.rows.last?.delivery == .rejected }
@@ -567,7 +569,7 @@ func failedRestorationRetirementKeepsTheSavedReplacementAndAllowsRetry() async t
     let bytes = Data("Keep the saved replacement".utf8)
     let file = try await store.stage(data: bytes, name: "Original.txt", mediaType: "text/plain")
     await fixture.refuseUploads()
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     _ = try await until(session) { $0.connection == .connected }
     #expect(await session.submit("Keep this draft", files: [file]))
     let rejected = try await until(session) { $0.rows.last?.delivery == .rejected }
@@ -580,7 +582,11 @@ func failedRestorationRetirementKeepsTheSavedReplacementAndAllowsRetry() async t
     try await persistence.save(
       .init(text: prepared.text, mode: prepared.mode, attachments: prepared.attachments),
       revision: empty.revision + 1)
-    let stranger = CoordinatorSession(outboxURL: directory.appending(path: "unrelated.json"))
+    let (unrelated, unrelatedRoot) = temporaryProfile()
+    defer { try? FileManager.default.removeItem(at: unrelatedRoot) }
+    let stranger = CoordinatorSession(
+      directory: unrelated, address: try CoordinatorAddress(host: "100.64.1.2"), pin: fixture.id,
+      stamps: StampSource(), transport: CoordinatorTransport { _ in throw ConnectionError.closed })
     #expect(await stranger.commitRestoration(prepared) == .invalidated)
     #expect(try Data(contentsOf: outbox) == original)
     try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
@@ -603,7 +609,7 @@ func failedRestorationRetirementKeepsTheSavedReplacementAndAllowsRetry() async t
     let retired = try await until(session) { _ in true }
     #expect(!retired.rows.contains { $0.inputID == inputID })
     #expect(
-      try savedInputs(at: outbox).isEmpty)
+      try queuedRequests(outbox).isEmpty)
     #expect(try Data(contentsOf: ownedFile.url) == bytes)
     #expect(await fixture.count() == 0, "Retirement never submits the restored draft")
   }
@@ -617,7 +623,7 @@ func reconciledInputInvalidatesRestorationWithoutDeletingTheSavedReplacement() a
     let bytes = Data("Original attachment".utf8)
     let file = try await store.stage(data: bytes, name: "Original.txt", mediaType: "text/plain")
     await fixture.loseInputAcknowledgements()
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     _ = try await until(session) { $0.connection == .connected }
     #expect(await session.submit("Original accepted by the coordinator", files: [file]))
     let uncertain = try await until(session) { $0.rows.last?.delivery == .uncertain }
@@ -633,7 +639,7 @@ func reconciledInputInvalidatesRestorationWithoutDeletingTheSavedReplacement() a
     #expect(await session.commitRestoration(prepared) == .invalidated)
     #expect(await session.restore(inputID, to: store) == nil)
     #expect(
-      try savedInputs(at: outbox).isEmpty)
+      try queuedRequests(outbox).isEmpty)
     let saved = try await ComposerDraftStore(url: draftURL).load(from: store)
     #expect(saved.draft.attachments == prepared.attachments)
     #expect(try Data(contentsOf: #require(prepared.attachments.first).url) == bytes)
@@ -652,14 +658,13 @@ private func until(_ session: CoordinatorSession, _ predicate: @Sendable (ChatSn
   async throws
 {
   try await withCoordinator { session, fixture, outbox in
-    let address = try CoordinatorAddress(host: "100.64.1.2")
     await fixture.loseInputAcknowledgements()
-    await session.connect(address)
+    await session.connect()
     _ = try await until(session) { $0.connection == .connected }
     #expect(await session.submit("Keep this original") == true)
     let uncertain = try await until(session) { $0.rows.contains { $0.delivery == .uncertain } }
     let id = try #require(uncertain.rows.first(where: { $0.delivery == .uncertain })?.inputID)
-    let saved = try savedInputs(at: outbox)
+    let saved = try queuedRequests(outbox)
     #expect(saved.map(\.inputId) == [id])
     #expect(await fixture.count() == 1, "An uncertain write must not be replayed automatically")
   }
@@ -719,7 +724,7 @@ private func until(_ session: CoordinatorSession, _ predicate: @Sendable (ChatSn
 {
   try await withCoordinator { session, fixture, _ in
     await fixture.holdSnapshot()
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     _ = try await until(session) { $0.conversationID != nil && $0.connection == .connecting }
     #expect(await session.submit("Too early") == false)
     await fixture.releaseSnapshot()

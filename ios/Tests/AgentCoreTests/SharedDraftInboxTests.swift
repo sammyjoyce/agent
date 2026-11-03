@@ -671,48 +671,46 @@ import UniformTypeIdentifiers
     let files = AttachmentStore(directory: root.appending(path: "Drafts"))
     let url = root.appending(path: "Composer/draft.json")
     let model = ChatModel(
-      draftStore: files, persistence: ComposerDraftStore(url: url), sharedInbox: inbox,
-      admit: { _, _, _, _ in
-        Issue.record("Import must never send")
-        return false
-      })
-    await model.restoreDraft()
-    model.connection = .connected
-    model.draft = "Already typing"
-    await model.attach(
-      data: Data("existing file".utf8), name: "Existing.txt", mediaType: "text/plain")
-    #expect(await model.saveDraft())
-    let original = try #require(model.attachments.first)
-    let id = try await inbox.enqueue(images: images(root), note: "Shared note")
-    let preserved = root.appending(path: "PreservedComposer")
-    try FileManager.default.moveItem(at: url.deletingLastPathComponent(), to: preserved)
-    try Data("Not a directory".utf8).write(to: url.deletingLastPathComponent())
-    await model.receiveSharedDrafts()
-    #expect(model.draft == "Already typing\n\nShared note")
-    #expect(model.attachments.count == 2)
-    #expect(model.attachments.first == original)
-    #expect(model.pendingSharedImport)
-    #expect(!model.canSend)
-    #expect(!inbox.acknowledged(id))
-    #expect(
-      FileManager.default.fileExists(
-        atPath: root.appending(path: "SharedDraftInbox/\(id.uuidString)").path))
-    try FileManager.default.removeItem(at: url.deletingLastPathComponent())
-    try FileManager.default.moveItem(at: preserved, to: url.deletingLastPathComponent())
-    await model.receiveSharedDrafts()
-    #expect(model.draft == "Already typing\n\nShared note")
-    #expect(model.attachments.count == 2)
-    #expect(Set(model.attachments.map(\.id)).count == 2)
-    #expect(!model.pendingSharedImport)
-    #expect(inbox.acknowledged(id))
-    let reopened = ChatModel(
       draftStore: files, persistence: ComposerDraftStore(url: url), sharedInbox: inbox)
-    await reopened.restoreDraft()
-    #expect(reopened.draft == model.draft)
-    #expect(reopened.attachments == model.attachments)
-    let saved = try await ComposerDraftStore(url: url).load(from: files)
-    #expect(saved.draft.consumedTransfers.isEmpty)
-    #expect(try Data(contentsOf: original.url) == Data("existing file".utf8))
+    await model.restoreDraft()
+    try await withConnectedCoordinator(model) { _, directory in
+      model.draft = "Already typing"
+      await model.attach(
+        data: Data("existing file".utf8), name: "Existing.txt", mediaType: "text/plain")
+      #expect(await model.saveDraft())
+      let original = try #require(model.attachments.first)
+      let id = try await inbox.enqueue(images: images(root), note: "Shared note")
+      let preserved = root.appending(path: "PreservedComposer")
+      try FileManager.default.moveItem(at: url.deletingLastPathComponent(), to: preserved)
+      try Data("Not a directory".utf8).write(to: url.deletingLastPathComponent())
+      await model.receiveSharedDrafts()
+      #expect(model.draft == "Already typing\n\nShared note")
+      #expect(model.attachments.count == 2)
+      #expect(model.attachments.first == original)
+      #expect(model.pendingSharedImport)
+      #expect(!model.canSend)
+      #expect(!inbox.acknowledged(id))
+      #expect(
+        FileManager.default.fileExists(
+          atPath: root.appending(path: "SharedDraftInbox/\(id.uuidString)").path))
+      try FileManager.default.removeItem(at: url.deletingLastPathComponent())
+      try FileManager.default.moveItem(at: preserved, to: url.deletingLastPathComponent())
+      await model.receiveSharedDrafts()
+      #expect(model.draft == "Already typing\n\nShared note")
+      #expect(model.attachments.count == 2)
+      #expect(Set(model.attachments.map(\.id)).count == 2)
+      #expect(!model.pendingSharedImport)
+      #expect(inbox.acknowledged(id))
+      let reopened = ChatModel(
+        draftStore: files, persistence: ComposerDraftStore(url: url), sharedInbox: inbox)
+      await reopened.restoreDraft()
+      #expect(reopened.draft == model.draft)
+      #expect(reopened.attachments == model.attachments)
+      let saved = try await ComposerDraftStore(url: url).load(from: files)
+      #expect(saved.draft.consumedTransfers.isEmpty)
+      #expect(try Data(contentsOf: original.url) == Data("existing file".utf8))
+      #expect((try? queuedRequests(directory.outbox)) == nil, "Import must never send")
+    }
   }
 
   @Test @MainActor
@@ -737,11 +735,7 @@ import UniformTypeIdentifiers
     }
     #expect(!inbox.acknowledged(id))
     let model = ChatModel(
-      draftStore: files, persistence: ComposerDraftStore(url: url), sharedInbox: inbox,
-      admit: { _, _, _, _ in
-        Issue.record("Recovery must never autosend")
-        return false
-      })
+      draftStore: files, persistence: ComposerDraftStore(url: url), sharedInbox: inbox)
     await model.restoreDraft()
     #expect(model.draft == "One shared note")
     #expect(model.mode == .followUp)
@@ -764,10 +758,14 @@ import UniformTypeIdentifiers
     let url = root.appending(path: "Composer/draft.json")
     let model = ChatModel(draftStore: files, persistence: ComposerDraftStore(url: url))
     await model.restoreDraft()
-    model.connection = .connected
-    model.draft = "/feedback Preserve this exact capture"
     let capture = try png()
-    await model.send(screenshot: { capture })
+    // A read-only profile refuses each Send, as a failed admission does.
+    try await withConnectedCoordinator(model) { _, directory in
+      try await withReadOnlyProfile(directory) {
+        model.draft = "/feedback Preserve this exact capture"
+        await model.send(screenshot: { capture })
+      }
+    }
     #expect(await model.saveDraft())
     let original = model.attachments
     #expect(original.map(\.reference.name) == ["Feedback.png", "Composer.log"])
@@ -775,12 +773,15 @@ import UniformTypeIdentifiers
     let diagnostics = try #require(original.last)
     let log = try Data(contentsOf: diagnostics.url)
     let reopened = ChatModel(draftStore: files, persistence: ComposerDraftStore(url: url))
-    await reopened.restoreDraft()
-    reopened.connection = .connected
-    await reopened.send(screenshot: {
-      Issue.record("The saved feedback image must not be recaptured")
-      return capture
-    })
+    try await withConnectedCoordinator(reopened) { _, directory in
+      await reopened.restoreDraft()
+      try await withReadOnlyProfile(directory) {
+        await reopened.send(screenshot: {
+          Issue.record("The saved feedback image must not be recaptured")
+          return capture
+        })
+      }
+    }
     #expect(reopened.draft == model.draft)
     #expect(reopened.attachments == original)
     #expect(try Data(contentsOf: image.url) == capture)
@@ -795,34 +796,32 @@ import UniformTypeIdentifiers
     let files = AttachmentStore(directory: root.appending(path: "Drafts"))
     let url = root.appending(path: "Composer/draft.json")
     let model = ChatModel(
-      draftStore: files, persistence: ComposerDraftStore(url: url), sharedInbox: inbox,
-      admit: { _, _, _, _ in
-        Issue.record("Recovery must never autosend")
-        return false
-      })
+      draftStore: files, persistence: ComposerDraftStore(url: url), sharedInbox: inbox)
     await model.restoreDraft()
-    model.connection = .connected
-    let id = try await inbox.enqueue(images: images(root), note: "Retain this shared note")
-    let preserved = root.appending(path: "PreservedComposer")
-    try FileManager.default.moveItem(at: url.deletingLastPathComponent(), to: preserved)
-    try Data("Not a directory".utf8).write(to: url.deletingLastPathComponent())
-    await model.receiveSharedDrafts()
-    #expect(model.pendingSharedImport)
-    #expect(!model.canSend)
-    try FileManager.default.removeItem(at: url.deletingLastPathComponent())
-    try FileManager.default.moveItem(at: preserved, to: url.deletingLastPathComponent())
-    #expect(await model.saveDraft())
-    // Another consumer can finish acknowledgement after this host has already
-    // persisted the complete note/files/UUID. Retry must not need a new batch.
-    #expect(try await inbox.consumeNext(into: files) { _ in })
-    #expect(inbox.acknowledged(id))
-    await model.receiveSharedDrafts()
-    #expect(!model.pendingSharedImport)
-    #expect(model.canSend)
-    #expect(model.draft == "Retain this shared note")
-    #expect(model.attachments.count == 1)
-    let saved = try await ComposerDraftStore(url: url).load(from: files)
-    #expect(saved.draft.consumedTransfers.isEmpty)
+    try await withConnectedCoordinator(model) { _, directory in
+      let id = try await inbox.enqueue(images: images(root), note: "Retain this shared note")
+      let preserved = root.appending(path: "PreservedComposer")
+      try FileManager.default.moveItem(at: url.deletingLastPathComponent(), to: preserved)
+      try Data("Not a directory".utf8).write(to: url.deletingLastPathComponent())
+      await model.receiveSharedDrafts()
+      #expect(model.pendingSharedImport)
+      #expect(!model.canSend)
+      try FileManager.default.removeItem(at: url.deletingLastPathComponent())
+      try FileManager.default.moveItem(at: preserved, to: url.deletingLastPathComponent())
+      #expect(await model.saveDraft())
+      // Another consumer can finish acknowledgement after this host has already
+      // persisted the complete note/files/UUID. Retry must not need a new batch.
+      #expect(try await inbox.consumeNext(into: files) { _ in })
+      #expect(inbox.acknowledged(id))
+      await model.receiveSharedDrafts()
+      #expect(!model.pendingSharedImport)
+      #expect(model.canSend)
+      #expect(model.draft == "Retain this shared note")
+      #expect(model.attachments.count == 1)
+      let saved = try await ComposerDraftStore(url: url).load(from: files)
+      #expect(saved.draft.consumedTransfers.isEmpty)
+      #expect((try? queuedRequests(directory.outbox)) == nil, "Recovery must never autosend")
+    }
   }
 
   @Test @MainActor

@@ -6,6 +6,8 @@ public enum Delivery: String, Sendable, Equatable {
   case saved = "Sent"
   case uncertain = "Delivery unconfirmed"
   case rejected = "Needs attention"
+  /// Its queued item was withdrawn because the user sent a restored copy instead.
+  case withdrawn = "Not sent"
 }
 
 public struct ChatRow: Identifiable, Sendable, Equatable {
@@ -30,6 +32,11 @@ public struct ChatRow: Identifiable, Sendable, Equatable {
     if role == .notice, let noticeOrigin { return "Job: \(noticeOrigin.title)" }
     return nil
   }
+  /// When this phone received the row. The owning session sets it, and it never decreases in
+  /// that session's row order.
+  public var receivedAt: Date?
+  /// The Send this user row belongs to, shared with other coordinators' rows of one message.
+  public var sendID: String?
 
   init(
     id: String, entryID: String? = nil, role: HistoryRole, text: String, tool: ToolHistory? = nil,
@@ -73,6 +80,11 @@ struct Transcript: Sendable {
       return storage
     }
   }
+
+  /// Rows in order without preparing their text, for bookkeeping between publications.
+  var unpreparedRows: [ChatRow] { storage }
+  /// The row streamed text grows until its entry replaces it.
+  var streamingRowID: String? { responseID }
 
   private mutating func append(_ row: ChatRow) {
     if let position = row.positionID,

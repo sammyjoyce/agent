@@ -49,6 +49,29 @@ enum TranscriptItem: Identifiable {
     }
   }
 
+  var lane: ProfileID? {
+    switch self {
+    case .message(let row): row.lane
+    case .activity(let group): group.lane
+    }
+  }
+
+  /// The items that open a run of one coordinator's rows between your messages, where the
+  /// feed names that coordinator.
+  static func runStarts(_ items: [TranscriptItem]) -> Set<String> {
+    var starts: Set<String> = []
+    var run: ProfileID??
+    for item in items {
+      if case .message(let row) = item, row.row.role == .user {
+        run = nil
+        continue
+      }
+      if run != .some(item.lane) { starts.insert(item.id) }
+      run = .some(item.lane)
+    }
+    return starts
+  }
+
   static func grouped(_ rows: [RowModel], preserving previous: [TranscriptItem] = [])
     -> [TranscriptItem]
   {
@@ -80,6 +103,8 @@ enum TranscriptItem: Identifiable {
       if row.row.tool != nil || row.row.role == .thinking
         || (row.row.role == .tool && row.row.presentation != nil)
       {
+        // One coordinator per group, so its label and tool details follow the right lane.
+        if let last = activity.last, last.lane != row.lane { flush() }
         activity.append(row)
       } else {
         flush()
@@ -95,6 +120,7 @@ enum TranscriptItem: Identifiable {
 struct ActivityGroup: Identifiable {
   let id: String
   let rows: [RowModel]
+  var lane: ProfileID? { rows.first?.lane }
 
   var status: ToolStatus? {
     rows.compactMap { $0.row.tool?.status }.max { $0.activityPriority < $1.activityPriority }
