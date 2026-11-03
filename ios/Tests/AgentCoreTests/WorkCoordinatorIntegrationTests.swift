@@ -18,12 +18,21 @@ func nativeWorkInspectionReadsTheRealCoordinatorAndDetachesWithoutStoppingWork()
   let jobID = try #require(environment["AGENT_WORK_E2E_JOB"])
   let parentID = try #require(environment["AGENT_WORK_E2E_PARENT"])
   let childID = try #require(environment["AGENT_WORK_E2E_CHILD"])
-  let address = try CoordinatorAddress(host: "100.64.1.2")
-  let transport: @Sendable (CoordinatorAddress) async throws -> LineConnection = { _ in
-    LineConnection(connection: NWConnection(to: .unix(path: socket), using: .tcp))
-  }
+  // The coordinator persists its ID in the state directory beside its socket.
+  let pin = try #require(
+    CoordinatorID(
+      wire: String(
+        contentsOf: URL(filePath: socket).deletingLastPathComponent().appending(
+          path: "coordinator-id"), encoding: .utf8)))
+  let profile = ProfileDirectory(
+    ProfileID(), applicationSupport: directory.appending(path: "native"),
+    caches: directory.appending(path: "native"))
   let session = CoordinatorSession(
-    outboxURL: directory.appending(path: "main-outbox.json"), connectTransport: transport)
+    directory: profile, address: try CoordinatorAddress(host: "100.64.1.2"), pin: pin,
+    stamps: StampSource(),
+    transport: CoordinatorTransport { _ in
+      LineConnection(connection: NWConnection(to: .unix(path: socket), using: .tcp))
+    })
   let model = ChatModel()
   func waitFor(_ description: String, _ predicate: () -> Bool) async throws {
     let deadline = ContinuousClock.now + .seconds(20)
@@ -33,19 +42,20 @@ func nativeWorkInspectionReadsTheRealCoordinatorAndDetachesWithoutStoppingWork()
     }
   }
   do {
-    await model.connect(session: session, address: address)
+    model.attach(Lane(id: profile.profile, session: session, hold: LegacyHold(profile)))
+    await model.setActive(true)
     try await waitFor("Main readiness") { model.connection == .connected }
     #expect(model.workInspectionSupported)
     guard case .list(let listing) = try await model.jobs() else {
       Issue.record("Job listing lost its typed diagnostics")
-      await model.stop()
+      await model.detach(profile.profile)
       return
     }
     let listed = try #require(listing.jobs.first { $0.job.id == jobID })
     let taskID = try #require(listed.taskId)
     guard case .detail(let detail) = try await model.jobs(jobID) else {
       Issue.record("Job detail lost its typed diagnostics")
-      await model.stop()
+      await model.detach(profile.profile)
       return
     }
     #expect(detail.job.taskId == taskID)
@@ -58,14 +68,12 @@ func nativeWorkInspectionReadsTheRealCoordinatorAndDetachesWithoutStoppingWork()
     #expect(child.taskId == taskID)
     #expect(child.agentId == "review")
     for conversation in [parent, child] {
-      let outbox = directory.appending(path: "inspect-\(conversation.conversationId).json")
-      let unrelatedOutbox = Data("Preserve the independent Main outbox".utf8)
-      try unrelatedOutbox.write(to: outbox)
-      let inspector = CoordinatorSession(
-        outboxURL: outbox, inspecting: conversation, connectTransport: transport)
+      // The inspection shares the Main profile's directory and must leave its outbox as it was.
+      let mainOutbox = try? Data(contentsOf: profile.outbox)
       let inspectedModel = ChatModel(inspecting: conversation)
       do {
-        await inspectedModel.connect(session: inspector, address: address)
+        await inspectedModel.connectInspection(using: model)
+        let inspector = try #require(inspectedModel.lanes.first?.session)
         try await waitFor("saved work readiness") {
           inspectedModel.connection == .connected
         }
@@ -90,19 +98,19 @@ func nativeWorkInspectionReadsTheRealCoordinatorAndDetachesWithoutStoppingWork()
         }
         #expect(await inspector.submit("Inspection must never admit this input") == false)
         await inspectedModel.interrupt()
-        await inspectedModel.stop()
-        #expect(try Data(contentsOf: outbox) == unrelatedOutbox)
+        await inspectedModel.detach(profile.profile)
+        #expect((try? Data(contentsOf: profile.outbox)) == mainOutbox)
       } catch {
-        await inspectedModel.stop()
+        await inspectedModel.detach(profile.profile)
         throw error
       }
     }
     // Closing both inspection sockets leaves the independent Main observer and
     // the same read-only job/catalog controls usable.
     #expect(try await model.conversations(query: taskID).items.count >= 2)
-    await model.stop()
+    await model.detach(profile.profile)
   } catch {
-    await model.stop()
+    await model.detach(profile.profile)
     throw error
   }
 }
@@ -110,7 +118,7 @@ func nativeWorkInspectionReadsTheRealCoordinatorAndDetachesWithoutStoppingWork()
 @Test(.timeLimit(.minutes(1)))
 func olderCoordinatorsDoNotReceiveUnsupportedWorkControlsOrComposerFallbacks() async throws {
   try await withCoordinator { session, fixture, _ in
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     for await snapshot in session.updates where snapshot.connection == .connected {
       #expect(!snapshot.workInspectionSupported)
       break

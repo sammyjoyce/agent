@@ -619,6 +619,484 @@
         }
       }
 
+      /// How many pixels are within `tolerance` of `color` on every channel.
+      private func pixels(near color: (Double, Double, Double), in image: CGImage) throws -> Int {
+        var bytes = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        try bytes.withUnsafeMutableBytes { buffer in
+          let context = try #require(
+            CGContext(
+              data: buffer.baseAddress, width: image.width, height: image.height,
+              bitsPerComponent: 8, bytesPerRow: image.width * 4,
+              space: CGColorSpaceCreateDeviceRGB(),
+              bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+                | CGBitmapInfo.byteOrder32Big.rawValue))
+          context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        }
+        let target = [color.0, color.1, color.2].map { $0 * 255 }
+        return stride(from: 0, to: bytes.count, by: 4).filter { offset in
+          (0..<3).allSatisfy { abs(Double(bytes[offset + $0]) - target[$0]) < 16 }
+        }.count
+      }
+
+      @MainActor @Test func twoCoordinatorFeedNamesEachCoordinatorAndFoldsABroadcast() async throws
+      {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = CoordinatorProfile(
+          name: try TagName("Work"), address: try CoordinatorAddress(host: "100.64.1.2", port: 4001)
+        )
+        let personal = CoordinatorProfile(
+          name: try TagName("Personal"),
+          address: try CoordinatorAddress(host: "100.64.1.2", port: 4002))
+        let model = ChatModel()
+        model.profiles = [work, personal]
+        // Sessions that never connect stand in for the paired coordinators.
+        for profile in [work, personal] {
+          let directory = ProfileDirectory(profile.id, applicationSupport: root, caches: root)
+          model.attach(
+            Lane(
+              id: profile.id,
+              session: CoordinatorSession(
+                directory: directory, address: profile.address, pin: CoordinatorID(UUID()),
+                stamps: StampSource()),
+              hold: LegacyHold(directory)))
+        }
+        func message(_ id: String, _ role: HistoryRole, _ text: String, tool: ToolHistory? = nil)
+          -> HistoryMessage
+        {
+          .init(
+            continuation: false, entryId: id, finalChunk: true, role: role, text: text, tool: tool)
+        }
+        func stamped(_ rows: [ChatRow], _ times: [TimeInterval], sends: [Int: String]) -> [ChatRow]
+        {
+          zip(rows.indices, zip(rows, times)).map { index, pair in
+            var row = pair.0
+            row.receivedAt = Date(timeIntervalSince1970: pair.1)
+            row.sendID = sends[index]
+            return row
+          }
+        }
+        let broadcast = "Flying to Lisbon, offline until 6"
+        var workTranscript = Transcript()
+        for item in [
+          message("w1", .final, "The nightly build finished. Two flaky tests were retried."),
+          message("w2", .user, "Rotate the staging deploy key"),
+          message(
+            "w3", .tool, "rotate-key staging",
+            tool: .init(callId: "rotate", name: "exec", status: .finished)),
+          message("w4", .final, "Rotated. The old key is revoked."),
+          message("w5", .user, broadcast),
+          message("w6", .final, "Noted. I'll hold the release review."),
+        ] {
+          workTranscript.message(item)
+        }
+        var fromWork = ChatSnapshot()
+        fromWork.connection = .connected
+        fromWork.rows = stamped(workTranscript.rows, [1, 3, 4, 5, 6, 8], sends: [1: "A", 4: "B"])
+        fromWork.sends = [
+          "A": .init(recipients: [work.id], progress: .placed),
+          "B": .init(recipients: [work.id, personal.id], progress: .placed),
+        ]
+        var personalTranscript = Transcript()
+        personalTranscript.message(
+          message("p1", .final, "Your 9:40 flight to Lisbon moved to gate B12."))
+        personalTranscript.pending(
+          .init(inputId: "personal-lisbon", mode: .steer, text: broadcast), delivery: .uncertain)
+        personalTranscript.message(
+          message("p2", .final, "Safe flight. Your boarding pass is in Wallet."))
+        var fromPersonal = ChatSnapshot()
+        fromPersonal.connection = .connected
+        fromPersonal.rows = stamped(personalTranscript.rows, [2, 6.001, 9], sends: [1: "B"])
+        fromPersonal.sends = [
+          "B": .init(recipients: [work.id, personal.id], progress: .pending(.uncertain))
+        ]
+        model.apply(fromWork, lane: work.id)
+        model.apply(fromPersonal, lane: personal.id)
+        model.recipient = work.id
+        model.draft = "Check the release checklist"
+
+        #expect(
+          model.rows.first { $0.id == "send:B" }?.receipts == [
+            Receipt(lane: work.id, status: .placed),
+            Receipt(lane: personal.id, status: .pending(.uncertain, inputID: "personal-lisbon")),
+          ])
+        #expect(model.rows.first { $0.id == "send:A" }?.receipts.count == 1)
+        #expect(model.rows.filter { $0.row.text == broadcast }.count == 1, "The broadcast folds")
+        #expect(TranscriptItem.runStarts(model.transcriptItems).count == 5)
+        #expect(model.recipientLine == "To Work")
+        func render(_ scheme: ColorScheme) async throws -> CGImage {
+          let dimensions = CGSize(width: 390, height: 844)
+          let host = UIHostingController(
+            rootView: MainChatView(model: model).environment(\.colorScheme, scheme))
+          let scene = try #require(
+            UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+          let previousWindow = scene.windows.first(where: \.isKeyWindow)
+          let window = UIWindow(windowScene: scene)
+          window.overrideUserInterfaceStyle = scheme == .dark ? .dark : .light
+          let container = UIViewController()
+          window.rootViewController = container
+          window.makeKeyAndVisible()
+          defer {
+            window.isHidden = true
+            host.willMove(toParent: nil)
+            host.view.removeFromSuperview()
+            host.removeFromParent()
+            window.rootViewController = nil
+            previousWindow?.makeKey()
+          }
+          window.layoutIfNeeded()
+          container.addChild(host)
+          container.view.addSubview(host.view)
+          host.view.frame = CGRect(origin: .zero, size: dimensions)
+          host.didMove(toParent: container)
+          host.view.layoutIfNeeded()
+          try await Task.sleep(for: .milliseconds(100))
+          host.view.layoutIfNeeded()
+          let format = UIGraphicsImageRendererFormat()
+          format.scale = 1
+          format.preferredRange = .standard
+          return try #require(
+            UIGraphicsImageRenderer(size: dimensions, format: format).image { _ in
+              #expect(host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true))
+            }.cgImage)
+        }
+        for scheme in [ColorScheme.light, .dark] {
+          let image = try await render(scheme)
+          try requireVisibleContent(image)
+          if scheme == .light {
+            #expect(try pixels(near: (0.11, 0.31, 0.85), in: image) > 20, "Work's blue label")
+            #expect(try pixels(near: (0.76, 0.25, 0.05), in: image) > 20, "Personal's orange label")
+          }
+          Attachment.record(image, named: "two-coordinator-feed-\(scheme)", as: .png)
+        }
+
+        let systemRed = (1.0, 0.23, 0.19)
+        model.recipient = nil
+        model.draft = "@"
+        #expect(model.recipientLine == "Choose a coordinator" && !model.pickerMatches.isEmpty)
+        let picking = try await render(.light)
+        Attachment.record(picking, named: "two-coordinator-picker-hint", as: .png)
+        #expect(try pixels(near: systemRed, in: picking) == 0, "An open picker is not an error")
+        model.draft = "@Nobody check the invented report"
+        let unknown = try await render(.light)
+        #expect(try pixels(near: systemRed, in: unknown) > 0, "An unknown tag is an error")
+      }
+
+      /// The chip stays on the draft's first line, one line tall, however long its name or large
+      /// the text. Its frame is all a tap can hit, so no line of the draft reaches into it: text
+      /// beside it starts after it, and wrapped lines start under it at the field's leading edge.
+      @MainActor @Test func theChipStaysInsideTheDraftsFirstLineAtEveryTextSize() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let draft =
+          "Synthetic draft wraps under its recipient chip and remains readable. Second sentence ends here."
+        let sizes: [UIContentSizeCategory] = [
+          .extraSmall, .small, .medium, .large, .extraLarge, .extraExtraLarge,
+          .extraExtraExtraLarge, .accessibilityMedium, .accessibilityLarge,
+          .accessibilityExtraLarge, .accessibilityExtraExtraLarge,
+          .accessibilityExtraExtraExtraLarge,
+        ]
+        let cases = sizes.map { ("Personal", $0) } + [(String(repeating: "W", count: 32), .large)]
+        for (name, size) in cases {
+          let chosen = CoordinatorProfile(
+            name: try TagName(name), address: try CoordinatorAddress(host: "100.64.1.2"))
+          let other = CoordinatorProfile(
+            name: try TagName("Other"), address: try CoordinatorAddress(host: "100.64.1.3"))
+          let model = ChatModel()
+          model.profiles = [chosen, other]
+          for profile in model.profiles {
+            let directory = ProfileDirectory(profile.id, applicationSupport: root, caches: root)
+            model.attach(
+              Lane(
+                id: profile.id,
+                session: CoordinatorSession(
+                  directory: directory, address: profile.address, pin: CoordinatorID(UUID()),
+                  stamps: StampSource()),
+                hold: LegacyHold(directory)))
+          }
+          model.recipient = chosen.id
+          model.draft = draft
+          let host = UIHostingController(rootView: MainChatView(model: model))
+          host.traitOverrides.preferredContentSizeCategory = size
+          let scene = try #require(
+            UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+          let previousWindow = scene.windows.first(where: \.isKeyWindow)
+          let window = UIWindow(windowScene: scene)
+          window.rootViewController = host
+          window.makeKeyAndVisible()
+          defer {
+            window.isHidden = true
+            window.rootViewController = nil
+            previousWindow?.makeKey()
+          }
+          window.layoutIfNeeded()
+          try await Task.sleep(for: .milliseconds(300))
+          host.view.layoutIfNeeded()
+          func boxes(_ view: UIView) -> [ComposerField.DraftBox] {
+            (view as? ComposerField.DraftBox).map { [$0] } ?? view.subviews.flatMap(boxes)
+          }
+          let box = try #require(boxes(host.view).first)
+          let chip = try #require(box.subviews.compactMap { $0 as? UIButton }.first)
+          let field = box.draft
+          let inset = ComposerField.inset
+          let label = "\(name) at \(size.rawValue)"
+          // Each line of the draft where TextKit places a tap, in the field's coordinates.
+          var lines: [CGRect] = []
+          let layout = try #require(field.textLayoutManager)
+          layout.enumerateTextLayoutFragments(
+            from: layout.documentRange.location, options: [.ensuresLayout]
+          ) { fragment in
+            for line in fragment.textLineFragments {
+              lines.append(
+                line.typographicBounds.offsetBy(
+                  dx: field.textContainerInset.left + fragment.layoutFragmentFrame.minX,
+                  dy: field.textContainerInset.top + fragment.layoutFragmentFrame.minY))
+            }
+            return true
+          }
+          let font = try #require(field.font)
+          #expect(chip.frame.minY == inset.top, "\(label): the chip starts on the first line")
+          #expect(chip.frame.height == font.lineHeight, "\(label): the chip is one line tall")
+          #expect(
+            try #require(chip.titleLabel).frame.height <= chip.frame.height + 0.5,
+            "\(label): the chip's name takes one line")
+          #expect(
+            chip.frame.maxX <= box.bounds.width - inset.right, "\(label): a long name truncates")
+          #expect(
+            lines.allSatisfy { $0.minX >= chip.frame.maxX || $0.minY >= chip.frame.maxY },
+            "\(label): no line reaches into the chip")
+          let under = try #require(
+            lines.first { $0.minY >= chip.frame.maxY }, "\(label): the draft wraps")
+          #expect(
+            abs(under.minX - inset.left) < 0.5,
+            "\(label): wrapped lines start under the chip at the field's leading edge")
+          #expect(
+            under.minY - chip.frame.maxY < font.lineHeight / 2,
+            "\(label): the line under the chip is the next one")
+          let image = UIGraphicsImageRenderer(size: host.view.bounds.size).image { _ in
+            host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
+          }
+          Attachment.record(
+            try #require(image.cgImage), named: "chip-\(name.prefix(8))-\(size.rawValue)", as: .png)
+        }
+      }
+
+      /// VoiceOver reads the chip, then the draft, while all of the chip shows. Scrolled out of the
+      /// field, the chip is not an element, so VoiceOver cannot find it over the feed, and the
+      /// draft's own action still removes the recipient.
+      @MainActor @Test func voiceOverReachesTheChipOnlyWhileItShowsAndTheDraftCanRemoveIt()
+        async throws
+      {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = CoordinatorProfile(
+          name: try TagName("Work"), address: try CoordinatorAddress(host: "100.64.1.2"))
+        let personal = CoordinatorProfile(
+          name: try TagName("Personal"), address: try CoordinatorAddress(host: "100.64.1.3"))
+        let model = ChatModel()
+        model.profiles = [work, personal]
+        for profile in model.profiles {
+          let directory = ProfileDirectory(profile.id, applicationSupport: root, caches: root)
+          model.attach(
+            Lane(
+              id: profile.id,
+              session: CoordinatorSession(
+                directory: directory, address: profile.address, pin: CoordinatorID(UUID()),
+                stamps: StampSource()),
+              hold: LegacyHold(directory)))
+        }
+        model.recipient = work.id
+        model.draft = (1...10).map { "Invented line \($0) for Work only" }.joined(separator: "\n")
+        let host = UIHostingController(rootView: MainChatView(model: model))
+        let scene = try #require(
+          UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let previousWindow = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer {
+          window.isHidden = true
+          window.rootViewController = nil
+          previousWindow?.makeKey()
+        }
+        window.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(300))
+        host.view.layoutIfNeeded()
+        func boxes(_ view: UIView) -> [ComposerField.DraftBox] {
+          (view as? ComposerField.DraftBox).map { [$0] } ?? view.subviews.flatMap(boxes)
+        }
+        let box = try #require(boxes(host.view).first)
+        let chip = try #require(box.subviews.compactMap { $0 as? UIButton }.first)
+        let field = box.draft
+        func elements() -> [AnyObject] { (box.accessibilityElements ?? []).map { $0 as AnyObject } }
+        #expect(elements().count == 2 && elements().first === chip && elements().last === field)
+        #expect(chip.accessibilityLabel == "To Work")
+        field.setContentOffset(
+          CGPoint(x: 0, y: field.contentSize.height - field.bounds.height), animated: false)
+        box.layoutIfNeeded()
+        #expect(chip.frame.maxY <= 0, "The chip scrolled out with the first line")
+        #expect(elements().count == 1 && elements().first === field)
+        let action = try #require(
+          field.accessibilityCustomActions?.first { $0.name == "Remove recipient" })
+        #expect(action.actionHandler?(action) == true)
+        #expect(model.recipient == nil)
+      }
+
+      /// The feed and composer of a model with Work and Personal saved, in a key window, with the
+      /// composer's field focused.
+      @MainActor private func withComposer(
+        _ body:
+          @MainActor (ChatModel, ComposerField.DraftBox, CoordinatorProfile)
+          async throws -> Void
+      ) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = CoordinatorProfile(
+          name: try TagName("Work"), address: try CoordinatorAddress(host: "100.64.1.2"))
+        let personal = CoordinatorProfile(
+          name: try TagName("Personal"), address: try CoordinatorAddress(host: "100.64.1.3"))
+        let model = ChatModel()
+        model.profiles = [work, personal]
+        for profile in model.profiles {
+          let directory = ProfileDirectory(profile.id, applicationSupport: root, caches: root)
+          model.attach(Lane(id: profile.id, session: nil, hold: LegacyHold(directory)))
+        }
+        // The ink check reads dark text, whatever appearance an earlier test left the app in.
+        let defaults = UserDefaults.standard
+        let appearance = defaults.object(forKey: AppAppearance.preferenceKey)
+        defaults.set(AppAppearance.light.rawValue, forKey: AppAppearance.preferenceKey)
+        defer { defaults.set(appearance, forKey: AppAppearance.preferenceKey) }
+        let host = UIHostingController(rootView: MainChatView(model: model))
+        let scene = try #require(
+          UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let previousWindow = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer {
+          window.isHidden = true
+          window.rootViewController = nil
+          previousWindow?.makeKey()
+        }
+        window.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(300))
+        host.view.layoutIfNeeded()
+        func boxes(_ view: UIView) -> [ComposerField.DraftBox] {
+          (view as? ComposerField.DraftBox).map { [$0] } ?? view.subviews.flatMap(boxes)
+        }
+        let box = try #require(boxes(host.view).first)
+        box.draft.becomeFirstResponder()
+        try await Task.sleep(for: .milliseconds(200))
+        try await body(model, box, work)
+      }
+
+      /// "@Work " typed before an existing draft becomes the chip, and the caret stays at the edit,
+      /// moved back by the tag the text lost, so the next word lands where the user was typing.
+      @MainActor @Test func aTagTypedBeforeTheDraftLeavesTheCaretAtTheEdit() async throws {
+        try await withComposer { model, box, work in
+          let field = box.draft
+          model.draft = "Existing invented note"
+          try await Task.sleep(for: .milliseconds(200))
+          field.selectedRange = NSRange(location: 0, length: 0)
+          field.insertText("@Work ")
+          try await Task.sleep(for: .milliseconds(300))
+          print(
+            "IF7-V2[caret] after the tag: text=\(field.text.debugDescription) selection=\(field.selectedRange) recipient=\(model.recipient.map(model.name) ?? "nil")"
+          )
+          #expect(model.recipient == work.id && field.text == "Existing invented note")
+          #expect(field.selectedRange == NSRange(location: 0, length: 0))
+          field.insertText("Prefix ")
+          try await Task.sleep(for: .milliseconds(200))
+          print("IF7-V2[caret] next edit=\(model.draft.debugDescription)")
+          #expect(model.draft == "Prefix Existing invented note")
+        }
+      }
+
+      /// The user types a line after the chip and its ⓧ removes the chip. Then the user types more,
+      /// and the chip comes back. Each time the chip comes or goes, the draft is drawn at once where
+      /// its layout puts it, at the field's leading edge without the chip and after it with one, so
+      /// the caret and taps land on what is drawn.
+      @MainActor @Test func theDraftIsDrawnWhereItsLayoutPutsItWhenTheChipComesOrGoes()
+        async throws
+      {
+        try await withComposer { model, box, work in
+          let field = box.draft
+          model.recipient = work.id
+          try await Task.sleep(for: .milliseconds(200))
+          field.insertText("Invented one line")
+          try await Task.sleep(for: .milliseconds(300))
+          /// The leftmost and rightmost dark pixels of the first line as the field draws it.
+          func drawn() throws -> (minX: CGFloat, maxX: CGFloat) {
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 1
+            let image = UIGraphicsImageRenderer(bounds: field.bounds, format: format).image { _ in
+              field.drawHierarchy(in: field.bounds, afterScreenUpdates: true)
+            }
+            let cg = try #require(image.cgImage)
+            var pixels = [UInt8](repeating: 0, count: cg.width * cg.height * 4)
+            let context = try #require(
+              CGContext(
+                data: &pixels, width: cg.width, height: cg.height, bitsPerComponent: 8,
+                bytesPerRow: cg.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+            context.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
+            let top = Int(field.textContainerInset.top)
+            let bottom = min(cg.height, top + Int(try #require(field.font).lineHeight))
+            var span = (minX: CGFloat.infinity, maxX: -CGFloat.infinity)
+            for y in top..<bottom {
+              for x in 0..<cg.width {
+                let pixel = (y * cg.width + x) * 4
+                let rgb = Int(pixels[pixel]) + Int(pixels[pixel + 1]) + Int(pixels[pixel + 2])
+                if pixels[pixel + 3] > 128 && rgb < 330 {
+                  span = (min(span.minX, CGFloat(x)), max(span.maxX, CGFloat(x)))
+                }
+              }
+            }
+            return span
+          }
+          /// Where TextKit puts the first line, which is where a tap or the caret finds it.
+          func laidOut() throws -> CGFloat {
+            let layout = try #require(field.textLayoutManager)
+            var starts: [CGFloat] = []
+            layout.enumerateTextLayoutFragments(
+              from: layout.documentRange.location, options: [.ensuresLayout]
+            ) { fragment in
+              starts += fragment.textLineFragments.map {
+                field.textContainerInset.left + fragment.layoutFragmentFrame.minX
+                  + $0.typographicBounds.minX
+              }
+              return false
+            }
+            return try #require(starts.first)
+          }
+          let steps: [(String, ProfileID?, String)] = [
+            ("with the chip", work.id, ""), ("chip removed", nil, ""),
+            ("typed without the chip", nil, " two"), ("chip back", work.id, ""),
+          ]
+          for (step, chip, typed) in steps {
+            if !typed.isEmpty { field.insertText(typed) }
+            model.recipient = chip
+            try await Task.sleep(for: .milliseconds(100))
+            box.window?.layoutIfNeeded()
+            let line = try laidOut()
+            let ink = try drawn()
+            let end = field.caretRect(for: field.endOfDocument).midX
+            print(
+              "IF7-V2[draw] \(step): line x=\(line) drawn=\(ink.minX)...\(ink.maxX) caret at end=\(end)"
+            )
+            #expect(abs(ink.minX - line) < 4, "\(step): the first line is drawn where taps find it")
+            #expect(abs(ink.maxX - end) < 4, "\(step): the caret is drawn after the last letter")
+            if chip == nil && typed.isEmpty {
+              let edge = ComposerField.inset.left
+              #expect(abs(line - edge) < 0.5, "The first line keeps the chip's room")
+              #expect(
+                abs(field.caretRect(for: field.beginningOfDocument).midX - edge) < 0.5,
+                "The caret keeps the chip's room")
+            }
+          }
+        }
+      }
+
       @MainActor @Test func accessibilityTextSizeExpandsMessageLayout() async throws {
         var transcript = Transcript()
         transcript.message(

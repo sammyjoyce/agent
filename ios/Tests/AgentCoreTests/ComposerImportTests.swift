@@ -49,31 +49,29 @@ import UniformTypeIdentifiers
     let root = try root()
     defer { try? FileManager.default.removeItem(at: root) }
     let store = AttachmentStore(directory: root.appending(path: "Draft"))
-    let calls = ImportSubmissions()
-    let model = ChatModel(draftStore: store) { _, _, _ in
-      await calls.submitted()
-      return true
+    let model = ChatModel(draftStore: store)
+    try await withConnectedCoordinator(model) { _, directory in
+      model.draft = "Keep the note with this image."
+      await model.attach(
+        data: Data("Existing file".utf8), name: "Notes.txt", mediaType: "text/plain")
+      let existing = try #require(model.attachments.first)
+      await model.attach(providers: [try selectedImage(root)])
+      #expect(model.draft == "Keep the note with this image.")
+      #expect(model.attachments.count == 2)
+      #expect(model.attachments.first == existing)
+      #expect((try? queuedRequests(directory.outbox)) == nil, "Nothing was sent")
+      let image = try #require(model.attachments.last)
+      #expect(image.reference.mediaType == "image/jpeg")
+      let bytes = try Data(contentsOf: image.url)
+      let decoded = try #require(CGImageSourceCreateWithData(bytes as CFData, nil))
+      #expect(CGImageSourceGetType(decoded) == UTType.jpeg.identifier as CFString)
+      #expect(CGImageSourceGetCount(decoded) == 1)
+      await model.removeAttachment(image)
+      #expect(model.attachments == [existing])
+      #expect(!FileManager.default.fileExists(atPath: image.url.path))
+      #expect(try Data(contentsOf: existing.url) == Data("Existing file".utf8))
+      #expect(model.draft == "Keep the note with this image.")
     }
-    model.connection = .connected
-    model.draft = "Keep the note with this image."
-    await model.attach(data: Data("Existing file".utf8), name: "Notes.txt", mediaType: "text/plain")
-    let existing = try #require(model.attachments.first)
-    await model.attach(providers: [try selectedImage(root)])
-    #expect(model.draft == "Keep the note with this image.")
-    #expect(model.attachments.count == 2)
-    #expect(model.attachments.first == existing)
-    #expect(await calls.count == 0)
-    let image = try #require(model.attachments.last)
-    #expect(image.reference.mediaType == "image/jpeg")
-    let bytes = try Data(contentsOf: image.url)
-    let decoded = try #require(CGImageSourceCreateWithData(bytes as CFData, nil))
-    #expect(CGImageSourceGetType(decoded) == UTType.jpeg.identifier as CFString)
-    #expect(CGImageSourceGetCount(decoded) == 1)
-    await model.removeAttachment(image)
-    #expect(model.attachments == [existing])
-    #expect(!FileManager.default.fileExists(atPath: image.url.path))
-    #expect(try Data(contentsOf: existing.url) == Data("Existing file".utf8))
-    #expect(model.draft == "Keep the note with this image.")
   }
 
   @Test func failedSelectionDoesNotPartiallyImportOrLoseTheNoteAndExistingFiles() async throws {
@@ -117,9 +115,4 @@ import UniformTypeIdentifiers
     #expect(model.draft == "Keep this while a provider is cancelled.")
     #expect(model.error == nil)
   }
-}
-
-private actor ImportSubmissions {
-  private(set) var count = 0
-  func submitted() { count += 1 }
 }

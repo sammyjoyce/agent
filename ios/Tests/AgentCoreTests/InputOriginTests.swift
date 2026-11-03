@@ -9,11 +9,10 @@ func newNativeInputsAdvertiseIOSOnlyWhenTheCurrentConnectionSupportsOrigins(adve
 {
   try await withCoordinator { session, fixture, outbox in
     await fixture.advertiseInputOrigins(advertised)
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     for await update in session.updates where update.connection == .connected { break }
     #expect(await session.submit("A deliberately unsent-until-admitted native message"))
-    let requests = try JSONDecoder().decode(
-      [NativeRequestSubmit].self, from: Data(contentsOf: outbox))
+    let requests = try queuedRequests(outbox)
     #expect(requests.count == 1)
     #expect(requests.first?.origin == (advertised == true ? .ios : nil))
   }
@@ -22,19 +21,17 @@ func newNativeInputsAdvertiseIOSOnlyWhenTheCurrentConnectionSupportsOrigins(adve
 @Test(.timeLimit(.minutes(1)))
 func reconnectDoesNotReuseOriginCapabilityOrRewriteAnOlderPendingInput() async throws {
   try await withCoordinator { session, fixture, outbox in
-    let address = try CoordinatorAddress(host: "100.64.1.2")
     await fixture.advertiseInputOrigins(true)
     await fixture.loseInputAcknowledgements()
-    await session.connect(address)
+    await session.connect()
     for await update in session.updates where update.connection == .connected { break }
     #expect(await session.submit("Original input"))
     await session.disconnect()
     await fixture.advertiseInputOrigins(nil)
-    await session.connect(address)
+    await session.connect()
     for await update in session.updates where update.connection == .connected { break }
     #expect(await session.submit("New input on a legacy connection"))
-    let requests = try JSONDecoder().decode(
-      [NativeRequestSubmit].self, from: Data(contentsOf: outbox))
+    let requests = try queuedRequests(outbox)
     #expect(requests.last?.origin == nil)
   }
 }
@@ -44,11 +41,12 @@ func retryingALegacyOutboxNeverInventsAnOriginEvenAfterCapabilityIsAdvertised() 
   try await withCoordinator { session, fixture, outbox in
     let legacy = NativeRequestSubmit(
       inputId: UUID().uuidString, mode: .steer, text: "Legacy pending input")
-    try FileManager.default.createDirectory(
-      at: outbox.deletingLastPathComponent(), withIntermediateDirectories: true)
-    try JSONEncoder().encode([legacy]).write(to: outbox, options: .atomic)
+    let item = OutboxItem(
+      request: legacy, sendID: UUID().uuidString, recipients: [session.profile],
+      queuedAt: Date().timeIntervalSince1970)
+    try writePrivately(JSONEncoder().encode([item]), to: outbox)
     await fixture.advertiseInputOrigins(true)
-    await session.connect(try CoordinatorAddress(host: "100.64.1.2"))
+    await session.connect()
     for await update in session.updates where update.connection == .connected { break }
     await session.retry(legacy.inputId)
     for await actual in fixture.observedInputs {

@@ -1,159 +1,161 @@
 import Foundation
 import Observation
 
+/// One coordinator's enrollment channel. The app gets one only from
+/// `CoordinatorSession.notificationChannel`, so a profile's installation ID travels only over
+/// that profile's identity-checked sockets.
+public struct NotificationChannel: Sendable {
+  public let installation: ProfileID
+  let exchange: @Sendable (NotificationRequest) async throws -> NotificationStatus
+}
+
 /// Device enrollment uses control requests, never model input. Tokens stay in memory.
+/// The alerts toggle, permission and Apple registration belong to the app. Each saved
+/// coordinator has its own channel, keyed by the profile ID that is its installation ID.
 @MainActor @Observable
 public final class NotificationRegistration {
   public private(set) var enabled: Bool
-  public private(set) var configured = false
-  public private(set) var registered = false
   public private(set) var busy = false
+  /// Permission and Apple registration failures. Coordinator failures are per channel.
   public private(set) var error: String?
-  public let installationID: String
+  public struct ChannelStatus: Sendable, Equatable {
+    public var configured = false
+    public var registered = false
+    public var error: String?
+  }
+  private var channels: [ProfileID: ChannelStatus] = [:]
   private enum Authorization { case unchecked, allowed, denied }
   private enum AppleRegistration { case idle, requested, ready, failed }
   private struct Enrollment {
     let id: UUID
-    let generation: UUID
     let token: String
     let operation: Task<Void, any Error>
   }
+  /// Present while that profile's session is connected. Replacing it invalidates its work.
+  private struct Link {
+    let channel: NotificationChannel
+    let generation = UUID()
+    var enrollment: Enrollment?
+  }
+  @ObservationIgnored private var links: [ProfileID: Link] = [:]
+  /// Profiles whose installation Remove withdrew. Profile IDs are never reused, so none of
+  /// these connects or enrolls again.
+  @ObservationIgnored private var forgotten: Set<ProfileID> = []
+  /// Outlives links, so a request from an earlier connection still orders before later ones.
+  @ObservationIgnored private var controls: [ProfileID: Task<NotificationStatus, any Error>] = [:]
   @ObservationIgnored private var authorization = Authorization.unchecked
   @ObservationIgnored private var apple = AppleRegistration.idle
-  @ObservationIgnored private var enrollment: Enrollment?
   @ObservationIgnored private var token: String?
-  @ObservationIgnored private var generation = UUID()
-  @ObservationIgnored private var exchange:
-    (@Sendable (NotificationRequest) async throws -> NotificationStatus)?
-  @ObservationIgnored private var control: Task<NotificationStatus, any Error>?
   @ObservationIgnored private let permission: @MainActor () async throws -> Bool
   @ObservationIgnored private let register: @MainActor () -> Void
   @ObservationIgnored private let save: @MainActor (Bool) -> Void
 
   public init(
-    installationID: UUID, enabled: Bool,
+    enabled: Bool,
     permission: @escaping @MainActor () async throws -> Bool,
     register: @escaping @MainActor () -> Void,
     save: @escaping @MainActor (Bool) -> Void
   ) {
-    self.installationID = installationID.uuidString
     self.enabled = enabled
     self.permission = permission
     self.register = register
     self.save = save
   }
 
+  public func status(_ profile: ProfileID) -> ChannelStatus { channels[profile] ?? ChannelStatus() }
+
   public func start() async {
     guard enabled, authorization == .unchecked else { return }
     await setEnabled(true)
   }
 
-  public func disconnect() {
-    generation = UUID()
-    exchange = nil
-    configured = false
-    enrollment = nil
+  /// Keeps the last known `registered`, so a later opt-out can report an unconfirmed removal.
+  public func disconnect(_ profile: ProfileID) {
+    links[profile] = nil
+    channels[profile]?.configured = false
   }
 
-  public func connect(
-    exchange: @escaping @Sendable (NotificationRequest) async throws -> NotificationStatus
-  ) async {
-    self.exchange = exchange
-    let generation = UUID()
-    self.generation = generation
-    configured = false
-    enrollment = nil
+  public func connect(_ channel: NotificationChannel) async {
+    let profile = channel.installation
+    guard !forgotten.contains(profile) else { return }
+    let link = Link(channel: channel)
+    links[profile] = link
+    channels[profile, default: ChannelStatus()].configured = false
     do {
-      let status = try await request(.status(.init(installationId: installationID))).value
-      guard self.generation == generation else { return }
-      configured = status.configured
-      registered = status.registered
-      error = nil
+      let status = try await request(.status(.init(installationId: "\(profile)")), on: profile)
+        .value
+      guard current(profile, link) else { return }
+      channels[profile] = ChannelStatus(
+        configured: status.configured, registered: status.registered)
       if enabled {
         await start()
-        guard self.generation == generation else { return }
-        if enabled, authorization == .allowed, configured {
+        guard current(profile, link) else { return }
+        if enabled, authorization == .allowed, status.configured {
           registerWithApple()
-          if let token { try await enroll(token, generation: generation) }
+          if let token { try await enroll(token, on: profile, link: link) }
         }
-      } else if registered {
+      } else if status.registered {
         // A lost withdrawal receipt must not silently re-enable alerts after
         // relaunch. Removing the same installation again is idempotent.
-        try await withdraw()
+        try await unregister(profile)
       }
     } catch {
-      if self.generation == generation {
-        self.error =
-          enabled || !registered
-          ? error.localizedDescription
-          : removalError(error)
-      }
+      guard current(profile, link) else { return }
+      channels[profile]?.error =
+        enabled || !status(profile).registered
+        ? error.localizedDescription : removalError(error)
     }
   }
 
+  /// Enrolls or withdraws on every channel.
   public func setEnabled(_ value: Bool) async {
     guard !busy else { return }
     busy = true
     defer { busy = false }
-    var generation = generation
     do {
       if value {
         // Authorization belongs to the installation, not a connection that may
         // reconnect while Apple's first-launch prompt is open.
         let allowed = try await permission()
-        generation = self.generation
         authorization = allowed ? .allowed : .denied
         guard allowed else {
-          try await withdraw()
+          await withdraw()
           throw RegistrationError.permission
         }
         enabled = true
         save(true)
         registerWithApple()
-        if configured, let token { try await enroll(token, generation: generation) }
+        if let token { await enrollLinked(token) }
       } else {
-        try await withdraw()
+        await withdraw()
       }
-      if self.generation == generation { error = nil }
+      error = nil
     } catch {
-      if self.generation == generation {
-        self.error = !enabled && registered ? removalError(error) : error.localizedDescription
-      }
+      self.error = error.localizedDescription
     }
   }
 
-  private func registerWithApple() {
-    guard apple == .idle || apple == .failed else { return }
-    apple = .requested
-    register()
-  }
-
-  private func withdraw() async throws {
-    // Persist intent before a receipt: late token callbacks cannot re-enroll.
-    enabled = false
-    save(false)
-    enrollment = nil
-    guard exchange != nil else {
-      if registered { throw ConnectionError.closed }
-      return
+  /// Removes the profile's installation over its live channel, if any, then forgets it. True
+  /// once its coordinator confirmed it holds no registration for it.
+  @discardableResult public func forget(_ profile: ProfileID) async -> Bool {
+    forgotten.insert(profile)
+    // Without a configured status, a token arriving during the withdrawal skips this profile.
+    channels[profile] = nil
+    defer {
+      links[profile] = nil
+      controls[profile] = nil
     }
-    let generation = generation
-    let status = try await request(.unregister(.init(installationId: installationID))).value
-    guard self.generation == generation else { return }
-    registered = status.registered
+    let withdrawal = try? await request(
+      .unregister(.init(installationId: "\(profile)")), on: profile
+    ).value
+    return withdrawal?.registered == false
   }
 
   public func received(token: String) async {
     self.token = token
     apple = .ready
-    guard enabled, authorization == .allowed, configured else { return }
-    let generation = generation
-    do {
-      try await enroll(token, generation: generation)
-      if self.generation == generation { error = nil }
-    } catch {
-      if self.generation == generation { self.error = error.localizedDescription }
-    }
+    guard enabled, authorization == .allowed else { return }
+    await enrollLinked(token)
   }
 
   public func failed() {
@@ -164,47 +166,131 @@ public final class NotificationRegistration {
       "This device could not register with Apple. Check the app's Push Notifications signing capability and network connection."
   }
 
-  private func enroll(_ token: String, generation: UUID) async throws {
+  private func registerWithApple() {
+    guard apple == .idle || apple == .failed else { return }
+    apple = .requested
+    register()
+  }
+
+  private func current(_ profile: ProfileID, _ link: Link) -> Bool {
+    !forgotten.contains(profile) && links[profile]?.generation == link.generation
+  }
+
+  private func enrollLinked(_ token: String) async {
+    for (profile, link) in links where status(profile).configured {
+      do {
+        try await enroll(token, on: profile, link: link)
+        if current(profile, link) { channels[profile]?.error = nil }
+      } catch {
+        if current(profile, link) { channels[profile]?.error = error.localizedDescription }
+      }
+    }
+  }
+
+  private func withdraw() async {
+    // Persist intent before a receipt: late token callbacks cannot re-enroll.
+    enabled = false
+    save(false)
+    for profile in Array(channels.keys) {
+      links[profile]?.enrollment = nil
+      do {
+        try await unregister(profile)
+        channels[profile]?.error = nil
+      } catch {
+        channels[profile]?.error = removalError(error)
+      }
+    }
+  }
+
+  private func unregister(_ profile: ProfileID) async throws {
+    guard let link = links[profile] else {
+      if status(profile).registered { throw ConnectionError.closed }
+      return
+    }
+    let status = try await request(.unregister(.init(installationId: "\(profile)")), on: profile)
+      .value
+    guard current(profile, link) else { return }
+    channels[profile]?.registered = status.registered
+  }
+
+  private func enroll(_ token: String, on profile: ProfileID, link: Link) async throws {
     let pending: Enrollment
-    if let current = enrollment, current.generation == generation, current.token == token {
+    if let current = links[profile]?.enrollment, self.current(profile, link),
+      current.token == token
+    {
       pending = current
     } else {
       let id = UUID()
-      let response = try request(.register(.init(installationId: installationID, token: token)))
+      let response = try request(
+        .register(.init(installationId: "\(profile)", token: token)), on: profile)
       let operation = Task { [weak self] in
         let status = try await response.value
-        guard let self, self.generation == generation, self.enrollment?.id == id else { return }
-        self.registered = status.registered
+        guard let self, self.current(profile, link), self.links[profile]?.enrollment?.id == id
+        else { return }
+        self.channels[profile]?.registered = status.registered
         if !status.registered { throw RegistrationError.coordinatorSetup }
       }
-      pending = Enrollment(
-        id: id, generation: generation, token: token, operation: operation)
-      enrollment = pending
+      pending = Enrollment(id: id, token: token, operation: operation)
+      links[profile]?.enrollment = pending
     }
     do {
       try await pending.operation.value
     } catch {
-      if enrollment?.id == pending.id { enrollment = nil }
+      if links[profile]?.enrollment?.id == pending.id { links[profile]?.enrollment = nil }
       throw error
     }
   }
 
-  private func request(_ request: NotificationRequest) throws -> Task<NotificationStatus, any Error>
-  {
-    guard let exchange else { throw ConnectionError.closed }
-    let previous = control
+  private func request(_ request: NotificationRequest, on profile: ProfileID) throws -> Task<
+    NotificationStatus, any Error
+  > {
+    guard let link = links[profile] else { throw ConnectionError.closed }
+    let previous = controls[profile]
+    let exchange = link.channel.exchange
     // Serialize enrollment and withdrawal. A late token registration cannot
     // overtake a user's disable request on another control connection.
     let operation = Task {
       _ = try? await previous?.value
       return try await exchange(request)
     }
-    control = operation
+    controls[profile] = operation
     return operation
   }
 
   private func removalError(_ error: any Error) -> String {
     "Notification removal is unconfirmed. Reconnect or retry removing this device. \(error.localizedDescription)"
+  }
+}
+
+/// An alert withdrawal that Remove saved before withdrawing. It outlives the profile, so it
+/// keeps the address and pin that reach that profile's coordinator alone.
+public struct PendingWithdrawal: Codable, Sendable, Equatable {
+  public let installation: ProfileID
+  public let address: CoordinatorAddress
+  public let pin: CoordinatorID
+
+  public init(installation: ProfileID, address: CoordinatorAddress, pin: CoordinatorID) {
+    self.installation = installation
+    self.address = address
+    self.pin = pin
+  }
+
+  /// Withdraws the installation over one socket that proves the pin. True once the coordinator
+  /// confirmed it holds no registration for it.
+  public func send(transport: CoordinatorTransport) async throws -> Bool {
+    let stream = try await CoordinatorDialer(address: address, pin: pin, transport: transport)
+      .open()
+    do {
+      try await timedSend(
+        stream,
+        .notifications(.init(request: .unregister(.init(installationId: "\(installation)")))))
+      let status = try await notificationStatus(on: stream)
+      await stream.close()
+      return !status.registered
+    } catch {
+      await stream.close()
+      throw error
+    }
   }
 }
 

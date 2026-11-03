@@ -4,6 +4,7 @@ import Network
 import Testing
 
 @testable import AgentCore
+@testable import AgentUI
 
 func send(_ data: Data, on connection: NWConnection) async throws {
   try await withCheckedThrowingContinuation {
@@ -17,6 +18,8 @@ func send(_ data: Data, on connection: NWConnection) async throws {
 }
 
 actor FixtureCoordinator {
+  /// What this fixture answers `identify` with. Sessions pass it as their pin.
+  nonisolated let id = CoordinatorID(UUID())
   nonisolated let closedObservations: AsyncStream<Void>
   nonisolated let closedToolLookups: AsyncStream<Void>
   private let closedContinuation: AsyncStream<Void>.Continuation
@@ -88,6 +91,8 @@ actor FixtureCoordinator {
   }
   func toolLookups() -> [NativeRequestToolDetails] { toolRequests }
   func notificationControls() -> [NotificationRequest] { notificationRequests }
+  /// Whether this coordinator holds a device registration, as its last applied control left it.
+  func holdsRegistration() -> Bool { notificationsRegistered }
   func dropNextNotificationRemoval() { dropNotificationRemoval = true }
   func holdNotificationRegistration() { notificationsHeld = true }
   func releaseNotificationRegistration() {
@@ -102,16 +107,83 @@ actor FixtureCoordinator {
     release = nil
   }
   private var sockets: [NWConnection] = []
+  private var requests: [NativeRequest] = []
+  private var dropsIdentify = false
+  private var holdsIdentity = false
+  /// Set once an `identify` arrived and its answer was held.
+  private(set) var identityHeld = false
+  private var identityRelease: CheckedContinuation<Void, Never>?
+  /// Holds the answer to the next `identify` until `releaseIdentity`, as a slow proof would.
+  func holdNextIdentity() { holdsIdentity = true }
+  func releaseIdentity() {
+    holdsIdentity = false
+    identityRelease?.resume()
+    identityRelease = nil
+  }
+  /// Every request any socket carried, in arrival order.
+  func received() -> [NativeRequest] { requests }
+  /// Behaves like a coordinator built before identities. It closes on `identify` without a frame.
+  func dropIdentify(_ drops: Bool = true) { dropsIdentify = drops }
+  func emitOnObserver(_ event: NativeEvent) async throws {
+    try await emit(event, on: #require(observer))
+  }
   private var submissions: [NativeRequestSubmit] = []
   private var files: [String: Data] = [:]
   private var uploads = 0
   private var rejectUploads = false
   func refuseUploads() { rejectUploads = true }
+  func acceptUploads() { rejectUploads = false }
+  private var rejectsSubmits = false
+  /// Rejects each submit once read, as a coordinator refusing an input does, and keeps nothing.
+  func rejectSubmits(_ rejects: Bool = true) { rejectsSubmits = rejects }
+  private var holdsSubmitReply = false
+  private var submitReplyRelease: CheckedContinuation<Void, Never>?
+  /// Keeps the next submit and holds its answer until `releaseSubmitReply`, as a slow coordinator
+  /// does after the write.
+  func holdNextSubmitReply() { holdsSubmitReply = true }
+  func releaseSubmitReply() {
+    holdsSubmitReply = false
+    submitReplyRelease?.resume()
+    submitReplyRelease = nil
+  }
   func uploadCount() -> Int { uploads }
   func uploaded(_ id: String) -> Data? { files[id] }
   func count() -> Int { submissions.count }
+  private var busy = false
+  /// Submits the busy turn has not placed, each with the socket still waiting for it.
+  private var unplaced: [(input: String, socket: NWConnection?)] = []
+  private var keepsNextRejected = false
+  /// From now on accepts each submit at once and places it only at `finishTurn`, as a coordinator
+  /// busy with a turn does with a follow-up.
+  func holdPlacements() { busy = true }
+  /// Rejects the next submit but keeps it, as a coordinator whose turn ended while saving it does.
+  /// Observing reports it as the turn left it.
+  func rejectNextSubmitButKeepIt() { keepsNextRejected = true }
+  /// The turn ends, and every submit it held is placed in order. Each placement goes to the socket
+  /// that sent the submit while the phone keeps it open. A kept input's socket closed with its
+  /// rejection, so its placement goes to the observer, as a coordinator tells every observer.
+  func finishTurn() async throws {
+    busy = false
+    for (input, socket) in unplaced {
+      let placed = NativeEvent.placed(.init(entryId: "placed-\(input)", inputId: input))
+      if let socket {
+        try? await emit(placed, on: socket)
+        try? await emit(.done, on: socket)
+      } else if let observer {
+        try? await emit(placed, on: observer)
+      }
+    }
+    unplaced = []
+  }
+  /// The input IDs of every submit placed so far.
+  func placedInputs() -> [String] { placedSubmits.map(\.inputId) }
+  private var placedSubmits: [NativeRequestSubmit] {
+    submissions.filter { submit in !unplaced.contains { $0.input == submit.inputId } }
+  }
   func stop() {
     releaseHistory()
+    releaseIdentity()
+    releaseSubmitReply()
     for socket in sockets { socket.cancel() }
     sockets = []
   }
@@ -140,7 +212,19 @@ actor FixtureCoordinator {
       let command = try JSONDecoder().decode(NativeCommand.self, from: bytes.prefix(upTo: end))
       bytes.removeSubrange(...end)
       guard case .native(let value) = command else { return }
+      requests.append(value.request)
       switch value.request {
+      case .identify:
+        if holdsIdentity {
+          holdsIdentity = false
+          identityHeld = true
+          await withCheckedContinuation { identityRelease = $0 }
+        }
+        if dropsIdentify {
+          socket.cancel()
+          return
+        }
+        try await emit(.identity(.init(coordinatorId: "\(id.uuid)".lowercased())), on: socket)
       case .settings(let request):
         settingsRequests.append(request)
         settingsObserved.continuation.yield(())
@@ -201,7 +285,8 @@ actor FixtureCoordinator {
               conversationId: "fixture-root", conversationSettings: conversationSettings,
               inputOrigins: inputOrigins, model: "fixture/model")), on: socket)
         if delaySnapshot { await withCheckedContinuation { release = $0 } }
-        let messages = submissions.filter { request.inputIds.contains($0.inputId) }.map { input in
+        let placed = placedSubmits
+        let messages = placed.filter { request.inputIds.contains($0.inputId) }.map { input in
           HistoryMessage(
             attachments: input.attachments, continuation: false, entryId: "placed-\(input.inputId)",
             finalChunk: true, role: .user,
@@ -209,7 +294,9 @@ actor FixtureCoordinator {
         }
         for input in submissions where request.inputIds.contains(input.inputId) {
           try await emit(
-            .placed(.init(entryId: "placed-\(input.inputId)", inputId: input.inputId)), on: socket)
+            placed.contains(input)
+              ? .placed(.init(entryId: "placed-\(input.inputId)", inputId: input.inputId))
+              : .accepted(.init(inputId: input.inputId)), on: socket)
         }
         try await emit(
           .history(
@@ -221,11 +308,37 @@ actor FixtureCoordinator {
             continuation.resume()
           }
         }
+        if observer === socket { observer = nil }
         closedContinuation.yield(())
         return
       case .submit(let request):
+        if rejectsSubmits {
+          try await emit(
+            .rejected(
+              .init(
+                inputId: request.inputId, message: "Invented: the coordinator refused this input")
+            ), on: socket)
+          try await emit(.done, on: socket)
+          return
+        }
         submissions.append(request)
         inputsObserved.continuation.yield(request)
+        if holdsSubmitReply {
+          holdsSubmitReply = false
+          await withCheckedContinuation { submitReplyRelease = $0 }
+        }
+        if keepsNextRejected {
+          keepsNextRejected = false
+          if busy { unplaced.append((request.inputId, nil)) }
+          try await emit(
+            .rejected(
+              .init(
+                inputId: request.inputId,
+                message: "The turn ended while this input was being saved; its original is retained"
+              )), on: socket)
+          try await emit(.done, on: socket)
+          return
+        }
         if request.text.hasPrefix("/feedback ") {
           try await emit(
             .feedbackReady(
@@ -240,6 +353,10 @@ actor FixtureCoordinator {
         }
         if !dropInputAcknowledgements {
           try await emit(.accepted(.init(inputId: request.inputId)), on: socket)
+        }
+        if busy {
+          unplaced.append((request.inputId, socket))
+          return
         }
         socket.send(
           content: nil, contentContext: .finalMessage, isComplete: true, completion: .idempotent)
@@ -299,14 +416,12 @@ actor FixtureCoordinator {
   }
 }
 
-func withCoordinator(
-  _ body: @Sendable (CoordinatorSession, FixtureCoordinator, URL) async throws -> Void
-) async throws {
+/// Serves `fixture` on a loopback port until the listener is cancelled.
+func listen(_ fixture: FixtureCoordinator) async throws -> (NWListener, NWEndpoint.Port) {
   let parameters = NWParameters.tcp
   parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
   let listener = try NWListener(using: parameters)
   let ready = AsyncThrowingStream<Void, any Error>.makeStream()
-  let fixture = FixtureCoordinator()
   listener.stateUpdateHandler = { state in
     if case .ready = state { ready.continuation.yield(()) }
     if case .failed(let error) = state { ready.continuation.finish(throwing: error) }
@@ -326,19 +441,73 @@ func withCoordinator(
     }
   }
   listener.start(queue: .global())
-  defer { listener.cancel() }
   for try await _ in ready.stream { break }
-  let port = try #require(listener.port)
-  let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-  let outbox = directory.appending(path: "outbox.json")
-  defer { try? FileManager.default.removeItem(at: directory) }
+  return (listener, try #require(listener.port))
+}
+
+func loopback(_ port: NWEndpoint.Port) -> CoordinatorTransport {
+  CoordinatorTransport { _ in
+    LineConnection(connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+  }
+}
+
+/// The requests in a profile's live outbox, in queue order.
+func queuedRequests(_ outbox: URL) throws -> [NativeRequestSubmit] {
+  try JSONDecoder().decode([OutboxItem].self, from: Data(contentsOf: outbox)).map(\.request)
+}
+
+/// Saves `requests` in the profile's outbox, each a Send to it alone from an earlier launch.
+func saveOutbox(_ requests: [NativeRequestSubmit], in directory: ProfileDirectory) throws {
+  let items = requests.map {
+    OutboxItem(
+      request: $0, sendID: UUID().uuidString, recipients: [directory.profile],
+      queuedAt: Date().timeIntervalSince1970)
+  }
+  try writePrivately(JSONEncoder().encode(items), to: directory.outbox)
+}
+
+/// Makes the profile's directory read-only, so the next stage cannot save, until `body` ends.
+@MainActor func withReadOnlyProfile(
+  _ directory: ProfileDirectory, _ body: () async throws -> Void
+) async throws {
+  try FileManager.default.createDirectory(at: directory.root, withIntermediateDirectories: true)
+  try FileManager.default.setAttributes(
+    [.posixPermissions: 0o500], ofItemAtPath: directory.root.path)
+  defer {
+    try? FileManager.default.setAttributes(
+      [.posixPermissions: 0o700], ofItemAtPath: directory.root.path)
+  }
+  try await body()
+}
+
+/// A profile directory under a fresh temporary root, removed by the caller.
+func temporaryProfile() -> (ProfileDirectory, URL) {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  return (ProfileDirectory(ProfileID(), applicationSupport: root, caches: root), root)
+}
+
+/// The feed lane of `session`, holding nothing from before the update.
+func lane(_ session: CoordinatorSession) -> Lane {
+  let empty = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  return Lane(
+    id: session.profile, session: session,
+    hold: LegacyHold(
+      ProfileDirectory(session.profile, applicationSupport: empty, caches: empty)))
+}
+
+func withCoordinator(
+  _ body: @Sendable (CoordinatorSession, FixtureCoordinator, URL) async throws -> Void
+) async throws {
+  let fixture = FixtureCoordinator()
+  let (listener, port) = try await listen(fixture)
+  defer { listener.cancel() }
+  let (directory, root) = temporaryProfile()
+  defer { try? FileManager.default.removeItem(at: root) }
   let session = CoordinatorSession(
-    outboxURL: outbox,
-    connectTransport: { _ in
-      LineConnection(connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
-    })
+    directory: directory, address: try CoordinatorAddress(host: "100.64.1.2"), pin: fixture.id,
+    stamps: StampSource(), transport: loopback(port))
   do {
-    try await body(session, fixture, outbox)
+    try await body(session, fixture, directory.outbox)
     await session.disconnect()
     await fixture.stop()
   } catch {
@@ -346,4 +515,38 @@ func withCoordinator(
     await fixture.stop()
     throw error
   }
+}
+
+/// Saves one coordinator for `model` on a loopback fixture and connects it as the app does, so a
+/// Send reaches it. The lane is detached after `body`.
+@MainActor func withConnectedCoordinator(
+  _ model: ChatModel, _ body: (FixtureCoordinator, ProfileDirectory) async throws -> Void
+) async throws {
+  let fixture = FixtureCoordinator()
+  let (listener, port) = try await listen(fixture)
+  defer { listener.cancel() }
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let profile = CoordinatorProfile(
+    name: try TagName("Work"), address: try CoordinatorAddress(host: "100.64.1.2"))
+  let directory = ProfileDirectory(profile.id, applicationSupport: root, caches: root)
+  model.profiles = [profile]
+  model.attach(
+    Lane(
+      id: profile.id,
+      session: CoordinatorSession(
+        directory: directory, address: profile.address, pin: fixture.id, stamps: StampSource(),
+        transport: loopback(port)),
+      hold: LegacyHold(directory)))
+  await model.setActive(true)
+  while model.connection != .connected { try await Task.sleep(for: .milliseconds(1)) }
+  do {
+    try await body(fixture, directory)
+  } catch {
+    await model.detach(profile.id)
+    await fixture.stop()
+    throw error
+  }
+  await model.detach(profile.id)
+  await fixture.stop()
 }

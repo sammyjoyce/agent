@@ -7,10 +7,12 @@ import UserNotifications
   import UIKit
 #endif
 
-/// The app delegate owns OS registration; the coordinator owns delivery.
+/// The app delegate owns OS registration; the coordinator owns delivery. As the
+/// process-scoped object, it also owns the saved coordinators.
 @MainActor @Observable
 public final class AppNotifications: NSObject {
   public let registration: NotificationRegistration
+  public let coordinators: Coordinators
   public var mainVisible = false
   public private(set) var openedTarget: NotificationTarget?
   var presentsAlerts: Bool { !mainVisible && registration.enabled }
@@ -18,13 +20,20 @@ public final class AppNotifications: NSObject {
 
   public override convenience init() { self.init(defaults: .standard) }
 
-  public init(defaults: UserDefaults) {
-    let identifier =
-      defaults.string(forKey: "notificationInstallationID").flatMap(UUID.init(uuidString:))
-      ?? UUID()
-    defaults.set(identifier.uuidString, forKey: "notificationInstallationID")
-    registration = NotificationRegistration(
-      installationID: identifier,
+  public convenience init(defaults: UserDefaults) {
+    self.init(
+      defaults: defaults, applicationSupport: .applicationSupportDirectory,
+      caches: .cachesDirectory, transport: .tailnet,
+      persistence: ComposerDraftStore(
+        url: URL.applicationSupportDirectory.appending(path: "Agent/Composer/draft.json")),
+      sharedInbox: try? SharedDraftInbox.configured())
+  }
+
+  init(
+    defaults: UserDefaults, applicationSupport: URL, caches: URL, transport: CoordinatorTransport,
+    persistence: ComposerDraftStore? = nil, sharedInbox: SharedDraftInbox? = nil
+  ) {
+    let registration = NotificationRegistration(
       enabled: defaults.object(forKey: "notificationsEnabled") == nil
         || defaults.bool(forKey: "notificationsEnabled"),
       permission: {
@@ -47,6 +56,10 @@ public final class AppNotifications: NSObject {
         #endif
       },
       save: { defaults.set($0, forKey: "notificationsEnabled") })
+    self.registration = registration
+    coordinators = Coordinators(
+      registration: registration, defaults: defaults, applicationSupport: applicationSupport,
+      caches: caches, transport: transport, persistence: persistence, sharedInbox: sharedInbox)
     super.init()
   }
 
