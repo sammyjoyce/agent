@@ -539,6 +539,42 @@ func stagingSendsNothingAndUnstagingLeavesNoTrace() async throws {
   }
 }
 
+/// Remove retires a session before it deletes the profile's files. Whoever still holds the
+/// session, it never connects, sends a waiting input or a control, or writes the directory again.
+@Test(.timeLimit(.minutes(1)))
+func aRetiredSessionNeverConnectsSendsOrWritesAgain() async throws {
+  try await withProfile { fixture, directory, launch in
+    let session = try await launch()
+    await session.connect()
+    _ = try await until(session) { $0.connection == .connected }
+    let waiting = try #require(
+      await session.stage(
+        "Invented: call the vet", sendID: "send-8", recipients: [directory.profile]))
+    let control = try #require(
+      await session.stage("/status", sendID: "send-9", recipients: [directory.profile]))
+    await session.disconnect()
+    #expect(await session.start(waiting), "It waits for its lane to connect")
+    await session.retire()
+    let requests = await fixture.received().count
+    await session.connect()
+    try await Task.sleep(for: .seconds(1))
+    #expect(await fixture.received().count == requests, "Nothing dials the coordinator again")
+    #expect(await session.start(control) == false, "A control it did not send is reported")
+    #expect(await session.start(waiting), "Only a control is reported")
+    try directory.remove()
+    #expect(
+      await session.stage("Invented: one more", sendID: "send-10", recipients: [directory.profile])
+        == nil)
+    await session.retry(waiting.inputID)
+    await session.discard(waiting.inputID)
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(await fixture.count() == 0, "Nothing was sent")
+    #expect(
+      !FileManager.default.fileExists(atPath: directory.root.path),
+      "Nothing writes the deleted directory")
+  }
+}
+
 enum LaneReturn: Sendable { case reconnect, foreground }
 
 @Test(.timeLimit(.minutes(1)), arguments: [LaneReturn.reconnect, .foreground])

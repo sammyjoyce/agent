@@ -112,6 +112,8 @@ public actor CoordinatorSession {
   /// unstaged. A started one waits for this lane to connect, then sends once.
   private var unsent: [String: Unsent] = [:]
   private var attemptedInputs: Set<String> = []
+  /// Set for good by `retire`. A retired session never connects, sends or writes again.
+  private var retired = false
   private var generation = UUID()
   private var flush: Task<Void, Never>?
   private let outboxURL: URL
@@ -149,6 +151,7 @@ public actor CoordinatorSession {
   }
 
   public func connect() async {
+    guard !retired else { return }
     let generation = UUID()
     await disconnect(generation: generation)
     guard self.generation == generation else { return }
@@ -175,6 +178,14 @@ public actor CoordinatorSession {
   }
 
   public func disconnect() async { await disconnect(generation: UUID()) }
+
+  /// Ends this session when its lane leaves the feed, before its profile's files may be deleted.
+  /// It disconnects, and whoever still holds it, it never connects, sends or writes its
+  /// directory again.
+  public func retire() async {
+    retired = true
+    await disconnect()
+  }
   private func disconnect(generation: UUID) async {
     self.generation = generation
     observation?.cancel()
@@ -216,7 +227,7 @@ public actor CoordinatorSession {
     _ text: String, mode: InputMode = .steer, files: [LocalAttachment] = [], sendID: String,
     recipients: [ProfileID]
   ) async -> StagedInput? {
-    guard actions.count < 32, snapshot.connection == .connected,
+    guard !retired, actions.count < 32, snapshot.connection == .connected,
       !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !files.isEmpty
     else { return nil }
     guard text.utf8.count <= 65536 else {
@@ -291,9 +302,11 @@ public actor CoordinatorSession {
   /// Sends a staged input on this coordinator's own verified socket. While this lane is not
   /// connected, a durable one waits and goes once it connects. One this session is too busy to
   /// send stays queued as unconfirmed, for Check. A control is saved nowhere, so one that cannot
-  /// go now is not sent at all, and this returns false.
+  /// go now is not sent at all, and this returns false. A retired session sends nothing, and a
+  /// durable input stays in the outbox for the profile's next session or for Remove to delete.
   @discardableResult public func start(_ staged: StagedInput) -> Bool {
     guard staged.profile == profile else { return false }
+    guard !retired else { return staged.control == nil }
     if staged.control == nil {
       guard unsent[staged.inputID] == .staged else { return true }
       guard snapshot.connection == .connected else {
@@ -333,7 +346,7 @@ public actor CoordinatorSession {
   }
 
   public func retry(_ inputID: String) {
-    guard actions.count < 32, snapshot.connection == .connected,
+    guard !retired, actions.count < 32, snapshot.connection == .connected,
       let item = pending.first(where: { $0.request.inputId == inputID })
     else { return }
     unsent[inputID] = nil
@@ -976,6 +989,7 @@ public actor CoordinatorSession {
   }
 
   @discardableResult private func saveLedger() -> Bool {
+    guard !retired else { return false }
     ledger.prune(keeping: transcript.unpreparedRows)
     do {
       try writePrivately(JSONEncoder().encode(ledger), to: ledgerURL)
@@ -1052,6 +1066,7 @@ public actor CoordinatorSession {
     }
   }
   private func saveOutbox() throws {
+    guard !retired else { throw CancellationError() }
     try writePrivately(JSONEncoder().encode(pending), to: outboxURL)
   }
 }

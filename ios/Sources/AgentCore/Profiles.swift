@@ -150,7 +150,7 @@ public struct ProfileDirectory: Sendable {
   var previews: URL { cache.appending(path: "Previews") }
 
   /// Deletes everything the phone keeps for this profile. Call only after its session is
-  /// quiesced and `profiles.json` no longer lists it.
+  /// retired and `profiles.json` no longer lists it.
   public func remove() throws {
     for url in [root, cache] where FileManager.default.fileExists(atPath: url.path) {
       try FileManager.default.removeItem(at: url)

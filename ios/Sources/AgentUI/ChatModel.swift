@@ -142,9 +142,10 @@ final class ChatModel {
     Task { await loadHeld(lane) }
   }
 
-  /// Stops sends to the lane and quiesces its session before returning, so nothing writes
-  /// to the profile's directory afterwards.
+  /// Retires the lane's session, then drops the lane. Every session that is not in a lane is
+  /// retired, so nothing connects, sends or writes the profile's directory through it again.
   func detach(_ id: ProfileID) async {
+    await lanes.first { $0.id == id }?.session?.retire()
     guard let index = lanes.firstIndex(where: { $0.id == id }) else { return }
     let lane = lanes.remove(at: index)
     observations.removeValue(forKey: id)?.cancel()
@@ -155,11 +156,12 @@ final class ChatModel {
       if !multiple { error = nil }
       refresh()
     }
-    await lane.session?.disconnect()
   }
 
+  /// Reads each lane again after every await, so a lane detached meanwhile is skipped.
   func setActive(_ active: Bool) async {
-    for session in lanes.compactMap(\.session) {
+    for id in lanes.map(\.id) {
+      guard let session = lanes.first(where: { $0.id == id })?.session else { continue }
       if active { await session.connect() } else { await session.disconnect() }
     }
   }
@@ -167,8 +169,8 @@ final class ChatModel {
   /// "Try again": reconnects now instead of waiting out the backoff, one lane or every lane
   /// that is not connected.
   func reconnect(_ id: ProfileID? = nil) async {
-    for lane in lanes where id == lane.id || (id == nil && !connected(lane.id)) {
-      await lane.session?.connect()
+    for lane in lanes.map(\.id) where id == lane || (id == nil && !connected(lane)) {
+      await lanes.first { $0.id == lane }?.session?.connect()
     }
   }
 

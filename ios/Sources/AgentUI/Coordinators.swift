@@ -190,7 +190,7 @@ public final class Coordinators {
   /// it removed, with no await since the check, so nothing addresses it again. Then saves
   /// `profiles.json` without it and with its pending alert withdrawal in one write, and a failed
   /// save changes nothing else. Only then withdraws alerts over the still-attached session,
-  /// quiesces the lane and deletes the profile's files.
+  /// retires the lane's session and deletes the profile's files.
   func remove(_ id: ProfileID) async throws {
     try await serially {
       guard let profile = profiles.first(where: { $0.id == id }) else { return }

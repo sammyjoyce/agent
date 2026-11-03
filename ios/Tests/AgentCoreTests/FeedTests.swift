@@ -363,6 +363,10 @@ private func submits(_ fixture: FixtureCoordinator) async -> [NativeRequestSubmi
   await fixture.received().compactMap { if case .submit(let input) = $0 { input } else { nil } }
 }
 
+private func observes(_ fixture: FixtureCoordinator) async -> Int {
+  await fixture.received().filter { if case .observe = $0 { true } else { false } }.count
+}
+
 @MainActor @Test(.timeLimit(.minutes(1)))
 func aSecondCoordinatorIsAddedOnceUnderItsOwnName() async throws {
   try await withTwoFixtures { coordinators, first, _, _ in
@@ -949,10 +953,10 @@ func aMessageToBothKeepsItsRecipientsAfterOneIsRemovedAndAddedAgain() async thro
 
 // MARK: - Profile mutations run one at a time, and Remove commits before it withdraws
 
-/// An address edit swaps Work's session, and Remove starts while the old lane is detached and
-/// the new one is not attached yet. Remove waits for the edit, so Work keeps no lane, no row and
-/// no directory. Tests run in parallel on the main actor, so an iteration can miss that window
-/// and then removes Work after the edit.
+/// An address edit swaps Work's session, and Remove starts while the edit retires the old session
+/// or connects the new one. Remove waits for the edit, so Work keeps no lane, no row and no
+/// directory. Tests run in parallel on the main actor, so an iteration can miss that window and
+/// then removes Work after the edit.
 @MainActor @Test(.timeLimit(.minutes(2)))
 func anEditAndARemoveOfOneCoordinatorRunOneAfterTheOther() async throws {
   var overlapped = 0
@@ -974,8 +978,11 @@ func anEditAndARemoveOfOneCoordinatorRunOneAfterTheOther() async throws {
           work, name: TagName("Office"), address: CoordinatorAddress(host: "100.64.1.3", port: 4001)
         )
       }
-      while !editFinished && chat.lanes.contains(where: { $0.id == work }) { await Task.yield() }
-      if !chat.lanes.contains(where: { $0.id == work }) { overlapped += 1 }
+      let original = chat.lanes.first { $0.id == work }?.session
+      while !editFinished, chat.snapshots[work]?.connection == .connected,
+        chat.lanes.first(where: { $0.id == work })?.session === original
+      { await Task.yield() }
+      if !editFinished { overlapped += 1 }
       try await coordinators.remove(work)
       try await editing.value
       try await Task.sleep(for: .milliseconds(150))
@@ -987,7 +994,7 @@ func anEditAndARemoveOfOneCoordinatorRunOneAfterTheOther() async throws {
       #expect(!FileManager.default.fileExists(atPath: directory.root.path))
     }
   }
-  #expect(overlapped > 0, "Remove started while the edit had Work's lane detached")
+  #expect(overlapped > 0, "Remove started while the edit swapped Work's session")
 }
 
 /// The same edit and Remove, then `/feedback` with Personal alone saved. The automatic
@@ -1011,9 +1018,11 @@ func aFeedbackScreenshotAfterAnEditAndRemoveShowsOnlyTheCoordinatorLeft() async 
       try await coordinators.update(
         work, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.3", port: 4001))
     }
-    while !editFinished && chat.lanes.contains(where: { $0.id == work }) { await Task.yield() }
-    try #require(
-      !chat.lanes.contains { $0.id == work }, "Remove starts while the edit has Work detached")
+    let original = chat.lanes.first { $0.id == work }?.session
+    while !editFinished, chat.snapshots[work]?.connection == .connected,
+      chat.lanes.first(where: { $0.id == work })?.session === original
+    { await Task.yield() }
+    try #require(!editFinished, "Remove starts while the edit swaps Work's session")
     try await coordinators.remove(work)
     try await editing.value
     try await Task.sleep(for: .milliseconds(500))
@@ -1181,6 +1190,63 @@ func aPendingWithdrawalIsDroppedOnceItsAddressAnswersAsAnotherCoordinator() asyn
   chat.removed[directory.profile] = "Work"
   chat.attach(Lane(id: directory.profile, session: nil, hold: LegacyHold(directory)))
   #expect(chat.lanes.isEmpty)
+}
+
+/// The app becomes active while Remove of Personal runs, as when it returns to the foreground
+/// during a confirmed Remove. Both start on the main actor in this order. Nothing may dial
+/// Personal again or write into its deleted directory after Remove returns.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func anActivationDuringRemoveNeverReconnectsTheRemovedCoordinator() async throws {
+  try await withTwoFixtures { coordinators, _, personalFixture, root in
+    let (_, personal) = try await addWorkAndPersonal(coordinators)
+    let directory = ProfileDirectory(personal, applicationSupport: root, caches: root)
+    await personalFixture.replyToHistory(
+      initial: .init(
+        messages: [
+          HistoryMessage(
+            continuation: false, entryId: "p-reply", finalChunk: true, role: .final,
+            text: "An invented Personal reply")
+        ], nextCursor: nil, pageComplete: true), pages: [:])
+    let activating = Task { @MainActor in await coordinators.setActive(true) }
+    let removing = Task { @MainActor in try await coordinators.remove(personal) }
+    await activating.value
+    try await removing.value
+    let observesAtRemove = await observes(personalFixture)
+    #expect(coordinators.profiles.map(\.name.description) == ["Work"])
+    #expect(!FileManager.default.fileExists(atPath: directory.ledger.path))
+    try await Task.sleep(for: .seconds(2))
+    #expect(
+      await observes(personalFixture) == observesAtRemove,
+      "Nothing dials the removed coordinator again")
+    #expect(
+      !FileManager.default.fileExists(atPath: directory.ledger.path),
+      "Nothing writes into the removed coordinator's directory")
+  }
+}
+
+/// The same activation, with a message to Personal waiting for Personal's lane to reconnect.
+/// Remove's confirmation says it deletes that message, so it must never leave the phone.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func anActivationDuringRemoveNeverSendsTheMessageRemoveDeletes() async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, _ in
+    let (_, personal) = try await addWorkAndPersonal(coordinators)
+    let session = try #require(coordinators.chat.lanes.first { $0.id == personal }?.session)
+    let text = "Invented: renew the passport before March"
+    let staged = try #require(
+      await session.stage(text, sendID: UUID().uuidString, recipients: [personal]))
+    await session.disconnect()
+    #expect(await session.start(staged))
+    #expect(
+      await coordinators.removalMessage(personal)
+        == "This deletes 1 queued message on this phone.")
+    let activating = Task { @MainActor in await coordinators.setActive(true) }
+    let removing = Task { @MainActor in try await coordinators.remove(personal) }
+    await activating.value
+    try await removing.value
+    try await Task.sleep(for: .seconds(2))
+    #expect(await submits(personalFixture).isEmpty, "Remove deleted this message")
+    #expect(await submits(workFixture).isEmpty)
+  }
 }
 
 // MARK: - A recipient reads not sent only from a positive record, and unknown without one
