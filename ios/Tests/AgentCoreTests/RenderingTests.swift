@@ -957,6 +957,46 @@
         }
       }
 
+      /// Restores a message held for Work, with `text`, into the hosted composer.
+      @MainActor private func restoreHeld(
+        _ text: String, model: ChatModel, work: CoordinatorProfile
+      ) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = ProfileDirectory(work.id, applicationSupport: root, caches: root)
+        try writePrivately(
+          JSONEncoder().encode([
+            NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: text)
+          ]), to: directory.legacy.appending(path: "pending.json"))
+        let hold = LegacyHold(directory)
+        model.attach(Lane(id: work.id, session: nil, hold: hold))
+        let item = try #require(try await hold.items().first)
+        await model.restoreHeld(HeldMessage(lane: work.id, item: item))
+        try await Task.sleep(for: .milliseconds(250))
+      }
+
+      /// A message held for Work is restored. Its text is a heading line, then "@Personal …". After
+      /// the chip's ⓧ the user selects the heading in the field and deletes it. The tag now at the
+      /// start is the restored text's own, so it stays text and no chip appears.
+      @MainActor @Test func deletingARestoredHeadingInTheFieldPromotesNothing() async throws {
+        try await withComposer { model, box, work in
+          let field = box.draft
+          let heading = "Invented memo heading\n"
+          let body = "@Personal invented quotation"
+          try await restoreHeld(heading + body, model: model, work: work)
+          model.recipient = nil
+          try await Task.sleep(for: .milliseconds(200))
+          field.selectedRange = NSRange(location: 0, length: heading.utf16.count)
+          field.deleteBackward()
+          try await Task.sleep(for: .milliseconds(300))
+          print(
+            "IF8-W2[field] deleting the selected heading: text=\(model.draft.debugDescription) chip=\(model.recipient.map(model.name) ?? "none")"
+          )
+          #expect(model.recipient == nil)
+          #expect(model.draft == body)
+        }
+      }
+
       /// The user types a line after the chip and its ⓧ removes the chip. Then the user types more,
       /// and the chip comes back. Each time the chip comes or goes, the draft is drawn at once where
       /// its layout puts it, at the field's leading edge without the chip and after it with one, so

@@ -1763,12 +1763,11 @@ func aRecipientWhoseLedgerCouldNotBeReadReadsUnknownAfterTheClockMovedBack() asy
   await personalPeer.stop()
 }
 
-/// Personal refuses its copy of a message to both. Restoring that copy and sending it to Work
-/// instead discards Personal's original, so Personal never placed the message, and the original
-/// bubble must not read "To Work and Personal".
+/// Personal refuses its copy of a message to both, and the user discards it. Personal never placed
+/// the message, so the bubble must not read "To Work and Personal".
 @MainActor @Test(.timeLimit(.minutes(1)))
-func aCopyRestoredFromPersonalAndSentToWorkLeavesTheOriginalNotSentToPersonal() async throws {
-  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+func aCopyDiscardedAtPersonalLeavesTheOriginalNotSentToPersonal() async throws {
+  try await withTwoFixtures { coordinators, _, personalFixture, root in
     await personalFixture.refuseUploads()
     let (work, personal) = try await addWorkAndPersonal(coordinators)
     let chat = coordinators.chat
@@ -1790,13 +1789,7 @@ func aCopyRestoredFromPersonalAndSentToWorkLeavesTheOriginalNotSentToPersonal() 
     try await eventually("both connected") {
       chat.snapshots.values.filter { $0.connection == .connected }.count == 2
     }
-    await chat.restore(try #require(rejected))
-    chat.recipient = nil
-    chat.draft = "@Work " + chat.draft
-    chat.promoteTypedTag()
-    #expect(chat.recipient == work && chat.recipientLine == "To Work")
-    await chat.send()
-    try await eventually("the copy at Work") { await workFixture.count() == 2 }
+    await chat.discard(try #require(rejected))
     let personalOutbox = ProfileDirectory(personal, applicationSupport: root, caches: root).outbox
     try await eventually("Personal's original withdrawn") {
       (try? queuedRequests(personalOutbox))?.isEmpty == true
@@ -3381,25 +3374,91 @@ func aRestoredDraftsTextStaysLiteralOnceItsChipIsRemoved(_ text: String) async t
   }
 }
 
-/// The same restored draft. After the chip's ⓧ the user types "@Work " at its start, and that tag
-/// still becomes the chip, with the restored text after it, literal.
+/// The same restored draft. After the chip's ⓧ the user types "@Work " at its start. A restored
+/// draft's text is literal for good, so the typed tag stays text, the picker stays closed, and the
+/// draft goes to every coordinator as written.
 @MainActor @Test(.timeLimit(.minutes(1)))
-func aTagTypedAtTheStartOfARestoredDraftStillBecomesTheChip() async throws {
+func aTagTypedAtTheStartOfARestoredDraftStaysLiteral() async throws {
   try await withTwoFixtures { coordinators, workFixture, _, root in
-    let (work, _) = try await addWorkAndPersonal(coordinators)
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
     let chat = coordinators.chat
     let text = "@Personal invented: forward Work's board deck to the auditors"
     _ = try await restoreWorkOnlyMessage(chat, workFixture, text, root: root)
     chat.recipient = nil
+    var offered: [String] = []
     for (offset, character) in "@Work ".enumerated() {
       chat.draft.insert(character, at: chat.draft.index(chat.draft.startIndex, offsetBy: offset))
       chat.promoteTypedTag()
+      offered += chat.pickerMatches.map(\.name.description)
     }
     print(
-      "IF7-V4[typed at the start] chip=\(chat.recipient.map(chat.name) ?? "none") line=\(chat.recipientLine) draft=\(chat.draft.debugDescription)"
+      "IF8-W2[typed at the start] chip=\(chat.recipient.map(chat.name) ?? "none") picker=\(offered) line=\(chat.recipientLine) draft=\(chat.draft.debugDescription)"
     )
-    #expect(chat.recipient == work && chat.draft == text)
-    #expect(chat.recipientLine == "To Work" && chat.addressing == .to([work], body: text))
+    #expect(chat.recipient == nil && chat.draft == "@Work " + text)
+    #expect(offered.isEmpty, "The picker opened over a restored draft")
+    #expect(chat.recipientLine == "To Work and Personal")
+    #expect(chat.addressing == .to([work, personal], body: "@Work " + text))
+  }
+}
+
+/// Work refuses a message whose text is a heading line, then "@Personal …", and the user restores
+/// it and removes its chip. Deleting the heading leaves "@Personal " at the start, but it is the
+/// restored text's own, so it stays literal. Both coordinators get the text and the file as they
+/// are, and nothing becomes Personal's alone.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func deletingARestoredDraftsHeadingPromotesNothing() async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let heading = "Invented memo heading\n"
+    let body = "@Personal invented quotation from Work's meeting"
+    _ = try await restoreWorkOnlyMessage(chat, workFixture, heading + body, root: root)
+    chat.recipient = nil
+    print(
+      "IF8-W2[heading] before deletion: \(chat.recipientLine), text=\(chat.draft.debugDescription)")
+    chat.draft.removeFirst(heading.count)
+    chat.promoteTypedTag()
+    print(
+      "IF8-W2[heading] after deleting it: \(chat.recipientLine), text=\(chat.draft.debugDescription), chip=\(chat.recipient.map(chat.name) ?? "none")"
+    )
+    #expect(chat.recipient == nil)
+    #expect(chat.addressing == .to([work, personal], body: body))
+    await workFixture.acceptUploads()
+    await chat.send()
+    try await eventually("Personal got it") { await personalFixture.count() == 1 }
+    _ = await within(3) { await workFixture.count() == 1 }
+    let atWork = await submits(workFixture)
+    let atPersonal = await submits(personalFixture)
+    print(
+      "IF8-W2[heading] wire: Work=\(atWork.map(\.text)) Personal=\(atPersonal.map(\.text)) files=\(atWork.flatMap { $0.attachments ?? [] }.map(\.name)) \(atPersonal.flatMap { $0.attachments ?? [] }.map(\.name))"
+    )
+    #expect(atWork.map(\.text) == [body] && atPersonal.map(\.text) == [body])
+    #expect(atWork.flatMap { $0.attachments ?? [] }.map(\.name) == ["Deck.txt"])
+    #expect(atPersonal.flatMap { $0.attachments ?? [] }.map(\.name) == ["Deck.txt"])
+  }
+}
+
+/// The user removes a restored draft's chip, deletes the "@" of its leading "@Personal" and types
+/// it again, one edit each, as the field reports them. The tag is still the restored text's own,
+/// so the draft stays literal and goes to both coordinators as written.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func retypingTheAtSignOfARestoredTagPromotesNothing() async throws {
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let text = "@Personal invented: forward Work's board deck to the auditors"
+    _ = try await restoreWorkOnlyMessage(chat, workFixture, text, root: root)
+    chat.recipient = nil
+    chat.draft.removeFirst()
+    chat.promoteTypedTag()
+    chat.draft.insert("@", at: chat.draft.startIndex)
+    chat.promoteTypedTag()
+    print(
+      "IF8-W2[retyped @] chip=\(chat.recipient.map(chat.name) ?? "none") line=\(chat.recipientLine) draft=\(chat.draft.debugDescription)"
+    )
+    #expect(chat.recipient == nil, "One retyped @ promoted Work's restored text to a chip")
+    #expect(chat.draft == text, "The restored text changed")
+    #expect(chat.addressing == .to([work, personal], body: text))
   }
 }
 
