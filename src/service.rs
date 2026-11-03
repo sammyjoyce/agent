@@ -11,12 +11,14 @@ use std::{
 
 use crate::{
     broker::Broker,
+    coordinator_id::CoordinatorId,
+    native::{NativeEvent, NativeRequest},
     protocol::{CoordinatorBootstrap, HostCommand, RuntimeCommand, RuntimeEventKind},
 };
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     task::JoinSet,
     time::timeout,
@@ -317,6 +319,17 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         .context("Client sent no command")?;
     let mut command: RuntimeCommand =
         serde_json::from_slice(&initial).context("Client sent an invalid command")?;
+    if matches!(
+        command,
+        RuntimeCommand::Native {
+            request: NativeRequest::Identify
+        }
+    ) {
+        let Some(next) = identify(&mut reader, &mut writer, runtime.coordinator_id()).await? else {
+            return Ok(());
+        };
+        command = next;
+    }
     let attachment = match &command {
         RuntimeCommand::Attachment { request } => Some((request.clone(), false)),
         RuntimeCommand::Native {
@@ -572,6 +585,32 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     }
     runtime.detach(call.request_id).await;
     result
+}
+
+/// Answers the `Identify` preamble, then reads the connection's real first
+/// command. Returns `None` when the client only asked who answers.
+async fn identify<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut FrameReader<R>,
+    writer: &mut W,
+    coordinator: CoordinatorId,
+) -> Result<Option<RuntimeCommand>> {
+    write_frame(
+        writer,
+        &NativeEvent::Identity {
+            coordinator_id: coordinator.to_string(),
+        },
+    )
+    .await?;
+    let Some(frame) = timeout(Duration::from_secs(60), reader.next_frame()).await?? else {
+        return Ok(None);
+    };
+    let next: RuntimeCommand =
+        serde_json::from_slice(&frame).context("Client sent an invalid command")?;
+    ensure!(
+        matches!(next, RuntimeCommand::Native { .. }),
+        "An identified connection must carry native requests"
+    );
+    Ok(Some(next))
 }
 
 fn disconnected() -> crate::protocol::HostResult {
@@ -1199,6 +1238,79 @@ mod tests {
         let event: RuntimeEventKind =
             serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
         assert!(matches!(event, RuntimeEventKind::Done));
+    }
+
+    async fn exchange(mut stream: UnixStream, commands: &[RuntimeCommand], close: bool) -> String {
+        for command in commands {
+            write_frame(&mut stream, command).await.unwrap();
+        }
+        if close {
+            stream.shutdown().await.unwrap();
+        }
+        let mut bytes = Vec::new();
+        timeout(Duration::from_secs(3), stream.read_to_end(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn identify_names_the_coordinator_before_the_unchanged_first_request() {
+        use crate::native::NativeRequest::{Identify, Observe};
+        let native = |request| RuntimeCommand::Native { request };
+        let service = Running::start().await;
+        let identity = format!(
+            "{{\"type\":\"identity\",\"coordinator_id\":\"{}\"}}\n",
+            fs::read_to_string(service.directory.path().join("coordinator-id")).unwrap()
+        );
+        let observe = || {
+            native(Observe {
+                input_ids: vec![],
+                source_status: None,
+            })
+        };
+        let plain = exchange(service.client().await, &[observe()], false).await;
+        assert!(plain.starts_with(r#"{"type":"commands""#), "{plain}");
+        assert_eq!(
+            exchange(
+                service.client().await,
+                &[native(Identify), observe()],
+                false
+            )
+            .await,
+            identity.clone() + &plain
+        );
+        assert_eq!(
+            exchange(service.client().await, &[native(Identify)], true).await,
+            identity
+        );
+        assert_eq!(
+            exchange(
+                service.client().await,
+                &[native(Identify), native(Identify)],
+                false
+            )
+            .await,
+            identity.clone()
+                + r#"{"type":"failure","message":"Identify must be the first request on a connection"}"#
+                + "\n"
+                + r#"{"type":"done"}"#
+                + "\n"
+        );
+        fs::remove_file(service.directory.path().join("admitted")).unwrap();
+        assert_eq!(
+            exchange(
+                service.client().await,
+                &[native(Identify), RuntimeCommand::Status],
+                false
+            )
+            .await,
+            identity
+        );
+        assert!(!service.directory.path().join("admitted").exists());
+        status(service.client().await).await;
+        service.stop().await;
     }
 
     #[tokio::test]

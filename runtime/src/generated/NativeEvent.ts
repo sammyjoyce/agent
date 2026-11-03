@@ -16,4 +16,4 @@ export type NativeEvent = { "type": "feedback_ready", input_id: string, receipt:
 /**
  * Additive to the legacy notice shape, so older observers still decode it.
  */
-settings?: NativeSettingsSnapshot, job_status?: NativeJobStatus, } | { "type": "failure", message: string, } | { "type": "idle" } | { "type": "disconnect" } | { "type": "notifications", status: NotificationStatus, } | { "type": "done" };
+settings?: NativeSettingsSnapshot, job_status?: NativeJobStatus, } | { "type": "failure", message: string, } | { "type": "idle" } | { "type": "disconnect" } | { "type": "notifications", status: NotificationStatus, } | { "type": "done" } | { "type": "identity", coordinator_id: string, };

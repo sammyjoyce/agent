@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use crate::coordinator_id::CoordinatorId;
 use crate::protocol::{
     ErrorCode, HostResult, PROTOCOL_VERSION, RuntimeCommand, RuntimeEvent, RuntimeEventKind,
     RuntimeRequest,
@@ -51,6 +52,7 @@ pub struct Runtime {
     actor: Option<JoinHandle<Result<()>>>,
     shutdown: watch::Sender<bool>,
     service_diagnostics: Mutex<Diagnostics>,
+    coordinator_id: CoordinatorId,
 }
 
 enum CommandMessage {
@@ -127,6 +129,7 @@ impl Runtime {
             .open(state.join("writer.lock"))?;
         fs2::FileExt::try_lock_exclusive(&guard)
             .context("Another agent process owns this state directory")?;
+        let coordinator_id = CoordinatorId::load_or_mint(state)?;
         let lock_fd = guard.as_raw_fd();
         let mut command = Command::new("node");
         command
@@ -194,7 +197,12 @@ impl Runtime {
             actor: Some(actor),
             shutdown,
             service_diagnostics,
+            coordinator_id,
         })
+    }
+
+    pub fn coordinator_id(&self) -> CoordinatorId {
+        self.coordinator_id
     }
 
     pub async fn request(&self, command: RuntimeCommand) -> Result<RuntimeCall> {

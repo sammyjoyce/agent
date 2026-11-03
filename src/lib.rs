@@ -2,6 +2,7 @@ pub mod attachments;
 pub mod chat_commands;
 pub mod config;
 pub mod context;
+pub mod coordinator_id;
 pub mod discovery;
 pub mod embeddings;
 pub mod feedback;
