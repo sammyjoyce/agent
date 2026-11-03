@@ -233,6 +233,33 @@ final class ComposerInteractionTests: XCTestCase {
     XCTAssertTrue(first.hasPrefix("Add attachments or commands"), first)
   }
 
+  // The feed follows Work's replies as they arrive, from one to more than fill the screen. At
+  // each length, opening the picker keeps the newest reply above it.
+  func testOpeningThePickerKeepsTheNewestReplyAboveItAtEveryFeedLength() async throws {
+    let (app, work, _) = try await launchWithWorkAndPersonal()
+    defer { app.terminate() }
+    let composer = app.descendants(matching: .any).matching(identifier: "Message the coordinator")
+      .firstMatch
+    composer.tap()
+    var covered: [Int] = []
+    for count in 1...16 {
+      let newest = "Reply \(count) from Work, long enough to fill a line of the feed."
+      try await work.reply(newest, id: "reply-\(count)")
+      XCTAssertTrue(app.staticTexts[newest].waitForExistence(timeout: 5))
+      try await Task.sleep(for: .milliseconds(500))
+      if !app.keyboards.keys["@"].exists { app.keyboards.keys["more"].tap() }
+      app.keyboards.keys["@"].tap()
+      let picker = app.buttons["Send to Work"]
+      XCTAssertTrue(picker.waitForExistence(timeout: 3))
+      try await Task.sleep(for: .milliseconds(500))
+      // The picker's rows sit 6 points inside its card.
+      if app.staticTexts[newest].frame.maxY > picker.frame.minY - 6 { covered.append(count) }
+      app.keyboards.keys["delete"].tap()
+      XCTAssertTrue(picker.waitForNonExistence(timeout: 3))
+    }
+    XCTAssertEqual(covered, [], "The picker covered the newest reply with this many replies")
+  }
+
   // A person's scroll while the whole feed fits picks the first row as the reading position.
   // Replies then grow the feed past the screen, and the app follows them to the bottom.
   func testOpeningThePickerKeepsTheNewestRepliesInView() async throws {

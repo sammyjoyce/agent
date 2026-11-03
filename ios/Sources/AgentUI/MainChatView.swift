@@ -346,6 +346,15 @@ public struct MainChatView: View {
       .onChange(of: model.revision) { _, _ in
         if followsLatest { scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom) }
       }
+      .onScrollGeometryChange(for: CGFloat.self) { geometry in
+        geometry.containerSize.height
+      } action: { old, new in
+        // A taller composer, such as one opening the picker, makes the feed shorter. SwiftUI keeps
+        // its bottom in view for a short feed but not for a long one.
+        if new < old && followsLatest && !userScrolling {
+          scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
+        }
+      }
       .onChange(of: notifications?.openedTarget) { _, target in
         if target != nil { scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom) }
       }
