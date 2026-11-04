@@ -181,7 +181,8 @@ func migrationQuarantinesTheLastQueueIntoAnUnpairedProfileShownAtOnce() async th
 @MainActor
 @Test(
   arguments: [
-    Coordinators.MigrationStep.queueNamed, .profileSaved, .quarantined, .markerRemoved,
+    Coordinators.MigrationStep.queueNamed, .profileSaved, .queueListed, .quarantined,
+    .markerRemoved,
   ])
 func migrationResumesAfterACrashAtEveryStepWithACustomPort(_ step: Coordinators.MigrationStep)
   async throws
@@ -206,9 +207,10 @@ func migrationResumesAfterACrashAtEveryStepWithACustomPort(_ step: Coordinators.
 }
 
 private let stoppedThenRelaunched: [(step: Coordinators.MigrationStep, host: String)] = [
-  (.queueNamed, "100.64.1.2"), (.profileSaved, "100.64.1.2"), (.quarantined, "100.64.1.2"),
-  (.markerRemoved, "100.64.1.2"), (.queueNamed, "100.64.1.3"), (.profileSaved, "100.64.1.3"),
-  (.quarantined, "100.64.1.3"), (.markerRemoved, "100.64.1.3"),
+  (.queueNamed, "100.64.1.2"), (.profileSaved, "100.64.1.2"), (.queueListed, "100.64.1.2"),
+  (.quarantined, "100.64.1.2"), (.markerRemoved, "100.64.1.2"), (.queueNamed, "100.64.1.3"),
+  (.profileSaved, "100.64.1.3"), (.queueListed, "100.64.1.3"), (.quarantined, "100.64.1.3"),
+  (.markerRemoved, "100.64.1.3"),
 ]
 
 /// A migration stops after a step, then the single-address build runs again and queues another
@@ -243,7 +245,8 @@ func theSingleAddressBuildQueuingAgainBeforeAMigrationResumesGetsAQueueOfItsOwn(
   install.defaults.set(host, forKey: "coordinatorAddress")
   if resumeStops {
     for stop in [
-      Coordinators.MigrationStep.queueNamed, .profileSaved, .quarantined, .markerRemoved,
+      Coordinators.MigrationStep.queueNamed, .profileSaved, .queueListed, .quarantined,
+      .markerRemoved,
     ] {
       migrate(stoppingAfter: stop)
     }
@@ -791,7 +794,8 @@ func anAddressEditThatPairsTheMigratedProfileElsewhereSendsTheBuildsInstallation
 @Test(
   .timeLimit(.minutes(1)),
   arguments: [
-    Coordinators.MigrationStep.queueNamed, .profileSaved, .quarantined, .markerRemoved,
+    Coordinators.MigrationStep.queueNamed, .profileSaved, .queueListed, .quarantined,
+    .markerRemoved,
   ])
 func theSingleAddressBuildsAlertInstallationIsWithdrawnAfterACrashAndALostReply(
   _ step: Coordinators.MigrationStep
@@ -2698,7 +2702,8 @@ func theShippedBuildsLaunchDeletesNothingThisBuildSaved() async throws {
 @MainActor
 @Test(
   arguments: [
-    Coordinators.MigrationStep.queueNamed, .profileSaved, .quarantined, .markerRemoved,
+    Coordinators.MigrationStep.queueNamed, .profileSaved, .queueListed, .quarantined,
+    .markerRemoved,
   ])
 func aMigrationStoppedAtAnyStepLeavesTheShippedBuildNothingToDelete(
   _ step: Coordinators.MigrationStep

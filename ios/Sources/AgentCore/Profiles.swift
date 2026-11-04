@@ -277,16 +277,6 @@ public struct HeldQueue: Codable, Sendable, Equatable, Identifiable {
     return named
   }
 
-  /// Makes `source` a queue's folder: names it, then renames it into `Agent/Held`. A stop at any
-  /// point resumes with the queue its record names.
-  public static func adopt(_ source: URL, as queue: HeldQueue, applicationSupport: URL) throws
-    -> HeldQueue
-  {
-    let named = try name(source, as: queue, applicationSupport: applicationSupport)
-    try moveOnce(source, to: named.folder(applicationSupport: applicationSupport))
-    return named
-  }
-
   /// Renames the queue's folder to the name only a deletion reads, and returns that name. A launch
   /// deletes what a Remove marked and did not finish deleting.
   public func markDeleted(applicationSupport: URL) throws -> URL {
