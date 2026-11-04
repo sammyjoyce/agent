@@ -494,6 +494,8 @@ extension Coordinators {
   /// - Only pairing changes an unpaired profile's address, so its `Legacy` folder was queued for it.
   /// - A recorded `origin` is a folder's only when exactly one holder matches it: unpaired at its
   ///   address, or pinned to its coordinator.
+  /// - A `held` record with the holder's ID is its `Legacy` folder's only while that queue has no
+  ///   folder in `Agent/Held`. Once it has one, the `Legacy` folder came later.
   /// - Anything else is unknown, and Restore asks.
   /// An installation no folder took keeps a queue of its own at its address.
   private static func adoptEarlier(
@@ -514,7 +516,10 @@ extension Coordinators {
     for directory in holders {
       let id = directory.profile
       let queue: HeldQueue
-      if let record = saved.held.first(where: { $0.id.uuidString == id.description }) {
+      if let record = saved.held.first(where: { $0.id.uuidString == id.description }),
+        !FileManager.default.fileExists(
+          atPath: record.folder(applicationSupport: applicationSupport).path)
+      {
         queue = record
       } else if let origin, originHolder == id {
         queue = HeldQueue(

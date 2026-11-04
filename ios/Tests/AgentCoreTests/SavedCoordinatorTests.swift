@@ -2880,8 +2880,10 @@ func aRecordOfAQueueAlreadyHeldGivesNothingToALaterLegacyFolder() async throws {
     let held = try #require(chat.held.first { $0.item.text == later })
     await chat.restoreHeld(held)
     let restored = (draft: chat.draft, recipient: chat.recipient)
-    if !chat.draft.isEmpty { await chat.send() }
-    _ = try await settles { await submitted(work) + submitted(personal) != [] }
+    if !chat.draft.isEmpty {
+      await chat.send()
+      _ = try await settles { await submitted(work) + submitted(personal) != [] }
+    }
     print(
       "IF17-S2[a later note in Personal's Legacy folder] owners=\(owners) Restore: draft=\(restored.draft.debugDescription) to=\(restored.recipient.map(chat.name) ?? "nobody") after Send: Work's coordinator got=\(await submitted(work)) Personal's coordinator got=\(await submitted(personal))"
     )
