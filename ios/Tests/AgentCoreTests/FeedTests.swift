@@ -1040,7 +1040,8 @@ func anEditAndARemoveOfOneCoordinatorRunOneAfterTheOther() async throws {
 /// screenshot shows the feed at Send, so that feed must hold nothing of Work.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func aFeedbackScreenshotAfterAnEditAndRemoveShowsOnlyTheCoordinatorLeft() async throws {
-  try await withTwoFixtures { coordinators, workFixture, personalFixture, _ in
+  let gate = DialGate()
+  try await withTwoFixtures(holdingWork: gate) { coordinators, workFixture, personalFixture, _ in
     let (work, personal) = try await addWorkAndPersonal(coordinators)
     let chat = coordinators.chat
     let workOnly = "Invented private Work-only board minutes"
@@ -1051,19 +1052,22 @@ func aFeedbackScreenshotAfterAnEditAndRemoveShowsOnlyTheCoordinatorLeft() async 
             continuation: false, entryId: "private-work", finalChunk: true, role: .final,
             text: workOnly)
         ], pageComplete: true), pages: [:])
-    var editFinished = false
+    await gate.arm()
     let editing = Task { @MainActor in
-      defer { editFinished = true }
       try await coordinators.update(
         work, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.3", port: 4001))
     }
-    let original = chat.lanes.first { $0.id == work }?.session
-    while !editFinished, chat.snapshots[work]?.connection == .connected,
-      chat.lanes.first(where: { $0.id == work })?.session === original
-    { await Task.yield() }
-    try #require(!editFinished, "Remove starts while the edit swaps Work's session")
-    try await coordinators.remove(work)
+    try await eventually("the edit proving Work's new address") { await gate.waiting }
+    // Profile changes run one at a time, so Remove waits its turn while the edit is held there.
+    var removeCalled = false
+    let removing = Task { @MainActor in
+      removeCalled = true
+      try await coordinators.remove(work)
+    }
+    try await eventually("Remove called during the edit") { removeCalled }
+    await gate.open()
     try await editing.value
+    try await removing.value
     try await Task.sleep(for: .milliseconds(500))
     #expect(coordinators.profiles.map(\.id) == [personal])
     var shown: [String]?
@@ -3689,6 +3693,13 @@ func aRestoredDraftEditedWhileItsSendCopiesStaysLiteral() async throws {
     chat.promoteTypedTag()
     let during = chat.recipientLine
     await sending.value
+    // The fixtures close each accepted submit's socket unanswered, so both lanes reconnect, and
+    // until then the line says which is not connected instead of naming the recipients.
+    try await eventually("both observe again") {
+      let again = await observes(workFixture) + observes(personalFixture)
+      return again >= observed + 2
+        && chat.snapshots.values.allSatisfy { $0.connection == .connected }
+    }
     let after = chat.recipientLine
     chat.draft += "."
     chat.promoteTypedTag()
@@ -3701,14 +3712,10 @@ func aRestoredDraftEditedWhileItsSendCopiesStaysLiteral() async throws {
     #expect(chat.recipient == nil, "The restored text's own tag became the chip after Send")
     #expect(chat.addressing == .to([work, personal], body: body + "."))
     #expect(!originalQueued, "Send carried the restored message unchanged, yet the original stays")
-    // The fixtures close each accepted submit's socket unanswered, so both lanes reconnect.
-    try await eventually("both observe again") {
-      let again = await observes(workFixture) + observes(personalFixture)
-      return again >= observed + 2
-        && chat.snapshots.values.allSatisfy { $0.connection == .connected }
-    }
     await chat.send()
-    _ = await within(3) { await workFixture.count() + personalFixture.count() == 4 }
+    try await eventually("both got the next Send") {
+      await workFixture.count() + personalFixture.count() == 4
+    }
     let atWork = await submits(workFixture).map(\.text)
     let atPersonal = await submits(personalFixture).map(\.text)
     print("IF9-Y1 wire: Work=\(atWork) Personal=\(atPersonal)")
