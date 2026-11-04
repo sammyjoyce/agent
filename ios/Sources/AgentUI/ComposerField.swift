@@ -22,7 +22,8 @@
     /// The coordinator whose restored message the draft holds. The field's undo actions go whenever
     /// it changes.
     let restoredFrom: ProfileID?
-    let edit: (String) -> Void
+    /// Reports the field's text, and that text without what an input method is still composing.
+    let edit: (_ text: String, _ committed: String) -> Void
     let removeChip: () -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -309,7 +310,16 @@
       var field: ComposerField?
       /// The `restoredFrom` the field's undo actions were recorded under.
       var restoredFrom: ProfileID?
-      func textViewDidChange(_ view: UITextView) { field?.edit(view.text) }
+      func textViewDidChange(_ view: UITextView) {
+        var committed = view.text ?? ""
+        if let marked = view.markedTextRange {
+          let start = view.offset(from: view.beginningOfDocument, to: marked.start)
+          let length = view.offset(from: marked.start, to: marked.end)
+          committed = (committed as NSString).replacingCharacters(
+            in: NSRange(location: start, length: length), with: "")
+        }
+        field?.edit(view.text, committed)
+      }
       /// The chip moves with the first line.
       func scrollViewDidScroll(_ view: UIScrollView) { view.superview?.setNeedsLayout() }
     }

@@ -79,7 +79,8 @@ public struct RestoredDraft: Sendable {
   public let attachments: [LocalAttachment]
 }
 
-/// An input `stage` saved, waiting for `start` or `unstage` on the same session.
+/// An input `stage` saved, waiting for `start` on the same session, or for `unstage` on whichever
+/// session holds its profile's outbox.
 public struct StagedInput: Sendable, Equatable {
   public let inputID: String
   public let sendID: String
@@ -136,13 +137,16 @@ public actor CoordinatorSession {
   /// when a save fails.
   private var loaded = false
   private enum Unsent { case staged, waiting }
-  /// Durable inputs this process staged that have not left the phone. Only a staged one can be
-  /// unstaged. A started one waits for this lane to connect, then sends once.
+  /// Durable inputs this session staged that have not left the phone. A staged one can be
+  /// unstaged, as can an inherited one. A started one waits for this lane to connect, then sends
+  /// once.
   private var unsent: [String: Unsent] = [:]
   /// Exchanges that have not written their input to the coordinator yet, by action. `started` is
   /// the input a Send started, and nil for Check / retry of a queued one.
   private var unwritten: [(action: UUID, inputID: String, started: StagedInput?)] = []
   private var attemptedInputs: Set<String> = []
+  /// Inputs this session found in its outbox and has not written to its coordinator since.
+  private var inherited: Set<String> = []
   /// Set for good by `retire`. A retired session never connects, sends or writes again.
   private var retired = false
   private var generation = UUID()
@@ -207,20 +211,7 @@ public actor CoordinatorSession {
     await disconnect(generation: generation)
     guard self.generation == generation else { return }
     identityFailure = nil
-    if inspectedConversation == nil, !loaded {
-      do {
-        pending = try JSONDecoder().decode(
-          [OutboxItem].self, from: Data(contentsOf: directory.outbox))
-      } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-        pending = []
-      } catch {
-        snapshot.error =
-          "The saved outbox could not be read. It was preserved; no messages were replayed."
-        publish()
-        return
-      }
-      loaded = true
-    }
+    guard loadOutbox() else { return }
     if let newest = pending.map(\.queuedAt).max() { stamps.seed(newest) }
     // The outbox belongs to this profile and every socket proves its pinned coordinator,
     // so these IDs reach only the coordinator they were queued for.
@@ -234,13 +225,34 @@ public actor CoordinatorSession {
     observation = Task { [weak self] in await self?.observe(generation: generation) }
   }
 
+  /// Reads the outbox, once per session. False while it cannot be read, with the reason in the
+  /// snapshot's error. An inspection session never reads it.
+  private func loadOutbox() -> Bool {
+    guard inspectedConversation == nil, !loaded else { return true }
+    do {
+      pending = try JSONDecoder().decode(
+        [OutboxItem].self, from: Data(contentsOf: directory.outbox))
+    } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+      pending = []
+    } catch {
+      snapshot.error =
+        "The saved outbox could not be read. It was preserved; no messages were replayed."
+      publish()
+      return false
+    }
+    inherited = Set(pending.map(\.request.inputId))
+    loaded = true
+    return true
+  }
+
   public func disconnect() async { await disconnect(generation: UUID()) }
 
   /// Ends this session when its lane leaves the feed, before its profile's files may be deleted.
   /// It disconnects, and whoever still holds it, it never connects, sends or writes its
   /// directory again. Returns, once, the started inputs it cancels before they left the phone:
   /// durable ones waiting for this lane, and any an exchange had not written yet. A staged input
-  /// that was not started is its sender's to report, since `start` then answers `.retired`.
+  /// that was not started stays its sender's: `start` then answers `.retired`, and `unstage`
+  /// leaves it to the profile's next session.
   @discardableResult public func retire() async -> [StagedInput] {
     guard !retired else { return [] }
     retired = true
@@ -399,17 +411,33 @@ public actor CoordinatorSession {
   }
 
   /// Withdraws a staged input that never started: its outbox item, its row, and the stored
-  /// files no other item uses.
-  public func unstage(_ staged: StagedInput) async {
-    guard staged.profile == profile, unsent[staged.inputID] == .staged else { return }
+  /// files no other item uses. When an address edit retired the session that staged it, this
+  /// session holds the item and withdraws it too, unless this session wrote it since. Returns
+  /// false, withdrawing nothing, once this session is retired, since its outbox is then the
+  /// profile's next session's or deleted.
+  @discardableResult public func unstage(_ staged: StagedInput) async -> Bool {
+    guard staged.profile == profile else { return true }
+    guard !retired else { return false }
+    switch unsent[staged.inputID] {
+    case .staged: break
+    case .waiting: return true
+    case nil:
+      guard loadOutbox(), inherited.contains(staged.inputID),
+        pending.contains(where: { $0.request.inputId == staged.inputID })
+      else { return true }
+      for attempt in unwritten where attempt.inputID == staged.inputID {
+        actions[attempt.action]?.cancel()
+      }
+    }
     guard let removal = acknowledge(staged.inputID) else {
       publish()
-      return
+      return true
     }
     unsent[staged.inputID] = nil
     transcript.removeInput(staged.inputID)
     publish()
     await removal.value
+    return true
   }
 
   /// Writes a queued input again under its original ID. One the coordinator accepted is observed by
@@ -764,6 +792,7 @@ public actor CoordinatorSession {
         // Cleared before the write, so a refusal never stands once the input may have left.
         mark(inputID, refused: false)
         attemptedInputs.insert(inputID)
+        inherited.remove(inputID)
       }
       unwritten.removeAll { $0.action == id }
       try await timedSend(stream, request)
