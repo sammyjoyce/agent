@@ -27,7 +27,8 @@ actor FixtureCoordinator {
   private var toolRequests: [NativeRequestToolDetails] = []
   private var toolReply: [NativeEvent] = []
   private var notificationRequests: [NotificationRequest] = []
-  private var notificationsRegistered = false
+  /// Each installation this coordinator holds a registration for, with its device token.
+  private var registrations: [String: String] = [:]
   private var notificationsHeld = false
   private var dropNotificationRemoval = false
   private var notificationRelease: CheckedContinuation<Void, Never>?
@@ -72,8 +73,19 @@ actor FixtureCoordinator {
   }
   func toolLookups() -> [NativeRequestToolDetails] { toolRequests }
   func notificationControls() -> [NotificationRequest] { notificationRequests }
-  /// Whether this coordinator holds a device registration, as its last applied control left it.
-  func holdsRegistration() -> Bool { notificationsRegistered }
+  /// Whether this coordinator holds any device registration, as its applied controls left it.
+  func holdsRegistration() -> Bool { !registrations.isEmpty }
+  /// Whether this coordinator holds a registration for `installation`.
+  func holds(_ installation: String) -> Bool { registrations[installation.lowercased()] != nil }
+  /// Registers `installation` as a client that never identifies does, such as the single-address
+  /// build.
+  func register(_ installation: String, token: String) { enroll(installation, token: token) }
+  /// A token names one app on one device, so it moves to the installation that registered it
+  /// last, as `runtime/src/notifications.ts` does.
+  private func enroll(_ installation: String, token: String) {
+    registrations = registrations.filter { $0.value != token.lowercased() }
+    registrations[installation.lowercased()] = token.lowercased()
+  }
   func dropNextNotificationRemoval() { dropNotificationRemoval = true }
   func holdNotificationRegistration() { notificationsHeld = true }
   func releaseNotificationRegistration() {
@@ -214,17 +226,20 @@ actor FixtureCoordinator {
           socket.cancel()
           return
         }
+        let installation: String
         switch request.request {
-        case .register:
+        case .register(let value):
           if notificationsHeld { await withCheckedContinuation { notificationRelease = $0 } }
-          notificationsRegistered = true
-        case .unregister: notificationsRegistered = false
-        case .status: break
+          enroll(value.installationId, token: value.token)
+          installation = value.installationId
+        case .unregister(let value):
+          registrations[value.installationId.lowercased()] = nil
+          installation = value.installationId
+        case .status(let value): installation = value.installationId
         }
         try await emit(
           .notifications(
-            .init(status: .init(configured: true, registered: notificationsRegistered))), on: socket
-        )
+            .init(status: .init(configured: true, registered: holds(installation)))), on: socket)
         try await emit(.done, on: socket)
       case .toolDetails(let request):
         toolRequests.append(request)

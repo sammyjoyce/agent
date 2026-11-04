@@ -202,6 +202,17 @@ final class ChatModel {
 
   func paired(_ id: ProfileID) -> Bool { lanes.first { $0.id == id }?.session != nil }
 
+  /// A coordinator's line under the feed and in Settings. When its address answers as another
+  /// saved coordinator, the line names that one and points to this one's address, since editing
+  /// it keeps the queue that Remove would delete.
+  func laneError(_ id: ProfileID) -> String? {
+    guard let snapshot = snapshots[id] else { return nil }
+    guard let found = snapshot.answeredAs,
+      let other = profiles.first(where: { $0.id != id && $0.pin == found })
+    else { return snapshot.error }
+    return "This address now answers as \(other.name). Edit \(name(id))'s address."
+  }
+
   /// Adds a saved coordinator's lane, or replaces an unpaired lane with its paired one.
   /// A lane whose session was live must be detached first, so two sessions never share
   /// an outbox. A removed coordinator gets none. Connecting is `setActive`'s job.

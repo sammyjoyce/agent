@@ -51,6 +51,10 @@ public struct ChatSnapshot: Sendable {
   public var sourceWarning: String?
   public var sources: [SourceState] = []
   public var error: String?
+  /// The coordinator this profile's address answers as, while that is not its pin. The session
+  /// words `error` as a reinstall, since only the feed knows whether another saved profile is
+  /// pinned to it, as when two coordinators trade addresses.
+  public var answeredAs: CoordinatorID?
   /// Every Send this coordinator holds, from its outbox and ledger rather than the loaded
   /// rows, so a Send whose row left the window still reports.
   public var sends: [String: SendStatus] = [:]
@@ -187,6 +191,7 @@ public actor CoordinatorSession {
     await disconnect(generation: generation)
     guard self.generation == generation else { return }
     identityFailure = nil
+    snapshot.answeredAs = nil
     guard loadOutbox() else { return }
     if let newest = pending.map(\.queuedAt).max() { stamps.seed(newest) }
     // The outbox belongs to this profile and every socket proves its pinned coordinator,
@@ -607,6 +612,7 @@ public actor CoordinatorSession {
             snapshot.connection = .connected
             snapshot.error = nil
             identityFailure = nil
+            snapshot.answeredAs = nil
             for item in pending where unsent[item.request.inputId] == .waiting {
               unsent[item.request.inputId] = nil
               perform(.submit(item.request), inputID: item.request.inputId, sending: staged(item))
@@ -643,7 +649,7 @@ public actor CoordinatorSession {
   }
   private func noteIdentityFailure(_ error: any Error) {
     switch error as? ConnectionError {
-    case .wrongCoordinator:
+    case .wrongCoordinator(let found):
       // Counted as Remove's confirmation counts, since the banner sends the user to Remove.
       let held =
         switch try? directory.queuedMessages() {
@@ -653,7 +659,10 @@ public actor CoordinatorSession {
         }
       identityFailure =
         "This address now answers as a different coordinator. \(held) Remove it and add it again."
-    case .unidentifiedCoordinator: identityFailure = ConnectionError.describe(error)
+      snapshot.answeredAs = found
+    case .unidentifiedCoordinator:
+      identityFailure = ConnectionError.describe(error)
+      snapshot.answeredAs = nil
     default: break
     }
   }

@@ -47,6 +47,12 @@ internal-only upload when needed.
 Main-chat alerts require the one-time [APNs setup](../docs/notifications.md).
 They start enabled: allow the notification prompt on first opening, then connect
 to register automatically. Disable **Main-chat updates** in Connection anytime.
+After an update from a build without saved coordinators, the app withdraws that
+build's alert registration once the coordinator it used pairs, whatever the
+toggle says. That coordinator then alerts this device only through the saved
+coordinator's own registration, and only while alerts are on. Until the
+coordinator confirms, the app sends the withdrawal again each time it becomes
+active.
 **Connection → Appearance** follows the system by default. Choose **Light** or
 **Dark** to keep a saved override.
 
@@ -130,7 +136,11 @@ Mode if requested, then Run.
   It saves `profiles.json` without the coordinator, and with a record of its
   alert withdrawal, before it withdraws alerts or deletes anything, so a failed
   save leaves the coordinator as it was. A withdrawal its coordinator has not
-  confirmed is sent again each time the app becomes active. Each launch deletes
+  confirmed is sent again each time the app becomes active, at the removed
+  coordinator's address or at a saved address that now answers as it. Another
+  coordinator's answer confirms nothing. The phone stops trying once every one
+  of those addresses answers as another coordinator, as after a reinstall,
+  since it then knows no way to reach the removed one. Each launch deletes
   the files of every coordinator `profiles.json` no longer lists. Until the app
   quits, a chip for a removed coordinator, a message restored from one, or a
   leading `@Name` that names no saved coordinator blocks Send, with one
@@ -138,9 +148,12 @@ Mode if requested, then Run.
 - Every connection first asks for the coordinator's ID and writes nothing else
   unless the ID matches the saved one. A coordinator too old to answer shows
   "Update the coordinator". If the address now answers as a different
-  coordinator, the queue stays on the phone. Both cases keep retrying. An
-  address edit that reaches a different coordinator saves nothing, and the
-  form names the coordinator saved at that address, if there is one.
+  coordinator, the queue stays on the phone. Both cases keep retrying. When
+  that coordinator is another saved one, as when two coordinators trade
+  addresses, the line names it and asks you to edit the address, which keeps
+  the queue. An address edit that reaches a different coordinator saves
+  nothing, and the form names the coordinator saved at that address, if there
+  is one.
 - Coordinator acknowledgements are saved with each outbox input. Accepted
   messages stay saved through suspension, reconnect and app restart; they are
   observed by their original IDs until placement and cannot be resubmitted or

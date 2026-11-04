@@ -341,10 +341,16 @@ private actor DialGate {
   }
 }
 
-/// Where Work's addresses lead. A test can point them at Personal, as a moved name would.
+/// Where Work's addresses lead. A test can point them at Personal, as a moved name would, swap
+/// Work's and Personal's, as when the two coordinators trade ports, or leave Personal's address
+/// answering nothing.
 private actor WorkRoute {
   private(set) var answersAsPersonal = false
+  private(set) var swapped = false
+  private(set) var personalsAddressDown = false
   func point(atPersonal value: Bool) { answersAsPersonal = value }
+  func swap() { swapped = true }
+  func takePersonalsAddressDown(_ value: Bool) { personalsAddressDown = value }
 }
 
 /// Two loopback coordinators, Personal at port 4002 of an invented address and Work at any
@@ -369,8 +375,12 @@ private actor WorkRoute {
     registration: registration, defaults: defaults, applicationSupport: root, caches: root,
     transport: CoordinatorTransport { address in
       if address.port == 4001 { await gate?.pass() }
+      if address.port == 4002, await route?.personalsAddressDown == true {
+        throw ConnectionError.timedOut
+      }
       let repointed = await route?.answersAsPersonal == true
-      let personal = address.port == 4002 || repointed
+      let swapped = await route?.swapped == true
+      let personal = (address.port == 4002) != swapped || repointed
       return LineConnection(
         connection: NWConnection(
           host: .ipv4(.loopback), port: personal ? secondPort : firstPort, using: .tcp))
@@ -1252,8 +1262,10 @@ func aWithdrawalItsCoordinatorNeverConfirmedIsSentAgainOnTheNextActivation() asy
   }
 }
 
-/// A pending withdrawal whose address now answers as another coordinator is dropped: that
-/// coordinator never held the registration, and it never sees the removed installation ID.
+/// A pending withdrawal whose address now answers as another coordinator, while no saved address
+/// answers as its own, is dropped. No address this phone knows reaches the coordinator that holds
+/// the registration, as after a reinstall, and the coordinator that answers never sees the removed
+/// installation ID.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func aPendingWithdrawalIsDroppedOnceItsAddressAnswersAsAnotherCoordinator() async throws {
   let registration = NotificationRegistration(
@@ -1277,6 +1289,62 @@ func aPendingWithdrawalIsDroppedOnceItsAddressAnswersAsAnotherCoordinator() asyn
     }
     let seen = await personalFixture.received().dropFirst(before)
     #expect(!seen.contains { "\($0)".contains("\(work)") }, "Personal saw Work's installation ID")
+  }
+}
+
+/// Work enrolled this device for alerts, then Work and Personal trade ports, and the user removes
+/// Work anyway while its line names Personal. Personal answers at Work's saved address and never
+/// held Work's registration, so its answer confirms nothing. While Personal's saved address answers
+/// nothing, Work's coordinator may be there, so the withdrawal is kept. Once it answers, as Work's
+/// coordinator, the withdrawal reaches it there over a socket that proves Work's pin. Personal
+/// never sees Work's installation ID.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aWithdrawalReachesItsCoordinatorAtTheSavedAddressItNowAnswersAt() async throws {
+  let registration = NotificationRegistration(
+    enabled: true, permission: { true }, register: {}, save: { _ in })
+  await registration.start()
+  await registration.received(token: String(repeating: "ab", count: 32))
+  let route = WorkRoute()
+  try await withTwoFixtures(registration: registration, route: route) {
+    coordinators, workFixture, personalFixture, root in
+    let (work, _) = try await addWorkAndPersonal(coordinators)
+    try await eventually("Work enrolled") { registration.status(work).registered }
+    await route.swap()
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    try await eventually("Work's line names who answers") {
+      coordinators.chat.laneError(work)?.hasPrefix("This address now answers as") == true
+    }
+    let before = await personalFixture.received().count
+    try await coordinators.remove(work)
+    await route.takePersonalsAddressDown(true)
+    await coordinators.setActive(false)
+    // Lets a dial Work's retired lane had started land first.
+    try await Task.sleep(for: .milliseconds(200))
+    let identifies = await personalFixture.received().filter { $0 == .identify }.count
+    await coordinators.setActive(true)
+    try await eventually("the withdrawal tried at Work's saved address") {
+      await personalFixture.received().filter { $0 == .identify }.count > identifies
+    }
+    try await Task.sleep(for: .milliseconds(300))
+    let keptWhileDown = try savedWithdrawals(root)
+    await route.takePersonalsAddressDown(false)
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    try await eventually("the saved withdrawal settled") {
+      (try? savedWithdrawals(root))?.isEmpty == true
+    }
+    let withdrawal = NotificationRequest.unregister(.init(installationId: "\(work)"))
+    let atWork = await workFixture.notificationControls().filter { $0 == withdrawal }.count
+    let held = await workFixture.holds("\(work)")
+    let seen = await personalFixture.received().dropFirst(before)
+    let leaked = seen.contains { "\($0)".contains("\(work)") }
+    print(
+      "IF13-X1[withdrawal after the swap] kept while Personal's address was down=\(keptWhileDown == ["\(work)"]) withdrawals Work's coordinator got=\(atWork) Work's coordinator still holds this device=\(held) Personal saw Work's installation=\(leaked)"
+    )
+    #expect(keptWhileDown == ["\(work)"], "Dropped while Work's coordinator might be unreachable")
+    #expect(!held, "A removed coordinator keeps alerting this device")
+    #expect(!leaked, "Personal saw Work's installation ID")
   }
 }
 
@@ -1654,6 +1722,9 @@ func aFirstRecipientsCappedRecordReadsUnknownOnceItsMessageIsLoadedEarlier() asy
       Ledger.self, from: Data(contentsOf: workDirectory.ledger))
     return saved != nil && saved?.sends["send-old"] == nil
   }
+  // The placement that dropped it arrives on the reconnect that follows the submit, and an earlier
+  // page loads only once that reconnect completes.
+  _ = try await until(workSession) { $0.connection == .connected }
   await workSession.loadEarlier()
   await personalSession.loadEarlier()
   let workSnapshot = try await until(workSession) { $0.rows.contains { $0.entryID == "w-old" } }
