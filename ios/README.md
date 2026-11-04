@@ -184,7 +184,9 @@ Mode if requested, then Run.
   been delivered. The app never sends them. **Restore to composer** makes a new
   message for you to send, and **Discard** deletes one. A held message leaves
   the hold only when you send its restored copy unchanged to its coordinator,
-  or discard it.
+  or discard it. If a saved coordinator's held messages cannot be read, the
+  chat says so for as long as that coordinator is saved and its last read
+  failed, whatever the other coordinators' reads found.
 - Do not restore an uncertain submission as a new message to bypass checking its
   original ID. Coordinator admission may already have succeeded.
 - Use the **+** menu for files, photos, commands and delivery mode, or drop files

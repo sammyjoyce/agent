@@ -130,8 +130,19 @@ final class ChatModel {
   /// picks a recipient or changes the picker before then.
   private(set) var committed = ""
   var attachments: [LocalAttachment] = [] { didSet { forgetClearedSource() } }
-  private(set) var held: [HeldMessage] = []
-  private(set) var heldError: String?
+  /// Messages held from before the update, by lane in feed order.
+  var held: [HeldMessage] {
+    lanes.flatMap { lane in
+      ((try? holds[lane.id]?.get()) ?? []).map { HeldMessage(lane: lane.id, item: $0) }
+    }
+  }
+  /// Shown while any attached lane's held messages could not be read when last loaded.
+  var heldError: String? {
+    holds.values.contains { if case .failure = $0 { true } else { false } }
+      ? "Messages held from before the update could not be read. They stay on this phone." : nil
+  }
+  /// Each attached lane's latest read of its messages held from before the update.
+  private var holds: [ProfileID: Result<[LegacyItem], any Error>] = [:]
   /// The coordinator whose restored message the draft holds. While it is set, no tag in the draft
   /// is read and the draft stays that coordinator's, however it is edited. Only clearing the draft
   /// ends it, and the field's Undo never reaches back past that.
@@ -230,7 +241,7 @@ final class ChatModel {
       let lane = lanes.remove(at: index)
       observations.removeValue(forKey: id)?.cancel()
       registration?.disconnect(id)
-      held.removeAll { $0.lane == id }
+      holds[id] = nil
       if lane.session != nil {
         snapshots[id] = nil
         if !multiple { failure = nil }
@@ -600,15 +611,10 @@ final class ChatModel {
     }
   }
   private func loadHeld(_ lane: Lane) async {
-    do {
-      let items = try await lane.hold.items()
-      guard lanes.contains(where: { $0.id == lane.id }) else { return }
-      held = held.filter { $0.lane != lane.id } + items.map { HeldMessage(lane: lane.id, item: $0) }
-      heldError = nil
-    } catch {
-      heldError =
-        "Messages held from before the update could not be read. They stay on this phone."
-    }
+    let read: Result<[LegacyItem], any Error>
+    do { read = .success(try await lane.hold.items()) } catch { read = .failure(error) }
+    guard lanes.contains(where: { $0.id == lane.id }) else { return }
+    holds[lane.id] = read
   }
 
   // MARK: - Attachments

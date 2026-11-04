@@ -237,6 +237,108 @@ func migrationResumesAfterACrashAtEveryStepWithACustomPort(_ step: Coordinators.
   #expect(try Data(contentsOf: file) == garbage)
 }
 
+/// Work's messages held from before the update cannot be read, and Personal holds some that can.
+@MainActor private struct TwoHolds {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  let work: CoordinatorProfile
+  let personal: CoordinatorProfile
+  let chat = ChatModel()
+  static let warning =
+    "Messages held from before the update could not be read. They stay on this phone."
+
+  init(personalHolds texts: [String]) throws {
+    work = CoordinatorProfile(
+      name: try TagName("Work"), address: try CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    personal = CoordinatorProfile(
+      name: try TagName("Personal"),
+      address: try CoordinatorAddress(host: "100.64.1.3", port: 4002))
+    let unreadable = directory(work)
+    try FileManager.default.createDirectory(
+      at: unreadable.legacy, withIntermediateDirectories: true)
+    try Data("not a queue".utf8).write(to: unreadable.legacyQueue)
+    try writePrivately(
+      JSONEncoder().encode(
+        texts.enumerated().map { index, text in
+          NativeRequestSubmit(inputId: "held-\(index)", mode: .steer, text: text)
+        }), to: directory(personal).legacyQueue)
+    chat.profiles = [work, personal]
+  }
+
+  func directory(_ profile: CoordinatorProfile) -> ProfileDirectory {
+    ProfileDirectory(profile.id, applicationSupport: root, caches: root)
+  }
+  func attach(_ profile: CoordinatorProfile) {
+    chat.attach(Lane(id: profile.id, session: nil, hold: LegacyHold(directory(profile))))
+  }
+  func remove() { try? FileManager.default.removeItem(at: root) }
+}
+
+/// Personal's hold is read, then Work's cannot be. The user removes Work, whose files Remove
+/// deletes. The warning over the feed goes with Work's lane, and Personal's held message stays.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func removingTheLaneWhoseHeldMessagesCannotBeReadRemovesTheWarning() async throws {
+  let holds = try TwoHolds(personalHolds: ["Invented: Personal's held note"])
+  defer { holds.remove() }
+  let chat = holds.chat
+  holds.attach(holds.personal)
+  try await eventually("Personal's held message") { chat.held.count == 1 }
+  holds.attach(holds.work)
+  try await eventually("the warning over the feed") { chat.heldError != nil }
+  await chat.detach(holds.work.id)
+  print(
+    "IF14-W2[Work removed] warning=\(chat.heldError ?? "nil") held=\(chat.held.map(\.item.text))"
+  )
+  #expect(chat.heldError == nil, "A removed coordinator's warning stays over the feed")
+  #expect(chat.held.map(\.item.text) == ["Invented: Personal's held note"])
+}
+
+/// Work's hold cannot be read, and Personal's hold is read after it, at attach and again after the
+/// user discards one of Personal's held messages. Whichever read finishes last, the warning shows
+/// while Work's lane is attached, and only then.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func theHeldWarningStaysWhileAnUnreadableLaneIsAttachedWhicheverReadFinishesLast()
+  async throws
+{
+  let holds = try TwoHolds(personalHolds: [
+    "Invented: Personal's first held note", "Invented: Personal's second held note",
+  ])
+  defer { holds.remove() }
+  let chat = holds.chat
+  holds.attach(holds.work)
+  try await eventually("the warning over the feed") { chat.heldError != nil }
+  holds.attach(holds.personal)
+  try await eventually("Personal's held messages") { chat.held.count == 2 }
+  let afterAttach = chat.heldError
+  await chat.discardHeld(try #require(chat.held.first))
+  let afterDiscard = chat.heldError
+  await chat.detach(holds.work.id)
+  print(
+    "IF14-W2[Personal read last] warning after Personal's read=\(afterAttach ?? "nil") after Personal's discard=\(afterDiscard ?? "nil") after Work removed=\(chat.heldError ?? "nil") held=\(chat.held.map(\.item.text))"
+  )
+  #expect(afterAttach == TwoHolds.warning, "Personal's read hid Work's warning")
+  #expect(afterDiscard == TwoHolds.warning, "Reading Personal's hold again hid Work's warning")
+  #expect(chat.heldError == nil)
+  #expect(chat.held.map(\.item.text) == ["Invented: Personal's second held note"])
+}
+
+/// The user removes Work before the read of its held messages, which cannot succeed, finishes.
+/// That read shows no warning over the feed.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aHeldReadThatFinishesAfterItsLaneIsRemovedShowsNoWarning() async throws {
+  let holds = try TwoHolds(personalHolds: ["Invented: Personal's held note"])
+  defer { holds.remove() }
+  let chat = holds.chat
+  holds.attach(holds.personal)
+  try await eventually("Personal's held message") { chat.held.count == 1 }
+  holds.attach(holds.work)
+  await chat.detach(holds.work.id)
+  // Long enough for the read that Work's attach started to finish.
+  try await Task.sleep(for: .milliseconds(500))
+  print("IF14-W2[Work removed before its read finished] warning=\(chat.heldError ?? "nil")")
+  #expect(chat.heldError == nil, "A removed coordinator's late read put its warning over the feed")
+  #expect(chat.held.map(\.item.text) == ["Invented: Personal's held note"])
+}
+
 @MainActor @Test(.timeLimit(.minutes(1)))
 func theMigratedProfilePairsAndHeldMessagesLeaveOnlyByADeliberateSend() async throws {
   let install = try await LegacyInstall()
