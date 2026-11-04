@@ -1667,6 +1667,9 @@ func aFirstRecipientsCappedRecordReadsUnknownOnceItsMessageIsLoadedEarlier() asy
       Ledger.self, from: Data(contentsOf: workDirectory.ledger))
     return saved != nil && saved?.sends["send-old"] == nil
   }
+  // The placement that dropped it arrives on the reconnect that follows the submit, and an earlier
+  // page loads only once that reconnect completes.
+  _ = try await until(workSession) { $0.connection == .connected }
   await workSession.loadEarlier()
   await personalSession.loadEarlier()
   let workSnapshot = try await until(workSession) { $0.rows.contains { $0.entryID == "w-old" } }
