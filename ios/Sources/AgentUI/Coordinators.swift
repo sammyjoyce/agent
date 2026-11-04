@@ -223,13 +223,15 @@ public final class Coordinators {
         throw error
       }
       withdrawals = pending
+      queues = kept
+      // The profile stays until its lane is detached, so the feed still names that lane's rows.
+      // The one save before then is given `remaining`.
       if await registration?.forget(id) == true {
         confirmWithdrawal(InstallationID(id), saved: remaining)
       }
       await chat.detach(id)
       pairing.removeValue(forKey: id)?.cancel()
       profiles = remaining
-      queues = kept
       pairingError[id] = nil
       try directory(id).remove()
       for folder in held.map({ $0.folder(applicationSupport: applicationSupport) })

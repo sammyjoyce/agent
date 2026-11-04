@@ -1191,6 +1191,118 @@ func removeCountsQueuedAndHeldMessagesAndDeletesOnlyAfterSaving() async throws {
   await fixture.stop()
 }
 
+/// Removing the coordinator the single-address build's queue belongs to never saves that queue's
+/// record again, whether or not its coordinator confirms the alert withdrawal during Remove. When
+/// the queue's folder cannot be deleted, the next launch deletes it, so the messages Remove counted
+/// never come back.
+@MainActor
+@Test(
+  .timeLimit(.minutes(1)), arguments: [(true, false), (true, true), (false, false), (false, true)])
+func removeNeverSavesTheHeldQueuesItDeletes(confirmed: Bool, folderLocked: Bool) async throws {
+  let install = try await LegacyInstall()
+  defer { install.remove() }
+  let fixture = FixtureCoordinator()
+  let (listener, port) = try await listen(fixture)
+  defer { listener.cancel() }
+  @MainActor func launch() -> Coordinators {
+    Coordinators(
+      registration: confirmed
+        ? NotificationRegistration(
+          enabled: false, permission: { true }, register: {}, save: { _ in }) : nil,
+      defaults: install.defaults, applicationSupport: install.support, caches: install.caches,
+      transport: loopback(port))
+  }
+  let coordinators = launch()
+  let profile = try #require(coordinators.profiles.first)
+  await coordinators.setActive(true)
+  try await eventually("paired and connected") { coordinators.chat.connection == .connected }
+  try await eventually("held rows") { coordinators.chat.held.count == 2 }
+  if confirmed {
+    try await eventually("alerts asked over the profile's session") {
+      await fixture.notificationControls().contains(
+        .status(.init(installationId: "\(profile.id)")))
+    }
+  }
+  let folder = try #require(coordinators.queues.first).folder(applicationSupport: install.support)
+  let files = FileManager.default
+  if folderLocked {
+    try files.setAttributes([.posixPermissions: 0o500], ofItemAtPath: folder.path)
+  }
+  var refused = false
+  do { try await coordinators.remove(profile.id) } catch { refused = true }
+  if folderLocked {
+    try files.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
+  }
+  await coordinators.setActive(false)
+  struct Saved: Decodable {
+    let profiles: [CoordinatorProfile]
+    let withdrawals: [PendingWithdrawal]
+    let held: [HeldQueue]
+  }
+  let saved = try JSONDecoder().decode(Saved.self, from: install.savedProfiles())
+  let relaunched = launch()
+  let folders =
+    (try? files.contentsOfDirectory(atPath: install.support.appending(path: "Agent/Held").path))
+    ?? []
+  print(
+    "IF16-T3-A[confirmed=\(confirmed) folder locked=\(folderLocked)] Remove refused=\(refused) profiles.json: profiles=\(saved.profiles.count) held=\(saved.held.count) | after a relaunch: queues=\(relaunched.queues.count) Held folders=\(folders.count)"
+  )
+  #expect(
+    saved.withdrawals.contains { $0.installation == InstallationID(profile.id) } == !confirmed)
+  #expect(refused == folderLocked)
+  #expect(
+    saved.profiles.isEmpty && saved.held.isEmpty, "profiles.json lists a queue Remove deleted")
+  #expect(relaunched.queues.isEmpty && folders.isEmpty, "Messages Remove deleted are held again")
+  await fixture.stop()
+}
+
+/// `profiles.json` is all a relaunch sees, so after each change to saved coordinators it lists what
+/// the app holds: the migrated profile edited to Work's address, Personal added at the build's
+/// address, which takes the build's queue, then each removed while its coordinator confirms the
+/// alert withdrawal.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func profilesJSONListsWhatTheAppHoldsAfterEveryChange() async throws {
+  let install = try await LegacyInstall()
+  defer { install.remove() }
+  let registration = NotificationRegistration(
+    enabled: false, permission: { true }, register: {}, save: { _ in })
+  try await withTheOldAddressSilent(install, registration: registration) {
+    coordinators, migrated, used, work, bringBack in
+    var steps: [String] = []
+    @MainActor func record(_ step: String) throws {
+      let saved = try JSONDecoder().decode(
+        Coordinators.SavedProfiles.self, from: install.savedProfiles())
+      let same = saved.profiles == coordinators.profiles && saved.held == coordinators.queues
+      steps.append(
+        "\(step): \(same ? "same" : "differs") | saved \(saved.profiles.map(\.name.description)) with \(saved.held.count) queues | the app \(coordinators.profiles.map(\.name.description)) with \(coordinators.queues.count) queues"
+      )
+    }
+    func alertsAsked(_ id: ProfileID, at fixture: FixtureCoordinator) async throws {
+      try await eventually("alerts asked over \(id)'s session") {
+        await fixture.notificationControls().contains(.status(.init(installationId: "\(id)")))
+      }
+    }
+    try record("launch")
+    try await coordinators.update(
+      migrated.id, name: TagName("Work"),
+      address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    try record("the migrated profile edited to Work's address")
+    await bringBack()
+    try await coordinators.add(name: TagName("Personal"), address: install.address)
+    try record("Personal added at the build's address")
+    let personal = try #require(coordinators.profiles.last)
+    #expect(coordinators.queues.map(\.coordinator) == [personal.pin])
+    try await alertsAsked(personal.id, at: used)
+    try await alertsAsked(migrated.id, at: work)
+    try await coordinators.remove(personal.id)
+    try record("Personal removed")
+    try await coordinators.remove(migrated.id)
+    try record("Work removed")
+    print("IF16-T3-B\n" + steps.joined(separator: "\n"))
+    #expect(steps.allSatisfy { $0.contains(": same |") }, "profiles.json differs from the app")
+  }
+}
+
 /// A Remove that stopped after saving leaves its files. The next launch deletes every profile
 /// directory and held queue `profiles.json` does not list, and keeps the ones it lists.
 @MainActor @Test func launchDeletesTheFilesOfEveryProfileThatIsNoLongerSaved() throws {
