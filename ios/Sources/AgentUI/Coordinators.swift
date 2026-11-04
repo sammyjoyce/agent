@@ -27,7 +27,7 @@ public final class Coordinators {
   @ObservationIgnored private var pairing: [ProfileID: Task<Void, Never>] = [:]
   /// Alert withdrawals `profiles.json` keeps until a coordinator confirms them.
   @ObservationIgnored private var withdrawals: [PendingWithdrawal] = []
-  @ObservationIgnored private var withdrawing: [ProfileID: Task<Void, Never>] = [:]
+  @ObservationIgnored private var withdrawing: [InstallationID: Task<Void, Never>] = [:]
   /// True while a profile mutation runs. The ones waiting their turn, in call order.
   @ObservationIgnored private var mutating = false
   @ObservationIgnored private var waiting: [CheckedContinuation<Void, Never>] = []
@@ -110,8 +110,7 @@ public final class Coordinators {
         let found = try await identifyCoordinator(at: profile.address, transport: transport)
         var next = profiles
         guard try CoordinatorProfile.admit(found, for: id, in: &next) else { return true }
-        try save(next)
-        profiles = next
+        try savePairing(next, id)
         pairingError[id] = nil
         await start(id)
         return true
@@ -151,12 +150,11 @@ public final class Coordinators {
       next[index].name = name
       next[index].address = address
       if let found { _ = try CoordinatorProfile.admit(found, for: id, in: &next) }
-      try save(next)
-      profiles = next
-      guard found != nil, next[index].pin != nil else { return }
+      try savePairing(next, id)
+      guard found != nil, profiles[index].pin != nil else { return }
       let hold = chat.lanes.first { $0.id == id }?.hold
       await chat.detach(id)
-      chat.attach(lane(next[index], hold: hold))
+      chat.attach(lane(profiles[index], hold: hold))
       if chat.active { await chat.lanes.first { $0.id == id }?.session?.connect() }
     }
   }
@@ -192,7 +190,8 @@ public final class Coordinators {
       var pending = withdrawals
       // Only a paired profile ever had a session to enroll alerts over.
       if let pin = profile.pin {
-        pending.append(PendingWithdrawal(installation: id, address: profile.address, pin: pin))
+        pending.append(
+          PendingWithdrawal(installation: InstallationID(id), address: profile.address, pin: pin))
       }
       do {
         try save(remaining, withdrawals: pending)
@@ -201,7 +200,9 @@ public final class Coordinators {
         throw error
       }
       withdrawals = pending
-      if await registration?.forget(id) == true { confirmWithdrawal(id, saved: remaining) }
+      if await registration?.forget(id) == true {
+        confirmWithdrawal(InstallationID(id), saved: remaining)
+      }
       await chat.detach(id)
       pairing.removeValue(forKey: id)?.cancel()
       profiles = remaining
@@ -210,32 +211,54 @@ public final class Coordinators {
     }
   }
 
-  /// Sends a saved withdrawal again over a socket that proves its pin. The record goes once the
-  /// coordinator confirms, or once the address answers as another coordinator, which never
-  /// held this registration.
+  /// Sends a saved withdrawal again over a socket that proves its pin: at its own address, else at
+  /// the first saved address that answers as its coordinator, as after two coordinators trade
+  /// addresses. Another coordinator never held this registration, so its answer confirms nothing.
+  /// The record goes once its coordinator confirms, or once every one of those addresses answers
+  /// as another coordinator, since this phone then knows no way to reach it, as after a reinstall.
   private func retry(_ withdrawal: PendingWithdrawal) {
     let id = withdrawal.installation
     withdrawing.removeValue(forKey: id)?.cancel()
+    var addresses = [withdrawal.address]
+    for profile in profiles where !addresses.contains(profile.address) {
+      addresses.append(profile.address)
+    }
     withdrawing[id] = Task { [weak self, transport] in
-      let confirmed: Bool
-      do {
-        confirmed = try await withdrawal.send(transport: transport)
-      } catch ConnectionError.wrongCoordinator {
-        confirmed = true
-      } catch {
-        confirmed = false
+      var settled = true
+      for address in addresses where !Task.isCancelled {
+        do {
+          settled = try await withdrawal.send(to: address, transport: transport)
+          break
+        } catch ConnectionError.wrongCoordinator {
+          continue
+        } catch {
+          settled = false
+        }
       }
-      guard confirmed, let self else { return }
+      guard settled, !Task.isCancelled, let self else { return }
       await self.serially { self.confirmWithdrawal(id, saved: self.profiles) }
     }
   }
 
   /// Drops a confirmed withdrawal's record. If that save fails the record stays, and the next
   /// activation finds nothing left to withdraw.
-  private func confirmWithdrawal(_ id: ProfileID, saved profiles: [CoordinatorProfile]) {
+  private func confirmWithdrawal(_ id: InstallationID, saved profiles: [CoordinatorProfile]) {
     let rest = withdrawals.filter { $0.installation != id }
     do { try save(profiles, withdrawals: rest) } catch { return }
     withdrawals = rest
+  }
+
+  /// Saves `next`, in which `admit` may have just paired `id`. A paired profile hands over the
+  /// single-address build's installation it inherited, in the same write as its pin, and the
+  /// withdrawal goes at once.
+  private func savePairing(_ next: [CoordinatorProfile], _ id: ProfileID) throws {
+    var next = next
+    let inherited = next.firstIndex { $0.id == id }.flatMap { next[$0].takeInheritedWithdrawal() }
+    let pending = withdrawals + [inherited].compactMap { $0 }
+    try save(next, withdrawals: pending)
+    profiles = next
+    withdrawals = pending
+    if let inherited, chat.active { retry(inherited) }
   }
 
   private func start(_ id: ProfileID) async {
@@ -297,8 +320,9 @@ extension Coordinators {
   enum MigrationStep { case profileSaved, quarantined, markerRemoved }
 
   /// One-shot and idempotent, offline. Moves the single-address build's last queue into the
-  /// migrated profile's read-only hold. `coordinatorAddress` is the resume marker. It goes
-  /// before the port key, so a crash in between cannot re-run with the default port.
+  /// migrated profile's read-only hold, and its alert installation onto that profile until it
+  /// pairs. `coordinatorAddress` is the resume marker. It goes before the port key, so a crash in
+  /// between cannot re-run with the default port.
   static func migrate(
     defaults: UserDefaults, applicationSupport: URL, caches: URL,
     crash: (MigrationStep) throws -> Void = { _ in }
@@ -319,7 +343,11 @@ extension Coordinators {
       if let existing = saved.profiles.first(where: { $0.address == address }) {
         profile = existing
       } else {
-        profile = CoordinatorProfile(name: TagName(defaultFor: address), address: address)
+        // In the same write as the profile, since the ID leaves the defaults below.
+        profile = CoordinatorProfile(
+          name: TagName(defaultFor: address), address: address,
+          inherited: defaults.string(forKey: "notificationInstallationID").flatMap(
+            InstallationID.init(legacy:)))
         saved.profiles.append(profile)
         try save(saved, applicationSupport: applicationSupport)
       }
