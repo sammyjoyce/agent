@@ -1610,3 +1610,111 @@ func feedbackAttachesTheScreenshotOnlyWhenEverythingOnScreenIsTheRecipients(_ he
     }
   }
 }
+
+/// The single-address build used `studio.example-tailnet.ts.net`, which does not resolve yet after
+/// the update, so the user adds the same machine as Personal by its tailnet IP. Once the name
+/// resolves, the migrated profile's own pairing finds Personal's coordinator there and is refused.
+/// That probe still proves Personal's coordinator answers at the build's address, so what the build
+/// left goes to it: its alert installation is withdrawn there, whatever the toggle says, and Restore
+/// addresses its held messages to Personal.
+@MainActor
+@Test(
+  .timeLimit(.minutes(1)),
+  arguments: ["left off", "turned off before the old coordinator pairs"])
+func theBuildsCoordinatorSavedUnderAnotherAddressTakesWhatTheBuildLeft(_ alerts: String)
+  async throws
+{
+  let install = try await LegacyInstall(
+    host: "studio.example-tailnet.ts.net", alerts: alerts != "left off")
+  defer { install.remove() }
+  let registration = NotificationRegistration(
+    enabled: install.alerts, permission: { true }, register: {},
+    save: { install.defaults.set($0, forKey: "notificationsEnabled") })
+  if alerts != "left off" {
+    await registration.start()
+    await registration.received(token: String(repeating: "ab", count: 32))
+    await registration.setEnabled(false)
+  }
+  let used = FixtureCoordinator()
+  await used.register(install.installation, token: String(repeating: "ab", count: 32))
+  let (listener, port) = try await listen(used)
+  defer { listener.cancel() }
+  let routes = Routes([4002: port])
+  let coordinators = Coordinators(
+    registration: registration, defaults: install.defaults, applicationSupport: install.support,
+    caches: install.caches,
+    transport: CoordinatorTransport { address in
+      guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
+      return LineConnection(
+        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+    })
+  let chat = coordinators.chat
+  let migrated = try #require(coordinators.profiles.first)
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await used.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("the build's address answered nothing") {
+      coordinators.pairingError[migrated.id] != nil
+    }
+    try await coordinators.add(
+      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+    await routes.set([4002: port, install.address.port: port])
+    coordinators.retryPairing(migrated.id)
+    try await eventually("the migrated profile's pairing refused") {
+      coordinators.pairingError[migrated.id]?.hasPrefix("Already saved") == true
+    }
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    let withdrawn = try await settles { !(await used.holds(install.installation)) }
+    try await eventually("held rows") { chat.held.count == 2 }
+    let held = try #require(chat.held.first { $0.item.text == "Second held note" })
+    await chat.restoreHeld(held)
+    let personal = try #require(coordinators.profiles.first { $0.id != migrated.id })
+    print(
+      "IF15-U3[\(alerts)] the migrated profile's line=\(coordinators.pairingError[migrated.id] ?? "nil") toggle=\(registration.enabled ? "on" : "off") old installation still held=\(!withdrawn) Restore: draft=\(chat.draft.debugDescription) recipient=\(chat.recipient.map(chat.name) ?? "none")"
+    )
+    #expect(coordinators.pairingError[migrated.id] == "Already saved as Personal.")
+    #expect(withdrawn, "The build's coordinator keeps alerting this device")
+    #expect(chat.draft == "Second held note" && chat.recipient == personal.id)
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
+/// The user points Work at the single-address build's address, where a coordinator no saved profile
+/// is pinned to answers, so the edit is refused. That coordinator takes nothing the build left: its
+/// installation stays, and Restore still asks who gets a held message.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func anEditRefusedAtTheBuildsAddressGivesWhatItLeftToNoOne() async throws {
+  let install = try await LegacyInstall()
+  defer { install.remove() }
+  try await withTheOldAddressSilent(install) { coordinators, migrated, used, _, bringBack in
+    let chat = coordinators.chat
+    try await coordinators.update(
+      migrated.id, name: TagName("Work"),
+      address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    try await eventually("Work paired") { chat.snapshots[migrated.id]?.connection == .connected }
+    await bringBack()
+    var shown = "nothing"
+    do {
+      try await coordinators.update(migrated.id, name: TagName("Work"), address: install.address)
+    } catch { shown = error.localizedDescription }
+    try await eventually("held rows") { chat.held.count == 2 }
+    let held = try #require(chat.held.first { $0.item.text == "Second held note" })
+    await chat.restoreHeld(held)
+    // Long enough for a withdrawal sent at once to arrive over loopback.
+    try await Task.sleep(for: .seconds(1))
+    let kept = await used.holds(install.installation)
+    print(
+      "IF15-U3[refused, unsaved coordinator] the form shows \"\(shown)\" Restore: draft=\(chat.draft.debugDescription) offered=\(chat.heldChoices.map(\.name.description)) old installation still held=\(kept)"
+    )
+    #expect(shown == "This address answers as a different coordinator. Nothing was saved.")
+    #expect(chat.draft.isEmpty, "Restore addressed a held message without a choice")
+    #expect(kept, "A coordinator no saved profile is pinned to was sent the build's installation")
+  }
+}

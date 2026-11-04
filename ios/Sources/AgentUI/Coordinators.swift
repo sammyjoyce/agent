@@ -121,8 +121,8 @@ public final class Coordinators {
       do {
         let found = try await identifyCoordinator(at: profile.address, transport: transport)
         var next = profiles
-        guard try CoordinatorProfile.admit(found, for: id, in: &next) else { return true }
-        try savePairing(next, id)
+        guard try admit(found, for: id, in: &next, at: profile.address) else { return true }
+        try save(next, answered: found, at: profile.address)
         pairingError[id] = nil
         await start(id)
         return true
@@ -141,8 +141,8 @@ public final class Coordinators {
       let found = try await identifyCoordinator(at: address, transport: transport)
       let profile = CoordinatorProfile(name: name, address: address)
       var next = profiles + [profile]
-      _ = try CoordinatorProfile.admit(found, for: profile.id, in: &next)
-      try savePairing(next, profile.id)
+      _ = try admit(found, for: profile.id, in: &next, at: address)
+      try save(next, answered: found, at: address)
       chat.attach(lane(next[next.count - 1]))
       if chat.active { await chat.lanes.first { $0.id == profile.id }?.session?.connect() }
     }
@@ -160,8 +160,8 @@ public final class Coordinators {
       var next = profiles
       next[index].name = name
       next[index].address = address
-      if let found { _ = try CoordinatorProfile.admit(found, for: id, in: &next) }
-      try savePairing(next, id)
+      if let found { _ = try admit(found, for: id, in: &next, at: address) }
+      try save(next, answered: found ?? next[index].pin, at: address)
       guard found != nil, profiles[index].pin != nil else { return }
       let hold = chat.lanes.first { $0.id == id }?.hold
       await chat.detach(id)
@@ -261,14 +261,31 @@ public final class Coordinators {
     withdrawals = rest
   }
 
-  /// Saves `next`, in which `admit` may have just paired `id` or proven it at a new address. A
-  /// profile paired at the single-address build's address takes over what that build left, and its
-  /// installation's withdrawal is saved in the same write and goes at once.
-  private func savePairing(_ next: [CoordinatorProfile], _ id: ProfileID) throws {
-    var origin = origin
-    let handover = next.first { $0.id == id }.flatMap { profile in
-      profile.pin.flatMap { origin?.pair($0, at: profile.address) }
+  /// `CoordinatorProfile.admit`, whose refusal still saves what the probe proved: the socket at
+  /// `address` answered as `found`, which may be a saved coordinator.
+  private func admit(
+    _ found: CoordinatorID, for id: ProfileID, in next: inout [CoordinatorProfile],
+    at address: CoordinatorAddress
+  ) throws -> Bool {
+    do { return try CoordinatorProfile.admit(found, for: id, in: &next) } catch {
+      // A save that fails is tried again the next time this address answers.
+      try? save(profiles, answered: found, at: address)
+      throw error
     }
+  }
+
+  /// Saves `next` after a socket at `address` answered as `found`. When a profile in `next` is
+  /// pinned to `found`, what the single-address build left for `address` goes to `found`, and the
+  /// installation's withdrawal is saved in the same write and goes at once. A coordinator no saved
+  /// profile is pinned to takes nothing. When nothing changed, nothing is written.
+  private func save(
+    _ next: [CoordinatorProfile], answered found: CoordinatorID?, at address: CoordinatorAddress
+  ) throws {
+    var origin = origin
+    let handover = found.flatMap { found in
+      next.contains { $0.pin == found } ? origin?.pair(found, at: address) : nil
+    }
+    guard next != profiles || origin != self.origin else { return }
     let pending = withdrawals + [handover].compactMap { $0 }
     try save(SavedProfiles(profiles: next, withdrawals: pending, origin: origin))
     profiles = next
