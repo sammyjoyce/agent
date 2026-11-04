@@ -2691,6 +2691,88 @@ func theShippedBuildsLaunchDeletesNothingThisBuildSaved() async throws {
   }
 }
 
+/// An earlier build of this app left a note in Personal's `Legacy` folder, and the single-address
+/// build left notes in two outboxes. The migration stops at each time it reaches `step`, and the
+/// build the fork shipped before this one is launched over what it left: that launch deletes
+/// nothing. Then this build resumes, and every queue named at the stop holds its notes, once.
+@MainActor
+@Test(
+  arguments: [
+    Coordinators.MigrationStep.queueNamed, .profileSaved, .quarantined, .markerRemoved,
+  ])
+func aMigrationStoppedAtAnyStepLeavesTheShippedBuildNothingToDelete(
+  _ step: Coordinators.MigrationStep
+) async throws {
+  var stops: [String] = []
+  for stop in 1... {
+    let install = try await LegacyInstall()
+    defer { install.remove() }
+    func note(_ text: String) -> NativeRequestSubmit {
+      NativeRequestSubmit(inputId: UUID().uuidString, mode: .followUp, text: text)
+    }
+    try writePrivately(
+      JSONEncoder().encode([note("Invented note from another launch")]),
+      to: install.otherOutbox.appending(path: "pending.json"))
+    let personal = CoordinatorProfile(
+      name: try TagName("Personal"), address: try CoordinatorAddress(host: "100.64.1.3"))
+    let legacy = ProfileDirectory(
+      personal.id, applicationSupport: install.support, caches: install.caches
+    ).legacy
+    try writePrivately(
+      JSONEncoder().encode([note("Invented note an earlier build held")]),
+      to: legacy.appending(path: "pending.json"))
+    struct Earlier: Encodable { let profiles: [CoordinatorProfile] }
+    try writePrivately(
+      JSONEncoder().encode(Earlier(profiles: [personal])),
+      to: install.support.appending(path: "Agent/profiles.json"))
+    var reached = 0
+    do {
+      _ = try Coordinators.migrate(
+        defaults: install.defaults, applicationSupport: install.support, caches: install.caches,
+        crash: {
+          guard $0 == step else { return }
+          reached += 1
+          if reached == stop { throw Crash() }
+        })
+      break
+    } catch is Crash {}
+    struct Listed: Decodable {
+      struct Queue: Decodable { let id: UUID }
+      let held: [Queue]?
+    }
+    let listed = try JSONDecoder().decode(Listed.self, from: install.savedProfiles()).held ?? []
+    let folders =
+      (try? FileManager.default.contentsOfDirectory(
+        atPath: install.support.appending(path: "Agent/Held").path)) ?? []
+    let sources = try [install.oldOutbox, install.otherOutbox, legacy].compactMap {
+      try HeldQueue.recorded(in: $0)?.id
+    }
+    let named = Set(listed.map(\.id) + folders.compactMap(UUID.init(uuidString:)) + sources)
+    let deleted = try ShippedBuild.launchDeletes(support: install.support, caches: install.caches)
+    let resumed = try Coordinators.migrate(
+      defaults: install.defaults, applicationSupport: install.support, caches: install.caches)
+    var held: [String] = []
+    for queue in resumed.held {
+      held += try await LegacyHold(queue.folder(applicationSupport: install.support)).items().map(
+        \.text)
+    }
+    let after = try ShippedBuild.launchDeletes(support: install.support, caches: install.caches)
+    stops.append(
+      "\(step) #\(stop): Agent/Held=\(folders.count) listed=\(listed.count) | the shipped build deletes \(deleted.map(\.lastPathComponent)) | resumed: queues=\(resumed.held.count) named at the stop kept=\(named.isSubset(of: Set(resumed.held.map(\.id)))) notes=\(held.count) the shipped build deletes \(after.count)"
+    )
+    #expect(deleted.isEmpty, "The shipped build deletes what a stopped migration left")
+    #expect(named.isSubset(of: Set(resumed.held.map(\.id))), "A queue named at the stop is gone")
+    #expect(resumed.held.count == 3)
+    #expect(
+      held.sorted()
+        == (install.queued.map(\.text) + [
+          "Invented note from another launch", "Invented note an earlier build held",
+        ]).sorted())
+    #expect(after.isEmpty)
+  }
+  print("IF17b-S4\n" + stops.joined(separator: "\n"))
+}
+
 /// This build held the single-address build's queue for 100.64.1.2:43187. Then the build the fork
 /// shipped before this one ran: its coordinator answered there, so that build bound the queue to it
 /// and withdrew the old alert installation, and the user moved the profile to port 4001. This build,
