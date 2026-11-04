@@ -7,7 +7,10 @@
   @testable import AgentUI
 
   #if os(iOS)
+    import CryptoKit
+    import Network
     import UIKit
+    import Vision
   #else
     import AppKit
   #endif
@@ -603,8 +606,7 @@
               id: profile.id,
               session: CoordinatorSession(
                 directory: directory, address: profile.address, pin: CoordinatorID(UUID()),
-                stamps: StampSource()),
-              hold: LegacyHold(directory)))
+                stamps: StampSource())))
         }
         func message(_ id: String, _ role: HistoryRole, _ text: String, tool: ToolHistory? = nil)
           -> HistoryMessage
@@ -756,8 +758,7 @@
                 id: profile.id,
                 session: CoordinatorSession(
                   directory: directory, address: profile.address, pin: CoordinatorID(UUID()),
-                  stamps: StampSource()),
-                hold: LegacyHold(directory)))
+                  stamps: StampSource())))
           }
           model.recipient = chosen.id
           model.draft = draft
@@ -847,8 +848,7 @@
               id: profile.id,
               session: CoordinatorSession(
                 directory: directory, address: profile.address, pin: CoordinatorID(UUID()),
-                stamps: StampSource()),
-              hold: LegacyHold(directory)))
+                stamps: StampSource())))
         }
         model.recipient = work.id
         model.draft = (1...10).map { "Invented line \($0) for Work only" }.joined(separator: "\n")
@@ -904,7 +904,7 @@
         model.profiles = [work, personal]
         for profile in model.profiles {
           let directory = ProfileDirectory(profile.id, applicationSupport: root, caches: root)
-          model.attach(Lane(id: profile.id, session: nil, hold: LegacyHold(directory)))
+          model.attach(Lane(id: profile.id, session: nil))
         }
         // The ink check reads dark text, whatever appearance an earlier test left the app in.
         let defaults = UserDefaults.standard
@@ -1078,7 +1078,7 @@
             let session = CoordinatorSession(
               directory: directory, address: profile.address, pin: fixture.id, stamps: stamps,
               transport: loopback(port))
-            model.attach(Lane(id: profile.id, session: session, hold: LegacyHold(directory)))
+            model.attach(Lane(id: profile.id, session: session))
           }
           await model.setActive(true)
           do {
@@ -1171,10 +1171,11 @@
       ) async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
-        let directory = ProfileDirectory(profile.id, applicationSupport: root, caches: root)
+        let queue = HeldQueue(address: nil, installation: nil)
+        let folder = queue.folder(applicationSupport: root)
         var attachments: [AttachmentRef]?
         if let file {
-          let store = AttachmentStore(directory: directory.legacy.appending(path: "Attachments"))
+          let store = AttachmentStore(directory: folder.appending(path: "Attachments"))
           let staged = try await store.stage(
             data: Data("Invented: \(file)".utf8), name: file, mediaType: "text/plain")
           attachments = [staged.reference]
@@ -1183,11 +1184,11 @@
           JSONEncoder().encode([
             NativeRequestSubmit(
               attachments: attachments, inputId: UUID().uuidString, mode: .steer, text: text)
-          ]), to: directory.legacy.appending(path: "pending.json"))
-        let hold = LegacyHold(directory)
-        model.attach(Lane(id: profile.id, session: nil, hold: hold))
-        let item = try #require(try await hold.items().first)
-        await model.restoreHeld(HeldMessage(lane: profile.id, item: item), for: profile.id)
+          ]), to: folder.appending(path: "pending.json"))
+        let hold = Hold(queue: queue, store: LegacyHold(folder))
+        model.holds.append(hold)
+        let item = try #require(try await hold.store.items().first)
+        await model.restoreHeld(HeldMessage(queue: queue.id, item: item), for: profile.id)
         try await Task.sleep(for: .milliseconds(250))
       }
 
@@ -1538,6 +1539,123 @@
         #expect(standard.width == accessible.width)
         #expect(accessible.height > standard.height)
         Attachment.record(accessible, named: "message-accessibility", as: .png)
+      }
+
+      /// The single-address build queued a private note for the coordinator at 100.64.1.3, which
+      /// answers nothing after the update, so the user points the one saved coordinator at Work's
+      /// address. The note stays on screen, held, and nothing says it is Work's. `/feedback` sent
+      /// from the real screen reaches Work without a screenshot, and the composer says why. Once the
+      /// user discards the note, the next `/feedback` attaches the real screen, which shows only
+      /// Work's feed and the draft.
+      @MainActor @Test func feedbackFromTheRealScreenNeverUploadsAnotherCoordinatorsHeldNote()
+        async throws
+      {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suite = "if15-hosted-\(UUID())"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set("100.64.1.3", forKey: "coordinatorAddress")
+        let key = SHA256.hash(data: Data("100.64.1.3:43187".utf8)).map {
+          String(format: "%02x", $0)
+        }.joined()
+        let queue = root.appending(path: "Agent/Outbox/\(key)/pending.json")
+        try FileManager.default.createDirectory(
+          at: queue.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let secret = "PERSONAL SECRET 246810"
+        try JSONEncoder().encode([
+          NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: secret)
+        ]).write(to: queue)
+        let work = FixtureCoordinator()
+        let (listener, port) = try await listen(work)
+        defer { listener.cancel() }
+        let coordinators = Coordinators(
+          registration: nil, defaults: defaults, applicationSupport: root,
+          caches: root.appending(path: "Caches"),
+          transport: CoordinatorTransport { address in
+            guard address.host == "100.64.1.2" else { throw ConnectionError.timedOut }
+            return LineConnection(
+              connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+          })
+        let profile = try #require(coordinators.profiles.first)
+        try await coordinators.update(
+          profile.id, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2"))
+        await coordinators.setActive(true)
+        let model = coordinators.chat
+        @MainActor func waitFor(_ what: String, _ predicate: () async -> Bool) async throws {
+          let deadline = ContinuousClock.now + .seconds(15)
+          while !(await predicate()) {
+            try #require(ContinuousClock.now < deadline, "Timed out waiting for \(what)")
+            try await Task.sleep(for: .milliseconds(10))
+          }
+        }
+        try await waitFor("Work connected with the note held") {
+          model.connection == .connected && model.held.count == 1
+        }
+        let scene = try #require(
+          UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let previous = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        let host = UIHostingController(rootView: MainChatView(model: model))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer {
+          window.isHidden = true
+          window.rootViewController = nil
+          previous?.makeKey()
+        }
+        window.layoutIfNeeded()
+        let capture = AppScreenshot()
+        capture.anchor = host.view
+        @MainActor func feedback(_ text: String) async throws -> [AttachmentRef] {
+          let before = await work.count()
+          model.draft = text
+          try await Task.sleep(for: .milliseconds(700))
+          host.view.layoutIfNeeded()
+          await model.send(screenshot: capture.png)
+          try await waitFor("Work got \(text)") { await work.count() == before + 1 }
+          let inputs = await work.received().compactMap { event -> NativeRequestSubmit? in
+            if case .submit(let input) = event { input } else { nil }
+          }
+          return try #require(inputs.last { $0.text == text }).attachments ?? []
+        }
+        func recognized(_ png: Data) throws -> String {
+          let request = VNRecognizeTextRequest()
+          request.recognitionLevel = .accurate
+          try VNImageRequestHandler(data: png).perform([request])
+          return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+            .joined(separator: " | ")
+        }
+        let first = try await feedback("/feedback invented issue")
+        let line = model.error ?? "nil"
+        var leaked: [String] = []
+        for file in first {
+          leaked.append(try recognized(try #require(await work.uploaded(file.id))))
+        }
+        print(
+          "IF15-U1[real screen, note held for 100.64.1.3] files=\(first.map(\.name)) uploads=\(await work.uploadCount()) composer=\(line) uploaded text=\(leaked)"
+        )
+        #expect(
+          first.isEmpty, "Work got the screen while it showed a note held for another address")
+        #expect(!leaked.contains { $0.contains(secret) })
+        #expect(
+          line
+            == "Feedback was sent without a screenshot. The screen shows messages held from before the update, which may be another coordinator's."
+        )
+        await model.discardHeld(try #require(model.held.first))
+        try await waitFor("the note discarded") { model.held.isEmpty }
+        let second = try await feedback("/feedback second invented issue")
+        let screenshot = try #require(second.first, "No screenshot once only Work's feed shows")
+        let png = try #require(await work.uploaded(screenshot.id))
+        let text = try recognized(png)
+        print(
+          "IF15-U1[real screen, note discarded] files=\(second.map(\.name)) bytes=\(png.count) composer=\(model.error ?? "nil") OCR=\(text)"
+        )
+        #expect(second.map(\.name) == ["Feedback.png"])
+        #expect(!text.contains(secret))
+        #expect(text.contains("second invented issue"), "The real screen was not what Work got")
+        await coordinators.setActive(false)
+        await work.stop()
       }
     #endif
   }

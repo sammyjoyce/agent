@@ -464,13 +464,19 @@ func temporaryProfile() -> (ProfileDirectory, URL) {
   return (ProfileDirectory(ProfileID(), applicationSupport: root, caches: root), root)
 }
 
-/// The feed lane of `session`, holding nothing from before the update.
-func lane(_ session: CoordinatorSession) -> Lane {
-  let empty = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-  return Lane(
-    id: session.profile, session: session,
-    hold: LegacyHold(
-      ProfileDirectory(session.profile, applicationSupport: empty, caches: empty)))
+/// The feed lane of `session`.
+func lane(_ session: CoordinatorSession) -> Lane { Lane(id: session.profile, session: session) }
+
+/// A queue the single-address build left with `messages`, queued for `address`, in its own folder
+/// under `root`, and its store, for the feed to hold.
+func heldQueue(
+  _ messages: [NativeRequestSubmit], in root: URL, address: CoordinatorAddress? = nil,
+  coordinator: CoordinatorID? = nil
+) throws -> Hold {
+  let queue = HeldQueue(address: address, coordinator: coordinator, installation: nil)
+  let folder = queue.folder(applicationSupport: root)
+  try writePrivately(JSONEncoder().encode(messages), to: folder.appending(path: "pending.json"))
+  return Hold(queue: queue, store: LegacyHold(folder))
 }
 
 func withCoordinator(

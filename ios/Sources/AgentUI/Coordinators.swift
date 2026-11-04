@@ -13,10 +13,20 @@ public final class Coordinators {
     get { chat.profiles }
     set { chat.profiles = newValue }
   }
-  /// What the single-address build left. The feed keeps the one copy, as it does `profiles`.
-  private(set) var origin: LegacyOrigin? {
-    get { chat.origin }
-    set { chat.origin = newValue }
+  /// What the single-address build left, one queue for each launch of it that left something. The
+  /// feed keeps the one copy, as it does `profiles`, each queue with the store that reads its folder.
+  private(set) var queues: [HeldQueue] {
+    get { chat.holds.map(\.queue) }
+    set {
+      let stores = Dictionary(
+        chat.holds.map { ($0.queue.id, $0.store) }, uniquingKeysWith: { first, _ in first })
+      chat.holds = newValue.map { queue in
+        Hold(
+          queue: queue,
+          store: stores[queue.id]
+            ?? LegacyHold(queue.folder(applicationSupport: applicationSupport)))
+      }
+    }
   }
   /// Why an unpaired profile is not paired yet.
   private(set) var pairingError: [ProfileID: String] = [:]
@@ -61,8 +71,8 @@ public final class Coordinators {
         defaults: defaults, applicationSupport: applicationSupport, caches: caches)
       profiles = saved.profiles
       withdrawals = saved.withdrawals
-      origin = saved.origin
-      Self.removeUnlisted(saved.profiles, applicationSupport: applicationSupport, caches: caches)
+      queues = saved.held
+      Self.removeUnlisted(saved, applicationSupport: applicationSupport, caches: caches)
     } catch {
       failure =
         "Saved coordinators could not be loaded. Nothing was changed. Reopen Agent to try again. \(error.localizedDescription)"
@@ -121,8 +131,8 @@ public final class Coordinators {
       do {
         let found = try await identifyCoordinator(at: profile.address, transport: transport)
         var next = profiles
-        guard try CoordinatorProfile.admit(found, for: id, in: &next) else { return true }
-        try savePairing(next, id)
+        guard try admit(found, for: id, in: &next, at: profile.address) else { return true }
+        try save(next, answered: found, at: profile.address)
         pairingError[id] = nil
         await start(id)
         return true
@@ -141,8 +151,8 @@ public final class Coordinators {
       let found = try await identifyCoordinator(at: address, transport: transport)
       let profile = CoordinatorProfile(name: name, address: address)
       var next = profiles + [profile]
-      _ = try CoordinatorProfile.admit(found, for: profile.id, in: &next)
-      try savePairing(next, profile.id)
+      _ = try admit(found, for: profile.id, in: &next, at: address)
+      try save(next, answered: found, at: address)
       chat.attach(lane(next[next.count - 1]))
       if chat.active { await chat.lanes.first { $0.id == profile.id }?.session?.connect() }
     }
@@ -160,18 +170,17 @@ public final class Coordinators {
       var next = profiles
       next[index].name = name
       next[index].address = address
-      if let found { _ = try CoordinatorProfile.admit(found, for: id, in: &next) }
-      try savePairing(next, id)
+      if let found { _ = try admit(found, for: id, in: &next, at: address) }
+      try save(next, answered: found ?? next[index].pin, at: address)
       guard found != nil, profiles[index].pin != nil else { return }
-      let hold = chat.lanes.first { $0.id == id }?.hold
       await chat.detach(id)
-      chat.attach(lane(profiles[index], hold: hold))
+      chat.attach(lane(profiles[index]))
       if chat.active { await chat.lanes.first { $0.id == id }?.session?.connect() }
     }
   }
 
-  /// Remove's confirmation: how many messages it deletes on this phone, queued plus held. A
-  /// queue that cannot be read is never counted as empty.
+  /// Remove's confirmation: how many messages it deletes on this phone, queued plus held for its
+  /// coordinator. A queue that cannot be read is never counted as empty.
   func removalMessage(_ id: ProfileID) -> String {
     do {
       return switch try directory(id).queuedMessages() {
@@ -186,9 +195,10 @@ public final class Coordinators {
 
   /// Refuses while the draft is addressed to or restored from the coordinator. Otherwise marks
   /// it removed, with no await since the check, so nothing addresses it again. Then saves
-  /// `profiles.json` without it and with its pending alert withdrawal in one write, and a failed
-  /// save changes nothing else. Only then withdraws alerts over the still-attached session,
-  /// retires the lane's session and deletes the profile's files.
+  /// `profiles.json` without it, without the queues held for its coordinator, and with its pending
+  /// alert withdrawal, in one write, and a failed save changes nothing else. Only then withdraws
+  /// alerts over the still-attached session, retires the lane's session and deletes the profile's
+  /// files and those queues. Every other held message stays.
   func remove(_ id: ProfileID) async throws {
     try await serially {
       guard let profile = profiles.first(where: { $0.id == id }) else { return }
@@ -204,8 +214,10 @@ public final class Coordinators {
         pending.append(
           PendingWithdrawal(installation: InstallationID(id), address: profile.address, pin: pin))
       }
+      let held = queues.filter { $0.coordinator != nil && $0.coordinator == profile.pin }
+      let kept = queues.filter { queue in !held.contains { $0.id == queue.id } }
       do {
-        try save(SavedProfiles(profiles: remaining, withdrawals: pending, origin: origin))
+        try save(SavedProfiles(profiles: remaining, withdrawals: pending, held: kept))
       } catch {
         chat.removed[id] = nil
         throw error
@@ -217,8 +229,13 @@ public final class Coordinators {
       await chat.detach(id)
       pairing.removeValue(forKey: id)?.cancel()
       profiles = remaining
+      queues = kept
       pairingError[id] = nil
       try directory(id).remove()
+      for folder in held.map({ $0.folder(applicationSupport: applicationSupport) })
+      where FileManager.default.fileExists(atPath: folder.path) {
+        try FileManager.default.removeItem(at: folder)
+      }
     }
   }
 
@@ -256,35 +273,56 @@ public final class Coordinators {
   private func confirmWithdrawal(_ id: InstallationID, saved profiles: [CoordinatorProfile]) {
     let rest = withdrawals.filter { $0.installation != id }
     do {
-      try save(SavedProfiles(profiles: profiles, withdrawals: rest, origin: origin))
+      try save(SavedProfiles(profiles: profiles, withdrawals: rest, held: queues))
     } catch { return }
     withdrawals = rest
   }
 
-  /// Saves `next`, in which `admit` may have just paired `id` or proven it at a new address. A
-  /// profile paired at the single-address build's address takes over what that build left, and its
-  /// installation's withdrawal is saved in the same write and goes at once.
-  private func savePairing(_ next: [CoordinatorProfile], _ id: ProfileID) throws {
-    var origin = origin
-    let handover = next.first { $0.id == id }.flatMap { profile in
-      profile.pin.flatMap { origin?.pair($0, at: profile.address) }
+  /// `CoordinatorProfile.admit`, whose refusal still saves what the probe proved: the socket at
+  /// `address` answered as `found`, which may be a saved coordinator.
+  private func admit(
+    _ found: CoordinatorID, for id: ProfileID, in next: inout [CoordinatorProfile],
+    at address: CoordinatorAddress
+  ) throws -> Bool {
+    do { return try CoordinatorProfile.admit(found, for: id, in: &next) } catch {
+      // A save that fails is tried again the next time this address answers.
+      try? save(profiles, answered: found, at: address)
+      throw error
     }
-    let pending = withdrawals + [handover].compactMap { $0 }
-    try save(SavedProfiles(profiles: next, withdrawals: pending, origin: origin))
+  }
+
+  /// Saves `next` after a socket at `address` answered as `found`. When a profile in `next` is
+  /// pinned to `found`, each queue the single-address build left for `address` that no coordinator
+  /// took yet goes to `found`, and its installation's withdrawal is saved in the same write and goes
+  /// at once. A coordinator no saved profile is pinned to takes nothing. When nothing changed,
+  /// nothing is written.
+  private func save(
+    _ next: [CoordinatorProfile], answered found: CoordinatorID?, at address: CoordinatorAddress
+  ) throws {
+    var queues = queues
+    var handovers: [PendingWithdrawal] = []
+    if let found, next.contains(where: { $0.pin == found }) {
+      for index in queues.indices {
+        if let handover = queues[index].bind(found, at: address) { handovers.append(handover) }
+      }
+    }
+    guard next != profiles || queues != self.queues else { return }
+    let pending = withdrawals + handovers
+    try save(SavedProfiles(profiles: next, withdrawals: pending, held: queues))
     profiles = next
     withdrawals = pending
-    self.origin = origin
-    if let handover, chat.active { retry(handover) }
+    self.queues = queues
+    if chat.active { for handover in handovers { retry(handover) } }
   }
 
   private func start(_ id: ProfileID) async {
     guard let profile = profiles.first(where: { $0.id == id }) else { return }
-    chat.attach(lane(profile, hold: chat.lanes.first { $0.id == id }?.hold))
+    chat.attach(lane(profile))
     if chat.active { await chat.lanes.first { $0.id == id }?.session?.connect() }
   }
 
   /// The one place a session is built. Only a pinned profile gets one.
-  private func lane(_ profile: CoordinatorProfile, hold: LegacyHold? = nil) -> Lane {
+  private func lane(_ profile: CoordinatorProfile) -> Lane {
     let directory = directory(profile.id)
     return Lane(
       id: profile.id,
@@ -292,12 +330,16 @@ public final class Coordinators {
         CoordinatorSession(
           directory: directory, address: profile.address, pin: $0, stamps: stamps,
           transport: transport)
-      },
-      hold: hold ?? LegacyHold(directory))
+      })
   }
 
+  /// The profile's paths. Its count of what Remove deletes reads `profiles.json` for the queues
+  /// held for its coordinator, so a session's banner and Remove's confirmation agree.
   private func directory(_ id: ProfileID) -> ProfileDirectory {
-    ProfileDirectory(id, applicationSupport: applicationSupport, caches: caches)
+    ProfileDirectory(id, applicationSupport: applicationSupport, caches: caches) {
+      [applicationSupport] in
+      try Self.heldCount(for: id, applicationSupport: applicationSupport)
+    }
   }
 
   /// Callers save first and assign after, so memory never runs ahead of disk.
@@ -315,76 +357,182 @@ extension Coordinators {
     var profiles: [CoordinatorProfile]
     /// Alert withdrawals Remove saved that no coordinator has confirmed yet.
     var withdrawals: [PendingWithdrawal]
-    var origin: LegacyOrigin?
+    /// What the single-address build left, one queue for each launch of it that left something.
+    var held: [HeldQueue]
+    /// What an earlier build of this app wrote about the single-address build in place of `held`,
+    /// until `migrate` adopts it. Never written.
+    var earlier: Earlier?
+
+    private enum CodingKeys: String, CodingKey { case profiles, withdrawals, held }
 
     init(
       profiles: [CoordinatorProfile], withdrawals: [PendingWithdrawal] = [],
-      origin: LegacyOrigin? = nil
+      held: [HeldQueue] = []
     ) {
       self.profiles = profiles
       self.withdrawals = withdrawals
-      self.origin = origin
+      self.held = held
     }
     init(from decoder: any Decoder) throws {
       let container = try decoder.container(keyedBy: CodingKeys.self)
       profiles = try container.decode([CoordinatorProfile].self, forKey: .profiles)
       withdrawals =
         try container.decodeIfPresent([PendingWithdrawal].self, forKey: .withdrawals) ?? []
-      // The previous build kept the installation on the migrated profile as `inherited`, only
-      // while that profile was unpaired, so still at the address it was migrated from.
-      struct Earlier: Decodable {
-        let address: CoordinatorAddress
+      if let held = try container.decodeIfPresent([HeldQueue].self, forKey: .held) {
+        self.held = held
+      } else {
+        held = []
+        earlier = try Earlier(from: decoder)
+      }
+    }
+  }
+
+  /// What earlier builds of this app wrote about the single-address build. One kept a single
+  /// `origin` for its one held queue. One before it kept the build's alert installation on the
+  /// migrated profile as `inherited` while that profile was unpaired. The first ones kept neither.
+  struct Earlier: Decodable, Equatable {
+    struct Origin: Decodable, Equatable {
+      let address: CoordinatorAddress
+      let coordinator: CoordinatorID?
+      let installation: InstallationID?
+    }
+    let origin: Origin?
+    let inherited: [ProfileID: InstallationID]
+
+    private enum CodingKeys: String, CodingKey { case origin, profiles }
+
+    init(from decoder: any Decoder) throws {
+      let container = try decoder.container(keyedBy: CodingKeys.self)
+      origin = try container.decodeIfPresent(Origin.self, forKey: .origin)
+      struct Profile: Decodable {
+        let id: ProfileID
         let inherited: InstallationID?
       }
-      origin =
-        try container.decodeIfPresent(LegacyOrigin.self, forKey: .origin)
-        ?? container.decode([Earlier].self, forKey: .profiles).first { $0.inherited != nil }.map {
-          LegacyOrigin(address: $0.address, installation: $0.inherited)
-        }
+      inherited = Dictionary(
+        try container.decode([Profile].self, forKey: .profiles).compactMap { profile in
+          profile.inherited.map { (profile.id, $0) }
+        }, uniquingKeysWith: { first, _ in first })
     }
   }
 
   /// Checkpoints after which a test can stop a migration, standing in for a crash.
-  enum MigrationStep { case profileSaved, quarantined, markerRemoved }
+  enum MigrationStep { case queueNamed, profileSaved, quarantined, markerRemoved }
 
-  /// One-shot and idempotent, offline. Moves the single-address build's last queue into the
-  /// migrated profile's read-only hold, and its alert installation onto that profile until it
-  /// pairs. `coordinatorAddress` is the resume marker. It goes before the port key, so a crash in
-  /// between cannot re-run with the default port.
+  /// Names the queue a migration moves the single-address build's outbox into, until it finishes,
+  /// so one that stops at any step resumes with the same queue.
+  private static let migratingQueue = "migratingHeldQueue"
+
+  /// Idempotent and offline, at every launch. Adopts what earlier builds of this app held. Then
+  /// moves the single-address build's last queue into a held queue of its own, keyed to the address
+  /// it was queued for and keeping the build's alert installation, and saves a profile at that
+  /// address. `coordinatorAddress` is the resume marker. It goes before the port key, so a crash in
+  /// between cannot re-run with the default port. Last, each queue held for an address that exactly
+  /// one saved profile is pinned at goes to that profile's coordinator.
   static func migrate(
     defaults: UserDefaults, applicationSupport: URL, caches: URL,
     crash: (MigrationStep) throws -> Void = { _ in }
   ) throws -> SavedProfiles {
     var saved = try load(applicationSupport: applicationSupport)
-    guard let host = defaults.string(forKey: "coordinatorAddress") else {
-      defaults.removeObject(forKey: "coordinatorPort")
-      defaults.removeObject(forKey: "notificationInstallationID")
-      return saved
+    if let earlier = saved.earlier {
+      saved.held = adopt(
+        earlier, profiles: saved.profiles, applicationSupport: applicationSupport, caches: caches)
+      saved.earlier = nil
+      try save(saved, applicationSupport: applicationSupport)
     }
+    for queue in saved.held {
+      try queue.adoptFolder(applicationSupport: applicationSupport, caches: caches)
+    }
+    if let host = defaults.string(forKey: "coordinatorAddress") {
+      try quarantine(
+        host: host, into: &saved, defaults: defaults, applicationSupport: applicationSupport,
+        caches: caches, crash: crash)
+    }
+    for key in ["coordinatorPort", "notificationInstallationID", migratingQueue] {
+      defaults.removeObject(forKey: key)
+    }
+    if bindPinned(&saved) { try save(saved, applicationSupport: applicationSupport) }
+    return saved
+  }
+
+  /// Earlier builds of this app held the single-address build's queue in the migrated profile's
+  /// `Legacy` folder. Each saved profile's such folder becomes a queue, keyed to the address it was
+  /// queued for when this phone knows it: the one the earlier build recorded, else the profile's own
+  /// while it never paired, since only pairing changes a migrated profile's address. A paired one
+  /// may have been edited before it paired, so its queue's address is unknown. An installation no
+  /// folder took still waits for a coordinator at its address.
+  private static func adopt(
+    _ earlier: Earlier, profiles: [CoordinatorProfile], applicationSupport: URL, caches: URL
+  ) -> [HeldQueue] {
+    let holders = profiles.filter {
+      FileManager.default.fileExists(
+        atPath: ProfileDirectory($0.id, applicationSupport: applicationSupport, caches: caches)
+          .legacy.path)
+    }
+    var origin = earlier.origin
+    var queues = holders.map { holder in
+      if let installation = earlier.inherited[holder.id] {
+        return HeldQueue(adopting: holder.id, address: holder.address, installation: installation)
+      }
+      if let recorded = origin, holders.count == 1 {
+        origin = nil
+        return HeldQueue(
+          adopting: holder.id, address: recorded.address, coordinator: recorded.coordinator,
+          installation: recorded.installation)
+      }
+      return HeldQueue(
+        adopting: holder.id, address: holder.pin == nil ? holder.address : nil, installation: nil)
+    }
+    if let origin, origin.installation != nil {
+      queues.append(
+        HeldQueue(
+          address: origin.address, coordinator: origin.coordinator,
+          installation: origin.installation))
+    }
+    for profile in profiles where !holders.contains(where: { $0.id == profile.id }) {
+      if let installation = earlier.inherited[profile.id] {
+        queues.append(HeldQueue(address: profile.address, installation: installation))
+      }
+    }
+    return queues
+  }
+
+  /// Moves the single-address build's outbox for its last address into a held queue of its own.
+  private static func quarantine(
+    host: String, into saved: inout SavedProfiles, defaults: UserDefaults,
+    applicationSupport: URL, caches: URL, crash: (MigrationStep) throws -> Void
+  ) throws {
     let port = defaults.string(forKey: "coordinatorPort") ?? "43187"
     if let port = UInt16(port.trimmingCharacters(in: .whitespacesAndNewlines)),
       let address = try? CoordinatorAddress(
         host: host.trimmingCharacters(in: .whitespacesAndNewlines), port: port)
     {
-      // Saved before the move, so a quarantined queue always has a profile pointing at it.
-      let profile: CoordinatorProfile
-      if let existing = saved.profiles.first(where: { $0.address == address }) {
-        profile = existing
-      } else {
-        profile = CoordinatorProfile(name: TagName(defaultFor: address), address: address)
-        saved.profiles.append(profile)
+      let id = defaults.string(forKey: migratingQueue).flatMap(UUID.init(uuidString:)) ?? UUID()
+      defaults.set(id.uuidString, forKey: migratingQueue)
+      try crash(.queueNamed)
+      var next = saved
+      if !next.profiles.contains(where: { $0.address == address }) {
+        next.profiles.append(
+          CoordinatorProfile(name: TagName(defaultFor: address), address: address))
+      }
+      if !next.held.contains(where: { $0.id == id }) {
         // In the same write as the profile, since the installation ID leaves the defaults below.
-        saved.origin = LegacyOrigin(
-          address: address,
-          installation: defaults.string(forKey: "notificationInstallationID").flatMap(
-            InstallationID.init(legacy:)))
-        try save(saved, applicationSupport: applicationSupport)
+        next.held.append(
+          HeldQueue(
+            id: id, address: address,
+            installation: defaults.string(forKey: "notificationInstallationID").flatMap(
+              InstallationID.init(legacy:))))
+      }
+      // Saved before the move, so a quarantined queue always has a record pointing at it.
+      if next != saved {
+        try save(next, applicationSupport: applicationSupport)
+        saved = next
       }
       try crash(.profileSaved)
-      try quarantineLegacyOutbox(
-        for: address,
-        into: ProfileDirectory(profile.id, applicationSupport: applicationSupport, caches: caches),
-        applicationSupport: applicationSupport)
+      if let queue = saved.held.first(where: { $0.id == id }) {
+        try quarantineLegacyOutbox(
+          for: address, into: queue.folder(applicationSupport: applicationSupport),
+          applicationSupport: applicationSupport)
+      }
       try crash(.quarantined)
     }
     let previews = caches.appending(path: "Agent/Previews")
@@ -393,33 +541,60 @@ extension Coordinators {
     }
     defaults.removeObject(forKey: "coordinatorAddress")
     try crash(.markerRemoved)
-    defaults.removeObject(forKey: "coordinatorPort")
-    defaults.removeObject(forKey: "notificationInstallationID")
-    return saved
   }
 
-  /// Deletes every profile directory `profiles.json` does not list, such as the files of a
-  /// Remove that stopped after its save. Anything left is deleted at the next launch.
-  private static func removeUnlisted(
-    _ profiles: [CoordinatorProfile], applicationSupport: URL, caches: URL
-  ) {
-    let listed = Set(profiles.map(\.id.description))
-    let files = FileManager.default
-    for base in [applicationSupport, caches] {
-      let parent = base.appending(path: "Agent/Profiles")
-      let directories =
-        (try? files.contentsOfDirectory(at: parent, includingPropertiesForKeys: nil)) ?? []
-      for directory in directories where !listed.contains(directory.lastPathComponent) {
-        try? files.removeItem(at: directory)
+  /// Gives each queue held for an address that exactly one saved profile is pinned at to that
+  /// profile's coordinator, with its installation's withdrawal. True when any changed.
+  private static func bindPinned(_ saved: inout SavedProfiles) -> Bool {
+    let before = saved
+    for index in saved.held.indices {
+      guard let address = saved.held[index].address else { continue }
+      let pins = saved.profiles.filter { $0.address == address }.compactMap(\.pin)
+      guard pins.count == 1 else { continue }
+      if let handover = saved.held[index].bind(pins[0], at: address) {
+        saved.withdrawals.append(handover)
       }
+    }
+    return saved != before
+  }
+
+  /// How many held messages Remove deletes with `id`: those of every queue held for its
+  /// coordinator, read from disk.
+  nonisolated static func heldCount(for id: ProfileID, applicationSupport: URL) throws -> Int {
+    let saved = try load(applicationSupport: applicationSupport)
+    guard let pin = saved.profiles.first(where: { $0.id == id })?.pin else { return 0 }
+    return try saved.held.filter { $0.coordinator == pin }.reduce(0) {
+      try $0 + heldMessages(in: $1.folder(applicationSupport: applicationSupport))
     }
   }
 
-  private static func url(_ applicationSupport: URL) -> URL {
+  /// Deletes every profile directory and held queue `profiles.json` does not list, such as the
+  /// files of a Remove that stopped after its save. Anything left is deleted at the next launch.
+  private static func removeUnlisted(
+    _ saved: SavedProfiles, applicationSupport: URL, caches: URL
+  ) {
+    let files = FileManager.default
+    func removeEverything(in parent: URL, except listed: Set<String>) {
+      let entries =
+        (try? files.contentsOfDirectory(at: parent, includingPropertiesForKeys: nil)) ?? []
+      for entry in entries where !listed.contains(entry.lastPathComponent) {
+        try? files.removeItem(at: entry)
+      }
+    }
+    let profiles = Set(saved.profiles.map(\.id.description))
+    for base in [applicationSupport, caches] {
+      removeEverything(in: base.appending(path: "Agent/Profiles"), except: profiles)
+    }
+    removeEverything(
+      in: applicationSupport.appending(path: "Agent/Held"),
+      except: Set(saved.held.map(\.id.uuidString)))
+  }
+
+  private nonisolated static func url(_ applicationSupport: URL) -> URL {
     applicationSupport.appending(path: "Agent/profiles.json")
   }
 
-  private static func load(applicationSupport: URL) throws -> SavedProfiles {
+  private nonisolated static func load(applicationSupport: URL) throws -> SavedProfiles {
     do {
       return try JSONDecoder().decode(
         SavedProfiles.self, from: Data(contentsOf: url(applicationSupport)))
