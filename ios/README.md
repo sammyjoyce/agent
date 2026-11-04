@@ -146,10 +146,11 @@ required for sharing on a phone; an unsigned build does not establish that.
   coordinator. A restored message's text is never read for tags, so removing
   its chip sends it to every coordinator as it is. A tag you type in it stays
   text, and the picker does not open. Send empties the composer, and text you
-  enter while it sends is still restored text. Clearing the composer ends it,
-  so text you type or paste afterwards is new, and a leading `@Name` in it
-  becomes the chip. Undo after clearing brings back its text, which is still
-  restored text. The line under the field names the recipients, or
+  enter while it sends is still restored text. Clearing the composer, its text
+  and its files, ends it, so text you type or paste afterwards is new, and a
+  leading `@Name` in it becomes the chip. Undo never reaches back past a
+  Restore or past clearing a restored message. The original is still queued or
+  held, so restore it again. The line under the field names the recipients, or
   says why Send is blocked, before you send. After a removal the composer keeps working
   this way with one coordinator left, until the app quits.
   A message to several coordinators is saved
@@ -203,10 +204,11 @@ required for sharing on a phone; an unsigned build does not establish that.
   addressed to its own coordinator. Text you type or files you attach while it
   copies the files stay, after the restored message. If you pick another
   coordinator meanwhile, Restore leaves your draft alone. The app removes the
-  original only when you send the restored message unchanged, with the same text
-  and every restored file, and only while its coordinator still refuses it.
-  Once you clear the composer, the original stays even if you send the same
-  text again, typed, pasted or put back by Undo. If
+  original only when you send the restored message unchanged to its coordinator,
+  with the same text and every restored file, and only while its coordinator
+  still refuses it.
+  Once you clear the composer, the original stays even if you type or paste
+  the same text again and send it. If
   you send something else instead, the original stays and still needs
   attention, and **Discard** removes it. The refusal is saved with the queued
   message until it is sent again, so after a reconnect, an address edit or a
@@ -234,9 +236,9 @@ required for sharing on a phone; an unsigned build does not establish that.
   queued. That build never recorded their coordinator, so they may already have
   been delivered. The app never sends them. **Restore to composer** makes a new
   message for you to send, and **Discard** deletes one. A held message leaves
-  the hold only when you send its restored copy unchanged, or discard it. A held
-  message the earlier build saw its coordinator accept offers only **Discard**,
-  since a restored copy would send it twice.
+  the hold only when you send its restored copy unchanged to its coordinator,
+  or discard it. A held message the earlier build saw its coordinator accept
+  offers only **Discard**, since a restored copy would send it twice.
 - Do not restore an uncertain submission as a new message to bypass checking its
   original ID. Coordinator admission may already have succeeded.
 - Use the **+** menu for files, photos, commands and delivery mode, or drop files

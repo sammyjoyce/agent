@@ -1237,21 +1237,30 @@
         }
       }
 
-      /// Restores a message held for Work, with `text`, into the hosted composer.
+      /// Restores a message held for `profile`, with `text` and, if `file` names one, an invented
+      /// file, into the hosted composer.
       @MainActor private func restoreHeld(
-        _ text: String, model: ChatModel, work: CoordinatorProfile
+        _ text: String, file: String? = nil, model: ChatModel, from profile: CoordinatorProfile
       ) async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
-        let directory = ProfileDirectory(work.id, applicationSupport: root, caches: root)
+        let directory = ProfileDirectory(profile.id, applicationSupport: root, caches: root)
+        var attachments: [AttachmentRef]?
+        if let file {
+          let store = AttachmentStore(directory: directory.legacy.appending(path: "Attachments"))
+          let staged = try await store.stage(
+            data: Data("Invented: \(file)".utf8), name: file, mediaType: "text/plain")
+          attachments = [staged.reference]
+        }
         try writePrivately(
           JSONEncoder().encode([
-            NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: text)
+            NativeRequestSubmit(
+              attachments: attachments, inputId: UUID().uuidString, mode: .steer, text: text)
           ]), to: directory.legacy.appending(path: "pending.json"))
         let hold = LegacyHold(directory)
-        model.attach(Lane(id: work.id, session: nil, hold: hold))
+        model.attach(Lane(id: profile.id, session: nil, hold: hold))
         let item = try #require(try await hold.items().first)
-        await model.restoreHeld(HeldMessage(lane: work.id, item: item))
+        await model.restoreHeld(HeldMessage(lane: profile.id, item: item))
         try await Task.sleep(for: .milliseconds(250))
       }
 
@@ -1263,7 +1272,7 @@
           let field = box.draft
           let heading = "Invented memo heading\n"
           let body = "@Personal invented quotation"
-          try await restoreHeld(heading + body, model: model, work: work)
+          try await restoreHeld(heading + body, model: model, from: work)
           model.recipient = nil
           try await Task.sleep(for: .milliseconds(200))
           field.selectedRange = NSRange(location: 0, length: heading.utf16.count)
@@ -1278,16 +1287,16 @@
       }
 
       /// A message held for Work starts with "@Personal". The user restores it, removes its chip and
-      /// empties the field, deleting all of its text at once, cutting it, or deleting it key by key,
-      /// then undoes that. Undo brings back the restored text and the restored draft with it, so no
-      /// chip appears and the text is as it was. Redo empties the field again, and after a second
-      /// Undo a key typed at the end of the text still promotes nothing.
+      /// empties the field, deleting all of its text at once, cutting it, or deleting it key by key.
+      /// That ends the restored draft, and the field's Undo never reaches back past it, so Undo and
+      /// Redo bring nothing back. The held message is still there to restore. Undo and Redo still
+      /// work for what the user types next.
       @MainActor @Test(arguments: ["delete", "cut", "keys"])
-      func undoAfterEmptyingARestoredDraftKeepsItLiteral(_ how: String) async throws {
+      func undoAfterEmptyingARestoredDraftBringsNothingBack(_ how: String) async throws {
         try await withComposer { model, box, work in
           let field = box.draft
           let text = "@Personal invented quotation from Work"
-          try await restoreHeld(text, model: model, work: work)
+          try await restoreHeld(text, model: model, from: work)
           model.recipient = nil
           try await Task.sleep(for: .milliseconds(200))
           let undo = try #require(field.undoManager)
@@ -1306,27 +1315,32 @@
           }
           try await Task.sleep(for: .milliseconds(300))
           let emptied = model.draft
+          let canUndo = undo.canUndo
           undo.undo()
           try await Task.sleep(for: .milliseconds(300))
-          print(
-            "IF9-Y2[\(how)] emptied=\(emptied.debugDescription) undone: chip=\(model.recipient.map(model.name) ?? "none") draft=\(model.draft.debugDescription) field=\(field.text.debugDescription) line=\(model.recipientLine)"
-          )
-          #expect(emptied.isEmpty)
-          #expect(model.recipient == nil, "Undo turned the restored text's own tag into the chip")
-          #expect(model.draft == text && field.text == text, "Undo changed the restored text")
+          let undone = model.draft
           undo.redo()
           try await Task.sleep(for: .milliseconds(300))
-          let redone = model.draft
-          undo.undo()
-          try await Task.sleep(for: .milliseconds(300))
-          field.selectedRange = NSRange(location: field.text.utf16.count, length: 0)
-          field.insertText(".")
-          try await Task.sleep(for: .milliseconds(300))
           print(
-            "IF9-Y2[\(how)] redone=\(redone.debugDescription) undone again, one more key: chip=\(model.recipient.map(model.name) ?? "none") draft=\(model.draft.debugDescription)"
+            "IF10-2[\(how)] emptied=\(emptied.debugDescription) canUndo=\(canUndo) undone: chip=\(model.recipient.map(model.name) ?? "none") draft=\(undone.debugDescription) redone=\(model.draft.debugDescription) field=\(field.text.debugDescription) held=\(model.held.count)"
           )
-          #expect(redone.isEmpty, "Redo did not empty the field again")
-          #expect(model.recipient == nil && model.draft == text + ".")
+          #expect(emptied.isEmpty)
+          #expect(undone.isEmpty, "Undo brought back the cleared restored text")
+          #expect(model.draft.isEmpty && field.text.isEmpty, "Redo brought back restored text")
+          #expect(model.recipient == nil)
+          #expect(model.held.count == 1, "The held message is gone")
+          field.insertText("Invented new note")
+          try await Task.sleep(for: .milliseconds(200))
+          undo.undo()
+          try await Task.sleep(for: .milliseconds(200))
+          let typedUndone = model.draft
+          undo.redo()
+          try await Task.sleep(for: .milliseconds(200))
+          print(
+            "IF10-2[\(how)] typed next: undone=\(typedUndone.debugDescription) redone=\(model.draft.debugDescription)"
+          )
+          #expect(typedUndone.isEmpty, "Undo of what the user typed next")
+          #expect(model.draft == "Invented new note", "Redo of what the user typed next")
         }
       }
 
@@ -1338,7 +1352,7 @@
           let field = box.draft
           let personal = try #require(model.profiles.last?.id)
           let text = "@Personal invented: forward Work's board deck to the auditors"
-          try await restoreHeld(text, model: model, work: work)
+          try await restoreHeld(text, model: model, from: work)
           model.recipient = nil
           try await Task.sleep(for: .milliseconds(200))
           field.selectedRange = NSRange(location: 0, length: field.text.utf16.count)
@@ -1351,6 +1365,149 @@
           )
           #expect(model.recipient == personal)
           #expect(model.draft == "invented: forward Work's board deck to the auditors")
+        }
+      }
+
+      /// The user edits Work's restored draft, its chip removed, without emptying it, so it stays
+      /// restored and literal: pastes other text over all of it, pastes the same text over it, or
+      /// types into a restored message that has only a file. Then the user empties the composer,
+      /// text and file, which ends the restored draft, and Undo brings nothing back.
+      @MainActor @Test(arguments: ["other text pasted", "the same text pasted", "typed by a file"])
+      func undoAfterEmptyingAnEditedRestoredDraftBringsNothingBack(_ edit: String) async throws {
+        try await withComposer { model, box, work in
+          let field = box.draft
+          var text = "@Personal invented quotation from Work"
+          switch edit {
+          case "typed by a file":
+            try await restoreHeld("", file: "Deck.txt", model: model, from: work)
+            model.recipient = nil
+            try await Task.sleep(for: .milliseconds(300))
+            text = "@Personal invented quotation for both"
+            for character in text {
+              field.insertText(String(character))
+              try await Task.sleep(for: .milliseconds(30))
+            }
+          case "other text pasted":
+            try await restoreHeld("Invented restored Work note", model: model, from: work)
+            model.recipient = nil
+            try await Task.sleep(for: .milliseconds(200))
+            text = "@Personal invented replacement while still restored"
+            UIPasteboard.general.string = text
+            field.selectedRange = NSRange(location: 0, length: field.text.utf16.count)
+            field.paste(nil)
+          default:
+            try await restoreHeld(text, model: model, from: work)
+            model.recipient = nil
+            try await Task.sleep(for: .milliseconds(200))
+            field.selectedRange = NSRange(location: 0, length: field.text.utf16.count)
+            field.copy(nil)
+            field.paste(nil)
+          }
+          try await Task.sleep(for: .milliseconds(300))
+          print(
+            "IF10-2[\(edit)] before emptying: chip=\(model.recipient.map(model.name) ?? "none") restoredFrom=\(model.restoredFrom.map(model.name) ?? "none") draft=\(model.draft.debugDescription) files=\(model.attachments.count)"
+          )
+          #expect(model.restoredFrom == work.id && model.recipient == nil && model.draft == text)
+          field.selectedRange = NSRange(location: 0, length: field.text.utf16.count)
+          field.deleteBackward()
+          try await Task.sleep(for: .milliseconds(200))
+          for file in model.attachments { await model.removeAttachment(file) }
+          try await Task.sleep(for: .milliseconds(200))
+          field.undoManager?.undo()
+          try await Task.sleep(for: .milliseconds(300))
+          print(
+            "IF10-2[\(edit)] after Undo: chip=\(model.recipient.map(model.name) ?? "none") draft=\(model.draft.debugDescription) field=\(field.text.debugDescription) files=\(model.attachments.count)"
+          )
+          #expect(model.draft.isEmpty && field.text.isEmpty, "Undo brought back restored text")
+          #expect(model.recipient == nil)
+        }
+      }
+
+      /// A Restore ends the field's Undo even when it puts in only a file, so Undo never brings what
+      /// the composer held before into the restored message. Before Personal's held message with only
+      /// a file is restored, the field held Work's restored text, or text the user typed, and the user
+      /// deleted it.
+      @MainActor @Test(arguments: ["Work's restored text", "typed text"])
+      func undoAfterAFileOnlyRestoreBringsNothingBack(_ before: String) async throws {
+        try await withComposer { model, box, work in
+          let field = box.draft
+          let personal = try #require(model.profiles.last)
+          let text = "Invented: Work's merger memo for the board"
+          if before == "typed text" {
+            field.insertText(text)
+          } else {
+            try await restoreHeld(text, model: model, from: work)
+          }
+          try await Task.sleep(for: .milliseconds(200))
+          field.selectedRange = NSRange(location: 0, length: field.text.utf16.count)
+          field.deleteBackward()
+          try await Task.sleep(for: .milliseconds(300))
+          try await restoreHeld("", file: "Receipt.txt", model: model, from: personal)
+          let undo = try #require(field.undoManager)
+          let canUndo = undo.canUndo
+          undo.undo()
+          try await Task.sleep(for: .milliseconds(300))
+          print(
+            "IF10-2[file-only Restore after \(before)] canUndo=\(canUndo) after Undo: chip=\(model.shownChip.map(model.name) ?? "none") draft=\(model.draft.debugDescription) files=\(model.attachments.map(\.reference.name))"
+          )
+          #expect(model.draft.isEmpty && field.text.isEmpty, "Undo brought text into Personal's")
+          #expect(model.recipient == personal.id)
+          #expect(model.attachments.map(\.reference.name) == ["Receipt.txt"])
+        }
+      }
+
+      /// With Work the only coordinator saved, the user restores its held message, which binds it to
+      /// Work with no chip, and deletes its text. Undo brings nothing back, before Personal is added
+      /// or after, through a sheet whose own text field takes the keyboard, as Settings' does. No
+      /// text is left that could go to Personal.
+      @MainActor @Test(arguments: ["undo, then add", "add through a sheet, then undo"])
+      func undoAfterClearingARestoredDraftWithOneCoordinatorBringsNothingBack(_ order: String)
+        async throws
+      {
+        try await withComposer { model, box, work in
+          let field = box.draft
+          let personal = try #require(model.profiles.last)
+          let personalLane = try #require(model.lanes.first { $0.id == personal.id })
+          await model.detach(personal.id)
+          model.profiles = [work]
+          try await Task.sleep(for: .milliseconds(200))
+          let text = "Invented: Work's merger memo for the board"
+          try await restoreHeld(text, model: model, from: work)
+          let bound = model.recipient
+          field.selectedRange = NSRange(location: 0, length: field.text.utf16.count)
+          field.deleteBackward()
+          try await Task.sleep(for: .milliseconds(300))
+          if order == "undo, then add" {
+            field.undoManager?.undo()
+            try await Task.sleep(for: .milliseconds(300))
+            model.profiles = [work, personal]
+            model.attach(personalLane)
+          } else {
+            let host = try #require(box.window?.rootViewController)
+            let sheet = UIViewController()
+            let address = UITextField(frame: CGRect(x: 20, y: 100, width: 300, height: 44))
+            sheet.view.addSubview(address)
+            host.present(sheet, animated: false)
+            try await Task.sleep(for: .milliseconds(400))
+            address.becomeFirstResponder()
+            address.insertText("100.64.1.3")
+            try await Task.sleep(for: .milliseconds(200))
+            model.profiles = [work, personal]
+            model.attach(personalLane)
+            address.resignFirstResponder()
+            sheet.dismiss(animated: false)
+            try await Task.sleep(for: .milliseconds(400))
+            field.becomeFirstResponder()
+            try await Task.sleep(for: .milliseconds(200))
+            field.undoManager?.undo()
+          }
+          try await Task.sleep(for: .milliseconds(300))
+          print(
+            "IF10-2[one coordinator, \(order)] restored: recipient=\(bound.map(model.name) ?? "none") with Personal added, after Undo: draft=\(model.draft.debugDescription) recipient=\(model.recipient.map(model.name) ?? "none") chip=\(model.shownChip.map(model.name) ?? "none") line=\(model.recipientLine)"
+          )
+          #expect(bound == work.id, "Restore did not bind the draft to Work")
+          #expect(model.draft.isEmpty && field.text.isEmpty, "Undo brought back Work's text")
+          #expect(model.recipient == nil)
         }
       }
 
