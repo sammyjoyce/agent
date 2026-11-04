@@ -138,7 +138,9 @@ Mode if requested, then Run.
 - Every connection first asks for the coordinator's ID and writes nothing else
   unless the ID matches the saved one. A coordinator too old to answer shows
   "Update the coordinator". If the address now answers as a different
-  coordinator, the queue stays on the phone. Both cases keep retrying.
+  coordinator, the queue stays on the phone. Both cases keep retrying. An
+  address edit that reaches a different coordinator saves nothing, and the
+  form names the coordinator saved at that address, if there is one.
 - Transient network loss reconnects automatically. Suspension releases owned
   connections. Returning reconnects and reconciles
   the original input IDs. Uncertain writes are never automatically replayed.
