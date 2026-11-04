@@ -139,14 +139,18 @@ private actor ReconnectCoordinator {
             continuation: false, entryId: "saved-\($0.inputId)", finalChunk: true,
             role: .user, text: $0.text)
         }
-        try await emit(
-          .history(.init(messages: messages, nextCursor: nil, pageComplete: true)), to: socket)
         // Exercise the legacy history-first ordering with a real gap between
         // page completion and the independent input-placement receipt.
-        if behavior == .heldPlacement && !saved.isEmpty && !placementReleased {
-          await withCheckedContinuation { placementRelease = $0 }
+        if behavior == .heldPlacement {
+          try await emit(
+            .history(.init(messages: messages, nextCursor: nil, pageComplete: true)), to: socket)
+          if !saved.isEmpty && !placementReleased {
+            await withCheckedContinuation { placementRelease = $0 }
+          }
+          guard !stopped else { return }
         }
-        guard !stopped else { return }
+        // Otherwise, as the coordinator does, receipts come before the history page, whose
+        // completion is what makes a client connected.
         for input in saved {
           if behavior == .acknowledged {
             if let acceptedWork {
@@ -157,6 +161,10 @@ private actor ReconnectCoordinator {
             try await emit(
               .placed(.init(entryId: "saved-\(input.inputId)", inputId: input.inputId)), to: socket)
           }
+        }
+        if behavior != .heldPlacement {
+          try await emit(
+            .history(.init(messages: messages, nextCursor: nil, pageComplete: true)), to: socket)
         }
         if behavior == .paused {
           try await emit(
@@ -272,8 +280,7 @@ private actor ReconnectCoordinator {
       id: directory.profile,
       session: CoordinatorSession(
         directory: directory, address: address, pin: fixture.id, stamps: StampSource(),
-        transport: loopback(port)),
-      hold: LegacyHold(directory))
+        transport: loopback(port)))
   }
   let model = ChatModel()
   model.attach(lane())
