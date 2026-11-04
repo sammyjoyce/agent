@@ -371,24 +371,29 @@ public final class Coordinators {
   /// Callers save first and assign after, so memory never runs ahead of disk.
   private func save(_ saved: SavedProfiles) throws {
     if let failure { throw SaveRefused(message: failure) }
-    try Self.save(saved, applicationSupport: applicationSupport)
+    var saved = saved
+    try Self.save(&saved, applicationSupport: applicationSupport)
   }
 }
 
 // MARK: - profiles.json and migration
 
 extension Coordinators {
-  /// What `profiles.json` holds. Each held queue records itself in its own folder instead, so a
-  /// build that rewrites this file without knowing about held queues loses none of them.
+  /// What `profiles.json` holds. Each held queue records itself in its own folder, so a build that
+  /// rewrites this file without knowing about held queues loses none of them.
   struct SavedProfiles: Codable, Equatable {
     var profiles: [CoordinatorProfile]
     /// Alert withdrawals that no coordinator has confirmed yet.
     var withdrawals: [PendingWithdrawal]
+    /// Every held queue as its folder recorded it when this was saved. The build before this one
+    /// deletes each `Agent/Held` folder this does not name, so every save lists them all. Launch
+    /// reads it back only for what that build changed.
+    var held: [HeldQueue] = []
     /// What an earlier build of this app wrote about the single-address build, until `migrate`
     /// adopts it. Never written.
     var earlier: Earlier?
 
-    private enum CodingKeys: String, CodingKey { case profiles, withdrawals }
+    private enum CodingKeys: String, CodingKey { case profiles, withdrawals, held }
 
     init(profiles: [CoordinatorProfile], withdrawals: [PendingWithdrawal] = []) {
       self.profiles = profiles
@@ -399,6 +404,7 @@ extension Coordinators {
       profiles = try container.decode([CoordinatorProfile].self, forKey: .profiles)
       withdrawals =
         try container.decodeIfPresent([PendingWithdrawal].self, forKey: .withdrawals) ?? []
+      held = try container.decodeIfPresent([HeldQueue].self, forKey: .held) ?? []
       let earlier = try Earlier(from: decoder)
       self.earlier = earlier.isEmpty ? nil : earlier
     }
@@ -412,26 +418,23 @@ extension Coordinators {
     var held: [HeldQueue]
   }
 
-  /// What earlier builds of this app wrote about the single-address build. One before this one kept
-  /// each queue's record in a `held` list. One kept a single `origin`. One before it kept the
-  /// build's alert installation on the migrated profile as `inherited` while that profile was
-  /// unpaired. The first ones kept none of them.
+  /// What earlier builds of this app wrote about the single-address build. One kept a single
+  /// `origin`. One before it kept the build's alert installation on the migrated profile as
+  /// `inherited` while that profile was unpaired. The first ones kept neither.
   struct Earlier: Decodable, Equatable {
     struct Origin: Decodable, Equatable {
       let address: CoordinatorAddress
       let coordinator: CoordinatorID?
       let installation: InstallationID?
     }
-    let held: [HeldQueue]
     let origin: Origin?
     let inherited: [ProfileID: InstallationID]
-    var isEmpty: Bool { held.isEmpty && origin == nil && inherited.isEmpty }
+    var isEmpty: Bool { origin == nil && inherited.isEmpty }
 
-    private enum CodingKeys: String, CodingKey { case held, origin, profiles }
+    private enum CodingKeys: String, CodingKey { case origin, profiles }
 
     init(from decoder: any Decoder) throws {
       let container = try decoder.container(keyedBy: CodingKeys.self)
-      held = try container.decodeIfPresent([HeldQueue].self, forKey: .held) ?? []
       origin = try container.decodeIfPresent(Origin.self, forKey: .origin)
       struct Profile: Decodable {
         let id: ProfileID
@@ -452,18 +455,19 @@ extension Coordinators {
   /// point resumes and nothing is ever deleted here. The single-address build's outbox for its last
   /// address keeps the build's alert installation, and a profile is saved at that address, named so
   /// its `@` tag names it alone. `coordinatorAddress` is the resume marker. It goes before the port
-  /// key, so a crash in between cannot re-run with the default port. Last, each queue held for an
-  /// address that exactly one saved profile is pinned at goes to that profile's coordinator.
+  /// key, so a crash in between cannot re-run with the default port. Then each queue no coordinator
+  /// took yet goes to the first one proven at its address, and `profiles.json` lists every queue.
   static func migrate(
     defaults: UserDefaults, applicationSupport: URL, caches: URL,
     crash: (MigrationStep) throws -> Void = { _ in }
   ) throws -> Stored {
     var saved = try load(applicationSupport: applicationSupport)
+    let listed = saved.held
     let adopted = try adoptEarlier(saved, applicationSupport: applicationSupport, caches: caches)
     let earlier = saved.earlier
     if earlier != nil {
       saved.earlier = nil
-      try save(saved, applicationSupport: applicationSupport)
+      try save(&saved, applicationSupport: applicationSupport)
     }
     if let host = defaults.string(forKey: "coordinatorAddress") {
       try quarantine(
@@ -479,13 +483,14 @@ extension Coordinators {
         + adopted.compactMap(\.address) + [earlier?.origin?.address].compactMap { $0 },
       applicationSupport: applicationSupport)
     var held = try HeldQueue.all(applicationSupport: applicationSupport)
-    try bindPinned(&saved, &held, applicationSupport: applicationSupport)
+    try bind(&saved, &held, listed: listed, applicationSupport: applicationSupport)
+    if saved.held != held { try save(&saved, applicationSupport: applicationSupport) }
     return Stored(profiles: saved.profiles, withdrawals: saved.withdrawals, held: held)
   }
 
   /// The held queues, after each `Legacy` folder earlier builds of this app left in a profile's
   /// directory becomes one, and after what those builds recorded is written into each queue's
-  /// folder. A queue's address is known only where it is proven:
+  /// folder that records nothing. A queue's address is known only where it is proven:
   /// - Only pairing changes an unpaired profile's address, so its `Legacy` folder was queued for it.
   /// - A recorded `origin` is a folder's only when exactly one holder matches it: unpaired at its
   ///   address, or pinned to its coordinator.
@@ -509,7 +514,7 @@ extension Coordinators {
     for directory in holders {
       let id = directory.profile
       let queue: HeldQueue
-      if let record = earlier?.held.first(where: { $0.id.uuidString == id.description }) {
+      if let record = saved.held.first(where: { $0.id.uuidString == id.description }) {
         queue = record
       } else if let origin, originHolder == id {
         queue = HeldQueue(
@@ -523,7 +528,7 @@ extension Coordinators {
       }
       _ = try HeldQueue.adopt(directory.legacy, as: queue, applicationSupport: applicationSupport)
     }
-    for record in earlier?.held ?? [] {
+    for record in saved.held {
       let folder = record.folder(applicationSupport: applicationSupport)
       guard try HeldQueue.recorded(in: folder) == nil,
         FileManager.default.fileExists(atPath: folder.path) || record.installation != nil
@@ -591,7 +596,7 @@ extension Coordinators {
       if !saved.profiles.contains(where: { $0.address == address }) {
         let name = CoordinatorProfile.unusedName(TagName(defaultFor: address), in: saved.profiles)
         saved.profiles.append(CoordinatorProfile(name: name, address: address))
-        try save(saved, applicationSupport: applicationSupport)
+        try save(&saved, applicationSupport: applicationSupport)
       }
       try crash(.profileSaved)
       if FileManager.default.fileExists(atPath: outbox.path) {
@@ -630,19 +635,23 @@ extension Coordinators {
     }
   }
 
-  /// Gives each queue held for an address that exactly one saved profile is pinned at to that
-  /// profile's coordinator. Its installation's withdrawal is saved first, so a stop before its
-  /// record is written binds it again and adds no second withdrawal.
-  private static func bindPinned(
-    _ saved: inout SavedProfiles, _ held: inout [HeldQueue], applicationSupport: URL
+  /// Gives each queue no coordinator took yet to the first one proven at its address: the one the
+  /// build before this one bound it to, when `listed` says so at the address its folder records,
+  /// else the only one a saved profile is pinned to there. That build saved the withdrawal of each
+  /// binding it listed in the same write. Any other binding's withdrawal is saved first, so a stop
+  /// before its record is written binds it again and adds no second withdrawal.
+  private static func bind(
+    _ saved: inout SavedProfiles, _ held: inout [HeldQueue], listed: [HeldQueue],
+    applicationSupport: URL
   ) throws {
     var bound: [HeldQueue] = []
     for index in held.indices {
       guard let address = held[index].address else { continue }
+      let proven = listed.first { $0.id == held[index].id && $0.address == address }?.coordinator
       let pins = saved.profiles.filter { $0.address == address }.compactMap(\.pin)
-      guard pins.count == 1 else { continue }
+      guard let found = proven ?? (pins.count == 1 ? pins[0] : nil) else { continue }
       let before = held[index]
-      if let handover = held[index].bind(pins[0], at: address),
+      if let handover = held[index].bind(found, at: address), proven == nil,
         !saved.withdrawals.contains(handover)
       {
         saved.withdrawals.append(handover)
@@ -650,7 +659,7 @@ extension Coordinators {
       if held[index] != before { bound.append(held[index]) }
     }
     guard !bound.isEmpty else { return }
-    try save(saved, applicationSupport: applicationSupport)
+    try save(&saved, applicationSupport: applicationSupport)
     for queue in bound {
       try queue.record(in: queue.folder(applicationSupport: applicationSupport))
     }
@@ -707,8 +716,10 @@ extension Coordinators {
     }
   }
 
-  /// Readable after first unlock, so a launch while locked still knows its coordinators.
-  private static func save(_ saved: SavedProfiles, applicationSupport: URL) throws {
+  /// Readable after first unlock, so a launch while locked still knows its coordinators. `held`
+  /// becomes what the queues' folders record now, whatever the caller passed.
+  private static func save(_ saved: inout SavedProfiles, applicationSupport: URL) throws {
+    saved.held = try HeldQueue.all(applicationSupport: applicationSupport)
     let url = url(applicationSupport)
     try FileManager.default.createDirectory(
       at: url.deletingLastPathComponent(), withIntermediateDirectories: true,

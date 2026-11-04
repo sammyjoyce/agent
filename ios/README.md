@@ -209,9 +209,12 @@ Mode if requested, then Run.
   that address that finds a saved coordinator, or by a coordinator already saved
   there, the only one, when the app starts. Each queue's folder records its
   address, its coordinator and that build's alert registration, so installing an
-  earlier build of this app and then this one again loses none of them. What an
-  earlier build recorded about a queue counts only where it proves the queue's
-  address or coordinator.
+  earlier build of this app and then this one again loses none of them.
+  `profiles.json` also lists every held queue, because the build before this one
+  deletes each held folder it does not list. What an earlier build recorded
+  about a queue counts only where it proves the queue's address or coordinator,
+  and a coordinator it bound a queue to counts only at the address the queue's
+  folder records.
   **Restore to composer** makes a new message for you to send, addressed to that
   coordinator. Until one is, Restore asks which paired coordinator gets it. If no
   build recorded the address, Restore always asks. **Discard** deletes a held
