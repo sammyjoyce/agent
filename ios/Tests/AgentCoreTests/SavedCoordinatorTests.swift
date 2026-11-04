@@ -1551,3 +1551,62 @@ func anInstallationThePreviousBuildSavedOnTheMigratedProfileIsStillWithdrawn() a
   await coordinators.setActive(false)
   await fixture.stop()
 }
+
+/// The single-address build queued messages for its coordinator at its address, which answers
+/// nothing after the update. In "held for another address", the user points the one saved
+/// coordinator at Work's address, so the held messages show over Work's feed and nothing says they
+/// are Work's. `/feedback` then reaches Work without the automatic screenshot, which would show
+/// them, and the composer says why. In "held for this coordinator", the build's coordinator answers
+/// at its address again and pairs, so everything on screen is its own and the screenshot goes.
+@MainActor
+@Test(
+  .timeLimit(.minutes(1)), arguments: ["held for another address", "held for this coordinator"])
+func feedbackAttachesTheScreenshotOnlyWhenEverythingOnScreenIsTheRecipients(_ held: String)
+  async throws
+{
+  let install = try await LegacyInstall()
+  defer { install.remove() }
+  try await withTheOldAddressSilent(install) { coordinators, migrated, used, work, bringBack in
+    let chat = coordinators.chat
+    let recipient: FixtureCoordinator
+    if held == "held for this coordinator" {
+      await bringBack()
+      coordinators.retryPairing(migrated.id)
+      recipient = used
+    } else {
+      try await coordinators.update(
+        migrated.id, name: TagName("Work"),
+        address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+      recipient = work
+    }
+    try await eventually("held rows and a connection") {
+      chat.held.count == 2 && chat.connection == .connected
+    }
+    chat.draft = "/feedback The invented reply is clipped"
+    var captures = 0
+    await chat.send(screenshot: {
+      captures += 1
+      return Data("Invented screen showing the held notes".utf8)
+    })
+    try await eventually("the feedback at its coordinator") { await recipient.count() == 1 }
+    let files = await recipient.received().compactMap { event -> NativeRequestSubmit? in
+      if case .submit(let input) = event { input } else { nil }
+    }.flatMap { $0.attachments ?? [] }.map(\.name)
+    let uploads = await recipient.uploadCount()
+    print(
+      "IF15-U1[\(held)] screenshots captured=\(captures) uploads=\(uploads) files=\(files) composer=\(chat.error ?? "nil")"
+    )
+    if held == "held for this coordinator" {
+      #expect(captures == 1 && files == ["Feedback.png"])
+      #expect(chat.error == nil)
+    } else {
+      #expect(captures == 0, "The screenshot captured messages held for another address")
+      #expect(
+        uploads == 0 && files.isEmpty, "Work got a screenshot of another coordinator's messages")
+      #expect(
+        chat.error
+          == "Feedback was sent without a screenshot. The screen shows messages held from before the update, which may be another coordinator's."
+      )
+    }
+  }
+}

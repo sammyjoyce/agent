@@ -202,7 +202,10 @@ Mode if requested, then Run.
 - `/feedback` captures the current app window before sending and includes it
   with the report. Failed admission keeps that exact screenshot for retry.
   With more than one coordinator saved nothing is captured, because the feed
-  shows every coordinator's conversation. A kept screenshot, or any restored
+  shows every coordinator's conversation. With one saved, nothing is captured
+  while the chat shows messages held from before the update that may be another
+  coordinator's. The report then goes without a screenshot, and the line under
+  the chat says why. A kept screenshot, or any restored
   `Feedback.png` whatever its text says, belongs to the coordinator it came from
   and is sent to that coordinator alone; otherwise it must be removed before
   sending.

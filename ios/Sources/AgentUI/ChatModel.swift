@@ -105,7 +105,8 @@ final class ChatModel {
     let parts = reports + [failure, current].compactMap { $0 }
     return parts.isEmpty ? nil : parts.joined(separator: " ")
   }
-  /// Who did not get the last Send, and why. Only the next Send clears it.
+  /// What the last Send left out, and why: who did not get it, or the screenshot `/feedback` did not
+  /// attach. Only the next Send clears it.
   private(set) var reports: [String] = []
   /// The composer's own latest failure.
   var failure: String?
@@ -143,6 +144,16 @@ final class ChatModel {
   var heldCoordinator: ProfileID? {
     guard let coordinator = origin?.coordinator else { return nil }
     return profiles.first { $0.pin == coordinator && removed[$0.id] == nil }?.id
+  }
+  /// The saved coordinator a held message belongs to, or nil when this phone cannot name one.
+  func owner(_ message: HeldMessage) -> ProfileID? { heldCoordinator }
+  /// The one saved coordinator that everything the feed can show belongs to: every lane's
+  /// conversation and every message held from before the update. nil while the feed can show
+  /// another coordinator's messages, or held messages this phone cannot name a coordinator for.
+  var feedOwner: ProfileID? {
+    let owners = Set(lanes.map { ProfileID?.some($0.id) } + held.map(owner))
+    guard owners.count == 1, let only = owners.first else { return nil }
+    return only
   }
   /// Whom Restore offers for a held message while `heldCoordinator` is nil: every paired
   /// coordinator not being removed.
@@ -407,20 +418,25 @@ final class ChatModel {
     let original = source
     let chip = recipient
     var files = attachments
+    // With one coordinator saved, `/feedback` attaches the screen, so the composer says why it did not.
+    var withheld = false
     do {
-      // With two coordinators, a screenshot of the feed would show one's conversation to the other.
-      if profiles.count == 1, let shown = profiles.first?.id, lanes.allSatisfy({ $0.id == shown }),
-        text.split(whereSeparator: \.isWhitespace).first == "/feedback",
+      if text.split(whereSeparator: \.isWhitespace).first == "/feedback",
         !files.contains(where: { screenshotOwners[$0.id] != nil }), let screenshot
       {
-        guard files.count < AttachmentLimits.maximumCount else { throw AttachmentError.tooMany }
-        // Capture before the composer changes. A failed admission retains this exact image.
-        let data = try screenshot()
-        let file = try await attachmentStore().stage(
-          data: data, name: "Feedback.png", mediaType: "image/png")
-        attachments.append(file)
-        files.append(file)
-        screenshotOwners[file.id] = shown
+        // The screenshot shows the feed, so it goes only where everything the feed shows belongs.
+        if let shown = feedOwner {
+          guard files.count < AttachmentLimits.maximumCount else { throw AttachmentError.tooMany }
+          // Capture before the composer changes. A failed admission retains this exact image.
+          let data = try screenshot()
+          let file = try await attachmentStore().stage(
+            data: data, name: "Feedback.png", mediaType: "image/png")
+          attachments.append(file)
+          files.append(file)
+          screenshotOwners[file.id] = shown
+        } else {
+          withheld = !multiple
+        }
       }
     } catch {
       failure = error.localizedDescription
@@ -467,6 +483,11 @@ final class ChatModel {
     report(misses)
     // Nothing went, so the draft stays for another try.
     guard misses.count < staged.count else { return }
+    if withheld {
+      report(
+        "Feedback was sent without a screenshot. The screen shows messages held from before the update, which may be another coordinator's."
+      )
+    }
     if draft == text {
       draft = ""
       restoredFrom = nil
