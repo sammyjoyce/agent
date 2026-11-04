@@ -282,6 +282,58 @@ final class ComposerInteractionTests: XCTestCase {
     XCTAssertEqual(toPersonal, [text + "."])
   }
 
+  // The same restored text, chip removed. The user deletes it key by key and undoes with
+  // Command-Z. Undo brings the restored text back with no chip, and each coordinator gets it as it
+  // was.
+  func testUndoAfterDeletingARestoredDraftKeyByKeyKeepsItLiteral() async throws {
+    let (app, work, personal) = try await launchWithWorkAndPersonal()
+    defer { app.terminate() }
+    continueAfterFailure = true
+    await work.rejectSubmits(true)
+    let composer = app.textViews["Message the coordinator"]
+    let line = app.staticTexts["recipientLine"]
+    composer.tap()
+    composer.typeText("@Work ")
+    XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3))
+    let text = "@Personal invented: forward the deck to the auditors"
+    composer.typeText(text)
+    app.buttons["Send message"].tap()
+    let restore = app.buttons["Restore Work's copy to composer"]
+    XCTAssertTrue(restore.waitForExistence(timeout: 10))
+    await work.rejectSubmits(false)
+    restore.tap()
+    XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3))
+    app.buttons["To Work"].tap()
+    XCTAssertTrue(app.staticTexts["To Work and Personal"].waitForExistence(timeout: 3))
+    composer.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: text.count))
+    try await Task.sleep(for: .milliseconds(500))
+    let cleared = isEmpty(composer)
+    composer.typeKey("z", modifierFlags: .command)
+    try await Task.sleep(for: .seconds(1))
+    let personalChip = app.buttons["To Personal"].exists
+    print(
+      "IF9-Y2[ui] cleared=\(cleared) after Command-Z: value=\(composer.value as? String ?? "nil") personalChip=\(personalChip) line=\(line.label)"
+    )
+    XCTAssertTrue(cleared, "The keys did not empty the field")
+    XCTAssertFalse(personalChip, "Undo made the restored text's tag Personal's chip")
+    XCTAssertEqual(composer.value as? String, text)
+    XCTAssertEqual(line.label, "To Work and Personal")
+    let send = app.buttons["Send message"]
+    try await Task.sleep(for: .seconds(1))
+    XCTAssertTrue(send.isHittable)
+    send.tap()
+    try await eventually {
+      let toWork = await work.submits()
+      let toPersonal = await personal.submits()
+      return toWork.count == 1 && toPersonal.count == 1
+    }
+    let toWork = await work.submits()
+    let toPersonal = await personal.submits()
+    print("IF9-Y2[ui] Work received \(toWork) Personal received \(toPersonal)")
+    XCTAssertEqual(toWork, [text])
+    XCTAssertEqual(toPersonal, [text])
+  }
+
   // Work refuses its copy of a message to both. Its line offers Restore and Discard. Discard
   // removes Work's original, and the line reads "Not sent to Work" with no Restore.
   func testDiscardingARefusedCopyReadsNotSentToItsCoordinator() async throws {

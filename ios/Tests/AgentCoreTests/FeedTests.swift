@@ -3554,6 +3554,118 @@ func retypingTheAtSignOfARestoredTagPromotesNothing() async throws {
   }
 }
 
+/// Work refuses a message whose text is a heading line, then "@Personal …", and the user restores
+/// it and removes its chip. Send empties the composer at its tap. While it copies the message for
+/// both coordinators, the user enters the text again without the heading. Send delivers the
+/// restored message and withdraws Work's original, and the draft entered meanwhile stays. Send did
+/// not clear that draft, so it is still the restored one: a key typed after Send promotes nothing,
+/// and the next Send gives both coordinators the text as written. Once a Send clears the draft, a
+/// tag the user types becomes the chip again.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRestoredDraftEditedWhileItsSendCopiesStaysLiteral() async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let heading = "Invented memo heading\n"
+    let body = "@Personal invented quotation from Work's memo"
+    let original = try await restoreWorkOnlyMessage(chat, workFixture, heading + body, root: root)
+    chat.recipient = nil
+    await workFixture.acceptUploads()
+    let observed = await observes(workFixture) + observes(personalFixture)
+    let sending = Task { @MainActor in await chat.send() }
+    await Task.yield()
+    try #require(chat.admitting, "The edit comes while Send copies the message")
+    try #require(chat.draft.isEmpty, "Send takes the text at its tap")
+    chat.draft = body
+    chat.promoteTypedTag()
+    let during = chat.recipientLine
+    await sending.value
+    // The fixtures close each accepted submit's socket unanswered, so both lanes reconnect.
+    try await eventually("both observe again") {
+      let again = await observes(workFixture) + observes(personalFixture)
+      return again >= observed + 2
+        && chat.snapshots.values.allSatisfy { $0.connection == .connected }
+    }
+    let after = chat.recipientLine
+    chat.draft += "."
+    chat.promoteTypedTag()
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let originalQueued = try queuedRequests(outbox).contains { $0.inputId == original.inputId }
+    print(
+      "IF9-Y1 during the Send: \(during); after it: \(after); one more key: chip=\(chat.recipient.map(chat.name) ?? "none") line=\(chat.recipientLine) draft=\(chat.draft.debugDescription) originalQueued=\(originalQueued)"
+    )
+    #expect(during == "To Work and Personal" && after == "To Work and Personal")
+    #expect(chat.recipient == nil, "The restored text's own tag became the chip after Send")
+    #expect(chat.addressing == .to([work, personal], body: body + "."))
+    #expect(!originalQueued, "Send carried the restored message unchanged, yet the original stays")
+    await chat.send()
+    _ = await within(3) { await workFixture.count() + personalFixture.count() == 4 }
+    let atWork = await submits(workFixture).map(\.text)
+    let atPersonal = await submits(personalFixture).map(\.text)
+    print("IF9-Y1 wire: Work=\(atWork) Personal=\(atPersonal)")
+    #expect(atWork == [heading + body, body + "."], "Work did not get the text as written")
+    #expect(atPersonal == [heading + body, body + "."])
+    chat.draft = "@Personal "
+    chat.promoteTypedTag()
+    #expect(chat.recipient == personal, "A tag typed once Send cleared the draft stays text")
+  }
+}
+
+/// Work refuses a message whose text starts with "@Personal", and the user restores it and removes
+/// its chip. The user empties the composer, deleting the text in the field and then the restored
+/// file if there is one, and undoes the deletion. The field puts the text back still marked as
+/// Work's restored text, so the draft is restored again. Its text stays literal, the line reads
+/// "To Work and Personal" and both coordinators get the text as written. Emptying the composer
+/// ended the original's withdrawal, so the original stays queued for Discard.
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: ["its text", "its text, then its file"])
+func undoingTheEmptyingOfARestoredDraftKeepsItLiteral(_ emptied: String) async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+    let (work, _) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let text = "@Personal invented: forward Work's board deck to the auditors"
+    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let withFile = emptied == "its text, then its file"
+    let original: NativeRequestSubmit
+    if withFile {
+      original = try await restoreWorkOnlyMessage(chat, workFixture, text, root: root)
+    } else {
+      await workFixture.rejectSubmits()
+      chat.recipient = work
+      chat.draft = text
+      await chat.send()
+      try await eventually("Work refused it") {
+        chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
+      }
+      await workFixture.rejectSubmits(false)
+      original = try #require(try queuedRequests(outbox).first)
+      await chat.restore(original.inputId)
+    }
+    chat.recipient = nil
+    // As the field reports them: emptied text carries no mark, and Undo's text carries Work's.
+    chat.edit("", restoredFrom: nil)
+    chat.promoteTypedTag()
+    for file in chat.attachments { await chat.removeAttachment(file) }
+    chat.edit(text, restoredFrom: work)
+    chat.promoteTypedTag()
+    print(
+      "IF9-Y2[\(emptied)] after Undo: chip=\(chat.recipient.map(chat.name) ?? "none") line=\(chat.recipientLine) draft=\(chat.draft.debugDescription) files=\(chat.attachments.count)"
+    )
+    #expect(chat.recipient == nil && chat.draft == text && chat.attachments.isEmpty)
+    #expect(chat.recipientLine == "To Work and Personal")
+    await chat.send()
+    _ = await within(3) { await workFixture.count() + personalFixture.count() == 2 }
+    try await Task.sleep(for: .milliseconds(300))
+    let atWork = await submits(workFixture).filter { $0.inputId != original.inputId }.map(\.text)
+    let atPersonal = await submits(personalFixture).map(\.text)
+    let originalQueued = try queuedRequests(outbox).contains { $0.inputId == original.inputId }
+    print(
+      "IF9-Y2[\(emptied)] wire: Work=\(atWork) Personal=\(atPersonal) originalQueued=\(originalQueued)"
+    )
+    #expect(atWork == [text] && atPersonal == [text])
+    #expect(originalQueued, "Emptying the composer ended the withdrawal, yet the original went")
+  }
+}
+
 // MARK: - A restored source leaves only when a Send carries it unchanged, or by Discard
 
 /// `inputID`'s item in the outbox, if it is still queued. One still marked refused can be withdrawn

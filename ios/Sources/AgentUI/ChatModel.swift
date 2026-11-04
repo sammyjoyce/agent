@@ -154,7 +154,13 @@ final class ChatModel {
   }
   private(set) var held: [HeldMessage] = []
   private(set) var heldError: String?
-  private(set) var restoredFrom: RestoredSource?
+  /// The coordinator whose restored message the draft holds. While it is set, no tag in the draft
+  /// is read and the draft stays that coordinator's, however it is edited. Only clearing the draft
+  /// ends it, and Undo of the clearing brings it back.
+  private(set) var restoredFrom: ProfileID?
+  /// The original Restore copied into the draft, until the next Send or until the composer is
+  /// emptied. A Send that carries it unchanged withdraws it.
+  private(set) var source: RestoredSource?
   /// Each lane's latest published state.
   private(set) var snapshots: [ProfileID: ChatSnapshot] = [:]
   /// One coordinator's source checks from its current connection, and the warning their gaps raise.
@@ -555,7 +561,7 @@ final class ChatModel {
   /// True while the draft is the coordinator's: chosen as the chip, restored from it, or led
   /// by a typed tag with its name.
   func addresses(_ id: ProfileID) -> Bool {
-    if recipient == id || restoredFrom?.lane == id { return true }
+    if recipient == id || restoredFrom == id { return true }
     guard recipient == nil, restoredFrom == nil,
       let name = profiles.first(where: { $0.id == id })?.name.description
     else { return false }
@@ -564,7 +570,7 @@ final class ChatModel {
 
   private func address(_ text: String, hasAttachments: Bool, chip: ProfileID?) -> Addressing {
     // A restored message stays its source's under any chip, so a removed source blocks it.
-    if let source = restoredFrom?.lane, let name = removed[source] {
+    if let lane = restoredFrom, let name = removed[lane] {
       return .blocked("\(name) was removed")
     }
     // A restored message's text is never a tag, whatever its chip (DESIGN-REVIEW A2).
@@ -600,6 +606,16 @@ final class ChatModel {
     guard removed[id] == nil else { return }
     recipient = id
     draft = ""
+  }
+
+  /// An edit the user made in the field, with the coordinator whose restored text the field holds,
+  /// read from the text itself. Emptying the composer ends a restored draft. Undo then brings back
+  /// its text, still marked as restored, so the draft is restored again. Text typed or pasted into
+  /// the emptied composer carries no mark, so it is a new message.
+  func edit(_ text: String, restoredFrom lane: ProfileID?) {
+    // Send's clear reports the emptied field back. An echo of the draft is not an edit.
+    if draft != text { draft = text }
+    if restoredFrom == nil, let lane { restoredFrom = lane }
   }
 
   /// A complete leading tag followed by a space becomes the chip, and the text after it is
@@ -641,7 +657,7 @@ final class ChatModel {
     }
     let text = draft
     let mode = mode
-    let source = restoredFrom
+    let original = source
     let chip = recipient
     let originalFiles = attachments
     let identity = ComposerInputIdentity(composerID: composerID)
@@ -732,15 +748,19 @@ final class ChatModel {
       // The outboxes own this message even if their connections have since stopped.
       admission = .saved
       logComposer(.outboxSaved)
-      if draftRevision == clearedRevision, recipient == chip { recipient = nil }
+      // Who the draft is for goes with the Send only while nothing was typed since its tap.
+      if draftRevision == clearedRevision {
+        restoredFrom = nil
+        if recipient == chip { recipient = nil }
+      }
       let sentIDs = Set(files.map(\.id))
       attachments.removeAll { sentIDs.contains($0.id) }
       for id in sentIDs { screenshotOwners[id] = nil }
       retiredDraftFiles.append(contentsOf: files)
       _ = await saveDraft()
-      guard let source else { return }
-      if restoredFrom == source { restoredFrom = nil }
-      if source.isCarried(by: body, files: files) { await remove(source) }
+      guard let original else { return }
+      if source == original { source = nil }
+      if original.isCarried(by: body, files: files) { await remove(original) }
     }
   }
 
@@ -917,7 +937,8 @@ final class ChatModel {
     for file in restored.attachments where file.reference.name == "Feedback.png" {
       screenshotOwners[file.id] = lane
     }
-    restoredFrom = RestoredSource(
+    restoredFrom = lane
+    source = RestoredSource(
       lane: lane, item: item, kind: kind, text: restored.text,
       files: Set(restored.attachments.map(\.id)))
     // Last, since an empty restored text clears the draft above, which drops an undrawn recipient.
@@ -930,6 +951,7 @@ final class ChatModel {
     // A Send in flight emptied the composer at its tap and still decides who the message is for.
     guard admission == nil, draft.isEmpty && attachments.isEmpty else { return }
     restoredFrom = nil
+    source = nil
     // Only Restore sets a recipient no chip shows, so it goes with the draft it was set for.
     if !addressesByName { recipient = nil }
   }
