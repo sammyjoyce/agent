@@ -1,4 +1,5 @@
 #if os(iOS)
+  import AgentCore
   import SwiftUI
   import UIKit
 
@@ -13,12 +14,19 @@
     }
     static let inset = UIEdgeInsets(top: 11, left: 2, bottom: 11, right: 2)
     static let maximumLines: CGFloat = 6
+    /// Marks restored text with the coordinator it was restored from.
+    static let restoredMark = NSAttributedString.Key("AgentRestoredFrom")
     let text: String
     let placeholder: String
     let chip: Chip?
     /// The latest tag that became the chip.
     let promotion: Promotion?
-    let edit: (String) -> Void
+    /// The coordinator whose restored message the draft holds. Text the model sets meanwhile is
+    /// marked with it, and the field's Undo and Redo keep the mark with that text however they
+    /// group the user's keys.
+    let restoredFrom: ProfileID?
+    /// Each edit the user makes, with the coordinator any of its text is marked with.
+    let edit: (String, ProfileID?) -> Void
     let removeChip: () -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -52,6 +60,11 @@
         let selection = Self.selection(
           view.selectedRange, replacing: change.range, with: change.length)
         view.text = text
+        if let restoredFrom {
+          view.textStorage.addAttribute(
+            Self.restoredMark, value: restoredFrom,
+            range: NSRange(location: 0, length: view.textStorage.length))
+        }
         view.selectedRange = selection
         // The field's undo actions were recorded against the text it had. Applied to this one they
         // would change characters the user did not just type, such as a body after a promoted tag.
@@ -294,7 +307,18 @@
 
     @MainActor final class Coordinator: NSObject, UITextViewDelegate {
       var field: ComposerField?
-      func textViewDidChange(_ view: UITextView) { field?.edit(view.text) }
+      func textViewDidChange(_ view: UITextView) {
+        var lane: ProfileID?
+        view.textStorage.enumerateAttribute(
+          ComposerField.restoredMark, in: NSRange(location: 0, length: view.textStorage.length)
+        ) { value, _, stop in
+          if let value = value as? ProfileID {
+            lane = value
+            stop.pointee = true
+          }
+        }
+        field?.edit(view.text, lane)
+      }
       /// The chip moves with the first line.
       func scrollViewDidScroll(_ view: UIScrollView) { view.superview?.setNeedsLayout() }
     }
