@@ -2485,6 +2485,187 @@ func thePreviousBuildRewritingProfilesJSONKeepsEveryHeldMessageAndInstallation()
   #expect(kept, "The single-address build's alert installation is lost")
 }
 
+/// PR #10 (`0d8daa0`), the build the fork shipped before this one, as its launch reads
+/// `profiles.json` and then deletes every entry of `Agent/Profiles`, in Application Support and in
+/// Caches, and of `Agent/Held` that the file does not list. A file it cannot decode stops its launch
+/// before it deletes anything. This copies what that build does, so it changes only if that build's
+/// source does, which it cannot.
+private enum ShippedBuild {
+  struct Address: Decodable {
+    let host: String
+    let port: UInt16
+  }
+  struct Profile: Decodable {
+    let id: UUID
+    let name: String
+    let address: Address
+    let pin: UUID?
+  }
+  struct Withdrawal: Decodable {
+    let installation: UUID
+    let address: Address
+    let pin: UUID
+  }
+  struct Queue: Decodable {
+    let id: UUID
+    let address: Address?
+    let coordinator: UUID?
+    let installation: UUID?
+  }
+  struct Saved: Decodable {
+    let profiles: [Profile]
+    let withdrawals: [Withdrawal]?
+    /// Absent, it lists no held queue.
+    let held: [Queue]?
+  }
+
+  /// What its launch over `support` and `caches` deletes.
+  static func launchDeletes(support: URL, caches: URL) throws -> [URL] {
+    let saved = try JSONDecoder().decode(
+      Saved.self, from: Data(contentsOf: support.appending(path: "Agent/profiles.json")))
+    func unlisted(in parent: URL, _ listed: [UUID]) -> [URL] {
+      let names = Set(listed.map(\.uuidString))
+      let entries =
+        (try? FileManager.default.contentsOfDirectory(at: parent, includingPropertiesForKeys: nil))
+        ?? []
+      return entries.filter { !names.contains($0.lastPathComponent) }
+    }
+    let profiles = saved.profiles.map(\.id)
+    return unlisted(in: support.appending(path: "Agent/Profiles"), profiles)
+      + unlisted(in: caches.appending(path: "Agent/Profiles"), profiles)
+      + unlisted(in: support.appending(path: "Agent/Held"), (saved.held ?? []).map(\.id))
+  }
+}
+
+/// The single-address build queued two messages for its coordinator, one with a file, and this
+/// build holds them. The build the fork shipped before this one is installed over it and launched
+/// once, and then this build again. Both messages and the file are still held.
+@MainActor @Test
+func launchingTheShippedBuildOverThisOneKeepsEveryHeldMessage() async throws {
+  let install = try await LegacyInstall()
+  defer { install.remove() }
+  @MainActor func launch() -> Coordinators {
+    Coordinators(
+      registration: nil, defaults: install.defaults, applicationSupport: install.support,
+      caches: install.caches,
+      transport: CoordinatorTransport { _ in throw ConnectionError.timedOut })
+  }
+  let first = launch().queues
+  let deleted = try ShippedBuild.launchDeletes(support: install.support, caches: install.caches)
+  for entry in deleted { try FileManager.default.removeItem(at: entry) }
+  let again = launch()
+  let shown = try await settles { again.chat.held.count == 2 }
+  let file = again.queues.first.flatMap {
+    try? Data(
+      contentsOf: $0.folder(applicationSupport: install.support).appending(
+        path: "Attachments/\(install.attachment.id)/Notes.txt"))
+  }
+  print(
+    "IF17-S1-1[the shipped build launched once over this one] it deleted=\(deleted.map(\.lastPathComponent)) | this build again: queues=\(again.queues.count) held=\(again.chat.held.map(\.item.text)) file kept=\(file == install.bytes)"
+  )
+  #expect(deleted.isEmpty, "The shipped build deleted what this build holds")
+  #expect(shown && again.chat.held.map(\.item.text) == install.queued.map(\.text))
+  #expect(again.queues == first)
+  #expect(file == install.bytes, "The held message's file is gone")
+}
+
+/// After every change this build saves, a launch of the build the fork shipped before this one
+/// deletes no held queue and no saved coordinator's files: at the migration, which also holds a
+/// second launch's note for an address this phone never saved, after the migrated profile is edited
+/// to Work's address, after Personal is added at the build's address and takes its queue, and after
+/// each is removed.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func theShippedBuildsLaunchDeletesNothingThisBuildSaved() async throws {
+  let install = try await LegacyInstall()
+  defer { install.remove() }
+  try writePrivately(
+    JSONEncoder().encode([
+      NativeRequestSubmit(
+        inputId: UUID().uuidString, mode: .steer, text: "Invented note from another launch")
+    ]), to: install.otherOutbox.appending(path: "pending.json"))
+  try await withTheOldAddressSilent(install) { coordinators, migrated, _, _, bringBack in
+    var steps: [String] = []
+    @MainActor func check(_ step: String) throws {
+      let deleted = try ShippedBuild.launchDeletes(
+        support: install.support, caches: install.caches
+      ).map(\.lastPathComponent)
+      let held = try HeldQueue.all(applicationSupport: install.support)
+      let live = Set(held.map(\.id.uuidString) + coordinators.profiles.map(\.id.description))
+      steps.append(
+        "\(step): holds \(held.count) queues | the shipped build deletes \(deleted.count), of them held or saved \(deleted.filter(live.contains).count)"
+      )
+    }
+    try check("launch")
+    try await coordinators.update(
+      migrated.id, name: TagName("Work"),
+      address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    try check("the migrated profile edited to Work's address")
+    await bringBack()
+    try await coordinators.add(name: TagName("Personal"), address: install.address)
+    try check("Personal added at the build's address")
+    let personal = try #require(coordinators.profiles.last)
+    try await coordinators.remove(coordinators.removal(personal.id))
+    try check("Personal removed")
+    try await coordinators.remove(coordinators.removal(migrated.id))
+    try check("Work removed")
+    print("IF17-S1-2\n" + steps.joined(separator: "\n"))
+    #expect(
+      steps.allSatisfy { $0.hasSuffix("of them held or saved 0") },
+      "The shipped build deletes a held queue or a saved coordinator's files")
+  }
+}
+
+/// This build held the single-address build's queue for 100.64.1.2:43187. Then the build the fork
+/// shipped before this one ran: its coordinator answered there, so that build bound the queue to it
+/// and withdrew the old alert installation, and the user moved the profile to port 4001. This build,
+/// launched again, keeps that binding, since the queue's folder records that address. A binding
+/// `profiles.json` gives at an address the folder does not record proves nothing, so the queue
+/// stays unbound with its installation.
+@MainActor @Test(arguments: ["the queue's address", "another address"])
+func whatTheShippedBuildBoundStaysBoundWhereTheFolderAgrees(_ at: String) async throws {
+  let install = try await LegacyInstall()
+  defer { install.remove() }
+  @MainActor func launch() -> Coordinators {
+    Coordinators(
+      registration: nil, defaults: install.defaults, applicationSupport: install.support,
+      caches: install.caches,
+      transport: CoordinatorTransport { _ in throw ConnectionError.timedOut })
+  }
+  let first = launch()
+  let queue = try #require(first.queues.first)
+  let migrated = try #require(first.profiles.first)
+  let coordinator = CoordinatorID(UUID())
+  let host = at == "the queue's address" ? "100.64.1.2" : "100.64.1.3"
+  try writePrivately(
+    Data(
+      """
+      {"withdrawals":[],\
+      "profiles":[{"id":"\(migrated.id)","name":"Work",\
+      "address":{"host":"100.64.1.2","port":4001},"pin":"\(coordinator.uuid.uuidString)"}],\
+      "held":[{"id":"\(queue.id.uuidString)","address":{"host":"\(host)","port":43187},\
+      "coordinator":"\(coordinator.uuid.uuidString)"}]}
+      """.utf8), to: install.support.appending(path: "Agent/profiles.json"))
+  let again = launch()
+  let shown = try await settles { again.chat.held.count == 2 }
+  let after = try #require(again.queues.first)
+  struct Saved: Decodable {
+    let withdrawals: [PendingWithdrawal]
+    let held: [HeldQueue]?
+  }
+  let saved = try JSONDecoder().decode(Saved.self, from: install.savedProfiles())
+  print(
+    "IF17-S1-3[the shipped build bound the queue at \(at)] queue bound to it=\(after.coordinator == coordinator) old installation kept=\(after.installation != nil) withdrawals=\(saved.withdrawals.count) held=\(again.chat.held.map(\.item.text)) profiles.json lists it bound=\(saved.held.map { $0.map { $0.coordinator == coordinator } } ?? [])"
+  )
+  #expect(shown && again.chat.held.map(\.item.text) == install.queued.map(\.text))
+  if at == "the queue's address" {
+    #expect(after.coordinator == coordinator && after.installation == nil)
+    #expect(saved.withdrawals.isEmpty, "The installation that build withdrew is withdrawn again")
+  } else {
+    #expect(after.coordinator == nil && after.installation?.description == install.installation)
+  }
+  #expect(saved.held == again.queues, "profiles.json does not list what the folders record")
+}
+
 /// The single-address build left two messages for its coordinator at 100.64.1.2:43187, which
 /// answers nothing at the update. The user taps Remove coordinator, and its confirmation counts no
 /// held messages. Then the build's coordinator answers again: the migrated profile's own Try again
