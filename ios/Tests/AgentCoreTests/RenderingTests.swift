@@ -1164,8 +1164,8 @@
         }
       }
 
-      /// Restores a message held for `profile`, with `text` and, if `file` names one, an invented
-      /// file, into the hosted composer.
+      /// Restores a message held in `profile`'s directory, with `text` and, if `file` names one, an
+      /// invented file, into the hosted composer, choosing `profile` for it.
       @MainActor private func restoreHeld(
         _ text: String, file: String? = nil, model: ChatModel, from profile: CoordinatorProfile
       ) async throws {
@@ -1187,7 +1187,7 @@
         let hold = LegacyHold(directory)
         model.attach(Lane(id: profile.id, session: nil, hold: hold))
         let item = try #require(try await hold.items().first)
-        await model.restoreHeld(HeldMessage(lane: profile.id, item: item))
+        await model.restoreHeld(HeldMessage(lane: profile.id, item: item), for: profile.id)
         try await Task.sleep(for: .milliseconds(250))
       }
 
