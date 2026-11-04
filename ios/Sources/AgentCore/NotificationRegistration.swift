@@ -262,22 +262,45 @@ public final class NotificationRegistration {
   }
 }
 
-/// An alert withdrawal that Remove saved before withdrawing. It outlives the profile, so it
-/// keeps the address and pin that reach that profile's coordinator alone.
+/// An alert installation a coordinator may hold for this device: a saved profile's ID, or the one
+/// the single-address build registered.
+public struct InstallationID: Hashable, Sendable, Codable, CustomStringConvertible {
+  let uuid: UUID
+  public init(_ profile: ProfileID) { uuid = profile.uuid }
+  /// The single-address build's `notificationInstallationID`, when it is a UUID.
+  public init?(legacy value: String) {
+    guard let uuid = UUID(uuidString: value) else { return nil }
+    self.uuid = uuid
+  }
+  public init(from decoder: any Decoder) throws {
+    uuid = try decoder.singleValueContainer().decode(UUID.self)
+  }
+  public func encode(to encoder: any Encoder) throws {
+    var container = encoder.singleValueContainer()
+    try container.encode(uuid)
+  }
+  public var description: String { uuid.uuidString }
+}
+
+/// An alert withdrawal saved before it is sent: Remove's, or the single-address build's once the
+/// profile migrated from it pairs. It outlives the profile, so it keeps the address and pin that
+/// reach that coordinator alone.
 public struct PendingWithdrawal: Codable, Sendable, Equatable {
-  public let installation: ProfileID
+  public let installation: InstallationID
   public let address: CoordinatorAddress
   public let pin: CoordinatorID
 
-  public init(installation: ProfileID, address: CoordinatorAddress, pin: CoordinatorID) {
+  public init(installation: InstallationID, address: CoordinatorAddress, pin: CoordinatorID) {
     self.installation = installation
     self.address = address
     self.pin = pin
   }
 
-  /// Withdraws the installation over one socket that proves the pin. True once the coordinator
-  /// confirmed it holds no registration for it.
-  public func send(transport: CoordinatorTransport) async throws -> Bool {
+  /// Withdraws the installation over one socket to `address` that proves the pin. True once the
+  /// coordinator confirmed it holds no registration for it.
+  public func send(to address: CoordinatorAddress, transport: CoordinatorTransport) async throws
+    -> Bool
+  {
     let stream = try await CoordinatorDialer(address: address, pin: pin, transport: transport)
       .open()
     do {

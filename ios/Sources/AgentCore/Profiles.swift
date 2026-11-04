@@ -97,11 +97,23 @@ public struct CoordinatorProfile: Codable, Sendable, Identifiable, Equatable {
   public var address: CoordinatorAddress
   /// The coordinator every socket must reach. `nil` until paired. Set once, by `admit`.
   public internal(set) var pin: CoordinatorID?
+  /// The single-address build's alert installation, on the profile migrated from that build. Its
+  /// coordinator may still hold it, and only a socket that proves the pin may carry it, so it
+  /// waits here until pairing.
+  public internal(set) var inherited: InstallationID?
 
-  public init(name: TagName, address: CoordinatorAddress) {
+  public init(name: TagName, address: CoordinatorAddress, inherited: InstallationID? = nil) {
     id = ProfileID()
     self.name = name
     self.address = address
+    self.inherited = inherited
+  }
+
+  /// Once paired, hands over the inherited installation as a withdrawal over the pin.
+  public mutating func takeInheritedWithdrawal() -> PendingWithdrawal? {
+    guard let pin, let inherited else { return nil }
+    self.inherited = nil
+    return PendingWithdrawal(installation: inherited, address: address, pin: pin)
   }
 
   /// The pairing decision after `identifyCoordinator(at:)`. Returns true when it pinned the

@@ -12,6 +12,9 @@ private struct LegacyInstall {
   let suite: String
   let defaults: UserDefaults
   let address: CoordinatorAddress
+  /// The build's one alert installation ID, which its coordinator may still hold.
+  let installation: String
+  let alerts: Bool
   let queued: [NativeRequestSubmit]
   let pending: Data
   let attachment: AttachmentRef
@@ -30,15 +33,16 @@ private struct LegacyInstall {
     return support.appending(path: "Agent/Outbox/\(key)")
   }
 
-  init(host: String = "100.64.1.2", port: String? = nil) async throws {
+  init(host: String = "100.64.1.2", port: String? = nil, alerts: Bool = false) async throws {
     let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
     let support = root.appending(path: "Support")
     let suite = "legacy-install-\(UUID())"
     let defaults = try #require(UserDefaults(suiteName: suite))
     defaults.set(host, forKey: "coordinatorAddress")
     if let port { defaults.set(port, forKey: "coordinatorPort") }
-    defaults.set(UUID().uuidString, forKey: "notificationInstallationID")
-    defaults.set(false, forKey: "notificationsEnabled")
+    let installation = UUID().uuidString
+    defaults.set(installation, forKey: "notificationInstallationID")
+    defaults.set(alerts, forKey: "notificationsEnabled")
     let address = try CoordinatorAddress(host: host, port: try #require(UInt16(port ?? "43187")))
     let old = Self.outbox(support, address.host, address.port)
     let bytes = Data("Invented attachment bytes".utf8)
@@ -66,6 +70,8 @@ private struct LegacyInstall {
     self.suite = suite
     self.defaults = defaults
     self.address = address
+    self.installation = installation
+    self.alerts = alerts
     self.queued = queued
     self.pending = pending
     self.attachment = attachment
@@ -105,7 +111,7 @@ private struct LegacyInstall {
     #expect(defaults.object(forKey: "coordinatorAddress") == nil)
     #expect(defaults.object(forKey: "coordinatorPort") == nil)
     #expect(defaults.object(forKey: "notificationInstallationID") == nil)
-    #expect(defaults.object(forKey: "notificationsEnabled") as? Bool == false)
+    #expect(defaults.object(forKey: "notificationsEnabled") as? Bool == alerts)
     struct Saved: Decodable { let profiles: [CoordinatorProfile] }
     #expect(try JSONDecoder().decode(Saved.self, from: savedProfiles()).profiles == profiles)
   }
@@ -120,6 +126,33 @@ private struct Crash: Error {}
   while !(await predicate()) {
     try #require(ContinuousClock.now < deadline, "Timed out waiting for \(description)")
     try await Task.sleep(for: .milliseconds(5))
+  }
+}
+
+/// Waits up to ten seconds for `predicate` and says whether it held, so a test can print what it
+/// found before it expects.
+@MainActor private func settles(_ predicate: () async -> Bool) async throws -> Bool {
+  let deadline = ContinuousClock.now + .seconds(10)
+  while !(await predicate()) {
+    if ContinuousClock.now >= deadline { return false }
+    try await Task.sleep(for: .milliseconds(10))
+  }
+  return true
+}
+
+/// Each alert control a coordinator got, naming the single-address build's installation "old" and
+/// the profile's own "profile".
+private func described(
+  _ controls: [NotificationRequest], old: String, profile: ProfileID
+) -> [String] {
+  controls.map { request in
+    let (kind, id) =
+      switch request {
+      case .status(let value): ("status", value.installationId)
+      case .register(let value): ("register", value.installationId)
+      case .unregister(let value): ("unregister", value.installationId)
+      }
+    return "\(kind)(\(id == old ? "old" : id == "\(profile)" ? "profile" : id))"
   }
 }
 
@@ -227,9 +260,15 @@ func theMigratedProfilePairsAndHeldMessagesLeaveOnlyByADeliberateSend() async th
     try JSONDecoder().decode(Saved.self, from: install.savedProfiles()).profiles.first?.pin
       == fixture.id)
   #expect(await fixture.received().contains(.observe(.init(inputIds: []))))
-  try await eventually("this lane's own notification channel") {
-    await fixture.notificationControls() == [.status(.init(installationId: "\(profile.id)"))]
+  try await eventually("this lane's own notification channel, and the old installation withdrawn") {
+    let controls = await fixture.notificationControls()
+    return controls.contains(.status(.init(installationId: "\(profile.id)")))
+      && controls.contains(.unregister(.init(installationId: install.installation)))
   }
+  #expect(
+    described(await fixture.notificationControls(), old: install.installation, profile: profile.id)
+      .allSatisfy { $0.hasSuffix("(profile)") || $0 == "unregister(old)" },
+    "Only this profile's installation, and the old one's withdrawal")
   let first = try #require(chat.held.first)
   await chat.restoreHeld(first)
   #expect(chat.draft == first.item.text, "Restore puts the text in verbatim")
@@ -256,6 +295,167 @@ func theMigratedProfilePairsAndHeldMessagesLeaveOnlyByADeliberateSend() async th
   #expect(!wire.contains(install.queued[1].text))
   await coordinators.setActive(false)
   await fixture.stop()
+}
+
+/// The single-address build registered one alert installation with its coordinator. With alerts
+/// off, that build withdrew it again at each connection until the coordinator confirmed. With
+/// alerts on, only a register of the same token for another installation removes it. The update
+/// can land before either, and the user can turn alerts off before the first connection. Once the
+/// migrated profile pairs, a socket that proves its pin withdraws the old installation, so the
+/// coordinator alerts this device only through the profile's own installation, and only while
+/// alerts are on.
+@MainActor
+@Test(
+  .timeLimit(.minutes(1)), arguments: ["left off", "turned off after the update", "left on"])
+func theSingleAddressBuildsAlertInstallationIsWithdrawnOnceTheMigratedProfilePairs(
+  _ alerts: String
+) async throws {
+  let install = try await LegacyInstall(alerts: alerts != "left off")
+  defer { install.remove() }
+  let token = String(repeating: "ab", count: 32)
+  let fixture = FixtureCoordinator()
+  await fixture.register(install.installation, token: token)
+  let (listener, port) = try await listen(fixture)
+  defer { listener.cancel() }
+  let registration = NotificationRegistration(
+    enabled: install.alerts, permission: { true }, register: {},
+    save: { install.defaults.set($0, forKey: "notificationsEnabled") })
+  let coordinators = Coordinators(
+    registration: registration, defaults: install.defaults, applicationSupport: install.support,
+    caches: install.caches, transport: loopback(port))
+  let profile = try #require(coordinators.profiles.first)
+  switch alerts {
+  case "turned off after the update": await registration.setEnabled(false)
+  case "left on":
+    await registration.start()
+    await registration.received(token: token)
+  default: break
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("the migrated profile paired and connected") {
+      coordinators.chat.connection == .connected
+    }
+    try await eventually("its alert channel checked") {
+      await fixture.notificationControls().contains(
+        .status(.init(installationId: "\(profile.id)")))
+    }
+    let withdrawn = try await settles { !(await fixture.holds(install.installation)) }
+    let profileHeld =
+      alerts == "left on"
+      ? try await settles { await fixture.holds("\(profile.id)") }
+      : await fixture.holds("\(profile.id)")
+    let controls = described(
+      await fixture.notificationControls(), old: install.installation, profile: profile.id)
+    print(
+      "IF13-X2[\(alerts)] toggle=\(registration.enabled ? "on" : "off") controls=\(controls) old installation held=\(!withdrawn) profile's installation held=\(profileHeld)"
+    )
+    #expect(withdrawn, "The coordinator keeps the single-address build's installation")
+    #expect(profileHeld == (alerts == "left on"))
+  } catch {
+    await coordinators.setActive(false)
+    await fixture.stop()
+    throw error
+  }
+  await coordinators.setActive(false)
+  await fixture.stop()
+}
+
+/// The migrated profile's saved address no longer answers, so it stays unpaired until the user
+/// edits the address. The edit pairs it, and the single-address build's alert installation is
+/// withdrawn over the paired profile's socket, as when the profile pairs on its own.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func anAddressEditThatPairsTheMigratedProfileWithdrawsTheOldAlertInstallation() async throws {
+  let install = try await LegacyInstall()
+  defer { install.remove() }
+  let fixture = FixtureCoordinator()
+  await fixture.register(install.installation, token: String(repeating: "ab", count: 32))
+  let (listener, port) = try await listen(fixture)
+  defer { listener.cancel() }
+  let coordinators = Coordinators(
+    registration: nil, defaults: install.defaults, applicationSupport: install.support,
+    caches: install.caches,
+    transport: CoordinatorTransport { address in
+      guard address.port == 4001 else { throw ConnectionError.timedOut }
+      return LineConnection(
+        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+    })
+  let profile = try #require(coordinators.profiles.first)
+  await coordinators.setActive(true)
+  do {
+    try await eventually("the saved address answered nothing") {
+      coordinators.pairingError[profile.id] != nil
+    }
+    try await coordinators.update(
+      profile.id, name: profile.name,
+      address: CoordinatorAddress(host: install.address.host, port: 4001))
+    try await eventually("paired at the edited address") {
+      coordinators.chat.connection == .connected
+    }
+    let withdrawn = try await settles { !(await fixture.holds(install.installation)) }
+    let controls = described(
+      await fixture.notificationControls(), old: install.installation, profile: profile.id)
+    print(
+      "IF13-X2[paired by an address edit] controls=\(controls) old installation held=\(!withdrawn)"
+    )
+    #expect(withdrawn, "The coordinator keeps the single-address build's installation")
+  } catch {
+    await coordinators.setActive(false)
+    await fixture.stop()
+    throw error
+  }
+  await coordinators.setActive(false)
+  await fixture.stop()
+}
+
+/// A launch that stops after any migration step, then a withdrawal whose reply is lost, still end
+/// with the single-address build's alert installation withdrawn. The phone keeps that withdrawal
+/// across a relaunch until the coordinator confirms it.
+@MainActor
+@Test(
+  .timeLimit(.minutes(1)),
+  arguments: [
+    Coordinators.MigrationStep.profileSaved, .quarantined, .markerRemoved,
+  ])
+func theSingleAddressBuildsAlertInstallationIsWithdrawnAfterACrashAndALostReply(
+  _ step: Coordinators.MigrationStep
+) async throws {
+  let install = try await LegacyInstall(port: "4123")
+  defer { install.remove() }
+  let fixture = FixtureCoordinator()
+  await fixture.register(install.installation, token: String(repeating: "ab", count: 32))
+  let (listener, port) = try await listen(fixture)
+  defer { listener.cancel() }
+  #expect(throws: Crash.self) {
+    try Coordinators.migrate(
+      defaults: install.defaults, applicationSupport: install.support, caches: install.caches,
+      crash: { if $0 == step { throw Crash() } })
+  }
+  @MainActor func launch() -> Coordinators {
+    Coordinators(
+      registration: NotificationRegistration(
+        enabled: false, permission: { true }, register: {}, save: { _ in }),
+      defaults: install.defaults, applicationSupport: install.support, caches: install.caches,
+      transport: loopback(port))
+  }
+  let withdrawal = NotificationRequest.unregister(.init(installationId: install.installation))
+  await fixture.dropNextNotificationRemoval()
+  let first = launch()
+  await first.setActive(true)
+  let lost = try await settles { await fixture.notificationControls().contains(withdrawal) }
+  await first.setActive(false)
+  let second = launch()
+  await second.setActive(true)
+  let withdrawn = try await settles { !(await fixture.holds(install.installation)) }
+  let sent = await fixture.notificationControls().filter { $0 == withdrawal }.count
+  print(
+    "IF13-X2[crash after \(step)] first withdrawal sent and lost=\(lost) withdrawals sent=\(sent) old installation held=\(!withdrawn)"
+  )
+  await second.setActive(false)
+  await fixture.stop()
+  #expect(lost, "The first launch never withdrew the old installation")
+  #expect(withdrawn, "The coordinator keeps the single-address build's installation")
+  #expect(sent == 2, "Sent once per launch until confirmed")
 }
 
 @MainActor @Test(.timeLimit(.minutes(1)))
@@ -422,6 +622,146 @@ func aRefusedAddressEditKeepsTheQueueAndNeverSendsTheUserToRemove(_ typo: String
     #expect(chat.snapshots[id]?.connection == .connected)
     #expect(queued == ["Invented follow-up for the Work board"])
     #expect(strangerHeard == 0, "The refused address saw only the probe")
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
+/// Which fixture each saved port reaches. A test changes it as coordinators move.
+private actor Routes {
+  private var table: [UInt16: NWEndpoint.Port]
+  init(_ table: [UInt16: NWEndpoint.Port]) { self.table = table }
+  func set(_ next: [UInt16: NWEndpoint.Port]) { table = next }
+  func port(_ saved: UInt16) -> NWEndpoint.Port? { table[saved] }
+}
+
+/// Work and Personal run on one machine at ports 4001 and 4002, and Work refused a follow-up that
+/// this phone still holds. Then the two coordinators trade ports, so each lane reaches the other
+/// saved coordinator. Each line names that coordinator and points to editing its own address. It
+/// never points to Remove, which deletes Work's follow-up, and re-adding Work there would bind the
+/// name to Personal's coordinator. Following Work's line keeps the follow-up, and following both
+/// keeps `@Work` going to Work's coordinator. An address that answers as a coordinator no profile
+/// is pinned to, as after a reinstall, keeps the reinstall line with Remove's count.
+@MainActor
+@Test(.timeLimit(.minutes(1)), arguments: ["Work's line", "both lines", "a reinstall"])
+func aLaneWhoseAddressAnswersAsAnotherSavedCoordinatorNamesItAndNeverSendsTheUserToRemove(
+  _ followed: String
+) async throws {
+  let work = FixtureCoordinator()
+  let personal = FixtureCoordinator()
+  let stranger = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(work)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personal)
+  defer { personalListener.cancel() }
+  let (strangerListener, strangerPort) = try await listen(stranger)
+  defer { strangerListener.cancel() }
+  let routes = Routes([4001: workPort, 4002: personalPort])
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "swap-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: CoordinatorTransport { address in
+      guard let port = await routes.port(address.port) else {
+        throw ConnectionError.invalidAddress
+      }
+      return LineConnection(
+        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+    })
+  func stop() async {
+    await coordinators.setActive(false)
+    for fixture in [work, personal, stranger] { await fixture.stop() }
+  }
+  do {
+    await coordinators.setActive(true)
+    try await coordinators.add(
+      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    try await coordinators.add(
+      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+    let chat = coordinators.chat
+    let workID = coordinators.profiles[0].id
+    let personalID = coordinators.profiles[1].id
+    try await eventually("both connected") {
+      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+    }
+    await work.rejectSubmits()
+    chat.draft = "@Work Invented follow-up: renew the parking permit"
+    chat.promoteTypedTag()
+    await chat.send()
+    let outbox = ProfileDirectory(workID, applicationSupport: root, caches: root).outbox
+    try await eventually("Work refused the follow-up") {
+      chat.snapshots[workID]?.rows.contains { $0.delivery == .rejected } == true
+    }
+    await work.rejectSubmits(false)
+    await routes.set(
+      followed == "a reinstall"
+        ? [4001: strangerPort, 4002: personalPort] : [4001: personalPort, 4002: workPort])
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    try await eventually("Work's line names who answers") {
+      chat.laneError(workID)?.hasPrefix("This address now answers as") == true
+    }
+    let workLine = chat.laneError(workID) ?? "nil"
+    print("IF13-X1[\(followed)] Work's line: \(workLine)")
+    if followed == "a reinstall" {
+      #expect(
+        workLine
+          == "This address now answers as a different coordinator. 1 queued message is held on this phone. Remove it and add it again."
+      )
+      try await eventually("Personal connected beside it") {
+        chat.snapshots[personalID]?.connection == .connected
+      }
+    } else {
+      try await eventually("Personal's line names who answers") {
+        chat.laneError(personalID)?.hasPrefix("This address now answers as") == true
+      }
+      let personalLine = chat.laneError(personalID) ?? "nil"
+      print("IF13-X1[\(followed)] Personal's line: \(personalLine)")
+      #expect(workLine == "This address now answers as Personal. Edit Work's address.")
+      #expect(personalLine == "This address now answers as Work. Edit Personal's address.")
+      #expect(
+        !workLine.contains("Remove") && !personalLine.contains("Remove"),
+        "A line sends the user to Remove, which deletes the queue")
+      try await coordinators.update(
+        workID, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+      try await eventually("Work reconnected where its coordinator answers") {
+        chat.snapshots[workID]?.connection == .connected
+      }
+      let queued = (try? queuedRequests(outbox).map(\.text)) ?? []
+      print(
+        "IF13-X1[\(followed)] after editing Work's address: Work's line=\(chat.laneError(workID) ?? "nil") Work's queue=\(queued)"
+      )
+      #expect(queued == ["Invented follow-up: renew the parking permit"])
+      #expect(chat.laneError(workID) == nil)
+      if followed == "both lines" {
+        try await coordinators.update(
+          personalID, name: TagName("Personal"),
+          address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+        try await eventually("Personal reconnected where its coordinator answers") {
+          chat.snapshots[personalID]?.connection == .connected
+        }
+        let before = (await work.count(), await personal.count())
+        chat.draft = "@Work Invented note: the quarterly board pack"
+        chat.promoteTypedTag()
+        let line = chat.recipientLine
+        await chat.send()
+        try await eventually("Work's coordinator got the note") { await work.count() > before.0 }
+        try await Task.sleep(for: .milliseconds(300))
+        let gotByWork = await work.count() - before.0
+        let gotByPersonal = await personal.count() - before.1
+        print(
+          "IF13-X1[\(followed)] after editing both: line=\(line) Work's coordinator got=\(gotByWork) Personal's coordinator got=\(gotByPersonal)"
+        )
+        #expect(line == "To Work")
+        #expect(gotByWork == 1)
+        #expect(gotByPersonal == 0, "The @Work note reached Personal's coordinator")
+      }
+    }
   } catch {
     await stop()
     throw error
