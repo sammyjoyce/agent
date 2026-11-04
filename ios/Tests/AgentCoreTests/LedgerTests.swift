@@ -375,8 +375,11 @@ func aSendStillReportsAfterItsRowLeavesTheWindow() async throws {
     let staged = try #require(
       await session.stage("To both", sendID: "send-2", recipients: recipients))
     await session.start(staged)
+    // The fixture closes the submit's socket, so the session reconnects, and it can publish the
+    // placement before that reconnect completes. Latest loads nothing until it has.
     let placed = try await until(session) {
-      $0.rows.contains { $0.sendID == "send-2" && $0.entryID != nil && $0.delivery == .saved }
+      $0.connection == .connected
+        && $0.rows.contains { $0.sendID == "send-2" && $0.entryID != nil && $0.delivery == .saved }
     }
     #expect(placed.sends["send-2"] == SendStatus(recipients: recipients, progress: .placed))
     await fixture.replyToLatest(

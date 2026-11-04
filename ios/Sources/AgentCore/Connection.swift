@@ -78,19 +78,19 @@ extension CoordinatorAddress: Codable {
   }
 }
 
-public enum ConnectionError: Error, LocalizedError, Sendable {
+public enum ConnectionError: Error, LocalizedError, Sendable, Equatable {
   case invalidAddress, dnsUnavailable, vpnUnavailable, frameTooLarge, incompleteFrame, closed,
     timedOut
   /// The socket closed or answered something other than `identity`, as a coordinator built
   /// before identities does.
   case unidentifiedCoordinator
-  /// The socket named a coordinator other than the profile's pin.
-  case wrongCoordinator
+  /// The socket named a coordinator other than the profile's pin, the one carried here.
+  case wrongCoordinator(CoordinatorID)
   public var errorDescription: String? {
     switch self {
     case .unidentifiedCoordinator: "Update the coordinator to use it with this app."
-    case .wrongCoordinator:
-      "This address now answers as a different coordinator. Remove it and add it again."
+    // No advice: it may be another saved coordinator, and only the feed can tell.
+    case .wrongCoordinator: "This address now answers as a different coordinator."
     case .vpnUnavailable:
       "Connect Tailscale first. No active point-to-point interface has a Tailscale IPv4 address."
     case .invalidAddress: "Enter a Tailscale IPv4 address or full MagicDNS name and port."
@@ -166,7 +166,8 @@ struct CoordinatorDialer: Sendable {
   func open() async throws -> VerifiedConnection {
     let line = try await transport.connect(address)
     do {
-      guard try await identify(line) == pin else { throw ConnectionError.wrongCoordinator }
+      let found = try await identify(line)
+      guard found == pin else { throw ConnectionError.wrongCoordinator(found) }
       return VerifiedConnection(line: line)
     } catch {
       await line.close()
