@@ -2322,9 +2322,9 @@ func aCopyWhoseSessionRetiredDuringASendThatReachedNoOneIsNotKept(_ change: Stri
 }
 
 /// A message to both whose socket to Work is still proving Work's identity when Remove takes Work,
-/// while Personal refuses its copy. One coordinator is left, so Personal's errors show in the
-/// composer. What Remove cut off stays named beside them, and beside any other failure, until the
-/// next Send.
+/// while Personal refuses its copy. One coordinator is left, so Personal's current error shows in
+/// the composer, beside the composer's own failure. What Remove cut off stays named beside them
+/// until the next Send.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func whatRemoveCutOffStaysNamedUntilTheNextSendWithOneCoordinatorLeft() async throws {
   try await withTwoFixtures { coordinators, workFixture, personalFixture, _ in
@@ -2365,7 +2365,8 @@ func whatRemoveCutOffStaysNamedUntilTheNextSendWithOneCoordinatorLeft() async th
     print("IF6-T3 after a refused Restore: composer error=\(chat.error ?? "nil")")
     #expect(
       chat.error
-        == "\(report) Send or clear the current draft before restoring another message.")
+        == "\(report) Send or clear the current draft before restoring another message. Attachment storage is full"
+    )
     await personalFixture.acceptUploads()
     await chat.send()
     try await eventually("Personal got the next message") {
@@ -2373,6 +2374,81 @@ func whatRemoveCutOffStaysNamedUntilTheNextSendWithOneCoordinatorLeft() async th
     }
     print("IF6-T3 after the next Send: composer error=\(chat.error ?? "nil")")
     #expect(chat.error?.contains(report) != true, "The next Send clears the report")
+  }
+}
+
+// MARK: - The composer shows a coordinator's error only while it is current and saved alone
+
+/// With Work saved alone, its address starts answering as a coordinator no profile has, so the
+/// composer shows Work's line, which advises Remove. The user adds Personal, and the coordinator at
+/// Work's address turns out to be Personal's, so Work's line above the feed names Personal and
+/// points to Work's address. Nothing under the composer may still advise Remove, and once Work's
+/// coordinator answers at Work's address again, nothing is left there.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aLoneCoordinatorsErrorLeavesTheComposerOnceASecondIsAddedAndWhenItRecovers() async throws {
+  let route = WorkRoute()
+  try await withTwoFixtures(route: route) { coordinators, _, _, _ in
+    try await coordinators.add(
+      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    let chat = coordinators.chat
+    let work = try #require(coordinators.profiles.first?.id)
+    try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
+    await route.point(atPersonal: true)
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    try await eventually("Work's line under the composer") {
+      chat.error?.hasSuffix("Remove it and add it again.") == true
+    }
+    print("IF14-W1[Work alone] composer: \(chat.error ?? "nil")")
+    try await coordinators.add(
+      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+    try await eventually("Work's line names Personal") {
+      chat.laneError(work) == "This address now answers as Personal. Edit Work's address."
+    }
+    print(
+      "IF14-W1[Personal added] Work's line: \(chat.laneError(work) ?? "nil") composer: \(chat.error ?? "nil")"
+    )
+    #expect(chat.error == nil, "The composer still shows Work's line from when it was alone")
+    await route.point(atPersonal: false)
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    try await eventually("Work reconnected") { chat.snapshots[work]?.connection == .connected }
+    print(
+      "IF14-W1[Work recovered] Work's line: \(chat.laneError(work) ?? "nil") composer: \(chat.error ?? "nil")"
+    )
+    #expect(chat.laneError(work) == nil)
+    #expect(chat.error == nil, "The composer still shows a line its lane no longer has")
+  }
+}
+
+/// The other direction. Work's address answers as Personal while both are saved, so Work's error
+/// is on Work's own line and not under the composer. The user removes Personal, which leaves Work
+/// alone. Work's current error, the reinstall line once no saved coordinator answers there, then
+/// shows under the composer, at once and after Work's next attempt.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aCoordinatorLeftAloneShowsItsCurrentErrorUnderTheComposer() async throws {
+  let route = WorkRoute()
+  try await withTwoFixtures(route: route) { coordinators, _, _, _ in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    await route.point(atPersonal: true)
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    try await eventually("Work's line names Personal") {
+      chat.laneError(work) == "This address now answers as Personal. Edit Work's address."
+    }
+    #expect(chat.error == nil, "With two coordinators each error shows on its own lane's line")
+    try await coordinators.remove(personal)
+    let atRemoval = chat.error
+    await chat.reconnect(work)
+    let afterAttempt = await within(6) {
+      chat.error?.hasSuffix("Remove it and add it again.") == true
+    }
+    print(
+      "IF14-W1[Personal removed] composer at once: \(atRemoval ?? "nil") after Work's next attempt: \(chat.error ?? "nil")"
+    )
+    #expect(afterAttempt, "Work's error never reached the composer")
+    #expect(atRemoval == chat.laneError(work), "Work's current error waited for its next attempt")
   }
 }
 

@@ -92,15 +92,17 @@ final class ChatModel {
   var canLoadEarlier = false
   var loadingHistory = false
   var includesLatest = true
-  /// What the composer shows under the feed: what it reported since the last Send, then the latest
-  /// failure.
+  /// What the composer shows under the feed: what it reported since the last Send, its own latest
+  /// failure, then, with one coordinator, that coordinator's current error, which has no line of
+  /// its own.
   var error: String? {
-    let parts = reports + [failure].compactMap { $0 }
+    let current = multiple ? nil : lanes.lazy.compactMap { self.laneError($0.id) }.first
+    let parts = reports + [failure, current].compactMap { $0 }
     return parts.isEmpty ? nil : parts.joined(separator: " ")
   }
   /// Who did not get the last Send, and why. Only the next Send clears it.
   private(set) var reports: [String] = []
-  /// The latest failure: the composer's own, or, with one coordinator, that coordinator's error.
+  /// The composer's own latest failure.
   var failure: String?
   var revision = 0
   /// Saved coordinators in order, kept by `Coordinators`. Names, colors and the feed's lane
@@ -719,9 +721,6 @@ final class ChatModel {
   // MARK: - Feed
 
   func apply(_ update: ChatSnapshot, lane id: ProfileID) {
-    // With several coordinators each lane's error shows on its own line instead. With one, an
-    // update that neither has nor clears an error leaves the composer's own failure in place.
-    if !multiple, update.error != nil || snapshots[id]?.error != nil { failure = update.error }
     snapshots[id] = update
     refresh()
   }

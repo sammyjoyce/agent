@@ -153,7 +153,9 @@ Mode if requested, then Run.
   addresses, the line names it and asks you to edit the address, which keeps
   the queue. An address edit that reaches a different coordinator saves
   nothing, and the form names the coordinator saved at that address, if there
-  is one.
+  is one. With two or more coordinators, each one's error shows on its own
+  line above the feed. With one, its error shows under the feed, beside any
+  error of the composer's own, and only while it lasts.
 - Transient network loss reconnects automatically. Suspension releases owned
   connections. Returning reconnects and reconciles
   the original input IDs. Uncertain writes are never automatically replayed.
