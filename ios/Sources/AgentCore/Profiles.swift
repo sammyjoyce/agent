@@ -75,12 +75,16 @@ public enum ProfileError: Error, LocalizedError, Equatable, Sendable {
   case invalidName
   case duplicateName(String)
   case duplicateCoordinator(savedAs: String)
+  /// An edited address answers as a coordinator that no saved profile is pinned to.
+  case differentCoordinator
   public var errorDescription: String? {
     switch self {
     case .invalidName:
       "Use up to 32 letters, digits, hyphens or underscores, starting with a letter or digit."
     case .duplicateName(let name): "There is already a coordinator named \(name)."
     case .duplicateCoordinator(let name): "Already saved as \(name)."
+    case .differentCoordinator:
+      "This address answers as a different coordinator. Nothing was saved."
     }
   }
 }
@@ -101,18 +105,18 @@ public struct CoordinatorProfile: Codable, Sendable, Identifiable, Equatable {
   }
 
   /// The pairing decision after `identifyCoordinator(at:)`. Returns true when it pinned the
-  /// profile, so `profiles` must be saved before any session is built.
+  /// profile, so `profiles` must be saved before any session is built. A refused edit leaves the
+  /// profile's saved address working, so its refusal names where the new address leads and never
+  /// the lane's advice to remove the profile.
   public static func admit(
     _ found: CoordinatorID, for id: ProfileID, in profiles: inout [CoordinatorProfile]
   ) throws -> Bool {
     guard let index = profiles.firstIndex(where: { $0.id == id }) else { return false }
-    if let pin = profiles[index].pin {
-      guard pin == found else { throw ConnectionError.wrongCoordinator }
-      return false
-    }
+    if profiles[index].pin == found { return false }
     if let other = profiles.first(where: { $0.id != id && $0.pin == found }) {
       throw ProfileError.duplicateCoordinator(savedAs: other.name.description)
     }
+    guard profiles[index].pin == nil else { throw ProfileError.differentCoordinator }
     profiles[index].pin = found
     return true
   }

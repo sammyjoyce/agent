@@ -723,6 +723,127 @@ func theNextSessionWithdrawsAnInputItsRetiredOneStagedUnlessItWroteIt(_ when: St
   }
 }
 
+/// A Send stages an input, and an address edit retires the session that staged it. The next session
+/// writes it with Check / retry, and the coordinator accepts it. More edits replace that session
+/// before the Send, which reached no one, withdraws the input through the session that holds the
+/// outbox then. The input may have left the phone, so it stays queued until its coordinator places
+/// it, however many edits followed, and before or after that session saw the acceptance. An input
+/// no session wrote is withdrawn.
+@Test(
+  .timeLimit(.minutes(1)),
+  arguments: [
+    "never written", "before it connects", "once it saw the acceptance", "three edits on",
+  ])
+func noSessionWithdrawsAnInputAnEarlierSessionWrote(_ when: String) async throws {
+  try await withProfile { fixture, directory, launch in
+    let first = try await launch()
+    await first.connect()
+    _ = try await until(first) { $0.connection == .connected }
+    let staged = try #require(
+      await first.stage(
+        "Invented: the venue deposit is paid", sendID: "send-12", recipients: [directory.profile]))
+    await first.retire()
+    var session = try await launch()
+    await session.connect()
+    _ = try await until(session) { $0.connection == .connected }
+    if when != "never written" {
+      await fixture.holdPlacements()
+      await session.retry(staged.inputID)
+      _ = try await until(session) { snapshot in
+        snapshot.rows.contains { $0.inputID == staged.inputID && $0.delivery == .saved }
+      }
+    }
+    for _ in 1...(when == "three edits on" ? 3 : 1) {
+      await session.retire()
+      session = try await launch()
+      guard when == "once it saw the acceptance" || when == "three edits on" else { continue }
+      await session.connect()
+      _ = try await until(session) { snapshot in
+        snapshot.connection == .connected
+          && snapshot.rows.contains { $0.inputID == staged.inputID && $0.delivery == .saved }
+      }
+    }
+    #expect(await session.unstage(staged))
+    let queued = try outboxItems(directory.outbox).map(\.request.inputId)
+    print(
+      "IF12-1[\(when)] queued once the latest session withdrew it=\(queued.count) coordinator got=\(await fixture.count())"
+    )
+    guard when != "never written" else {
+      #expect(queued.isEmpty, "An input no session wrote stayed queued")
+      #expect(await fixture.count() == 0)
+      return
+    }
+    try #require(queued == [staged.inputID], "An input a Check / retry wrote was withdrawn")
+    try await fixture.finishTurn()
+    await session.connect()
+    let placed = try await until(session) { snapshot in
+      snapshot.rows.contains { $0.entryID == "placed-\(staged.inputID)" && $0.delivery == .saved }
+    }
+    print(
+      "IF12-1[\(when)] once placed: send=\(String(describing: placed.sends["send-12"]?.progress))")
+    #expect(
+      placed.sends["send-12"] == SendStatus(recipients: [directory.profile], progress: .placed))
+    #expect(try outboxItems(directory.outbox).isEmpty)
+    #expect(await fixture.count() == 1, "Sent once")
+  }
+}
+
+/// Before a submit is written, the outbox saves that its input may have left the phone. When that
+/// cannot be saved, the submit is not written, since a later session would read the input as never
+/// sent and could withdraw it. It never left, so it needs attention.
+@Test(.timeLimit(.minutes(1)))
+func aSubmitIsNotWrittenWhileTheOutboxCannotSayItMayLeave() async throws {
+  try await withProfile { fixture, directory, launch in
+    let session = try await launch()
+    await session.connect()
+    _ = try await until(session) { $0.connection == .connected }
+    let staged = try #require(
+      await session.stage(
+        "Invented: the alarm code changed", sendID: "send-13", recipients: [directory.profile]))
+    let folder = directory.outbox.deletingLastPathComponent()
+    try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: folder.path)
+    defer {
+      try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
+    }
+    await session.start(staged)
+    let failed = try await until(session) { snapshot in
+      snapshot.rows.contains { $0.inputID == staged.inputID && $0.delivery != .sending }
+    }
+    let row = failed.rows.first { $0.inputID == staged.inputID }
+    print(
+      "IF12-1[unsaved] error=\(failed.error ?? "nil") row=\(row?.delivery?.rawValue ?? "none") coordinator got=\(await fixture.count())"
+    )
+    #expect(failed.error == "The on-device outbox could not be saved. Nothing was sent.")
+    #expect(row?.delivery == .rejected)
+    #expect(await fixture.count() == 0, "The submit was written")
+  }
+}
+
+/// An older build saved no staged mark, so an input it queued may have left the phone, and no
+/// session withdraws it.
+@Test(.timeLimit(.minutes(1)))
+func anInputAnOlderBuildQueuedIsNeverWithdrawn() async throws {
+  try await withProfile { fixture, directory, launch in
+    let request = NativeRequestSubmit(
+      inputId: UUID().uuidString, mode: .steer, text: "Invented: the boiler service is booked")
+    try saveOutbox([request], in: directory)
+    let item = try #require(try outboxItems(directory.outbox).first)
+    let session = try await launch()
+    await session.unstage(
+      StagedInput(
+        inputID: request.inputId, sendID: item.sendID, profile: directory.profile, control: nil,
+        composer: nil))
+    let queued = try outboxItems(directory.outbox).map(\.request.inputId)
+    print("IF12-1[older build] queued once a session withdrew it=\(queued.count)")
+    #expect(queued == [request.inputId])
+    await session.connect()
+    let shown = try await until(session) { $0.connection == .connected }
+    let row = shown.rows.first { $0.inputID == request.inputId }
+    #expect(row?.delivery == .uncertain)
+    #expect(await fixture.count() == 0)
+  }
+}
+
 enum LaneReturn: Sendable { case reconnect, foreground }
 
 @Test(.timeLimit(.minutes(1)), arguments: [LaneReturn.reconnect, .foreground])

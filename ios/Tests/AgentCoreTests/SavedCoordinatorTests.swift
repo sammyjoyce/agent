@@ -390,7 +390,7 @@ func anAddressEditIsProbedAgainstThePinBeforeAnythingIsSaved() async throws {
       name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4003))
   }
   let saved = try Data(contentsOf: root.appending(path: "Agent/profiles.json"))
-  await #expect(throws: ConnectionError.wrongCoordinator) {
+  await #expect(throws: ProfileError.differentCoordinator) {
     try await coordinators.update(
       id, name: work, address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
   }
@@ -408,6 +408,98 @@ func anAddressEditIsProbedAgainstThePinBeforeAnythingIsSaved() async throws {
   await coordinators.setActive(false)
   await right.stop()
   await wrong.stop()
+}
+
+/// The user edits Work's address and mistypes it, so it reaches Personal's coordinator or one this
+/// phone never saved. The edit saves nothing, and Work keeps its address, its connection and its
+/// queued message. The form names the coordinator saved at that address, as Add does, or says the
+/// address answers as a different coordinator and nothing was saved. It never tells the user to
+/// remove Work, which would delete the queue.
+@MainActor
+@Test(
+  .timeLimit(.minutes(1)), arguments: ["Personal's address", "an unsaved coordinator's address"])
+func aRefusedAddressEditKeepsTheQueueAndNeverSendsTheUserToRemove(_ typo: String) async throws {
+  let work = FixtureCoordinator()
+  let personal = FixtureCoordinator()
+  let stranger = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(work)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personal)
+  defer { personalListener.cancel() }
+  let (strangerListener, strangerPort) = try await listen(stranger)
+  defer { strangerListener.cancel() }
+  let routes: [UInt16: NWEndpoint.Port] = [4001: workPort, 4002: personalPort, 4005: strangerPort]
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "edit-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: CoordinatorTransport { address in
+      LineConnection(
+        connection: NWConnection(host: .ipv4(.loopback), port: routes[address.port]!, using: .tcp))
+    })
+  func stop() async {
+    await coordinators.setActive(false)
+    for fixture in [work, personal, stranger] { await fixture.stop() }
+  }
+  do {
+    await coordinators.setActive(true)
+    try await coordinators.add(
+      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    try await coordinators.add(
+      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+    let chat = coordinators.chat
+    let id = coordinators.profiles[0].id
+    try await eventually("both connected") {
+      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+    }
+    // Work is busy with a turn, so a follow-up it accepts stays queued on this phone.
+    await work.holdPlacements()
+    chat.draft = "@Work Invented follow-up for the Work board"
+    chat.promoteTypedTag()
+    await chat.send()
+    let outbox = ProfileDirectory(id, applicationSupport: root, caches: root).outbox
+    try await eventually("Work accepted the follow-up") {
+      await work.count() == 1 && (try? queuedRequests(outbox).count) == 1
+    }
+    let saved = try Data(contentsOf: root.appending(path: "Agent/profiles.json"))
+    let typed = try CoordinatorAddress(
+      host: "100.64.1.2", port: typo == "Personal's address" ? 4002 : 4005)
+    var shown = "nothing"
+    do { try await coordinators.update(id, name: TagName("Work"), address: typed) } catch {
+      shown = error.localizedDescription
+    }
+    var addShown = "nothing"
+    if typo == "Personal's address" {
+      do { try await coordinators.add(name: TagName("Spare"), address: typed) } catch {
+        addShown = error.localizedDescription
+      }
+    }
+    let port = coordinators.profiles.first { $0.id == id }?.address.port
+    let queued = (try? queuedRequests(outbox).map(\.text)) ?? []
+    let strangerHeard = await stranger.received().filter { $0 != .identify }.count
+    print(
+      "IF12-2[\(typo)] the form shows \"\(shown)\" Add shows \"\(addShown)\" Work's saved port=\(port ?? 0) connected=\(chat.snapshots[id]?.connection == .connected) Work's queue=\(queued)"
+    )
+    if typo == "Personal's address" {
+      #expect(shown == "Already saved as Personal.")
+      #expect(addShown == shown, "The edit says what Add says for the same address")
+    } else {
+      #expect(shown == "This address answers as a different coordinator. Nothing was saved.")
+    }
+    #expect(!shown.contains("Remove"), "The form sends the user to Remove, which deletes the queue")
+    #expect(try Data(contentsOf: root.appending(path: "Agent/profiles.json")) == saved)
+    #expect(port == 4001)
+    #expect(chat.snapshots[id]?.connection == .connected)
+    #expect(queued == ["Invented follow-up for the Work board"])
+    #expect(strangerHeard == 0, "The refused address saw only the probe")
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
 }
 
 /// Holds the first dial until `open`, standing in for a slow address probe.
