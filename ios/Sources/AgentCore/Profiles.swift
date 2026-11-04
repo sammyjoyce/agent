@@ -151,6 +151,18 @@ public struct CoordinatorProfile: Codable, Sendable, Identifiable, Equatable {
     }
     return candidate
   }
+
+  /// `profiles` with each name a profile before it has, ignoring case, replaced by the `unusedName`
+  /// no other profile has, as an earlier build's migration may have saved. Every other name stays.
+  public static func uniquelyNamed(_ profiles: [CoordinatorProfile]) -> [CoordinatorProfile] {
+    var named = profiles
+    for index in named.indices
+    where (try? checkName(named[index].name, for: nil, in: Array(named[..<index]))) == nil {
+      named[index].name = unusedName(
+        named[index].name, in: named.filter { $0.id != named[index].id })
+    }
+    return named
+  }
 }
 
 /// What one launch of the single-address build left: the messages it queued for the coordinator at

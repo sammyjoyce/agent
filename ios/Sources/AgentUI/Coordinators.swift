@@ -452,11 +452,12 @@ extension Coordinators {
 
   /// Idempotent and offline, at every launch. Every folder the single-address build or an earlier
   /// build of this app left messages in becomes a held queue that records itself, so a stop at any
-  /// point resumes and nothing is ever deleted here. The single-address build's outbox for its last
-  /// address keeps the build's alert installation, and a profile is saved at that address, named so
-  /// its `@` tag names it alone. `coordinatorAddress` is the resume marker. It goes before the port
-  /// key, so a crash in between cannot re-run with the default port. Then each queue no coordinator
-  /// took yet goes to the first one proven at its address, and `profiles.json` lists every queue.
+  /// point resumes and nothing is ever deleted here. Each saved name is made unique, ignoring case.
+  /// The single-address build's outbox for its last address keeps the build's alert installation,
+  /// and a profile is saved at that address, named so its `@` tag names it alone.
+  /// `coordinatorAddress` is the resume marker. It goes before the port key, so a crash in between
+  /// cannot re-run with the default port. Then each queue no coordinator took yet goes to the first
+  /// one proven at its address, and `profiles.json` lists every queue.
   static func migrate(
     defaults: UserDefaults, applicationSupport: URL, caches: URL,
     crash: (MigrationStep) throws -> Void = { _ in }
@@ -465,8 +466,10 @@ extension Coordinators {
     let listed = saved.held
     let adopted = try adoptEarlier(saved, applicationSupport: applicationSupport, caches: caches)
     let earlier = saved.earlier
-    if earlier != nil {
+    let named = CoordinatorProfile.uniquelyNamed(saved.profiles)
+    if earlier != nil || named != saved.profiles {
       saved.earlier = nil
+      saved.profiles = named
       try save(&saved, applicationSupport: applicationSupport)
     }
     if let host = defaults.string(forKey: "coordinatorAddress") {

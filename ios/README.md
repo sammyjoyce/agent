@@ -202,12 +202,15 @@ Mode if requested, then Run.
   queued for the coordinator at its address. Each launch of that build keeps its
   own queue and the address it was queued for, every queue it left is held, and
   the update saves a coordinator at its last address under a name no saved
-  coordinator has. That build never recorded which coordinator answered there,
-  so they may already have been delivered. The app never sends them. A queue
-  belongs to the first saved coordinator the phone proves answers at its
-  address: by pairing, adding or editing a coordinator there, by any probe of
-  that address that finds a saved coordinator, or by a coordinator already saved
-  there, the only one, when the app starts. Each queue's folder records its
+  coordinator has. A name an earlier build of this app saved twice, ignoring
+  case, keeps its first coordinator, and the later one gets the first free name,
+  such as `Coordinator-2`. The build without saved coordinators never recorded
+  which coordinator answered at an address, so they may already have been
+  delivered. The app never sends them. A queue belongs to the first saved
+  coordinator the phone proves answers at its address: by pairing, adding or
+  editing a coordinator there, by any probe of that address that finds a saved
+  coordinator, or by a coordinator already saved there, the only one, when the
+  app starts. Each queue's folder records its
   address, its coordinator and that build's alert registration, so installing an
   earlier build of this app and then this one again loses none of them.
   `profiles.json` also lists every held queue, because the build before this one
