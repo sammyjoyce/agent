@@ -2812,6 +2812,89 @@ func aPreviousBuildsOriginGoesOnlyToTheFolderItDescribes() async throws {
   await stop()
 }
 
+/// The build the fork shipped before this one held the single-address build's first note, queued
+/// for 100.64.1.2:43187, from Personal's `Legacy` folder, so its queue took Personal's ID, and bound
+/// it to Work, saved at that address. The user had pointed Personal at 4002. Then the single-address
+/// build queued a note for 4002, and #9 held it in Personal's `Legacy` folder again and kept that
+/// build's `held` list. The list's record for Personal's ID describes the first note, already held,
+/// and not this later one, so Restore asks who gets it and nothing goes to Work.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRecordOfAQueueAlreadyHeldGivesNothingToALaterLegacyFolder() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "if17-chain-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let work = FixtureCoordinator()
+  let personal = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(work)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personal)
+  defer { personalListener.cancel() }
+  let workProfile = ProfileID()
+  let personalProfile = ProfileID()
+  try writePrivately(
+    Data(
+      """
+      {"withdrawals":[],\
+      "held":[{"id":"\(personalProfile)","address":{"host":"100.64.1.2","port":43187},\
+      "coordinator":"\(work.id.uuid.uuidString)"}],\
+      "profiles":[{"address":{"host":"100.64.1.2","port":4002},"id":"\(personalProfile)",\
+      "name":"Personal","pin":"\(personal.id.uuid.uuidString)"},\
+      {"address":{"host":"100.64.1.2","port":43187},"id":"\(workProfile)",\
+      "name":"Work","pin":"\(work.id.uuid.uuidString)"}]}
+      """.utf8), to: root.appending(path: "Agent/profiles.json"))
+  func queue(_ text: String, in folder: URL) throws {
+    try writePrivately(
+      JSONEncoder().encode([
+        NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: text)
+      ]),
+      to: folder.appending(path: "pending.json"))
+  }
+  let first = "Invented note queued for Work at 43187"
+  let later = "Invented note queued for Personal at 4002"
+  try queue(first, in: root.appending(path: "Agent/Held/\(personalProfile)"))
+  try queue(
+    later, in: ProfileDirectory(personalProfile, applicationSupport: root, caches: root).legacy)
+  let routes = Routes([43187: workPort, 4002: personalPort])
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: CoordinatorTransport { address in
+      guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
+      return LineConnection(
+        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+    })
+  let chat = coordinators.chat
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await work.stop()
+    await personal.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("both connected") {
+      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+    }
+    try await eventually("two held rows") { chat.held.count == 2 }
+    let owners = chat.held.map { "\($0.item.text): \(chat.owner($0).map(chat.name) ?? "nobody")" }
+    let held = try #require(chat.held.first { $0.item.text == later })
+    await chat.restoreHeld(held)
+    let restored = (draft: chat.draft, recipient: chat.recipient)
+    if !chat.draft.isEmpty { await chat.send() }
+    _ = try await settles { await submitted(work) + submitted(personal) != [] }
+    print(
+      "IF17-S2[a later note in Personal's Legacy folder] owners=\(owners) Restore: draft=\(restored.draft.debugDescription) to=\(restored.recipient.map(chat.name) ?? "nobody") after Send: Work's coordinator got=\(await submitted(work)) Personal's coordinator got=\(await submitted(personal))"
+    )
+    #expect(owners == ["\(first): Work", "\(later): nobody"])
+    #expect(restored.draft.isEmpty && restored.recipient == nil)
+    #expect(await submitted(work).isEmpty, "A note queued for Personal's address went to Work")
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
 /// The build before this one migrated the single-address build's first launch into the migrated
 /// profile's `Legacy` folder. The single-address build ran again and queued another note, and that
 /// build left its outbox where it was: at the same address, or at one this phone never saved. This
