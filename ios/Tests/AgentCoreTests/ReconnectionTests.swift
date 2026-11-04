@@ -182,7 +182,7 @@ private actor ReconnectCoordinator {
     directory: directory, address: try CoordinatorAddress(host: "100.64.1.2"), pin: fixture.id,
     stamps: StampSource(), transport: loopback(port))
   let model = ChatModel()
-  model.attach(Lane(id: directory.profile, session: session, hold: LegacyHold(directory)))
+  model.attach(Lane(id: directory.profile, session: session))
   await model.setActive(true)
   do {
     try await body(model, fixture, directory.outbox)

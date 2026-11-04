@@ -606,8 +606,7 @@
               id: profile.id,
               session: CoordinatorSession(
                 directory: directory, address: profile.address, pin: CoordinatorID(UUID()),
-                stamps: StampSource()),
-              hold: LegacyHold(directory)))
+                stamps: StampSource())))
         }
         func message(_ id: String, _ role: HistoryRole, _ text: String, tool: ToolHistory? = nil)
           -> HistoryMessage
@@ -759,8 +758,7 @@
                 id: profile.id,
                 session: CoordinatorSession(
                   directory: directory, address: profile.address, pin: CoordinatorID(UUID()),
-                  stamps: StampSource()),
-                hold: LegacyHold(directory)))
+                  stamps: StampSource())))
           }
           model.recipient = chosen.id
           model.draft = draft
@@ -850,8 +848,7 @@
               id: profile.id,
               session: CoordinatorSession(
                 directory: directory, address: profile.address, pin: CoordinatorID(UUID()),
-                stamps: StampSource()),
-              hold: LegacyHold(directory)))
+                stamps: StampSource())))
         }
         model.recipient = work.id
         model.draft = (1...10).map { "Invented line \($0) for Work only" }.joined(separator: "\n")
@@ -907,7 +904,7 @@
         model.profiles = [work, personal]
         for profile in model.profiles {
           let directory = ProfileDirectory(profile.id, applicationSupport: root, caches: root)
-          model.attach(Lane(id: profile.id, session: nil, hold: LegacyHold(directory)))
+          model.attach(Lane(id: profile.id, session: nil))
         }
         // The ink check reads dark text, whatever appearance an earlier test left the app in.
         let defaults = UserDefaults.standard
@@ -1081,7 +1078,7 @@
             let session = CoordinatorSession(
               directory: directory, address: profile.address, pin: fixture.id, stamps: stamps,
               transport: loopback(port))
-            model.attach(Lane(id: profile.id, session: session, hold: LegacyHold(directory)))
+            model.attach(Lane(id: profile.id, session: session))
           }
           await model.setActive(true)
           do {
@@ -1174,10 +1171,11 @@
       ) async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
-        let directory = ProfileDirectory(profile.id, applicationSupport: root, caches: root)
+        let queue = HeldQueue(address: nil, installation: nil)
+        let folder = queue.folder(applicationSupport: root)
         var attachments: [AttachmentRef]?
         if let file {
-          let store = AttachmentStore(directory: directory.legacy.appending(path: "Attachments"))
+          let store = AttachmentStore(directory: folder.appending(path: "Attachments"))
           let staged = try await store.stage(
             data: Data("Invented: \(file)".utf8), name: file, mediaType: "text/plain")
           attachments = [staged.reference]
@@ -1186,11 +1184,11 @@
           JSONEncoder().encode([
             NativeRequestSubmit(
               attachments: attachments, inputId: UUID().uuidString, mode: .steer, text: text)
-          ]), to: directory.legacy.appending(path: "pending.json"))
-        let hold = LegacyHold(directory)
-        model.attach(Lane(id: profile.id, session: nil, hold: hold))
-        let item = try #require(try await hold.items().first)
-        await model.restoreHeld(HeldMessage(lane: profile.id, item: item), for: profile.id)
+          ]), to: folder.appending(path: "pending.json"))
+        let hold = Hold(queue: queue, store: LegacyHold(folder))
+        model.holds.append(hold)
+        let item = try #require(try await hold.store.items().first)
+        await model.restoreHeld(HeldMessage(queue: queue.id, item: item), for: profile.id)
         try await Task.sleep(for: .milliseconds(250))
       }
 

@@ -32,12 +32,16 @@ final class RowModel: Identifiable {
   }
 }
 
-/// One saved coordinator in the feed. `session` is nil until the profile is paired. Its
-/// messages held from before the update show either way.
+/// One saved coordinator in the feed. `session` is nil until the profile is paired.
 struct Lane {
   let id: ProfileID
   let session: CoordinatorSession?
-  let hold: LegacyHold
+}
+
+/// One queue the single-address build left, and the store that reads its folder.
+struct Hold {
+  var queue: HeldQueue
+  let store: LegacyHold
 }
 
 /// A tag typed at the start of the draft that became the chip. The draft went from `typed` to
@@ -48,7 +52,8 @@ struct Promotion: Equatable {
 }
 
 struct HeldMessage: Identifiable, Equatable {
-  let lane: ProfileID
+  /// The `HeldQueue` holding it.
+  let queue: UUID
   let item: LegacyItem
   var id: String { item.id }
 }
@@ -59,8 +64,8 @@ struct HeldMessage: Identifiable, Equatable {
 struct RestoredSource: Equatable {
   enum Kind: Equatable {
     case live
-    /// Held from before the update in `holder`'s directory.
-    case legacy(holder: ProfileID)
+    /// Held from before the update in `queue`.
+    case held(queue: UUID)
   }
   /// Its coordinator.
   let lane: ProfileID
@@ -136,17 +141,25 @@ final class ChatModel {
   /// picks a recipient or changes the picker before then.
   private(set) var committed = ""
   var attachments: [LocalAttachment] = [] { didSet { forgetClearedSource() } }
-  /// What the single-address build left, kept by `Coordinators`.
-  var origin: LegacyOrigin?
-  /// The saved coordinator that messages held from before the update belong to: the one a saved
-  /// profile paired with at the address the single-address build used. nil until one has, and
-  /// Restore then asks the user.
-  var heldCoordinator: ProfileID? {
-    guard let coordinator = origin?.coordinator else { return nil }
+  /// The queues the single-address build left, kept by `Coordinators`, each with the store that
+  /// reads its folder. A queue that arrives is read at once.
+  var holds: [Hold] = [] {
+    didSet {
+      let current = Set(holds.map(\.queue.id))
+      for id in reads.keys where !current.contains(id) { reads[id] = nil }
+      let known = Set(oldValue.map(\.queue.id))
+      for hold in holds where !known.contains(hold.queue.id) { Task { await read(hold) } }
+    }
+  }
+  /// The saved coordinator a held message belongs to: the one its queue went to once this phone
+  /// proved it answers at the address the message was queued for. nil until then, and Restore then
+  /// asks the user.
+  func owner(_ message: HeldMessage) -> ProfileID? {
+    guard
+      let coordinator = holds.first(where: { $0.queue.id == message.queue })?.queue.coordinator
+    else { return nil }
     return profiles.first { $0.pin == coordinator && removed[$0.id] == nil }?.id
   }
-  /// The saved coordinator a held message belongs to, or nil when this phone cannot name one.
-  func owner(_ message: HeldMessage) -> ProfileID? { heldCoordinator }
   /// The one saved coordinator that everything the feed can show belongs to: every lane's
   /// conversation and every message held from before the update. nil while the feed can show
   /// another coordinator's messages, or held messages this phone cannot name a coordinator for.
@@ -155,24 +168,41 @@ final class ChatModel {
     guard owners.count == 1, let only = owners.first else { return nil }
     return only
   }
-  /// Whom Restore offers for a held message while `heldCoordinator` is nil: every paired
-  /// coordinator not being removed.
+  /// Whom Restore offers for a held message without an owner: every paired coordinator not being
+  /// removed.
   var heldChoices: [CoordinatorProfile] {
     profiles.filter { $0.pin != nil && removed[$0.id] == nil }
   }
-  /// Messages held from before the update, by lane in feed order.
+  /// Why Restore asks who gets a held message, and what a Send to the one chosen leaves. It names
+  /// the address the message was queued for only when this phone recorded it.
+  func heldNote(_ message: HeldMessage) -> String {
+    let address = holds.first { $0.queue.id == message.queue }?.queue.address
+    let pair = "Pair a coordinator to send it."
+    guard let address else {
+      let unknown = "This phone did not record which coordinator it was queued for"
+      return heldChoices.isEmpty
+        ? "\(unknown). \(pair)" : "\(unknown), so it stays held after you send it."
+    }
+    let queued = "It was queued for the coordinator at \(address.host):\(address.port)."
+    return heldChoices.isEmpty
+      ? "\(queued) \(pair)"
+      : "\(queued) No saved coordinator is paired there, so it stays held after you send it."
+  }
+  /// Messages held from before the update, queue by queue.
   var held: [HeldMessage] {
-    lanes.flatMap { lane in
-      ((try? holds[lane.id]?.get()) ?? []).map { HeldMessage(lane: lane.id, item: $0) }
+    holds.flatMap { hold in
+      ((try? reads[hold.queue.id]?.get()) ?? []).map {
+        HeldMessage(queue: hold.queue.id, item: $0)
+      }
     }
   }
-  /// Shown while any attached lane's held messages could not be read when last loaded.
+  /// Shown while any queue's held messages could not be read when last loaded.
   var heldError: String? {
-    holds.values.contains { if case .failure = $0 { true } else { false } }
+    reads.values.contains { if case .failure = $0 { true } else { false } }
       ? "Messages held from before the update could not be read. They stay on this phone." : nil
   }
-  /// Each attached lane's latest read of its messages held from before the update.
-  private var holds: [ProfileID: Result<[LegacyItem], any Error>] = [:]
+  /// Each queue's latest read of its messages.
+  private var reads: [UUID: Result<[LegacyItem], any Error>] = [:]
   /// The coordinator whose restored message the draft holds. While it is set, no tag in the draft
   /// is read and the draft stays that coordinator's, however it is edited. Only clearing the draft
   /// ends it, and the field's Undo never reaches back past that.
@@ -259,7 +289,6 @@ final class ChatModel {
         Task { for input in inputs { await withdraw(input, from: session, lane: lane.id) } }
       }
     }
-    Task { await loadHeld(lane) }
   }
 
   /// Retires the lane's session, then drops the lane. Every session that is not in a lane is
@@ -271,7 +300,6 @@ final class ChatModel {
       let lane = lanes.remove(at: index)
       observations.removeValue(forKey: id)?.cancel()
       registration?.disconnect(id)
-      holds[id] = nil
       if lane.session != nil {
         snapshots[id] = nil
         if !multiple { failure = nil }
@@ -578,28 +606,26 @@ final class ChatModel {
       await fill(restored, for: lane.id, source: (inputID, .live), store)
     } catch { failure = error.localizedDescription }
   }
-  /// Copies a held message into the composer with its text as it was, addressed to the coordinator
-  /// held messages belong to, or else to `chosen`, and with neither does nothing. It stays held
-  /// until a Send carries the copy unchanged to the coordinator it belongs to, since only that one
-  /// is known to be the coordinator it was queued for.
+  /// Copies a held message into the composer with its text as it was, addressed to its owner, or
+  /// else to `chosen`, and with neither does nothing. It stays held until a Send carries the copy
+  /// unchanged to its owner, since only that one is known to be the coordinator it was queued for.
   func restoreHeld(_ message: HeldMessage, for chosen: ProfileID? = nil) async {
-    let owner = heldCoordinator
-    guard let holder = lanes.first(where: { $0.id == message.lane }),
-      let recipient = chosen ?? owner, readyToRestore(from: holder.id),
-      readyToRestore(from: recipient)
+    let owner = owner(message)
+    guard let hold = holds.first(where: { $0.queue.id == message.queue }),
+      let recipient = chosen ?? owner, readyToRestore(from: recipient)
     else { return }
     do {
       let store = try attachmentStore()
-      guard let restored = try await holder.hold.restore(message.id, to: store) else { return }
+      guard let restored = try await hold.store.restore(message.id, to: store) else { return }
       await fill(
         restored, for: recipient,
-        source: recipient == owner ? (message.id, .legacy(holder: holder.id)) : nil, store)
+        source: recipient == owner ? (message.id, .held(queue: message.queue)) : nil, store)
     } catch { failure = error.localizedDescription }
   }
   func discardHeld(_ message: HeldMessage) async {
-    guard let lane = lanes.first(where: { $0.id == message.lane }) else { return }
-    do { try await lane.hold.discard(message.id) } catch { failure = error.localizedDescription }
-    await loadHeld(lane)
+    guard let hold = holds.first(where: { $0.queue.id == message.queue }) else { return }
+    do { try await hold.store.discard(message.id) } catch { failure = error.localizedDescription }
+    await read(hold)
   }
   private func readyToRestore(from lane: ProfileID) -> Bool {
     if let name = removed[lane] {
@@ -649,24 +675,24 @@ final class ChatModel {
     // Only Restore sets a recipient no chip shows, so it goes with the draft it was set for.
     if !addressesByName { recipient = nil }
   }
-  /// Runs once a Send carried the source's content unchanged. A lane removed meanwhile took its
-  /// source with it.
+  /// Runs once a Send carried the source's content unchanged. A lane or queue removed meanwhile
+  /// took its source with it.
   private func remove(_ source: RestoredSource) async {
     switch source.kind {
     case .live: await lanes.first { $0.id == source.lane }?.session?.discard(source.item)
-    case .legacy(let holder):
-      guard let lane = lanes.first(where: { $0.id == holder }) else { return }
-      do { try await lane.hold.discard(source.item) } catch {
+    case .held(let queue):
+      guard let hold = holds.first(where: { $0.queue.id == queue }) else { return }
+      do { try await hold.store.discard(source.item) } catch {
         failure = error.localizedDescription
       }
-      await loadHeld(lane)
+      await read(hold)
     }
   }
-  private func loadHeld(_ lane: Lane) async {
-    let read: Result<[LegacyItem], any Error>
-    do { read = .success(try await lane.hold.items()) } catch { read = .failure(error) }
-    guard lanes.contains(where: { $0.id == lane.id }) else { return }
-    holds[lane.id] = read
+  private func read(_ hold: Hold) async {
+    let result: Result<[LegacyItem], any Error>
+    do { result = .success(try await hold.store.items()) } catch { result = .failure(error) }
+    guard holds.contains(where: { $0.queue.id == hold.queue.id }) else { return }
+    reads[hold.queue.id] = result
   }
 
   // MARK: - Attachments

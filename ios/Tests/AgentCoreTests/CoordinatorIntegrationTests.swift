@@ -92,7 +92,7 @@ func nativeClientReconcilesAgainstTheProductionCoordinator() async throws {
       #expect(connected)
       await session.disconnect()
     }
-    model.attach(Lane(id: profile.profile, session: session, hold: LegacyHold(profile)))
+    model.attach(Lane(id: profile.profile, session: session))
     await model.setActive(true)
     try await waitFor("connected before service restart") { model.connection == .connected }
     try verifySavedInput(model.rows.map(\.row))
