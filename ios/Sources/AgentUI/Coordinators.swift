@@ -425,7 +425,7 @@ extension Coordinators {
   /// Idempotent and offline, at every launch. Adopts what earlier builds of this app held. Then
   /// moves the single-address build's last queue into a held queue of its own, keyed to the address
   /// it was queued for and keeping the build's alert installation, and saves a profile at that
-  /// address. `coordinatorAddress` is the resume marker. It goes before the port key, so a crash in
+  /// address, named so its `@` tag names it alone. `coordinatorAddress` is the resume marker. It goes before the port key, so a crash in
   /// between cannot re-run with the default port. Last, each queue held for an address that exactly
   /// one saved profile is pinned at goes to that profile's coordinator.
   static func migrate(
@@ -512,8 +512,8 @@ extension Coordinators {
       try crash(.queueNamed)
       var next = saved
       if !next.profiles.contains(where: { $0.address == address }) {
-        next.profiles.append(
-          CoordinatorProfile(name: TagName(defaultFor: address), address: address))
+        let name = CoordinatorProfile.unusedName(TagName(defaultFor: address), in: next.profiles)
+        next.profiles.append(CoordinatorProfile(name: name, address: address))
       }
       if !next.held.contains(where: { $0.id == id }) {
         // In the same write as the profile, since the installation ID leaves the defaults below.

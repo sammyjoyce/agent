@@ -286,6 +286,52 @@ func theSingleAddressBuildQueuingAgainBeforeAMigrationResumesGetsAQueueOfItsOwn(
   #expect(later == resumed, "A later launch changes nothing")
 }
 
+/// The single-address build is installed again after a migration and used at another address that
+/// gets the same default name, a tailnet IP's or a MagicDNS label already 32 characters long. The
+/// second migration names its profile so that no two saved names match ignoring case, and keeps the
+/// first one's name. Once both are paired, each name's `@` tag addresses that coordinator alone.
+@MainActor
+@Test(
+  arguments: [
+    ("100.64.1.2", "100.64.1.3"),
+    (
+      "abcdefghijklmnopqrstuvwxyz012345.one.example-tailnet.ts.net",
+      "abcdefghijklmnopqrstuvwxyz012345.two.example-tailnet.ts.net"
+    ),
+  ])
+func aSecondMigrationNamesItsCoordinatorSoEachTagAddressesOne(_ first: String, _ second: String)
+  throws
+{
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  let suite = "if16-names-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer {
+    defaults.removePersistentDomain(forName: suite)
+    try? FileManager.default.removeItem(at: root)
+  }
+  defaults.set(first, forKey: "coordinatorAddress")
+  let before = try Coordinators.migrate(defaults: defaults, applicationSupport: root, caches: root)
+  defaults.set(second, forKey: "coordinatorAddress")
+  let after = try Coordinators.migrate(defaults: defaults, applicationSupport: root, caches: root)
+  var profiles = after.profiles
+  for profile in after.profiles {
+    _ = try CoordinatorProfile.admit(CoordinatorID(UUID()), for: profile.id, in: &profiles)
+  }
+  let peers = profiles.map {
+    Addressing.Coordinator(id: $0.id, name: $0.name.description, paired: true, connected: true)
+  }
+  let routed = profiles.map {
+    Addressing.parse("@\($0.name) invented note", hasAttachments: false, chip: nil, among: peers)
+  }
+  print(
+    "IF16-T2[\(first), then \(second)] names=\(after.profiles.map(\.name.description)) routed=\(routed)"
+  )
+  #expect(after.profiles.count == 2 && after.profiles.first == before.profiles.first)
+  #expect(Set(after.profiles.map { $0.name.description.lowercased() }).count == 2)
+  #expect(try after.profiles.allSatisfy { try TagName($0.name.description) == $0.name })
+  #expect(routed == profiles.map { .to([$0.id], body: "invented note") })
+}
+
 @MainActor @Test func legacyHoldRestoresACopyAndDiscardsOnlyTheChosenItem() async throws {
   let install = try await LegacyInstall()
   defer { install.remove() }

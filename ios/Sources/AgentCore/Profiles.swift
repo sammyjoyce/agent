@@ -63,6 +63,12 @@ public struct TagName: Hashable, Sendable, Codable, CustomStringConvertible {
     }
   }
 
+  /// `name` with `-number` after it, shortened to fit 32 characters.
+  init(_ name: TagName, numbered number: Int) {
+    let suffix = "-\(number)"
+    description = String(name.description.prefix(32 - suffix.count)) + suffix
+  }
+
   public init(from decoder: any Decoder) throws {
     try self.init(decoder.singleValueContainer().decode(String.self))
   }
@@ -132,6 +138,18 @@ public struct CoordinatorProfile: Codable, Sendable, Identifiable, Equatable {
     }) {
       throw ProfileError.duplicateName(other.name.description)
     }
+  }
+
+  /// `name`, else the first of `name-2`, `name-3` and on that `checkName` accepts, for a profile
+  /// the app names itself.
+  public static func unusedName(_ name: TagName, in profiles: [CoordinatorProfile]) -> TagName {
+    var candidate = name
+    var number = 1
+    while (try? checkName(candidate, for: nil, in: profiles)) == nil {
+      number += 1
+      candidate = TagName(name, numbered: number)
+    }
+    return candidate
   }
 }
 
