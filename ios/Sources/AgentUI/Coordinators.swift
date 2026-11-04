@@ -13,6 +13,11 @@ public final class Coordinators {
     get { chat.profiles }
     set { chat.profiles = newValue }
   }
+  /// What the single-address build left. The feed keeps the one copy, as it does `profiles`.
+  private(set) var origin: LegacyOrigin? {
+    get { chat.origin }
+    set { chat.origin = newValue }
+  }
   /// Why an unpaired profile is not paired yet.
   private(set) var pairingError: [ProfileID: String] = [:]
   /// Saved coordinators could not be loaded. Nothing is written over them.
@@ -50,6 +55,7 @@ public final class Coordinators {
         defaults: defaults, applicationSupport: applicationSupport, caches: caches)
       profiles = saved.profiles
       withdrawals = saved.withdrawals
+      origin = saved.origin
       Self.removeUnlisted(saved.profiles, applicationSupport: applicationSupport, caches: caches)
     } catch {
       failure =
@@ -130,8 +136,7 @@ public final class Coordinators {
       let profile = CoordinatorProfile(name: name, address: address)
       var next = profiles + [profile]
       _ = try CoordinatorProfile.admit(found, for: profile.id, in: &next)
-      try save(next)
-      profiles = next
+      try savePairing(next, profile.id)
       chat.attach(lane(next[next.count - 1]))
       if chat.active { await chat.lanes.first { $0.id == profile.id }?.session?.connect() }
     }
@@ -194,7 +199,7 @@ public final class Coordinators {
           PendingWithdrawal(installation: InstallationID(id), address: profile.address, pin: pin))
       }
       do {
-        try save(remaining, withdrawals: pending)
+        try save(SavedProfiles(profiles: remaining, withdrawals: pending, origin: origin))
       } catch {
         chat.removed[id] = nil
         throw error
@@ -244,21 +249,26 @@ public final class Coordinators {
   /// activation finds nothing left to withdraw.
   private func confirmWithdrawal(_ id: InstallationID, saved profiles: [CoordinatorProfile]) {
     let rest = withdrawals.filter { $0.installation != id }
-    do { try save(profiles, withdrawals: rest) } catch { return }
+    do {
+      try save(SavedProfiles(profiles: profiles, withdrawals: rest, origin: origin))
+    } catch { return }
     withdrawals = rest
   }
 
-  /// Saves `next`, in which `admit` may have just paired `id`. A paired profile hands over the
-  /// single-address build's installation it inherited, in the same write as its pin, and the
-  /// withdrawal goes at once.
+  /// Saves `next`, in which `admit` may have just paired `id` or proven it at a new address. A
+  /// profile paired at the single-address build's address takes over what that build left, and its
+  /// installation's withdrawal is saved in the same write and goes at once.
   private func savePairing(_ next: [CoordinatorProfile], _ id: ProfileID) throws {
-    var next = next
-    let inherited = next.firstIndex { $0.id == id }.flatMap { next[$0].takeInheritedWithdrawal() }
-    let pending = withdrawals + [inherited].compactMap { $0 }
-    try save(next, withdrawals: pending)
+    var origin = origin
+    let handover = next.first { $0.id == id }.flatMap { profile in
+      profile.pin.flatMap { origin?.pair($0, at: profile.address) }
+    }
+    let pending = withdrawals + [handover].compactMap { $0 }
+    try save(SavedProfiles(profiles: next, withdrawals: pending, origin: origin))
     profiles = next
     withdrawals = pending
-    if let inherited, chat.active { retry(inherited) }
+    self.origin = origin
+    if let handover, chat.active { retry(handover) }
   }
 
   private func start(_ id: ProfileID) async {
@@ -285,13 +295,9 @@ public final class Coordinators {
   }
 
   /// Callers save first and assign after, so memory never runs ahead of disk.
-  private func save(
-    _ profiles: [CoordinatorProfile], withdrawals: [PendingWithdrawal]? = nil
-  ) throws {
+  private func save(_ saved: SavedProfiles) throws {
     if let failure { throw SaveRefused(message: failure) }
-    try Self.save(
-      SavedProfiles(profiles: profiles, withdrawals: withdrawals ?? self.withdrawals),
-      applicationSupport: applicationSupport)
+    try Self.save(saved, applicationSupport: applicationSupport)
   }
 }
 
@@ -303,16 +309,32 @@ extension Coordinators {
     var profiles: [CoordinatorProfile]
     /// Alert withdrawals Remove saved that no coordinator has confirmed yet.
     var withdrawals: [PendingWithdrawal]
+    var origin: LegacyOrigin?
 
-    init(profiles: [CoordinatorProfile], withdrawals: [PendingWithdrawal] = []) {
+    init(
+      profiles: [CoordinatorProfile], withdrawals: [PendingWithdrawal] = [],
+      origin: LegacyOrigin? = nil
+    ) {
       self.profiles = profiles
       self.withdrawals = withdrawals
+      self.origin = origin
     }
     init(from decoder: any Decoder) throws {
       let container = try decoder.container(keyedBy: CodingKeys.self)
       profiles = try container.decode([CoordinatorProfile].self, forKey: .profiles)
       withdrawals =
         try container.decodeIfPresent([PendingWithdrawal].self, forKey: .withdrawals) ?? []
+      // The previous build kept the installation on the migrated profile as `inherited`, only
+      // while that profile was unpaired, so still at the address it was migrated from.
+      struct Earlier: Decodable {
+        let address: CoordinatorAddress
+        let inherited: InstallationID?
+      }
+      origin =
+        try container.decodeIfPresent(LegacyOrigin.self, forKey: .origin)
+        ?? container.decode([Earlier].self, forKey: .profiles).first { $0.inherited != nil }.map {
+          LegacyOrigin(address: $0.address, installation: $0.inherited)
+        }
     }
   }
 
@@ -343,12 +365,13 @@ extension Coordinators {
       if let existing = saved.profiles.first(where: { $0.address == address }) {
         profile = existing
       } else {
-        // In the same write as the profile, since the ID leaves the defaults below.
-        profile = CoordinatorProfile(
-          name: TagName(defaultFor: address), address: address,
-          inherited: defaults.string(forKey: "notificationInstallationID").flatMap(
-            InstallationID.init(legacy:)))
+        profile = CoordinatorProfile(name: TagName(defaultFor: address), address: address)
         saved.profiles.append(profile)
+        // In the same write as the profile, since the installation ID leaves the defaults below.
+        saved.origin = LegacyOrigin(
+          address: address,
+          installation: defaults.string(forKey: "notificationInstallationID").flatMap(
+            InstallationID.init(legacy:)))
         try save(saved, applicationSupport: applicationSupport)
       }
       try crash(.profileSaved)

@@ -57,7 +57,12 @@ struct HeldMessage: Identifiable, Equatable {
 /// queued or held until a Send carries that content unchanged to its coordinator, or the user
 /// discards it, so nothing its coordinator did not get is lost.
 struct RestoredSource: Equatable {
-  enum Kind { case live, legacy }
+  enum Kind: Equatable {
+    case live
+    /// Held from before the update in `holder`'s directory.
+    case legacy(holder: ProfileID)
+  }
+  /// Its coordinator.
   let lane: ProfileID
   let item: String
   let kind: Kind
@@ -99,15 +104,17 @@ final class ChatModel {
   var canLoadEarlier = false
   var loadingHistory = false
   var includesLatest = true
-  /// What the composer shows under the feed: what it reported since the last Send, then the latest
-  /// failure.
+  /// What the composer shows under the feed: what it reported since the last Send, its own latest
+  /// failure, then, with one coordinator, that coordinator's current error, which has no line of
+  /// its own.
   var error: String? {
-    let parts = reports + [failure].compactMap { $0 }
+    let current = multiple ? nil : lanes.lazy.compactMap { self.laneError($0.id) }.first
+    let parts = reports + [failure, current].compactMap { $0 }
     return parts.isEmpty ? nil : parts.joined(separator: " ")
   }
   /// Who did not get the last Send, and why. Only the next Send clears it.
   private(set) var reports: [String] = []
-  /// The latest failure: the composer's own, or, with one coordinator, that coordinator's error.
+  /// The composer's own latest failure.
   var failure: String?
   var revision = 0
   /// Saved coordinators in order, kept by `Coordinators`. Names, colors and the feed's lane
@@ -145,8 +152,33 @@ final class ChatModel {
       scheduleDraftSave()
     }
   }
-  private(set) var held: [HeldMessage] = []
-  private(set) var heldError: String?
+  /// What the single-address build left, kept by `Coordinators`.
+  var origin: LegacyOrigin?
+  /// The saved coordinator that messages held from before the update belong to: the one a saved
+  /// profile paired with at the address the single-address build used. nil until one has, and
+  /// Restore then asks the user.
+  var heldCoordinator: ProfileID? {
+    guard let coordinator = origin?.coordinator else { return nil }
+    return profiles.first { $0.pin == coordinator && removed[$0.id] == nil }?.id
+  }
+  /// Whom Restore offers for a held message while `heldCoordinator` is nil: every paired
+  /// coordinator not being removed.
+  var heldChoices: [CoordinatorProfile] {
+    profiles.filter { $0.pin != nil && removed[$0.id] == nil }
+  }
+  /// Messages held from before the update, by lane in feed order.
+  var held: [HeldMessage] {
+    lanes.flatMap { lane in
+      ((try? holds[lane.id]?.get()) ?? []).map { HeldMessage(lane: lane.id, item: $0) }
+    }
+  }
+  /// Shown while any attached lane's held messages could not be read when last loaded.
+  var heldError: String? {
+    holds.values.contains { if case .failure = $0 { true } else { false } }
+      ? "Messages held from before the update could not be read. They stay on this phone." : nil
+  }
+  /// Each attached lane's latest read of its messages held from before the update.
+  private var holds: [ProfileID: Result<[LegacyItem], any Error>] = [:]
   /// The coordinator whose restored message the draft holds. While it is set, no tag in the draft
   /// is read and the draft stays that coordinator's, however it is edited. Only clearing the draft
   /// ends it, and the field's Undo never reaches back past that.
@@ -392,7 +424,7 @@ final class ChatModel {
       let lane = lanes.remove(at: index)
       observations.removeValue(forKey: id)?.cancel()
       registration?.disconnect(id)
-      held.removeAll { $0.lane == id }
+      holds[id] = nil
       if lane.session != nil {
         snapshots[id] = nil
         if !multiple { failure = nil }
@@ -762,16 +794,25 @@ final class ChatModel {
     do {
       let store = try attachmentStore()
       guard let restored = await lane.session?.restore(inputID, to: store) else { return }
-      await fill(restored, from: lane.id, item: inputID, kind: .live, store)
+      await fill(restored, for: lane.id, source: (inputID, .live), store)
     } catch { failure = error.localizedDescription }
   }
-  func restoreHeld(_ message: HeldMessage) async {
-    guard let lane = lanes.first(where: { $0.id == message.lane }), readyToRestore(from: lane.id)
+  /// Copies a held message into the composer with its text as it was, addressed to the coordinator
+  /// held messages belong to, or else to `chosen`, and with neither does nothing. It stays held
+  /// until a Send carries the copy unchanged to the coordinator it belongs to, since only that one
+  /// is known to be the coordinator it was queued for.
+  func restoreHeld(_ message: HeldMessage, for chosen: ProfileID? = nil) async {
+    let owner = heldCoordinator
+    guard let holder = lanes.first(where: { $0.id == message.lane }),
+      let recipient = chosen ?? owner, readyToRestore(from: holder.id),
+      readyToRestore(from: recipient)
     else { return }
     do {
       let store = try attachmentStore()
-      guard let restored = try await lane.hold.restore(message.id, to: store) else { return }
-      await fill(restored, from: lane.id, item: message.id, kind: .legacy, store)
+      guard let restored = try await holder.hold.restore(message.id, to: store) else { return }
+      await fill(
+        restored, for: recipient,
+        source: recipient == owner ? (message.id, .legacy(holder: holder.id)) : nil, store)
     } catch { failure = error.localizedDescription }
   }
   func discardHeld(_ message: HeldMessage) async {
@@ -796,10 +837,11 @@ final class ChatModel {
   }
   /// Puts the restored message before what the user typed or attached while its files were copied,
   /// as on `main`. What the user addressed to another coordinator meanwhile stays as it is, since
-  /// the restored message stays its source's, and the copies go.
+  /// the restored message stays `lane`'s, and the copies go. Without a `source` it is a copy that
+  /// withdraws nothing.
   private func fill(
-    _ restored: RestoredDraft, from lane: ProfileID, item: String, kind: RestoredSource.Kind,
-    _ store: AttachmentStore
+    _ restored: RestoredDraft, for lane: ProfileID,
+    source original: (item: String, kind: RestoredSource.Kind)?, _ store: AttachmentStore
   ) async {
     guard (draft.isEmpty && attachments.isEmpty) || recipient == nil || recipient == lane
     else {
@@ -815,9 +857,11 @@ final class ChatModel {
       screenshotOwners[file.id] = lane
     }
     restoredFrom = lane
-    source = RestoredSource(
-      lane: lane, item: item, kind: kind, text: restored.text,
-      files: Set(restored.attachments.map(\.id)))
+    source = original.map {
+      RestoredSource(
+        lane: lane, item: $0.item, kind: $0.kind, text: restored.text,
+        files: Set(restored.attachments.map(\.id)))
+    }
     // Last, since an empty restored text clears the draft above, which drops an undrawn recipient.
     recipient = lane
   }
@@ -831,10 +875,10 @@ final class ChatModel {
   /// Runs once a Send carried the source's content unchanged. A lane removed meanwhile took its
   /// source with it.
   private func remove(_ source: RestoredSource) async {
-    guard let lane = lanes.first(where: { $0.id == source.lane }) else { return }
     switch source.kind {
-    case .live: await lane.session?.discard(source.item)
-    case .legacy:
+    case .live: await lanes.first { $0.id == source.lane }?.session?.discard(source.item)
+    case .legacy(let holder):
+      guard let lane = lanes.first(where: { $0.id == holder }) else { return }
       do { try await lane.hold.discard(source.item) } catch {
         failure = error.localizedDescription
       }
@@ -842,15 +886,10 @@ final class ChatModel {
     }
   }
   private func loadHeld(_ lane: Lane) async {
-    do {
-      let items = try await lane.hold.items()
-      guard lanes.contains(where: { $0.id == lane.id }) else { return }
-      held = held.filter { $0.lane != lane.id } + items.map { HeldMessage(lane: lane.id, item: $0) }
-      heldError = nil
-    } catch {
-      heldError =
-        "Messages held from before the update could not be read. They stay on this phone."
-    }
+    let read: Result<[LegacyItem], any Error>
+    do { read = .success(try await lane.hold.items()) } catch { read = .failure(error) }
+    guard lanes.contains(where: { $0.id == lane.id }) else { return }
+    holds[lane.id] = read
   }
 
   // MARK: - Attachments
@@ -992,9 +1031,6 @@ final class ChatModel {
   // MARK: - Feed
 
   func apply(_ update: ChatSnapshot, lane id: ProfileID) {
-    // With several coordinators each lane's error shows on its own line instead. With one, an
-    // update that neither has nor clears an error leaves the composer's own failure in place.
-    if !multiple, update.error != nil || snapshots[id]?.error != nil { failure = update.error }
     snapshots[id] = update
     refresh()
   }
