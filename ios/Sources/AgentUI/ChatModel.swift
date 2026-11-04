@@ -121,7 +121,7 @@ final class ChatModel {
   private(set) var heldError: String?
   /// The coordinator whose restored message the draft holds. While it is set, no tag in the draft
   /// is read and the draft stays that coordinator's, however it is edited. Only clearing the draft
-  /// ends it, and Undo of the clearing brings it back.
+  /// ends it, and the field's Undo never reaches back past that.
   private(set) var restoredFrom: ProfileID?
   /// The original Restore copied into the draft, until the next Send or until the composer is
   /// emptied. A Send that carries it unchanged to its coordinator withdraws it.
@@ -304,15 +304,6 @@ final class ChatModel {
     guard removed[id] == nil else { return }
     recipient = id
     draft = ""
-  }
-
-  /// An edit the user made in the field, with the coordinator whose restored text the field holds,
-  /// read from the text itself. Emptying the composer ends a restored draft. Undo then brings back
-  /// its text, still marked as restored, so the draft is restored again. Text typed or pasted into
-  /// the emptied composer carries no mark, so it is a new message.
-  func edit(_ text: String, restoredFrom lane: ProfileID?) {
-    draft = text
-    if restoredFrom == nil, let lane { restoredFrom = lane }
   }
 
   /// A complete leading tag followed by a space becomes the chip, and the text after it is

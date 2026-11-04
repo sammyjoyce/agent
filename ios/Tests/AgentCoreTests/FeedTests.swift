@@ -3565,15 +3565,15 @@ func aRestoredDraftEditedWhileItsSendCopiesStaysLiteral() async throws {
 }
 
 /// Work refuses a message whose text starts with "@Personal", and the user restores it and removes
-/// its chip. The user empties the composer, deleting the text in the field and then the restored
-/// file if there is one, and undoes the deletion. The field puts the text back still marked as
-/// Work's restored text, so the draft is restored again. Its text stays literal, the line reads
-/// "To Work and Personal" and both coordinators get the text as written. Emptying the composer
-/// ended the original's withdrawal, so the original stays queued for Discard.
+/// its chip. The user empties the composer, deleting the text and then the restored file if there
+/// is one. That ends the restored draft, and the field's Undo never reaches back past it. The
+/// original stays queued and still needs attention, so the user restores it again. Its text is
+/// literal again, and with the chip removed both coordinators get it as written, which withdraws
+/// the original.
 @MainActor @Test(.timeLimit(.minutes(1)), arguments: ["its text", "its text, then its file"])
-func undoingTheEmptyingOfARestoredDraftKeepsItLiteral(_ emptied: String) async throws {
+func anEmptiedRestoredDraftLeavesItsOriginalToRestoreAgain(_ emptied: String) async throws {
   try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
-    let (work, _) = try await addWorkAndPersonal(coordinators)
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
     let chat = coordinators.chat
     let text = "@Personal invented: forward Work's board deck to the auditors"
     let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
@@ -3594,28 +3594,38 @@ func undoingTheEmptyingOfARestoredDraftKeepsItLiteral(_ emptied: String) async t
       await chat.restore(original.inputId)
     }
     chat.recipient = nil
-    // As the field reports them: emptied text carries no mark, and Undo's text carries Work's.
-    chat.edit("", restoredFrom: nil)
+    chat.draft = ""
     chat.promoteTypedTag()
     for file in chat.attachments { await chat.removeAttachment(file) }
-    chat.edit(text, restoredFrom: work)
+    let kept = try queuedItem(outbox, original.inputId)
+    print(
+      "IF10-2[\(emptied)] emptied: restoredFrom=\(chat.restoredFrom.map(chat.name) ?? "none") recipient=\(chat.recipient.map(chat.name) ?? "none") originalQueued=\(kept != nil) refused=\(kept?.refused == true)"
+    )
+    #expect(chat.restoredFrom == nil && chat.recipient == nil)
+    #expect(kept?.refused == true, "The original no longer needs attention")
+    await workFixture.acceptUploads()
+    await chat.restore(original.inputId)
+    chat.recipient = nil
     chat.promoteTypedTag()
     print(
-      "IF9-Y2[\(emptied)] after Undo: chip=\(chat.recipient.map(chat.name) ?? "none") line=\(chat.recipientLine) draft=\(chat.draft.debugDescription) files=\(chat.attachments.count)"
+      "IF10-2[\(emptied)] restored again: line=\(chat.recipientLine) draft=\(chat.draft.debugDescription) files=\(chat.attachments.count)"
     )
-    #expect(chat.recipient == nil && chat.draft == text && chat.attachments.isEmpty)
-    #expect(chat.recipientLine == "To Work and Personal")
+    #expect(chat.addressing == .to([work, personal], body: text))
+    try await eventually("both connected") { chat.canSend }
     await chat.send()
-    _ = await within(3) { await workFixture.count() + personalFixture.count() == 2 }
+    _ = await within(3) {
+      await submits(workFixture).filter { $0.inputId != original.inputId }.count
+        + personalFixture.count() == 2
+    }
     try await Task.sleep(for: .milliseconds(300))
     let atWork = await submits(workFixture).filter { $0.inputId != original.inputId }.map(\.text)
     let atPersonal = await submits(personalFixture).map(\.text)
     let originalQueued = try queuedRequests(outbox).contains { $0.inputId == original.inputId }
     print(
-      "IF9-Y2[\(emptied)] wire: Work=\(atWork) Personal=\(atPersonal) originalQueued=\(originalQueued)"
+      "IF10-2[\(emptied)] wire: Work=\(atWork) Personal=\(atPersonal) originalQueued=\(originalQueued)"
     )
     #expect(atWork == [text] && atPersonal == [text])
-    #expect(originalQueued, "Emptying the composer ended the withdrawal, yet the original went")
+    #expect(!originalQueued, "The copy went unchanged to Work, yet the original stays")
   }
 }
 
