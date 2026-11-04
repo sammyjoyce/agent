@@ -54,8 +54,8 @@ struct HeldMessage: Identifiable, Equatable {
 }
 
 /// Where the composer's restored draft came from, and what Restore put in it. The source stays
-/// queued or held until a Send carries that content unchanged, or the user discards it, so nothing
-/// the user did not send is lost.
+/// queued or held until a Send carries that content unchanged to its coordinator, or the user
+/// discards it, so nothing its coordinator did not get is lost.
 struct RestoredSource: Equatable {
   enum Kind { case live, legacy }
   let lane: ProfileID
@@ -65,11 +65,15 @@ struct RestoredSource: Equatable {
   /// The IDs of the file copies Restore put in the composer.
   let files: Set<String>
 
-  /// True when a Send of `body` with `sent` files carries this content unchanged, meaning the same
-  /// text, ignoring surrounding whitespace, and every file Restore put in the composer.
-  func isCarried(by body: String, files sent: [LocalAttachment]) -> Bool {
-    body.trimmingCharacters(in: .whitespacesAndNewlines)
-      == text.trimmingCharacters(in: .whitespacesAndNewlines)
+  /// True when a Send of `body` with `sent` files to `recipients` carries this content unchanged to
+  /// its coordinator, meaning the same text, ignoring surrounding whitespace, and every file Restore
+  /// put in the composer.
+  func isCarried(by body: String, files sent: [LocalAttachment], to recipients: [ProfileID])
+    -> Bool
+  {
+    recipients.contains(lane)
+      && body.trimmingCharacters(in: .whitespacesAndNewlines)
+        == text.trimmingCharacters(in: .whitespacesAndNewlines)
       && files.isSubset(of: sent.map(\.id))
   }
 }
@@ -125,10 +129,10 @@ final class ChatModel {
   private(set) var heldError: String?
   /// The coordinator whose restored message the draft holds. While it is set, no tag in the draft
   /// is read and the draft stays that coordinator's, however it is edited. Only clearing the draft
-  /// ends it, and Undo of the clearing brings it back.
+  /// ends it, and the field's Undo never reaches back past that.
   private(set) var restoredFrom: ProfileID?
   /// The original Restore copied into the draft, until the next Send or until the composer is
-  /// emptied. A Send that carries it unchanged withdraws it.
+  /// emptied. A Send that carries it unchanged to its coordinator withdraws it.
   private(set) var source: RestoredSource?
   /// Each lane's latest published state.
   private(set) var snapshots: [ProfileID: ChatSnapshot] = [:]
@@ -325,15 +329,6 @@ final class ChatModel {
     draft = ""
   }
 
-  /// An edit the user made in the field, with the coordinator whose restored text the field holds,
-  /// read from the text itself. Emptying the composer ends a restored draft. Undo then brings back
-  /// its text, still marked as restored, so the draft is restored again. Text typed or pasted into
-  /// the emptied composer carries no mark, so it is a new message.
-  func edit(_ text: String, restoredFrom lane: ProfileID?) {
-    draft = text
-    if restoredFrom == nil, let lane { restoredFrom = lane }
-  }
-
   /// A complete leading tag followed by a space becomes the chip, and the text after it is
   /// never read for tags. The composer calls this after each edit. A restored draft's text is
   /// literal for good, so no tag in it ever becomes the chip.
@@ -440,7 +435,7 @@ final class ChatModel {
     }
     guard let original else { return }
     if source == original { source = nil }
-    if original.isCarried(by: body, files: files) { await remove(original) }
+    if original.isCarried(by: body, files: files, to: recipients) { await remove(original) }
   }
 
   /// Why a coordinator did not get an input of a Send.

@@ -14,19 +14,15 @@
     }
     static let inset = UIEdgeInsets(top: 11, left: 2, bottom: 11, right: 2)
     static let maximumLines: CGFloat = 6
-    /// Marks restored text with the coordinator it was restored from.
-    static let restoredMark = NSAttributedString.Key("AgentRestoredFrom")
     let text: String
     let placeholder: String
     let chip: Chip?
     /// The latest tag that became the chip.
     let promotion: Promotion?
-    /// The coordinator whose restored message the draft holds. Text the model sets meanwhile is
-    /// marked with it, and the field's Undo and Redo keep the mark with that text however they
-    /// group the user's keys.
+    /// The coordinator whose restored message the draft holds. The field's undo actions go whenever
+    /// it changes.
     let restoredFrom: ProfileID?
-    /// Each edit the user makes, with the coordinator any of its text is marked with.
-    let edit: (String, ProfileID?) -> Void
+    let edit: (String) -> Void
     let removeChip: () -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -60,14 +56,16 @@
         let selection = Self.selection(
           view.selectedRange, replacing: change.range, with: change.length)
         view.text = text
-        if let restoredFrom {
-          view.textStorage.addAttribute(
-            Self.restoredMark, value: restoredFrom,
-            range: NSRange(location: 0, length: view.textStorage.length))
-        }
         view.selectedRange = selection
         // The field's undo actions were recorded against the text it had. Applied to this one they
         // would change characters the user did not just type, such as a body after a promoted tag.
+        view.undoManager?.removeAllActions()
+      }
+      // Undo never crosses the start or the end of a restored draft. Across a Restore it would put
+      // earlier text into the restored message. Across the emptying of one it would bring the
+      // restored text back as new text, read for tags and bound to no coordinator.
+      if context.coordinator.restoredFrom != restoredFrom {
+        context.coordinator.restoredFrom = restoredFrom
         view.undoManager?.removeAllActions()
       }
       view.placeholder.text = placeholder
@@ -307,18 +305,9 @@
 
     @MainActor final class Coordinator: NSObject, UITextViewDelegate {
       var field: ComposerField?
-      func textViewDidChange(_ view: UITextView) {
-        var lane: ProfileID?
-        view.textStorage.enumerateAttribute(
-          ComposerField.restoredMark, in: NSRange(location: 0, length: view.textStorage.length)
-        ) { value, _, stop in
-          if let value = value as? ProfileID {
-            lane = value
-            stop.pointee = true
-          }
-        }
-        field?.edit(view.text, lane)
-      }
+      /// The `restoredFrom` the field's undo actions were recorded under.
+      var restoredFrom: ProfileID?
+      func textViewDidChange(_ view: UITextView) { field?.edit(view.text) }
       /// The chip moves with the first line.
       func scrollViewDidScroll(_ view: UIScrollView) { view.superview?.setNeedsLayout() }
     }

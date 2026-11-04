@@ -279,10 +279,11 @@ final class ComposerInteractionTests: XCTestCase {
     XCTAssertEqual(toPersonal, [text + "."])
   }
 
-  // The same restored text, chip removed. The user deletes it key by key and undoes with
-  // Command-Z. Undo brings the restored text back with no chip, and each coordinator gets it as it
-  // was.
-  func testUndoAfterDeletingARestoredDraftKeyByKeyKeepsItLiteral() async throws {
+  // The same restored text, chip removed. The user deletes it key by key, which ends the restored
+  // draft, and presses Command-Z. Undo never reaches back past that, so nothing comes back and Send
+  // stays off. Work's original still offers Restore, which brings its text back as Work's, and
+  // with the chip removed each coordinator gets it as it was.
+  func testUndoAfterDeletingARestoredDraftKeyByKeyBringsNothingBack() async throws {
     let (app, work, personal) = try await launchWithWorkAndPersonal()
     defer { app.terminate() }
     continueAfterFailure = true
@@ -308,14 +309,20 @@ final class ComposerInteractionTests: XCTestCase {
     composer.typeKey("z", modifierFlags: .command)
     try await Task.sleep(for: .seconds(1))
     let personalChip = app.buttons["To Personal"].exists
+    let send = app.buttons["Send message"]
     print(
-      "IF9-Y2[ui] cleared=\(cleared) after Command-Z: value=\(composer.value as? String ?? "nil") personalChip=\(personalChip) line=\(line.label)"
+      "IF10-2[ui] cleared=\(cleared) after Command-Z: value=\(composer.value as? String ?? "nil") personalChip=\(personalChip) line=\(line.label) sendEnabled=\(send.isEnabled) restoreOffered=\(restore.exists)"
     )
     XCTAssertTrue(cleared, "The keys did not empty the field")
+    XCTAssertTrue(isEmpty(composer), "Undo brought back the cleared restored text")
     XCTAssertFalse(personalChip, "Undo made the restored text's tag Personal's chip")
+    XCTAssertFalse(send.isEnabled, "Send is on with nothing to send")
+    XCTAssertTrue(restore.exists, "Work's original no longer offers Restore")
+    restore.tap()
+    XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3))
     XCTAssertEqual(composer.value as? String, text)
-    XCTAssertEqual(line.label, "To Work and Personal")
-    let send = app.buttons["Send message"]
+    app.buttons["To Work"].tap()
+    XCTAssertTrue(app.staticTexts["To Work and Personal"].waitForExistence(timeout: 3))
     try await Task.sleep(for: .seconds(1))
     XCTAssertTrue(send.isHittable)
     send.tap()
@@ -326,7 +333,7 @@ final class ComposerInteractionTests: XCTestCase {
     }
     let toWork = await work.submits()
     let toPersonal = await personal.submits()
-    print("IF9-Y2[ui] Work received \(toWork) Personal received \(toPersonal)")
+    print("IF10-2[ui] restored again, Work received \(toWork) Personal received \(toPersonal)")
     XCTAssertEqual(toWork, [text])
     XCTAssertEqual(toPersonal, [text])
   }
@@ -749,6 +756,59 @@ final class HistoryInteractionTests: XCTestCase {
 
 @MainActor
 final class RestoreInteractionTests: XCTestCase {
+  // One saved coordinator refuses a message, and the user restores it, which binds it to that
+  // coordinator with no chip. The user deletes it key by key, which ends the restored draft, and
+  // presses Command-Z. Undo never reaches back past that, so no text comes back bound to no
+  // coordinator, to go to every coordinator once another is added. The original still needs
+  // attention, and Restore brings it back.
+  func testUndoAfterDeletingARestoredDraftWithOneCoordinatorBringsNothingBack() async throws {
+    continueAfterFailure = true
+    executionTimeAllowance = 120
+    let work = InteractionPeer()
+    addTeardownBlock { await work.stop() }
+    let empty = NativeEventHistory(messages: [], nextCursor: nil, pageComplete: true)
+    await work.history(initial: empty, pages: [:], latest: empty)
+    let port = try await work.start()
+    await work.rejectSubmits(true)
+    let app = XCUIApplication()
+    app.launchEnvironment["AGENT_INTERACTION_PORT"] = String(port)
+    app.launchEnvironment["AGENT_INTERACTION_COORDINATOR"] = work.coordinator.uuidString
+    app.launchArguments += ["-notificationsEnabled", "NO"]
+    app.launch()
+    defer { app.terminate() }
+    let composer = app.textViews["Message the coordinator"]
+    let send = app.buttons["Send message"]
+    XCTAssertTrue(composer.waitForExistence(timeout: 10))
+    composer.tap()
+    let text = "Invented: Work's merger memo for the board"
+    composer.typeText(text)
+    XCTAssertTrue(send.wait(for: \.isEnabled, toEqual: true, timeout: 10))
+    send.tap()
+    let restore = app.buttons["Restore to composer"]
+    XCTAssertTrue(restore.waitForExistence(timeout: 10), "The refused message offers Restore")
+    await work.rejectSubmits(false)
+    restore.tap()
+    try await eventually { composer.value as? String == text }
+    composer.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: text.count))
+    try await Task.sleep(for: .milliseconds(500))
+    let emptied = [nil, "", "Message Agent"]
+    let cleared = emptied.contains(composer.value as? String)
+    composer.typeKey("z", modifierFlags: .command)
+    try await Task.sleep(for: .seconds(1))
+    let undone = composer.value as? String
+    print(
+      "IF10-2[ui, one coordinator] cleared=\(cleared) after Command-Z: value=\(undone ?? "nil") sendEnabled=\(send.isEnabled) restoreOffered=\(restore.exists)"
+    )
+    XCTAssertTrue(cleared, "The keys did not empty the field")
+    XCTAssertTrue(emptied.contains(undone), "Undo brought back the cleared restored text")
+    XCTAssertFalse(send.isEnabled, "Send is on with nothing to send")
+    XCTAssertTrue(restore.exists, "The original no longer offers Restore")
+    restore.tap()
+    try await eventually { composer.value as? String == text }
+    send.tap()
+    try await eventually { await work.submits() == [text] }
+  }
+
   // One saved coordinator refuses a message. The user restores it and sends the copy once the
   // coordinator takes messages again.
   func testARefusedMessageRestoredAndResentWithOneCoordinator() async throws {
