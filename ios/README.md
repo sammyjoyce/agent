@@ -47,6 +47,12 @@ internal-only upload when needed.
 Main-chat alerts require the one-time [APNs setup](../docs/notifications.md).
 They start enabled: allow the notification prompt on first opening, then connect
 to register automatically. Disable **Main-chat updates** in Connection anytime.
+After an update from a build without saved coordinators, the app withdraws that
+build's alert registration once the coordinator it used pairs, whatever the
+toggle says. That coordinator then alerts this device only through the saved
+coordinator's own registration, and only while alerts are on. Until the
+coordinator confirms, the app sends the withdrawal again each time it becomes
+active.
 **Connection → Appearance** follows the system by default. Choose **Light** or
 **Dark** to keep a saved override.
 
