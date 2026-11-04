@@ -152,6 +152,9 @@ final class ChatModel {
   @ObservationIgnored private(set) var active = false
   @ObservationIgnored private(set) var lanes: [Lane] = []
   @ObservationIgnored private var observations: [ProfileID: Task<Void, Never>] = [:]
+  /// Inputs of a Send that reached no one, staged at a session that was retired before they could
+  /// be withdrawn, by profile. The profile's next session withdraws them once it is attached.
+  @ObservationIgnored private var unstaging: [ProfileID: [StagedInput]] = [:]
 
   init(draftStore: AttachmentStore? = nil, registration: NotificationRegistration? = nil) {
     self.draftStore = draftStore
@@ -198,6 +201,9 @@ final class ChatModel {
       snapshots[lane.id] = nil
       refresh()
       observations[lane.id] = observe(session, lane: lane.id)
+      if let inputs = unstaging.removeValue(forKey: lane.id) {
+        Task { for input in inputs { await withdraw(input, from: session, lane: lane.id) } }
+      }
     }
     Task { await loadHeld(lane) }
   }
@@ -397,7 +403,7 @@ final class ChatModel {
         let input = await session.stage(
           body, mode: mode, files: files, sendID: sendID, recipients: recipients)
       else {
-        for item in staged { await item.session.unstage(item.input) }
+        for item in staged { await withdraw(item.input, from: item.session, lane: item.id) }
         // With one coordinator saved and none removed, its own reason is the composer's error.
         if removed[id] != nil {
           report("Nothing was sent. " + Missed.removed.sentence([name(id)], "this message"))
@@ -432,6 +438,23 @@ final class ChatModel {
     guard let original else { return }
     if source == original { source = nil }
     if original.isCarried(by: body, files: files, to: recipients) { await remove(original) }
+  }
+
+  /// Withdraws an input a Send staged and never started from its coordinator's outbox, through the
+  /// session that holds the outbox now. An address edit retires the session that staged it and
+  /// attaches the profile's next one, which then withdraws it, at once or once it is attached.
+  /// Remove deletes the outbox, so nothing is left to withdraw.
+  private func withdraw(_ input: StagedInput, from session: CoordinatorSession, lane id: ProfileID)
+    async
+  {
+    var session = session
+    while await session.unstage(input) == false {
+      guard let next = lanes.first(where: { $0.id == id })?.session, next !== session else {
+        if removed[id] == nil { unstaging[id, default: []].append(input) }
+        return
+      }
+      session = next
+    }
   }
 
   /// Why a coordinator did not get an input of a Send.

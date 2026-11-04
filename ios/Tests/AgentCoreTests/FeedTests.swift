@@ -2090,6 +2090,162 @@ func aSendWhoseAddressChangesWhileItsDialIsPendingIsNamedOnlyIfLost(saved: Int, 
   }
 }
 
+// MARK: - A Send that reaches no one leaves no copy, whichever session holds the outbox
+
+/// Puts `text` and eight files of the largest size in the draft, so copying them into each
+/// recipient's outbox takes a while. With `clashAt`, that outbox already holds another file under
+/// the last one's ID, so its coordinator cannot take the message. Returns that file's folder.
+@MainActor private func draftEightLargeFiles(
+  _ chat: ChatModel, _ text: String, clashAt directory: ProfileDirectory? = nil
+) async throws -> URL? {
+  chat.draft = text
+  for index in 1...8 {
+    await chat.attach(
+      data: Data(repeating: UInt8(index), count: AttachmentLimits.maximumBytes),
+      name: "Scan\(index).bin", mediaType: "application/octet-stream")
+  }
+  try #require(chat.attachments.count == 8)
+  guard let directory else { return nil }
+  let last = try #require(chat.attachments.last)
+  let clash = directory.outboxAttachments.appending(path: last.id)
+  try FileManager.default.createDirectory(at: clash, withIntermediateDirectories: true)
+  try Data(repeating: 0xEE, count: AttachmentLimits.maximumBytes).write(
+    to: clash.appending(path: last.reference.name))
+  return clash
+}
+
+/// A message with eight files goes to both, and Work saves its copy first. While Personal still
+/// copies the files, Work's address is edited to another that reaches Work, which retires Work's
+/// session and gives its outbox to a new one, or it is not, the control. Then Personal cannot take
+/// the message: another file is saved under one of its IDs, or Personal's connection drops. Nothing
+/// was sent, so no coordinator keeps a copy, the feed shows none, and the draft stays with its
+/// error. Sending it again gives each coordinator the message once.
+@MainActor
+@Test(
+  .timeLimit(.minutes(5)), arguments: [(false, "clash"), (true, "clash"), (true, "Personal drops")])
+func aSendToBothPersonalRefusesLeavesNothingAtWorkAfterAnAddressEdit(
+  _ edit: Bool, _ failure: String
+) async throws {
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let text = "Invented: the quarterly scans for both"
+    let personalDirectory = ProfileDirectory(personal, applicationSupport: root, caches: root)
+    let clash = try await draftEightLargeFiles(
+      chat, text, clashAt: failure == "clash" ? personalDirectory : nil)
+    let workOutbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let sending = Task { await chat.send() }
+    if edit {
+      try await eventually("Work saved its copy") {
+        ((try? queuedRequests(workOutbox)) ?? []).count == 1
+      }
+      if failure == "Personal drops" {
+        // Personal's connection drops while it still copies the files, and stays down.
+        await personalFixture.dropIdentify()
+        await personalFixture.stop()
+        try await eventually("Personal's lane down") {
+          chat.snapshots[personal]?.connection != .connected
+        }
+      }
+      try await coordinators.update(
+        work, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4003))
+      try #require(chat.admitting, "The edit finished while Personal still copied the files")
+    }
+    await sending.value
+    try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
+    let queuedAtWork = ((try? queuedRequests(workOutbox)) ?? []).map(\.text)
+    let workRow = chat.snapshots[work]?.rows.first { $0.text == text }
+    let receipts =
+      chat.rows.first { $0.row.text == text }?.receipts.map { $0.line(chat.name($0.lane)) } ?? []
+    print(
+      "IF11-2[edit=\(edit), \(failure)] after the Send: error=\(chat.error ?? "nil") draftKept=\(chat.draft == text) files=\(chat.attachments.count) Work's outbox=\(queuedAtWork) Work's row=\(workRow?.delivery?.rawValue ?? "none") receipts=\(receipts)"
+    )
+    #expect(chat.draft == text && chat.attachments.count == 8, "The draft stays")
+    #expect(chat.error == "Nothing was sent. Personal did not take the message.")
+    #expect(queuedAtWork.isEmpty, "Personal did not take it, yet Work keeps a copy queued")
+    #expect(workRow == nil && receipts.isEmpty, "The feed shows a message that was not sent")
+    if let clash { try FileManager.default.removeItem(at: clash) }
+    if failure == "Personal drops" {
+      await personalFixture.dropIdentify(false)
+      await chat.reconnect(personal)
+    }
+    // The text alone is sent again, so its copies upload quickly however loaded the host is.
+    for file in chat.attachments { await chat.removeAttachment(file) }
+    try await eventually("both connected again") { chat.canSend }
+    await chat.send()
+    // Check / retry on a copy the failed Send left at Work, as its row offers.
+    if let left = workRow?.inputID { await chat.retry(left) }
+    try await eventually("each coordinator got it") {
+      let (atWork, atPersonal) = (await workFixture.count(), await personalFixture.count())
+      return atWork >= (workRow == nil ? 1 : 2) && atPersonal >= 1
+    }
+    let atWork = await submits(workFixture).map(\.text)
+    let atPersonal = await submits(personalFixture).map(\.text)
+    print(
+      "IF11-2[edit=\(edit), \(failure)] sent again: Work got \(atWork.count)x, Personal got \(atPersonal.count)x"
+    )
+    #expect(atWork == [text] && atPersonal == [text], "Each coordinator gets the message once")
+  }
+}
+
+/// The same Send, with Work's session retired while Personal still copies the files, and Personal
+/// refusing before the change that retired it is done. An address edit retires Work's session before
+/// it attaches the next one. Remove retires it, then deletes Work's files. The retired session
+/// writes nothing, so Remove's deletion stands, and after an edit the next session withdraws Work's
+/// copy once it is attached.
+@MainActor @Test(.timeLimit(.minutes(2)), arguments: ["an address edit", "Remove"])
+func aCopyWhoseSessionRetiredDuringASendThatReachedNoOneIsNotKept(_ change: String)
+  async throws
+{
+  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let text = "Invented: the signed lease for both"
+    _ = try await draftEightLargeFiles(
+      chat, text, clashAt: ProfileDirectory(personal, applicationSupport: root, caches: root))
+    let workDirectory = ProfileDirectory(work, applicationSupport: root, caches: root)
+    let retiring = try #require(chat.lanes.first { $0.id == work }?.session)
+    let sending = Task { await chat.send() }
+    try await eventually("Work saved its copy") {
+      ((try? queuedRequests(workDirectory.outbox)) ?? []).count == 1
+    }
+    if change == "Remove" {
+      try await coordinators.remove(work)
+    } else {
+      await retiring.retire()
+    }
+    try #require(chat.admitting, "Work's session retired while Personal still copied the files")
+    await sending.value
+    let afterSend = ((try? queuedRequests(workDirectory.outbox)) ?? []).map(\.text)
+    if change == "Remove" {
+      try await Task.sleep(for: .milliseconds(300))
+      let recreated = FileManager.default.fileExists(atPath: workDirectory.root.path)
+      print(
+        "IF11-2[\(change)] error=\(chat.error ?? "nil") Work's folder recreated=\(recreated) Work got=\(await workFixture.count())"
+      )
+      #expect(!recreated, "Something wrote Work's folder after Remove deleted it")
+    } else {
+      try await coordinators.update(
+        work, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4003))
+      try await eventually("Work's next session connected") {
+        chat.snapshots[work]?.connection == .connected
+      }
+      let withdrawn = await within(15) {
+        ((try? queuedRequests(workDirectory.outbox)) ?? []).isEmpty
+          && chat.snapshots[work]?.rows.contains { $0.text == text } == false
+      }
+      print(
+        "IF11-2[\(change)] error=\(chat.error ?? "nil") Work's outbox after the Send=\(afterSend) withdrawn once the next session is attached=\(withdrawn) Work got=\(await workFixture.count())"
+      )
+      #expect(withdrawn, "Work's next session keeps a copy of a message that was not sent")
+    }
+    // With one coordinator left, Personal's own error follows the composer's.
+    #expect(chat.error?.hasPrefix("Nothing was sent. Personal did not take the message.") == true)
+    #expect(chat.draft == text, "The draft stays")
+    #expect((await workFixture.count(), await personalFixture.count()) == (0, 0))
+  }
+}
+
 /// A message to both whose socket to Work is still proving Work's identity when Remove takes Work,
 /// while Personal refuses its copy. One coordinator is left, so Personal's errors show in the
 /// composer. What Remove cut off stays named beside them, and beside any other failure, until the
