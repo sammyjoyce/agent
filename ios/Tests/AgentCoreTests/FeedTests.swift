@@ -817,7 +817,7 @@ func nothingRestoredChosenOrTaggedDuringRemoveReachesTheOtherCoordinator() async
     #expect(!chat.canSend && chat.recipientLine == "Work was removed")
     chat.recipient = nil
     chat.draft = ""
-    await chat.restoreHeld(held)
+    await chat.restoreHeld(held, for: work)
     await chat.restore(queued.inputId)
     #expect(chat.draft.isEmpty && chat.attachments.isEmpty, "Restore refuses while Work is removed")
     await gate.open()
@@ -2411,9 +2411,9 @@ func aCopyWhoseSessionRetiredDuringASendThatReachedNoOneIsNotKept(_ change: Stri
 }
 
 /// A message to both whose socket to Work is still proving Work's identity when Remove takes Work,
-/// while Personal refuses its copy. One coordinator is left, so Personal's errors show in the
-/// composer. What Remove cut off stays named beside them, and beside any other failure, until the
-/// next Send.
+/// while Personal refuses its copy. One coordinator is left, so Personal's current error shows in
+/// the composer, beside the composer's own failure. What Remove cut off stays named beside them
+/// until the next Send.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func whatRemoveCutOffStaysNamedUntilTheNextSendWithOneCoordinatorLeft() async throws {
   try await withTwoFixtures { coordinators, workFixture, personalFixture, _ in
@@ -2454,7 +2454,8 @@ func whatRemoveCutOffStaysNamedUntilTheNextSendWithOneCoordinatorLeft() async th
     print("IF6-T3 after a refused Restore: composer error=\(chat.error ?? "nil")")
     #expect(
       chat.error
-        == "\(report) Send or clear the current draft before restoring another message.")
+        == "\(report) Send or clear the current draft before restoring another message. Attachment storage is full"
+    )
     await personalFixture.acceptUploads()
     await chat.send()
     try await eventually("Personal got the next message") {
@@ -2462,6 +2463,81 @@ func whatRemoveCutOffStaysNamedUntilTheNextSendWithOneCoordinatorLeft() async th
     }
     print("IF6-T3 after the next Send: composer error=\(chat.error ?? "nil")")
     #expect(chat.error?.contains(report) != true, "The next Send clears the report")
+  }
+}
+
+// MARK: - The composer shows a coordinator's error only while it is current and saved alone
+
+/// With Work saved alone, its address starts answering as a coordinator no profile has, so the
+/// composer shows Work's line, which advises Remove. The user adds Personal, and the coordinator at
+/// Work's address turns out to be Personal's, so Work's line above the feed names Personal and
+/// points to Work's address. Nothing under the composer may still advise Remove, and once Work's
+/// coordinator answers at Work's address again, nothing is left there.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aLoneCoordinatorsErrorLeavesTheComposerOnceASecondIsAddedAndWhenItRecovers() async throws {
+  let route = WorkRoute()
+  try await withTwoFixtures(route: route) { coordinators, _, _, _ in
+    try await coordinators.add(
+      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    let chat = coordinators.chat
+    let work = try #require(coordinators.profiles.first?.id)
+    try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
+    await route.point(atPersonal: true)
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    try await eventually("Work's line under the composer") {
+      chat.error?.hasSuffix("Remove it and add it again.") == true
+    }
+    print("IF14-W1[Work alone] composer: \(chat.error ?? "nil")")
+    try await coordinators.add(
+      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+    try await eventually("Work's line names Personal") {
+      chat.laneError(work) == "This address now answers as Personal. Edit Work's address."
+    }
+    print(
+      "IF14-W1[Personal added] Work's line: \(chat.laneError(work) ?? "nil") composer: \(chat.error ?? "nil")"
+    )
+    #expect(chat.error == nil, "The composer still shows Work's line from when it was alone")
+    await route.point(atPersonal: false)
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    try await eventually("Work reconnected") { chat.snapshots[work]?.connection == .connected }
+    print(
+      "IF14-W1[Work recovered] Work's line: \(chat.laneError(work) ?? "nil") composer: \(chat.error ?? "nil")"
+    )
+    #expect(chat.laneError(work) == nil)
+    #expect(chat.error == nil, "The composer still shows a line its lane no longer has")
+  }
+}
+
+/// The other direction. Work's address answers as Personal while both are saved, so Work's error
+/// is on Work's own line and not under the composer. The user removes Personal, which leaves Work
+/// alone. Work's current error, the reinstall line once no saved coordinator answers there, then
+/// shows under the composer, at once and after Work's next attempt.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aCoordinatorLeftAloneShowsItsCurrentErrorUnderTheComposer() async throws {
+  let route = WorkRoute()
+  try await withTwoFixtures(route: route) { coordinators, _, _, _ in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    await route.point(atPersonal: true)
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    try await eventually("Work's line names Personal") {
+      chat.laneError(work) == "This address now answers as Personal. Edit Work's address."
+    }
+    #expect(chat.error == nil, "With two coordinators each error shows on its own lane's line")
+    try await coordinators.remove(personal)
+    let atRemoval = chat.error
+    await chat.reconnect(work)
+    let afterAttempt = await within(6) {
+      chat.error?.hasSuffix("Remove it and add it again.") == true
+    }
+    print(
+      "IF14-W1[Personal removed] composer at once: \(atRemoval ?? "nil") after Work's next attempt: \(chat.error ?? "nil")"
+    )
+    #expect(afterAttempt, "Work's error never reached the composer")
+    #expect(atRemoval == chat.laneError(work), "Work's current error waited for its next attempt")
   }
 }
 
@@ -3150,9 +3226,11 @@ func aRestoredFileWithNoTextStaysItsSourcesOnceAnotherIsAdded() async throws {
   try await restoreWithOneCoordinatorThenAddPersonal("", "file only")
 }
 
-/// A message held from before the update is restored while its migrated coordinator is the only
-/// one saved. The user adds Personal, then taps Send. Legacy Restore addresses the migrated
-/// profile, so Work alone gets it.
+/// A message held from before the update, with no record of the address it was queued for, is
+/// restored while Work is the only coordinator saved. Restore addresses it to no one until the user
+/// chooses Work. The user adds Personal, then taps Send. The restored message stays Work's, so
+/// Work alone gets it. Nothing shows that Work is the coordinator it was queued for, so it stays
+/// held.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func aHeldMessageRestoredWithOneCoordinatorStaysItsOnceAnotherIsAdded() async throws {
   try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
@@ -3170,6 +3248,8 @@ func aHeldMessageRestoredWithOneCoordinatorStaysItsOnceAnotherIsAdded() async th
     let hold = try #require(chat.lanes.first { $0.id == work }?.hold)
     let held = HeldMessage(lane: work, item: try #require(try await hold.items().first))
     await chat.restoreHeld(held)
+    #expect(chat.draft.isEmpty && chat.heldCoordinator == nil, "Restore chose for the user")
+    await chat.restoreHeld(held, for: work)
     print(
       "IF6-T1[legacy] restored with one coordinator: recipient=\(chat.recipient.map(chat.name) ?? "none") chip=\(chat.shownChip.map(chat.name) ?? "none") draft=\(chat.draft)"
     )
@@ -3192,7 +3272,8 @@ func aHeldMessageRestoredWithOneCoordinatorStaysItsOnceAnotherIsAdded() async th
     print("IF6-T1[legacy] Work received \(workGot) Personal received \(personalGot) held=\(left)")
     #expect(personalGot.isEmpty, "A message held for Work reached Personal")
     #expect(workGot == [text])
-    #expect(left.isEmpty, "The held message leaves its hold once its copy was admitted")
+    #expect(
+      left == ["held-1"], "A copy sent where the user chose took the original out of the hold")
   }
 }
 
@@ -3258,29 +3339,33 @@ func aHeldMessageRestoredWithOneCoordinatorStaysItsOnceAnotherIsAdded() async th
   await stop()
 }
 
-/// The user restores the held message of the unpaired migrated coordinator, then adds Personal,
-/// which is up to date. The message stays the migrated coordinator's: Send is blocked because it
-/// is not paired, and the message stays in its hold.
+/// The migrated coordinator is not updated yet, so it stays unpaired at the address the held
+/// message was queued for. Restore addresses the message to no one and offers no coordinator, since
+/// none is paired. The user adds Personal, which is up to date, at another address. Restore still
+/// addresses it to no one and offers only Personal. Nothing reaches Personal, and the message stays
+/// in its hold.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func aHeldMessageOfAnUnpairedCoordinatorStaysItsOnceAnotherIsAdded() async throws {
   try await withAnUnpairedHeldMessage { coordinators, migrated, personalFixture, text in
     let chat = coordinators.chat
-    await chat.restoreHeld(try #require(chat.held.first))
+    let held = try #require(chat.held.first)
+    await chat.restoreHeld(held)
     print(
-      "IF6-T1[unpaired] restored: recipient=\(chat.recipient.map(chat.name) ?? "none") chip=\(chat.shownChip.map(chat.name) ?? "none") draft=\(chat.draft) files=\(chat.attachments.map(\.reference.name)) canSend=\(chat.canSend)"
+      "IF6-T1[unpaired] Restore: draft=\(chat.draft.debugDescription) offered=\(chat.heldChoices.map(\.name.description))"
     )
-    #expect(chat.recipient == migrated.id && chat.shownChip == nil && !chat.canSend)
+    #expect(chat.draft.isEmpty && chat.heldChoices.isEmpty)
     try await coordinators.add(
       name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
     let personal = try #require(coordinators.profiles.last?.id)
     try await eventually("Personal connected") {
       chat.snapshots[personal]?.connection == .connected
     }
+    await chat.restoreHeld(held)
     print(
-      "IF6-T1[unpaired] after Add Personal: recipientLine=\(chat.recipientLine) canSend=\(chat.canSend)"
+      "IF6-T1[unpaired] after Add Personal, Restore: draft=\(chat.draft.debugDescription) offered=\(chat.heldChoices.map(\.name.description))"
     )
-    #expect(chat.shownChip == migrated.id)
-    #expect(chat.recipientLine == "\(migrated.name) is not paired yet" && !chat.canSend)
+    #expect(chat.draft.isEmpty, "Restore addressed it to Personal without the user choosing")
+    #expect(chat.heldChoices.map(\.id) == [personal], "Restore offered an unpaired coordinator")
     await chat.send()
     try await Task.sleep(for: .milliseconds(500))
     let got = await submits(personalFixture)
@@ -3290,26 +3375,24 @@ func aHeldMessageOfAnUnpairedCoordinatorStaysItsOnceAnotherIsAdded() async throw
     #expect(got.isEmpty, "A message held for the migrated coordinator reached Personal")
     #expect(await personalFixture.uploadCount() == 0)
     #expect(chat.held.map(\.item.text) == [text], "It stays in its hold")
+    #expect(migrated.pin == nil)
   }
 }
 
-/// The same held message, restored with Personal added. The user removes its chip, so the line
-/// reads "To Personal", since the migrated coordinator is not paired, and sends it. Personal gets
-/// it, as the line said. The migrated coordinator never did, so its message stays in its hold.
+/// The same held message with Personal added. The user chooses Personal for it, so the line reads
+/// "To Personal", and sends it. Personal gets it, as the line said. Nothing shows that Personal is
+/// the coordinator it was queued for, so the message stays in its hold.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func aHeldMessageSentWithoutItsUnpairedCoordinatorStaysHeld() async throws {
   try await withAnUnpairedHeldMessage { coordinators, migrated, personalFixture, text in
     let chat = coordinators.chat
-    await chat.restoreHeld(try #require(chat.held.first))
     try await coordinators.add(
       name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
     let personal = try #require(coordinators.profiles.last?.id)
     try await eventually("Personal connected") {
       chat.snapshots[personal]?.connection == .connected
     }
-    // The chip's ⓧ, whose hint reads "Removes the recipient, so the message goes to every
-    // coordinator."
-    chat.recipient = nil
+    await chat.restoreHeld(try #require(chat.held.first), for: personal)
     print(
       "IF10-1 before Send: line=\(chat.recipientLine) canSend=\(chat.canSend) draft=\(chat.draft.debugDescription)"
     )
@@ -3959,6 +4042,14 @@ func anEmptiedRestoredDraftLeavesItsOriginalToRestoreAgain(_ emptied: String) as
 
 // MARK: - A restored source leaves only when its coordinator gets it unchanged, or by Discard
 
+/// Records `profile` as the coordinator paired at the address the single-address build used, so
+/// the messages held from before the update are its, as when the migrated profile pairs there.
+@MainActor private func holdFor(_ profile: CoordinatorProfile, in chat: ChatModel) throws {
+  var origin = LegacyOrigin(address: profile.address, installation: nil)
+  _ = origin.pair(try #require(profile.pin), at: profile.address)
+  chat.origin = origin
+}
+
 /// `inputID`'s item in the outbox, if it is still queued. One still marked refused can be withdrawn
 /// by Discard or by a Send that carries its restored copy unchanged.
 private func queuedItem(_ outbox: URL, _ inputID: String) throws -> OutboxItem? {
@@ -4024,13 +4115,15 @@ func aCommandSentOverARestoredDraftKeepsTheOriginalQueued(_ setup: String) async
   }
 }
 
-/// A message held from before the update is restored, and /status from the Commands menu replaces
-/// the draft. Send delivers /status, and the held message stays in its hold.
+/// A message held from before the update for Work, which paired where it was queued, is restored,
+/// and /status from the Commands menu replaces the draft. Send delivers /status, and the held
+/// message stays in its hold.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func aHeldMessageStaysHeldWhenACommandIsSentOverItsRestoredDraft() async throws {
   try await withTwoFixtures { coordinators, workFixture, _, root in
     let work = try await addWork(coordinators)
     let chat = coordinators.chat
+    try holdFor(coordinators.profiles[0], in: chat)
     let text = "Invented: Work's held reorg memo"
     let directory = ProfileDirectory(work, applicationSupport: root, caches: root)
     try FileManager.default.createDirectory(at: directory.legacy, withIntermediateDirectories: true)

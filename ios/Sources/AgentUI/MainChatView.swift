@@ -29,6 +29,8 @@ public struct MainChatView: View {
   @State private var visibleItem: String?
   @State private var historyRequest: HistoryNavigation?
   @State private var importingFiles = false
+  /// A held message whose Restore waits for the user to choose who gets it.
+  @State private var choosing: HeldMessage?
   #if os(iOS)
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var capture = AppScreenshot()
@@ -258,6 +260,17 @@ public struct MainChatView: View {
   private var inspecting: Bool { model.inspectedConversation != nil }
   /// A saved profile that is not paired yet. It shows its held messages and takes no sends.
   private var unpaired: CoordinatorProfile? { coordinators?.profiles.first { $0.pin == nil } }
+  /// Why Restore asks who gets a held message, and what a Send to the one chosen leaves.
+  private var heldChoiceNote: String {
+    let queued =
+      model.origin.map {
+        "It was queued for the coordinator at \($0.address.host):\($0.address.port)."
+      }
+      ?? "This phone did not record which coordinator it was queued for."
+    return model.heldChoices.isEmpty
+      ? "\(queued) Pair a coordinator to send it."
+      : "\(queued) No saved coordinator is paired there, so it stays held after you send it."
+  }
   /// The error under the feed. With one coordinator saved, an unpaired one's pairing error stands
   /// in for the composer's latest failure, after what the composer reported.
   private var composerError: String? {
@@ -359,8 +372,29 @@ public struct MainChatView: View {
             }
             ForEach(model.held) { message in
               HeldMessageRow(
-                message: message, restore: { Task { await model.restoreHeld(message) } },
-                discard: { Task { await model.discardHeld(message) } })
+                message: message,
+                restore: {
+                  if model.heldCoordinator == nil {
+                    choosing = message
+                  } else {
+                    Task { await model.restoreHeld(message) }
+                  }
+                }, discard: { Task { await model.discardHeld(message) } }
+              )
+              .confirmationDialog(
+                "Who should get this message?",
+                isPresented: Binding(
+                  get: { choosing?.id == message.id }, set: { if !$0 { choosing = nil } }),
+                titleVisibility: .visible
+              ) {
+                ForEach(model.heldChoices) { profile in
+                  Button(profile.name.description) {
+                    Task { await model.restoreHeld(message, for: profile.id) }
+                  }
+                }
+              } message: {
+                Text(heldChoiceNote)
+              }
             }
             ForEach(items) { item in
               Group {
