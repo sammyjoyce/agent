@@ -1148,6 +1148,83 @@
         }
       }
 
+      /// A message held for Work starts with "@Personal". The user restores it, removes its chip and
+      /// empties the field, deleting all of its text at once, cutting it, or deleting it key by key,
+      /// then undoes that. Undo brings back the restored text and the restored draft with it, so no
+      /// chip appears and the text is as it was. Redo empties the field again, and after a second
+      /// Undo a key typed at the end of the text still promotes nothing.
+      @MainActor @Test(arguments: ["delete", "cut", "keys"])
+      func undoAfterEmptyingARestoredDraftKeepsItLiteral(_ how: String) async throws {
+        try await withComposer { model, box, work in
+          let field = box.draft
+          let text = "@Personal invented quotation from Work"
+          try await restoreHeld(text, model: model, work: work)
+          model.recipient = nil
+          try await Task.sleep(for: .milliseconds(200))
+          let undo = try #require(field.undoManager)
+          field.selectedRange = NSRange(location: 0, length: field.text.utf16.count)
+          switch how {
+          case "cut": field.cut(nil)
+          case "keys":
+            field.selectedRange = NSRange(location: field.text.utf16.count, length: 0)
+            // One key per turn of the run loop, as a person types, so the field records the run
+            // of keys as one step at its first key.
+            for _ in text {
+              field.deleteBackward()
+              try await Task.sleep(for: .milliseconds(30))
+            }
+          default: field.deleteBackward()
+          }
+          try await Task.sleep(for: .milliseconds(300))
+          let emptied = model.draft
+          undo.undo()
+          try await Task.sleep(for: .milliseconds(300))
+          print(
+            "IF9-Y2[\(how)] emptied=\(emptied.debugDescription) undone: chip=\(model.recipient.map(model.name) ?? "none") draft=\(model.draft.debugDescription) field=\(field.text.debugDescription) line=\(model.recipientLine)"
+          )
+          #expect(emptied.isEmpty)
+          #expect(model.recipient == nil, "Undo turned the restored text's own tag into the chip")
+          #expect(model.draft == text && field.text == text, "Undo changed the restored text")
+          undo.redo()
+          try await Task.sleep(for: .milliseconds(300))
+          let redone = model.draft
+          undo.undo()
+          try await Task.sleep(for: .milliseconds(300))
+          field.selectedRange = NSRange(location: field.text.utf16.count, length: 0)
+          field.insertText(".")
+          try await Task.sleep(for: .milliseconds(300))
+          print(
+            "IF9-Y2[\(how)] redone=\(redone.debugDescription) undone again, one more key: chip=\(model.recipient.map(model.name) ?? "none") draft=\(model.draft.debugDescription)"
+          )
+          #expect(redone.isEmpty, "Redo did not empty the field again")
+          #expect(model.recipient == nil && model.draft == text + ".")
+        }
+      }
+
+      /// The same restored draft, chip removed. The user cuts all of its text, which empties the
+      /// composer and ends the restored draft, and pastes it back. Pasted text is typed text, as text
+      /// typed again is, so its leading "@Personal " becomes the chip.
+      @MainActor @Test func textPastedIntoAnEmptiedRestoredDraftIsTyped() async throws {
+        try await withComposer { model, box, work in
+          let field = box.draft
+          let personal = try #require(model.profiles.last?.id)
+          let text = "@Personal invented: forward Work's board deck to the auditors"
+          try await restoreHeld(text, model: model, work: work)
+          model.recipient = nil
+          try await Task.sleep(for: .milliseconds(200))
+          field.selectedRange = NSRange(location: 0, length: field.text.utf16.count)
+          field.cut(nil)
+          try await Task.sleep(for: .milliseconds(300))
+          field.paste(nil)
+          try await Task.sleep(for: .milliseconds(300))
+          print(
+            "IF9-Y2[paste] chip=\(model.recipient.map(model.name) ?? "none") draft=\(model.draft.debugDescription)"
+          )
+          #expect(model.recipient == personal)
+          #expect(model.draft == "invented: forward Work's board deck to the auditors")
+        }
+      }
+
       /// The user types a line after the chip and its ⓧ removes the chip. Then the user types more,
       /// and the chip comes back. Each time the chip comes or goes, the draft is drawn at once where
       /// its layout puts it, at the field's leading edge without the chip and after it with one, so

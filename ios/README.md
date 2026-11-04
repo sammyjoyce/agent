@@ -121,7 +121,11 @@ required for sharing on a phone; an unsigned build does not establish that.
   that coordinator only. Without a chip the message goes to every paired
   coordinator. A restored message's text is never read for tags, so removing
   its chip sends it to every coordinator as it is. A tag you type in it stays
-  text, and the picker does not open. The line under the field names the recipients, or
+  text, and the picker does not open. If you edit it while it sends, the text
+  left in the composer is still restored text. Clearing the composer ends it,
+  so text you type or paste afterwards is new, and a leading `@Name` in it
+  becomes the chip. Undo after clearing brings back its text, which is still
+  restored text. The line under the field names the recipients, or
   says why Send is blocked, before you send. After a removal the composer keeps working
   this way with one coordinator left, until the app quits.
   A message to several coordinators is saved
@@ -176,7 +180,9 @@ required for sharing on a phone; an unsigned build does not establish that.
   copies the files stay, after the restored message. If you pick another
   coordinator meanwhile, Restore leaves your draft alone. The app removes the
   original only when you send the restored message unchanged, with the same text
-  and every restored file, and only while its coordinator still refuses it. If
+  and every restored file, and only while its coordinator still refuses it.
+  Once you clear the composer, the original stays even if you send the same
+  text again, typed, pasted or put back by Undo. If
   you send something else instead, the original stays and still needs
   attention, and **Discard** removes it. The refusal is saved with the queued
   message until it is sent again, so after a reconnect, an address edit or a
