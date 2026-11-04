@@ -42,7 +42,7 @@ func nativeWorkInspectionReadsTheRealCoordinatorAndDetachesWithoutStoppingWork()
     }
   }
   do {
-    model.attach(Lane(id: profile.profile, session: session, hold: LegacyHold(profile)))
+    model.attach(Lane(id: profile.profile, session: session))
     await model.setActive(true)
     try await waitFor("Main readiness") { model.connection == .connected }
     #expect(model.workInspectionSupported)

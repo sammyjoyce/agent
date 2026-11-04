@@ -23,8 +23,7 @@ import Testing
       id: profile.id,
       session: CoordinatorSession(
         directory: directory, address: profile.address, pin: fixture.id, stamps: StampSource(),
-        transport: loopback(port)),
-      hold: LegacyHold(directory)))
+        transport: loopback(port))))
   await model.setActive(true)
   while model.connection != .connected { try await Task.sleep(for: .milliseconds(1)) }
   do {

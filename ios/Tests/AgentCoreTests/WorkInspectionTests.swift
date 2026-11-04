@@ -242,7 +242,7 @@ private func inspectionJob(
       let (directory, root) = temporaryProfile()
       defer { try? FileManager.default.removeItem(at: root) }
       let model = ChatModel()
-      model.attach(Lane(id: directory.profile, session: nil, hold: LegacyHold(directory)))
+      model.attach(Lane(id: directory.profile, session: nil))
       var checks = ChatSnapshot()
       checks.connection = .connected
       checks.sources = [

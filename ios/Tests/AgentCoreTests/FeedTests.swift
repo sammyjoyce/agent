@@ -268,7 +268,7 @@ private func row(
   defer { for root in [workRoot, personalRoot] { try? FileManager.default.removeItem(at: root) } }
   let model = ChatModel()
   for directory in [work, personal] {
-    model.attach(Lane(id: directory.profile, session: nil, hold: LegacyHold(directory)))
+    model.attach(Lane(id: directory.profile, session: nil))
   }
   let mail = SourceKey(account: "mail-primary", provider: "google")
   func checks(_ coverage: SourceCoverage, _ warning: String?) -> ChatSnapshot {
@@ -764,12 +764,12 @@ func nothingRestoredChosenOrTaggedDuringRemoveReachesTheOtherCoordinator() async
       chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
     }
     let queued = try #require(try queuedRequests(workDirectory.outbox).first)
-    try writePrivately(
-      JSONEncoder().encode([
-        NativeRequestSubmit(inputId: "held-1", mode: .steer, text: "Invented Work-only held text")
-      ]), to: workDirectory.legacy.appending(path: "pending.json"))
-    let hold = try #require(chat.lanes.first { $0.id == work }?.hold)
-    let held = HeldMessage(lane: work, item: try #require(try await hold.items().first))
+    let hold = try heldQueue(
+      [NativeRequestSubmit(inputId: "held-1", mode: .steer, text: "Invented Work-only held text")],
+      in: root)
+    chat.holds.append(hold)
+    let held = HeldMessage(
+      queue: hold.queue.id, item: try #require(try await hold.store.items().first))
 
     await gate.arm()
     let removal = Task { try await coordinators.remove(work) }
@@ -1354,7 +1354,7 @@ func aWithdrawalReachesItsCoordinatorAtTheSavedAddressItNowAnswersAt() async thr
   defer { try? FileManager.default.removeItem(at: root) }
   let chat = ChatModel()
   chat.removed[directory.profile] = "Work"
-  chat.attach(Lane(id: directory.profile, session: nil, hold: LegacyHold(directory)))
+  chat.attach(Lane(id: directory.profile, session: nil))
   #expect(chat.lanes.isEmpty)
 }
 
@@ -3202,15 +3202,13 @@ func aHeldMessageRestoredWithOneCoordinatorStaysItsOnceAnotherIsAdded() async th
     let chat = coordinators.chat
     try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
     let text = "Invented: Work's held reorg memo"
-    let directory = ProfileDirectory(work, applicationSupport: root, caches: root)
-    try FileManager.default.createDirectory(at: directory.legacy, withIntermediateDirectories: true)
-    try writePrivately(
-      JSONEncoder().encode([NativeRequestSubmit(inputId: "held-1", mode: .steer, text: text)]),
-      to: directory.legacy.appending(path: "pending.json"))
-    let hold = try #require(chat.lanes.first { $0.id == work }?.hold)
-    let held = HeldMessage(lane: work, item: try #require(try await hold.items().first))
+    let hold = try heldQueue(
+      [NativeRequestSubmit(inputId: "held-1", mode: .steer, text: text)], in: root)
+    chat.holds.append(hold)
+    let held = HeldMessage(
+      queue: hold.queue.id, item: try #require(try await hold.store.items().first))
     await chat.restoreHeld(held)
-    #expect(chat.draft.isEmpty && chat.heldCoordinator == nil, "Restore chose for the user")
+    #expect(chat.draft.isEmpty && chat.owner(held) == nil, "Restore chose for the user")
     await chat.restoreHeld(held, for: work)
     print(
       "IF6-T1[legacy] restored with one coordinator: recipient=\(chat.recipient.map(chat.name) ?? "none") chip=\(chat.shownChip.map(chat.name) ?? "none") draft=\(chat.draft)"
@@ -3230,7 +3228,7 @@ func aHeldMessageRestoredWithOneCoordinatorStaysItsOnceAnotherIsAdded() async th
     try await Task.sleep(for: .milliseconds(500))
     let workGot = await submits(workFixture).map(\.text)
     let personalGot = await submits(personalFixture).map(\.text)
-    let left = try await hold.items().map(\.id)
+    let left = try await hold.store.items().map(\.id)
     print("IF6-T1[legacy] Work received \(workGot) Personal received \(personalGot) held=\(left)")
     #expect(personalGot.isEmpty, "A message held for Work reached Personal")
     #expect(workGot == [text])
@@ -3362,8 +3360,8 @@ func aHeldMessageSentWithoutItsUnpairedCoordinatorStaysHeld() async throws {
     await chat.send()
     try await eventually("Personal got it") { await personalFixture.count() == 1 }
     try await Task.sleep(for: .milliseconds(300))
-    let hold = try #require(chat.lanes.first { $0.id == migrated.id }?.hold)
-    let heldForMigrated = try await hold.items().map(\.text)
+    let hold = try #require(chat.holds.first)
+    let heldForMigrated = try await hold.store.items().map(\.text)
     let got = await submits(personalFixture).map(\.text)
     print(
       "IF10-1 after Send: Personal=\(got) heldFor\(migrated.name)=\(heldForMigrated) modelHeld=\(chat.held.map(\.item.text))"
@@ -4003,12 +4001,15 @@ func anEmptiedRestoredDraftLeavesItsOriginalToRestoreAgain(_ emptied: String) as
 
 // MARK: - A restored source leaves only when its coordinator gets it unchanged, or by Discard
 
-/// Records `profile` as the coordinator paired at the address the single-address build used, so
-/// the messages held from before the update are its, as when the migrated profile pairs there.
-@MainActor private func holdFor(_ profile: CoordinatorProfile, in chat: ChatModel) throws {
-  var origin = LegacyOrigin(address: profile.address, installation: nil)
-  _ = origin.pair(try #require(profile.pin), at: profile.address)
-  chat.origin = origin
+/// Holds `messages` from before the update for `profile`'s coordinator, which this phone proved
+/// answers at the address they were queued for, as when the migrated profile pairs there.
+@MainActor private func holdFor(
+  _ profile: CoordinatorProfile, _ messages: [NativeRequestSubmit], in chat: ChatModel, root: URL
+) throws -> Hold {
+  let pin = try #require(profile.pin)
+  let hold = try heldQueue(messages, in: root, address: profile.address, coordinator: pin)
+  chat.holds.append(hold)
+  return hold
 }
 
 /// `inputID`'s item in the outbox, if it is still queued. One still marked refused can be withdrawn
@@ -4084,17 +4085,14 @@ func aCommandSentOverARestoredDraftKeepsTheOriginalQueued(_ setup: String) async
 @MainActor @Test(.timeLimit(.minutes(1)))
 func aHeldMessageStaysHeldWhenACommandIsSentOverItsRestoredDraft() async throws {
   try await withTwoFixtures { coordinators, workFixture, _, root in
-    let work = try await addWork(coordinators)
+    _ = try await addWork(coordinators)
     let chat = coordinators.chat
-    try holdFor(coordinators.profiles[0], in: chat)
     let text = "Invented: Work's held reorg memo"
-    let directory = ProfileDirectory(work, applicationSupport: root, caches: root)
-    try FileManager.default.createDirectory(at: directory.legacy, withIntermediateDirectories: true)
-    try writePrivately(
-      JSONEncoder().encode([NativeRequestSubmit(inputId: "held-1", mode: .steer, text: text)]),
-      to: directory.legacy.appending(path: "pending.json"))
-    let hold = try #require(chat.lanes.first { $0.id == work }?.hold)
-    let held = HeldMessage(lane: work, item: try #require(try await hold.items().first))
+    let hold = try holdFor(
+      coordinators.profiles[0], [NativeRequestSubmit(inputId: "held-1", mode: .steer, text: text)],
+      in: chat, root: root)
+    let held = HeldMessage(
+      queue: hold.queue.id, item: try #require(try await hold.store.items().first))
     await chat.restoreHeld(held)
     chat.draft = "/status "
     chat.promoteTypedTag()
@@ -4103,7 +4101,7 @@ func aHeldMessageStaysHeldWhenACommandIsSentOverItsRestoredDraft() async throws 
       await submits(workFixture).contains { $0.text.hasPrefix("/status") }
     }
     try await Task.sleep(for: .milliseconds(300))
-    let left = try await hold.items()
+    let left = try await hold.store.items()
     print(
       "IF8-W1[held] Work received \(await submits(workFixture).map(\.text)) held=\(left.map(\.text)) draft=\(chat.draft.debugDescription)"
     )

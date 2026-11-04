@@ -51,7 +51,7 @@
                   LineConnection(
                     connection: NWConnection(host: .ipv4(.loopback), port: peer.port, using: .tcp))
                 })
-              model.attach(Lane(id: profile.id, session: session, hold: LegacyHold(directory)))
+              model.attach(Lane(id: profile.id, session: session))
             }
             await model.setActive(true)
             // Keep the SwiftUI-owned task alive. Cancellation releases the sessions.

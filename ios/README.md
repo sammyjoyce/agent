@@ -52,11 +52,12 @@ Main-chat alerts require the one-time [APNs setup](../docs/notifications.md).
 They start enabled: allow the notification prompt on first opening, then connect
 to register automatically. Disable **Main-chat updates** in Connection anytime.
 After an update from a build without saved coordinators, the app withdraws that
-build's alert registration once a saved coordinator pairs at the address that
-build used, whatever the toggle says. That coordinator then alerts this device
-only through the saved coordinator's own registration, and only while alerts
-are on. A coordinator paired at another address is never sent the withdrawal,
-since the phone cannot tell whether it is the one that build used. Until the
+build's alert registration once it proves that a saved coordinator answers at
+the address that build used, whatever the toggle says. That coordinator then
+alerts this device only through the saved coordinator's own registration, and
+only while alerts are on. A coordinator saved only at another address is sent
+the withdrawal once a probe of that build's address finds it there. Until then
+the phone cannot tell whether it is the one that build used. Until the
 coordinator confirms, the app sends the withdrawal again each time it becomes
 active.
 **Connection → Appearance** follows the system by default. Choose **Light** or
@@ -233,18 +234,24 @@ required for sharing on a phone; an unsigned build does not establish that.
   preserving its identity. Conversation inspection includes sub-agents and live
   updates, uses the shared history renderer and never sends or stops work.
 - The top of the chat holds messages that a build without saved coordinators
-  queued for the coordinator at its address. That build never recorded which
+  queued for the coordinator at its address. Each launch of that build keeps its
+  own queue and the address it was queued for. That build never recorded which
   coordinator answered there, so they may already have been delivered. The app
-  never sends them. **Restore to composer** makes a new message for you to send,
-  addressed to the saved coordinator paired at that address. Until one is,
-  Restore asks which paired coordinator gets it. **Discard** deletes a held
+  never sends them. A queue belongs to the first saved coordinator the phone
+  proves answers at its address: by pairing, adding or editing a coordinator
+  there, by any probe of that address that finds a saved coordinator, or by a
+  coordinator already saved there, the only one, when the app starts.
+  **Restore to composer** makes a new message for you to send, addressed to that
+  coordinator. Until one is, Restore asks which paired coordinator gets it. If no
+  build recorded the address, Restore always asks. **Discard** deletes a held
   message. A held message leaves the hold only when you send its restored copy
-  unchanged to the coordinator paired at its address, or discard it. A held
-  message the earlier build saw its coordinator accept offers only **Discard**,
-  since a restored copy would send it twice. If a saved
-  coordinator's held messages cannot be read, the
-  chat says so for as long as that coordinator is saved and its last read
-  failed, whatever the other coordinators' reads found.
+  unchanged to the coordinator it belongs to, or discard it. A held message the
+  earlier build saw its coordinator accept offers only **Discard**, since a
+  restored copy would send it twice. Removing a
+  coordinator deletes the held messages that belong to it, and its confirmation
+  counts them. Every other held message stays. If held messages cannot be read,
+  the chat says so for as long as they are on this phone and their last read
+  failed.
 - Do not restore an uncertain submission as a new message to bypass checking its
   original ID. Coordinator admission may already have succeeded.
 - Use the **+** menu for files, photos, commands and delivery mode, or drop files
@@ -267,7 +274,10 @@ required for sharing on a phone; an unsigned build does not establish that.
 - `/feedback` captures the current app window before sending and includes it
   with the report. Failed admission keeps that exact screenshot for retry.
   With more than one coordinator saved nothing is captured, because the feed
-  shows every coordinator's conversation. A kept screenshot, or any restored
+  shows every coordinator's conversation. With one saved, nothing is captured
+  while the chat shows messages held from before the update that may be another
+  coordinator's. The report then goes without a screenshot, and the line under
+  the chat says why. A kept screenshot, or any restored
   `Feedback.png` whatever its text says, belongs to the coordinator it came from
   and is sent to that coordinator alone; otherwise it must be removed before
   sending.

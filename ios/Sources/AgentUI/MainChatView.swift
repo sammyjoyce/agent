@@ -255,17 +255,6 @@ public struct MainChatView: View {
   private var inspecting: Bool { model.inspectedConversation != nil }
   /// A saved profile that is not paired yet. It shows its held messages and takes no sends.
   private var unpaired: CoordinatorProfile? { coordinators?.profiles.first { $0.pin == nil } }
-  /// Why Restore asks who gets a held message, and what a Send to the one chosen leaves.
-  private var heldChoiceNote: String {
-    let queued =
-      model.origin.map {
-        "It was queued for the coordinator at \($0.address.host):\($0.address.port)."
-      }
-      ?? "This phone did not record which coordinator it was queued for."
-    return model.heldChoices.isEmpty
-      ? "\(queued) Pair a coordinator to send it."
-      : "\(queued) No saved coordinator is paired there, so it stays held after you send it."
-  }
   /// The error under the feed. With one coordinator saved, an unpaired one's pairing error stands
   /// in for the composer's latest failure, after what the composer reported.
   private var composerError: String? {
@@ -369,7 +358,7 @@ public struct MainChatView: View {
               HeldMessageRow(
                 message: message,
                 restore: {
-                  if model.heldCoordinator == nil {
+                  if model.owner(message) == nil {
                     choosing = message
                   } else {
                     Task { await model.restoreHeld(message) }
@@ -388,7 +377,7 @@ public struct MainChatView: View {
                   }
                 }
               } message: {
-                Text(heldChoiceNote)
+                Text(model.heldNote(message))
               }
             }
             ForEach(items) { item in

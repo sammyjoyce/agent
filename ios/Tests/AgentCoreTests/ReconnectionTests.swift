@@ -108,13 +108,8 @@ private actor ReconnectCoordinator {
         }
         guard !stopped else { return }
         let saved = submissions.filter { request.inputIds.contains($0.inputId) }
-        let messages = (behavior == .acknowledged ? [] : saved).map {
-          HistoryMessage(
-            continuation: false, entryId: "saved-\($0.inputId)", finalChunk: true,
-            role: .user, text: $0.text)
-        }
-        try await emit(
-          .history(.init(messages: messages, nextCursor: nil, pageComplete: true)), to: socket)
+        // As the coordinator does, receipts come before the history page, whose completion is what
+        // makes a client connected.
         for input in saved {
           if behavior == .acknowledged {
             if let acceptedWork {
@@ -126,6 +121,13 @@ private actor ReconnectCoordinator {
               .placed(.init(entryId: "saved-\(input.inputId)", inputId: input.inputId)), to: socket)
           }
         }
+        let messages = (behavior == .acknowledged ? [] : saved).map {
+          HistoryMessage(
+            continuation: false, entryId: "saved-\($0.inputId)", finalChunk: true,
+            role: .user, text: $0.text)
+        }
+        try await emit(
+          .history(.init(messages: messages, nextCursor: nil, pageComplete: true)), to: socket)
         if behavior == .paused {
           try await emit(
             .failure(.init(message: "Main processing is paused after repeated restarts.")),
@@ -236,8 +238,7 @@ private actor ReconnectCoordinator {
       id: directory.profile,
       session: CoordinatorSession(
         directory: directory, address: address, pin: fixture.id, stamps: StampSource(),
-        transport: loopback(port)),
-      hold: LegacyHold(directory))
+        transport: loopback(port)))
   }
   let model = ChatModel()
   model.attach(lane())
