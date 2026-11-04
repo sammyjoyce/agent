@@ -200,12 +200,18 @@ Mode if requested, then Run.
   Live recovery clears old errors; repeated polls add no history or alerts.
 - The top of the chat holds messages that a build without saved coordinators
   queued for the coordinator at its address. Each launch of that build keeps its
-  own queue and the address it was queued for. That build never recorded which
-  coordinator answered there, so they may already have been delivered. The app
-  never sends them. A queue belongs to the first saved coordinator the phone
-  proves answers at its address: by pairing, adding or editing a coordinator
-  there, by any probe of that address that finds a saved coordinator, or by a
-  coordinator already saved there, the only one, when the app starts.
+  own queue and the address it was queued for, every queue it left is held, and
+  the update saves a coordinator at its last address under a name no saved
+  coordinator has. That build never recorded which coordinator answered there,
+  so they may already have been delivered. The app never sends them. A queue
+  belongs to the first saved coordinator the phone proves answers at its
+  address: by pairing, adding or editing a coordinator there, by any probe of
+  that address that finds a saved coordinator, or by a coordinator already saved
+  there, the only one, when the app starts. Each queue's folder records its
+  address, its coordinator and that build's alert registration, so installing an
+  earlier build of this app and then this one again loses none of them. What an
+  earlier build recorded about a queue counts only where it proves the queue's
+  address or coordinator.
   **Restore to composer** makes a new message for you to send, addressed to that
   coordinator. Until one is, Restore asks which paired coordinator gets it. If no
   build recorded the address, Restore always asks. **Discard** deletes a held
@@ -213,10 +219,12 @@ Mode if requested, then Run.
   unchanged to the coordinator it belongs to, or discard it. A held message the
   earlier build saw its coordinator accept offers only **Discard**, since a
   restored copy would send it twice. Removing a
-  coordinator deletes the held messages that belong to it, and its confirmation
-  counts them. Every other held message stays. If held messages cannot be read,
-  the chat says so for as long as they are on this phone and their last read
-  failed.
+  coordinator deletes the held messages its confirmation counted as that
+  coordinator's, and no others: a queue that becomes that coordinator's after
+  the confirmation stays. A Remove that stops part way may leave held messages
+  that show again, and Discard deletes them. Nothing else deletes a held
+  message. If held messages cannot be read, the chat says so for as long as they
+  are on this phone and their last read failed.
 - Do not restore an uncertain submission as a new message to bypass checking its
   original ID. Coordinator admission may already have succeeded.
 - Use the **+** menu for files, photos, commands and delivery mode, or drop files

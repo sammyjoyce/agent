@@ -522,7 +522,8 @@ func aTypedTagAfterARemovalBecomesTheChip() async throws {
     chat.draft = ""
     try await coordinators.add(
       name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
-    try await coordinators.remove(try #require(coordinators.profiles.last?.id))
+    try await coordinators.remove(
+      coordinators.removal(try #require(coordinators.profiles.last?.id)))
     chat.draft = "@W"
     print("IF6-T4 picker for @W: \(chat.pickerMatches.map(\.name.description))")
     #expect(chat.pickerMatches.map(\.id) == [work], "Typing @W offers Work")
@@ -639,7 +640,7 @@ func removeRefusesWhileTheDraftIsAddressedToOrRestoredFromThatCoordinator() asyn
     for chip in [work, nil] {
       chat.recipient = chip
       do {
-        try await coordinators.remove(work)
+        try await coordinators.remove(coordinators.removal(work))
         Issue.record("Remove went ahead with a draft from Work, chip \(String(describing: chip))")
       } catch {
         #expect(error.localizedDescription == "Send or clear the draft for Work first.")
@@ -648,7 +649,7 @@ func removeRefusesWhileTheDraftIsAddressedToOrRestoredFromThatCoordinator() asyn
     }
     chat.draft = ""
     for file in chat.attachments { await chat.removeAttachment(file) }
-    try await coordinators.remove(work)
+    try await coordinators.remove(coordinators.removal(work))
     #expect(coordinators.profiles.map(\.id) == [personal], "A cleared draft lets Remove go ahead")
   }
 }
@@ -710,7 +711,7 @@ func anAutomaticScreenshotNeverGoesToACoordinatorItWasNotCapturedWith() async th
     let screenshot = try #require(chat.attachments.first)
     try await coordinators.add(
       name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
-    try await coordinators.remove(work)
+    try await coordinators.remove(coordinators.removal(work))
     try await eventually("Personal connected") { chat.connection == .connected }
     await chat.send()
     #expect(chat.error?.hasPrefix("Remove the automatic screenshot") == true)
@@ -772,7 +773,7 @@ func nothingRestoredChosenOrTaggedDuringRemoveReachesTheOtherCoordinator() async
       queue: hold.queue.id, item: try #require(try await hold.store.items().first))
 
     await gate.arm()
-    let removal = Task { try await coordinators.remove(work) }
+    let removal = Task { try await coordinators.remove(coordinators.removal(work)) }
     try await eventually("Remove waiting on Work's alert withdrawal") { await gate.waiting }
     chat.draft = "@Wo"
     #expect(chat.pickerMatches.isEmpty, "Work is not offered while it is removed")
@@ -822,7 +823,7 @@ func aMessageRestoredFromARemovedCoordinatorStaysBlockedUnderAnyAddress() async 
     await gate.arm()
     // Both start on the main actor in this order, so the restore resumes after Remove's mark.
     let restoring = Task { @MainActor in await chat.restore(queued.inputId) }
-    let removal = Task { @MainActor in try await coordinators.remove(work) }
+    let removal = Task { @MainActor in try await coordinators.remove(coordinators.removal(work)) }
     await restoring.value
     #expect(chat.draft == queued.text && chat.recipient == work)
     try await eventually("Remove waiting on Work's alert withdrawal") { await gate.waiting }
@@ -854,7 +855,7 @@ func removeRefusesATypedTagAndNothingNamingARemovedCoordinatorSends() async thro
       mediaType: "text/plain")
     #expect(chat.recipient == nil && chat.recipientLine == "To Work")
     do {
-      try await coordinators.remove(work)
+      try await coordinators.remove(coordinators.removal(work))
       Issue.record("Remove went ahead with a draft tagged @Work")
     } catch {
       #expect(error.localizedDescription == "Send or clear the draft for Work first.")
@@ -862,7 +863,7 @@ func removeRefusesATypedTagAndNothingNamingARemovedCoordinatorSends() async thro
     #expect(coordinators.profiles.map(\.id) == [work, personal])
     chat.draft = ""
     for file in chat.attachments { await chat.removeAttachment(file) }
-    try await coordinators.remove(work)
+    try await coordinators.remove(coordinators.removal(work))
     #expect(coordinators.profiles.map(\.id) == [personal])
     let drafts: [(chip: ProfileID?, text: String, blocked: String)] = [
       (nil, "@Work see the invented board minutes", "No coordinator named Work"),
@@ -1040,7 +1041,7 @@ func aMessageToBothKeepsItsRecipientsAfterOneIsRemovedAndAddedAgain() async thro
       chat.rows.first { $0.row.text == tagged }?.receipts == [Receipt(lane: work, status: .placed)]
     }
     try await bothConnected()
-    try await coordinators.remove(personal)
+    try await coordinators.remove(coordinators.removal(personal))
     try await coordinators.add(
       name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
     try await bothConnected()
@@ -1087,7 +1088,7 @@ func anEditAndARemoveOfOneCoordinatorRunOneAfterTheOther() async throws {
         chat.lanes.first(where: { $0.id == work })?.session === original
       { await Task.yield() }
       if !editFinished { overlapped += 1 }
-      try await coordinators.remove(work)
+      try await coordinators.remove(coordinators.removal(work))
       try await editing.value
       try await Task.sleep(for: .milliseconds(150))
       let directory = ProfileDirectory(work, applicationSupport: root, caches: root)
@@ -1127,7 +1128,7 @@ func aFeedbackScreenshotAfterAnEditAndRemoveShowsOnlyTheCoordinatorLeft() async 
     var removeCalled = false
     let removing = Task { @MainActor in
       removeCalled = true
-      try await coordinators.remove(work)
+      try await coordinators.remove(coordinators.removal(work))
     }
     try await eventually("Remove called during the edit") { removeCalled }
     await gate.open()
@@ -1170,7 +1171,7 @@ func aTagForARenamedCoordinatorStaysBlockedOnceItIsRemoved() async throws {
     try await coordinators.update(
       work, name: TagName("Job"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
     #expect(chat.addressing == .blocked("No coordinator named Work"))
-    try await coordinators.remove(work)
+    try await coordinators.remove(coordinators.removal(work))
     #expect(coordinators.profiles.map(\.id) == [personal])
     #expect(chat.addressing == .blocked("No coordinator named Work"))
     #expect(!chat.canSend)
@@ -1200,7 +1201,9 @@ func aRemoveThatCannotSaveLeavesTheCoordinatorAndItsAlertsAsTheyWere() async thr
     let agent = root.appending(path: "Agent")
     try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: agent.path)
     var refusal: String?
-    do { try await coordinators.remove(work) } catch { refusal = error.localizedDescription }
+    do { try await coordinators.remove(coordinators.removal(work)) } catch {
+      refusal = error.localizedDescription
+    }
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: agent.path)
     #expect(refusal != nil, "The failed save is reported")
     #expect(coordinators.profiles.map(\.id) == [work, personal])
@@ -1244,7 +1247,7 @@ func aWithdrawalItsCoordinatorNeverConfirmedIsSentAgainOnTheNextActivation() asy
     let (work, personal) = try await addWorkAndPersonal(coordinators)
     try await eventually("Work enrolled") { registration.status(work).registered }
     await workFixture.dropNextNotificationRemoval()
-    try await coordinators.remove(work)
+    try await coordinators.remove(coordinators.removal(work))
     #expect(coordinators.profiles.map(\.id) == [personal])
     let directory = ProfileDirectory(work, applicationSupport: root, caches: root)
     #expect(!FileManager.default.fileExists(atPath: directory.root.path))
@@ -1278,7 +1281,7 @@ func aPendingWithdrawalIsDroppedOnceItsAddressAnswersAsAnotherCoordinator() asyn
     let (work, _) = try await addWorkAndPersonal(coordinators)
     try await eventually("Work enrolled") { registration.status(work).registered }
     await workFixture.dropNextNotificationRemoval()
-    try await coordinators.remove(work)
+    try await coordinators.remove(coordinators.removal(work))
     #expect(try savedWithdrawals(root) == ["\(work)"])
     await coordinators.setActive(false)
     await route.point(atPersonal: true)
@@ -1316,7 +1319,7 @@ func aWithdrawalReachesItsCoordinatorAtTheSavedAddressItNowAnswersAt() async thr
       coordinators.chat.laneError(work)?.hasPrefix("This address now answers as") == true
     }
     let before = await personalFixture.received().count
-    try await coordinators.remove(work)
+    try await coordinators.remove(coordinators.removal(work))
     await route.takePersonalsAddressDown(true)
     await coordinators.setActive(false)
     // Lets a dial Work's retired lane had started land first.
@@ -1374,7 +1377,9 @@ func anActivationDuringRemoveNeverReconnectsTheRemovedCoordinator() async throws
             text: "An invented Personal reply")
         ], nextCursor: nil, pageComplete: true), pages: [:])
     let activating = Task { @MainActor in await coordinators.setActive(true) }
-    let removing = Task { @MainActor in try await coordinators.remove(personal) }
+    let removing = Task { @MainActor in
+      try await coordinators.remove(coordinators.removal(personal))
+    }
     await activating.value
     try await removing.value
     let observesAtRemove = await observes(personalFixture)
@@ -1403,10 +1408,12 @@ func anActivationDuringRemoveNeverSendsTheMessageRemoveDeletes() async throws {
     await session.disconnect()
     #expect(await session.start(staged) == .started)
     #expect(
-      coordinators.removalMessage(personal)
+      coordinators.removal(personal).message
         == "This deletes 1 queued message on this phone.")
     let activating = Task { @MainActor in await coordinators.setActive(true) }
-    let removing = Task { @MainActor in try await coordinators.remove(personal) }
+    let removing = Task { @MainActor in
+      try await coordinators.remove(coordinators.removal(personal))
+    }
     await activating.value
     try await removing.value
     try await Task.sleep(for: .seconds(2))
@@ -2068,7 +2075,7 @@ func aControlDuringRemoveNamesTheRemovedCoordinatorItSkipped() async throws {
     let chat = coordinators.chat
     chat.draft = "/status"
     let sending = Task { @MainActor in await chat.send() }
-    let removing = Task { @MainActor in try await coordinators.remove(work) }
+    let removing = Task { @MainActor in try await coordinators.remove(coordinators.removal(work)) }
     await sending.value
     try await removing.value
     try await Task.sleep(for: .milliseconds(300))
@@ -2097,7 +2104,7 @@ func aMessageDuringRemoveNamesTheRemovedCoordinatorItDidNotReach() async throws 
     let text = "Invented: ship the quarterly report"
     chat.draft = text
     let sending = Task { @MainActor in await chat.send() }
-    let removing = Task { @MainActor in try await coordinators.remove(work) }
+    let removing = Task { @MainActor in try await coordinators.remove(coordinators.removal(work)) }
     await sending.value
     try await removing.value
     try await Task.sleep(for: .milliseconds(300))
@@ -2126,7 +2133,9 @@ func aMessageDuringRemoveOfItsSecondRecipientNamesIt() async throws {
     let text = "Invented: water the plants on Friday"
     chat.draft = text
     let sending = Task { @MainActor in await chat.send() }
-    let removing = Task { @MainActor in try await coordinators.remove(personal) }
+    let removing = Task { @MainActor in
+      try await coordinators.remove(coordinators.removal(personal))
+    }
     await sending.value
     try await removing.value
     try await Task.sleep(for: .milliseconds(300))
@@ -2163,7 +2172,7 @@ func aSendRemovedDuringItsIdentityProofNamesTheCoordinatorItDidNotReach(_ draft:
       await workFixture.identityHeld
     }
     try await eventually("Personal got it") { await personalFixture.count() == 1 }
-    try await coordinators.remove(work)
+    try await coordinators.remove(coordinators.removal(work))
     await workFixture.releaseIdentity()
     try await Task.sleep(for: .milliseconds(350))
     print("IF5-S1-C draft=\(draft) error=\(chat.error ?? "nil")")
@@ -2340,7 +2349,7 @@ func aCopyWhoseSessionRetiredDuringASendThatReachedNoOneIsNotKept(_ change: Stri
       ((try? queuedRequests(workDirectory.outbox)) ?? []).count == 1
     }
     if change == "Remove" {
-      try await coordinators.remove(work)
+      try await coordinators.remove(coordinators.removal(work))
     } else {
       await retiring.retire()
     }
@@ -2386,7 +2395,7 @@ func whatRemoveCutOffStaysNamedUntilTheNextSendWithOneCoordinatorLeft() async th
     let (work, personal) = try await addWorkAndPersonal(coordinators)
     let chat = coordinators.chat
     await personalFixture.refuseUploads()
-    print("IF6-T3 Remove's confirmation: \(coordinators.removalMessage(work))")
+    print("IF6-T3 Remove's confirmation: \(coordinators.removal(work).message)")
     await workFixture.holdNextIdentity()
     chat.draft = "Invented: the shared holiday budget"
     await chat.attach(
@@ -2399,7 +2408,7 @@ func whatRemoveCutOffStaysNamedUntilTheNextSendWithOneCoordinatorLeft() async th
     print(
       "IF6-T3 before Remove: composer error=\(chat.error ?? "nil") Personal lane=\(chat.snapshots[personal]?.error ?? "nil")"
     )
-    try await coordinators.remove(work)
+    try await coordinators.remove(coordinators.removal(work))
     await workFixture.releaseIdentity()
     print("IF6-T3 Remove returned: composer error=\(chat.error ?? "nil")")
     let report = "Work did not get this message. It was removed."
@@ -2493,7 +2502,7 @@ func aCoordinatorLeftAloneShowsItsCurrentErrorUnderTheComposer() async throws {
       chat.laneError(work) == "This address now answers as Personal. Edit Work's address."
     }
     #expect(chat.error == nil, "With two coordinators each error shows on its own lane's line")
-    try await coordinators.remove(personal)
+    try await coordinators.remove(coordinators.removal(personal))
     let atRemoval = chat.error
     await chat.reconnect(work)
     let afterAttempt = await within(6) {
@@ -3102,7 +3111,8 @@ func restoreDrawsAChipOnlyWhileTheComposerNamesRecipients() async throws {
 
     try await coordinators.add(
       name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
-    try await coordinators.remove(try #require(coordinators.profiles.last?.id))
+    try await coordinators.remove(
+      coordinators.removal(try #require(coordinators.profiles.last?.id)))
     await chat.restore(original.inputId)
     #expect(chat.shownChip == work, "Once one was removed, Restore shows its chip")
     #expect(chat.addressing == .to([work], body: text))

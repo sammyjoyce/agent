@@ -19,7 +19,7 @@ func send(_ data: Data, on connection: NWConnection) async throws {
 
 actor FixtureCoordinator {
   /// What this fixture answers `identify` with. Sessions pass it as their pin.
-  nonisolated let id = CoordinatorID(UUID())
+  nonisolated let id: CoordinatorID
   nonisolated let closedObservations: AsyncStream<Void>
   nonisolated let closedToolLookups: AsyncStream<Void>
   private let closedContinuation: AsyncStream<Void>.Continuation
@@ -46,7 +46,9 @@ actor FixtureCoordinator {
   private var historyRelease: CheckedContinuation<Void, Never>?
   private let historyObserved = AsyncStream<String>.makeStream()
   nonisolated var observedHistory: AsyncStream<String> { historyObserved.stream }
-  init() {
+  /// `id` answers as a coordinator an earlier launch saw.
+  init(id: CoordinatorID = CoordinatorID(UUID())) {
+    self.id = id
     let pair = AsyncStream<Void>.makeStream()
     closedObservations = pair.stream
     closedContinuation = pair.continuation
