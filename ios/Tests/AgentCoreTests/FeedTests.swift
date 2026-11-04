@@ -4230,3 +4230,98 @@ func aRefusedOriginalItsCoordinatorKeptReadsDeliveredOncePlaced() async throws {
     #expect(chat.snapshots[work]?.sends[item.sendID]?.progress == .placed)
   }
 }
+
+// MARK: - A copy that may have left the phone stays when its Send reaches no one
+
+/// Blocks the calling thread, so an actor running this holds every later call behind it.
+private func blockUntil(_ release: DispatchSemaphore) { release.wait() }
+private func signalled(_ semaphore: DispatchSemaphore) -> Bool {
+  semaphore.wait(timeout: .now()) == .success
+}
+extension CoordinatorSession {
+  /// Holds this session's actor until `release`, then drops its connection, so a stage queued
+  /// behind it finds the lane down. It is a test-only barrier and changes no saved state.
+  fileprivate func dropOnceReleased(entered: DispatchSemaphore, release: DispatchSemaphore) async {
+    entered.signal()
+    blockUntil(release)
+    await disconnect()
+  }
+}
+
+/// A Send to both saves Work's copy while Personal's actor is held. An edit of Work's address to
+/// another address of Work replaces Work's session, and the next session shows the copy
+/// unconfirmed. Check / retry writes it there, and Work accepts it. With `anotherEdit`, a second
+/// edit replaces that session too. Personal then drops before its copy is saved, so the Send
+/// reaches no one and withdraws Work's copy. Work may hold it, so the phone keeps it queued and in
+/// the feed, and reads it delivered once Work places it.
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true])
+func aCopyCheckRetrySentDuringASendThatReachedNoOneStaysAfterAnyEdits(_ anotherEdit: Bool)
+  async throws
+{
+  try await withTwoFixtures { coordinators, workFixture, _, root in
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let personalSession = try #require(chat.lanes.first { $0.id == personal }?.session)
+    let workOutbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
+    let entered = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    defer { release.signal() }
+    let dropping = Task.detached {
+      await personalSession.dropOnceReleased(entered: entered, release: release)
+    }
+    try await eventually("Personal's actor held") { signalled(entered) }
+    let text = "Invented invitation for both"
+    chat.draft = text
+    let sending = Task { await chat.send() }
+    try await eventually("Work saved its copy") {
+      ((try? queuedRequests(workOutbox)) ?? []).count == 1
+    }
+    let input = try #require(try queuedRequests(workOutbox).first?.inputId)
+    await workFixture.holdPlacements()
+    try await coordinators.update(
+      work, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4003))
+    try await eventually("Work's next session offers Check / retry") {
+      chat.snapshots[work]?.connection == .connected
+        && chat.snapshots[work]?.rows.contains { $0.inputID == input && $0.delivery == .uncertain }
+          == true
+    }
+    await chat.retry(input)
+    try await eventually("Work accepted the checked copy") {
+      chat.snapshots[work]?.rows.contains { $0.inputID == input && $0.delivery == .saved } == true
+    }
+    if anotherEdit {
+      try await coordinators.update(
+        work, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4004))
+      try await eventually("Work's next session saw the acceptance") {
+        chat.snapshots[work]?.connection == .connected
+          && chat.snapshots[work]?.rows.contains { $0.inputID == input && $0.delivery == .saved }
+            == true
+      }
+    }
+    try #require(chat.admitting, "The Send was still waiting for Personal")
+    release.signal()
+    await dropping.value
+    await sending.value
+    let queued = ((try? queuedRequests(workOutbox)) ?? []).map(\.inputId)
+    print(
+      "IF12-1[anotherEdit=\(anotherEdit)] after the Send: error=\(chat.error ?? "nil") draftKept=\(chat.draft == text) Work got=\(await workFixture.count()) Work's outbox=\(queued.count)"
+    )
+    try #require(queued == [input], "Work's accepted copy was withdrawn as never sent")
+    try await workFixture.finishTurn()
+    await chat.reconnect(work)
+    @MainActor func receipts() -> [String] {
+      chat.rows.filter { $0.row.text == text }.flatMap { row in
+        row.receipts.map { $0.line(chat.name($0.lane)) }
+      }
+    }
+    try await eventually("Work placed it") { receipts().contains("Work · Delivered") }
+    let bubbles = chat.rows.filter { $0.row.text == text }.count
+    let atWork = await workFixture.count()
+    print(
+      "IF12-1[anotherEdit=\(anotherEdit)] once Work placed it: bubbles=\(bubbles) receipts=\(receipts()) Work got=\(atWork)"
+    )
+    #expect(bubbles == 1)
+    #expect(try queuedRequests(workOutbox).isEmpty)
+    #expect(atWork == 1, "Sent once")
+  }
+}

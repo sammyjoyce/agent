@@ -17,6 +17,10 @@ private struct CoordinatorRejection: LocalizedError {
   var errorDescription: String? { message }
 }
 
+private struct OutboxNotSaved: LocalizedError {
+  var errorDescription: String? { "The on-device outbox could not be saved. Nothing was sent." }
+}
+
 /// A notification control's answer: one status, then `done`.
 func notificationStatus(on stream: VerifiedConnection) async throws -> NotificationStatus {
   var status: NotificationStatus?
@@ -133,14 +137,13 @@ public actor CoordinatorSession {
   private var loaded = false
   private enum Unsent { case staged, waiting }
   /// Durable inputs this session staged that have not left the phone. A staged one can be
-  /// unstaged, as can an inherited one. A started one waits for this lane to connect, then sends
-  /// once.
+  /// unstaged, as can an inherited one no session has written. A started one waits for this lane to
+  /// connect, then sends once.
   private var unsent: [String: Unsent] = [:]
   /// Exchanges that have not written their input to the coordinator yet, by action. `started` is
   /// the input a Send started, and nil for Check / retry of a queued one.
   private var unwritten: [(action: UUID, inputID: String, started: StagedInput?)] = []
-  private var attemptedInputs: Set<String> = []
-  /// Inputs this session found in its outbox and has not written to its coordinator since.
+  /// Inputs this session found in its outbox, rather than staged itself.
   private var inherited: Set<String> = []
   /// Set for good by `retire`. A retired session never connects, sends or writes again.
   private var retired = false
@@ -189,9 +192,8 @@ public actor CoordinatorSession {
     // The outbox belongs to this profile and every socket proves its pinned coordinator,
     // so these IDs reach only the coordinator they were queued for.
     for item in pending {
-      let mayHaveLeft = unsent[item.request.inputId] == nil
-      if mayHaveLeft { attemptedInputs.insert(item.request.inputId) }
-      transcript.pending(item.request, delivery: mayHaveLeft ? unanswered(item) : .sending)
+      let sending = unsent[item.request.inputId] != nil
+      transcript.pending(item.request, delivery: sending ? .sending : unanswered(item))
     }
     stampRows()
     snapshot.error = nil
@@ -337,7 +339,8 @@ public actor CoordinatorSession {
     }
     pending.append(
       OutboxItem(
-        request: request, sendID: sendID, recipients: recipients, queuedAt: stamps.next()))
+        request: request, sendID: sendID, recipients: recipients, queuedAt: stamps.next(),
+        staged: true))
     do { try saveOutbox() } catch {
       pending.removeLast()
       await removeFiles(adopted).value
@@ -383,9 +386,9 @@ public actor CoordinatorSession {
 
   /// Withdraws a staged input that never started: its outbox item, its row, and the stored
   /// files no other item uses. When an address edit retired the session that staged it, this
-  /// session holds the item and withdraws it too, unless this session wrote it since. Returns
-  /// false, withdrawing nothing, once this session is retired, since its outbox is then the
-  /// profile's next session's or deleted.
+  /// session holds the item and withdraws it too, while its saved staged mark says no session has
+  /// written it. Returns false, withdrawing nothing, once this session is retired, since its outbox
+  /// is then the profile's next session's or deleted.
   @discardableResult public func unstage(_ staged: StagedInput) async -> Bool {
     guard staged.profile == profile else { return true }
     guard !retired else { return false }
@@ -394,7 +397,7 @@ public actor CoordinatorSession {
     case .waiting: return true
     case nil:
       guard loadOutbox(), inherited.contains(staged.inputID),
-        pending.contains(where: { $0.request.inputId == staged.inputID })
+        pending.contains(where: { $0.request.inputId == staged.inputID && $0.staged == true })
       else { return true }
       for attempt in unwritten where attempt.inputID == staged.inputID {
         actions[attempt.action]?.cancel()
@@ -717,12 +720,7 @@ public actor CoordinatorSession {
       }
       try Task.checkCancellation()
       guard self.generation == generation else { throw CancellationError() }
-      if let inputID {
-        // Cleared before the write, so a refusal never stands once the input may have left.
-        mark(inputID, refused: false)
-        attemptedInputs.insert(inputID)
-        inherited.remove(inputID)
-      }
+      if let inputID { try markLeaving(inputID) }
       unwritten.removeAll { $0.action == id }
       try await timedSend(stream, request)
       while !Task.isCancelled {
@@ -757,7 +755,7 @@ public actor CoordinatorSession {
       failed = true
       if self.generation == generation && !Task.isCancelled {
         if let inputID, let item = pending.first(where: { $0.request.inputId == inputID }) {
-          let mayHaveLeft = attemptedInputs.contains(inputID)
+          let mayHaveLeft = item.staged != true
           transcript.delivery(inputID, mayHaveLeft ? unanswered(item) : .rejected)
           if !mayHaveLeft { mark(inputID, refused: true) }
         }
@@ -1197,10 +1195,11 @@ public actor CoordinatorSession {
     }
     continuation.yield(snapshot)
   }
-  /// How a queued item that may have left the phone reads until its coordinator answers about it.
+  /// How a queued item this session is not sending reads until its coordinator answers about it.
   /// Once the coordinator accepted it, it reads Saved. While a refusal is the coordinator's latest
   /// word it stays refused, so Restore and Discard stay offered. Otherwise it is unconfirmed, for
-  /// Check / retry.
+  /// Check / retry, even while still staged, since only Check / retry sends a staged item that a
+  /// killed app or a retired session left behind.
   private func unanswered(_ item: OutboxItem) -> Delivery {
     item.accepted == true ? .saved : item.refused == true ? .rejected : .uncertain
   }
@@ -1236,6 +1235,25 @@ public actor CoordinatorSession {
     }
     return .withdrawn
   }
+  /// Records, before an input's submit is written, that it may leave the phone, so no refusal
+  /// stands and it is no longer staged. A session that reads it staged withdraws it, so that mark
+  /// goes only with a saved outbox, and this throws, writing nothing, when the save fails. A refusal
+  /// on an item no longer staged is cleared as `mark` clears it, in memory if the save fails.
+  private func markLeaving(_ inputID: String) throws {
+    guard let index = pending.firstIndex(where: { $0.request.inputId == inputID }),
+      pending[index].staged == true
+    else {
+      mark(inputID, refused: false)
+      return
+    }
+    let item = pending[index]
+    pending[index].staged = nil
+    pending[index].refused = nil
+    do { try saveOutbox() } catch {
+      pending[index] = item
+      throw OutboxNotSaved()
+    }
+  }
   /// Removes an item from the outbox. Returns the removal of its files, or nil when the outbox
   /// could not be saved and the item stays.
   @discardableResult private func acknowledge(_ inputID: String) -> Task<Void, Never>? {
@@ -1249,7 +1267,6 @@ public actor CoordinatorSession {
       snapshot.error = "The saved outbox could not be updated. Original files were preserved."
       return nil
     }
-    attemptedInputs.remove(inputID)
     return removeFiles(completed)
   }
   /// Deletes stored copies that no queued item still uses.
