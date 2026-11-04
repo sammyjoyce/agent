@@ -480,8 +480,7 @@ extension Coordinators {
         host: host, into: &saved, held: adopted, defaults: defaults,
         applicationSupport: applicationSupport, caches: caches, crash: crash)
     }
-    // migratingHeldQueue: the queue the build before this one moves this outbox into, should it
-    // launch before this migration finishes. It reads no queue's record.
+    // migratingHeldQueue: where the build before this one named a queue it was moving.
     for key in ["coordinatorPort", "notificationInstallationID", "migratingHeldQueue"] {
       defaults.removeObject(forKey: key)
     }
@@ -637,7 +636,6 @@ extension Coordinators {
       let outbox = legacyOutbox(for: address, applicationSupport: applicationSupport)
       if FileManager.default.fileExists(atPath: outbox.path) {
         queue = try HeldQueue.name(outbox, as: queue, applicationSupport: applicationSupport)
-        defaults.set(queue.id.uuidString, forKey: "migratingHeldQueue")
       } else if let installation = queue.installation,
         !carries(installation, held: held, saved: saved)
       {
