@@ -141,8 +141,9 @@ Mode if requested, then Run.
   addressed to its own coordinator. Text you type or files you attach while it
   copies the files stay, after the restored message. If you pick another
   coordinator meanwhile, Restore leaves your draft alone. The app removes the
-  original only when you send the restored message unchanged, with the same text
-  and every restored file, and only while its coordinator still refuses it.
+  original only when you send the restored message unchanged to its coordinator,
+  with the same text and every restored file, and only while its coordinator
+  still refuses it.
   Once you clear the composer, the original stays even if you send the same
   text again, typed, pasted or put back by Undo. If
   you send something else instead, the original stays and still needs
@@ -159,7 +160,8 @@ Mode if requested, then Run.
   queued. That build never recorded their coordinator, so they may already have
   been delivered. The app never sends them. **Restore to composer** makes a new
   message for you to send, and **Discard** deletes one. A held message leaves
-  the hold only when you send its restored copy unchanged, or discard it.
+  the hold only when you send its restored copy unchanged to its coordinator,
+  or discard it.
 - Do not restore an uncertain submission as a new message to bypass checking its
   original ID. Coordinator admission may already have succeeded.
 - Use the **+** menu for files, photos, commands and delivery mode, or drop files

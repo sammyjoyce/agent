@@ -2872,12 +2872,12 @@ func aHeldMessageRestoredWithOneCoordinatorStaysItsOnceAnotherIsAdded() async th
   }
 }
 
-/// The single-address build left a queue for a coordinator that is not updated yet, so the
-/// migrated profile stays unpaired. The user restores its held message, then adds Personal, which
-/// is up to date. The message stays the migrated coordinator's: Send is blocked because it is not
-/// paired, and the message stays in its hold.
-@MainActor @Test(.timeLimit(.minutes(1)))
-func aHeldMessageOfAnUnpairedCoordinatorStaysItsOnceAnotherIsAdded() async throws {
+/// The single-address build left a queue, a message with a file, for a coordinator that is not
+/// updated yet, so the migrated profile stays unpaired. The body gets the profile, Personal's
+/// fixture, at port 4002, and the held message's text once the message shows and pairing failed.
+@MainActor private func withAnUnpairedHeldMessage(
+  _ body: (Coordinators, CoordinatorProfile, FixtureCoordinator, String) async throws -> Void
+) async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
   let support = root.appending(path: "Support")
@@ -2926,6 +2926,21 @@ func aHeldMessageOfAnUnpairedCoordinatorStaysItsOnceAnotherIsAdded() async throw
   do {
     try await eventually("the held message shows") { !chat.held.isEmpty }
     try await eventually("pairing refused") { coordinators.pairingError[migrated.id] != nil }
+    try await body(coordinators, migrated, personalFixture, text)
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
+/// The user restores the held message of the unpaired migrated coordinator, then adds Personal,
+/// which is up to date. The message stays the migrated coordinator's: Send is blocked because it
+/// is not paired, and the message stays in its hold.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aHeldMessageOfAnUnpairedCoordinatorStaysItsOnceAnotherIsAdded() async throws {
+  try await withAnUnpairedHeldMessage { coordinators, migrated, personalFixture, text in
+    let chat = coordinators.chat
     await chat.restoreHeld(try #require(chat.held.first))
     print(
       "IF6-T1[unpaired] restored: recipient=\(chat.recipient.map(chat.name) ?? "none") chip=\(chat.shownChip.map(chat.name) ?? "none") draft=\(chat.draft) files=\(chat.attachments.map(\.reference.name)) canSend=\(chat.canSend)"
@@ -2951,11 +2966,43 @@ func aHeldMessageOfAnUnpairedCoordinatorStaysItsOnceAnotherIsAdded() async throw
     #expect(got.isEmpty, "A message held for the migrated coordinator reached Personal")
     #expect(await personalFixture.uploadCount() == 0)
     #expect(chat.held.map(\.item.text) == [text], "It stays in its hold")
-  } catch {
-    await stop()
-    throw error
   }
-  await stop()
+}
+
+/// The same held message, restored with Personal added. The user removes its chip, so the line
+/// reads "To Personal", since the migrated coordinator is not paired, and sends it. Personal gets
+/// it, as the line said. The migrated coordinator never did, so its message stays in its hold.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aHeldMessageSentWithoutItsUnpairedCoordinatorStaysHeld() async throws {
+  try await withAnUnpairedHeldMessage { coordinators, migrated, personalFixture, text in
+    let chat = coordinators.chat
+    await chat.restoreHeld(try #require(chat.held.first))
+    try await coordinators.add(
+      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+    let personal = try #require(coordinators.profiles.last?.id)
+    try await eventually("Personal connected") {
+      chat.snapshots[personal]?.connection == .connected
+    }
+    // The chip's ⓧ, whose hint reads "Removes the recipient, so the message goes to every
+    // coordinator."
+    chat.recipient = nil
+    print(
+      "IF10-1 before Send: line=\(chat.recipientLine) canSend=\(chat.canSend) draft=\(chat.draft.debugDescription)"
+    )
+    #expect(chat.recipientLine == "To Personal" && chat.canSend)
+    await chat.send()
+    try await eventually("Personal got it") { await personalFixture.count() == 1 }
+    try await Task.sleep(for: .milliseconds(300))
+    let hold = try #require(chat.lanes.first { $0.id == migrated.id }?.hold)
+    let heldForMigrated = try await hold.items().map(\.text)
+    let got = await submits(personalFixture).map(\.text)
+    print(
+      "IF10-1 after Send: Personal=\(got) heldFor\(migrated.name)=\(heldForMigrated) modelHeld=\(chat.held.map(\.item.text))"
+    )
+    #expect(got == [text], "Personal did not get what the line named it for")
+    #expect(heldForMigrated == [text], "The held message left the hold its coordinator never got")
+    #expect(chat.held.map(\.item.text) == [text], "The held row is gone")
+  }
 }
 
 // MARK: - A recipient's status follows its coordinator's latest word
@@ -3572,7 +3619,7 @@ func undoingTheEmptyingOfARestoredDraftKeepsItLiteral(_ emptied: String) async t
   }
 }
 
-// MARK: - A restored source leaves only when a Send carries it unchanged, or by Discard
+// MARK: - A restored source leaves only when its coordinator gets it unchanged, or by Discard
 
 /// `inputID`'s item in the outbox, if it is still queued. One still marked refused can be withdrawn
 /// by Discard or by a Send that carries its restored copy unchanged.
