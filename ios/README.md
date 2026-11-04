@@ -48,9 +48,11 @@ Main-chat alerts require the one-time [APNs setup](../docs/notifications.md).
 They start enabled: allow the notification prompt on first opening, then connect
 to register automatically. Disable **Main-chat updates** in Connection anytime.
 After an update from a build without saved coordinators, the app withdraws that
-build's alert registration once the coordinator it used pairs, whatever the
-toggle says. That coordinator then alerts this device only through the saved
-coordinator's own registration, and only while alerts are on. Until the
+build's alert registration once a saved coordinator pairs at the address that
+build used, whatever the toggle says. That coordinator then alerts this device
+only through the saved coordinator's own registration, and only while alerts
+are on. A coordinator paired at another address is never sent the withdrawal,
+since the phone cannot tell whether it is the one that build used. Until the
 coordinator confirms, the app sends the withdrawal again each time it becomes
 active.
 **Connection → Appearance** follows the system by default. Choose **Light** or
@@ -153,7 +155,9 @@ Mode if requested, then Run.
   addresses, the line names it and asks you to edit the address, which keeps
   the queue. An address edit that reaches a different coordinator saves
   nothing, and the form names the coordinator saved at that address, if there
-  is one.
+  is one. With two or more coordinators, each one's error shows on its own
+  line above the feed. With one, its error shows under the feed, beside any
+  error of the composer's own, and only while it lasts.
 - Transient network loss reconnects automatically. Suspension releases owned
   connections. Returning reconnects and reconciles
   the original input IDs. Uncertain writes are never automatically replayed.
@@ -178,11 +182,16 @@ Mode if requested, then Run.
   you send the copy is cancelled. Each connection asks the coordinator about
   every queued message and the newest withdrawn originals, 32 in all.
 - The top of the chat holds messages that a build without saved coordinators
-  queued. That build never recorded their coordinator, so they may already have
-  been delivered. The app never sends them. **Restore to composer** makes a new
-  message for you to send, and **Discard** deletes one. A held message leaves
-  the hold only when you send its restored copy unchanged to its coordinator,
-  or discard it.
+  queued for the coordinator at its address. That build never recorded which
+  coordinator answered there, so they may already have been delivered. The app
+  never sends them. **Restore to composer** makes a new message for you to send,
+  addressed to the saved coordinator paired at that address. Until one is,
+  Restore asks which paired coordinator gets it. **Discard** deletes a held
+  message. A held message leaves the hold only when you send its restored copy
+  unchanged to the coordinator paired at its address, or discard it. If a saved
+  coordinator's held messages cannot be read, the
+  chat says so for as long as that coordinator is saved and its last read
+  failed, whatever the other coordinators' reads found.
 - Do not restore an uncertain submission as a new message to bypass checking its
   original ID. Coordinator admission may already have succeeded.
 - Use the **+** menu for files, photos, commands and delivery mode, or drop files

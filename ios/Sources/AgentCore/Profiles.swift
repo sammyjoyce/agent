@@ -97,23 +97,11 @@ public struct CoordinatorProfile: Codable, Sendable, Identifiable, Equatable {
   public var address: CoordinatorAddress
   /// The coordinator every socket must reach. `nil` until paired. Set once, by `admit`.
   public internal(set) var pin: CoordinatorID?
-  /// The single-address build's alert installation, on the profile migrated from that build. Its
-  /// coordinator may still hold it, and only a socket that proves the pin may carry it, so it
-  /// waits here until pairing.
-  public internal(set) var inherited: InstallationID?
 
-  public init(name: TagName, address: CoordinatorAddress, inherited: InstallationID? = nil) {
+  public init(name: TagName, address: CoordinatorAddress) {
     id = ProfileID()
     self.name = name
     self.address = address
-    self.inherited = inherited
-  }
-
-  /// Once paired, hands over the inherited installation as a withdrawal over the pin.
-  public mutating func takeInheritedWithdrawal() -> PendingWithdrawal? {
-    guard let pin, let inherited else { return nil }
-    self.inherited = nil
-    return PendingWithdrawal(installation: inherited, address: address, pin: pin)
   }
 
   /// The pairing decision after `identifyCoordinator(at:)`. Returns true when it pinned the
@@ -143,6 +131,35 @@ public struct CoordinatorProfile: Codable, Sendable, Identifiable, Equatable {
     }) {
       throw ProfileError.duplicateName(other.name.description)
     }
+  }
+}
+
+/// What the single-address build left for the coordinator at its address: the messages it queued,
+/// held in the migrated profile's directory, and its alert installation. The build never learned
+/// that coordinator's ID, so both belong to the coordinator a saved profile pairs with at
+/// `address`, whichever profile that is, and not to the migrated profile wherever it points.
+public struct LegacyOrigin: Codable, Sendable, Equatable {
+  public let address: CoordinatorAddress
+  /// The coordinator a saved profile paired with at `address`, once one has.
+  public private(set) var coordinator: CoordinatorID?
+  /// The build's alert installation, until that pairing hands it over as a withdrawal.
+  public private(set) var installation: InstallationID?
+
+  public init(address: CoordinatorAddress, installation: InstallationID?) {
+    self.address = address
+    self.installation = installation
+  }
+
+  /// Records `found` as this origin's coordinator when it is the first a saved profile pairs with at
+  /// `address`, and returns the installation's withdrawal to it there. Anywhere else, or later,
+  /// changes nothing.
+  public mutating func pair(_ found: CoordinatorID, at address: CoordinatorAddress)
+    -> PendingWithdrawal?
+  {
+    guard address == self.address, coordinator == nil else { return nil }
+    coordinator = found
+    defer { installation = nil }
+    return installation.map { PendingWithdrawal(installation: $0, address: address, pin: found) }
   }
 }
 
