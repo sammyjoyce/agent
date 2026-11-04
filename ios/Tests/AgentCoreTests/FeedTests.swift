@@ -2927,12 +2927,12 @@ func aHeldMessageRestoredWithOneCoordinatorStaysItsOnceAnotherIsAdded() async th
   }
 }
 
-/// The single-address build left a queue for a coordinator that is not updated yet, so the
-/// migrated profile stays unpaired. The user restores its held message, then adds Personal, which
-/// is up to date. The message stays the migrated coordinator's: Send is blocked because it is not
-/// paired, and the message stays in its hold.
-@MainActor @Test(.timeLimit(.minutes(1)))
-func aHeldMessageOfAnUnpairedCoordinatorStaysItsOnceAnotherIsAdded() async throws {
+/// The single-address build left a queue, a message with a file, for a coordinator that is not
+/// updated yet, so the migrated profile stays unpaired. The body gets the profile, Personal's
+/// fixture, at port 4002, and the held message's text once the message shows and pairing failed.
+@MainActor private func withAnUnpairedHeldMessage(
+  _ body: (Coordinators, CoordinatorProfile, FixtureCoordinator, String) async throws -> Void
+) async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
   let support = root.appending(path: "Support")
@@ -2981,6 +2981,21 @@ func aHeldMessageOfAnUnpairedCoordinatorStaysItsOnceAnotherIsAdded() async throw
   do {
     try await eventually("the held message shows") { !chat.held.isEmpty }
     try await eventually("pairing refused") { coordinators.pairingError[migrated.id] != nil }
+    try await body(coordinators, migrated, personalFixture, text)
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
+/// The user restores the held message of the unpaired migrated coordinator, then adds Personal,
+/// which is up to date. The message stays the migrated coordinator's: Send is blocked because it
+/// is not paired, and the message stays in its hold.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aHeldMessageOfAnUnpairedCoordinatorStaysItsOnceAnotherIsAdded() async throws {
+  try await withAnUnpairedHeldMessage { coordinators, migrated, personalFixture, text in
+    let chat = coordinators.chat
     await chat.restoreHeld(try #require(chat.held.first))
     print(
       "IF6-T1[unpaired] restored: recipient=\(chat.recipient.map(chat.name) ?? "none") chip=\(chat.shownChip.map(chat.name) ?? "none") draft=\(chat.draft) files=\(chat.attachments.map(\.reference.name)) canSend=\(chat.canSend)"
@@ -3006,11 +3021,43 @@ func aHeldMessageOfAnUnpairedCoordinatorStaysItsOnceAnotherIsAdded() async throw
     #expect(got.isEmpty, "A message held for the migrated coordinator reached Personal")
     #expect(await personalFixture.uploadCount() == 0)
     #expect(chat.held.map(\.item.text) == [text], "It stays in its hold")
-  } catch {
-    await stop()
-    throw error
   }
-  await stop()
+}
+
+/// The same held message, restored with Personal added. The user removes its chip, so the line
+/// reads "To Personal", since the migrated coordinator is not paired, and sends it. Personal gets
+/// it, as the line said. The migrated coordinator never did, so its message stays in its hold.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aHeldMessageSentWithoutItsUnpairedCoordinatorStaysHeld() async throws {
+  try await withAnUnpairedHeldMessage { coordinators, migrated, personalFixture, text in
+    let chat = coordinators.chat
+    await chat.restoreHeld(try #require(chat.held.first))
+    try await coordinators.add(
+      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+    let personal = try #require(coordinators.profiles.last?.id)
+    try await eventually("Personal connected") {
+      chat.snapshots[personal]?.connection == .connected
+    }
+    // The chip's ⓧ, whose hint reads "Removes the recipient, so the message goes to every
+    // coordinator."
+    chat.recipient = nil
+    print(
+      "IF10-1 before Send: line=\(chat.recipientLine) canSend=\(chat.canSend) draft=\(chat.draft.debugDescription)"
+    )
+    #expect(chat.recipientLine == "To Personal" && chat.canSend)
+    await chat.send()
+    try await eventually("Personal got it") { await personalFixture.count() == 1 }
+    try await Task.sleep(for: .milliseconds(300))
+    let hold = try #require(chat.lanes.first { $0.id == migrated.id }?.hold)
+    let heldForMigrated = try await hold.items().map(\.text)
+    let got = await submits(personalFixture).map(\.text)
+    print(
+      "IF10-1 after Send: Personal=\(got) heldFor\(migrated.name)=\(heldForMigrated) modelHeld=\(chat.held.map(\.item.text))"
+    )
+    #expect(got == [text], "Personal did not get what the line named it for")
+    #expect(heldForMigrated == [text], "The held message left the hold its coordinator never got")
+    #expect(chat.held.map(\.item.text) == [text], "The held row is gone")
+  }
 }
 
 // MARK: - A recipient's status follows its coordinator's latest word
@@ -3573,15 +3620,15 @@ func aRestoredDraftEditedWhileItsSendCopiesStaysLiteral() async throws {
 }
 
 /// Work refuses a message whose text starts with "@Personal", and the user restores it and removes
-/// its chip. The user empties the composer, deleting the text in the field and then the restored
-/// file if there is one, and undoes the deletion. The field puts the text back still marked as
-/// Work's restored text, so the draft is restored again. Its text stays literal, the line reads
-/// "To Work and Personal" and both coordinators get the text as written. Emptying the composer
-/// ended the original's withdrawal, so the original stays queued for Discard.
+/// its chip. The user empties the composer, deleting the text and then the restored file if there
+/// is one. That ends the restored draft, and the field's Undo never reaches back past it. The
+/// original stays queued and still needs attention, so the user restores it again. Its text is
+/// literal again, and with the chip removed both coordinators get it as written, which withdraws
+/// the original.
 @MainActor @Test(.timeLimit(.minutes(1)), arguments: ["its text", "its text, then its file"])
-func undoingTheEmptyingOfARestoredDraftKeepsItLiteral(_ emptied: String) async throws {
+func anEmptiedRestoredDraftLeavesItsOriginalToRestoreAgain(_ emptied: String) async throws {
   try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
-    let (work, _) = try await addWorkAndPersonal(coordinators)
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
     let chat = coordinators.chat
     let text = "@Personal invented: forward Work's board deck to the auditors"
     let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
@@ -3602,32 +3649,42 @@ func undoingTheEmptyingOfARestoredDraftKeepsItLiteral(_ emptied: String) async t
       await chat.restore(original.inputId)
     }
     chat.recipient = nil
-    // As the field reports them: emptied text carries no mark, and Undo's text carries Work's.
-    chat.edit("", restoredFrom: nil)
+    chat.draft = ""
     chat.promoteTypedTag()
     for file in chat.attachments { await chat.removeAttachment(file) }
-    chat.edit(text, restoredFrom: work)
+    let kept = try queuedItem(outbox, original.inputId)
+    print(
+      "IF10-2[\(emptied)] emptied: restoredFrom=\(chat.restoredFrom.map(chat.name) ?? "none") recipient=\(chat.recipient.map(chat.name) ?? "none") originalQueued=\(kept != nil) refused=\(kept?.refused == true)"
+    )
+    #expect(chat.restoredFrom == nil && chat.recipient == nil)
+    #expect(kept?.refused == true, "The original no longer needs attention")
+    await workFixture.acceptUploads()
+    await chat.restore(original.inputId)
+    chat.recipient = nil
     chat.promoteTypedTag()
     print(
-      "IF9-Y2[\(emptied)] after Undo: chip=\(chat.recipient.map(chat.name) ?? "none") line=\(chat.recipientLine) draft=\(chat.draft.debugDescription) files=\(chat.attachments.count)"
+      "IF10-2[\(emptied)] restored again: line=\(chat.recipientLine) draft=\(chat.draft.debugDescription) files=\(chat.attachments.count)"
     )
-    #expect(chat.recipient == nil && chat.draft == text && chat.attachments.isEmpty)
-    #expect(chat.recipientLine == "To Work and Personal")
+    #expect(chat.addressing == .to([work, personal], body: text))
+    try await eventually("both connected") { chat.canSend }
     await chat.send()
-    _ = await within(3) { await workFixture.count() + personalFixture.count() == 2 }
+    _ = await within(3) {
+      await submits(workFixture).filter { $0.inputId != original.inputId }.count
+        + personalFixture.count() == 2
+    }
     try await Task.sleep(for: .milliseconds(300))
     let atWork = await submits(workFixture).filter { $0.inputId != original.inputId }.map(\.text)
     let atPersonal = await submits(personalFixture).map(\.text)
     let originalQueued = try queuedRequests(outbox).contains { $0.inputId == original.inputId }
     print(
-      "IF9-Y2[\(emptied)] wire: Work=\(atWork) Personal=\(atPersonal) originalQueued=\(originalQueued)"
+      "IF10-2[\(emptied)] wire: Work=\(atWork) Personal=\(atPersonal) originalQueued=\(originalQueued)"
     )
     #expect(atWork == [text] && atPersonal == [text])
-    #expect(originalQueued, "Emptying the composer ended the withdrawal, yet the original went")
+    #expect(!originalQueued, "The copy went unchanged to Work, yet the original stays")
   }
 }
 
-// MARK: - A restored source leaves only when a Send carries it unchanged, or by Discard
+// MARK: - A restored source leaves only when its coordinator gets it unchanged, or by Discard
 
 /// `inputID`'s item in the outbox, if it is still queued. One still marked refused can be withdrawn
 /// by Discard or by a Send that carries its restored copy unchanged.
