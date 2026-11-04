@@ -219,7 +219,7 @@ func anIdentityFrameAfterThePreambleFailsTheSocketClosed() async throws {
   #expect(try CoordinatorProfile.admit(work, for: first, in: &profiles))
   #expect(profiles[0].pin == work)
   #expect(try !CoordinatorProfile.admit(work, for: first, in: &profiles), "Same coordinator")
-  #expect(throws: ConnectionError.wrongCoordinator) {
+  #expect(throws: ProfileError.differentCoordinator) {
     try CoordinatorProfile.admit(personal, for: first, in: &profiles)
   }
   #expect(profiles[0].pin == work, "A pin never changes")
@@ -227,9 +227,17 @@ func anIdentityFrameAfterThePreambleFailsTheSocketClosed() async throws {
     try CoordinatorProfile.admit(work, for: second, in: &profiles)
   }
   #expect(profiles[1].pin == nil)
+  #expect(try CoordinatorProfile.admit(personal, for: second, in: &profiles))
+  #expect(throws: ProfileError.duplicateCoordinator(savedAs: "Personal")) {
+    try CoordinatorProfile.admit(personal, for: first, in: &profiles)
+  }
+  #expect(profiles[0].pin == work, "An edit to another saved coordinator changes no pin")
   #expect(
     ProfileError.duplicateCoordinator(savedAs: "Work").localizedDescription
       == "Already saved as Work.")
+  #expect(
+    ProfileError.differentCoordinator.localizedDescription
+      == "This address answers as a different coordinator. Nothing was saved.")
 }
 
 @Test func coordinatorNamesAreTagsThatStayUniqueIgnoringCase() throws {
