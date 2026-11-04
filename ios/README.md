@@ -109,7 +109,9 @@ Mode if requested, then Run.
   this way with one coordinator left, until the app quits.
   A message to several coordinators is saved
   in each one's outbox under its own input ID before any of them is sent. If
-  one refuses it, none keeps it and the draft stays. Its bubble reads "To Work
+  one refuses it, none keeps it and the draft stays, except a copy that
+  **Check / retry** already sent. That copy stays queued, since its
+  coordinator may have it. The message's bubble reads "To Work
   and Personal" once every recipient has it. Otherwise it shows each
   coordinator's delivery with its own **Check / retry**, or **Restore** and
   **Discard**. A
@@ -136,7 +138,9 @@ Mode if requested, then Run.
 - Every connection first asks for the coordinator's ID and writes nothing else
   unless the ID matches the saved one. A coordinator too old to answer shows
   "Update the coordinator". If the address now answers as a different
-  coordinator, the queue stays on the phone. Both cases keep retrying.
+  coordinator, the queue stays on the phone. Both cases keep retrying. An
+  address edit that reaches a different coordinator saves nothing, and the
+  form names the coordinator saved at that address, if there is one.
 - Transient network loss reconnects automatically. Suspension releases owned
   connections. Returning reconnects and reconciles
   the original input IDs. Uncertain writes are never automatically replayed.

@@ -36,9 +36,14 @@ struct OutboxItem: Codable, Equatable, Sendable {
   /// as when its upload was refused. It stays until its submit is written again or the coordinator
   /// reports it accepted or placed. Absent otherwise. Only a refused item may be withdrawn.
   var refused: Bool?
+  /// true from `stage` until a session first writes its submit. It is removed, and the outbox saved,
+  /// before that write, so every later session knows whether the input may have left the phone.
+  /// Only a staged item can be unstaged. An item without it may have left, as may every item an
+  /// older build saved.
+  var staged: Bool?
 
   enum CodingKeys: String, CodingKey {
-    case request, recipients, refused
+    case request, recipients, refused, staged
     case sendID = "send_id"
     case queuedAt = "queued_at"
   }
