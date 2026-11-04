@@ -2571,38 +2571,44 @@ func thePreviousBuildRewritingProfilesJSONKeepsEveryHeldMessageAndInstallation()
 /// before it deletes anything. This copies what that build does, so it changes only if that build's
 /// source does, which it cannot.
 private enum ShippedBuild {
-  struct Address: Decodable {
+  struct Address: Codable, Equatable {
     let host: String
     let port: UInt16
   }
-  struct Profile: Decodable {
+  struct Profile: Codable, Equatable {
     let id: UUID
     let name: String
     let address: Address
     let pin: UUID?
   }
-  struct Withdrawal: Decodable {
+  struct Withdrawal: Codable, Equatable {
     let installation: UUID
     let address: Address
     let pin: UUID
   }
-  struct Queue: Decodable {
+  struct Queue: Codable, Equatable {
     let id: UUID
     let address: Address?
-    let coordinator: UUID?
-    let installation: UUID?
+    var coordinator: UUID?
+    var installation: UUID?
   }
-  struct Saved: Decodable {
-    let profiles: [Profile]
-    let withdrawals: [Withdrawal]?
+  struct Saved: Codable, Equatable {
+    var profiles: [Profile]
+    var withdrawals: [Withdrawal]?
     /// Absent, it lists no held queue.
-    let held: [Queue]?
+    var held: [Queue]?
   }
+
+  static func file(_ support: URL) -> URL { support.appending(path: "Agent/profiles.json") }
 
   /// What its launch over `support` and `caches` deletes.
   static func launchDeletes(support: URL, caches: URL) throws -> [URL] {
-    let saved = try JSONDecoder().decode(
-      Saved.self, from: Data(contentsOf: support.appending(path: "Agent/profiles.json")))
+    try launchDeletes(Data(contentsOf: file(support)), support: support, caches: caches)
+  }
+
+  /// What its launch deletes when `profiles.json` holds `data`.
+  static func launchDeletes(_ data: Data, support: URL, caches: URL) throws -> [URL] {
+    let saved = try JSONDecoder().decode(Saved.self, from: data)
     func unlisted(in parent: URL, _ listed: [UUID]) -> [URL] {
       let names = Set(listed.map(\.uuidString))
       let entries =
@@ -2614,6 +2620,161 @@ private enum ShippedBuild {
     return unlisted(in: support.appending(path: "Agent/Profiles"), profiles)
       + unlisted(in: caches.appending(path: "Agent/Profiles"), profiles)
       + unlisted(in: support.appending(path: "Agent/Held"), (saved.held ?? []).map(\.id))
+  }
+
+  /// Its whole launch, offline, over a file in its own format or none, and what it deleted
+  /// (`Coordinators.swift:431-455`, `499-559`, `573-591`). Each queue the file lists takes the
+  /// `Legacy` folder of the profile with its ID. While `coordinatorAddress` is set, the outbox for
+  /// that address moves into the queue `migratingHeldQueue` names, else into a new one, which the
+  /// file lists at that address with `notificationInstallationID` unless it lists that ID already,
+  /// and a profile is saved there. A queue no coordinator took goes to the only profile pinned at its
+  /// address. Then every unlisted folder is deleted.
+  static func launch(defaults: UserDefaults, support: URL, caches: URL) throws -> [URL] {
+    var saved = Saved(profiles: [], withdrawals: [], held: [])
+    if let data = try? Data(contentsOf: file(support)) {
+      saved = try JSONDecoder().decode(Saved.self, from: data)
+    }
+    guard var held = saved.held else {
+      throw CocoaError(.featureUnsupported, userInfo: [NSDebugDescriptionErrorKey: "No held list"])
+    }
+    var withdrawals = saved.withdrawals ?? []
+    func save() throws {
+      saved = Saved(profiles: saved.profiles, withdrawals: withdrawals, held: held)
+      try writePrivately(JSONEncoder().encode(saved), to: file(support))
+    }
+    func folder(_ id: UUID) -> URL { support.appending(path: "Agent/Held/\(id.uuidString)") }
+    for queue in held {
+      try moveOnce(
+        ProfileDirectory(ProfileID(queue.id), applicationSupport: support, caches: caches).legacy,
+        to: folder(queue.id))
+    }
+    if let host = defaults.string(forKey: "coordinatorAddress") {
+      let port = defaults.string(forKey: "coordinatorPort") ?? "43187"
+      if let port = UInt16(port.trimmingCharacters(in: .whitespacesAndNewlines)),
+        let address = try? CoordinatorAddress(
+          host: host.trimmingCharacters(in: .whitespacesAndNewlines), port: port)
+      {
+        let id = defaults.string(forKey: "migratingHeldQueue").flatMap(UUID.init) ?? UUID()
+        defaults.set(id.uuidString, forKey: "migratingHeldQueue")
+        let at = Address(host: address.host, port: address.port)
+        let before = (saved.profiles, held)
+        if !saved.profiles.contains(where: { $0.address == at }) {
+          saved.profiles.append(
+            Profile(
+              id: UUID(), name: TagName(defaultFor: address).description, address: at, pin: nil))
+        }
+        if !held.contains(where: { $0.id == id }) {
+          held.append(
+            Queue(
+              id: id, address: at, coordinator: nil,
+              installation: defaults.string(forKey: "notificationInstallationID").flatMap(
+                UUID.init)))
+        }
+        if saved.profiles != before.0 || held != before.1 { try save() }
+        try moveOnce(legacyOutbox(for: address, applicationSupport: support), to: folder(id))
+      }
+      let previews = caches.appending(path: "Agent/Previews")
+      if FileManager.default.fileExists(atPath: previews.path) {
+        try FileManager.default.removeItem(at: previews)
+      }
+      defaults.removeObject(forKey: "coordinatorAddress")
+    }
+    for key in ["coordinatorPort", "notificationInstallationID", "migratingHeldQueue"] {
+      defaults.removeObject(forKey: key)
+    }
+    let unbound = held
+    for index in held.indices {
+      guard let address = held[index].address, held[index].coordinator == nil else { continue }
+      let pins = saved.profiles.filter { $0.address == address }.compactMap(\.pin)
+      guard pins.count == 1 else { continue }
+      if let installation = held[index].installation {
+        withdrawals.append(Withdrawal(installation: installation, address: address, pin: pins[0]))
+      }
+      held[index].coordinator = pins[0]
+      held[index].installation = nil
+    }
+    if held != unbound { try save() }
+    let deleted = try launchDeletes(
+      JSONEncoder().encode(Saved(profiles: saved.profiles, withdrawals: withdrawals, held: held)),
+      support: support, caches: caches)
+    for entry in deleted { try FileManager.default.removeItem(at: entry) }
+    return deleted
+  }
+}
+
+/// PR #9 (`ba93f33`), which the fork shipped before #10, as each of its saves writes
+/// `profiles.json`: the profiles and withdrawals it read, and an `origin` it read from the file or
+/// from a profile's `inherited`. It writes nothing else it read, so every save drops `held`
+/// (`Coordinators.swift:313-345`). Pairing a profile is one such save, and it hands the origin's
+/// alert installation to the coordinator paired at the origin's address (`:264-278`). This copies
+/// what that build does, so it changes only if that build's source does, which it cannot.
+private enum NinthBuild {
+  struct Address: Codable, Equatable {
+    let host: String
+    let port: UInt16
+  }
+  struct Profile: Codable {
+    let id: UUID
+    let name: String
+    let address: Address
+    var pin: UUID?
+  }
+  struct Withdrawal: Codable {
+    let installation: UUID
+    let address: Address
+    let pin: UUID
+  }
+  struct Origin: Codable {
+    let address: Address
+    var coordinator: UUID?
+    var installation: UUID?
+  }
+  struct Saved: Codable {
+    var profiles: [Profile]
+    var withdrawals: [Withdrawal]
+    var origin: Origin?
+
+    private enum CodingKeys: String, CodingKey { case profiles, withdrawals, origin }
+
+    init(from decoder: any Decoder) throws {
+      let container = try decoder.container(keyedBy: CodingKeys.self)
+      profiles = try container.decode([Profile].self, forKey: .profiles)
+      withdrawals = try container.decodeIfPresent([Withdrawal].self, forKey: .withdrawals) ?? []
+      struct Earlier: Decodable {
+        let address: Address
+        let inherited: UUID?
+      }
+      origin =
+        try container.decodeIfPresent(Origin.self, forKey: .origin)
+        ?? container.decode([Earlier].self, forKey: .profiles).first { $0.inherited != nil }.map {
+          Origin(address: $0.address, coordinator: nil, installation: $0.inherited)
+        }
+    }
+  }
+
+  /// `data`, a `profiles.json`, as one save of that build writes it, pairing `profile` with
+  /// `coordinator` when given.
+  static func save(
+    _ data: Data, pairing profile: ProfileID? = nil, with coordinator: CoordinatorID? = nil
+  ) throws -> Data {
+    var saved = try JSONDecoder().decode(Saved.self, from: data)
+    if let profile, let coordinator,
+      let index = saved.profiles.firstIndex(where: { $0.id == profile.uuid })
+    {
+      saved.profiles[index].pin = coordinator.uuid
+      if var origin = saved.origin, origin.address == saved.profiles[index].address,
+        origin.coordinator == nil
+      {
+        origin.coordinator = coordinator.uuid
+        if let installation = origin.installation {
+          saved.withdrawals.append(
+            Withdrawal(installation: installation, address: origin.address, pin: coordinator.uuid))
+        }
+        origin.installation = nil
+        saved.origin = origin
+      }
+    }
+    return try JSONEncoder().encode(saved)
   }
 }
 
@@ -2649,11 +2810,51 @@ func launchingTheShippedBuildOverThisOneKeepsEveryHeldMessage() async throws {
   #expect(file == install.bytes, "The held message's file is gone")
 }
 
+/// Opus's round-18 R1. The single-address build queued two messages for its coordinator, one with a
+/// file, and this build holds them while that coordinator answers nothing. #9 is installed over
+/// this build, the coordinator answers, and #9 pairs the saved profile, which saves `profiles.json`
+/// with only what #9 knows. Then #10 is installed and launched once, and then this build again.
+/// Both messages and the file are still held, for the coordinator #9 paired.
+@MainActor @Test
+func theShippedBuildLaunchedAfterTheOneBeforeItSavedKeepsEveryHeldMessage() async throws {
+  let install = try await LegacyInstall()
+  defer { install.remove() }
+  @MainActor func launch() -> Coordinators {
+    Coordinators(
+      registration: nil, defaults: install.defaults, applicationSupport: install.support,
+      caches: install.caches,
+      transport: CoordinatorTransport { _ in throw ConnectionError.timedOut })
+  }
+  let migrated = try #require(launch().profiles.first)
+  let file = ShippedBuild.file(install.support)
+  try writePrivately(
+    NinthBuild.save(Data(contentsOf: file), pairing: migrated.id, with: CoordinatorID(UUID())),
+    to: file)
+  let keys = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any]
+  let deleted = try ShippedBuild.launchDeletes(support: install.support, caches: install.caches)
+  for entry in deleted { try FileManager.default.removeItem(at: entry) }
+  let again = launch()
+  let shown = try await settles { again.chat.held.count == 2 }
+  let owners = again.chat.held.map { again.chat.owner($0) == migrated.id }
+  let kept = again.queues.first.flatMap {
+    try? Data(
+      contentsOf: $0.folder(applicationSupport: install.support).appending(
+        path: "Attachments/\(install.attachment.id)/Notes.txt"))
+  }
+  print(
+    "IF18-R1[this build, #9 pairs, #10 launches, this build] #9 saved keys=\(keys?.keys.sorted() ?? []) | #10 deleted=\(deleted.map(\.lastPathComponent)) | this build again: queues=\(again.queues.count) held=\(again.chat.held.map(\.item.text)) for the paired coordinator=\(owners) file kept=\(kept == install.bytes)"
+  )
+  #expect(deleted.isEmpty, "#10 deleted what this build holds after #9 saved")
+  #expect(shown && again.chat.held.map(\.item.text) == install.queued.map(\.text))
+  #expect(owners == [true, true])
+  #expect(kept == install.bytes, "The held message's file is gone")
+}
+
 /// After every change this build saves, a launch of the build the fork shipped before this one
-/// deletes no held queue and no saved coordinator's files: at the migration, which also holds a
-/// second launch's note for an address this phone never saved, after the migrated profile is edited
-/// to Work's address, after Personal is added at the build's address and takes its queue, and after
-/// each is removed.
+/// deletes no held queue and no saved coordinator's files, also once #9 has saved `profiles.json`
+/// with only what #9 knows: at the migration, which also holds a second launch's note for an
+/// address this phone never saved, after the migrated profile is edited to Work's address, after
+/// Personal is added at the build's address and takes its queue, and after each is removed.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func theShippedBuildsLaunchDeletesNothingThisBuildSaved() async throws {
   let install = try await LegacyInstall()
@@ -2666,13 +2867,18 @@ func theShippedBuildsLaunchDeletesNothingThisBuildSaved() async throws {
   try await withTheOldAddressSilent(install) { coordinators, migrated, _, _, bringBack in
     var steps: [String] = []
     @MainActor func check(_ step: String) throws {
-      let deleted = try ShippedBuild.launchDeletes(
-        support: install.support, caches: install.caches
-      ).map(\.lastPathComponent)
+      let file = try Data(contentsOf: ShippedBuild.file(install.support))
       let held = try HeldQueue.all(applicationSupport: install.support)
       let live = Set(held.map(\.id.uuidString) + coordinators.profiles.map(\.id.description))
+      func deletes(_ file: Data) throws -> String {
+        let deleted = try ShippedBuild.launchDeletes(
+          file, support: install.support, caches: install.caches
+        ).map(\.lastPathComponent)
+        let lost = deleted.filter(live.contains).count
+        return "deletes \(deleted.count), of them held or saved \(lost)"
+      }
       steps.append(
-        "\(step): holds \(held.count) queues | the shipped build deletes \(deleted.count), of them held or saved \(deleted.filter(live.contains).count)"
+        "\(step): holds \(held.count) queues | the shipped build \(try deletes(file)) | after #9 saved, it \(try deletes(NinthBuild.save(file)))"
       )
     }
     try check("launch")
@@ -2690,7 +2896,7 @@ func theShippedBuildsLaunchDeletesNothingThisBuildSaved() async throws {
     try check("Work removed")
     print("IF17-S1-2\n" + steps.joined(separator: "\n"))
     #expect(
-      steps.allSatisfy { $0.hasSuffix("of them held or saved 0") },
+      steps.allSatisfy { $0.components(separatedBy: "of them held or saved 0").count == 3 },
       "The shipped build deletes a held queue or a saved coordinator's files")
   }
 }
@@ -3170,4 +3376,437 @@ func twoQueuesAtOneAddressBindOnOnePairing() async throws {
   }
   await coordinators.setActive(false)
   await used.stop()
+}
+
+/// Opus's round-18 R2. #9 held the single-address build's note m1, queued for 100.64.1.2:43187, in
+/// the unpaired profile's `Legacy` folder, and this build adopted it. The user pointed that profile
+/// at Personal's address, 4002, and added Work at 43187, which took m1. Work went offline, and the
+/// user removed Work, which deleted m1 as its confirmation counted. Then the single-address build
+/// queued m2 for 4002, and #9 held it in Personal's `Legacy` folder without saving. Nothing this
+/// build knew about the deleted queue reaches m2: it goes to no one until the user chooses.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aQueueRemoveDeletedGivesNothingToALaterLegacyFolder() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "if18-r2-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let work = FixtureCoordinator()
+  let personal = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(work)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personal)
+  defer { personalListener.cancel() }
+  let migrated = ProfileID()
+  try writePrivately(
+    Data(
+      """
+      {"withdrawals":[],\
+      "origin":{"address":{"host":"100.64.1.2","port":43187},"installation":"\(UUID().uuidString)"},\
+      "profiles":[{"address":{"host":"100.64.1.2","port":43187},"id":"\(migrated)",\
+      "name":"Coordinator"}]}
+      """.utf8), to: root.appending(path: "Agent/profiles.json"))
+  let legacy = ProfileDirectory(migrated, applicationSupport: root, caches: root).legacy
+  func queue(_ text: String) throws {
+    try writePrivately(
+      JSONEncoder().encode([
+        NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: text)
+      ]), to: legacy.appending(path: "pending.json"))
+  }
+  try queue("m1: queued for Work at 43187")
+  let routes = Routes([4002: personalPort])
+  @MainActor func launch() -> Coordinators {
+    Coordinators(
+      registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+      transport: CoordinatorTransport { address in
+        guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
+        return LineConnection(
+          connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+      })
+  }
+  let workAddress = try CoordinatorAddress(host: "100.64.1.2")
+  let first = launch()
+  try await first.update(
+    migrated, name: TagName("Personal"),
+    address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+  await routes.set([43187: workPort, 4002: personalPort])
+  try await first.add(name: TagName("Work"), address: workAddress)
+  let removed = try #require(first.profiles.first { $0.pin == work.id })
+  await routes.set([4002: personalPort])
+  let removal = first.removal(removed.id)
+  try await first.remove(removal)
+  try queue("m2: queued for Personal at 4002")
+  await routes.set([43187: workPort, 4002: personalPort])
+  let coordinators = launch()
+  let chat = coordinators.chat
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await work.stop()
+    await personal.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await coordinators.add(name: TagName("Work"), address: workAddress)
+    try await eventually("both connected") {
+      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+    }
+    try await eventually("m2 held") { chat.held.count == 1 }
+    let held = try #require(chat.held.first)
+    let owner = chat.owner(held).map(chat.name) ?? "nobody"
+    let note = chat.heldNote(held)
+    await chat.restoreHeld(held)
+    let restored = (draft: chat.draft, recipient: chat.recipient)
+    if !chat.draft.isEmpty {
+      await chat.send()
+      _ = try await settles { await submitted(work) + submitted(personal) != [] }
+    }
+    print(
+      "IF18-R2[Work removed offline, then a later note in Personal's Legacy folder] Remove Work? \(removal.message) | m2: owner=\(owner) note=\(note.debugDescription) Restore: draft=\(restored.draft.debugDescription) to=\(restored.recipient.map(chat.name) ?? "nobody") after Send: Work's coordinator got=\(await submitted(work)) Personal's coordinator got=\(await submitted(personal))"
+    )
+    #expect(removal.message == "This deletes 1 queued message on this phone.")
+    #expect(owner == "nobody")
+    #expect(restored.draft.isEmpty && restored.recipient == nil)
+    #expect(await submitted(work).isEmpty, "A note queued for Personal's address went to Work")
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
+/// Opus's round-18 R3 and sonnet's round-18 finding 1. The single-address build queued m1 for
+/// 100.64.1.2:43187, and this build's migration stopped after `step`. That build then ran again at
+/// 4002 and queued m4 there, with its alert installation or a new one. #10 launched, and then this
+/// build. Each note is held once, at the address it was queued for, no outbox is left, and each
+/// installation is on a queue or a saved withdrawal.
+@MainActor
+@Test(
+  arguments: [Coordinators.MigrationStep.queueNamed, .queueListed, .quarantined], [false, true])
+func theShippedBuildMovesNoOutboxIntoAQueueAStoppedMigrationNamed(
+  _ step: Coordinators.MigrationStep, _ newInstallation: Bool
+) async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "if18-r3-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  var installations = [UUID().uuidString]
+  func singleAddressBuild(_ text: String, at address: CoordinatorAddress) throws {
+    defaults.set(address.host, forKey: "coordinatorAddress")
+    defaults.set("\(address.port)", forKey: "coordinatorPort")
+    defaults.set(installations.last, forKey: "notificationInstallationID")
+    try writePrivately(
+      JSONEncoder().encode([
+        NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: text)
+      ]),
+      to: legacyOutbox(for: address, applicationSupport: root).appending(path: "pending.json"))
+  }
+  try singleAddressBuild(
+    "m1: queued at 43187 before the update", at: CoordinatorAddress(host: "100.64.1.2"))
+  #expect(throws: Crash.self) {
+    try Coordinators.migrate(
+      defaults: defaults, applicationSupport: root, caches: root,
+      crash: { if $0 == step { throw Crash() } })
+  }
+  if newInstallation { installations.append(UUID().uuidString) }
+  try singleAddressBuild(
+    "m4: queued at 4002 by the reinstalled build",
+    at: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+  let deleted = try ShippedBuild.launch(defaults: defaults, support: root, caches: root)
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: CoordinatorTransport { _ in throw ConnectionError.timedOut })
+  let shown = try await settles { coordinators.chat.held.count == 2 }
+  let held = coordinators.chat.held.map { message in
+    let address = coordinators.queues.first { $0.id == message.queue }?.address
+    return "\(message.item.text) at \(address.map { "\($0.host):\($0.port)" } ?? "unknown")"
+  }.sorted()
+  let outboxes =
+    (try? FileManager.default.contentsOfDirectory(
+      atPath: root.appending(path: "Agent/Outbox").path)) ?? []
+  let saved = try JSONDecoder().decode(
+    Coordinators.SavedProfiles.self, from: Data(contentsOf: ShippedBuild.file(root)))
+  let kept = installations.map { installation in
+    coordinators.queues.contains { $0.installation?.description == installation }
+      || saved.withdrawals.contains { $0.installation.description == installation }
+  }
+  print(
+    "IF18-R3[stopped after \(step), \(newInstallation ? "a new" : "the same") installation at 4002] #10 deleted=\(deleted.map(\.lastPathComponent)) | this build: held=\(held) outboxes left=\(outboxes.count) installations recorded=\(kept)"
+  )
+  #expect(
+    shown
+      && held == [
+        "m1: queued at 43187 before the update at 100.64.1.2:43187",
+        "m4: queued at 4002 by the reinstalled build at 100.64.1.2:4002",
+      ])
+  #expect(outboxes.isEmpty, "An outbox the single-address build left is never shown")
+  #expect(kept == installations.map { _ in true }, "An alert installation is recorded nowhere")
+}
+
+/// Sonnet's round-18 finding 2. This build holds the single-address build's note for
+/// 100.64.1.2:43187. That build ran again at the same address with a new alert installation and
+/// queued nothing, so the migration keeps that installation in a queue of its own, which holds no
+/// message. The migration stops after `step`, #10 launches, and then this build: the installation
+/// is still recorded, on a queue or as a saved withdrawal, and the note is still held.
+@MainActor @Test(arguments: [Coordinators.MigrationStep.queueNamed, .markerRemoved])
+func anAlertInstallationAStoppedMigrationKeptOutlivesTheShippedBuild(
+  _ step: Coordinators.MigrationStep
+) async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "if18-s2-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  @MainActor func launch() -> Coordinators {
+    Coordinators(
+      registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+      transport: CoordinatorTransport { _ in throw ConnectionError.timedOut })
+  }
+  defaults.set("100.64.1.2", forKey: "coordinatorAddress")
+  defaults.set(UUID().uuidString, forKey: "notificationInstallationID")
+  try writePrivately(
+    JSONEncoder().encode([
+      NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: "Invented held note")
+    ]),
+    to: legacyOutbox(for: CoordinatorAddress(host: "100.64.1.2"), applicationSupport: root)
+      .appending(path: "pending.json"))
+  _ = launch()
+  let installation = UUID().uuidString
+  defaults.set("100.64.1.2", forKey: "coordinatorAddress")
+  defaults.set(installation, forKey: "notificationInstallationID")
+  #expect(throws: Crash.self) {
+    try Coordinators.migrate(
+      defaults: defaults, applicationSupport: root, caches: root,
+      crash: { if $0 == step { throw Crash() } })
+  }
+  let deleted = try ShippedBuild.launch(defaults: defaults, support: root, caches: root)
+  let coordinators = launch()
+  let shown = try await settles { coordinators.chat.held.count == 1 }
+  let saved = try JSONDecoder().decode(
+    Coordinators.SavedProfiles.self, from: Data(contentsOf: ShippedBuild.file(root)))
+  let kept =
+    coordinators.queues.contains { $0.installation?.description == installation }
+    || saved.withdrawals.contains { $0.installation.description == installation }
+  print(
+    "IF18-S2[stopped after \(step)] #10 deleted=\(deleted.map(\.lastPathComponent)) | this build: queues=\(coordinators.queues.map { "\($0.id.uuidString.prefix(8)) installation=\($0.installation.map { "\($0)" == installation ? "the new one" : "the first" } ?? "none")" }) held=\(coordinators.chat.held.map(\.item.text)) the new installation recorded=\(kept)"
+  )
+  #expect(kept, "The single-address build's alert installation is recorded nowhere")
+  #expect(shown, "The held note is gone")
+}
+
+/// Where a build the fork shipped deletes or moves what it finds, as a path relative to Application
+/// Support or to Caches. `listed` names the profiles `profiles.json` lists, which #9 and #10 keep
+/// when they save it:
+/// - `Agent/Held`: #10's launch deletes every folder its `held` list does not name, and every #9
+///   save drops that list (0d8daa0 `Coordinators.swift:588-590`, ba93f33 `:313-345`).
+/// - `Agent/Profiles/<id>`, in both, unless `listed` names it: #2 to #10 delete it at launch
+///   (0d8daa0 `Coordinators.swift:584-587`, ba93f33 `:403-416`).
+/// - `Agent/Profiles/<id>/Legacy`: #10 moves it into `Agent/Held` (0d8daa0 `Profiles.swift:189-194`).
+/// - `Agent/Outbox`: the single-address build sends what it queued there and deletes it, and #2 to
+///   #10 move it (3978bb7 `ChatModel.swift:76-82`, ba93f33 `Profiles.swift:212-226`, 0d8daa0
+///   `Profiles.swift:254-261`).
+/// - `Agent/Previews` in Caches: #2 to #10 delete it while they migrate (ba93f33
+///   `Coordinators.swift:390-393`, 0d8daa0 `:538-541`).
+private func aShippedBuildDeletes(_ path: String, inCaches: Bool, listed: Set<String>) -> Bool {
+  let parts = path.split(separator: "/").map(String.init)
+  guard parts.count > 1, parts[0] == "Agent" else { return false }
+  switch parts[1] {
+  case "Held", "Outbox": return !inCaches
+  case "Previews": return inCaches
+  case "Profiles":
+    return parts.count > 2
+      && (!listed.contains(parts[2]) || (parts.count > 3 && parts[3] == "Legacy"))
+  default: return false
+  }
+}
+
+/// A queue's record that a migration writes into the folder it adopts, before that folder moves out
+/// of where a build the fork shipped deletes or moves it.
+private func isARecordInAnAdoptedFolder(_ path: String) -> Bool {
+  let parts = path.split(separator: "/").map(String.init)
+  return parts.last == "queue.json"
+    && (parts.count == 4 && ["Held", "Outbox"].contains(parts[1])
+      || parts.count == 5 && parts[1] == "Profiles" && parts[3] == "Legacy")
+}
+
+/// Every file this build writes or moves under Application Support and Caches, since the last look.
+@MainActor private struct Writes {
+  let support: URL
+  let caches: URL
+  private var seen: (support: [String: String], caches: [String: String])
+
+  init(support: URL, caches: URL) {
+    self.support = support
+    self.caches = caches
+    seen = (Self.files(under: support), Self.files(under: caches))
+  }
+
+  /// Each regular file under `base`, by its path relative to `base`, with what a write or a move
+  /// changes: its file number, its modification time and its size.
+  private static func files(under base: URL) -> [String: String] {
+    let manager = FileManager.default
+    var found: [String: String] = [:]
+    for path in manager.subpaths(atPath: base.path) ?? [] {
+      guard let attributes = try? manager.attributesOfItem(atPath: base.appending(path: path).path),
+        attributes[.type] as? FileAttributeType == .typeRegular
+      else { continue }
+      let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSinceReferenceDate ?? 0
+      found[path] = "\(attributes[.systemFileNumber] ?? 0) \(modified) \(attributes[.size] ?? 0)"
+    }
+    return found
+  }
+
+  /// What was written since the last look where a build the fork shipped deletes or moves it.
+  mutating func whereAShippedBuildDeletes() throws -> [String] {
+    struct Saved: Decodable {
+      struct Profile: Decodable { let id: UUID }
+      let profiles: [Profile]
+    }
+    let file = support.appending(path: "Agent/profiles.json")
+    let listed =
+      FileManager.default.fileExists(atPath: file.path)
+      ? Set(
+        try JSONDecoder().decode(Saved.self, from: Data(contentsOf: file)).profiles.map(
+          \.id.uuidString)) : []
+    let now = (support: Self.files(under: support), caches: Self.files(under: caches))
+    defer { seen = now }
+    let support = now.support.filter { seen.support[$0.key] != $0.value }.keys.filter {
+      aShippedBuildDeletes($0, inCaches: false, listed: listed)
+    }
+    let caches = now.caches.filter { seen.caches[$0.key] != $0.value }.keys.filter {
+      aShippedBuildDeletes($0, inCaches: true, listed: listed)
+    }
+    return support.sorted() + caches.map { "Caches/\($0)" }.sorted()
+  }
+}
+
+/// What the builds before this one leave for a migration besides `install`: a note the
+/// single-address build queued for another address, a note #9 held in Personal's `Legacy` folder,
+/// and a note #10 held in `Agent/Held`, whose list #9 dropped when it saved. Returns every note left.
+private func leaveEveryKindOfSource(_ install: LegacyInstall) throws -> [String] {
+  func queue(_ text: String, in folder: URL) throws {
+    try writePrivately(
+      JSONEncoder().encode([
+        NativeRequestSubmit(inputId: UUID().uuidString, mode: .followUp, text: text)
+      ]), to: folder.appending(path: "pending.json"))
+  }
+  let personal = CoordinatorProfile(
+    name: try TagName("Personal"), address: try CoordinatorAddress(host: "100.64.1.3"))
+  try queue("Invented note from another launch", in: install.otherOutbox)
+  try queue(
+    "Invented note an earlier build held",
+    in: ProfileDirectory(personal.id, applicationSupport: install.support, caches: install.caches)
+      .legacy)
+  try queue(
+    "Invented note the shipped build held",
+    in: install.support.appending(path: "Agent/Held/\(UUID().uuidString)"))
+  struct Earlier: Encodable { let profiles: [CoordinatorProfile] }
+  try writePrivately(
+    JSONEncoder().encode(Earlier(profiles: [personal])),
+    to: install.support.appending(path: "Agent/profiles.json"))
+  return install.queued.map(\.text) + [
+    "Invented note from another launch", "Invented note an earlier build held",
+    "Invented note the shipped build held",
+  ]
+}
+
+/// Nothing this build writes stays where a build the fork shipped deletes or moves it, so neither
+/// installing one over this build nor #9 saving before #10 launches reaches a held message. The one
+/// exception is a migration stopped while it adopts a folder: the queue's record in that folder,
+/// written just before the folder moves out. Checked after a migration stopped at each step, each
+/// time it reaches it, and after each change: the launch that migrates every kind of folder,
+/// pairing, an edit, adding a coordinator that takes a queue, Restore, Discard, and Remove.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func nothingThisBuildWritesStaysWhereAShippedBuildDeletesIt() async throws {
+  var stops: [String] = []
+  for step in [
+    Coordinators.MigrationStep.queueNamed, .profileSaved, .queueListed, .quarantined,
+    .markerRemoved,
+  ] {
+    for stop in 1... {
+      let install = try await LegacyInstall()
+      defer { install.remove() }
+      let notes = try leaveEveryKindOfSource(install)
+      var writes = Writes(support: install.support, caches: install.caches)
+      var reached = 0
+      var stopped = false
+      do {
+        _ = try Coordinators.migrate(
+          defaults: install.defaults, applicationSupport: install.support, caches: install.caches,
+          crash: {
+            guard $0 == step else { return }
+            reached += 1
+            if reached == stop { throw Crash() }
+          })
+      } catch is Crash { stopped = true }
+      let written = try writes.whereAShippedBuildDeletes()
+      stops.append(
+        "\(step) #\(stop) \(stopped ? "stopped" : "finished") with \(notes.count) notes: written where a shipped build deletes=\(written)"
+      )
+      #expect(
+        written.allSatisfy { stopped && isARecordInAnAdoptedFolder($0) },
+        "This build wrote where a shipped build deletes: \(written)")
+      if !stopped { break }
+    }
+  }
+  print("IF18-structural stops\n" + stops.joined(separator: "\n"))
+
+  let install = try await LegacyInstall()
+  defer { install.remove() }
+  try writePrivately(
+    JSONEncoder().encode([
+      NativeRequestSubmit(
+        inputId: UUID().uuidString, mode: .steer, text: "Invented note from another launch")
+    ]), to: install.otherOutbox.appending(path: "pending.json"))
+  let shipped = UUID()
+  try writePrivately(
+    JSONEncoder().encode([
+      NativeRequestSubmit(
+        inputId: UUID().uuidString, mode: .steer, text: "Invented note the shipped build held")
+    ]),
+    to: install.support.appending(path: "Agent/Held/\(shipped.uuidString)/pending.json"))
+  try writePrivately(
+    Data(
+      """
+      {"profiles":[],"withdrawals":[],"held":[{"id":"\(shipped.uuidString)",\
+      "address":{"host":"100.64.1.3","port":43187},"installation":"\(UUID().uuidString)"}]}
+      """.utf8), to: install.support.appending(path: "Agent/profiles.json"))
+  var writes = Writes(support: install.support, caches: install.caches)
+  try await withTheOldAddressSilent(install) { coordinators, migrated, _, _, bringBack in
+    let chat = coordinators.chat
+    var changes: [String] = []
+    @MainActor func check(_ change: String) throws {
+      let written = try writes.whereAShippedBuildDeletes()
+      changes.append("\(change): written where a shipped build deletes=\(written)")
+      #expect(written.isEmpty, "\(change) wrote where a shipped build deletes: \(written)")
+    }
+    try await eventually("held rows") { chat.held.count == 4 }
+    try check("the launch that migrates")
+    try await coordinators.update(
+      migrated.id, name: TagName("Work"),
+      address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    try await eventually("Work connected") {
+      chat.snapshots[migrated.id]?.connection == .connected
+    }
+    try check("the migrated profile edited to Work's address and paired")
+    await bringBack()
+    try await coordinators.add(name: TagName("Personal"), address: install.address)
+    let personal = try #require(coordinators.profiles.last)
+    try await eventually("Personal connected") {
+      chat.snapshots[personal.id]?.connection == .connected
+    }
+    try check("Personal added at the build's address, taking its queue")
+    let restored = try #require(chat.held.first { $0.item.text == "Second held note" })
+    await chat.restoreHeld(restored)
+    chat.draft = ""
+    chat.recipient = nil
+    try check("Restore")
+    await chat.discardHeld(restored)
+    try check("Discard")
+    try await coordinators.remove(coordinators.removal(personal.id))
+    try check("Personal removed")
+    try await coordinators.remove(coordinators.removal(migrated.id))
+    try check("Work removed")
+    print("IF18-structural changes\n" + changes.joined(separator: "\n"))
+  }
 }
