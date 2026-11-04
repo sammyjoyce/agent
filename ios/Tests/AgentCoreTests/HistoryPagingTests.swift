@@ -13,6 +13,14 @@ private func page(_ id: String, role: HistoryRole = .tool, next: String?) -> Nat
     ], nextCursor: next, pageComplete: true)
 }
 
+/// The session's first snapshot that `holds`.
+private func until(
+  _ session: CoordinatorSession, _ holds: @Sendable (ChatSnapshot) -> Bool
+) async throws -> ChatSnapshot {
+  for await snapshot in session.updates where holds(snapshot) { return snapshot }
+  throw ConnectionError.closed
+}
+
 @Test(.timeLimit(.minutes(1)))
 func earlierHistoryCoalescesActivityPagesAndKeepsOneOwnerAcrossOtherControls() async throws {
   try await withCoordinator { session, fixture, _ in
@@ -156,27 +164,27 @@ func latestHistoryReplacesAnOlderWindowAndKeepsConcurrentLiveMessages() async th
       })
     await fixture.replyToHistory(
       initial: .init(messages: recent, nextCursor: "page-1", pageComplete: true), pages: pages)
+    // Built with Swift 6.4.2, a wait's closure here ran the code of a closure in an #expect
+    // argument, so the wait returned at once. Waits go through `until`, and no #expect argument
+    // holds a closure.
     await session.connect()
-    for await update in session.updates where update.connection == .connected { break }
+    _ = try await until(session) { $0.connection == .connected }
     await session.loadEarlier()
-    for await update in session.updates
-    where !update.loadingHistory && update.olderCursor == "page-3" {
-      #expect(update.rows.contains { $0.entryID == "recent-0" })
-      #expect(!update.rows.contains { $0.entryID == "recent-19" })
-      #expect(!update.includesLatest)
-      break
-    }
+    let older = try await until(session) { !$0.loadingHistory && $0.olderCursor == "page-3" }
+    let olderEntries = older.rows.compactMap(\.entryID)
+    #expect(olderEntries.contains("recent-0"))
+    #expect(!olderEntries.contains("recent-19"))
+    #expect(!older.includesLatest)
     await fixture.replyToLatest(
       .init(messages: recent, nextCursor: "latest-older", pageComplete: true))
     try await fixture.liveMessage(
       .init(
         continuation: false, entryId: "live-start", finalChunk: true,
         role: .tool, text: "", tool: .init(callId: "held-tool", name: "exec", status: .running)))
-    for await update in session.updates
-    where update.rows.contains(where: { $0.tool?.callId == "held-tool" }) {
-      #expect(!update.includesLatest)
-      break
+    let started = try await until(session) { snapshot in
+      snapshot.rows.contains { $0.tool?.callId == "held-tool" }
     }
+    #expect(!started.includesLatest)
     await fixture.holdHistory("<latest>")
     let latest = Task { await session.loadLatest() }
     for await cursor in fixture.observedHistory where cursor == "<latest>" { break }
@@ -189,22 +197,21 @@ func latestHistoryReplacesAnOlderWindowAndKeepsConcurrentLiveMessages() async th
       .init(
         continuation: false, entryId: "new-live", finalChunk: true,
         role: .final, text: "This reply arrived while the recent window was loading."))
-    for await update in session.updates
-    where update.rows.contains(where: { $0.entryID == "new-live" }) {
-      #expect(!update.includesLatest)
-      break
+    let live = try await until(session) { snapshot in
+      snapshot.rows.contains { $0.entryID == "new-live" }
     }
+    #expect(!live.includesLatest)
     await fixture.releaseHistory()
     await latest.value
-    for await update in session.updates
-    where !update.loadingHistory && update.olderCursor == "latest-older" {
-      #expect(
-        update.rows.compactMap(\.entryID) == recent.map(\.entryId) + ["live-result", "new-live"])
-      #expect(
-        update.rows.first(where: { $0.tool?.callId == "held-tool" })?.tool?.status == .finished)
-      #expect(update.includesLatest)
-      break
+    let refreshed = try await until(session) {
+      !$0.loadingHistory && $0.olderCursor == "latest-older"
     }
+    let entries = refreshed.rows.compactMap(\.entryID)
+    let expected = recent.map(\.entryId) + ["live-result", "new-live"]
+    let tool = refreshed.rows.first { $0.tool?.callId == "held-tool" }?.tool?.status
+    #expect(entries == expected)
+    #expect(tool == .finished)
+    #expect(refreshed.includesLatest)
     #expect(await fixture.historyRequests() == ["page-1", "page-2", "<latest>"])
   }
 }

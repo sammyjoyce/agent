@@ -628,8 +628,9 @@ public struct MainChatView: View {
           #endif
         }
         .disabled(!model.draftReady)
-        // The field drops a rewrite made inside its own write, so the tag moves after it.
-        .onChange(of: model.draft) { model.promoteTypedTag() }
+        // The field drops a rewrite made inside its own write, so the tag moves after it. Tags are
+        // read from committed text alone, so one an input method composes moves once committed.
+        .onChange(of: model.committed) { model.promoteTypedTag() }
         Button {
           if showsStop {
             Task { await model.interrupt() }
@@ -692,9 +693,7 @@ public struct MainChatView: View {
           let badge = badge($0)
           return .init(name: badge.name, color: UIColor(badge.color))
         }, editor: composerEditor, promotion: model.promotion, restoredFrom: model.restoredFrom,
-        // Send's clear reports the emptied field back. An echo of the draft is not an edit.
-        edit: { if model.draft != $0 { model.draft = $0 } },
-        removeChip: { model.recipient = nil })
+        edit: { model.edit($0, committed: $1) }, removeChip: { model.recipient = nil })
     }
   #else
     private func chip(_ recipient: ProfileID) -> some View {

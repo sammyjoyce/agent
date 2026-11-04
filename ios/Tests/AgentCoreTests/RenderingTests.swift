@@ -1237,6 +1237,117 @@
         }
       }
 
+      /// The composer of `withComposer` with Work and Personal each paired to its own loopback
+      /// coordinator and connected, so a Send reaches the wire. `root` holds their profiles.
+      @MainActor private func withLiveComposer(
+        _ body:
+          @MainActor (
+            ChatModel, ComposerField.DraftBox, FixtureCoordinator, FixtureCoordinator, URL
+          ) async throws -> Void
+      ) async throws {
+        try await withComposer { model, box, _ in
+          let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+          defer { try? FileManager.default.removeItem(at: root) }
+          let work = FixtureCoordinator()
+          let personal = FixtureCoordinator()
+          let (workListener, workPort) = try await listen(work)
+          defer { workListener.cancel() }
+          let (personalListener, personalPort) = try await listen(personal)
+          defer { personalListener.cancel() }
+          let stamps = StampSource()
+          for (profile, (fixture, port)) in zip(
+            model.profiles, [(work, workPort), (personal, personalPort)])
+          {
+            let directory = ProfileDirectory(profile.id, applicationSupport: root, caches: root)
+            let session = CoordinatorSession(
+              directory: directory, address: profile.address, pin: fixture.id, stamps: stamps,
+              transport: loopback(port))
+            model.attach(Lane(id: profile.id, session: session, hold: LegacyHold(directory)))
+          }
+          await model.setActive(true)
+          do {
+            let deadline = ContinuousClock.now + .seconds(15)
+            while model.snapshots.values.filter({ $0.connection == .connected }).count != 2 {
+              try #require(ContinuousClock.now < deadline, "Work and Personal connect")
+              try await Task.sleep(for: .milliseconds(10))
+            }
+            try await body(model, box, work, personal, root)
+          } catch {
+            await model.setActive(false)
+            await work.stop()
+            await personal.stop()
+            throw error
+          }
+          await model.setActive(false)
+          await work.stop()
+          await personal.stop()
+        }
+      }
+
+      /// An input method composes "@Work " from an empty field, or "Work " after a typed "@", and has
+      /// not committed it. Its text picks no recipient, the picker stays as the committed text left
+      /// it, and the composition stays in the field. The input method then replaces its composition
+      /// with "@Personal …" and commits it. Only committed text is read for tags, so Personal becomes
+      /// the chip, and Send gives Personal alone the text after the tag.
+      @MainActor @Test(arguments: ["from an empty field", "after a typed @"])
+      func aTagAnInputMethodComposesPicksNoRecipientUntilItIsCommitted(_ start: String)
+        async throws
+      {
+        try await withLiveComposer { model, box, work, personal, root in
+          let field = box.draft
+          let typed = start == "after a typed @" ? "@" : ""
+          if !typed.isEmpty { field.insertText(typed) }
+          try await Task.sleep(for: .milliseconds(200))
+          let pickerBefore = model.pickerMatches.map(\.name.description)
+          @MainActor func compose(_ text: String) async throws {
+            let composed = String(text.dropFirst(typed.count))
+            field.setMarkedText(
+              composed, selectedRange: NSRange(location: composed.utf16.count, length: 0))
+            try await Task.sleep(for: .milliseconds(300))
+          }
+          try await compose("@Wo")
+          let pickerComposing = model.pickerMatches.map(\.name.description)
+          try await compose("@Work ")
+          print(
+            "IF11-1[\(start)] composing: marked=\(field.markedTextRange != nil) draft=\(model.draft.debugDescription) chip=\(model.recipient.map(model.name) ?? "none") picker before=\(pickerBefore) while composing=\(pickerComposing)"
+          )
+          #expect(field.markedTextRange != nil, "The field ended the input method's composition")
+          #expect(model.recipient == nil && model.draft == "@Work ", "Composed text picked Work")
+          #expect(pickerComposing == pickerBefore, "Composed text changed the picker")
+          try await compose("@Personal invented final candidate")
+          field.unmarkText()
+          try await Task.sleep(for: .milliseconds(300))
+          print(
+            "IF11-1[\(start)] committed: draft=\(model.draft.debugDescription) chip=\(model.recipient.map(model.name) ?? "none") line=\(model.recipientLine)"
+          )
+          #expect(model.recipient == model.profiles.last?.id, "The committed tag is not the chip")
+          #expect(model.draft == "invented final candidate")
+          await model.send()
+          let workProfile = try #require(model.profiles.first)
+          let workOutbox = ProfileDirectory(
+            workProfile.id, applicationSupport: root, caches: root
+          ).outbox
+          let stagedAtWork = (try? queuedRequests(workOutbox))?.map(\.text) ?? []
+          let deadline = ContinuousClock.now + .seconds(15)
+          while await work.count() + personal.count() == 0 {
+            try #require(ContinuousClock.now < deadline, "A coordinator got the message")
+            try await Task.sleep(for: .milliseconds(10))
+          }
+          func texts(_ fixture: FixtureCoordinator) async -> [String] {
+            await fixture.received().compactMap { event in
+              if case .submit(let input) = event { input.text } else { nil }
+            }
+          }
+          let atWork = await texts(work)
+          let atPersonal = await texts(personal)
+          print(
+            "IF11-1[\(start)] wire: stagedAtWork=\(stagedAtWork) Work=\(atWork) Personal=\(atPersonal)"
+          )
+          #expect(stagedAtWork.isEmpty && atWork.isEmpty, "Personal's message went to Work")
+          #expect(atPersonal == ["invented final candidate"])
+        }
+      }
+
       /// Restores a message held for `profile`, with `text` and, if `file` names one, an invented
       /// file, into the hosted composer.
       @MainActor private func restoreHeld(
