@@ -211,15 +211,17 @@ Mode if requested, then Run.
   editing a coordinator there, by any probe of that address that finds a saved
   coordinator, or by a coordinator already saved there, the only one, when the
   app starts. Each queue's folder records its
-  address, its coordinator and that build's alert registration, so installing an
-  earlier build of this app and then this one again loses none of them.
-  `profiles.json` also lists every held queue, because the build before this one
-  deletes each held folder it does not list. A queue is listed before its folder
-  moves into the hold, so a launch that stops part way leaves that build nothing
-  to delete. What an earlier build recorded
+  address, its coordinator and that build's alert registration. The folders are
+  in `Agent/HeldQueues`, where no earlier build of this app reads, writes or
+  deletes anything, so installing earlier builds over this one in any order, and
+  then this one again, loses none of them. Those builds do not show them. The
+  build before this one kept its own held queues in `Agent/Held` and deletes each
+  folder there that `profiles.json` does not list. The update moves each of them
+  into `Agent/HeldQueues` with what that build listed about it, and until it has
+  moved, `profiles.json` lists it in that build's format, so a launch that stops
+  part way leaves that build nothing to delete. What an earlier build recorded
   about a queue counts only where it proves the queue's address or coordinator,
-  and a coordinator it bound a queue to counts only at the address the queue's
-  folder records.
+  and what the build before this one listed describes only the folder it kept.
   **Restore to composer** makes a new message for you to send, addressed to that
   coordinator. Until one is, Restore asks which paired coordinator gets it. If no
   build recorded the address, Restore always asks. **Discard** deletes a held

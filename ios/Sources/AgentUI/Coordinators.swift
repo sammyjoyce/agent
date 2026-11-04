@@ -385,9 +385,9 @@ extension Coordinators {
     var profiles: [CoordinatorProfile]
     /// Alert withdrawals that no coordinator has confirmed yet.
     var withdrawals: [PendingWithdrawal]
-    /// Every held queue as its folder recorded it when this was saved. The build before this one
-    /// deletes each `Agent/Held` folder this does not name, so every save lists them all. Launch
-    /// reads it back only for what that build changed.
+    /// The queues the build before this one keeps in `Agent/Held`, in its format. That build deletes
+    /// every folder there this does not name, so each save names each folder still there, and no
+    /// other queue.
     var held: [HeldQueue] = []
     /// What an earlier build of this app wrote about the single-address build, until `migrate`
     /// adopts it. Never written.
@@ -448,33 +448,41 @@ extension Coordinators {
   }
 
   /// Checkpoints after which a test can stop a migration, standing in for a crash.
-  enum MigrationStep { case queueNamed, profileSaved, queueListed, quarantined, markerRemoved }
+  enum MigrationStep { case queueNamed, profileSaved, queueRecorded, quarantined, markerRemoved }
 
   /// Idempotent and offline, at every launch. Every folder the single-address build or an earlier
-  /// build of this app left messages in becomes a held queue that records itself and is listed in
-  /// `profiles.json` before it moves, so a stop at any point resumes and nothing is ever deleted
-  /// here or by the build before this one. Each saved name is made unique, ignoring case.
+  /// build of this app left messages in becomes a held queue in `Agent/HeldQueues`, where no earlier
+  /// build reads, writes or deletes. Each folder records its queue before it moves there, so a stop
+  /// at any point resumes. Until a folder the build before this one left in `Agent/Held` moves,
+  /// `profiles.json` names it, since that build deletes every folder there the file does not name.
+  /// Each saved name is made unique, ignoring case.
   /// The single-address build's outbox for its last address keeps the build's alert installation,
   /// and a profile is saved at that address, named so its `@` tag names it alone.
   /// `coordinatorAddress` is the resume marker. It goes before the port key, so a crash in between
-  /// cannot re-run with the default port. Then each queue no coordinator took yet goes to the first
-  /// one proven at its address, and `profiles.json` lists every queue.
+  /// cannot re-run with the default port. Then each queue no coordinator took yet goes to the only
+  /// one a saved profile is pinned to at its address.
   static func migrate(
     defaults: UserDefaults, applicationSupport: URL, caches: URL,
     crash: (MigrationStep) throws -> Void = { _ in }
   ) throws -> Stored {
     var saved = try load(applicationSupport: applicationSupport)
-    let listed = saved.held
     let (adopted, legacy) = try adoptEarlier(
       saved, applicationSupport: applicationSupport, caches: caches)
     let earlier = saved.earlier
     let named = CoordinatorProfile.uniquelyNamed(saved.profiles)
-    if earlier != nil || named != saved.profiles {
+    let shipped = try leftInAgentHeld(listing: saved.held, applicationSupport: applicationSupport)
+    if earlier != nil || named != saved.profiles || saved.held != shipped.map(\.queue) {
       saved.earlier = nil
       saved.profiles = named
       try save(&saved, applicationSupport: applicationSupport)
     }
-    try hold(legacy, in: &saved, applicationSupport: applicationSupport, crash: crash)
+    try hold(legacy, applicationSupport: applicationSupport, crash: crash)
+    // One save per move: that build moves the `Legacy` folder of the profile whose ID a listed queue
+    // has into that queue's folder, with its record, so a queue stays listed only while it is there.
+    for source in shipped {
+      try hold([source], applicationSupport: applicationSupport, crash: crash)
+      try save(&saved, applicationSupport: applicationSupport)
+    }
     if let host = defaults.string(forKey: "coordinatorAddress") {
       try quarantine(
         host: host, into: &saved, held: adopted, defaults: defaults,
@@ -487,26 +495,23 @@ extension Coordinators {
     try adoptOutboxes(
       knowing: saved.profiles.map(\.address) + saved.withdrawals.map(\.address)
         + adopted.compactMap(\.address) + [earlier?.origin?.address].compactMap { $0 },
-      into: &saved, applicationSupport: applicationSupport, crash: crash)
+      applicationSupport: applicationSupport, crash: crash)
     var held = try HeldQueue.all(applicationSupport: applicationSupport)
-    try bind(&saved, &held, listed: listed, applicationSupport: applicationSupport)
-    if saved.held != held { try save(&saved, applicationSupport: applicationSupport) }
+    try bind(&saved, &held, applicationSupport: applicationSupport)
     return Stored(profiles: saved.profiles, withdrawals: saved.withdrawals, held: held)
   }
 
   /// The held queues, once each `Legacy` folder earlier builds of this app left in a profile's
-  /// directory records the queue it becomes, and after what those builds recorded is written into
-  /// each queue's folder that records nothing, except a queue whose source still records it: this
-  /// build listed it before a stop and moves it next. Those `Legacy` folders are returned to be
-  /// held, so they are counted here before they move. A queue's address is known only where it is
-  /// proven:
+  /// directory records the queue it becomes, and each alert installation they recorded that no
+  /// folder took has a queue of its own. Nothing is saved here, so what those builds wrote stays in
+  /// `profiles.json` until each record is on disk. Those `Legacy` folders are returned to be held.
+  /// A queue's address is known only where it is proven:
   /// - Only pairing changes an unpaired profile's address, so its `Legacy` folder was queued for it.
   /// - A recorded `origin` is a folder's only when exactly one holder matches it: unpaired at its
   ///   address, or pinned to its coordinator.
-  /// - A `held` record with the holder's ID is its `Legacy` folder's only while that queue has no
-  ///   folder in `Agent/Held`. Once it has one, the `Legacy` folder came later.
   /// - Anything else is unknown, and Restore asks.
-  /// An installation no folder took keeps a queue of its own at its address.
+  /// A queue the build before this one lists describes only its own folder in `Agent/Held`, so it
+  /// gives nothing to a `Legacy` folder. Without that folder, only its installation is kept.
   private static func adoptEarlier(
     _ saved: SavedProfiles, applicationSupport: URL, caches: URL
   ) throws -> (held: [HeldQueue], legacy: [(source: URL, queue: HeldQueue)]) {
@@ -526,12 +531,7 @@ extension Coordinators {
     for directory in holders {
       let id = directory.profile
       let queue: HeldQueue
-      if let record = saved.held.first(where: { $0.id.uuidString == id.description }),
-        !FileManager.default.fileExists(
-          atPath: record.folder(applicationSupport: applicationSupport).path)
-      {
-        queue = record
-      } else if let origin, originHolder == id {
+      if let origin, originHolder == id {
         queue = HeldQueue(
           adopting: id, address: origin.address, coordinator: origin.coordinator,
           installation: origin.installation)
@@ -547,15 +547,6 @@ extension Coordinators {
           try HeldQueue.name(directory.legacy, as: queue, applicationSupport: applicationSupport)
         ))
     }
-    let moving = try (legacy.map(\.source) + outboxes(applicationSupport: applicationSupport))
-      .compactMap { try HeldQueue.recorded(in: $0)?.id }
-    for record in saved.held where !moving.contains(record.id) {
-      let folder = record.folder(applicationSupport: applicationSupport)
-      guard try HeldQueue.recorded(in: folder) == nil,
-        FileManager.default.fileExists(atPath: folder.path) || record.installation != nil
-      else { continue }
-      try record.record(in: folder)
-    }
     var held = try HeldQueue.all(applicationSupport: applicationSupport) + legacy.map(\.queue)
     var waiting: [HeldQueue] = []
     if let origin, originHolder == nil, let installation = origin.installation {
@@ -568,6 +559,11 @@ extension Coordinators {
         waiting.append(HeldQueue(address: profile.address, installation: installation))
       }
     }
+    let shipped = applicationSupport.appending(path: "Agent/Held")
+    for queue in saved.held
+    where !FileManager.default.fileExists(atPath: shipped.appending(path: "\(queue.id)").path) {
+      waiting.append(HeldQueue(address: queue.address, installation: queue.installation))
+    }
     for queue in waiting {
       guard let installation = queue.installation,
         !carries(installation, held: held, saved: saved)
@@ -578,31 +574,39 @@ extension Coordinators {
     return (held, legacy)
   }
 
-  /// Makes each source a queue's folder: records the queue in it, unless a stopped launch already
-  /// did, lists each in `profiles.json`, and only then renames each into `Agent/Held`. The build
-  /// before this one deletes every folder there that file does not list, and tolerates a listed
-  /// queue whose folder is not there yet. A stop at any point resumes with the queue each source
-  /// records.
-  private static func hold(
-    _ sources: [(source: URL, queue: HeldQueue)], in saved: inout SavedProfiles,
-    applicationSupport: URL, crash: (MigrationStep) throws -> Void
-  ) throws {
-    let files = FileManager.default
-    let moving = try sources.filter { files.fileExists(atPath: $0.source.path) }.map {
-      (
-        source: $0.source,
-        queue: try HeldQueue.name($0.source, as: $0.queue, applicationSupport: applicationSupport)
+  /// Each folder the build before this one left in `Agent/Held`, with the queue `profiles.json`
+  /// names it as: what `listing` says about it, else what the folder records, else a queue whose
+  /// address is unknown. That build named each folder for its queue.
+  private static func leftInAgentHeld(listing: [HeldQueue], applicationSupport: URL) throws
+    -> [(source: URL, queue: HeldQueue)]
+  {
+    let entries: [URL]
+    do {
+      entries = try FileManager.default.contentsOfDirectory(
+        at: applicationSupport.appending(path: "Agent/Held"), includingPropertiesForKeys: nil)
+    } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [] }
+    return try entries.compactMap { folder in
+      guard let id = UUID(uuidString: folder.lastPathComponent) else { return nil }
+      let known = try listing.first { $0.id == id } ?? HeldQueue.recorded(in: folder)
+      return (
+        folder,
+        HeldQueue(
+          id: id, address: known?.address, coordinator: known?.coordinator,
+          installation: known?.installation)
       )
-    }.filter {
-      !files.fileExists(atPath: $0.queue.folder(applicationSupport: applicationSupport).path)
     }
-    guard !moving.isEmpty else { return }
-    if moving.contains(where: { queue in !saved.held.contains { $0.id == queue.queue.id } }) {
-      try save(&saved, listing: moving.map(\.queue), applicationSupport: applicationSupport)
-    }
-    try crash(.queueListed)
-    for (source, queue) in moving {
-      try moveOnce(source, to: queue.folder(applicationSupport: applicationSupport))
+  }
+
+  /// Moves each source into the queue it records, recording `queue` in it first unless a stopped
+  /// launch already recorded one, so a stop at any point resumes with the queue each source records.
+  private static func hold(
+    _ sources: [(source: URL, queue: HeldQueue)], applicationSupport: URL,
+    crash: (MigrationStep) throws -> Void
+  ) throws {
+    for (source, queue) in sources where FileManager.default.fileExists(atPath: source.path) {
+      let named = try HeldQueue.name(source, as: queue, applicationSupport: applicationSupport)
+      try crash(.queueRecorded)
+      try moveOnce(source, to: named.folder(applicationSupport: applicationSupport))
     }
   }
 
@@ -648,8 +652,7 @@ extension Coordinators {
         try save(&saved, applicationSupport: applicationSupport)
       }
       try crash(.profileSaved)
-      try hold(
-        [(outbox, queue)], in: &saved, applicationSupport: applicationSupport, crash: crash)
+      try hold([(outbox, queue)], applicationSupport: applicationSupport, crash: crash)
       try crash(.quarantined)
     }
     let previews = caches.appending(path: "Agent/Previews")
@@ -664,7 +667,7 @@ extension Coordinators {
   /// or once a stopped launch recorded it. Its address is the one of `known` whose key names the
   /// outbox, else unknown.
   private static func adoptOutboxes(
-    knowing known: [CoordinatorAddress], into saved: inout SavedProfiles, applicationSupport: URL,
+    knowing known: [CoordinatorAddress], applicationSupport: URL,
     crash: (MigrationStep) throws -> Void
   ) throws {
     let addresses = Dictionary(
@@ -676,7 +679,7 @@ extension Coordinators {
     }.map {
       ($0, HeldQueue(address: addresses[$0.lastPathComponent], installation: nil))
     }
-    try hold(held, in: &saved, applicationSupport: applicationSupport, crash: crash)
+    try hold(held, applicationSupport: applicationSupport, crash: crash)
   }
 
   /// Every outbox the single-address build left.
@@ -686,23 +689,19 @@ extension Coordinators {
       ?? []
   }
 
-  /// Gives each queue no coordinator took yet to the first one proven at its address: the one the
-  /// build before this one bound it to, when `listed` says so at the address its folder records,
-  /// else the only one a saved profile is pinned to there. That build saved the withdrawal of each
-  /// binding it listed in the same write. Any other binding's withdrawal is saved first, so a stop
-  /// before its record is written binds it again and adds no second withdrawal.
+  /// Gives each queue no coordinator took yet to the only one a saved profile is pinned to at its
+  /// address. Each binding's withdrawal is saved first, unless an equal one is saved already, so a
+  /// stop before its record is written binds it again and adds no second withdrawal.
   private static func bind(
-    _ saved: inout SavedProfiles, _ held: inout [HeldQueue], listed: [HeldQueue],
-    applicationSupport: URL
+    _ saved: inout SavedProfiles, _ held: inout [HeldQueue], applicationSupport: URL
   ) throws {
     var bound: [HeldQueue] = []
     for index in held.indices {
       guard let address = held[index].address else { continue }
-      let proven = listed.first { $0.id == held[index].id && $0.address == address }?.coordinator
       let pins = saved.profiles.filter { $0.address == address }.compactMap(\.pin)
-      guard let found = proven ?? (pins.count == 1 ? pins[0] : nil) else { continue }
+      guard pins.count == 1 else { continue }
       let before = held[index]
-      if let handover = held[index].bind(found, at: address), proven == nil,
+      if let handover = held[index].bind(pins[0], at: address),
         !saved.withdrawals.contains(handover)
       {
         saved.withdrawals.append(handover)
@@ -768,12 +767,10 @@ extension Coordinators {
   }
 
   /// Readable after first unlock, so a launch while locked still knows its coordinators. `held`
-  /// becomes what the queues' folders record now, and then `listing`, whose folders are not there
-  /// yet, whatever the caller passed.
-  private static func save(
-    _ saved: inout SavedProfiles, listing: [HeldQueue] = [], applicationSupport: URL
-  ) throws {
-    saved.held = try HeldQueue.all(applicationSupport: applicationSupport) + listing
+  /// becomes each folder still in `Agent/Held`, as `leftInAgentHeld` names it.
+  private static func save(_ saved: inout SavedProfiles, applicationSupport: URL) throws {
+    saved.held = try leftInAgentHeld(listing: saved.held, applicationSupport: applicationSupport)
+      .map(\.queue)
     let url = url(applicationSupport)
     try FileManager.default.createDirectory(
       at: url.deletingLastPathComponent(), withIntermediateDirectories: true,

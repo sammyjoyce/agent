@@ -202,9 +202,10 @@ public struct HeldQueue: Codable, Sendable, Equatable, Identifiable {
     return installation.map { PendingWithdrawal(installation: $0, address: address, pin: found) }
   }
 
-  /// The queue's messages and their files. No profile's directory holds it, so it outlives any.
+  /// The queue's messages and their files. No profile's directory holds it, so it outlives any, and
+  /// no earlier build of this app reads, writes or deletes anything in `Agent/HeldQueues`.
   public func folder(applicationSupport: URL) -> URL {
-    applicationSupport.appending(path: "Agent/Held/\(id.uuidString)")
+    applicationSupport.appending(path: "Agent/HeldQueues/\(id.uuidString)")
   }
 
   /// The queue an earlier build of this app held in `profile`'s directory. It takes the profile's
@@ -233,13 +234,13 @@ public struct HeldQueue: Codable, Sendable, Equatable, Identifiable {
       JSONEncoder().encode(self), to: Self.record(in: folder), readableAfterFirstUnlock: true)
   }
 
-  /// Every queue in `Agent/Held`, oldest folder first. A folder that records none is a queue whose
-  /// address and coordinator are unknown.
+  /// Every queue in `Agent/HeldQueues`, oldest folder first. A folder that records none is a queue
+  /// whose address and coordinator are unknown.
   public static func all(applicationSupport: URL) throws -> [HeldQueue] {
     let entries: [URL]
     do {
       entries = try FileManager.default.contentsOfDirectory(
-        at: applicationSupport.appending(path: "Agent/Held"),
+        at: applicationSupport.appending(path: "Agent/HeldQueues"),
         includingPropertiesForKeys: [.creationDateKey])
     } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [] }
     var queues: [(created: Date, queue: HeldQueue)] = []
@@ -260,20 +261,20 @@ public struct HeldQueue: Codable, Sendable, Equatable, Identifiable {
   }
 
   /// Records `queue` in `source`, unless a stopped launch already recorded one there, and returns
-  /// the queue its record names. A queue whose ID another folder has takes a new one, so no folder
-  /// later moves into another's.
+  /// the queue its record names. A queue whose folder another source already took gets a new ID
+  /// first, so every source moves into a folder of its own.
   public static func name(_ source: URL, as queue: HeldQueue, applicationSupport: URL) throws
     -> HeldQueue
   {
-    if let recorded = try recorded(in: source) { return recorded }
-    var named = queue
+    let recorded = try recorded(in: source)
+    var named = recorded ?? queue
     if FileManager.default.fileExists(
-      atPath: queue.folder(applicationSupport: applicationSupport).path)
+      atPath: named.folder(applicationSupport: applicationSupport).path)
     {
       named = HeldQueue(
-        address: queue.address, coordinator: queue.coordinator, installation: queue.installation)
+        address: named.address, coordinator: named.coordinator, installation: named.installation)
     }
-    try named.record(in: source)
+    if named != recorded { try named.record(in: source) }
     return named
   }
 
@@ -290,7 +291,7 @@ public struct HeldQueue: Codable, Sendable, Equatable, Identifiable {
 
   /// Deletes every folder a Remove marked. Any other folder stays.
   public static func deleteMarked(applicationSupport: URL) {
-    let held = applicationSupport.appending(path: "Agent/Held")
+    let held = applicationSupport.appending(path: "Agent/HeldQueues")
     let entries =
       (try? FileManager.default.contentsOfDirectory(at: held, includingPropertiesForKeys: nil))
       ?? []
