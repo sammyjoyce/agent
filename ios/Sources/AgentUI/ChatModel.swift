@@ -57,7 +57,12 @@ struct HeldMessage: Identifiable, Equatable {
 /// queued or held until a Send carries that content unchanged to its coordinator, or the user
 /// discards it, so nothing its coordinator did not get is lost.
 struct RestoredSource: Equatable {
-  enum Kind { case live, legacy }
+  enum Kind: Equatable {
+    case live
+    /// Held from before the update in `holder`'s directory.
+    case legacy(holder: ProfileID)
+  }
+  /// Its coordinator.
   let lane: ProfileID
   let item: String
   let kind: Kind
@@ -130,6 +135,20 @@ final class ChatModel {
   /// picks a recipient or changes the picker before then.
   private(set) var committed = ""
   var attachments: [LocalAttachment] = [] { didSet { forgetClearedSource() } }
+  /// What the single-address build left, kept by `Coordinators`.
+  var origin: LegacyOrigin?
+  /// The saved coordinator that messages held from before the update belong to: the one a saved
+  /// profile paired with at the address the single-address build used. nil until one has, and
+  /// Restore then asks the user.
+  var heldCoordinator: ProfileID? {
+    guard let coordinator = origin?.coordinator else { return nil }
+    return profiles.first { $0.pin == coordinator && removed[$0.id] == nil }?.id
+  }
+  /// Whom Restore offers for a held message while `heldCoordinator` is nil: every paired
+  /// coordinator not being removed.
+  var heldChoices: [CoordinatorProfile] {
+    profiles.filter { $0.pin != nil && removed[$0.id] == nil }
+  }
   /// Messages held from before the update, by lane in feed order.
   var held: [HeldMessage] {
     lanes.flatMap { lane in
@@ -535,16 +554,25 @@ final class ChatModel {
     do {
       let store = try attachmentStore()
       guard let restored = await lane.session?.restore(inputID, to: store) else { return }
-      await fill(restored, from: lane.id, item: inputID, kind: .live, store)
+      await fill(restored, for: lane.id, source: (inputID, .live), store)
     } catch { failure = error.localizedDescription }
   }
-  func restoreHeld(_ message: HeldMessage) async {
-    guard let lane = lanes.first(where: { $0.id == message.lane }), readyToRestore(from: lane.id)
+  /// Copies a held message into the composer with its text as it was, addressed to the coordinator
+  /// held messages belong to, or else to `chosen`, and with neither does nothing. It stays held
+  /// until a Send carries the copy unchanged to the coordinator it belongs to, since only that one
+  /// is known to be the coordinator it was queued for.
+  func restoreHeld(_ message: HeldMessage, for chosen: ProfileID? = nil) async {
+    let owner = heldCoordinator
+    guard let holder = lanes.first(where: { $0.id == message.lane }),
+      let recipient = chosen ?? owner, readyToRestore(from: holder.id),
+      readyToRestore(from: recipient)
     else { return }
     do {
       let store = try attachmentStore()
-      guard let restored = try await lane.hold.restore(message.id, to: store) else { return }
-      await fill(restored, from: lane.id, item: message.id, kind: .legacy, store)
+      guard let restored = try await holder.hold.restore(message.id, to: store) else { return }
+      await fill(
+        restored, for: recipient,
+        source: recipient == owner ? (message.id, .legacy(holder: holder.id)) : nil, store)
     } catch { failure = error.localizedDescription }
   }
   func discardHeld(_ message: HeldMessage) async {
@@ -565,10 +593,11 @@ final class ChatModel {
   }
   /// Puts the restored message before what the user typed or attached while its files were copied,
   /// as on `main`. What the user addressed to another coordinator meanwhile stays as it is, since
-  /// the restored message stays its source's, and the copies go.
+  /// the restored message stays `lane`'s, and the copies go. Without a `source` it is a copy that
+  /// withdraws nothing.
   private func fill(
-    _ restored: RestoredDraft, from lane: ProfileID, item: String, kind: RestoredSource.Kind,
-    _ store: AttachmentStore
+    _ restored: RestoredDraft, for lane: ProfileID,
+    source original: (item: String, kind: RestoredSource.Kind)?, _ store: AttachmentStore
   ) async {
     guard (draft.isEmpty && attachments.isEmpty) || recipient == nil || recipient == lane
     else {
@@ -584,9 +613,11 @@ final class ChatModel {
       screenshotOwners[file.id] = lane
     }
     restoredFrom = lane
-    source = RestoredSource(
-      lane: lane, item: item, kind: kind, text: restored.text,
-      files: Set(restored.attachments.map(\.id)))
+    source = original.map {
+      RestoredSource(
+        lane: lane, item: $0.item, kind: $0.kind, text: restored.text,
+        files: Set(restored.attachments.map(\.id)))
+    }
     // Last, since an empty restored text clears the draft above, which drops an undrawn recipient.
     recipient = lane
   }
@@ -600,10 +631,10 @@ final class ChatModel {
   /// Runs once a Send carried the source's content unchanged. A lane removed meanwhile took its
   /// source with it.
   private func remove(_ source: RestoredSource) async {
-    guard let lane = lanes.first(where: { $0.id == source.lane }) else { return }
     switch source.kind {
-    case .live: await lane.session?.discard(source.item)
-    case .legacy:
+    case .live: await lanes.first { $0.id == source.lane }?.session?.discard(source.item)
+    case .legacy(let holder):
+      guard let lane = lanes.first(where: { $0.id == holder }) else { return }
       do { try await lane.hold.discard(source.item) } catch {
         failure = error.localizedDescription
       }
