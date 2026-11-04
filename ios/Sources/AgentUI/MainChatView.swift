@@ -205,7 +205,9 @@ public struct MainChatView: View {
     guard let snapshot = model.snapshots[profile.id] else {
       return (ConnectionState.connecting.label, true, false)
     }
-    if let error = snapshot.error { return (error, false, snapshot.connection != .connected) }
+    if let error = model.laneError(profile.id) {
+      return (error, false, snapshot.connection != .connected)
+    }
     switch snapshot.connection {
     case .connected: return nil
     case .connecting, .reconnecting: return (snapshot.connection.label, true, false)

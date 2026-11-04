@@ -429,6 +429,146 @@ func aRefusedAddressEditKeepsTheQueueAndNeverSendsTheUserToRemove(_ typo: String
   await stop()
 }
 
+/// Which fixture each saved port reaches. A test changes it as coordinators move.
+private actor Routes {
+  private var table: [UInt16: NWEndpoint.Port]
+  init(_ table: [UInt16: NWEndpoint.Port]) { self.table = table }
+  func set(_ next: [UInt16: NWEndpoint.Port]) { table = next }
+  func port(_ saved: UInt16) -> NWEndpoint.Port? { table[saved] }
+}
+
+/// Work and Personal run on one machine at ports 4001 and 4002, and Work refused a follow-up that
+/// this phone still holds. Then the two coordinators trade ports, so each lane reaches the other
+/// saved coordinator. Each line names that coordinator and points to editing its own address. It
+/// never points to Remove, which deletes Work's follow-up, and re-adding Work there would bind the
+/// name to Personal's coordinator. Following Work's line keeps the follow-up, and following both
+/// keeps `@Work` going to Work's coordinator. An address that answers as a coordinator no profile
+/// is pinned to, as after a reinstall, keeps the reinstall line with Remove's count.
+@MainActor
+@Test(.timeLimit(.minutes(1)), arguments: ["Work's line", "both lines", "a reinstall"])
+func aLaneWhoseAddressAnswersAsAnotherSavedCoordinatorNamesItAndNeverSendsTheUserToRemove(
+  _ followed: String
+) async throws {
+  let work = FixtureCoordinator()
+  let personal = FixtureCoordinator()
+  let stranger = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(work)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personal)
+  defer { personalListener.cancel() }
+  let (strangerListener, strangerPort) = try await listen(stranger)
+  defer { strangerListener.cancel() }
+  let routes = Routes([4001: workPort, 4002: personalPort])
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "swap-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: CoordinatorTransport { address in
+      guard let port = await routes.port(address.port) else {
+        throw ConnectionError.invalidAddress
+      }
+      return LineConnection(
+        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+    })
+  func stop() async {
+    await coordinators.setActive(false)
+    for fixture in [work, personal, stranger] { await fixture.stop() }
+  }
+  do {
+    await coordinators.setActive(true)
+    try await coordinators.add(
+      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    try await coordinators.add(
+      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+    let chat = coordinators.chat
+    let workID = coordinators.profiles[0].id
+    let personalID = coordinators.profiles[1].id
+    try await eventually("both connected") {
+      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+    }
+    await work.rejectSubmits()
+    chat.draft = "@Work Invented follow-up: renew the parking permit"
+    chat.promoteTypedTag()
+    await chat.send()
+    let outbox = ProfileDirectory(workID, applicationSupport: root, caches: root).outbox
+    try await eventually("Work refused the follow-up") {
+      chat.snapshots[workID]?.rows.contains { $0.delivery == .rejected } == true
+    }
+    await work.rejectSubmits(false)
+    await routes.set(
+      followed == "a reinstall"
+        ? [4001: strangerPort, 4002: personalPort] : [4001: personalPort, 4002: workPort])
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    try await eventually("Work's line names who answers") {
+      chat.laneError(workID)?.hasPrefix("This address now answers as") == true
+    }
+    let workLine = chat.laneError(workID) ?? "nil"
+    print("IF13-X1[\(followed)] Work's line: \(workLine)")
+    if followed == "a reinstall" {
+      #expect(
+        workLine
+          == "This address now answers as a different coordinator. 1 queued message is held on this phone. Remove it and add it again."
+      )
+      try await eventually("Personal connected beside it") {
+        chat.snapshots[personalID]?.connection == .connected
+      }
+    } else {
+      try await eventually("Personal's line names who answers") {
+        chat.laneError(personalID)?.hasPrefix("This address now answers as") == true
+      }
+      let personalLine = chat.laneError(personalID) ?? "nil"
+      print("IF13-X1[\(followed)] Personal's line: \(personalLine)")
+      #expect(workLine == "This address now answers as Personal. Edit Work's address.")
+      #expect(personalLine == "This address now answers as Work. Edit Personal's address.")
+      #expect(
+        !workLine.contains("Remove") && !personalLine.contains("Remove"),
+        "A line sends the user to Remove, which deletes the queue")
+      try await coordinators.update(
+        workID, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+      try await eventually("Work reconnected where its coordinator answers") {
+        chat.snapshots[workID]?.connection == .connected
+      }
+      let queued = (try? queuedRequests(outbox).map(\.text)) ?? []
+      print(
+        "IF13-X1[\(followed)] after editing Work's address: Work's line=\(chat.laneError(workID) ?? "nil") Work's queue=\(queued)"
+      )
+      #expect(queued == ["Invented follow-up: renew the parking permit"])
+      #expect(chat.laneError(workID) == nil)
+      if followed == "both lines" {
+        try await coordinators.update(
+          personalID, name: TagName("Personal"),
+          address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+        try await eventually("Personal reconnected where its coordinator answers") {
+          chat.snapshots[personalID]?.connection == .connected
+        }
+        let before = (await work.count(), await personal.count())
+        chat.draft = "@Work Invented note: the quarterly board pack"
+        chat.promoteTypedTag()
+        let line = chat.recipientLine
+        await chat.send()
+        try await eventually("Work's coordinator got the note") { await work.count() > before.0 }
+        try await Task.sleep(for: .milliseconds(300))
+        let gotByWork = await work.count() - before.0
+        let gotByPersonal = await personal.count() - before.1
+        print(
+          "IF13-X1[\(followed)] after editing both: line=\(line) Work's coordinator got=\(gotByWork) Personal's coordinator got=\(gotByPersonal)"
+        )
+        #expect(line == "To Work")
+        #expect(gotByWork == 1)
+        #expect(gotByPersonal == 0, "The @Work note reached Personal's coordinator")
+      }
+    }
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
 /// Holds the first dial until `open`, standing in for a slow address probe.
 private actor ProbeGate {
   private(set) var waiting = false

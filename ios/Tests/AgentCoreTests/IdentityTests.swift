@@ -76,20 +76,23 @@ func aSocketThatNamesAnotherCoordinatorCarriesOnlyIdentify(_ path: GatePath) asy
     let text = "Typed for the paired coordinator"
     switch path {
     case .notifications:
-      await #expect(throws: ConnectionError.wrongCoordinator) {
+      await #expect(throws: ConnectionError.wrongCoordinator(wrong.id)) {
         try await session.notifications(.status(.init(installationId: "\(directory.profile)")))
       }
     case .toolDetails:
-      await #expect(throws: ConnectionError.wrongCoordinator) {
+      await #expect(throws: ConnectionError.wrongCoordinator(wrong.id)) {
         try await session.toolDetails(entryID: "7", callID: "call-7")
       }
     case .preview:
       let reference = AttachmentRef(
         id: UUID().uuidString, mediaType: "text/plain", name: "Notes.txt",
         sha256: String(repeating: "0", count: 64), sizeBytes: 3)
-      await #expect(throws: ConnectionError.wrongCoordinator) {
+      let refused = await #expect(throws: ConnectionError.wrongCoordinator(wrong.id)) {
         try await session.preview(reference)
       }
+      // The composer shows this text. The other coordinator may be one the user saved, and
+      // Remove would delete this one's queue.
+      #expect(refused?.localizedDescription.contains("Remove") == false)
     case .history:
       await session.loadLatest()
     case .submit:
@@ -107,6 +110,7 @@ func aSocketThatNamesAnotherCoordinatorCarriesOnlyIdentify(_ path: GatePath) asy
         $0.connection == .reconnecting && $0.error?.contains("different coordinator") == true
       }
       #expect(refused.error?.contains("held on this phone. Remove it and add it again.") == true)
+      #expect(refused.answeredAs == wrong.id, "The lane can name who answered")
       #expect(refused.rows.first { $0.inputID == held.inputId }?.delivery == .uncertain)
       if path == .submit {
         let typed = try #require(refused.rows.first { $0.text == text })
@@ -139,11 +143,13 @@ func aNameThatReturnsToItsCoordinatorReconnectsAndReconciles() async throws {
       refused.error
         == "This address now answers as a different coordinator. 1 queued message is held on this phone. Remove it and add it again."
     )
+    #expect(refused.answeredAs == wrong.id)
     await route.point(to: rightPort)
     let recovered = try await snapshot(session) {
       $0.connection == .connected && $0.rows.contains { $0.inputID == id && $0.delivery == nil }
     }
     #expect(recovered.error == nil)
+    #expect(recovered.answeredAs == nil)
     #expect(try queuedRequests(directory.outbox).isEmpty)
     #expect(await right.count() == 1, "Reconciliation never resends")
     #expect(await right.received().contains(.observe(.init(inputIds: [id]))))

@@ -275,9 +275,11 @@ public struct PendingWithdrawal: Codable, Sendable, Equatable {
     self.pin = pin
   }
 
-  /// Withdraws the installation over one socket that proves the pin. True once the coordinator
-  /// confirmed it holds no registration for it.
-  public func send(transport: CoordinatorTransport) async throws -> Bool {
+  /// Withdraws the installation over one socket to `address` that proves the pin. True once the
+  /// coordinator confirmed it holds no registration for it.
+  public func send(to address: CoordinatorAddress, transport: CoordinatorTransport) async throws
+    -> Bool
+  {
     let stream = try await CoordinatorDialer(address: address, pin: pin, transport: transport)
       .open()
     do {

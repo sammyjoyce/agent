@@ -216,22 +216,31 @@ public final class Coordinators {
     }
   }
 
-  /// Sends a saved withdrawal again over a socket that proves its pin. The record goes once the
-  /// coordinator confirms, or once the address answers as another coordinator, which never
-  /// held this registration.
+  /// Sends a saved withdrawal again over a socket that proves its pin: at its own address, else at
+  /// the first saved address that answers as its coordinator, as after two coordinators trade
+  /// addresses. Another coordinator never held this registration, so its answer confirms nothing.
+  /// The record goes once its coordinator confirms, or once every one of those addresses answers
+  /// as another coordinator, since this phone then knows no way to reach it, as after a reinstall.
   private func retry(_ withdrawal: PendingWithdrawal) {
     let id = withdrawal.installation
     withdrawing.removeValue(forKey: id)?.cancel()
+    var addresses = [withdrawal.address]
+    for profile in profiles where !addresses.contains(profile.address) {
+      addresses.append(profile.address)
+    }
     withdrawing[id] = Task { [weak self, transport] in
-      let confirmed: Bool
-      do {
-        confirmed = try await withdrawal.send(transport: transport)
-      } catch ConnectionError.wrongCoordinator {
-        confirmed = true
-      } catch {
-        confirmed = false
+      var settled = true
+      for address in addresses where !Task.isCancelled {
+        do {
+          settled = try await withdrawal.send(to: address, transport: transport)
+          break
+        } catch ConnectionError.wrongCoordinator {
+          continue
+        } catch {
+          settled = false
+        }
       }
-      guard confirmed, let self else { return }
+      guard settled, !Task.isCancelled, let self else { return }
       await self.serially { self.confirmWithdrawal(id, saved: self.profiles) }
     }
   }
