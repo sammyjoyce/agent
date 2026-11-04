@@ -329,6 +329,82 @@ func aSecondMigrationNamesItsCoordinatorSoEachTagAddressesOne(_ first: String, _
   #expect(routed == profiles.map { .to([$0.id], body: "invented note") })
 }
 
+/// This build migrated the single-address build's first launch at 100.64.1.2 as Coordinator. Then
+/// #9 migrated a second launch at 100.64.1.3, which saves another Coordinator, after the user may
+/// have saved Coordinator-2. This build, launched again, keeps the first name and every name no
+/// other one has, and gives the later Coordinator the first free one, so each `@` tag addresses one
+/// coordinator.
+@MainActor @Test(arguments: [false, true])
+func aDuplicateNameAnEarlierBuildSavedGetsTheFirstFreeOne(coordinator2Saved: Bool) async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "if17-names-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  func queue(_ text: String, in folder: URL) throws {
+    try writePrivately(
+      JSONEncoder().encode([
+        NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: text)
+      ]),
+      to: folder.appending(path: "pending.json"))
+  }
+  defaults.set("100.64.1.2", forKey: "coordinatorAddress")
+  try queue("First launch's note", in: LegacyInstall.outbox(root, "100.64.1.2", 43187))
+  let migrated = try #require(
+    Coordinators.migrate(defaults: defaults, applicationSupport: root, caches: root).profiles.first)
+  let saved = try CoordinatorProfile(
+    name: TagName("Coordinator-2"), address: .init(host: "100.64.1.4"))
+  let second = try CoordinatorProfile(
+    name: TagName("Coordinator"), address: .init(host: "100.64.1.3"))
+  struct WrittenByNine: Encodable {
+    struct Origin: Encodable {
+      let address: CoordinatorAddress
+      let installation: String
+    }
+    let profiles: [CoordinatorProfile]
+    let withdrawals: [PendingWithdrawal]
+    let origin: Origin
+  }
+  try writePrivately(
+    JSONEncoder().encode(
+      WrittenByNine(
+        profiles: [migrated] + (coordinator2Saved ? [saved] : []) + [second], withdrawals: [],
+        origin: .init(address: second.address, installation: UUID().uuidString))),
+    to: root.appending(path: "Agent/profiles.json"))
+  try queue(
+    "Second launch's note",
+    in: ProfileDirectory(second.id, applicationSupport: root, caches: root).legacy)
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: CoordinatorTransport { _ in throw ConnectionError.timedOut })
+  let shown = try await settles { coordinators.chat.held.count == 2 }
+  let names = coordinators.profiles.map(\.name.description)
+  struct Saved: Decodable { let profiles: [CoordinatorProfile] }
+  let written = try JSONDecoder().decode(
+    Saved.self, from: Data(contentsOf: root.appending(path: "Agent/profiles.json")))
+  var paired = coordinators.profiles
+  for profile in coordinators.profiles {
+    _ = try CoordinatorProfile.admit(CoordinatorID(UUID()), for: profile.id, in: &paired)
+  }
+  let peers = paired.map {
+    Addressing.Coordinator(id: $0.id, name: $0.name.description, paired: true, connected: true)
+  }
+  let routed = paired.map {
+    Addressing.parse("@\($0.name) invented note", hasAttachments: false, chip: nil, among: peers)
+  }
+  print(
+    "IF17-S3[Coordinator-2 saved=\(coordinator2Saved)] names=\(names) saved=\(written.profiles.map(\.name.description)) held=\(coordinators.chat.held.map(\.item.text)) routed=\(routed)"
+  )
+  #expect(
+    names
+      == (coordinator2Saved
+        ? ["Coordinator", "Coordinator-2", "Coordinator-3"] : ["Coordinator", "Coordinator-2"]))
+  #expect(written.profiles == coordinators.profiles, "The new names are not saved")
+  #expect(coordinators.profiles.map(\.id) == written.profiles.map(\.id))
+  #expect(routed == paired.map { .to([$0.id], body: "invented note") })
+  #expect(shown, "A held note is not shown")
+}
+
 @MainActor @Test func legacyHoldRestoresACopyAndDiscardsOnlyTheChosenItem() async throws {
   let install = try await LegacyInstall()
   defer { install.remove() }
