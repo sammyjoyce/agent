@@ -419,7 +419,7 @@ extension Coordinators {
   enum MigrationStep { case queueNamed, profileSaved, quarantined, markerRemoved }
 
   /// Names the queue a migration moves the single-address build's outbox into, until it finishes,
-  /// so one that stops at any step resumes with the same queue.
+  /// so one that stops at any step resumes with the same queue while its move is still to do.
   private static let migratingQueue = "migratingHeldQueue"
 
   /// Idempotent and offline, at every launch. Adopts what earlier builds of this app held. Then
@@ -506,7 +506,8 @@ extension Coordinators {
       let address = try? CoordinatorAddress(
         host: host.trimmingCharacters(in: .whitespacesAndNewlines), port: port)
     {
-      let id = defaults.string(forKey: migratingQueue).flatMap(UUID.init(uuidString:)) ?? UUID()
+      let id = try queueToFill(
+        for: address, in: saved, defaults: defaults, applicationSupport: applicationSupport)
       defaults.set(id.uuidString, forKey: migratingQueue)
       try crash(.queueNamed)
       var next = saved
@@ -529,9 +530,9 @@ extension Coordinators {
       }
       try crash(.profileSaved)
       if let queue = saved.held.first(where: { $0.id == id }) {
-        try quarantineLegacyOutbox(
-          for: address, into: queue.folder(applicationSupport: applicationSupport),
-          applicationSupport: applicationSupport)
+        try moveOnce(
+          legacyOutbox(for: address, applicationSupport: applicationSupport),
+          to: queue.folder(applicationSupport: applicationSupport))
       }
       try crash(.quarantined)
     }
@@ -541,6 +542,30 @@ extension Coordinators {
     }
     defaults.removeObject(forKey: "coordinatorAddress")
     try crash(.markerRemoved)
+  }
+
+  /// The queue this run moves the build's outbox for `address` into: the one a stopped run named
+  /// while its move is still to do, else a new one. A stopped run's queue for another address first
+  /// gets the move that run started. An outbox at a queue's address after its folder was filled is
+  /// one the build queued since, so it gets a new queue.
+  private static func queueToFill(
+    for address: CoordinatorAddress, in saved: SavedProfiles, defaults: UserDefaults,
+    applicationSupport: URL
+  ) throws -> UUID {
+    guard let named = defaults.string(forKey: migratingQueue).flatMap(UUID.init(uuidString:))
+    else { return UUID() }
+    guard let queue = saved.held.first(where: { $0.id == named }) else { return named }
+    let folder = queue.folder(applicationSupport: applicationSupport)
+    guard queue.address == address else {
+      if let started = queue.address {
+        try moveOnce(legacyOutbox(for: started, applicationSupport: applicationSupport), to: folder)
+      }
+      return UUID()
+    }
+    let files = FileManager.default
+    let outbox = legacyOutbox(for: address, applicationSupport: applicationSupport)
+    return files.fileExists(atPath: folder.path) && files.fileExists(atPath: outbox.path)
+      ? UUID() : named
   }
 
   /// Gives each queue held for an address that exactly one saved profile is pinned at to that

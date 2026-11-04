@@ -208,6 +208,84 @@ func migrationResumesAfterACrashAtEveryStepWithACustomPort(_ step: Coordinators.
   #expect(resumed.profiles.first?.address.port == 4123)
 }
 
+private let stoppedThenRelaunched: [(step: Coordinators.MigrationStep, host: String)] = [
+  (.queueNamed, "100.64.1.2"), (.profileSaved, "100.64.1.2"), (.quarantined, "100.64.1.2"),
+  (.markerRemoved, "100.64.1.2"), (.profileSaved, "100.64.1.3"), (.quarantined, "100.64.1.3"),
+  (.markerRemoved, "100.64.1.3"),
+]
+
+/// A migration stops after a step, then the single-address build runs again and queues another
+/// message, at its address or at another one it was pointed at. The resume finishes only the move
+/// it started, from its queue's own address, and holds what the build queued after that move in a
+/// queue of its own, also when the resume itself stops after each step in turn. Every message is
+/// held once, in a queue keyed to the address it was queued for.
+@MainActor @Test(arguments: stoppedThenRelaunched, [false, true])
+func theSingleAddressBuildQueuingAgainBeforeAMigrationResumesGetsAQueueOfItsOwn(
+  _ stopped: (step: Coordinators.MigrationStep, host: String), _ resumeStops: Bool
+) async throws {
+  let (step, host) = stopped
+  let install = try await LegacyInstall()
+  defer { install.remove() }
+  func migrate(stoppingAfter stop: Coordinators.MigrationStep) {
+    #expect(throws: Crash.self) {
+      try Coordinators.migrate(
+        defaults: install.defaults, applicationSupport: install.support, caches: install.caches,
+        crash: { if $0 == stop { throw Crash() } })
+    }
+  }
+  migrate(stoppingAfter: step)
+  let relaunched = try CoordinatorAddress(host: host)
+  let outbox = LegacyInstall.outbox(install.support, relaunched.host, relaunched.port)
+  let file = outbox.appending(path: "pending.json")
+  let before =
+    (try? JSONDecoder().decode([NativeRequestSubmit].self, from: Data(contentsOf: file))) ?? []
+  let again = NativeRequestSubmit(
+    inputId: UUID().uuidString, mode: .followUp, text: "New note from another launch")
+  try FileManager.default.createDirectory(at: outbox, withIntermediateDirectories: true)
+  try JSONEncoder().encode(before + [again]).write(to: file)
+  install.defaults.set(host, forKey: "coordinatorAddress")
+  if resumeStops {
+    for stop in [
+      Coordinators.MigrationStep.queueNamed, .profileSaved, .quarantined, .markerRemoved,
+    ] {
+      migrate(stoppingAfter: stop)
+    }
+  }
+  let resumed = try Coordinators.migrate(
+    defaults: install.defaults, applicationSupport: install.support, caches: install.caches)
+  func queued(_ text: String, for address: CoordinatorAddress?) -> String {
+    "\(text) for \(address.map { "\($0.host):\($0.port)" } ?? "no address")"
+  }
+  var held: [String] = []
+  for queue in resumed.held {
+    held += try await LegacyHold(queue.folder(applicationSupport: install.support)).items().map {
+      queued($0.text, for: queue.address)
+    }
+  }
+  let left = Set([install.oldOutbox.path, outbox.path]).filter {
+    FileManager.default.fileExists(atPath: $0)
+  }
+  print(
+    "IF16-T1[stopped after \(step), relaunched at \(host), resume stops=\(resumeStops)] queues=\(resumed.held.count) held=\(held) outboxes left=\(left.count) marker=\(install.defaults.string(forKey: "coordinatorAddress") ?? "nil")"
+  )
+  var expected = install.queued.map { queued($0.text, for: install.address) }
+  expected.append(queued(again.text, for: relaunched))
+  #expect(held.sorted() == expected.sorted(), "Each message is held once, for its own address")
+  #expect(left.isEmpty, "An outbox the build left is in no listed queue")
+  let first = try #require(resumed.held.first)
+  #expect(first.address == install.address && first.coordinator == nil)
+  #expect(first.installation?.description == install.installation)
+  #expect(
+    resumed.profiles.map(\.address)
+      == (relaunched == install.address ? [install.address] : [install.address, relaunched]))
+  #expect(install.defaults.object(forKey: "coordinatorAddress") == nil)
+  #expect(
+    install.defaults.dictionaryRepresentation().keys.allSatisfy { !$0.hasPrefix("migrating") })
+  let later = try Coordinators.migrate(
+    defaults: install.defaults, applicationSupport: install.support, caches: install.caches)
+  #expect(later == resumed, "A later launch changes nothing")
+}
+
 @MainActor @Test func legacyHoldRestoresACopyAndDiscardsOnlyTheChosenItem() async throws {
   let install = try await LegacyInstall()
   defer { install.remove() }

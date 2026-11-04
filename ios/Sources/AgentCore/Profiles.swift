@@ -249,15 +249,13 @@ public struct ProfileDirectory: Sendable {
   }
 }
 
-/// Migration only. Renames the single-address build's outbox for `address`
-/// (`Agent/Outbox/<sha256(host:port)>`) to `folder`, which no session reads.
-public func quarantineLegacyOutbox(
-  for address: CoordinatorAddress, into folder: URL, applicationSupport: URL
-) throws {
+/// Migration only. The single-address build's outbox for `address`,
+/// `Agent/Outbox/<sha256(host:port)>`, which no session reads.
+public func legacyOutbox(for address: CoordinatorAddress, applicationSupport: URL) -> URL {
   let key = SHA256.hash(data: Data("\(address.host):\(address.port)".utf8)).map {
     String(format: "%02x", $0)
   }.joined()
-  try moveOnce(applicationSupport.appending(path: "Agent/Outbox/\(key)"), to: folder)
+  return applicationSupport.appending(path: "Agent/Outbox/\(key)")
 }
 
 /// Renames `source` to `destination`. A missing source or an existing destination is a no-op, so
