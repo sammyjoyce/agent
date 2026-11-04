@@ -85,6 +85,12 @@ private actor ReconnectCoordinator {
         }
         guard !stopped else { return }
         let saved = submissions.filter { request.inputIds.contains($0.inputId) }
+        // As the coordinator does, receipts come before the history page, whose completion is what
+        // makes a client connected.
+        for input in saved {
+          try await emit(
+            .placed(.init(entryId: "saved-\(input.inputId)", inputId: input.inputId)), to: socket)
+        }
         let messages = saved.map {
           HistoryMessage(
             continuation: false, entryId: "saved-\($0.inputId)", finalChunk: true,
@@ -92,10 +98,6 @@ private actor ReconnectCoordinator {
         }
         try await emit(
           .history(.init(messages: messages, nextCursor: nil, pageComplete: true)), to: socket)
-        for input in saved {
-          try await emit(
-            .placed(.init(entryId: "saved-\(input.inputId)", inputId: input.inputId)), to: socket)
-        }
         try await emit(.idle, to: socket)
         if behavior == .close { return }
         _ = try await receive(socket)
