@@ -115,7 +115,18 @@ final class ChatModel {
   /// Coordinators removed in this process, or being removed, by the name they had. Nothing
   /// addresses one again, and profile IDs are never reused.
   var removed: [ProfileID: String] = [:]
-  var draft = "" { didSet { forgetClearedSource() } }
+  /// What the composer holds. A draft changed in code replaces the field's text, composition
+  /// included, so all of it is committed.
+  var draft = "" {
+    didSet {
+      committed = draft
+      forgetClearedSource()
+    }
+  }
+  /// The draft without the text an input method is still composing in the field, and the only text
+  /// tags are read from. A composition is tentative until the input method commits it, so it never
+  /// picks a recipient or changes the picker before then.
+  private(set) var committed = ""
   var attachments: [LocalAttachment] = [] { didSet { forgetClearedSource() } }
   private(set) var held: [HeldMessage] = []
   private(set) var heldError: String?
@@ -141,6 +152,9 @@ final class ChatModel {
   @ObservationIgnored private(set) var active = false
   @ObservationIgnored private(set) var lanes: [Lane] = []
   @ObservationIgnored private var observations: [ProfileID: Task<Void, Never>] = [:]
+  /// Inputs of a Send that reached no one, staged at a session that was retired before they could
+  /// be withdrawn, by profile. The profile's next session withdraws them once it is attached.
+  @ObservationIgnored private var unstaging: [ProfileID: [StagedInput]] = [:]
 
   init(draftStore: AttachmentStore? = nil, registration: NotificationRegistration? = nil) {
     self.draftStore = draftStore
@@ -187,6 +201,9 @@ final class ChatModel {
       snapshots[lane.id] = nil
       refresh()
       observations[lane.id] = observe(session, lane: lane.id)
+      if let inputs = unstaging.removeValue(forKey: lane.id) {
+        Task { for input in inputs { await withdraw(input, from: session, lane: lane.id) } }
+      }
     }
     Task { await loadHeld(lane) }
   }
@@ -288,13 +305,13 @@ final class ChatModel {
     }
   }
 
-  /// Saved coordinators matching an `@` still being typed, for the picker above the composer. A
-  /// restored draft offers none, since choosing one replaces the draft.
+  /// Saved coordinators matching an `@` still being typed in the committed text, for the picker
+  /// above the composer. A restored draft offers none, since choosing one replaces the draft.
   var pickerMatches: [CoordinatorProfile] {
-    guard addressesByName, recipient == nil, restoredFrom == nil, draft.first == "@",
-      !draft.contains(where: \.isWhitespace)
+    guard addressesByName, recipient == nil, restoredFrom == nil, committed.first == "@",
+      !committed.contains(where: \.isWhitespace)
     else { return [] }
-    let typed = draft.dropFirst().lowercased()
+    let typed = committed.dropFirst().lowercased()
     return profiles.filter {
       removed[$0.id] == nil && $0.name.description.lowercased().hasPrefix(typed)
     }
@@ -306,11 +323,20 @@ final class ChatModel {
     draft = ""
   }
 
+  /// The field's text, and that text without what an input method is still composing.
+  func edit(_ text: String, committed: String) {
+    draft = text
+    self.committed = committed
+  }
+
   /// A complete leading tag followed by a space becomes the chip, and the text after it is
-  /// never read for tags. The composer calls this after each edit. A restored draft's text is
-  /// literal for good, so no tag in it ever becomes the chip.
+  /// never read for tags. The composer calls this whenever the committed text changes. A restored
+  /// draft's text is literal for good, so no tag in it ever becomes the chip, and none does while
+  /// an input method is still composing the draft.
   func promoteTypedTag() {
-    guard addressesByName, recipient == nil, restoredFrom == nil, draft.first == "@" else { return }
+    guard addressesByName, recipient == nil, restoredFrom == nil, committed == draft,
+      draft.first == "@"
+    else { return }
     let word = draft.dropFirst().prefix { !$0.isWhitespace }
     let named = profiles.filter { $0.name.description.lowercased() == word.lowercased() }
     guard word.endIndex < draft.endIndex, let match = named.first, named.count == 1 else { return }
@@ -377,7 +403,7 @@ final class ChatModel {
         let input = await session.stage(
           body, mode: mode, files: files, sendID: sendID, recipients: recipients)
       else {
-        for item in staged { await item.session.unstage(item.input) }
+        for item in staged { await withdraw(item.input, from: item.session, lane: item.id) }
         // With one coordinator saved and none removed, its own reason is the composer's error.
         if removed[id] != nil {
           report("Nothing was sent. " + Missed.removed.sentence([name(id)], "this message"))
@@ -412,6 +438,23 @@ final class ChatModel {
     guard let original else { return }
     if source == original { source = nil }
     if original.isCarried(by: body, files: files, to: recipients) { await remove(original) }
+  }
+
+  /// Withdraws an input a Send staged and never started from its coordinator's outbox, through the
+  /// session that holds the outbox now. An address edit retires the session that staged it and
+  /// attaches the profile's next one, which then withdraws it, at once or once it is attached.
+  /// Remove deletes the outbox, so nothing is left to withdraw.
+  private func withdraw(_ input: StagedInput, from session: CoordinatorSession, lane id: ProfileID)
+    async
+  {
+    var session = session
+    while await session.unstage(input) == false {
+      guard let next = lanes.first(where: { $0.id == id })?.session, next !== session else {
+        if removed[id] == nil { unstaging[id, default: []].append(input) }
+        return
+      }
+      session = next
+    }
   }
 
   /// Why a coordinator did not get an input of a Send.

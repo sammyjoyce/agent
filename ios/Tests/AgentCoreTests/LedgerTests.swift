@@ -659,6 +659,69 @@ func aRetiredSessionNeverConnectsSendsOrWritesAgain() async throws {
   }
 }
 
+/// A Send stages an input, and an address edit retires the session before the Send starts it. The
+/// profile's next session shows the input as unconfirmed, since it cannot know the input never
+/// left. The Send then reaches no one, so its sender withdraws the input. The retired session
+/// writes nothing, and the next session withdraws it: before it connects, or while a Check / retry
+/// it started has not written the input yet. Once that Check / retry wrote it, the coordinator may
+/// hold it, so it stays queued.
+@Test(
+  .timeLimit(.minutes(1)),
+  arguments: ["before it connects", "while Check / retry dials", "once Check / retry wrote it"])
+func theNextSessionWithdrawsAnInputItsRetiredOneStagedUnlessItWroteIt(_ when: String)
+  async throws
+{
+  try await withProfile { fixture, directory, launch in
+    let first = try await launch()
+    await first.connect()
+    _ = try await until(first) { $0.connection == .connected }
+    let staged = try #require(
+      await first.stage(
+        "Invented: the venue is booked", sendID: "send-11", recipients: [directory.profile]))
+    await first.retire()
+    await first.unstage(staged)
+    let keptByRetired = try outboxItems(directory.outbox).map(\.request.inputId)
+    let next = try await launch()
+    if when == "before it connects" {
+      await next.unstage(staged)
+      await next.connect()
+      _ = try await until(next) { $0.connection == .connected }
+    } else {
+      await next.connect()
+      _ = try await until(next) { snapshot in
+        snapshot.connection == .connected
+          && snapshot.rows.contains { $0.inputID == staged.inputID && $0.delivery == .uncertain }
+      }
+      if when == "while Check / retry dials" {
+        await fixture.holdNextIdentity()
+        await next.retry(staged.inputID)
+        try await eventually("Check / retry's socket proving the coordinator") {
+          await fixture.identityHeld
+        }
+        await next.unstage(staged)
+        await fixture.releaseIdentity()
+      } else {
+        await fixture.holdNextSubmitReply()
+        await next.retry(staged.inputID)
+        try await eventually("the coordinator read the input") { await fixture.count() == 1 }
+        await next.unstage(staged)
+      }
+    }
+    try await Task.sleep(for: .milliseconds(300))
+    let queued = (try? outboxItems(directory.outbox).map(\.request.inputId)) ?? []
+    print(
+      "IF11-2[\(when)] kept by the retired session=\(keptByRetired.count) queued once the next one withdrew it=\(queued.count) coordinator got=\(await fixture.count())"
+    )
+    #expect(keptByRetired == [staged.inputID], "The retired session wrote its outbox")
+    if when == "once Check / retry wrote it" {
+      #expect(queued == [staged.inputID], "An input that may have left the phone was withdrawn")
+    } else {
+      #expect(queued.isEmpty, "The next session kept an input that never left the phone")
+      #expect(await fixture.count() == 0, "The withdrawn input was sent")
+    }
+  }
+}
+
 enum LaneReturn: Sendable { case reconnect, foreground }
 
 @Test(.timeLimit(.minutes(1)), arguments: [LaneReturn.reconnect, .foreground])

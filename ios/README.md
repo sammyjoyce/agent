@@ -93,7 +93,10 @@ Mode if requested, then Run.
   phone received each entry. Each coordinator's replies start with its name in
   its color. Typing `@` offers the saved names. A chosen name, or `@Name`
   followed by a space, becomes a chip in the composer, and the message goes to
-  that coordinator only. Without a chip the message goes to every paired
+  that coordinator only. Names are read only from text the keyboard has
+  committed, so a word it is still composing, such as one awaiting conversion
+  or dictation, offers no names and makes no chip until it is committed.
+  Without a chip the message goes to every paired
   coordinator. A restored message's text is never read for tags, so removing
   its chip sends it to every coordinator as it is. A tag you type in it stays
   text, and the picker does not open. If you edit it while it sends, the text
