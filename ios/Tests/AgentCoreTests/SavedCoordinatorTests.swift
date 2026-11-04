@@ -91,19 +91,25 @@ private struct LegacyInstall {
     try Data(contentsOf: support.appending(path: "Agent/profiles.json"))
   }
 
-  /// The end state migration.md promises, whatever run got it there.
-  func expectMigrated(_ profiles: [CoordinatorProfile]) throws {
+  /// The end state migration.md promises, whatever run got it there: one unpaired profile at the
+  /// build's address, and one queue keyed to that address, holding the build's messages in its own
+  /// folder and its alert installation.
+  func expectMigrated(_ profiles: [CoordinatorProfile], held: [HeldQueue]) throws {
     let files = FileManager.default
     #expect(profiles.count == 1)
     let profile = try #require(profiles.first)
     #expect(profile.pin == nil)
     #expect(profile.address == address)
-    let legacy = directory(profile).legacy
-    #expect(try Data(contentsOf: legacy.appending(path: "pending.json")) == pending)
+    #expect(held.count == 1)
+    let queue = try #require(held.first)
+    #expect(queue.address == address && queue.coordinator == nil)
+    #expect(queue.installation?.description == installation)
+    let folder = queue.folder(applicationSupport: support)
+    #expect(try Data(contentsOf: folder.appending(path: "pending.json")) == pending)
     #expect(
-      try Data(contentsOf: legacy.appending(path: "Attachments/\(attachment.id)/Notes.txt"))
+      try Data(contentsOf: folder.appending(path: "Attachments/\(attachment.id)/Notes.txt"))
         == bytes)
-    #expect(!files.fileExists(atPath: directory(profile).outbox.deletingLastPathComponent().path))
+    #expect(!files.fileExists(atPath: directory(profile).root.path), "Nothing in the profile")
     #expect(!files.fileExists(atPath: oldOutbox.path))
     #expect(try Data(contentsOf: otherOutbox.appending(path: "pending.json")) == Data("[]".utf8))
     #expect(files.fileExists(atPath: draft.path), "The global composer store is kept")
@@ -112,8 +118,13 @@ private struct LegacyInstall {
     #expect(defaults.object(forKey: "coordinatorPort") == nil)
     #expect(defaults.object(forKey: "notificationInstallationID") == nil)
     #expect(defaults.object(forKey: "notificationsEnabled") as? Bool == alerts)
-    struct Saved: Decodable { let profiles: [CoordinatorProfile] }
-    #expect(try JSONDecoder().decode(Saved.self, from: savedProfiles()).profiles == profiles)
+    #expect(defaults.dictionaryRepresentation().keys.allSatisfy { !$0.hasPrefix("migrating") })
+    struct Saved: Decodable {
+      let profiles: [CoordinatorProfile]
+      let held: [HeldQueue]
+    }
+    let saved = try JSONDecoder().decode(Saved.self, from: savedProfiles())
+    #expect(saved.profiles == profiles && saved.held == held)
   }
 }
 
@@ -163,7 +174,7 @@ func migrationQuarantinesTheLastQueueIntoAnUnpairedProfileShownAtOnce() async th
   let coordinators = Coordinators(
     registration: nil, defaults: install.defaults, applicationSupport: install.support,
     caches: install.caches, transport: .tailnet)
-  try install.expectMigrated(coordinators.profiles)
+  try install.expectMigrated(coordinators.profiles, held: coordinators.queues)
   #expect(coordinators.profiles.first?.name.description == "studio")
   #expect(coordinators.chat.lanes.map(\.session).allSatisfy { $0 == nil }, "Unpaired: no session")
   try await eventually("held rows before pairing") { coordinators.chat.held.count == 2 }
@@ -173,7 +184,7 @@ func migrationQuarantinesTheLastQueueIntoAnUnpairedProfileShownAtOnce() async th
 @MainActor
 @Test(
   arguments: [
-    Coordinators.MigrationStep.profileSaved, .quarantined, .markerRemoved,
+    Coordinators.MigrationStep.queueNamed, .profileSaved, .quarantined, .markerRemoved,
   ])
 func migrationResumesAfterACrashAtEveryStepWithACustomPort(_ step: Coordinators.MigrationStep)
   async throws
@@ -192,20 +203,20 @@ func migrationResumesAfterACrashAtEveryStepWithACustomPort(_ step: Coordinators.
     #expect(!FileManager.default.fileExists(atPath: profile.appending(path: "Outbox").path))
   }
   let resumed = try Coordinators.migrate(
-    defaults: install.defaults, applicationSupport: install.support, caches: install.caches
-  ).profiles
-  try install.expectMigrated(resumed)
-  #expect(resumed.first?.address.port == 4123)
+    defaults: install.defaults, applicationSupport: install.support, caches: install.caches)
+  try install.expectMigrated(resumed.profiles, held: resumed.held)
+  #expect(resumed.profiles.first?.address.port == 4123)
 }
 
 @MainActor @Test func legacyHoldRestoresACopyAndDiscardsOnlyTheChosenItem() async throws {
   let install = try await LegacyInstall()
   defer { install.remove() }
-  let profile = try #require(
+  let queue = try #require(
     try Coordinators.migrate(
       defaults: install.defaults, applicationSupport: install.support, caches: install.caches
-    ).profiles.first)
-  let hold = LegacyHold(install.directory(profile))
+    ).held.first)
+  let folder = queue.folder(applicationSupport: install.support)
+  let hold = LegacyHold(folder)
   #expect(try await hold.items().map(\.id) == install.queued.map(\.inputId))
   let drafts = AttachmentStore(directory: install.support.appending(path: "Agent/Drafts"))
   let first = install.queued[0]
@@ -217,103 +228,127 @@ func migrationResumesAfterACrashAtEveryStepWithACustomPort(_ step: Coordinators.
   #expect(try await hold.items().count == 2, "Restore copies; the held item stays")
   try await hold.discard(first.inputId)
   #expect(try await hold.items().map(\.id) == [install.queued[1].inputId])
-  let held = install.directory(profile).legacy.appending(
-    path: "Attachments/\(install.attachment.id)")
+  let held = folder.appending(path: "Attachments/\(install.attachment.id)")
   #expect(!FileManager.default.fileExists(atPath: held.path))
   #expect(try Data(contentsOf: copy.url) == install.bytes, "The draft copy has its own lifetime")
 }
 
 @Test func anUnreadableHoldSurfacesAnErrorAndStaysOnDisk() async throws {
-  let (directory, root) = temporaryProfile()
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let file = directory.legacy.appending(path: "pending.json")
-  try FileManager.default.createDirectory(
-    at: directory.legacy, withIntermediateDirectories: true)
+  let file = root.appending(path: "pending.json")
+  try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
   let garbage = Data("not a queue".utf8)
   try garbage.write(to: file)
-  let hold = LegacyHold(directory)
+  let hold = LegacyHold(root)
   await #expect(throws: (any Error).self) { try await hold.items() }
   await #expect(throws: (any Error).self) { try await hold.discard("any") }
   #expect(try Data(contentsOf: file) == garbage)
 }
 
-/// Work's messages held from before the update cannot be read, and Personal holds some that can.
+/// Work's queue held from before the update cannot be read, and Personal's holds some that can.
 @MainActor private struct TwoHolds {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-  let work: CoordinatorProfile
-  let personal: CoordinatorProfile
+  let work: Hold
+  let personal: Hold
   let chat = ChatModel()
   static let warning =
     "Messages held from before the update could not be read. They stay on this phone."
 
   init(personalHolds texts: [String]) throws {
-    work = CoordinatorProfile(
-      name: try TagName("Work"), address: try CoordinatorAddress(host: "100.64.1.2", port: 4001))
-    personal = CoordinatorProfile(
-      name: try TagName("Personal"),
-      address: try CoordinatorAddress(host: "100.64.1.3", port: 4002))
-    let unreadable = directory(work)
-    try FileManager.default.createDirectory(
-      at: unreadable.legacy, withIntermediateDirectories: true)
-    try Data("not a queue".utf8).write(to: unreadable.legacyQueue)
-    try writePrivately(
-      JSONEncoder().encode(
-        texts.enumerated().map { index, text in
-          NativeRequestSubmit(inputId: "held-\(index)", mode: .steer, text: text)
-        }), to: directory(personal).legacyQueue)
-    chat.profiles = [work, personal]
+    let unreadable = HeldQueue(
+      address: try CoordinatorAddress(host: "100.64.1.2", port: 4001), installation: nil)
+    let folder = unreadable.folder(applicationSupport: root)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    try Data("not a queue".utf8).write(to: folder.appending(path: "pending.json"))
+    work = Hold(queue: unreadable, store: LegacyHold(folder))
+    personal = try heldQueue(
+      texts.enumerated().map { index, text in
+        NativeRequestSubmit(inputId: "held-\(index)", mode: .steer, text: text)
+      }, in: root, address: try CoordinatorAddress(host: "100.64.1.3", port: 4002))
   }
 
-  func directory(_ profile: CoordinatorProfile) -> ProfileDirectory {
-    ProfileDirectory(profile.id, applicationSupport: root, caches: root)
-  }
-  func attach(_ profile: CoordinatorProfile) {
-    chat.attach(Lane(id: profile.id, session: nil, hold: LegacyHold(directory(profile))))
-  }
+  func hold(_ hold: Hold) { chat.holds.append(hold) }
+  /// What Remove does to a queue held for the coordinator it removes.
+  func release(_ hold: Hold) { chat.holds.removeAll { $0.queue.id == hold.queue.id } }
   func remove() { try? FileManager.default.removeItem(at: root) }
 }
 
-/// Personal's hold is read, then Work's cannot be. The user removes Work, whose files Remove
-/// deletes. The warning over the feed goes with Work's lane, and Personal's held message stays.
+/// Work's queue held from before the update cannot be read, and Personal's can. The user removes
+/// Work, which deletes the messages held for its coordinator. The warning over the feed goes with
+/// them, and Personal's held message stays, after a relaunch too.
 @MainActor @Test(.timeLimit(.minutes(1)))
-func removingTheLaneWhoseHeldMessagesCannotBeReadRemovesTheWarning() async throws {
-  let holds = try TwoHolds(personalHolds: ["Invented: Personal's held note"])
-  defer { holds.remove() }
-  let chat = holds.chat
-  holds.attach(holds.personal)
-  try await eventually("Personal's held message") { chat.held.count == 1 }
-  holds.attach(holds.work)
-  try await eventually("the warning over the feed") { chat.heldError != nil }
-  await chat.detach(holds.work.id)
+func removingTheCoordinatorWhoseHeldMessagesCannotBeReadRemovesTheWarning() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "two-holds-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  var work = CoordinatorProfile(
+    name: try TagName("Work"), address: try CoordinatorAddress(host: "100.64.1.2", port: 4001))
+  work.pin = CoordinatorID(UUID())
+  var personal = CoordinatorProfile(
+    name: try TagName("Personal"), address: try CoordinatorAddress(host: "100.64.1.3", port: 4002))
+  personal.pin = CoordinatorID(UUID())
+  let unreadable = HeldQueue(address: work.address, coordinator: work.pin, installation: nil)
+  let readable = HeldQueue(address: personal.address, coordinator: personal.pin, installation: nil)
+  try writePrivately(
+    Data("not a queue".utf8),
+    to: unreadable.folder(applicationSupport: root).appending(path: "pending.json"))
+  try writePrivately(
+    JSONEncoder().encode([
+      NativeRequestSubmit(inputId: "held-0", mode: .steer, text: "Invented: Personal's held note")
+    ]), to: readable.folder(applicationSupport: root).appending(path: "pending.json"))
+  try writePrivately(
+    JSONEncoder().encode(
+      Coordinators.SavedProfiles(profiles: [work, personal], held: [unreadable, readable])),
+    to: root.appending(path: "Agent/profiles.json"))
+  @MainActor func launch() -> Coordinators {
+    Coordinators(
+      registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+      transport: .tailnet)
+  }
+  let coordinators = launch()
+  let chat = coordinators.chat
+  try await eventually("Personal's held message and the warning") {
+    chat.held.count == 1 && chat.heldError != nil
+  }
+  let confirmation = coordinators.removalMessage(work.id)
+  try await coordinators.remove(work.id)
+  let relaunched = launch()
+  try await eventually("Personal's held message after a relaunch") {
+    relaunched.chat.held.count == 1
+  }
   print(
-    "IF14-W2[Work removed] warning=\(chat.heldError ?? "nil") held=\(chat.held.map(\.item.text))"
+    "IF14-W2[Work removed] Remove Work? \(confirmation) warning=\(chat.heldError ?? "nil") held=\(chat.held.map(\.item.text)) after a relaunch: warning=\(relaunched.chat.heldError ?? "nil")"
   )
+  #expect(confirmation == "Queued messages on this phone could not be read. Removing deletes them.")
   #expect(chat.heldError == nil, "A removed coordinator's warning stays over the feed")
   #expect(chat.held.map(\.item.text) == ["Invented: Personal's held note"])
+  #expect(relaunched.chat.heldError == nil)
+  #expect(!FileManager.default.fileExists(atPath: unreadable.folder(applicationSupport: root).path))
 }
 
-/// Work's hold cannot be read, and Personal's hold is read after it, at attach and again after the
-/// user discards one of Personal's held messages. Whichever read finishes last, the warning shows
-/// while Work's lane is attached, and only then.
+/// Work's queue cannot be read, and Personal's is read after it, when it arrives and again after
+/// the user discards one of Personal's held messages. Whichever read finishes last, the warning
+/// shows while Work's queue is held, and only then.
 @MainActor @Test(.timeLimit(.minutes(1)))
-func theHeldWarningStaysWhileAnUnreadableLaneIsAttachedWhicheverReadFinishesLast()
-  async throws
-{
+func theHeldWarningStaysWhileAnUnreadableQueueIsHeldWhicheverReadFinishesLast() async throws {
   let holds = try TwoHolds(personalHolds: [
     "Invented: Personal's first held note", "Invented: Personal's second held note",
   ])
   defer { holds.remove() }
   let chat = holds.chat
-  holds.attach(holds.work)
+  holds.hold(holds.work)
   try await eventually("the warning over the feed") { chat.heldError != nil }
-  holds.attach(holds.personal)
+  holds.hold(holds.personal)
   try await eventually("Personal's held messages") { chat.held.count == 2 }
   let afterAttach = chat.heldError
   await chat.discardHeld(try #require(chat.held.first))
   let afterDiscard = chat.heldError
-  await chat.detach(holds.work.id)
+  holds.release(holds.work)
   print(
-    "IF14-W2[Personal read last] warning after Personal's read=\(afterAttach ?? "nil") after Personal's discard=\(afterDiscard ?? "nil") after Work removed=\(chat.heldError ?? "nil") held=\(chat.held.map(\.item.text))"
+    "IF14-W2[Personal read last] warning after Personal's read=\(afterAttach ?? "nil") after Personal's discard=\(afterDiscard ?? "nil") after Work's queue left=\(chat.heldError ?? "nil") held=\(chat.held.map(\.item.text))"
   )
   #expect(afterAttach == TwoHolds.warning, "Personal's read hid Work's warning")
   #expect(afterDiscard == TwoHolds.warning, "Reading Personal's hold again hid Work's warning")
@@ -321,21 +356,21 @@ func theHeldWarningStaysWhileAnUnreadableLaneIsAttachedWhicheverReadFinishesLast
   #expect(chat.held.map(\.item.text) == ["Invented: Personal's second held note"])
 }
 
-/// The user removes Work before the read of its held messages, which cannot succeed, finishes.
-/// That read shows no warning over the feed.
+/// Work's queue leaves before the read of its held messages, which cannot succeed, finishes. That
+/// read shows no warning over the feed.
 @MainActor @Test(.timeLimit(.minutes(1)))
-func aHeldReadThatFinishesAfterItsLaneIsRemovedShowsNoWarning() async throws {
+func aHeldReadThatFinishesAfterItsQueueLeftShowsNoWarning() async throws {
   let holds = try TwoHolds(personalHolds: ["Invented: Personal's held note"])
   defer { holds.remove() }
   let chat = holds.chat
-  holds.attach(holds.personal)
+  holds.hold(holds.personal)
   try await eventually("Personal's held message") { chat.held.count == 1 }
-  holds.attach(holds.work)
-  await chat.detach(holds.work.id)
-  // Long enough for the read that Work's attach started to finish.
+  holds.hold(holds.work)
+  holds.release(holds.work)
+  // Long enough for the read that Work's queue started to finish.
   try await Task.sleep(for: .milliseconds(500))
-  print("IF14-W2[Work removed before its read finished] warning=\(chat.heldError ?? "nil")")
-  #expect(chat.heldError == nil, "A removed coordinator's late read put its warning over the feed")
+  print("IF14-W2[Work's queue left before its read finished] warning=\(chat.heldError ?? "nil")")
+  #expect(chat.heldError == nil, "A late read of a queue that left put its warning over the feed")
   #expect(chat.held.map(\.item.text) == ["Invented: Personal's held note"])
 }
 
@@ -502,14 +537,14 @@ func anAddressEditThatPairsTheMigratedProfileElsewhereSendsTheBuildsInstallation
     try await Task.sleep(for: .seconds(1))
     let sent = await fixture.notificationControls().contains(
       .unregister(.init(installationId: install.installation)))
-    struct Saved: Decodable { let origin: LegacyOrigin? }
-    let origin = try JSONDecoder().decode(Saved.self, from: install.savedProfiles()).origin
+    struct Saved: Decodable { let held: [HeldQueue] }
+    let queue = try JSONDecoder().decode(Saved.self, from: install.savedProfiles()).held.first
     print(
-      "IF14-V2[paired elsewhere] controls=\(described(await fixture.notificationControls(), old: install.installation, profile: profile.id)) installation still saved=\(origin?.installation != nil) old installation held=\(await fixture.holds(install.installation))"
+      "IF14-V2[paired elsewhere] controls=\(described(await fixture.notificationControls(), old: install.installation, profile: profile.id)) installation still saved=\(queue?.installation != nil) old installation held=\(await fixture.holds(install.installation))"
     )
     #expect(!sent, "A coordinator paired at another address was sent the build's installation")
-    #expect(origin?.installation?.description == install.installation)
-    #expect(origin?.address == install.address)
+    #expect(queue?.installation?.description == install.installation)
+    #expect(queue?.address == install.address)
   } catch {
     await coordinators.setActive(false)
     await fixture.stop()
@@ -526,7 +561,7 @@ func anAddressEditThatPairsTheMigratedProfileElsewhereSendsTheBuildsInstallation
 @Test(
   .timeLimit(.minutes(1)),
   arguments: [
-    Coordinators.MigrationStep.profileSaved, .quarantined, .markerRemoved,
+    Coordinators.MigrationStep.queueNamed, .profileSaved, .quarantined, .markerRemoved,
   ])
 func theSingleAddressBuildsAlertInstallationIsWithdrawnAfterACrashAndALostReply(
   _ step: Coordinators.MigrationStep
@@ -585,7 +620,7 @@ func anOldCoordinatorLeavesTheProfileUnpairedUntilItAnswers() async throws {
   try await eventually("a pairing error") { coordinators.pairingError[id] != nil }
   #expect(coordinators.pairingError[id] == "Update the coordinator to use it with this app.")
   #expect(coordinators.profiles.first?.pin == nil)
-  try install.expectMigrated(coordinators.profiles)
+  try install.expectMigrated(coordinators.profiles, held: coordinators.queues)
   #expect(await fixture.received().allSatisfy { $0 == .identify })
   await fixture.dropIdentify(false)
   coordinators.retryPairing(id)
@@ -988,6 +1023,11 @@ func removeCountsQueuedAndHeldMessagesAndDeletesOnlyAfterSaving() async throws {
   #expect(try JSONDecoder().decode(Saved.self, from: install.savedProfiles()).profiles.isEmpty)
   #expect(!FileManager.default.fileExists(atPath: directory.root.path))
   #expect(!FileManager.default.fileExists(atPath: directory.cache.path))
+  #expect(coordinators.queues.isEmpty && chat.held.isEmpty)
+  let heldLeft =
+    (try? FileManager.default.contentsOfDirectory(
+      atPath: install.support.appending(path: "Agent/Held").path)) ?? []
+  #expect(heldLeft.isEmpty, "The messages held for the removed coordinator stay on this phone")
   #expect(
     await fixture.notificationControls().contains(
       .unregister(.init(installationId: "\(profile.id)"))), "Alerts are withdrawn")
@@ -996,7 +1036,7 @@ func removeCountsQueuedAndHeldMessagesAndDeletesOnlyAfterSaving() async throws {
 }
 
 /// A Remove that stopped after saving leaves its files. The next launch deletes every profile
-/// directory `profiles.json` does not list, and keeps the ones it lists.
+/// directory and held queue `profiles.json` does not list, and keeps the ones it lists.
 @MainActor @Test func launchDeletesTheFilesOfEveryProfileThatIsNoLongerSaved() throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
@@ -1006,10 +1046,15 @@ func removeCountsQueuedAndHeldMessagesAndDeletesOnlyAfterSaving() async throws {
   defer { defaults.removePersistentDomain(forName: suite) }
   let saved = CoordinatorProfile(
     name: try TagName("Work"), address: try CoordinatorAddress(host: "100.64.1.2"))
-  struct Saved: Encodable { let profiles: [CoordinatorProfile] }
+  let listed = HeldQueue(address: saved.address, installation: nil)
+  let unlisted = HeldQueue(address: saved.address, installation: nil)
   try writePrivately(
-    JSONEncoder().encode(Saved(profiles: [saved])),
+    JSONEncoder().encode(Coordinators.SavedProfiles(profiles: [saved], held: [listed])),
     to: root.appending(path: "Agent/profiles.json"))
+  for queue in [listed, unlisted] {
+    try writePrivately(
+      Data("[]".utf8), to: queue.folder(applicationSupport: root).appending(path: "pending.json"))
+  }
   let kept = ProfileDirectory(saved.id, applicationSupport: root, caches: caches)
   let removed = ProfileDirectory(ProfileID(), applicationSupport: root, caches: caches)
   for directory in [kept, removed] {
@@ -1024,6 +1069,8 @@ func removeCountsQueuedAndHeldMessagesAndDeletesOnlyAfterSaving() async throws {
   #expect(FileManager.default.fileExists(atPath: kept.previews.path))
   #expect(!FileManager.default.fileExists(atPath: removed.root.path))
   #expect(!FileManager.default.fileExists(atPath: removed.cache.path))
+  #expect(FileManager.default.fileExists(atPath: listed.folder(applicationSupport: root).path))
+  #expect(!FileManager.default.fileExists(atPath: unlisted.folder(applicationSupport: root).path))
 }
 
 /// Where the migrated address leads. Once Work is reinstalled it answers as another coordinator.
@@ -1126,6 +1173,11 @@ func removeNeverCallsAnUnreadableQueueEmpty() async throws {
   let suite = "remove-\(UUID())"
   let defaults = try #require(UserDefaults(suiteName: suite))
   defer { defaults.removePersistentDomain(forName: suite) }
+  // A queue the single-address build left for the address Work is added at, so it is Work's.
+  let queue = HeldQueue(address: try CoordinatorAddress(host: "100.64.1.2"), installation: nil)
+  try writePrivately(
+    JSONEncoder().encode(Coordinators.SavedProfiles(profiles: [], held: [queue])),
+    to: root.appending(path: "Agent/profiles.json"))
   let coordinators = Coordinators(
     registration: nil, defaults: defaults, applicationSupport: root, caches: root,
     transport: loopback(port))
@@ -1138,7 +1190,7 @@ func removeNeverCallsAnUnreadableQueueEmpty() async throws {
   let outbox = coordinators.removalMessage(id)
   #expect(outbox == unreadable, "An unreadable outbox")
   try FileManager.default.removeItem(at: directory.outbox)
-  let held = directory.legacy.appending(path: "pending.json")
+  let held = queue.folder(applicationSupport: root).appending(path: "pending.json")
   try writePrivately(
     JSONEncoder().encode([
       NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: "Invented held note")
@@ -1148,6 +1200,7 @@ func removeNeverCallsAnUnreadableQueueEmpty() async throws {
   #expect(hold == unreadable, "An unreadable hold")
   try await coordinators.remove(id)
   #expect(!FileManager.default.fileExists(atPath: directory.root.path))
+  #expect(!FileManager.default.fileExists(atPath: held.deletingLastPathComponent().path))
   await fixture.stop()
 }
 
@@ -1163,7 +1216,7 @@ func restoreCopiesARejectedItemAndRemovesItOnlyOnceTheCopyIsAdmitted() async thr
     directory: directory, address: try CoordinatorAddress(host: "100.64.1.2"), pin: fixture.id,
     stamps: StampSource(), transport: loopback(port))
   let chat = ChatModel(draftStore: AttachmentStore(directory: root.appending(path: "Drafts")))
-  chat.attach(Lane(id: directory.profile, session: session, hold: LegacyHold(directory)))
+  chat.attach(Lane(id: directory.profile, session: session))
   await chat.setActive(true)
   try await eventually("connected") { chat.connection == .connected }
   chat.draft = "Needs a second try"
@@ -1237,21 +1290,21 @@ func aHeldMessageStartingWithAnotherNameRestoresToItsOwnCoordinatorAsTyped() asy
 
 // MARK: - What the single-address build left belongs to the coordinator at its address
 
-/// What the single-address build left goes to the first coordinator a saved profile pairs with at
-/// its address, once. A pairing at any other address, or a later one there, changes nothing.
+/// What one launch of the single-address build left goes to the first coordinator proven at its
+/// address, once. One proven at any other address, or a later one there, takes nothing.
 @Test func theFirstCoordinatorPairedAtTheBuildsAddressTakesWhatItLeft() throws {
   let address = try CoordinatorAddress(host: "100.64.1.2")
   let installation = try #require(InstallationID(legacy: UUID().uuidString))
-  var origin = LegacyOrigin(address: address, installation: installation)
+  var queue = HeldQueue(address: address, installation: installation)
   let first = CoordinatorID(UUID())
   let later = CoordinatorID(UUID())
-  #expect(origin.pair(first, at: try CoordinatorAddress(host: "100.64.1.2", port: 4001)) == nil)
-  #expect(origin.coordinator == nil && origin.installation == installation)
+  #expect(queue.bind(first, at: try CoordinatorAddress(host: "100.64.1.2", port: 4001)) == nil)
+  #expect(queue.coordinator == nil && queue.installation == installation)
   #expect(
-    origin.pair(first, at: address)
+    queue.bind(first, at: address)
       == PendingWithdrawal(installation: installation, address: address, pin: first))
-  #expect(origin.pair(later, at: address) == nil)
-  #expect(origin.coordinator == first && origin.installation == nil)
+  #expect(queue.bind(later, at: address) == nil)
+  #expect(queue.coordinator == first && queue.installation == nil)
 }
 
 private func submitted(_ fixture: FixtureCoordinator) async -> [String] {
@@ -1543,6 +1596,9 @@ func anInstallationThePreviousBuildSavedOnTheMigratedProfileIsStillWithdrawn() a
       "IF14-V2[previous build's profiles.json] withdrawn=\(withdrawn) saved=\(String(decoding: try Data(contentsOf: file), as: UTF8.self).replacingOccurrences(of: installation, with: "<old>"))"
     )
     #expect(withdrawn, "The installation the previous build saved was never withdrawn")
+    // The queue that kept only the installation has no folder, and Remove still finishes.
+    try await coordinators.remove(try #require(coordinators.profiles.first).id)
+    #expect(coordinators.profiles.isEmpty && coordinators.queues.isEmpty)
   } catch {
     await coordinators.setActive(false)
     await fixture.stop()
@@ -1550,4 +1606,548 @@ func anInstallationThePreviousBuildSavedOnTheMigratedProfileIsStillWithdrawn() a
   }
   await coordinators.setActive(false)
   await fixture.stop()
+}
+
+/// The single-address build queued messages for its coordinator at its address, which answers
+/// nothing after the update. In "held for another address", the user points the one saved
+/// coordinator at Work's address, so the held messages show over Work's feed and nothing says they
+/// are Work's. `/feedback` then reaches Work without the automatic screenshot, which would show
+/// them, and the composer says why. In "held for this coordinator", the build's coordinator answers
+/// at its address again and pairs, so everything on screen is its own and the screenshot goes.
+@MainActor
+@Test(
+  .timeLimit(.minutes(1)), arguments: ["held for another address", "held for this coordinator"])
+func feedbackAttachesTheScreenshotOnlyWhenEverythingOnScreenIsTheRecipients(_ held: String)
+  async throws
+{
+  let install = try await LegacyInstall()
+  defer { install.remove() }
+  try await withTheOldAddressSilent(install) { coordinators, migrated, used, work, bringBack in
+    let chat = coordinators.chat
+    let recipient: FixtureCoordinator
+    if held == "held for this coordinator" {
+      await bringBack()
+      coordinators.retryPairing(migrated.id)
+      recipient = used
+    } else {
+      try await coordinators.update(
+        migrated.id, name: TagName("Work"),
+        address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+      recipient = work
+    }
+    try await eventually("held rows and a connection") {
+      chat.held.count == 2 && chat.connection == .connected
+    }
+    chat.draft = "/feedback The invented reply is clipped"
+    var captures = 0
+    await chat.send(screenshot: {
+      captures += 1
+      return Data("Invented screen showing the held notes".utf8)
+    })
+    try await eventually("the feedback at its coordinator") { await recipient.count() == 1 }
+    let files = await recipient.received().compactMap { event -> NativeRequestSubmit? in
+      if case .submit(let input) = event { input } else { nil }
+    }.flatMap { $0.attachments ?? [] }.map(\.name)
+    let uploads = await recipient.uploadCount()
+    print(
+      "IF15-U1[\(held)] screenshots captured=\(captures) uploads=\(uploads) files=\(files) composer=\(chat.error ?? "nil")"
+    )
+    if held == "held for this coordinator" {
+      #expect(captures == 1 && files == ["Feedback.png"])
+      #expect(chat.error == nil)
+    } else {
+      #expect(captures == 0, "The screenshot captured messages held for another address")
+      #expect(
+        uploads == 0 && files.isEmpty, "Work got a screenshot of another coordinator's messages")
+      #expect(
+        chat.error
+          == "Feedback was sent without a screenshot. The screen shows messages held from before the update, which may be another coordinator's."
+      )
+    }
+  }
+}
+
+/// The single-address build used `studio.example-tailnet.ts.net`, which does not resolve yet after
+/// the update, so the user adds the same machine as Personal by its tailnet IP. Once the name
+/// resolves, the migrated profile's own pairing finds Personal's coordinator there and is refused.
+/// That probe still proves Personal's coordinator answers at the build's address, so what the build
+/// left goes to it: its alert installation is withdrawn there, whatever the toggle says, and Restore
+/// addresses its held messages to Personal.
+@MainActor
+@Test(
+  .timeLimit(.minutes(1)),
+  arguments: ["left off", "turned off before the old coordinator pairs"])
+func theBuildsCoordinatorSavedUnderAnotherAddressTakesWhatTheBuildLeft(_ alerts: String)
+  async throws
+{
+  let install = try await LegacyInstall(
+    host: "studio.example-tailnet.ts.net", alerts: alerts != "left off")
+  defer { install.remove() }
+  let registration = NotificationRegistration(
+    enabled: install.alerts, permission: { true }, register: {},
+    save: { install.defaults.set($0, forKey: "notificationsEnabled") })
+  if alerts != "left off" {
+    await registration.start()
+    await registration.received(token: String(repeating: "ab", count: 32))
+    await registration.setEnabled(false)
+  }
+  let used = FixtureCoordinator()
+  await used.register(install.installation, token: String(repeating: "ab", count: 32))
+  let (listener, port) = try await listen(used)
+  defer { listener.cancel() }
+  let routes = Routes([4002: port])
+  let coordinators = Coordinators(
+    registration: registration, defaults: install.defaults, applicationSupport: install.support,
+    caches: install.caches,
+    transport: CoordinatorTransport { address in
+      guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
+      return LineConnection(
+        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+    })
+  let chat = coordinators.chat
+  let migrated = try #require(coordinators.profiles.first)
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await used.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("the build's address answered nothing") {
+      coordinators.pairingError[migrated.id] != nil
+    }
+    try await coordinators.add(
+      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+    await routes.set([4002: port, install.address.port: port])
+    coordinators.retryPairing(migrated.id)
+    try await eventually("the migrated profile's pairing refused") {
+      coordinators.pairingError[migrated.id]?.hasPrefix("Already saved") == true
+    }
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    let withdrawn = try await settles { !(await used.holds(install.installation)) }
+    try await eventually("held rows") { chat.held.count == 2 }
+    let held = try #require(chat.held.first { $0.item.text == "Second held note" })
+    await chat.restoreHeld(held)
+    let personal = try #require(coordinators.profiles.first { $0.id != migrated.id })
+    print(
+      "IF15-U3[\(alerts)] the migrated profile's line=\(coordinators.pairingError[migrated.id] ?? "nil") toggle=\(registration.enabled ? "on" : "off") old installation still held=\(!withdrawn) Restore: draft=\(chat.draft.debugDescription) recipient=\(chat.recipient.map(chat.name) ?? "none")"
+    )
+    #expect(coordinators.pairingError[migrated.id] == "Already saved as Personal.")
+    #expect(withdrawn, "The build's coordinator keeps alerting this device")
+    #expect(chat.draft == "Second held note" && chat.recipient == personal.id)
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
+/// The user points Work at the single-address build's address, where a coordinator no saved profile
+/// is pinned to answers, so the edit is refused. That coordinator takes nothing the build left: its
+/// installation stays, and Restore still asks who gets a held message.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func anEditRefusedAtTheBuildsAddressGivesWhatItLeftToNoOne() async throws {
+  let install = try await LegacyInstall()
+  defer { install.remove() }
+  try await withTheOldAddressSilent(install) { coordinators, migrated, used, _, bringBack in
+    let chat = coordinators.chat
+    try await coordinators.update(
+      migrated.id, name: TagName("Work"),
+      address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    try await eventually("Work paired") { chat.snapshots[migrated.id]?.connection == .connected }
+    await bringBack()
+    var shown = "nothing"
+    do {
+      try await coordinators.update(migrated.id, name: TagName("Work"), address: install.address)
+    } catch { shown = error.localizedDescription }
+    try await eventually("held rows") { chat.held.count == 2 }
+    let held = try #require(chat.held.first { $0.item.text == "Second held note" })
+    await chat.restoreHeld(held)
+    // Long enough for a withdrawal sent at once to arrive over loopback.
+    try await Task.sleep(for: .seconds(1))
+    let kept = await used.holds(install.installation)
+    print(
+      "IF15-U3[refused, unsaved coordinator] the form shows \"\(shown)\" Restore: draft=\(chat.draft.debugDescription) offered=\(chat.heldChoices.map(\.name.description)) old installation still held=\(kept)"
+    )
+    #expect(shown == "This address answers as a different coordinator. Nothing was saved.")
+    #expect(chat.draft.isEmpty, "Restore addressed a held message without a choice")
+    #expect(kept, "A coordinator no saved profile is pinned to was sent the build's installation")
+  }
+}
+
+/// The single-address build queued two messages for its coordinator at its address, which answers
+/// nothing after the update. Either the user points the migrated profile at Work, or adds the
+/// build's coordinator as Personal at that address before the migrated profile pairs. The messages
+/// were queued for the coordinator Personal pins, so removing Work, or the duplicate profile, keeps
+/// them in the feed and after a relaunch, and its confirmation does not count them.
+@MainActor
+@Test(
+  .timeLimit(.minutes(1)),
+  arguments: ["the migrated profile edited to Work", "Personal added before it pairs"])
+func removingACoordinatorKeepsHeldMessagesQueuedForAnother(_ path: String) async throws {
+  let install = try await LegacyInstall()
+  defer { install.remove() }
+  try await withTheOldAddressSilent(install) { coordinators, migrated, _, _, bringBack in
+    let chat = coordinators.chat
+    if path == "the migrated profile edited to Work" {
+      try await coordinators.update(
+        migrated.id, name: TagName("Work"),
+        address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+      try await eventually("Work paired") {
+        chat.snapshots[migrated.id]?.connection == .connected
+      }
+      await bringBack()
+      try await coordinators.add(name: TagName("Personal"), address: install.address)
+      try await eventually("both connected") {
+        chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+      }
+    } else {
+      await bringBack()
+      try await coordinators.add(name: TagName("Personal"), address: install.address)
+      try await eventually("the migrated profile's pairing refused") {
+        coordinators.pairingError[migrated.id]?.hasPrefix("Already saved") == true
+      }
+    }
+    try await eventually("held rows") { chat.held.count == 2 }
+    let holder = try #require(coordinators.profiles.first { $0.id == migrated.id })
+    let held = try #require(chat.held.first { $0.item.text == "Second held note" })
+    await chat.restoreHeld(held)
+    let restored = (draft: chat.draft, line: chat.recipientLine)
+    chat.draft = ""
+    let confirmation = coordinators.removalMessage(migrated.id)
+    try await coordinators.remove(migrated.id)
+    let kept = chat.held.map(\.item.text)
+    let relaunched = Coordinators(
+      registration: nil, defaults: install.defaults, applicationSupport: install.support,
+      caches: install.caches, transport: .tailnet)
+    let keptAfterRelaunch = try await settles { relaunched.chat.held.count == 2 }
+    print(
+      "IF15-U4-A[\(path)] Restore: draft=\(restored.draft.debugDescription) line=\(restored.line) | Remove \(holder.name)? \(confirmation) | after Remove: held=\(kept) saved=\(coordinators.profiles.map(\.name.description)) | after a relaunch: held=\(relaunched.chat.held.map(\.item.text))"
+    )
+    #expect(restored.draft == "Second held note" && restored.line == "To Personal")
+    #expect(
+      confirmation == "No queued messages are on this phone.",
+      "Remove counts Personal's held messages as \(holder.name)'s")
+    #expect(kept.count == 2, "Removing \(holder.name) deleted held messages queued for Personal")
+    #expect(keptAfterRelaunch, "Held messages queued for Personal were gone after a relaunch")
+  }
+}
+
+/// A `profiles.json` an earlier build wrote: the migrated profile is unpaired and keeps the build's
+/// installation as `inherited`, and Personal is paired at the build's address. Personal's
+/// coordinator takes what the build left at launch: the installation is withdrawn, whatever the
+/// toggle says, and Restore addresses the held message to Personal.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aPreviousBuildsFileWithTheBuildsCoordinatorPairedAtItsAddressBindsWhatItLeft()
+  async throws
+{
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "if15-b1-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  defaults.set(false, forKey: "notificationsEnabled")
+  let old = UUID().uuidString
+  let used = FixtureCoordinator()
+  await used.register(old, token: String(repeating: "ab", count: 32))
+  let (listener, port) = try await listen(used)
+  defer { listener.cancel() }
+  let migrated = ProfileID()
+  let personal = ProfileID()
+  let file = root.appending(path: "Agent/profiles.json")
+  try FileManager.default.createDirectory(
+    at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+  try Data(
+    """
+    {"withdrawals":[],"profiles":[{"id":"\(migrated)","name":"Coordinator",\
+    "address":{"host":"100.64.1.2","port":43187},"inherited":"\(old)"},\
+    {"id":"\(personal)","name":"Personal","address":{"host":"100.64.1.2","port":43187},\
+    "pin":"\(used.id.uuid.uuidString)"}]}
+    """.utf8
+  ).write(to: file)
+  try writePrivately(
+    JSONEncoder().encode([
+      NativeRequestSubmit(inputId: UUID().uuidString, mode: .followUp, text: "Second held note")
+    ]),
+    to: root.appending(path: "Agent/Profiles/\(migrated)/Legacy/pending.json"))
+  let registration = NotificationRegistration(
+    enabled: false, permission: { true }, register: {},
+    save: { defaults.set($0, forKey: "notificationsEnabled") })
+  let coordinators = Coordinators(
+    registration: registration, defaults: defaults, applicationSupport: root, caches: root,
+    transport: loopback(port))
+  let chat = coordinators.chat
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await used.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("Personal connected") {
+      chat.snapshots[personal]?.connection == .connected
+    }
+    try await eventually("held row") { chat.held.count == 1 }
+    let held = try #require(chat.held.first)
+    await chat.restoreHeld(held)
+    let restored = (draft: chat.draft, line: chat.recipientLine)
+    await coordinators.setActive(false)
+    await coordinators.setActive(true)
+    let withdrawn = try await settles { !(await used.holds(old)) }
+    print(
+      "IF15-U4-B1[#8 profiles.json, Personal paired at the build's address] Restore: draft=\(restored.draft.debugDescription) line=\(restored.line) toggle=\(registration.enabled ? "on" : "off") old installation still held=\(!withdrawn)"
+    )
+    #expect(restored.draft == "Second held note" && restored.line == "To Personal")
+    #expect(withdrawn, "The build's coordinator keeps alerting this device")
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
+/// A `profiles.json` an earlier build wrote once its migrated profile paired, which recorded no
+/// address for the messages held in that profile's directory. The profile may have been edited
+/// before it paired, so Restore asks, the note does not claim to know the address, and a Send to
+/// the one chosen leaves the message held.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func heldMessagesWithNoRecordedAddressAskWithoutClaimingNothingIsPairedThere() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "if15-b2-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let used = FixtureCoordinator()
+  let (listener, port) = try await listen(used)
+  defer { listener.cancel() }
+  let migrated = ProfileID()
+  let file = root.appending(path: "Agent/profiles.json")
+  try FileManager.default.createDirectory(
+    at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+  try Data(
+    """
+    {"withdrawals":[],"profiles":[{"id":"\(migrated)","name":"Coordinator",\
+    "address":{"host":"100.64.1.2","port":43187},"pin":"\(used.id.uuid.uuidString)"}]}
+    """.utf8
+  ).write(to: file)
+  try writePrivately(
+    JSONEncoder().encode([
+      NativeRequestSubmit(inputId: UUID().uuidString, mode: .followUp, text: "Second held note")
+    ]),
+    to: root.appending(path: "Agent/Profiles/\(migrated)/Legacy/pending.json"))
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: loopback(port))
+  let chat = coordinators.chat
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await used.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("connected") { chat.connection == .connected }
+    try await eventually("held row") { chat.held.count == 1 }
+    let held = try #require(chat.held.first)
+    await chat.restoreHeld(held)
+    let withoutChoice = chat.draft
+    let offered = chat.heldChoices.map(\.name.description)
+    let note = chat.heldNote(held)
+    await chat.restoreHeld(held, for: migrated)
+    await chat.send()
+    let delivered = try await settles { await submitted(used) == ["Second held note"] }
+    print(
+      "IF15-U4-B2[#8 profiles.json, the migrated profile paired] Restore without a choice: draft=\(withoutChoice.debugDescription) offered=\(offered) note=\(note.debugDescription) after choosing and Send: delivered=\(delivered) still held=\(chat.held.map(\.item.text))"
+    )
+    #expect(withoutChoice.isEmpty && offered == ["Coordinator"])
+    #expect(
+      note
+        == "This phone did not record which coordinator it was queued for, so it stays held after you send it."
+    )
+    #expect(delivered && chat.held.map(\.item.text) == ["Second held note"])
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
+/// This build ran, and Work paired at the single-address build's address. Then the single-address
+/// build ran again, at port 4002, and queued another message, and this build ran again. That
+/// migration keys its own queue to 4002 and leaves the earlier one as it was. Each held message goes
+/// to the coordinator at the address it was queued for: Personal when it is saved at 4002, and Work
+/// for the first build's message after the second migration's profile pairs at 4002 and is named
+/// Personal.
+@MainActor
+@Test(.timeLimit(.minutes(1)), arguments: ["saved as Personal", "new address"])
+func aSecondMigrationAddressesEachHeldMessageToTheCoordinatorAtItsOwnAddress(_ when: String)
+  async throws
+{
+  let install = try await LegacyInstall()
+  defer { install.remove() }
+  let work = FixtureCoordinator()
+  let personal = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(work)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personal)
+  defer { personalListener.cancel() }
+  let routes = Routes([install.address.port: workPort, 4002: personalPort])
+  let transport = CoordinatorTransport { address in
+    guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
+    return LineConnection(
+      connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+  }
+  let second = try CoordinatorAddress(host: "100.64.1.2", port: 4002)
+  do {
+    let first = Coordinators(
+      registration: nil, defaults: install.defaults, applicationSupport: install.support,
+      caches: install.caches, transport: transport)
+    await first.setActive(true)
+    let migrated = try #require(first.profiles.first)
+    try await eventually("Work paired at the build's address") {
+      first.chat.snapshots[migrated.id]?.connection == .connected
+    }
+    try await first.update(migrated.id, name: TagName("Work"), address: install.address)
+    if when == "saved as Personal" {
+      try await first.add(name: TagName("Personal"), address: second)
+    }
+    try await eventually("held rows") { first.chat.held.count == 2 }
+    if when == "saved as Personal" {
+      for message in first.chat.held { await first.chat.discardHeld(message) }
+    }
+    await first.setActive(false)
+  }
+  install.defaults.set("100.64.1.2", forKey: "coordinatorAddress")
+  install.defaults.set("4002", forKey: "coordinatorPort")
+  install.defaults.set(UUID().uuidString, forKey: "notificationInstallationID")
+  let outbox = LegacyInstall.outbox(install.support, "100.64.1.2", 4002)
+  try FileManager.default.createDirectory(at: outbox, withIntermediateDirectories: true)
+  try JSONEncoder().encode([
+    NativeRequestSubmit(
+      inputId: UUID().uuidString, mode: .followUp, text: "Invented note queued for 4002")
+  ]).write(to: outbox.appending(path: "pending.json"))
+  let coordinators = Coordinators(
+    registration: nil, defaults: install.defaults, applicationSupport: install.support,
+    caches: install.caches, transport: transport)
+  let chat = coordinators.chat
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await work.stop()
+    await personal.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("both connected") {
+      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+    }
+    if when == "new address" {
+      let added = try #require(coordinators.profiles.last)
+      try await coordinators.update(added.id, name: TagName("Personal"), address: second)
+    }
+    try await eventually("held rows") { chat.held.count == (when == "new address" ? 3 : 1) }
+    let held = try #require(
+      when == "new address"
+        ? chat.held.first { $0.item.text == "Second held note" } : chat.held.first)
+    await chat.restoreHeld(held)
+    let restored = (draft: chat.draft, line: chat.recipientLine)
+    await chat.send()
+    _ = try await settles { await submitted(work) + submitted(personal) != [] }
+    print(
+      "IF15-U4-C[\(when)] saved=\(coordinators.profiles.map { "\($0.name)@\($0.address.port)" }) Restore: draft=\(restored.draft.debugDescription) line=\(restored.line) after Send: Work's coordinator got=\(await submitted(work)) Personal's coordinator got=\(await submitted(personal))"
+    )
+    let atWork = await submitted(work)
+    let atPersonal = await submitted(personal)
+    if when == "new address" {
+      #expect(restored.line == "To Work")
+      #expect(atWork == ["Second held note"] && atPersonal.isEmpty)
+    } else {
+      #expect(restored.line == "To Personal")
+      #expect(atPersonal == ["Invented note queued for 4002"] && atWork.isEmpty)
+    }
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
+/// A `profiles.json` the build before this one wrote: one `origin`, already paired with Work's
+/// coordinator, for the messages held in the migrated profile's `Legacy` folder. A launch that
+/// stopped after saving the queue and before moving its folder resumes the move. The held message
+/// goes to Work, and Remove counts and deletes it with Work.
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: ["as written", "after an adoption stopped"])
+func aPreviousBuildsOriginStaysWithTheMessagesItHeld(_ state: String) async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "if15-origin-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let work = FixtureCoordinator()
+  let (listener, port) = try await listen(work)
+  defer { listener.cancel() }
+  var profile = CoordinatorProfile(
+    name: try TagName("Work"), address: try CoordinatorAddress(host: "100.64.1.2", port: 4001))
+  profile.pin = work.id
+  let migrated = profile.id
+  let file = root.appending(path: "Agent/profiles.json")
+  let built = try CoordinatorAddress(host: "100.64.1.2")
+  if state == "as written" {
+    try FileManager.default.createDirectory(
+      at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try Data(
+      """
+      {"withdrawals":[],"profiles":[{"id":"\(migrated)","name":"Work",\
+      "address":{"host":"100.64.1.2","port":4001},"pin":"\(work.id.uuid.uuidString)"}],\
+      "origin":{"address":{"host":"100.64.1.2","port":43187},\
+      "coordinator":"\(work.id.uuid.uuidString)"}}
+      """.utf8
+    ).write(to: file)
+  } else {
+    let queue = HeldQueue(
+      adopting: migrated, address: built, coordinator: work.id, installation: nil)
+    try writePrivately(
+      JSONEncoder().encode(Coordinators.SavedProfiles(profiles: [profile], held: [queue])),
+      to: file)
+  }
+  try writePrivately(
+    JSONEncoder().encode([
+      NativeRequestSubmit(inputId: UUID().uuidString, mode: .followUp, text: "Second held note")
+    ]),
+    to: ProfileDirectory(migrated, applicationSupport: root, caches: root).legacy.appending(
+      path: "pending.json"))
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: loopback(port))
+  let chat = coordinators.chat
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await work.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("Work connected") { chat.connection == .connected }
+    try await eventually("held row") { chat.held.count == 1 }
+    let held = try #require(chat.held.first)
+    await chat.restoreHeld(held)
+    let restored = (draft: chat.draft, recipient: chat.recipient)
+    chat.draft = ""
+    let queue = try #require(coordinators.queues.first)
+    let moved = FileManager.default.fileExists(
+      atPath: queue.folder(applicationSupport: root).appending(path: "pending.json").path)
+    let left = FileManager.default.fileExists(
+      atPath: ProfileDirectory(migrated, applicationSupport: root, caches: root).legacy.path)
+    let confirmation = coordinators.removalMessage(migrated)
+    try await coordinators.remove(migrated)
+    print(
+      "IF15-U4-F[\(state)] queues=\(coordinators.queues.count) Restore: draft=\(restored.draft.debugDescription) to Work=\(restored.recipient == migrated) folder moved=\(moved) left in the profile=\(left) | Remove Work? \(confirmation) | after Remove: held=\(chat.held.map(\.item.text)) folder kept=\(FileManager.default.fileExists(atPath: queue.folder(applicationSupport: root).path))"
+    )
+    #expect(queue.address == built && queue.coordinator == work.id)
+    #expect(restored.draft == "Second held note" && restored.recipient == migrated)
+    #expect(moved && !left, "The held queue's folder still depends on the profile's")
+    #expect(confirmation == "This deletes 1 queued message on this phone.")
+    #expect(chat.held.isEmpty && coordinators.queues.isEmpty)
+    #expect(!FileManager.default.fileExists(atPath: queue.folder(applicationSupport: root).path))
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
 }

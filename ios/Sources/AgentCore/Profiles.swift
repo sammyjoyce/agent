@@ -6,6 +6,7 @@ import Foundation
 public struct ProfileID: Hashable, Sendable, Codable, CustomStringConvertible {
   let uuid: UUID
   public init() { uuid = UUID() }
+  init(_ uuid: UUID) { self.uuid = uuid }
   public init(from decoder: any Decoder) throws {
     uuid = try decoder.singleValueContainer().decode(UUID.self)
   }
@@ -134,26 +135,34 @@ public struct CoordinatorProfile: Codable, Sendable, Identifiable, Equatable {
   }
 }
 
-/// What the single-address build left for the coordinator at its address: the messages it queued,
-/// held in the migrated profile's directory, and its alert installation. The build never learned
-/// that coordinator's ID, so both belong to the coordinator a saved profile pairs with at
-/// `address`, whichever profile that is, and not to the migrated profile wherever it points.
-public struct LegacyOrigin: Codable, Sendable, Equatable {
-  public let address: CoordinatorAddress
-  /// The coordinator a saved profile paired with at `address`, once one has.
+/// What one launch of the single-address build left: the messages it queued for the coordinator at
+/// `address`, held in the queue's own folder, and its alert installation. The build never learned
+/// that coordinator's ID, so both belong to the first coordinator this phone proves answers at
+/// `address` while a saved profile is pinned to it, whichever profile that is. Each launch's queue
+/// keeps its own address and coordinator, whatever a later one left.
+public struct HeldQueue: Codable, Sendable, Equatable, Identifiable {
+  /// Names the queue's folder.
+  public let id: UUID
+  /// Where the build sent these messages, or nil when no build recorded it.
+  public let address: CoordinatorAddress?
+  /// The coordinator these messages belong to, once one was proven at `address`.
   public private(set) var coordinator: CoordinatorID?
-  /// The build's alert installation, until that pairing hands it over as a withdrawal.
+  /// The build's alert installation, until the coordinator takes it as a withdrawal.
   public private(set) var installation: InstallationID?
 
-  public init(address: CoordinatorAddress, installation: InstallationID?) {
+  public init(
+    id: UUID = UUID(), address: CoordinatorAddress?, coordinator: CoordinatorID? = nil,
+    installation: InstallationID?
+  ) {
+    self.id = id
     self.address = address
+    self.coordinator = coordinator
     self.installation = installation
   }
 
-  /// Records `found` as this origin's coordinator when it is the first a saved profile pairs with at
-  /// `address`, and returns the installation's withdrawal to it there. Anywhere else, or later,
-  /// changes nothing.
-  public mutating func pair(_ found: CoordinatorID, at address: CoordinatorAddress)
+  /// Records `found` as this queue's coordinator when it is the first proven at `address`, and
+  /// returns the installation's withdrawal to it there. Anywhere else, or later, changes nothing.
+  public mutating func bind(_ found: CoordinatorID, at address: CoordinatorAddress)
     -> PendingWithdrawal?
   {
     guard address == self.address, coordinator == nil else { return nil }
@@ -161,6 +170,40 @@ public struct LegacyOrigin: Codable, Sendable, Equatable {
     defer { installation = nil }
     return installation.map { PendingWithdrawal(installation: $0, address: address, pin: found) }
   }
+
+  /// The queue's messages and their files. No profile's directory holds it, so it outlives any.
+  public func folder(applicationSupport: URL) -> URL {
+    applicationSupport.appending(path: "Agent/Held/\(id.uuidString)")
+  }
+
+  /// The queue an earlier build of this app held in `profile`'s directory. It takes the profile's
+  /// ID, so a launch that stops before `adoptFolder` finds that folder again.
+  public init(
+    adopting profile: ProfileID, address: CoordinatorAddress?, coordinator: CoordinatorID? = nil,
+    installation: InstallationID?
+  ) {
+    self.init(
+      id: profile.uuid, address: address, coordinator: coordinator, installation: installation)
+  }
+
+  /// Moves the folder an earlier build held this queue in, if it is still there, to `folder`.
+  public func adoptFolder(applicationSupport: URL, caches: URL) throws {
+    let earlier = ProfileDirectory(
+      ProfileID(id), applicationSupport: applicationSupport, caches: caches)
+    try moveOnce(earlier.legacy, to: folder(applicationSupport: applicationSupport))
+  }
+}
+
+/// How many messages a held queue's folder holds, read from disk. A missing file holds none. An
+/// unreadable one throws, so it is never counted as empty.
+public func heldMessages(in folder: URL) throws -> Int {
+  try countItems(NativeRequestSubmit.self, in: folder.appending(path: "pending.json"))
+}
+
+private func countItems<Item: Decodable>(_: Item.Type, in file: URL) throws -> Int {
+  do {
+    return try JSONDecoder().decode([Item].self, from: Data(contentsOf: file)).count
+  } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return 0 }
 }
 
 /// Every on-device path of one saved coordinator.
@@ -168,32 +211,33 @@ public struct ProfileDirectory: Sendable {
   public let profile: ProfileID
   let root: URL
   let cache: URL
+  /// Counts the messages held from before the update that belong to this profile's coordinator.
+  /// Their queues live outside this directory, and Remove deletes them with it.
+  let held: @Sendable () throws -> Int
 
-  public init(_ profile: ProfileID, applicationSupport: URL, caches: URL) {
+  public init(
+    _ profile: ProfileID, applicationSupport: URL, caches: URL,
+    held: @escaping @Sendable () throws -> Int = { 0 }
+  ) {
     self.profile = profile
     root = applicationSupport.appending(path: "Agent/Profiles/\(profile)")
     cache = caches.appending(path: "Agent/Profiles/\(profile)")
+    self.held = held
   }
 
   var outbox: URL { root.appending(path: "Outbox/pending.json") }
   var outboxAttachments: URL { root.appending(path: "Outbox/Attachments") }
   var ledger: URL { root.appending(path: "Ledger.json") }
-  /// The quarantined single-address queue. No session reads it. `LegacyHold` restores and
-  /// discards its messages.
-  var legacy: URL { root.appending(path: "Legacy") }
-  var legacyQueue: URL { legacy.appending(path: "pending.json") }
+  /// Where earlier builds of this app held the single-address build's queue, in the migrated
+  /// profile's directory. Launch moves it to its `HeldQueue`'s folder.
+  public var legacy: URL { root.appending(path: "Legacy") }
   var previews: URL { cache.appending(path: "Previews") }
 
   /// How many messages Remove deletes on this phone, queued in the outbox or held from before the
-  /// update, read from disk. A missing file holds none. An unreadable one throws, so it is never
-  /// counted as empty.
+  /// update for this profile's coordinator, read from disk. A missing file holds none. An
+  /// unreadable one throws, so it is never counted as empty.
   public func queuedMessages() throws -> Int {
-    func count<Item: Decodable>(_: Item.Type, in file: URL) throws -> Int {
-      do {
-        return try JSONDecoder().decode([Item].self, from: Data(contentsOf: file)).count
-      } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return 0 }
-    }
-    return try count(OutboxItem.self, in: outbox) + count(NativeRequestSubmit.self, in: legacyQueue)
+    try countItems(OutboxItem.self, in: outbox) + held()
   }
 
   /// Deletes everything the phone keeps for this profile. Call only after its session is
@@ -206,23 +250,26 @@ public struct ProfileDirectory: Sendable {
 }
 
 /// Migration only. Renames the single-address build's outbox for `address`
-/// (`Agent/Outbox/<sha256(host:port)>`) to the profile's `Legacy/`, never to its live
-/// outbox. A missing source or an existing destination is a no-op, so a crash at any
-/// point converges on the next launch.
+/// (`Agent/Outbox/<sha256(host:port)>`) to `folder`, which no session reads.
 public func quarantineLegacyOutbox(
-  for address: CoordinatorAddress, into directory: ProfileDirectory, applicationSupport: URL
+  for address: CoordinatorAddress, into folder: URL, applicationSupport: URL
 ) throws {
   let key = SHA256.hash(data: Data("\(address.host):\(address.port)".utf8)).map {
     String(format: "%02x", $0)
   }.joined()
-  let source = applicationSupport.appending(path: "Agent/Outbox/\(key)")
+  try moveOnce(applicationSupport.appending(path: "Agent/Outbox/\(key)"), to: folder)
+}
+
+/// Renames `source` to `destination`. A missing source or an existing destination is a no-op, so
+/// a crash at any point converges on the next launch.
+public func moveOnce(_ source: URL, to destination: URL) throws {
   let files = FileManager.default
-  guard files.fileExists(atPath: source.path), !files.fileExists(atPath: directory.legacy.path)
+  guard files.fileExists(atPath: source.path), !files.fileExists(atPath: destination.path)
   else { return }
   try files.createDirectory(
-    at: directory.root, withIntermediateDirectories: true,
+    at: destination.deletingLastPathComponent(), withIntermediateDirectories: true,
     attributes: [.posixPermissions: 0o700])
-  try files.moveItem(at: source, to: directory.legacy)
+  try files.moveItem(at: source, to: destination)
 }
 
 /// A message queued before the update. Its coordinator was never recorded, so it may
@@ -233,15 +280,15 @@ public struct LegacyItem: Sendable, Identifiable, Equatable {
   public let attachments: [AttachmentRef]
 }
 
-/// The quarantined queue of one profile. It has no transport, so a held item can never be
-/// sent, retried or observed. Restore copies it into a draft. Only Discard removes it.
+/// A held queue's folder. It has no transport, so a held item can never be sent, retried or
+/// observed. Restore copies it into a draft. Only Discard removes it.
 public actor LegacyHold {
   private let file: URL
   private let attachments: AttachmentStore
 
-  public init(_ directory: ProfileDirectory) {
-    file = directory.legacyQueue
-    attachments = AttachmentStore(directory: directory.legacy.appending(path: "Attachments"))
+  public init(_ folder: URL) {
+    file = folder.appending(path: "pending.json")
+    attachments = AttachmentStore(directory: folder.appending(path: "Attachments"))
   }
 
   /// A missing file holds nothing. An unreadable one throws and stays on disk.
