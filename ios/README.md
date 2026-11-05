@@ -150,8 +150,9 @@ Mode if requested, then Run.
   leading `@Name` that names no saved coordinator blocks Send, with one
   coordinator left too, so nothing meant for it goes to another coordinator.
 - Every connection first asks for the coordinator's ID and writes nothing else
-  unless the ID matches the saved one. A coordinator too old to answer shows
-  "Update the coordinator". If the address now answers as a different
+  unless the ID matches the saved one. A coordinator too old to answer, or one
+  that answers and then closes without replying to the app's first request,
+  shows "Update the coordinator". If the address now answers as a different
   coordinator, the queue stays on the phone. Both cases keep retrying. When
   that coordinator is another saved one, as when two coordinators trade
   addresses, the line names it and asks you to edit the address, which keeps

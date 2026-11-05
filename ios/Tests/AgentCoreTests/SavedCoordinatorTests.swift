@@ -865,6 +865,112 @@ func anOldCoordinatorLeavesTheProfileUnpairedUntilItAnswers() async throws {
   await fixture.stop()
 }
 
+/// The app, active, with Work added at `fixture`.
+@MainActor private func withWorkAdded(
+  at fixture: FixtureCoordinator, _ body: (Coordinators, ProfileID) async throws -> Void
+) async throws {
+  let (listener, port) = try await listen(fixture)
+  defer { listener.cancel() }
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "work-added-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: loopback(port))
+  await coordinators.setActive(true)
+  do {
+    try await coordinators.add(
+      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2"))
+    try await body(coordinators, try #require(coordinators.profiles.first?.id))
+  } catch {
+    await coordinators.setActive(false)
+    await fixture.stop()
+    throw error
+  }
+  await coordinators.setActive(false)
+  await fixture.stop()
+}
+
+private func observes(_ fixture: FixtureCoordinator) async -> Int {
+  await fixture.received().filter { if case .observe = $0 { true } else { false } }.count
+}
+
+/// Round 19's probe of this app against a `0d8daa0` coordinator, which answers `identify` and then
+/// closes on the observe's `source_status`. Add only asks who answers, so it saves the coordinator.
+/// The lane then says to update it, keeps retrying, and connects once it is updated.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aCoordinatorThatIdentifiesThenClosesOnTheObserveSaysUpdateIt() async throws {
+  let fixture = FixtureCoordinator()
+  await fixture.leaveObserveUnanswered(.closedOnSourceStatus)
+  try await withWorkAdded(at: fixture) { coordinators, work in
+    let chat = coordinators.chat
+    #expect(coordinators.profiles.first?.pin == fixture.id)
+    chat.draft = "Invented note for the old coordinator"
+    let found = try await settles { chat.laneError(work) != nil }
+    print(
+      "OLDCOORD lane=\(chat.snapshots[work].map { "\($0.connection)" } ?? "-") laneError=\(chat.laneError(work) ?? "nil") composerError=\(chat.error ?? "nil") canSend=\(chat.canSend) observes=\(await observes(fixture))"
+    )
+    #expect(found, "The lane reconnects with no reason")
+    #expect(chat.laneError(work) == "Update the coordinator to use it with this app.")
+    #expect(chat.error == "Update the coordinator to use it with this app.")
+    #expect(chat.snapshots[work]?.connection == .reconnecting)
+    #expect(!chat.canSend)
+    let attempts = await observes(fixture)
+    try await eventually("a retry after the backoff") { await observes(fixture) > attempts }
+    #expect(chat.laneError(work) == "Update the coordinator to use it with this app.")
+    await fixture.leaveObserveUnanswered(nil)
+    try await eventually("connected once updated") {
+      chat.snapshots[work]?.connection == .connected
+    }
+    #expect(chat.laneError(work) == nil)
+    #expect(chat.draft == "Invented note for the old coordinator")
+    #expect(await fixture.count() == 0)
+  }
+}
+
+/// A socket the network resets before the first reply is a drop, not an old coordinator.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aSocketResetBeforeTheFirstReplyOnlyReconnects() async throws {
+  let fixture = FixtureCoordinator()
+  await fixture.leaveObserveUnanswered(.reset)
+  try await withWorkAdded(at: fixture) { coordinators, work in
+    let chat = coordinators.chat
+    try await eventually("a retry after the backoff") { await observes(fixture) >= 2 }
+    #expect(chat.snapshots[work]?.connection == .reconnecting)
+    #expect(chat.laneError(work) == nil)
+    #expect(chat.error == nil)
+  }
+}
+
+/// A lost action reply makes the phone close its observer, here while that observer waits for its
+/// first reply on a stalled network. The phone closed it, not the coordinator, so the lane only
+/// reconnects.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func anObserverThePhoneClosesBeforeItsFirstReplyOnlyReconnects() async throws {
+  let fixture = FixtureCoordinator()
+  try await withWorkAdded(at: fixture) { coordinators, work in
+    let chat = coordinators.chat
+    try await eventually("connected") { chat.snapshots[work]?.connection == .connected }
+    await fixture.loseInputAcknowledgements()
+    await fixture.holdNextSubmitReply()
+    chat.draft = "Invented note whose reply is held"
+    await chat.send()
+    try await eventually("the held submit") { await fixture.count() == 1 }
+    await fixture.leaveObserveUnanswered(.silent)
+    chat.draft = "Invented note whose reply is lost"
+    await chat.send()
+    try await eventually("an observer waiting for its first reply") {
+      await observes(fixture) == 2
+    }
+    await fixture.releaseSubmitReply()
+    try await eventually("a retry after the phone closed it") { await observes(fixture) == 3 }
+    #expect(chat.snapshots[work]?.connection == .reconnecting)
+    #expect(chat.laneError(work) == nil)
+  }
+}
+
 @MainActor @Test(.timeLimit(.minutes(1)))
 func anAddressEditIsProbedAgainstThePinBeforeAnythingIsSaved() async throws {
   let right = FixtureCoordinator()
