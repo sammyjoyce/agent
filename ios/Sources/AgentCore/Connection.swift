@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 import Network
 
-public struct CoordinatorAddress: Sendable, Equatable {
+public struct CoordinatorAddress: Sendable, Hashable {
   public let host: String
   public let port: UInt16
 

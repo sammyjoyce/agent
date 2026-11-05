@@ -42,7 +42,9 @@ public final class Coordinators {
   @ObservationIgnored private var pairing: [ProfileID: Task<Void, Never>] = [:]
   /// Alert withdrawals `profiles.json` keeps until a coordinator confirms them.
   @ObservationIgnored private var withdrawals: [PendingWithdrawal] = []
-  @ObservationIgnored private var withdrawing: [InstallationID: Task<Void, Never>] = [:]
+  /// One retry per saved withdrawal. Two held queues can carry one installation to two
+  /// coordinators, and each coordinator needs its own.
+  @ObservationIgnored private var withdrawing: [PendingWithdrawal: Task<Void, Never>] = [:]
   /// True while a profile mutation runs. The ones waiting their turn, in call order.
   @ObservationIgnored private var mutating = false
   @ObservationIgnored private var waiting: [CheckedContinuation<Void, Never>] = []
@@ -220,10 +222,10 @@ public final class Coordinators {
       let remaining = profiles.filter { $0.id != id }
       var pending = withdrawals
       // Only a paired profile ever had a session to enroll alerts over.
-      if let pin = profile.pin {
-        pending.append(
-          PendingWithdrawal(installation: InstallationID(id), address: profile.address, pin: pin))
+      let withdrawal = profile.pin.map {
+        PendingWithdrawal(installation: InstallationID(id), address: profile.address, pin: $0)
       }
+      if let withdrawal { pending.append(withdrawal) }
       do {
         try save(SavedProfiles(profiles: remaining, withdrawals: pending))
       } catch {
@@ -241,8 +243,8 @@ public final class Coordinators {
       queues = queues.filter { marked[$0.id] == nil }
       // The profile stays until its lane is detached, so the feed still names that lane's rows.
       // The one save before then is given `remaining`.
-      if await registration?.forget(id) == true {
-        confirmWithdrawal(InstallationID(id), saved: remaining)
+      if await registration?.forget(id) == true, let withdrawal {
+        confirmWithdrawal(withdrawal, saved: remaining)
       }
       await chat.detach(id)
       pairing.removeValue(forKey: id)?.cancel()
@@ -262,13 +264,12 @@ public final class Coordinators {
   /// The record goes once its coordinator confirms, or once every one of those addresses answers
   /// as another coordinator, since this phone then knows no way to reach it, as after a reinstall.
   private func retry(_ withdrawal: PendingWithdrawal) {
-    let id = withdrawal.installation
-    withdrawing.removeValue(forKey: id)?.cancel()
+    withdrawing.removeValue(forKey: withdrawal)?.cancel()
     var addresses = [withdrawal.address]
     for profile in profiles where !addresses.contains(profile.address) {
       addresses.append(profile.address)
     }
-    withdrawing[id] = Task { [weak self, transport] in
+    withdrawing[withdrawal] = Task { [weak self, transport] in
       var settled = true
       for address in addresses where !Task.isCancelled {
         do {
@@ -281,14 +282,17 @@ public final class Coordinators {
         }
       }
       guard settled, !Task.isCancelled, let self else { return }
-      await self.serially { self.confirmWithdrawal(id, saved: self.profiles) }
+      await self.serially { self.confirmWithdrawal(withdrawal, saved: self.profiles) }
     }
   }
 
-  /// Drops a confirmed withdrawal's record. If that save fails the record stays, and the next
-  /// activation finds nothing left to withdraw.
-  private func confirmWithdrawal(_ id: InstallationID, saved profiles: [CoordinatorProfile]) {
-    let rest = withdrawals.filter { $0.installation != id }
+  /// Drops a confirmed withdrawal's record and no other, since another coordinator may hold the
+  /// same installation. If that save fails the record stays, and the next activation finds nothing
+  /// left to withdraw.
+  private func confirmWithdrawal(
+    _ withdrawal: PendingWithdrawal, saved profiles: [CoordinatorProfile]
+  ) {
+    let rest = withdrawals.filter { $0 != withdrawal }
     do {
       try save(SavedProfiles(profiles: profiles, withdrawals: rest))
     } catch { return }
