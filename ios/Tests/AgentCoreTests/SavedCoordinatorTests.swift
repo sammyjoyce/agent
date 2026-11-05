@@ -3108,9 +3108,10 @@ func aMigrationStoppedAtAnyStepLeavesTheShippedBuildNothingToDelete(
 /// `Agent/Held`, bound it to the coordinator it proved at the queue's address, 100.64.1.2:43187,
 /// saved the withdrawal of the old alert installation, and the user then moved the profile to port
 /// 4001. This build adopts that queue with the binding that build listed and saves no second
-/// withdrawal. The same listing for a queue of this build's names no folder in `Agent/Held`, so it
-/// gives that queue nothing: it stays unbound with its installation. Either way the list goes.
-@MainActor @Test(arguments: ["#10's queue", "a queue of this build's"])
+/// withdrawal. A listing under another queue's ID, or one for this build's queue at another
+/// address, gives this build's queue nothing: it stays unbound with its installation. Either way
+/// the list goes.
+@MainActor @Test(arguments: ["#10's queue", "another queue's ID", "another address"])
 func aBindingTheShippedBuildListedCountsOnlyForItsOwnFolder(_ whose: String) async throws {
   let install = try await LegacyInstall()
   defer { install.remove() }
@@ -3143,7 +3144,8 @@ func aBindingTheShippedBuildListedCountsOnlyForItsOwnFolder(_ whose: String) asy
       {"withdrawals":[\(withdrawals)],\
       "profiles":[{"id":"\(migrated.id)","name":"Work",\
       "address":{"host":"100.64.1.2","port":4001},"pin":"\(coordinator.uuid.uuidString)"}],\
-      "held":[{"id":"\(queue.id.uuidString)","address":{"host":"100.64.1.2","port":43187},\
+      "held":[{"id":"\(whose == "another queue's ID" ? UUID() : queue.id)",\
+      "address":{"host":"100.64.1.2","port":\(whose == "another address" ? 4002 : 43187)},\
       "coordinator":"\(coordinator.uuid.uuidString)"}]}
       """.utf8), to: install.support.appending(path: "Agent/profiles.json"))
   let again = launch()
