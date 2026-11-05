@@ -28,8 +28,6 @@ public struct MainChatView: View {
   @State private var visibleItem: String?
   @State private var historyRequest: HistoryNavigation?
   @State private var importingFiles = false
-  /// A held message whose Restore waits for the user to choose who gets it.
-  @State private var choosing: HeldMessage?
   #if os(iOS)
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var capture = AppScreenshot()
@@ -357,18 +355,13 @@ public struct MainChatView: View {
             ForEach(model.held) { message in
               HeldMessageRow(
                 message: message,
-                restore: {
-                  if model.owner(message) == nil {
-                    choosing = message
-                  } else {
-                    Task { await model.restoreHeld(message) }
-                  }
-                }, discard: { Task { await model.discardHeld(message) } }
+                restore: { Task { await model.restoreHeld(message) } },
+                discard: { Task { await model.discardHeld(message) } }
               )
               .confirmationDialog(
                 "Who should get this message?",
                 isPresented: Binding(
-                  get: { choosing?.id == message.id }, set: { if !$0 { choosing = nil } }),
+                  get: { model.asking?.id == message.id }, set: { if !$0 { model.stopAsking() } }),
                 titleVisibility: .visible
               ) {
                 ForEach(model.heldChoices) { profile in

@@ -125,7 +125,7 @@ final class ChatModel {
   var revision = 0
   /// Saved coordinators in order, kept by `Coordinators`. Names, colors and the feed's lane
   /// order come from here.
-  var profiles: [CoordinatorProfile] = []
+  var profiles: [CoordinatorProfile] = [] { didSet { endAnsweredQuestion() } }
   /// The one coordinator the draft goes to, or nil for every paired one. While it is set, the
   /// draft is never read for tags.
   var recipient: ProfileID?
@@ -134,7 +134,7 @@ final class ChatModel {
   private(set) var promotion: Promotion?
   /// Coordinators removed in this process, or being removed, by the name they had. Nothing
   /// addresses one again, and profile IDs are never reused.
-  var removed: [ProfileID: String] = [:]
+  var removed: [ProfileID: String] = [:] { didSet { endAnsweredQuestion() } }
   /// What the composer holds. A draft changed in code replaces the field's text, composition
   /// included, so all of it is committed.
   var draft = "" {
@@ -166,6 +166,7 @@ final class ChatModel {
       for id in reads.keys where !current.contains(id) { reads[id] = nil }
       let known = Set(oldValue.map(\.queue.id))
       for hold in holds where !known.contains(hold.queue.id) { Task { await read(hold) } }
+      endAnsweredQuestion()
     }
   }
   /// The saved coordinator a held message belongs to: the one its queue went to once this phone
@@ -189,6 +190,15 @@ final class ChatModel {
   /// removed.
   var heldChoices: [CoordinatorProfile] {
     profiles.filter { $0.pin != nil && removed[$0.id] == nil }
+  }
+  /// The held message Restore is asking who should get. Restore asks only about a message with no
+  /// owner, and `heldNote` says so, so the question ends once the message gains one, as when its
+  /// queue's coordinator pairs, and does not come back if that owner goes.
+  private(set) var asking: HeldMessage?
+  func stopAsking() { asking = nil }
+  /// Runs on each change to `profiles`, `removed` and `holds`, which are what `owner` reads.
+  private func endAnsweredQuestion() {
+    if let asking, owner(asking) != nil { self.asking = nil }
   }
   /// Why Restore asks who gets a held message, and what a Send to the one chosen leaves. It names
   /// the address the message was queued for only when this phone recorded it, and says no saved
@@ -854,10 +864,17 @@ final class ChatModel {
     } catch { failure = error.localizedDescription }
   }
   /// Copies a held message into the composer with its text as it was, addressed to its owner, or
-  /// else to `chosen`, and with neither does nothing. It stays held until a Send carries the copy
-  /// unchanged to its owner, since only that one is known to be the coordinator it was queued for.
+  /// else to `chosen`, and with neither asks who should get it. It stays held until a Send carries
+  /// the copy unchanged to its owner, since only that one is known to be the coordinator it was
+  /// queued for. A `chosen` answers only a message with no owner, so once the message has gained
+  /// another owner, as when its queue's coordinator paired while Restore asked, it restores nothing.
   func restoreHeld(_ message: HeldMessage, for chosen: ProfileID? = nil) async {
     let owner = owner(message)
+    if chosen == nil, owner == nil {
+      asking = message
+      return
+    }
+    if let chosen, let owner, chosen != owner { return }
     guard let hold = holds.first(where: { $0.queue.id == message.queue }),
       let recipient = chosen ?? owner, readyToRestore(from: recipient)
     else { return }
