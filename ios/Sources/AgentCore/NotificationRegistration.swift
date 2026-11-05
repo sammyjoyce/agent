@@ -101,9 +101,9 @@ public final class NotificationRegistration {
       }
     } catch {
       guard current(profile, link) else { return }
+      let registered = status(profile).registered
       channels[profile]?.error =
-        enabled || !status(profile).registered
-        ? error.localizedDescription : removalError(error)
+        enabled || !registered ? error.localizedDescription : removalError(error)
     }
   }
 
