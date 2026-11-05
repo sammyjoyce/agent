@@ -53,9 +53,10 @@ the address that build used, whatever the toggle says. That coordinator then
 alerts this device only through the saved coordinator's own registration, and
 only while alerts are on. A coordinator saved only at another address is sent
 the withdrawal once a probe of that build's address finds it there. Until then
-the phone cannot tell whether it is the one that build used. Until the
-coordinator confirms, the app sends the withdrawal again each time it becomes
-active.
+the phone cannot tell whether it is the one that build used. When that build
+used more than one address, each coordinator proven at one of them gets its own
+withdrawal. Until that coordinator confirms, the app sends it again each time it
+becomes active.
 **Connection → Appearance** follows the system by default. Choose **Light** or
 **Dark** to keep a saved override.
 
