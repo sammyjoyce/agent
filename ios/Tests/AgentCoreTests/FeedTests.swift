@@ -401,10 +401,14 @@ private actor WorkRoute {
   await second.stop()
 }
 
+/// How long a wait across a lane's reconnect may take. A session whose dial fails backs off up to
+/// 32 s before it dials again.
+private let reconnecting = Duration.seconds(45)
+
 @MainActor private func eventually(
-  _ description: String, _ predicate: () async -> Bool
+  _ description: String, within limit: Duration = .seconds(15), _ predicate: () async -> Bool
 ) async throws {
-  let deadline = ContinuousClock.now + .seconds(15)
+  let deadline = ContinuousClock.now + limit
   while !(await predicate()) {
     try #require(ContinuousClock.now < deadline, "Timed out waiting for \(description)")
     try await Task.sleep(for: .milliseconds(5))
@@ -2050,8 +2054,10 @@ func aControlACoordinatorDidNotGetNamesItInTheError() async throws {
     }
     chat.draft = "/status"
     try await sendWhileWorkDrops()
+    try await eventually("Personal got /status") {
+      await submits(personalFixture).map(\.text) == ["/status"]
+    }
     try await Task.sleep(for: .milliseconds(250))
-    #expect(await submits(personalFixture).map(\.text) == ["/status"])
     #expect(await submits(workFixture).isEmpty, "A control is never sent later")
     #expect(chat.error == "Work did not get /status. It is not connected.")
     #expect(chat.draft.isEmpty, "Personal got it")
@@ -2078,12 +2084,16 @@ func aControlDuringRemoveNamesTheRemovedCoordinatorItSkipped() async throws {
     let removing = Task { @MainActor in try await coordinators.remove(coordinators.removal(work)) }
     await sending.value
     try await removing.value
-    try await Task.sleep(for: .milliseconds(300))
+    let named = "Work did not get /status. It was removed."
+    try await eventually("Personal got /status") {
+      await submits(personalFixture).map(\.text) == ["/status"]
+    }
+    try await eventually("Work got /status, or the composer says it did not") {
+      await !submits(workFixture).isEmpty || chat.error == named
+    }
     let sentToWork = await submits(workFixture).map(\.text)
-    #expect(await submits(personalFixture).map(\.text) == ["/status"])
     #expect(
-      sentToWork.isEmpty
-        ? chat.error == "Work did not get /status. It was removed." : chat.error == nil,
+      sentToWork.isEmpty ? chat.error == named : chat.error == nil,
       "Work got \(sentToWork), and the error says \(chat.error ?? "nothing")")
     #expect(chat.draft.isEmpty, "Personal got it")
     let outbox = ProfileDirectory(personal, applicationSupport: root, caches: root).outbox
@@ -2107,7 +2117,11 @@ func aMessageDuringRemoveNamesTheRemovedCoordinatorItDidNotReach() async throws 
     let removing = Task { @MainActor in try await coordinators.remove(coordinators.removal(work)) }
     await sending.value
     try await removing.value
-    try await Task.sleep(for: .milliseconds(300))
+    let named = "Work did not get this message. It was removed."
+    try await eventually("Personal got it") { await submits(personalFixture).map(\.text) == [text] }
+    try await eventually("Work got it, or the composer says it did not") {
+      await !submits(workFixture).isEmpty || chat.error == named
+    }
     let atWork = await submits(workFixture).map(\.text)
     let atPersonal = await submits(personalFixture).map(\.text)
     print(
@@ -2116,8 +2130,7 @@ func aMessageDuringRemoveNamesTheRemovedCoordinatorItDidNotReach() async throws 
     #expect(atPersonal == [text])
     if atWork.isEmpty {
       #expect(
-        chat.error == "Work did not get this message. It was removed.",
-        "Work got nothing, and the error says \(chat.error ?? "nothing")")
+        chat.error == named, "Work got nothing, and the error says \(chat.error ?? "nothing")")
     }
   }
 }
@@ -2138,7 +2151,14 @@ func aMessageDuringRemoveOfItsSecondRecipientNamesIt() async throws {
     }
     await sending.value
     try await removing.value
-    try await Task.sleep(for: .milliseconds(300))
+    let named = "Personal did not get this message. It was removed."
+    let nothing = "Nothing was sent. \(named)"
+    try await eventually("Work got it, or the composer says nothing was sent") {
+      await !submits(workFixture).isEmpty || chat.error == nothing
+    }
+    try await eventually("Personal got it, or the composer says it did not") {
+      await !submits(personalFixture).isEmpty || chat.error?.contains(named) == true
+    }
     let atWork = await submits(workFixture).map(\.text)
     let atPersonal = await submits(personalFixture).map(\.text)
     print(
@@ -2146,11 +2166,11 @@ func aMessageDuringRemoveOfItsSecondRecipientNamesIt() async throws {
     )
     if atPersonal.isEmpty {
       #expect(
-        chat.error?.contains("Personal did not get this message. It was removed.") == true,
+        chat.error?.contains(named) == true,
         "Personal got nothing, and the error says \(chat.error ?? "nothing")")
     }
     if atWork.isEmpty {
-      #expect(chat.error == "Nothing was sent. Personal did not get this message. It was removed.")
+      #expect(chat.error == nothing)
       #expect(chat.draft == text, "Nothing went, so the draft stays")
     }
   }
@@ -2215,6 +2235,11 @@ func aSendWhoseAddressChangesWhileItsDialIsPendingIsNamedOnlyIfLost(saved: Int, 
     try await coordinators.update(
       work, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.3", port: 4003))
     await gate.open()
+    if saved == 2 {
+      try await eventually("Personal got it") {
+        await submits(personalFixture).map(\.text) == [draft]
+      }
+    }
     try await Task.sleep(for: .milliseconds(350))
     print("IF5-S1-D saved=\(saved) draft=\(draft) error=\(chat.error ?? "nil")")
     #expect(await submits(workFixture).isEmpty)
@@ -2253,6 +2278,43 @@ func aSendWhoseAddressChangesWhileItsDialIsPendingIsNamedOnlyIfLost(saved: Int, 
   return clash
 }
 
+/// A draft file whose bytes come through a named pipe, so a copy that reaches it waits until the
+/// test feeds it. Each feed gives one reader the file's bytes.
+private struct PipedFile: Sendable {
+  let url: URL
+  let bytes: Data
+
+  init(_ file: LocalAttachment) throws {
+    url = file.url
+    bytes = try Data(contentsOf: url)
+    try FileManager.default.removeItem(at: url)
+    guard mkfifo(url.path, 0o600) == 0 else {
+      throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+  }
+
+  /// Waits for the next reader to open the pipe, then gives it the bytes.
+  func feed() async throws {
+    try await withCheckedThrowingContinuation {
+      (continuation: CheckedContinuation<Void, any Error>) in
+      DispatchQueue.global().async {
+        do {
+          let writer = try FileHandle(forWritingTo: url)
+          try writer.write(contentsOf: bytes)
+          try writer.close()
+          continuation.resume()
+        } catch { continuation.resume(throwing: error) }
+      }
+    }
+  }
+
+  /// Ends a reader still waiting at the pipe with no bytes, so a failed test leaves no copy stuck.
+  func release() {
+    let writer = open(url.path, O_WRONLY | O_NONBLOCK)
+    if writer >= 0 { close(writer) }
+  }
+}
+
 /// A message with eight files goes to both, and Work saves its copy first. While Personal still
 /// copies the files, Work's address is edited to another that reaches Work, which retires Work's
 /// session and gives its outbox to a new one, or it is not, the control. Then Personal cannot take
@@ -2272,6 +2334,10 @@ func aSendToBothPersonalRefusesLeavesNothingAtWorkAfterAnAddressEdit(
     let personalDirectory = ProfileDirectory(personal, applicationSupport: root, caches: root)
     let clash = try await draftEightLargeFiles(
       chat, text, clashAt: failure == "clash" ? personalDirectory : nil)
+    // Personal's copy of the seventh file waits until the edit is done.
+    let held = try edit ? PipedFile(#require(chat.attachments.dropLast().last)) : nil
+    defer { held?.release() }
+    let workCopy = Task { try await held?.feed() }
     let workOutbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
     let sending = Task { await chat.send() }
     if edit {
@@ -2289,6 +2355,8 @@ func aSendToBothPersonalRefusesLeavesNothingAtWorkAfterAnAddressEdit(
       try await coordinators.update(
         work, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4003))
       try #require(chat.admitting, "The edit finished while Personal still copied the files")
+      try await workCopy.value
+      try await held?.feed()
     }
     await sending.value
     try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
@@ -2589,7 +2657,7 @@ func anActiveChangeOverlappedByAnInactiveOneLeavesNoLaneLive() async throws {
   await chat.attach(data: Data("invented lease".utf8), name: "Lease.txt", mediaType: "text/plain")
   await chat.send()
   var rejected: String?
-  try await eventually("Work placed it and Personal refused it") {
+  try await eventually("Work placed it and Personal refused it", within: reconnecting) {
     let receipts = chat.rows.first { $0.row.text == text }?.receipts ?? []
     guard receipts.first?.status == .placed, receipts.count == 2,
       case .pending(.rejected, let id?) = receipts[1].status
@@ -2649,7 +2717,7 @@ func aRestoredSourceSavedAgainBeforeItsCopyIsSentReadsDeliveredOncePlaced() asyn
 /// each message at once. A retry that wrote the original before its copy was admitted gets it
 /// placed, and it reads Delivered. One that had not written it is cancelled when the copy withdraws
 /// the original, which then reads not sent and never reaches Personal.
-@MainActor @Test(.timeLimit(.minutes(1)))
+@MainActor @Test(.timeLimit(.minutes(2)))
 func aRestoredSourceRetriedAsItsCopyIsSentReadsDeliveredOncePlaced() async throws {
   try await withTwoFixtures { coordinators, _, personalFixture, _ in
     await personalFixture.refuseUploads()
@@ -2664,15 +2732,15 @@ func aRestoredSourceRetriedAsItsCopyIsSentReadsDeliveredOncePlaced() async throw
     @MainActor func connected() -> Int {
       chat.snapshots.values.filter { $0.connection == .connected }.count
     }
-    try await eventually("both connected") { connected() == 2 }
+    try await eventually("both connected", within: reconnecting) { connected() == 2 }
     await chat.restore(source)
     await coordinators.setActive(false)
     await coordinators.setActive(true)
-    try await eventually("both connected again") { connected() == 2 }
+    try await eventually("both connected again", within: reconnecting) { connected() == 2 }
     await personalFixture.acceptUploads()
     await chat.retry(source)
     await chat.send()
-    try await eventually("Personal placed or withdrew the original") {
+    try await eventually("Personal placed or withdrew the original", within: reconnecting) {
       let progress = chat.snapshots[personal]?.sends[send]?.progress
       let submitted = await personalFixture.count()
       return progress == .placed && submitted == 2 || progress == .withdrawn && submitted >= 1
@@ -2725,8 +2793,9 @@ func aRestoredSourceTheCoordinatorAcceptsBeforeItsCopyIsSentStaysQueued() async 
     await chat.restore(source)
     await coordinators.setActive(false)
     await coordinators.setActive(true)
-    try await eventually("Personal reports the original accepted") {
-      lines().contains("Personal · Saved")
+    // A coordinator reports what it accepted before the history page that connects the lane.
+    try await eventually("Personal reports the original accepted, and Send can go") {
+      lines().contains("Personal · Saved") && chat.canSend
     }
     await chat.send()
     try await eventually("the copy at Personal") { await personalFixture.count() == 2 }
@@ -3033,6 +3102,7 @@ func aRestoredSourceWrittenAgainStaysQueuedUntilItsCoordinatorAnswers() async th
         || lines() == ["Work · Delivered", "Personal · Delivered"]
     }
     print("IF6-T2[written] once Personal answered: \(lines())")
+    try await eventually("the copy at Personal") { await personalFixture.count() >= 2 }
     #expect(await personalFixture.count() == 2)
   }
 }
