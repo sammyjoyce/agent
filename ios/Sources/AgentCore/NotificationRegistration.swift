@@ -285,7 +285,7 @@ public struct InstallationID: Hashable, Sendable, Codable, CustomStringConvertib
 /// An alert withdrawal saved before it is sent: Remove's, or the single-address build's once the
 /// profile migrated from it pairs. It outlives the profile, so it keeps the address and pin that
 /// reach that coordinator alone.
-public struct PendingWithdrawal: Codable, Sendable, Equatable {
+public struct PendingWithdrawal: Codable, Sendable, Hashable {
   public let installation: InstallationID
   public let address: CoordinatorAddress
   public let pin: CoordinatorID

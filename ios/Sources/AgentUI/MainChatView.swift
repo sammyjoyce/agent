@@ -880,7 +880,7 @@ private struct CoordinatorForm: View {
   @State private var port = "43187"
   @State private var formError: String?
   @State private var saving = false
-  @State private var removal: String?
+  @State private var removal: Coordinators.Removal?
   @Environment(\.dismiss) private var dismiss
 
   init(coordinators: Coordinators, profile: CoordinatorProfile?, pushed: Bool) {
@@ -927,17 +927,17 @@ private struct CoordinatorForm: View {
       .onChange(of: profile?.id) { load() }
     if let profile {
       Button("Remove coordinator", role: .destructive) {
-        removal = coordinators.removalMessage(profile.id)
+        removal = coordinators.removal(profile.id)
       }
       .disabled(saving)
       .confirmationDialog(
         "Remove \(profile.name.description)?",
         isPresented: Binding(get: { removal != nil }, set: { if !$0 { removal = nil } }),
-        titleVisibility: .visible
-      ) {
-        Button("Remove", role: .destructive) { Task { await remove(profile.id) } }
-      } message: {
-        Text(removal ?? "")
+        titleVisibility: .visible, presenting: removal
+      ) { confirmed in
+        Button("Remove", role: .destructive) { Task { await remove(confirmed) } }
+      } message: { confirmed in
+        Text(confirmed.message)
       }
     }
   }
@@ -973,9 +973,9 @@ private struct CoordinatorForm: View {
       dismiss()
     } catch { formError = error.localizedDescription }
   }
-  private func remove(_ id: ProfileID) async {
+  private func remove(_ confirmed: Coordinators.Removal) async {
     do {
-      try await coordinators.remove(id)
+      try await coordinators.remove(confirmed)
       if pushed { dismiss() }
     } catch { formError = error.localizedDescription }
   }

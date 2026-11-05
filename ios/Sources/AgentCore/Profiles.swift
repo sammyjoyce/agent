@@ -63,6 +63,12 @@ public struct TagName: Hashable, Sendable, Codable, CustomStringConvertible {
     }
   }
 
+  /// `name` with `-number` after it, shortened to fit 32 characters.
+  init(_ name: TagName, numbered number: Int) {
+    let suffix = "-\(number)"
+    description = String(name.description.prefix(32 - suffix.count)) + suffix
+  }
+
   public init(from decoder: any Decoder) throws {
     try self.init(decoder.singleValueContainer().decode(String.self))
   }
@@ -133,13 +139,38 @@ public struct CoordinatorProfile: Codable, Sendable, Identifiable, Equatable {
       throw ProfileError.duplicateName(other.name.description)
     }
   }
+
+  /// `name`, else the first of `name-2`, `name-3` and on that `checkName` accepts, for a profile
+  /// the app names itself.
+  public static func unusedName(_ name: TagName, in profiles: [CoordinatorProfile]) -> TagName {
+    var candidate = name
+    var number = 1
+    while (try? checkName(candidate, for: nil, in: profiles)) == nil {
+      number += 1
+      candidate = TagName(name, numbered: number)
+    }
+    return candidate
+  }
+
+  /// `profiles` with each name a profile before it has, ignoring case, replaced by the `unusedName`
+  /// no other profile has, as an earlier build's migration may have saved. Every other name stays.
+  public static func uniquelyNamed(_ profiles: [CoordinatorProfile]) -> [CoordinatorProfile] {
+    var named = profiles
+    for index in named.indices
+    where (try? checkName(named[index].name, for: nil, in: Array(named[..<index]))) == nil {
+      named[index].name = unusedName(
+        named[index].name, in: named.filter { $0.id != named[index].id })
+    }
+    return named
+  }
 }
 
 /// What one launch of the single-address build left: the messages it queued for the coordinator at
 /// `address`, held in the queue's own folder, and its alert installation. The build never learned
 /// that coordinator's ID, so both belong to the first coordinator this phone proves answers at
 /// `address` while a saved profile is pinned to it, whichever profile that is. Each launch's queue
-/// keeps its own address and coordinator, whatever a later one left.
+/// keeps its own address and coordinator, whatever a later one left. The folder records the queue
+/// itself, so nothing else has to list it, and only a Remove the user confirmed deletes it.
 public struct HeldQueue: Codable, Sendable, Equatable, Identifiable {
   /// Names the queue's folder.
   public let id: UUID
@@ -171,9 +202,10 @@ public struct HeldQueue: Codable, Sendable, Equatable, Identifiable {
     return installation.map { PendingWithdrawal(installation: $0, address: address, pin: found) }
   }
 
-  /// The queue's messages and their files. No profile's directory holds it, so it outlives any.
+  /// The queue's messages and their files. No profile's directory holds it, so it outlives any, and
+  /// no earlier build of this app reads, writes or deletes anything in `Agent/HeldQueues`.
   public func folder(applicationSupport: URL) -> URL {
-    applicationSupport.appending(path: "Agent/Held/\(id.uuidString)")
+    applicationSupport.appending(path: "Agent/HeldQueues/\(id.uuidString)")
   }
 
   /// The queue an earlier build of this app held in `profile`'s directory. It takes the profile's
@@ -186,11 +218,85 @@ public struct HeldQueue: Codable, Sendable, Equatable, Identifiable {
       id: profile.uuid, address: address, coordinator: coordinator, installation: installation)
   }
 
-  /// Moves the folder an earlier build held this queue in, if it is still there, to `folder`.
-  public func adoptFolder(applicationSupport: URL, caches: URL) throws {
-    let earlier = ProfileDirectory(
-      ProfileID(id), applicationSupport: applicationSupport, caches: caches)
-    try moveOnce(earlier.legacy, to: folder(applicationSupport: applicationSupport))
+  private static func record(in folder: URL) -> URL { folder.appending(path: "queue.json") }
+
+  /// The queue `folder` records, or nil when it records none.
+  public static func recorded(in folder: URL) throws -> HeldQueue? {
+    do {
+      return try JSONDecoder().decode(HeldQueue.self, from: Data(contentsOf: record(in: folder)))
+    } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
+  }
+
+  /// Writes this queue's record into `folder`, creating it. Readable after first unlock, as
+  /// `profiles.json` is, so a launch while locked still knows whose each queue is.
+  public func record(in folder: URL) throws {
+    try writePrivately(
+      JSONEncoder().encode(self), to: Self.record(in: folder), readableAfterFirstUnlock: true)
+  }
+
+  /// Every queue in `Agent/HeldQueues`, oldest folder first. A folder that records none is a queue
+  /// whose address and coordinator are unknown.
+  public static func all(applicationSupport: URL) throws -> [HeldQueue] {
+    let entries: [URL]
+    do {
+      entries = try FileManager.default.contentsOfDirectory(
+        at: applicationSupport.appending(path: "Agent/HeldQueues"),
+        includingPropertiesForKeys: [.creationDateKey])
+    } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [] }
+    var queues: [(created: Date, queue: HeldQueue)] = []
+    for entry in entries {
+      guard let id = UUID(uuidString: entry.lastPathComponent) else { continue }
+      let recorded = try recorded(in: entry)
+      queues.append(
+        (
+          try entry.resourceValues(forKeys: [.creationDateKey]).creationDate ?? .distantPast,
+          HeldQueue(
+            id: id, address: recorded?.address, coordinator: recorded?.coordinator,
+            installation: recorded?.installation)
+        ))
+    }
+    return queues.sorted {
+      ($0.created, $0.queue.id.uuidString) < ($1.created, $1.queue.id.uuidString)
+    }.map(\.queue)
+  }
+
+  /// Records `queue` in `source`, over any record a stopped launch left there, and returns it. A
+  /// queue whose folder another source already took gets a new ID first, so every source moves into
+  /// a folder of its own.
+  public static func name(_ source: URL, as queue: HeldQueue, applicationSupport: URL) throws
+    -> HeldQueue
+  {
+    var named = queue
+    if FileManager.default.fileExists(
+      atPath: named.folder(applicationSupport: applicationSupport).path)
+    {
+      named = HeldQueue(
+        address: named.address, coordinator: named.coordinator, installation: named.installation)
+    }
+    if try named != recorded(in: source) { try named.record(in: source) }
+    return named
+  }
+
+  /// Renames the queue's folder to the name only a deletion reads, and returns that name. A launch
+  /// deletes what a Remove marked and did not finish deleting.
+  public func markDeleted(applicationSupport: URL) throws -> URL {
+    let folder = folder(applicationSupport: applicationSupport)
+    let marked = folder.appendingPathExtension("deleted")
+    if FileManager.default.fileExists(atPath: folder.path) {
+      try FileManager.default.moveItem(at: folder, to: marked)
+    }
+    return marked
+  }
+
+  /// Deletes every folder a Remove marked. Any other folder stays.
+  public static func deleteMarked(applicationSupport: URL) {
+    let held = applicationSupport.appending(path: "Agent/HeldQueues")
+    let entries =
+      (try? FileManager.default.contentsOfDirectory(at: held, includingPropertiesForKeys: nil))
+      ?? []
+    for entry in entries where entry.pathExtension == "deleted" {
+      try? FileManager.default.removeItem(at: entry)
+    }
   }
 }
 
@@ -233,6 +339,17 @@ public struct ProfileDirectory: Sendable {
   public var legacy: URL { root.appending(path: "Legacy") }
   var previews: URL { cache.appending(path: "Previews") }
 
+  /// Every profile directory with a `Legacy` folder, whether `profiles.json` lists it or not.
+  public static func holdingLegacy(applicationSupport: URL, caches: URL) -> [ProfileDirectory] {
+    let entries =
+      (try? FileManager.default.contentsOfDirectory(
+        at: applicationSupport.appending(path: "Agent/Profiles"), includingPropertiesForKeys: nil))
+      ?? []
+    return entries.compactMap { UUID(uuidString: $0.lastPathComponent) }.map {
+      ProfileDirectory(ProfileID($0), applicationSupport: applicationSupport, caches: caches)
+    }.filter { FileManager.default.fileExists(atPath: $0.legacy.path) }
+  }
+
   /// How many messages Remove deletes on this phone, queued in the outbox or held from before the
   /// update for this profile's coordinator, read from disk. A missing file holds none. An
   /// unreadable one throws, so it is never counted as empty.
@@ -249,15 +366,13 @@ public struct ProfileDirectory: Sendable {
   }
 }
 
-/// Migration only. Renames the single-address build's outbox for `address`
-/// (`Agent/Outbox/<sha256(host:port)>`) to `folder`, which no session reads.
-public func quarantineLegacyOutbox(
-  for address: CoordinatorAddress, into folder: URL, applicationSupport: URL
-) throws {
+/// Migration only. The single-address build's outbox for `address`,
+/// `Agent/Outbox/<sha256(host:port)>`, which no session reads.
+public func legacyOutbox(for address: CoordinatorAddress, applicationSupport: URL) -> URL {
   let key = SHA256.hash(data: Data("\(address.host):\(address.port)".utf8)).map {
     String(format: "%02x", $0)
   }.joined()
-  try moveOnce(applicationSupport.appending(path: "Agent/Outbox/\(key)"), to: folder)
+  return applicationSupport.appending(path: "Agent/Outbox/\(key)")
 }
 
 /// Renames `source` to `destination`. A missing source or an existing destination is a no-op, so
@@ -357,12 +472,18 @@ public actor LegacyHold {
 }
 
 /// Atomic, readable only by this app, excluded from backup.
-func writePrivately(_ data: Data, to url: URL) throws {
+func writePrivately(_ data: Data, to url: URL, readableAfterFirstUnlock: Bool = false) throws {
   try FileManager.default.createDirectory(
     at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
     attributes: [.posixPermissions: 0o700])
   #if os(iOS)
-    try data.write(to: url, options: [.atomic, .completeFileProtection])
+    try data.write(
+      to: url,
+      options: [
+        .atomic,
+        readableAfterFirstUnlock
+          ? .completeFileProtectionUntilFirstUserAuthentication : .completeFileProtection,
+      ])
   #else
     try data.write(to: url, options: .atomic)
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)

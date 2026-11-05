@@ -19,7 +19,7 @@ func send(_ data: Data, on connection: NWConnection) async throws {
 
 actor FixtureCoordinator {
   /// What this fixture answers `identify` with. Sessions pass it as their pin.
-  nonisolated let id = CoordinatorID(UUID())
+  nonisolated let id: CoordinatorID
   nonisolated let closedObservations: AsyncStream<Void>
   nonisolated let closedToolLookups: AsyncStream<Void>
   private let closedContinuation: AsyncStream<Void>.Continuation
@@ -65,7 +65,9 @@ actor FixtureCoordinator {
   private var historyRelease: CheckedContinuation<Void, Never>?
   private let historyObserved = AsyncStream<String>.makeStream()
   nonisolated var observedHistory: AsyncStream<String> { historyObserved.stream }
-  init() {
+  /// `id` answers as a coordinator an earlier launch saw.
+  init(id: CoordinatorID = CoordinatorID(UUID())) {
+    self.id = id
     let pair = AsyncStream<Void>.makeStream()
     closedObservations = pair.stream
     closedContinuation = pair.continuation
@@ -136,6 +138,18 @@ actor FixtureCoordinator {
   func received() -> [NativeRequest] { requests }
   /// Behaves like a coordinator built before identities. It closes on `identify` without a frame.
   func dropIdentify(_ drops: Bool = true) { dropsIdentify = drops }
+  /// How an observe goes unanswered, with no frame.
+  enum UnansweredObserve: Sendable {
+    /// The coordinator closes on an observe carrying `source_status`, as one built with identities
+    /// but before source status, such as `0d8daa0`, does when it cannot parse it.
+    case closedOnSourceStatus
+    /// The network resets the socket.
+    case reset
+    /// Nothing arrives, and the socket stays open until the phone closes it, as on a stalled network.
+    case silent
+  }
+  private var unansweredObserve: UnansweredObserve?
+  func leaveObserveUnanswered(_ how: UnansweredObserve?) { unansweredObserve = how }
   func emitOnObserver(_ event: NativeEvent) async throws {
     try await emit(event, on: #require(observer))
   }
@@ -293,6 +307,22 @@ actor FixtureCoordinator {
         closedToolContinuation.yield(())
         return
       case .observe(let request):
+        switch unansweredObserve {
+        case .closedOnSourceStatus where request.sourceStatus != nil:
+          socket.cancel()
+          return
+        case .reset:
+          socket.forceCancel()
+          return
+        case .silent:
+          await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            socket.receive(minimumIncompleteLength: 1, maximumLength: 1) { _, _, _, _ in
+              continuation.resume()
+            }
+          }
+          return
+        case .closedOnSourceStatus, nil: break
+        }
         observer = socket
         try await emit(
           .ready(

@@ -490,6 +490,7 @@ final class AgentUITests: XCTestCase {
     let previous = continueAfterFailure
     continueAfterFailure = true
     defer { continueAfterFailure = previous }
+    let window = app.windows.firstMatch.frame
     let partialRowFrames: [CGRect]
     if types.contains(.contrast), let visibleForm {
       partialRowFrames = visibleForm.element.cells.allElementsBoundByIndex.map { $0.frame }
@@ -525,6 +526,9 @@ final class AgentUITests: XCTestCase {
       // WCAG 1.4.3 excludes inactive controls from text-contrast requirements.
       // https://www.w3.org/WAI/WCAG21/Understanding/contrast-minimum#inactive-user-interface-components
       if !element.isEnabled { return true }
+      // The contrast audit samples an element's whole frame, and the part past the screen edge
+      // reads as black. Judge only text a user can see in full.
+      if !window.contains(element.frame) { return true }
       if !partialRowFrames.isEmpty {
         let frame = element.frame
         // Readable-row geometry is captured for this pose before the audit;
