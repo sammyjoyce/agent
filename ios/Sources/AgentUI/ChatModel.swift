@@ -178,19 +178,26 @@ final class ChatModel {
     profiles.filter { $0.pin != nil && removed[$0.id] == nil }
   }
   /// Why Restore asks who gets a held message, and what a Send to the one chosen leaves. It names
-  /// the address the message was queued for only when this phone recorded it.
+  /// the address the message was queued for only when this phone recorded it, and says no saved
+  /// coordinator is paired there only when none is.
   func heldNote(_ message: HeldMessage) -> String {
-    let address = holds.first { $0.queue.id == message.queue }?.queue.address
-    let pair = "Pair a coordinator to send it."
-    guard let address else {
-      let unknown = "This phone did not record which coordinator it was queued for"
-      return heldChoices.isEmpty
-        ? "\(unknown). \(pair)" : "\(unknown), so it stays held after you send it."
+    let queue = holds.first { $0.queue.id == message.queue }?.queue
+    let stays =
+      heldChoices.isEmpty
+      ? ". Pair a coordinator to send it." : ", so it stays held after you send it."
+    guard let address = queue?.address else {
+      return "This phone did not record which coordinator it was queued for\(stays)"
     }
-    let queued = "It was queued for the coordinator at \(address.host):\(address.port)."
-    return heldChoices.isEmpty
-      ? "\(queued) \(pair)"
-      : "\(queued) No saved coordinator is paired there, so it stays held after you send it."
+    let at = "\(address.host):\(address.port)"
+    if queue?.coordinator != nil {
+      return "It was queued for a coordinator at \(at) that is no longer saved\(stays)"
+    }
+    let queued = "It was queued for the coordinator at \(at)."
+    if heldChoices.isEmpty { return "\(queued) Pair a coordinator to send it." }
+    // Launch binds a queue only when exactly one coordinator is paired at its address.
+    return heldChoices.contains { $0.address == address }
+      ? "\(queued) This phone cannot tell which saved coordinator that is\(stays)"
+      : "\(queued) No saved coordinator is paired there\(stays)"
   }
   /// Messages held from before the update, queue by queue.
   var held: [HeldMessage] {
