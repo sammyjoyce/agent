@@ -2443,6 +2443,101 @@ func heldMessagesWithNoRecordedAddressAskWithoutClaimingNothingIsPairedThere() a
   await stop()
 }
 
+/// A held message queued for 100.64.1.2:43187 that this phone names no owner for, while Personal
+/// answers there: its queue is bound to Work, which is no longer saved; or Work and Personal are
+/// both paired there, so launch cannot tell whose it is; or only Personal is saved, at 4002.
+/// Restore asks, its note says which of these it is and says nobody is paired at that address
+/// only when nobody is, and a Send to Personal leaves the message held.
+@MainActor
+@Test(
+  .timeLimit(.minutes(1)),
+  arguments: [
+    (
+      "bound to Work, no longer saved",
+      "It was queued for a coordinator at 100.64.1.2:43187 that is no longer saved, so it stays held after you send it."
+    ),
+    (
+      "Work and Personal paired there",
+      "It was queued for the coordinator at 100.64.1.2:43187. This phone cannot tell which saved coordinator that is, so it stays held after you send it."
+    ),
+    (
+      "nobody paired there",
+      "It was queued for the coordinator at 100.64.1.2:43187. No saved coordinator is paired there, so it stays held after you send it."
+    ),
+  ])
+func restoresNoteSaysNobodyIsPairedAtTheAddressOnlyWhenNobodyIs(
+  _ state: String, _ expected: String
+) async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "r21r-note-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let personal = FixtureCoordinator()
+  let (listener, port) = try await listen(personal)
+  defer { listener.cancel() }
+  let work = CoordinatorID(UUID())
+  let queued = try CoordinatorAddress(host: "100.64.1.2")
+  var profiles = [
+    CoordinatorProfile(
+      name: try TagName("Personal"),
+      address: state == "nobody paired there"
+        ? try CoordinatorAddress(host: "100.64.1.2", port: 4002) : queued)
+  ]
+  profiles[0].pin = personal.id
+  if state == "Work and Personal paired there" {
+    var both = CoordinatorProfile(name: try TagName("Work"), address: queued)
+    both.pin = work
+    profiles.append(both)
+  }
+  try writePrivately(
+    JSONEncoder().encode(Coordinators.SavedProfiles(profiles: profiles)),
+    to: root.appending(path: "Agent/profiles.json"))
+  let queue = HeldQueue(
+    address: queued, coordinator: state == "bound to Work, no longer saved" ? work : nil,
+    installation: nil)
+  let note = "Invented note queued for 100.64.1.2:43187"
+  try writePrivately(
+    JSONEncoder().encode([
+      NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: note)
+    ]), to: queue.folder(applicationSupport: root).appending(path: "pending.json"))
+  try queue.record(in: queue.folder(applicationSupport: root))
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: loopback(port))
+  let chat = coordinators.chat
+  let chosen = try #require(coordinators.profiles.first { $0.pin == personal.id }).id
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await personal.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("Personal connected and the message held") {
+      chat.snapshots[chosen]?.connection == .connected && chat.held.count == 1
+    }
+    let held = try #require(chat.held.first)
+    await chat.restoreHeld(held)
+    let asked = chat.owner(held) == nil && chat.draft.isEmpty
+    let shown = chat.heldNote(held)
+    await chat.restoreHeld(held, for: chosen)
+    _ = try await settles { chat.canSend }
+    await chat.send()
+    let delivered = try await settles { await submitted(personal) == [note] }
+    print(
+      "R21-note[\(state)] saved=\(coordinators.profiles.map { "\($0.name)@\($0.address.port)" }) Restore asked=\(asked) offered=\(chat.heldChoices.map(\.name.description)) note=\(shown.debugDescription) after choosing Personal and Send: delivered=\(delivered) still held=\(chat.held.count)"
+    )
+    #expect(asked, "Restore did not ask who gets a message with no owner")
+    #expect(shown == expected)
+    #expect(
+      delivered && chat.held.map(\.item.text) == [note], "The copy sent to Personal was not kept")
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
 /// This build ran, and Work paired at the single-address build's address. Then the single-address
 /// build ran again, at port 4002, and queued another message, and this build ran again. That
 /// migration keys its own queue to 4002 and leaves the earlier one as it was. Each held message goes
