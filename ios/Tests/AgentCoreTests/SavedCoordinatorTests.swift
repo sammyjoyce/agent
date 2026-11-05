@@ -2705,6 +2705,75 @@ func aChoiceMadeBeforeTheHeldMessageGainedAnOwnerRestoresNothing() async throws 
   await stop()
 }
 
+/// Work and Personal are both paired at 100.64.1.2:43187, where Personal answers, and a message
+/// held for that address has no owner, so Restore asks. Renaming either one keeps its address, so
+/// no socket proves who answers there. The message still has no owner, and Restore still asks.
+@MainActor
+@Test(.timeLimit(.minutes(1)), arguments: ["Work", "Personal"])
+func renamingOneOfTwoCoordinatorsAtAHeldMessagesAddressLeavesItUnowned(_ renamed: String)
+  async throws
+{
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "r22f-rename-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let personal = FixtureCoordinator()
+  let (listener, port) = try await listen(personal)
+  defer { listener.cancel() }
+  let queued = try CoordinatorAddress(host: "100.64.1.2")
+  var work = CoordinatorProfile(name: try TagName("Work"), address: queued)
+  work.pin = CoordinatorID(UUID())
+  var paired = CoordinatorProfile(name: try TagName("Personal"), address: queued)
+  paired.pin = personal.id
+  try writePrivately(
+    JSONEncoder().encode(Coordinators.SavedProfiles(profiles: [work, paired])),
+    to: root.appending(path: "Agent/profiles.json"))
+  let queue = HeldQueue(address: queued, coordinator: nil, installation: nil)
+  let note = "Invented note queued for 100.64.1.2:43187"
+  try writePrivately(
+    JSONEncoder().encode([
+      NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: note)
+    ]), to: queue.folder(applicationSupport: root).appending(path: "pending.json"))
+  try queue.record(in: queue.folder(applicationSupport: root))
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: loopback(port))
+  let chat = coordinators.chat
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await personal.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("Personal connected and the message held") {
+      chat.snapshots[paired.id]?.connection == .connected && chat.held.count == 1
+    }
+    let held = try #require(chat.held.first)
+    await chat.restoreHeld(held)
+    let askedBefore = chat.asking?.id == held.id
+    chat.stopAsking()
+    let target = renamed == "Work" ? work : paired
+    try await coordinators.update(
+      target.id, name: try TagName(renamed == "Work" ? "Office" : "Home"), address: queued)
+    let owner = chat.owner(held).map { chat.name($0) } ?? "nobody"
+    await chat.restoreHeld(held)
+    let askedAfter = chat.asking?.id == held.id && chat.draft.isEmpty
+    let onDisk = try HeldQueue.all(applicationSupport: root).map(\.coordinator)
+    print(
+      "R22F-rename[\(renamed)] asked before=\(askedBefore) after renaming \(renamed): owner=\(owner) asked=\(askedAfter) draft=\(chat.draft.debugDescription) queue on disk bound=\(onDisk.map { $0 != nil })"
+    )
+    #expect(askedBefore, "Restore did not ask with two coordinators paired at the address")
+    #expect(owner == "nobody", "A rename gave the message an owner no socket proved")
+    #expect(askedAfter, "Restore stopped asking after a rename")
+    #expect(onDisk == [nil], "A rename bound the queue on disk")
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
 /// This build ran, and Work paired at the single-address build's address. Then the single-address
 /// build ran again, at port 4002, and queued another message, and this build ran again. That
 /// migration keys its own queue to 4002 and leaves the earlier one as it was. Each held message goes
