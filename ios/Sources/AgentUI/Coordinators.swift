@@ -511,7 +511,10 @@ extension Coordinators {
   /// - Any other folder keeps the queue a stopped launch recorded in it.
   /// - Anything else is unknown, and Restore asks.
   /// A queue the build before this one lists describes only its own folder in `Agent/Held`, so it
-  /// gives nothing to a `Legacy` folder. Without that folder, only its installation is kept.
+  /// gives nothing to a `Legacy` folder. Without that folder, its installation is kept. If this build
+  /// moved the folder into `Agent/HeldQueues` and the save that drops the listing failed, that build
+  /// may have bound the listing since, so the queue with the listing's ID takes its coordinator while
+  /// that queue is unbound at the listed address.
   private static func adoptEarlier(
     _ saved: SavedProfiles, applicationSupport: URL, caches: URL
   ) throws -> (held: [HeldQueue], legacy: [(source: URL, queue: HeldQueue)]) {
@@ -549,7 +552,23 @@ extension Coordinators {
           try HeldQueue.name(directory.legacy, as: queue, applicationSupport: applicationSupport)
         ))
     }
-    var held = try HeldQueue.all(applicationSupport: applicationSupport) + legacy.map(\.queue)
+    let shipped = applicationSupport.appending(path: "Agent/Held")
+    let gone = saved.held.filter {
+      !FileManager.default.fileExists(atPath: shipped.appending(path: "\($0.id)").path)
+    }
+    var held = try HeldQueue.all(applicationSupport: applicationSupport)
+    for index in held.indices {
+      guard let listed = gone.first(where: { $0.id == held[index].id }),
+        let coordinator = listed.coordinator, let address = listed.address
+      else { continue }
+      let before = held[index]
+      // The build before this one saved this binding's withdrawal when it bound the listing.
+      _ = held[index].bind(coordinator, at: address)
+      if held[index] != before {
+        try held[index].record(in: held[index].folder(applicationSupport: applicationSupport))
+      }
+    }
+    held += legacy.map(\.queue)
     var waiting: [HeldQueue] = []
     if let origin, originHolder == nil, let installation = origin.installation {
       waiting.append(
@@ -561,9 +580,7 @@ extension Coordinators {
         waiting.append(HeldQueue(address: profile.address, installation: installation))
       }
     }
-    let shipped = applicationSupport.appending(path: "Agent/Held")
-    for queue in saved.held
-    where !FileManager.default.fileExists(atPath: shipped.appending(path: "\(queue.id)").path) {
+    for queue in gone {
       waiting.append(HeldQueue(address: queue.address, installation: queue.installation))
     }
     for queue in waiting {
