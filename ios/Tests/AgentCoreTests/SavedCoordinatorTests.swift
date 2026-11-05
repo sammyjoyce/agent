@@ -3399,6 +3399,234 @@ func aBindingTheShippedBuildMadeAfterAFailedSaveFollowsTheFolderThisBuildMoved()
   await stop()
 }
 
+/// A launch of this build on a disk too full to save `profiles.json`, where a folder can still be
+/// made: each held folder moves into `Agent/HeldQueues`, and the save after the moves fails.
+@MainActor private func launchWhoseSaveFails(defaults: UserDefaults, root: URL) throws {
+  let agent = root.appending(path: "Agent")
+  try FileManager.default.createDirectory(
+    at: agent.appending(path: "HeldQueues"), withIntermediateDirectories: true)
+  try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: agent.path)
+  defer {
+    try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: agent.path)
+  }
+  #expect(throws: (any Error).self) {
+    try Coordinators.migrate(defaults: defaults, applicationSupport: root, caches: root)
+  }
+}
+
+/// Restores each held note that has an owner and sends it once the composer can, one at a time,
+/// and returns the name Restore addressed each to, by the note's text.
+@MainActor private func restoreAndSendEachOwnedNote(
+  _ chat: ChatModel, to fixtures: [FixtureCoordinator]
+) async throws -> [String: String] {
+  func sent() async -> Int {
+    var count = 0
+    for fixture in fixtures { count += await submitted(fixture).count }
+    return count
+  }
+  var addressed: [String: String] = [:]
+  for note in chat.held where chat.owner(note) != nil {
+    let before = await sent()
+    await chat.restoreHeld(note)
+    addressed[note.item.text] = chat.recipient.map(chat.name) ?? "nobody"
+    guard !chat.draft.isEmpty else { continue }
+    _ = try await settles { chat.canSend }
+    await chat.send()
+    _ = try await settles { await sent() > before }
+  }
+  return addressed
+}
+
+/// Opus's round-21 chain L. The single-address build queued m1 for 100.64.1.2:43187 while Work
+/// answered there. #9 held it in the migrated profile's `Legacy` folder, and #10 held it in
+/// `Agent/Held` under that profile's ID, bound to Work. The user moved Work to 4002. The
+/// single-address build then queued m2 for 43187, and #9 held it in the same `Legacy` folder. A
+/// launch of this build moves both folders into `Agent/HeldQueues` and fails to save, so
+/// `profiles.json` still lists #10's binding. Then Personal answers at 43187, and the migrated
+/// profile pairs with it. #10's binding was for m1 alone, so m1 reaches Work only, and m2, queued
+/// after Work left 43187, reaches Personal only.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aBindingTheShippedBuildListedStaysWithTheNoteItWasForAfterAFailedSave() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "r21r-chain-l-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let work = FixtureCoordinator()
+  let personal = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(work)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personal)
+  defer { personalListener.cancel() }
+  let migrated = ProfileID()
+  try writePrivately(
+    Data(
+      """
+      {"withdrawals":[],\
+      "held":[{"id":"\(migrated)","address":{"host":"100.64.1.2","port":43187},\
+      "coordinator":"\(work.id.uuid.uuidString)"}],\
+      "profiles":[{"id":"\(migrated)","name":"Coordinator",\
+      "address":{"host":"100.64.1.2","port":43187}},\
+      {"id":"\(ProfileID())","name":"Work",\
+      "address":{"host":"100.64.1.2","port":4002},"pin":"\(work.id.uuid.uuidString)"}]}
+      """.utf8), to: ShippedBuild.file(root))
+  func queue(_ text: String, in folder: URL) throws {
+    try writePrivately(
+      JSONEncoder().encode([
+        NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: text)
+      ]), to: folder.appending(path: "pending.json"))
+  }
+  let m1 = "m1: queued at 43187 while Work answered"
+  let m2 = "m2: queued at 43187 after Work moved to 4002"
+  try queue(m1, in: root.appending(path: "Agent/Held/\(migrated)"))
+  try queue(m2, in: ProfileDirectory(migrated, applicationSupport: root, caches: root).legacy)
+  try launchWhoseSaveFails(defaults: defaults, root: root)
+  let listed =
+    try JSONDecoder().decode(
+      ShippedBuild.Saved.self, from: Data(contentsOf: ShippedBuild.file(root))
+    ).held ?? []
+  let leftInHeld =
+    (try? FileManager.default.contentsOfDirectory(
+      atPath: root.appending(path: "Agent/Held").path)) ?? []
+  let routes = Routes([4002: workPort, 43187: personalPort])
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: CoordinatorTransport { address in
+      guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
+      return LineConnection(
+        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+    })
+  let chat = coordinators.chat
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await work.stop()
+    await personal.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("both connected and both notes held") {
+      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+        && chat.held.count == 2
+    }
+    _ = try await settles { chat.held.allSatisfy { chat.owner($0) != nil } }
+    let owners = chat.held.map {
+      "\($0.item.text.prefix(2)): \(chat.owner($0).map(chat.name) ?? "nobody")"
+    }
+    let addressed = try await restoreAndSendEachOwnedNote(chat, to: [work, personal])
+    print(
+      "R21-L[#10's folder and a later Legacy folder moved, then the save failed] still listed=\(listed.map { "bound to Work=\($0.coordinator == work.id.uuid)" }) left in Agent/Held=\(leftInHeld.count) | this build: owners=\(owners) Restore addressed=\(addressed.sorted { $0.key < $1.key }.map { "\($0.key.prefix(2)) to \($0.value)" }) after Send: Work's coordinator got=\(await submitted(work).map { $0.prefix(2) }) Personal's coordinator got=\(await submitted(personal).map { $0.prefix(2) })"
+    )
+    #expect(
+      listed.map(\.coordinator) == [work.id.uuid] && leftInHeld.isEmpty,
+      "The failed launch did not move #10's folder while its binding stayed listed")
+    #expect(await submitted(work) == [m1], "Work did not get m1 alone")
+    #expect(
+      await submitted(personal) == [m2], "m2, queued after Work left 43187, did not reach Personal")
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
+/// Opus's round-21 chain C. The single-address build queued m1 for 100.64.1.2:43187 with its alert
+/// installation, and #9 held both in the migrated profile's `Legacy` folder. This build adopted that
+/// folder offline. The single-address build then queued m2 for 43187, #9 held it in the same
+/// `Legacy` folder, and #9 saved `profiles.json` without `held`. #10 listed that folder under the
+/// profile's ID with no installation, and once Work answered at 43187 bound it to Work, saving no
+/// withdrawal. A launch of this build moves #10's folder into `Agent/HeldQueues` and fails to save,
+/// so `profiles.json` still lists that binding. Work answers at 43187 again: both notes reach Work,
+/// and Work gets the old installation's withdrawal once.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func theOldInstallationIsWithdrawnAfterTheShippedBuildBoundALaterFolderAndASaveFailed()
+  async throws
+{
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "r21r-chain-c-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let work = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(work)
+  defer { workListener.cancel() }
+  let migrated = ProfileID()
+  let installation = UUID().uuidString
+  try writePrivately(
+    Data(
+      """
+      {"withdrawals":[],\
+      "origin":{"address":{"host":"100.64.1.2","port":43187},"installation":"\(installation)"},\
+      "profiles":[{"id":"\(migrated)","name":"Coordinator",\
+      "address":{"host":"100.64.1.2","port":43187}}]}
+      """.utf8), to: ShippedBuild.file(root))
+  let legacy = ProfileDirectory(migrated, applicationSupport: root, caches: root).legacy
+  func queue(_ text: String) throws {
+    try writePrivately(
+      JSONEncoder().encode([
+        NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: text)
+      ]), to: legacy.appending(path: "pending.json"))
+  }
+  let m1 = "m1: queued at 43187 with the old alert installation"
+  let m2 = "m2: queued at 43187 later"
+  try queue(m1)
+  _ = try Coordinators.migrate(defaults: defaults, applicationSupport: root, caches: root)
+  try queue(m2)
+  let shipped = root.appending(path: "Agent/Held/\(migrated)")
+  try FileManager.default.createDirectory(
+    at: shipped.deletingLastPathComponent(), withIntermediateDirectories: true)
+  try FileManager.default.moveItem(at: legacy, to: shipped)
+  try writePrivately(
+    Data(
+      """
+      {"withdrawals":[],\
+      "held":[{"id":"\(migrated)","address":{"host":"100.64.1.2","port":43187}}],\
+      "profiles":[{"id":"\(migrated)","name":"Coordinator",\
+      "address":{"host":"100.64.1.2","port":43187}}]}
+      """.utf8), to: ShippedBuild.file(root))
+  let address = try CoordinatorAddress(host: "100.64.1.2")
+  try ShippedBuild.save(support: root, answered: work.id, at: address) {
+    $0 = $0.map { .init(id: $0.id, name: $0.name, address: $0.address, pin: work.id.uuid) }
+  }
+  let byTen = try JSONDecoder().decode(
+    ShippedBuild.Saved.self, from: Data(contentsOf: ShippedBuild.file(root)))
+  try launchWhoseSaveFails(defaults: defaults, root: root)
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: loopback(workPort))
+  let chat = coordinators.chat
+  func unregistered() async -> [String] {
+    await work.notificationControls().compactMap {
+      if case .unregister(let value) = $0 { value.installationId.uppercased() } else { nil }
+    }
+  }
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await work.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("connected and both notes held") {
+      chat.snapshots.values.first?.connection == .connected && chat.held.count == 2
+    }
+    _ = try await settles { await !unregistered().isEmpty }
+    let addressed = try await restoreAndSendEachOwnedNote(chat, to: [work])
+    print(
+      "R21-C[#10 bound a later folder under an adopted queue's ID, then the save failed] #10 listed=\(byTen.held?.map { "bound to Work=\($0.coordinator == work.id.uuid) installation=\($0.installation != nil)" } ?? []) withdrawals=\(byTen.withdrawals?.count ?? 0) | this build: queues=\(coordinators.queues.map { "bound to Work=\($0.coordinator == work.id) installation=\($0.installation != nil)" }) Restore addressed=\(addressed.sorted { $0.key < $1.key }.map { "\($0.key.prefix(2)) to \($0.value)" }) | Work's coordinator: unregistered the old installation=\(await unregistered().filter { $0 == installation }.count) others=\(await unregistered().filter { $0 != installation }.count) got=\(await submitted(work).map { $0.prefix(2) })"
+    )
+    #expect(
+      byTen.held?.map(\.coordinator) == [work.id.uuid] && byTen.withdrawals?.isEmpty == true,
+      "#10 did not bind its listing to Work without a withdrawal")
+    #expect(
+      await unregistered() == [installation],
+      "Work did not get the old installation's withdrawal exactly once")
+    #expect(await submitted(work).sorted() == [m1, m2])
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
 /// The `profiles.json` #9 wrote once it paired the migrated profile with Work at 43187 and bound
 /// `origin` to Work, and the user then moved Work to 4002 and added Personal, which answers at 43187.
 private func writeNinthBuildsPairedFile(
