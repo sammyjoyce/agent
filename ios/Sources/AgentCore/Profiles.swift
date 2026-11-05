@@ -260,21 +260,20 @@ public struct HeldQueue: Codable, Sendable, Equatable, Identifiable {
     }.map(\.queue)
   }
 
-  /// Records `queue` in `source`, unless a stopped launch already recorded one there, and returns
-  /// the queue its record names. A queue whose folder another source already took gets a new ID
-  /// first, so every source moves into a folder of its own.
+  /// Records `queue` in `source`, over any record a stopped launch left there, and returns it. A
+  /// queue whose folder another source already took gets a new ID first, so every source moves into
+  /// a folder of its own.
   public static func name(_ source: URL, as queue: HeldQueue, applicationSupport: URL) throws
     -> HeldQueue
   {
-    let recorded = try recorded(in: source)
-    var named = recorded ?? queue
+    var named = queue
     if FileManager.default.fileExists(
       atPath: named.folder(applicationSupport: applicationSupport).path)
     {
       named = HeldQueue(
         address: named.address, coordinator: named.coordinator, installation: named.installation)
     }
-    if named != recorded { try named.record(in: source) }
+    if try named != recorded(in: source) { try named.record(in: source) }
     return named
   }
 

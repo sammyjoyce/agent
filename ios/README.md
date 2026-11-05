@@ -224,6 +224,11 @@ Mode if requested, then Run.
   part way leaves that build nothing to delete. What an earlier build recorded
   about a queue counts only where it proves the queue's address or coordinator,
   and what the build before this one listed describes only the folder it kept.
+  The update writes each folder's queue into the folder before moving it, so a
+  launch that stops part way resumes with that queue. Until the folder moves,
+  what `profiles.json` says about it in an earlier build's format wins over what
+  the update wrote, so a coordinator that build proved for the queue after the
+  stop keeps it.
   **Restore to composer** makes a new message for you to send, addressed to that
   coordinator. Until one is, Restore asks which paired coordinator gets it. If no
   build recorded the address, Restore always asks. **Discard** deletes a held

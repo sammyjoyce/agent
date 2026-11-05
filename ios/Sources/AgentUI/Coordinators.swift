@@ -512,7 +512,9 @@ extension Coordinators {
   /// A queue's address is known only where it is proven:
   /// - Only pairing changes an unpaired profile's address, so its `Legacy` folder was queued for it.
   /// - A recorded `origin` is a folder's only when exactly one holder matches it: unpaired at its
-  ///   address, or pinned to its coordinator.
+  ///   address, or pinned to its coordinator. It wins over the queue a stopped launch recorded in
+  ///   that folder, since an earlier build may have paired its coordinator after the stop.
+  /// - Any other folder keeps the queue a stopped launch recorded in it.
   /// - Anything else is unknown, and Restore asks.
   /// A queue the build before this one lists describes only its own folder in `Agent/Held`, so it
   /// gives nothing to a `Legacy` folder. Without that folder, only its installation is kept.
@@ -541,9 +543,11 @@ extension Coordinators {
           installation: origin.installation)
       } else {
         let profile = holder(directory)
-        queue = HeldQueue(
-          adopting: id, address: profile?.pin == nil ? profile?.address : nil,
-          installation: earlier?.inherited[id])
+        queue =
+          try HeldQueue.recorded(in: directory.legacy)
+          ?? HeldQueue(
+            adopting: id, address: profile?.pin == nil ? profile?.address : nil,
+            installation: earlier?.inherited[id])
       }
       legacy.append(
         (
@@ -580,7 +584,8 @@ extension Coordinators {
 
   /// Each folder the build before this one left in `Agent/Held`, with the queue `profiles.json`
   /// names it as: what `listing` says about it, else what the folder records, else a queue whose
-  /// address is unknown. That build named each folder for its queue.
+  /// address is unknown. That build named each folder for its queue. The listing wins over what a
+  /// stopped launch recorded in the folder, since that build may have bound the queue after the stop.
   private static func leftInAgentHeld(listing: [HeldQueue], applicationSupport: URL) throws
     -> [(source: URL, queue: HeldQueue)]
   {
@@ -601,8 +606,8 @@ extension Coordinators {
     }
   }
 
-  /// Moves each source into the queue it records, recording `queue` in it first unless a stopped
-  /// launch already recorded one, so a stop at any point resumes with the queue each source records.
+  /// Moves each source into `queue`, recording it in the source first, so the queue's record moves
+  /// with its folder.
   private static func hold(
     _ sources: [(source: URL, queue: HeldQueue)], applicationSupport: URL,
     crash: (MigrationStep) throws -> Void
@@ -643,7 +648,9 @@ extension Coordinators {
           InstallationID.init(legacy:)))
       let outbox = legacyOutbox(for: address, applicationSupport: applicationSupport)
       if FileManager.default.fileExists(atPath: outbox.path) {
-        queue = try HeldQueue.name(outbox, as: queue, applicationSupport: applicationSupport)
+        queue = try HeldQueue.name(
+          outbox, as: HeldQueue.recorded(in: outbox) ?? queue,
+          applicationSupport: applicationSupport)
       } else if let installation = queue.installation,
         !carries(installation, held: held, saved: saved)
       {
@@ -668,8 +675,8 @@ extension Coordinators {
   }
 
   /// Every other outbox the single-address build left becomes a held queue once it holds a message,
-  /// or once a stopped launch recorded it. Its address is the one of `known` whose key names the
-  /// outbox, else unknown.
+  /// or once a stopped launch recorded it. It keeps the queue a stopped launch recorded in it, else
+  /// its address is the one of `known` whose key names the outbox, else unknown.
   private static func adoptOutboxes(
     knowing known: [CoordinatorAddress], applicationSupport: URL,
     crash: (MigrationStep) throws -> Void
@@ -681,7 +688,11 @@ extension Coordinators {
     let held = try outboxes(applicationSupport: applicationSupport).filter {
       try HeldQueue.recorded(in: $0) != nil || (try? heldMessages(in: $0)) != 0
     }.map {
-      ($0, HeldQueue(address: addresses[$0.lastPathComponent], installation: nil))
+      (
+        $0,
+        try HeldQueue.recorded(in: $0)
+          ?? HeldQueue(address: addresses[$0.lastPathComponent], installation: nil)
+      )
     }
     try hold(held, applicationSupport: applicationSupport, crash: crash)
   }
