@@ -3399,6 +3399,143 @@ func aBindingTheShippedBuildMadeAfterAFailedSaveFollowsTheFolderThisBuildMoved()
   await stop()
 }
 
+/// The `profiles.json` #9 wrote once it paired the migrated profile with Work at 43187 and bound
+/// `origin` to Work, and the user then moved Work to 4002 and added Personal, which answers at 43187.
+private func writeNinthBuildsPairedFile(
+  root: URL, work: ProfileID, workCoordinator: CoordinatorID, personal: CoordinatorID,
+  withdrawn installation: String?
+) throws {
+  let withdrawals = installation.map {
+    """
+    {"installation":"\($0)","address":{"host":"100.64.1.2","port":43187},\
+    "pin":"\(workCoordinator.uuid.uuidString)"}
+    """
+  }
+  try writePrivately(
+    Data(
+      """
+      {"withdrawals":[\(withdrawals ?? "")],\
+      "origin":{"address":{"host":"100.64.1.2","port":43187},\
+      "coordinator":"\(workCoordinator.uuid.uuidString)"},\
+      "profiles":[{"id":"\(work)","name":"Work",\
+      "address":{"host":"100.64.1.2","port":4002},"pin":"\(workCoordinator.uuid.uuidString)"},\
+      {"id":"\(UUID())","name":"Personal",\
+      "address":{"host":"100.64.1.2","port":43187},"pin":"\(personal.uuid.uuidString)"}]}
+      """.utf8), to: root.appending(path: "Agent/profiles.json"))
+}
+
+/// What the user sees once this build launches with Work at 4002 and Personal at 43187: who each held
+/// note belongs to, the draft and recipient Restore gives the one held note, and what each
+/// coordinator got after Send.
+private struct RestoredAndSent {
+  let queues: [String]
+  let owners: [String]
+  let draft: String
+  let recipient: String
+  let atWork: [String]
+  let atPersonal: [String]
+}
+
+@MainActor private func restoreAndSend(
+  root: URL, defaults: UserDefaults, work: FixtureCoordinator, workPort: NWEndpoint.Port,
+  personal: FixtureCoordinator, personalPort: NWEndpoint.Port
+) async throws -> RestoredAndSent {
+  let routes = Routes([4002: workPort, 43187: personalPort])
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: CoordinatorTransport { address in
+      guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
+      return LineConnection(
+        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+    })
+  let chat = coordinators.chat
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await work.stop()
+    await personal.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("both connected and the note held") {
+      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+        && chat.held.count == 1
+    }
+    func who(_ pin: CoordinatorID?) -> String {
+      pin == work.id ? "Work" : pin == personal.id ? "Personal" : "nobody"
+    }
+    let queues = coordinators.queues.map {
+      "\($0.id.uuidString.prefix(8)) at \($0.address.map { "\($0.port)" } ?? "?") bound to \(who($0.coordinator))"
+    }
+    let owners = chat.held.map { chat.owner($0).map(chat.name) ?? "nobody" }
+    await chat.restoreHeld(try #require(chat.held.first))
+    let draft = chat.draft
+    let recipient = chat.recipient.map(chat.name) ?? "nobody"
+    if !chat.draft.isEmpty {
+      await chat.send()
+      _ = try await settles { await submitted(work) + submitted(personal) != [] }
+    }
+    let result = RestoredAndSent(
+      queues: queues, owners: owners, draft: draft, recipient: recipient,
+      atWork: await submitted(work), atPersonal: await submitted(personal))
+    await stop()
+    return result
+  } catch {
+    await stop()
+    throw error
+  }
+}
+
+/// #9 held the single-address build's note for 100.64.1.2:43187 in the migrated profile's `Legacy`
+/// folder, with an `origin` it had bound to Work. The user moved Work to 4002 and added Personal,
+/// which answers at 43187. A launch of this build records the folder's queue from `origin`, saves
+/// `profiles.json` without it, and stops before the folder moves. No `origin` is left to describe the
+/// folder, and Work is pinned, so only that record says whose the note is. The next launch keeps it,
+/// so the note restores to Work and only Work gets it.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aLegacyFolderKeepsWhatOriginSaidOnceALaunchStoppedAfterSavingWithoutIt() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "r20t-record-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let work = FixtureCoordinator()
+  let personal = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(work)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personal)
+  defer { personalListener.cancel() }
+  let migrated = ProfileID()
+  try writeNinthBuildsPairedFile(
+    root: root, work: migrated, workCoordinator: work.id, personal: personal.id, withdrawn: nil)
+  let legacy = ProfileDirectory(migrated, applicationSupport: root, caches: root).legacy
+  let note = "Note queued while Work answered at 43187"
+  try writePrivately(
+    JSONEncoder().encode([
+      NativeRequestSubmit(inputId: UUID().uuidString, mode: .followUp, text: note)
+    ]), to: legacy.appending(path: "pending.json"))
+  #expect(throws: Crash.self) {
+    try Coordinators.migrate(
+      defaults: defaults, applicationSupport: root, caches: root,
+      crash: { if $0 == .queueRecorded { throw Crash() } })
+  }
+  let recorded = try HeldQueue.recorded(in: legacy)
+  let originLeft =
+    try JSONSerialization.jsonObject(
+      with: Data(contentsOf: root.appending(path: "Agent/profiles.json"))) as? [String: Any]
+  let seen = try await restoreAndSend(
+    root: root, defaults: defaults, work: work, workPort: workPort, personal: personal,
+    personalPort: personalPort)
+  print(
+    "IF21-record[origin saved away, then stopped before the move] record left=\(recorded != nil) origin left=\(originLeft?["origin"] != nil) | this build: queues=\(seen.queues) owners=\(seen.owners) Restore: draft=\(seen.draft.debugDescription) to=\(seen.recipient) after Send: Work's coordinator got=\(seen.atWork) Personal's coordinator got=\(seen.atPersonal)"
+  )
+  #expect(recorded != nil, "The stopped launch recorded no queue in the Legacy folder")
+  #expect(originLeft?["origin"] == nil, "origin is still saved, so it still describes the folder")
+  #expect(seen.owners == ["Work"])
+  #expect(seen.draft == note && seen.recipient == "Work")
+  #expect(seen.atWork == [note])
+  #expect(seen.atPersonal.isEmpty, "A note queued while Work answered went to Personal")
+}
+
 /// The single-address build left two messages for its coordinator at 100.64.1.2:43187, which
 /// answers nothing at the update. The user taps Remove coordinator, and its confirmation counts no
 /// held messages. Then the build's coordinator answers again: the migrated profile's own Try again
