@@ -2621,6 +2621,90 @@ func restoresQuestionEndsOnceTheHeldMessageGainsAnOwner(_ path: String) async th
   await stop()
 }
 
+/// Restore asks who gets a message held for 100.64.1.2:43187, and offers Personal, paired at 4002.
+/// Before the user answers, "Coordinator" pairs with Work at 43187, which makes Work the message's
+/// owner. The user's tap on Personal then arrives. It restores nothing, so a Send gives Personal
+/// nothing, and Restore then addresses the message to Work.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aChoiceMadeBeforeTheHeldMessageGainedAnOwnerRestoresNothing() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "r22f-stale-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let work = FixtureCoordinator()
+  let personal = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(work)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personal)
+  defer { personalListener.cancel() }
+  let queued = try CoordinatorAddress(host: "100.64.1.2")
+  let migrated = CoordinatorProfile(name: try TagName("Coordinator"), address: queued)
+  var paired = CoordinatorProfile(
+    name: try TagName("Personal"), address: try CoordinatorAddress(host: "100.64.1.2", port: 4002))
+  paired.pin = personal.id
+  try writePrivately(
+    JSONEncoder().encode(Coordinators.SavedProfiles(profiles: [migrated, paired])),
+    to: root.appending(path: "Agent/profiles.json"))
+  let queue = HeldQueue(address: queued, coordinator: nil, installation: nil)
+  let note = "Invented note queued for 100.64.1.2:43187"
+  try writePrivately(
+    JSONEncoder().encode([
+      NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: note)
+    ]), to: queue.folder(applicationSupport: root).appending(path: "pending.json"))
+  try queue.record(in: queue.folder(applicationSupport: root))
+  let routes = Routes([4002: personalPort])
+  let transport = CoordinatorTransport { address in
+    guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
+    return LineConnection(
+      connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+  }
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: transport)
+  let chat = coordinators.chat
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await work.stop()
+    await personal.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("Personal connected and the message held") {
+      chat.snapshots[paired.id]?.connection == .connected && chat.held.count == 1
+    }
+    let held = try #require(chat.held.first)
+    await chat.restoreHeld(held)
+    let offered = chat.asking?.id == held.id && chat.heldChoices.map(\.id) == [paired.id]
+    await routes.set([4002: personalPort, 43187: workPort])
+    try await eventually("Coordinator paired with Work and owns the message") {
+      chat.owner(held) == migrated.id && chat.snapshots[migrated.id]?.connection == .connected
+    }
+    await chat.restoreHeld(held, for: paired.id)
+    let staleDraft = chat.draft
+    await chat.send()
+    await chat.restoreHeld(held)
+    let toOwner = chat.draft == note && chat.recipient == migrated.id
+    _ = try await settles { chat.canSend }
+    await chat.send()
+    let workGot = try await settles { await submitted(work) == [note] }
+    let personalGot = await submitted(personal)
+    print(
+      "R22F-stale offered Personal=\(offered) draft after the stale tap=\(staleDraft.debugDescription) Restore again to Coordinator=\(toOwner) | Work got it=\(workGot) Personal got=\(personalGot) still held=\(chat.held.map(\.item.text))"
+    )
+    #expect(offered, "Restore did not ask, offering Personal, while the message had no owner")
+    #expect(staleDraft.isEmpty, "A choice of Personal restored a message Work now owns")
+    #expect(personalGot.isEmpty, "Personal got a message Work owns")
+    #expect(
+      toOwner && workGot && chat.held.isEmpty,
+      "Restore did not send the message to its owner and withdraw the original")
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
 /// This build ran, and Work paired at the single-address build's address. Then the single-address
 /// build ran again, at port 4002, and queued another message, and this build ran again. That
 /// migration keys its own queue to 4002 and leaves the earlier one as it was. Each held message goes
