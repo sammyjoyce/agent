@@ -356,6 +356,15 @@ export class SourceJournal {
     if (state === undefined) throw new TaskError("Source admission lost its canonical state");
     return { ...result, state };
   }
+  async retire(sources: readonly SourceKey[]): Promise<void> {
+    if (sources.length === 0) return;
+    await this.prepare();
+    if (sources.some((source) => sameSource(source, OUTCOMES))) throw new TaskError("Task outcomes are retired by the owned task lifecycle");
+    await this.session.commit(async (tx) => {
+      const journal = await tx.doc(Control);
+      journal.sources = journal.sources.filter((state) => !sources.some((source) => sameSource(source, state.source)));
+    }, BACKGROUND_CONTEXT);
+  }
   async decide(keys: readonly string[], decision: Decision): Promise<{ unverified_source_links: { task_id: string; source: SourceRef }[] }> {
     await this.prepare(); await this.tasks.prepare();
     if (keys.length === 0) throw new TaskError("Choose source events to account for");

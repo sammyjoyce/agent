@@ -27,6 +27,9 @@ pub struct SourceKey {
     pub account: String,
 }
 
+/// Stands in for a provider's accounts while discovery cannot list them.
+pub const DISCOVERY_ACCOUNT: &str = "discovery";
+
 /// Opaque to the caller and meaningful only to the matching provider/account.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
 pub struct SourceCheckpoint {
@@ -310,7 +313,7 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                     Err(error) => {
                         let accounts = namespaces
                             .clone()
-                            .unwrap_or_else(|| vec!["discovery".into()]);
+                            .unwrap_or_else(|| vec![DISCOVERY_ACCOUNT.into()]);
                         for account in accounts {
                             failures.push(SourceBatch::unavailable(
                                 SourceKey {
@@ -348,7 +351,7 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                     Err(error) => {
                         for account in namespaces
                             .clone()
-                            .unwrap_or_else(|| vec!["discovery".into()])
+                            .unwrap_or_else(|| vec![DISCOVERY_ACCOUNT.into()])
                         {
                             failures.push(SourceBatch::unavailable(
                                 SourceKey {
@@ -374,7 +377,7 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                     Err(error) => {
                         for account in namespaces
                             .clone()
-                            .unwrap_or_else(|| vec!["discovery".into()])
+                            .unwrap_or_else(|| vec![DISCOVERY_ACCOUNT.into()])
                         {
                             failures.push(SourceBatch::unavailable(
                                 SourceKey {
@@ -400,7 +403,7 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                     Err(error) => {
                         for account in namespaces
                             .clone()
-                            .unwrap_or_else(|| vec!["discovery".into()])
+                            .unwrap_or_else(|| vec![DISCOVERY_ACCOUNT.into()])
                         {
                             failures.push(SourceBatch::unavailable(
                                 SourceKey {

@@ -417,6 +417,27 @@ test("stale and incomplete reads retain new events without rolling back canonica
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("a successful discovery round retires the failed discovery placeholder and keeps account checkpoints across reopen", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-source-")); let app = await open(directory);
+  const placeholder = { provider: "mail", account: "discovery" };
+  try {
+    await app.sources.admit(batch([event("one")], "a1"), null);
+    await app.sources.admit({ source: placeholder, events: [], checkpoint: null,
+      coverage: { status: "unavailable", message: "Mail account discovery failed; coverage is unknown" } }, null);
+    assert.ok((await app.sources.states()).some((state) => state.coverage.status === "unavailable"));
+    await app.sources.admit(batch([], "a2"), { value: "a1" });
+    await app.sources.retire([placeholder]);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    await app.sources.retire([placeholder]);
+    assert.deepEqual((await app.sources.states()).map(({ source, checkpoint, coverage }) => ({ source, checkpoint, coverage })), [
+      { source: { provider: "task_outcomes", account: "local" }, checkpoint: null, coverage: { status: "complete" } },
+      { source: { provider: "mail", account: "alpha" }, checkpoint: { value: "a2" }, coverage: { status: "complete" } },
+    ]);
+    assert.equal((await app.sources.events({ pending: true })).length, 1);
+    await assert.rejects(app.sources.retire([{ provider: "task_outcomes", account: "local" }]), /Task outcomes/);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("empty source coverage gaps do not cause a model call or an all-clear notification", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-source-")); const app = await open(directory);
   try {

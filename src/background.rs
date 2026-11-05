@@ -120,6 +120,8 @@ pub enum BackgroundResponse {
     },
     Sources {
         reads: Vec<SourceRead>,
+        /// Checkpointless discovery states this round neither reports nor polls; delete them.
+        retired: Vec<crate::sources::SourceKey>,
         cursor: Option<SourcePollCursor>,
     },
 }
@@ -297,8 +299,12 @@ pub async fn execute(request: BackgroundRequest) -> Result<BackgroundResponse> {
             states,
             cursor,
         } => {
-            let (reads, cursor) = crate::intake::poll(&sources, &states, cursor).await?;
-            Ok(BackgroundResponse::Sources { reads, cursor })
+            let (reads, retired, cursor) = crate::intake::poll(&sources, &states, cursor).await?;
+            Ok(BackgroundResponse::Sources {
+                reads,
+                retired,
+                cursor,
+            })
         }
     }
 }

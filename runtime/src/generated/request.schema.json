@@ -251,6 +251,13 @@
                 "$ref": "#/$defs/SourceRead"
               }
             },
+            "retired": {
+              "description": "Checkpointless discovery states this round neither reports nor polls; delete them.",
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SourceKey"
+              }
+            },
             "type": {
               "type": "string",
               "const": "sources"
@@ -258,7 +265,8 @@
           },
           "required": [
             "type",
-            "reads"
+            "reads",
+            "retired"
           ]
         }
       ]

@@ -216,6 +216,7 @@ async function openApplication(): Promise<Application> {
         for (const read of result.response.reads) {
           signal.throwIfAborted(); await sources.admit(read.batch, read.expected_checkpoint);
         }
+        signal.throwIfAborted(); await sources.retire(result.response.retired);
         cursor = result.response.cursor;
       } while (cursor !== null);
     },
