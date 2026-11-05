@@ -19,10 +19,15 @@ pub async fn poll(
             .iter()
             .filter(|state| {
                 state.source.account == DISCOVERY_ACCOUNT
+                    && state.checkpoint.is_none()
                     && !catalog
                         .failures
                         .iter()
                         .any(|failure| failure.source == state.source)
+                    && !catalog
+                        .sources
+                        .iter()
+                        .any(|source| source.key() == state.source)
             })
             .map(|state| state.source.clone())
             .collect();

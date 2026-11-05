@@ -100,7 +100,7 @@ pub enum BackgroundResponse {
     },
     Sources {
         reads: Vec<SourceRead>,
-        /// Discovery placeholders this round no longer reports; delete their states.
+        /// Checkpointless discovery states this round neither reports nor polls; delete them.
         retired: Vec<crate::sources::SourceKey>,
         cursor: Option<SourcePollCursor>,
     },

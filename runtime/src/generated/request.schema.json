@@ -252,7 +252,7 @@
               }
             },
             "retired": {
-              "description": "Discovery placeholders this round no longer reports; delete their states.",
+              "description": "Checkpointless discovery states this round neither reports nor polls; delete them.",
               "type": "array",
               "items": {
                 "$ref": "#/$defs/SourceKey"

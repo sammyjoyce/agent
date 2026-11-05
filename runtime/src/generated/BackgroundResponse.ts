@@ -6,6 +6,6 @@ import type { SourceRead } from "./SourceRead.js";
 
 export type BackgroundResponse = { "type": "plan", plan: OccurrencePlan, } | { "type": "sources", reads: Array<SourceRead>,
 /**
- * Discovery placeholders this round no longer reports; delete their states.
+ * Checkpointless discovery states this round neither reports nor polls; delete them.
  */
 retired: Array<SourceKey>, cursor: SourcePollCursor | null, };
