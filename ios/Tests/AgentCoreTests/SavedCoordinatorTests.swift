@@ -3536,6 +3536,70 @@ func aLegacyFolderKeepsWhatOriginSaidOnceALaunchStoppedAfterSavingWithoutIt() as
   #expect(seen.atPersonal.isEmpty, "A note queued while Work answered went to Personal")
 }
 
+/// #9 held the single-address build's note for 100.64.1.2:43187 in the migrated profile's `Legacy`
+/// folder, with an unpaired `origin` there carrying the build's alert installation. A launch of this
+/// build records the folder's queue, unbound at 43187, and its save of `profiles.json` fails, so
+/// `origin` stays. #9 then pairs the profile with Work at 43187 and binds `origin` to Work. The user
+/// moves Work to 4002 and adds Personal, which answers at 43187. `origin` is newer than the record,
+/// so the note restores to Work and only Work gets it.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func theOriginNinePairedAfterAFailedSaveOutlivesThatLaunchsRecord() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "r20t-origin-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let work = FixtureCoordinator()
+  let personal = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(work)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personal)
+  defer { personalListener.cancel() }
+  let migrated = ProfileID()
+  let installation = UUID().uuidString
+  let agent = root.appending(path: "Agent")
+  try writePrivately(
+    Data(
+      """
+      {"withdrawals":[],"origin":{"address":{"host":"100.64.1.2","port":43187},\
+      "installation":"\(installation)"},\
+      "profiles":[{"id":"\(migrated)","name":"Work",\
+      "address":{"host":"100.64.1.2","port":43187}}]}
+      """.utf8), to: agent.appending(path: "profiles.json"))
+  let legacy = ProfileDirectory(migrated, applicationSupport: root, caches: root).legacy
+  let note = "Note queued while Work answered at 43187"
+  try writePrivately(
+    JSONEncoder().encode([
+      NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: note)
+    ]), to: legacy.appending(path: "pending.json"))
+  try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: agent.path)
+  #expect(throws: (any Error).self) {
+    try Coordinators.migrate(defaults: defaults, applicationSupport: root, caches: root)
+  }
+  try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: agent.path)
+  let recorded = try HeldQueue.recorded(in: legacy)
+  let originLeft =
+    try JSONSerialization.jsonObject(
+      with: Data(contentsOf: agent.appending(path: "profiles.json"))) as? [String: Any]
+  try writeNinthBuildsPairedFile(
+    root: root, work: migrated, workCoordinator: work.id, personal: personal.id,
+    withdrawn: installation)
+  let seen = try await restoreAndSend(
+    root: root, defaults: defaults, work: work, workPort: workPort, personal: personal,
+    personalPort: personalPort)
+  print(
+    "IF21-origin[recorded, then the save failed, then #9 bound origin] record left=\(recorded.map { "at \($0.address.map { "\($0.port)" } ?? "?") bound=\($0.coordinator != nil)" } ?? "none") origin left=\(originLeft?["origin"] != nil) | this build: queues=\(seen.queues) owners=\(seen.owners) Restore: draft=\(seen.draft.debugDescription) to=\(seen.recipient) after Send: Work's coordinator got=\(seen.atWork) Personal's coordinator got=\(seen.atPersonal)"
+  )
+  #expect(
+    recorded != nil && recorded?.coordinator == nil,
+    "The failed launch recorded no unbound queue in the folder")
+  #expect(originLeft?["origin"] != nil, "The failed save dropped origin, so #9 cannot bind it")
+  #expect(seen.owners == ["Work"])
+  #expect(seen.draft == note && seen.recipient == "Work")
+  #expect(seen.atWork == [note])
+  #expect(seen.atPersonal.isEmpty, "A note queued while Work answered went to Personal")
+}
+
 /// The single-address build left two messages for its coordinator at 100.64.1.2:43187, which
 /// answers nothing at the update. The user taps Remove coordinator, and its confirmation counts no
 /// held messages. Then the build's coordinator answers again: the migrated profile's own Try again
