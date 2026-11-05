@@ -2,7 +2,7 @@
 use crate::{
     background::{SourcePollCursor, SourceRead},
     protocol::SourceState,
-    sources::{SourceBatch, SourceConfig, SourceCoverage},
+    sources::{DISCOVERY_ACCOUNT, SourceBatch, SourceConfig, SourceCoverage, SourceKey},
 };
 use anyhow::{Context, Result, ensure};
 
@@ -10,10 +10,27 @@ pub async fn poll(
     config: &[SourceConfig],
     states: &[SourceState],
     cursor: Option<SourcePollCursor>,
-) -> Result<(Vec<SourceRead>, Option<SourcePollCursor>)> {
+) -> Result<(Vec<SourceRead>, Vec<SourceKey>, Option<SourcePollCursor>)> {
     let catalog = crate::sources::configured(config).await;
     let mut reads = Vec::new();
+    let mut retired = Vec::new();
     if cursor.is_none() {
+        retired = states
+            .iter()
+            .filter(|state| {
+                state.source.account == DISCOVERY_ACCOUNT
+                    && state.checkpoint.is_none()
+                    && !catalog
+                        .failures
+                        .iter()
+                        .any(|failure| failure.source == state.source)
+                    && !catalog
+                        .sources
+                        .iter()
+                        .any(|source| source.key() == state.source)
+            })
+            .map(|state| state.source.clone())
+            .collect();
         for batch in catalog.failures {
             let expected_checkpoint = states
                 .iter()
@@ -36,7 +53,7 @@ pub async fn poll(
         (sources.next(), 0)
     };
     let Some(source) = source else {
-        return Ok((reads, None));
+        return Ok((reads, retired, None));
     };
     let key = source.key();
     let expected_checkpoint = states
@@ -78,5 +95,5 @@ pub async fn poll(
         batch,
         expected_checkpoint,
     });
-    Ok((reads, next))
+    Ok((reads, retired, next))
 }

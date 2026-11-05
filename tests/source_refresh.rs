@@ -126,6 +126,7 @@ async fn real_source_pages_cross_the_transport_individually_and_retain_account_c
                 BackgroundResponse::Sources {
                     reads,
                     cursor: next,
+                    ..
                 },
         } = serde_json::from_slice(&wire).unwrap()
         else {
@@ -222,7 +223,7 @@ async fn normalization_that_exceeds_the_page_budget_preserves_the_supplied_check
     let wire = serde_json::to_vec(&HostResult::Background { response }).unwrap();
     assert!(wire.len() <= MAX_FRAME_BYTES);
     let HostResult::Background {
-        response: BackgroundResponse::Sources { reads, cursor },
+        response: BackgroundResponse::Sources { reads, cursor, .. },
     } = serde_json::from_slice(&wire).unwrap()
     else {
         panic!("The source response did not survive the wire round trip");
