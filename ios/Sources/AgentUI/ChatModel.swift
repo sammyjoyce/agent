@@ -646,13 +646,15 @@ final class ChatModel {
   /// Copies a held message into the composer with its text as it was, addressed to its owner, or
   /// else to `chosen`, and with neither asks who should get it. It stays held until a Send carries
   /// the copy unchanged to its owner, since only that one is known to be the coordinator it was
-  /// queued for.
+  /// queued for. A `chosen` answers only a message with no owner, so once the message has gained
+  /// another owner, as when its queue's coordinator paired while Restore asked, it restores nothing.
   func restoreHeld(_ message: HeldMessage, for chosen: ProfileID? = nil) async {
     let owner = owner(message)
     if chosen == nil, owner == nil {
       asking = message
       return
     }
+    if let chosen, let owner, chosen != owner { return }
     guard let hold = holds.first(where: { $0.queue.id == message.queue }),
       let recipient = chosen ?? owner, readyToRestore(from: recipient)
     else { return }
