@@ -177,6 +177,10 @@ final class ChatModel {
   var heldChoices: [CoordinatorProfile] {
     profiles.filter { $0.pin != nil && removed[$0.id] == nil }
   }
+  /// The held message Restore is asking who should get. Restore asks only about a message with no
+  /// owner.
+  private(set) var asking: HeldMessage?
+  func stopAsking() { asking = nil }
   /// Why Restore asks who gets a held message, and what a Send to the one chosen leaves. It names
   /// the address the message was queued for only when this phone recorded it, and says no saved
   /// coordinator is paired there only when none is.
@@ -634,10 +638,15 @@ final class ChatModel {
     } catch { failure = error.localizedDescription }
   }
   /// Copies a held message into the composer with its text as it was, addressed to its owner, or
-  /// else to `chosen`, and with neither does nothing. It stays held until a Send carries the copy
-  /// unchanged to its owner, since only that one is known to be the coordinator it was queued for.
+  /// else to `chosen`, and with neither asks who should get it. It stays held until a Send carries
+  /// the copy unchanged to its owner, since only that one is known to be the coordinator it was
+  /// queued for.
   func restoreHeld(_ message: HeldMessage, for chosen: ProfileID? = nil) async {
     let owner = owner(message)
+    if chosen == nil, owner == nil {
+      asking = message
+      return
+    }
     guard let hold = holds.first(where: { $0.queue.id == message.queue }),
       let recipient = chosen ?? owner, readyToRestore(from: recipient)
     else { return }
