@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 import Network
 
-public struct CoordinatorAddress: Sendable, Equatable {
+public struct CoordinatorAddress: Sendable, Hashable {
   public let host: String
   public let port: UInt16
 
@@ -84,11 +84,15 @@ public enum ConnectionError: Error, LocalizedError, Sendable, Equatable {
   /// The socket closed or answered something other than `identity`, as a coordinator built
   /// before identities does.
   case unidentifiedCoordinator
+  /// The coordinator proved its identity, then ended the stream without answering the observe, as
+  /// one built before a field the observe carries does.
+  case outdatedCoordinator
   /// The socket named a coordinator other than the profile's pin, the one carried here.
   case wrongCoordinator(CoordinatorID)
   public var errorDescription: String? {
     switch self {
-    case .unidentifiedCoordinator: "Update the coordinator to use it with this app."
+    case .unidentifiedCoordinator, .outdatedCoordinator:
+      "Update the coordinator to use it with this app."
     // No advice: it may be another saved coordinator, and only the feed can tell.
     case .wrongCoordinator: "This address now answers as a different coordinator."
     case .vpnUnavailable:
@@ -123,7 +127,7 @@ public enum ConnectionError: Error, LocalizedError, Sendable, Equatable {
     if let error = error as? ConnectionError {
       switch error {
       case .closed, .timedOut, .incompleteFrame, .dnsUnavailable, .vpnUnavailable,
-        .unidentifiedCoordinator, .wrongCoordinator:
+        .unidentifiedCoordinator, .outdatedCoordinator, .wrongCoordinator:
         return true
       case .invalidAddress, .frameTooLarge: return false
       }
@@ -214,6 +218,7 @@ struct VerifiedConnection: Sendable {
   func send(_ request: NativeRequest) async throws { try await line.send(request) }
   func next() async throws -> NativeEvent { try verified(await line.next()) }
   func close() async { await line.close() }
+  var endedByPeer: Bool { get async { await line.endedByPeer } }
 }
 
 /// Writes one frame, closing the connection if it is not written within 15 seconds.
@@ -269,6 +274,8 @@ actor LineConnection {
     case failed(NWError)
   }
   private var readState = ReadState.open
+  /// The peer ended the stream, rather than this side closing it or the network failing it.
+  private(set) var endedByPeer = false
   private var terminalError: (any Error)? {
     switch readState {
     case .failed(let error): error
@@ -433,7 +440,10 @@ actor LineConnection {
       }
       if let error = terminalError { throw error }
       buffer.append(data)
-      if complete { readState = .eof }
+      if complete {
+        readState = .eof
+        endedByPeer = true
+      }
     }
   }
 }

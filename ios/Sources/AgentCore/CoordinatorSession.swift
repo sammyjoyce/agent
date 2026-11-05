@@ -728,6 +728,7 @@ public actor CoordinatorSession {
     var attempt = 0
     while !Task.isCancelled && self.generation == generation {
       var stream: VerifiedConnection?
+      var answered = false
       do {
         resetCapabilities()
         transcript.reconnect()
@@ -752,6 +753,7 @@ public actor CoordinatorSession {
         while !Task.isCancelled {
           let event =
             try await (snapshot.connection == .connected ? stream.next() : timedNext(stream))
+          answered = true
           guard self.generation == generation else { return }
           // Before readiness this rejects observation admission. Afterwards the
           // same event can be a mirrored model-turn failure; keep observing.
@@ -807,6 +809,11 @@ public actor CoordinatorSession {
       } catch {
         await stream?.close()
         guard !Task.isCancelled, self.generation == generation else { return }
+        // A network drop never ends the stream from the coordinator's side. Every current
+        // coordinator answers an observe with a frame before anything that can fail.
+        let endedByPeer = await stream?.endedByPeer ?? false
+        let outdated = !answered && endedByPeer && error as? ConnectionError == .closed
+        let error = outdated ? ConnectionError.outdatedCoordinator : error
         connection = nil
         for item in pending where unsent[item.request.inputId] == nil {
           transcript.delivery(item.request.inputId, unanswered(item))
@@ -843,7 +850,7 @@ public actor CoordinatorSession {
       identityFailure =
         "This address now answers as a different coordinator. \(held) Remove it and add it again."
       snapshot.answeredAs = found
-    case .unidentifiedCoordinator:
+    case .unidentifiedCoordinator, .outdatedCoordinator:
       identityFailure = ConnectionError.describe(error)
       snapshot.answeredAs = nil
     default: break

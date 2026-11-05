@@ -57,9 +57,10 @@ the address that build used, whatever the toggle says. That coordinator then
 alerts this device only through the saved coordinator's own registration, and
 only while alerts are on. A coordinator saved only at another address is sent
 the withdrawal once a probe of that build's address finds it there. Until then
-the phone cannot tell whether it is the one that build used. Until the
-coordinator confirms, the app sends the withdrawal again each time it becomes
-active.
+the phone cannot tell whether it is the one that build used. When that build
+used more than one address, each coordinator proven at one of them gets its own
+withdrawal. Until that coordinator confirms, the app sends it again each time it
+becomes active.
 **Connection → Appearance** follows the system by default. Choose **Light** or
 **Dark** to keep a saved override.
 
@@ -198,8 +199,9 @@ required for sharing on a phone; an unsigned build does not establish that.
   leading `@Name` that names no saved coordinator blocks Send, with one
   coordinator left too, so nothing meant for it goes to another coordinator.
 - Every connection first asks for the coordinator's ID and writes nothing else
-  unless the ID matches the saved one. A coordinator too old to answer shows
-  "Update the coordinator". If the address now answers as a different
+  unless the ID matches the saved one. A coordinator too old to answer, or one
+  that answers and then closes without replying to the app's first request,
+  shows "Update the coordinator". If the address now answers as a different
   coordinator, the queue stays on the phone. Both cases keep retrying. When
   that coordinator is another saved one, as when two coordinators trade
   addresses, the line names it and asks you to edit the address, which keeps
@@ -259,12 +261,33 @@ required for sharing on a phone; an unsigned build does not establish that.
   updates, uses the shared history renderer and never sends or stops work.
 - The top of the chat holds messages that a build without saved coordinators
   queued for the coordinator at its address. Each launch of that build keeps its
-  own queue and the address it was queued for. That build never recorded which
-  coordinator answered there, so they may already have been delivered. The app
-  never sends them. A queue belongs to the first saved coordinator the phone
-  proves answers at its address: by pairing, adding or editing a coordinator
-  there, by any probe of that address that finds a saved coordinator, or by a
-  coordinator already saved there, the only one, when the app starts.
+  own queue and the address it was queued for, every queue it left is held, and
+  the update saves a coordinator at its last address under a name no saved
+  coordinator has. A name an earlier build of this app saved twice, ignoring
+  case, keeps its first coordinator, and the later one gets the first free name,
+  such as `Coordinator-2`. The build without saved coordinators never recorded
+  which coordinator answered at an address, so they may already have been
+  delivered. The app never sends them. A queue belongs to the first saved
+  coordinator the phone proves answers at its address: by pairing, adding or
+  editing a coordinator there, by any probe of that address that finds a saved
+  coordinator, or by a coordinator already saved there, the only one, when the
+  app starts. Each queue's folder records its
+  address, its coordinator and that build's alert registration. The folders are
+  in `Agent/HeldQueues`, where no earlier build of this app reads, writes or
+  deletes anything, so installing earlier builds over this one in any order, and
+  then this one again, loses none of them. Those builds do not show them. The
+  build before this one kept its own held queues in `Agent/Held` and deletes each
+  folder there that `profiles.json` does not list. The update moves each of them
+  into `Agent/HeldQueues` with what that build listed about it, and until it has
+  moved, `profiles.json` lists it in that build's format, so a launch that stops
+  part way leaves that build nothing to delete. What an earlier build recorded
+  about a queue counts only where it proves the queue's address or coordinator,
+  and what the build before this one listed describes only the folder it kept.
+  The update writes each folder's queue into the folder before moving it, so a
+  launch that stops part way resumes with that queue. Until the folder moves,
+  what `profiles.json` says about it in an earlier build's format wins over what
+  the update wrote, so a coordinator that build proved for the queue after the
+  stop keeps it.
   **Restore to composer** makes a new message for you to send, addressed to that
   coordinator. Until one is, Restore asks which paired coordinator gets it. If no
   build recorded the address, Restore always asks. **Discard** deletes a held
@@ -272,10 +295,12 @@ required for sharing on a phone; an unsigned build does not establish that.
   unchanged to the coordinator it belongs to, or discard it. A held message the
   earlier build saw its coordinator accept offers only **Discard**, since a
   restored copy would send it twice. Removing a
-  coordinator deletes the held messages that belong to it, and its confirmation
-  counts them. Every other held message stays. If held messages cannot be read,
-  the chat says so for as long as they are on this phone and their last read
-  failed.
+  coordinator deletes the held messages its confirmation counted as that
+  coordinator's, and no others: a queue that becomes that coordinator's after
+  the confirmation stays. A Remove that stops part way may leave held messages
+  that show again, and Discard deletes them. Nothing else deletes a held
+  message. If held messages cannot be read, the chat says so for as long as they
+  are on this phone and their last read failed.
 - Do not restore an uncertain submission as a new message to bypass checking its
   original ID. Coordinator admission may already have succeeded.
 - Use the **+** menu for files, photos, commands and delivery mode, or drop files
