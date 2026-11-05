@@ -3108,9 +3108,10 @@ func aMigrationStoppedAtAnyStepLeavesTheShippedBuildNothingToDelete(
 /// `Agent/Held`, bound it to the coordinator it proved at the queue's address, 100.64.1.2:43187,
 /// saved the withdrawal of the old alert installation, and the user then moved the profile to port
 /// 4001. This build adopts that queue with the binding that build listed and saves no second
-/// withdrawal. The same listing for a queue of this build's names no folder in `Agent/Held`, so it
-/// gives that queue nothing: it stays unbound with its installation. Either way the list goes.
-@MainActor @Test(arguments: ["#10's queue", "a queue of this build's"])
+/// withdrawal. A listing under another queue's ID, or one for this build's queue at another
+/// address, gives this build's queue nothing: it stays unbound with its installation. Either way
+/// the list goes.
+@MainActor @Test(arguments: ["#10's queue", "another queue's ID", "another address"])
 func aBindingTheShippedBuildListedCountsOnlyForItsOwnFolder(_ whose: String) async throws {
   let install = try await LegacyInstall()
   defer { install.remove() }
@@ -3143,7 +3144,8 @@ func aBindingTheShippedBuildListedCountsOnlyForItsOwnFolder(_ whose: String) asy
       {"withdrawals":[\(withdrawals)],\
       "profiles":[{"id":"\(migrated.id)","name":"Work",\
       "address":{"host":"100.64.1.2","port":4001},"pin":"\(coordinator.uuid.uuidString)"}],\
-      "held":[{"id":"\(queue.id.uuidString)","address":{"host":"100.64.1.2","port":43187},\
+      "held":[{"id":"\(whose == "another queue's ID" ? UUID() : queue.id)",\
+      "address":{"host":"100.64.1.2","port":\(whose == "another address" ? 4002 : 43187)},\
       "coordinator":"\(coordinator.uuid.uuidString)"}]}
       """.utf8), to: install.support.appending(path: "Agent/profiles.json"))
   let again = launch()
@@ -3279,6 +3281,323 @@ func aBindingTheShippedBuildMadeAfterALaunchStoppedOutlivesThatLaunchsRecord(
     throw error
   }
   await stop()
+}
+
+/// Window W. #10 held the single-address build's notes for 100.64.1.2:43187 in `Agent/Held`. A
+/// launch of this build moves that folder into `Agent/HeldQueues`, and the save that drops it from
+/// `profiles.json`'s `held` fails. #10 then pairs the migrated profile with Work at 43187, which
+/// binds the queue it still lists to Work and saves the old alert installation's withdrawal. The
+/// user moves Work to 4002 and adds Personal, which now answers at 43187. The moved queue keeps
+/// #10's binding and gets no second withdrawal, so the notes restore to Work and only Work gets them.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aBindingTheShippedBuildMadeAfterAFailedSaveFollowsTheFolderThisBuildMoved() async throws {
+  let install = try await LegacyInstall()
+  defer { install.remove() }
+  let work = FixtureCoordinator()
+  let personal = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(work)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personal)
+  defer { personalListener.cancel() }
+  _ = try ShippedBuild.launch(
+    defaults: install.defaults, support: install.support, caches: install.caches)
+  let agent = install.support.appending(path: "Agent")
+  try FileManager.default.createDirectory(
+    at: agent.appending(path: "HeldQueues"), withIntermediateDirectories: true)
+  try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: agent.path)
+  #expect(throws: (any Error).self) {
+    try Coordinators.migrate(
+      defaults: install.defaults, applicationSupport: install.support, caches: install.caches)
+  }
+  try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: agent.path)
+  func listed() throws -> [ShippedBuild.Queue] {
+    try JSONDecoder().decode(
+      ShippedBuild.Saved.self, from: Data(contentsOf: ShippedBuild.file(install.support))
+    ).held ?? []
+  }
+  let shipped =
+    (try? FileManager.default.contentsOfDirectory(atPath: agent.appending(path: "Held").path))
+    ?? []
+  let moved = try HeldQueue.all(applicationSupport: install.support)
+  let stillListed = try listed()
+  let failed =
+    "Agent/Held=\(shipped.count) Agent/HeldQueues=\(moved.map { "\($0.id.uuidString.prefix(8)) bound=\($0.coordinator != nil)" }) listed=\(stillListed.map { "\($0.id.uuidString.prefix(8))" })"
+  #expect(shipped.isEmpty && moved.map(\.id) == stillListed.map(\.id), "No listed folder moved")
+  _ = try ShippedBuild.launch(
+    defaults: install.defaults, support: install.support, caches: install.caches)
+  let old = ShippedBuild.Address(host: install.address.host, port: install.address.port)
+  let movedWork = try CoordinatorAddress(host: install.address.host, port: 4002)
+  try ShippedBuild.save(support: install.support, answered: work.id, at: install.address) {
+    $0 = $0.map {
+      $0.address == old ? .init(id: $0.id, name: $0.name, address: old, pin: work.id.uuid) : $0
+    }
+  }
+  try ShippedBuild.save(support: install.support, answered: work.id, at: movedWork) {
+    $0 = $0.map {
+      $0.pin == work.id.uuid
+        ? .init(
+          id: $0.id, name: "Work", address: .init(host: movedWork.host, port: 4002), pin: $0.pin)
+        : $0
+    }
+  }
+  try ShippedBuild.save(support: install.support, answered: personal.id, at: install.address) {
+    $0.append(.init(id: UUID(), name: "Personal", address: old, pin: personal.id.uuid))
+  }
+  let listedByTen = try listed()
+  let routes = Routes([4002: workPort, install.address.port: personalPort])
+  let coordinators = Coordinators(
+    registration: nil, defaults: install.defaults, applicationSupport: install.support,
+    caches: install.caches,
+    transport: CoordinatorTransport { address in
+      guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
+      return LineConnection(
+        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+    })
+  struct Saved: Decodable { let withdrawals: [PendingWithdrawal] }
+  let withdrawals = try JSONDecoder().decode(Saved.self, from: install.savedProfiles()).withdrawals
+  let shippedWithdrawal = PendingWithdrawal(
+    installation: try #require(InstallationID(legacy: install.installation)),
+    address: install.address, pin: work.id)
+  let chat = coordinators.chat
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await work.stop()
+    await personal.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("both connected and the notes held") {
+      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+        && chat.held.count == 2
+    }
+    let owners = chat.held.map { chat.owner($0).map(chat.name) ?? "nobody" }
+    let note = try #require(chat.held.first { $0.item.text == "Second held note" })
+    await chat.restoreHeld(note)
+    let restored = (draft: chat.draft, recipient: chat.recipient.map(chat.name) ?? "nobody")
+    if !chat.draft.isEmpty {
+      await chat.send()
+      _ = try await settles { await submitted(work) + submitted(personal) != [] }
+    }
+    func who(_ pin: CoordinatorID?) -> String {
+      pin == work.id ? "Work" : pin == personal.id ? "Personal" : "nobody"
+    }
+    print(
+      "IF20-W[#10's folder moved, then the save failed] \(failed) | #10 listed=\(listedByTen.map { "\($0.id.uuidString.prefix(8)) bound to Work=\($0.coordinator == work.id.uuid)" }) | this build: queues=\(coordinators.queues.map { "\($0.id.uuidString.prefix(8)) bound to \(who($0.coordinator))" }) withdrawals at launch=\(withdrawals.map { "to \(who($0.pin)) saved by #10=\($0 == shippedWithdrawal)" }) owners=\(owners) Restore: draft=\(restored.draft.debugDescription) to=\(restored.recipient) after Send: Work's coordinator got=\(await submitted(work)) Personal's coordinator got=\(await submitted(personal))"
+    )
+    #expect(listedByTen.map(\.coordinator) == [work.id.uuid], "#10 did not bind the queue to Work")
+    #expect(coordinators.queues.map(\.id) == listedByTen.map(\.id), "The queue #10 listed is gone")
+    #expect(
+      withdrawals == [shippedWithdrawal], "The old installation's withdrawal is not #10's alone")
+    #expect(owners == ["Work", "Work"])
+    #expect(restored.draft == "Second held note" && restored.recipient == "Work")
+    #expect(await submitted(work) == ["Second held note"])
+    #expect(await submitted(personal).isEmpty, "A note queued while Work answered went to Personal")
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
+/// The `profiles.json` #9 wrote once it paired the migrated profile with Work at 43187 and bound
+/// `origin` to Work, and the user then moved Work to 4002 and added Personal, which answers at 43187.
+private func writeNinthBuildsPairedFile(
+  root: URL, work: ProfileID, workCoordinator: CoordinatorID, personal: CoordinatorID,
+  withdrawn installation: String?
+) throws {
+  let withdrawals = installation.map {
+    """
+    {"installation":"\($0)","address":{"host":"100.64.1.2","port":43187},\
+    "pin":"\(workCoordinator.uuid.uuidString)"}
+    """
+  }
+  try writePrivately(
+    Data(
+      """
+      {"withdrawals":[\(withdrawals ?? "")],\
+      "origin":{"address":{"host":"100.64.1.2","port":43187},\
+      "coordinator":"\(workCoordinator.uuid.uuidString)"},\
+      "profiles":[{"id":"\(work)","name":"Work",\
+      "address":{"host":"100.64.1.2","port":4002},"pin":"\(workCoordinator.uuid.uuidString)"},\
+      {"id":"\(UUID())","name":"Personal",\
+      "address":{"host":"100.64.1.2","port":43187},"pin":"\(personal.uuid.uuidString)"}]}
+      """.utf8), to: root.appending(path: "Agent/profiles.json"))
+}
+
+/// What the user sees once this build launches with Work at 4002 and Personal at 43187: who each held
+/// note belongs to, the draft and recipient Restore gives the one held note, and what each
+/// coordinator got after Send.
+private struct RestoredAndSent {
+  let queues: [String]
+  let owners: [String]
+  let draft: String
+  let recipient: String
+  let atWork: [String]
+  let atPersonal: [String]
+}
+
+@MainActor private func restoreAndSend(
+  root: URL, defaults: UserDefaults, work: FixtureCoordinator, workPort: NWEndpoint.Port,
+  personal: FixtureCoordinator, personalPort: NWEndpoint.Port
+) async throws -> RestoredAndSent {
+  let routes = Routes([4002: workPort, 43187: personalPort])
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: CoordinatorTransport { address in
+      guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
+      return LineConnection(
+        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+    })
+  let chat = coordinators.chat
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await work.stop()
+    await personal.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("both connected and the note held") {
+      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
+        && chat.held.count == 1
+    }
+    func who(_ pin: CoordinatorID?) -> String {
+      pin == work.id ? "Work" : pin == personal.id ? "Personal" : "nobody"
+    }
+    let queues = coordinators.queues.map {
+      "\($0.id.uuidString.prefix(8)) at \($0.address.map { "\($0.port)" } ?? "?") bound to \(who($0.coordinator))"
+    }
+    let owners = chat.held.map { chat.owner($0).map(chat.name) ?? "nobody" }
+    await chat.restoreHeld(try #require(chat.held.first))
+    let draft = chat.draft
+    let recipient = chat.recipient.map(chat.name) ?? "nobody"
+    if !chat.draft.isEmpty {
+      await chat.send()
+      _ = try await settles { await submitted(work) + submitted(personal) != [] }
+    }
+    let result = RestoredAndSent(
+      queues: queues, owners: owners, draft: draft, recipient: recipient,
+      atWork: await submitted(work), atPersonal: await submitted(personal))
+    await stop()
+    return result
+  } catch {
+    await stop()
+    throw error
+  }
+}
+
+/// #9 held the single-address build's note for 100.64.1.2:43187 in the migrated profile's `Legacy`
+/// folder, with an `origin` it had bound to Work. The user moved Work to 4002 and added Personal,
+/// which answers at 43187. A launch of this build records the folder's queue from `origin`, saves
+/// `profiles.json` without it, and stops before the folder moves. No `origin` is left to describe the
+/// folder, and Work is pinned, so only that record says whose the note is. The next launch keeps it,
+/// so the note restores to Work and only Work gets it.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aLegacyFolderKeepsWhatOriginSaidOnceALaunchStoppedAfterSavingWithoutIt() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "r20t-record-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let work = FixtureCoordinator()
+  let personal = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(work)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personal)
+  defer { personalListener.cancel() }
+  let migrated = ProfileID()
+  try writeNinthBuildsPairedFile(
+    root: root, work: migrated, workCoordinator: work.id, personal: personal.id, withdrawn: nil)
+  let legacy = ProfileDirectory(migrated, applicationSupport: root, caches: root).legacy
+  let note = "Note queued while Work answered at 43187"
+  try writePrivately(
+    JSONEncoder().encode([
+      NativeRequestSubmit(inputId: UUID().uuidString, mode: .followUp, text: note)
+    ]), to: legacy.appending(path: "pending.json"))
+  #expect(throws: Crash.self) {
+    try Coordinators.migrate(
+      defaults: defaults, applicationSupport: root, caches: root,
+      crash: { if $0 == .queueRecorded { throw Crash() } })
+  }
+  let recorded = try HeldQueue.recorded(in: legacy)
+  let originLeft =
+    try JSONSerialization.jsonObject(
+      with: Data(contentsOf: root.appending(path: "Agent/profiles.json"))) as? [String: Any]
+  let seen = try await restoreAndSend(
+    root: root, defaults: defaults, work: work, workPort: workPort, personal: personal,
+    personalPort: personalPort)
+  print(
+    "IF21-record[origin saved away, then stopped before the move] record left=\(recorded != nil) origin left=\(originLeft?["origin"] != nil) | this build: queues=\(seen.queues) owners=\(seen.owners) Restore: draft=\(seen.draft.debugDescription) to=\(seen.recipient) after Send: Work's coordinator got=\(seen.atWork) Personal's coordinator got=\(seen.atPersonal)"
+  )
+  #expect(recorded != nil, "The stopped launch recorded no queue in the Legacy folder")
+  #expect(originLeft?["origin"] == nil, "origin is still saved, so it still describes the folder")
+  #expect(seen.owners == ["Work"])
+  #expect(seen.draft == note && seen.recipient == "Work")
+  #expect(seen.atWork == [note])
+  #expect(seen.atPersonal.isEmpty, "A note queued while Work answered went to Personal")
+}
+
+/// #9 held the single-address build's note for 100.64.1.2:43187 in the migrated profile's `Legacy`
+/// folder, with an unpaired `origin` there carrying the build's alert installation. A launch of this
+/// build records the folder's queue, unbound at 43187, and its save of `profiles.json` fails, so
+/// `origin` stays. #9 then pairs the profile with Work at 43187 and binds `origin` to Work. The user
+/// moves Work to 4002 and adds Personal, which answers at 43187. `origin` is newer than the record,
+/// so the note restores to Work and only Work gets it.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func theOriginNinePairedAfterAFailedSaveOutlivesThatLaunchsRecord() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "r20t-origin-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let work = FixtureCoordinator()
+  let personal = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(work)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personal)
+  defer { personalListener.cancel() }
+  let migrated = ProfileID()
+  let installation = UUID().uuidString
+  let agent = root.appending(path: "Agent")
+  try writePrivately(
+    Data(
+      """
+      {"withdrawals":[],"origin":{"address":{"host":"100.64.1.2","port":43187},\
+      "installation":"\(installation)"},\
+      "profiles":[{"id":"\(migrated)","name":"Work",\
+      "address":{"host":"100.64.1.2","port":43187}}]}
+      """.utf8), to: agent.appending(path: "profiles.json"))
+  let legacy = ProfileDirectory(migrated, applicationSupport: root, caches: root).legacy
+  let note = "Note queued while Work answered at 43187"
+  try writePrivately(
+    JSONEncoder().encode([
+      NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: note)
+    ]), to: legacy.appending(path: "pending.json"))
+  try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: agent.path)
+  #expect(throws: (any Error).self) {
+    try Coordinators.migrate(defaults: defaults, applicationSupport: root, caches: root)
+  }
+  try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: agent.path)
+  let recorded = try HeldQueue.recorded(in: legacy)
+  let originLeft =
+    try JSONSerialization.jsonObject(
+      with: Data(contentsOf: agent.appending(path: "profiles.json"))) as? [String: Any]
+  try writeNinthBuildsPairedFile(
+    root: root, work: migrated, workCoordinator: work.id, personal: personal.id,
+    withdrawn: installation)
+  let seen = try await restoreAndSend(
+    root: root, defaults: defaults, work: work, workPort: workPort, personal: personal,
+    personalPort: personalPort)
+  print(
+    "IF21-origin[recorded, then the save failed, then #9 bound origin] record left=\(recorded.map { "at \($0.address.map { "\($0.port)" } ?? "?") bound=\($0.coordinator != nil)" } ?? "none") origin left=\(originLeft?["origin"] != nil) | this build: queues=\(seen.queues) owners=\(seen.owners) Restore: draft=\(seen.draft.debugDescription) to=\(seen.recipient) after Send: Work's coordinator got=\(seen.atWork) Personal's coordinator got=\(seen.atPersonal)"
+  )
+  #expect(
+    recorded != nil && recorded?.coordinator == nil,
+    "The failed launch recorded no unbound queue in the folder")
+  #expect(originLeft?["origin"] != nil, "The failed save dropped origin, so #9 cannot bind it")
+  #expect(seen.owners == ["Work"])
+  #expect(seen.draft == note && seen.recipient == "Work")
+  #expect(seen.atWork == [note])
+  #expect(seen.atPersonal.isEmpty, "A note queued while Work answered went to Personal")
 }
 
 /// The single-address build left two messages for its coordinator at 100.64.1.2:43187, which
