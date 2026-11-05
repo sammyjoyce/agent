@@ -13,10 +13,15 @@ private func until(
   throw ConnectionError.closed
 }
 
+/// How long a wait across a lane's reconnect may take. A session whose dial fails backs off up to
+/// 32 s before it dials again.
+private let reconnecting = Duration.seconds(45)
+
 private func eventually(
-  _ description: String, _ predicate: @Sendable () async throws -> Bool
+  _ description: String, within limit: Duration = .seconds(15),
+  _ predicate: @Sendable () async throws -> Bool
 ) async throws {
-  let deadline = ContinuousClock.now + .seconds(15)
+  let deadline = ContinuousClock.now + limit
   while try !(await predicate()) {
     try #require(ContinuousClock.now < deadline, "Timed out waiting for \(description)")
     try await Task.sleep(for: .milliseconds(5))
@@ -847,7 +852,7 @@ func anInputAnOlderBuildQueuedIsNeverWithdrawn() async throws {
 
 enum LaneReturn: Sendable { case reconnect, foreground }
 
-@Test(.timeLimit(.minutes(1)), arguments: [LaneReturn.reconnect, .foreground])
+@Test(.timeLimit(.minutes(2)), arguments: [LaneReturn.reconnect, .foreground])
 func aStagedInputWhoseLaneDropsBeforeStartIsSentOnceItsLaneReturns(_ lane: LaneReturn)
   async throws
 {
@@ -880,7 +885,8 @@ func aStagedInputWhoseLaneDropsBeforeStartIsSentOnceItsLaneReturns(_ lane: LaneR
     }
     await fixture.releaseSnapshot()
     let entry = "placed-\(staged.inputID)"
-    try await eventually("the waiting input placed") {
+    // The coordinator reports placement on the observer's next connection.
+    try await eventually("the waiting input placed", within: reconnecting) {
       try queuedRequests(outbox).isEmpty
     }
     let placed = try await until(session) {

@@ -366,10 +366,18 @@ final class AgentUITests: XCTestCase {
     let previous = continueAfterFailure
     continueAfterFailure = true
     defer { continueAfterFailure = previous }
+    let window = app.windows.firstMatch.frame
     try app.performAccessibilityAudit(for: types) { issue in
       // WCAG 1.4.3 excludes inactive controls from text-contrast requirements.
       // https://www.w3.org/WAI/WCAG21/Understanding/contrast-minimum#inactive-user-interface-components
       if issue.auditType == .contrast, issue.element?.isEnabled == false { return true }
+      // The contrast audit samples an element's whole frame, and the part past the screen edge
+      // reads as black. Judge only text a user can see in full.
+      if issue.auditType == .contrast, let element = issue.element,
+        !window.contains(element.frame)
+      {
+        return true
+      }
       guard ProcessInfo.processInfo.operatingSystemVersion.majorVersion == 27,
         issue.auditType == .contrast, let element = issue.element,
         element.identifier == "dismissConnection", element.label == "Done"
