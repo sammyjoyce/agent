@@ -2579,6 +2579,242 @@ func restoresNoteSaysNobodyIsPairedAtTheAddressOnlyWhenNobodyIs(
   await stop()
 }
 
+/// Personal is paired at 100.64.1.2:4002, and "Coordinator" is unpaired. Restore on a message held
+/// for 43187 asks who gets it. While it asks, the pairing retry pairs "Coordinator" with Work,
+/// which makes it the message's owner: at 43187, which binds the message's queue to Work, or at
+/// 4005 when the queue was already bound to Work. The question ends then, since its note says
+/// nobody owns the message, and it does not come back once that owner is removed.
+@MainActor
+@Test(.timeLimit(.minutes(1)), arguments: ["pairs at the queue's address", "queue already Work's"])
+func restoresQuestionEndsOnceTheHeldMessageGainsAnOwner(_ path: String) async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "r22d-asking-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let work = FixtureCoordinator()
+  let personal = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(work)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personal)
+  defer { personalListener.cancel() }
+  let queued = try CoordinatorAddress(host: "100.64.1.2")
+  let bound = path == "queue already Work's"
+  let migrated = CoordinatorProfile(
+    name: try TagName("Coordinator"),
+    address: bound ? try CoordinatorAddress(host: "100.64.1.2", port: 4005) : queued)
+  var paired = CoordinatorProfile(
+    name: try TagName("Personal"), address: try CoordinatorAddress(host: "100.64.1.2", port: 4002))
+  paired.pin = personal.id
+  try writePrivately(
+    JSONEncoder().encode(Coordinators.SavedProfiles(profiles: [migrated, paired])),
+    to: root.appending(path: "Agent/profiles.json"))
+  let queue = HeldQueue(address: queued, coordinator: bound ? work.id : nil, installation: nil)
+  let note = "Invented note queued for 100.64.1.2:43187"
+  try writePrivately(
+    JSONEncoder().encode([
+      NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: note)
+    ]), to: queue.folder(applicationSupport: root).appending(path: "pending.json"))
+  try queue.record(in: queue.folder(applicationSupport: root))
+  let routes = Routes([4002: personalPort])
+  let transport = CoordinatorTransport { address in
+    guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
+    return LineConnection(
+      connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+  }
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: transport)
+  let chat = coordinators.chat
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await work.stop()
+    await personal.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("Personal connected and the message held") {
+      chat.snapshots[paired.id]?.connection == .connected && chat.held.count == 1
+    }
+    let held = try #require(chat.held.first)
+    await chat.restoreHeld(held)
+    let askedFirst = chat.asking?.id == held.id
+    await routes.set([4002: personalPort, migrated.address.port: workPort])
+    try await eventually("Coordinator paired with Work and owns the message") {
+      chat.owner(held) == migrated.id
+    }
+    let askedOwned = chat.asking?.id == held.id
+    try await coordinators.remove(
+      Coordinators.Removal(profile: migrated.id, message: "", held: []))
+    let askedAfterRemove = chat.asking?.id == held.id
+    print(
+      "R22D-asking[\(path)] asked before pairing=\(askedFirst) after Coordinator paired=\(askedOwned) after it was removed=\(askedAfterRemove) owner now=\(chat.owner(held).map { "\($0)" } ?? "nobody") still held=\(chat.held.map(\.item.text))"
+    )
+    #expect(askedFirst, "Restore did not ask who gets a message with no owner")
+    #expect(!askedOwned, "Restore still asks after the message gained an owner")
+    #expect(
+      chat.owner(held) == nil && chat.held.count == 1 && !askedAfterRemove,
+      "Restore asks again once the message's owner is removed")
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
+/// Restore asks who gets a message held for 100.64.1.2:43187, and offers Personal, paired at 4002.
+/// Before the user answers, "Coordinator" pairs with Work at 43187, which makes Work the message's
+/// owner. The user's tap on Personal then arrives. It restores nothing, so a Send gives Personal
+/// nothing, and Restore then addresses the message to Work.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aChoiceMadeBeforeTheHeldMessageGainedAnOwnerRestoresNothing() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "r22f-stale-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let work = FixtureCoordinator()
+  let personal = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(work)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personal)
+  defer { personalListener.cancel() }
+  let queued = try CoordinatorAddress(host: "100.64.1.2")
+  let migrated = CoordinatorProfile(name: try TagName("Coordinator"), address: queued)
+  var paired = CoordinatorProfile(
+    name: try TagName("Personal"), address: try CoordinatorAddress(host: "100.64.1.2", port: 4002))
+  paired.pin = personal.id
+  try writePrivately(
+    JSONEncoder().encode(Coordinators.SavedProfiles(profiles: [migrated, paired])),
+    to: root.appending(path: "Agent/profiles.json"))
+  let queue = HeldQueue(address: queued, coordinator: nil, installation: nil)
+  let note = "Invented note queued for 100.64.1.2:43187"
+  try writePrivately(
+    JSONEncoder().encode([
+      NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: note)
+    ]), to: queue.folder(applicationSupport: root).appending(path: "pending.json"))
+  try queue.record(in: queue.folder(applicationSupport: root))
+  let routes = Routes([4002: personalPort])
+  let transport = CoordinatorTransport { address in
+    guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
+    return LineConnection(
+      connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+  }
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: transport)
+  let chat = coordinators.chat
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await work.stop()
+    await personal.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("Personal connected and the message held") {
+      chat.snapshots[paired.id]?.connection == .connected && chat.held.count == 1
+    }
+    let held = try #require(chat.held.first)
+    await chat.restoreHeld(held)
+    let offered = chat.asking?.id == held.id && chat.heldChoices.map(\.id) == [paired.id]
+    await routes.set([4002: personalPort, 43187: workPort])
+    try await eventually("Coordinator paired with Work and owns the message") {
+      chat.owner(held) == migrated.id && chat.snapshots[migrated.id]?.connection == .connected
+    }
+    await chat.restoreHeld(held, for: paired.id)
+    let staleDraft = chat.draft
+    await chat.send()
+    await chat.restoreHeld(held)
+    let toOwner = chat.draft == note && chat.recipient == migrated.id
+    _ = try await settles { chat.canSend }
+    await chat.send()
+    let workGot = try await settles { await submitted(work) == [note] }
+    let personalGot = await submitted(personal)
+    print(
+      "R22F-stale offered Personal=\(offered) draft after the stale tap=\(staleDraft.debugDescription) Restore again to Coordinator=\(toOwner) | Work got it=\(workGot) Personal got=\(personalGot) still held=\(chat.held.map(\.item.text))"
+    )
+    #expect(offered, "Restore did not ask, offering Personal, while the message had no owner")
+    #expect(staleDraft.isEmpty, "A choice of Personal restored a message Work now owns")
+    #expect(personalGot.isEmpty, "Personal got a message Work owns")
+    #expect(
+      toOwner && workGot && chat.held.isEmpty,
+      "Restore did not send the message to its owner and withdraw the original")
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
+/// Work and Personal are both paired at 100.64.1.2:43187, where Personal answers, and a message
+/// held for that address has no owner, so Restore asks. Renaming either one keeps its address, so
+/// no socket proves who answers there. The message still has no owner, and Restore still asks.
+@MainActor
+@Test(.timeLimit(.minutes(1)), arguments: ["Work", "Personal"])
+func renamingOneOfTwoCoordinatorsAtAHeldMessagesAddressLeavesItUnowned(_ renamed: String)
+  async throws
+{
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "r22f-rename-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let personal = FixtureCoordinator()
+  let (listener, port) = try await listen(personal)
+  defer { listener.cancel() }
+  let queued = try CoordinatorAddress(host: "100.64.1.2")
+  var work = CoordinatorProfile(name: try TagName("Work"), address: queued)
+  work.pin = CoordinatorID(UUID())
+  var paired = CoordinatorProfile(name: try TagName("Personal"), address: queued)
+  paired.pin = personal.id
+  try writePrivately(
+    JSONEncoder().encode(Coordinators.SavedProfiles(profiles: [work, paired])),
+    to: root.appending(path: "Agent/profiles.json"))
+  let queue = HeldQueue(address: queued, coordinator: nil, installation: nil)
+  let note = "Invented note queued for 100.64.1.2:43187"
+  try writePrivately(
+    JSONEncoder().encode([
+      NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: note)
+    ]), to: queue.folder(applicationSupport: root).appending(path: "pending.json"))
+  try queue.record(in: queue.folder(applicationSupport: root))
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: loopback(port))
+  let chat = coordinators.chat
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await personal.stop()
+  }
+  await coordinators.setActive(true)
+  do {
+    try await eventually("Personal connected and the message held") {
+      chat.snapshots[paired.id]?.connection == .connected && chat.held.count == 1
+    }
+    let held = try #require(chat.held.first)
+    await chat.restoreHeld(held)
+    let askedBefore = chat.asking?.id == held.id
+    chat.stopAsking()
+    let target = renamed == "Work" ? work : paired
+    try await coordinators.update(
+      target.id, name: try TagName(renamed == "Work" ? "Office" : "Home"), address: queued)
+    let owner = chat.owner(held).map { chat.name($0) } ?? "nobody"
+    await chat.restoreHeld(held)
+    let askedAfter = chat.asking?.id == held.id && chat.draft.isEmpty
+    let onDisk = try HeldQueue.all(applicationSupport: root).map(\.coordinator)
+    print(
+      "R22F-rename[\(renamed)] asked before=\(askedBefore) after renaming \(renamed): owner=\(owner) asked=\(askedAfter) draft=\(chat.draft.debugDescription) queue on disk bound=\(onDisk.map { $0 != nil })"
+    )
+    #expect(askedBefore, "Restore did not ask with two coordinators paired at the address")
+    #expect(owner == "nobody", "A rename gave the message an owner no socket proved")
+    #expect(askedAfter, "Restore stopped asking after a rename")
+    #expect(onDisk == [nil], "A rename bound the queue on disk")
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
 /// This build ran, and Work paired at the single-address build's address. Then the single-address
 /// build ran again, at port 4002, and queued another message, and this build ran again. That
 /// migration keys its own queue to 4002 and leaves the earlier one as it was. Each held message goes

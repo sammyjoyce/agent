@@ -155,7 +155,9 @@ public final class Coordinators {
   }
 
   /// Probes a new address against the pin before saving anything. A different coordinator
-  /// saves nothing. An unpaired profile pairs at the new address.
+  /// saves nothing. An unpaired profile pairs at the new address. An unchanged address is not
+  /// probed, so held queues there go to the profile's pin only as launch gives them, when it is the
+  /// only one paired there.
   func update(_ id: ProfileID, name: TagName, address: CoordinatorAddress) async throws {
     try await serially {
       guard let index = profiles.firstIndex(where: { $0.id == id }) else { return }
@@ -167,7 +169,8 @@ public final class Coordinators {
       next[index].name = name
       next[index].address = address
       if let found { _ = try admit(found, for: id, in: &next, at: address) }
-      try save(next, answered: found ?? next[index].pin, at: address)
+      let pinned = next.filter { $0.address == address }.compactMap(\.pin)
+      try save(next, answered: found ?? (pinned.count == 1 ? next[index].pin : nil), at: address)
       guard found != nil, profiles[index].pin != nil else { return }
       await chat.detach(id)
       chat.attach(lane(profiles[index]))

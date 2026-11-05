@@ -457,6 +457,31 @@ func notificationForgetReportsAWithdrawalItsCoordinatorNeverConfirmed() async {
   #expect(await registration.forget(unlinked) == false, "No channel confirms nothing")
 }
 
+/// A lane connects and its coordinator's first alert request fails, as when its socket cannot open,
+/// times out or drops. The app keeps running and the channel's error line says why, with alerts on
+/// or off. With alerts off and the coordinator still holding this installation, the failure is the
+/// withdrawal's, and the line says the removal is unconfirmed.
+@Test(arguments: ["alerts on", "alerts off", "alerts off, still registered"]) @MainActor
+func notificationAFailedAlertRequestOnConnectSetsTheChannelsError(_ state: String) async {
+  let profile = ProfileID()
+  let registration = NotificationRegistration(
+    enabled: state == "alerts on", permission: { true }, register: {}, save: { _ in })
+  await registration.connect(
+    NotificationChannel(installation: profile) { request in
+      if state == "alerts off, still registered", case .status = request {
+        return .init(configured: true, registered: true)
+      }
+      throw ConnectionError.closed
+    })
+  let line = registration.status(profile).error
+  print("R22F-alerts[\(state)] survived; error=\(line ?? "nil")")
+  if state == "alerts off, still registered" {
+    #expect(line?.hasPrefix("Notification removal is unconfirmed.") == true)
+  } else {
+    #expect(line == ConnectionError.closed.localizedDescription)
+  }
+}
+
 /// One coordinator's notification controls. After `hold`, the next request waits for `open`.
 private actor HeldControls {
   private(set) var sent: [NotificationRequest] = []
