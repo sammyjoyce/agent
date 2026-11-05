@@ -25,14 +25,17 @@ fn install_switchboard(bin: &Path) -> std::path::PathBuf {
 }
 
 async fn round(config: &[SourceConfig], states: &mut Vec<SourceState>) {
-    let BackgroundResponse::Sources { reads, cursor } =
-        background::execute(BackgroundRequest::PollSources {
-            sources: config.to_vec(),
-            states: states.clone(),
-            cursor: None,
-        })
-        .await
-        .unwrap()
+    let BackgroundResponse::Sources {
+        reads,
+        retired,
+        cursor,
+    } = background::execute(BackgroundRequest::PollSources {
+        sources: config.to_vec(),
+        states: states.clone(),
+        cursor: None,
+    })
+    .await
+    .unwrap()
     else {
         panic!("Source polling returned another background response");
     };
@@ -52,6 +55,7 @@ async fn round(config: &[SourceConfig], states: &mut Vec<SourceState>) {
             None => states.push(admitted),
         }
     }
+    states.retain(|state| !retired.contains(&state.source));
 }
 
 fn state<'a>(states: &'a [SourceState], account: &str) -> Option<&'a SourceState> {

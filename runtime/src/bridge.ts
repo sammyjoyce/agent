@@ -168,6 +168,7 @@ async function openApplication(): Promise<Application> {
         const result = await backgroundCall({ type: "background", request: { type: "poll_sources", sources: settings.sources, states: await sources.states(), cursor } });
         if (result.type !== "background" || result.response.type !== "sources") throw new TaskError("Background source coverage could not be read");
         for (const read of result.response.reads) await sources.admit(read.batch, read.expected_checkpoint);
+        await sources.retire(result.response.retired);
         cursor = result.response.cursor;
       } while (cursor !== null);
     },

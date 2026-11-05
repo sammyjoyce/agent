@@ -100,6 +100,8 @@ pub enum BackgroundResponse {
     },
     Sources {
         reads: Vec<SourceRead>,
+        /// Discovery placeholders this round no longer reports; delete their states.
+        retired: Vec<crate::sources::SourceKey>,
         cursor: Option<SourcePollCursor>,
     },
 }
@@ -237,8 +239,12 @@ pub async fn execute(request: BackgroundRequest) -> Result<BackgroundResponse> {
             states,
             cursor,
         } => {
-            let (reads, cursor) = crate::intake::poll(&sources, &states, cursor).await?;
-            Ok(BackgroundResponse::Sources { reads, cursor })
+            let (reads, retired, cursor) = crate::intake::poll(&sources, &states, cursor).await?;
+            Ok(BackgroundResponse::Sources {
+                reads,
+                retired,
+                cursor,
+            })
         }
     }
 }

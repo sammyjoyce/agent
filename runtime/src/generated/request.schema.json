@@ -251,6 +251,13 @@
                 "$ref": "#/$defs/SourceRead"
               }
             },
+            "retired": {
+              "description": "Discovery placeholders this round no longer reports; delete their states.",
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SourceKey"
+              }
+            },
             "type": {
               "type": "string",
               "const": "sources"
@@ -258,7 +265,8 @@
           },
           "required": [
             "type",
-            "reads"
+            "reads",
+            "retired"
           ]
         }
       ]
