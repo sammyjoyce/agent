@@ -3381,6 +3381,99 @@ func twoQueuesAtOneAddressBindOnOnePairing() async throws {
   await used.stop()
 }
 
+/// Two held queues carry the single-address build's one alert installation, as after opus's round-18
+/// R3 chain: one queued at 100.64.1.2:43187, where Work answers, and one at 4002, where Personal
+/// answers. Both coordinators hold that installation. Each queue binds to its own coordinator, and
+/// each binding's withdrawal goes to that coordinator alone: Personal's confirmation drops only
+/// Personal's record, so while Work answers nothing its record stays, and Work gets its own
+/// withdrawal once it answers.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func eachCoordinatorHoldingTheOldInstallationGetsItsOwnWithdrawal() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "if18-r4-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let work = FixtureCoordinator()
+  let personal = FixtureCoordinator()
+  let installation = UUID().uuidString
+  for fixture in [work, personal] {
+    await fixture.register(installation, token: String(repeating: "ab", count: 32))
+  }
+  let (workListener, workPort) = try await listen(work)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personal)
+  defer { personalListener.cancel() }
+  let first = try CoordinatorAddress(host: "100.64.1.2")
+  let second = try CoordinatorAddress(host: "100.64.1.2", port: 4002)
+  var profiles = [
+    CoordinatorProfile(name: try TagName("Work"), address: first),
+    CoordinatorProfile(name: try TagName("Personal"), address: second),
+  ]
+  profiles[0].pin = work.id
+  profiles[1].pin = personal.id
+  try writePrivately(
+    JSONEncoder().encode(Coordinators.SavedProfiles(profiles: profiles)),
+    to: root.appending(path: "Agent/profiles.json"))
+  for (address, text) in [(first, "m1"), (second, "m4")] {
+    let queue = HeldQueue(address: address, installation: InstallationID(legacy: installation))
+    try writePrivately(
+      JSONEncoder().encode([
+        NativeRequestSubmit(inputId: UUID().uuidString, mode: .steer, text: "\(text): invented")
+      ]), to: queue.folder(applicationSupport: root).appending(path: "pending.json"))
+    try queue.record(in: queue.folder(applicationSupport: root))
+  }
+  let routes = Routes([4002: personalPort])
+  let coordinators = Coordinators(
+    registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+    transport: CoordinatorTransport { address in
+      guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
+      return LineConnection(
+        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+    })
+  struct Saved: Decodable { let withdrawals: [PendingWithdrawal] }
+  func saved() throws -> [String] {
+    let file = root.appending(path: "Agent/profiles.json")
+    return try JSONDecoder().decode(Saved.self, from: Data(contentsOf: file)).withdrawals.map {
+      $0.pin == work.id ? "to Work" : $0.pin == personal.id ? "to Personal" : "?"
+    }
+  }
+  func unregistered(_ fixture: FixtureCoordinator) async -> Int {
+    let controls = await fixture.notificationControls()
+    return controls.filter { if case .unregister = $0 { true } else { false } }.count
+  }
+  @MainActor func stop() async {
+    await coordinators.setActive(false)
+    await work.stop()
+    await personal.stop()
+  }
+  do {
+    let atLaunch = try saved()
+    await coordinators.setActive(true)
+    _ = try await settles { (try? saved()) == ["to Work"] }
+    let workOffline = (
+      saved: try saved(), work: await unregistered(work), personal: await unregistered(personal),
+      workHolds: await work.holds(installation), personalHolds: await personal.holds(installation)
+    )
+    await coordinators.setActive(false)
+    await routes.set([43187: workPort, 4002: personalPort])
+    await coordinators.setActive(true)
+    _ = try await settles { (try? saved())?.isEmpty == true }
+    print(
+      "IF18-R4 saved withdrawals at launch=\(atLaunch) | Work offline: saved=\(workOffline.saved) unregisters Work=\(workOffline.work) Personal=\(workOffline.personal) still held by Work=\(workOffline.workHolds) Personal=\(workOffline.personalHolds) | Work answering: saved=\(try saved()) unregisters Work=\(await unregistered(work)) still held by Work=\(await work.holds(installation))"
+    )
+    #expect(atLaunch.sorted() == ["to Personal", "to Work"])
+    #expect(workOffline.saved == ["to Work"], "Personal's confirmation dropped Work's record")
+    #expect(!workOffline.personalHolds && workOffline.workHolds)
+    #expect(try saved().isEmpty)
+    #expect(await !work.holds(installation), "Work still holds the old installation")
+  } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
 /// Opus's round-18 R2. #9 held the single-address build's note m1, queued for 100.64.1.2:43187, in
 /// the unpaired profile's `Legacy` folder, and this build adopted it. The user pointed that profile
 /// at Personal's address, 4002, and added Work at 43187, which took m1. Work went offline, and the
