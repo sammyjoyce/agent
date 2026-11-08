@@ -45,22 +45,22 @@ func nativeWorkInspectionReadsTheRealCoordinatorAndDetachesWithoutStoppingWork()
     model.attach(Lane(id: profile.profile, session: session))
     await model.setActive(true)
     try await waitFor("Main readiness") { model.connection == .connected }
-    #expect(model.workInspectionSupported)
-    guard case .list(let listing) = try await model.jobs() else {
+    #expect(model.snapshots[profile.profile]?.workInspectionSupported == true)
+    guard case .list(let listing) = try await model.jobs(lane: profile.profile) else {
       Issue.record("Job listing lost its typed diagnostics")
       await model.detach(profile.profile)
       return
     }
     let listed = try #require(listing.jobs.first { $0.job.id == jobID })
     let taskID = try #require(listed.taskId)
-    guard case .detail(let detail) = try await model.jobs(jobID) else {
+    guard case .detail(let detail) = try await model.jobs(jobID, lane: profile.profile) else {
       Issue.record("Job detail lost its typed diagnostics")
       await model.detach(profile.profile)
       return
     }
     #expect(detail.job.taskId == taskID)
     #expect(detail.job.lastRun != nil)
-    let page = try await model.conversations(query: taskID)
+    let page = try await model.conversations(query: taskID, lane: profile.profile)
     let parent = try #require(page.items.first { $0.conversationId == parentID })
     let child = try #require(page.items.first { $0.conversationId == childID })
     #expect(parent.taskId == taskID)
@@ -72,7 +72,7 @@ func nativeWorkInspectionReadsTheRealCoordinatorAndDetachesWithoutStoppingWork()
       let mainOutbox = try? Data(contentsOf: profile.outbox)
       let inspectedModel = ChatModel(inspecting: conversation)
       do {
-        await inspectedModel.connectInspection(using: model)
+        await inspectedModel.connectInspection(using: model, lane: profile.profile)
         let inspector = try #require(inspectedModel.lanes.first?.session)
         try await waitFor("saved work readiness") {
           inspectedModel.connection == .connected
@@ -82,8 +82,8 @@ func nativeWorkInspectionReadsTheRealCoordinatorAndDetachesWithoutStoppingWork()
           inspectedModel.rows.contains {
             $0.row.text == "Retained \(conversation.conversationId) request"
           })
-        #expect(!inspectedModel.workInspectionSupported)
-        #expect(!inspectedModel.settingsSupported)
+        #expect(inspectedModel.snapshots[profile.profile]?.workInspectionSupported == false)
+        #expect(inspectedModel.snapshots[profile.profile]?.settingsSupported == false)
         if conversation.conversationId == parentID {
           let currentRows = Set(inspectedModel.rows.map(\.id))
           await inspectedModel.history(anchorID: nil)
@@ -107,7 +107,7 @@ func nativeWorkInspectionReadsTheRealCoordinatorAndDetachesWithoutStoppingWork()
     }
     // Closing both inspection sockets leaves the independent Main observer and
     // the same read-only job/catalog controls usable.
-    #expect(try await model.conversations(query: taskID).items.count >= 2)
+    #expect(try await model.conversations(query: taskID, lane: profile.profile).items.count >= 2)
     await model.detach(profile.profile)
   } catch {
     await model.detach(profile.profile)

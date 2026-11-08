@@ -3,12 +3,20 @@ import SwiftUI
 
 struct ConversationSettingsView: View {
   let model: ChatModel
+  let lane: ProfileID
+  @State private var busy = false
+  @State private var error: String?
+
+  private var ready: Bool {
+    model.snapshots[lane]?.settingsSupported == true
+      && model.snapshots[lane]?.connection == .connected
+  }
 
   var body: some View {
     Form {
-      if !model.settingsSupported {
+      if model.snapshots[lane]?.settingsSupported != true {
         Text("Conversation settings are not advertised by this connection.")
-      } else if let settings = model.conversationSettings {
+      } else if let settings = model.snapshots[lane]?.settings {
         Section {
           LabeledContent("Configured", value: description(settings.configured.model))
           LabeledContent("Effective", value: settings.effective.map(description) ?? "Unknown")
@@ -80,23 +88,34 @@ struct ConversationSettingsView: View {
             Text("Model capabilities have not been reported.").font(.footnote)
           }
         }
-        .disabled(model.settingsBusy || model.connection != .connected)
-      } else if model.settingsBusy {
+        .disabled(busy || !ready)
+      } else if busy {
         ProgressView("Loading conversation settings")
       }
-      if let error = model.settingsError {
+      if let error {
         Text(error).foregroundStyle(.red).accessibilityIdentifier("conversationSettingsError")
       }
-      Button("Refresh") { Task { await model.refreshSettings() } }
-        .disabled(model.settingsBusy || !model.settingsSupported || model.connection != .connected)
+      Button("Refresh") { Task { await run(nil) } }
+        .disabled(busy || !ready)
     }
-    .navigationTitle("Conversation settings")
-    .task(id: model.settingsSupported && model.connection == .connected) {
-      await model.refreshSettings()
+    .navigationTitle(model.laneTitle("Conversation settings", for: lane))
+    .task(id: ready) { await run(nil) }
+  }
+  /// Reads the settings, or with `change` changes them, once. A read cut off by a reconnect stays
+  /// quiet, since the next connection reads again.
+  private func run(_ change: ConversationChange?) async {
+    guard !busy, ready else { return }
+    busy = true
+    error = nil
+    defer { busy = false }
+    do { try await model.settings(change: change, lane: lane) } catch {
+      guard !Task.isCancelled else { return }
+      if change == nil, case LaneError.interrupted = error { return }
+      self.error = error.localizedDescription
     }
   }
   private func change(_ change: ConversationChange) {
-    Task { await model.refreshSettings(change: change) }
+    Task { await run(change) }
   }
   private func key(_ selection: ModelSelection) -> String {
     "\(selection.provider.rawValue)/\(selection.modelId)"

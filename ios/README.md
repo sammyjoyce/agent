@@ -121,6 +121,8 @@ required for sharing on a phone; an unsigned build does not establish that.
   the same protection, and it keeps the order you saw across a relaunch.
 - The unsent composer saves its note, delivery mode and attachment references
   together. Reopening restores that draft; importing or restoring never sends it.
+  The draft keeps its recipient and restored origin across a relaunch too, and
+  one naming a coordinator no longer saved blocks Send.
   Choosing a command preserves the note and replaces only a known command prefix.
   The composer uses a plain native `UITextView`. Send copies its text and
   clears the visible buffer synchronously, keeping the keyboard active.
@@ -259,6 +261,8 @@ required for sharing on a phone; an unsigned build does not establish that.
   **Retry interrupted run** resumes an execution parked at the restart limit,
   preserving its identity. Conversation inspection includes sub-agents and live
   updates, uses the shared history renderer and never sends or stops work.
+  With two or more coordinators, each coordinator's page under Connection holds
+  its own **Jobs and work** and **Conversation settings**.
 - The top of the chat holds messages that a build without saved coordinators
   queued for the coordinator at its address. Each launch of that build keeps its
   own queue and the address it was queued for, every queue it left is held, and

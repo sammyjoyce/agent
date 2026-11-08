@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -40,6 +41,70 @@ public struct ComposerSubmission: Sendable, Equatable {
   }
 }
 
+/// Where the composer's restored draft came from, and what Restore put in it. The source stays
+/// queued or held until a Send carries that content unchanged to its coordinator, or the user
+/// discards it, so nothing its coordinator did not get is lost.
+public struct RestoredSource: Codable, Sendable, Equatable {
+  public enum Kind: Codable, Sendable, Equatable {
+    case live
+    /// Held from before the update in `queue`.
+    case held(queue: UUID)
+  }
+  /// Its coordinator.
+  public let lane: ProfileID
+  public let item: String
+  public let kind: Kind
+  private let textDigest: String
+  /// The IDs of the file copies Restore put in the composer.
+  public let files: Set<String>
+
+  public init(lane: ProfileID, item: String, kind: Kind, text: String, files: Set<String>) {
+    self.lane = lane
+    self.item = item
+    self.kind = kind
+    textDigest = Self.trimmedDigest(text)
+    self.files = files
+  }
+
+  private static func trimmedDigest(_ text: String) -> String {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return SHA256.hash(data: Data(trimmed.utf8)).map { String(format: "%02x", $0) }.joined()
+  }
+
+  /// True when a Send of `body` with `sentFiles` to `recipients` carries this content unchanged
+  /// to its coordinator, meaning the same text, ignoring surrounding whitespace, and every file
+  /// Restore put in the composer.
+  public func isCarried(
+    by body: String, files sentFiles: [LocalAttachment], to recipients: [ProfileID]
+  ) -> Bool {
+    recipients.contains(lane) && Self.trimmedDigest(body) == textDigest
+      && files.isSubset(of: sentFiles.map(\.id))
+  }
+}
+
+/// Whom an unsent draft is for, by profile ID rather than name, so a rename cannot stale it. It is
+/// saved in the same atomic record as the text, so the two never disagree on disk.
+public struct DraftAddressing: Codable, Sendable, Equatable {
+  /// The one coordinator the draft goes to, or nil for every paired one.
+  public var recipient: ProfileID?
+  /// The coordinator whose restored message the draft holds.
+  public var restoredFrom: ProfileID?
+  /// Whose feed the automatic `/feedback` screenshot shows.
+  public var screenshotOwner: ProfileID?
+  /// The restored original, which a Send that carries it unchanged withdraws.
+  public var source: RestoredSource?
+  public init(
+    recipient: ProfileID? = nil, restoredFrom: ProfileID? = nil, screenshotOwner: ProfileID? = nil,
+    source: RestoredSource? = nil
+  ) {
+    self.recipient = recipient
+    self.restoredFrom = restoredFrom
+    self.screenshotOwner = screenshotOwner
+    self.source = source
+  }
+  public var isEmpty: Bool { self == DraftAddressing() }
+}
+
 public struct ComposerDraft: Sendable, Equatable {
   public var text: String
   public var mode: InputMode
@@ -48,10 +113,12 @@ public struct ComposerDraft: Sendable, Equatable {
   public var feedbackScreenshotID: String?
   public var composerID: UUID?
   public var submission: ComposerSubmission?
+  public var addressing: DraftAddressing
   public init(
     text: String = "", mode: InputMode = .steer, attachments: [LocalAttachment] = [],
     consumedTransfers: Set<UUID> = [], feedbackScreenshotID: String? = nil,
-    composerID: UUID? = nil, submission: ComposerSubmission? = nil
+    composerID: UUID? = nil, submission: ComposerSubmission? = nil,
+    addressing: DraftAddressing = DraftAddressing()
   ) {
     self.text = text
     self.mode = mode
@@ -60,6 +127,7 @@ public struct ComposerDraft: Sendable, Equatable {
     self.feedbackScreenshotID = feedbackScreenshotID
     self.composerID = composerID
     self.submission = submission
+    self.addressing = addressing
   }
 }
 
@@ -83,6 +151,8 @@ public actor ComposerDraftStore {
     let feedbackScreenshotID: String?
     let composerID: UUID?
     let submission: Submission?
+    /// Absent from records saved before addressing was stored, and whenever it is empty.
+    let addressing: DraftAddressing?
   }
   private static let maximumRecordBytes = 512 * 1024
   private let url: URL
@@ -134,13 +204,18 @@ public actor ComposerDraftStore {
     if let submitted, !owned, !submitted.text.isEmpty {
       text = submitted.text + (text.isEmpty ? "" : "\n\n" + text)
     }
+    let screenshot = record.feedbackScreenshotID ?? (owned ? nil : submitted?.feedbackScreenshotID)
+    var addressing = record.addressing ?? DraftAddressing()
+    // An outbox holds the Send this record was saved for, and whom that draft was for went with
+    // it. Only a draft begun since keeps an address.
+    if owned, record.text.isEmpty, record.attachments.isEmpty { addressing = DraftAddressing() }
+    if screenshot == nil { addressing.screenshotOwner = nil }
     return (
       ComposerDraft(
         text: text, mode: record.mode, attachments: files,
         consumedTransfers: record.consumedTransfers,
-        feedbackScreenshotID: record.feedbackScreenshotID
-          ?? (owned ? nil : submitted?.feedbackScreenshotID),
-        composerID: record.composerID), record.revision, retired
+        feedbackScreenshotID: screenshot, composerID: record.composerID, addressing: addressing),
+      record.revision, retired
     )
   }
 
@@ -168,7 +243,7 @@ public actor ComposerDraftStore {
       revision: revision, text: draft.text, mode: draft.mode,
       attachments: draft.attachments.map(\.reference), consumedTransfers: draft.consumedTransfers,
       feedbackScreenshotID: draft.feedbackScreenshotID, composerID: draft.composerID,
-      submission: submission)
+      submission: submission, addressing: draft.addressing.isEmpty ? nil : draft.addressing)
     let data = try JSONEncoder().encode(record)
     guard data.count <= Self.maximumRecordBytes else { throw ComposerDraftError.tooLarge }
     let directory = url.deletingLastPathComponent()

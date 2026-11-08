@@ -203,6 +203,10 @@ public actor CoordinatorSession {
   private var ledger: Ledger
   /// Each visible row's receive stamp, kept by row ID so a row that changes key keeps it.
   private var rowStamps: [String: TimeInterval] = [:]
+  private struct WeakSession { weak var session: CoordinatorSession? }
+  /// The inspections this session minted. Their screens own them, and this session ends them.
+  private var inspectors: [WeakSession] = []
+  private var liveInspectors: [CoordinatorSession] { inspectors.compactMap { $0.session } }
 
   /// Every socket reaches `address` and must name `pin`. A profile without a pin has no session.
   /// Every session in the process shares `stamps`.
@@ -215,12 +219,17 @@ public actor CoordinatorSession {
       dialer: CoordinatorDialer(address: address, pin: pin, transport: transport), stamps: stamps,
       inspecting: nil)
   }
-  /// A read-only session for one saved conversation on this session's coordinator. Its sockets
-  /// prove the same pinned coordinator, and it never reads or writes the profile's outbox or
-  /// ledger.
-  public nonisolated func inspector(_ conversation: SavedConversation) -> CoordinatorSession {
-    CoordinatorSession(
+  /// A read-only session for one saved conversation on this session's coordinator, or nil once
+  /// this session is retired or is itself an inspection. Its sockets prove the same pinned
+  /// coordinator, and it never reads or writes the profile's outbox or ledger. This session's
+  /// connect, disconnect and retire carry over to it.
+  public func inspector(_ conversation: SavedConversation) -> CoordinatorSession? {
+    guard !retired, inspectedConversation == nil else { return nil }
+    inspectors.removeAll { $0.session == nil }
+    let inspector = CoordinatorSession(
       directory: directory, dialer: dialer, stamps: stamps, inspecting: conversation)
+    inspectors.append(WeakSession(session: inspector))
+    return inspector
   }
   private init(
     directory: ProfileDirectory, dialer: CoordinatorDialer, stamps: StampSource,
@@ -256,7 +265,10 @@ public actor CoordinatorSession {
     guard self.generation == generation else { return }
     identityFailure = nil
     snapshot.answeredAs = nil
-    guard loadOutbox() else { return }
+    guard loadOutbox() else {
+      await connectInspections(generation)
+      return
+    }
     if let newest = pending.map(\.queuedAt).max() { stamps.seed(newest) }
     // The outbox belongs to this profile and every socket proves its pinned coordinator,
     // so these IDs reach only the coordinator they were queued for.
@@ -267,6 +279,12 @@ public actor CoordinatorSession {
     stampRows()
     snapshot.error = nil
     observation = Task { [weak self] in await self?.observe(generation: generation) }
+    await connectInspections(generation)
+  }
+  private func connectInspections(_ generation: UUID) async {
+    for inspector in liveInspectors where self.generation == generation {
+      await inspector.connect()
+    }
   }
 
   /// Reads the outbox, once per session. False while it cannot be read, with the reason in the
@@ -290,20 +308,29 @@ public actor CoordinatorSession {
     return true
   }
 
-  public func disconnect() async { await disconnect(generation: UUID()) }
+  public func disconnect() async {
+    let generation = UUID()
+    await disconnect(generation: generation)
+    for inspector in liveInspectors where self.generation == generation {
+      await inspector.disconnect()
+    }
+  }
 
   /// Ends this session when its lane leaves the feed, before its profile's files may be deleted.
   /// It disconnects, and whoever still holds it, it never connects, sends or writes its
-  /// directory again. Returns, once, the started inputs it cancels before they left the phone:
-  /// durable ones waiting for this lane, and any an exchange had not written yet. A staged input
-  /// that was not started stays its sender's: `start` then answers `.retired`, and `unstage`
-  /// leaves it to the profile's next session.
+  /// directory again. The inspections it minted end with it. Returns, once, the started inputs
+  /// it cancels before they left the phone: durable ones waiting for this lane, and any an
+  /// exchange had not written yet. A staged input that was not started stays its sender's:
+  /// `start` then answers `.retired`, and `unstage` leaves it to the profile's next session.
   @discardableResult public func retire() async -> [StagedInput] {
     guard !retired else { return [] }
     retired = true
+    let satellites = liveInspectors
+    inspectors = []
     let waiting = pending.filter { unsent[$0.request.inputId] == .waiting }.map { staged($0) }
     let cancelled = waiting + unwritten.compactMap(\.started)
-    await disconnect()
+    await disconnect(generation: UUID())
+    for inspector in satellites { await inspector.retire() }
     return cancelled
   }
   private func staged(_ item: OutboxItem) -> StagedInput {
@@ -761,7 +788,8 @@ public actor CoordinatorSession {
             throw CoordinatorRejection(message: value.message, code: value.code)
           }
           if case .disconnect = event {
-            await disconnect()
+            // `/exit` ends this session's sockets, not its inspections'.
+            await disconnect(generation: UUID())
             return
           }
           if case .ready(let value) = event {
@@ -927,7 +955,7 @@ public actor CoordinatorSession {
         guard self.generation == generation else { break }
         if case .done = event { break }
         if case .disconnect = event {
-          await disconnect()
+          await disconnect(generation: UUID())
           return nil
         }
         // The observer alone owns live transcript presentation. Action

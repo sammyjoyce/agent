@@ -759,8 +759,10 @@ import UniformTypeIdentifiers
     let model = ChatModel(draftStore: files, persistence: ComposerDraftStore(url: url))
     await model.restoreDraft()
     let capture = try png()
+    var profile: CoordinatorProfile?
     // A read-only profile refuses each Send, as a failed admission does.
     try await withConnectedCoordinator(model) { _, directory in
+      profile = model.profiles[0]
       try await withReadOnlyProfile(directory) {
         model.draft = "/feedback Preserve this exact capture"
         await model.send(screenshot: { capture })
@@ -773,7 +775,7 @@ import UniformTypeIdentifiers
     let diagnostics = try #require(original.last)
     let log = try Data(contentsOf: diagnostics.url)
     let reopened = ChatModel(draftStore: files, persistence: ComposerDraftStore(url: url))
-    try await withConnectedCoordinator(reopened) { _, directory in
+    try await withConnectedCoordinator(reopened, profile: profile) { _, directory in
       await reopened.restoreDraft()
       try await withReadOnlyProfile(directory) {
         await reopened.send(screenshot: {

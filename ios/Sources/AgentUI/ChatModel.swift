@@ -59,36 +59,6 @@ struct HeldMessage: Identifiable, Equatable {
   var id: String { item.id }
 }
 
-/// Where the composer's restored draft came from, and what Restore put in it. The source stays
-/// queued or held until a Send carries that content unchanged to its coordinator, or the user
-/// discards it, so nothing its coordinator did not get is lost.
-struct RestoredSource: Equatable {
-  enum Kind: Equatable {
-    case live
-    /// Held from before the update in `queue`.
-    case held(queue: UUID)
-  }
-  /// Its coordinator.
-  let lane: ProfileID
-  let item: String
-  let kind: Kind
-  let text: String
-  /// The IDs of the file copies Restore put in the composer.
-  let files: Set<String>
-
-  /// True when a Send of `body` with `sent` files to `recipients` carries this content unchanged to
-  /// its coordinator, meaning the same text, ignoring surrounding whitespace, and every file Restore
-  /// put in the composer.
-  func isCarried(by body: String, files sent: [LocalAttachment], to recipients: [ProfileID])
-    -> Bool
-  {
-    recipients.contains(lane)
-      && body.trimmingCharacters(in: .whitespacesAndNewlines)
-        == text.trimmingCharacters(in: .whitespacesAndNewlines)
-      && files.isSubset(of: sent.map(\.id))
-  }
-}
-
 /// The one feed and the one composer for every saved coordinator.
 @MainActor @Observable
 final class ChatModel {
@@ -112,16 +82,13 @@ final class ChatModel {
     didSet { transcriptItems = TranscriptItem.grouped(rows, preserving: transcriptItems) }
   }
   private(set) var transcriptItems: [TranscriptItem] = []
+  /// The feed's aggregate: the best state any lane is in. One coordinator's own state is its
+  /// snapshot's.
   var connection: ConnectionState = .disconnected
+  /// The model of the first lane that has reported, the header's label with one coordinator saved.
   var model = "Unknown"
   var commands: [SlashCommand] = []
-  private(set) var settingsSupported = false
-  private(set) var workInspectionSupported = false
   let inspectedConversation: SavedConversation?
-  private(set) var conversationSettings: NativeSettingsSnapshot?
-  private(set) var settingsBusy = false
-  var settingsError: String?
-  @ObservationIgnored private var settingsRequest: UUID?
   var busy = false
   var canLoadEarlier = false
   var loadingHistory = false
@@ -145,7 +112,7 @@ final class ChatModel {
   var profiles: [CoordinatorProfile] = [] { didSet { endAnsweredQuestion() } }
   /// The one coordinator the draft goes to, or nil for every paired one. While it is set, the
   /// draft is never read for tags.
-  var recipient: ProfileID?
+  var recipient: ProfileID? { didSet { scheduleDraftSave() } }
   /// The latest tag that became the chip, so the composer moves the caret back by exactly what
   /// the draft lost.
   private(set) var promotion: Promotion?
@@ -258,12 +225,15 @@ final class ChatModel {
   /// The coordinator whose restored message the draft holds. While it is set, no tag in the draft
   /// is read and the draft stays that coordinator's, however it is edited. Only clearing the draft
   /// ends it, and the field's Undo never reaches back past that.
-  private(set) var restoredFrom: ProfileID?
+  private(set) var restoredFrom: ProfileID? { didSet { scheduleDraftSave() } }
   /// The original Restore copied into the draft, until the next Send or until the composer is
   /// emptied. A Send that carries it unchanged to its coordinator withdraws it.
-  private(set) var source: RestoredSource?
+  private(set) var source: RestoredSource? { didSet { scheduleDraftSave() } }
   /// Each lane's latest published state.
   private(set) var snapshots: [ProfileID: ChatSnapshot] = [:]
+  /// Bumped when a lane's session starts to retire and whenever a session attaches. Never reset,
+  /// so a value is never reused.
+  private(set) var laneEpochs: [ProfileID: Int] = [:]
   /// One coordinator's source checks from its current connection, and the warning their gaps raise.
   struct SourceReport: Identifiable, Equatable {
     let id: ProfileID
@@ -347,7 +317,8 @@ final class ChatModel {
   private var currentDraft: ComposerDraft {
     var value = ComposerDraft(
       text: draft, mode: mode, attachments: attachments, consumedTransfers: consumedTransfers,
-      composerID: composerID)
+      composerID: composerID,
+      addressing: DraftAddressing(recipient: recipient, restoredFrom: restoredFrom, source: source))
     if case .pending(let text, let submission) = admission {
       if let submission {
         let submittedIDs = Set(submission.attachments.map(\.id))
@@ -358,6 +329,10 @@ final class ChatModel {
       }
     }
     value.feedbackScreenshotID = value.attachments.first { screenshotOwners[$0.id] != nil }?.id
+    // A screenshot the pending Send holds comes back with the text if the outbox never takes it,
+    // so its owner is saved too.
+    let shot = value.feedbackScreenshotID ?? value.submission?.feedbackScreenshotID
+    value.addressing.screenshotOwner = shot.flatMap { screenshotOwners[$0] }
     return value
   }
   private func scheduleDraftSave() {
@@ -416,15 +391,10 @@ final class ChatModel {
       mode = restored.draft.mode
       attachments = restored.draft.attachments
       consumedTransfers = restored.draft.consumedTransfers
-      // The saved draft marks the automatic screenshot but not whose feed it shows. With one
-      // coordinator saved it can only be that one's. Otherwise it belongs to none, so Send refuses
-      // it for every coordinator until it is removed.
-      screenshotOwners = [:]
-      if let id = restored.draft.feedbackScreenshotID {
-        screenshotOwners[id] = profiles.count == 1 ? profiles[0].id : ProfileID()
-      }
       composerID = restored.draft.composerID ?? composerID
       retiredDraftFiles = restored.retiredAttachments
+      // Last, since the text's and files' didSet drops a restored source while both are empty.
+      adopt(restored.draft)
       persistentRevision = restored.revision
       changingDraft = false
       draftReady = true
@@ -436,6 +406,26 @@ final class ChatModel {
       }
       await receiveSharedDrafts()
     } catch { draftError = error.localizedDescription }
+  }
+  /// Restores whom the saved draft is for. A recipient or source coordinator not saved now, whether
+  /// removed earlier or not loaded, is marked removed, so Send blocks instead of reaching another.
+  private func adopt(_ saved: ComposerDraft) {
+    let addressing = saved.addressing
+    let named = [addressing.recipient, addressing.restoredFrom].compactMap { $0 }
+    for id in named where !profiles.contains(where: { $0.id == id }) {
+      removed[id] = removed[id] ?? "A coordinator"
+    }
+    screenshotOwners = [:]
+    // Only a draft saved before owners were stored lacks one. With one coordinator saved it can
+    // only be that one's. Otherwise it belongs to none, so Send refuses it for every coordinator
+    // until the screenshot is removed.
+    if let id = saved.feedbackScreenshotID {
+      screenshotOwners[id] =
+        addressing.screenshotOwner ?? (profiles.count == 1 ? profiles[0].id : ProfileID())
+    }
+    source = addressing.source
+    restoredFrom = addressing.restoredFrom
+    recipient = addressing.recipient
   }
   func receiveSharedDrafts() async {
     guard draftReady, !preparingAttachments, !admitting, let sharedInbox, persistence != nil else {
@@ -501,6 +491,18 @@ final class ChatModel {
 
   func paired(_ id: ProfileID) -> Bool { lanes.first { $0.id == id }?.session != nil }
 
+  func laneEpoch(_ id: ProfileID) -> Int { laneEpochs[id] ?? 0 }
+
+  /// For the UI: whether `id` is saved and not being removed.
+  func isSaved(_ id: ProfileID) -> Bool {
+    removed[id] == nil && profiles.contains { $0.id == id }
+  }
+
+  /// `base` led by the coordinator's name while several are saved, as in "Work · Jobs and work".
+  func laneTitle(_ base: String, for id: ProfileID) -> String {
+    multiple ? "\(name(id)) · \(base)" : base
+  }
+
   /// A coordinator's line under the feed and in Settings. When its address answers as another
   /// saved coordinator, the line names that one and points to this one's address, since editing
   /// it keeps the queue that Remove would delete.
@@ -528,6 +530,7 @@ final class ChatModel {
     }
     if let session = lane.session {
       snapshots[lane.id] = nil
+      laneEpochs[lane.id, default: 0] += 1
       refresh()
       observations[lane.id] = observe(session, lane: lane.id)
       if let inputs = unstaging.removeValue(forKey: lane.id) {
@@ -540,6 +543,9 @@ final class ChatModel {
   /// retired, so nothing connects, sends or writes the profile's directory through it again. The
   /// composer names what the retirement cancelled before it left the phone.
   func detach(_ id: ProfileID) async {
+    if lanes.contains(where: { $0.id == id && $0.session != nil }) {
+      laneEpochs[id, default: 0] += 1
+    }
     let cancelled = await lanes.first { $0.id == id }?.session?.retire() ?? []
     if let index = lanes.firstIndex(where: { $0.id == id }) {
       let lane = lanes.remove(at: index)
@@ -594,28 +600,44 @@ final class ChatModel {
 
   private func connected(_ id: ProfileID) -> Bool { snapshots[id]?.connection == .connected }
 
-  // MARK: - Conversation settings and Jobs and work
+  // MARK: - Conversation settings and Jobs and work, each on one coordinator
 
-  /// The lane conversation settings, jobs and inspections reach. With several coordinators saved
-  /// there is none, so a settings change or a job retry never goes to a coordinator the user did
-  /// not choose.
-  private var soleLane: Lane? {
-    guard !multiple, lanes.count == 1, lanes.first?.session != nil else { return nil }
-    return lanes.first
+  /// The one way a lane control reaches a session. It runs `run` once and retries nothing, and
+  /// nothing comes back from a session that changed under the call.
+  func onLane<T>(_ id: ProfileID, _ run: (CoordinatorSession) async throws -> T) async throws -> T {
+    if let name = removed[id] { throw LaneError.gone(name) }
+    guard let lane = lanes.first(where: { $0.id == id }) else { throw LaneError.gone(name(id)) }
+    guard let session = lane.session else { throw LaneError.notPaired(name(id)) }
+    let epoch = laneEpoch(id)
+    let value: T
+    do { value = try await run(session) } catch {
+      if let name = removed[id] { throw LaneError.gone(name) }
+      // A session throws CancellationError when its connection is cut mid-request. Only this
+      // task's own cancellation stays one.
+      if laneEpoch(id) != epoch || (error is CancellationError && !Task.isCancelled) {
+        throw LaneError.interrupted(name(id))
+      }
+      throw error
+    }
+    guard laneEpoch(id) == epoch else { throw LaneError.interrupted(name(id)) }
+    return value
   }
-  /// Opens this inspection on `owner`'s coordinator, over a read-only session of its own.
-  func connectInspection(using owner: ChatModel) async {
-    guard let conversation = inspectedConversation, lanes.isEmpty, let lane = owner.soleLane,
-      let inspector = lane.session?.inspector(conversation)
-    else {
+  /// Opens this inspection on `owner`'s coordinator `id`, over a read-only session that the
+  /// coordinator's own session mints and ends.
+  func connectInspection(using owner: ChatModel, lane id: ProfileID) async {
+    guard let conversation = inspectedConversation, lanes.isEmpty else {
       failure = ConnectionError.closed.localizedDescription
       return
     }
-    profiles = owner.profiles
-    lanes = [Lane(id: lane.id, session: inspector)]
-    snapshots[lane.id] = nil
-    observations[lane.id] = observe(inspector, lane: lane.id)
-    await inspector.connect()
+    do {
+      let minted = try await owner.onLane(id) { await $0.inspector(conversation) }
+      guard let inspector = minted else { throw ConnectionError.closed }
+      profiles = owner.profiles.filter { $0.id == id }
+      lanes = [Lane(id: id, session: inspector)]
+      snapshots[id] = nil
+      observations[id] = observe(inspector, lane: id)
+      if owner.active { await inspector.connect() }
+    } catch { failure = error.localizedDescription }
   }
   /// Keeps an inspection connected until the task that owns it is cancelled.
   func runUntilCancelled() async {
@@ -628,43 +650,21 @@ final class ChatModel {
     connection = .disconnected
     for session in sessions { await session.retire() }
   }
-  func jobs(_ id: String? = nil) async throws -> NativeJobStatus {
-    guard let session = soleLane?.session else { throw ConnectionError.closed }
-    return try await session.jobs(id)
+  func jobs(_ id: String? = nil, lane: ProfileID) async throws -> NativeJobStatus {
+    try await onLane(lane) { try await $0.jobs(id) }
   }
-  func retryJob(_ id: String) async throws -> ScheduledJobStatus {
-    guard let session = soleLane?.session else { throw ConnectionError.closed }
-    return try await session.retryJob(id)
+  func retryJob(_ id: String, lane: ProfileID) async throws -> ScheduledJobStatus {
+    try await onLane(lane) { try await $0.retryJob(id) }
   }
-  func conversations(query: String = "", cursor: String? = nil) async throws
+  func conversations(query: String = "", cursor: String? = nil, lane: ProfileID) async throws
     -> NativeEventConversations
   {
-    guard let session = soleLane?.session else { throw ConnectionError.closed }
-    return try await session.conversations(query: query, cursor: cursor)
+    try await onLane(lane) { try await $0.conversations(query: query, cursor: cursor) }
   }
-  func refreshSettings(change: ConversationChange? = nil) async {
-    guard !settingsBusy, settingsSupported, let session = soleLane?.session,
-      connection == .connected
-    else { return }
-    let id = UUID()
-    settingsRequest = id
-    settingsBusy = true
-    settingsError = nil
-    defer {
-      if settingsRequest == id {
-        settingsRequest = nil
-        settingsBusy = false
-      }
-    }
-    do {
-      let settings = try await session.settings(change: change)
-      guard soleLane?.session === session, !Task.isCancelled else { return }
-      conversationSettings = settings
-    } catch {
-      if soleLane?.session === session, !(error is CancellationError) {
-        settingsError = error.localizedDescription
-      }
-    }
+  /// Reads the lane's conversation settings, or changes them. The value lands in the lane's
+  /// snapshot through its session's own publish.
+  func settings(change: ConversationChange? = nil, lane: ProfileID) async throws {
+    _ = try await onLane(lane) { try await $0.settings(change: change) }
   }
 
   // MARK: - Addressing
@@ -1301,10 +1301,6 @@ final class ChatModel {
         all.contains { $0.connection == state }
       } ?? .disconnected
     model = all.first?.model ?? "Unknown"
-    let sole = soleLane.flatMap { snapshots[$0.id] }
-    settingsSupported = sole?.settingsSupported ?? false
-    workInspectionSupported = sole?.workInspectionSupported ?? false
-    conversationSettings = sole?.settings
     busy = all.contains(where: \.busy)
     var usages: Set<String> = []
     commands = all.flatMap(\.commands).filter { usages.insert($0.usage).inserted }
