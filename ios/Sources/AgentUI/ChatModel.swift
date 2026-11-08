@@ -58,36 +58,6 @@ struct HeldMessage: Identifiable, Equatable {
   var id: String { item.id }
 }
 
-/// Where the composer's restored draft came from, and what Restore put in it. The source stays
-/// queued or held until a Send carries that content unchanged to its coordinator, or the user
-/// discards it, so nothing its coordinator did not get is lost.
-struct RestoredSource: Equatable {
-  enum Kind: Equatable {
-    case live
-    /// Held from before the update in `queue`.
-    case held(queue: UUID)
-  }
-  /// Its coordinator.
-  let lane: ProfileID
-  let item: String
-  let kind: Kind
-  let text: String
-  /// The IDs of the file copies Restore put in the composer.
-  let files: Set<String>
-
-  /// True when a Send of `body` with `sent` files to `recipients` carries this content unchanged to
-  /// its coordinator, meaning the same text, ignoring surrounding whitespace, and every file Restore
-  /// put in the composer.
-  func isCarried(by body: String, files sent: [LocalAttachment], to recipients: [ProfileID])
-    -> Bool
-  {
-    recipients.contains(lane)
-      && body.trimmingCharacters(in: .whitespacesAndNewlines)
-        == text.trimmingCharacters(in: .whitespacesAndNewlines)
-      && files.isSubset(of: sent.map(\.id))
-  }
-}
-
 /// The one feed and the one composer for every saved coordinator.
 @MainActor @Observable
 final class ChatModel {
@@ -125,7 +95,7 @@ final class ChatModel {
   var profiles: [CoordinatorProfile] = [] { didSet { endAnsweredQuestion() } }
   /// The one coordinator the draft goes to, or nil for every paired one. While it is set, the
   /// draft is never read for tags.
-  var recipient: ProfileID?
+  var recipient: ProfileID? { didSet { scheduleDraftSave() } }
   /// The latest tag that became the chip, so the composer moves the caret back by exactly what
   /// the draft lost.
   private(set) var promotion: Promotion?
@@ -237,10 +207,10 @@ final class ChatModel {
   /// The coordinator whose restored message the draft holds. While it is set, no tag in the draft
   /// is read and the draft stays that coordinator's, however it is edited. Only clearing the draft
   /// ends it, and the field's Undo never reaches back past that.
-  private(set) var restoredFrom: ProfileID?
+  private(set) var restoredFrom: ProfileID? { didSet { scheduleDraftSave() } }
   /// The original Restore copied into the draft, until the next Send or until the composer is
   /// emptied. A Send that carries it unchanged to its coordinator withdraws it.
-  private(set) var source: RestoredSource?
+  private(set) var source: RestoredSource? { didSet { scheduleDraftSave() } }
   /// Each lane's latest published state.
   private(set) var snapshots: [ProfileID: ChatSnapshot] = [:]
   /// Bumped when a lane's session starts to retire and whenever a session attaches. Never reset,
@@ -308,9 +278,13 @@ final class ChatModel {
   }
 
   private var currentDraft: ComposerDraft {
-    ComposerDraft(
+    let shot = attachments.first { screenshotOwners[$0.id] != nil }
+    return ComposerDraft(
       text: draft, mode: mode, attachments: attachments, consumedTransfers: consumedTransfers,
-      feedbackScreenshotID: attachments.first { screenshotOwners[$0.id] != nil }?.id)
+      feedbackScreenshotID: shot?.id,
+      addressing: DraftAddressing(
+        recipient: recipient, restoredFrom: restoredFrom,
+        screenshotOwner: shot.flatMap { screenshotOwners[$0.id] }, source: source))
   }
   private func scheduleDraftSave() {
     guard draftReady, !changingDraft, let persistence else { return }
@@ -355,13 +329,8 @@ final class ChatModel {
       mode = restored.draft.mode
       attachments = restored.draft.attachments
       consumedTransfers = restored.draft.consumedTransfers
-      // The saved draft marks the automatic screenshot but not whose feed it shows. With one
-      // coordinator saved it can only be that one's. Otherwise it belongs to none, so Send refuses
-      // it for every coordinator until it is removed.
-      screenshotOwners = [:]
-      if let id = restored.draft.feedbackScreenshotID {
-        screenshotOwners[id] = profiles.count == 1 ? profiles[0].id : ProfileID()
-      }
+      // Last, since the text's and files' didSet drops a restored source while both are empty.
+      adopt(restored.draft)
       persistentRevision = restored.revision
       changingDraft = false
       draftReady = true
@@ -372,6 +341,26 @@ final class ChatModel {
       }
       await receiveSharedDrafts()
     } catch { draftError = error.localizedDescription }
+  }
+  /// Restores whom the saved draft is for. A recipient or source coordinator not saved now, whether
+  /// removed earlier or not loaded, is marked removed, so Send blocks instead of reaching another.
+  private func adopt(_ saved: ComposerDraft) {
+    let addressing = saved.addressing
+    let named = [addressing.recipient, addressing.restoredFrom].compactMap { $0 }
+    for id in named where !profiles.contains(where: { $0.id == id }) {
+      removed[id] = removed[id] ?? "A coordinator"
+    }
+    screenshotOwners = [:]
+    // Only a draft saved before owners were stored lacks one. With one coordinator saved it can
+    // only be that one's. Otherwise it belongs to none, so Send refuses it for every coordinator
+    // until the screenshot is removed.
+    if let id = saved.feedbackScreenshotID {
+      screenshotOwners[id] =
+        addressing.screenshotOwner ?? (profiles.count == 1 ? profiles[0].id : ProfileID())
+    }
+    source = addressing.source
+    restoredFrom = addressing.restoredFrom
+    recipient = addressing.recipient
   }
   func receiveSharedDrafts() async {
     guard draftReady, !preparingAttachments, !admitting, let sharedInbox, persistence != nil else {

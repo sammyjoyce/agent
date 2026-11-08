@@ -645,15 +645,17 @@ func withCoordinator(
 /// Saves one coordinator for `model` on a loopback fixture and connects it as the app does, so a
 /// Send reaches it. The lane is detached after `body`.
 @MainActor func withConnectedCoordinator(
-  _ model: ChatModel, _ body: (FixtureCoordinator, ProfileDirectory) async throws -> Void
+  _ model: ChatModel, profile: CoordinatorProfile? = nil,
+  _ body: (FixtureCoordinator, ProfileDirectory) async throws -> Void
 ) async throws {
   let fixture = FixtureCoordinator()
   let (listener, port) = try await listen(fixture)
   defer { listener.cancel() }
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let profile = CoordinatorProfile(
+  let fresh = CoordinatorProfile(
     name: try TagName("Work"), address: try CoordinatorAddress(host: "100.64.1.2"))
+  let profile = profile ?? fresh
   let directory = ProfileDirectory(profile.id, applicationSupport: root, caches: root)
   model.profiles = [profile]
   model.attach(
