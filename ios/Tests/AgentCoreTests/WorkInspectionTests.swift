@@ -310,9 +310,12 @@ private func inspectionJob(
           try await Task.sleep(for: .milliseconds(20))
         }
         #expect(await model.snapshots[session.profile]?.settings != nil)
-        try await Self.captureWork(
-          NavigationStack { ConversationSettingsView(model: model, lane: session.profile) },
-          name: "connected-conversation-settings")
+        let lane = session.profile
+        try await Task { @MainActor in
+          try await Self.captureWork(
+            NavigationStack { ConversationSettingsView(model: model, lane: lane) },
+            name: "connected-conversation-settings")
+        }.value
         #expect(await fixture.count() == 0)
         await model.detach(session.profile)
       }
