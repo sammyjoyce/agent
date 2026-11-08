@@ -658,6 +658,13 @@ final class HistoryInteractionTests: XCTestCase {
     app.descendants(matching: .any).matching(identifier: "Message the coordinator").firstMatch
   }
 
+  private func feedButton(_ kind: String, row: String, app: XCUIApplication) -> XCUIElement {
+    app.buttons.matching(
+      NSPredicate(
+        format: "identifier BEGINSWITH %@ AND identifier ENDSWITH %@", "\(kind):", "/\(row)")
+    ).firstMatch
+  }
+
   func testShareExtensionSavesAnUnsentDraftAndHostImportsItOnceAfterRelaunch() async throws {
     let text = "Selected content for the unsent shared draft."
     let app = try await launchMessages([
@@ -853,14 +860,14 @@ final class HistoryInteractionTests: XCTestCase {
             role: .tool, text: output.stdout,
             tool: .init(callId: "shell-card", name: "exec", status: .finished))
         ], toolDetails: ["shell-card": details], appearance: appearance)
-      let group = app.buttons["activity:tool:shell-card"]
+      let group = feedButton("activity", row: "tool:shell-card", app: app)
       XCTAssertTrue(group.waitForExistence(timeout: 5), app.debugDescription)
       let collapsed = XCTAttachment(screenshot: app.screenshot())
       collapsed.name = "native-shell-collapsed-\(appearance)"
       collapsed.lifetime = .keepAlways
       add(collapsed)
       group.tap()
-      let command = app.buttons["activity-item:tool:shell-card"]
+      let command = feedButton("activity-item", row: "tool:shell-card", app: app)
       XCTAssertTrue(command.waitForExistence(timeout: 3), app.debugDescription)
       command.tap()
       let success = app.staticTexts["Success"]
@@ -907,7 +914,7 @@ final class HistoryInteractionTests: XCTestCase {
         continuation: false, entryId: "2", finalChunk: true, role: .thinking,
         text: "Second supplied summary.\n\nNo hidden thinking is fetched."),
     ])
-    let group = app.buttons["activity:entry:1:0"]
+    let group = feedButton("activity", row: "entry:1:0", app: app)
     XCTAssertTrue(group.waitForExistence(timeout: 5))
     group.tap()
     XCTAssertTrue(app.staticTexts["Every provider-supplied line stays visible."].exists)
@@ -1169,11 +1176,7 @@ final class HistoryInteractionTests: XCTestCase {
       transcript.swipeDown(velocity: .fast)
     }
     try await eventually { await peer.cursors() == ["one"] }
-    // Feed row IDs carry the coordinator's profile ID: `activity:<profile>/tool:call-75`.
-    let group = app.buttons.matching(
-      NSPredicate(
-        format: "identifier BEGINSWITH 'activity:' AND identifier ENDSWITH '/tool:call-75'")
-    ).firstMatch
+    let group = feedButton("activity", row: "tool:call-75", app: app)
     XCTAssertTrue(group.waitForExistence(timeout: 3))
     XCTAssertTrue(group.isHittable)
     let anchor = group.frame
