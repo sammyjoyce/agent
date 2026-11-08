@@ -541,7 +541,7 @@ final class ChatModel {
   /// Opens this inspection on `owner`'s coordinator, over a read-only session of its own.
   func connectInspection(using owner: ChatModel) async {
     guard let conversation = inspectedConversation, lanes.isEmpty, let lane = owner.soleLane,
-      let inspector = lane.session?.inspector(conversation)
+      let inspector = await lane.session?.inspector(conversation)
     else {
       failure = ConnectionError.closed.localizedDescription
       return

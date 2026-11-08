@@ -35,6 +35,9 @@ actor FixtureCoordinator {
   nonisolated var closedSettings: AsyncStream<Void> { settingsClosed.stream }
   private let inputsObserved = AsyncStream<NativeRequestSubmit>.makeStream()
   nonisolated var observedInputs: AsyncStream<NativeRequestSubmit> { inputsObserved.stream }
+  private let inspectionsClosed = AsyncStream<String>.makeStream()
+  /// The conversation ID of each inspection socket the phone closed.
+  nonisolated var closedInspections: AsyncStream<String> { inspectionsClosed.stream }
   func advertiseSettings(_ value: Bool?) { conversationSettings = value }
   func replyToSettings(_ value: NativeSettingsSnapshot) {
     settingsReply = [.notice(.init(settings: value, text: "Conversation settings")), .done]
@@ -355,6 +358,17 @@ actor FixtureCoordinator {
         }
         if observer === socket { observer = nil }
         closedContinuation.yield(())
+        return
+      case .inspect(let request):
+        let ready = NativeEventReady(
+          conversationId: request.conversationId, model: "fixture/model", working: false)
+        try await emit(.ready(ready), on: socket)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+          socket.receive(minimumIncompleteLength: 1, maximumLength: 1) { _, _, _, _ in
+            continuation.resume()
+          }
+        }
+        inspectionsClosed.continuation.yield(request.conversationId)
         return
       case .submit(let request):
         if rejectsSubmits {
