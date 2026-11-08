@@ -82,6 +82,9 @@ final class WorkNavigationTests: XCTestCase {
     let menu = app.buttons["composerMenu"]
     XCTAssertTrue(menu.isHittable)
     menu.tap()
+    // At this size the menu scrolls, and only its rows on screen are elements. It opens at the
+    // rows nearest the button, and Delivery is the farthest.
+    app.collectionViews.firstMatch.swipeDown()
     XCTAssertTrue(app.buttons["Follow-up"].waitForExistence(timeout: 3))
     capture("large-type-native-composer-actions", app: app)
     app.buttons["Follow-up"].tap()
