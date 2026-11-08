@@ -50,11 +50,6 @@ final class ComposerInteractionTests: XCTestCase {
     XCTAssertTrue(app.staticTexts["To Work and Personal"].waitForExistence(timeout: 10))
     return (app, work, personal)
   }
-  /// An empty draft reports its placeholder as its value, which is what VoiceOver reads.
-  private func isEmpty(_ field: XCUIElement) -> Bool {
-    let value = field.value as? String
-    return value == nil || value == "" || value == "Message Beep Boop"
-  }
   /// Where the field draws its one line of text, in points from its leading edge: the leftmost and
   /// rightmost gray pixels in a screenshot that stand out from the field's background, in either
   /// appearance. A chip's name and the caret are colored, so neither counts.
@@ -116,7 +111,7 @@ final class ComposerInteractionTests: XCTestCase {
     composer.typeText("@Work ")
     XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3), "The typed tag is the chip")
     XCTAssertTrue(
-      isEmpty(composer),
+      composer.showsNoText,
       "The typed tag left the field, which shows \(composer.value as? String ?? "nil")")
     let text = "Anything urgent this morning?"
     composer.typeText(text)
@@ -150,7 +145,7 @@ final class ComposerInteractionTests: XCTestCase {
       return toWork == [text] && toPersonal == [text]
     }
     XCTAssertTrue(
-      isEmpty(composer),
+      composer.showsNoText,
       "The field kept the sent text: \(composer.value as? String ?? "nil")")
     composer.typeText("x")
     XCTAssertEqual(composer.value as? String, "x", "The next key starts a new draft")
@@ -306,7 +301,7 @@ final class ComposerInteractionTests: XCTestCase {
     XCTAssertTrue(app.staticTexts["To Work and Personal"].waitForExistence(timeout: 3))
     composer.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: text.count))
     try await Task.sleep(for: .milliseconds(500))
-    let cleared = isEmpty(composer)
+    let cleared = composer.showsNoText
     composer.typeKey("z", modifierFlags: .command)
     try await Task.sleep(for: .seconds(1))
     let personalChip = app.buttons["To Personal"].exists
@@ -315,7 +310,7 @@ final class ComposerInteractionTests: XCTestCase {
       "IF10-2[ui] cleared=\(cleared) after Command-Z: value=\(composer.value as? String ?? "nil") personalChip=\(personalChip) line=\(line.label) sendEnabled=\(send.isEnabled) restoreOffered=\(restore.exists)"
     )
     XCTAssertTrue(cleared, "The keys did not empty the field")
-    XCTAssertTrue(isEmpty(composer), "Undo brought back the cleared restored text")
+    XCTAssertTrue(composer.showsNoText, "Undo brought back the cleared restored text")
     XCTAssertFalse(personalChip, "Undo made the restored text's tag Personal's chip")
     XCTAssertFalse(send.isEnabled, "Send is on with nothing to send")
     XCTAssertTrue(restore.exists, "Work's original no longer offers Restore")
@@ -763,12 +758,9 @@ final class HistoryInteractionTests: XCTestCase {
     let delete = app.keys["delete"]
     XCTAssertTrue(delete.exists)
     delete.tap()
-    let cleared = XCTNSPredicateExpectation(
-      predicate: NSPredicate(format: "value == %@", ""), object: composer)
-    XCTAssertEqual(
-      XCTWaiter.wait(for: [cleared], timeout: 3), .completed,
+    XCTAssertTrue(
+      composer.wait(for: \.showsNoText, toEqual: true, timeout: 3),
       "Native Select All/Delete must clear the exact composer value: \(composer.debugDescription)")
-    XCTAssertEqual(composer.value as? String, "")
     first.press(forDuration: 1)
     let select = action("Select text", app: app)
     XCTAssertTrue(select.waitForExistence(timeout: 3))
@@ -1286,8 +1278,7 @@ final class RestoreInteractionTests: XCTestCase {
     try await eventually { composer.value as? String == text }
     composer.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: text.count))
     try await Task.sleep(for: .milliseconds(500))
-    let emptied = [nil, "", "Message Beep Boop"]
-    let cleared = emptied.contains(composer.value as? String)
+    let cleared = composer.showsNoText
     composer.typeKey("z", modifierFlags: .command)
     try await Task.sleep(for: .seconds(1))
     let undone = composer.value as? String
@@ -1295,7 +1286,7 @@ final class RestoreInteractionTests: XCTestCase {
       "IF10-2[ui, one coordinator] cleared=\(cleared) after Command-Z: value=\(undone ?? "nil") sendEnabled=\(send.isEnabled) restoreOffered=\(restore.exists)"
     )
     XCTAssertTrue(cleared, "The keys did not empty the field")
-    XCTAssertTrue(emptied.contains(undone), "Undo brought back the cleared restored text")
+    XCTAssertTrue(composer.showsNoText, "Undo brought back the cleared restored text")
     XCTAssertFalse(send.isEnabled, "Send is on with nothing to send")
     XCTAssertTrue(restore.exists, "The original no longer offers Restore")
     restore.tap()
