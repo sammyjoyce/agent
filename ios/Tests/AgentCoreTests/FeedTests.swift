@@ -323,7 +323,7 @@ private func row(
 }
 
 /// Holds the next dial to Work's port once armed, as a slow tailnet would.
-private actor DialGate {
+actor DialGate {
   private var armed = false
   private(set) var waiting = false
   private var release: CheckedContinuation<Void, Never>?
@@ -344,7 +344,7 @@ private actor DialGate {
 /// Where Work's addresses lead. A test can point them at Personal, as a moved name would, swap
 /// Work's and Personal's, as when the two coordinators trade ports, or leave Personal's address
 /// answering nothing.
-private actor WorkRoute {
+actor WorkRoute {
   private(set) var answersAsPersonal = false
   private(set) var swapped = false
   private(set) var personalsAddressDown = false
@@ -355,7 +355,7 @@ private actor WorkRoute {
 
 /// Two loopback coordinators, Personal at port 4002 of an invented address and Work at any
 /// other address, and a fresh `Coordinators` with nothing saved, as the app builds it.
-@MainActor private func withTwoFixtures(
+@MainActor func withTwoFixtures(
   registration: NotificationRegistration? = nil, holdingWork gate: DialGate? = nil,
   route: WorkRoute? = nil,
   _ body: (Coordinators, FixtureCoordinator, FixtureCoordinator, URL) async throws -> Void
@@ -415,7 +415,7 @@ private let reconnecting = Duration.seconds(45)
   }
 }
 
-@MainActor private func addWorkAndPersonal(_ coordinators: Coordinators) async throws -> (
+@MainActor func addWorkAndPersonal(_ coordinators: Coordinators) async throws -> (
   work: ProfileID, personal: ProfileID
 ) {
   try await coordinators.add(

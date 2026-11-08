@@ -1,8 +1,23 @@
 import AgentCore
 import SwiftUI
 
+/// When a page of Jobs and work reads again: on Refresh, and each time its coordinator becomes
+/// ready, as after a reconnect or on a new session.
+struct WorkReload: Equatable {
+  let refresh: UUID
+  let ready: Bool
+}
+
+extension ChatModel {
+  /// True while `lane` is connected and advertises Jobs and work.
+  fileprivate func workReady(_ lane: ProfileID) -> Bool {
+    snapshots[lane].map { $0.workInspectionSupported && $0.connection == .connected } ?? false
+  }
+}
+
 struct WorkView: View {
   let model: ChatModel
+  let lane: ProfileID
   @State private var jobs: [ScheduledJobStatus] = []
   @State private var conversations: [SavedConversation] = []
   @State private var cursor: String?
@@ -19,19 +34,20 @@ struct WorkView: View {
   var body: some View {
     List {
       if let error { WorkDiagnosticText(error, identifier: "workReadError") }
-      if !loaded {
-        ProgressView("Reading jobs and saved work")
-      } else {
-        WorkCatalogSections(model: model, jobs: jobs, conversations: conversations) {
+      if !model.workReady(lane) { WorkNotConnected(model: model, lane: lane) }
+      if loaded {
+        WorkCatalogSections(model: model, lane: lane, jobs: jobs, conversations: conversations) {
           inspection = .init($0)
         }
         if cursor != nil {
           Button("Load more saved conversations") { more += 1 }
             .disabled(busy).accessibilityIdentifier("loadMoreWork")
         }
+      } else if model.workReady(lane) {
+        ProgressView("Reading jobs and saved work")
       }
     }
-    .navigationTitle("Jobs and work")
+    .navigationTitle(model.laneTitle("Jobs and work", for: lane))
     .searchable(text: $query, prompt: "Saved conversation title or ID")
     .onSubmit(of: .search) { refresh = UUID() }
     .onChange(of: query) { _, value in if value.isEmpty { refresh = UUID() } }
@@ -41,14 +57,17 @@ struct WorkView: View {
           .disabled(busy).accessibilityIdentifier("refreshWork")
       }
     }
-    .task(id: refresh) { await reload() }
+    .task(id: WorkReload(refresh: refresh, ready: model.workReady(lane))) { await reload() }
     .task(id: more) { if more > 0 { await loadMore() } }
     .refreshable { await reload() }
-    .sheet(item: $inspection) { ConversationInspectionView(owner: model, initial: $0.conversation) }
+    .sheet(item: $inspection) {
+      ConversationInspectionView(owner: model, lane: lane, initial: $0.conversation)
+    }
     .accessibilityIdentifier("workCatalog")
   }
 
   private func reload() async {
+    guard model.workReady(lane) else { return }
     let id = UUID()
     let search = query
     request = id
@@ -56,17 +75,20 @@ struct WorkView: View {
     error = nil
     defer { if request == id { busy = false } }
     do {
-      guard case .list(let listing) = try await model.jobs() else {
+      guard case .list(let listing) = try await model.jobs(lane: lane) else {
         throw ConnectionError.incompleteFrame
       }
       guard request == id, !Task.isCancelled else { return }
       jobs = listing.jobs
-      let page = try await model.conversations(query: search)
+      let page = try await model.conversations(query: search, lane: lane)
       guard request == id, !Task.isCancelled else { return }
       conversations = page.items
       cursor = page.nextCursor
       appliedQuery = search
       loaded = true
+    } catch LaneError.interrupted {
+      // WorkReload reads again once the coordinator is ready, so an interrupted read stays quiet.
+      return
     } catch {
       guard request == id, !Task.isCancelled else { return }
       loaded = true
@@ -75,24 +97,38 @@ struct WorkView: View {
   }
 
   private func loadMore() async {
-    guard let cursor, !busy else { return }
+    guard let cursor, !busy, model.workReady(lane) else { return }
     let id = request
     busy = true
     defer { if request == id { busy = false } }
     do {
-      let page = try await model.conversations(query: appliedQuery, cursor: cursor)
+      let page = try await model.conversations(query: appliedQuery, cursor: cursor, lane: lane)
       guard request == id, !Task.isCancelled else { return }
       let known = Set(conversations.map(\.conversationId))
       conversations.append(contentsOf: page.items.filter { !known.contains($0.conversationId) })
       self.cursor = page.nextCursor
+    } catch LaneError.interrupted {
+      return
     } catch {
       if request == id, !Task.isCancelled { self.error = error.localizedDescription }
     }
   }
 }
 
+private struct WorkNotConnected: View {
+  let model: ChatModel
+  let lane: ProfileID
+
+  var body: some View {
+    let name = model.multiple ? model.name(lane) : "the coordinator"
+    Text("Not connected. This page reads again when \(name) reconnects.")
+      .font(.footnote).foregroundStyle(.secondary)
+  }
+}
+
 struct WorkCatalogSections: View {
   let model: ChatModel
+  let lane: ProfileID
   let jobs: [ScheduledJobStatus]
   let conversations: [SavedConversation]
   let inspect: (SavedConversation) -> Void
@@ -102,7 +138,7 @@ struct WorkCatalogSections: View {
       if jobs.isEmpty { Text("No applied scheduled jobs.").foregroundStyle(.secondary) }
       ForEach(jobs, id: \.job.id) { status in
         NavigationLink {
-          JobDetailView(jobID: status.job.id, model: model)
+          JobDetailView(jobID: status.job.id, model: model, lane: lane)
         } label: {
           VStack(alignment: .leading, spacing: 5) {
             Text(verbatim: status.job.title).font(.headline)
@@ -156,6 +192,7 @@ struct WorkCatalogSections: View {
 struct JobDetailView: View {
   let jobID: String
   let model: ChatModel
+  let lane: ProfileID
   @State private var status: ScheduledJobStatus?
   @State private var owner: SavedConversation?
   @State private var error: String?
@@ -170,6 +207,7 @@ struct JobDetailView: View {
   var body: some View {
     Form {
       if let error { WorkDiagnosticText(error, identifier: "jobReadError") }
+      if !model.workReady(lane) { WorkNotConnected(model: model, lane: lane) }
       if let status {
         JobDiagnosticSections(status: status)
         if status.canRetryInterruptedRun {
@@ -177,7 +215,9 @@ struct JobDetailView: View {
             Button("Retry interrupted run", systemImage: "arrow.clockwise") { retry += 1 }
               .disabled(retrying).accessibilityIdentifier("retryInterruptedJob")
             Text(
-              "Retries the retained interrupted execution. It does not start another scheduled run."
+              model.multiple
+                ? "Retries the retained interrupted execution on \(model.name(lane)). It does not start another scheduled run."
+                : "Retries the retained interrupted execution. It does not start another scheduled run."
             )
             .font(.footnote).foregroundStyle(.secondary)
           }
@@ -195,7 +235,7 @@ struct JobDetailView: View {
               .foregroundStyle(.secondary)
           }
         }
-      } else if error == nil {
+      } else if error == nil, model.workReady(lane) {
         ProgressView("Reading job")
       }
     }
@@ -206,34 +246,38 @@ struct JobDetailView: View {
           .disabled(retrying)
       }
     }
-    .task(id: refresh) { await load() }
+    .task(id: WorkReload(refresh: refresh, ready: model.workReady(lane))) { await load() }
     .task(id: retry) {
       guard retry > handledRetry else { return }
       handledRetry = retry
       await retryInterruptedRun()
     }
     .refreshable { await load() }
-    .sheet(item: $inspection) { ConversationInspectionView(owner: model, initial: $0.conversation) }
+    .sheet(item: $inspection) {
+      ConversationInspectionView(owner: model, lane: lane, initial: $0.conversation)
+    }
     .accessibilityIdentifier("jobDetails")
   }
 
   private func load() async {
-    guard !retrying else { return }
+    guard !retrying, model.workReady(lane) else { return }
     let id = UUID()
     request = id
     error = nil
     do {
-      guard case .detail(let detail) = try await model.jobs(jobID) else {
+      guard case .detail(let detail) = try await model.jobs(jobID, lane: lane) else {
         throw ConnectionError.incompleteFrame
       }
       guard request == id, !Task.isCancelled else { return }
       status = detail.job
       owner = nil
       if let taskID = detail.job.inspectionTaskID {
-        let page = try await model.conversations(query: taskID)
+        let page = try await model.conversations(query: taskID, lane: lane)
         guard request == id, !Task.isCancelled else { return }
         owner = page.items.first { $0.taskId == taskID && $0.agentId == nil }
       }
+    } catch LaneError.interrupted {
+      return
     } catch {
       if request == id, !Task.isCancelled { self.error = error.localizedDescription }
     }
@@ -245,11 +289,17 @@ struct JobDetailView: View {
     error = nil
     defer { retrying = false }
     do {
-      let resumed = try await model.retryJob(jobID)
+      let resumed = try await model.retryJob(jobID, lane: lane)
       guard !Task.isCancelled else { return }
       status = resumed
     } catch {
-      if !Task.isCancelled { self.error = error.localizedDescription }
+      guard !Task.isCancelled else { return }
+      self.error = error.localizedDescription
+      // The retry may or may not have run, so the page reads the job again.
+      if case LaneError.interrupted = error {
+        status = nil
+        refresh = UUID()
+      }
     }
   }
 }
@@ -396,13 +446,15 @@ private struct WorkInspection: Identifiable {
 
 struct ConversationInspectionView: View {
   let owner: ChatModel
+  let lane: ProfileID
   @State private var selected: SavedConversation
-  init(owner: ChatModel, initial: SavedConversation) {
+  init(owner: ChatModel, lane: ProfileID, initial: SavedConversation) {
     self.owner = owner
+    self.lane = lane
     _selected = State(initialValue: initial)
   }
   var body: some View {
-    InspectionScreen(owner: owner, conversation: selected) { selected = $0 }
+    InspectionScreen(owner: owner, lane: lane, conversation: selected) { selected = $0 }
       .id(selected.conversationId)
   }
   static func relationships(for conversation: SavedConversation, in items: [SavedConversation])
@@ -416,15 +468,18 @@ struct ConversationInspectionView: View {
 
 private struct InspectionScreen: View {
   let owner: ChatModel
+  let lane: ProfileID
   let conversation: SavedConversation
   let select: (SavedConversation) -> Void
   @State private var model: ChatModel
   @State private var related: [SavedConversation] = []
   @State private var relationshipError: String?
   init(
-    owner: ChatModel, conversation: SavedConversation, select: @escaping (SavedConversation) -> Void
+    owner: ChatModel, lane: ProfileID, conversation: SavedConversation,
+    select: @escaping (SavedConversation) -> Void
   ) {
     self.owner = owner
+    self.lane = lane
     self.conversation = conversation
     self.select = select
     _model = State(initialValue: ChatModel(inspecting: conversation))
@@ -437,10 +492,10 @@ private struct InspectionScreen: View {
         }
       }
       .task {
-        await model.connectInspection(using: owner)
+        await model.connectInspection(using: owner, lane: lane)
         if !Task.isCancelled, let taskID = conversation.taskId {
           do {
-            let page = try await owner.conversations(query: taskID)
+            let page = try await owner.conversations(query: taskID, lane: lane)
             related = ConversationInspectionView.relationships(for: conversation, in: page.items)
           } catch {
             if !Task.isCancelled { relationshipError = error.localizedDescription }

@@ -312,6 +312,9 @@ public struct MainChatView: View {
     case .disconnected: return (snapshot.connection.label, false, true)
     }
   }
+  private func statusText(_ profile: CoordinatorProfile) -> String {
+    laneState(profile)?.message ?? ConnectionState.connected.label
+  }
   @ViewBuilder private func laneStatus(_ profile: CoordinatorProfile) -> some View {
     if let state = laneState(profile) {
       HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -738,19 +741,8 @@ public struct MainChatView: View {
             LabeledContent("Model", value: model.model)
           }
           NavigationLink("Sources") { SourceDetailsView(model: model) }
-          // Each reaches a single coordinator, so they show only while one is saved.
-          if !model.multiple {
-            if model.workInspectionSupported {
-              NavigationLink("Jobs and work") { WorkView(model: model) }
-            } else if model.connection == .connected {
-              Text("Update the coordinator to inspect scheduled jobs and saved work.")
-                .font(.footnote)
-            }
-            if model.settingsSupported {
-              NavigationLink("Conversation settings") { ConversationSettingsView(model: model) }
-            } else if model.connection == .connected {
-              Text("Conversation settings are not advertised by this coordinator.").font(.footnote)
-            }
+          if !model.multiple, let lane = model.profiles.first?.id {
+            CoordinatorControls(model: model, lane: lane)
           }
           Picker("Appearance", selection: $appearance) {
             ForEach(AppAppearance.allCases) { appearance in
@@ -765,14 +757,22 @@ public struct MainChatView: View {
               ForEach(coordinators.profiles) { profile in
                 NavigationLink {
                   Form {
+                    Section {
+                      LabeledContent("Status", value: statusText(profile))
+                      LabeledContent(
+                        "Model", value: model.snapshots[profile.id]?.model ?? "Unknown")
+                      CoordinatorControls(model: model, lane: profile.id)
+                    }
                     CoordinatorForm(coordinators: coordinators, profile: profile, pushed: true)
                   }
                   .navigationTitle(profile.name.description)
                 } label: {
                   VStack(alignment: .leading, spacing: 2) {
                     badge(profile.id).title
-                    Text(laneState(profile)?.message ?? ConnectionState.connected.label)
-                      .font(.footnote).foregroundStyle(.secondary)
+                    Text(statusText(profile)).font(.footnote).foregroundStyle(.secondary)
+                    if let state = model.snapshots[profile.id], state.connection == .connected {
+                      Text(state.model).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
                   }
                   .accessibilityElement(children: .combine)
                 }

@@ -35,6 +35,9 @@ actor FixtureCoordinator {
   nonisolated var closedSettings: AsyncStream<Void> { settingsClosed.stream }
   private let inputsObserved = AsyncStream<NativeRequestSubmit>.makeStream()
   nonisolated var observedInputs: AsyncStream<NativeRequestSubmit> { inputsObserved.stream }
+  private let inspectionsClosed = AsyncStream<String>.makeStream()
+  /// The conversation ID of each inspection socket the phone closed.
+  nonisolated var closedInspections: AsyncStream<String> { inspectionsClosed.stream }
   func advertiseSettings(_ value: Bool?) { conversationSettings = value }
   func replyToSettings(_ value: NativeSettingsSnapshot) {
     settingsReply = [.notice(.init(settings: value, text: "Conversation settings")), .done]
@@ -45,6 +48,29 @@ actor FixtureCoordinator {
   func settingsControls() -> [NativeRequestSettings] { settingsRequests }
   private var inputOrigins: Bool?
   func advertiseInputOrigins(_ value: Bool?) { inputOrigins = value }
+  private var workInspection: Bool?
+  func advertiseWorkInspection(_ value: Bool?) { workInspection = value }
+  private var servedJobs: [ScheduledJobStatus] = []
+  private var servedConversations: [SavedConversation] = []
+  private var pageSize = 10
+  /// Answers Jobs and work from these. A catalog cursor is the index of the page's first item.
+  func serveWork(jobs: [ScheduledJobStatus], conversations: [SavedConversation], pageSize: Int) {
+    servedJobs = jobs
+    servedConversations = conversations
+    self.pageSize = pageSize
+  }
+  private var retried: [String] = []
+  private var holdsRetryReply = false
+  private var retryReplyRelease: CheckedContinuation<Void, Never>?
+  /// Holds the answer to the next retry until `releaseRetryReply`.
+  func holdNextRetryReply() { holdsRetryReply = true }
+  func releaseRetryReply() {
+    holdsRetryReply = false
+    retryReplyRelease?.resume()
+    retryReplyRelease = nil
+  }
+  /// The job ID of every retry received, in arrival order.
+  func retryRequests() -> [String] { retried }
   private var notificationRequests: [NotificationRequest] = []
   /// Each installation this coordinator holds a registration for, with its device token.
   private var registrations: [String: String] = [:]
@@ -210,6 +236,7 @@ actor FixtureCoordinator {
     releaseHistory()
     releaseIdentity()
     releaseSubmitReply()
+    releaseRetryReply()
     for socket in sockets { socket.cancel() }
     sockets = []
   }
@@ -328,7 +355,8 @@ actor FixtureCoordinator {
           .ready(
             .init(
               conversationId: "fixture-root", conversationSettings: conversationSettings,
-              inputOrigins: inputOrigins, model: "fixture/model")), on: socket)
+              inputOrigins: inputOrigins, model: "fixture/model", workInspection: workInspection)),
+          on: socket)
         if delaySnapshot { await withCheckedContinuation { release = $0 } }
         let placed = placedSubmits
         let messages = placed.filter { request.inputIds.contains($0.inputId) }.map { input in
@@ -355,6 +383,43 @@ actor FixtureCoordinator {
         }
         if observer === socket { observer = nil }
         closedContinuation.yield(())
+        return
+      case .jobs(let request):
+        try await emit(jobReply(request.jobId), on: socket)
+        try await emit(.done, on: socket)
+        return
+      case .retryJob(let request):
+        retried.append(request.jobId)
+        if holdsRetryReply {
+          holdsRetryReply = false
+          await withCheckedContinuation { retryReplyRelease = $0 }
+        }
+        // The phone may have closed the socket while the answer was held.
+        try? await emit(jobReply(request.jobId), on: socket)
+        try? await emit(.done, on: socket)
+        return
+      case .conversations(let request):
+        let matches = servedConversations.filter {
+          request.query.isEmpty || $0.title.contains(request.query)
+            || $0.conversationId == request.query || $0.taskId == request.query
+        }
+        let start = request.cursor.flatMap { Int($0) } ?? 0
+        let end = min(start + pageSize, matches.count)
+        let page = NativeEventConversations(
+          items: Array(matches[start..<end]), nextCursor: end < matches.count ? "\(end)" : nil)
+        try await emit(.conversations(page), on: socket)
+        try await emit(.done, on: socket)
+        return
+      case .inspect(let request):
+        let ready = NativeEventReady(
+          conversationId: request.conversationId, model: "fixture/model", working: false)
+        try await emit(.ready(ready), on: socket)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+          socket.receive(minimumIncompleteLength: 1, maximumLength: 1) { _, _, _, _ in
+            continuation.resume()
+          }
+        }
+        inspectionsClosed.continuation.yield(request.conversationId)
         return
       case .submit(let request):
         if rejectsSubmits {
@@ -453,6 +518,15 @@ actor FixtureCoordinator {
         return
       }
     }
+  }
+  private func jobReply(_ id: String?) -> NativeEvent {
+    guard let id else {
+      return .notice(.init(jobStatus: .list(.init(jobs: servedJobs)), text: "Scheduled jobs"))
+    }
+    guard let job = servedJobs.first(where: { $0.job.id == id }) else {
+      return .failure(.init(message: "Invented: no scheduled job \(id)"))
+    }
+    return .notice(.init(jobStatus: .detail(.init(job: job)), text: job.job.title))
   }
   private func emit(_ event: NativeEvent, on socket: NWConnection) async throws {
     var data = try JSONEncoder().encode(event)
@@ -571,15 +645,17 @@ func withCoordinator(
 /// Saves one coordinator for `model` on a loopback fixture and connects it as the app does, so a
 /// Send reaches it. The lane is detached after `body`.
 @MainActor func withConnectedCoordinator(
-  _ model: ChatModel, _ body: (FixtureCoordinator, ProfileDirectory) async throws -> Void
+  _ model: ChatModel, profile: CoordinatorProfile? = nil,
+  _ body: (FixtureCoordinator, ProfileDirectory) async throws -> Void
 ) async throws {
   let fixture = FixtureCoordinator()
   let (listener, port) = try await listen(fixture)
   defer { listener.cancel() }
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let profile = CoordinatorProfile(
+  let fresh = CoordinatorProfile(
     name: try TagName("Work"), address: try CoordinatorAddress(host: "100.64.1.2"))
+  let profile = profile ?? fresh
   let directory = ProfileDirectory(profile.id, applicationSupport: root, caches: root)
   model.profiles = [profile]
   model.attach(
