@@ -466,11 +466,11 @@ final class ComposerInteractionTests: XCTestCase {
     defer { try? voiceOver.disable() }
     let field = try voiceOver.currentSpeech().utterance
     XCTAssertTrue(
-      field.contains("Message the coordinator Text field Is editing Message Agen"), field)
+      field.contains("Message the coordinator Text field Is editing Message Beep Boop"), field)
     let before = try voiceOver.moveBackward().utterance
     XCTAssertTrue(before.hasPrefix("To Work Button"), before)
     let first = try voiceOver.moveBackward().utterance
-    XCTAssertTrue(first.hasPrefix("Add attachments or commands"), first)
+    XCTAssertTrue(first.hasPrefix("Paste images"), first)
   }
 
   // The feed follows Work's replies as they arrive, from one to more than fill the screen. At
