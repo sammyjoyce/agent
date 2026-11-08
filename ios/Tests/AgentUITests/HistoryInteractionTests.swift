@@ -711,7 +711,10 @@ final class HistoryInteractionTests: XCTestCase {
     XCTAssertEqual(XCTWaiter.wait(for: [imported], timeout: 5), .completed, app.debugDescription)
     let draft = try XCTUnwrap(composer.value as? String)
     XCTAssertEqual(draft.components(separatedBy: text).count, 2)
-    XCTAssertFalse(app.buttons["Send message"].isEnabled)
+    let sendInEitherMode = app.buttons.matching(
+      NSPredicate(format: "label IN %@", ["Send message", "Queue follow-up"])
+    ).firstMatch
+    XCTAssertFalse(sendInEitherMode.isEnabled)
     app.terminate()
     app.launch()
     if app.buttons["dismissConnection"].waitForExistence(timeout: 3) {
@@ -720,7 +723,7 @@ final class HistoryInteractionTests: XCTestCase {
     let restored = XCTNSPredicateExpectation(
       predicate: NSPredicate(format: "value == %@", draft), object: editor(app))
     XCTAssertEqual(XCTWaiter.wait(for: [restored], timeout: 5), .completed, app.debugDescription)
-    XCTAssertFalse(app.buttons["Send message"].isEnabled)
+    XCTAssertFalse(sendInEitherMode.isEnabled)
   }
 
   func testWholeMessageCopyAndPartialNativeSelectionPasteThroughComposer() async throws {
