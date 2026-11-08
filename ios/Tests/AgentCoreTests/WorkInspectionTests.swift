@@ -196,8 +196,8 @@ private func inspectionJob(
           NavigationStack {
             List {
               WorkCatalogSections(
-                model: ChatModel(), jobs: [parked, running], conversations: [parent, child],
-                inspect: { _ in })
+                model: ChatModel(), lane: ProfileID(), jobs: [parked, running],
+                conversations: [parent, child], inspect: { _ in })
             }
             .navigationTitle("Jobs and work")
           }, name: "jobs-work-catalog-\(scheme)", scheme: scheme)
@@ -303,10 +303,15 @@ private func inspectionJob(
         while await model.connection != .connected, ContinuousClock.now < deadline {
           try await Task.sleep(for: .milliseconds(20))
         }
-        await model.refreshSettings()
-        #expect(await model.conversationSettings != nil)
+        try await model.settings(lane: session.profile)
+        while await model.snapshots[session.profile]?.settings == nil,
+          ContinuousClock.now < deadline
+        {
+          try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(await model.snapshots[session.profile]?.settings != nil)
         try await Self.captureWork(
-          NavigationStack { ConversationSettingsView(model: model) },
+          NavigationStack { ConversationSettingsView(model: model, lane: session.profile) },
           name: "connected-conversation-settings")
         #expect(await fixture.count() == 0)
         await model.detach(session.profile)

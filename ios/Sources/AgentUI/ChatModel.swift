@@ -95,16 +95,13 @@ final class ChatModel {
     didSet { transcriptItems = TranscriptItem.grouped(rows, preserving: transcriptItems) }
   }
   private(set) var transcriptItems: [TranscriptItem] = []
+  /// The feed's aggregate: the best state any lane is in. One coordinator's own state is its
+  /// snapshot's.
   var connection: ConnectionState = .disconnected
+  /// The model of the first lane that has reported, the header's label with one coordinator saved.
   var model = "Unknown"
   var commands: [SlashCommand] = []
-  private(set) var settingsSupported = false
-  private(set) var workInspectionSupported = false
   let inspectedConversation: SavedConversation?
-  private(set) var conversationSettings: NativeSettingsSnapshot?
-  private(set) var settingsBusy = false
-  var settingsError: String?
-  @ObservationIgnored private var settingsRequest: UUID?
   var busy = false
   var canLoadEarlier = false
   var loadingHistory = false
@@ -246,6 +243,9 @@ final class ChatModel {
   private(set) var source: RestoredSource?
   /// Each lane's latest published state.
   private(set) var snapshots: [ProfileID: ChatSnapshot] = [:]
+  /// Bumped when a lane's session starts to retire and whenever a session attaches. Never reset,
+  /// so a value is never reused.
+  private(set) var laneEpochs: [ProfileID: Int] = [:]
   /// One coordinator's source checks from its current connection, and the warning their gaps raise.
   struct SourceReport: Identifiable, Equatable {
     let id: ProfileID
@@ -437,6 +437,18 @@ final class ChatModel {
 
   func paired(_ id: ProfileID) -> Bool { lanes.first { $0.id == id }?.session != nil }
 
+  func laneEpoch(_ id: ProfileID) -> Int { laneEpochs[id] ?? 0 }
+
+  /// For the UI: whether `id` is saved and not being removed.
+  func isSaved(_ id: ProfileID) -> Bool {
+    removed[id] == nil && profiles.contains { $0.id == id }
+  }
+
+  /// `base` led by the coordinator's name while several are saved, as in "Work · Jobs and work".
+  func laneTitle(_ base: String, for id: ProfileID) -> String {
+    multiple ? "\(name(id)) · \(base)" : base
+  }
+
   /// A coordinator's line under the feed and in Settings. When its address answers as another
   /// saved coordinator, the line names that one and points to this one's address, since editing
   /// it keeps the queue that Remove would delete.
@@ -464,6 +476,7 @@ final class ChatModel {
     }
     if let session = lane.session {
       snapshots[lane.id] = nil
+      laneEpochs[lane.id, default: 0] += 1
       refresh()
       observations[lane.id] = observe(session, lane: lane.id)
       if let inputs = unstaging.removeValue(forKey: lane.id) {
@@ -476,6 +489,9 @@ final class ChatModel {
   /// retired, so nothing connects, sends or writes the profile's directory through it again. The
   /// composer names what the retirement cancelled before it left the phone.
   func detach(_ id: ProfileID) async {
+    if lanes.contains(where: { $0.id == id && $0.session != nil }) {
+      laneEpochs[id, default: 0] += 1
+    }
     let cancelled = await lanes.first { $0.id == id }?.session?.retire() ?? []
     if let index = lanes.firstIndex(where: { $0.id == id }) {
       let lane = lanes.remove(at: index)
@@ -529,28 +545,44 @@ final class ChatModel {
 
   private func connected(_ id: ProfileID) -> Bool { snapshots[id]?.connection == .connected }
 
-  // MARK: - Conversation settings and Jobs and work
+  // MARK: - Conversation settings and Jobs and work, each on one coordinator
 
-  /// The lane conversation settings, jobs and inspections reach. With several coordinators saved
-  /// there is none, so a settings change or a job retry never goes to a coordinator the user did
-  /// not choose.
-  private var soleLane: Lane? {
-    guard !multiple, lanes.count == 1, lanes.first?.session != nil else { return nil }
-    return lanes.first
+  /// The one way a lane control reaches a session. It runs `run` once and retries nothing, and
+  /// nothing comes back from a session that changed under the call.
+  func onLane<T>(_ id: ProfileID, _ run: (CoordinatorSession) async throws -> T) async throws -> T {
+    if let name = removed[id] { throw LaneError.gone(name) }
+    guard let lane = lanes.first(where: { $0.id == id }) else { throw LaneError.gone(name(id)) }
+    guard let session = lane.session else { throw LaneError.notPaired(name(id)) }
+    let epoch = laneEpoch(id)
+    let value: T
+    do { value = try await run(session) } catch {
+      if let name = removed[id] { throw LaneError.gone(name) }
+      // A session throws CancellationError when its connection is cut mid-request. Only this
+      // task's own cancellation stays one.
+      if laneEpoch(id) != epoch || (error is CancellationError && !Task.isCancelled) {
+        throw LaneError.interrupted(name(id))
+      }
+      throw error
+    }
+    guard laneEpoch(id) == epoch else { throw LaneError.interrupted(name(id)) }
+    return value
   }
-  /// Opens this inspection on `owner`'s coordinator, over a read-only session of its own.
-  func connectInspection(using owner: ChatModel) async {
-    guard let conversation = inspectedConversation, lanes.isEmpty, let lane = owner.soleLane,
-      let inspector = await lane.session?.inspector(conversation)
-    else {
+  /// Opens this inspection on `owner`'s coordinator `id`, over a read-only session that the
+  /// coordinator's own session mints and ends.
+  func connectInspection(using owner: ChatModel, lane id: ProfileID) async {
+    guard let conversation = inspectedConversation, lanes.isEmpty else {
       failure = ConnectionError.closed.localizedDescription
       return
     }
-    profiles = owner.profiles
-    lanes = [Lane(id: lane.id, session: inspector)]
-    snapshots[lane.id] = nil
-    observations[lane.id] = observe(inspector, lane: lane.id)
-    await inspector.connect()
+    do {
+      let minted = try await owner.onLane(id) { await $0.inspector(conversation) }
+      guard let inspector = minted else { throw ConnectionError.closed }
+      profiles = owner.profiles.filter { $0.id == id }
+      lanes = [Lane(id: id, session: inspector)]
+      snapshots[id] = nil
+      observations[id] = observe(inspector, lane: id)
+      if owner.active { await inspector.connect() }
+    } catch { failure = error.localizedDescription }
   }
   /// Keeps an inspection connected until the task that owns it is cancelled.
   func runUntilCancelled() async {
@@ -563,43 +595,21 @@ final class ChatModel {
     connection = .disconnected
     for session in sessions { await session.retire() }
   }
-  func jobs(_ id: String? = nil) async throws -> NativeJobStatus {
-    guard let session = soleLane?.session else { throw ConnectionError.closed }
-    return try await session.jobs(id)
+  func jobs(_ id: String? = nil, lane: ProfileID) async throws -> NativeJobStatus {
+    try await onLane(lane) { try await $0.jobs(id) }
   }
-  func retryJob(_ id: String) async throws -> ScheduledJobStatus {
-    guard let session = soleLane?.session else { throw ConnectionError.closed }
-    return try await session.retryJob(id)
+  func retryJob(_ id: String, lane: ProfileID) async throws -> ScheduledJobStatus {
+    try await onLane(lane) { try await $0.retryJob(id) }
   }
-  func conversations(query: String = "", cursor: String? = nil) async throws
+  func conversations(query: String = "", cursor: String? = nil, lane: ProfileID) async throws
     -> NativeEventConversations
   {
-    guard let session = soleLane?.session else { throw ConnectionError.closed }
-    return try await session.conversations(query: query, cursor: cursor)
+    try await onLane(lane) { try await $0.conversations(query: query, cursor: cursor) }
   }
-  func refreshSettings(change: ConversationChange? = nil) async {
-    guard !settingsBusy, settingsSupported, let session = soleLane?.session,
-      connection == .connected
-    else { return }
-    let id = UUID()
-    settingsRequest = id
-    settingsBusy = true
-    settingsError = nil
-    defer {
-      if settingsRequest == id {
-        settingsRequest = nil
-        settingsBusy = false
-      }
-    }
-    do {
-      let settings = try await session.settings(change: change)
-      guard soleLane?.session === session, !Task.isCancelled else { return }
-      conversationSettings = settings
-    } catch {
-      if soleLane?.session === session, !(error is CancellationError) {
-        settingsError = error.localizedDescription
-      }
-    }
+  /// Reads the lane's conversation settings, or changes them. The value lands in the lane's
+  /// snapshot through its session's own publish.
+  func settings(change: ConversationChange? = nil, lane: ProfileID) async throws {
+    _ = try await onLane(lane) { try await $0.settings(change: change) }
   }
 
   // MARK: - Addressing
@@ -1130,10 +1140,6 @@ final class ChatModel {
         all.contains { $0.connection == state }
       } ?? .disconnected
     model = all.first?.model ?? "Unknown"
-    let sole = soleLane.flatMap { snapshots[$0.id] }
-    settingsSupported = sole?.settingsSupported ?? false
-    workInspectionSupported = sole?.workInspectionSupported ?? false
-    conversationSettings = sole?.settings
     busy = all.contains(where: \.busy)
     var usages: Set<String> = []
     commands = all.flatMap(\.commands).filter { usages.insert($0.usage).inserted }
