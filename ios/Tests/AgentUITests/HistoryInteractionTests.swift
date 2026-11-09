@@ -1470,7 +1470,7 @@ final class RestoreInteractionTests: XCTestCase {
 
 // Shared DEBUG app fixture, real screen/session and an owned NDJSON loopback
 // peer. Replies are released by assertions instead of elapsed time.
-private actor InteractionPeer {
+actor InteractionPeer {
   /// The ID this peer answers `identify` with. The app pins it.
   nonisolated let coordinator: UUID
   init(coordinator: UUID = UUID()) { self.coordinator = coordinator }
@@ -1517,6 +1517,12 @@ private actor InteractionPeer {
   func observations() -> Int { observed }
   /// Closes the app's observation, as a dropped network does.
   func dropObserver() { observer?.cancel() }
+  func placeLastSubmit() async throws {
+    let input = try XCTUnwrap(submitted.last)
+    try await emit(
+      .placed(.init(entryId: "placed-\(input.inputId)", inputId: input.inputId)),
+      to: XCTUnwrap(observer))
+  }
   func beginReply(_ text: String) async throws {
     try await emit(.textDelta(.init(text: text)), to: XCTUnwrap(observer))
   }

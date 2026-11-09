@@ -153,7 +153,7 @@
         addSubview(button)
         button.isHidden = true
         button.accessibilityHint =
-          "Removes the recipient, so the message goes to every coordinator."
+          "Removes the recipient. The draft is addressed to every coordinator and may need All to send."
         button.addAction(UIAction { [weak self] _ in self?.remove() }, for: .primaryActionTriggered)
       }
       required init?(coder: NSCoder) { return nil }
