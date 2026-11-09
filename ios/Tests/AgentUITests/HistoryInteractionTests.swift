@@ -538,6 +538,97 @@ final class ComposerInteractionTests: XCTestCase {
 
 @MainActor
 final class HistoryInteractionTests: XCTestCase {
+  func testRunKeepsDraftAndCoordinatorsAcrossRelaunch() async throws {
+    continueAfterFailure = false
+    executionTimeAllowance = 120
+    let work = InteractionPeer()
+    let personal = InteractionPeer()
+    let relaunchedWork = InteractionPeer(coordinator: work.coordinator)
+    let relaunchedPersonal = InteractionPeer(coordinator: personal.coordinator)
+    let history = NativeEventHistory(messages: [], nextCursor: nil, pageComplete: true)
+    var ports: [String] = []
+    for peer in [work, personal, relaunchedWork, relaunchedPersonal] {
+      addTeardownBlock { await peer.stop() }
+      await peer.history(initial: history, pages: [:], latest: history)
+      ports.append(String(try await peer.start()))
+    }
+    let app = XCUIApplication()
+    let runs = [UUID().uuidString, UUID().uuidString]
+    app.launchEnvironment["AGENT_INTERACTION_RUN"] = runs[0]
+    app.launchEnvironment["AGENT_INTERACTION_PORT"] = ports.prefix(2).joined(separator: ",")
+    app.launchEnvironment["AGENT_INTERACTION_COORDINATOR"] = [work, personal]
+      .map { $0.coordinator.uuidString }.joined(separator: ",")
+    app.launchArguments += ["-notificationsEnabled", "NO"]
+    addTeardownBlock { @MainActor in
+      if app.state != .notRunning { app.terminate() }
+      app.launchEnvironment["AGENT_INTERACTION_CLEANUP"] = "1"
+      for run in runs {
+        app.launchEnvironment["AGENT_INTERACTION_RUN"] = run
+        app.launch()
+        XCTAssertTrue(app.staticTexts["Interaction fixture cleaned"].waitForExistence(timeout: 5))
+        app.terminate()
+      }
+    }
+
+    app.launch()
+    try await eventually {
+      let workObserved = await work.observations()
+      let personalObserved = await personal.observations()
+      return workObserved > 0 && personalObserved > 0
+    }
+    app.buttons["Connection"].tap()
+    let appearance = app.descendants(matching: .any).matching(identifier: "appearancePicker")
+      .firstMatch
+    XCTAssertTrue(appearance.waitForExistence(timeout: 5))
+    appearance.tap()
+    app.buttons["Dark"].tap()
+    app.buttons["Done"].tap()
+
+    let composer = app.textViews["Message the coordinator"]
+    XCTAssertTrue(composer.waitForExistence(timeout: 5))
+    XCTAssertTrue(composer.wait(for: \.isEnabled, toEqual: true, timeout: 10))
+    composer.tap()
+    composer.typeText("@Work ")
+    XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3))
+    let draft = "Invented draft for the next launch"
+    composer.typeText(draft)
+    app.terminate()
+
+    app.launchEnvironment["AGENT_INTERACTION_PORT"] = ports.suffix(2).joined(separator: ",")
+    app.launch()
+    XCTAssertTrue(composer.waitForExistence(timeout: 10))
+    XCTAssertTrue(composer.wait(for: \.isEnabled, toEqual: true, timeout: 10))
+    XCTAssertEqual(composer.value as? String, draft)
+    XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 5))
+    try await eventually {
+      let workObserved = await relaunchedWork.observations()
+      let personalObserved = await relaunchedPersonal.observations()
+      return workObserved > 0 && personalObserved > 0
+    }
+    app.buttons["Connection"].tap()
+    appearance.tap()
+    let dark = app.buttons["Dark"]
+    XCTAssertTrue(dark.isSelected)
+    dark.tap()
+    for name in ["Work", "Personal"] {
+      let connected = app.buttons.matching(
+        NSPredicate(format: "label CONTAINS %@ AND label CONTAINS %@", name, "Connected")
+      ).firstMatch
+      XCTAssertTrue(connected.waitForExistence(timeout: 5), "\(name) did not connect")
+    }
+
+    app.terminate()
+    app.launchEnvironment["AGENT_INTERACTION_RUN"] = runs[1]
+    app.launch()
+    XCTAssertTrue(composer.waitForExistence(timeout: 10))
+    XCTAssertTrue(composer.wait(for: \.isEnabled, toEqual: true, timeout: 10))
+    XCTAssertEqual(composer.value as? String, "Message Beep Boop")
+    XCTAssertFalse(app.buttons["To Work"].exists)
+    app.buttons["Connection"].tap()
+    appearance.tap()
+    XCTAssertTrue(app.buttons["System"].isSelected)
+  }
+
   private func launchMessages(
     _ messages: [HistoryMessage], toolDetails: [String: ToolDetails] = [:],
     appearance: String? = nil
@@ -1381,7 +1472,8 @@ final class RestoreInteractionTests: XCTestCase {
 // peer. Replies are released by assertions instead of elapsed time.
 private actor InteractionPeer {
   /// The ID this peer answers `identify` with. The app pins it.
-  nonisolated let coordinator = UUID()
+  nonisolated let coordinator: UUID
+  init(coordinator: UUID = UUID()) { self.coordinator = coordinator }
   private var listener: NWListener?
   private var sockets: [UUID: NWConnection] = [:]
   private var initial: NativeEventHistory?

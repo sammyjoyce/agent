@@ -1,4 +1,5 @@
 #if DEBUG
+  import CryptoKit
   import Foundation
   import Network
   import SwiftUI
@@ -12,6 +13,8 @@
   struct InteractionFixture: View {
     /// One lane per peer, in order. Two peers are saved as Work and Personal.
     let peers: [(port: NWEndpoint.Port, coordinator: CoordinatorID)]
+    let runID: String?
+    let cleanup: Bool
     @State private var model = ChatModel()
 
     /// `AGENT_INTERACTION_PORT` and `AGENT_INTERACTION_COORDINATOR` are comma-separated lists.
@@ -27,10 +30,20 @@
         }
       }
       guard !peers.isEmpty, peers.count == ports.count else { return nil }
-      return Self(peers: peers)
+      let runID = environment["AGENT_INTERACTION_RUN"].flatMap { $0.isEmpty ? nil : $0 }
+      return Self(
+        peers: peers, runID: runID, cleanup: environment["AGENT_INTERACTION_CLEANUP"] == "1")
     }
 
     var body: some View {
+      if let runID {
+        PersistentInteractionFixture(peers: peers, runID: runID, cleanup: cleanup)
+      } else {
+        transient
+      }
+    }
+
+    private var transient: some View {
       MainChatView(model: model)
         .task {
           let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
@@ -60,6 +73,94 @@
             for profile in profiles { await model.detach(profile.id) }
           } catch { model.failure = error.localizedDescription }
         }
+    }
+  }
+
+  private struct PersistentInteractionFixture: View {
+    let peers: [(port: NWEndpoint.Port, coordinator: CoordinatorID)]
+    let runID: String
+    let cleanup: Bool
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var context: Context?
+    @State private var message = "Preparing interaction fixture"
+
+    private struct Context {
+      let defaults: UserDefaults
+      let notifications: AppNotifications
+    }
+
+    var body: some View {
+      Group {
+        if let context {
+          MainChatView(notifications: context.notifications)
+            .defaultAppStorage(context.defaults)
+        } else {
+          Text(message)
+        }
+      }
+      .task { await start() }
+      .onChange(of: scenePhase) { _, phase in
+        guard let notifications = context?.notifications else { return }
+        Task { await notifications.coordinators.setActive(phase == .active) }
+      }
+    }
+
+    private func start() async {
+      let key = SHA256.hash(data: Data(runID.utf8)).map { String(format: "%02x", $0) }.joined()
+      let suite = "dev.jessfraz.Agent.InteractionFixture.\(key)"
+      let root = URL.applicationSupportDirectory.appending(path: "Agent/InteractionFixtures/\(key)")
+      guard let defaults = UserDefaults(suiteName: suite) else {
+        message = "Could not create interaction fixture defaults"
+        return
+      }
+      do {
+        if cleanup {
+          if FileManager.default.fileExists(atPath: root.path) {
+            try FileManager.default.removeItem(at: root)
+          }
+          defaults.removePersistentDomain(forName: suite)
+          message = "Interaction fixture cleaned"
+          return
+        }
+        let names = ["Work", "Personal"]
+        guard peers.count <= names.count else {
+          message = "Interaction fixture supports at most two peers"
+          return
+        }
+        let support = root.appending(path: "Support")
+        let caches = root.appending(path: "Caches")
+        let addresses = try peers.indices.map {
+          try CoordinatorAddress(host: "100.64.1.\($0 + 2)")
+        }
+        let ports = Dictionary(uniqueKeysWithValues: zip(addresses, peers.map(\.port)))
+        let profilesURL = support.appending(path: "Agent/profiles.json")
+        if !FileManager.default.fileExists(atPath: profilesURL.path) {
+          let profiles = try peers.indices.map { index in
+            var profile = CoordinatorProfile(
+              name: try TagName(names[index]), address: addresses[index])
+            profile.pin = peers[index].coordinator
+            return profile
+          }
+          try writePrivately(
+            JSONEncoder().encode(Coordinators.SavedProfiles(profiles: profiles)), to: profilesURL)
+        }
+        if defaults.persistentDomain(forName: suite)?["notificationsEnabled"] == nil {
+          defaults.set(false, forKey: "notificationsEnabled")
+        }
+        let transport = CoordinatorTransport { address in
+          guard let port = ports[address] else { throw ConnectionError.invalidAddress }
+          return LineConnection(
+            connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+        }
+        let notifications = AppNotifications(
+          defaults: defaults, applicationSupport: support, caches: caches, transport: transport,
+          persistence: ComposerDraftStore(url: support.appending(path: "Agent/Composer/draft.json"))
+        )
+        context = Context(defaults: defaults, notifications: notifications)
+        await notifications.coordinators.setActive(scenePhase == .active)
+      } catch {
+        message = "Interaction fixture failed: \(error.localizedDescription)"
+      }
     }
   }
 #endif
