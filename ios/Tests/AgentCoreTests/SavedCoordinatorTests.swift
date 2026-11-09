@@ -651,7 +651,7 @@ func theMigratedProfilePairsAndHeldMessagesLeaveOnlyByADeliberateSend() async th
   #expect(chat.held.count == 2, "Clearing the restored draft keeps the held item")
   await chat.restoreHeld(first)
   #expect(await fixture.count() == 0, "Restore sends nothing")
-  await chat.send()
+  await chat.send()?.value
   try await eventually("the held source removed after admission") {
     chat.held.map(\.id) == [install.queued[1].inputId]
   }
@@ -959,11 +959,11 @@ func anObserverThePhoneClosesBeforeItsFirstReplyOnlyReconnects() async throws {
     await fixture.loseInputAcknowledgements()
     await fixture.holdNextSubmitReply()
     chat.draft = "Invented note whose reply is held"
-    await chat.send()
+    await chat.send()?.value
     try await eventually("the held submit") { await fixture.count() == 1 }
     await fixture.leaveObserveUnanswered(.silent)
     chat.draft = "Invented note whose reply is lost"
-    await chat.send()
+    await chat.send()?.value
     try await eventually("an observer waiting for its first reply") {
       await observes(fixture) == 2
     }
@@ -1075,7 +1075,7 @@ func aRefusedAddressEditKeepsTheQueueAndNeverSendsTheUserToRemove(_ typo: String
     await work.holdPlacements()
     chat.draft = "@Work Invented follow-up for the Work board"
     chat.promoteTypedTag()
-    await chat.send()
+    await chat.send()?.value
     let outbox = ProfileDirectory(id, applicationSupport: root, caches: root).outbox
     try await eventually("Work accepted the follow-up") {
       await work.count() == 1 && (try? queuedRequests(outbox).count) == 1
@@ -1181,7 +1181,7 @@ func aLaneWhoseAddressAnswersAsAnotherSavedCoordinatorNamesItAndNeverSendsTheUse
     await work.rejectSubmits()
     chat.draft = "@Work Invented follow-up: renew the parking permit"
     chat.promoteTypedTag()
-    await chat.send()
+    await chat.send()?.value
     let outbox = ProfileDirectory(workID, applicationSupport: root, caches: root).outbox
     try await eventually("Work refused the follow-up") {
       chat.snapshots[workID]?.rows.contains { $0.delivery == .rejected } == true
@@ -1238,7 +1238,7 @@ func aLaneWhoseAddressAnswersAsAnotherSavedCoordinatorNamesItAndNeverSendsTheUse
         chat.draft = "@Work Invented note: the quarterly board pack"
         chat.promoteTypedTag()
         let line = chat.recipientLine
-        await chat.send()
+        await chat.send()?.value
         try await eventually("Work's coordinator got the note") { await work.count() > before.0 }
         try await Task.sleep(for: .milliseconds(300))
         let gotByWork = await work.count() - before.0
@@ -1345,7 +1345,7 @@ func removeCountsQueuedAndHeldMessagesAndDeletesOnlyAfterSaving() async throws {
   try await eventually("paired and connected") { chat.connection == .connected }
   chat.draft = "Kept on this phone"
   await chat.attach(data: Data("bytes".utf8), name: "Notes.txt", mediaType: "text/plain")
-  await chat.send()
+  await chat.send()?.value
   try await eventually("a rejected live item") {
     chat.rows.contains { $0.row.delivery == .rejected }
   }
@@ -1607,7 +1607,7 @@ func aReinstalledCoordinatorsBannerCountsWhatRemoveDeletes(queued: Bool) async t
     if queued {
       await original.rejectSubmits()
       chat.draft = "Invented: and the trailer"
-      await chat.send()
+      await chat.send()?.value
       try await eventually("Work refused it") {
         chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
       }
@@ -1696,7 +1696,7 @@ func restoreCopiesARejectedItemAndRemovesItOnlyOnceTheCopyIsAdmitted() async thr
   try await eventually("connected") { chat.connection == .connected }
   chat.draft = "Needs a second try"
   await chat.attach(data: Data("bytes".utf8), name: "Notes.txt", mediaType: "text/plain")
-  await chat.send()
+  await chat.send()?.value
   try await eventually("rejected") { chat.rows.contains { $0.row.delivery == .rejected } }
   let original = try #require(try queuedRequests(directory.outbox).first)
   await chat.restore(original.inputId)
@@ -1707,7 +1707,7 @@ func restoreCopiesARejectedItemAndRemovesItOnlyOnceTheCopyIsAdmitted() async thr
   #expect(
     try queuedRequests(directory.outbox) == [original], "Clearing the draft keeps the source")
   await chat.restore(original.inputId)
-  await chat.send()
+  await chat.send()?.value
   let after = try queuedRequests(directory.outbox)
   #expect(after.count == 1 && after.first?.inputId != original.inputId)
   await chat.detach(directory.profile)
@@ -1747,7 +1747,7 @@ func aHeldMessageStartingWithAnotherNameRestoresToItsOwnCoordinatorAsTyped() asy
     chat.destination.chip == profile.id, "Restore addresses the profile the queue was held for")
   #expect(chat.draft == held.item.text)
   #expect(chat.recipientLine == "To \(profile.name.description)")
-  await chat.send()
+  await chat.send()?.value
   try await eventually("the restored message at its own coordinator") {
     await migrated.count() == 1
   }
@@ -1871,7 +1871,7 @@ func aHeldMessageGoesToTheCoordinatorAtItsAddressOrWhereTheUserChooses(_ when: S
     let restored = chat.draft
     let line = chat.addressesByName ? chat.recipientLine : "(no recipient line)"
     let offered = chat.heldChoices.map(\.name.description)
-    await chat.send()
+    await chat.send()?.value
     let reached = try await settles { await submitted(used) + submitted(work) != [] }
     print(
       "IF14-V1[\(when)] Restore: draft=\(restored.debugDescription) line=\(line) offered=\(offered) after Send, reached anyone=\(reached) Work's coordinator got=\(await submitted(work)) the build's coordinator got=\(await submitted(used)) held=\(chat.held.map(\.item.text))"
@@ -1888,7 +1888,7 @@ func aHeldMessageGoesToTheCoordinatorAtItsAddressOrWhereTheUserChooses(_ when: S
       #expect(restored.isEmpty, "Restore addressed it to Work without the user choosing")
       #expect(offered == ["Work"])
       await chat.restoreHeld(held, for: migrated.id)
-      await chat.send()
+      await chat.send()?.value
       let chosen = try await settles { await submitted(work) == ["Second held note"] }
       print(
         "IF14-V1[\(when)] the user chose Work: Work's coordinator got=\(await submitted(work)) held=\(chat.held.map(\.item.text))"
@@ -1927,7 +1927,7 @@ func aHeldMessageForItsCoordinatorAtANewAddressTakesOneChoice() async throws {
     let withoutChoice = chat.draft
     let offered = chat.heldChoices.map(\.name.description)
     await chat.restoreHeld(held, for: migrated.id)
-    await chat.send()
+    await chat.send()?.value
     let delivered = try await settles { await submitted(used) == ["Second held note"] }
     let stillHeld = chat.held.contains { $0.id == held.id }
     await chat.discardHeld(held)
@@ -2120,7 +2120,7 @@ func feedbackAttachesTheScreenshotOnlyWhenEverythingOnScreenIsTheRecipients(_ he
     await chat.send(screenshot: {
       captures += 1
       return Data("Invented screen showing the held notes".utf8)
-    })
+    })?.value
     try await eventually("the feedback at its coordinator") { await recipient.count() == 1 }
     let files = await recipient.received().compactMap { event -> NativeRequestSubmit? in
       if case .submit(let input) = event { input } else { nil }
@@ -2429,7 +2429,7 @@ func heldMessagesWithNoRecordedAddressAskWithoutClaimingNothingIsPairedThere() a
     let offered = chat.heldChoices.map(\.name.description)
     let note = chat.heldNote(held)
     await chat.restoreHeld(held, for: migrated)
-    await chat.send()
+    await chat.send()?.value
     let delivered = try await settles { await submitted(used) == ["Second held note"] }
     print(
       "IF15-U4-B2[#8 profiles.json, the migrated profile paired] Restore without a choice: draft=\(withoutChoice.debugDescription) offered=\(offered) note=\(note.debugDescription) after choosing and Send: delivered=\(delivered) still held=\(chat.held.map(\.item.text))"
@@ -2526,7 +2526,7 @@ func restoresNoteSaysNobodyIsPairedAtTheAddressOnlyWhenNobodyIs(
     let shown = chat.heldNote(held)
     await chat.restoreHeld(held, for: chosen)
     _ = try await settles { chat.canSend }
-    await chat.send()
+    await chat.send()?.value
     let delivered = try await settles { await submitted(personal) == [note] }
     print(
       "R21-note[\(state)] saved=\(coordinators.profiles.map { "\($0.name)@\($0.address.port)" }) Restore asked=\(asked) offered=\(chat.heldChoices.map(\.name.description)) note=\(shown.debugDescription) after choosing Personal and Send: delivered=\(delivered) still held=\(chat.held.count)"
@@ -2686,11 +2686,11 @@ func aChoiceMadeBeforeTheHeldMessageGainedAnOwnerRestoresNothing() async throws 
     }
     await chat.restoreHeld(held, for: paired.id)
     let staleDraft = chat.draft
-    await chat.send()
+    await chat.send()?.value
     await chat.restoreHeld(held)
     let toOwner = chat.draft == note && chat.destination.chip == migrated.id
     _ = try await settles { chat.canSend }
-    await chat.send()
+    await chat.send()?.value
     let workGot = try await settles { await submitted(work) == [note] }
     let personalGot = await submitted(personal)
     print(
@@ -2856,7 +2856,7 @@ func aSecondMigrationAddressesEachHeldMessageToTheCoordinatorAtItsOwnAddress(_ w
         ? chat.held.first { $0.item.text == "Second held note" } : chat.held.first)
     await chat.restoreHeld(held)
     let restored = (draft: chat.draft, line: chat.recipientLine)
-    await chat.send()
+    await chat.send()?.value
     _ = try await settles { await submitted(work) + submitted(personal) != [] }
     print(
       "IF15-U4-C[\(when)] saved=\(coordinators.profiles.map { "\($0.name)@\($0.address.port)" }) Restore: draft=\(restored.draft.debugDescription) line=\(restored.line) after Send: Work's coordinator got=\(await submitted(work)) Personal's coordinator got=\(await submitted(personal))"
@@ -3596,7 +3596,7 @@ func aBindingTheShippedBuildMadeAfterALaunchStoppedOutlivesThatLaunchsRecord(
     await chat.restoreHeld(note)
     let restored = (draft: chat.draft, recipient: chat.destination.chip.map(chat.name) ?? "nobody")
     if !chat.draft.isEmpty {
-      await chat.send()
+      await chat.send()?.value
       _ = try await settles { await submitted(work) + submitted(personal) != [] }
     }
     print(
@@ -3648,7 +3648,7 @@ func aBindingTheShippedBuildMadeAfterALaunchStoppedOutlivesThatLaunchsRecord(
     addressed[note.item.text] = chat.destination.chip.map(chat.name) ?? "nobody"
     guard !chat.draft.isEmpty else { continue }
     _ = try await settles { chat.canSend }
-    await chat.send()
+    await chat.send()?.value
     _ = try await settles { await sent() > before }
   }
   return addressed
@@ -3916,7 +3916,7 @@ private struct RestoredAndSent {
     let draft = chat.draft
     let recipient = chat.destination.chip.map(chat.name) ?? "nobody"
     if !chat.draft.isEmpty {
-      await chat.send()
+      await chat.send()?.value
       _ = try await settles { await submitted(work) + submitted(personal) != [] }
     }
     let result = RestoredAndSent(
@@ -4176,7 +4176,7 @@ func aPreviousBuildsOriginGoesOnlyToTheFolderItDescribes() async throws {
     let queue = try #require(coordinators.queues.first { $0.id == held.queue })
     await chat.restoreHeld(held)
     let restored = (draft: chat.draft, recipient: chat.destination.chip)
-    await chat.send()
+    await chat.send()?.value
     _ = try await settles { await submitted(work) + submitted(personal) != [] }
     print(
       "IF16-T4-3[this build over the previous build's origin] queue address=\(queue.address.map { "\($0.host):\($0.port)" } ?? "unknown") bound=\(queue.coordinator == work.id ? "Work" : queue.coordinator == personal.id ? "Personal" : "nobody") Restore: draft=\(restored.draft.debugDescription) to=\(restored.recipient.map(chat.name) ?? "nobody") after Send: Work's coordinator got=\(await submitted(work)) Personal's coordinator got=\(await submitted(personal))"
@@ -4260,7 +4260,7 @@ func aRecordOfAQueueAlreadyHeldGivesNothingToALaterLegacyFolder() async throws {
     await chat.restoreHeld(held)
     let restored = (draft: chat.draft, recipient: chat.destination.chip)
     if !chat.draft.isEmpty {
-      await chat.send()
+      await chat.send()?.value
       _ = try await settles { await submitted(work) + submitted(personal) != [] }
     }
     print(
@@ -4560,7 +4560,7 @@ func aQueueRemoveDeletedGivesNothingToALaterLegacyFolder() async throws {
     await chat.restoreHeld(held)
     let restored = (draft: chat.draft, recipient: chat.destination.chip)
     if !chat.draft.isEmpty {
-      await chat.send()
+      await chat.send()?.value
       _ = try await settles { await submitted(work) + submitted(personal) != [] }
     }
     print(

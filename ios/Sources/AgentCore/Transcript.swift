@@ -85,8 +85,11 @@ struct Transcript: Sendable {
   var unpreparedRows: [ChatRow] { storage }
   /// The row streamed text grows until its entry replaces it.
   var streamingRowID: String? { responseID }
+  /// How many times a row was appended, so a caller can tell whether an event added one.
+  private(set) var appends = 0
 
   private mutating func append(_ row: ChatRow) {
+    appends &+= 1
     if let position = row.positionID,
       let index = storage.firstIndex(where: { $0.positionID.map { $0 > position } ?? false })
     {
@@ -509,7 +512,7 @@ private struct NativeEntryID: Sendable, Equatable, Comparable {
 }
 
 extension HistoryRole {
-  fileprivate var carriesAnswer: Bool {
+  var carriesAnswer: Bool {
     switch self {
     case .assistant, .final, .commentary: true
     case .thinking, .tool, .user, .notice, .partialAnswer: false

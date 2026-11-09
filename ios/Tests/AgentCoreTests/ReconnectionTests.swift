@@ -272,7 +272,7 @@ private func acknowledgedInputsRemainSavedAcrossClientLifecycleAndCannotBeResubm
   try await withReconnectCoordinator(.acknowledged) { model, fixture, outbox, reopen in
     try await waitForReconnectState { model.connection == .connected }
     model.draft = "Continue the supplier drawing review"
-    await model.send()
+    await model.send()?.value
     try await waitForReconnectState { model.rows.first?.row.delivery == .saved }
     let input = try #require(await fixture.submitted().first)
     let originalID = try #require(model.rows.first?.id)
@@ -322,7 +322,7 @@ private func admittedInputWorkReconcilesAfterReopenWithoutBecomingADeliveryError
     try await waitForReconnectState { model.connection == .connected }
     await fixture.describeWork(work)
     model.draft = "Review the connector drawing"
-    await model.send()
+    await model.send()?.value
     try await waitForReconnectState { model.rows.first?.row.delivery == .saved }
     #expect(model.rows.first?.row.work == work)
     #expect(model.error == nil)
@@ -391,7 +391,7 @@ private func actionFailureDoesNotStopTheObserversActiveWorkOrUndoAdmission() asy
   try await withReconnectCoordinator(.active) { model, fixture, _ in
     try await waitForReconnectState { model.connection == .connected && model.busy }
     model.draft = "Check the related drawing"
-    await model.send()
+    await model.send()?.value
     try await waitForReconnectState { model.error != nil }
     #expect(model.busy)
     #expect(model.connection == .connected)
@@ -493,7 +493,7 @@ func acknowledgedActionReplyReconnectsAndReconcilesWithoutResendingOrClearingNew
   try await withReconnectCoordinator(.recover) { model, fixture, outbox in
     try await waitForReconnectState { model.connection == .connected }
     model.draft = "The original submission"
-    await model.send()
+    await model.send()?.value
     model.draft = "New typing survives reconnection"
     try await waitForReconnectState { model.connection == .reconnecting }
     #expect(model.connection.label == "Reconnecting…")
@@ -604,7 +604,7 @@ func establishedObservationSurvivesTurnFailureAndAdmitsTheNextInput() async thro
     #expect(model.rows.isEmpty, "The failure remains ephemeral")
     model.draft = "Try the next request"
     try #require(model.canSend)
-    await model.send()
+    await model.send()?.value
     try await waitForReconnectFixture { await fixture.submitted().count == 1 }
     let submitted = try #require(await fixture.submitted().first)
     try await waitForReconnectState {

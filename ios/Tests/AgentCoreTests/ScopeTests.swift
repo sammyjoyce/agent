@@ -152,7 +152,7 @@ private func temporaryRoot() throws -> URL {
 
 /// A file whose bytes come through a named pipe, so a copy that opens it waits until the test
 /// calls `finish()`.
-@MainActor private final class PipedCopy {
+@MainActor final class PipedCopy {
   let url: URL
   private let bytes: Data
   private var writer: Int32 = -1
@@ -183,10 +183,13 @@ private func temporaryRoot() throws -> URL {
     }
   }
 
-  /// Gives the copy the bytes and ends the file, so the copy completes.
+  /// Gives the copy the bytes and ends the file, so the copy completes. A regular file with the
+  /// same bytes then takes the pipe's place, so a later copy reads it instead of waiting forever.
   func finish() {
     _ = bytes.withUnsafeBytes { write(writer, $0.baseAddress, $0.count) }
     release()
+    let file = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+    if (try? bytes.write(to: file)) != nil { _ = rename(file.path, url.path) }
   }
 
   /// Ends a copy still waiting at the pipe, so a failed test leaves none stuck.
@@ -393,7 +396,7 @@ private func imageProvider(in root: URL) throws -> NSItemProvider {
       let (work, personal) = try await addWorkAndPersonal(coordinators)
       let chat = coordinators.chat
       chat.draft = "An invented message to both"
-      await chat.send()
+      await chat.send()?.value
       let deadline = ContinuousClock.now + .seconds(15)
       while ![work, personal].allSatisfy({ id in
         chat.snapshots[id]?.sends.values.contains { $0.progress == .placed } == true
@@ -653,9 +656,9 @@ private func imageProvider(in root: URL) throws -> NSItemProvider {
       #expect(chat.attachments.count == 1)
       #expect(chat.destination == .begunIn(work), "The file keeps the feed it was picked in")
       #expect(chat.recipientLine == "This draft goes to Work" && !chat.canSend)
-      await chat.send()
+      await chat.send()?.value
       chat.show(.one(work))
-      await chat.send()
+      await chat.send()?.value
       try await eventually("Work got it") { await workFixture.count() == 1 }
       #expect(await personalFixture.count() == 0)
     }
@@ -676,7 +679,7 @@ private func imageProvider(in root: URL) throws -> NSItemProvider {
       chat.draft = "Invented: the venue contract"
       await chat.attach(
         data: Data("invented contract".utf8), name: "Contract.txt", mediaType: "text/plain")
-      await chat.send()
+      await chat.send()?.value
       try await eventually("rejected by Personal") {
         chat.snapshots[personal]?.rows.contains { $0.delivery == .rejected } == true
       }
@@ -725,7 +728,7 @@ private func imageProvider(in root: URL) throws -> NSItemProvider {
       chat.draft = "Invented: the Work offsite contract"
       await chat.attach(
         data: Data("invented contract".utf8), name: "Contract.txt", mediaType: "text/plain")
-      await chat.send()
+      await chat.send()?.value
       try await eventually("rejected by Work") {
         chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
       }
@@ -756,7 +759,7 @@ private func imageProvider(in root: URL) throws -> NSItemProvider {
       chat.edit(finished, committed: finished)
       chat.promoteTypedTag()
       chat.show(.one(personal))
-      await chat.send()
+      await chat.send()?.value
       try await eventually("Personal got it") { await personalFixture.count() == 1 }
       #expect(await submitted(personalFixture) == ["the venue shortlist"])
       #expect(await workFixture.count() == 0)
@@ -779,7 +782,7 @@ private func imageProvider(in root: URL) throws -> NSItemProvider {
       chat.draft = text
       await chat.attach(
         data: Data("invented contract".utf8), name: "Contract.txt", mediaType: "text/plain")
-      await chat.send()
+      await chat.send()?.value
       try await eventually("rejected by Work") {
         chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
       }
@@ -800,7 +803,7 @@ private func imageProvider(in root: URL) throws -> NSItemProvider {
       #expect(chat.attachments.map(\.reference.name) == ["Contract.txt"])
       await workFixture.acceptUploads()
       try await eventually("Send is enabled") { chat.canSend }
-      await chat.send()
+      await chat.send()?.value
       try await eventually("Work got it") { await workFixture.count() == 1 }
       #expect(await submitted(workFixture) == [text + "\n\n" + typed])
     }
@@ -924,13 +927,13 @@ private func imageProvider(in root: URL) throws -> NSItemProvider {
         data: Data("invented lease".utf8), name: "Lease.txt", mediaType: "text/plain")
       let held = try PipedCopy(replacing: #require(chat.attachments.first).url)
       defer { held.release() }
-      let sending = Task { await chat.send() }
+      let sending = chat.send()
       try await held.opened()
       #expect(chat.admitting)
       chat.removeChip()
       #expect(chat.destination == .chip(work), "The chip stays while the Send is admitting")
       held.finish()
-      await sending.value
+      await sending?.value
       #expect(chat.draft.isEmpty && chat.attachments.isEmpty && chat.destination == .open)
       try await eventually("Work got it") { await workFixture.count() == 1 }
       #expect(await personalFixture.count() == 0)
@@ -951,28 +954,22 @@ private func imageProvider(in root: URL) throws -> NSItemProvider {
         data: Data("invented agenda".utf8), name: "Agenda.txt", mediaType: "text/plain")
       let held = try PipedCopy(replacing: #require(chat.attachments.first).url)
       defer { held.release() }
-      let sending = Task { await chat.send() }
+      let sending = chat.send()
       try await held.opened()
       chat.show(.one(work))
       #expect(chat.admitting)
       #expect(chat.addressing == .elsewhere([work, personal], narrows: true))
       chat.setChip(work)
       #expect(chat.destination == .open, "The draft keeps its address while the Send is admitting")
-      // Work's copy holds the pipe open, so Personal's copy, which starts after it, gets its own.
-      try FileManager.default.removeItem(at: held.url)
-      try #require(mkfifo(held.url.path, 0o600) == 0)
       held.finish()
-      // Personal's copy reads the file again.
-      try await held.opened()
-      held.finish()
-      await sending.value
+      await sending?.value
       #expect(chat.draft.isEmpty && chat.attachments.isEmpty && chat.destination == .open)
       try await eventually("each got it, and Work is connected again") {
         let (atWork, atPersonal) = (await submitted(workFixture), await submitted(personalFixture))
         return atWork == [text] && atPersonal == [text]
           && chat.snapshots[work]?.connection == .connected
       }
-      await chat.send()
+      await chat.send()?.value
       try await Task.sleep(for: .seconds(1))
       #expect(await submitted(workFixture) == [text], "Work gets the message once")
     }

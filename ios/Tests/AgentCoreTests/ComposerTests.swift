@@ -41,11 +41,11 @@ import Testing
 func sendPreservesNewTypingAndCannotAdmitTheSameDraftTwice() async throws {
   try await withConnectedModel { model, _, directory in
     model.draft = "Original draft"
-    let sending = Task { await model.send() }
+    let sending = model.send()
     while !model.admitting { await Task.yield() }
     model.draft = "New typing while admission is pending"
-    await model.send()
-    await sending.value
+    await model.send()?.value
+    await sending?.value
     let queued = try queuedRequests(directory.outbox)
     #expect(queued.map(\.text) == ["Original draft"])
     #expect(model.draft == "New typing while admission is pending")
@@ -57,12 +57,12 @@ func sendPreservesNewTypingAndCannotAdmitTheSameDraftTwice() async throws {
 func durableAdmissionDoesNotEraseANewerDraftWithIdenticalText(afterClearing: Bool) async throws {
   try await withConnectedModel { model, _, directory in
     model.draft = "The same text in a different draft"
-    let sending = Task { await model.send() }
+    let sending = model.send()
     while !model.admitting { await Task.yield() }
     if afterClearing { model.draft = "" }
     model.draft = "The same text in a different draft"
-    await model.send()
-    await sending.value
+    await model.send()?.value
+    await sending?.value
     let queued = try queuedRequests(directory.outbox)
     #expect(queued.count == 1)
     #expect(model.draft == "The same text in a different draft")
@@ -75,11 +75,11 @@ func sendKeepsAnUnadmittedDraftAndClearsOnlyItsAdmittedOriginal() async throws {
   try await withConnectedModel { model, _, directory in
     let oversized = String(repeating: "x", count: 65537)
     model.draft = oversized
-    await model.send()
+    await model.send()?.value
     #expect(model.draft == oversized)
     #expect((try? queuedRequests(directory.outbox)) == nil, "Nothing was saved")
     model.draft = "Saved original"
-    await model.send()
+    await model.send()?.value
     #expect(model.draft.isEmpty)
     let queued = try queuedRequests(directory.outbox)
     #expect(queued.map(\.text) == ["Saved original"])
@@ -95,12 +95,12 @@ func feedbackCapturesOnceAndFailedAdmissionKeepsTheExactScreenshot() async throw
       await model.send(screenshot: {
         captures += 1
         return Data([1, 2, 3])
-      })
+      })?.value
       let original = try #require(model.attachments.first)
       await model.send(screenshot: {
         captures += 1
         return Data([4, 5, 6])
-      })
+      })?.value
       #expect(captures == 1)
       #expect(model.attachments == [original])
       #expect(try Data(contentsOf: original.url) == Data([1, 2, 3]))
@@ -113,10 +113,10 @@ func feedbackCapturesOnceAndFailedAdmissionKeepsTheExactScreenshot() async throw
 func attachmentOnlyAdmissionPreservesFilesAddedWhileTheOriginalIsSaving() async throws {
   try await withConnectedModel { model, _, directory in
     await model.attach(data: Data([1]), name: "First.txt", mediaType: "text/plain")
-    let sending = Task { await model.send() }
+    let sending = model.send()
     while !model.admitting { await Task.yield() }
     await model.attach(data: Data([2]), name: "Second.txt", mediaType: "text/plain")
-    await sending.value
+    await sending?.value
     #expect(model.attachments.map(\.reference.name) == ["Second.txt"])
     #expect(try Data(contentsOf: #require(model.attachments.first).url) == Data([2]))
     let queued = try queuedRequests(directory.outbox)

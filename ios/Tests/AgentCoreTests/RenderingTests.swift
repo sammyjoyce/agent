@@ -1195,7 +1195,7 @@
           #expect(
             model.destination.chip == model.profiles.last?.id, "The committed tag is not the chip")
           #expect(model.draft == "invented final candidate")
-          await model.send()
+          await model.send()?.value
           let workProfile = try #require(model.profiles.first)
           let workOutbox = ProfileDirectory(
             workProfile.id, applicationSupport: root, caches: root
@@ -1670,7 +1670,7 @@
           model.draft = text
           try await Task.sleep(for: .milliseconds(700))
           host.view.layoutIfNeeded()
-          await model.send(screenshot: capture.png)
+          await model.send(screenshot: capture.png)?.value
           try await waitFor("Work got \(text)") { await work.count() == before + 1 }
           let inputs = await work.received().compactMap { event -> NativeRequestSubmit? in
             if case .submit(let input) = event { input } else { nil }

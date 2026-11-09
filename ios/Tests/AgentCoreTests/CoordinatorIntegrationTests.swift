@@ -256,7 +256,7 @@ func twoCoordinatorFeedRoutesOnlyToAddressedCoordinators() async throws {
   #expect(chat.destination.chip.map(chat.name) == "Work", "The chip says Work")
   type(tagged)
   #expect(chat.recipientLine == "To Work")
-  await chat.send()
+  await chat.send()?.value
   #expect(chat.draft.isEmpty && chat.destination.chip == nil, "The @Work message was admitted")
   try await eventually("Work answering the @Work submit") {
     bubbles(tagged).count == 1 && bubbles(tagged)[0].receipts.map(\.lane) == [work]
@@ -266,7 +266,7 @@ func twoCoordinatorFeedRoutesOnlyToAddressedCoordinators() async throws {
   type(broadcast)
   #expect(chat.destination.chip == nil)
   #expect(chat.recipientLine == "To Work and Personal")
-  await chat.send()
+  await chat.send()?.value
   #expect(chat.draft.isEmpty, "The untagged message was admitted")
   try await eventually("both coordinators answering the untagged submit") {
     bubbles(broadcast).count == 1
@@ -296,7 +296,7 @@ func twoCoordinatorFeedRoutesOnlyToAddressedCoordinators() async throws {
   type("@Work ")
   type(afterRepoint)
   #expect(chat.recipientLine == "Work is not connected")
-  await chat.send()
+  await chat.send()?.value
   #expect(
     chat.draft == afterRepoint && chat.destination.chip == work, "The new @Work message stays")
   let workOutbox = ProfileDirectory(work, applicationSupport: support, caches: caches).outbox
