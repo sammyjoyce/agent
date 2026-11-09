@@ -7,16 +7,65 @@ import UserNotifications
   import UIKit
 #endif
 
+enum AlertOrigin: Equatable {
+  case unnamed
+  case named(ProfileID)
+  case malformed
+}
+
+struct OpenRequest: Equatable {
+  let id = UUID()
+  let notice: String?
+}
+
+public enum MainVisibility: Equatable {
+  case hidden
+  case visible(atLatest: Bool)
+}
+
 /// The app delegate owns OS registration; the coordinator owns delivery. As the
 /// process-scoped object, it also owns the saved coordinators.
 @MainActor @Observable
 public final class AppNotifications: NSObject {
   public let registration: NotificationRegistration
   public let coordinators: Coordinators
-  public var mainVisible = false
-  public private(set) var openedTarget: NotificationTarget?
-  var presentsAlerts: Bool { !mainVisible && registration.enabled }
-  func open(_ target: NotificationTarget) { openedTarget = target }
+  public var mainVisible: MainVisibility = .hidden
+  private(set) var openRequest: OpenRequest?
+  #if DEBUG
+    @ObservationIgnored private weak var fixtureTarget: AppNotifications?
+    @ObservationIgnored private var pendingFixtureOrigin: AlertOrigin?
+
+    func forwardFixtureOpens(to target: AppNotifications) {
+      fixtureTarget = target
+      if let origin = pendingFixtureOrigin {
+        pendingFixtureOrigin = nil
+        target.open(origin)
+      }
+    }
+  #endif
+
+  func open(_ origin: AlertOrigin) {
+    #if DEBUG
+      if let fixtureTarget {
+        fixtureTarget.open(origin)
+        return
+      }
+      pendingFixtureOrigin = origin
+    #endif
+    openRequest = OpenRequest(notice: coordinators.show(opening: origin))
+  }
+
+  func presents(_ origin: AlertOrigin?) -> Bool {
+    #if DEBUG
+      if let fixtureTarget { return fixtureTarget.presents(origin) }
+    #endif
+    guard registration.enabled else { return false }
+    guard case .visible(let atLatest) = mainVisible else { return true }
+    let chat = coordinators.chat
+    guard chat.multiple else { return false }
+    guard atLatest, let origin, let routed = coordinators.route(origin) else { return true }
+    return !chat.scope.shows(routed)
+  }
 
   public override convenience init() { self.init(defaults: .standard) }
 
@@ -63,11 +112,19 @@ public final class AppNotifications: NSObject {
     super.init()
   }
 
-  private nonisolated static func target(_ userInfo: [AnyHashable: Any]) -> NotificationTarget? {
-    guard let value = userInfo["agent"], JSONSerialization.isValidJSONObject(value),
-      let data = try? JSONSerialization.data(withJSONObject: value)
+  nonisolated static func origin(_ userInfo: [AnyHashable: Any]) -> AlertOrigin? {
+    guard var agent = userInfo["agent"] as? [String: Any] else { return nil }
+    let key = agent.removeValue(forKey: "installation_id")
+    guard JSONSerialization.isValidJSONObject(agent),
+      let data = try? JSONSerialization.data(withJSONObject: agent),
+      (try? JSONDecoder().decode(NotificationTarget.self, from: data)) != nil
     else { return nil }
-    return try? JSONDecoder().decode(NotificationTarget.self, from: data)
+    switch key {
+    case .none, .some(is NSNull): return .unnamed
+    case .some(let wire as String):
+      return ProfileID(wire: wire).map(AlertOrigin.named) ?? .malformed
+    case .some: return .malformed
+    }
   }
 }
 
@@ -104,8 +161,9 @@ public final class AppNotifications: NSObject {
       withCompletionHandler completionHandler:
         @escaping @Sendable (UNNotificationPresentationOptions) -> Void
     ) {
+      let origin = Self.origin(notification.request.content.userInfo)
       DispatchQueue.main.async {
-        completionHandler(self.presentsAlerts ? [.banner, .sound] : [])
+        completionHandler(self.presents(origin) ? [.banner, .sound] : [])
       }
     }
 
@@ -114,9 +172,9 @@ public final class AppNotifications: NSObject {
       didReceive response: UNNotificationResponse,
       withCompletionHandler completionHandler: @escaping @Sendable () -> Void
     ) {
-      let target = Self.target(response.notification.request.content.userInfo)
+      let origin = Self.origin(response.notification.request.content.userInfo)
       DispatchQueue.main.async {
-        if let target { self.open(target) }
+        if let origin { self.open(origin) }
         completionHandler()
       }
     }

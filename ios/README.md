@@ -358,6 +358,8 @@ CI runs `host`, `simulator-core`, `simulator-performance` and `simulator-ui` in
 parallel; every phase must pass. The default local command runs all checks;
 `simulator` keeps the three simulator suites together for local use. Each
 simulator phase creates and removes its own device.
+To run only the live notification-tap test, run
+`python3 ios/scripts/test-notification-tap.py SIMULATOR_UDID ARTIFACT_DIRECTORY`.
 Set `IOS_SIMULATOR_RUNTIME` to an exact identifier from
 `xcrun simctl list runtimes` to qualify a particular installed runtime.
 The `Agent` scheme's hosted tests also check that accessibility text sizes

@@ -9,7 +9,7 @@ struct AgentApp: App {
   var body: some Scene {
     WindowGroup {
       #if DEBUG
-        if let fixture = InteractionFixture.fromEnvironment() {
+        if let fixture = InteractionFixture.fromEnvironment(notifications: notifications) {
           fixture
         } else {
           MainChatView(notifications: notifications)
@@ -20,7 +20,7 @@ struct AgentApp: App {
     }
     .onChange(of: scenePhase, initial: true) { _, phase in
       #if DEBUG
-        if InteractionFixture.fromEnvironment()?.runID != nil { return }
+        if InteractionFixture.fromEnvironment(notifications: notifications)?.runID != nil { return }
       #endif
       Task { await notifications.coordinators.setActive(phase == .active) }
     }

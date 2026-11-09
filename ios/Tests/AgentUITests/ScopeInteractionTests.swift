@@ -4,7 +4,7 @@ import XCTest
 @MainActor
 final class ScopeInteractionTests: XCTestCase {
   private func launch(
-    count: Int = 2, largestText: Bool = false,
+    count: Int = 2, largestText: Bool = false, notifications: Bool = false,
     configure: ((InteractionPeer, InteractionPeer) async -> Void)? = nil
   ) async throws -> (XCUIApplication, InteractionPeer, InteractionPeer) {
     continueAfterFailure = false
@@ -26,7 +26,16 @@ final class ScopeInteractionTests: XCTestCase {
     app.launchEnvironment["AGENT_INTERACTION_PORT"] = ports.joined(separator: ",")
     app.launchEnvironment["AGENT_INTERACTION_COORDINATOR"] = peers.map { $0.coordinator.uuidString }
       .joined(separator: ",")
-    app.launchArguments += ["-notificationsEnabled", "NO"]
+    app.launchArguments += ["-notificationsEnabled", notifications ? "YES" : "NO"]
+    if notifications {
+      app.launchEnvironment["AGENT_INTERACTION_ALERTS"] = "1"
+      addUIInterruptionMonitor(withDescription: "Allow notifications") { alert in
+        let allow = alert.buttons["Allow"]
+        guard allow.exists else { return false }
+        allow.tap()
+        return true
+      }
+    }
     if largestText {
       app.launchArguments += [
         "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL",
@@ -40,6 +49,11 @@ final class ScopeInteractionTests: XCTestCase {
       app.terminate()
     }
     app.launch()
+    if notifications {
+      let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+      let allow = springboard.buttons["Allow"]
+      if allow.waitForExistence(timeout: 3) { allow.tap() }
+    }
     XCTAssertTrue(app.textViews["Message the coordinator"].waitForExistence(timeout: 10))
     try await wait { await work.observations() > 0 }
     if count > 1 { try await wait { await personal.observations() > 0 } }
@@ -71,6 +85,94 @@ final class ScopeInteractionTests: XCTestCase {
     XCTAssertTrue(field.wait(for: \.isEnabled, toEqual: true, timeout: 10))
     field.tap()
     field.typeText(text)
+  }
+
+  func testNotificationTapsRouteWithoutChangingTheDraft() async throws {
+    let device = try XCTUnwrap(ProcessInfo.processInfo.environment["SIMULATOR_UDID"])
+    try XCTSkipUnless(
+      FileManager.default.fileExists(atPath: "/tmp/agent-notification-\(device).enabled"),
+      "Run ios/scripts/test-notification-tap.py to deliver APNs payloads")
+    let (app, work, personal) = try await launch(notifications: true) { _, personal in
+      let history = NativeEventHistory(
+        messages: [
+          .init(
+            continuation: false, entryId: "personal-latest", finalChunk: true, role: .final,
+            text: "Personal's latest invented reply")
+        ], nextCursor: nil, pageComplete: true)
+      await personal.history(initial: history, pages: [:], latest: history)
+    }
+    let run = try XCTUnwrap(app.launchEnvironment["AGENT_INTERACTION_RUN"])
+    let signal = URL(fileURLWithPath: "/tmp/agent-notification-\(device).json")
+    addTeardownBlock { try? FileManager.default.removeItem(at: signal) }
+    let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+    func tapAlert(_ stage: String) throws {
+      let data = try JSONSerialization.data(withJSONObject: ["stage": stage, "run": run])
+      try data.write(to: signal, options: .atomic)
+      let alert = springboard.descendants(matching: .any).matching(
+        NSPredicate(format: "label CONTAINS 'Private fixture response'")
+      )
+      .firstMatch
+      if !alert.waitForExistence(timeout: 5) {
+        let top = springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.01))
+        let middle = springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.75))
+        top.press(forDuration: 0.1, thenDragTo: middle)
+      }
+      XCTAssertTrue(alert.waitForExistence(timeout: 15), springboard.debugDescription)
+      alert.tap()
+    }
+    func capture(_ name: String) {
+      let attachment = XCTAttachment(screenshot: app.screenshot())
+      attachment.name = name
+      attachment.lifetime = .keepAlways
+      add(attachment)
+    }
+    choose("Work", app)
+    type("Keep this Work draft", app)
+    XCUIDevice.shared.press(.home)
+    XCTAssertTrue(app.wait(for: .runningBackground, timeout: 10))
+    try tapAlert("named")
+    XCTAssertTrue(app.buttons["scopeMenu"].waitForExistence(timeout: 10))
+    XCTAssertTrue(app.buttons["scopeMenu"].label.contains("Personal"))
+    XCTAssertEqual(
+      app.textViews["Message the coordinator"].value as? String, "Keep this Work draft")
+    XCTAssertEqual(app.staticTexts["recipientLine"].label, "This draft goes to Work")
+    XCTAssertTrue(app.staticTexts["Personal's latest invented reply"].isHittable)
+    capture("notification-personal-with-work-draft")
+    try await wait { await personal.cursors().contains("<latest>") }
+    let previousLatest = await personal.cursors().filter { $0 == "<latest>" }.count
+    choose("Work", app)
+    XCTAssertTrue(app.buttons["scopeMenu"].label.contains("Work"))
+    app.terminate()
+    try tapAlert("cold")
+    XCTAssertTrue(app.buttons["scopeMenu"].waitForExistence(timeout: 15))
+    XCTAssertTrue(app.buttons["scopeMenu"].label.contains("Personal"))
+    XCTAssertEqual(
+      app.textViews["Message the coordinator"].value as? String, "Keep this Work draft")
+    XCTAssertEqual(app.staticTexts["recipientLine"].label, "This draft goes to Work")
+    try await wait { await personal.cursors().filter { $0 == "<latest>" }.count > previousLatest }
+    XCUIDevice.shared.press(.home)
+    XCTAssertTrue(app.wait(for: .runningBackground, timeout: 10))
+    try tapAlert("unnamed")
+    let notice = app.staticTexts[
+      "This notification did not say which coordinator sent it. Showing all."]
+    XCTAssertTrue(notice.waitForExistence(timeout: 10), app.debugDescription)
+    XCTAssertTrue(app.buttons["scopeMenu"].label.contains("All coordinators"))
+    capture("notification-unnamed-all")
+    app.buttons["scopeMenu"].tap()
+    let all = app.descendants(matching: .any).matching(
+      NSPredicate(format: "label == 'All coordinators'")
+    ).firstMatch
+    XCTAssertTrue(all.waitForExistence(timeout: 5))
+    all.tap()
+    XCTAssertTrue(notice.waitForNonExistence(timeout: 5))
+    let workSubmits = await work.submitAttempts()
+    let personalSubmits = await personal.submitAttempts()
+    let workRetries = await work.retries()
+    let personalRetries = await personal.retries()
+    XCTAssertEqual(workSubmits, 0)
+    XCTAssertEqual(personalSubmits, 0)
+    XCTAssertEqual(workRetries, 0)
+    XCTAssertEqual(personalRetries, 0)
   }
 
   func testTheTitleMenuShowsWorkAndASendReachesOnlyWork() async throws {

@@ -130,9 +130,9 @@ func notificationForegroundPolicyAndTapUseTheExistingMainWithoutPersistingDevice
   defer { defaults.removePersistentDomain(forName: name) }
   defaults.set(true, forKey: "notificationsEnabled")
   let notifications = notificationsWithoutSavedCoordinators(defaults)
-  #expect(notifications.presentsAlerts)
-  notifications.mainVisible = true
-  #expect(!notifications.presentsAlerts)
+  #expect(notifications.presents(.unnamed))
+  notifications.mainVisible = .visible(atLatest: false)
+  #expect(!notifications.presents(.unnamed))
   let target = NotificationTarget(conversationId: "1", entryId: "42")
   let oldPayload = #"{"conversation_id":"1","entry_id":"42"}"#
   let newPayload =
@@ -144,11 +144,178 @@ func notificationForegroundPolicyAndTapUseTheExistingMainWithoutPersistingDevice
   let named = try decoder.decode(NotificationTarget.self, from: Data(newPayload.utf8))
   #expect(named.conversationId == "1" && named.entryId == "42")
   #expect(named.installationId == "11111111-1111-4111-8111-111111111111")
-  notifications.open(target)
-  notifications.open(target)
-  #expect(notifications.openedTarget == target)
+  notifications.open(.unnamed)
+  let first = notifications.openRequest
+  notifications.open(.unnamed)
+  #expect(notifications.openRequest != first)
   await notifications.registration.received(token: String(repeating: "ab", count: 32))
   #expect(defaults.persistentDomain(forName: name)?.keys.sorted() == ["notificationsEnabled"])
+}
+
+@MainActor
+private final class AlertFixture {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  let suite = "alert-route-\(UUID())"
+  let defaults: UserDefaults
+  let profiles: [CoordinatorProfile]
+  let notifications: AppNotifications
+
+  init(count: Int = 2) throws {
+    defaults = try #require(UserDefaults(suiteName: suite))
+    defaults.set(true, forKey: "notificationsEnabled")
+    profiles = try (0..<count).map { index in
+      var profile = CoordinatorProfile(
+        name: try TagName(["Work", "Personal", "Other"][index]),
+        address: try CoordinatorAddress(host: "100.64.1.\(index + 2)"))
+      profile.pin = CoordinatorID(UUID())
+      return profile
+    }
+    try writePrivately(
+      JSONEncoder().encode(Coordinators.SavedProfiles(profiles: profiles)),
+      to: root.appending(path: "Agent/profiles.json"))
+    notifications = AppNotifications(
+      defaults: defaults, applicationSupport: root, caches: root, transport: .tailnet)
+  }
+
+  func clean() {
+    defaults.removePersistentDomain(forName: suite)
+    try? FileManager.default.removeItem(at: root)
+  }
+}
+
+@Test @MainActor
+func originKeepsMissingNullAndMalformedApart() throws {
+  let id = try #require(ProfileID(wire: "11111111-1111-4111-8111-111111111111"))
+  let base: [String: Any] = ["conversation_id": "1", "entry_id": "42"]
+  func payload(_ value: Any?) -> [AnyHashable: Any] {
+    var agent = base
+    if let value { agent["installation_id"] = value }
+    return ["agent": agent]
+  }
+  #expect(AppNotifications.origin(payload(nil)) == .unnamed)
+  #expect(AppNotifications.origin(payload(NSNull())) == .unnamed)
+  #expect(AppNotifications.origin(payload("\(id)")) == .named(id))
+  #expect(AppNotifications.origin(payload("not-a-uuid")) == .malformed)
+  #expect(AppNotifications.origin(payload(42)) == .malformed)
+  #expect(AppNotifications.origin(payload(["id": "invalid"])) == .malformed)
+  #expect(AppNotifications.origin(["agent": "invalid"]) == nil)
+  #expect(AppNotifications.origin(["agent": ["conversation_id": "1"]]) == nil)
+}
+
+@Test @MainActor
+func aTapFromPersonalShowsPersonalWithNoNotice() throws {
+  let fixture = try AlertFixture()
+  defer { fixture.clean() }
+  let notifications = fixture.notifications
+  notifications.coordinators.chat.show(.one(fixture.profiles[0].id))
+  notifications.open(.named(fixture.profiles[1].id))
+  #expect(notifications.coordinators.chat.scope == .one(fixture.profiles[1].id))
+  #expect(notifications.openRequest?.notice == nil)
+}
+
+@Test @MainActor
+func aTapWithoutTheKeyShowsAllWithANotice() throws {
+  let fixture = try AlertFixture()
+  defer { fixture.clean() }
+  let notifications = fixture.notifications
+  notifications.coordinators.chat.show(.one(fixture.profiles[0].id))
+  notifications.open(.unnamed)
+  #expect(notifications.coordinators.chat.scope == .all)
+  #expect(
+    notifications.openRequest?.notice
+      == "This notification did not say which coordinator sent it. Showing all.")
+}
+
+@Test @MainActor
+func aTapNamingNoSavedCoordinatorKeepsTheScopeWithANotice() async throws {
+  let fixture = try AlertFixture(count: 3)
+  defer { fixture.clean() }
+  let notifications = fixture.notifications
+  let coordinators = notifications.coordinators
+  let removed = fixture.profiles[2].id
+  try await coordinators.remove(coordinators.removal(removed))
+  coordinators.chat.show(.one(fixture.profiles[0].id))
+  for origin in [AlertOrigin.malformed, .named(ProfileID()), .named(removed)] {
+    notifications.open(origin)
+    #expect(coordinators.chat.scope == .one(fixture.profiles[0].id))
+    #expect(
+      notifications.openRequest?.notice == "This notification did not name a saved coordinator.")
+  }
+}
+
+@Test @MainActor
+func withOneSavedEveryTapBehavesAsToday() throws {
+  let fixture = try AlertFixture(count: 1)
+  defer { fixture.clean() }
+  let notifications = fixture.notifications
+  for origin in [
+    AlertOrigin.unnamed, .malformed, .named(fixture.profiles[0].id), .named(ProfileID()),
+  ] {
+    notifications.open(origin)
+    #expect(notifications.coordinators.chat.scope == .all)
+    #expect(notifications.openRequest?.notice == nil)
+    #expect(fixture.defaults.object(forKey: "feedScope") == nil)
+  }
+}
+
+@Test @MainActor
+func aTapNeverChangesTheDraft() throws {
+  let fixture = try AlertFixture()
+  defer { fixture.clean() }
+  let notifications = fixture.notifications
+  let chat = notifications.coordinators.chat
+  chat.show(.one(fixture.profiles[0].id))
+  chat.draft = "An invented Work draft"
+  let destination = chat.destination
+  for origin in [AlertOrigin.named(fixture.profiles[1].id), .unnamed, .malformed] {
+    notifications.open(origin)
+    #expect(chat.draft == "An invented Work draft")
+    #expect(chat.destination == destination)
+  }
+}
+
+@Test @MainActor
+func theSameAlertTappedTwiceOpensTwice() throws {
+  let fixture = try AlertFixture()
+  defer { fixture.clean() }
+  let notifications = fixture.notifications
+  notifications.open(.named(fixture.profiles[1].id))
+  let first = try #require(notifications.openRequest)
+  notifications.open(.named(fixture.profiles[1].id))
+  #expect(notifications.openRequest != first)
+}
+
+@Test @MainActor
+func notificationBannersRespectTheVisibleScopeAndLatestWindow() async throws {
+  let fixture = try AlertFixture()
+  defer { fixture.clean() }
+  let notifications = fixture.notifications
+  let chat = notifications.coordinators.chat
+  let work = fixture.profiles[0].id
+  let personal = fixture.profiles[1].id
+  chat.show(.one(personal))
+  notifications.mainVisible = .visible(atLatest: true)
+  #expect(!notifications.presents(.named(personal)))
+  notifications.mainVisible = .visible(atLatest: false)
+  #expect(notifications.presents(.named(personal)))
+  chat.show(.one(work))
+  notifications.mainVisible = .visible(atLatest: true)
+  #expect(notifications.presents(.named(personal)))
+  chat.show(.all)
+  #expect(notifications.presents(.unnamed))
+  #expect(notifications.presents(.malformed))
+  #expect(notifications.presents(.named(ProfileID())))
+  #expect(notifications.presents(nil))
+  notifications.mainVisible = .hidden
+  #expect(notifications.presents(.named(personal)))
+  await notifications.registration.setEnabled(false)
+  #expect(!notifications.presents(.named(personal)))
+  let single = try AlertFixture(count: 1)
+  defer { single.clean() }
+  single.notifications.mainVisible = .visible(atLatest: false)
+  for origin in [AlertOrigin.unnamed, .malformed, .named(ProfileID())] {
+    #expect(!single.notifications.presents(origin))
+  }
 }
 
 @Test(.timeLimit(.minutes(1)))

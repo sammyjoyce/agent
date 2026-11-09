@@ -3,6 +3,7 @@
   import Foundation
   import Network
   import SwiftUI
+  import UserNotifications
 
   @testable import AgentCore
   @testable import AgentUI
@@ -15,11 +16,28 @@
     let peers: [(port: NWEndpoint.Port, coordinator: CoordinatorID)]
     let runID: String?
     let cleanup: Bool
+    let requestAlerts: Bool
+    let delegate: AppNotifications
     @State private var model = ChatModel()
 
     /// `AGENT_INTERACTION_PORT` and `AGENT_INTERACTION_COORDINATOR` are comma-separated lists.
-    static func fromEnvironment() -> Self? {
-      let environment = ProcessInfo.processInfo.environment
+    static func fromEnvironment(notifications: AppNotifications) -> Self? {
+      let current = ProcessInfo.processInfo.environment
+      let key = "interactionFixtureLaunch"
+      let environment: [String: String]
+      if current["AGENT_INTERACTION_PORT"] != nil {
+        environment = current
+        if current["AGENT_INTERACTION_CLEANUP"] == "1" {
+          UserDefaults.standard.removeObject(forKey: key)
+        } else if current["AGENT_INTERACTION_RUN"] != nil,
+          current["AGENT_INTERACTION_ALERTS"] == "1"
+        {
+          UserDefaults.standard.set(
+            current.filter { $0.key.hasPrefix("AGENT_INTERACTION_") }, forKey: key)
+        }
+      } else {
+        environment = UserDefaults.standard.dictionary(forKey: key) as? [String: String] ?? [:]
+      }
       guard let ports = environment["AGENT_INTERACTION_PORT"]?.split(separator: ","),
         let coordinators = environment["AGENT_INTERACTION_COORDINATOR"]?.split(separator: ","),
         ports.count == coordinators.count
@@ -32,12 +50,15 @@
       guard !peers.isEmpty, peers.count == ports.count else { return nil }
       let runID = environment["AGENT_INTERACTION_RUN"].flatMap { $0.isEmpty ? nil : $0 }
       return Self(
-        peers: peers, runID: runID, cleanup: environment["AGENT_INTERACTION_CLEANUP"] == "1")
+        peers: peers, runID: runID, cleanup: environment["AGENT_INTERACTION_CLEANUP"] == "1",
+        requestAlerts: environment["AGENT_INTERACTION_ALERTS"] == "1", delegate: notifications)
     }
 
     var body: some View {
       if let runID {
-        PersistentInteractionFixture(peers: peers, runID: runID, cleanup: cleanup)
+        PersistentInteractionFixture(
+          peers: peers, runID: runID, cleanup: cleanup, requestAlerts: requestAlerts,
+          delegate: delegate)
       } else {
         transient
       }
@@ -80,6 +101,8 @@
     let peers: [(port: NWEndpoint.Port, coordinator: CoordinatorID)]
     let runID: String
     let cleanup: Bool
+    let requestAlerts: Bool
+    let delegate: AppNotifications
     @Environment(\.scenePhase) private var scenePhase
     @State private var context: Context?
     @State private var message = "Preparing interaction fixture"
@@ -122,6 +145,11 @@
           message = "Interaction fixture cleaned"
           return
         }
+        if requestAlerts {
+          _ = try await UNUserNotificationCenter.current().requestAuthorization(options: [
+            .alert, .sound,
+          ])
+        }
         let names = ["Work", "Personal"]
         guard peers.count <= names.count else {
           message = "Interaction fixture supports at most two peers"
@@ -156,6 +184,7 @@
           defaults: defaults, applicationSupport: support, caches: caches, transport: transport,
           persistence: ComposerDraftStore(url: support.appending(path: "Agent/Composer/draft.json"))
         )
+        delegate.forwardFixtureOpens(to: notifications)
         context = Context(defaults: defaults, notifications: notifications)
         await notifications.coordinators.setActive(scenePhase == .active)
       } catch {
