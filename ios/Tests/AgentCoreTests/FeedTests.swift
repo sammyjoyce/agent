@@ -2273,9 +2273,10 @@ func aSendWhoseAddressChangesWhileItsDialIsPendingIsNamedOnlyIfLost(saved: Int, 
 
 /// A draft file whose bytes come through a named pipe, so a copy that reaches it waits until the
 /// test feeds it. Each feed gives one reader the file's bytes.
-private struct PipedFile: Sendable {
+@MainActor private final class PipedFile {
   let url: URL
-  let bytes: Data
+  private let bytes: Data
+  private var writer: Int32 = -1
 
   init(_ file: LocalAttachment) throws {
     url = file.url
@@ -2286,25 +2287,45 @@ private struct PipedFile: Sendable {
     }
   }
 
-  /// Waits for the next reader to open the pipe, then gives it the bytes.
+  /// Returns once `copy` has opened the pipe. The copy then waits for `feed()`.
+  func opened(by copy: String) async throws {
+    try await eventually("\(copy) to open \(url.lastPathComponent)") {
+      if writer < 0 { writer = open(url.path, O_WRONLY | O_NONBLOCK) }
+      return writer >= 0
+    }
+  }
+
+  /// Gives the copy that opened the pipe the file's bytes, then ends the file. Fails once the copy
+  /// has read nothing for 15 seconds.
   func feed() async throws {
-    try await withCheckedThrowingContinuation {
-      (continuation: CheckedContinuation<Void, any Error>) in
+    let (writer, bytes) = (writer, bytes)
+    self.writer = -1
+    let sent = await withCheckedContinuation { (continuation: CheckedContinuation<Int, Never>) in
       DispatchQueue.global().async {
-        do {
-          let writer = try FileHandle(forWritingTo: url)
-          try writer.write(contentsOf: bytes)
-          try writer.close()
-          continuation.resume()
-        } catch { continuation.resume(throwing: error) }
+        var (sent, progress) = (0, ContinuousClock.now)
+        var ready = pollfd(fd: writer, events: Int16(POLLOUT), revents: 0)
+        while sent < bytes.count, ContinuousClock.now - progress < .seconds(15) {
+          // poll can report a named pipe writable while a write to it still returns EAGAIN.
+          poll(&ready, 1, 1_000)
+          let count = bytes[sent...].withUnsafeBytes { write(writer, $0.baseAddress, $0.count) }
+          if count > 0 {
+            (sent, progress) = (sent + count, .now)
+          } else if errno != EAGAIN {
+            break
+          }
+        }
+        close(writer)
+        continuation.resume(returning: sent)
       }
     }
+    try #require(sent == bytes.count, "The copy stopped reading \(url.lastPathComponent)")
   }
 
   /// Ends a reader still waiting at the pipe with no bytes, so a failed test leaves no copy stuck.
   func release() {
-    let writer = open(url.path, O_WRONLY | O_NONBLOCK)
+    if writer < 0 { writer = open(url.path, O_WRONLY | O_NONBLOCK) }
     if writer >= 0 { close(writer) }
+    writer = -1
   }
 }
 
@@ -2330,13 +2351,15 @@ func aSendToBothPersonalRefusesLeavesNothingAtWorkAfterAnAddressEdit(
     // Personal's copy of the seventh file waits until the edit is done.
     let held = try edit ? PipedFile(#require(chat.attachments.dropLast().last)) : nil
     defer { held?.release() }
-    let workCopy = Task { try await held?.feed() }
     let workOutbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
     let sending = Task { await chat.send() }
-    if edit {
+    if let held {
+      try await held.opened(by: "Work's copy")
+      try await held.feed()
       try await eventually("Work saved its copy") {
         ((try? queuedRequests(workOutbox)) ?? []).count == 1
       }
+      try await held.opened(by: "Personal's copy")
       if failure == "Personal drops" {
         // Personal's connection drops while it still copies the files, and stays down.
         await personalFixture.dropIdentify()
@@ -2348,8 +2371,7 @@ func aSendToBothPersonalRefusesLeavesNothingAtWorkAfterAnAddressEdit(
       try await coordinators.update(
         work, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4003))
       try #require(chat.admitting, "The edit finished while Personal still copied the files")
-      try await workCopy.value
-      try await held?.feed()
+      try await held.feed()
     }
     await sending.value
     try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
