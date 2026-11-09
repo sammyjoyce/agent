@@ -7,6 +7,11 @@ public struct ProfileID: Hashable, Sendable, Codable, CustomStringConvertible {
   let uuid: UUID
   public init() { uuid = UUID() }
   init(_ uuid: UUID) { self.uuid = uuid }
+  /// A profile ID as another layer wrote it, such as the saved feed scope. nil unless it is a UUID.
+  public init?(wire: String) {
+    guard let uuid = UUID(uuidString: wire) else { return nil }
+    self.uuid = uuid
+  }
   public init(from decoder: any Decoder) throws {
     uuid = try decoder.singleValueContainer().decode(UUID.self)
   }

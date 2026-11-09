@@ -11,6 +11,8 @@
     struct Chip: Equatable {
       let name: String
       let color: UIColor
+      /// False while a Send is admitting, when its ⓧ is disabled.
+      let removable: Bool
     }
     static let inset = UIEdgeInsets(top: 11, left: 2, bottom: 11, right: 2)
     static let maximumLines: CGFloat = 6
@@ -128,10 +130,11 @@
           guard chip != oldValue else { return }
           titleSize = 0
           button.isHidden = chip == nil
+          button.isEnabled = chip?.removable == true
           button.accessibilityLabel = chip.map { "To \($0.name)" }
           // VoiceOver can remove the recipient from the draft, even with the chip scrolled away.
           draft.accessibilityCustomActions =
-            chip == nil
+            chip?.removable != true
             ? nil
             : [
               UIAccessibilityCustomAction(name: "Remove recipient") { [weak self] _ in

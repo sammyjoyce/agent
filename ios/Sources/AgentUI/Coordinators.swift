@@ -61,7 +61,8 @@ public final class Coordinators {
     self.transport = transport
     chat = ChatModel(
       draftStore: AttachmentStore(directory: applicationSupport.appending(path: "Agent/Drafts")),
-      persistence: persistence, sharedInbox: sharedInbox, registration: registration)
+      persistence: persistence, sharedInbox: sharedInbox, registration: registration,
+      scope: ScopePreference(defaults: defaults))
     do {
       let stored = try Self.migrate(
         defaults: defaults, applicationSupport: applicationSupport, caches: caches)
@@ -200,8 +201,8 @@ public final class Coordinators {
     return Removal(profile: id, message: message, held: Set(held.map(\.id)))
   }
 
-  /// Refuses while the draft is addressed to or restored from the coordinator. Otherwise marks
-  /// it removed, with no await since the check, so nothing addresses it again. Then saves
+  /// Refuses while the draft is addressed to, begun in or restored from the coordinator. Otherwise
+  /// marks it removed, with no await since the check, so nothing addresses it again. Then saves
   /// `profiles.json` without it and with its pending alert withdrawal, in one write, and a failed
   /// save changes nothing else. Next it marks the held queues its confirmation counted, so a launch
   /// after a stop from there deletes them. Only then withdraws alerts over the still-attached

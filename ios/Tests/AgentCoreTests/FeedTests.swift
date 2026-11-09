@@ -92,7 +92,8 @@ import Testing
   for item in cases {
     #expect(
       Addressing.parse(
-        item.draft, hasAttachments: item.files, chip: item.chip, among: item.saved)
+        item.draft, hasAttachments: item.files,
+        destination: item.chip.map(DraftDestination.chip) ?? .open, among: item.saved)
         == item.expected, "\(item.draft.debugDescription) with \(item.saved.map(\.name))")
   }
   // Personal was removed. A coordinator added again under its name is a new one.
@@ -122,9 +123,95 @@ import Testing
   for item in removedCases {
     #expect(
       Addressing.parse(
-        item.draft, hasAttachments: false, chip: item.chip, among: item.saved,
+        item.draft, hasAttachments: false,
+        destination: item.chip.map(DraftDestination.chip) ?? .open, among: item.saved,
         removed: [personal: "Personal"]) == item.expected,
       "\(item.draft.debugDescription) with \(item.saved.map(\.name))")
+  }
+}
+
+/// A draft begun in one coordinator's conversation goes there unless its chip or tags say
+/// otherwise, and is read over every saved coordinator whatever the feed shows.
+@Test func theBeginStampIsReadAfterTheChipAndTagsAndBeforeEveryPairedCoordinator() {
+  let work = ProfileID()
+  let personal = ProfileID()
+  let home = ProfileID()
+  func saved(_ id: ProfileID, _ name: String, paired: Bool = true, connected: Bool = true)
+    -> Addressing.Coordinator
+  {
+    .init(id: id, name: name, paired: paired, connected: connected)
+  }
+  let pair = [saved(work, "Work"), saved(personal, "Personal")]
+  let left = [saved(personal, "Personal")]
+  let cases:
+    [(
+      draft: String, destination: DraftDestination, literal: Bool,
+      saved: [Addressing.Coordinator], removed: [ProfileID: String], expected: Addressing
+    )] = [
+      ("@Personal hi", .chip(work), false, pair, [:], .to([work], body: "@Personal hi")),
+      ("@Personal hi", .begunIn(work), false, pair, [:], .to([personal], body: "hi")),
+      ("@Wrok hi", .begunIn(work), false, pair, [:], .blocked("No coordinator named Wrok")),
+      ("hi", .begunIn(work), false, pair, [:], .to([work], body: "hi")),
+      ("", .begunIn(personal), false, pair, [:], .empty([personal])),
+      ("hi", .open, false, pair, [:], .to([work, personal], body: "hi")),
+      ("@Personal hi", .open, true, pair, [:], .to([work, personal], body: "@Personal hi")),
+      ("hi", .begunIn(work), false, left, [work: "Work"], .blocked("Work was removed")),
+      ("@Personal hi", .begunIn(work), false, left, [work: "Work"], .to([personal], body: "hi")),
+      ("hi", .begunIn(home), false, pair, [:], .blocked("Choose who receives this message")),
+      (
+        "hi", .begunIn(work), false,
+        [saved(work, "Work", paired: false), saved(personal, "Personal")],
+        [:], .blocked("Work is not paired yet")
+      ),
+      (
+        "hi", .begunIn(work), false,
+        [saved(work, "Work", connected: false), saved(personal, "Personal")], [:],
+        .blocked("Work is not connected")
+      ),
+      (
+        "@Personal hi", .begunIn(work), false, [saved(work, "Work")], [:],
+        .to([work], body: "@Personal hi")
+      ),
+    ]
+  for item in cases {
+    #expect(
+      Addressing.parse(
+        item.draft, hasAttachments: false, destination: item.destination, literal: item.literal,
+        among: item.saved, removed: item.removed) == item.expected,
+      "\(item.draft.debugDescription) \(item.destination) with \(item.saved.map(\.name))")
+  }
+}
+
+/// The scope shown can only refuse a draft. It passes the draft as parsed or names where it
+/// would go, and never changes who gets it.
+@Test func aScopeOnlyVetoesAndNeverChangesTheRecipients() throws {
+  let work = ProfileID()
+  let personal = ProfileID()
+  let home = ProfileID()
+  let recipients = [[], [work], [personal], [work, personal], [personal, work], [work, home]]
+  let values =
+    recipients.flatMap { ids -> [Addressing] in
+      [.to(ids, body: "hi"), .empty(ids), .elsewhere(ids, narrows: false)]
+    } + [.blocked("Work was removed")]
+  for value in values {
+    for scope in [FeedScope.all, .one(work), .one(personal), .one(home)] {
+      for unbound in [false, true] {
+        let gated = value.gated(by: scope, unbound: unbound)
+        let label = "\(value) in \(scope), unbound \(unbound)"
+        switch (value, gated) {
+        case (.to(let ids, _), .elsewhere(let named, let narrows)),
+          (.empty(let ids), .elsewhere(let named, let narrows)):
+          let shown = try #require(scope.coordinator, "\(label): All refused a draft")
+          #expect(ids != [shown] && named == ids, "\(label)")
+          #expect(narrows == (unbound && ids.contains(shown)), "\(label)")
+        case (.to(let ids, _), .to), (.empty(let ids), .empty):
+          #expect(gated == value, "\(label)")
+          #expect(scope.coordinator.map { ids == [$0] } ?? true, "\(label) passed")
+        default:
+          #expect(gated == value, "\(label) became \(gated)")
+        }
+      }
+    }
   }
 }
 
@@ -488,12 +575,12 @@ func anUntaggedSendReachesBothCoordinatorsAndATaggedOneOnlyItsOwn() async throws
 
     chat.draft = "@Work "
     chat.promoteTypedTag()
-    #expect(chat.recipient == work && chat.draft.isEmpty, "A typed tag becomes the chip")
+    #expect(chat.destination.chip == work && chat.draft.isEmpty, "A typed tag becomes the chip")
     chat.draft = "@Personal rotate the staging deploy key"
     chat.promoteTypedTag()
     #expect(chat.recipientLine == "To Work", "Text after the chip is never routed")
     await chat.send()
-    #expect(chat.recipient == nil && chat.draft.isEmpty)
+    #expect(chat.destination.chip == nil && chat.draft.isEmpty)
     try await eventually("Work's second submit") { await workFixture.count() == 2 }
     #expect(
       await submits(workFixture).map(\.text) == [
@@ -521,7 +608,7 @@ func aTypedTagAfterARemovalBecomesTheChip() async throws {
     #expect(chat.pickerMatches.isEmpty, "With one coordinator saved nothing is offered")
     chat.draft = "@Work "
     chat.promoteTypedTag()
-    #expect(chat.recipient == nil && chat.draft == "@Work ", "The tag stays text")
+    #expect(chat.destination.chip == nil && chat.draft == "@Work ", "The tag stays text")
     chat.draft = ""
     try await coordinators.add(
       name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
@@ -533,9 +620,9 @@ func aTypedTagAfterARemovalBecomesTheChip() async throws {
     chat.draft = "@Work "
     chat.promoteTypedTag()
     print(
-      "IF6-T4 after @Work: recipient=\(chat.recipient.map(chat.name) ?? "none") draft=\(chat.draft.debugDescription) line=\(chat.recipientLine)"
+      "IF6-T4 after @Work: recipient=\(chat.destination.chip.map(chat.name) ?? "none") draft=\(chat.draft.debugDescription) line=\(chat.recipientLine)"
     )
-    #expect(chat.recipient == work, "The typed tag did not become the chip")
+    #expect(chat.destination.chip == work, "The typed tag did not become the chip")
     #expect(chat.draft.isEmpty)
     #expect(chat.shownChip == work && chat.recipientLine == "To Work")
     chat.draft = "Invented: the venue is booked"
@@ -598,7 +685,7 @@ func restoreAddressesTheSourceCoordinatorAndKeepsItsTextLiteral() async throws {
     let (_, personal) = try await addWorkAndPersonal(coordinators)
     let chat = coordinators.chat
     let outbox = ProfileDirectory(personal, applicationSupport: root, caches: root).outbox
-    chat.recipient = personal
+    chat.setChip(personal)
     chat.draft = "@Work check the invented report"
     await chat.attach(data: Data("bytes".utf8), name: "Notes.txt", mediaType: "text/plain")
     await chat.send()
@@ -610,7 +697,7 @@ func restoreAddressesTheSourceCoordinatorAndKeepsItsTextLiteral() async throws {
       chat.rows.first { $0.row.role == .user }?.receipts
         == [Receipt(lane: personal, status: .pending(.rejected, inputID: original.inputId))])
     await chat.restore(original.inputId)
-    #expect(chat.recipient == personal)
+    #expect(chat.destination.chip == personal)
     #expect(chat.draft == "@Work check the invented report")
     #expect(chat.recipientLine == "To Personal")
     #expect(try queuedRequests(outbox) == [original], "Restore copies")
@@ -630,7 +717,7 @@ func removeRefusesWhileTheDraftIsAddressedToOrRestoredFromThatCoordinator() asyn
     let (work, personal) = try await addWorkAndPersonal(coordinators)
     let chat = coordinators.chat
     let workOutbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
-    chat.recipient = work
+    chat.setChip(work)
     chat.draft = "Invented Q3 numbers for the Work board"
     await chat.attach(data: Data("bytes".utf8), name: "Payroll.txt", mediaType: "text/plain")
     await chat.send()
@@ -641,7 +728,7 @@ func removeRefusesWhileTheDraftIsAddressedToOrRestoredFromThatCoordinator() asyn
     await chat.restore(original.inputId)
     #expect(chat.recipientLine == "To Work")
     for chip in [work, nil] {
-      chat.recipient = chip
+      if let chip { chat.setChip(chip) } else { chat.removeChip() }
       do {
         try await coordinators.remove(coordinators.removal(work))
         Issue.record("Remove went ahead with a draft from Work, chip \(String(describing: chip))")
@@ -759,7 +846,7 @@ func nothingRestoredChosenOrTaggedDuringRemoveReachesTheOtherCoordinator() async
     let chat = coordinators.chat
     try await eventually("Work's alert channel linked") { registration.status(work).configured }
     let workDirectory = ProfileDirectory(work, applicationSupport: root, caches: root)
-    chat.recipient = work
+    chat.setChip(work)
     chat.draft = "Invented Q3 payroll numbers for the Work board"
     await chat.attach(
       data: Data("invented payroll".utf8), name: "Payroll.txt", mediaType: "text/plain")
@@ -781,11 +868,11 @@ func nothingRestoredChosenOrTaggedDuringRemoveReachesTheOtherCoordinator() async
     chat.draft = "@Wo"
     #expect(chat.pickerMatches.isEmpty, "Work is not offered while it is removed")
     chat.choose(work)
-    #expect(chat.recipient == nil)
+    #expect(chat.destination.chip == nil)
     chat.draft = "@Work see the invented payroll"
     chat.promoteTypedTag()
     #expect(!chat.canSend && chat.recipientLine == "Work was removed")
-    chat.recipient = nil
+    chat.removeChip()
     chat.draft = ""
     await chat.restoreHeld(held, for: work)
     await chat.restore(queued.inputId)
@@ -813,7 +900,7 @@ func aMessageRestoredFromARemovedCoordinatorStaysBlockedUnderAnyAddress() async 
     let (work, personal) = try await addWorkAndPersonal(coordinators)
     let chat = coordinators.chat
     try await eventually("Work's alert channel linked") { registration.status(work).configured }
-    chat.recipient = work
+    chat.setChip(work)
     chat.draft = "Invented Q3 payroll numbers for the Work board"
     await chat.attach(
       data: Data("invented payroll".utf8), name: "Payroll.txt", mediaType: "text/plain")
@@ -828,13 +915,13 @@ func aMessageRestoredFromARemovedCoordinatorStaysBlockedUnderAnyAddress() async 
     let restoring = Task { @MainActor in await chat.restore(queued.inputId) }
     let removal = Task { @MainActor in try await coordinators.remove(coordinators.removal(work)) }
     await restoring.value
-    #expect(chat.draft == queued.text && chat.recipient == work)
+    #expect(chat.draft == queued.text && chat.destination.chip == work)
     try await eventually("Remove waiting on Work's alert withdrawal") { await gate.waiting }
     await gate.open()
     try await removal.value
     #expect(coordinators.profiles.map(\.id) == [personal])
     for chip in [work, nil] {
-      chat.recipient = chip
+      if let chip { chat.setChip(chip) } else { chat.removeChip() }
       #expect(chat.addressing == .blocked("Work was removed"))
       await chat.send()
     }
@@ -856,7 +943,7 @@ func removeRefusesATypedTagAndNothingNamingARemovedCoordinatorSends() async thro
     await chat.attach(
       data: Data("invented board minutes".utf8), name: "Board-minutes.txt",
       mediaType: "text/plain")
-    #expect(chat.recipient == nil && chat.recipientLine == "To Work")
+    #expect(chat.destination.chip == nil && chat.recipientLine == "To Work")
     do {
       try await coordinators.remove(coordinators.removal(work))
       Issue.record("Remove went ahead with a draft tagged @Work")
@@ -873,7 +960,7 @@ func removeRefusesATypedTagAndNothingNamingARemovedCoordinatorSends() async thro
       (work, "Invented board minutes", "Work was removed"),
     ]
     for draft in drafts {
-      chat.recipient = draft.chip
+      if let chip = draft.chip { chat.setChip(chip) } else { chat.removeChip() }
       chat.draft = draft.text
       #expect(chat.addressing == .blocked(draft.blocked), "\(draft.text)")
       await chat.send()
@@ -915,7 +1002,7 @@ func anEditedFeedbackKeepsItsScreenshotWithItsCoordinatorThroughRestore() async 
     }
     await chat.restore(queued.inputId)
     let restored = try #require(chat.attachments.first)
-    chat.recipient = nil
+    chat.removeChip()
     await chat.send()
     #expect(chat.error?.hasPrefix("Remove the automatic screenshot") == true)
     try await Task.sleep(for: .milliseconds(300))
@@ -1037,7 +1124,7 @@ func aMessageToBothKeepsItsRecipientsAfterOneIsRemovedAndAddedAgain() async thro
     }
     try await bothConnected()
     let tagged = "Invented note for Work only"
-    chat.recipient = work
+    chat.setChip(work)
     chat.draft = tagged
     await chat.send()
     try await eventually("the tagged Send placed") {
@@ -1170,7 +1257,7 @@ func aTagForARenamedCoordinatorStaysBlockedOnceItIsRemoved() async throws {
     await chat.attach(
       data: Data("invented board minutes".utf8), name: "Board-minutes.txt",
       mediaType: "text/plain")
-    #expect(chat.recipient == nil && chat.recipientLine == "To Work")
+    #expect(chat.destination.chip == nil && chat.recipientLine == "To Work")
     try await coordinators.update(
       work, name: TagName("Job"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
     #expect(chat.addressing == .blocked("No coordinator named Work"))
@@ -1978,7 +2065,7 @@ func aSecondFileNamedFeedbackPngNeverClearsTheScreenshotsOwner() async throws {
     let chosen = try #require(chat.attachments.last)
     #expect(try Data(contentsOf: automatic.url) == privateImage)
     await chat.removeAttachment(chosen)
-    chat.recipient = nil
+    chat.removeChip()
     await chat.send()
     #expect(chat.error?.hasPrefix("Remove the automatic screenshot") == true)
     try await Task.sleep(for: .milliseconds(350))
@@ -1997,7 +2084,7 @@ func aRestoredFeedbackPngGoesToTheCoordinatorItCameFromAlone() async throws {
     let (work, _) = try await addWorkAndPersonal(coordinators)
     let chat = coordinators.chat
     let workDirectory = ProfileDirectory(work, applicationSupport: root, caches: root)
-    chat.recipient = work
+    chat.setChip(work)
     chat.draft = "Invented ordinary note, not feedback"
     await chat.attach(
       data: Data("invented user file bytes".utf8), name: "Feedback.png", mediaType: "image/png")
@@ -2007,11 +2094,11 @@ func aRestoredFeedbackPngGoesToTheCoordinatorItCameFromAlone() async throws {
     }
     let queued = try #require(try queuedRequests(workDirectory.outbox).first)
     await chat.restore(queued.inputId)
-    #expect(chat.recipient == work && chat.recipientLine == "To Work")
-    chat.recipient = nil
+    #expect(chat.destination.chip == work && chat.recipientLine == "To Work")
+    chat.removeChip()
     await chat.send()
     #expect(chat.error?.hasPrefix("Remove the automatic screenshot") == true, "Not to both")
-    chat.recipient = work
+    chat.setChip(work)
     chat.failure = nil
     await workFixture.acceptUploads()
     await chat.send()
@@ -2055,13 +2142,14 @@ func aControlACoordinatorDidNotGetNamesItInTheError() async throws {
     #expect(chat.error == "Work did not get /status. It is not connected.")
     #expect(chat.draft.isEmpty, "Personal got it")
 
-    chat.recipient = work
+    chat.setChip(work)
     chat.draft = "/status"
     try await sendWhileWorkDrops()
     try await Task.sleep(for: .milliseconds(250))
     #expect(await submits(workFixture).isEmpty)
     #expect(chat.error == "Work did not get /status. It is not connected.")
-    #expect(chat.draft == "/status" && chat.recipient == work, "Nothing went, so the draft stays")
+    #expect(
+      chat.draft == "/status" && chat.destination.chip == work, "Nothing went, so the draft stays")
   }
 }
 
@@ -2844,7 +2932,7 @@ func aRestoredSourceIsWithdrawnAfterAnAddressEditOnceItsCopyIsSent() async throw
     let (work, _) = try await addWorkAndPersonal(coordinators)
     let chat = coordinators.chat
     let text = "Invented: the signed contractor agreement"
-    chat.recipient = work
+    chat.setChip(work)
     chat.draft = text
     await chat.attach(
       data: Data("invented agreement".utf8), name: "Agreement.txt", mediaType: "text/plain")
@@ -3186,13 +3274,13 @@ func restoreDrawsAChipOnlyWhileTheComposerNamesRecipients() async throws {
     let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
     let original = try #require(try queuedRequests(outbox).first)
     await chat.restore(original.inputId)
-    #expect(chat.recipient == work, "Restore binds the draft to its coordinator")
+    #expect(chat.destination.chip == work, "Restore binds the draft to its coordinator")
     #expect(chat.shownChip == nil, "With one coordinator saved, Restore shows no chip")
     #expect(chat.draft == text && chat.attachments.count == 1)
     #expect(chat.addressing == .to([work], body: text))
     chat.draft = ""
     for file in chat.attachments { await chat.removeAttachment(file) }
-    #expect(chat.recipient == nil, "A cleared restored draft binds nothing")
+    #expect(chat.destination.chip == nil, "A cleared restored draft binds nothing")
 
     try await coordinators.add(
       name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
@@ -3230,9 +3318,9 @@ func restoreDrawsAChipOnlyWhileTheComposerNamesRecipients() async throws {
     let original = try #require(try queuedRequests(outbox).first)
     await chat.restore(original.inputId)
     print(
-      "IF6-T1[\(tag)] restored with one coordinator: recipient=\(chat.recipient.map(chat.name) ?? "none") chip=\(chat.shownChip.map(chat.name) ?? "none") draft=\(chat.draft)"
+      "IF6-T1[\(tag)] restored with one coordinator: recipient=\(chat.destination.chip.map(chat.name) ?? "none") chip=\(chat.shownChip.map(chat.name) ?? "none") draft=\(chat.draft)"
     )
-    #expect(chat.recipient == work, "Restore binds the draft to Work")
+    #expect(chat.destination.chip == work, "Restore binds the draft to Work")
     #expect(chat.shownChip == nil, "With one coordinator saved no chip is drawn")
     #expect(chat.draft == text && chat.attachments.map(\.reference.name) == ["Numbers.txt"])
     try await coordinators.add(
@@ -3306,9 +3394,9 @@ func aHeldMessageRestoredWithOneCoordinatorStaysItsOnceAnotherIsAdded() async th
     #expect(chat.draft.isEmpty && chat.owner(held) == nil, "Restore chose for the user")
     await chat.restoreHeld(held, for: work)
     print(
-      "IF6-T1[legacy] restored with one coordinator: recipient=\(chat.recipient.map(chat.name) ?? "none") chip=\(chat.shownChip.map(chat.name) ?? "none") draft=\(chat.draft)"
+      "IF6-T1[legacy] restored with one coordinator: recipient=\(chat.destination.chip.map(chat.name) ?? "none") chip=\(chat.shownChip.map(chat.name) ?? "none") draft=\(chat.draft)"
     )
-    #expect(chat.recipient == work && chat.shownChip == nil && chat.draft == text)
+    #expect(chat.destination.chip == work && chat.shownChip == nil && chat.draft == text)
     try await coordinators.add(
       name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
     try await eventually("both connected") {
@@ -3757,7 +3845,7 @@ func restoreKeepsWhatTheUserAddedWhileItCopied(_ what: String) async throws {
       #expect(chat.draft == restoredText)
       #expect(chat.attachments.map(\.reference.name) == names + ["Receipt.txt"])
     }
-    #expect(chat.recipient == work)
+    #expect(chat.destination.chip == work)
   }
 }
 
@@ -3772,7 +3860,7 @@ func restoreLeavesADraftAddressedElsewhereMeanwhileAlone() async throws {
     let chat = coordinators.chat
     await workFixture.refuseUploads()
     let big = Data(repeating: 0x42, count: 16 * 1024 * 1024)
-    chat.recipient = work
+    chat.setChip(work)
     chat.draft = "Invented: Work's scanned contracts"
     for index in 0..<8 {
       await chat.attach(data: big, name: "Contract\(index).pdf", mediaType: "application/pdf")
@@ -3794,10 +3882,10 @@ func restoreLeavesADraftAddressedElsewhereMeanwhileAlone() async throws {
     chat.draft = note
     await restoring.value
     print(
-      "IF7-V3[elsewhere] copying=\(stillCopying) chip=\(chat.recipient.map(chat.name) ?? "none") draft=\(chat.draft.debugDescription) files=\(chat.attachments.map(\.reference.name)) error=\(chat.error ?? "nil") draft files \(before)->\(draftFiles().count)"
+      "IF7-V3[elsewhere] copying=\(stillCopying) chip=\(chat.destination.chip.map(chat.name) ?? "none") draft=\(chat.draft.debugDescription) files=\(chat.attachments.map(\.reference.name)) error=\(chat.error ?? "nil") draft files \(before)->\(draftFiles().count)"
     )
     #expect(stillCopying, "The user acted after Restore filled the composer")
-    #expect(chat.recipient == personal && chat.draft == note && chat.attachments.isEmpty)
+    #expect(chat.destination.chip == personal && chat.draft == note && chat.attachments.isEmpty)
     #expect(chat.error == "Send or clear the current draft before restoring another message.")
     #expect(draftFiles().count == before, "Restore left its copies in the drafts folder")
     await workFixture.acceptUploads()
@@ -3819,7 +3907,7 @@ func restoreLeavesADraftAddressedElsewhereMeanwhileAlone() async throws {
 ) async throws -> NativeRequestSubmit {
   let work = try #require(chat.profiles.first?.id)
   await workFixture.refuseUploads()
-  chat.recipient = work
+  chat.setChip(work)
   chat.draft = text
   await chat.attach(
     data: Data("Invented: Work board deck".utf8), name: "Deck.txt", mediaType: "text/plain")
@@ -3853,7 +3941,7 @@ func aRestoredDraftsTextStaysLiteralOnceItsChipIsRemoved(_ text: String) async t
     )
     // The chip's ⓧ, whose hint reads "Removes the recipient, so the message goes to every
     // coordinator."
-    chat.recipient = nil
+    chat.removeChip()
     print(
       "IF7-V4[\(tag)] after the chip's ⓧ: line=\(chat.recipientLine) picker=\(chat.pickerMatches.map(\.name.description))"
     )
@@ -3863,9 +3951,9 @@ func aRestoredDraftsTextStaysLiteralOnceItsChipIsRemoved(_ text: String) async t
     chat.draft += "."
     chat.promoteTypedTag()
     print(
-      "IF7-V4[\(tag)] after one more key: chip=\(chat.recipient.map(chat.name) ?? "none") line=\(chat.recipientLine) draft=\(chat.draft.debugDescription)"
+      "IF7-V4[\(tag)] after one more key: chip=\(chat.destination.chip.map(chat.name) ?? "none") line=\(chat.recipientLine) draft=\(chat.draft.debugDescription)"
     )
-    #expect(chat.recipient == nil && chat.draft == text + ".")
+    #expect(chat.destination.chip == nil && chat.draft == text + ".")
     #expect(chat.addressing == .to([work, personal], body: text + "."))
     await workFixture.acceptUploads()
     await chat.send()
@@ -3891,7 +3979,7 @@ func aTagTypedAtTheStartOfARestoredDraftStaysLiteral() async throws {
     let chat = coordinators.chat
     let text = "@Personal invented: forward Work's board deck to the auditors"
     _ = try await restoreWorkOnlyMessage(chat, workFixture, text, root: root)
-    chat.recipient = nil
+    chat.removeChip()
     var offered: [String] = []
     for (offset, character) in "@Work ".enumerated() {
       chat.draft.insert(character, at: chat.draft.index(chat.draft.startIndex, offsetBy: offset))
@@ -3899,9 +3987,9 @@ func aTagTypedAtTheStartOfARestoredDraftStaysLiteral() async throws {
       offered += chat.pickerMatches.map(\.name.description)
     }
     print(
-      "IF8-W2[typed at the start] chip=\(chat.recipient.map(chat.name) ?? "none") picker=\(offered) line=\(chat.recipientLine) draft=\(chat.draft.debugDescription)"
+      "IF8-W2[typed at the start] chip=\(chat.destination.chip.map(chat.name) ?? "none") picker=\(offered) line=\(chat.recipientLine) draft=\(chat.draft.debugDescription)"
     )
-    #expect(chat.recipient == nil && chat.draft == "@Work " + text)
+    #expect(chat.destination.chip == nil && chat.draft == "@Work " + text)
     #expect(offered.isEmpty, "The picker opened over a restored draft")
     #expect(chat.recipientLine == "To Work and Personal")
     #expect(chat.addressing == .to([work, personal], body: "@Work " + text))
@@ -3920,15 +4008,15 @@ func deletingARestoredDraftsHeadingPromotesNothing() async throws {
     let heading = "Invented memo heading\n"
     let body = "@Personal invented quotation from Work's meeting"
     _ = try await restoreWorkOnlyMessage(chat, workFixture, heading + body, root: root)
-    chat.recipient = nil
+    chat.removeChip()
     print(
       "IF8-W2[heading] before deletion: \(chat.recipientLine), text=\(chat.draft.debugDescription)")
     chat.draft.removeFirst(heading.count)
     chat.promoteTypedTag()
     print(
-      "IF8-W2[heading] after deleting it: \(chat.recipientLine), text=\(chat.draft.debugDescription), chip=\(chat.recipient.map(chat.name) ?? "none")"
+      "IF8-W2[heading] after deleting it: \(chat.recipientLine), text=\(chat.draft.debugDescription), chip=\(chat.destination.chip.map(chat.name) ?? "none")"
     )
-    #expect(chat.recipient == nil)
+    #expect(chat.destination.chip == nil)
     #expect(chat.addressing == .to([work, personal], body: body))
     await workFixture.acceptUploads()
     await chat.send()
@@ -3955,15 +4043,15 @@ func retypingTheAtSignOfARestoredTagPromotesNothing() async throws {
     let chat = coordinators.chat
     let text = "@Personal invented: forward Work's board deck to the auditors"
     _ = try await restoreWorkOnlyMessage(chat, workFixture, text, root: root)
-    chat.recipient = nil
+    chat.removeChip()
     chat.draft.removeFirst()
     chat.promoteTypedTag()
     chat.draft.insert("@", at: chat.draft.startIndex)
     chat.promoteTypedTag()
     print(
-      "IF8-W2[retyped @] chip=\(chat.recipient.map(chat.name) ?? "none") line=\(chat.recipientLine) draft=\(chat.draft.debugDescription)"
+      "IF8-W2[retyped @] chip=\(chat.destination.chip.map(chat.name) ?? "none") line=\(chat.recipientLine) draft=\(chat.draft.debugDescription)"
     )
-    #expect(chat.recipient == nil, "One retyped @ promoted Work's restored text to a chip")
+    #expect(chat.destination.chip == nil, "One retyped @ promoted Work's restored text to a chip")
     #expect(chat.draft == text, "The restored text changed")
     #expect(chat.addressing == .to([work, personal], body: text))
   }
@@ -3983,7 +4071,7 @@ func aRestoredDraftEditedWhileItsSendCopiesStaysLiteral() async throws {
     let heading = "Invented memo heading\n"
     let body = "@Personal invented quotation from Work's memo"
     let original = try await restoreWorkOnlyMessage(chat, workFixture, heading + body, root: root)
-    chat.recipient = nil
+    chat.removeChip()
     await workFixture.acceptUploads()
     let observed = await observes(workFixture) + observes(personalFixture)
     let sending = Task { @MainActor in await chat.send() }
@@ -4006,10 +4094,10 @@ func aRestoredDraftEditedWhileItsSendCopiesStaysLiteral() async throws {
     let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
     let originalQueued = try queuedRequests(outbox).contains { $0.inputId == original.inputId }
     print(
-      "IF9-Y1 during the Send: \(during); after it: \(after); one more key: chip=\(chat.recipient.map(chat.name) ?? "none") line=\(chat.recipientLine) draft=\(chat.draft.debugDescription) originalQueued=\(originalQueued)"
+      "IF9-Y1 during the Send: \(during); after it: \(after); one more key: chip=\(chat.destination.chip.map(chat.name) ?? "none") line=\(chat.recipientLine) draft=\(chat.draft.debugDescription) originalQueued=\(originalQueued)"
     )
     #expect(during == "To Work and Personal" && after == "To Work and Personal")
-    #expect(chat.recipient == nil, "The restored text's own tag became the chip after Send")
+    #expect(chat.destination.chip == nil, "The restored text's own tag became the chip after Send")
     #expect(chat.addressing == .to([work, personal], body: body + "."))
     #expect(!originalQueued, "Send carried the restored message unchanged, yet the original stays")
     await chat.send()
@@ -4023,7 +4111,7 @@ func aRestoredDraftEditedWhileItsSendCopiesStaysLiteral() async throws {
     #expect(atPersonal == [heading + body, body + "."])
     chat.draft = "@Personal "
     chat.promoteTypedTag()
-    #expect(chat.recipient == personal, "A tag typed once Send cleared the draft stays text")
+    #expect(chat.destination.chip == personal, "A tag typed once Send cleared the draft stays text")
   }
 }
 
@@ -4046,7 +4134,7 @@ func anEmptiedRestoredDraftLeavesItsOriginalToRestoreAgain(_ emptied: String) as
       original = try await restoreWorkOnlyMessage(chat, workFixture, text, root: root)
     } else {
       await workFixture.rejectSubmits()
-      chat.recipient = work
+      chat.setChip(work)
       chat.draft = text
       await chat.send()
       try await eventually("Work refused it") {
@@ -4056,19 +4144,19 @@ func anEmptiedRestoredDraftLeavesItsOriginalToRestoreAgain(_ emptied: String) as
       original = try #require(try queuedRequests(outbox).first)
       await chat.restore(original.inputId)
     }
-    chat.recipient = nil
+    chat.removeChip()
     chat.draft = ""
     chat.promoteTypedTag()
     for file in chat.attachments { await chat.removeAttachment(file) }
     let kept = try queuedItem(outbox, original.inputId)
     print(
-      "IF10-2[\(emptied)] emptied: restoredFrom=\(chat.restoredFrom.map(chat.name) ?? "none") recipient=\(chat.recipient.map(chat.name) ?? "none") originalQueued=\(kept != nil) refused=\(kept?.refused == true)"
+      "IF10-2[\(emptied)] emptied: restoredFrom=\(chat.restoredFrom.map(chat.name) ?? "none") recipient=\(chat.destination.chip.map(chat.name) ?? "none") originalQueued=\(kept != nil) refused=\(kept?.refused == true)"
     )
-    #expect(chat.restoredFrom == nil && chat.recipient == nil)
+    #expect(chat.restoredFrom == nil && chat.destination.chip == nil)
     #expect(kept?.refused == true, "The original no longer needs attention")
     await workFixture.acceptUploads()
     await chat.restore(original.inputId)
-    chat.recipient = nil
+    chat.removeChip()
     chat.promoteTypedTag()
     print(
       "IF10-2[\(emptied)] restored again: line=\(chat.recipientLine) draft=\(chat.draft.debugDescription) files=\(chat.attachments.count)"
@@ -4135,7 +4223,11 @@ func aCommandSentOverARestoredDraftKeepsTheOriginalQueued(_ setup: String) async
     let chat = coordinators.chat
     await workFixture.rejectSubmits()
     let text = "Invented: renew the greenhouse lease before Friday"
-    chat.recipient = setup == "two coordinators" ? work : nil
+    if let chip = setup == "two coordinators" ? work : nil {
+      chat.setChip(chip)
+    } else {
+      chat.removeChip()
+    }
     chat.draft = text
     await chat.send()
     try await eventually("Work refused it") {

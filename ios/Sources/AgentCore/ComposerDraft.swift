@@ -55,26 +55,88 @@ public struct RestoredSource: Codable, Sendable, Equatable {
   }
 }
 
+/// Where a draft goes when its text does not say. It is one value, so every check reads the chip
+/// and the begin stamp together, and no draft holds both. Showing another coordinator never
+/// writes it.
+public enum DraftDestination: Sendable, Equatable {
+  /// No chip and no stamp. Leading tags pick the recipients, else every paired coordinator.
+  case open
+  /// No chip. Leading tags pick the recipients, else this coordinator, whose conversation was
+  /// shown when the user started the draft in an empty composer.
+  case begunIn(ProfileID)
+  /// The chip. This coordinator alone, and the text is literal.
+  case chip(ProfileID)
+
+  /// The coordinator the stamp or the chip names.
+  public var coordinator: ProfileID? {
+    switch self {
+    case .open: nil
+    case .begunIn(let id), .chip(let id): id
+    }
+  }
+
+  public var chip: ProfileID? {
+    if case .chip(let id) = self { return id }
+    return nil
+  }
+}
+
 /// Whom an unsent draft is for, by profile ID rather than name, so a rename cannot stale it. It is
 /// saved in the same atomic record as the text, so the two never disagree on disk.
 public struct DraftAddressing: Codable, Sendable, Equatable {
-  /// The one coordinator the draft goes to, or nil for every paired one.
-  public var recipient: ProfileID?
+  /// Where the draft goes when its text does not say.
+  public var destination: DraftDestination
   /// The coordinator whose restored message the draft holds.
   public var restoredFrom: ProfileID?
   /// Whose feed the automatic `/feedback` screenshot shows.
   public var screenshotOwner: ProfileID?
   /// The restored original, which a Send that carries it unchanged withdraws.
   public var source: RestoredSource?
+
+  /// A chip keeps the `recipient` key that older records use, so they load with the meaning they
+  /// had. A stamp is saved under `begunIn`.
+  private enum CodingKeys: String, CodingKey {
+    case recipient, begunIn, restoredFrom, screenshotOwner, source
+  }
+
   public init(
-    recipient: ProfileID? = nil, restoredFrom: ProfileID? = nil, screenshotOwner: ProfileID? = nil,
-    source: RestoredSource? = nil
+    destination: DraftDestination = .open, restoredFrom: ProfileID? = nil,
+    screenshotOwner: ProfileID? = nil, source: RestoredSource? = nil
   ) {
-    self.recipient = recipient
+    self.destination = destination
     self.restoredFrom = restoredFrom
     self.screenshotOwner = screenshotOwner
     self.source = source
   }
+
+  /// The one place the two keys become one value. A record holding both reads as the chip, since
+  /// choosing a chip is the stronger act.
+  public init(from decoder: any Decoder) throws {
+    let keys = try decoder.container(keyedBy: CodingKeys.self)
+    if let id = try keys.decodeIfPresent(ProfileID.self, forKey: .recipient) {
+      destination = .chip(id)
+    } else if let id = try keys.decodeIfPresent(ProfileID.self, forKey: .begunIn) {
+      destination = .begunIn(id)
+    } else {
+      destination = .open
+    }
+    restoredFrom = try keys.decodeIfPresent(ProfileID.self, forKey: .restoredFrom)
+    screenshotOwner = try keys.decodeIfPresent(ProfileID.self, forKey: .screenshotOwner)
+    source = try keys.decodeIfPresent(RestoredSource.self, forKey: .source)
+  }
+
+  public func encode(to encoder: any Encoder) throws {
+    var keys = encoder.container(keyedBy: CodingKeys.self)
+    switch destination {
+    case .open: break
+    case .begunIn(let id): try keys.encode(id, forKey: .begunIn)
+    case .chip(let id): try keys.encode(id, forKey: .recipient)
+    }
+    try keys.encodeIfPresent(restoredFrom, forKey: .restoredFrom)
+    try keys.encodeIfPresent(screenshotOwner, forKey: .screenshotOwner)
+    try keys.encodeIfPresent(source, forKey: .source)
+  }
+
   public var isEmpty: Bool { self == DraftAddressing() }
 }
 
