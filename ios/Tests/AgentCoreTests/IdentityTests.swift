@@ -6,9 +6,9 @@ import Testing
 
 /// Stands in for a MagicDNS name that can be re-pointed at another coordinator.
 private actor Route {
-  private(set) var port: NWEndpoint.Port
-  init(_ port: NWEndpoint.Port) { self.port = port }
-  func point(to port: NWEndpoint.Port) { self.port = port }
+  private(set) var port: NWEndpoint
+  init(_ port: NWEndpoint) { self.port = port }
+  func point(to port: NWEndpoint) { self.port = port }
 }
 
 private func snapshot(
@@ -24,8 +24,8 @@ private func withRepointedName(
   queue: [NativeRequestSubmit] = [],
   _ body:
     @Sendable (
-      CoordinatorSession, FixtureCoordinator, FixtureCoordinator, Route, NWEndpoint.Port,
-      NWEndpoint.Port, ProfileDirectory
+      CoordinatorSession, FixtureCoordinator, FixtureCoordinator, Route, NWEndpoint,
+      NWEndpoint, ProfileDirectory
     ) async throws -> Void
 ) async throws {
   let right = FixtureCoordinator()
@@ -43,7 +43,7 @@ private func withRepointedName(
     stamps: StampSource(),
     transport: CoordinatorTransport { _ in
       LineConnection(
-        connection: NWConnection(host: .ipv4(.loopback), port: await route.port, using: .tcp))
+        connection: NWConnection(to: await route.port, using: .tcp))
     })
   do {
     try await body(session, right, wrong, route, rightPort, wrongPort, directory)

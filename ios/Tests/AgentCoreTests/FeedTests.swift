@@ -382,8 +382,7 @@ actor WorkRoute {
       let swapped = await route?.swapped == true
       let personal = (address.port == 4002) != swapped || repointed
       return LineConnection(
-        connection: NWConnection(
-          host: .ipv4(.loopback), port: personal ? secondPort : firstPort, using: .tcp))
+        connection: NWConnection(to: personal ? secondPort : firstPort, using: .tcp))
     })
   await coordinators.setActive(true)
   do {
@@ -1451,9 +1450,7 @@ func aMessageToBothStagedOnlyAtWorkBeforeAKillReadsUnknownAtPersonal() async thr
       registration: nil, defaults: defaults, applicationSupport: root, caches: root,
       transport: CoordinatorTransport { address in
         LineConnection(
-          connection: NWConnection(
-            host: .ipv4(.loopback), port: address.port == 4002 ? personalPort : workPort,
-            using: .tcp))
+          connection: NWConnection(to: address.port == 4002 ? personalPort : workPort, using: .tcp))
       })
   }
   let before = launch()
@@ -1515,9 +1512,7 @@ func aMessageToBothReadsUnknownAtACoordinatorWhoseLedgerCouldNotBeRead() async t
       registration: nil, defaults: defaults, applicationSupport: root, caches: root,
       transport: CoordinatorTransport { address in
         LineConnection(
-          connection: NWConnection(
-            host: .ipv4(.loopback), port: address.port == 4002 ? personalPort : workPort,
-            using: .tcp))
+          connection: NWConnection(to: address.port == 4002 ? personalPort : workPort, using: .tcp))
       })
   }
   let before = launch()
@@ -1777,9 +1772,7 @@ func aMessageToBothReadsUnknownAtACoordinatorWhoseOutboxCouldNotBeRead() async t
       registration: nil, defaults: defaults, applicationSupport: root, caches: root,
       transport: CoordinatorTransport { address in
         LineConnection(
-          connection: NWConnection(
-            host: .ipv4(.loopback), port: address.port == 4002 ? personalPort : workPort,
-            using: .tcp))
+          connection: NWConnection(to: address.port == 4002 ? personalPort : workPort, using: .tcp))
       })
   }
   let before = launch()
@@ -3356,9 +3349,7 @@ func aHeldMessageRestoredWithOneCoordinatorStaysItsOnceAnotherIsAdded() async th
     caches: root.appending(path: "Caches"),
     transport: CoordinatorTransport { address in
       LineConnection(
-        connection: NWConnection(
-          host: .ipv4(.loopback), port: address.port == 4002 ? personalPort : oldPort,
-          using: .tcp))
+        connection: NWConnection(to: address.port == 4002 ? personalPort : oldPort, using: .tcp))
     })
   let chat = coordinators.chat
   let migrated = try #require(coordinators.profiles.first)
