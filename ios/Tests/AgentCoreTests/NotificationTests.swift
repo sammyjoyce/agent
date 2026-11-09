@@ -134,6 +134,16 @@ func notificationForegroundPolicyAndTapUseTheExistingMainWithoutPersistingDevice
   notifications.mainVisible = true
   #expect(!notifications.presentsAlerts)
   let target = NotificationTarget(conversationId: "1", entryId: "42")
+  let oldPayload = #"{"conversation_id":"1","entry_id":"42"}"#
+  let newPayload =
+    #"{"conversation_id":"1","entry_id":"42","installation_id":"11111111-1111-4111-8111-111111111111"}"#
+  let nullPayload = #"{"conversation_id":"1","entry_id":"42","installation_id":null}"#
+  let decoder = JSONDecoder()
+  #expect(try decoder.decode(NotificationTarget.self, from: Data(oldPayload.utf8)) == target)
+  #expect(try decoder.decode(NotificationTarget.self, from: Data(nullPayload.utf8)) == target)
+  let named = try decoder.decode(NotificationTarget.self, from: Data(newPayload.utf8))
+  #expect(named.conversationId == "1" && named.entryId == "42")
+  #expect(named.installationId == "11111111-1111-4111-8111-111111111111")
   notifications.open(target)
   notifications.open(target)
   #expect(notifications.openedTarget == target)

@@ -113,6 +113,9 @@ test("new canonical replies and curated notices reach APNs once per device, with
   const notice = await append(app.session, "agent.user_notice", "A useful curated update", "toolUse");
   await until(app.session, t.signal, async () => (await delivery(app.session, second, notice))?.state === "accepted");
   assert.equal(f.requests.length, 4);
+  const installations = new Map([["/3/device/" + token, first], ["/3/device/" + replacement, second]]);
+  assert.deepEqual(f.requests.map((request) => request.headers[":path"]).sort(),
+    ["/3/device/" + token, "/3/device/" + token, "/3/device/" + replacement, "/3/device/" + replacement].sort());
   for (const request of f.requests) {
     const authorization = request.headers.authorization; assert.equal(typeof authorization, "string");
     assert.ok(typeof authorization === "string"); const encoded = authorization.replace(/^bearer /u, "").split("."); assert.equal(encoded.length, 3);
@@ -126,6 +129,9 @@ test("new canonical replies and curated notices reach APNs once per device, with
       ? "Private fixture response" : "A useful curated update" }, sound: "default" });
     assert.equal(request.body.agent.conversation_id, ROOT_CONVERSATION_ID.toString());
     assert.ok([reply.id.toString(), notice.id.toString()].includes(String(request.body.agent.entry_id)));
+    const path = request.headers[":path"]; assert.ok(typeof path === "string");
+    const installation = installations.get(path); assert.ok(installation);
+    assert.equal(request.body.agent.installation_id, installation);
   }
   assert.equal(new Set(f.requests.map((request) => request.headers.authorization)).size, 1, "Reuse the token rather than rotating it per delivery");
   assert.equal(new Set(f.requests.map((request) => request.headers["apns-id"])).size, 4);
@@ -163,7 +169,7 @@ test("APNs previews contain readable bounded reply or explicit notice text, neve
   assert.deepEqual(sent.body.aps, { alert: { title: "Beep Boop", body: "The drawing needs your review." }, sound: "default" });
   assert.equal(JSON.stringify(sent.body).includes("INTERNAL_CONTEXT"), false);
   assert.doesNotMatch(JSON.stringify(sent.body), /private-job-label|PRIVATE_JOB_TITLE/);
-  assert.deepEqual(sent.body.agent, { conversation_id: "1", entry_id: notice.id.toString() });
+  assert.deepEqual(sent.body.agent, { conversation_id: "1", entry_id: notice.id.toString(), installation_id: first });
 });
 
 test("restart preserves an uncertain attempt without resending; a rejected token is retired and explicit registration recovers", { timeout: 10_000 }, async (t) => {
@@ -365,7 +371,7 @@ syncBuiltinESMExports();
       settings: { model: DEFAULT_MODEL, instructions: "", context_repositories: [], sources: [] } } } }) + "\n");
     await Promise.all([done.promise, delivered.promise]);
     assert.equal(f.requests.length, 1); assert.ok(object(f.requests[0]?.body));
-    assert.deepEqual(f.requests[0].body.agent, { conversation_id: ROOT_CONVERSATION_ID.toString(), entry_id: entry.id.toString() });
+    assert.deepEqual(f.requests[0].body.agent, { conversation_id: ROOT_CONVERSATION_ID.toString(), entry_id: entry.id.toString(), installation_id: first });
     assert.equal(frames.some((frame) => ["host_call", "answer", "input_accepted"].includes(frame.event.type)), false,
       "Notification recovery must not ask a model, admit input or allocate a Rex worker");
   } finally {
