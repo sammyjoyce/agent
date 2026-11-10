@@ -794,7 +794,7 @@ func anAddressEditThatPairsTheMigratedProfileElsewhereSendsTheBuildsInstallation
     transport: CoordinatorTransport { address in
       guard address.port == 4001 else { throw ConnectionError.timedOut }
       return LineConnection(
-        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+        connection: NWConnection(to: port, using: .tcp))
     })
   let profile = try #require(coordinators.profiles.first)
   await coordinators.setActive(true)
@@ -906,11 +906,12 @@ func anOldCoordinatorLeavesTheProfileUnpairedUntilItAnswers() async throws {
   await fixture.stop()
 }
 
-/// The app, active, with Work added at `fixture`.
+/// The app, active, with Work added at `fixture`, served over TCP when `tcp` is set.
 @MainActor private func withWorkAdded(
-  at fixture: FixtureCoordinator, _ body: (Coordinators, ProfileID) async throws -> Void
+  at fixture: FixtureCoordinator, tcp: Bool = false,
+  _ body: (Coordinators, ProfileID) async throws -> Void
 ) async throws {
-  let (listener, port) = try await listen(fixture)
+  let (listener, port) = try await listen(fixture, tcp: tcp)
   defer { listener.cancel() }
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
@@ -976,7 +977,7 @@ func aCoordinatorThatIdentifiesThenClosesOnTheObserveSaysUpdateIt() async throws
 func aSocketResetBeforeTheFirstReplyOnlyReconnects() async throws {
   let fixture = FixtureCoordinator()
   await fixture.leaveObserveUnanswered(.reset)
-  try await withWorkAdded(at: fixture) { coordinators, work in
+  try await withWorkAdded(at: fixture, tcp: true) { coordinators, work in
     let chat = coordinators.chat
     try await eventually("a retry after the backoff") { await observes(fixture) >= 2 }
     #expect(chat.snapshots[work]?.connection == .reconnecting)
@@ -1021,7 +1022,7 @@ func anAddressEditIsProbedAgainstThePinBeforeAnythingIsSaved() async throws {
   let (wrongListener, wrongPort) = try await listen(wrong)
   defer { wrongListener.cancel() }
   // The typed port picks which fixture answers, standing in for two addresses.
-  let routes: [UInt16: NWEndpoint.Port] = [4001: rightPort, 4002: wrongPort, 4003: rightPort]
+  let routes: [UInt16: NWEndpoint] = [4001: rightPort, 4002: wrongPort, 4003: rightPort]
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
   let suite = "edit-\(UUID())"
@@ -1031,7 +1032,7 @@ func anAddressEditIsProbedAgainstThePinBeforeAnythingIsSaved() async throws {
     registration: nil, defaults: defaults, applicationSupport: root, caches: root,
     transport: CoordinatorTransport { address in
       LineConnection(
-        connection: NWConnection(host: .ipv4(.loopback), port: routes[address.port]!, using: .tcp))
+        connection: NWConnection(to: routes[address.port]!, using: .tcp))
     })
   await coordinators.setActive(true)
   let work = try TagName("Work")
@@ -1082,7 +1083,7 @@ func aRefusedAddressEditKeepsTheQueueAndNeverSendsTheUserToRemove(_ typo: String
   defer { personalListener.cancel() }
   let (strangerListener, strangerPort) = try await listen(stranger)
   defer { strangerListener.cancel() }
-  let routes: [UInt16: NWEndpoint.Port] = [4001: workPort, 4002: personalPort, 4005: strangerPort]
+  let routes: [UInt16: NWEndpoint] = [4001: workPort, 4002: personalPort, 4005: strangerPort]
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
   let suite = "edit-\(UUID())"
@@ -1092,7 +1093,7 @@ func aRefusedAddressEditKeepsTheQueueAndNeverSendsTheUserToRemove(_ typo: String
     registration: nil, defaults: defaults, applicationSupport: root, caches: root,
     transport: CoordinatorTransport { address in
       LineConnection(
-        connection: NWConnection(host: .ipv4(.loopback), port: routes[address.port]!, using: .tcp))
+        connection: NWConnection(to: routes[address.port]!, using: .tcp))
     })
   func stop() async {
     await coordinators.setActive(false)
@@ -1158,10 +1159,10 @@ func aRefusedAddressEditKeepsTheQueueAndNeverSendsTheUserToRemove(_ typo: String
 
 /// Which fixture each saved port reaches. A test changes it as coordinators move.
 private actor Routes {
-  private var table: [UInt16: NWEndpoint.Port]
-  init(_ table: [UInt16: NWEndpoint.Port]) { self.table = table }
-  func set(_ next: [UInt16: NWEndpoint.Port]) { table = next }
-  func port(_ saved: UInt16) -> NWEndpoint.Port? { table[saved] }
+  private var table: [UInt16: NWEndpoint]
+  init(_ table: [UInt16: NWEndpoint]) { self.table = table }
+  func set(_ next: [UInt16: NWEndpoint]) { table = next }
+  func port(_ saved: UInt16) -> NWEndpoint? { table[saved] }
 }
 
 /// Work and Personal run on one machine at ports 4001 and 4002, and Work refused a follow-up that
@@ -1198,7 +1199,7 @@ func aLaneWhoseAddressAnswersAsAnotherSavedCoordinatorNamesItAndNeverSendsTheUse
         throw ConnectionError.invalidAddress
       }
       return LineConnection(
-        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+        connection: NWConnection(to: port, using: .tcp))
     })
   func stop() async {
     await coordinators.setActive(false)
@@ -1323,7 +1324,7 @@ func twoEditsToOneNameRunInTurnAndOnlyTheFirstSaves() async throws {
   defer { workListener.cancel() }
   let (personalListener, personalPort) = try await listen(personal)
   defer { personalListener.cancel() }
-  let routes: [UInt16: NWEndpoint.Port] = [4001: workPort, 4002: personalPort, 4003: workPort]
+  let routes: [UInt16: NWEndpoint] = [4001: workPort, 4002: personalPort, 4003: workPort]
   let gate = ProbeGate()
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
@@ -1335,7 +1336,7 @@ func twoEditsToOneNameRunInTurnAndOnlyTheFirstSaves() async throws {
     transport: CoordinatorTransport { address in
       if address.port == 4003 { await gate.pass() }
       return LineConnection(
-        connection: NWConnection(host: .ipv4(.loopback), port: routes[address.port]!, using: .tcp))
+        connection: NWConnection(to: routes[address.port]!, using: .tcp))
     })
   try await coordinators.add(
     name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
@@ -1627,7 +1628,7 @@ func aReinstalledCoordinatorsBannerCountsWhatRemoveDeletes(queued: Bool) async t
     transport: CoordinatorTransport { _ in
       let port = await reinstall.done ? reinstalledPort : originalPort
       return LineConnection(
-        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+        connection: NWConnection(to: port, using: .tcp))
     })
   let chat = coordinators.chat
   let work = try #require(coordinators.profiles.first?.id)
@@ -1762,13 +1763,13 @@ func aHeldMessageStartingWithAnotherNameRestoresToItsOwnCoordinatorAsTyped() asy
   defer { migratedListener.cancel() }
   let (personalListener, personalPort) = try await listen(personal)
   defer { personalListener.cancel() }
-  let routes: [UInt16: NWEndpoint.Port] = [install.address.port: migratedPort, 4002: personalPort]
+  let routes: [UInt16: NWEndpoint] = [install.address.port: migratedPort, 4002: personalPort]
   let coordinators = Coordinators(
     registration: nil, defaults: install.defaults, applicationSupport: install.support,
     caches: install.caches,
     transport: CoordinatorTransport { address in
       LineConnection(
-        connection: NWConnection(host: .ipv4(.loopback), port: routes[address.port]!, using: .tcp))
+        connection: NWConnection(to: routes[address.port]!, using: .tcp))
     })
   let chat = coordinators.chat
   let profile = try #require(coordinators.profiles.first)
@@ -1852,7 +1853,7 @@ private func submitted(_ fixture: FixtureCoordinator) async -> [String] {
     transport: CoordinatorTransport { address in
       guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
       return LineConnection(
-        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+        connection: NWConnection(to: port, using: .tcp))
     })
   let migrated = try #require(coordinators.profiles.first)
   @MainActor func stop() async {
@@ -2216,7 +2217,7 @@ func theBuildsCoordinatorSavedUnderAnotherAddressTakesWhatTheBuildLeft(_ alerts:
     transport: CoordinatorTransport { address in
       guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
       return LineConnection(
-        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+        connection: NWConnection(to: port, using: .tcp))
     })
   let chat = coordinators.chat
   let migrated = try #require(coordinators.profiles.first)
@@ -2620,7 +2621,7 @@ func restoresQuestionEndsOnceTheHeldMessageGainsAnOwner(_ path: String) async th
   let transport = CoordinatorTransport { address in
     guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
     return LineConnection(
-      connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+      connection: NWConnection(to: port, using: .tcp))
   }
   let coordinators = Coordinators(
     registration: nil, defaults: defaults, applicationSupport: root, caches: root,
@@ -2698,7 +2699,7 @@ func aChoiceMadeBeforeTheHeldMessageGainedAnOwnerRestoresNothing() async throws 
   let transport = CoordinatorTransport { address in
     guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
     return LineConnection(
-      connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+      connection: NWConnection(to: port, using: .tcp))
   }
   let coordinators = Coordinators(
     registration: nil, defaults: defaults, applicationSupport: root, caches: root,
@@ -2838,7 +2839,7 @@ func aSecondMigrationAddressesEachHeldMessageToTheCoordinatorAtItsOwnAddress(_ w
   let transport = CoordinatorTransport { address in
     guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
     return LineConnection(
-      connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+      connection: NWConnection(to: port, using: .tcp))
   }
   let second = try CoordinatorAddress(host: "100.64.1.2", port: 4002)
   do {
@@ -3614,7 +3615,7 @@ func aBindingTheShippedBuildMadeAfterALaunchStoppedOutlivesThatLaunchsRecord(
     transport: CoordinatorTransport { address in
       guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
       return LineConnection(
-        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+        connection: NWConnection(to: port, using: .tcp))
     })
   let chat = coordinators.chat
   @MainActor func stop() async {
@@ -3748,7 +3749,7 @@ func aBindingTheShippedBuildListedStaysWithTheNoteItWasForAfterAFailedSave() asy
     transport: CoordinatorTransport { address in
       guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
       return LineConnection(
-        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+        connection: NWConnection(to: port, using: .tcp))
     })
   let chat = coordinators.chat
   @MainActor func stop() async {
@@ -3919,8 +3920,8 @@ private struct RestoredAndSent {
 }
 
 @MainActor private func restoreAndSend(
-  root: URL, defaults: UserDefaults, work: FixtureCoordinator, workPort: NWEndpoint.Port,
-  personal: FixtureCoordinator, personalPort: NWEndpoint.Port
+  root: URL, defaults: UserDefaults, work: FixtureCoordinator, workPort: NWEndpoint,
+  personal: FixtureCoordinator, personalPort: NWEndpoint
 ) async throws -> RestoredAndSent {
   let routes = Routes([4002: workPort, 43187: personalPort])
   let coordinators = Coordinators(
@@ -3928,7 +3929,7 @@ private struct RestoredAndSent {
     transport: CoordinatorTransport { address in
       guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
       return LineConnection(
-        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+        connection: NWConnection(to: port, using: .tcp))
     })
   let chat = coordinators.chat
   @MainActor func stop() async {
@@ -4103,7 +4104,7 @@ func removeDeletesOnlyTheHeldQueuesItsConfirmationCounted(_ removing: String) as
     transport: CoordinatorTransport { address in
       guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
       return LineConnection(
-        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+        connection: NWConnection(to: port, using: .tcp))
     })
   let chat = coordinators.chat
   let migrated = try #require(coordinators.profiles.first)
@@ -4195,7 +4196,7 @@ func aPreviousBuildsOriginGoesOnlyToTheFolderItDescribes() async throws {
     transport: CoordinatorTransport { address in
       guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
       return LineConnection(
-        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+        connection: NWConnection(to: port, using: .tcp))
     })
   let chat = coordinators.chat
   @MainActor func stop() async {
@@ -4278,7 +4279,7 @@ func aRecordOfAQueueAlreadyHeldGivesNothingToALaterLegacyFolder() async throws {
     transport: CoordinatorTransport { address in
       guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
       return LineConnection(
-        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+        connection: NWConnection(to: port, using: .tcp))
     })
   let chat = coordinators.chat
   @MainActor func stop() async {
@@ -4473,7 +4474,7 @@ func eachCoordinatorHoldingTheOldInstallationGetsItsOwnWithdrawal() async throws
     transport: CoordinatorTransport { address in
       guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
       return LineConnection(
-        connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+        connection: NWConnection(to: port, using: .tcp))
     })
   struct Saved: Decodable { let withdrawals: [PendingWithdrawal] }
   func saved() throws -> [String] {
@@ -4561,7 +4562,7 @@ func aQueueRemoveDeletedGivesNothingToALaterLegacyFolder() async throws {
       transport: CoordinatorTransport { address in
         guard let port = await routes.port(address.port) else { throw ConnectionError.timedOut }
         return LineConnection(
-          connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+          connection: NWConnection(to: port, using: .tcp))
       })
   }
   let workAddress = try CoordinatorAddress(host: "100.64.1.2")
