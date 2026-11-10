@@ -100,17 +100,25 @@ public final class AppNotifications: NSObject {
   extension AppNotifications: UNUserNotificationCenterDelegate {
     public nonisolated func userNotificationCenter(
       _ center: UNUserNotificationCenter,
-      willPresent notification: UNNotification
-    ) async -> UNNotificationPresentationOptions {
-      await MainActor.run { presentsAlerts ? [.banner, .sound] : [] }
+      willPresent notification: UNNotification,
+      withCompletionHandler completionHandler:
+        @escaping @Sendable (UNNotificationPresentationOptions) -> Void
+    ) {
+      DispatchQueue.main.async {
+        completionHandler(self.presentsAlerts ? [.banner, .sound] : [])
+      }
     }
 
     public nonisolated func userNotificationCenter(
       _ center: UNUserNotificationCenter,
-      didReceive response: UNNotificationResponse
-    ) async {
+      didReceive response: UNNotificationResponse,
+      withCompletionHandler completionHandler: @escaping @Sendable () -> Void
+    ) {
       let target = Self.target(response.notification.request.content.userInfo)
-      if let target { await MainActor.run { open(target) } }
+      DispatchQueue.main.async {
+        if let target { self.open(target) }
+        completionHandler()
+      }
     }
   }
 #endif
