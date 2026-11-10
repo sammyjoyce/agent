@@ -1,6 +1,37 @@
 import AgentCore
 import Foundation
 
+/// Which coordinators' conversations the feed shows, not a list of recipients.
+enum FeedScope: Hashable, Sendable {
+  case all
+  case one(ProfileID)
+
+  var coordinator: ProfileID? {
+    if case .one(let id) = self { return id }
+    return nil
+  }
+
+  func shows(_ id: ProfileID) -> Bool {
+    switch self {
+    case .all: true
+    case .one(let shown): shown == id
+    }
+  }
+
+  init(sending ids: [ProfileID]) {
+    self = ids.count == 1 ? .one(ids[0]) : .all
+  }
+
+  static func resolve(
+    _ requested: FeedScope, profiles: [CoordinatorProfile], removed: [ProfileID: String]
+  ) -> FeedScope {
+    guard profiles.count > 1, case .one(let id) = requested, removed[id] == nil,
+      profiles.contains(where: { $0.id == id })
+    else { return .all }
+    return requested
+  }
+}
+
 /// Who a draft goes to, or why Send is blocked. The recipient line and Send both read it.
 enum Addressing: Equatable {
   /// Send reaches these coordinators, in profile order, with this body.
@@ -140,12 +171,42 @@ struct FeedRow: Equatable {
   let receipts: [Receipt]
 }
 
+struct FeedProjection: Equatable {
+  var rows: [FeedRow]
+  var connection: ConnectionState
+  var model: String
+  var busy: Bool
+  var commands: [SlashCommand]
+  var canLoadEarlier: Bool
+  var loadingHistory: Bool
+  var includesLatest: Bool
+}
+
 enum Feed {
-  /// Every lane's rows in the order this phone received them: by receive time, then lane
-  /// order, then row order, which keeps each coordinator's own order. Row IDs become
-  /// `<profile>/<row>`. A Send's user rows show once, as `send:<id>` at its first position.
-  static func merge(_ lanes: [(id: ProfileID, snapshot: ChatSnapshot)]) -> [FeedRow] {
-    let ordered = lanes.enumerated().flatMap { lane, source in
+  static func project(
+    _ lanes: [(id: ProfileID, snapshot: ChatSnapshot)], scope: FeedScope
+  ) -> FeedProjection {
+    let shown = lanes.filter { scope.shows($0.id) }.map(\.snapshot)
+    let connection =
+      [ConnectionState.connected, .reconnecting, .connecting].first { state in
+        shown.contains { $0.connection == state }
+      } ?? .disconnected
+    var usages: Set<String> = []
+    let commands = shown.flatMap(\.commands).filter { usages.insert($0.usage).inserted }
+    return FeedProjection(
+      rows: merge(lanes, showing: scope), connection: connection,
+      model: shown.first?.model ?? "Unknown", busy: shown.contains(where: \.busy),
+      commands: commands, canLoadEarlier: shown.contains { $0.olderCursor != nil },
+      loadingHistory: shown.contains(where: \.loadingHistory),
+      includesLatest: shown.allSatisfy(\.includesLatest))
+  }
+
+  /// Shown lanes' rows in receive order, with receipts read from every lane. A Send's user
+  /// rows show once, as `send:<id>` at its first position among the shown lanes.
+  static func merge(
+    _ lanes: [(id: ProfileID, snapshot: ChatSnapshot)], showing scope: FeedScope = .all
+  ) -> [FeedRow] {
+    let ordered = lanes.enumerated().filter { scope.shows($0.element.id) }.flatMap { lane, source in
       source.snapshot.rows.enumerated().map { index, row in
         (stamp: row.receivedAt ?? .distantPast, lane: lane, index: index, id: source.id, row: row)
       }
