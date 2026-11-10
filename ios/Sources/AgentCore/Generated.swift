@@ -1812,13 +1812,16 @@ public struct NotificationStatus: Codable, Sendable, Equatable {
 public struct NotificationTarget: Codable, Sendable, Equatable {
     public var `conversationId`: String
     public var `entryId`: String
-    public init(`conversationId`: String, `entryId`: String) {
+    public var `installationId`: String?
+    public init(`conversationId`: String, `entryId`: String, `installationId`: String? = nil) {
         self.`conversationId` = `conversationId`
         self.`entryId` = `entryId`
+        self.`installationId` = `installationId`
     }
     enum CodingKeys: String, CodingKey {
         case `conversationId` = "conversation_id"
         case `entryId` = "entry_id"
+        case `installationId` = "installation_id"
     }
 }
 

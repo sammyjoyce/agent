@@ -120,7 +120,8 @@ export class ApnsClient {
           } catch { /* A provider rejection remains a rejection without retaining its body. */ }
           finish({ state: status === 429 || (status >= 500 && status <= 599) ? "retrying" : "rejected", status, invalid_device });
         });
-        const target: NotificationTarget = { conversation_id: delivery.conversation_id, entry_id: delivery.entry_id };
+        const target: NotificationTarget = { conversation_id: delivery.conversation_id, entry_id: delivery.entry_id,
+          installation_id: delivery.installation_id };
         request.end(JSON.stringify({ aps: { alert: { title: "Beep Boop", body: preview }, sound: "default" }, agent: target }));
       });
     } catch { return uncertain; }

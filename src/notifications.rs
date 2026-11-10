@@ -108,11 +108,41 @@ pub struct NotificationStatus {
 pub struct NotificationTarget {
     pub conversation_id: String,
     pub entry_id: String,
+    /// The receiving installation, absent in alerts sent by older coordinators.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub installation_id: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_target_installation_id_is_optional_on_the_wire() {
+        let old = serde_json::json!({"conversation_id": "1", "entry_id": "42"});
+        let target: NotificationTarget = serde_json::from_value(old.clone()).unwrap();
+        assert!(target.installation_id.is_none());
+        assert_eq!(serde_json::to_value(&target).unwrap(), old);
+
+        let null = serde_json::json!({
+            "conversation_id": "1", "entry_id": "42", "installation_id": null
+        });
+        let target: NotificationTarget = serde_json::from_value(null).unwrap();
+        assert!(target.installation_id.is_none());
+        assert_eq!(serde_json::to_value(&target).unwrap(), old);
+
+        let named = serde_json::json!({
+            "conversation_id": "1", "entry_id": "42",
+            "installation_id": "11111111-1111-4111-8111-111111111111"
+        });
+        let target: NotificationTarget = serde_json::from_value(named.clone()).unwrap();
+        assert_eq!(
+            target.installation_id.as_deref(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
+        assert_eq!(serde_json::to_value(target).unwrap(), named);
+    }
 
     #[test]
     fn registration_uses_native_identity_and_accepts_variable_length_tokens() {
