@@ -855,10 +855,11 @@
         #expect(model.rows.filter { $0.row.text == broadcast }.count == 1, "The broadcast folds")
         #expect(TranscriptItem.runStarts(model.transcriptItems).count == 5)
         #expect(model.recipientLine == "To Work")
-        func render(_ scheme: ColorScheme) async throws -> CGImage {
+        func render(_ scheme: ColorScheme, size: DynamicTypeSize = .large) async throws -> CGImage {
           let dimensions = CGSize(width: 390, height: 844)
           let host = UIHostingController(
-            rootView: MainChatView(model: model).environment(\.colorScheme, scheme))
+            rootView: MainChatView(model: model).environment(\.colorScheme, scheme)
+              .environment(\.dynamicTypeSize, size))
           let scene = try #require(
             UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
           let previousWindow = scene.windows.first(where: \.isKeyWindow)
@@ -901,6 +902,17 @@
           Attachment.record(image, named: "two-coordinator-feed-\(scheme)", as: .png)
         }
 
+        model.show(.one(work.id))
+        for (name, scheme, size) in [
+          ("light", ColorScheme.light, DynamicTypeSize.large),
+          ("dark", .dark, .large),
+          ("large-text", .light, .accessibility3),
+        ] {
+          let image = try await render(scheme, size: size)
+          try requireVisibleContent(image)
+          Attachment.record(image, named: "scoped-full-chat-\(name)", as: .png)
+        }
+        model.show(.all)
         let systemRed = (1.0, 0.23, 0.19)
         model.removeChip()
         model.draft = "@"
