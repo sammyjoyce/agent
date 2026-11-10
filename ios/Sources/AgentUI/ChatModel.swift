@@ -26,10 +26,13 @@ final class RowModel: Identifiable {
     lane = feed.lane
     receipts = feed.receipts
   }
-  func update(_ feed: FeedRow) {
+  @discardableResult
+  func update(_ feed: FeedRow) -> Bool {
+    let changed = row != feed.row || lane != feed.lane || receipts != feed.receipts
     if row != feed.row { row = feed.row }
     if lane != feed.lane { lane = feed.lane }
     if receipts != feed.receipts { receipts = feed.receipts }
+    return changed
   }
 }
 
@@ -1274,19 +1277,21 @@ final class ChatModel {
 
   func apply(_ update: ChatSnapshot, lane id: ProfileID) {
     snapshots[id] = update
-    refresh()
+    refresh(changed: id)
   }
 
   /// Rebuilds the feed and the composer's view of the coordinators from every lane's state.
-  private func refresh() {
+  private func refresh(changed: ProfileID? = nil) {
     let states = lanes.compactMap { lane in
       snapshots[lane.id].map { (id: lane.id, snapshot: $0) }
     }
+    let projection = Feed.project(states, scope: .all)
     let existing = Dictionary(
       rows.map { ($0.id, $0) }, uniquingKeysWith: { original, _ in original })
-    let next = Feed.merge(states).map { row -> RowModel in
+    var changedShown = rows.map(\.id) != projection.rows.map(\.id)
+    let next = projection.rows.map { row -> RowModel in
       guard let model = existing[row.id] else { return RowModel(row) }
-      model.update(row)
+      if model.update(row) { changedShown = true }
       return model
     }
     if rows.map(\.id) != next.map(\.id) {
@@ -1294,18 +1299,19 @@ final class ChatModel {
     } else {
       transcriptItems = TranscriptItem.grouped(rows, preserving: transcriptItems)
     }
-    revision &+= 1
-    let all = states.map(\.snapshot)
-    connection =
-      [ConnectionState.connected, .reconnecting, .connecting].first { state in
-        all.contains { $0.connection == state }
-      } ?? .disconnected
-    model = all.first?.model ?? "Unknown"
-    busy = all.contains(where: \.busy)
-    var usages: Set<String> = []
-    commands = all.flatMap(\.commands).filter { usages.insert($0.usage).inserted }
-    canLoadEarlier = all.contains { $0.olderCursor != nil }
-    loadingHistory = all.contains(where: \.loadingHistory)
-    includesLatest = all.allSatisfy(\.includesLatest)
+    if connection != projection.connection || model != projection.model || busy != projection.busy
+      || commands != projection.commands || canLoadEarlier != projection.canLoadEarlier
+      || loadingHistory != projection.loadingHistory || includesLatest != projection.includesLatest
+    {
+      changedShown = true
+    }
+    connection = projection.connection
+    model = projection.model
+    busy = projection.busy
+    commands = projection.commands
+    canLoadEarlier = projection.canLoadEarlier
+    loadingHistory = projection.loadingHistory
+    includesLatest = projection.includesLatest
+    if changedShown || changed == nil { revision &+= 1 }
   }
 }
