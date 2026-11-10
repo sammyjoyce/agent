@@ -67,8 +67,12 @@ public struct MainChatView: View {
   public var body: some View {
     NavigationStack {
       VStack(spacing: 0) {
-        if model.multiple {
+        if model.namesLanes {
           ForEach(model.profiles) { profile in laneStatus(profile) }
+        } else if let shown = model.scope.coordinator,
+          let profile = model.profiles.first(where: { $0.id == shown })
+        {
+          laneStatus(profile)
         } else if let status = connectionStatus {
           HStack(spacing: 8) {
             ProgressView().controlSize(.mini)
@@ -77,13 +81,14 @@ public struct MainChatView: View {
           .frame(maxWidth: .infinity, alignment: .leading)
           .padding(.horizontal, 16).padding(.vertical, 8)
         }
-        ForEach(model.sourceReports.filter { $0.warning != nil }) { report in
+        ForEach(model.sourceReports.filter { model.scope.shows($0.id) && $0.warning != nil }) {
+          report in
           Button {
             sourceDetails = true
           } label: {
             HStack {
               Label {
-                model.multiple
+                model.namesLanes
                   ? badge(report.id).title + Text(" \(report.warning ?? "")")
                   : Text(report.warning ?? "")
               } icon: {
@@ -115,7 +120,7 @@ public struct MainChatView: View {
           )
           .accessibilityIdentifier("relatedWork")
         }
-        transcript
+        transcript.id(model.scope)
         if let error = model.draftError {
           VStack(alignment: .leading) {
             Text(error).font(.callout).foregroundStyle(.red)
@@ -154,15 +159,15 @@ public struct MainChatView: View {
       #endif
       .toolbar {
         ToolbarItem(placement: .principal) {
-          VStack(spacing: 1) {
-            Text(model.inspectedConversation?.title ?? "Beep Boop").font(.headline).lineLimit(1)
-            Text(
-              model.multiple
-                ? joinedNames(model.profiles.map(\.name.description))
-                : model.model.split(separator: "/").last.map(String.init) ?? model.model
-            )
-            .font(.caption).foregroundStyle(.primary.opacity(0.65)).lineLimit(1)
-          }.accessibilityElement(children: .combine)
+          if model.multiple && !inspecting {
+            ScopeMenu(model: model, badge: badge)
+          } else {
+            VStack(spacing: 1) {
+              Text(model.inspectedConversation?.title ?? "Beep Boop").font(.headline).lineLimit(1)
+              Text(model.model.split(separator: "/").last.map(String.init) ?? model.model)
+                .font(.caption).foregroundStyle(.primary.opacity(0.65)).lineLimit(1)
+            }.accessibilityElement(children: .combine)
+          }
         }
         ToolbarItem(placement: .primaryAction) {
           if inspecting {
@@ -238,6 +243,16 @@ public struct MainChatView: View {
       }
       .onAppear { notifications?.mainVisible = mainVisible }
       .onDisappear { notifications?.mainVisible = false }
+      .onChange(of: model.scope) { _, scope in
+        followsLatest = true
+        userScrolling = false
+        atTop = false
+        latestVisible = true
+        presentedLatest = false
+        visibleItem = nil
+        activityExpansion = ActivityExpansion()
+        historyRequest = model.includesLatest ? nil : .latest(UUID(), scope: scope)
+      }
       .onChange(of: settings) { _, _ in notifications?.mainVisible = mainVisible }
       .onChange(of: sourceDetails) { _, _ in notifications?.mainVisible = mainVisible }
       .onChange(of: notifications?.openedTarget) { _, target in
@@ -319,7 +334,9 @@ public struct MainChatView: View {
   @ViewBuilder private func laneStatus(_ profile: CoordinatorProfile) -> some View {
     if let state = laneState(profile) {
       HStack(alignment: .firstTextBaseline, spacing: 8) {
-        (badge(profile.id).title + Text(" \(state.message)").foregroundStyle(.secondary))
+        (model.namesLanes
+          ? badge(profile.id).title + Text(" \(state.message)").foregroundStyle(.secondary)
+          : Text(state.message).foregroundStyle(.secondary))
           .font(.footnote).fixedSize(horizontal: false, vertical: true)
           .frame(maxWidth: .infinity, alignment: .leading)
           .accessibilityLabel("\(profile.name.description). \(state.message)")
@@ -340,7 +357,7 @@ public struct MainChatView: View {
   }
   private var transcript: some View {
     let items = model.transcriptItems
-    let starts = model.multiple ? TranscriptItem.runStarts(items) : []
+    let starts = model.namesLanes ? TranscriptItem.runStarts(items) : []
     let badges = badges
     return ScrollViewReader { scroll in
       ScrollView {
@@ -348,7 +365,7 @@ public struct MainChatView: View {
           // Pagination is section structure, not transcript content. Keep
           // one lazy layout so explicit row targets remain discoverable.
           Section {
-            if model.rows.isEmpty && model.held.isEmpty {
+            if model.rows.isEmpty && model.shownHeld.isEmpty {
               Text("No messages yet").font(.callout).foregroundStyle(.primary)
                 .frame(maxWidth: .infinity).padding(.vertical, 32)
             }
@@ -356,7 +373,7 @@ public struct MainChatView: View {
               Text(heldError).font(.callout).foregroundStyle(.red)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            ForEach(model.held) { message in
+            ForEach(model.shownHeld) { message in
               HeldMessageRow(
                 message: message,
                 restore: { Task { await model.restoreHeld(message) } },
@@ -521,7 +538,7 @@ public struct MainChatView: View {
         restore: { id in Task { await model.restore(id) } },
         discard: { id in Task { await model.discard(id) } },
         preview: { file in Task { await model.preview(file, lane: row.lane) } },
-        badges: badges)
+        badges: badges, implied: model.scope.coordinator)
     case .activity(let group):
       ActivityGroupView(
         group: group, expansion: $activityExpansion,
@@ -668,19 +685,17 @@ public struct MainChatView: View {
         RoundedRectangle(cornerRadius: 26).strokeBorder(.primary.opacity(0.12), lineWidth: 0.5)
       }
       if model.addressesByName {
-        // With the picker open the tag is still being typed, which is not an error.
-        let blocked =
-          if case .blocked = model.addressing, model.pickerMatches.isEmpty { true } else { false }
-        Text(model.recipientLine).font(.footnote)
-          .foregroundStyle(blocked ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
-          .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12)
-          .accessibilityIdentifier("recipientLine")
+        RecipientLine(model: model)
       }
     }
     .padding(.horizontal, 12).padding(.vertical, 8).background(.background)
   }
   private var placeholder: String {
-    model.mode == .steer ? "Message Beep Boop" : "Queue a follow-up"
+    if let shown = model.scope.coordinator {
+      return model.mode == .steer
+        ? "Message \(model.name(shown))" : "Queue a follow-up for \(model.name(shown))"
+    }
+    return model.mode == .steer ? "Message Beep Boop" : "Queue a follow-up"
   }
   #if os(iOS)
     /// The draft with the chip on its first line, like a word typed there.
@@ -709,7 +724,9 @@ public struct MainChatView: View {
         .contentShape(Rectangle())
       }
       .buttonStyle(.plain).disabled(model.admitting).accessibilityLabel("To \(badge.name)")
-      .accessibilityHint("Removes the recipient, so the message goes to every coordinator.")
+      .accessibilityHint(
+        "Removes the recipient. The draft is addressed to every coordinator and may need All to send."
+      )
     }
   #endif
   /// Saved names matching an `@` being typed. Choosing one sets the composer's recipient.
@@ -740,6 +757,15 @@ public struct MainChatView: View {
   private var connectionSettings: some View {
     NavigationStack {
       Form {
+        if model.multiple, let shown = model.scope.coordinator,
+          let profile = model.profiles.first(where: { $0.id == shown })
+        {
+          Section(model.name(shown)) {
+            LabeledContent("Status", value: statusText(profile))
+            LabeledContent("Model", value: model.model)
+            CoordinatorControls(model: model, lane: shown)
+          }
+        }
         Section {
           if !model.multiple {
             LabeledContent("Status", value: model.connection.label)
@@ -979,6 +1005,166 @@ private struct CoordinatorForm: View {
   }
 }
 
+/// The title chooses the feed without changing the draft's destination.
+private struct ScopeMenu: View {
+  let model: ChatModel
+  let badge: (ProfileID) -> CoordinatorBadge
+
+  var body: some View {
+    Menu {
+      row(.all, title: "All coordinators", news: nil)
+      Divider()
+      ForEach(model.news) { news in
+        row(.one(news.id), title: model.name(news.id), news: news)
+      }
+    } label: {
+      VStack(spacing: 1) {
+        HStack(spacing: 4) {
+          if let shown = model.scope.coordinator { dot(shown, size: 8) }
+          Text(model.scope.coordinator.map(model.name) ?? "All coordinators").font(.headline)
+          Image(systemName: "chevron.down").font(.caption.weight(.bold)).foregroundStyle(.secondary)
+        }
+        if let other = singleOtherWithNews {
+          HStack(spacing: 4) {
+            dot(other.id, size: 6)
+            Text("\(model.name(other.id)) · \(summary(other))")
+          }
+          .font(.caption.weight(.semibold)).foregroundStyle(badge(other.id).color)
+        } else {
+          Text(subtitle).font(.caption).foregroundStyle(.primary.opacity(0.65))
+        }
+      }
+      .foregroundStyle(.primary).lineLimit(1).minimumScaleFactor(0.7)
+    }
+    .accessibilityIdentifier("scopeMenu")
+  }
+
+  private var others: [LaneNews] {
+    model.news.filter { $0.id != model.scope.coordinator }
+  }
+  private var singleOtherWithNews: LaneNews? {
+    guard model.scope.coordinator != nil, others.count == 1,
+      let other = others.first, !summary(other).isEmpty
+    else { return nil }
+    return other
+  }
+  private var subtitle: String {
+    guard model.scope.coordinator != nil else {
+      return joinedNames(model.profiles.map(\.name.description))
+    }
+    guard others.count > 1 else {
+      return model.model.split(separator: "/").last.map(String.init) ?? model.model
+    }
+    let attention = others.filter { $0.attention != nil }.count
+    let held = others.reduce(0) { $0 + $1.held }
+    let unseen = others.reduce(0) { $0 + $1.unseen }
+    if attention > 0 {
+      return "\(others.count) others · \(attention) \(attention == 1 ? "needs" : "need") attention"
+    }
+    if held > 0 { return "\(others.count) others · \(held) held" }
+    if unseen > 0 { return "\(others.count) others · \(unseen) new" }
+    return model.model.split(separator: "/").last.map(String.init) ?? model.model
+  }
+  private func summary(_ news: LaneNews) -> String {
+    switch news.attention {
+    case .notPaired: return "Not paired"
+    case .notConnected: return "Not connected"
+    case .error(let error): return error
+    case nil: break
+    }
+    if news.held > 0 { return "\(news.held) held" }
+    if news.unseen > 0 { return "\(news.unseen) new" }
+    return ""
+  }
+  private func rowSubtitle(_ news: LaneNews?) -> String? {
+    guard let news else {
+      let held = model.unownedHeld
+      return held == 0
+        ? nil : "\(held) held \(held == 1 ? "message needs" : "messages need") a coordinator"
+    }
+    if news.attention != nil { return summary(news) }
+    if news.held > 0 { return "\(news.held) held" }
+    if news.unseen > 0 { return "\(news.unseen) new since you last looked" }
+    return nil
+  }
+  @ViewBuilder private func row(_ scope: FeedScope, title: String, news: LaneNews?) -> some View {
+    let subtitle = rowSubtitle(news)
+    if model.scope == scope {
+      Toggle(isOn: .constant(true)) {
+        Text(title)
+        icon(scope)
+      }
+      .accessibilityLabel(title)
+    } else {
+      Button {
+        model.show(scope)
+      } label: {
+        Text(title)
+        if let subtitle { Text(subtitle) }
+        icon(scope)
+      }
+      .accessibilityLabel(
+        news.map {
+          $0.unseen > 0 && $0.attention == nil && $0.held == 0
+            ? "\(title), \($0.unseen) new \($0.unseen == 1 ? "reply" : "replies") since you last looked"
+            : [title, subtitle].compactMap { $0 }.joined(separator: ", ")
+        } ?? [title, subtitle].compactMap { $0 }.joined(separator: ", "))
+    }
+  }
+  @ViewBuilder private func icon(_ scope: FeedScope) -> some View {
+    if let id = scope.coordinator {
+      #if os(iOS)
+        if let image = UIImage(systemName: "circle.fill") {
+          Image(
+            uiImage: image.withTintColor(UIColor(badge(id).color), renderingMode: .alwaysOriginal))
+        }
+      #else
+        Image(systemName: "circle.fill").foregroundStyle(badge(id).color)
+      #endif
+    } else {
+      Image(systemName: "square.stack")
+    }
+  }
+  private func dot(_ id: ProfileID, size: CGFloat) -> some View {
+    Circle().fill(badge(id).color).frame(width: size, height: size)
+  }
+}
+
+private struct RecipientLine: View {
+  let model: ChatModel
+
+  var body: some View {
+    let blocked: Bool =
+      switch model.addressing {
+      case .blocked: model.pickerMatches.isEmpty
+      case .elsewhere: true
+      case .to, .empty: false
+      }
+    VStack(alignment: .leading, spacing: 4) {
+      Text(model.recipientLine).font(.footnote)
+        .foregroundStyle(blocked ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
+        .accessibilityIdentifier("recipientLine")
+      if case .elsewhere(let ids, let narrows) = model.addressing {
+        ViewThatFits(in: .horizontal) {
+          HStack { actions(ids, narrows: narrows) }
+          VStack(alignment: .leading) { actions(ids, narrows: narrows) }
+        }
+        .font(.footnote)
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12)
+  }
+  @ViewBuilder private func actions(_ ids: [ProfileID], narrows: Bool) -> some View {
+    Button("Show \(ids.count == 1 ? model.name(ids[0]) : "All")") {
+      model.show(FeedScope(sending: ids))
+    }
+    if narrows, let shown = model.scope.coordinator {
+      Button("Address to \(model.name(shown)) only") { model.setChip(shown) }
+        .disabled(model.admitting)
+    }
+  }
+}
+
 /// A coordinator as the feed draws it: its name in its color.
 struct CoordinatorBadge {
   let name: String
@@ -1093,13 +1279,14 @@ struct MessageRow: View {
   let preview: (AttachmentRef) -> Void
   /// Names and colors with two or more coordinators. Empty draws the one-coordinator row.
   let badges: [ProfileID: CoordinatorBadge]
+  let implied: ProfileID?
   @State private var expanded = false
   @Environment(\.dynamicTypeSize) private var typeSize
 
   init(
     model: RowModel, retry: @escaping (String) -> Void, restore: @escaping (String) -> Void,
     discard: @escaping (String) -> Void, preview: @escaping (AttachmentRef) -> Void = { _ in },
-    badges: [ProfileID: CoordinatorBadge] = [:]
+    badges: [ProfileID: CoordinatorBadge] = [:], implied: ProfileID? = nil
   ) {
     self.model = model
     self.retry = retry
@@ -1107,6 +1294,7 @@ struct MessageRow: View {
     self.discard = discard
     self.preview = preview
     self.badges = badges
+    self.implied = implied
   }
 
   var body: some View {
@@ -1123,7 +1311,9 @@ struct MessageRow: View {
       if isUser, let provenance = model.row.provenanceLabel {
         Text(provenance).font(.caption).foregroundStyle(.secondary)
       }
-      if isUser, !badges.isEmpty, !model.receipts.isEmpty {
+      if isUser, !badges.isEmpty, !model.receipts.isEmpty,
+        model.receipts.map(\.lane) != implied.map({ [$0] })
+      {
         receipt
       } else {
         delivery
@@ -1232,7 +1422,7 @@ struct MessageRow: View {
   /// The row's text, led by the tag of the one coordinator a tagged Send went to.
   private var blocks: [RichBlock] {
     guard isUser, model.receipts.count == 1, let lane = model.receipts.first?.lane,
-      let badge = badges[lane]
+      lane != implied, let badge = badges[lane]
     else { return model.row.blocks }
     var tag = AttributedString("@\(badge.name) ")
     tag.foregroundColor = badge.color
