@@ -1737,8 +1737,7 @@
           try await Task.sleep(for: .milliseconds(200))
           field.insertText("Invented one line")
           try await Task.sleep(for: .milliseconds(300))
-          /// The leftmost and rightmost dark pixels of the first line as the field draws it.
-          func drawn() throws -> (minX: CGFloat, maxX: CGFloat) {
+          func inkSpan(top: CGFloat, bottom: CGFloat) throws -> (minX: CGFloat, maxX: CGFloat) {
             let format = UIGraphicsImageRendererFormat()
             format.scale = 1
             let image = UIGraphicsImageRenderer(bounds: field.bounds, format: format).image { _ in
@@ -1752,14 +1751,13 @@
                 bytesPerRow: cg.width * 4, space: CGColorSpaceCreateDeviceRGB(),
                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
             context.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
-            let top = Int(field.textContainerInset.top)
-            let bottom = min(cg.height, top + Int(try #require(field.font).lineHeight))
             var span = (minX: CGFloat.infinity, maxX: -CGFloat.infinity)
-            for y in top..<bottom {
+            for y in max(0, Int(top))..<min(cg.height, Int(bottom)) {
               for x in 0..<cg.width {
                 let pixel = (y * cg.width + x) * 4
-                let rgb = Int(pixels[pixel]) + Int(pixels[pixel + 1]) + Int(pixels[pixel + 2])
-                if pixels[pixel + 3] > 128 && rgb < 330 {
+                let rgb = pixels[pixel..<pixel + 3].map(Int.init)
+                let untinted = (rgb.max() ?? 0) - (rgb.min() ?? 0) < 40
+                if pixels[pixel + 3] > 128 && rgb.reduce(0, +) < 330 && untinted {
                   span = (min(span.minX, CGFloat(x)), max(span.maxX, CGFloat(x)))
                 }
               }
@@ -1791,13 +1789,19 @@
             try await Task.sleep(for: .milliseconds(100))
             box.window?.layoutIfNeeded()
             let line = try laidOut()
-            let ink = try drawn()
-            let end = field.caretRect(for: field.endOfDocument).midX
+            let top = field.textContainerInset.top
+            let firstLine = try inkSpan(
+              top: top, bottom: top + (try #require(field.font).lineHeight))
+            let caret = field.caretRect(for: field.endOfDocument)
+            let lastLine = try inkSpan(top: caret.minY, bottom: caret.maxY)
             print(
-              "IF7-V2[draw] \(step): line x=\(line) drawn=\(ink.minX)...\(ink.maxX) caret at end=\(end)"
+              "IF7-V2[draw] \(step): line x=\(line) drawn=\(firstLine.minX)...\(firstLine.maxX) caret at end=\(caret) drawn there=\(lastLine.minX)...\(lastLine.maxX)"
             )
-            #expect(abs(ink.minX - line) < 4, "\(step): the first line is drawn where taps find it")
-            #expect(abs(ink.maxX - end) < 4, "\(step): the caret is drawn after the last letter")
+            #expect(
+              abs(firstLine.minX - line) < 4, "\(step): the first line is drawn where taps find it")
+            #expect(
+              abs(lastLine.maxX - caret.midX) < 4,
+              "\(step): the caret is drawn after the last letter")
             if chip == nil && typed.isEmpty {
               let edge = ComposerField.inset.left
               #expect(abs(line - edge) < 0.5, "The first line keeps the chip's room")
@@ -1909,7 +1913,7 @@
           request.recognitionLevel = .accurate
           try VNImageRequestHandler(data: png).perform([request])
           return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
-            .joined(separator: " | ")
+            .joined(separator: " ")
         }
         let first = try await feedback("/feedback invented issue")
         let line = model.error ?? "nil"
