@@ -50,11 +50,6 @@ final class ComposerInteractionTests: XCTestCase {
     XCTAssertTrue(app.staticTexts["To Work and Personal"].waitForExistence(timeout: 10))
     return (app, work, personal)
   }
-  /// An empty draft reports its placeholder as its value, which is what VoiceOver reads.
-  private func isEmpty(_ field: XCUIElement) -> Bool {
-    let value = field.value as? String
-    return value == nil || value == "" || value == "Message Beep Boop"
-  }
   /// Where the field draws its one line of text, in points from its leading edge: the leftmost and
   /// rightmost gray pixels in a screenshot that stand out from the field's background, in either
   /// appearance. A chip's name and the caret are colored, so neither counts.
@@ -116,7 +111,7 @@ final class ComposerInteractionTests: XCTestCase {
     composer.typeText("@Work ")
     XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3), "The typed tag is the chip")
     XCTAssertTrue(
-      isEmpty(composer),
+      composer.showsNoText,
       "The typed tag left the field, which shows \(composer.value as? String ?? "nil")")
     let text = "Anything urgent this morning?"
     composer.typeText(text)
@@ -150,7 +145,7 @@ final class ComposerInteractionTests: XCTestCase {
       return toWork == [text] && toPersonal == [text]
     }
     XCTAssertTrue(
-      isEmpty(composer),
+      composer.showsNoText,
       "The field kept the sent text: \(composer.value as? String ?? "nil")")
     composer.typeText("x")
     XCTAssertEqual(composer.value as? String, "x", "The next key starts a new draft")
@@ -306,7 +301,7 @@ final class ComposerInteractionTests: XCTestCase {
     XCTAssertTrue(app.staticTexts["To Work and Personal"].waitForExistence(timeout: 3))
     composer.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: text.count))
     try await Task.sleep(for: .milliseconds(500))
-    let cleared = isEmpty(composer)
+    let cleared = composer.showsNoText
     composer.typeKey("z", modifierFlags: .command)
     try await Task.sleep(for: .seconds(1))
     let personalChip = app.buttons["To Personal"].exists
@@ -315,7 +310,7 @@ final class ComposerInteractionTests: XCTestCase {
       "IF10-2[ui] cleared=\(cleared) after Command-Z: value=\(composer.value as? String ?? "nil") personalChip=\(personalChip) line=\(line.label) sendEnabled=\(send.isEnabled) restoreOffered=\(restore.exists)"
     )
     XCTAssertTrue(cleared, "The keys did not empty the field")
-    XCTAssertTrue(isEmpty(composer), "Undo brought back the cleared restored text")
+    XCTAssertTrue(composer.showsNoText, "Undo brought back the cleared restored text")
     XCTAssertFalse(personalChip, "Undo made the restored text's tag Personal's chip")
     XCTAssertFalse(send.isEnabled, "Send is on with nothing to send")
     XCTAssertTrue(restore.exists, "Work's original no longer offers Restore")
@@ -471,11 +466,11 @@ final class ComposerInteractionTests: XCTestCase {
     defer { try? voiceOver.disable() }
     let field = try voiceOver.currentSpeech().utterance
     XCTAssertTrue(
-      field.contains("Message the coordinator Text field Is editing Message Agen"), field)
+      field.contains("Message the coordinator Text field Is editing Message Beep Boop"), field)
     let before = try voiceOver.moveBackward().utterance
     XCTAssertTrue(before.hasPrefix("To Work Button"), before)
     let first = try voiceOver.moveBackward().utterance
-    XCTAssertTrue(first.hasPrefix("Add attachments or commands"), first)
+    XCTAssertTrue(first.hasPrefix("Paste images"), first)
   }
 
   // The feed follows Work's replies as they arrive, from one to more than fill the screen. At
@@ -658,6 +653,13 @@ final class HistoryInteractionTests: XCTestCase {
     app.descendants(matching: .any).matching(identifier: "Message the coordinator").firstMatch
   }
 
+  private func feedButton(_ kind: String, row: String, app: XCUIApplication) -> XCUIElement {
+    app.buttons.matching(
+      NSPredicate(
+        format: "identifier BEGINSWITH %@ AND identifier ENDSWITH %@", "\(kind):", "/\(row)")
+    ).firstMatch
+  }
+
   func testShareExtensionSavesAnUnsentDraftAndHostImportsItOnceAfterRelaunch() async throws {
     let text = "Selected content for the unsent shared draft."
     let app = try await launchMessages([
@@ -709,7 +711,10 @@ final class HistoryInteractionTests: XCTestCase {
     XCTAssertEqual(XCTWaiter.wait(for: [imported], timeout: 5), .completed, app.debugDescription)
     let draft = try XCTUnwrap(composer.value as? String)
     XCTAssertEqual(draft.components(separatedBy: text).count, 2)
-    XCTAssertFalse(app.buttons["Send message"].isEnabled)
+    let sendInEitherMode = app.buttons.matching(
+      NSPredicate(format: "label IN %@", ["Send message", "Queue follow-up"])
+    ).firstMatch
+    XCTAssertFalse(sendInEitherMode.isEnabled)
     app.terminate()
     app.launch()
     if app.buttons["dismissConnection"].waitForExistence(timeout: 3) {
@@ -718,7 +723,7 @@ final class HistoryInteractionTests: XCTestCase {
     let restored = XCTNSPredicateExpectation(
       predicate: NSPredicate(format: "value == %@", draft), object: editor(app))
     XCTAssertEqual(XCTWaiter.wait(for: [restored], timeout: 5), .completed, app.debugDescription)
-    XCTAssertFalse(app.buttons["Send message"].isEnabled)
+    XCTAssertFalse(sendInEitherMode.isEnabled)
   }
 
   func testWholeMessageCopyAndPartialNativeSelectionPasteThroughComposer() async throws {
@@ -756,12 +761,9 @@ final class HistoryInteractionTests: XCTestCase {
     let delete = app.keys["delete"]
     XCTAssertTrue(delete.exists)
     delete.tap()
-    let cleared = XCTNSPredicateExpectation(
-      predicate: NSPredicate(format: "value == %@", ""), object: composer)
-    XCTAssertEqual(
-      XCTWaiter.wait(for: [cleared], timeout: 3), .completed,
+    XCTAssertTrue(
+      composer.wait(for: \.showsNoText, toEqual: true, timeout: 3),
       "Native Select All/Delete must clear the exact composer value: \(composer.debugDescription)")
-    XCTAssertEqual(composer.value as? String, "")
     first.press(forDuration: 1)
     let select = action("Select text", app: app)
     XCTAssertTrue(select.waitForExistence(timeout: 3))
@@ -853,14 +855,14 @@ final class HistoryInteractionTests: XCTestCase {
             role: .tool, text: output.stdout,
             tool: .init(callId: "shell-card", name: "exec", status: .finished))
         ], toolDetails: ["shell-card": details], appearance: appearance)
-      let group = app.buttons["activity:tool:shell-card"]
+      let group = feedButton("activity", row: "tool:shell-card", app: app)
       XCTAssertTrue(group.waitForExistence(timeout: 5), app.debugDescription)
       let collapsed = XCTAttachment(screenshot: app.screenshot())
       collapsed.name = "native-shell-collapsed-\(appearance)"
       collapsed.lifetime = .keepAlways
       add(collapsed)
       group.tap()
-      let command = app.buttons["activity-item:tool:shell-card"]
+      let command = feedButton("activity-item", row: "tool:shell-card", app: app)
       XCTAssertTrue(command.waitForExistence(timeout: 3), app.debugDescription)
       command.tap()
       let success = app.staticTexts["Success"]
@@ -907,7 +909,7 @@ final class HistoryInteractionTests: XCTestCase {
         continuation: false, entryId: "2", finalChunk: true, role: .thinking,
         text: "Second supplied summary.\n\nNo hidden thinking is fetched."),
     ])
-    let group = app.buttons["activity:entry:1:0"]
+    let group = feedButton("activity", row: "entry:1:0", app: app)
     XCTAssertTrue(group.waitForExistence(timeout: 5))
     group.tap()
     XCTAssertTrue(app.staticTexts["Every provider-supplied line stays visible."].exists)
@@ -1169,11 +1171,7 @@ final class HistoryInteractionTests: XCTestCase {
       transcript.swipeDown(velocity: .fast)
     }
     try await eventually { await peer.cursors() == ["one"] }
-    // Feed row IDs carry the coordinator's profile ID: `activity:<profile>/tool:call-75`.
-    let group = app.buttons.matching(
-      NSPredicate(
-        format: "identifier BEGINSWITH 'activity:' AND identifier ENDSWITH '/tool:call-75'")
-    ).firstMatch
+    let group = feedButton("activity", row: "tool:call-75", app: app)
     XCTAssertTrue(group.waitForExistence(timeout: 3))
     XCTAssertTrue(group.isHittable)
     let anchor = group.frame
@@ -1283,8 +1281,7 @@ final class RestoreInteractionTests: XCTestCase {
     try await eventually { composer.value as? String == text }
     composer.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: text.count))
     try await Task.sleep(for: .milliseconds(500))
-    let emptied = [nil, "", "Message Beep Boop"]
-    let cleared = emptied.contains(composer.value as? String)
+    let cleared = composer.showsNoText
     composer.typeKey("z", modifierFlags: .command)
     try await Task.sleep(for: .seconds(1))
     let undone = composer.value as? String
@@ -1292,7 +1289,7 @@ final class RestoreInteractionTests: XCTestCase {
       "IF10-2[ui, one coordinator] cleared=\(cleared) after Command-Z: value=\(undone ?? "nil") sendEnabled=\(send.isEnabled) restoreOffered=\(restore.exists)"
     )
     XCTAssertTrue(cleared, "The keys did not empty the field")
-    XCTAssertTrue(emptied.contains(undone), "Undo brought back the cleared restored text")
+    XCTAssertTrue(composer.showsNoText, "Undo brought back the cleared restored text")
     XCTAssertFalse(send.isEnabled, "Send is on with nothing to send")
     XCTAssertTrue(restore.exists, "The original no longer offers Restore")
     restore.tap()

@@ -1,6 +1,14 @@
 import UIKit
 import XCTest
 
+extension XCUIElement {
+  var showsNoText: Bool {
+    let value = self.value as? String
+    return value == nil || value == "" || value == placeholderValue
+      || ["Message Beep Boop", "Queue a follow-up"].contains(value)
+  }
+}
+
 @MainActor
 final class AgentUITests: XCTestCase {
   private enum Appearance: String, CaseIterable {
@@ -75,18 +83,18 @@ final class AgentUITests: XCTestCase {
   private func replace(_ field: XCUIElement, with text: String) {
     field.tap()
     // The default port equals its prompt, but is still real text to select.
-    if let value = field.value as? String, !value.isEmpty,
-      field.elementType == .textField || value != field.placeholderValue
-    {
+    let hasText =
+      field.elementType == .textField
+      ? !(field.value as? String ?? "").isEmpty : !field.showsNoText
+    if hasText {
       field.press(forDuration: 1)
       let selectAll = XCUIApplication().menuItems["Select All"]
       XCTAssertTrue(selectAll.waitForExistence(timeout: 3), XCUIApplication().debugDescription)
       selectAll.tap()
     }
     field.typeText(text.isEmpty ? XCUIKeyboardKey.delete.rawValue : text)
-    let value = field.value as? String
     if text.isEmpty {
-      XCTAssertTrue(value == nil || value == "" || value == field.placeholderValue)
+      XCTAssertTrue(field.showsNoText)
     } else {
       let entered = XCTNSPredicateExpectation(
         predicate: NSPredicate(format: "value == %@", text), object: field)
@@ -334,6 +342,11 @@ final class AgentUITests: XCTestCase {
     let composer = app.descendants(matching: .any).matching(identifier: "Message the coordinator")
       .firstMatch
     XCTAssertTrue(composer.waitForExistence(timeout: 5))
+    app.buttons["composerMenu"].tap()
+    app.buttons["Steer"].tap()
+    replace(composer, with: "")
+    app.buttons["Connection"].tap()
+    app.buttons["Done"].tap()
     let reachesComposer = { (utterance: String) in utterance.contains("Message the coordinator") }
     let steer = try spokenThrough(reachesComposer)
     XCTAssertTrue(
