@@ -19,6 +19,9 @@ struct AgentApp: App {
       #endif
     }
     .onChange(of: scenePhase, initial: true) { _, phase in
+      #if DEBUG
+        if InteractionFixture.isRequested { return }
+      #endif
       Task { await notifications.coordinators.setActive(phase == .active) }
     }
   }

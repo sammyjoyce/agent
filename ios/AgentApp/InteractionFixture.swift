@@ -10,20 +10,40 @@
   // with. The screen owns production startup, persistence and foreground recovery, and the
   // identity check stays in use; release builds have no override.
   struct InteractionFixture: View {
+    typealias Peer = (port: NWEndpoint.Port, coordinator: CoordinatorID)
+
+    /// Where one storage ID keeps its settings and files. A relaunch with the same ID finds both.
+    private struct Storage {
+      let suite: String
+      let root: URL
+
+      init(_ id: UUID) {
+        let key = id.uuidString.lowercased()
+        suite = "dev.jessfraz.Agent.Interaction.\(key)"
+        root = URL.applicationSupportDirectory.appending(path: "Agent/Interaction/\(key)")
+      }
+
+      /// Leaves nothing of the ID behind. Storage already erased stays erased.
+      func erase() throws {
+        if FileManager.default.fileExists(atPath: root.path) {
+          try FileManager.default.removeItem(at: root)
+        }
+        UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
+      }
+    }
+
     @MainActor private struct Lifetime {
       let notifications: AppNotifications
       let defaults: UserDefaults
 
       /// One saved coordinator per peer, in order. Two peers are saved as Work and Personal.
-      init?(peers: [(port: NWEndpoint.Port, coordinator: CoordinatorID)], storageID: UUID) {
-        let key = storageID.uuidString.lowercased()
+      init?(peers: [Peer], storage: Storage) {
         let names = ["Work", "Personal"]
-        guard peers.count <= names.count,
-          let defaults = UserDefaults(suiteName: "dev.jessfraz.Agent.Interaction.\(key)")
+        guard peers.count <= names.count, let defaults = UserDefaults(suiteName: storage.suite)
         else { return nil }
         self.defaults = defaults
         defaults.register(defaults: ["notificationsEnabled": false])
-        let root = URL.applicationSupportDirectory.appending(path: "Agent/Interaction/\(key)")
+        let root = storage.root
         let support = root.appending(path: "Support")
         do {
           let addresses = try peers.indices.map {
@@ -59,14 +79,16 @@
       }
     }
 
-    // Reconstruction must keep the model and its settings/store identity together.
-    @State private var lifetime: Lifetime
+    // Reconstruction must keep the model and its settings/store identity together. It is nil
+    // once a cleanup launch erased its storage.
+    @State private var lifetime: Lifetime?
     @Environment(\.scenePhase) private var scenePhase
 
-    private init(lifetime: Lifetime) { _lifetime = State(initialValue: lifetime) }
+    private init(lifetime: Lifetime?) { _lifetime = State(initialValue: lifetime) }
 
-    /// `AGENT_INTERACTION_PORT` and `AGENT_INTERACTION_COORDINATOR` are comma-separated lists.
-    static func fromEnvironment() -> Self? {
+    /// The peers the launch names. `AGENT_INTERACTION_PORT` and `AGENT_INTERACTION_COORDINATOR`
+    /// are comma-separated lists.
+    private static var requestedPeers: [Peer]? {
       let environment = ProcessInfo.processInfo.environment
       guard let ports = environment["AGENT_INTERACTION_PORT"]?.split(separator: ","),
         let coordinators = environment["AGENT_INTERACTION_COORDINATOR"]?.split(separator: ","),
@@ -77,19 +99,38 @@
           CoordinatorID(wire: String(coordinator)).map { (port, $0) }
         }
       }
-      guard !peers.isEmpty, peers.count == ports.count else { return nil }
-      let storageID = environment["AGENT_INTERACTION_ID"].flatMap(UUID.init(uuidString:)) ?? UUID()
-      guard let lifetime = Lifetime(peers: peers, storageID: storageID) else { return nil }
+      return !peers.isEmpty && peers.count == ports.count ? peers : nil
+    }
+
+    /// True when the launch asks for the fixture. Its own coordinators are then the only ones the
+    /// scene phase drives, so the app delegate's never share an inbox or a registration with them.
+    static var isRequested: Bool { requestedPeers != nil }
+
+    /// `AGENT_INTERACTION_ID` names the storage a relaunch reuses. With it,
+    /// `AGENT_INTERACTION_CLEANUP=1` erases that storage and shows only that it did.
+    static func fromEnvironment() -> Self? {
+      let environment = ProcessInfo.processInfo.environment
+      guard let peers = requestedPeers else { return nil }
+      let named = environment["AGENT_INTERACTION_ID"].flatMap(UUID.init(uuidString:))
+      if let named, environment["AGENT_INTERACTION_CLEANUP"] == "1" {
+        return (try? Storage(named).erase()).map { Self(lifetime: nil) }
+      }
+      guard let lifetime = Lifetime(peers: peers, storage: Storage(named ?? UUID())) else {
+        return nil
+      }
       return Self(lifetime: lifetime)
     }
 
     var body: some View {
-      MainChatView(notifications: lifetime.notifications)
-        .defaultAppStorage(lifetime.defaults)
-        // The app's own phase handler drives the app delegate's coordinators, not these.
-        .onChange(of: scenePhase, initial: true) { _, phase in
-          Task { await lifetime.notifications.coordinators.setActive(phase == .active) }
-        }
+      if let lifetime {
+        MainChatView(notifications: lifetime.notifications)
+          .defaultAppStorage(lifetime.defaults)
+          .onChange(of: scenePhase, initial: true) { _, phase in
+            Task { await lifetime.notifications.coordinators.setActive(phase == .active) }
+          }
+      } else {
+        Text("Interaction fixture cleaned")
+      }
     }
   }
 #endif
