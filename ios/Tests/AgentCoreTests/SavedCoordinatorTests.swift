@@ -321,7 +321,8 @@ func aSecondMigrationNamesItsCoordinatorSoEachTagAddressesOne(_ first: String, _
     Addressing.Coordinator(id: $0.id, name: $0.name.description, paired: true, connected: true)
   }
   let routed = profiles.map {
-    Addressing.parse("@\($0.name) invented note", hasAttachments: false, chip: nil, among: peers)
+    Addressing.parse(
+      "@\($0.name) invented note", hasAttachments: false, destination: .open, among: peers)
   }
   print(
     "IF16-T2[\(first), then \(second)] names=\(after.profiles.map(\.name.description)) routed=\(routed)"
@@ -393,7 +394,8 @@ func aDuplicateNameAnEarlierBuildSavedGetsTheFirstFreeOne(coordinator2Saved: Boo
     Addressing.Coordinator(id: $0.id, name: $0.name.description, paired: true, connected: true)
   }
   let routed = paired.map {
-    Addressing.parse("@\($0.name) invented note", hasAttachments: false, chip: nil, among: peers)
+    Addressing.parse(
+      "@\($0.name) invented note", hasAttachments: false, destination: .open, among: peers)
   }
   print(
     "IF17-S3[Coordinator-2 saved=\(coordinator2Saved)] names=\(names) saved=\(written.profiles.map(\.name.description)) held=\(coordinators.chat.held.map(\.item.text)) routed=\(routed)"
@@ -1741,7 +1743,8 @@ func aHeldMessageStartingWithAnotherNameRestoresToItsOwnCoordinatorAsTyped() asy
   }
   let held = try #require(chat.held.first { $0.item.text.hasPrefix("@Personal") })
   await chat.restoreHeld(held)
-  #expect(chat.recipient == profile.id, "Restore addresses the profile the queue was held for")
+  #expect(
+    chat.destination.chip == profile.id, "Restore addresses the profile the queue was held for")
   #expect(chat.draft == held.item.text)
   #expect(chat.recipientLine == "To \(profile.name.description)")
   await chat.send()
@@ -1780,7 +1783,7 @@ func aHeldMessageStartingWithAnotherNameRestoresToItsOwnCoordinatorAsTyped() asy
   #expect(queue.coordinator == first && queue.installation == nil)
 }
 
-private func submitted(_ fixture: FixtureCoordinator) async -> [String] {
+func submitted(_ fixture: FixtureCoordinator) async -> [String] {
   await fixture.received().compactMap {
     if case .submit(let input) = $0 { input.text } else { nil }
   }
@@ -2204,11 +2207,11 @@ func theBuildsCoordinatorSavedUnderAnotherAddressTakesWhatTheBuildLeft(_ alerts:
     await chat.restoreHeld(held)
     let personal = try #require(coordinators.profiles.first { $0.id != migrated.id })
     print(
-      "IF15-U3[\(alerts)] the migrated profile's line=\(coordinators.pairingError[migrated.id] ?? "nil") toggle=\(registration.enabled ? "on" : "off") old installation still held=\(!withdrawn) Restore: draft=\(chat.draft.debugDescription) recipient=\(chat.recipient.map(chat.name) ?? "none")"
+      "IF15-U3[\(alerts)] the migrated profile's line=\(coordinators.pairingError[migrated.id] ?? "nil") toggle=\(registration.enabled ? "on" : "off") old installation still held=\(!withdrawn) Restore: draft=\(chat.draft.debugDescription) recipient=\(chat.destination.chip.map(chat.name) ?? "none")"
     )
     #expect(coordinators.pairingError[migrated.id] == "Already saved as Personal.")
     #expect(withdrawn, "The build's coordinator keeps alerting this device")
-    #expect(chat.draft == "Second held note" && chat.recipient == personal.id)
+    #expect(chat.draft == "Second held note" && chat.destination.chip == personal.id)
   } catch {
     await stop()
     throw error
@@ -2685,7 +2688,7 @@ func aChoiceMadeBeforeTheHeldMessageGainedAnOwnerRestoresNothing() async throws 
     let staleDraft = chat.draft
     await chat.send()
     await chat.restoreHeld(held)
-    let toOwner = chat.draft == note && chat.recipient == migrated.id
+    let toOwner = chat.draft == note && chat.destination.chip == migrated.id
     _ = try await settles { chat.canSend }
     await chat.send()
     let workGot = try await settles { await submitted(work) == [note] }
@@ -2935,7 +2938,7 @@ func aPreviousBuildsOriginStaysWithTheMessagesItHeld(_ state: String) async thro
     try await eventually("held row") { chat.held.count == 1 }
     let held = try #require(chat.held.first)
     await chat.restoreHeld(held)
-    let restored = (draft: chat.draft, recipient: chat.recipient)
+    let restored = (draft: chat.draft, recipient: chat.destination.chip)
     chat.draft = ""
     let queue = try #require(coordinators.queues.first)
     let moved = FileManager.default.fileExists(
@@ -3591,7 +3594,7 @@ func aBindingTheShippedBuildMadeAfterALaunchStoppedOutlivesThatLaunchsRecord(
     let owners = chat.held.map { chat.owner($0).map(chat.name) ?? "nobody" }
     let note = try #require(chat.held.first { $0.item.text == "Second held note" })
     await chat.restoreHeld(note)
-    let restored = (draft: chat.draft, recipient: chat.recipient.map(chat.name) ?? "nobody")
+    let restored = (draft: chat.draft, recipient: chat.destination.chip.map(chat.name) ?? "nobody")
     if !chat.draft.isEmpty {
       await chat.send()
       _ = try await settles { await submitted(work) + submitted(personal) != [] }
@@ -3642,7 +3645,7 @@ func aBindingTheShippedBuildMadeAfterALaunchStoppedOutlivesThatLaunchsRecord(
   for note in chat.held where chat.owner(note) != nil {
     let before = await sent()
     await chat.restoreHeld(note)
-    addressed[note.item.text] = chat.recipient.map(chat.name) ?? "nobody"
+    addressed[note.item.text] = chat.destination.chip.map(chat.name) ?? "nobody"
     guard !chat.draft.isEmpty else { continue }
     _ = try await settles { chat.canSend }
     await chat.send()
@@ -3911,7 +3914,7 @@ private struct RestoredAndSent {
     let owners = chat.held.map { chat.owner($0).map(chat.name) ?? "nobody" }
     await chat.restoreHeld(try #require(chat.held.first))
     let draft = chat.draft
-    let recipient = chat.recipient.map(chat.name) ?? "nobody"
+    let recipient = chat.destination.chip.map(chat.name) ?? "nobody"
     if !chat.draft.isEmpty {
       await chat.send()
       _ = try await settles { await submitted(work) + submitted(personal) != [] }
@@ -4172,7 +4175,7 @@ func aPreviousBuildsOriginGoesOnlyToTheFolderItDescribes() async throws {
     let held = try #require(chat.held.first)
     let queue = try #require(coordinators.queues.first { $0.id == held.queue })
     await chat.restoreHeld(held)
-    let restored = (draft: chat.draft, recipient: chat.recipient)
+    let restored = (draft: chat.draft, recipient: chat.destination.chip)
     await chat.send()
     _ = try await settles { await submitted(work) + submitted(personal) != [] }
     print(
@@ -4255,7 +4258,7 @@ func aRecordOfAQueueAlreadyHeldGivesNothingToALaterLegacyFolder() async throws {
     let owners = chat.held.map { "\($0.item.text): \(chat.owner($0).map(chat.name) ?? "nobody")" }
     let held = try #require(chat.held.first { $0.item.text == later })
     await chat.restoreHeld(held)
-    let restored = (draft: chat.draft, recipient: chat.recipient)
+    let restored = (draft: chat.draft, recipient: chat.destination.chip)
     if !chat.draft.isEmpty {
       await chat.send()
       _ = try await settles { await submitted(work) + submitted(personal) != [] }
@@ -4555,7 +4558,7 @@ func aQueueRemoveDeletedGivesNothingToALaterLegacyFolder() async throws {
     let owner = chat.owner(held).map(chat.name) ?? "nobody"
     let note = chat.heldNote(held)
     await chat.restoreHeld(held)
-    let restored = (draft: chat.draft, recipient: chat.recipient)
+    let restored = (draft: chat.draft, recipient: chat.destination.chip)
     if !chat.draft.isEmpty {
       await chat.send()
       _ = try await settles { await submitted(work) + submitted(personal) != [] }
@@ -4899,7 +4902,7 @@ func nothingThisBuildWritesStaysWhereAShippedBuildDeletesIt() async throws {
     let restored = try #require(chat.held.first { $0.item.text == "Second held note" })
     await chat.restoreHeld(restored)
     chat.draft = ""
-    chat.recipient = nil
+    chat.removeChip()
     try check("Restore")
     await chat.discardHeld(restored)
     try check("Discard")

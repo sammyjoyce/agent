@@ -714,7 +714,7 @@
         ]
         model.apply(fromWork, lane: work.id)
         model.apply(fromPersonal, lane: personal.id)
-        model.recipient = work.id
+        model.setChip(work.id)
         model.draft = "Check the release checklist"
 
         #expect(
@@ -773,7 +773,7 @@
         }
 
         let systemRed = (1.0, 0.23, 0.19)
-        model.recipient = nil
+        model.removeChip()
         model.draft = "@"
         #expect(model.recipientLine == "Choose a coordinator" && !model.pickerMatches.isEmpty)
         let picking = try await render(.light)
@@ -815,7 +815,7 @@
                   directory: directory, address: profile.address, pin: CoordinatorID(UUID()),
                   stamps: StampSource())))
           }
-          model.recipient = chosen.id
+          model.setChip(chosen.id)
           model.draft = draft
           let host = UIHostingController(rootView: MainChatView(model: model))
           host.traitOverrides.preferredContentSizeCategory = size
@@ -905,7 +905,7 @@
                 directory: directory, address: profile.address, pin: CoordinatorID(UUID()),
                 stamps: StampSource())))
         }
-        model.recipient = work.id
+        model.setChip(work.id)
         model.draft = (1...10).map { "Invented line \($0) for Work only" }.joined(separator: "\n")
         let host = UIHostingController(rootView: MainChatView(model: model))
         let scene = try #require(
@@ -939,7 +939,7 @@
         let action = try #require(
           field.accessibilityCustomActions?.first { $0.name == "Remove recipient" })
         #expect(action.actionHandler?(action) == true)
-        #expect(model.recipient == nil)
+        #expect(model.destination.chip == nil)
       }
 
       /// The feed and composer of a model with Work and Personal saved, in a key window, with the
@@ -1001,9 +1001,9 @@
           field.insertText("@Work ")
           try await Task.sleep(for: .milliseconds(300))
           print(
-            "IF7-V2[caret] after the tag: text=\(field.text.debugDescription) selection=\(field.selectedRange) recipient=\(model.recipient.map(model.name) ?? "nil")"
+            "IF7-V2[caret] after the tag: text=\(field.text.debugDescription) selection=\(field.selectedRange) recipient=\(model.destination.chip.map(model.name) ?? "nil")"
           )
-          #expect(model.recipient == work.id && field.text == "Existing invented note")
+          #expect(model.destination.chip == work.id && field.text == "Existing invented note")
           #expect(field.selectedRange == NSRange(location: 0, length: 0))
           field.insertText("Prefix ")
           try await Task.sleep(for: .milliseconds(200))
@@ -1019,18 +1019,18 @@
         try await withComposer { model, box, work in
           let field = box.draft
           let original = "@Work invented quotation"
-          model.recipient = work.id
+          model.setChip(work.id)
           model.draft = original
           try await Task.sleep(for: .milliseconds(250))
-          model.recipient = nil
+          model.removeChip()
           try await Task.sleep(for: .milliseconds(200))
           field.selectedRange = NSRange(location: 0, length: 0)
           field.insertText("@Work ")
           try await Task.sleep(for: .milliseconds(300))
           print(
-            "IF8-W4 after the tag: text=\(field.text.debugDescription) selection=\(field.selectedRange) chip=\(model.recipient.map(model.name) ?? "none")"
+            "IF8-W4 after the tag: text=\(field.text.debugDescription) selection=\(field.selectedRange) chip=\(model.destination.chip.map(model.name) ?? "none")"
           )
-          #expect(model.recipient == work.id && field.text == original)
+          #expect(model.destination.chip == work.id && field.text == original)
           #expect(field.selectedRange == NSRange(location: 0, length: 0))
           field.insertText("Prefix ")
           try await Task.sleep(for: .milliseconds(200))
@@ -1052,20 +1052,20 @@
           try await Task.sleep(for: .milliseconds(300))
           let undo = try #require(field.undoManager)
           print(
-            "IF8-W3 after the tag: canUndo=\(undo.canUndo) text=\(model.draft.debugDescription) chip=\(model.recipient.map(model.name) ?? "none")"
+            "IF8-W3 after the tag: canUndo=\(undo.canUndo) text=\(model.draft.debugDescription) chip=\(model.destination.chip.map(model.name) ?? "none")"
           )
           undo.undo()
           try await Task.sleep(for: .milliseconds(300))
           print(
-            "IF8-W3 undone: text=\(model.draft.debugDescription) chip=\(model.recipient.map(model.name) ?? "none")"
+            "IF8-W3 undone: text=\(model.draft.debugDescription) chip=\(model.destination.chip.map(model.name) ?? "none")"
           )
           #expect(model.draft == "Existing invented note")
           undo.redo()
           try await Task.sleep(for: .milliseconds(300))
           print(
-            "IF8-W3 redone: text=\(model.draft.debugDescription) chip=\(model.recipient.map(model.name) ?? "none")"
+            "IF8-W3 redone: text=\(model.draft.debugDescription) chip=\(model.destination.chip.map(model.name) ?? "none")"
           )
-          #expect(model.draft == "Existing invented note" && model.recipient == work.id)
+          #expect(model.draft == "Existing invented note" && model.destination.chip == work.id)
           field.selectedRange = NSRange(location: field.text.utf16.count, length: 0)
           field.insertText(" today")
           try await Task.sleep(for: .milliseconds(200))
@@ -1180,18 +1180,20 @@
           let pickerComposing = model.pickerMatches.map(\.name.description)
           try await compose("@Work ")
           print(
-            "IF11-1[\(start)] composing: marked=\(field.markedTextRange != nil) draft=\(model.draft.debugDescription) chip=\(model.recipient.map(model.name) ?? "none") picker before=\(pickerBefore) while composing=\(pickerComposing)"
+            "IF11-1[\(start)] composing: marked=\(field.markedTextRange != nil) draft=\(model.draft.debugDescription) chip=\(model.destination.chip.map(model.name) ?? "none") picker before=\(pickerBefore) while composing=\(pickerComposing)"
           )
           #expect(field.markedTextRange != nil, "The field ended the input method's composition")
-          #expect(model.recipient == nil && model.draft == "@Work ", "Composed text picked Work")
+          #expect(
+            model.destination.chip == nil && model.draft == "@Work ", "Composed text picked Work")
           #expect(pickerComposing == pickerBefore, "Composed text changed the picker")
           try await compose("@Personal invented final candidate")
           field.unmarkText()
           try await Task.sleep(for: .milliseconds(300))
           print(
-            "IF11-1[\(start)] committed: draft=\(model.draft.debugDescription) chip=\(model.recipient.map(model.name) ?? "none") line=\(model.recipientLine)"
+            "IF11-1[\(start)] committed: draft=\(model.draft.debugDescription) chip=\(model.destination.chip.map(model.name) ?? "none") line=\(model.recipientLine)"
           )
-          #expect(model.recipient == model.profiles.last?.id, "The committed tag is not the chip")
+          #expect(
+            model.destination.chip == model.profiles.last?.id, "The committed tag is not the chip")
           #expect(model.draft == "invented final candidate")
           await model.send()
           let workProfile = try #require(model.profiles.first)
@@ -1256,15 +1258,15 @@
           let heading = "Invented memo heading\n"
           let body = "@Personal invented quotation"
           try await restoreHeld(heading + body, model: model, from: work)
-          model.recipient = nil
+          model.removeChip()
           try await Task.sleep(for: .milliseconds(200))
           field.selectedRange = NSRange(location: 0, length: heading.utf16.count)
           field.deleteBackward()
           try await Task.sleep(for: .milliseconds(300))
           print(
-            "IF8-W2[field] deleting the selected heading: text=\(model.draft.debugDescription) chip=\(model.recipient.map(model.name) ?? "none")"
+            "IF8-W2[field] deleting the selected heading: text=\(model.draft.debugDescription) chip=\(model.destination.chip.map(model.name) ?? "none")"
           )
-          #expect(model.recipient == nil)
+          #expect(model.destination.chip == nil)
           #expect(model.draft == body)
         }
       }
@@ -1280,7 +1282,7 @@
           let field = box.draft
           let text = "@Personal invented quotation from Work"
           try await restoreHeld(text, model: model, from: work)
-          model.recipient = nil
+          model.removeChip()
           try await Task.sleep(for: .milliseconds(200))
           let undo = try #require(field.undoManager)
           field.selectedRange = NSRange(location: 0, length: field.text.utf16.count)
@@ -1305,12 +1307,12 @@
           undo.redo()
           try await Task.sleep(for: .milliseconds(300))
           print(
-            "IF10-2[\(how)] emptied=\(emptied.debugDescription) canUndo=\(canUndo) undone: chip=\(model.recipient.map(model.name) ?? "none") draft=\(undone.debugDescription) redone=\(model.draft.debugDescription) field=\(field.text.debugDescription) held=\(model.held.count)"
+            "IF10-2[\(how)] emptied=\(emptied.debugDescription) canUndo=\(canUndo) undone: chip=\(model.destination.chip.map(model.name) ?? "none") draft=\(undone.debugDescription) redone=\(model.draft.debugDescription) field=\(field.text.debugDescription) held=\(model.held.count)"
           )
           #expect(emptied.isEmpty)
           #expect(undone.isEmpty, "Undo brought back the cleared restored text")
           #expect(model.draft.isEmpty && field.text.isEmpty, "Redo brought back restored text")
-          #expect(model.recipient == nil)
+          #expect(model.destination.chip == nil)
           #expect(model.held.count == 1, "The held message is gone")
           field.insertText("Invented new note")
           try await Task.sleep(for: .milliseconds(200))
@@ -1336,7 +1338,7 @@
           let personal = try #require(model.profiles.last?.id)
           let text = "@Personal invented: forward Work's board deck to the auditors"
           try await restoreHeld(text, model: model, from: work)
-          model.recipient = nil
+          model.removeChip()
           try await Task.sleep(for: .milliseconds(200))
           field.selectedRange = NSRange(location: 0, length: field.text.utf16.count)
           field.cut(nil)
@@ -1344,9 +1346,9 @@
           field.paste(nil)
           try await Task.sleep(for: .milliseconds(300))
           print(
-            "IF9-Y2[paste] chip=\(model.recipient.map(model.name) ?? "none") draft=\(model.draft.debugDescription)"
+            "IF9-Y2[paste] chip=\(model.destination.chip.map(model.name) ?? "none") draft=\(model.draft.debugDescription)"
           )
-          #expect(model.recipient == personal)
+          #expect(model.destination.chip == personal)
           #expect(model.draft == "invented: forward Work's board deck to the auditors")
         }
       }
@@ -1363,7 +1365,7 @@
           switch edit {
           case "typed by a file":
             try await restoreHeld("", file: "Deck.txt", model: model, from: work)
-            model.recipient = nil
+            model.removeChip()
             try await Task.sleep(for: .milliseconds(300))
             text = "@Personal invented quotation for both"
             for character in text {
@@ -1372,7 +1374,7 @@
             }
           case "other text pasted":
             try await restoreHeld("Invented restored Work note", model: model, from: work)
-            model.recipient = nil
+            model.removeChip()
             try await Task.sleep(for: .milliseconds(200))
             text = "@Personal invented replacement while still restored"
             UIPasteboard.general.string = text
@@ -1380,7 +1382,7 @@
             field.paste(nil)
           default:
             try await restoreHeld(text, model: model, from: work)
-            model.recipient = nil
+            model.removeChip()
             try await Task.sleep(for: .milliseconds(200))
             field.selectedRange = NSRange(location: 0, length: field.text.utf16.count)
             field.copy(nil)
@@ -1388,9 +1390,10 @@
           }
           try await Task.sleep(for: .milliseconds(300))
           print(
-            "IF10-2[\(edit)] before emptying: chip=\(model.recipient.map(model.name) ?? "none") restoredFrom=\(model.restoredFrom.map(model.name) ?? "none") draft=\(model.draft.debugDescription) files=\(model.attachments.count)"
+            "IF10-2[\(edit)] before emptying: chip=\(model.destination.chip.map(model.name) ?? "none") restoredFrom=\(model.restoredFrom.map(model.name) ?? "none") draft=\(model.draft.debugDescription) files=\(model.attachments.count)"
           )
-          #expect(model.restoredFrom == work.id && model.recipient == nil && model.draft == text)
+          #expect(
+            model.restoredFrom == work.id && model.destination.chip == nil && model.draft == text)
           field.selectedRange = NSRange(location: 0, length: field.text.utf16.count)
           field.deleteBackward()
           try await Task.sleep(for: .milliseconds(200))
@@ -1399,10 +1402,10 @@
           field.undoManager?.undo()
           try await Task.sleep(for: .milliseconds(300))
           print(
-            "IF10-2[\(edit)] after Undo: chip=\(model.recipient.map(model.name) ?? "none") draft=\(model.draft.debugDescription) field=\(field.text.debugDescription) files=\(model.attachments.count)"
+            "IF10-2[\(edit)] after Undo: chip=\(model.destination.chip.map(model.name) ?? "none") draft=\(model.draft.debugDescription) field=\(field.text.debugDescription) files=\(model.attachments.count)"
           )
           #expect(model.draft.isEmpty && field.text.isEmpty, "Undo brought back restored text")
-          #expect(model.recipient == nil)
+          #expect(model.destination.chip == nil)
         }
       }
 
@@ -1434,7 +1437,7 @@
             "IF10-2[file-only Restore after \(before)] canUndo=\(canUndo) after Undo: chip=\(model.shownChip.map(model.name) ?? "none") draft=\(model.draft.debugDescription) files=\(model.attachments.map(\.reference.name))"
           )
           #expect(model.draft.isEmpty && field.text.isEmpty, "Undo brought text into Personal's")
-          #expect(model.recipient == personal.id)
+          #expect(model.destination.chip == personal.id)
           #expect(model.attachments.map(\.reference.name) == ["Receipt.txt"])
         }
       }
@@ -1456,7 +1459,7 @@
           try await Task.sleep(for: .milliseconds(200))
           let text = "Invented: Work's merger memo for the board"
           try await restoreHeld(text, model: model, from: work)
-          let bound = model.recipient
+          let bound = model.destination.chip
           field.selectedRange = NSRange(location: 0, length: field.text.utf16.count)
           field.deleteBackward()
           try await Task.sleep(for: .milliseconds(300))
@@ -1486,11 +1489,11 @@
           }
           try await Task.sleep(for: .milliseconds(300))
           print(
-            "IF10-2[one coordinator, \(order)] restored: recipient=\(bound.map(model.name) ?? "none") with Personal added, after Undo: draft=\(model.draft.debugDescription) recipient=\(model.recipient.map(model.name) ?? "none") chip=\(model.shownChip.map(model.name) ?? "none") line=\(model.recipientLine)"
+            "IF10-2[one coordinator, \(order)] restored: recipient=\(bound.map(model.name) ?? "none") with Personal added, after Undo: draft=\(model.draft.debugDescription) recipient=\(model.destination.chip.map(model.name) ?? "none") chip=\(model.shownChip.map(model.name) ?? "none") line=\(model.recipientLine)"
           )
           #expect(bound == work.id, "Restore did not bind the draft to Work")
           #expect(model.draft.isEmpty && field.text.isEmpty, "Undo brought back Work's text")
-          #expect(model.recipient == nil)
+          #expect(model.destination.chip == nil)
         }
       }
 
@@ -1503,7 +1506,7 @@
       {
         try await withComposer { model, box, work in
           let field = box.draft
-          model.recipient = work.id
+          model.setChip(work.id)
           try await Task.sleep(for: .milliseconds(200))
           field.insertText("Invented one line")
           try await Task.sleep(for: .milliseconds(300))
@@ -1557,7 +1560,7 @@
           ]
           for (step, chip, typed) in steps {
             if !typed.isEmpty { field.insertText(typed) }
-            model.recipient = chip
+            if let chip { model.setChip(chip) } else { model.removeChip() }
             try await Task.sleep(for: .milliseconds(100))
             box.window?.layoutIfNeeded()
             let line = try laidOut()

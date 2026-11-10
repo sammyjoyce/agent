@@ -55,7 +55,7 @@ import UniformTypeIdentifiers
       await model.attach(
         data: Data("Existing file".utf8), name: "Notes.txt", mediaType: "text/plain")
       let existing = try #require(model.attachments.first)
-      await model.attach(providers: [try selectedImage(root)])
+      await model.attach(providers: [try selectedImage(root)])?.value
       #expect(model.draft == "Keep the note with this image.")
       #expect(model.attachments.count == 2)
       #expect(model.attachments.first == existing)
@@ -83,7 +83,7 @@ import UniformTypeIdentifiers
     await model.attach(data: Data("Kept".utf8), name: "Notes.txt", mediaType: "text/plain")
     let existing = model.attachments
     let before = try FileManager.default.contentsOfDirectory(atPath: directory.path).sorted()
-    await model.attach(providers: [try selectedImage(root), NSItemProvider()])
+    await model.attach(providers: [try selectedImage(root), NSItemProvider()])?.value
     #expect(model.draft == "Unchanged note")
     #expect(model.attachments == existing)
     #expect(model.error != nil)
@@ -106,7 +106,7 @@ import UniformTypeIdentifiers
       entered.continuation.yield(())
       return progress
     }
-    let task = Task { await model.attach(providers: [provider]) }
+    let task = try #require(model.attach(providers: [provider]))
     for await _ in entered.stream { break }
     task.cancel()
     await task.value

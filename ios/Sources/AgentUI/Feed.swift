@@ -39,6 +39,10 @@ enum Addressing: Equatable {
   /// Nothing to send yet. It would reach these.
   case empty([ProfileID])
   case blocked(String)
+  /// The feed shows one coordinator's conversation, and the draft would reach these instead,
+  /// exactly as parsed. `narrows` is true only for an unbound broadcast that includes the shown
+  /// coordinator, the one draft that may be addressed to it alone. Send is disabled.
+  case elsewhere([ProfileID], narrows: Bool)
 
   /// A saved coordinator as addressing sees it.
   struct Coordinator: Equatable {
@@ -48,29 +52,33 @@ enum Addressing: Equatable {
     let connected: Bool
   }
 
-  /// With two or more saved coordinators, or one once another was `removed`, `chip` names the
+  /// With two or more saved coordinators, or one once another was `removed`, a chip names the
   /// one recipient and the text is literal. Without a chip, leading `@Name` tags pick the
-  /// recipients and are not sent, a tag naming no saved coordinator blocks Send, and no tag
-  /// means every paired coordinator. A `literal` text, such as a restored message, is never read
-  /// for tags, so without a chip it goes to every paired coordinator as it is. With one saved
-  /// coordinator and none removed the text goes as typed. A chip naming no saved coordinator
-  /// blocks Send however many are saved.
+  /// recipients and are not sent, and a tag naming no saved coordinator blocks Send. With neither,
+  /// the draft goes to the coordinator it began in, or else to every paired coordinator. A stamp
+  /// naming no saved coordinator blocks Send. A `literal` text, such as a restored message, is
+  /// never read for tags, so with no chip or stamp it goes to every paired coordinator as it is.
+  /// With one saved coordinator and none removed the text goes as typed. A chip naming no saved
+  /// coordinator blocks Send however many are saved. `coordinators` is every saved coordinator
+  /// whatever the feed shows, so the grammar never changes with it.
   static func parse(
-    _ draft: String, hasAttachments: Bool, chip: ProfileID?, literal: Bool = false,
+    _ draft: String, hasAttachments: Bool, destination: DraftDestination, literal: Bool = false,
     among coordinators: [Coordinator], removed: [ProfileID: String] = [:]
   ) -> Addressing {
     let (tags, rest) = leadingTags(draft)
     func named(_ word: Substring) -> [Coordinator] {
       coordinators.filter { $0.name.lowercased() == word.lowercased() }
     }
-    if let chip, !coordinators.contains(where: { $0.id == chip }) {
-      return .blocked(
-        removed[chip].map { "\($0) was removed" } ?? "Choose who receives this message")
+    func gone(_ id: ProfileID) -> Addressing {
+      .blocked(removed[id].map { "\($0) was removed" } ?? "Choose who receives this message")
+    }
+    if let chip = destination.chip, !coordinators.contains(where: { $0.id == chip }) {
+      return gone(chip)
     }
     var recipients = coordinators.filter(\.paired)
     var body = Substring(draft)
     if coordinators.count > 1 || !removed.isEmpty {
-      if let chip {
+      if let chip = destination.chip {
         recipients = coordinators.filter { $0.id == chip }
       } else if !literal, !tags.isEmpty {
         var tagged: Set<ProfileID> = []
@@ -92,6 +100,9 @@ enum Addressing: Equatable {
         }
         recipients = coordinators.filter { tagged.contains($0.id) }
         body = rest
+      } else if case .begunIn(let id) = destination {
+        guard let begun = coordinators.first(where: { $0.id == id }) else { return gone(id) }
+        recipients = [begun]
       }
       if let unpaired = recipients.first(where: { !$0.paired }) {
         return .blocked("\(unpaired.name) is not paired yet")
@@ -107,6 +118,19 @@ enum Addressing: Equatable {
       return .empty(ids)
     }
     return .to(ids, body: String(body))
+  }
+
+  /// The veto of a feed showing one coordinator. It never adds, drops or reorders a recipient.
+  /// All passes everything. One coordinator's feed passes a draft only when it goes to exactly
+  /// that coordinator, and names any other destination with `elsewhere`. `unbound` is true for a
+  /// draft with no chip, stamp, tag or restored text, which goes to every paired coordinator.
+  func gated(by scope: FeedScope, unbound: Bool) -> Addressing {
+    guard let shown = scope.coordinator else { return self }
+    switch self {
+    case .to(let ids, _), .empty(let ids):
+      return ids == [shown] ? self : .elsewhere(ids, narrows: unbound && ids.contains(shown))
+    case .blocked, .elsewhere: return self
+    }
   }
 
   /// The draft's leading `@Name` words, and the text after them.
