@@ -748,7 +748,7 @@ import UniformTypeIdentifiers
       profile = model.profiles[0]
       try await withReadOnlyProfile(directory) {
         model.draft = "/feedback Preserve this exact capture"
-        await model.send(screenshot: { capture })
+        await model.send(screenshot: { capture })?.value
       }
     }
     #expect(await model.saveDraft())
@@ -760,7 +760,7 @@ import UniformTypeIdentifiers
         await reopened.send(screenshot: {
           Issue.record("The saved feedback image must not be recaptured")
           return capture
-        })
+        })?.value
       }
     }
     #expect(reopened.draft == model.draft)

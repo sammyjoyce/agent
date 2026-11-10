@@ -550,7 +550,7 @@ func anUntaggedSendReachesBothCoordinatorsAndATaggedOneOnlyItsOwn() async throws
     let broadcast = "Flying to Lisbon, offline until 6"
     chat.draft = broadcast
     #expect(chat.recipientLine == "To Work and Personal")
-    await chat.send()
+    await chat.send()?.value
     try await eventually("one submit at each coordinator") {
       (await workFixture.count(), await personalFixture.count()) == (1, 1)
     }
@@ -579,7 +579,7 @@ func anUntaggedSendReachesBothCoordinatorsAndATaggedOneOnlyItsOwn() async throws
     chat.draft = "@Personal rotate the staging deploy key"
     chat.promoteTypedTag()
     #expect(chat.recipientLine == "To Work", "Text after the chip is never routed")
-    await chat.send()
+    await chat.send()?.value
     #expect(chat.destination.chip == nil && chat.draft.isEmpty)
     try await eventually("Work's second submit") { await workFixture.count() == 2 }
     #expect(
@@ -626,7 +626,7 @@ func aTypedTagAfterARemovalBecomesTheChip() async throws {
     #expect(chat.draft.isEmpty)
     #expect(chat.shownChip == work && chat.recipientLine == "To Work")
     chat.draft = "Invented: the venue is booked"
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work got it") { await workFixture.count() == 1 }
     #expect(await submits(workFixture).map(\.text) == ["Invented: the venue is booked"])
   }
@@ -638,7 +638,7 @@ func aFeedbackToBothStaysOneBubbleWithEachRecipientsStatusOnceSettled() async th
     let (work, personal) = try await addWorkAndPersonal(coordinators)
     let chat = coordinators.chat
     chat.draft = "/feedback The invented text is clipped"
-    await chat.send()
+    await chat.send()?.value
     try await eventually("both settled") {
       (await workFixture.count(), await personalFixture.count()) == (1, 1)
         && chat.snapshots.values.allSatisfy {
@@ -663,7 +663,7 @@ func aRefusedStageLeavesNothingQueuedAnywhereAndKeepsTheDraft() async throws {
       ProfileDirectory(personal, applicationSupport: root, caches: root)
     ) {
       chat.draft = "Both or neither"
-      await chat.send()
+      await chat.send()?.value
     }
     #expect(chat.draft == "Both or neither")
     #expect(chat.error == "Nothing was sent. Personal did not take the message.")
@@ -671,7 +671,7 @@ func aRefusedStageLeavesNothingQueuedAnywhereAndKeepsTheDraft() async throws {
     #expect((await workFixture.count(), await personalFixture.count()) == (0, 0))
     try await eventually("Personal's own reason") { chat.snapshots[personal]?.error != nil }
     #expect(!chat.rows.contains { $0.row.role == .user })
-    await chat.send()
+    await chat.send()?.value
     try await eventually("the kept draft sent to both") {
       (await workFixture.count(), await personalFixture.count()) == (1, 1)
     }
@@ -688,7 +688,7 @@ func restoreAddressesTheSourceCoordinatorAndKeepsItsTextLiteral() async throws {
     chat.setChip(personal)
     chat.draft = "@Work check the invented report"
     await chat.attach(data: Data("bytes".utf8), name: "Notes.txt", mediaType: "text/plain")
-    await chat.send()
+    await chat.send()?.value
     try await eventually("rejected by Personal") {
       chat.snapshots[personal]?.rows.contains { $0.delivery == .rejected } == true
     }
@@ -701,7 +701,7 @@ func restoreAddressesTheSourceCoordinatorAndKeepsItsTextLiteral() async throws {
     #expect(chat.draft == "@Work check the invented report")
     #expect(chat.recipientLine == "To Personal")
     #expect(try queuedRequests(outbox) == [original], "Restore copies")
-    await chat.send()
+    await chat.send()?.value
     let after = try queuedRequests(outbox)
     #expect(after.count == 1 && after.first?.inputId != original.inputId)
     #expect(after.first?.text == "@Work check the invented report")
@@ -720,7 +720,7 @@ func removeRefusesWhileTheDraftIsAddressedToOrRestoredFromThatCoordinator() asyn
     chat.setChip(work)
     chat.draft = "Invented Q3 numbers for the Work board"
     await chat.attach(data: Data("bytes".utf8), name: "Payroll.txt", mediaType: "text/plain")
-    await chat.send()
+    await chat.send()?.value
     try await eventually("rejected by Work") {
       chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
     }
@@ -758,7 +758,7 @@ func aScreenshotKeptFromOneCoordinatorIsRefusedOnceASecondIsSaved() async throws
       await chat.send(screenshot: {
         captures += 1
         return Data([1, 2, 3])
-      })
+      })?.value
     }
     #expect(captures == 1 && chat.attachments.map(\.reference.name) == ["Feedback.png"])
     try await coordinators.add(
@@ -769,7 +769,7 @@ func aScreenshotKeptFromOneCoordinatorIsRefusedOnceASecondIsSaved() async throws
     await chat.send(screenshot: {
       captures += 1
       return Data([4, 5, 6])
-    })
+    })?.value
     #expect(chat.error?.hasPrefix("Remove the automatic screenshot") == true)
     #expect(captures == 1)
     #expect((await workFixture.count(), await personalFixture.count()) == (0, 0))
@@ -777,7 +777,7 @@ func aScreenshotKeptFromOneCoordinatorIsRefusedOnceASecondIsSaved() async throws
     await chat.send(screenshot: {
       captures += 1
       return Data([7, 8, 9])
-    })
+    })?.value
     #expect(captures == 1, "No automatic screenshot with two coordinators")
     try await eventually("feedback without a screenshot at both") {
       (await workFixture.count(), await personalFixture.count()) == (1, 1)
@@ -796,17 +796,17 @@ func anAutomaticScreenshotNeverGoesToACoordinatorItWasNotCapturedWith() async th
     try await eventually("Work connected") { chat.connection == .connected }
     try await withReadOnlyProfile(ProfileDirectory(work, applicationSupport: root, caches: root)) {
       chat.draft = "/feedback The invented Work reply is clipped"
-      await chat.send(screenshot: { Data("Invented Work feed".utf8) })
+      await chat.send(screenshot: { Data("Invented Work feed".utf8) })?.value
     }
     let screenshot = try #require(chat.attachments.first)
     try await coordinators.add(
       name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
     try await coordinators.remove(coordinators.removal(work))
     try await eventually("Personal connected") { chat.connection == .connected }
-    await chat.send()
+    await chat.send()?.value
     #expect(chat.error?.hasPrefix("Remove the automatic screenshot") == true)
     await chat.removeAttachment(screenshot)
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Personal's feedback") { await personalFixture.count() > 0 }
     #expect(await submits(personalFixture).map { $0.attachments ?? [] } == [[]])
     #expect(await personalFixture.uploaded(screenshot.id) == nil)
@@ -850,7 +850,7 @@ func nothingRestoredChosenOrTaggedDuringRemoveReachesTheOtherCoordinator() async
     chat.draft = "Invented Q3 payroll numbers for the Work board"
     await chat.attach(
       data: Data("invented payroll".utf8), name: "Payroll.txt", mediaType: "text/plain")
-    await chat.send()
+    await chat.send()?.value
     try await eventually("rejected by Work") {
       chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
     }
@@ -880,7 +880,7 @@ func nothingRestoredChosenOrTaggedDuringRemoveReachesTheOtherCoordinator() async
     await gate.open()
     try await removal.value
     #expect(coordinators.profiles.map(\.id) == [personal])
-    await chat.send()
+    await chat.send()?.value
     try await Task.sleep(for: .seconds(1))
     let atPersonal = await submits(personalFixture)
     #expect(atPersonal.isEmpty, "Personal received \(atPersonal.map(\.text))")
@@ -904,7 +904,7 @@ func aMessageRestoredFromARemovedCoordinatorStaysBlockedUnderAnyAddress() async 
     chat.draft = "Invented Q3 payroll numbers for the Work board"
     await chat.attach(
       data: Data("invented payroll".utf8), name: "Payroll.txt", mediaType: "text/plain")
-    await chat.send()
+    await chat.send()?.value
     try await eventually("rejected by Work") {
       chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
     }
@@ -923,7 +923,7 @@ func aMessageRestoredFromARemovedCoordinatorStaysBlockedUnderAnyAddress() async 
     for chip in [work, nil] {
       if let chip { chat.setChip(chip) } else { chat.removeChip() }
       #expect(chat.addressing == .blocked("Work was removed"))
-      await chat.send()
+      await chat.send()?.value
     }
     try await Task.sleep(for: .milliseconds(500))
     let atPersonal = await submits(personalFixture)
@@ -963,7 +963,7 @@ func removeRefusesATypedTagAndNothingNamingARemovedCoordinatorSends() async thro
       if let chip = draft.chip { chat.setChip(chip) } else { chat.removeChip() }
       chat.draft = draft.text
       #expect(chat.addressing == .blocked(draft.blocked), "\(draft.text)")
-      await chat.send()
+      await chat.send()?.value
       #expect(chat.draft == draft.text, "Send keeps a draft for a removed coordinator")
     }
     try await Task.sleep(for: .milliseconds(500))
@@ -985,12 +985,12 @@ func anEditedFeedbackKeepsItsScreenshotWithItsCoordinatorThroughRestore() async 
     let directory = ProfileDirectory(work, applicationSupport: root, caches: root)
     try await withReadOnlyProfile(directory) {
       chat.draft = "/feedback The invented Work feed is clipped"
-      await chat.send(screenshot: { Data("Invented private Work screenshot bytes".utf8) })
+      await chat.send(screenshot: { Data("Invented private Work screenshot bytes".utf8) })?.value
     }
     #expect(chat.attachments.map(\.reference.name) == ["Feedback.png"])
     await workFixture.refuseUploads()
     chat.draft = "The invented Work feed is clipped"
-    await chat.send()
+    await chat.send()?.value
     try await eventually("the edited message rejected at Work") {
       chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
     }
@@ -1003,7 +1003,7 @@ func anEditedFeedbackKeepsItsScreenshotWithItsCoordinatorThroughRestore() async 
     await chat.restore(queued.inputId)
     let restored = try #require(chat.attachments.first)
     chat.removeChip()
-    await chat.send()
+    await chat.send()?.value
     #expect(chat.error?.hasPrefix("Remove the automatic screenshot") == true)
     try await Task.sleep(for: .milliseconds(300))
     #expect(await personalFixture.uploaded(restored.id) == nil)
@@ -1117,7 +1117,7 @@ func aMessageToBothKeepsItsRecipientsAfterOneIsRemovedAndAddedAgain() async thro
     }
     let broadcast = "Flying to Lisbon, offline until 6"
     chat.draft = broadcast
-    await chat.send()
+    await chat.send()?.value
     try await eventually("the broadcast placed at both") {
       chat.rows.first { $0.row.text == broadcast }?.receipts
         == [Receipt(lane: work, status: .placed), Receipt(lane: personal, status: .placed)]
@@ -1126,7 +1126,7 @@ func aMessageToBothKeepsItsRecipientsAfterOneIsRemovedAndAddedAgain() async thro
     let tagged = "Invented note for Work only"
     chat.setChip(work)
     chat.draft = tagged
-    await chat.send()
+    await chat.send()?.value
     try await eventually("the tagged Send placed") {
       chat.rows.first { $0.row.text == tagged }?.receipts == [Receipt(lane: work, status: .placed)]
     }
@@ -1232,7 +1232,7 @@ func aFeedbackScreenshotAfterAnEditAndRemoveShowsOnlyTheCoordinatorLeft() async 
     await chat.send(screenshot: {
       shown = chat.rows.map(\.row.text)
       return Data((shown ?? []).joined(separator: "\n").utf8)
-    })
+    })?.value
     try await eventually("Personal's feedback") { await personalFixture.count() == 1 }
     let request = try #require(await submits(personalFixture).first)
     let screenshot = try #require(request.attachments?.first)
@@ -1265,7 +1265,7 @@ func aTagForARenamedCoordinatorStaysBlockedOnceItIsRemoved() async throws {
     #expect(coordinators.profiles.map(\.id) == [personal])
     #expect(chat.addressing == .blocked("No coordinator named Work"))
     #expect(!chat.canSend)
-    await chat.send()
+    await chat.send()?.value
     try await Task.sleep(for: .seconds(1))
     let atPersonal = await submits(personalFixture)
     #expect(atPersonal.isEmpty, "Personal received \(atPersonal.map(\.text))")
@@ -1868,7 +1868,7 @@ func aMessageToBothReadsUnknownAtACoordinatorWhoseOutboxCouldNotBeRead() async t
   let text = "Invented: the plumber comes Thursday at 9"
   await workFixture.holdSnapshot()
   before.chat.draft = text
-  await before.chat.send()
+  await before.chat.send()?.value
   try await eventually("Work's coordinator has Work's copy") {
     await submits(workFixture).map(\.text) == [text]
   }
@@ -1995,7 +1995,7 @@ func aCopyDiscardedAtPersonalLeavesTheOriginalNotSentToPersonal() async throws {
     let text = "Invented: the signed lease for both of you"
     chat.draft = text
     await chat.attach(data: Data("invented lease".utf8), name: "Lease.txt", mediaType: "text/plain")
-    await chat.send()
+    await chat.send()?.value
     var rejected: String?
     try await eventually("Work placed it and Personal refused it") {
       let receipts = chat.rows.first { $0.row.text == text }?.receipts ?? []
@@ -2042,14 +2042,14 @@ func aSecondFileNamedFeedbackPngNeverClearsTheScreenshotsOwner() async throws {
     let privateImage = Data("Invented private Work screenshot bytes".utf8)
     try await withReadOnlyProfile(directory) {
       chat.draft = "/feedback The Work feed is clipped"
-      await chat.send(screenshot: { privateImage })
+      await chat.send(screenshot: { privateImage })?.value
     }
     try #require(chat.attachments.count == 1)
     await chat.attach(
       data: Data("Invented manually attached reference picture".utf8), name: "Feedback.png",
       mediaType: "image/png")
     await workFixture.refuseUploads()
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work refused the upload") {
       chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
     }
@@ -2066,7 +2066,7 @@ func aSecondFileNamedFeedbackPngNeverClearsTheScreenshotsOwner() async throws {
     #expect(try Data(contentsOf: automatic.url) == privateImage)
     await chat.removeAttachment(chosen)
     chat.removeChip()
-    await chat.send()
+    await chat.send()?.value
     #expect(chat.error?.hasPrefix("Remove the automatic screenshot") == true)
     try await Task.sleep(for: .milliseconds(350))
     let atPersonal = await submits(personalFixture)
@@ -2088,7 +2088,7 @@ func aRestoredFeedbackPngGoesToTheCoordinatorItCameFromAlone() async throws {
     chat.draft = "Invented ordinary note, not feedback"
     await chat.attach(
       data: Data("invented user file bytes".utf8), name: "Feedback.png", mediaType: "image/png")
-    await chat.send()
+    await chat.send()?.value
     try await eventually("rejected by Work") {
       chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
     }
@@ -2096,12 +2096,12 @@ func aRestoredFeedbackPngGoesToTheCoordinatorItCameFromAlone() async throws {
     await chat.restore(queued.inputId)
     #expect(chat.destination.chip == work && chat.recipientLine == "To Work")
     chat.removeChip()
-    await chat.send()
+    await chat.send()?.value
     #expect(chat.error?.hasPrefix("Remove the automatic screenshot") == true, "Not to both")
     chat.setChip(work)
     chat.failure = nil
     await workFixture.acceptUploads()
-    await chat.send()
+    await chat.send()?.value
     #expect(chat.error == nil)
     #expect(chat.draft.isEmpty && chat.attachments.isEmpty)
     try await eventually("Work's copy") { await workFixture.count() == 1 }
@@ -2123,9 +2123,9 @@ func aControlACoordinatorDidNotGetNamesItInTheError() async throws {
     let session = try #require(chat.lanes.first { $0.id == work }?.session)
     @MainActor func sendWhileWorkDrops() async throws {
       // Both start on the main actor in this order, so Work drops after its stage.
-      let sending = Task { @MainActor in await chat.send() }
+      let sending = chat.send()
       let dropping = Task { @MainActor in await session.disconnect() }
-      await sending.value
+      await sending?.value
       await dropping.value
       await session.connect()
       try await eventually("both connected again") {
@@ -2161,9 +2161,9 @@ func aControlDuringRemoveNamesTheRemovedCoordinatorItSkipped() async throws {
     let (work, personal) = try await addWorkAndPersonal(coordinators)
     let chat = coordinators.chat
     chat.draft = "/status"
-    let sending = Task { @MainActor in await chat.send() }
+    let sending = chat.send()
     let removing = Task { @MainActor in try await coordinators.remove(coordinators.removal(work)) }
-    await sending.value
+    await sending?.value
     try await removing.value
     let named = "Work did not get /status. It was removed."
     try await eventually("Personal got /status") {
@@ -2194,9 +2194,9 @@ func aMessageDuringRemoveNamesTheRemovedCoordinatorItDidNotReach() async throws 
     let chat = coordinators.chat
     let text = "Invented: ship the quarterly report"
     chat.draft = text
-    let sending = Task { @MainActor in await chat.send() }
+    let sending = chat.send()
     let removing = Task { @MainActor in try await coordinators.remove(coordinators.removal(work)) }
-    await sending.value
+    await sending?.value
     try await removing.value
     let named = "Work did not get this message. It was removed."
     try await eventually("Personal got it") { await submits(personalFixture).map(\.text) == [text] }
@@ -2226,11 +2226,11 @@ func aMessageDuringRemoveOfItsSecondRecipientNamesIt() async throws {
     let chat = coordinators.chat
     let text = "Invented: water the plants on Friday"
     chat.draft = text
-    let sending = Task { @MainActor in await chat.send() }
+    let sending = chat.send()
     let removing = Task { @MainActor in
       try await coordinators.remove(coordinators.removal(personal))
     }
-    await sending.value
+    await sending?.value
     try await removing.value
     let named = "Personal did not get this message. It was removed."
     let nothing = "Nothing was sent. \(named)"
@@ -2268,7 +2268,7 @@ func aSendRemovedDuringItsIdentityProofNamesTheCoordinatorItDidNotReach(_ draft:
     let chat = coordinators.chat
     await workFixture.holdNextIdentity()
     chat.draft = draft
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work's socket waiting for its identity") {
       await workFixture.identityHeld
     }
@@ -2311,7 +2311,7 @@ func aSendWhoseAddressChangesWhileItsDialIsPendingIsNamedOnlyIfLost(saved: Int, 
     let chat = coordinators.chat
     await gate.arm()
     chat.draft = draft
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work's dial held") { await gate.waiting }
     try await coordinators.update(
       work, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.3", port: 4003))
@@ -2440,7 +2440,7 @@ func aSendToBothPersonalRefusesLeavesNothingAtWorkAfterAnAddressEdit(
     let held = try edit ? PipedFile(#require(chat.attachments.dropLast().last)) : nil
     defer { held?.release() }
     let workOutbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
-    let sending = Task { await chat.send() }
+    let sending = chat.send()
     if let held {
       try await held.opened(by: "Work's copy")
       try await held.feed()
@@ -2461,7 +2461,7 @@ func aSendToBothPersonalRefusesLeavesNothingAtWorkAfterAnAddressEdit(
       try #require(chat.admitting, "The edit finished while Personal still copied the files")
       try await held.feed()
     }
-    await sending.value
+    await sending?.value
     try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
     let queuedAtWork = ((try? queuedRequests(workOutbox)) ?? []).map(\.text)
     let workRow = chat.snapshots[work]?.rows.first { $0.text == text }
@@ -2482,7 +2482,7 @@ func aSendToBothPersonalRefusesLeavesNothingAtWorkAfterAnAddressEdit(
     // The text alone is sent again, so its copies upload quickly however loaded the host is.
     for file in chat.attachments { await chat.removeAttachment(file) }
     try await eventually("both connected again") { chat.canSend }
-    await chat.send()
+    await chat.send()?.value
     // Check / retry on a copy the failed Send left at Work, as its row offers.
     if let left = workRow?.inputID { await chat.retry(left) }
     try await eventually("each coordinator got it") {
@@ -2515,7 +2515,7 @@ func aCopyWhoseSessionRetiredDuringASendThatReachedNoOneIsNotKept(_ change: Stri
       chat, text, clashAt: ProfileDirectory(personal, applicationSupport: root, caches: root))
     let workDirectory = ProfileDirectory(work, applicationSupport: root, caches: root)
     let retiring = try #require(chat.lanes.first { $0.id == work }?.session)
-    let sending = Task { await chat.send() }
+    let sending = chat.send()
     try await eventually("Work saved its copy") {
       ((try? queuedRequests(workDirectory.outbox)) ?? []).count == 1
     }
@@ -2525,7 +2525,7 @@ func aCopyWhoseSessionRetiredDuringASendThatReachedNoOneIsNotKept(_ change: Stri
       await retiring.retire()
     }
     try #require(chat.admitting, "Work's session retired while Personal still copied the files")
-    await sending.value
+    await sending?.value
     let afterSend = ((try? queuedRequests(workDirectory.outbox)) ?? []).map(\.text)
     if change == "Remove" {
       try await Task.sleep(for: .milliseconds(300))
@@ -2571,7 +2571,7 @@ func whatRemoveCutOffStaysNamedUntilTheNextSendWithOneCoordinatorLeft() async th
     chat.draft = "Invented: the shared holiday budget"
     await chat.attach(
       data: Data("invented budget".utf8), name: "Budget.txt", mediaType: "text/plain")
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work's socket waiting for its identity") {
       await workFixture.identityHeld
     }
@@ -2603,7 +2603,7 @@ func whatRemoveCutOffStaysNamedUntilTheNextSendWithOneCoordinatorLeft() async th
         == "\(report) Send or clear the current draft before restoring another message. Attachment storage is full"
     )
     await personalFixture.acceptUploads()
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Personal got the next message") {
       await submits(personalFixture).contains { $0.text == "Invented: a draft in progress" }
     }
@@ -2758,7 +2758,7 @@ func anActiveChangeOverlappedByAnInactiveOneLeavesNoLaneLive() async throws {
 {
   chat.draft = text
   await chat.attach(data: Data("invented lease".utf8), name: "Lease.txt", mediaType: "text/plain")
-  await chat.send()
+  await chat.send()?.value
   var rejected: String?
   try await eventually("Work placed it and Personal refused it", within: reconnecting) {
     let receipts = chat.rows.first { $0.row.text == text }?.receipts ?? []
@@ -2801,7 +2801,7 @@ func aRestoredSourceSavedAgainBeforeItsCopyIsSentReadsDeliveredOncePlaced() asyn
     await personalFixture.acceptUploads()
     await chat.retry(source)
     try await eventually("Personal saved the original") { lines().contains("Personal · Sent") }
-    await chat.send()
+    await chat.send()?.value
     try await personalFixture.finishTurn()
     try await eventually("Personal placed the original and the copy") {
       await personalFixture.placedInputs().count == 2
@@ -2841,8 +2841,12 @@ func aRestoredSourceRetriedAsItsCopyIsSentReadsDeliveredOncePlaced() async throw
     await coordinators.setActive(true)
     try await eventually("both connected again", within: reconnecting) { connected() == 2 }
     await personalFixture.acceptUploads()
+    // Personal answers its first submit only once the copy is admitted. The answer ends that socket,
+    // which would take Personal's lane down before the copy is saved.
+    await personalFixture.holdNextSubmitReply()
     await chat.retry(source)
-    await chat.send()
+    await chat.send()?.value
+    await personalFixture.releaseSubmitReply()
     try await eventually("Personal placed or withdrew the original", within: reconnecting) {
       let progress = chat.snapshots[personal]?.sends[send]?.progress
       let submitted = await personalFixture.count()
@@ -2877,7 +2881,7 @@ func aRestoredSourceTheCoordinatorAcceptsBeforeItsCopyIsSentStaysQueued() async 
     let chat = coordinators.chat
     let text = "Invented: the gate code changed to 4410"
     chat.draft = text
-    await chat.send()
+    await chat.send()?.value
     var rejected: String?
     try await eventually("Work placed it and Personal rejected it") {
       let receipts = chat.rows.first { $0.row.text == text }?.receipts ?? []
@@ -2900,7 +2904,7 @@ func aRestoredSourceTheCoordinatorAcceptsBeforeItsCopyIsSentStaysQueued() async 
     try await eventually("Personal reports the original accepted, and Send can go") {
       lines().contains("Personal · Sent") && chat.canSend
     }
-    await chat.send()
+    await chat.send()?.value
     try await eventually("the copy at Personal") { await personalFixture.count() == 2 }
     let outbox = ProfileDirectory(personal, applicationSupport: root, caches: root).outbox
     print("IF5-S3-C \(lines()) record=\(String(describing: chat.snapshots[personal]?.sends[send]))")
@@ -2936,7 +2940,7 @@ func aRestoredSourceIsWithdrawnAfterAnAddressEditOnceItsCopyIsSent() async throw
     chat.draft = text
     await chat.attach(
       data: Data("invented agreement".utf8), name: "Agreement.txt", mediaType: "text/plain")
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work refused it") {
       chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
     }
@@ -2959,7 +2963,7 @@ func aRestoredSourceIsWithdrawnAfterAnAddressEditOnceItsCopyIsSent() async throw
     }
     print("IF6-T2[edit] after the address edit: \(lines())")
     await workFixture.acceptUploads()
-    await chat.send()
+    await chat.send()?.value
     try await eventually("the copy left") { await workFixture.count() >= 1 }
     try await Task.sleep(for: .milliseconds(300))
     let stillQueued = try queuedRequests(outbox).contains { $0.inputId == original.inputId }
@@ -2992,7 +2996,7 @@ func withOneCoordinatorARestoredSourceIsWithdrawnAfterAnAddressEdit() async thro
     chat.draft = text
     await chat.attach(
       data: Data("invented permit".utf8), name: "Permit.txt", mediaType: "text/plain")
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work refused it") { chat.rows.contains { $0.row.delivery == .rejected } }
     let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
     let original = try #require(try queuedRequests(outbox).first)
@@ -3001,7 +3005,7 @@ func withOneCoordinatorARestoredSourceIsWithdrawnAfterAnAddressEdit() async thro
       work, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.3", port: 4001))
     try await eventually("Work reconnected") { chat.snapshots[work]?.connection == .connected }
     await workFixture.acceptUploads()
-    await chat.send()
+    await chat.send()?.value
     try await eventually("the copy left") { await workFixture.count() >= 1 }
     try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
     @MainActor func originalRow() -> ChatRow? {
@@ -3035,7 +3039,7 @@ func aRestoredSourceRefusedAgainOnRetryIsWithdrawnOnceItsCopyIsSent() async thro
     let text = "Invented: the gas bill"
     chat.draft = text
     await chat.attach(data: Data("invented bill".utf8), name: "Bill.txt", mediaType: "text/plain")
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work refused it") { chat.rows.contains { $0.row.delivery == .rejected } }
     let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
     let original = try #require(try queuedRequests(outbox).first)
@@ -3054,7 +3058,7 @@ func aRestoredSourceRefusedAgainOnRetryIsWithdrawnOnceItsCopyIsSent() async thro
     print("IF6-T2[refused again] after Check / retry: original row=\(originalRow())")
     #expect(await workFixture.count() == 0, "The retry never wrote its submit")
     await workFixture.acceptUploads()
-    await chat.send()
+    await chat.send()?.value
     try await eventually("the copy left") { await workFixture.count() >= 1 }
     let row = originalRow()
     let stillQueued = try queuedRequests(outbox).contains { $0.inputId == original.inputId }
@@ -3100,7 +3104,7 @@ func aRestoredSourceWhoseRetryWasCancelledIsWithdrawnOnceItsCopyIsSent() async t
     await coordinators.setActive(true)
     try await eventually("both connected again") { connected() == 2 }
     await personalFixture.acceptUploads()
-    await chat.send()
+    await chat.send()?.value
     try await eventually("the copy at Personal") { await personalFixture.count() == 1 }
     try await Task.sleep(for: .milliseconds(300))
     let outbox = ProfileDirectory(personal, applicationSupport: root, caches: root).outbox
@@ -3125,7 +3129,7 @@ func aRestoredSourceWhoseRetryWasCancelledIsWithdrawnOnceItsCopyIsSent() async t
 ) async throws -> (source: String, bubble: String) {
   await personalFixture.rejectSubmits()
   chat.draft = text
-  await chat.send()
+  await chat.send()?.value
   var rejected: String?
   try await eventually("Work placed it and Personal rejected it") {
     let receipts = chat.rows.first { $0.row.text == text }?.receipts ?? []
@@ -3157,7 +3161,7 @@ func aRestoredSourceRetriedButNotYetWrittenIsWithdrawnOnceItsCopyIsSent() async 
     try await eventually("Personal's socket waiting for its identity") {
       await personalFixture.identityHeld
     }
-    await chat.send()
+    await chat.send()?.value
     try await eventually("the copy at Personal") { await personalFixture.count() == 1 }
     await personalFixture.releaseIdentity()
     _ = await within(3) { await personalFixture.count() >= 2 }
@@ -3193,7 +3197,7 @@ func aRestoredSourceWrittenAgainStaysQueuedUntilItsCoordinatorAnswers() async th
     try await eventually("Personal received the original again") {
       await personalFixture.count() == 1
     }
-    await chat.send()
+    await chat.send()?.value
     let outbox = ProfileDirectory(personal, applicationSupport: root, caches: root).outbox
     let stillQueued = try queuedRequests(outbox).contains { $0.inputId == source }
     print("IF6-T2[written] after sending the copy: originalStillQueued=\(stillQueued) \(lines())")
@@ -3227,13 +3231,13 @@ func withOneCoordinatorARestoredAndResentOriginalReadsNotSent() async throws {
     #expect(!chat.multiple)
     chat.draft = "Invented: the plumber's quote, attached"
     await chat.attach(data: Data("invented quote".utf8), name: "Quote.txt", mediaType: "text/plain")
-    await chat.send()
+    await chat.send()?.value
     try await eventually("rejected") { chat.rows.contains { $0.row.delivery == .rejected } }
     let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
     let original = try #require(try queuedRequests(outbox).first)
     await chat.restore(original.inputId)
     await workFixture.acceptUploads()
-    await chat.send()
+    await chat.send()?.value
     try await eventually("the copy at Work and the original out of the outbox") {
       await workFixture.count() == 1
         && (try? queuedRequests(outbox))?.contains { $0.inputId == original.inputId } == false
@@ -3269,7 +3273,7 @@ func restoreDrawsAChipOnlyWhileTheComposerNamesRecipients() async throws {
     let text = "@Personal is copied on the invented lease"
     chat.draft = text
     await chat.attach(data: Data("invented lease".utf8), name: "Lease.txt", mediaType: "text/plain")
-    await chat.send()
+    await chat.send()?.value
     try await eventually("rejected") { chat.rows.contains { $0.row.delivery == .rejected } }
     let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
     let original = try #require(try queuedRequests(outbox).first)
@@ -3312,7 +3316,7 @@ func restoreDrawsAChipOnlyWhileTheComposerNamesRecipients() async throws {
     await chat.attach(
       data: Data("Invented: Work's quarterly numbers".utf8), name: "Numbers.txt",
       mediaType: "text/plain")
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work refused it") { chat.rows.contains { $0.row.delivery == .rejected } }
     let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
     let original = try #require(try queuedRequests(outbox).first)
@@ -3334,7 +3338,7 @@ func restoreDrawsAChipOnlyWhileTheComposerNamesRecipients() async throws {
     )
     #expect(chat.shownChip == work && chat.recipientLine == "To Work")
     #expect(chat.addressing == .to([work], body: text), "The restored text stays literal")
-    await chat.send()
+    await chat.send()?.value
     try await eventually("a submit arrived") {
       await workFixture.count() + personalFixture.count() >= 1
     }
@@ -3404,7 +3408,7 @@ func aHeldMessageRestoredWithOneCoordinatorStaysItsOnceAnotherIsAdded() async th
     }
     print("IF6-T1[legacy] after Add Personal: recipientLine=\(chat.recipientLine)")
     #expect(chat.shownChip == work && chat.recipientLine == "To Work")
-    await chat.send()
+    await chat.send()?.value
     try await eventually("a submit arrived") {
       await workFixture.count() + personalFixture.count() >= 1
     }
@@ -3507,7 +3511,7 @@ func aHeldMessageOfAnUnpairedCoordinatorStaysItsOnceAnotherIsAdded() async throw
     )
     #expect(chat.draft.isEmpty, "Restore addressed it to Personal without the user choosing")
     #expect(chat.heldChoices.map(\.id) == [personal], "Restore offered an unpaired coordinator")
-    await chat.send()
+    await chat.send()?.value
     try await Task.sleep(for: .milliseconds(500))
     let got = await submits(personalFixture)
     print(
@@ -3538,7 +3542,7 @@ func aHeldMessageSentWithoutItsUnpairedCoordinatorStaysHeld() async throws {
       "IF10-1 before Send: line=\(chat.recipientLine) canSend=\(chat.canSend) draft=\(chat.draft.debugDescription)"
     )
     #expect(chat.recipientLine == "To Personal" && chat.canSend)
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Personal got it") { await personalFixture.count() == 1 }
     try await Task.sleep(for: .milliseconds(300))
     let hold = try #require(chat.holds.first)
@@ -3570,7 +3574,7 @@ func anAcknowledgementThisPhoneCouldNotSaveStillKeepsTheOriginal(placed: Bool, s
     let chat = coordinators.chat
     let text = "Invented: renew the greenhouse lease"
     chat.draft = text
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Personal rejected the original") {
       chat.snapshots[personal]?.rows.contains { $0.delivery == .rejected } == true
     }
@@ -3604,7 +3608,7 @@ func anAcknowledgementThisPhoneCouldNotSaveStillKeepsTheOriginal(placed: Bool, s
       "IF7-V1[placed=\(placed) storageFails=\(storageFails)] acknowledged: refusedOnDisk=\(saved.first?.refused == true)"
     )
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: blocked.path)
-    await chat.send()
+    await chat.send()?.value
     try await eventually("the copy at Personal") { await personalFixture.count() == 2 }
     try await Task.sleep(for: .milliseconds(200))
     let bubble = try #require(chat.rows.first { $0.row.text == text && $0.receipts.count == 2 })
@@ -3634,7 +3638,7 @@ func aRefusalThisPhoneCouldNotSaveStillWithdrawsTheOriginal(
     await personalFixture.rejectSubmits()
     await personalFixture.holdNextIdentity()
     chat.draft = "Invented: cancel the garden service"
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Personal's identity held") { await personalFixture.identityHeld }
     let directory = ProfileDirectory(personal, applicationSupport: root, caches: root)
     let original = try #require(try queuedRequests(directory.outbox).first)
@@ -3665,7 +3669,7 @@ func aRefusalThisPhoneCouldNotSaveStillWithdrawsTheOriginal(
       }
     }
     await personalFixture.rejectSubmits(false)
-    await chat.send()
+    await chat.send()?.value
     try await eventually("the restored copy at Personal") { await personalFixture.count() == 1 }
     let originalQueued = try queuedRequests(directory.outbox).contains {
       $0.inputId == original.inputId
@@ -3692,7 +3696,7 @@ func aRefusalThisPhoneCouldNotSaveStillWithdrawsTheOriginal(
   -> (source: String, bubble: String)
 {
   chat.draft = text
-  await chat.send()
+  await chat.send()?.value
   var rejected: String?
   try await eventually("Work placed it and Personal rejected it") {
     let receipts = chat.rows.first { $0.row.text == text }?.receipts ?? []
@@ -3721,7 +3725,7 @@ func aWithdrawnOriginalItsCoordinatorPlacesLaterReadsDelivered() async throws {
       (chat.rows.first { $0.id == bubble }?.receipts ?? []).map { $0.line(chat.name($0.lane)) }
     }
     await chat.restore(source)
-    await chat.send()
+    await chat.send()?.value
     try await eventually("the copy reached Personal") { await personalFixture.count() == 2 }
     try await Task.sleep(for: .milliseconds(300))
     let outbox = ProfileDirectory(personal, applicationSupport: root, caches: root).outbox
@@ -3757,7 +3761,7 @@ func aWithdrawnOriginalItsCoordinatorStillHoldsReadsSavedThenDelivered() async t
       (chat.rows.first { $0.id == bubble }?.receipts ?? []).map { $0.line(chat.name($0.lane)) }
     }
     await chat.restore(source)
-    await chat.send()
+    await chat.send()?.value
     try await eventually("the original withdrawn") {
       lines() == ["Work · Delivered", "Not sent to Personal"]
     }
@@ -3814,7 +3818,7 @@ func restoreKeepsWhatTheUserAddedWhileItCopied(_ what: String) async throws {
     for name in names {
       await chat.attach(data: big, name: name, mediaType: "application/pdf")
     }
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work refused it") { chat.rows.contains { $0.row.delivery == .rejected } }
     let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
     let original = try #require(try queuedRequests(outbox).first)
@@ -3865,7 +3869,7 @@ func restoreLeavesADraftAddressedElsewhereMeanwhileAlone() async throws {
     for index in 0..<8 {
       await chat.attach(data: big, name: "Contract\(index).pdf", mediaType: "application/pdf")
     }
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work refused it") {
       chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
     }
@@ -3889,7 +3893,7 @@ func restoreLeavesADraftAddressedElsewhereMeanwhileAlone() async throws {
     #expect(chat.error == "Send or clear the current draft before restoring another message.")
     #expect(draftFiles().count == before, "Restore left its copies in the drafts folder")
     await workFixture.acceptUploads()
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Personal got the note") { await personalFixture.count() == 1 }
     try await Task.sleep(for: .milliseconds(300))
     #expect(await submits(personalFixture).map(\.text) == [note])
@@ -3911,7 +3915,7 @@ func restoreLeavesADraftAddressedElsewhereMeanwhileAlone() async throws {
   chat.draft = text
   await chat.attach(
     data: Data("Invented: Work board deck".utf8), name: "Deck.txt", mediaType: "text/plain")
-  await chat.send()
+  await chat.send()?.value
   try await eventually("Work refused it") {
     chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
   }
@@ -3956,7 +3960,7 @@ func aRestoredDraftsTextStaysLiteralOnceItsChipIsRemoved(_ text: String) async t
     #expect(chat.destination.chip == nil && chat.draft == text + ".")
     #expect(chat.addressing == .to([work, personal], body: text + "."))
     await workFixture.acceptUploads()
-    await chat.send()
+    await chat.send()?.value
     _ = await within(3) { await workFixture.count() + personalFixture.count() == 2 }
     let workGot = await submits(workFixture).map(\.text)
     let personalGot = await submits(personalFixture)
@@ -4019,7 +4023,7 @@ func deletingARestoredDraftsHeadingPromotesNothing() async throws {
     #expect(chat.destination.chip == nil)
     #expect(chat.addressing == .to([work, personal], body: body))
     await workFixture.acceptUploads()
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Personal got it") { await personalFixture.count() == 1 }
     _ = await within(3) { await workFixture.count() == 1 }
     let atWork = await submits(workFixture)
@@ -4074,13 +4078,13 @@ func aRestoredDraftEditedWhileItsSendCopiesStaysLiteral() async throws {
     chat.removeChip()
     await workFixture.acceptUploads()
     let observed = await observes(workFixture) + observes(personalFixture)
-    let sending = Task { @MainActor in await chat.send() }
+    let sending = chat.send()
     await Task.yield()
     try #require(chat.admitting, "The edit comes while Send copies the message")
     chat.draft.removeFirst(heading.count)
     chat.promoteTypedTag()
     let during = chat.recipientLine
-    await sending.value
+    await sending?.value
     // The fixtures close each accepted submit's socket unanswered, so both lanes reconnect, and
     // until then the line says which is not connected instead of naming the recipients.
     try await eventually("both observe again") {
@@ -4100,7 +4104,7 @@ func aRestoredDraftEditedWhileItsSendCopiesStaysLiteral() async throws {
     #expect(chat.destination.chip == nil, "The restored text's own tag became the chip after Send")
     #expect(chat.addressing == .to([work, personal], body: body + "."))
     #expect(!originalQueued, "Send carried the restored message unchanged, yet the original stays")
-    await chat.send()
+    await chat.send()?.value
     try await eventually("both got the next Send") {
       await workFixture.count() + personalFixture.count() == 4
     }
@@ -4136,7 +4140,7 @@ func anEmptiedRestoredDraftLeavesItsOriginalToRestoreAgain(_ emptied: String) as
       await workFixture.rejectSubmits()
       chat.setChip(work)
       chat.draft = text
-      await chat.send()
+      await chat.send()?.value
       try await eventually("Work refused it") {
         chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
       }
@@ -4163,7 +4167,7 @@ func anEmptiedRestoredDraftLeavesItsOriginalToRestoreAgain(_ emptied: String) as
     )
     #expect(chat.addressing == .to([work, personal], body: text))
     try await eventually("both connected") { chat.canSend }
-    await chat.send()
+    await chat.send()?.value
     _ = await within(3) {
       await submits(workFixture).filter { $0.inputId != original.inputId }.count
         + personalFixture.count() == 2
@@ -4229,7 +4233,7 @@ func aCommandSentOverARestoredDraftKeepsTheOriginalQueued(_ setup: String) async
       chat.removeChip()
     }
     chat.draft = text
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work refused it") {
       chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
     }
@@ -4240,7 +4244,7 @@ func aCommandSentOverARestoredDraftKeepsTheOriginalQueued(_ setup: String) async
     // What the Commands menu's /status button does.
     chat.draft = "/status "
     chat.promoteTypedTag()
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work got /status") {
       await submits(workFixture).contains { $0.text.hasPrefix("/status") }
     }
@@ -4281,7 +4285,7 @@ func aHeldMessageStaysHeldWhenACommandIsSentOverItsRestoredDraft() async throws 
     await chat.restoreHeld(held)
     chat.draft = "/status "
     chat.promoteTypedTag()
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work got /status") {
       await submits(workFixture).contains { $0.text.hasPrefix("/status") }
     }
@@ -4307,7 +4311,7 @@ func aFeedbackSentOverARestoredDraftKeepsTheOriginalQueued() async throws {
     let text = "Invented: here is the signed greenhouse lease, please file it"
     chat.draft = text
     await chat.attach(data: Data("invented lease".utf8), name: "Lease.txt", mediaType: "text/plain")
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work refused it") {
       chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
     }
@@ -4317,7 +4321,7 @@ func aFeedbackSentOverARestoredDraftKeepsTheOriginalQueued() async throws {
     await workFixture.acceptUploads()
     chat.draft = "/feedback "
     chat.draft += "the upload button looks wrong"
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work got the feedback") {
       await submits(workFixture).contains { $0.text.hasPrefix("/feedback") }
     }
@@ -4347,7 +4351,7 @@ func aRestoredTextReplacedInOneEditKeepsTheOriginalQueued() async throws {
     await workFixture.rejectSubmits()
     let text = "Invented: renew the greenhouse lease before Friday"
     chat.draft = text
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work refused it") {
       chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
     }
@@ -4357,7 +4361,7 @@ func aRestoredTextReplacedInOneEditKeepsTheOriginalQueued() async throws {
     await workFixture.rejectSubmits(false)
     chat.draft = "I"
     chat.draft += "nvented: what time is the standup tomorrow?"
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work got the new message") {
       await submits(workFixture).contains { $0.text.contains("standup") }
     }
@@ -4392,7 +4396,7 @@ func aRestoredOriginalIsWithdrawnOnlyWhenItsContentIsSentUnchanged(_ edit: Strin
     let text = "Invented: the signed greenhouse lease"
     chat.draft = text
     await chat.attach(data: Data("invented lease".utf8), name: "Lease.txt", mediaType: "text/plain")
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work refused it") {
       chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
     }
@@ -4409,7 +4413,7 @@ func aRestoredOriginalIsWithdrawnOnlyWhenItsContentIsSentUnchanged(_ edit: Strin
     default: break
     }
     await workFixture.acceptUploads()
-    await chat.send()
+    await chat.send()?.value
     try await eventually("the copy at Work") { await workFixture.count() == 1 }
     try await Task.sleep(for: .milliseconds(300))
     let kept = try queuedItem(outbox, original.inputId)
@@ -4451,7 +4455,7 @@ func discardRemovesARefusedOriginalAndRecordsItWithdrawn(_ setup: String) async 
       chat.draft = "Invented: the signed lease"
       await chat.attach(
         data: Data("invented lease".utf8), name: "Lease.txt", mediaType: "text/plain")
-      await chat.send()
+      await chat.send()?.value
       try await eventually("Work refused it") {
         chat.snapshots[lane]?.rows.contains { $0.delivery == .rejected } == true
       }
@@ -4467,7 +4471,7 @@ func discardRemovesARefusedOriginalAndRecordsItWithdrawn(_ setup: String) async 
     chat.draft = "Invented: a different note instead"
     for file in chat.attachments { await chat.removeAttachment(file) }
     await fixture.acceptUploads()
-    await chat.send()
+    await chat.send()?.value
     try await eventually("the new note arrived") {
       await submits(fixture).contains { $0.text.contains("different note") }
     }
@@ -4507,7 +4511,7 @@ func aRefusedOriginalStillNeedsAttentionOnceTheAppComesBack() async throws {
     let chat = coordinators.chat
     await workFixture.rejectSubmits()
     chat.draft = "Invented: renew the greenhouse lease before Friday"
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work refused it") {
       chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
     }
@@ -4549,7 +4553,7 @@ func aRefusedOriginalItsCoordinatorKeptReadsDeliveredOncePlaced() async throws {
     await workFixture.holdPlacements()
     await workFixture.rejectNextSubmitButKeepIt()
     chat.draft = "Invented: the gate code changed to 4410"
-    await chat.send()
+    await chat.send()?.value
     try await eventually("Work rejected it") {
       chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
     }
@@ -4619,7 +4623,7 @@ func aCopyCheckRetrySentDuringASendThatReachedNoOneStaysAfterAnyEdits(_ anotherE
     try await eventually("Personal's actor held") { signalled(entered) }
     let text = "Invented invitation for both"
     chat.draft = text
-    let sending = Task { await chat.send() }
+    let sending = chat.send()
     try await eventually("Work saved its copy") {
       ((try? queuedRequests(workOutbox)) ?? []).count == 1
     }
@@ -4648,7 +4652,7 @@ func aCopyCheckRetrySentDuringASendThatReachedNoOneStaysAfterAnyEdits(_ anotherE
     try #require(chat.admitting, "The Send was still waiting for Personal")
     release.signal()
     await dropping.value
-    await sending.value
+    await sending?.value
     let queued = ((try? queuedRequests(workOutbox)) ?? []).map(\.inputId)
     print(
       "IF12-1[anotherEdit=\(anotherEdit)] after the Send: error=\(chat.error ?? "nil") draftKept=\(chat.draft == text) Work got=\(await workFixture.count()) Work's outbox=\(queued.count)"

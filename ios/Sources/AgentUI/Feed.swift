@@ -206,6 +206,23 @@ struct FeedProjection: Equatable {
   var includesLatest: Bool
 }
 
+/// One saved coordinator as a switcher sees it. It is derived on read, never stored.
+struct LaneNews: Identifiable, Equatable {
+  enum Attention: Equatable {
+    case notPaired
+    case notConnected
+    case error(String)
+  }
+  let id: ProfileID
+  /// Live replies its session received since it was last shown while the app was active. It is zero
+  /// after a launch and leaves out replies that arrived in the background.
+  let unseen: Int
+  /// Why it needs a look. It is nil while it connects, or while it is connected without an error.
+  let attention: Attention?
+  /// How many messages held from before the update it is proven to own.
+  let held: Int
+}
+
 enum Feed {
   static func project(
     _ lanes: [(id: ProfileID, snapshot: ChatSnapshot)], scope: FeedScope
