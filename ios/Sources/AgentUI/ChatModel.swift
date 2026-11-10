@@ -256,6 +256,13 @@ final class ChatModel {
       }
     }
   }
+  /// The held messages the scope shows. All shows every queue's, and one coordinator's feed shows
+  /// only the messages it is proven to own.
+  var shownHeld: [HeldMessage] {
+    scope.coordinator.map { id in held.filter { owner($0) == id } } ?? held
+  }
+  /// How many held messages no saved coordinator is proven to own. Only All shows them.
+  var unownedHeld: Int { held.filter { owner($0) == nil }.count }
   /// Shown while any queue's held messages could not be read when last loaded.
   var heldError: String? {
     reads.values.contains { if case .failure = $0 { true } else { false } }
@@ -276,6 +283,10 @@ final class ChatModel {
   /// Bumped when a lane's session starts to retire and whenever a session attaches. Never reset,
   /// so a value is never reused.
   private(set) var laneEpochs: [ProfileID: Int] = [:]
+  /// Each lane's `liveReplies` when it was last shown while the app was active, with the lane epoch
+  /// it was read under. A lane's first snapshot under a new epoch sets it, so a new coordinator, a
+  /// replaced session or a fresh launch has nothing new.
+  private var seen: [ProfileID: (epoch: Int, count: Int)] = [:]
   /// One coordinator's source checks from its current connection, and the warning their gaps raise.
   struct SourceReport: Identifiable, Equatable {
     let id: ProfileID
@@ -533,6 +544,9 @@ final class ChatModel {
   /// True while the composer names who gets the draft: with two or more saved coordinators, or
   /// once one was removed. With one saved and none removed it works as on `main`.
   var addressesByName: Bool { multiple || !removed.isEmpty }
+  /// True while the feed names coordinators, with two or more saved and All shown. It never gates
+  /// the composer, which reads `multiple` and `addressesByName`.
+  var namesLanes: Bool { multiple && scope == .all }
   /// The chip the composer draws while the composer names recipients. With one coordinator saved
   /// and none removed none is drawn, as on `main`, though a restored draft keeps its chip, so it
   /// stays its source's when another coordinator is added.
@@ -589,6 +603,25 @@ final class ChatModel {
       let other = profiles.first(where: { $0.id != id && $0.pin == found })
     else { return snapshot.error }
     return "This address now answers as \(other.name). Edit \(name(id))'s address."
+  }
+
+  /// Every saved coordinator's news, in profile order, for whichever switcher is drawn.
+  var news: [LaneNews] {
+    let owners = held.map(owner)
+    return profiles.map { profile in
+      let id = profile.id
+      let count = snapshots[id]?.liveReplies ?? 0
+      return LaneNews(
+        id: id, unseen: max(0, count - (seen[id]?.count ?? count)), attention: attention(id),
+        held: owners.filter { $0 == id }.count)
+    }
+  }
+
+  private func attention(_ id: ProfileID) -> LaneNews.Attention? {
+    guard paired(id) else { return .notPaired }
+    guard let snapshot = snapshots[id] else { return nil }
+    if let error = laneError(id) { return .error(error) }
+    return snapshot.connection == .disconnected ? .notConnected : nil
   }
 
   /// Adds a saved coordinator's lane, or replaces an unpaired lane with its paired one.
@@ -850,28 +883,71 @@ final class ChatModel {
     await startSend(screenshot: screenshot)?.value
   }
 
-  /// Snapshot and clear on the button's event, before scheduling any async work. The message is
-  /// then saved in every recipient's outbox before any of them starts, so a refusal leaves nothing
-  /// queued anywhere and the text comes back to the composer.
+  /// A recipient with the session it had at the tap. A session retired since refuses its stage,
+  /// and no other session stands in for it.
+  private typealias Target = (id: ProfileID, session: CoordinatorSession)
+
+  /// A Send refused in the tap's own turn, which keeps the draft as it is.
+  private func ignoreSend(_ reason: String? = nil) -> Task<Void, Never>? {
+    if let reason { failure = reason }
+    logComposer(.sendIgnored)
+    return nil
+  }
+
+  /// Snapshot and clear on the button's event, before scheduling any async work. The draft, its
+  /// recipients, their sessions and any `/feedback` screenshot all come from the tap, so nothing
+  /// after it, whether a switch, an edit or an address change, decides where the message goes. The
+  /// message is then saved in every recipient's outbox before any of them starts, so a refusal
+  /// leaves nothing queued anywhere and the text comes back to the composer.
   @discardableResult
-  func startSend(screenshot: (@MainActor () throws -> Data)? = nil) -> Task<Void, Never>? {
+  func startSend(screenshot capture: (@MainActor () throws -> Data)? = nil) -> Task<Void, Never>? {
     logComposer(.sendRequested)
-    guard canSend, case .to(let addressed, _) = addressing else {
-      logComposer(.sendIgnored)
-      return nil
-    }
+    guard canSend, case .to(let recipients, let body) = addressing else { return ignoreSend() }
     let text = draft
+    var owners = attachments.compactMap { screenshotOwners[$0.id] }
+    var shot: (png: Data, owner: ProfileID)?
+    // Why `/feedback` went without a screenshot, said once the message went.
+    var withheld: String?
+    if let capture, owners.isEmpty,
+      text.split(whereSeparator: \.isWhitespace).first == "/feedback"
+    {
+      if multiple {
+        withheld =
+          "Feedback was sent without a screenshot. With two or more coordinators saved, the screen can show another coordinator's messages."
+      } else if let owner = feedOwner {
+        // The screenshot shows the feed, so it goes only where everything the feed shows belongs.
+        guard attachments.count < AttachmentLimits.maximumCount else {
+          return ignoreSend(AttachmentError.tooMany.localizedDescription)
+        }
+        // Capture once. A failed admission retains this exact image.
+        do { shot = (try capture(), owner) } catch {
+          return ignoreSend(error.localizedDescription)
+        }
+        owners.append(owner)
+      } else {
+        withheld =
+          "Feedback was sent without a screenshot. The screen shows messages held from before the update, which may be another coordinator's."
+      }
+    }
+    // A file that may show one coordinator's feed goes to that coordinator alone.
+    guard owners.allSatisfy({ recipients == [$0] }) else {
+      return ignoreSend(
+        "Remove the automatic screenshot before sending. It could show one coordinator's messages to another."
+      )
+    }
+    let targets: [Target] = recipients.compactMap { id in
+      lanes.first { $0.id == id }?.session.map { (id, $0) }
+    }
+    guard let first = targets.first, targets.count == recipients.count else { return ignoreSend() }
     let mode = mode
     let original = source
-    let destination = destination
-    let scope = scope
     let originalFiles = attachments
     let identity = ComposerInputIdentity(composerID: composerID)
     // Clear the actual bound value before any await. The pending admission
     // retains the recovery copy until the durable outbox takes ownership.
     admission = .pending(
       text: text,
-      submission: submission(identity, text: text, files: originalFiles, to: addressed.first))
+      submission: submission(identity, text: text, files: originalFiles, at: first.session))
     changingDraft = true
     draft = ""
     changingDraft = false
@@ -895,90 +971,63 @@ final class ChatModel {
         forgetClearedSource()
       }
       var files = originalFiles
-      // With one coordinator saved, `/feedback` attaches the screen, so the composer says why it
-      // did not.
-      var withheld = false
-      do {
-        if text.split(whereSeparator: \.isWhitespace).first == "/feedback",
-          !files.contains(where: { screenshotOwners[$0.id] != nil }), let screenshot
-        {
-          // The screenshot shows the feed, so it goes only where everything the feed shows belongs.
-          if let shown = feedOwner {
-            guard files.count < AttachmentLimits.maximumCount else { throw AttachmentError.tooMany }
-            // Capture once. A failed admission retains this exact image.
-            let data = try screenshot()
-            let file = try await attachmentStore().stage(
-              data: data, name: "Feedback.png", mediaType: "image/png")
-            guard attachments.count < AttachmentLimits.maximumCount else {
-              try? await draftStore?.remove(file)
-              throw AttachmentError.tooMany
-            }
-            // The Send's own screenshot and log are not a newer draft, though an edit made while
-            // they were staged is.
-            var staged = draftRevision
-            attachments.append(file)
-            files.append(file)
-            screenshotOwners[file.id] = shown
-            clearedRevision &+= draftRevision &- staged
-            // Feedback owns private evidence, not transcript messages. Preserve the
-            // screenshot and user files even when log access or staging fails.
-            if attachments.count < AttachmentLimits.maximumCount {
-              let diagnostics = await ComposerDiagnostics.export()
-              if let log = try? await attachmentStore().stage(
-                data: Data(diagnostics.text.utf8), name: "Composer.log", mediaType: "text/plain")
-              {
-                if attachments.count < AttachmentLimits.maximumCount {
-                  staged = draftRevision
-                  attachments.append(log)
-                  files.append(log)
-                  clearedRevision &+= draftRevision &- staged
-                } else {
-                  try? await draftStore?.remove(log)
-                }
+      if let shot {
+        do {
+          let file = try await attachmentStore().stage(
+            data: shot.png, name: "Feedback.png", mediaType: "image/png")
+          guard attachments.count < AttachmentLimits.maximumCount else {
+            try? await draftStore?.remove(file)
+            throw AttachmentError.tooMany
+          }
+          // The Send's own screenshot and log are not a newer draft, though an edit made while
+          // they were staged is.
+          var staged = draftRevision
+          attachments.append(file)
+          files.append(file)
+          screenshotOwners[file.id] = shot.owner
+          clearedRevision &+= draftRevision &- staged
+          // Feedback owns private evidence, not transcript messages. Preserve the
+          // screenshot and user files even when log access or staging fails.
+          if attachments.count < AttachmentLimits.maximumCount {
+            let diagnostics = await ComposerDiagnostics.export()
+            if let log = try? await attachmentStore().stage(
+              data: Data(diagnostics.text.utf8), name: "Composer.log", mediaType: "text/plain")
+            {
+              if attachments.count < AttachmentLimits.maximumCount {
+                staged = draftRevision
+                attachments.append(log)
+                files.append(log)
+                clearedRevision &+= draftRevision &- staged
+              } else {
+                try? await draftStore?.remove(log)
               }
             }
-          } else {
-            withheld = !multiple
           }
+        } catch {
+          failure = error.localizedDescription
+          return
         }
-      } catch {
-        failure = error.localizedDescription
-        return
-      }
-      guard
-        case .to(let recipients, let body) = address(
-          text, hasAttachments: !files.isEmpty, destination: destination, in: scope)
-      else { return }
-      // A file that may show one coordinator's feed goes to that coordinator alone.
-      guard files.compactMap({ screenshotOwners[$0.id] }).allSatisfy({ recipients == [$0] }) else {
-        failure =
-          "Remove the automatic screenshot before sending. It could show one coordinator's messages to another."
-        return
       }
       // One receipt cannot name several outboxes, so the first recipient's holds it.
-      let submission = submission(identity, text: text, files: files, to: recipients.first)
+      let submission = submission(identity, text: text, files: files, at: first.session)
       admission = .pending(text: text, submission: submission)
       // The pending identity must be durable before the independent outbox can
       // claim it. New typing and files remain separate from this submitted note.
       guard await saveDraft() else { return }
       admitted = await admit { [self] in
         await deliver(
-          body, mode: mode, files: files, to: recipients, receipt: submission?.identity)
+          body, mode: mode, files: files, to: targets, receipt: submission.identity)
       }
       // Nothing went, so the text comes back for another try.
       guard admitted else { return }
       // The outboxes own this message even if their connections have since stopped.
       admission = .saved
       logComposer(.outboxSaved)
-      if withheld {
-        report(
-          "Feedback was sent without a screenshot. The screen shows messages held from before the update, which may be another coordinator's."
-        )
-      }
+      if let withheld { report(withheld) }
       // Who the draft is for goes with the Send only while nothing changed since its tap.
       if draftRevision == clearedRevision {
         restoredFrom = nil
-        self.destination = .open
+        destination = .open
       }
       let sentIDs = Set(files.map(\.id))
       attachments.removeAll { sentIDs.contains($0.id) }
@@ -991,57 +1040,57 @@ final class ChatModel {
     }
   }
 
-  /// Saves the message in every recipient's outbox, then starts each. A refusal withdraws every
+  /// Saves the message in every target's outbox, then starts each. A refusal withdraws every
   /// staged copy, so nothing is queued anywhere. Only the first recipient's copy carries the
   /// composer's receipt. True once any recipient has the message or still will.
   private func deliver(
-    _ body: String, mode: InputMode, files: [LocalAttachment], to recipients: [ProfileID],
-    receipt: ComposerInputIdentity?
+    _ body: String, mode: InputMode, files: [LocalAttachment], to targets: [Target],
+    receipt: ComposerInputIdentity
   ) async -> Bool {
+    let recipients = targets.map(\.id)
     let sendID = UUID().uuidString
     // Cleared before staging, so what a retirement cancels during this Send stays named.
     failure = nil
     reports = []
-    var staged: [(id: ProfileID, session: CoordinatorSession, input: StagedInput)] = []
-    for id in recipients {
-      guard let session = lanes.first(where: { $0.id == id })?.session,
-        let input = await session.stage(
+    var staged: [(target: Target, input: StagedInput)] = []
+    for target in targets {
+      guard
+        let input = await target.session.stage(
           body, mode: mode, files: files, sendID: sendID, recipients: recipients,
-          composer: id == recipients.first ? receipt : nil)
+          composer: target.id == recipients.first ? receipt : nil)
       else {
-        for item in staged { await withdraw(item.input, from: item.session, lane: item.id) }
+        for item in staged {
+          await withdraw(item.input, from: item.target.session, lane: item.target.id)
+        }
         // With one coordinator saved and none removed, its own reason is the composer's error.
-        if removed[id] != nil {
-          report("Nothing was sent. " + Missed.removed.sentence([name(id)], "this message"))
+        if removed[target.id] != nil {
+          report("Nothing was sent. " + Missed.removed.sentence([name(target.id)], "this message"))
         } else if addressesByName {
-          report("Nothing was sent. \(name(id)) did not take the message.")
+          report("Nothing was sent. \(name(target.id)) did not take the message.")
         }
         return false
       }
-      staged.append((id, session, input))
+      staged.append((target, input))
     }
     var misses: [(ProfileID, StagedInput, Missed)] = []
     for item in staged {
-      let outcome = await item.session.start(item.input)
-      if let why = missed(item.id, item.input, outcome) {
-        misses.append((item.id, item.input, why))
+      let outcome = await item.target.session.start(item.input)
+      if let why = missed(item.target.id, item.input, outcome) {
+        misses.append((item.target.id, item.input, why))
       }
     }
     report(misses)
     return misses.count < staged.count
   }
 
-  /// The composer's receipt for a Send whose first recipient is `recipient`, or nil while that
-  /// coordinator has no session to hold it.
+  /// The composer's receipt for a Send, held in the outbox of its first recipient's `session`.
   private func submission(
     _ identity: ComposerInputIdentity, text: String, files: [LocalAttachment],
-    to recipient: ProfileID?
-  ) -> ComposerSubmission? {
-    lanes.first { $0.id == recipient }?.session.map {
-      ComposerSubmission(
-        identity: identity, outboxURL: $0.outboxURL, text: text, attachments: files,
-        feedbackScreenshotID: files.first { screenshotOwners[$0.id] != nil }?.id)
-    }
+    at session: CoordinatorSession
+  ) -> ComposerSubmission {
+    ComposerSubmission(
+      identity: identity, outboxURL: session.outboxURL, text: text, attachments: files,
+      feedbackScreenshotID: files.first { screenshotOwners[$0.id] != nil }?.id)
   }
   private func logComposer(_ event: ComposerEvent, error: (any Error)? = nil) {
     let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
@@ -1406,11 +1455,11 @@ final class ChatModel {
     }
     return try await session.toolDetails(entryID: entryID, callID: tool.callId)
   }
-  /// Every coordinator with older history loads a page. The one holding `anchorID` keeps
-  /// that row in its window.
-  func history(anchorID: String?) async {
+  /// Every coordinator `scope` shows with older history loads a page. The one holding `anchorID`
+  /// keeps that row in its window.
+  func history(anchorID: String?, in scope: FeedScope) async {
     let anchor = rows.first { $0.id == anchorID }
-    let pages = lanes.compactMap { lane in
+    let pages = lanes.filter { scope.shows($0.id) }.compactMap { lane in
       lane.session.map { ($0, anchor?.lane == lane.id ? anchor?.row.id : nil) }
     }
     await withTaskGroup(of: Void.self) { group in
@@ -1419,21 +1468,25 @@ final class ChatModel {
       }
     }
   }
-  func latestHistory() async {
-    let sessions = lanes.compactMap(\.session)
+  /// Every coordinator `scope` shows loads its latest page.
+  func latestHistory(in scope: FeedScope) async {
+    let sessions = lanes.filter { scope.shows($0.id) }.compactMap(\.session)
     await withTaskGroup(of: Void.self) { group in
       for session in sessions { group.addTask { await session.loadLatest() } }
     }
   }
-  /// Stop response stops every coordinator that is working.
-  func interrupt() async {
-    for lane in lanes where snapshots[lane.id]?.busy == true { await lane.session?.interrupt() }
+  /// Stop response stops only the working coordinators `scope` shows.
+  func interrupt(in scope: FeedScope) async {
+    for lane in lanes where scope.shows(lane.id) && snapshots[lane.id]?.busy == true {
+      await lane.session?.interrupt()
+    }
   }
 
   // MARK: - Feed
 
   func apply(_ update: ChatSnapshot, lane id: ProfileID) {
     snapshots[id] = update
+    if seen[id]?.epoch != laneEpoch(id) { seen[id] = (laneEpoch(id), update.liveReplies) }
     refresh(changed: id)
   }
 
@@ -1476,5 +1529,11 @@ final class ChatModel {
     loadingHistory = projection.loadingHistory
     includesLatest = projection.includesLatest
     if changedShown || changed == nil { revision &+= 1 }
+    guard active else { return }
+    for id in lanes.map(\.id) where scope.shows(id) {
+      if let count = snapshots[id]?.liveReplies, seen[id]?.count != count {
+        seen[id]?.count = count
+      }
+    }
   }
 }

@@ -67,6 +67,10 @@ public struct ChatSnapshot: Sendable {
   /// Every Send this coordinator holds, from its outbox and ledger rather than the loaded
   /// rows, so a Send whose row left the window still reports.
   public var sends: [String: SendStatus] = [:]
+  /// Live replies this session received while connected. It only grows. A reply counts once, at
+  /// its first streamed chunk or, with nothing streamed, at its answer or message. History pages
+  /// and what a reconnect catches up on before its page never count.
+  public var liveReplies = 0
   public init() {}
 }
 
@@ -1342,6 +1346,7 @@ public actor CoordinatorSession {
   private func consume(_ event: NativeEvent, historyRequestID: UUID? = nil) {
     let previousTail = transcript.lastReceivedRowID
     let streaming = transcript.streamingRowID
+    let appends = transcript.appends
     switch event {
     case .commands(let value): snapshot.commands = value.commands
     case .sources(let value):
@@ -1456,7 +1461,22 @@ public actor CoordinatorSession {
       }
     default: break
     }
+    // The observer is connected only once its history page is in, so what a reconnect replays
+    // before that is not live. A reply's message after its streamed chunks is the same reply.
+    if snapshot.connection == .connected, streaming == nil, transcript.appends != appends,
+      Self.carriesReply(event)
+    {
+      snapshot.liveReplies += 1
+    }
     stampRows(replacing: streaming)
+  }
+
+  private static func carriesReply(_ event: NativeEvent) -> Bool {
+    switch event {
+    case .textDelta, .answer: true
+    case .message(let value): value.message.role.carriesAnswer
+    default: false
+    }
   }
 
   /// Stamps rows as the events that create them are consumed, never at publication, so the

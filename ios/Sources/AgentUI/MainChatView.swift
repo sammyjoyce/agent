@@ -451,8 +451,9 @@ public struct MainChatView: View {
       .task(id: historyRequest) {
         guard let request = historyRequest else { return }
         switch request {
-        case .earlier(_, let anchorID): await model.history(anchorID: anchorID)
-        case .latest: await model.latestHistory()
+        case .earlier(_, let anchorID, let scope):
+          await model.history(anchorID: anchorID, in: scope)
+        case .latest(_, let scope): await model.latestHistory(in: scope)
         }
         if !Task.isCancelled { historyRequest = nil }
       }
@@ -511,7 +512,7 @@ public struct MainChatView: View {
         if (!latestVisible || !model.includesLatest) && !model.rows.isEmpty {
           Button("Latest", systemImage: "arrow.down") {
             followsLatest = true
-            historyRequest = .latest(UUID())
+            historyRequest = .latest(UUID(), scope: model.scope)
             if reduceMotion {
               scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
             } else {
@@ -532,7 +533,7 @@ public struct MainChatView: View {
     let anchor =
       model.transcriptItems.first(where: { $0.id == visibleItem })
       ?? model.transcriptItems.first
-    historyRequest = .earlier(UUID(), anchorID: anchor?.anchorID)
+    historyRequest = .earlier(UUID(), anchorID: anchor?.anchorID, scope: model.scope)
   }
   @ViewBuilder private func transcriptItem(
     _ item: TranscriptItem, badges: [ProfileID: CoordinatorBadge]
@@ -611,7 +612,10 @@ public struct MainChatView: View {
             Text("Follow-up").tag(InputMode.followUp)
           }.pickerStyle(.inline).disabled(model.admitting)
           if model.busy {
-            Button("Stop response", systemImage: "stop.fill") { Task { await model.interrupt() } }
+            Button("Stop response", systemImage: "stop.fill") {
+              let shown = model.scope
+              Task { await model.interrupt(in: shown) }
+            }
           }
         } label: {
           Image(systemName: "plus").font(.system(size: 19, weight: .regular))
@@ -656,7 +660,8 @@ public struct MainChatView: View {
         .onChange(of: model.committed) { model.promoteTypedTag() }
         Button {
           if showsStop {
-            Task { await model.interrupt() }
+            let shown = model.scope
+            Task { await model.interrupt(in: shown) }
           } else {
             #if os(iOS)
               composerEditor.submit { text in
@@ -1104,9 +1109,10 @@ private enum TranscriptControlAnchor: Hashable {
   case latest
 }
 
+/// A history load and the scope on screen when it was asked for.
 private enum HistoryNavigation: Hashable {
-  case earlier(UUID, anchorID: String?)
-  case latest(UUID)
+  case earlier(UUID, anchorID: String?, scope: FeedScope)
+  case latest(UUID, scope: FeedScope)
 }
 
 struct MessageRow: View {

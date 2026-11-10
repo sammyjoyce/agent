@@ -2474,7 +2474,7 @@ func aSendToBothPersonalRefusesLeavesNothingAtWorkAfterAnAddressEdit(
     let held = try edit ? PipedFile(#require(chat.attachments.dropLast().last)) : nil
     defer { held?.release() }
     let workOutbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
-    let sending = Task { await chat.send() }
+    let sending = chat.startSend()
     if let held {
       try await held.opened(by: "Work's copy")
       try await held.feed()
@@ -2495,7 +2495,7 @@ func aSendToBothPersonalRefusesLeavesNothingAtWorkAfterAnAddressEdit(
       try #require(chat.admitting, "The edit finished while Personal still copied the files")
       try await held.feed()
     }
-    await sending.value
+    await sending?.value
     try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
     let queuedAtWork = ((try? queuedRequests(workOutbox)) ?? []).map(\.text)
     let workRow = chat.snapshots[work]?.rows.first { $0.text == text }
@@ -2549,7 +2549,7 @@ func aCopyWhoseSessionRetiredDuringASendThatReachedNoOneIsNotKept(_ change: Stri
       chat, text, clashAt: ProfileDirectory(personal, applicationSupport: root, caches: root))
     let workDirectory = ProfileDirectory(work, applicationSupport: root, caches: root)
     let retiring = try #require(chat.lanes.first { $0.id == work }?.session)
-    let sending = Task { await chat.send() }
+    let sending = chat.startSend()
     try await eventually("Work saved its copy") {
       ((try? queuedRequests(workDirectory.outbox)) ?? []).count == 1
     }
@@ -2559,7 +2559,7 @@ func aCopyWhoseSessionRetiredDuringASendThatReachedNoOneIsNotKept(_ change: Stri
       await retiring.retire()
     }
     try #require(chat.admitting, "Work's session retired while Personal still copied the files")
-    await sending.value
+    await sending?.value
     let afterSend = ((try? queuedRequests(workDirectory.outbox)) ?? []).map(\.text)
     if change == "Remove" {
       try await Task.sleep(for: .milliseconds(300))
@@ -4112,14 +4112,14 @@ func aRestoredDraftEditedWhileItsSendCopiesStaysLiteral() async throws {
     chat.removeChip()
     await workFixture.acceptUploads()
     let observed = await observes(workFixture) + observes(personalFixture)
-    let sending = Task { @MainActor in await chat.send() }
+    let sending = chat.startSend()
     await Task.yield()
     try #require(chat.admitting, "The edit comes while Send copies the message")
     try #require(chat.draft.isEmpty, "Send takes the text at its tap")
     chat.draft = body
     chat.promoteTypedTag()
     let during = chat.recipientLine
-    await sending.value
+    await sending?.value
     // The fixtures close each accepted submit's socket unanswered, so both lanes reconnect, and
     // until then the line says which is not connected instead of naming the recipients.
     try await eventually("both observe again") {
@@ -4654,7 +4654,7 @@ func aCopyCheckRetrySentDuringASendThatReachedNoOneStaysAfterAnyEdits(_ anotherE
     try await eventually("Personal's actor held") { signalled(entered) }
     let text = "Invented invitation for both"
     chat.draft = text
-    let sending = Task { await chat.send() }
+    let sending = chat.startSend()
     try await eventually("Work saved its copy") {
       ((try? queuedRequests(workOutbox)) ?? []).count == 1
     }
@@ -4683,7 +4683,7 @@ func aCopyCheckRetrySentDuringASendThatReachedNoOneStaysAfterAnyEdits(_ anotherE
     try #require(chat.admitting, "The Send was still waiting for Personal")
     release.signal()
     await dropping.value
-    await sending.value
+    await sending?.value
     let queued = ((try? queuedRequests(workOutbox)) ?? []).map(\.inputId)
     print(
       "IF12-1[anotherEdit=\(anotherEdit)] after the Send: error=\(chat.error ?? "nil") draftKept=\(chat.draft == text) Work got=\(await workFixture.count()) Work's outbox=\(queued.count)"

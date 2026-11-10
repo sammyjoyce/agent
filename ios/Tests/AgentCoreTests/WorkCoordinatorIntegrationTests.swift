@@ -86,7 +86,7 @@ func nativeWorkInspectionReadsTheRealCoordinatorAndDetachesWithoutStoppingWork()
         #expect(inspectedModel.snapshots[profile.profile]?.settingsSupported == false)
         if conversation.conversationId == parentID {
           let currentRows = Set(inspectedModel.rows.map(\.id))
-          await inspectedModel.history(anchorID: nil)
+          await inspectedModel.history(anchorID: nil, in: .all)
           try await waitFor("conversation-scoped earlier history") {
             !inspectedModel.loadingHistory
               && inspectedModel.rows.contains { !currentRows.contains($0.id) }
@@ -97,7 +97,7 @@ func nativeWorkInspectionReadsTheRealCoordinatorAndDetachesWithoutStoppingWork()
           #expect(earlierRows.allSatisfy { $0.row.text.hasPrefix("Earlier parent evidence ") })
         }
         #expect(await inspector.submit("Inspection must never admit this input") == false)
-        await inspectedModel.interrupt()
+        await inspectedModel.interrupt(in: .all)
         await inspectedModel.detach(profile.profile)
         #expect((try? Data(contentsOf: profile.outbox)) == mainOutbox)
       } catch {
