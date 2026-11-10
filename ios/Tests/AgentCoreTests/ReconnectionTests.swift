@@ -216,20 +216,21 @@ private actor ReconnectCoordinator {
   _ behavior: ReconnectBehavior,
   _ body: (ChatModel, ReconnectCoordinator, URL, @MainActor () async -> Void) async throws -> Void
 ) async throws {
+  let path = fixtureSocketPath()
   let parameters = NWParameters.tcp
-  parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
+  parameters.requiredLocalEndpoint = .unix(path: path)
   let listener = try NWListener(using: parameters)
   let ready = AsyncThrowingStream<Void, any Error>.makeStream()
   let fixture = ReconnectCoordinator(behavior)
   listener.stateUpdateHandler = { state in
     if case .ready = state { ready.continuation.yield(()) }
     if case .failed(let error) = state { ready.continuation.finish(throwing: error) }
+    if case .cancelled = state { try? FileManager.default.removeItem(atPath: path) }
   }
   listener.newConnectionHandler = { socket in Task { await fixture.accept(socket) } }
   listener.start(queue: .global())
   defer { listener.cancel() }
   for try await _ in ready.stream { break }
-  let port = try #require(listener.port)
   let (directory, root) = temporaryProfile()
   defer { try? FileManager.default.removeItem(at: root) }
   let address = try CoordinatorAddress(host: "100.64.1.2")
@@ -238,7 +239,7 @@ private actor ReconnectCoordinator {
       id: directory.profile,
       session: CoordinatorSession(
         directory: directory, address: address, pin: fixture.id, stamps: StampSource(),
-        transport: loopback(port)))
+        transport: loopback(.unix(path: path))))
   }
   let model = ChatModel()
   model.attach(lane())

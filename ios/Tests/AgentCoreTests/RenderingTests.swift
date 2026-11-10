@@ -1630,7 +1630,7 @@
           transport: CoordinatorTransport { address in
             guard address.host == "100.64.1.2" else { throw ConnectionError.timedOut }
             return LineConnection(
-              connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
+              connection: NWConnection(to: port, using: .tcp))
           })
         let profile = try #require(coordinators.profiles.first)
         try await coordinators.update(

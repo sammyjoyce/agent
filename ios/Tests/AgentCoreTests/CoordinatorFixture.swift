@@ -535,15 +535,27 @@ actor FixtureCoordinator {
   }
 }
 
-/// Serves `fixture` on a loopback port until the listener is cancelled.
-func listen(_ fixture: FixtureCoordinator) async throws -> (NWListener, NWEndpoint.Port) {
+/// A Unix socket path no other fixture uses. It is under /tmp because the iOS Simulator's
+/// temporary directory is too long for the 104-byte `sun_path` of a socket address.
+func fixtureSocketPath() -> String { "/tmp/agent-fixture-\(UUID().uuidString).sock" }
+
+/// Serves `fixture` until the listener is cancelled, at a Unix socket of its own, which takes no
+/// loopback port that a concurrent test run could collide with. `tcp` serves it on a loopback port
+/// instead, for a test of a reset, since over a Unix socket `forceCancel` reads as EOF and not
+/// ECONNRESET.
+func listen(_ fixture: FixtureCoordinator, tcp: Bool = false) async throws -> (
+  NWListener, NWEndpoint
+) {
+  let path = fixtureSocketPath()
   let parameters = NWParameters.tcp
-  parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
+  parameters.requiredLocalEndpoint =
+    tcp ? .hostPort(host: .ipv4(.loopback), port: .any) : .unix(path: path)
   let listener = try NWListener(using: parameters)
   let ready = AsyncThrowingStream<Void, any Error>.makeStream()
   listener.stateUpdateHandler = { state in
     if case .ready = state { ready.continuation.yield(()) }
     if case .failed(let error) = state { ready.continuation.finish(throwing: error) }
+    if case .cancelled = state { try? FileManager.default.removeItem(atPath: path) }
   }
   listener.newConnectionHandler = { socket in
     Task {
@@ -561,13 +573,12 @@ func listen(_ fixture: FixtureCoordinator) async throws -> (NWListener, NWEndpoi
   }
   listener.start(queue: .global())
   for try await _ in ready.stream { break }
-  return (listener, try #require(listener.port))
+  guard tcp else { return (listener, .unix(path: path)) }
+  return (listener, .hostPort(host: .ipv4(.loopback), port: try #require(listener.port)))
 }
 
-func loopback(_ port: NWEndpoint.Port) -> CoordinatorTransport {
-  CoordinatorTransport { _ in
-    LineConnection(connection: NWConnection(host: .ipv4(.loopback), port: port, using: .tcp))
-  }
+func loopback(_ endpoint: NWEndpoint) -> CoordinatorTransport {
+  CoordinatorTransport { _ in LineConnection(connection: NWConnection(to: endpoint, using: .tcp)) }
 }
 
 /// The requests in a profile's live outbox, in queue order.

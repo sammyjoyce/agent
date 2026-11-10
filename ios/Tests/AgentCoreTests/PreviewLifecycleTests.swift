@@ -88,7 +88,7 @@ private func withGatedPreviewCoordinator(
     stamps: StampSource(),
     transport: CoordinatorTransport { _ in
       let delayed = await gate.enter()
-      let socket = NWConnection(host: .ipv4(.loopback), port: port, using: .tcp)
+      let socket = NWConnection(to: port, using: .tcp)
       if delayed {
         socket.stateUpdateHandler = { state in
           if case .cancelled = state { Task { await gate.closed() } }
