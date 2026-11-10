@@ -2,6 +2,7 @@
   import Foundation
   import Network
   import SwiftUI
+  import UserNotifications
 
   @testable import AgentCore
   @testable import AgentUI
@@ -83,13 +84,37 @@
     // once a cleanup launch erased its storage.
     @State private var lifetime: Lifetime?
     @Environment(\.scenePhase) private var scenePhase
+    private let requestAlerts: Bool
+    /// The app delegate's object. The system hands alert taps to it, never to the fixture's own.
+    private let delegate: AppNotifications
 
-    private init(lifetime: Lifetime?) { _lifetime = State(initialValue: lifetime) }
+    private init(lifetime: Lifetime?, requestAlerts: Bool, delegate: AppNotifications) {
+      _lifetime = State(initialValue: lifetime)
+      self.requestAlerts = requestAlerts
+      self.delegate = delegate
+    }
+
+    /// The `AGENT_INTERACTION_*` values of this launch. A tap on an alert starts the app with no
+    /// environment, so a launch that names its storage and sets `AGENT_INTERACTION_ALERTS=1`
+    /// saves its values, and a launch that names no port reads them back until a cleanup launch.
+    private static let environment: [String: String] = {
+      let current = ProcessInfo.processInfo.environment
+      let key = "interactionFixtureLaunch"
+      guard current["AGENT_INTERACTION_PORT"] != nil else {
+        return UserDefaults.standard.dictionary(forKey: key) as? [String: String] ?? [:]
+      }
+      if current["AGENT_INTERACTION_CLEANUP"] == "1" {
+        UserDefaults.standard.removeObject(forKey: key)
+      } else if current["AGENT_INTERACTION_ID"] != nil, current["AGENT_INTERACTION_ALERTS"] == "1" {
+        UserDefaults.standard.set(
+          current.filter { $0.key.hasPrefix("AGENT_INTERACTION_") }, forKey: key)
+      }
+      return current
+    }()
 
     /// The peers the launch names. `AGENT_INTERACTION_PORT` and `AGENT_INTERACTION_COORDINATOR`
     /// are comma-separated lists.
     private static var requestedPeers: [Peer]? {
-      let environment = ProcessInfo.processInfo.environment
       guard let ports = environment["AGENT_INTERACTION_PORT"]?.split(separator: ","),
         let coordinators = environment["AGENT_INTERACTION_COORDINATOR"]?.split(separator: ","),
         ports.count == coordinators.count
@@ -108,17 +133,20 @@
 
     /// `AGENT_INTERACTION_ID` names the storage a relaunch reuses. With it,
     /// `AGENT_INTERACTION_CLEANUP=1` erases that storage and shows only that it did.
-    static func fromEnvironment() -> Self? {
-      let environment = ProcessInfo.processInfo.environment
+    /// `AGENT_INTERACTION_ALERTS=1` asks for permission to show alerts.
+    static func fromEnvironment(notifications: AppNotifications) -> Self? {
       guard let peers = requestedPeers else { return nil }
+      let requestAlerts = environment["AGENT_INTERACTION_ALERTS"] == "1"
       let named = environment["AGENT_INTERACTION_ID"].flatMap(UUID.init(uuidString:))
       if let named, environment["AGENT_INTERACTION_CLEANUP"] == "1" {
-        return (try? Storage(named).erase()).map { Self(lifetime: nil) }
+        return (try? Storage(named).erase()).map {
+          Self(lifetime: nil, requestAlerts: requestAlerts, delegate: notifications)
+        }
       }
       guard let lifetime = Lifetime(peers: peers, storage: Storage(named ?? UUID())) else {
         return nil
       }
-      return Self(lifetime: lifetime)
+      return Self(lifetime: lifetime, requestAlerts: requestAlerts, delegate: notifications)
     }
 
     var body: some View {
@@ -127,6 +155,14 @@
           .defaultAppStorage(lifetime.defaults)
           .onChange(of: scenePhase, initial: true) { _, phase in
             Task { await lifetime.notifications.coordinators.setActive(phase == .active) }
+          }
+          .task {
+            delegate.forwardFixtureOpens(to: lifetime.notifications)
+            if requestAlerts {
+              _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [
+                .alert, .sound,
+              ])
+            }
           }
       } else {
         Text("Interaction fixture cleaned")

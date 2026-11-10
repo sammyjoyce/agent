@@ -149,9 +149,14 @@ PY
 
 IFS=$'\t' read -r runtime_id device_type_id < "$run_dir/simulator-selection"
 simulator_id=
+notification_watcher=
 cleanup() {
   local status=$?
   trap - EXIT
+  if [[ -n "$notification_watcher" ]]; then
+    kill "$notification_watcher" 2>/dev/null || true
+    wait "$notification_watcher" 2>/dev/null || true
+  fi
   if [[ -n "$simulator_id" ]]; then
     xcrun simctl shutdown "$simulator_id" >/dev/null 2>&1 || true
     if ! xcrun simctl delete "$simulator_id"; then
@@ -228,6 +233,9 @@ for suite in "${suites[@]}"; do
         CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES test
       ;;
     rendering)
+      python3 "$native_dir/scripts/test-notification-tap.py" --watch "$simulator_id" \
+        "$run_dir/notification-tap" &
+      notification_watcher=$!
       # App Group access is enforced in the simulator too. Ad-hoc signing
       # supplies real entitlements without an Apple account or profile.
       xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
@@ -235,6 +243,9 @@ for suite in "${suites[@]}"; do
         -parallel-testing-enabled NO -test-timeouts-enabled YES -derivedDataPath "$run_dir/app" \
         -resultBundlePath "$run_dir/ios-rendering-tests.xcresult" \
         CODE_SIGNING_ALLOWED=YES CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= test
+      kill "$notification_watcher"
+      wait "$notification_watcher"
+      notification_watcher=
       ;;
   esac
 done

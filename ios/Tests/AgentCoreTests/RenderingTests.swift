@@ -1083,6 +1083,92 @@
         #expect(model.destination.chip == nil)
       }
 
+      @MainActor @Test(.timeLimit(.minutes(1)))
+      func aColdLaunchTapIsSeen() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let suite = "cold-alert-\(UUID())"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer {
+          defaults.removePersistentDomain(forName: suite)
+          try? FileManager.default.removeItem(at: root)
+        }
+        let workPeer = FixtureCoordinator()
+        let personalPeer = FixtureCoordinator()
+        let (workListener, workEndpoint) = try await listen(workPeer)
+        let (personalListener, personalEndpoint) = try await listen(personalPeer)
+        defer {
+          workListener.cancel()
+          personalListener.cancel()
+        }
+        let workAddress = try CoordinatorAddress(host: "100.64.1.2")
+        let personalAddress = try CoordinatorAddress(host: "100.64.1.3")
+        var work = CoordinatorProfile(name: try TagName("Work"), address: workAddress)
+        var personal = CoordinatorProfile(name: try TagName("Personal"), address: personalAddress)
+        work.pin = workPeer.id
+        personal.pin = personalPeer.id
+        try writePrivately(
+          JSONEncoder().encode(Coordinators.SavedProfiles(profiles: [work, personal])),
+          to: root.appending(path: "Agent/profiles.json"))
+        let old = NativeEventHistory(
+          messages: [
+            .init(
+              continuation: false, entryId: "old", finalChunk: true, role: .final,
+              text: "An older Personal reply")
+          ], nextCursor: nil, pageComplete: true)
+        let latest = NativeEventHistory(
+          messages: [
+            .init(
+              continuation: false, entryId: "latest", finalChunk: true, role: .final,
+              text: "The latest Personal reply")
+          ], nextCursor: nil, pageComplete: true)
+        await personalPeer.replyToHistory(initial: old, pages: [:])
+        await personalPeer.replyToLatest(latest)
+        let transport = CoordinatorTransport { address in
+          let endpoint = address == workAddress ? workEndpoint : personalEndpoint
+          return LineConnection(connection: NWConnection(to: endpoint, using: .tcp))
+        }
+        let notifications = AppNotifications(
+          defaults: defaults, applicationSupport: root, caches: root, transport: transport)
+        await notifications.coordinators.setActive(true)
+        for _ in 0..<100 where notifications.coordinators.chat.connection != .connected {
+          try await Task.sleep(for: .milliseconds(50))
+        }
+        notifications.open(.named(personal.id))
+        let host = UIHostingController(rootView: MainChatView(notifications: notifications))
+        let scene = try #require(
+          UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let previousWindow = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer {
+          window.isHidden = true
+          window.rootViewController = nil
+          previousWindow?.makeKey()
+        }
+        for _ in 0..<100 {
+          if notifications.coordinators.chat.rows.contains(where: {
+            $0.row.text == "The latest Personal reply"
+          }) {
+            break
+          }
+          try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(notifications.coordinators.chat.scope == .one(personal.id))
+        #expect(await personalPeer.historyRequests().contains("<latest>"))
+        #expect(notifications.coordinators.chat.rows.last?.row.text == "The latest Personal reply")
+        func scrolls(_ view: UIView) -> [UIScrollView] {
+          (view as? UIScrollView).map { [$0] } ?? view.subviews.flatMap(scrolls)
+        }
+        host.view.layoutIfNeeded()
+        let transcript = try #require(scrolls(host.view).first { $0.contentSize.height > 0 })
+        #expect(
+          transcript.contentOffset.y + transcript.bounds.height
+            + transcript.adjustedContentInset.bottom
+            >= transcript.contentSize.height - 2)
+        await notifications.coordinators.setActive(false)
+      }
+
       /// The feed and composer of a model with Work and Personal saved, in a key window, with the
       /// composer's field focused.
       @MainActor private func withComposer(

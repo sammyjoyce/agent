@@ -92,6 +92,26 @@ public final class Coordinators {
     for withdrawal in withdrawals { retry(withdrawal) }
   }
 
+  func route(_ origin: AlertOrigin) -> ProfileID? {
+    switch origin {
+    case .named(let id): return chat.isSaved(id) ? id : nil
+    case .unnamed, .malformed: return nil
+    }
+  }
+
+  func show(opening origin: AlertOrigin) -> String? {
+    guard chat.multiple else { return nil }
+    if let id = route(origin) {
+      chat.show(.one(id))
+      return nil
+    }
+    if origin == .unnamed {
+      chat.show(.all)
+      return "This notification did not say which coordinator sent it. Showing all."
+    }
+    return "This notification did not name a saved coordinator."
+  }
+
   /// Runs add, edit, pairing and removal one at a time in call order, so none of them sees
   /// another half done and every `profiles.json` save starts from the last one.
   private func serially<T>(_ mutation: () async throws -> T) async rethrows -> T {

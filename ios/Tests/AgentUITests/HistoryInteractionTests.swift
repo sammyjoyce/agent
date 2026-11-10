@@ -2151,6 +2151,8 @@ actor InteractionPeer {
   private var working = false
   private var streamsOnSubmit = false
   private var commandValues: [SlashCommand] = []
+  private var retryCount = 0
+  private var submitCount = 0
   func observationCount() -> Int { observations }
   func streamRepliesOnSubmit() { streamsOnSubmit = true }
   func toolDetails(_ values: [String: ToolDetails]) { toolReplies = values }
@@ -2178,6 +2180,8 @@ actor InteractionPeer {
     if let observer { try await emit(.sources(.init(sources: states)), to: observer) }
   }
   func submits() -> [String] { submitted.map(\.text) }
+  func retries() -> Int { retryCount }
+  func submitAttempts() -> Int { submitCount }
   /// Rejects each submit while set, as a coordinator that cannot take a message does.
   func rejectSubmits(_ value: Bool) { rejecting = value }
   /// The commands each observation announces, as a coordinator's `commands` frame does.
@@ -2292,7 +2296,11 @@ actor InteractionPeer {
         try await emitHistory(
           try XCTUnwrap(request.cursor == nil ? latest : pages[cursor]), to: socket)
         try await emit(.done, to: socket)
+      case .retryJob:
+        retryCount += 1
+        try await emit(.done, to: socket)
       case .submit(let request):
+        submitCount += 1
         if rejecting {
           try await emit(
             .rejected(

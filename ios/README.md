@@ -402,6 +402,8 @@ parallel; every phase must pass. The default local command runs all checks;
 simulator phase creates and removes its own device.
 Failed simulator runs also retain PNG/text attachments and their native manifest
 in a separate `ios-failures-*` CI artifact, alongside the complete result bundle.
+To run only the live notification-tap test, run
+`python3 ios/scripts/test-notification-tap.py SIMULATOR_UDID ARTIFACT_DIRECTORY`.
 Set `IOS_SIMULATOR_RUNTIME` to an exact identifier from
 `xcrun simctl list runtimes` to qualify a particular installed runtime.
 The `Agent` scheme's hosted tests also check that accessibility text sizes
