@@ -3,4 +3,8 @@
 /**
  * Routing identity; the bounded reply preview travels in APNs' native alert.
  */
-export type NotificationTarget = { conversation_id: string, entry_id: string, };
+export type NotificationTarget = { conversation_id: string, entry_id: string,
+/**
+ * The receiving installation, absent in alerts sent by older coordinators.
+ */
+installation_id?: string, };
