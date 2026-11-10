@@ -62,6 +62,22 @@ struct HeldMessage: Identifiable, Equatable {
   var id: String { item.id }
 }
 
+/// Where the feed scope is remembered for the device. `Coordinators` passes `UserDefaults`.
+/// Inspections and previews keep it in memory.
+struct ScopePreference {
+  static let key = "feedScope"
+  static var memory: ScopePreference { ScopePreference(defaults: nil) }
+  let defaults: UserDefaults?
+
+  /// "all", or a profile ID. Anything else loads as All.
+  func load() -> FeedScope {
+    defaults?.string(forKey: Self.key).flatMap(ProfileID.init(wire:)).map(FeedScope.one) ?? .all
+  }
+  func save(_ scope: FeedScope) {
+    defaults?.set(scope.coordinator?.description ?? "all", forKey: Self.key)
+  }
+}
+
 /// The one feed and the one composer for every saved coordinator.
 @MainActor @Observable
 final class ChatModel {
@@ -112,29 +128,51 @@ final class ChatModel {
   var revision = 0
   /// Saved coordinators in order, kept by `Coordinators`. Names, colors and the feed's lane
   /// order come from here.
-  var profiles: [CoordinatorProfile] = [] { didSet { endAnsweredQuestion() } }
-  /// The one coordinator the draft goes to, or nil for every paired one. While it is set, the
-  /// draft is never read for tags.
-  var recipient: ProfileID? { didSet { scheduleDraftSave() } }
+  var profiles: [CoordinatorProfile] = [] {
+    didSet {
+      endAnsweredQuestion()
+      followScope()
+    }
+  }
+  /// The scope last asked for, as saved. Only `show(_:)` changes it.
+  private var requested: FeedScope { didSet { followScope() } }
+  @ObservationIgnored private let preference: ScopePreference
+  /// The scope `rows` were built for.
+  @ObservationIgnored private var projected = FeedScope.all
+  /// What the feed shows. It is the request while that names a saved coordinator not being removed
+  /// and two or more are saved, else All. It is derived on every read, so Remove has nothing to fix
+  /// up.
+  var scope: FeedScope { FeedScope.resolve(requested, profiles: profiles, removed: removed) }
+  private func followScope() {
+    if scope != projected { refresh() }
+  }
+  /// Where the draft goes when its text does not say. Showing another scope never changes it.
+  private(set) var destination: DraftDestination = .open { didSet { draftChanged() } }
   /// The latest tag that became the chip, so the composer moves the caret back by exactly what
   /// the draft lost.
   private(set) var promotion: Promotion?
   /// Coordinators removed in this process, or being removed, by the name they had. Nothing
   /// addresses one again, and profile IDs are never reused.
-  var removed: [ProfileID: String] = [:] { didSet { endAnsweredQuestion() } }
+  var removed: [ProfileID: String] = [:] {
+    didSet {
+      endAnsweredQuestion()
+      followScope()
+    }
+  }
   /// What the composer holds. A draft changed in code replaces the field's text, composition
   /// included, so all of it is committed.
   var draft = "" {
     didSet {
-      draftRevision &+= 1
+      if oldValue.isEmpty, attachments.isEmpty, !draft.isEmpty { stampBegun() }
       committed = draft
       forgetClearedSource()
-      scheduleDraftSave()
+      draftChanged()
       if !changingDraft, oldValue.isEmpty != draft.isEmpty { logComposer(.edited) }
     }
   }
-  /// Counts every change to the draft, so a Send that went clears the recipient only when nothing
-  /// was typed since its tap.
+  /// Counts every write to the draft's text, files, destination, mode, `restoredFrom`, `source` and
+  /// screenshot owners. A Send that went clears who the draft is for only when nothing changed
+  /// since its tap, and a file action stamps only a draft nothing changed since the action began.
   @ObservationIgnored private var draftRevision = 0
   /// The draft without the text an input method is still composing in the field, and the only text
   /// tags are read from. A composition is tentative until the input method commits it, so it never
@@ -143,7 +181,7 @@ final class ChatModel {
   var attachments: [LocalAttachment] = [] {
     didSet {
       forgetClearedSource()
-      scheduleDraftSave()
+      draftChanged()
     }
   }
   /// The queues the single-address build left, kept by `Coordinators`, each with the store that
@@ -226,12 +264,13 @@ final class ChatModel {
   /// Each queue's latest read of its messages.
   private var reads: [UUID: Result<[LegacyItem], any Error>] = [:]
   /// The coordinator whose restored message the draft holds. While it is set, no tag in the draft
-  /// is read and the draft stays that coordinator's, however it is edited. Only clearing the draft
-  /// ends it, and the field's Undo never reaches back past that.
-  private(set) var restoredFrom: ProfileID? { didSet { scheduleDraftSave() } }
+  /// is read, so the text goes as written. It goes to that coordinator under its chip, and to every
+  /// paired coordinator once the chip is removed. Only clearing the draft ends it, and the field's
+  /// Undo never reaches back past that.
+  private(set) var restoredFrom: ProfileID? { didSet { draftChanged() } }
   /// The original Restore copied into the draft, until the next Send or until the composer is
   /// emptied. A Send that carries it unchanged to its coordinator withdraws it.
-  private(set) var source: RestoredSource? { didSet { scheduleDraftSave() } }
+  private(set) var source: RestoredSource? { didSet { draftChanged() } }
   /// Each lane's latest published state.
   private(set) var snapshots: [ProfileID: ChatSnapshot] = [:]
   /// Bumped when a lane's session starts to retire and whenever a session attaches. Never reset,
@@ -254,7 +293,7 @@ final class ChatModel {
   }
   var previewURL: URL?
   private(set) var preparingAttachments = false
-  var mode: InputMode = .steer { didSet { scheduleDraftSave() } }
+  var mode: InputMode = .steer { didSet { draftChanged() } }
   private(set) var draftReady: Bool
   private(set) var pendingSharedImport = false
   var draftError: String?
@@ -273,7 +312,7 @@ final class ChatModel {
   /// Draft files that may show a coordinator's feed, by attachment ID, each with the one
   /// coordinator it was captured for.
   @ObservationIgnored private var screenshotOwners: [String: ProfileID] = [:] {
-    didSet { scheduleDraftSave() }
+    didSet { draftChanged() }
   }
   @ObservationIgnored private let registration: NotificationRegistration?
   /// Whether the latest `setActive` asked for the app to be active.
@@ -288,6 +327,7 @@ final class ChatModel {
     inspecting conversation: SavedConversation? = nil,
     draftStore: AttachmentStore? = nil, persistence: ComposerDraftStore? = nil,
     sharedInbox: SharedDraftInbox? = nil, registration: NotificationRegistration? = nil,
+    scope preference: ScopePreference = .memory,
     admit: @escaping Admit = { deliver in await deliver() }
   ) {
     inspectedConversation = conversation
@@ -297,6 +337,8 @@ final class ChatModel {
     draftReady = persistence == nil
     self.registration = registration
     self.admit = admit
+    self.preference = preference
+    requested = preference.load()
   }
   deinit {
     for observation in observations.values { observation.cancel() }
@@ -321,7 +363,8 @@ final class ChatModel {
     var value = ComposerDraft(
       text: draft, mode: mode, attachments: attachments, consumedTransfers: consumedTransfers,
       composerID: composerID,
-      addressing: DraftAddressing(recipient: recipient, restoredFrom: restoredFrom, source: source))
+      addressing: DraftAddressing(
+        destination: destination, restoredFrom: restoredFrom, source: source))
     if case .pending(let text, let submission) = admission {
       if let submission {
         let submittedIDs = Set(submission.attachments.map(\.id))
@@ -337,6 +380,12 @@ final class ChatModel {
     let shot = value.feedbackScreenshotID ?? value.submission?.feedbackScreenshotID
     value.addressing.screenshotOwner = shot.flatMap { screenshotOwners[$0] }
     return value
+  }
+  /// Whom the draft is for, as it would be saved.
+  var draftAddressing: DraftAddressing { currentDraft.addressing }
+  private func draftChanged() {
+    draftRevision &+= 1
+    scheduleDraftSave()
   }
   private func scheduleDraftSave() {
     guard draftReady, !changingDraft, let persistence else { return }
@@ -410,11 +459,12 @@ final class ChatModel {
       await receiveSharedDrafts()
     } catch { draftError = error.localizedDescription }
   }
-  /// Restores whom the saved draft is for. A recipient or source coordinator not saved now, whether
-  /// removed earlier or not loaded, is marked removed, so Send blocks instead of reaching another.
+  /// Restores whom the saved draft is for. A chip, stamp or source coordinator not saved now,
+  /// whether removed earlier or not loaded, is marked removed, so Send blocks instead of reaching
+  /// another.
   private func adopt(_ saved: ComposerDraft) {
     let addressing = saved.addressing
-    let named = [addressing.recipient, addressing.restoredFrom].compactMap { $0 }
+    let named = [addressing.destination.coordinator, addressing.restoredFrom].compactMap { $0 }
     for id in named where !profiles.contains(where: { $0.id == id }) {
       removed[id] = removed[id] ?? "A coordinator"
     }
@@ -428,7 +478,7 @@ final class ChatModel {
     }
     source = addressing.source
     restoredFrom = addressing.restoredFrom
-    recipient = addressing.recipient
+    destination = addressing.destination
   }
   func receiveSharedDrafts() async {
     guard draftReady, !preparingAttachments, !admitting, let sharedInbox, persistence != nil else {
@@ -483,10 +533,34 @@ final class ChatModel {
   /// True while the composer names who gets the draft: with two or more saved coordinators, or
   /// once one was removed. With one saved and none removed it works as on `main`.
   var addressesByName: Bool { multiple || !removed.isEmpty }
-  /// The chip the composer draws: the recipient while the composer names recipients. With one
-  /// coordinator saved and none removed none is drawn, as on `main`, though a restored draft keeps
-  /// its recipient, so it stays its source's when another coordinator is added.
-  var shownChip: ProfileID? { addressesByName ? recipient : nil }
+  /// The chip the composer draws while the composer names recipients. With one coordinator saved
+  /// and none removed none is drawn, as on `main`, though a restored draft keeps its chip, so it
+  /// stays its source's when another coordinator is added.
+  var shownChip: ProfileID? { addressesByName ? destination.chip : nil }
+
+  /// Addresses the draft to `id` alone and keeps its text, as "Address to Work only" does. A
+  /// coordinator no longer saved blocks Send as a stale chip does. While a Send is admitting it
+  /// changes nothing.
+  func setChip(_ id: ProfileID) {
+    guard !admitting else { return }
+    destination = .chip(id)
+  }
+
+  /// The chip's ⓧ. The draft goes to every coordinator, as its hint says, and a restored draft's
+  /// text stays literal. While a Send is admitting the chip stays, since a changed draft would keep
+  /// the sent text in the composer.
+  func removeChip() {
+    guard !admitting, case .chip = destination else { return }
+    destination = .open
+  }
+
+  /// Shows a scope and saves it for the device, with fresh rows. It changes no draft, lane or
+  /// session.
+  func show(_ scope: FeedScope) {
+    guard scope != requested else { return }
+    requested = scope
+    preference.save(scope)
+  }
 
   func name(_ id: ProfileID) -> String {
     profiles.first { $0.id == id }?.name.description ?? removed[id] ?? "Coordinator"
@@ -672,33 +746,44 @@ final class ChatModel {
 
   // MARK: - Addressing
 
-  /// Who Send reaches with the current draft, or why it is blocked.
+  /// Who Send reaches with the current draft from the scope shown, or why it does not.
   var addressing: Addressing {
-    address(draft, hasAttachments: !attachments.isEmpty, chip: recipient)
+    address(draft, hasAttachments: !attachments.isEmpty, destination: destination, in: scope)
   }
 
-  /// True while the draft is the coordinator's: chosen as the chip, restored from it, or led
-  /// by a typed tag with its name.
+  /// True while the draft is the coordinator's. That is while the coordinator is its chip, the
+  /// draft began in its conversation or was restored from it, or a typed tag with its name leads it.
   func addresses(_ id: ProfileID) -> Bool {
-    if recipient == id || restoredFrom == id { return true }
-    guard recipient == nil, restoredFrom == nil,
+    if destination.coordinator == id || restoredFrom == id { return true }
+    guard destination.chip == nil, restoredFrom == nil,
       let name = profiles.first(where: { $0.id == id })?.name.description
     else { return false }
     return Addressing.leadingTags(draft).tags.contains { $0.lowercased() == name.lowercased() }
   }
 
-  private func address(_ text: String, hasAttachments: Bool, chip: ProfileID?) -> Addressing {
+  /// Parses the draft over every coordinator not removed, then applies the veto of the scope shown.
+  /// An empty composer with no chip or stamp in one coordinator's feed reads as begun there, since
+  /// the first character will stamp it.
+  private func address(
+    _ text: String, hasAttachments: Bool, destination: DraftDestination, in scope: FeedScope
+  ) -> Addressing {
     // A restored message stays its source's under any chip, so a removed source blocks it.
     if let lane = restoredFrom, let name = removed[lane] {
       return .blocked("\(name) was removed")
     }
+    let effective =
+      text.isEmpty && !hasAttachments && destination == .open
+      ? scope.coordinator.map(DraftDestination.begunIn) ?? .open : destination
     // A restored message's text is never a tag, whatever its chip (DESIGN-REVIEW A2).
-    return Addressing.parse(
-      text, hasAttachments: hasAttachments, chip: chip, literal: restoredFrom != nil,
+    let parsed = Addressing.parse(
+      text, hasAttachments: hasAttachments, destination: effective, literal: restoredFrom != nil,
       among: lanes.filter { removed[$0.id] == nil }.map {
         .init(
           id: $0.id, name: name($0.id), paired: $0.session != nil, connected: connected($0.id))
       }, removed: removed)
+    let unbound =
+      effective == .open && restoredFrom == nil && Addressing.leadingTags(text).tags.isEmpty
+    return parsed.gated(by: scope, unbound: unbound)
   }
 
   /// The line under the composer with two or more saved coordinators, or once one was removed.
@@ -706,13 +791,14 @@ final class ChatModel {
     switch addressing {
     case .to(let ids, _), .empty(let ids): "To " + joinedNames(ids.map(name))
     case .blocked(let reason): reason
+    case .elsewhere(let ids, _): "This draft goes to " + joinedNames(ids.map(name))
     }
   }
 
   /// Saved coordinators matching an `@` still being typed in the committed text, for the picker
   /// above the composer. A restored draft offers none, since choosing one replaces the draft.
   var pickerMatches: [CoordinatorProfile] {
-    guard addressesByName, recipient == nil, restoredFrom == nil, committed.first == "@",
+    guard addressesByName, destination.chip == nil, restoredFrom == nil, committed.first == "@",
       !committed.contains(where: \.isWhitespace)
     else { return [] }
     let typed = committed.dropFirst().lowercased()
@@ -723,7 +809,7 @@ final class ChatModel {
 
   func choose(_ id: ProfileID) {
     guard removed[id] == nil else { return }
-    recipient = id
+    destination = .chip(id)
     draft = ""
   }
 
@@ -739,13 +825,13 @@ final class ChatModel {
   /// draft's text is literal for good, so no tag in it ever becomes the chip, and none does while
   /// an input method is still composing the draft.
   func promoteTypedTag() {
-    guard addressesByName, recipient == nil, restoredFrom == nil, committed == draft,
+    guard addressesByName, destination.chip == nil, restoredFrom == nil, committed == draft,
       draft.first == "@"
     else { return }
     let word = draft.dropFirst().prefix { !$0.isWhitespace }
     let named = profiles.filter { $0.name.description.lowercased() == word.lowercased() }
     guard word.endIndex < draft.endIndex, let match = named.first, named.count == 1 else { return }
-    recipient = match.id
+    destination = .chip(match.id)
     let typed = draft
     draft = String(draft[draft.index(after: word.endIndex)...])
     promotion = Promotion(typed: typed, rest: draft)
@@ -777,7 +863,8 @@ final class ChatModel {
     let text = draft
     let mode = mode
     let original = source
-    let chip = recipient
+    let destination = destination
+    let scope = scope
     let originalFiles = attachments
     let identity = ComposerInputIdentity(composerID: composerID)
     // Clear the actual bound value before any await. The pending admission
@@ -789,17 +876,23 @@ final class ChatModel {
     draft = ""
     changingDraft = false
     logComposer(.cleared)
-    let clearedRevision = draftRevision
+    var clearedRevision = draftRevision
     return Task {
       var admitted = false
       defer {
         admission = nil
         if !admitted, !text.isEmpty {
           // Nothing went, so no outbox holds the message. Preserve both the original and
-          // anything typed while admission or attachment preparation was pending.
+          // anything typed while admission or attachment preparation was pending. It returns as
+          // the draft it was, so the scope shown now does not begin it again.
+          changingDraft = true
           draft = text + (draft.isEmpty ? "" : "\n\n" + draft)
+          changingDraft = false
+          scheduleDraftSave()
           logComposer(.localDraftRestored)
         }
+        // A composer emptied during the Send kept whom its draft was for until now.
+        forgetClearedSource()
       }
       var files = originalFiles
       // With one coordinator saved, `/feedback` attaches the screen, so the composer says why it
@@ -820,9 +913,13 @@ final class ChatModel {
               try? await draftStore?.remove(file)
               throw AttachmentError.tooMany
             }
+            // The Send's own screenshot and log are not a newer draft, though an edit made while
+            // they were staged is.
+            var staged = draftRevision
             attachments.append(file)
             files.append(file)
             screenshotOwners[file.id] = shown
+            clearedRevision &+= draftRevision &- staged
             // Feedback owns private evidence, not transcript messages. Preserve the
             // screenshot and user files even when log access or staging fails.
             if attachments.count < AttachmentLimits.maximumCount {
@@ -831,8 +928,10 @@ final class ChatModel {
                 data: Data(diagnostics.text.utf8), name: "Composer.log", mediaType: "text/plain")
               {
                 if attachments.count < AttachmentLimits.maximumCount {
+                  staged = draftRevision
                   attachments.append(log)
                   files.append(log)
+                  clearedRevision &+= draftRevision &- staged
                 } else {
                   try? await draftStore?.remove(log)
                 }
@@ -848,7 +947,7 @@ final class ChatModel {
       }
       guard
         case .to(let recipients, let body) = address(
-          text, hasAttachments: !files.isEmpty, chip: chip)
+          text, hasAttachments: !files.isEmpty, destination: destination, in: scope)
       else { return }
       // A file that may show one coordinator's feed goes to that coordinator alone.
       guard files.compactMap({ screenshotOwners[$0.id] }).allSatisfy({ recipients == [$0] }) else {
@@ -876,10 +975,10 @@ final class ChatModel {
           "Feedback was sent without a screenshot. The screen shows messages held from before the update, which may be another coordinator's."
         )
       }
-      // Who the draft is for goes with the Send only while nothing was typed since its tap.
+      // Who the draft is for goes with the Send only while nothing changed since its tap.
       if draftRevision == clearedRevision {
         restoredFrom = nil
-        if recipient == chip { recipient = nil }
+        self.destination = .open
       }
       let sentIDs = Set(files.map(\.id))
       attachments.removeAll { sentIDs.contains($0.id) }
@@ -1076,16 +1175,22 @@ final class ChatModel {
     }
     return true
   }
+  private func namesNoOneBut(_ lane: ProfileID) -> Bool {
+    guard addressesByName else { return true }
+    if let chip = destination.chip { return chip == lane }
+    let tags = restoredFrom == nil ? Addressing.leadingTags(draft).tags : []
+    guard tags.isEmpty else {
+      return tags.allSatisfy { $0.lowercased() == name(lane).lowercased() }
+    }
+    return destination.coordinator.map { $0 == lane } ?? true
+  }
   /// Puts the restored message before what the user typed or attached while its files were copied,
-  /// as on `main`. What the user addressed to another coordinator meanwhile stays as it is, since
-  /// the restored message stays `lane`'s, and the copies go. Without a `source` it is a copy that
-  /// withdraws nothing.
+  /// as on `main`. Without a `source` it is a copy that withdraws nothing.
   private func fill(
     _ restored: RestoredDraft, for lane: ProfileID,
     source original: (item: String, kind: RestoredSource.Kind)?, _ store: AttachmentStore
   ) async {
-    guard (draft.isEmpty && attachments.isEmpty) || recipient == nil || recipient == lane
-    else {
+    guard (draft.isEmpty && attachments.isEmpty) || namesNoOneBut(lane) else {
       failure = "Send or clear the current draft before restoring another message."
       for file in restored.attachments { try? await store.remove(file) }
       return
@@ -1103,8 +1208,8 @@ final class ChatModel {
         lane: lane, item: $0.item, kind: $0.kind, text: restored.text,
         files: Set(restored.attachments.map(\.id)))
     }
-    // Last, since an empty restored text clears the draft above, which drops an undrawn recipient.
-    recipient = lane
+    // Last, since an empty restored text clears the draft above, which drops an undrawn chip.
+    destination = .chip(lane)
     // The original stays queued or held until a Send carries this copy, so the copy is made
     // durable here and a relaunch keeps it.
     _ = await saveDraft()
@@ -1114,8 +1219,12 @@ final class ChatModel {
     guard admission == nil, draft.isEmpty && attachments.isEmpty else { return }
     restoredFrom = nil
     source = nil
-    // Only Restore sets a recipient no chip shows, so it goes with the draft it was set for.
-    if !addressesByName { recipient = nil }
+    switch destination {
+    case .begunIn: destination = .open
+    // Only Restore sets a chip the composer does not draw, so it goes with the draft it was set for.
+    case .chip where !addressesByName: destination = .open
+    case .open, .chip: break
+    }
   }
   /// Runs once a Send carried the source's content unchanged. A lane or queue removed meanwhile
   /// took its source with it.
@@ -1147,51 +1256,95 @@ final class ChatModel {
     draftStore = store
     return store
   }
-  func attach(urls: [URL]) async {
-    guard draftReady, !preparingAttachments else { return }
+
+  /// The text's begin stamp, in the same turn as the first character typed into an empty
+  /// composer. Share imports and a draft reload run under `changingDraft` and never stamp.
+  private func stampBegun() {
+    guard !changingDraft, destination == .open, let shown = scope.coordinator else { return }
+    destination = .begunIn(shown)
+  }
+
+  /// A file action's begin stamp. It holds the destination the scope shown gave an empty draft when
+  /// the user chose files, a photo, a paste or a drop, and the draft's revision then.
+  private struct BeginClaim {
+    let destination: DraftDestination
+    let revision: Int
+  }
+
+  private func claimBegin() -> BeginClaim? {
+    guard draft.isEmpty, attachments.isEmpty, destination == .open,
+      let shown = scope.coordinator
+    else { return nil }
+    return BeginClaim(destination: .begunIn(shown), revision: draftRevision)
+  }
+
+  /// The one way a file action's files join the draft. The claim stamps only a draft nothing
+  /// changed since it was taken, so a file that lands after a switch keeps the scope it was chosen
+  /// in, and one that lands in a draft typed, replaced or cleared meanwhile joins it unstamped.
+  private func append(_ files: [LocalAttachment], claim: BeginClaim?) {
+    let stamps = claim?.revision == draftRevision
+    attachments.append(contentsOf: files)
+    if stamps, let claim { destination = claim.destination }
+  }
+
+  /// Returns the copy it started, or nil when the composer takes no files now.
+  @discardableResult
+  func attach(urls: [URL]) -> Task<Void, Never>? {
+    guard draftReady, !preparingAttachments else { return nil }
+    var claim = claimBegin()
     preparingAttachments = true
-    defer { preparingAttachments = false }
-    do {
-      let store = try attachmentStore()
-      for url in urls {
-        guard attachments.count < AttachmentLimits.maximumCount else {
+    return Task {
+      defer { preparingAttachments = false }
+      do {
+        let store = try attachmentStore()
+        for url in urls {
+          guard attachments.count < AttachmentLimits.maximumCount else {
+            throw AttachmentError.tooMany
+          }
+          let scoped = url.startAccessingSecurityScopedResource()
+          defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+          append([try await store.stage(url: url)], claim: claim)
+          claim = nil
+        }
+      } catch { failure = error.localizedDescription }
+    }
+  }
+  @discardableResult
+  func attach(providers: [NSItemProvider]) -> Task<Void, Never>? {
+    guard draftReady, !preparingAttachments else { return nil }
+    let claim = claimBegin()
+    preparingAttachments = true
+    return Task {
+      defer { preparingAttachments = false }
+      var staged: [LocalAttachment] = []
+      do {
+        guard providers.count <= AttachmentLimits.maximumCount - attachments.count else {
           throw AttachmentError.tooMany
         }
-        let scoped = url.startAccessingSecurityScopedResource()
-        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        attachments.append(try await store.stage(url: url))
-      }
-    } catch { failure = error.localizedDescription }
-  }
-  func attach(providers: [NSItemProvider]) async {
-    guard draftReady, !preparingAttachments else { return }
-    preparingAttachments = true
-    defer { preparingAttachments = false }
-    var staged: [LocalAttachment] = []
-    do {
-      guard providers.count <= AttachmentLimits.maximumCount - attachments.count else {
-        throw AttachmentError.tooMany
-      }
-      let images = try await ItemProviderImages.load(providers)
-      let store = try attachmentStore()
-      for image in images {
+        let images = try await ItemProviderImages.load(providers)
+        let store = try attachmentStore()
+        for image in images {
+          try Task.checkCancellation()
+          staged.append(
+            try await store.stage(data: image.data, name: image.name, mediaType: image.mediaType))
+        }
         try Task.checkCancellation()
-        staged.append(
-          try await store.stage(data: image.data, name: image.name, mediaType: image.mediaType))
+        guard staged.count <= AttachmentLimits.maximumCount - attachments.count else {
+          throw AttachmentError.tooMany
+        }
+        // Adopt the complete selection once. Neither the note nor existing files
+        // belong to this import, including when a provider fails or is cancelled.
+        append(staged, claim: claim)
+      } catch {
+        for file in staged { try? await draftStore?.remove(file) }
+        if !(error is CancellationError) { failure = error.localizedDescription }
       }
-      try Task.checkCancellation()
-      guard staged.count <= AttachmentLimits.maximumCount - attachments.count else {
-        throw AttachmentError.tooMany
-      }
-      // Adopt the complete selection once. Neither the note nor existing files
-      // belong to this import, including when a provider fails or is cancelled.
-      attachments.append(contentsOf: staged)
-    } catch {
-      for file in staged { try? await draftStore?.remove(file) }
-      if !(error is CancellationError) { failure = error.localizedDescription }
     }
   }
   func attach(data: Data, name: String, mediaType: String) async {
+    await attach(data: data, name: name, mediaType: mediaType, claim: claimBegin())
+  }
+  private func attach(data: Data, name: String, mediaType: String, claim: BeginClaim?) async {
     guard draftReady else { return }
     do {
       guard attachments.count < AttachmentLimits.maximumCount else { throw AttachmentError.tooMany }
@@ -1200,20 +1353,24 @@ final class ChatModel {
         try? await draftStore?.remove(file)
         throw AttachmentError.tooMany
       }
-      attachments.append(file)
+      append([file], claim: claim)
     } catch { failure = error.localizedDescription }
   }
   #if os(iOS)
-    func attach(photo: PhotosPickerItem) async {
-      guard draftReady, !preparingAttachments else { return }
+    @discardableResult
+    func attach(photo: PhotosPickerItem) -> Task<Void, Never>? {
+      guard draftReady, !preparingAttachments else { return nil }
+      let claim = claimBegin()
       preparingAttachments = true
-      defer { preparingAttachments = false }
-      do {
-        guard let image = try await photo.loadTransferable(type: ImportedPhoto.self) else {
-          throw AttachmentError.invalidFile
-        }
-        await attach(data: image.data, name: "Photo.jpg", mediaType: "image/jpeg")
-      } catch { failure = error.localizedDescription }
+      return Task {
+        defer { preparingAttachments = false }
+        do {
+          guard let image = try await photo.loadTransferable(type: ImportedPhoto.self) else {
+            throw AttachmentError.invalidFile
+          }
+          await attach(data: image.data, name: "Photo.jpg", mediaType: "image/jpeg", claim: claim)
+        } catch { failure = error.localizedDescription }
+      }
     }
   #endif
   func removeAttachment(_ file: LocalAttachment) async {
@@ -1280,21 +1437,27 @@ final class ChatModel {
     refresh(changed: id)
   }
 
-  /// Rebuilds the feed and the composer's view of the coordinators from every lane's state.
+  /// Rebuilds the feed and the composer's view of the coordinators from every lane's state. Rows
+  /// built for another scope are never reused, since one ID can stand for another recipient's
+  /// copy there.
   private func refresh(changed: ProfileID? = nil) {
     let states = lanes.compactMap { lane in
       snapshots[lane.id].map { (id: lane.id, snapshot: $0) }
     }
-    let projection = Feed.project(states, scope: .all)
-    let existing = Dictionary(
-      rows.map { ($0.id, $0) }, uniquingKeysWith: { original, _ in original })
-    var changedShown = rows.map(\.id) != projection.rows.map(\.id)
+    let scope = scope
+    let projection = Feed.project(states, scope: scope)
+    let rebuilt = scope != projected
+    projected = scope
+    let existing =
+      rebuilt
+      ? [:] : Dictionary(rows.map { ($0.id, $0) }, uniquingKeysWith: { original, _ in original })
+    var changedShown = rebuilt || rows.map(\.id) != projection.rows.map(\.id)
     let next = projection.rows.map { row -> RowModel in
       guard let model = existing[row.id] else { return RowModel(row) }
       if model.update(row) { changedShown = true }
       return model
     }
-    if rows.map(\.id) != next.map(\.id) {
+    if rebuilt || rows.map(\.id) != next.map(\.id) {
       rows = next
     } else {
       transcriptItems = TranscriptItem.grouped(rows, preserving: transcriptItems)

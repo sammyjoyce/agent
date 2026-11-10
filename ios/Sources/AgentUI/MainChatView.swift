@@ -200,13 +200,13 @@ public struct MainChatView: View {
         isPresented: $importingFiles, allowedContentTypes: [.item], allowsMultipleSelection: true
       ) { result in
         switch result {
-        case .success(let urls): Task { await model.attach(urls: urls) }
+        case .success(let urls): model.attach(urls: urls)
         case .failure(let error): model.failure = error.localizedDescription
         }
       }
       .dropDestination(for: URL.self) { urls, _ in
         guard !inspecting, model.draftReady, !urls.isEmpty else { return false }
-        Task { await model.attach(urls: urls) }
+        model.attach(urls: urls)
         return true
       }
       #if os(iOS)
@@ -214,9 +214,10 @@ public struct MainChatView: View {
         .quickLookPreview($model.previewURL)
         .onChange(of: selectedPhoto) { _, photo in
           guard let photo else { return }
+          let attaching = model.attach(photo: photo)
           Task {
-            defer { selectedPhoto = nil }
-            await model.attach(photo: photo)
+            await attaching?.value
+            selectedPhoto = nil
           }
         }
       #endif
@@ -593,7 +594,8 @@ public struct MainChatView: View {
               }
             #endif
           }.disabled(
-            model.preparingAttachments || model.attachments.count >= AttachmentLimits.maximumCount)
+            model.admitting || model.preparingAttachments
+              || model.attachments.count >= AttachmentLimits.maximumCount)
           Menu("Commands", systemImage: "command") {
             ForEach(model.commands, id: \.usage) { command in
               Button {
@@ -603,11 +605,11 @@ public struct MainChatView: View {
                 Text(command.description)
               }
             }
-          }.disabled(model.commands.isEmpty)
+          }.disabled(model.admitting || model.commands.isEmpty)
           Picker("Delivery", selection: $model.mode) {
             Text("Steer").tag(InputMode.steer)
             Text("Follow-up").tag(InputMode.followUp)
-          }.pickerStyle(.inline)
+          }.pickerStyle(.inline).disabled(model.admitting)
           if model.busy {
             Button("Stop response", systemImage: "stop.fill") { Task { await model.interrupt() } }
           }
@@ -618,7 +620,7 @@ public struct MainChatView: View {
         .tint(.primary).accessibilityLabel("Add attachments or commands")
         .accessibilityIdentifier("composerMenu").disabled(!model.draftReady)
         PasteButton(supportedContentTypes: [.image]) { providers in
-          Task { await model.attach(providers: providers) }
+          model.attach(providers: providers)
         }
         .labelStyle(.iconOnly).buttonBorderShape(.circle)
         .frame(minWidth: 44, minHeight: 44)
@@ -712,15 +714,16 @@ public struct MainChatView: View {
         text: model.draft, placeholder: placeholder,
         chip: model.shownChip.map {
           let badge = badge($0)
-          return .init(name: badge.name, color: UIColor(badge.color))
+          return .init(
+            name: badge.name, color: UIColor(badge.color), removable: !model.admitting)
         }, editor: composerEditor, promotion: model.promotion, restoredFrom: model.restoredFrom,
-        edit: { model.edit($0, committed: $1) }, removeChip: { model.recipient = nil })
+        edit: { model.edit($0, committed: $1) }, removeChip: { model.removeChip() })
     }
   #else
     private func chip(_ recipient: ProfileID) -> some View {
       let badge = badge(recipient)
       return Button {
-        model.recipient = nil
+        model.removeChip()
       } label: {
         HStack(spacing: 3) {
           Text("@\(badge.name)").fontWeight(.semibold)
@@ -730,7 +733,7 @@ public struct MainChatView: View {
         .padding(.vertical, 11).foregroundStyle(badge.color).frame(minHeight: 44)
         .contentShape(Rectangle())
       }
-      .buttonStyle(.plain).accessibilityLabel("To \(badge.name)")
+      .buttonStyle(.plain).disabled(model.admitting).accessibilityLabel("To \(badge.name)")
       .accessibilityHint("Removes the recipient, so the message goes to every coordinator.")
     }
   #endif

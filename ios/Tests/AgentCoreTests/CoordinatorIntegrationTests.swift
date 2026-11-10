@@ -236,7 +236,7 @@ func twoCoordinatorFeedRoutesOnlyToAddressedCoordinators() async throws {
   // Restored while it is the only coordinator, a held message is bound to the migrated profile
   // with no chip drawn. It is never sent here, so invariant 4 still holds.
   await chat.restoreHeld(try #require(chat.held.first))
-  #expect(chat.recipient == work && chat.shownChip == nil && chat.draft == legacyText)
+  #expect(chat.destination.chip == work && chat.shownChip == nil && chat.draft == legacyText)
   try await coordinators.update(work, name: TagName("Work"), address: workAddress)
   try await coordinators.add(name: TagName("Personal"), address: personalAddress)
   let personal = try #require(coordinators.profiles.last?.id)
@@ -248,23 +248,23 @@ func twoCoordinatorFeedRoutesOnlyToAddressedCoordinators() async throws {
   #expect(
     chat.shownChip == work && chat.recipientLine == "To Work",
     "The restored held message stays the migrated profile's once Personal is added")
-  chat.recipient = nil
+  chat.removeChip()
   chat.draft = ""
 
   type("@Work ")
-  #expect(chat.recipient == work && chat.draft.isEmpty, "A typed tag becomes the chip")
-  #expect(chat.recipient.map(chat.name) == "Work", "The chip says Work")
+  #expect(chat.destination.chip == work && chat.draft.isEmpty, "A typed tag becomes the chip")
+  #expect(chat.destination.chip.map(chat.name) == "Work", "The chip says Work")
   type(tagged)
   #expect(chat.recipientLine == "To Work")
   await chat.send()
-  #expect(chat.draft.isEmpty && chat.recipient == nil, "The @Work message was admitted")
+  #expect(chat.draft.isEmpty && chat.destination.chip == nil, "The @Work message was admitted")
   try await eventually("Work answering the @Work submit") {
     bubbles(tagged).count == 1 && bubbles(tagged)[0].receipts.map(\.lane) == [work]
       && bubbles(tagged)[0].receipts.allSatisfy(answered)
   }
 
   type(broadcast)
-  #expect(chat.recipient == nil)
+  #expect(chat.destination.chip == nil)
   #expect(chat.recipientLine == "To Work and Personal")
   await chat.send()
   #expect(chat.draft.isEmpty, "The untagged message was admitted")
@@ -297,7 +297,8 @@ func twoCoordinatorFeedRoutesOnlyToAddressedCoordinators() async throws {
   type(afterRepoint)
   #expect(chat.recipientLine == "Work is not connected")
   await chat.send()
-  #expect(chat.draft == afterRepoint && chat.recipient == work, "The new @Work message stays")
+  #expect(
+    chat.draft == afterRepoint && chat.destination.chip == work, "The new @Work message stays")
   let workOutbox = ProfileDirectory(work, applicationSupport: support, caches: caches).outbox
   #expect(try queuedRequests(workOutbox).allSatisfy { $0.text != afterRepoint })
   #expect(
@@ -310,11 +311,12 @@ func twoCoordinatorFeedRoutesOnlyToAddressedCoordinators() async throws {
   try await repoint("work")
   try await eventually("Work reconnected") { chat.snapshots[work]?.connection == .connected }
 
-  chat.recipient = nil
+  chat.removeChip()
   chat.draft = ""
   let held = try #require(chat.held.first)
   await chat.restoreHeld(held)
-  #expect(chat.recipient == work, "A held message restores to the coordinator it was held for")
+  #expect(
+    chat.destination.chip == work, "A held message restores to the coordinator it was held for")
   #expect(chat.recipientLine == "To Work")
   #expect(chat.draft == legacyText)
   await coordinators.setActive(false)

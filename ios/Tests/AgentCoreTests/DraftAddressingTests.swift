@@ -35,13 +35,27 @@ private func profile(_ name: String, _ host: String) throws -> CoordinatorProfil
   CoordinatorProfile(name: try TagName(name), address: try CoordinatorAddress(host: host))
 }
 
+extension DraftDisk {
+  /// Writes a draft record as builds before the begin stamp saved it, with `addressing` as its
+  /// addressing object.
+  func saveRecord(_ text: String, addressing: [String: String]?) throws {
+    var record: [String: Any] = [
+      "revision": 1, "text": text, "mode": "steer", "attachments": [], "consumedTransfers": [],
+    ]
+    record["addressing"] = addressing
+    try FileManager.default.createDirectory(
+      at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: record).write(to: url)
+  }
+}
+
 @Test func addressingRoundTripsThroughTheStore() async throws {
   let disk = DraftDisk()
   defer { disk.erase() }
   let work = ProfileID()
   let shot = try await disk.screenshot()
   let addressing = DraftAddressing(
-    recipient: work, restoredFrom: work, screenshotOwner: work,
+    destination: .chip(work), restoredFrom: work, screenshotOwner: work,
     source: RestoredSource(
       lane: work, item: "example-item", kind: .held(queue: UUID()), text: "/feedback Invented",
       files: [shot.id]))
@@ -60,7 +74,8 @@ private func profile(_ name: String, _ host: String) throws -> CoordinatorProfil
   let source = RestoredSource(
     lane: work, item: "example-item", kind: .live, text: restored, files: [])
   try await ComposerDraftStore(url: disk.url).save(
-    ComposerDraft(text: restored, addressing: DraftAddressing(recipient: work, source: source)),
+    ComposerDraft(
+      text: restored, addressing: DraftAddressing(destination: .chip(work), source: source)),
     revision: 1)
   let record = try #require(String(data: try Data(contentsOf: disk.url), encoding: .utf8))
   #expect(record.components(separatedBy: restored).count == 2, "The record holds the text once")
@@ -75,11 +90,11 @@ private func profile(_ name: String, _ host: String) throws -> CoordinatorProfil
   let saved = try [profile("Work", "100.64.1.2"), profile("Personal", "100.64.1.3")]
   let first = await disk.launch(saved)
   first.draft = "Invented note"
-  first.recipient = saved[1].id
+  first.setChip(saved[1].id)
   #expect(await first.saveDraft())
   let next = await disk.launch(saved)
   #expect(next.draft == "Invented note")
-  #expect(next.recipient == saved[1].id)
+  #expect(next.destination.chip == saved[1].id)
   #expect(next.addresses(saved[1].id))
 }
 
@@ -91,12 +106,86 @@ func aSavedAddresseeThatNoLongerExistsBlocksInsteadOfBroadcasting() async throws
   let gone = saved[1]
   let first = await disk.launch(saved)
   first.draft = "Invented note"
-  first.recipient = gone.id
+  first.setChip(gone.id)
   #expect(await first.saveDraft())
   let next = ChatModel(draftStore: disk.files, persistence: ComposerDraftStore(url: disk.url))
   try await withConnectedCoordinator(next) { _, _ in
     await next.restoreDraft()
-    #expect(next.recipient == gone.id)
+    #expect(next.destination.chip == gone.id)
+    #expect(next.recipientLine == "A coordinator was removed")
+    #expect(!next.canSend)
+  }
+}
+
+@MainActor @Test func aRecordSavedBeforeThisChangeLoadsWithTodaysMeaning() async throws {
+  let saved = try [profile("Work", "100.64.1.2"), profile("Personal", "100.64.1.3")]
+  let (work, personal) = (saved[0].id, saved[1].id)
+  let records: [(addressing: [String: String]?, destination: DraftDestination)] = [
+    (nil, .open),
+    (["restoredFrom": "\(work)"], .open),
+    (["recipient": "\(personal)"], .chip(personal)),
+  ]
+  for record in records {
+    let disk = DraftDisk()
+    defer { disk.erase() }
+    try disk.saveRecord("Invented note", addressing: record.addressing)
+    let model = await disk.launch(saved)
+    #expect(model.draftError == nil)
+    #expect(model.draft == "Invented note")
+    #expect(model.destination == record.destination, "\(record.addressing ?? [:])")
+  }
+}
+
+@MainActor @Test func theDestinationRoundTripsAtomicallyWithTheText() async throws {
+  let saved = try [profile("Work", "100.64.1.2"), profile("Personal", "100.64.1.3")]
+  let (work, personal) = (saved[0].id, saved[1].id)
+  let destinations: [(shown: FeedScope, chip: ProfileID?, saved: DraftDestination)] = [
+    (.all, nil, .open), (.one(work), nil, .begunIn(work)), (.one(work), personal, .chip(personal)),
+  ]
+  for destination in destinations {
+    let disk = DraftDisk()
+    defer { disk.erase() }
+    let first = await disk.launch(saved)
+    first.show(destination.shown)
+    if let chip = destination.chip { first.setChip(chip) }
+    first.draft = "Invented note"
+    #expect(first.destination == destination.saved)
+    #expect(await first.saveDraft())
+    let next = await disk.launch(saved)
+    #expect(next.draft == "Invented note" && next.destination == destination.saved)
+    let data = try Data(contentsOf: disk.url)
+    let record = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let keys = (record["addressing"] as? [String: Any]).map { Set($0.keys) } ?? []
+    #expect(keys.intersection(["recipient", "begunIn"]).count <= 1, "\(keys)")
+  }
+}
+
+@MainActor @Test func aRecordWithBothKeysLoadsAsTheChip() async throws {
+  let disk = DraftDisk()
+  defer { disk.erase() }
+  let saved = try [profile("Work", "100.64.1.2"), profile("Personal", "100.64.1.3")]
+  try disk.saveRecord(
+    "Invented note", addressing: ["recipient": "\(saved[1].id)", "begunIn": "\(saved[0].id)"])
+  let model = await disk.launch(saved)
+  #expect(model.draft == "Invented note")
+  #expect(model.destination == .chip(saved[1].id))
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aSavedStampNamingNoSavedProfileBlocksInsteadOfBroadcasting() async throws {
+  let disk = DraftDisk()
+  defer { disk.erase() }
+  let saved = try [profile("Work", "100.64.1.2"), profile("Personal", "100.64.1.3")]
+  let gone = saved[1]
+  let first = await disk.launch(saved)
+  first.show(.one(gone.id))
+  first.draft = "Invented note"
+  #expect(first.destination == .begunIn(gone.id))
+  #expect(await first.saveDraft())
+  let next = ChatModel(draftStore: disk.files, persistence: ComposerDraftStore(url: disk.url))
+  try await withConnectedCoordinator(next) { _, _ in
+    await next.restoreDraft()
+    #expect(next.destination == .begunIn(gone.id))
     #expect(next.recipientLine == "A coordinator was removed")
     #expect(!next.canSend)
   }
@@ -155,11 +244,11 @@ func aSendTheOutboxHoldsTakesItsChipWithItWhenTheAppStopsThere() async throws {
   await model.restoreDraft()
   try await withConnectedCoordinator(model) { _, directory in
     model.draft = "Invented note"
-    model.recipient = model.profiles[0].id
+    model.setChip(model.profiles[0].id)
     await model.send()
     let queued = try queuedRequests(directory.outbox)
     #expect(queued.map(\.text) == ["Invented note"])
-    #expect(model.recipient == nil)
+    #expect(model.destination.chip == nil)
   }
   let stopped = try #require(next.draft)
   #expect(stopped.text.isEmpty)
