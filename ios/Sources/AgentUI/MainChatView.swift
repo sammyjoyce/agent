@@ -27,6 +27,8 @@ public struct MainChatView: View {
   @State private var presentedLatest = false
   @State private var visibleItem: String?
   @State private var historyRequest: HistoryNavigation?
+  @State private var alertNotice: String?
+  @State private var pendingAlertLatest: FeedScope?
   @State private var importingFiles = false
   #if os(iOS)
     @State private var selectedPhoto: PhotosPickerItem?
@@ -120,6 +122,16 @@ public struct MainChatView: View {
           )
           .accessibilityIdentifier("relatedWork")
         }
+        if let alertNotice {
+          HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(alertNotice).frame(maxWidth: .infinity, alignment: .leading)
+            Button("Dismiss notification notice", systemImage: "xmark") {
+              self.alertNotice = nil
+            }.labelStyle(.iconOnly)
+          }
+          .font(.footnote).padding(.horizontal, 16).padding(.vertical, 8)
+          .accessibilityIdentifier("notificationNotice")
+        }
         transcript.id(model.scope)
         if let error = model.draftError {
           VStack(alignment: .leading) {
@@ -160,7 +172,7 @@ public struct MainChatView: View {
       .toolbar {
         ToolbarItem(placement: .principal) {
           if model.multiple && !inspecting {
-            ScopeMenu(model: model, badge: badge)
+            ScopeMenu(model: model, badge: badge) { alertNotice = nil }
           } else {
             VStack(spacing: 1) {
               Text(model.inspectedConversation?.title ?? "Beep Boop").font(.headline).lineLimit(1)
@@ -242,8 +254,9 @@ public struct MainChatView: View {
         }
       }
       .onAppear { notifications?.mainVisible = mainVisible }
-      .onDisappear { notifications?.mainVisible = false }
+      .onDisappear { notifications?.mainVisible = .hidden }
       .onChange(of: model.scope) { _, scope in
+        if pendingAlertLatest != scope { pendingAlertLatest = nil }
         followsLatest = true
         userScrolling = false
         atTop = false
@@ -251,21 +264,34 @@ public struct MainChatView: View {
         presentedLatest = false
         visibleItem = nil
         activityExpansion = ActivityExpansion()
+        if case .latest(_, scope: scope)? = historyRequest { return }
         historyRequest = model.includesLatest ? nil : .latest(UUID(), scope: scope)
       }
       .onChange(of: settings) { _, _ in notifications?.mainVisible = mainVisible }
       .onChange(of: sourceDetails) { _, _ in notifications?.mainVisible = mainVisible }
-      .onChange(of: notifications?.openedTarget) { _, target in
-        if target != nil {
-          settings = false
-          sourceDetails = false
-          followsLatest = true
-        }
+      .onChange(of: latestVisible) { _, _ in notifications?.mainVisible = mainVisible }
+      .onChange(of: model.includesLatest) { _, _ in notifications?.mainVisible = mainVisible }
+      .onChange(of: model.connection) { _, connection in
+        guard connection == .connected, pendingAlertLatest == model.scope else { return }
+        pendingAlertLatest = nil
+        historyRequest = .latest(UUID(), scope: model.scope)
+      }
+      .onChange(of: notifications?.openRequest, initial: true) { _, request in
+        guard let request else { return }
+        settings = false
+        sourceDetails = false
+        followsLatest = true
+        alertNotice = request.notice
+        pendingAlertLatest = model.connection == .connected ? nil : model.scope
+        historyRequest = .latest(UUID(), scope: model.scope)
       }
     }
     .preferredColorScheme(appearance.colorScheme)
   }
-  private var mainVisible: Bool { scenePhase == .active && !settings && !sourceDetails }
+  private var mainVisible: MainVisibility {
+    scenePhase == .active && !settings && !sourceDetails
+      ? .visible(atLatest: latestVisible && model.includesLatest) : .hidden
+  }
   private var inspecting: Bool { model.inspectedConversation != nil }
   /// A saved profile that is not paired yet. It shows its held messages and takes no sends.
   private var unpaired: CoordinatorProfile? { coordinators?.profiles.first { $0.pin == nil } }
@@ -498,8 +524,8 @@ public struct MainChatView: View {
           scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
         }
       }
-      .onChange(of: notifications?.openedTarget) { _, target in
-        if target != nil { scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom) }
+      .onChange(of: notifications?.openRequest, initial: true) { _, request in
+        if request != nil { scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom) }
       }
       .overlay(alignment: .bottomTrailing) {
         if (!latestVisible || !model.includesLatest) && !model.rows.isEmpty {
@@ -1009,6 +1035,7 @@ private struct CoordinatorForm: View {
 private struct ScopeMenu: View {
   let model: ChatModel
   let badge: (ProfileID) -> CoordinatorBadge
+  let didChoose: () -> Void
 
   var body: some View {
     Menu {
@@ -1090,13 +1117,14 @@ private struct ScopeMenu: View {
   @ViewBuilder private func row(_ scope: FeedScope, title: String, news: LaneNews?) -> some View {
     let subtitle = rowSubtitle(news)
     if model.scope == scope {
-      Toggle(isOn: .constant(true)) {
+      Toggle(isOn: Binding(get: { true }, set: { _ in didChoose() })) {
         Text(title)
         icon(scope)
       }
       .accessibilityLabel(title)
     } else {
       Button {
+        didChoose()
         model.show(scope)
       } label: {
         Text(title)
