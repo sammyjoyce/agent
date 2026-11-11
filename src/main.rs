@@ -560,12 +560,22 @@ async fn main() -> Result<()> {
         config::validate_coordinator(value)?;
     }
     let cwd = env::current_dir()?;
+    // Rex tells a pane its session, not its server. A worker's pane is on the
+    // server that started it; any other terminal is on REX_SERVER, else the
+    // personal server, as Rex's own CLI assumes.
+    #[allow(clippy::disallowed_methods)]
+    let terminal = if matches!(action, Action::RunTask { .. }) {
+        rex.clone()
+    } else {
+        RexClient::for_process(None)?
+    };
     let client = ClientContext {
         config: &config,
         coordinator: coordinator.as_deref(),
         script: &script,
         directory: &directory,
         rex: &rex,
+        terminal: &terminal,
     };
     if let Action::Serve {
         tailnet_port,
@@ -787,7 +797,7 @@ async fn main() -> Result<()> {
             task_id,
             agent_id,
             allocation_id,
-            binding: local_worker_binding(&rex).await?,
+            binding: local_worker_binding(&rex, &terminal).await?,
             instructions: instructions::project(&cwd)?,
             model: selection.resolve(&environment(client).await?.model)?,
             cwd: cwd.to_string_lossy().into_owned(),
@@ -861,7 +871,7 @@ async fn main() -> Result<()> {
                 )
                 .await;
             }
-            chat_command(&rex, input, model, &cwd).await?
+            chat_command(&rex, &terminal, input, model, &cwd).await?
         }
         Action::Chat {
             prompt: None,
@@ -949,6 +959,7 @@ async fn main() -> Result<()> {
                         let script = script.clone();
                         let directory = directory.clone();
                         let rex = rex.clone();
+                        let terminal = terminal.clone();
                         let cwd = cwd.to_string_lossy().into_owned();
                         let model = model.clone();
                         let description = description.to_owned();
@@ -961,9 +972,11 @@ async fn main() -> Result<()> {
                                 script: &script,
                                 directory: &directory,
                                 rex: &rex,
+                                terminal: &terminal,
                             };
                             let captured = async {
-                                let context = feedback_context(&rex, cwd, model, None).await?;
+                                let context =
+                                    feedback_context(&rex, &terminal, cwd, model, None).await?;
                                 exchange(client, context.command(description)).await
                             }
                             .await;
@@ -1002,7 +1015,8 @@ async fn main() -> Result<()> {
                         continue;
                     }
                     if !line.trim().is_empty() {
-                        let command = chat_command(&rex, line, model.clone(), &cwd).await?;
+                        let command =
+                            chat_command(&rex, &terminal, line, model.clone(), &cwd).await?;
                         request_presented(
                             &arguments,
                             client,
@@ -1502,9 +1516,10 @@ fn selected_input(
     let script = client.script.to_owned();
     let directory = client.directory.to_owned();
     let rex = client.rex.clone();
+    let terminal = client.terminal.clone();
     while ui.admissions.try_join_next().is_some() {}
     ui.admissions.spawn(async move {
-        let client = ClientContext { config: &config, coordinator: coordinator.as_deref(), script: &script, directory: &directory, rex: &rex };
+        let client = ClientContext { config: &config, coordinator: coordinator.as_deref(), script: &script, directory: &directory, rex: &rex, terminal: &terminal };
         loop {
         let mut attachment = None;
         let result: std::result::Result<(), chat_view::ViewError> = async {
@@ -1540,7 +1555,7 @@ fn selected_input(
                 }));
                 return Ok(());
             }
-            let context = match chat_command(&rex, String::new(), None, &cwd).await? {
+            let context = match chat_command(&rex, &terminal, String::new(), None, &cwd).await? {
                 RuntimeCommand::Chat {
                     instructions,
                     origin_host_id,
@@ -1640,6 +1655,7 @@ async fn selected_interrupt(client: ClientContext<'_>, ui: &mut UiSession) -> Re
     let script = client.script.to_owned();
     let directory = client.directory.to_owned();
     let rex = client.rex.clone();
+    let terminal = client.terminal.clone();
     let sender = ui.view_sender.clone();
     let token = ui.view.as_ref().map(|view| view.token);
     // Switching views cancels local reads, not this already requested stop.
@@ -1650,6 +1666,7 @@ async fn selected_interrupt(client: ClientContext<'_>, ui: &mut UiSession) -> Re
             script: &script,
             directory: &directory,
             rex: &rex,
+            terminal: &terminal,
         };
         if let Some(mut previous) = previous {
             let _ = previous.wait_for(|stopped| *stopped).await;
@@ -1681,13 +1698,14 @@ async fn selected_interrupt(client: ClientContext<'_>, ui: &mut UiSession) -> Re
 
 async fn feedback_context(
     rex: &RexClient,
+    terminal: &RexClient,
     cwd: String,
     model: Option<ModelSelection>,
     target: Option<(TaskId, Option<String>)>,
 ) -> Result<FeedbackContext> {
     let origin_host_id = rex.whoami().await?.host_id.to_string();
     let binding = if env::var_os("REX_SESSION").is_some() && env::var_os("REX_BLOCK").is_some() {
-        Some(local_worker_binding(rex).await?)
+        Some(local_worker_binding(rex, terminal).await?)
     } else {
         None
     };
@@ -1719,6 +1737,7 @@ fn feedback_from_ui(
     let script = client.script.to_owned();
     let directory = client.directory.to_owned();
     let rex = client.rex.clone();
+    let terminal = client.terminal.clone();
     let handle = ui.handle.clone();
     let conversation_id = ui.conversation_id.clone();
     let queued_inputs = ui
@@ -1731,14 +1750,14 @@ fn feedback_from_ui(
     let client_errors = ui.errors.iter().cloned().collect();
     while ui.controls.try_join_next().is_some() {}
     ui.controls.spawn(async move {
-        let client = ClientContext { config: &config, coordinator: coordinator.as_deref(), script: &script, directory: &directory, rex: &rex };
+        let client = ClientContext { config: &config, coordinator: coordinator.as_deref(), script: &script, directory: &directory, rex: &rex, terminal: &terminal };
         let input_id = uuid::Uuid::new_v4();
         let mut input = input;
         let mut submitted = false;
         let result = async {
             let info = handle.info().await?;
             let draft = handle.draft().await?;
-            let mut context = feedback_context(&rex, info.cwd, info.model, target).await?;
+            let mut context = feedback_context(&rex, &terminal, info.cwd, info.model, target).await?;
             context.conversation_id = conversation_id;
             context.draft = draft;
             context.queued_inputs = queued_inputs;
@@ -1747,7 +1766,7 @@ fn feedback_from_ui(
             // Preserve styled HTML when it fits, otherwise bounded pane text.
             let capture = if input.attachment_count() < agent_cli::attachments::MAX_ATTACHMENTS {
                 match context.binding.as_ref() {
-                    Some(binding) => match capture_feedback_view(&rex, &directory, binding).await {
+                    Some(binding) => match capture_feedback_view(&terminal, &directory, binding).await {
                         Ok(capture) => Some(capture),
                         Err(error) => {
                             context.client_errors.push(format!("Terminal view capture unavailable: {error}"));
@@ -2118,6 +2137,7 @@ fn local_command_from_ui(
     let script = client.script.to_owned();
     let directory = client.directory.to_owned();
     let rex = client.rex.clone();
+    let terminal = client.terminal.clone();
     let handle = ui.handle.clone();
     let selected = ui
         .selected
@@ -2131,6 +2151,7 @@ fn local_command_from_ui(
             script: &script,
             directory: &directory,
             rex: &rex,
+            terminal: &terminal,
         };
         let changed = async {
             if let Some(request) = command.request() {
@@ -2203,6 +2224,8 @@ struct ClientContext<'a> {
     script: &'a Path,
     directory: &'a Path,
     rex: &'a RexClient,
+    /// Reaches the Rex server that owns this process's REX_SESSION.
+    terminal: &'a RexClient,
 }
 
 async fn prepare_attachments(client: ClientContext<'_>, input: &mut ComposerInput) -> Result<()> {
@@ -2341,6 +2364,7 @@ async fn local_command_plain(
                     script: client.script,
                     directory: client.directory,
                     rex: client.rex,
+                    terminal: client.terminal,
                 },
                 settings.model.provider,
             )
@@ -2358,6 +2382,7 @@ async fn local_command_plain(
                     script: client.script,
                     directory: client.directory,
                     rex: client.rex,
+                    terminal: client.terminal,
                 },
                 &settings.conversation_id,
             )
@@ -2654,6 +2679,7 @@ fn tool_details_from_ui(
     let script = client.script.to_owned();
     let directory = client.directory.to_owned();
     let rex = client.rex.clone();
+    let terminal = client.terminal.clone();
     let handle = ui.handle.clone();
     while ui.controls.try_join_next().is_some() {}
     ui.tool_lookup = Some(ui.controls.spawn(async move {
@@ -2663,6 +2689,7 @@ fn tool_details_from_ui(
             script: &script,
             directory: &directory,
             rex: &rex,
+            terminal: &terminal,
         };
         let details = read_tool_details(client, &request, target)
             .await
@@ -2789,6 +2816,7 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
         script,
         directory,
         rex,
+        terminal,
     } = client;
     ensure!(
         coordinator.is_some(),
@@ -2844,6 +2872,7 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
             let runtime = script.to_owned();
             let state = directory.to_owned();
             let collector = rex.clone();
+            let terminal = terminal.clone();
             let _collection = WatchGuard(tokio::spawn(async move {
                 loop {
                     if exchange(
@@ -2853,6 +2882,7 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
                             script: &runtime,
                             directory: &state,
                             rex: &collector,
+                            terminal: &terminal,
                         },
                         RuntimeCommand::CollectResources {
                             host_id: node.host_id.clone(),
@@ -2914,16 +2944,21 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
 
 async fn chat_command(
     rex: &RexClient,
+    terminal: &RexClient,
     input: String,
     model: Option<ModelSelection>,
     cwd: &Path,
 ) -> Result<RuntimeCommand> {
     if let Some(description) = agent_cli::feedback::command(&input) {
-        return Ok(
-            feedback_context(rex, cwd.to_string_lossy().into_owned(), model, None)
-                .await?
-                .command(description.to_owned()),
-        );
+        return Ok(feedback_context(
+            rex,
+            terminal,
+            cwd.to_string_lossy().into_owned(),
+            model,
+            None,
+        )
+        .await?
+        .command(description.to_owned()));
     }
     Ok(RuntimeCommand::Chat {
         origin: Some(agent_cli::protocol::InputOrigin::Cli),
@@ -2972,14 +3007,14 @@ fn worker_launch(
     })
 }
 
-async fn local_worker_binding(rex: &RexClient) -> Result<WorkerRef> {
+async fn local_worker_binding(rex: &RexClient, terminal: &RexClient) -> Result<WorkerRef> {
     let session = SessionId::parse(
         &env::var("REX_SESSION").context("Task workers must run in their assigned Rex session")?,
     )?;
     let block =
         BlockId::parse(&env::var("REX_BLOCK").context("Task worker has no assigned Rex pane")?)?;
     let identity = rex.whoami().await?;
-    let view = rex.inspect_session(&session).await?;
+    let view = terminal.inspect_session(&session).await?;
     let window = view
         .windows
         .iter()
@@ -3201,6 +3236,7 @@ async fn request_presented(
         script,
         directory,
         rex,
+        terminal,
     } = client;
     let login = matches!(command, RuntimeCommand::Login);
     let attached = matches!(command, RuntimeCommand::RunTask { .. });
@@ -3396,14 +3432,14 @@ async fn request_presented(
                     } else if let Some(description) = agent_cli::feedback::command(&line) {
                         if let Some((model, cwd)) = &feedback_settings {
                             let config = config.clone(); let coordinator = coordinator.map(str::to_owned);
-                            let script = script.to_owned(); let directory = directory.to_owned(); let rex = rex.clone();
+                            let script = script.to_owned(); let directory = directory.to_owned(); let rex = rex.clone(); let terminal = terminal.clone();
                             let cwd = cwd.clone(); let model = model.clone(); let target = history_target.clone();
                             let description = description.to_owned(); let json = arguments.json;
                             while feedback.try_join_next().is_some() {}
                             feedback.spawn(async move {
-                                let client = ClientContext { config: &config, coordinator: coordinator.as_deref(), script: &script, directory: &directory, rex: &rex };
+                                let client = ClientContext { config: &config, coordinator: coordinator.as_deref(), script: &script, directory: &directory, rex: &rex, terminal: &terminal };
                             let captured = async {
-                                let context = feedback_context(&rex, cwd, model, target).await?;
+                                let context = feedback_context(&rex, &terminal, cwd, model, target).await?;
                                 exchange(client, context.command(description)).await
                             }.await;
                             match captured {
@@ -3983,6 +4019,7 @@ mod tests {
                     script: Path::new("/example/unused-runtime"),
                     directory: directory.path(),
                     rex: &personal_rex(),
+                    terminal: &personal_rex(),
                 },
                 &request,
                 scoped.then(|| {
@@ -4047,6 +4084,7 @@ mod tests {
                     script: Path::new("/example/unused-runtime"),
                     directory: &path,
                     rex: &personal_rex(),
+                    terminal: &personal_rex(),
                 },
                 &request,
                 None,
@@ -4348,6 +4386,7 @@ esac
                 script: Path::new("/example/unused-runtime"),
                 directory: directory.path(),
                 rex: &personal_rex(),
+                terminal: &personal_rex(),
             },
             command,
         )
@@ -4461,6 +4500,7 @@ esac
             script: Path::new("/example/unused-runtime"),
             directory: directory.path(),
             rex: &personal_rex(),
+            terminal: &personal_rex(),
         };
         assert!(
             crate::prepare_attachments(client, &mut input)
@@ -4693,6 +4733,7 @@ esac
             script: Path::new("/unused-runtime"),
             directory: directory.path(),
             rex: &personal_rex(),
+            terminal: &personal_rex(),
         })
         .await
         .unwrap();
@@ -4733,6 +4774,7 @@ esac
                     script: Path::new("/unused-runtime"),
                     directory: directory.path(),
                     rex: &personal_rex(),
+                    terminal: &personal_rex(),
                 },
             )
             .await
@@ -4784,6 +4826,7 @@ esac
                 script: Path::new("/unused-runtime"),
                 directory: directory.path(),
                 rex: &personal_rex(),
+                terminal: &personal_rex(),
             },
         )
         .await
@@ -5039,6 +5082,7 @@ esac
                 script: Path::new("/unused-runtime"),
                 directory: directory.path(),
                 rex: &personal_rex(),
+                terminal: &personal_rex(),
             },
         )
         .await
@@ -5283,6 +5327,7 @@ esac
                     script: std::path::Path::new("unused-runtime"),
                     directory: directory.path(),
                     rex: &personal_rex(),
+                    terminal: &personal_rex(),
                 },
                 "saved-conversation",
             )

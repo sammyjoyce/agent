@@ -22,6 +22,7 @@ struct Target {
     script: PathBuf,
     directory: PathBuf,
     rex: RexClient,
+    terminal: RexClient,
     conversation_id: String,
 }
 impl Target {
@@ -32,6 +33,7 @@ impl Target {
             script: &self.script,
             directory: &self.directory,
             rex: &self.rex,
+            terminal: &self.terminal,
         }
     }
 }
@@ -328,6 +330,7 @@ pub(crate) async fn open(
         script: client.script.to_owned(),
         directory: client.directory.to_owned(),
         rex: client.rex.clone(),
+        terminal: client.terminal.clone(),
         conversation_id: item.conversation_id.clone(),
     });
     let observer = target.clone();

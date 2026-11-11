@@ -32,6 +32,7 @@ impl Job {
         let script: PathBuf = client.script.into();
         let directory: PathBuf = client.directory.into();
         let rex = client.rex.clone();
+        let terminal = client.terminal.clone();
         Self {
             task: tokio::spawn(async move {
                 let client = ClientContext {
@@ -40,6 +41,7 @@ impl Job {
                     script: &script,
                     directory: &directory,
                     rex: &rex,
+                    terminal: &terminal,
                 };
                 let (mut cursor, mut attaching) = match start {
                     Start::Recent => (None, None),
