@@ -297,6 +297,22 @@
             },
             "type": {
               "type": "string",
+              "const": "not_started"
+            }
+          },
+          "required": [
+            "type",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
               "const": "failed"
             }
           },

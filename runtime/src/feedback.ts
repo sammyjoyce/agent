@@ -55,7 +55,8 @@ function diagnostic(entry: EntryRecord, capture: Capture): FeedbackEntry {
     if (capture.evidence <= 0) { capture.truncated = true; return { entry_id: entry.id.toString(), kind: entry.kind, evidence }; }
     capture.evidence -= 1;
     const decision = { ...entry.data, reason: capture.text(entry.data.reason, 2048),
-      result: entry.data.result.type === "failed" ? { ...entry.data.result, message: capture.text(entry.data.result.message, 2048) } : entry.data.result };
+      result: entry.data.result.type === "failed" || entry.data.result.type === "not_started"
+        ? { ...entry.data.result, message: capture.text(entry.data.result.message, 2048) } : entry.data.result };
     // Keep typed identities intact. Omit a receipt that cannot fit or contains
     // credential forms elsewhere, rather than emitting partial lifecycle state.
     const serialized = JSON.stringify(decision);

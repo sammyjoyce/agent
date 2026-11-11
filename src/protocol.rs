@@ -717,6 +717,7 @@ pub enum AllocationResult {
     Spawned { binding: WorkerRef },
     Presence { presence: WorkerPresence },
     CreationUncertain { session_id: Option<String> },
+    NotStarted { message: String },
     Failed { message: String },
     Rejected,
 }
@@ -1046,6 +1047,10 @@ pub enum HostResult {
     },
     CreationUncertain {
         session_id: Option<String>,
+    },
+    /// Rex never received the create request, so retrying cannot duplicate a terminal.
+    NotStarted {
+        message: String,
     },
     Failed {
         message: String,

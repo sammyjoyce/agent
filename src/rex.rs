@@ -24,12 +24,18 @@ pub enum RexError {
     InvalidInput,
     InvalidId,
     Unavailable,
+    /// The selected server was not running, so the request never reached Rex.
+    ServerDown {
+        location: String,
+    },
     ReadFailed,
     OutputTooLarge,
     InvalidResponse,
     BindingMismatch,
     SessionNotFound,
-    CreationUncertain { session_id: Option<SessionId> },
+    CreationUncertain {
+        session_id: Option<SessionId>,
+    },
 }
 impl fmt::Display for RexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -37,6 +43,7 @@ impl fmt::Display for RexError {
             Self::InvalidInput => f.write_str("Invalid Rex worker request"),
             Self::InvalidId => f.write_str("Invalid Rex resource identifier"),
             Self::Unavailable => f.write_str("Rex CLI is unavailable"),
+            Self::ServerDown { location } => write!(f, "No Rex server is running at {location}"),
             Self::ReadFailed => f.write_str("Rex read failed or timed out"),
             Self::OutputTooLarge => f.write_str("Rex response exceeds the supported size limit"),
             Self::InvalidResponse => f.write_str("Rex returned an unsupported response"),
@@ -314,9 +321,7 @@ impl RexClient {
                 },
             )
             .await
-            .map_err(|_| RexError::CreationUncertain {
-                session_id: Some(session.clone()),
-            })?;
+            .map_err(|error| creation_failure(error, Some(session.clone())))?;
         let window: CreatedWindow =
             serde_json::from_slice(&receipt).map_err(|_| RexError::CreationUncertain {
                 session_id: Some(session.clone()),
@@ -387,11 +392,7 @@ impl RexClient {
         let output = self
             .api("session.create", &request)
             .await
-            .map_err(|error| match error {
-                CallFailure::Unavailable => RexError::Unavailable,
-                CallFailure::InvalidInput => RexError::InvalidInput,
-                _ => RexError::CreationUncertain { session_id: None },
-            })?;
+            .map_err(|error| creation_failure(error, None))?;
         decode_creation(&output)
     }
 
@@ -436,9 +437,7 @@ impl RexClient {
                 },
             )
             .await
-            .map_err(|_| RexError::CreationUncertain {
-                session_id: Some(binding.session_id.clone()),
-            })?;
+            .map_err(|error| creation_failure(error, Some(binding.session_id.clone())))?;
         let window: CreatedWindow =
             serde_json::from_slice(&receipt).map_err(|_| RexError::CreationUncertain {
                 session_id: Some(binding.session_id.clone()),
@@ -562,6 +561,19 @@ impl RexClient {
                 return Err(CallFailure::Failed);
             }
             if !status.success() {
+                if status.code() == Some(4)
+                    && let Some(location) = std::str::from_utf8(&error)
+                        .ok()
+                        .and_then(|error| error.strip_prefix("Error: no Rex server is running at "))
+                {
+                    let location = location.lines().next().unwrap_or_default();
+                    return Err(CallFailure::ServerDown {
+                        location: location
+                            .strip_suffix(", and autostart is disabled")
+                            .unwrap_or(location)
+                            .to_owned(),
+                    });
+                }
                 if std::str::from_utf8(&error)
                     .is_ok_and(|error| error.trim_end().ends_with("(status=413 code=too_large)"))
                 {
@@ -607,14 +619,25 @@ enum CallFailure {
     Failed,
     OutputTooLarge,
     SessionNotFound,
+    ServerDown { location: String },
 }
 fn read_failure(error: CallFailure) -> RexError {
     match error {
         CallFailure::Unavailable => RexError::Unavailable,
+        CallFailure::ServerDown { location } => RexError::ServerDown { location },
         CallFailure::InvalidInput => RexError::InvalidInput,
         CallFailure::Failed => RexError::ReadFailed,
         CallFailure::OutputTooLarge => RexError::OutputTooLarge,
         CallFailure::SessionNotFound => RexError::SessionNotFound,
+    }
+}
+/// Only a call that never reached Rex proves that nothing was created.
+fn creation_failure(error: CallFailure, session_id: Option<SessionId>) -> RexError {
+    match error {
+        CallFailure::Unavailable => RexError::Unavailable,
+        CallFailure::ServerDown { location } => RexError::ServerDown { location },
+        CallFailure::InvalidInput => RexError::InvalidInput,
+        _ => RexError::CreationUncertain { session_id },
     }
 }
 fn decode<T: DeserializeOwned>(output: &[u8]) -> Result<T, RexError> {
@@ -911,6 +934,90 @@ printf '<pre>Current task view 🦀</pre>\n'
                 "html"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn only_a_server_that_is_not_running_proves_a_create_was_never_received() {
+        const TEST: &str =
+            "rex::tests::only_a_server_that_is_not_running_proves_a_create_was_never_received";
+        let Some(case) = fake_rex::case() else {
+            for (case, variable, method) in [
+                (
+                    "down-create",
+                    "AGENT_TEST_FAKE_REX_DOWN_AT",
+                    "session.create",
+                ),
+                (
+                    "down-window",
+                    "AGENT_TEST_FAKE_REX_DOWN_AT",
+                    "session.new_window",
+                ),
+                (
+                    "lost-create",
+                    "AGENT_TEST_FAKE_REX_FAIL_AT",
+                    "session.create",
+                ),
+                (
+                    "lost-window",
+                    "AGENT_TEST_FAKE_REX_FAIL_AT",
+                    "session.new_window",
+                ),
+            ] {
+                fake_rex::run(TEST, case, &[(variable, method)]);
+            }
+            return;
+        };
+        let client = RexClient::new(None);
+        let session = SessionId::parse(fake_rex::ORIGIN_SESSION).unwrap();
+        let exited = WorkerBinding {
+            session_id: session.clone(),
+            window_id: WindowId::parse(fake_rex::ORIGIN_WINDOW).unwrap(),
+            block_id: BlockId::parse(fake_rex::ORIGIN_BLOCK).unwrap(),
+            revision: 1,
+        };
+        let cwd = Path::new("/tmp");
+        let expected = |down: bool, session_id: Option<SessionId>| {
+            if down {
+                RexError::ServerDown {
+                    location: "/run/user/1000/rex/server.sock".into(),
+                }
+            } else {
+                RexError::CreationUncertain { session_id }
+            }
+        };
+        let down = case.starts_with("down");
+        if case.ends_with("create") {
+            assert_eq!(
+                client
+                    .create_session("Task", "/example/agent", &[], cwd)
+                    .await
+                    .unwrap_err(),
+                expected(down, None)
+            );
+            assert_eq!(fake_rex::methods(), ["session.create"]);
+        } else {
+            let resumed = client
+                .resume_worker(&exited, "/example/agent", &[], cwd)
+                .await;
+            assert!(
+                matches!(&resumed, Err(error) if *error == expected(down, Some(session.clone())))
+            );
+            assert_eq!(
+                client
+                    .create_worker_window(&session, "Review", "/example/agent", &[], cwd)
+                    .await
+                    .unwrap_err(),
+                expected(down, Some(session.clone()))
+            );
+            assert_eq!(
+                fake_rex::methods(),
+                [
+                    "com.superlogical.terminal.process",
+                    "session.new_window",
+                    "session.new_window"
+                ]
+            );
+        }
     }
 
     #[test]
@@ -1475,5 +1582,92 @@ printf '%s\n' "$value"
             "Native Rex contract verified: three successful marker processes, two named windows in one session, parent reuse, sidebar promotion, and independent cleanup readback."
         );
         Ok(())
+    }
+}
+
+/// Runs a test scenario against `tests/fixtures/rex.sh`. PATH is process-wide,
+/// so each scenario re-executes the test binary with the fixture first on PATH.
+#[cfg(test)]
+pub(crate) mod fake_rex {
+    use std::path::Path;
+
+    pub(crate) const HOST: &str = "44444444-4444-4444-8444-444444444444";
+    pub(crate) const ORIGIN_SESSION: &str = "session:11111111-1111-4111-8111-111111111111";
+    pub(crate) const ORIGIN_WINDOW: &str = "window:22222222-2222-4222-8222-222222222222";
+    pub(crate) const ORIGIN_BLOCK: &str = "block:33333333-3333-4333-8333-333333333333";
+    pub(crate) const CREATED_SESSION: &str = "session:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const CASE: &str = "AGENT_TEST_FAKE_REX_CASE";
+
+    pub(crate) fn case() -> Option<String> {
+        std::env::var(CASE).ok()
+    }
+
+    pub(crate) fn run(test: &str, case: &str, envs: &[(&str, &str)]) {
+        let directory = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rex.sh"),
+            directory.path().join("rex"),
+        )
+        .unwrap();
+        let path = std::env::join_paths(std::iter::once(directory.path().to_owned()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(CASE, case)
+            .env("AGENT_TEST_FAKE_REX", directory.path())
+            .env("PATH", path)
+            .envs(envs.iter().copied())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "Fake Rex case {case}:\n{}\n{}\nCalls:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            std::fs::read_to_string(directory.path().join("calls")).unwrap_or_default(),
+        );
+    }
+
+    pub(crate) struct Call {
+        pub(crate) args: Vec<String>,
+    }
+    impl Call {
+        pub(crate) fn method(&self) -> &str {
+            let position = self
+                .args
+                .iter()
+                .position(|arg| arg == "call")
+                .map(|call| call + 1)
+                .or_else(|| {
+                    self.args
+                        .iter()
+                        .position(|arg| arg == "whoami" || arg == "hosts")
+                });
+            position.map_or("", |position| &self.args[position])
+        }
+    }
+
+    pub(crate) fn calls() -> Vec<Call> {
+        let root = std::env::var_os("AGENT_TEST_FAKE_REX").unwrap();
+        std::fs::read_to_string(Path::new(&root).join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                let (_server, args) = line.split_once('\t').unwrap();
+                Call {
+                    args: args.split_terminator('\u{1f}').map(str::to_owned).collect(),
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn methods() -> Vec<String> {
+        calls()
+            .iter()
+            .map(|call| call.method().to_owned())
+            .collect()
     }
 }

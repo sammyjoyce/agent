@@ -2,4 +2,4 @@
 import type { WorkerPresence } from "./WorkerPresence.js";
 import type { WorkerRef } from "./WorkerRef.js";
 
-export type AllocationResult = { "type": "pending" } | { "type": "written" } | { "type": "spawned", binding: WorkerRef, } | { "type": "presence", presence: WorkerPresence, } | { "type": "creation_uncertain", session_id: string | null, } | { "type": "failed", message: string, } | { "type": "rejected" };
+export type AllocationResult = { "type": "pending" } | { "type": "written" } | { "type": "spawned", binding: WorkerRef, } | { "type": "presence", presence: WorkerPresence, } | { "type": "creation_uncertain", session_id: string | null, } | { "type": "not_started", message: string, } | { "type": "failed", message: string, } | { "type": "rejected" };

@@ -84,7 +84,7 @@ function agentOutput(name: string, args: ToolCall["arguments"], sender: string, 
   return { ...output(value), details };
 }
 function hostOutput(result: HostResult) {
-  return output(result, result.type === "failed" || result.type === "creation_uncertain" ||
+  return output(result, result.type === "failed" || result.type === "creation_uncertain" || result.type === "not_started" ||
     (result.type === "process" && result.exit_code !== 0));
 }
 const source = Type.Object({ provider: Type.String(), account: Type.String(), thread_id: Type.String() });
