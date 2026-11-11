@@ -567,12 +567,7 @@ mod tests {
     #[tokio::test]
     async fn source_commands_capture_native_pages_beyond_the_model_output_budget_and_report_their_own_limit()
      {
-        use crate::{
-            host,
-            protocol::{HostCommand, HostResult},
-            runtime::MAX_FRAME_BYTES,
-            sources::read_command,
-        };
+        use crate::{host, protocol::HostResult, runtime::MAX_FRAME_BYTES, sources::read_command};
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("native-output");
         std::fs::write(&path, vec![b'x'; 512 * 1024]).unwrap();
@@ -586,13 +581,8 @@ mod tests {
         assert_eq!(source.exit_code, 0);
         assert!(!source.truncated);
         assert_eq!(source.stdout.len(), 512 * 1024);
-        let interactive = host::execute(HostCommand::Exec {
-            program: command[0].clone(),
-            args: command[1..].to_vec(),
-            cwd: "/".into(),
-            timeout_seconds: 900,
-        })
-        .await;
+        let interactive =
+            host::execute_process(&command[0], &command[1..], std::path::Path::new("/"), 900).await;
         assert!(
             matches!(interactive,HostResult::Process {exit_code:0,stdout,truncated:true,..} if stdout.len()==256*1024)
         );

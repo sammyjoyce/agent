@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "agent_cli::rex::RexClient::for_process", reason = "Each process selects Rex once in main; borrow the Executor's or caller's client instead" },
+]

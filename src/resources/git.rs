@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     host,
-    protocol::{HostCommand, HostResult, TaskId},
+    protocol::{HostResult, TaskId},
     resources::{
         CleanupPlan, CleanupReceipt, NativeWorktreeIdentity, ResourceBackend, ResourceRecord,
         ResourceReport, ResourceState, WorktreeAllocation,
@@ -109,14 +109,8 @@ struct Output {
 }
 
 async fn run(program: &str, args: Vec<String>, cwd: &Path) -> Result<Output> {
-    match host::execute(HostCommand::Exec {
-        program: program.into(),
-        args,
-        cwd: path_text(cwd)?,
-        timeout_seconds: 30,
-    })
-    .await
-    {
+    path_text(cwd)?;
+    match host::execute_process(program, &args, cwd, 30).await {
         HostResult::Process {
             exit_code,
             stdout,

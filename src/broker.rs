@@ -42,14 +42,19 @@ pub struct Broker {
 }
 
 impl Broker {
-    pub fn new(bootstrap: Option<&CoordinatorBootstrap>, state: &Path) -> Result<Self> {
-        Self::with_tailscale(bootstrap, state, crate::tailnet::Daemon::default())
+    pub fn new(
+        bootstrap: Option<&CoordinatorBootstrap>,
+        state: &Path,
+        rex: crate::rex::RexClient,
+    ) -> Result<Self> {
+        Self::with_tailscale(bootstrap, state, crate::tailnet::Daemon::default(), rex)
     }
 
     pub fn with_tailscale(
         bootstrap: Option<&CoordinatorBootstrap>,
         state: &Path,
         daemon: crate::tailnet::Daemon,
+        rex: crate::rex::RexClient,
     ) -> Result<Self> {
         let local = bootstrap.and_then(|bootstrap| bootstrap.node.clone());
         if let Some(node) = &local {
@@ -66,7 +71,7 @@ impl Broker {
             )?,
             None => ContextStore::default(),
         };
-        let mut executor = host::Executor::with_tailscale(state, daemon);
+        let mut executor = host::Executor::with_tailscale(state, daemon, rex);
         if let Some(launch) = local.as_ref().map(|node| &node.launch)
             && let Some(runtime) = &launch.runtime
         {
@@ -431,6 +436,7 @@ fn unavailable() -> HostResult {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use crate::{
         broker::Broker,
@@ -451,7 +457,12 @@ mod tests {
     #[tokio::test]
     async fn usage_stays_on_the_coordinator_and_rejects_an_unverified_account() {
         let directory = tempfile::tempdir().unwrap();
-        let broker = Broker::new(None, directory.path()).unwrap();
+        let broker = Broker::new(
+            None,
+            directory.path(),
+            crate::rex::RexClient::for_process(None).unwrap(),
+        )
+        .unwrap();
         let direct = broker
             .execute(HostCommand::ReadUsage {
                 expected_email: String::new(),
@@ -581,7 +592,14 @@ mod tests {
     async fn legacy_worker_rejects_child_resume_before_forwarding_and_still_handles_parent_resume()
     {
         let (_directory, runtime) = runtime().await;
-        let broker = Arc::new(Broker::new(None, std::path::Path::new("/tmp")).unwrap());
+        let broker = Arc::new(
+            Broker::new(
+                None,
+                std::path::Path::new("/tmp"),
+                crate::rex::RexClient::for_process(None).unwrap(),
+            )
+            .unwrap(),
+        );
         let id = "11111111-1111-4111-8111-111111111111";
         let mut worker = Worker::connect(broker.clone(), runtime.clone(), id).await;
         let session_id = uuid::Uuid::new_v4();
@@ -669,7 +687,14 @@ mod tests {
     #[tokio::test]
     async fn replacement_connections_own_new_effects_and_old_cleanup_cannot_remove_them() {
         let (_directory, runtime) = runtime().await;
-        let broker = Arc::new(Broker::new(None, std::path::Path::new("/tmp")).unwrap());
+        let broker = Arc::new(
+            Broker::new(
+                None,
+                std::path::Path::new("/tmp"),
+                crate::rex::RexClient::for_process(None).unwrap(),
+            )
+            .unwrap(),
+        );
         let id = "11111111-1111-4111-8111-111111111111";
         let mut old = Worker::connect(broker.clone(), runtime.clone(), id).await;
         let first = {
@@ -734,7 +759,14 @@ mod tests {
     #[tokio::test]
     async fn lost_effect_reply_is_uncertain_without_fallback_or_automatic_replay() {
         let (directory, runtime) = runtime().await;
-        let broker = Arc::new(Broker::new(None, std::path::Path::new("/tmp")).unwrap());
+        let broker = Arc::new(
+            Broker::new(
+                None,
+                std::path::Path::new("/tmp"),
+                crate::rex::RexClient::for_process(None).unwrap(),
+            )
+            .unwrap(),
+        );
         let id = "22222222-2222-4222-8222-222222222222";
         let mut worker = Worker::connect(broker.clone(), runtime.clone(), id).await;
         let marker = directory.path().join("side-effect");
@@ -762,7 +794,12 @@ mod tests {
             panic!("Expected effect")
         };
         assert!(matches!(
-            crate::host::execute(*remote_command).await,
+            crate::host::Executor::new(
+                directory.path(),
+                crate::rex::RexClient::for_process(None).unwrap()
+            )
+            .execute(*remote_command)
+            .await,
             HostResult::Process { exit_code: 0, .. }
         ));
         worker.close().await;
@@ -780,7 +817,14 @@ mod tests {
     #[tokio::test]
     async fn remote_exec_reply_wait_follows_its_requested_deadline_and_never_replays() {
         let (directory, runtime) = runtime().await;
-        let broker = Arc::new(Broker::new(None, std::path::Path::new("/tmp")).unwrap());
+        let broker = Arc::new(
+            Broker::new(
+                None,
+                std::path::Path::new("/tmp"),
+                crate::rex::RexClient::for_process(None).unwrap(),
+            )
+            .unwrap(),
+        );
         let id = "44444444-4444-4444-8444-444444444444";
         let mut worker = Worker::connect(broker.clone(), runtime.clone(), id).await;
         let marker = directory.path().join("must-not-run-on-coordinator");
@@ -867,7 +911,14 @@ mod tests {
     #[tokio::test]
     async fn unknown_worker_replies_cannot_complete_another_connections_effects() {
         let (_directory, runtime) = runtime().await;
-        let broker = Arc::new(Broker::new(None, std::path::Path::new("/tmp")).unwrap());
+        let broker = Arc::new(
+            Broker::new(
+                None,
+                std::path::Path::new("/tmp"),
+                crate::rex::RexClient::for_process(None).unwrap(),
+            )
+            .unwrap(),
+        );
         let worker = Worker::connect(
             broker.clone(),
             runtime.clone(),

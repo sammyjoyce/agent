@@ -105,6 +105,19 @@ pub struct RexIdentity {
     pub tailscale: Option<RexTailnet>,
 }
 
+#[derive(Deserialize)]
+struct PeerInventory {
+    #[serde(default)]
+    hosts: Vec<RexPeer>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RexPeer {
+    pub host_id: Option<String>,
+    pub label: String,
+    pub endpoints: Option<Vec<String>>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RexTailnet {
     pub dns_name: Option<String>,
@@ -189,6 +202,10 @@ pub struct RexClient {
     server: Option<String>,
 }
 
+fn personal_messages() -> RexClient {
+    RexClient { server: None }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum TerminalCapture {
     Html(String),
@@ -239,8 +256,37 @@ impl RexClient {
         })
     }
 
-    pub fn new(server: Option<String>) -> Self {
-        Self { server }
+    pub fn for_process(server: Option<&str>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            server.is_none_or(|server| !server.is_empty() && !server.contains('\0')),
+            "Invalid Rex server selection"
+        );
+        Ok(Self {
+            server: server.map(str::to_owned),
+        })
+    }
+
+    /// `rex hosts` reads the account's home inventory and ignores `--server`.
+    pub async fn peer_inventory(&self) -> Option<Vec<RexPeer>> {
+        let output = crate::host::execute_process(
+            "rex",
+            &["--autostart=false".into(), "hosts".into(), "--json".into()],
+            Path::new("/"),
+            15,
+        )
+        .await;
+        let crate::protocol::HostResult::Process {
+            exit_code: 0,
+            stdout,
+            truncated: false,
+            ..
+        } = output
+        else {
+            return None;
+        };
+        serde_json::from_str::<PeerInventory>(&stdout)
+            .ok()
+            .map(|inventory| inventory.hosts)
     }
 
     pub async fn whoami(&self) -> Result<RexIdentity, RexError> {
@@ -517,14 +563,7 @@ impl RexClient {
         .await
     }
 
-    fn command(&self, args: &[String]) -> Result<Command, CallFailure> {
-        if self
-            .server
-            .as_ref()
-            .is_some_and(|server| server.is_empty() || server.contains('\0'))
-        {
-            return Err(CallFailure::InvalidInput);
-        }
+    fn command(&self, args: &[String]) -> Command {
         let mut command = Command::new("rex");
         command.args(["--autostart=false", "--timeout", "8s"]);
         if let Some(server) = &self.server {
@@ -539,11 +578,11 @@ impl RexClient {
             .env_remove("REX_BLOCK")
             .env_remove("REX_CLIENT")
             .kill_on_drop(true);
-        Ok(command)
+        command
     }
 
     async fn run(&self, args: Vec<String>) -> Result<Vec<u8>, CallFailure> {
-        let mut command = self.command(&args)?;
+        let mut command = self.command(&args);
         let mut child = command.spawn().map_err(|_| CallFailure::Unavailable)?;
         let result = tokio::time::timeout(CALL_TIMEOUT, async {
             let stdout = child.stdout.take().ok_or(CallFailure::Failed)?;
@@ -859,6 +898,7 @@ fn decode_creation(output: &[u8]) -> Result<WorkerBinding, RexError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     const SESSION: &str = "session:11111111-1111-4111-8111-111111111111";
@@ -872,7 +912,8 @@ mod tests {
         const CHILD: &str = "AGENT_TEST_REX_CAPTURE_CHILD";
         const TEST: &str = "rex::tests::terminal_capture_targets_only_the_explicit_pane_and_keeps_rendered_evidence";
         if std::env::var_os(CHILD).is_some() {
-            let output = RexClient::new(None)
+            let output = RexClient::for_process(None)
+                .unwrap()
                 .capture_terminal(
                     &SessionId::parse(SESSION).unwrap(),
                     &BlockId::parse(BLOCK).unwrap(),
@@ -967,7 +1008,7 @@ printf '<pre>Current task view 🦀</pre>\n'
             }
             return;
         };
-        let client = RexClient::new(None);
+        let client = RexClient::for_process(None).unwrap();
         let session = SessionId::parse(fake_rex::ORIGIN_SESSION).unwrap();
         let exited = WorkerBinding {
             session_id: session.clone(),
@@ -1117,10 +1158,8 @@ printf '<pre>Current task view 🦀</pre>\n'
 
     #[test]
     fn cli_argv_disables_autostart_and_scopes_server_without_shell_interpolation() {
-        let client = RexClient::new(Some("https://worker.example.invalid".to_owned()));
-        let command = client
-            .command(&["whoami".to_owned(), "--json".to_owned()])
-            .unwrap();
+        let client = RexClient::for_process(Some("https://worker.example.invalid")).unwrap();
+        let command = client.command(&["whoami".to_owned(), "--json".to_owned()]);
         let args: Vec<_> = command
             .as_std()
             .get_args()
@@ -1145,7 +1184,7 @@ printf '<pre>Current task view 🦀</pre>\n'
         const TEST: &str =
             "rex::tests::native_process_completion_evidence_prevents_duplicate_chat_windows";
         if let Ok(directory) = std::env::var("AGENT_TEST_REX_PROCESS_FIXTURE") {
-            let client = RexClient::new(None);
+            let client = RexClient::for_process(None).unwrap();
             let binding = WorkerBinding {
                 session_id: SessionId::parse(SESSION).unwrap(),
                 window_id: WindowId::parse(WINDOW).unwrap(),
@@ -1419,7 +1458,8 @@ printf '%s\n' "$value"
     #[tokio::test]
     #[ignore = "requires a running Rex server; creates and removes one synthetic session"]
     async fn live_native_rex_worker_contract() -> anyhow::Result<()> {
-        let client = RexClient::new(std::env::var("AGENT_TEST_REX_SERVER").ok());
+        let client =
+            RexClient::for_process(std::env::var("AGENT_TEST_REX_SERVER").ok().as_deref())?;
         let identity = client.whoami().await?;
         let before = client.list_sessions().await?;
         let title = format!("agent-rex-contract-{}", Uuid::new_v4());

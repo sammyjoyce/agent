@@ -55,35 +55,13 @@ pub async fn relay(stream: UnixStream) -> Result<()> {
     Ok(())
 }
 
-pub async fn serve(script: &Path, state: &Path) -> Result<()> {
-    serve_until(script, state, shutdown_signal()).await
-}
-
-pub async fn serve_tailnet(
-    script: &Path,
-    state: &Path,
-    port: u16,
-    policy: crate::tailnet::PeerPolicy,
-    daemon: crate::tailnet::Daemon,
-) -> Result<()> {
-    serve_with_transport(
-        script,
-        state,
-        Some(port),
-        policy,
-        daemon,
-        None,
-        shutdown_signal(),
-    )
-    .await
-}
-
 pub async fn serve_configured(
     script: &Path,
     state: &Path,
     port: Option<u16>,
     policy: crate::tailnet::PeerPolicy,
     daemon: crate::tailnet::Daemon,
+    rex: crate::rex::RexClient,
     bootstrap: CoordinatorBootstrap,
 ) -> Result<()> {
     serve_with_transport(
@@ -92,6 +70,7 @@ pub async fn serve_configured(
         port,
         policy,
         daemon,
+        rex,
         Some(bootstrap),
         shutdown_signal(),
     )
@@ -114,6 +93,8 @@ async fn shutdown_signal() -> Result<ShutdownReason> {
     Ok(ShutdownReason::Signal(signal))
 }
 
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 async fn serve_until(
     script: &Path,
     state: &Path,
@@ -125,18 +106,21 @@ async fn serve_until(
         None,
         crate::tailnet::PeerPolicy::new(&[], &[])?,
         crate::tailnet::Daemon::default(),
+        crate::rex::RexClient::for_process(None)?,
         None,
         shutdown,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_with_transport(
     script: &Path,
     state: &Path,
     port: Option<u16>,
     policy: crate::tailnet::PeerPolicy,
     daemon: crate::tailnet::Daemon,
+    rex: crate::rex::RexClient,
     bootstrap: Option<CoordinatorBootstrap>,
     shutdown: impl Future<Output = Result<ShutdownReason>>,
 ) -> Result<()> {
@@ -152,7 +136,7 @@ async fn serve_with_transport(
         .transpose()?
         .and_then(|config| config.apns);
     let owner = Runtime::start_with_notifications(script, state, apns.as_ref())?;
-    let broker = match Broker::with_tailscale(bootstrap.as_ref(), state, daemon.clone()) {
+    let broker = match Broker::with_tailscale(bootstrap.as_ref(), state, daemon.clone(), rex) {
         Ok(broker) => Arc::new(broker),
         Err(error) => {
             owner.close().await?;
@@ -666,9 +650,11 @@ impl Drop for SocketOwner {
 
 #[cfg(test)]
 #[path = "service/reset_tests.rs"]
+#[allow(clippy::disallowed_methods)]
 mod reset_tests;
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use crate::protocol::{AuthStatus, HostResult, InputMode, RuntimeCommand, RuntimeEventKind};
     use crate::runtime::{FrameReader, Runtime, ShutdownSignal};
@@ -1597,7 +1583,14 @@ mod tests {
             authenticated(
                 server,
                 rejected_runtime,
-                Arc::new(crate::broker::Broker::new(None, std::path::Path::new("/tmp")).unwrap()),
+                Arc::new(
+                    crate::broker::Broker::new(
+                        None,
+                        std::path::Path::new("/tmp"),
+                        crate::rex::RexClient::for_process(None).unwrap(),
+                    )
+                    .unwrap(),
+                ),
                 peer,
                 async {
                     anyhow::bail!("Rejected synthetic peer");
@@ -1622,7 +1615,14 @@ mod tests {
             authenticated(
                 server,
                 allowed_runtime,
-                Arc::new(crate::broker::Broker::new(None, std::path::Path::new("/tmp")).unwrap()),
+                Arc::new(
+                    crate::broker::Broker::new(
+                        None,
+                        std::path::Path::new("/tmp"),
+                        crate::rex::RexClient::for_process(None).unwrap(),
+                    )
+                    .unwrap(),
+                ),
                 peer,
                 async { Ok(()) },
             )

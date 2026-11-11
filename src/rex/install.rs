@@ -12,7 +12,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::rex::{RexClient, read_failure};
+use crate::rex::{RexClient, personal_messages, read_failure};
 
 const BEGIN: &[u8] = b"-- BEGIN agent Messages (managed by agent rex install)";
 const END: &[u8] = b"-- END agent Messages";
@@ -31,7 +31,7 @@ pub async fn install(module_source: &str) -> Result<InstallOutcome> {
         env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
         dirs::home_dir(),
     )?;
-    install_at(&config_path, module_source, &RexClient::new(None)).await
+    install_at(&config_path, module_source, &personal_messages()).await
 }
 
 fn config_path(
@@ -344,12 +344,14 @@ impl Change {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::{fs, os::unix::fs::symlink, path::PathBuf};
 
     use crate::rex::{
         RexClient,
         install::{config_path, install_at, replace, snapshot},
+        personal_messages,
     };
 
     #[test]
@@ -382,7 +384,7 @@ mod tests {
         let owned = directory.path().join("owned.lua");
         fs::write(&owned, "return {}\n").unwrap();
         symlink(&owned, &path).unwrap();
-        let client = RexClient::new(None);
+        let client = personal_messages();
         assert!(install_at(&path, "return {}\n", &client).await.is_err());
         assert!(fs::symlink_metadata(&path).unwrap().is_symlink());
         fs::remove_file(&path).unwrap();
@@ -413,10 +415,11 @@ mod tests {
         let path = directory.path().join("init.lua");
         let original = b"-- existing configuration\n";
         fs::write(&path, original).unwrap();
-        let client = RexClient::new(Some(format!(
+        let client = RexClient::for_process(Some(&format!(
             "unix://{}",
             directory.path().join("offline.sock").display()
-        )));
+        )))
+        .unwrap();
         for (module, context) in [
             (
                 "this is not valid Lua",
@@ -513,7 +516,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&started.stderr)
         );
-        let client = RexClient::new(Some(endpoint));
+        let client = RexClient::for_process(Some(&endpoint)).unwrap();
         let other_directory = directory.path().join("other-config");
         fs::create_dir(&other_directory).unwrap();
         let other_path = other_directory.join("init.lua");

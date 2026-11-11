@@ -27,6 +27,7 @@ pub const DEFAULT_TIMEOUT_SECONDS: u16 = 15 * 60;
 
 /// One service owns its history connection and warm embedding child.
 pub struct Executor {
+    rex: RexClient,
     history: CodexHistory,
     embeddings: tokio::sync::Mutex<Option<Arc<LlamaProvider>>>,
     state: PathBuf,
@@ -35,12 +36,13 @@ pub struct Executor {
 }
 
 impl Executor {
-    pub fn new(state: &Path) -> Self {
-        Self::with_tailscale(state, crate::tailnet::Daemon::default())
+    pub fn new(state: &Path, rex: RexClient) -> Self {
+        Self::with_tailscale(state, crate::tailnet::Daemon::default(), rex)
     }
 
-    pub fn with_tailscale(state: &Path, daemon: crate::tailnet::Daemon) -> Self {
+    pub fn with_tailscale(state: &Path, daemon: crate::tailnet::Daemon, rex: RexClient) -> Self {
         Self {
+            rex,
             history: CodexHistory::new(),
             embeddings: tokio::sync::Mutex::new(None),
             state: state.to_owned(),
@@ -77,7 +79,7 @@ impl Executor {
             }
             HostCommand::Browser { host_id, request } => {
                 async {
-                    require_local_host(&host_id).await?;
+                    require_local_host(&self.rex, &host_id).await?;
                     let (_owner, cancelled) = tokio::sync::watch::channel(false);
                     Ok(HostResult::Browser {
                         response: self.browser.execute(request, cancelled).await,
@@ -111,7 +113,7 @@ impl Executor {
                 }
                 .await
             }
-            command => execute_inner(command).await,
+            command => execute_inner(&self.rex, command).await,
         };
         result.unwrap_or_else(|error| HostResult::Failed {
             message: error.to_string(),
@@ -124,7 +126,7 @@ impl Executor {
         mut cancelled: tokio::sync::watch::Receiver<bool>,
     ) -> HostResult {
         if let HostCommand::Browser { host_id, request } = &command {
-            return match require_local_host(host_id).await {
+            return match require_local_host(&self.rex, host_id).await {
                 Ok(()) => HostResult::Browser {
                     response: self.browser.execute(request.clone(), cancelled).await,
                 },
@@ -200,16 +202,34 @@ impl Executor {
     }
 }
 
-pub async fn execute(command: HostCommand) -> HostResult {
-    match execute_inner(command).await {
-        Ok(result) => result,
-        Err(error) => HostResult::Failed {
-            message: error.to_string(),
-        },
+pub(crate) async fn execute_process(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    timeout_seconds: u16,
+) -> HostResult {
+    async {
+        ensure!(timeout_seconds > 0, "Command timeout must be positive");
+        ensure!(
+            !program.is_empty() && cwd.is_absolute(),
+            "Command needs a program and absolute working directory"
+        );
+        run_process(
+            program,
+            args,
+            cwd,
+            Duration::from_secs(timeout_seconds.into()),
+            256 * 1024,
+        )
+        .await
     }
+    .await
+    .unwrap_or_else(|error| HostResult::Failed {
+        message: error.to_string(),
+    })
 }
 
-async fn execute_inner(command: HostCommand) -> Result<HostResult> {
+async fn execute_inner(rex: &RexClient, command: HostCommand) -> Result<HostResult> {
     match command {
         HostCommand::AttachmentWrite { .. } => {
             anyhow::bail!("Attachment transfer needs its owning host executor")
@@ -232,14 +252,13 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
             })
         }
         HostCommand::InspectWorker { binding } => {
-            let client = RexClient::new(None);
-            let identity = client.whoami().await?;
+            let identity = rex.whoami().await?;
             ensure!(
                 identity.host_id == HostId::parse(&binding.host_id)?,
                 "Worker belongs to another host"
             );
             Ok(HostResult::WorkerPresence {
-                presence: client
+                presence: rex
                     .worker_presence(&native_binding(&binding)?, &identity.host_id)
                     .await?,
             })
@@ -251,19 +270,19 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
             anyhow::bail!("This operation requires the coordinator's registered host broker")
         }
         HostCommand::ResourceAllocate { request } => {
-            require_local_host(&request.host_id).await?;
+            require_local_host(rex, &request.host_id).await?;
             Ok(HostResult::Resource {
                 report: GitBackend::default().allocate(request).await,
             })
         }
         HostCommand::ResourceInspect { record } => {
-            require_local_host(&record.host_id).await?;
+            require_local_host(rex, &record.host_id).await?;
             Ok(HostResult::Resource {
                 report: GitBackend::default().inspect(*record).await,
             })
         }
         HostCommand::ResourcePlanCleanup { record } => {
-            require_local_host(&record.host_id).await?;
+            require_local_host(rex, &record.host_id).await?;
             let directory = dirs::data_local_dir()
                 .context("No local application data directory")?
                 .join("agent/cleanup");
@@ -275,7 +294,7 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
             })
         }
         HostCommand::ResourceCollect { record, plan } => {
-            require_local_host(&record.host_id).await?;
+            require_local_host(rex, &record.host_id).await?;
             Ok(HostResult::Resource {
                 report: GitBackend::default().collect(*record, plan).await,
             })
@@ -286,22 +305,10 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
             cwd,
             timeout_seconds,
         } => {
-            ensure!(timeout_seconds > 0, "Command timeout must be positive");
-            ensure!(
-                !program.is_empty() && Path::new(&cwd).is_absolute(),
-                "Command needs a program and absolute working directory"
-            );
             if crate::sources::messages_read::is_read(&program, &args) {
                 return crate::rex::source::execute(program, args, cwd, timeout_seconds).await;
             }
-            run_process(
-                &program,
-                &args,
-                Path::new(&cwd),
-                Duration::from_secs(timeout_seconds.into()),
-                256 * 1024,
-            )
-            .await
+            Ok(execute_process(&program, &args, Path::new(&cwd), timeout_seconds).await)
         }
         HostCommand::ReadFile {
             path,
@@ -353,7 +360,17 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
             allocation_id,
             title,
             parent,
-        } => spawn_worker(&host, &task_id, &allocation_id, &title, parent.as_ref()).await,
+        } => {
+            spawn_worker(
+                rex,
+                &host,
+                &task_id,
+                &allocation_id,
+                &title,
+                parent.as_ref(),
+            )
+            .await
+        }
         HostCommand::SpawnSubagent {
             host,
             parent,
@@ -362,16 +379,14 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
             allocation_id,
             title,
         } => {
-            let client = RexClient::new(None);
             let checked = async {
-                let identity = client.whoami().await?;
+                let identity = rex.whoami().await?;
                 ensure!(
                     identity.host_id == HostId::parse(&parent.host_id)?,
                     "Subagent must use its task's host"
                 );
                 let native = native_binding(&parent)?;
-                client
-                    .inspect_session(&native.session_id)
+                rex.inspect_session(&native.session_id)
                     .await?
                     .verify_binding(&native, &identity.host_id)?;
                 Ok((identity, native))
@@ -382,7 +397,7 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
                 Err(error) => return Ok(not_started(error)),
             };
             let args = worker_args(&host, &task_id, &allocation_id, Some(&agent_id));
-            let created = client
+            let created = rex
                 .create_worker_window(
                     &native.session_id,
                     &title,
@@ -391,34 +406,34 @@ async fn execute_inner(command: HostCommand) -> Result<HostResult> {
                     Path::new(&host.cwd),
                 )
                 .await;
-            created_worker(&client, created, &identity.host_id).await
+            created_worker(rex, created, &identity.host_id).await
         }
         HostCommand::ResumeWorker {
             host,
             binding,
             task_id,
             allocation_id,
-        } => resume_bound_worker(host, binding, task_id, allocation_id, None).await,
+        } => resume_bound_worker(rex, host, binding, task_id, allocation_id, None).await,
         HostCommand::ResumeAgentWorker {
             host,
             binding,
             task_id,
             agent_id,
             allocation_id,
-        } => resume_bound_worker(host, binding, task_id, allocation_id, Some(agent_id)).await,
+        } => resume_bound_worker(rex, host, binding, task_id, allocation_id, Some(agent_id)).await,
     }
 }
 
 // Child identity is a distinct wire command: older nodes must reject it before
 // effects instead of silently starting a parent with a child's allocation.
 async fn resume_bound_worker(
+    client: &RexClient,
     host: WorkerHost,
     binding: WorkerRef,
     task_id: TaskId,
     allocation_id: String,
     agent_id: Option<String>,
 ) -> Result<HostResult> {
-    let client = RexClient::new(None);
     let native = native_binding(&binding)?;
     let identity = client.whoami().await?;
     ensure!(
@@ -440,8 +455,8 @@ async fn resume_bound_worker(
             )
             .await
         {
-            Ok(restored) if confirmed_binding(&client, &restored, &identity.host_id).await => {
-                promote(&client, &restored.session_id).await;
+            Ok(restored) if confirmed_binding(client, &restored, &identity.host_id).await => {
+                promote(client, &restored.session_id).await;
                 Ok(HostResult::Spawned {
                     binding: WorkerRef {
                         host_id: binding.host_id,
@@ -463,7 +478,7 @@ async fn resume_bound_worker(
     // A running client drains new pending inputs itself. An exited pane
     // needs a new execution in this same session, handled by Rex below.
     resume_worker(
-        &client,
+        client,
         &host,
         &task_id,
         &allocation_id,
@@ -473,8 +488,8 @@ async fn resume_bound_worker(
     .await
 }
 
-async fn require_local_host(expected: &str) -> Result<()> {
-    let identity = RexClient::new(None).whoami().await?;
+async fn require_local_host(rex: &RexClient, expected: &str) -> Result<()> {
+    let identity = rex.whoami().await?;
     ensure!(
         identity.host_id == HostId::parse(expected)?,
         "Resource belongs to another host"
@@ -533,13 +548,13 @@ fn worker_args(
 }
 
 async fn spawn_worker(
+    client: &RexClient,
     host: &WorkerHost,
     task_id: &TaskId,
     allocation_id: &str,
     title: &str,
     parent: Option<&WorkerRef>,
 ) -> Result<HostResult> {
-    let client = RexClient::new(None);
     let checked = async {
         let identity = client.whoami().await?;
         ensure!(
@@ -589,7 +604,7 @@ async fn spawn_worker(
                 .await
         }
     };
-    created_worker(&client, created, &identity.host_id).await
+    created_worker(client, created, &identity.host_id).await
 }
 
 fn not_started(error: anyhow::Error) -> HostResult {
@@ -838,6 +853,7 @@ pub(crate) async fn run_process_until(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::time::Duration;
 
@@ -845,10 +861,19 @@ mod tests {
     use tokio::{net::TcpStream, sync::oneshot, time::timeout};
 
     use crate::{
-        host::{execute, run_process, run_process_until},
+        host::{Executor, run_process, run_process_until},
         protocol::{HostCommand, HostResult},
-        rex::fake_rex,
+        rex::{RexClient, fake_rex},
     };
+
+    fn personal_executor(state: &std::path::Path) -> Executor {
+        Executor::new(state, RexClient::for_process(None).unwrap())
+    }
+
+    async fn execute(command: HostCommand) -> HostResult {
+        let directory = tempfile::tempdir().unwrap();
+        personal_executor(directory.path()).execute(command).await
+    }
 
     fn fixture_host() -> crate::protocol::WorkerHost {
         crate::protocol::WorkerHost {
@@ -907,7 +932,7 @@ mod tests {
             return;
         };
         let directory = tempfile::tempdir().unwrap();
-        let executor = crate::host::Executor::new(directory.path());
+        let executor = personal_executor(directory.path());
         let task_id: crate::protocol::TaskId =
             "77777777-7777-4777-8777-777777777777".parse().unwrap();
         let (command, create) = if case.starts_with("root") {
@@ -969,7 +994,7 @@ mod tests {
     #[tokio::test]
     async fn interrupt_releases_embedding_waiting_behind_the_owned_provider() {
         let directory = tempfile::tempdir().unwrap();
-        let executor = std::sync::Arc::new(crate::host::Executor::new(directory.path()));
+        let executor = std::sync::Arc::new(personal_executor(directory.path()));
         let held = executor.embeddings.lock().await;
         let (cancel, cancelled) = tokio::sync::watch::channel(false);
         let running = std::sync::Arc::clone(&executor);
@@ -1192,7 +1217,7 @@ setInterval(() => {}, 1000);
     #[tokio::test]
     async fn command_start_failure_reports_missing_directory_on_cancellable_executor() {
         let directory = tempfile::tempdir().unwrap();
-        let executor = crate::host::Executor::new(directory.path());
+        let executor = personal_executor(directory.path());
         let cwd = directory
             .path()
             .join("missing-directory")

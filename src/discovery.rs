@@ -2,53 +2,24 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
-
 use crate::{
-    config, host,
-    protocol::{AgentNode, HostCommand, HostResult, WorkerLaunch},
+    config,
+    protocol::{AgentNode, WorkerLaunch},
     rex::{HostId, RexClient},
 };
-
-#[derive(Deserialize)]
-struct Inventory {
-    #[serde(default)]
-    hosts: Vec<Peer>,
-}
-#[derive(Deserialize)]
-struct Peer {
-    host_id: Option<String>,
-    label: String,
-    endpoints: Option<Vec<String>>,
-}
+use anyhow::{Context, Result, ensure};
 
 pub async fn local_node(
+    rex: &RexClient,
     coordinator: Option<&str>,
     launch: WorkerLaunch,
     name: Option<&str>,
     daemon: &crate::tailnet::Daemon,
 ) -> Result<AgentNode> {
-    let identity = RexClient::new(None).whoami().await?;
-    let output = host::execute(HostCommand::Exec {
-        program: "rex".into(),
-        args: vec!["--autostart=false".into(), "hosts".into(), "--json".into()],
-        cwd: "/".into(),
-        timeout_seconds: 15,
-    })
-    .await;
-    let inventory = match output {
-        HostResult::Process {
-            exit_code: 0,
-            stdout,
-            truncated: false,
-            ..
-        } => serde_json::from_str::<Inventory>(&stdout).ok(),
-        _ => None,
-    };
-    let peer = inventory.as_ref().and_then(|inventory| {
-        inventory
-            .hosts
+    let identity = rex.whoami().await?;
+    let inventory = rex.peer_inventory().await;
+    let peer = inventory.as_ref().and_then(|hosts| {
+        hosts
             .iter()
             .find(|peer| peer.host_id.as_deref() == Some(&identity.host_id.to_string()))
     });

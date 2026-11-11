@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::{
     config, host,
     protocol::HostResult,
-    rex::RexClient,
+    rex::{RexClient, personal_messages},
     sources::{
         ReadOutput,
         messages_read::{Capture, Request},
@@ -257,7 +257,7 @@ async fn execute_request(request: Request) -> Result<HostResult> {
     let program = config::program()?;
     let program = program.to_str().context("Beep Boop path is not UTF-8")?;
     let path = std::env::var("PATH").context("Source command PATH is unavailable")?;
-    read_with(&RexClient::new(None), program, &path, &request).await
+    read_with(&personal_messages(), program, &path, &request).await
 }
 
 async fn read_with(
@@ -427,7 +427,7 @@ mod tests {
     use crate::{
         protocol::HostResult,
         rex::{
-            RexClient,
+            personal_messages,
             source::{MODULE, Start, read_with},
         },
         sources::messages_read::{Capture, Request},
@@ -468,7 +468,7 @@ mod tests {
         let program =
             std::env::var("AGENT_TEST_BIN").unwrap_or_else(|_| env!("CARGO_PKG_NAME").into());
         let result = read_with(
-            &RexClient::new(None),
+            &personal_messages(),
             &program,
             &std::env::var("PATH").unwrap(),
             &Request {
@@ -501,7 +501,7 @@ mod tests {
     #[ignore = "requires local Rex actions; executes only the native false utility"]
     async fn native_helper_exit_preserves_its_stage_and_code() {
         let error = read_with(
-            &RexClient::new(None),
+            &personal_messages(),
             "/usr/bin/false",
             &std::env::var("PATH").unwrap(),
             &Request {
@@ -759,7 +759,7 @@ return {busy_during_cleanup=busy.state,successor=next.state,old_stopped=exists(r
         std::fs::write(&producer, "#!/usr/bin/env node\nsetTimeout(() => process.stdout.write(require('node:fs').readFileSync(JSON.parse(process.argv.at(-1)).argv.at(-1))), 31000);\n").unwrap();
         std::fs::set_permissions(&producer, std::fs::Permissions::from_mode(0o700)).unwrap();
         let actual = read_with(
-            &RexClient::new(None),
+            &personal_messages(),
             producer.to_str().unwrap(),
             &std::env::var("PATH").unwrap(),
             &Request {
@@ -807,7 +807,7 @@ return {busy_during_cleanup=busy.state,successor=next.state,old_stopped=exists(r
             capture: Capture::Source,
         };
         let read = tokio::spawn(async move {
-            read_with(&RexClient::new(None), &program, &path, &request).await
+            read_with(&personal_messages(), &program, &path, &request).await
         });
         timeout(Duration::from_secs(10), async {
             while !port_file.exists() {
