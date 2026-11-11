@@ -10,10 +10,11 @@ method=
 payload=
 previous=
 socket=/run/user/1000/rex/server.sock
+server=${REX_SERVER:-unix://$socket}
 for argument do
   if [ -n "$method" ]; then payload=$argument; break; fi
   case "$previous:$argument" in
-    --server:unix://*) socket=${argument#unix://} ;;
+    --server:unix://*) socket=${argument#unix://}; server=$argument ;;
     call:*) method=$argument ;;
     *:whoami | *:hosts) method=$argument; break ;;
   esac
@@ -31,6 +32,10 @@ if [ -e "$root/dead" ]; then
   exit 4
 fi
 host=44444444-4444-4444-8444-444444444444
+if [ "$server" = "${AGENT_TEST_FAKE_REX_ORIGIN_SERVER-}" ]; then
+  host=55555555-5555-4555-8555-555555555555
+fi
+origin_session=session:11111111-1111-4111-8111-111111111111
 origin_window=window:22222222-2222-4222-8222-222222222222
 origin_block=block:33333333-3333-4333-8333-333333333333
 created=session:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
@@ -52,7 +57,8 @@ case "$method" in
     printf '{"window_id":"%s","block_ids":["%s"],"revision":2}\n' "$added_window" "$added_block" ;;
   session.view)
     session=$(printf '%s' "$payload" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
-    if [ "$session" = "${AGENT_TEST_FAKE_REX_MISSING-}" ]; then
+    if [ "$session" = "${AGENT_TEST_FAKE_REX_MISSING-}" ] ||
+      { [ "$session" = "$origin_session" ] && [ "$server" != "${AGENT_TEST_FAKE_REX_ORIGIN_SERVER:-$server}" ]; }; then
       printf 'Error: stream response "control-1" failed: session %s not found (status=404 code=session_not_found)\n' "$session" >&2
       exit 3
     fi
