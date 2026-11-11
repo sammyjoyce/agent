@@ -9,9 +9,11 @@ root=${AGENT_TEST_FAKE_REX:?}
 method=
 payload=
 previous=
+socket=/run/user/1000/rex/server.sock
 for argument do
   if [ -n "$method" ]; then payload=$argument; break; fi
   case "$previous:$argument" in
+    --server:unix://*) socket=${argument#unix://} ;;
     call:*) method=$argument ;;
     *:whoami | *:hosts) method=$argument; break ;;
   esac
@@ -25,8 +27,7 @@ if [ "${AGENT_TEST_FAKE_REX_DOWN_AT-}" = "$method" ]; then
   : > "$root/dead"
 fi
 if [ -e "$root/dead" ]; then
-  printf 'Error: no Rex server is running at %s, and autostart is disabled\n' \
-    "${AGENT_TEST_FAKE_REX_SOCKET:-/run/user/1000/rex/server.sock}" >&2
+  printf 'Error: no Rex server is running at %s, and autostart is disabled\n' "$socket" >&2
   exit 4
 fi
 host=44444444-4444-4444-8444-444444444444
@@ -51,6 +52,10 @@ case "$method" in
     printf '{"window_id":"%s","block_ids":["%s"],"revision":2}\n' "$added_window" "$added_block" ;;
   session.view)
     session=$(printf '%s' "$payload" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
+    if [ "$session" = "${AGENT_TEST_FAKE_REX_MISSING-}" ]; then
+      printf 'Error: stream response "control-1" failed: session %s not found (status=404 code=session_not_found)\n' "$session" >&2
+      exit 3
+    fi
     windows="$(block "$created_window" "$created_block"),$(block "$added_window" "$added_block")"
     if [ ! -e "$root/closed" ]; then windows="$(block "$origin_window" "$origin_block"),$windows"; fi
     printf '{"session_id":"%s","revision":2,"windows":[%s]}\n' "$session" "$windows" ;;

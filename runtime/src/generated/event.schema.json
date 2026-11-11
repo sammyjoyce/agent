@@ -2400,6 +2400,7 @@
               "$ref": "#/$defs/WorkerHost"
             },
             "parent": {
+              "description": "Where to open the root terminal if the node allows it. A node on a\nprivate Rex server checks its host and opens a new session instead.",
               "anyOf": [
                 {
                   "$ref": "#/$defs/WorkerRef"

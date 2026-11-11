@@ -1,4 +1,4 @@
-//! Typed Rex CLI boundary. No routing policy and no automatic mutation retries.
+//! Typed Rex CLI boundary. No automatic mutation retries.
 //! Native schemas are discovered per server with `rex api describe`.
 
 pub mod install;
@@ -199,11 +199,37 @@ impl SessionView {
 
 #[derive(Clone, Debug)]
 pub struct RexClient {
-    server: Option<String>,
+    route: RexRoute,
+}
+
+#[derive(Clone, Debug)]
+enum RexRoute {
+    /// The CLI's own selection: `REX_SERVER`, else the account's local server.
+    Personal,
+    /// `REX_SERVER` is removed because Rex falls back to the personal server
+    /// when that variable names a dead socket.
+    Private(LocalRexEndpoint),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalRexEndpoint(String);
+
+impl LocalRexEndpoint {
+    fn parse(input: &str) -> anyhow::Result<Self> {
+        let path = input.strip_prefix("unix://").map(Path::new);
+        anyhow::ensure!(
+            path.is_some_and(|path| path.is_absolute() && path.file_name().is_some())
+                && !input.contains(['\0', '?', '#']),
+            "--rex-server must be unix:// followed by an absolute socket path, not {input:?}"
+        );
+        Ok(Self(input.to_owned()))
+    }
 }
 
 fn personal_messages() -> RexClient {
-    RexClient { server: None }
+    RexClient {
+        route: RexRoute::Personal,
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -257,17 +283,30 @@ impl RexClient {
     }
 
     pub fn for_process(server: Option<&str>) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            server.is_none_or(|server| !server.is_empty() && !server.contains('\0')),
-            "Invalid Rex server selection"
-        );
-        Ok(Self {
-            server: server.map(str::to_owned),
-        })
+        let route = match server {
+            None => RexRoute::Personal,
+            Some(server) => RexRoute::Private(LocalRexEndpoint::parse(server)?),
+        };
+        Ok(Self { route })
     }
 
-    /// `rex hosts` reads the account's home inventory and ignores `--server`.
+    pub fn is_private(&self) -> bool {
+        matches!(self.route, RexRoute::Private(_))
+    }
+
+    pub fn rex_server_args(&self) -> Vec<String> {
+        match &self.route {
+            RexRoute::Personal => Vec::new(),
+            RexRoute::Private(endpoint) => vec!["--rex-server".into(), endpoint.0.clone()],
+        }
+    }
+
+    /// `rex hosts` reads the account's home inventory and ignores `--server`,
+    /// so a private server has none of its own.
     pub async fn peer_inventory(&self) -> Option<Vec<RexPeer>> {
+        if self.is_private() {
+            return None;
+        }
         let output = crate::host::execute_process(
             "rex",
             &["--autostart=false".into(), "hosts".into(), "--json".into()],
@@ -566,8 +605,11 @@ impl RexClient {
     fn command(&self, args: &[String]) -> Command {
         let mut command = Command::new("rex");
         command.args(["--autostart=false", "--timeout", "8s"]);
-        if let Some(server) = &self.server {
-            command.arg("--server").arg(server);
+        if let RexRoute::Private(endpoint) = &self.route {
+            command
+                .arg("--server")
+                .arg(&endpoint.0)
+                .env_remove("REX_SERVER");
         }
         command
             .args(args)
@@ -1158,7 +1200,8 @@ printf '<pre>Current task view 🦀</pre>\n'
 
     #[test]
     fn cli_argv_disables_autostart_and_scopes_server_without_shell_interpolation() {
-        let client = RexClient::for_process(Some("https://worker.example.invalid")).unwrap();
+        let client =
+            RexClient::for_process(Some("unix:///run/user/1000/agent rex/$(x).sock")).unwrap();
         let command = client.command(&["whoami".to_owned(), "--json".to_owned()]);
         let args: Vec<_> = command
             .as_std()
@@ -1172,11 +1215,43 @@ printf '<pre>Current task view 🦀</pre>\n'
                 "--timeout",
                 "8s",
                 "--server",
-                "https://worker.example.invalid",
+                "unix:///run/user/1000/agent rex/$(x).sock",
                 "whoami",
                 "--json"
             ]
         );
+    }
+
+    #[test]
+    fn local_rex_endpoint_accepts_only_an_absolute_unix_socket() {
+        for (input, accepted) in [
+            ("unix:///run/user/1000/rex-agent/server.sock", true),
+            ("unix:///tmp/a b/s.sock", true),
+            ("unix://relative/server.sock", false),
+            ("unix://", false),
+            ("unix:///", false),
+            ("/run/user/1000/rex-agent/server.sock", false),
+            ("UNIX:///run/user/1000/rex-agent/server.sock", false),
+            ("https://worker.example.invalid", false),
+            ("studio", false),
+            ("127.0.0.1:7777", false),
+            ("unix:///run/user/1000/rex.sock?mode=0600", false),
+            ("unix:///run/user/1000/rex.sock#pane", false),
+            ("unix:///run/user/1000/rex\0.sock", false),
+            ("", false),
+        ] {
+            assert_eq!(
+                LocalRexEndpoint::parse(input).is_ok(),
+                accepted,
+                "{input:?}"
+            );
+            assert_eq!(
+                RexClient::for_process(Some(input)).is_ok(),
+                accepted,
+                "{input:?}"
+            );
+        }
+        assert!(!RexClient::for_process(None).unwrap().is_private());
     }
 
     #[tokio::test]
@@ -1454,7 +1529,6 @@ printf '%s\n' "$value"
     }
 
     /// Opt-in only: creates and removes one synthetic session on the selected running Rex server.
-    /// Set AGENT_TEST_REX_SERVER for a remote server; omit it for the local server.
     #[tokio::test]
     #[ignore = "requires a running Rex server; creates and removes one synthetic session"]
     async fn live_native_rex_worker_contract() -> anyhow::Result<()> {
@@ -1625,89 +1699,6 @@ printf '%s\n' "$value"
     }
 }
 
-/// Runs a test scenario against `tests/fixtures/rex.sh`. PATH is process-wide,
-/// so each scenario re-executes the test binary with the fixture first on PATH.
 #[cfg(test)]
-pub(crate) mod fake_rex {
-    use std::path::Path;
-
-    pub(crate) const HOST: &str = "44444444-4444-4444-8444-444444444444";
-    pub(crate) const ORIGIN_SESSION: &str = "session:11111111-1111-4111-8111-111111111111";
-    pub(crate) const ORIGIN_WINDOW: &str = "window:22222222-2222-4222-8222-222222222222";
-    pub(crate) const ORIGIN_BLOCK: &str = "block:33333333-3333-4333-8333-333333333333";
-    pub(crate) const CREATED_SESSION: &str = "session:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const CASE: &str = "AGENT_TEST_FAKE_REX_CASE";
-
-    pub(crate) fn case() -> Option<String> {
-        std::env::var(CASE).ok()
-    }
-
-    pub(crate) fn run(test: &str, case: &str, envs: &[(&str, &str)]) {
-        let directory = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rex.sh"),
-            directory.path().join("rex"),
-        )
-        .unwrap();
-        let path = std::env::join_paths(std::iter::once(directory.path().to_owned()).chain(
-            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
-        ))
-        .unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", test, "--nocapture"])
-            .env(CASE, case)
-            .env("AGENT_TEST_FAKE_REX", directory.path())
-            .env("PATH", path)
-            .envs(envs.iter().copied())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
-            "Fake Rex case {case}:\n{}\n{}\nCalls:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-            std::fs::read_to_string(directory.path().join("calls")).unwrap_or_default(),
-        );
-    }
-
-    pub(crate) struct Call {
-        pub(crate) args: Vec<String>,
-    }
-    impl Call {
-        pub(crate) fn method(&self) -> &str {
-            let position = self
-                .args
-                .iter()
-                .position(|arg| arg == "call")
-                .map(|call| call + 1)
-                .or_else(|| {
-                    self.args
-                        .iter()
-                        .position(|arg| arg == "whoami" || arg == "hosts")
-                });
-            position.map_or("", |position| &self.args[position])
-        }
-    }
-
-    pub(crate) fn calls() -> Vec<Call> {
-        let root = std::env::var_os("AGENT_TEST_FAKE_REX").unwrap();
-        std::fs::read_to_string(Path::new(&root).join("calls"))
-            .unwrap_or_default()
-            .lines()
-            .map(|line| {
-                let (_server, args) = line.split_once('\t').unwrap();
-                Call {
-                    args: args.split_terminator('\u{1f}').map(str::to_owned).collect(),
-                }
-            })
-            .collect()
-    }
-
-    pub(crate) fn methods() -> Vec<String> {
-        calls()
-            .iter()
-            .map(|call| call.method().to_owned())
-            .collect()
-    }
-}
+#[path = "../tests/fixtures/fake_rex.rs"]
+pub(crate) mod fake_rex;

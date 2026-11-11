@@ -957,6 +957,8 @@ pub enum HostCommand {
     },
     SpawnWorker {
         host: WorkerHost,
+        /// Where to open the root terminal if the node allows it. A node on a
+        /// private Rex server checks its host and opens a new session instead.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         parent: Option<WorkerRef>,

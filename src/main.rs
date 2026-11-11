@@ -65,6 +65,10 @@ struct Arguments {
     /// Connect to a coordinator through Tailscale or an existing SSH host.
     #[arg(long, global = true)]
     coordinator: Option<String>,
+    /// Run Rex work on this private local server (unix:///absolute/socket)
+    /// instead of the personal one. Workers this process starts inherit it.
+    #[arg(long, global = true)]
+    rex_server: Option<String>,
     #[arg(long, global = true)]
     json: bool,
     /// Use the plain line interface in an interactive terminal.
@@ -431,7 +435,7 @@ fn runtime_script(explicit: Option<PathBuf>) -> PathBuf {
 async fn main() -> Result<()> {
     let mut arguments = Arguments::parse();
     #[allow(clippy::disallowed_methods)]
-    let rex = RexClient::for_process(None)?;
+    let rex = RexClient::for_process(arguments.rex_server.as_deref())?;
     let action = arguments.command.take().unwrap_or(Action::Chat {
         prompt: None,
         selection: ModelArgs::default(),
@@ -605,6 +609,12 @@ async fn main() -> Result<()> {
         .await
         {
             Ok(node) => Some(node),
+            // Exit so the service manager restarts us once the private Rex is up.
+            Err(error) if rex.is_private() => {
+                return Err(
+                    error.context("The private Rex server for this coordinator is unavailable")
+                );
+            }
             Err(_) => {
                 eprintln!(
                     "Local Rex is unavailable; this coordinator has no local worker until restarted."
@@ -3049,7 +3059,7 @@ async fn local_connection(
 }
 
 fn local_service_command(
-    _rex: &RexClient,
+    rex: &RexClient,
     program: &Path,
     script: &Path,
     directory: &Path,
@@ -3064,6 +3074,7 @@ fn local_service_command(
         .arg(directory)
         .arg("--runtime")
         .arg(script)
+        .args(rex.rex_server_args())
         .arg("serve")
         .arg("--local-only");
     command
@@ -3884,9 +3895,13 @@ fn import_phase_name(phase: &ImportPhase) -> &'static str {
 }
 
 #[cfg(test)]
+#[path = "../tests/fixtures/fake_rex.rs"]
+mod fake_rex;
+
+#[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
-    use crate::{Action, Arguments, ModelArgs, local_service_command};
+    use crate::{Action, Arguments, ModelArgs, fake_rex, local_service_command};
     use agent_cli::models::{ModelProvider, ModelSelection, Reasoning};
     use agent_cli::protocol::SearchMode;
     use agent_cli::rex::RexClient;
@@ -4821,28 +4836,134 @@ esac
 
     #[test]
     fn implicit_local_startup_preserves_paths_and_selects_only_the_unix_transport() {
+        const PRIVATE: &str = "unix:///run/user/1000/rex agent/server.sock";
         let program = Path::new("/example/agent");
         let script = Path::new("/example/runtime with spaces/bridge.js");
         let state = Path::new("/example/private state");
         let config = Path::new("/example/private config.toml");
-        for selected in [None, Some(config)] {
-            let command = local_service_command(&personal_rex(), program, script, state, selected);
-            let native = command.as_std();
-            let parsed = Arguments::try_parse_from(
-                std::iter::once(native.get_program()).chain(native.get_args()),
-            )
-            .unwrap();
-            assert_eq!(parsed.runtime.as_deref(), Some(script));
-            assert_eq!(parsed.state_dir.as_deref(), Some(state));
-            assert_eq!(parsed.config.as_deref(), selected);
-            assert!(matches!(
-                parsed.command,
-                Some(Action::Serve {
-                    local_only: true,
-                    no_sources: false,
-                    ..
-                })
-            ));
+        for server in [None, Some(PRIVATE)] {
+            let rex = RexClient::for_process(server).unwrap();
+            for selected in [None, Some(config)] {
+                let command = local_service_command(&rex, program, script, state, selected);
+                let native = command.as_std();
+                let argv: Vec<_> = native.get_args().map(|arg| arg.to_str().unwrap()).collect();
+                let mut expected = Vec::new();
+                if selected.is_some() {
+                    expected.extend(["--config", "/example/private config.toml"]);
+                }
+                expected.extend([
+                    "--state-dir",
+                    "/example/private state",
+                    "--runtime",
+                    "/example/runtime with spaces/bridge.js",
+                ]);
+                if let Some(server) = server {
+                    expected.extend(["--rex-server", server]);
+                }
+                expected.extend(["serve", "--local-only"]);
+                assert_eq!(argv, expected);
+                let parsed = Arguments::try_parse_from(
+                    std::iter::once(native.get_program()).chain(native.get_args()),
+                )
+                .unwrap();
+                assert_eq!(parsed.runtime.as_deref(), Some(script));
+                assert_eq!(parsed.state_dir.as_deref(), Some(state));
+                assert_eq!(parsed.config.as_deref(), selected);
+                assert_eq!(parsed.rex_server.as_deref(), server);
+                assert!(matches!(
+                    parsed.command,
+                    Some(Action::Serve {
+                        local_only: true,
+                        no_sources: false,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_worker_a_private_node_starts_selects_the_same_rex_server() {
+        use agent_cli::{
+            host::Executor,
+            protocol::{HostCommand, HostResult, TaskId, WorkerHost},
+        };
+        const TEST: &str = "tests::every_worker_a_private_node_starts_selects_the_same_rex_server";
+        const PRIVATE: &str = "unix:///run/user/1000/rex-agent/server.sock";
+        let Some(case) = fake_rex::case() else {
+            for case in ["private", "personal"] {
+                fake_rex::run(TEST, case, &[]);
+            }
+            return;
+        };
+        let server = (case == "private").then_some(PRIVATE);
+        let directory = tempfile::tempdir().unwrap();
+        let executor = Executor::new(directory.path(), RexClient::for_process(server).unwrap());
+        let host = WorkerHost {
+            host_id: Some(fake_rex::HOST.into()),
+            name: "fixture".into(),
+            rex_server: None,
+            coordinator: Some("coordinator.example.ts.net".into()),
+            cwd: "/tmp".into(),
+            agent_program: "/example/agent".into(),
+            launch: None,
+        };
+        let task_id: TaskId = "77777777-7777-4777-8777-777777777777".parse().unwrap();
+        let HostResult::Spawned { binding: root } = executor
+            .execute(HostCommand::SpawnWorker {
+                host: host.clone(),
+                parent: None,
+                task_id: task_id.clone(),
+                allocation_id: "allocation-root".into(),
+                title: "Synthetic task".into(),
+            })
+            .await
+        else {
+            panic!("The root worker must start");
+        };
+        for command in [
+            HostCommand::SpawnSubagent {
+                host: host.clone(),
+                parent: root.clone(),
+                task_id: task_id.clone(),
+                agent_id: "review".into(),
+                allocation_id: "allocation-child".into(),
+                title: "Review".into(),
+            },
+            HostCommand::ResumeWorker {
+                host,
+                binding: root,
+                task_id,
+                allocation_id: "allocation-root".into(),
+            },
+        ] {
+            let result = executor.execute(command).await;
+            assert!(matches!(result, HostResult::Spawned { .. }), "{result:?}");
+        }
+        let launches: Vec<Vec<String>> = fake_rex::calls()
+            .iter()
+            .filter_map(|call| match call.method() {
+                "session.create" => Some(call.payload()["initial_windows"][0]["layout"].clone()),
+                "session.new_window" => Some(call.payload()["layout"].clone()),
+                _ => None,
+            })
+            .map(|layout| {
+                serde_json::from_value(layout["block"]["options"]["command"].clone()).unwrap()
+            })
+            .collect();
+        assert_eq!(launches.len(), 3, "root, child and resumed root");
+        for argv in launches {
+            let parsed = Arguments::try_parse_from(&argv).unwrap();
+            assert!(
+                matches!(parsed.command, Some(Action::RunTask { .. })),
+                "{argv:?}"
+            );
+            assert_eq!(parsed.rex_server.as_deref(), server, "{argv:?}");
+            let run_task = argv.iter().position(|arg| arg == "run-task").unwrap();
+            match server {
+                Some(server) => assert_eq!(argv[run_task - 2..run_task], ["--rex-server", server]),
+                None => assert!(!argv.iter().any(|arg| arg == "--rex-server"), "{argv:?}"),
+            }
         }
     }
 
