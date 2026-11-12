@@ -34,11 +34,22 @@ private actor ComposerOwnershipGate {
   }
 }
 
-/// Attaches `session` as `model`'s only coordinator and waits for it to connect.
-@MainActor private func connect(_ model: ChatModel, to session: CoordinatorSession) async throws {
-  model.attach(lane(session))
+/// Attaches `sessions` as `model`'s coordinators, in order, and waits for each to connect.
+@MainActor private func connect(
+  _ model: ChatModel, to sessions: CoordinatorSession...
+) async throws {
+  for session in sessions { model.attach(lane(session)) }
   await model.setActive(true)
-  _ = try await snapshot(of: session, in: model) { $0.connection == .connected }
+  for session in sessions {
+    _ = try await snapshot(of: session, in: model) { $0.connection == .connected }
+  }
+}
+
+/// Connects `session` and waits until it is connected. Nothing else reads its updates.
+private func connected(_ session: CoordinatorSession) async throws {
+  await session.connect()
+  for await snapshot in session.updates where snapshot.connection == .connected { return }
+  throw ConnectionError.closed
 }
 
 enum ComposerOwnershipStage: CaseIterable, Sendable {
@@ -299,5 +310,106 @@ func acceptedSlashControlDoesNotReturnFromAFailedComposerCheckpoint(newTyping: B
     let reconnected = try await snapshot(of: session, in: model) { $0.connection == .connected }
     #expect(reconnected.rows.isEmpty)
     #expect(await fixture.count() == 1, "Reconnection must not submit the control again")
+  }
+}
+
+/// A control sent to two coordinators misses the first and reaches the second, and the app stops
+/// before it saves a newer draft. Recovery from the checkpoint saved before the Send must not
+/// offer the control again, since sending it again runs it twice.
+@Test(.timeLimit(.minutes(1)))
+func recoveryOffersASendAgainOnlyWhenNoRecipientReceivedIt() async throws {
+  try await withCoordinator { first, _, firstOutbox in
+    try await withCoordinator { second, secondFixture, _ in
+      try await connected(first)
+      try await connected(second)
+      let root = firstOutbox.deletingLastPathComponent()
+      let files = AttachmentStore(directory: root.appending(path: "ProbeFiles"))
+      let url = root.appending(path: "probe-draft.json")
+      let store = ComposerDraftStore(url: url)
+      _ = try await store.load(from: files)
+      let identity = ComposerInputIdentity(composerID: UUID())
+      let submission = ComposerSubmission(
+        identity: identity, outboxURL: firstOutbox, text: "/status", attachments: [])
+      try await store.save(
+        ComposerDraft(composerID: identity.composerID, submission: submission), revision: 1)
+      let recipients = [first.profile, second.profile]
+      let stagedFirst = try #require(
+        await first.stage(
+          "/status", sendID: "invented-send", recipients: recipients, composer: identity))
+      let stagedSecond = try #require(
+        await second.stage("/status", sendID: "invented-send", recipients: recipients))
+      #expect(try CoordinatorSession.ownsComposerInput(identity, outboxURL: firstOutbox))
+      await first.disconnect()
+      #expect(await first.start(stagedFirst) == .notSent)
+      #expect(await second.start(stagedSecond) == .started)
+      let deadline = ContinuousClock.now + .seconds(5)
+      while await secondFixture.count() == 0, ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(5))
+      }
+      #expect(await secondFixture.count() == 1)
+      #expect(try !CoordinatorSession.ownsComposerInput(identity, outboxURL: firstOutbox))
+      let recovered = try await ComposerDraftStore(url: url).load(from: files)
+      #expect(recovered.draft.text.isEmpty, "The second coordinator ran /status, so it stays sent")
+    }
+  }
+}
+
+enum RecipientOutbox: CaseIterable, Sendable { case first, second }
+
+/// A Send to two coordinators reaches both, and the checkpoint after it fails, so the saved draft
+/// still holds the Send. One recipient's outbox is then gone, as after that recipient released its
+/// receipt or was removed. The other recipient still proves the Send went.
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: RecipientOutbox.allCases)
+func aSendBothCoordinatorsReceivedIsNotOfferedAgainWhenOneOutboxIsGone(
+  gone: RecipientOutbox
+) async throws {
+  try await withCoordinator { first, firstFixture, firstOutbox in
+    try await withCoordinator { second, secondFixture, secondOutbox in
+      let directory = firstOutbox.deletingLastPathComponent().appending(path: "Composer")
+      let url = directory.appending(path: "draft.json")
+      let files = AttachmentStore(directory: directory.appending(path: "Files"))
+      let gate = ComposerOwnershipGate()
+      let model = await MainActor.run {
+        ChatModel(
+          draftStore: files, persistence: ComposerDraftStore(url: url),
+          admit: { deliver in await gate.wait(after: await deliver()) })
+      }
+      await model.restoreDraft()
+      try await connect(model, to: first, second)
+      await MainActor.run { model.draft = "/status" }
+      let sending = Task { await model.send() }
+      for await admitted in gate.entered.stream {
+        try #require(admitted)
+        break
+      }
+      for fixture in [firstFixture, secondFixture] {
+        for await input in fixture.observedInputs {
+          #expect(input.text == "/status")
+          break
+        }
+      }
+      try FileManager.default.setAttributes(
+        [.posixPermissions: 0o500], ofItemAtPath: directory.path)
+      defer {
+        try? FileManager.default.setAttributes(
+          [.posixPermissions: 0o700], ofItemAtPath: directory.path)
+      }
+      await gate.finish()
+      await sending.value
+      #expect(await model.draft.isEmpty)
+      #expect(await model.draftError != nil, "The checkpoint after the Send failed")
+      let outbox = gone == .first ? firstOutbox : secondOutbox
+      if FileManager.default.fileExists(atPath: outbox.path) {
+        try FileManager.default.removeItem(at: outbox)
+      }
+      let cold = await MainActor.run {
+        ChatModel(draftStore: files, persistence: ComposerDraftStore(url: url))
+      }
+      await cold.restoreDraft()
+      let offered = await cold.draft
+      #expect(offered.isEmpty, "Both coordinators ran /status, so it stays sent")
+      #expect(await firstFixture.count() == 1, "The first coordinator got /status once")
+      #expect(await secondFixture.count() == 1, "The second coordinator got /status once")
+    }
   }
 }
