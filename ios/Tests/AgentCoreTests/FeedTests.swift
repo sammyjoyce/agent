@@ -413,17 +413,23 @@ private func row(
 actor DialGate {
   private var armed = false
   private(set) var waiting = false
-  private var release: CheckedContinuation<Void, Never>?
+  private var release: CheckedContinuation<Void, any Error>?
   func arm() { armed = true }
-  func pass() async {
+  func pass() async throws {
     guard armed else { return }
     armed = false
     waiting = true
-    await withCheckedContinuation { release = $0 }
+    try await withCheckedThrowingContinuation { release = $0 }
   }
   func open() {
     armed = false
     release?.resume()
+    release = nil
+  }
+  /// Fails the held dial, as when the coordinator does not answer in time.
+  func fail() {
+    armed = false
+    release?.resume(throwing: ConnectionError.timedOut)
     release = nil
   }
 }
@@ -461,7 +467,7 @@ actor WorkRoute {
   let coordinators = Coordinators(
     registration: registration, defaults: defaults, applicationSupport: root, caches: root,
     transport: CoordinatorTransport { address in
-      if address.port == 4001 { await gate?.pass() }
+      if address.port == 4001 { try await gate?.pass() }
       if address.port == 4002, await route?.personalsAddressDown == true {
         throw ConnectionError.timedOut
       }

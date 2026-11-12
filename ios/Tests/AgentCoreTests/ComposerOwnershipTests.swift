@@ -319,11 +319,13 @@ enum SecondRecipient: CaseIterable, Sendable {
   case runsIt, isNotConnected
   /// Its session retires before the Send starts its copy, as an address edit retires it.
   case retiresFirst
+  /// The Send starts its copy, and the dial to the coordinator fails.
+  case dialFails
 
   /// What `start` answers for its copy.
   var start: StartOutcome {
     switch self {
-    case .runsIt: .started
+    case .runsIt, .dialFails: .started
     case .isNotConnected: .notSent
     case .retiresFirst: .retired
     }
@@ -333,60 +335,72 @@ enum SecondRecipient: CaseIterable, Sendable {
 /// A control sent to two coordinators misses the first, and the second runs it or misses too. The
 /// app stops before it saves a newer draft. Recovery from the checkpoint saved before the Send
 /// offers the control again only when neither ran it, since sending it again runs it twice.
-@Test(.timeLimit(.minutes(1)), arguments: SecondRecipient.allCases)
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: SecondRecipient.allCases)
 func recoveryOffersASendAgainOnlyWhenNoRecipientReceivedIt(second outcome: SecondRecipient)
   async throws
 {
   let secondMisses = outcome != .runsIt
-  try await withCoordinator { first, firstFixture, firstOutbox in
-    try await withCoordinator { second, secondFixture, secondOutbox in
-      try await connected(first)
-      try await connected(second)
-      let root = firstOutbox.deletingLastPathComponent()
-      let files = AttachmentStore(directory: root.appending(path: "ProbeFiles"))
-      let url = root.appending(path: "probe-draft.json")
-      let store = ComposerDraftStore(url: url)
-      _ = try await store.load(from: files)
-      let identity = ComposerInputIdentity(composerID: UUID())
-      let submission = ComposerSubmission(
-        identity: identity, outboxURLs: [firstOutbox, secondOutbox], text: "/status",
-        attachments: [])
-      try await store.save(
-        ComposerDraft(composerID: identity.composerID, submission: submission), revision: 1)
-      let recipients = [first.profile, second.profile]
-      let stagedFirst = try #require(
-        await first.stage(
-          "/status", sendID: "invented-send", recipients: recipients, composer: identity))
-      let stagedSecond = try #require(
-        await second.stage(
-          "/status", sendID: "invented-send", recipients: recipients, composer: identity))
-      #expect(try CoordinatorSession.ownsComposerInput(identity, outboxURL: firstOutbox))
-      #expect(try CoordinatorSession.ownsComposerInput(identity, outboxURL: secondOutbox))
-      await first.disconnect()
-      switch outcome {
-      case .runsIt: break
-      case .isNotConnected: await second.disconnect()
-      case .retiresFirst:
-        #expect(await second.retire().isEmpty, "The second session had started nothing")
-      }
-      #expect(await first.start(stagedFirst) == .notSent)
-      #expect(await second.start(stagedSecond) == outcome.start)
-      let deadline = ContinuousClock.now + .seconds(5)
-      while !secondMisses, await secondFixture.count() == 0, ContinuousClock.now < deadline {
-        try await Task.sleep(for: .milliseconds(5))
-      }
-      #expect(await firstFixture.count() == 0)
-      #expect(await secondFixture.count() == (secondMisses ? 0 : 1))
-      #expect(
-        try !CoordinatorSession.ownsComposerInput(identity, outboxURL: firstOutbox),
-        "The first outbox released the receipt")
-      let secondHolds = try CoordinatorSession.ownsComposerInput(identity, outboxURL: secondOutbox)
-      #expect(secondHolds == !secondMisses, "The second outbox holds it while its copy went")
-      let recovered = try await ComposerDraftStore(url: url).load(from: files)
-      #expect(
-        recovered.draft.text == (secondMisses ? "/status" : ""),
-        "/status comes back only when neither coordinator ran it")
+  try await withGatedCoordinators(2) { coordinators, root in
+    let (first, second) = (coordinators[0].session, coordinators[1].session)
+    let (firstOutbox, secondOutbox) = (first.outboxURL, second.outboxURL)
+    let (firstFixture, secondFixture) = (coordinators[0].fixture, coordinators[1].fixture)
+    let secondGate = coordinators[1].gate
+    try await connected(first)
+    try await connected(second)
+    let files = AttachmentStore(directory: root.appending(path: "ProbeFiles"))
+    let url = root.appending(path: "probe-draft.json")
+    let store = ComposerDraftStore(url: url)
+    _ = try await store.load(from: files)
+    let identity = ComposerInputIdentity(composerID: UUID())
+    let submission = ComposerSubmission(
+      identity: identity, outboxURLs: [firstOutbox, secondOutbox], text: "/status",
+      attachments: [])
+    try await store.save(
+      ComposerDraft(composerID: identity.composerID, submission: submission), revision: 1)
+    let recipients = [first.profile, second.profile]
+    let stagedFirst = try #require(
+      await first.stage(
+        "/status", sendID: "invented-send", recipients: recipients, composer: identity))
+    let stagedSecond = try #require(
+      await second.stage(
+        "/status", sendID: "invented-send", recipients: recipients, composer: identity))
+    #expect(try CoordinatorSession.ownsComposerInput(identity, outboxURL: firstOutbox))
+    #expect(try CoordinatorSession.ownsComposerInput(identity, outboxURL: secondOutbox))
+    await first.disconnect()
+    switch outcome {
+    case .runsIt: break
+    case .isNotConnected: await second.disconnect()
+    case .retiresFirst:
+      #expect(await second.retire().isEmpty, "The second session had started nothing")
+    case .dialFails: await secondGate.arm()
     }
+    #expect(await first.start(stagedFirst) == .notSent)
+    #expect(await second.start(stagedSecond) == outcome.start)
+    if outcome == .dialFails {
+      try await held(secondGate)
+      await secondGate.fail()
+    }
+    let deadline = ContinuousClock.now + .seconds(5)
+    while !secondMisses, await secondFixture.count() == 0, ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    while outcome == .dialFails,
+      try CoordinatorSession.ownsComposerInput(identity, outboxURL: secondOutbox),
+      ContinuousClock.now < deadline
+    {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(await firstFixture.count() == 0)
+    #expect(await secondFixture.count() == (secondMisses ? 0 : 1))
+    #expect(
+      try !CoordinatorSession.ownsComposerInput(identity, outboxURL: firstOutbox),
+      "The first outbox released the receipt")
+    let secondHolds = try CoordinatorSession.ownsComposerInput(identity, outboxURL: secondOutbox)
+    #expect(secondHolds == !secondMisses, "The second outbox holds it while its copy went")
+    let recovered = try await ComposerDraftStore(url: url).load(from: files)
+    #expect(
+      recovered.draft.text == (secondMisses ? "/status" : ""),
+      "/status comes back only when neither coordinator ran it")
   }
 }
 
@@ -480,7 +494,7 @@ private func held(_ gate: DialGate) async throws {
 }
 
 /// A fixture coordinator and a session that dials it through `gate`, which can hold a Send's dial
-/// so that its exchange waits before it writes anything.
+/// so that its exchange waits before it writes anything, and can then fail that dial.
 private struct GatedCoordinator {
   let fixture: FixtureCoordinator
   let endpoint: NWEndpoint
@@ -511,7 +525,7 @@ private struct GatedCoordinator {
       directory: directory, address: try CoordinatorAddress(host: "100.64.1.2"), pin: fixture.id,
       stamps: StampSource(),
       transport: CoordinatorTransport { _ in
-        await gate.pass()
+        try await gate.pass()
         return LineConnection(connection: NWConnection(to: endpoint, using: .tcp))
       })
     coordinators.append(
@@ -532,12 +546,26 @@ private struct GatedCoordinator {
   await stop()
 }
 
-/// A Send has begun toward one coordinator, but its socket is still connecting, when an address
-/// edit retires the session. Retirement cancels the input before it left the phone. The outbox
-/// then releases a control's receipt, while a message's stays with its queued copy for the
-/// profile's next session.
-@MainActor @Test(.timeLimit(.minutes(1)), arguments: ["/status", "An invented note"])
-func retirementReleasesTheReceiptOfAControlItsSessionNeverWrote(text: String) async throws {
+/// How a Send's copy stops after `start` and before its exchange writes it to the coordinator.
+enum UnwrittenStop: CaseIterable, Sendable {
+  /// An address edit retires the session.
+  case addressEdit
+  /// The session disconnects, as when the app goes inactive.
+  case disconnect
+  /// The dial to the coordinator fails.
+  case dialFails
+}
+
+/// A Send has begun toward one coordinator, but its socket is still connecting, when its copy
+/// stops. It never left the phone. The outbox then releases a control's receipt, while a
+/// message's stays with its queued copy.
+@MainActor
+@Test(
+  .timeLimit(.minutes(1)), arguments: UnwrittenStop.allCases, ["/status", "An invented note"])
+func aSendStoppedBeforeItLeftThePhoneReleasesOnlyAControlsReceipt(
+  stop: UnwrittenStop, text: String
+) async throws {
+  let control = text.hasPrefix("/")
   try await withGatedCoordinators(1) { coordinators, _ in
     let coordinator = coordinators[0]
     let session = coordinator.session
@@ -552,11 +580,21 @@ func retirementReleasesTheReceiptOfAControlItsSessionNeverWrote(text: String) as
     #expect(
       try CoordinatorSession.ownsComposerInput(identity, outboxURL: session.outboxURL),
       "The outbox holds the receipt while the Send is on its way")
-    #expect(await session.retire() == [staged], "Retirement cancels the unwritten input")
+    switch stop {
+    case .addressEdit:
+      #expect(await session.retire() == [staged], "Retirement cancels the unwritten input")
+    case .disconnect: await session.disconnect()
+    case .dialFails: await coordinator.gate.fail()
+    }
+    let deadline = ContinuousClock.now + .seconds(5)
+    while control, try CoordinatorSession.ownsComposerInput(identity, outboxURL: session.outboxURL),
+      ContinuousClock.now < deadline
+    {
+      try await Task.sleep(for: .milliseconds(5))
+    }
     let holds = try CoordinatorSession.ownsComposerInput(identity, outboxURL: session.outboxURL)
     #expect(
-      holds == !text.hasPrefix("/"),
-      "The outbox releases a control's receipt and keeps a queued message's")
+      holds == !control, "The outbox releases a control's receipt and keeps a queued message's")
     #expect(await coordinator.fixture.count() == 0, "The coordinator got nothing")
   }
 }
@@ -594,11 +632,13 @@ func retirementKeepsTheReceiptOfANewerSendThatWent() async throws {
   }
 }
 
-/// A Send of `/status` starts toward every recipient, and an address edit retires each session
-/// while its socket is still connecting, so no coordinator gets it. The checkpoint after the Send
-/// fails, as when the app stops before saving. Recovery offers `/status` again.
-@MainActor @Test(.timeLimit(.minutes(1)), arguments: [1, 2])
-func aSendAddressEditsStoppedEverywhereIsOfferedAgainAfterACrash(recipients: Int) async throws {
+/// A Send of `/status` starts toward every recipient, and each copy stops while its socket is
+/// still connecting, so no coordinator gets it. The checkpoint after the Send fails, as when the
+/// app stops before saving. Recovery offers `/status` again.
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: UnwrittenStop.allCases, [1, 2])
+func aSendStoppedEverywhereBeforeItLeftThePhoneIsOfferedAgainAfterACrash(
+  stop: UnwrittenStop, recipients: Int
+) async throws {
   try await withGatedCoordinators(recipients) { coordinators, root in
     let directory = root.appending(path: "Composer")
     let url = directory.appending(path: "draft.json")
@@ -620,15 +660,26 @@ func aSendAddressEditsStoppedEverywhereIsOfferedAgainAfterACrash(recipients: Int
       try #require(admitted, "Every recipient started /status")
       break
     }
-    for coordinator in coordinators {
-      try await held(coordinator.gate)
-      await model.detach(coordinator.session.profile)
-      let next = CoordinatorSession(
-        directory: coordinator.directory, address: try CoordinatorAddress(host: "100.64.1.2"),
-        pin: coordinator.fixture.id, stamps: StampSource(),
-        transport: loopback(coordinator.endpoint))
-      model.attach(lane(next))
-      await next.connect()
+    for coordinator in coordinators { try await held(coordinator.gate) }
+    switch stop {
+    case .addressEdit:
+      for coordinator in coordinators {
+        await model.detach(coordinator.session.profile)
+        let next = CoordinatorSession(
+          directory: coordinator.directory, address: try CoordinatorAddress(host: "100.64.1.2"),
+          pin: coordinator.fixture.id, stamps: StampSource(),
+          transport: loopback(coordinator.endpoint))
+        model.attach(lane(next))
+        await next.connect()
+      }
+    case .disconnect: await model.setActive(false)
+    case .dialFails: for coordinator in coordinators { await coordinator.gate.fail() }
+    }
+    let deadline = ContinuousClock.now + .seconds(5)
+    while try await ComposerDraftStore(url: url).load(from: files).draft.text.isEmpty,
+      ContinuousClock.now < deadline
+    {
+      try await Task.sleep(for: .milliseconds(5))
     }
     try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
     defer {
