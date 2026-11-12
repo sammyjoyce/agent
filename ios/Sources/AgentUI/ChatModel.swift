@@ -938,16 +938,16 @@ final class ChatModel {
     let targets: [Target] = recipients.compactMap { id in
       lanes.first { $0.id == id }?.session.map { (id, $0) }
     }
-    guard let first = targets.first, targets.count == recipients.count else { return ignoreSend() }
+    guard targets.count == recipients.count else { return ignoreSend() }
     let mode = mode
     let original = source
     let originalFiles = attachments
     let identity = ComposerInputIdentity(composerID: composerID)
     // Clear the actual bound value before any await. The pending admission
-    // retains the recovery copy until the durable outbox takes ownership.
+    // retains the recovery copy until the durable outboxes take ownership.
     admission = .pending(
       text: text,
-      submission: submission(identity, text: text, files: originalFiles, at: first.session))
+      submission: submission(identity, text: text, files: originalFiles, at: targets))
     changingDraft = true
     draft = ""
     changingDraft = false
@@ -1008,10 +1008,9 @@ final class ChatModel {
           return
         }
       }
-      // One receipt cannot name several outboxes, so the first recipient's holds it.
-      let submission = submission(identity, text: text, files: files, at: first.session)
+      let submission = submission(identity, text: text, files: files, at: targets)
       admission = .pending(text: text, submission: submission)
-      // The pending identity must be durable before the independent outbox can
+      // The pending identity must be durable before the independent outboxes can
       // claim it. New typing and files remain separate from this submitted note.
       guard await saveDraft() else { return }
       admitted = await admit { [self] in
@@ -1041,8 +1040,9 @@ final class ChatModel {
   }
 
   /// Saves the message in every target's outbox, then starts each. A refusal withdraws every
-  /// staged copy, so nothing is queued anywhere. Only the first recipient's copy carries the
-  /// composer's receipt. True once any recipient has the message or still will.
+  /// staged copy, so nothing is queued anywhere. Every copy carries the composer's receipt, and a
+  /// copy that does not go releases only its own, so recovery offers the text again only when no
+  /// recipient took it. True once any recipient has the message or still will.
   private func deliver(
     _ body: String, mode: InputMode, files: [LocalAttachment], to targets: [Target],
     receipt: ComposerInputIdentity
@@ -1057,7 +1057,7 @@ final class ChatModel {
       guard
         let input = await target.session.stage(
           body, mode: mode, files: files, sendID: sendID, recipients: recipients,
-          composer: target.id == recipients.first ? receipt : nil)
+          composer: receipt)
       else {
         for item in staged {
           await withdraw(item.input, from: item.target.session, lane: item.target.id)
@@ -1083,13 +1083,14 @@ final class ChatModel {
     return misses.count < staged.count
   }
 
-  /// The composer's receipt for a Send, held in the outbox of its first recipient's `session`.
+  /// The composer's receipt for a Send, held in the outbox of each of its `targets`.
   private func submission(
     _ identity: ComposerInputIdentity, text: String, files: [LocalAttachment],
-    at session: CoordinatorSession
+    at targets: [Target]
   ) -> ComposerSubmission {
     ComposerSubmission(
-      identity: identity, outboxURL: session.outboxURL, text: text, attachments: files,
+      identity: identity, outboxURLs: targets.map(\.session.outboxURL), text: text,
+      attachments: files,
       feedbackScreenshotID: files.first { screenshotOwners[$0.id] != nil }?.id)
   }
   private func logComposer(_ event: ComposerEvent, error: (any Error)? = nil) {

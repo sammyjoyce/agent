@@ -132,7 +132,8 @@ required for sharing on a phone; an unsigned build does not establish that.
   Recovery checks the original endpoint's retained receipt, so admitted text
   stays retired after a failed save or connection change. Newer typing and files
   survive. Controls retain receipts without becoming replayable inputs.
-  A Send to several coordinators keeps its receipt with the first one.
+  A Send to several coordinators keeps its receipt in each recipient's outbox.
+  Recovery offers its text again only when none of them still holds it.
   Ownership paths are relative to the composer record, allowing storage to move.
   Local rejection restores the unadmitted copy, preserving newer typing.
   Restoring an outbox input saves the complete replacement draft and keeps the

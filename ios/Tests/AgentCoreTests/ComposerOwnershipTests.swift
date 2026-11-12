@@ -313,13 +313,13 @@ func acceptedSlashControlDoesNotReturnFromAFailedComposerCheckpoint(newTyping: B
   }
 }
 
-/// A control sent to two coordinators misses the first and reaches the second, and the app stops
-/// before it saves a newer draft. Recovery from the checkpoint saved before the Send must not
-/// offer the control again, since sending it again runs it twice.
-@Test(.timeLimit(.minutes(1)))
-func recoveryOffersASendAgainOnlyWhenNoRecipientReceivedIt() async throws {
+/// A control sent to two coordinators misses the first, and the second runs it or misses too. The
+/// app stops before it saves a newer draft. Recovery from the checkpoint saved before the Send
+/// offers the control again only when neither ran it, since sending it again runs it twice.
+@Test(.timeLimit(.minutes(1)), arguments: [false, true])
+func recoveryOffersASendAgainOnlyWhenNoRecipientReceivedIt(secondMisses: Bool) async throws {
   try await withCoordinator { first, _, firstOutbox in
-    try await withCoordinator { second, secondFixture, _ in
+    try await withCoordinator { second, secondFixture, secondOutbox in
       try await connected(first)
       try await connected(second)
       let root = firstOutbox.deletingLastPathComponent()
@@ -329,7 +329,8 @@ func recoveryOffersASendAgainOnlyWhenNoRecipientReceivedIt() async throws {
       _ = try await store.load(from: files)
       let identity = ComposerInputIdentity(composerID: UUID())
       let submission = ComposerSubmission(
-        identity: identity, outboxURL: firstOutbox, text: "/status", attachments: [])
+        identity: identity, outboxURLs: [firstOutbox, secondOutbox], text: "/status",
+        attachments: [])
       try await store.save(
         ComposerDraft(composerID: identity.composerID, submission: submission), revision: 1)
       let recipients = [first.profile, second.profile]
@@ -337,19 +338,28 @@ func recoveryOffersASendAgainOnlyWhenNoRecipientReceivedIt() async throws {
         await first.stage(
           "/status", sendID: "invented-send", recipients: recipients, composer: identity))
       let stagedSecond = try #require(
-        await second.stage("/status", sendID: "invented-send", recipients: recipients))
+        await second.stage(
+          "/status", sendID: "invented-send", recipients: recipients, composer: identity))
       #expect(try CoordinatorSession.ownsComposerInput(identity, outboxURL: firstOutbox))
+      #expect(try CoordinatorSession.ownsComposerInput(identity, outboxURL: secondOutbox))
       await first.disconnect()
+      if secondMisses { await second.disconnect() }
       #expect(await first.start(stagedFirst) == .notSent)
-      #expect(await second.start(stagedSecond) == .started)
+      #expect(await second.start(stagedSecond) == (secondMisses ? .notSent : .started))
       let deadline = ContinuousClock.now + .seconds(5)
-      while await secondFixture.count() == 0, ContinuousClock.now < deadline {
+      while !secondMisses, await secondFixture.count() == 0, ContinuousClock.now < deadline {
         try await Task.sleep(for: .milliseconds(5))
       }
-      #expect(await secondFixture.count() == 1)
-      #expect(try !CoordinatorSession.ownsComposerInput(identity, outboxURL: firstOutbox))
+      #expect(await secondFixture.count() == (secondMisses ? 0 : 1))
+      #expect(
+        try !CoordinatorSession.ownsComposerInput(identity, outboxURL: firstOutbox),
+        "The first outbox released the receipt")
+      let secondHolds = try CoordinatorSession.ownsComposerInput(identity, outboxURL: secondOutbox)
+      #expect(secondHolds == !secondMisses, "The second outbox holds it while its copy went")
       let recovered = try await ComposerDraftStore(url: url).load(from: files)
-      #expect(recovered.draft.text.isEmpty, "The second coordinator ran /status, so it stays sent")
+      #expect(
+        recovered.draft.text == (secondMisses ? "/status" : ""),
+        "/status comes back only when neither coordinator ran it")
     }
   }
 }
@@ -357,8 +367,8 @@ func recoveryOffersASendAgainOnlyWhenNoRecipientReceivedIt() async throws {
 enum RecipientOutbox: CaseIterable, Sendable { case first, second }
 
 /// A Send to two coordinators reaches both, and the checkpoint after it fails, so the saved draft
-/// still holds the Send. One recipient's outbox is then gone, as after that recipient released its
-/// receipt or was removed. The other recipient still proves the Send went.
+/// still holds the Send. One recipient's outbox is then gone, as after Remove deletes that
+/// coordinator. The other recipient still proves the Send went.
 @MainActor @Test(.timeLimit(.minutes(1)), arguments: RecipientOutbox.allCases)
 func aSendBothCoordinatorsReceivedIsNotOfferedAgainWhenOneOutboxIsGone(
   gone: RecipientOutbox
@@ -398,10 +408,7 @@ func aSendBothCoordinatorsReceivedIsNotOfferedAgainWhenOneOutboxIsGone(
       await sending.value
       #expect(await model.draft.isEmpty)
       #expect(await model.draftError != nil, "The checkpoint after the Send failed")
-      let outbox = gone == .first ? firstOutbox : secondOutbox
-      if FileManager.default.fileExists(atPath: outbox.path) {
-        try FileManager.default.removeItem(at: outbox)
-      }
+      try FileManager.default.removeItem(at: gone == .first ? firstOutbox : secondOutbox)
       let cold = await MainActor.run {
         ChatModel(draftStore: files, persistence: ComposerDraftStore(url: url))
       }
@@ -411,5 +418,32 @@ func aSendBothCoordinatorsReceivedIsNotOfferedAgainWhenOneOutboxIsGone(
       #expect(await firstFixture.count() == 1, "The first coordinator got /status once")
       #expect(await secondFixture.count() == 1, "The second coordinator got /status once")
     }
+  }
+}
+
+/// A checkpoint the previous build saved during a Send names its one outbox under `outboxPath`.
+/// While that outbox holds the receipt, the Send stays sent.
+@Test(.timeLimit(.minutes(1)))
+func aCheckpointNamingOneOutboxStaysSentWhileThatOutboxHoldsTheReceipt() async throws {
+  try await withCoordinator { session, _, outbox in
+    try await connected(session)
+    let identity = ComposerInputIdentity(composerID: UUID())
+    _ = try #require(
+      await session.stage(
+        "/status", sendID: "invented-send", recipients: [session.profile], composer: identity))
+    let root = outbox.deletingLastPathComponent()
+    let url = root.appending(path: "legacy-draft.json")
+    let composer = identity.composerID.uuidString
+    try Data(
+      """
+      {"revision":1,"text":"","mode":"steer","attachments":[],"consumedTransfers":[],
+      "composerID":"\(composer)","submission":{"identity":{"composerID":"\(composer)",
+      "inputID":"\(identity.inputID.uuidString)"},"outboxPath":"pending.json","text":"/status",
+      "attachments":[]}}
+      """.utf8
+    ).write(to: url)
+    let recovered = try await ComposerDraftStore(url: url).load(
+      from: AttachmentStore(directory: root.appending(path: "LegacyFiles")))
+    #expect(recovered.draft.text.isEmpty, "The outbox holds the receipt, so /status stays sent")
   }
 }

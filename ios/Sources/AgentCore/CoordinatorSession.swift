@@ -433,10 +433,9 @@ public actor CoordinatorSession {
     }
     let request = NativeRequestSubmit(
       attachments: files.isEmpty && !feedback ? nil : files.map(\.reference),
-      inputId: composer?.inputID.uuidString ?? UUID().uuidString, mode: mode,
-      origin: inputOrigins ? .ios : nil, text: text)
+      inputId: UUID().uuidString, mode: mode, origin: inputOrigins ? .ios : nil, text: text)
     let previousComposers = composerInputs
-    if let composer { composerInputs[composer.composerID.uuidString] = request.inputId }
+    if let composer { composerInputs[composer.composerID.uuidString] = composer.inputID.uuidString }
     guard !control || feedback else {
       // Controls have no replayable payload, but their admitted composer identity
       // must survive a failed draft checkpoint just like a queued message's.
@@ -536,9 +535,7 @@ public actor CoordinatorSession {
       }
     }
     let previousComposers = composerInputs
-    if let key = staged.composer?.composerID.uuidString, composerInputs[key] == staged.inputID {
-      composerInputs[key] = nil
-    }
+    if let key = receiptKey(staged) { composerInputs[key] = nil }
     guard let removal = acknowledge(staged.inputID) else {
       composerInputs = previousComposers
       publish()
@@ -550,13 +547,21 @@ public actor CoordinatorSession {
     await removal.value
     return true
   }
-  /// A control that never left the phone was not admitted, so its composer keeps its text.
+  /// A control that never left the phone was not admitted, so this outbox releases its composer's
+  /// receipt.
   private func releaseReceipt(_ staged: StagedInput) {
-    guard let key = staged.composer?.composerID.uuidString, composerInputs[key] == staged.inputID
-    else { return }
+    guard let key = receiptKey(staged) else { return }
     let previousComposers = composerInputs
     composerInputs[key] = nil
     do { try saveOutbox() } catch { composerInputs = previousComposers }
+  }
+  /// The key of the composer receipt `staged` holds in this outbox, or nil when it holds none. The
+  /// receipt names the composer's submission, which every recipient's copy shares, while each
+  /// copy's input ID names that copy alone.
+  private func receiptKey(_ staged: StagedInput) -> String? {
+    guard let composer = staged.composer else { return nil }
+    let key = composer.composerID.uuidString
+    return composerInputs[key] == composer.inputID.uuidString ? key : nil
   }
 
   /// Writes a queued input again under its original ID. One the coordinator accepted is observed by

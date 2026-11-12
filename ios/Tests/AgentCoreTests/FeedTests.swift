@@ -593,10 +593,10 @@ func anUntaggedSendReachesBothCoordinatorsAndATaggedOneOnlyItsOwn() async throws
   }
 }
 
-/// A Send to both keeps the composer's receipt in the first recipient's outbox alone, under that
-/// copy's input ID. The other copy has its own ID and no receipt.
+/// A Send to both keeps the composer's receipt in each recipient's outbox. Each copy has its own
+/// input ID, so Retry, Discard and Restore reach the coordinator that holds it.
 @MainActor @Test(.timeLimit(.minutes(1)))
-func aSendToBothKeepsItsComposerReceiptWithTheFirstRecipientAlone() async throws {
+func aSendToBothKeepsItsComposerReceiptWithEachRecipient() async throws {
   try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
     await workFixture.holdPlacements()
     await personalFixture.holdPlacements()
@@ -613,12 +613,12 @@ func aSendToBothKeepsItsComposerReceiptWithTheFirstRecipientAlone() async throws
       try Data(contentsOf: ProfileDirectory(id, applicationSupport: root, caches: root).outbox)
     }
     let atWork = try JSONDecoder().decode(WithReceipts.self, from: outbox(work))
-    #expect(atWork.pending.count == 1)
-    #expect(Array(atWork.composerInputs.values) == atWork.pending.map(\.request.inputId))
-    let atPersonal = try JSONDecoder().decode([OutboxItem].self, from: outbox(personal))
-    #expect(atPersonal.count == 1, "No receipt, so Personal's outbox stays a bare array")
-    #expect(atPersonal.first?.request.inputId != atWork.pending.first?.request.inputId)
-    #expect(atPersonal.first?.sendID == atWork.pending.first?.sendID)
+    let atPersonal = try JSONDecoder().decode(WithReceipts.self, from: outbox(personal))
+    #expect(atWork.pending.count == 1 && atPersonal.pending.count == 1)
+    #expect(atWork.composerInputs.count == 1)
+    #expect(atPersonal.composerInputs == atWork.composerInputs, "Both hold the same receipt")
+    #expect(atPersonal.pending.first?.request.inputId != atWork.pending.first?.request.inputId)
+    #expect(atPersonal.pending.first?.sendID == atWork.pending.first?.sendID)
   }
 }
 
@@ -3636,8 +3636,7 @@ func anAcknowledgementThisPhoneCouldNotSaveStillKeepsTheOriginal(placed: Bool, s
         $0.inputID == original.inputId && $0.delivery == .saved
       } == true
     }
-    let saved = try JSONDecoder().decode(
-      [OutboxItem].self, from: Data(contentsOf: directory.outbox))
+    let saved = try queuedItems(directory.outbox)
     print(
       "IF7-V1[placed=\(placed) storageFails=\(storageFails)] acknowledged: refusedOnDisk=\(saved.first?.refused == true)"
     )
