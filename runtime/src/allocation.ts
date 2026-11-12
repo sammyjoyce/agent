@@ -12,6 +12,7 @@ export function allocationResult(result: HostResult): AllocationResult {
     case "spawned": return { type: "spawned", binding: result.binding };
     case "worker_presence": return { type: "presence", presence: result.presence };
     case "creation_uncertain": return { type: "creation_uncertain", session_id: result.session_id };
+    case "not_started": return { type: "not_started", message: result.message };
     case "failed": return { type: "failed", message: result.message };
     default: return { type: "failed", message: `Unexpected native allocation result: ${result.type}` };
   }

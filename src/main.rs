@@ -65,6 +65,10 @@ struct Arguments {
     /// Connect to a coordinator through Tailscale or an existing SSH host.
     #[arg(long, global = true)]
     coordinator: Option<String>,
+    /// Run Rex work on this private local server (unix:///absolute/socket)
+    /// instead of the personal one. Workers this process starts inherit it.
+    #[arg(long, global = true)]
+    rex_server: Option<String>,
     #[arg(long, global = true)]
     json: bool,
     /// Use the plain line interface in an interactive terminal.
@@ -430,6 +434,8 @@ fn runtime_script(explicit: Option<PathBuf>) -> PathBuf {
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut arguments = Arguments::parse();
+    #[allow(clippy::disallowed_methods)]
+    let rex = RexClient::for_process(arguments.rex_server.as_deref())?;
     let action = arguments.command.take().unwrap_or(Action::Chat {
         prompt: None,
         selection: ModelArgs::default(),
@@ -554,6 +560,23 @@ async fn main() -> Result<()> {
         config::validate_coordinator(value)?;
     }
     let cwd = env::current_dir()?;
+    // Rex tells a pane its session, not its server. A worker's pane is on the
+    // server that started it; any other terminal is on REX_SERVER, else the
+    // personal server, as Rex's own CLI assumes.
+    #[allow(clippy::disallowed_methods)]
+    let terminal = if matches!(action, Action::RunTask { .. }) {
+        rex.clone()
+    } else {
+        RexClient::for_process(None)?
+    };
+    let client = ClientContext {
+        config: &config,
+        coordinator: coordinator.as_deref(),
+        script: &script,
+        directory: &directory,
+        rex: &rex,
+        terminal: &terminal,
+    };
     if let Action::Serve {
         tailnet_port,
         local_only,
@@ -570,7 +593,7 @@ async fn main() -> Result<()> {
                 !local_only,
                 "A worker profile cannot start a second local coordinator"
             );
-            return worker_service(&config, coordinator.as_deref(), &script, &directory, 300).await;
+            return worker_service(client, 300).await;
         }
         if !no_sources {
             configure_messages(&config.sources).await;
@@ -584,6 +607,7 @@ async fn main() -> Result<()> {
             .clone()
             .unwrap_or(instructions::default_path()?);
         let node = match discovery::local_node(
+            &rex,
             None,
             config
                 .launch
@@ -595,6 +619,12 @@ async fn main() -> Result<()> {
         .await
         {
             Ok(node) => Some(node),
+            // Exit so the service manager restarts us once the private Rex is up.
+            Err(error) if rex.is_private() => {
+                return Err(
+                    error.context("The private Rex server for this coordinator is unavailable")
+                );
+            }
             Err(_) => {
                 eprintln!(
                     "Local Rex is unavailable; this coordinator has no local worker until restarted."
@@ -622,6 +652,7 @@ async fn main() -> Result<()> {
             (!local_only).then_some(tailnet_port),
             policy,
             daemon,
+            rex,
             bootstrap,
         )
         .await;
@@ -632,7 +663,7 @@ async fn main() -> Result<()> {
             "RPC must run on the selected coordinator"
         );
         return service::relay(
-            local_connection(&script, &directory, arguments.config.as_deref()).await?,
+            local_connection(&rex, &script, &directory, arguments.config.as_deref()).await?,
         )
         .await;
     }
@@ -641,31 +672,16 @@ async fn main() -> Result<()> {
             coordinator.is_some(),
             "Worker service requires a selected remote coordinator"
         );
-        return worker_service(
-            &config,
-            coordinator.as_deref(),
-            &script,
-            &directory,
-            interval_seconds,
-        )
-        .await;
+        return worker_service(client, interval_seconds).await;
     }
     let command = match action {
         Action::Login => RuntimeCommand::Login,
         Action::Status => RuntimeCommand::Status,
         Action::Usage => RuntimeCommand::Usage {
-            provider: conversation_settings(
-                &config,
-                coordinator.as_deref(),
-                &script,
-                &directory,
-                None,
-                None,
-                false,
-            )
-            .await?
-            .model
-            .provider,
+            provider: conversation_settings(client, None, None, false)
+                .await?
+                .model
+                .provider,
         },
         Action::Logout => RuntimeCommand::Logout,
         Action::Sources => RuntimeCommand::SourceStates,
@@ -699,7 +715,7 @@ async fn main() -> Result<()> {
         Action::Resources { command } => match command {
             ResourcesAction::List => RuntimeCommand::ListResources,
             ResourcesAction::Collect => RuntimeCommand::CollectResources {
-                host_id: RexClient::new(None).whoami().await?.host_id.to_string(),
+                host_id: rex.whoami().await?.host_id.to_string(),
             },
         },
         Action::Tasks { command } => match command {
@@ -781,13 +797,9 @@ async fn main() -> Result<()> {
             task_id,
             agent_id,
             allocation_id,
-            binding: local_worker_binding().await?,
+            binding: local_worker_binding(&rex, &terminal).await?,
             instructions: instructions::project(&cwd)?,
-            model: selection.resolve(
-                &environment(&config, coordinator.as_deref(), &script, &directory)
-                    .await?
-                    .model,
-            )?,
+            model: selection.resolve(&environment(client).await?.model)?,
             cwd: cwd.to_string_lossy().into_owned(),
             interactive: Some(true),
         },
@@ -795,14 +807,7 @@ async fn main() -> Result<()> {
             prompt: Some(input),
             selection,
         } => {
-            let model = selected_model(
-                selection,
-                &config,
-                coordinator.as_deref(),
-                &script,
-                &directory,
-            )
-            .await?;
+            let model = selected_model(selection, client).await?;
             if let Some(command) = ChatCommand::parse(&input) {
                 let command = command?;
                 match command {
@@ -814,10 +819,7 @@ async fn main() -> Result<()> {
                     ChatCommand::Resume { query } if use_tui(&arguments) => {
                         return chat_tui(
                             &arguments,
-                            &config,
-                            coordinator.as_deref(),
-                            &script,
-                            &directory,
+                            client,
                             &cwd,
                             ChatStart {
                                 model,
@@ -829,10 +831,7 @@ async fn main() -> Result<()> {
                     ChatCommand::History => {
                         return request(
                             &arguments,
-                            &config,
-                            coordinator.as_deref(),
-                            &script,
-                            &directory,
+                            client,
                             RuntimeCommand::ReadHistory {
                                 task_id: None,
                                 agent_id: None,
@@ -848,39 +847,22 @@ async fn main() -> Result<()> {
                             && let Some(model) = model
                         {
                             conversation_settings(
-                                &config,
-                                coordinator.as_deref(),
-                                &script,
-                                &directory,
+                                client,
                                 None,
                                 Some(ConversationChange::SetSelection { model }),
                                 false,
                             )
                             .await?;
                         }
-                        return local_command_plain(
-                            ClientContext {
-                                config: &config,
-                                coordinator: coordinator.as_deref(),
-                                script: &script,
-                                directory: &directory,
-                            },
-                            &command,
-                            None,
-                            &cwd,
-                            arguments.json,
-                        )
-                        .await;
+                        return local_command_plain(client, &command, None, &cwd, arguments.json)
+                            .await;
                     }
                 }
             }
             if use_tui(&arguments) {
                 return chat_tui(
                     &arguments,
-                    &config,
-                    coordinator.as_deref(),
-                    &script,
-                    &directory,
+                    client,
                     &cwd,
                     ChatStart {
                         model,
@@ -889,27 +871,17 @@ async fn main() -> Result<()> {
                 )
                 .await;
             }
-            chat_command(input, model, &cwd).await?
+            chat_command(&rex, &terminal, input, model, &cwd).await?
         }
         Action::Chat {
             prompt: None,
             selection,
         } => {
-            let model = selected_model(
-                selection,
-                &config,
-                coordinator.as_deref(),
-                &script,
-                &directory,
-            )
-            .await?;
+            let model = selected_model(selection, client).await?;
             if use_tui(&arguments) {
                 return chat_tui(
                     &arguments,
-                    &config,
-                    coordinator.as_deref(),
-                    &script,
-                    &directory,
+                    client,
                     &cwd,
                     ChatStart {
                         model,
@@ -919,30 +891,17 @@ async fn main() -> Result<()> {
                 .await;
             }
             conversation_settings(
-                &config,
-                coordinator.as_deref(),
-                &script,
-                &directory,
+                client,
                 None,
                 model.map(|model| ConversationChange::SetSelection { model }),
                 false,
             )
             .await?;
             let model: Option<ModelSelection> = None;
-            let _watch = watch(
-                &config,
-                coordinator.as_deref(),
-                &script,
-                &directory,
-                arguments.json,
-            )
-            .await?;
+            let _watch = watch(client, arguments.json).await?;
             let mut history_cursor = request(
                 &arguments,
-                &config,
-                coordinator.as_deref(),
-                &script,
-                &directory,
+                client,
                 RuntimeCommand::ReadHistory {
                     task_id: None,
                     agent_id: None,
@@ -977,12 +936,7 @@ async fn main() -> Result<()> {
                             Ok(ChatCommand::History | ChatCommand::Feedback { .. }) => {}
                             Ok(command) => {
                                 if let Err(error) = local_command_plain(
-                                    ClientContext {
-                                        config: &config,
-                                        coordinator: coordinator.as_deref(),
-                                        script: &script,
-                                        directory: &directory,
-                                    },
+                                    client,
                                     &command,
                                     None,
                                     &cwd,
@@ -1004,22 +958,26 @@ async fn main() -> Result<()> {
                         let coordinator = coordinator.clone();
                         let script = script.clone();
                         let directory = directory.clone();
+                        let rex = rex.clone();
+                        let terminal = terminal.clone();
                         let cwd = cwd.to_string_lossy().into_owned();
                         let model = model.clone();
                         let description = description.to_owned();
                         let json = arguments.json;
                         while feedback.try_join_next().is_some() {}
                         feedback.spawn(async move {
+                            let client = ClientContext {
+                                config: &config,
+                                coordinator: coordinator.as_deref(),
+                                script: &script,
+                                directory: &directory,
+                                rex: &rex,
+                                terminal: &terminal,
+                            };
                             let captured = async {
-                                let context = feedback_context(cwd, model, None).await?;
-                                exchange(
-                                    &config,
-                                    coordinator.as_deref(),
-                                    &script,
-                                    &directory,
-                                    context.command(description),
-                                )
-                                .await
+                                let context =
+                                    feedback_context(&rex, &terminal, cwd, model, None).await?;
+                                exchange(client, context.command(description)).await
                             }
                             .await;
                             match captured {
@@ -1045,10 +1003,7 @@ async fn main() -> Result<()> {
                         } else {
                             history_cursor = request(
                                 &arguments,
-                                &config,
-                                coordinator.as_deref(),
-                                &script,
-                                &directory,
+                                client,
                                 RuntimeCommand::ReadHistory {
                                     task_id: None,
                                     agent_id: None,
@@ -1060,15 +1015,11 @@ async fn main() -> Result<()> {
                         continue;
                     }
                     if !line.trim().is_empty() {
-                        let command = chat_command(line, model.clone(), &cwd).await?;
+                        let command =
+                            chat_command(&rex, &terminal, line, model.clone(), &cwd).await?;
                         request_presented(
                             &arguments,
-                            ClientContext {
-                                config: &config,
-                                coordinator: coordinator.as_deref(),
-                                script: &script,
-                                directory: &directory,
-                            },
+                            client,
                             command,
                             None,
                             PlainNoticeRoute::Watch,
@@ -1105,17 +1056,9 @@ async fn main() -> Result<()> {
         })?;
         let mut ui = UiSession::new(handle, inputs);
         ui.initial_replay = Some(ui.handle.begin_history_replay()?);
-        let result = request_with_ui(
-            &arguments,
-            &config,
-            coordinator.as_deref(),
-            &script,
-            &directory,
-            command,
-            &mut ui,
-        )
-        .await
-        .map(|_| ());
+        let result = request_with_ui(&arguments, client, command, &mut ui)
+            .await
+            .map(|_| ());
         let recovery = if result.is_err() {
             Some(preserve_ui_recovery(&directory, owner, &ui).await)
         } else {
@@ -1134,26 +1077,11 @@ async fn main() -> Result<()> {
         }
         return result.and(stopped);
     }
-    request(
-        &arguments,
-        &config,
-        coordinator.as_deref(),
-        &script,
-        &directory,
-        command,
-    )
-    .await
-    .map(|_| ())
+    request(&arguments, client, command).await.map(|_| ())
 }
 
-async fn watch(
-    config: &ClientConfig,
-    coordinator: Option<&str>,
-    script: &Path,
-    directory: &Path,
-    json: bool,
-) -> Result<WatchGuard> {
-    let mut wire = connection(config, coordinator, script, directory, false).await?;
+async fn watch(client: ClientContext<'_>, json: bool) -> Result<WatchGuard> {
+    let mut wire = connection(client, false).await?;
     write_command(&mut *wire.writer, &RuntimeCommand::Watch).await?;
     Ok(WatchGuard(tokio::spawn(async move {
         let _writer = wire.writer;
@@ -1587,8 +1515,11 @@ fn selected_input(
     let coordinator = client.coordinator.map(str::to_owned);
     let script = client.script.to_owned();
     let directory = client.directory.to_owned();
+    let rex = client.rex.clone();
+    let terminal = client.terminal.clone();
     while ui.admissions.try_join_next().is_some() {}
     ui.admissions.spawn(async move {
+        let client = ClientContext { config: &config, coordinator: coordinator.as_deref(), script: &script, directory: &directory, rex: &rex, terminal: &terminal };
         loop {
         let mut attachment = None;
         let result: std::result::Result<(), chat_view::ViewError> = async {
@@ -1606,9 +1537,7 @@ fn selected_input(
                 return Ok(());
             }
             let mut input = admission.input()?;
-            let prepared = prepare_attachments(ClientContext {
-                config: &config, coordinator: coordinator.as_deref(), script: &script, directory: &directory,
-            }, &mut input).await;
+            let prepared = prepare_attachments(client, &mut input).await;
             admission.prepared(input.clone())?;
             prepared?;
             if admission.stage()? == chat_admission::Stage::Canceled {
@@ -1626,7 +1555,7 @@ fn selected_input(
                 }));
                 return Ok(());
             }
-            let context = match chat_command(String::new(), None, &cwd).await? {
+            let context = match chat_command(&rex, &terminal, String::new(), None, &cwd).await? {
                 RuntimeCommand::Chat {
                     instructions,
                     origin_host_id,
@@ -1642,12 +1571,7 @@ fn selected_input(
                 _ => return Err(anyhow::anyhow!("The main chat context is unavailable").into()),
             };
             chat_view::control(
-                ClientContext {
-                    config: &config,
-                    coordinator: coordinator.as_deref(),
-                    script: &script,
-                    directory: &directory,
-                },
+                client,
                 RuntimeCommand::ConversationInput {
                     origin: Some(agent_cli::protocol::InputOrigin::Cli),
                     conversation_id: admission.conversation_id.clone(),
@@ -1730,22 +1654,24 @@ async fn selected_interrupt(client: ClientContext<'_>, ui: &mut UiSession) -> Re
     let coordinator = client.coordinator.map(str::to_owned);
     let script = client.script.to_owned();
     let directory = client.directory.to_owned();
+    let rex = client.rex.clone();
+    let terminal = client.terminal.clone();
     let sender = ui.view_sender.clone();
     let token = ui.view.as_ref().map(|view| view.token);
     // Switching views cancels local reads, not this already requested stop.
     ui.admissions.spawn(async move {
+        let client = ClientContext {
+            config: &config,
+            coordinator: coordinator.as_deref(),
+            script: &script,
+            directory: &directory,
+            rex: &rex,
+            terminal: &terminal,
+        };
         if let Some(mut previous) = previous {
             let _ = previous.wait_for(|stopped| *stopped).await;
         }
-        match exchange(
-            &config,
-            coordinator.as_deref(),
-            &script,
-            &directory,
-            command,
-        )
-        .await
-        {
+        match exchange(client, command).await {
             Ok(events) => {
                 if let Some(token) = token {
                     for event in events {
@@ -1771,13 +1697,15 @@ async fn selected_interrupt(client: ClientContext<'_>, ui: &mut UiSession) -> Re
 }
 
 async fn feedback_context(
+    rex: &RexClient,
+    terminal: &RexClient,
     cwd: String,
     model: Option<ModelSelection>,
     target: Option<(TaskId, Option<String>)>,
 ) -> Result<FeedbackContext> {
-    let origin_host_id = RexClient::new(None).whoami().await?.host_id.to_string();
+    let origin_host_id = rex.whoami().await?.host_id.to_string();
     let binding = if env::var_os("REX_SESSION").is_some() && env::var_os("REX_BLOCK").is_some() {
-        Some(local_worker_binding().await?)
+        Some(local_worker_binding(rex, terminal).await?)
     } else {
         None
     };
@@ -1799,18 +1727,17 @@ async fn feedback_context(
 }
 
 fn feedback_from_ui(
-    config: &ClientConfig,
-    coordinator: Option<&str>,
-    script: &Path,
-    directory: &Path,
+    client: ClientContext<'_>,
     ui: &mut UiSession,
     target: Option<(TaskId, Option<String>)>,
     input: ComposerInput,
 ) {
-    let config = config.clone();
-    let coordinator = coordinator.map(str::to_owned);
-    let script = script.to_owned();
-    let directory = directory.to_owned();
+    let config = client.config.clone();
+    let coordinator = client.coordinator.map(str::to_owned);
+    let script = client.script.to_owned();
+    let directory = client.directory.to_owned();
+    let rex = client.rex.clone();
+    let terminal = client.terminal.clone();
     let handle = ui.handle.clone();
     let conversation_id = ui.conversation_id.clone();
     let queued_inputs = ui
@@ -1823,13 +1750,14 @@ fn feedback_from_ui(
     let client_errors = ui.errors.iter().cloned().collect();
     while ui.controls.try_join_next().is_some() {}
     ui.controls.spawn(async move {
+        let client = ClientContext { config: &config, coordinator: coordinator.as_deref(), script: &script, directory: &directory, rex: &rex, terminal: &terminal };
         let input_id = uuid::Uuid::new_v4();
         let mut input = input;
         let mut submitted = false;
         let result = async {
             let info = handle.info().await?;
             let draft = handle.draft().await?;
-            let mut context = feedback_context(info.cwd, info.model, target).await?;
+            let mut context = feedback_context(&rex, &terminal, info.cwd, info.model, target).await?;
             context.conversation_id = conversation_id;
             context.draft = draft;
             context.queued_inputs = queued_inputs;
@@ -1838,7 +1766,7 @@ fn feedback_from_ui(
             // Preserve styled HTML when it fits, otherwise bounded pane text.
             let capture = if input.attachment_count() < agent_cli::attachments::MAX_ATTACHMENTS {
                 match context.binding.as_ref() {
-                    Some(binding) => match capture_feedback_view(&directory, binding).await {
+                    Some(binding) => match capture_feedback_view(&terminal, &directory, binding).await {
                         Ok(capture) => Some(capture),
                         Err(error) => {
                             context.client_errors.push(format!("Terminal view capture unavailable: {error}"));
@@ -1857,7 +1785,7 @@ fn feedback_from_ui(
             if let Some(capture) = &capture {
                 input.files.push(agent_cli::tui::attachments::ComposerFile::read_metadata(capture.path.clone())?);
             }
-            let prepared = prepare_attachments(ClientContext {config:&config,coordinator:coordinator.as_deref(),script:&script,directory:&directory}, &mut input).await;
+            let prepared = prepare_attachments(client, &mut input).await;
             if prepared.is_err() && let Some(capture)=&capture {
                 input.files.retain(|file| file.path != capture.path);
             }
@@ -1870,12 +1798,8 @@ fn feedback_from_ui(
             write_feedback_submission(&directory,input_id,&command)?;
             submitted = true;
             let events = exchange(
-                &config,
-                coordinator.as_deref(),
-                &script,
-                &directory,
-                command,
-            )
+                client,
+                command)
             .await?;
             ensure!(events.iter().any(|event|matches!(event,RuntimeEventKind::FeedbackReady{input_id:Some(id),..} if id==&input_id.to_string())),"Feedback admission was not confirmed");
             acknowledge_feedback_submission(&directory,&input_id.to_string());
@@ -1918,12 +1842,13 @@ impl Drop for FeedbackViewCapture {
     }
 }
 async fn capture_feedback_view(
+    rex: &RexClient,
     directory: &Path,
     binding: &WorkerRef,
 ) -> Result<FeedbackViewCapture> {
     use std::io::Write;
     use std::os::unix::fs::DirBuilderExt;
-    let capture = RexClient::new(None)
+    let capture = rex
         .capture_terminal(
             &SessionId::parse(&binding.session_id)?,
             &BlockId::parse(&binding.block_id)?,
@@ -2020,20 +1945,14 @@ async fn finish_controls(admissions: &mut tokio::task::JoinSet<()>) {
 }
 
 async fn conversation_settings(
-    config: &ClientConfig,
-    coordinator: Option<&str>,
-    script: &Path,
-    directory: &Path,
+    client: ClientContext<'_>,
     target: Option<(TaskId, Option<String>)>,
     change: Option<ConversationChange>,
     catalog: bool,
 ) -> Result<ConversationSettings> {
     let (task_id, agent_id) = target.map_or((None, None), |(task, agent)| (Some(task), agent));
     exchange(
-        config,
-        coordinator,
-        script,
-        directory,
+        client,
         RuntimeCommand::ConversationSettings {
             task_id,
             agent_id,
@@ -2106,17 +2025,14 @@ fn settings_text(
 }
 
 async fn local_settings(
-    config: &ClientConfig,
-    coordinator: Option<&str>,
-    script: &Path,
-    directory: &Path,
+    client: ClientContext<'_>,
     command: &ChatCommand,
     target: Option<(TaskId, Option<String>)>,
 ) -> Result<ConversationSettings> {
     let request = command
         .settings(target)
         .context("This command does not change conversation settings")?;
-    exchange(config, coordinator, script, directory, request)
+    exchange(client, request)
         .await?
         .into_iter()
         .find_map(|event| match event {
@@ -2130,24 +2046,18 @@ async fn conversation_usage(
     client: ClientContext<'_>,
     provider: ModelProvider,
 ) -> usage::UsageAvailability {
-    exchange(
-        client.config,
-        client.coordinator,
-        client.script,
-        client.directory,
-        RuntimeCommand::Usage { provider },
-    )
-    .await
-    .ok()
-    .and_then(|events| {
-        events.into_iter().find_map(|event| match event {
-            RuntimeEventKind::Usage { usage } => Some(usage),
-            _ => None,
+    exchange(client, RuntimeCommand::Usage { provider })
+        .await
+        .ok()
+        .and_then(|events| {
+            events.into_iter().find_map(|event| match event {
+                RuntimeEventKind::Usage { usage } => Some(usage),
+                _ => None,
+            })
         })
-    })
-    .unwrap_or(usage::UsageAvailability::Unavailable {
-        reason: usage::UsageUnavailable::ReadFailed,
-    })
+        .unwrap_or(usage::UsageAvailability::Unavailable {
+            reason: usage::UsageUnavailable::ReadFailed,
+        })
 }
 
 async fn native_conversation_usage(
@@ -2155,10 +2065,7 @@ async fn native_conversation_usage(
     conversation_id: &str,
 ) -> Result<agent_cli::protocol::ConversationUsage, NativeUsageFailure> {
     let result = exchange(
-        client.config,
-        client.coordinator,
-        client.script,
-        client.directory,
+        client,
         RuntimeCommand::ConversationUsage {
             conversation_id: conversation_id.to_owned(),
         },
@@ -2220,18 +2127,17 @@ fn native_usage_text(
 }
 
 fn local_command_from_ui(
-    config: &ClientConfig,
-    coordinator: Option<&str>,
-    script: &Path,
-    directory: &Path,
+    client: ClientContext<'_>,
     ui: &mut UiSession,
     target: Option<(TaskId, Option<String>)>,
     command: ChatCommand,
 ) {
-    let config = config.clone();
-    let coordinator = coordinator.map(str::to_owned);
-    let script = script.to_owned();
-    let directory = directory.to_owned();
+    let config = client.config.clone();
+    let coordinator = client.coordinator.map(str::to_owned);
+    let script = client.script.to_owned();
+    let directory = client.directory.to_owned();
+    let rex = client.rex.clone();
+    let terminal = client.terminal.clone();
     let handle = ui.handle.clone();
     let selected = ui
         .selected
@@ -2239,16 +2145,17 @@ fn local_command_from_ui(
         .map(|item| item.conversation_id.clone());
     while ui.controls.try_join_next().is_some() {}
     ui.controls.spawn(async move {
+        let client = ClientContext {
+            config: &config,
+            coordinator: coordinator.as_deref(),
+            script: &script,
+            directory: &directory,
+            rex: &rex,
+            terminal: &terminal,
+        };
         let changed = async {
             if let Some(request) = command.request() {
-                let events = exchange(
-                    &config,
-                    coordinator.as_deref(),
-                    &script,
-                    &directory,
-                    request,
-                )
-                .await?;
+                let events = exchange(client, request).await?;
                 for event in events {
                     let text = match &event {
                         RuntimeEventKind::Resources { resources } => {
@@ -2263,13 +2170,7 @@ fn local_command_from_ui(
                 return Ok(());
             }
             if matches!(command, ChatCommand::Machines) {
-                let inventory = machine_inventory(ClientContext {
-                    config: &config,
-                    coordinator: coordinator.as_deref(),
-                    script: &script,
-                    directory: &directory,
-                })
-                .await?;
+                let inventory = machine_inventory(client).await?;
                 return handle.notice(inventory.format(SystemTime::now()));
             }
             let info = handle.info().await?;
@@ -2284,58 +2185,26 @@ fn local_command_from_ui(
                 {
                     *selected = Some(conversation_id);
                 }
-                exchange(
-                    &config,
-                    coordinator.as_deref(),
-                    &script,
-                    &directory,
-                    request,
-                )
-                .await?
-                .into_iter()
-                .find_map(|event| match event {
-                    RuntimeEventKind::ConversationSettings { settings } => Some(settings),
-                    _ => None,
-                })
-                .context("The coordinator returned no conversation settings")?
+                exchange(client, request)
+                    .await?
+                    .into_iter()
+                    .find_map(|event| match event {
+                        RuntimeEventKind::ConversationSettings { settings } => Some(settings),
+                        _ => None,
+                    })
+                    .context("The coordinator returned no conversation settings")?
             } else {
-                local_settings(
-                    &config,
-                    coordinator.as_deref(),
-                    &script,
-                    &directory,
-                    &command,
-                    target,
-                )
-                .await?
+                local_settings(client, &command, target).await?
             };
             let mut text = settings_text(&command, &settings, &info, coordinator.as_deref());
             let provider = settings.model.provider;
             let conversation_id = settings.conversation_id.clone();
             handle.event(RuntimeEventKind::ConversationSettings { settings })?;
             if matches!(command, ChatCommand::Status) {
-                let metrics = native_conversation_usage(
-                    ClientContext {
-                        config: &config,
-                        coordinator: coordinator.as_deref(),
-                        script: &script,
-                        directory: &directory,
-                    },
-                    &conversation_id,
-                )
-                .await;
+                let metrics = native_conversation_usage(client, &conversation_id).await;
                 text.push_str("\n\n");
                 text.push_str(&native_usage_text(&metrics));
-                let usage = conversation_usage(
-                    ClientContext {
-                        config: &config,
-                        coordinator: coordinator.as_deref(),
-                        script: &script,
-                        directory: &directory,
-                    },
-                    provider,
-                )
-                .await;
+                let usage = conversation_usage(client, provider).await;
                 text.push_str("\n\n");
                 text.push_str(&usage::format_status(&usage, SystemTime::now()));
             }
@@ -2354,6 +2223,9 @@ struct ClientContext<'a> {
     coordinator: Option<&'a str>,
     script: &'a Path,
     directory: &'a Path,
+    rex: &'a RexClient,
+    /// Reaches the Rex server that owns this process's REX_SESSION.
+    terminal: &'a RexClient,
 }
 
 async fn prepare_attachments(client: ClientContext<'_>, input: &mut ComposerInput) -> Result<()> {
@@ -2369,14 +2241,7 @@ async fn prepare_attachments(client: ClientContext<'_>, input: &mut ComposerInpu
         reader,
         writer,
         child,
-    } = connection(
-        client.config,
-        client.coordinator,
-        client.script,
-        client.directory,
-        false,
-    )
-    .await?;
+    } = connection(client, false).await?;
     // The upload callback owns this one connection across chunks, including
     // its buffered reader and any local relay child.
     let transfer = Arc::new(tokio::sync::Mutex::new((
@@ -2430,29 +2295,23 @@ async fn prepare_attachments(client: ClientContext<'_>, input: &mut ComposerInpu
 async fn machine_inventory(
     client: ClientContext<'_>,
 ) -> Result<agent_cli::machines::MachineInventory> {
-    exchange(
-        client.config,
-        client.coordinator,
-        client.script,
-        client.directory,
-        RuntimeCommand::Environment { telemetry: true },
-    )
-    .await?
-    .into_iter()
-    .find_map(|event| match event {
-        RuntimeEventKind::Environment {
-            nodes,
-            online_host_ids,
-            unavailable_host_ids,
-            ..
-        } => Some(agent_cli::machines::MachineInventory {
-            nodes,
-            online_host_ids,
-            unavailable_host_ids: unavailable_host_ids.unwrap_or_default(),
-        }),
-        _ => None,
-    })
-    .context("The coordinator returned no machine inventory")
+    exchange(client, RuntimeCommand::Environment { telemetry: true })
+        .await?
+        .into_iter()
+        .find_map(|event| match event {
+            RuntimeEventKind::Environment {
+                nodes,
+                online_host_ids,
+                unavailable_host_ids,
+                ..
+            } => Some(agent_cli::machines::MachineInventory {
+                nodes,
+                online_host_ids,
+                unavailable_host_ids: unavailable_host_ids.unwrap_or_default(),
+            }),
+            _ => None,
+        })
+        .context("The coordinator returned no machine inventory")
 }
 
 async fn local_command_plain(
@@ -2481,15 +2340,7 @@ async fn local_command_plain(
         return Ok(());
     }
     if let Some(request) = command.request() {
-        for event in exchange(
-            client.config,
-            client.coordinator,
-            client.script,
-            client.directory,
-            request,
-        )
-        .await?
-        {
+        for event in exchange(client, request).await? {
             display(&event, json)?;
         }
         return Ok(());
@@ -2503,15 +2354,7 @@ async fn local_command_plain(
         }
         return Ok(());
     }
-    let settings = local_settings(
-        client.config,
-        client.coordinator,
-        client.script,
-        client.directory,
-        command,
-        target,
-    )
-    .await?;
+    let settings = local_settings(client, command, target).await?;
     let quota = if matches!(command, ChatCommand::Status) {
         Some(
             conversation_usage(
@@ -2520,6 +2363,8 @@ async fn local_command_plain(
                     coordinator: client.coordinator,
                     script: client.script,
                     directory: client.directory,
+                    rex: client.rex,
+                    terminal: client.terminal,
                 },
                 settings.model.provider,
             )
@@ -2536,6 +2381,8 @@ async fn local_command_plain(
                     coordinator: client.coordinator,
                     script: client.script,
                     directory: client.directory,
+                    rex: client.rex,
+                    terminal: client.terminal,
                 },
                 &settings.conversation_id,
             )
@@ -2606,19 +2453,10 @@ enum PlainNoticeRoute {
 
 async fn chat_tui(
     _arguments: &Arguments,
-    config: &ClientConfig,
-    coordinator: Option<&str>,
-    script: &Path,
-    directory: &Path,
+    client: ClientContext<'_>,
     cwd: &Path,
     start: ChatStart,
 ) -> Result<()> {
-    let client = ClientContext {
-        config,
-        coordinator,
-        script,
-        directory,
-    };
     let resuming = start.prompt.as_ref().is_some_and(|prompt| {
         matches!(
             ChatCommand::parse(prompt),
@@ -2633,11 +2471,7 @@ async fn chat_tui(
     let mut ui = UiSession::new(handle, inputs);
     let mut startup_inputs = VecDeque::new();
     let result = async {
-        let request = conversation_settings(
-            config,
-            coordinator,
-            script,
-            directory,
+        let request = conversation_settings( client,
             None,
             if resuming {
                 None
@@ -2646,8 +2480,7 @@ async fn chat_tui(
                     .model
                     .map(|model| ConversationChange::SetSelection { model })
             },
-            false,
-        );
+            false);
         tokio::pin!(request);
         let settings = loop {
             tokio::select! {
@@ -2677,18 +2510,14 @@ async fn chat_tui(
                     && let Some(selected) = &ui.selected
                 {
                     for event in exchange(
-                        config,
-                        coordinator,
-                        script,
-                        directory,
+                        client,
                         RuntimeCommand::ConversationSettings {
                             task_id: selected.task_id.clone(),
                             agent_id: selected.agent_id.clone(),
                             conversation_id: Some(selected.conversation_id.clone()),
                             change: Some(ConversationChange::SetSelection { model }),
                             catalog: false,
-                        },
-                    )
+                        })
                     .await?
                     {
                         ui.handle.event(event)?;
@@ -2720,29 +2549,19 @@ async fn chat_tui(
                     let target = ui.selected.as_ref().and_then(|item| {
                         item.task_id.clone().map(|id| (id, item.agent_id.clone()))
                     });
-                    local_command_from_ui(
-                        config,
-                        coordinator,
-                        script,
-                        directory,
+                    local_command_from_ui( client,
                         &mut ui,
                         target,
-                        command,
-                    );
+                        command);
                 }
                 TuiInput::Feedback(description) => {
                     let target = ui.selected.as_ref().and_then(|item| {
                         item.task_id.clone().map(|id| (id, item.agent_id.clone()))
                     });
-                    feedback_from_ui(
-                        config,
-                        coordinator,
-                        script,
-                        directory,
+                    feedback_from_ui( client,
                         &mut ui,
                         target,
-                        description,
-                    );
+                        description);
                 }
                 TuiInput::Interrupt => selected_interrupt(client, &mut ui).await?,
                 TuiInput::ToolDetails(request) => tool_details_from_ui(client, &mut ui, None, request),
@@ -2792,7 +2611,7 @@ async fn chat_tui(
                     return Ok(None);
                 }
                 write_ui_recovery(
-                    directory,
+                    client.directory,
                     &UiRecovery {
                         owner: UiRecoveryOwner::Main,
                         draft,
@@ -2806,7 +2625,7 @@ async fn chat_tui(
     } else {
         None
     };
-    let observed_recovery = preserve_observed_recovery(directory, &ui).await;
+    let observed_recovery = preserve_observed_recovery(client.directory, &ui).await;
     ui.close_view().await;
     finish_controls(&mut ui.controls).await;
     let stopped = guard.stop().await;
@@ -2859,21 +2678,22 @@ fn tool_details_from_ui(
     let coordinator = client.coordinator.map(str::to_owned);
     let script = client.script.to_owned();
     let directory = client.directory.to_owned();
+    let rex = client.rex.clone();
+    let terminal = client.terminal.clone();
     let handle = ui.handle.clone();
     while ui.controls.try_join_next().is_some() {}
     ui.tool_lookup = Some(ui.controls.spawn(async move {
-        let details = read_tool_details(
-            ClientContext {
-                config: &config,
-                coordinator: coordinator.as_deref(),
-                script: &script,
-                directory: &directory,
-            },
-            &request,
-            target,
-        )
-        .await
-        .map_err(|error| error.to_string());
+        let client = ClientContext {
+            config: &config,
+            coordinator: coordinator.as_deref(),
+            script: &script,
+            directory: &directory,
+            rex: &rex,
+            terminal: &terminal,
+        };
+        let details = read_tool_details(client, &request, target)
+            .await
+            .map_err(|error| error.to_string());
         let _ = handle.tool_details(request, details);
     }));
 }
@@ -2886,13 +2706,7 @@ async fn read_tool_details(
     let (task_id, agent_id) = target.map_or((None, None), |(task, agent)| (Some(task), agent));
     let events = tokio::time::timeout(
         Duration::from_secs(30),
-        exchange(
-            client.config,
-            client.coordinator,
-            client.script,
-            client.directory,
-            request.command(task_id, agent_id),
-        ),
+        exchange(client, request.command(task_id, agent_id)),
     )
     .await
     .context("Tool details timed out; expand the tool to retry.")??;
@@ -2918,14 +2732,11 @@ impl std::fmt::Display for CoordinatorFailure {
 impl std::error::Error for CoordinatorFailure {}
 
 async fn exchange(
-    config: &ClientConfig,
-    coordinator: Option<&str>,
-    script: &Path,
-    directory: &Path,
+    client: ClientContext<'_>,
     command: RuntimeCommand,
 ) -> Result<Vec<RuntimeEventKind>> {
     let feedback = matches!(&command, RuntimeCommand::Feedback { .. });
-    let mut wire = connection(config, coordinator, script, directory, false)
+    let mut wire = connection(client, false)
         .await
         .map_err(chat_view::ViewError::transport)?;
     write_command(&mut *wire.writer, &command)
@@ -2942,7 +2753,7 @@ async fn exchange(
                 chat_view::ViewError::transport(anyhow::anyhow!("Coordinator disconnected"))
             })?;
         let event = decode_coordinator_event(&frame)?;
-        acknowledge_feedback_event(directory, &command, &event)?;
+        acknowledge_feedback_event(client.directory, &command, &event)?;
         match event {
             event @ RuntimeEventKind::FeedbackReady { .. } if feedback => {
                 events.push(event);
@@ -2960,45 +2771,25 @@ async fn exchange(
     }
 }
 
-async fn environment(
-    config: &ClientConfig,
-    coordinator: Option<&str>,
-    script: &Path,
-    directory: &Path,
-) -> Result<CoordinatorSettings> {
-    exchange(
-        config,
-        coordinator,
-        script,
-        directory,
-        RuntimeCommand::Environment { telemetry: false },
-    )
-    .await?
-    .into_iter()
-    .find_map(|event| match event {
-        RuntimeEventKind::Environment { settings, .. } => Some(settings),
-        _ => None,
-    })
-    .context("Coordinator returned no shared settings")
+async fn environment(client: ClientContext<'_>) -> Result<CoordinatorSettings> {
+    exchange(client, RuntimeCommand::Environment { telemetry: false })
+        .await?
+        .into_iter()
+        .find_map(|event| match event {
+            RuntimeEventKind::Environment { settings, .. } => Some(settings),
+            _ => None,
+        })
+        .context("Coordinator returned no shared settings")
 }
 
 async fn selected_model(
     selection: ModelArgs,
-    config: &ClientConfig,
-    coordinator: Option<&str>,
-    script: &Path,
-    directory: &Path,
+    client: ClientContext<'_>,
 ) -> Result<Option<ModelSelection>> {
     if selection.is_empty() {
         return Ok(None);
     }
-    Ok(Some(
-        selection.resolve(
-            &environment(config, coordinator, script, directory)
-                .await?
-                .model,
-        )?,
-    ))
+    Ok(Some(selection.resolve(&environment(client).await?.model)?))
 }
 
 fn service_notice(message: impl std::fmt::Display) {
@@ -3018,20 +2809,22 @@ async fn configure_messages(sources: &[agent_cli::sources::SourceConfig]) {
     }
 }
 
-async fn worker_service(
-    config: &ClientConfig,
-    coordinator: Option<&str>,
-    script: &Path,
-    directory: &Path,
-    interval: u16,
-) -> Result<()> {
+async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> {
+    let ClientContext {
+        config,
+        coordinator,
+        script,
+        directory,
+        rex,
+        terminal,
+    } = client;
     ensure!(
         coordinator.is_some(),
         "A worker needs a selected coordinator"
     );
     let daemon = agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
     let executor = Arc::new(
-        host::Executor::with_tailscale(directory, daemon.clone())
+        host::Executor::with_tailscale(directory, daemon.clone(), rex.clone())
             .with_browser(script, config.browser.clone()),
     );
     let mut delay = 1;
@@ -3040,6 +2833,7 @@ async fn worker_service(
     loop {
         let attempt = async {
             let node = discovery::local_node(
+                rex,
                 coordinator,
                 config
                     .launch
@@ -3049,9 +2843,9 @@ async fn worker_service(
                 &daemon,
             )
             .await?;
-            let settings = environment(config, coordinator, script, directory).await?;
+            let settings = environment(client).await?;
             configure_messages(&settings.sources).await;
-            let mut wire = connection(config, coordinator, script, directory, false).await?;
+            let mut wire = connection(client, false).await?;
             write_command(
                 &mut *wire.writer,
                 &RuntimeCommand::ConnectWorker { node: node.clone() },
@@ -3077,13 +2871,19 @@ async fn worker_service(
             let target = coordinator.map(str::to_owned);
             let runtime = script.to_owned();
             let state = directory.to_owned();
+            let collector = rex.clone();
+            let terminal = terminal.clone();
             let _collection = WatchGuard(tokio::spawn(async move {
                 loop {
                     if exchange(
-                        &profile,
-                        target.as_deref(),
-                        &runtime,
-                        &state,
+                        ClientContext {
+                            config: &profile,
+                            coordinator: target.as_deref(),
+                            script: &runtime,
+                            directory: &state,
+                            rex: &collector,
+                            terminal: &terminal,
+                        },
                         RuntimeCommand::CollectResources {
                             host_id: node.host_id.clone(),
                         },
@@ -3143,16 +2943,22 @@ async fn worker_service(
 }
 
 async fn chat_command(
+    rex: &RexClient,
+    terminal: &RexClient,
     input: String,
     model: Option<ModelSelection>,
     cwd: &Path,
 ) -> Result<RuntimeCommand> {
     if let Some(description) = agent_cli::feedback::command(&input) {
-        return Ok(
-            feedback_context(cwd.to_string_lossy().into_owned(), model, None)
-                .await?
-                .command(description.to_owned()),
-        );
+        return Ok(feedback_context(
+            rex,
+            terminal,
+            cwd.to_string_lossy().into_owned(),
+            model,
+            None,
+        )
+        .await?
+        .command(description.to_owned()));
     }
     Ok(RuntimeCommand::Chat {
         origin: Some(agent_cli::protocol::InputOrigin::Cli),
@@ -3161,7 +2967,7 @@ async fn chat_command(
         input_id: None,
         instructions: instructions::project(cwd)?,
         model,
-        origin_host_id: RexClient::new(None)
+        origin_host_id: rex
             .whoami()
             .await
             .ok()
@@ -3201,15 +3007,14 @@ fn worker_launch(
     })
 }
 
-async fn local_worker_binding() -> Result<WorkerRef> {
+async fn local_worker_binding(rex: &RexClient, terminal: &RexClient) -> Result<WorkerRef> {
     let session = SessionId::parse(
         &env::var("REX_SESSION").context("Task workers must run in their assigned Rex session")?,
     )?;
     let block =
         BlockId::parse(&env::var("REX_BLOCK").context("Task worker has no assigned Rex pane")?)?;
-    let rex = RexClient::new(None);
     let identity = rex.whoami().await?;
-    let view = rex.inspect_session(&session).await?;
+    let view = terminal.inspect_session(&session).await?;
     let window = view
         .windows
         .iter()
@@ -3231,6 +3036,7 @@ async fn local_worker_binding() -> Result<WorkerRef> {
 }
 
 async fn local_connection(
+    rex: &RexClient,
     script: &Path,
     directory: &Path,
     config_path: Option<&Path>,
@@ -3250,7 +3056,8 @@ async fn local_connection(
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(directory.join("coordinator.log"))?;
-    let mut command = local_service_command(&config::program()?, script, directory, config_path);
+    let mut command =
+        local_service_command(rex, &config::program()?, script, directory, config_path);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -3287,6 +3094,7 @@ async fn local_connection(
 }
 
 fn local_service_command(
+    rex: &RexClient,
     program: &Path,
     script: &Path,
     directory: &Path,
@@ -3301,6 +3109,7 @@ fn local_service_command(
         .arg(directory)
         .arg("--runtime")
         .arg(script)
+        .args(rex.rex_server_args())
         .arg("serve")
         .arg("--local-only");
     command
@@ -3310,16 +3119,17 @@ fn quoted(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-async fn connection(
-    config: &ClientConfig,
-    coordinator: Option<&str>,
-    script: &Path,
-    directory: &Path,
-    login: bool,
-) -> Result<Wire> {
-    let Some(coordinator) = coordinator else {
+async fn connection(client: ClientContext<'_>, login: bool) -> Result<Wire> {
+    let config = client.config;
+    let Some(coordinator) = client.coordinator else {
         return Ok(Wire::local(
-            local_connection(script, directory, config.path.as_deref()).await?,
+            local_connection(
+                client.rex,
+                client.script,
+                client.directory,
+                config.path.as_deref(),
+            )
+            .await?,
         ));
     };
     if let Some(address) = coordinator.strip_prefix("tailscale://") {
@@ -3387,45 +3197,22 @@ async fn write_command(
 
 async fn request(
     arguments: &Arguments,
-    config: &ClientConfig,
-    coordinator: Option<&str>,
-    script: &Path,
-    directory: &Path,
+    client: ClientContext<'_>,
     command: RuntimeCommand,
 ) -> Result<Option<String>> {
-    request_presented(
-        arguments,
-        ClientContext {
-            config,
-            coordinator,
-            script,
-            directory,
-        },
-        command,
-        None,
-        PlainNoticeRoute::Direct,
-    )
-    .await
+    request_presented(arguments, client, command, None, PlainNoticeRoute::Direct).await
 }
 
 async fn request_with_ui(
     arguments: &Arguments,
-    config: &ClientConfig,
-    coordinator: Option<&str>,
-    script: &Path,
-    directory: &Path,
+    client: ClientContext<'_>,
     command: RuntimeCommand,
     ui: &mut UiSession,
 ) -> Result<Option<String>> {
     ui.failure_shown = false;
     request_presented(
         arguments,
-        ClientContext {
-            config,
-            coordinator,
-            script,
-            directory,
-        },
+        client,
         command,
         Some(Presentation {
             handle: ui.handle.clone(),
@@ -3448,6 +3235,8 @@ async fn request_presented(
         coordinator,
         script,
         directory,
+        rex,
+        terminal,
     } = client;
     let login = matches!(command, RuntimeCommand::Login);
     let attached = matches!(command, RuntimeCommand::RunTask { .. });
@@ -3486,11 +3275,12 @@ async fn request_presented(
         host::Executor::with_tailscale(
             directory,
             agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?,
+            rex.clone(),
         )
         .with_browser(script, config.browser.clone()),
     );
     let mut thinking = false;
-    let mut wire = connection(config, coordinator, script, directory, login).await?;
+    let mut wire = connection(client, login).await?;
     let relay_needed = match (
         login,
         coordinator.and_then(|value| value.strip_prefix("tailscale://")),
@@ -3538,9 +3328,9 @@ async fn request_presented(
                         let ui = presentation.as_mut().and_then(|view| view.session.as_deref_mut()).context("Missing terminal input owner")?;
                         if ui.selected.is_some() {
                             let cwd=feedback_settings.as_ref().map(|(_,cwd)|PathBuf::from(cwd)).unwrap_or(env::current_dir()?);
-                            selected_input(ClientContext{config,coordinator,script,directory},ui,input,mode,cwd)?;
+                            selected_input(client,ui,input,mode,cwd)?;
                         } else {
-                            if let Err(error) = prepare_attachments(ClientContext{config,coordinator,script,directory}, &mut input).await {
+                            if let Err(error) = prepare_attachments(client, &mut input).await {
                                 ui.handle.restore_composer(input)?;
                                 ui.handle.notice(format!("Nothing was sent: {error}"))?;
                                 continue;
@@ -3558,28 +3348,28 @@ async fn request_presented(
                     TuiInput::Feedback(description) => {
                         if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
                             let target=ui.selected.as_ref().map_or_else(||history_target.clone(),|item|item.task_id.clone().map(|id|(id,item.agent_id.clone())));
-                            feedback_from_ui(config, coordinator, script, directory, ui, target, description);
+                            feedback_from_ui( client, ui, target, description);
                         }
                     }
                     TuiInput::Command(command) => {
                         if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
                             if let ChatCommand::Resume{query}=command {
-                                if let Err(error)=chat_view::resume(ClientContext{config,coordinator,script,directory},ui,query.join(" ")).await {ui.handle.notice(error.to_string())?;}
+                                if let Err(error)=chat_view::resume(client,ui,query.join(" ")).await {ui.handle.notice(error.to_string())?;}
                             } else {
                                 let target=ui.selected.as_ref().map_or_else(||history_target.clone(),|item|item.task_id.clone().map(|id|(id,item.agent_id.clone())));
-                                local_command_from_ui(config, coordinator, script, directory, ui, target, command);
+                                local_command_from_ui( client, ui, target, command);
                             }
                         }
                     }
                     TuiInput::Interrupt => {
                         if let Some(ui)=presentation.as_mut().and_then(|view|view.session.as_deref_mut()).filter(|ui|ui.selected.is_some()) {
-                            selected_interrupt(ClientContext{config,coordinator,script,directory},ui).await?;
+                            selected_interrupt(client,ui).await?;
                         } else if active_turn { write_command(&mut *wire.writer, &RuntimeCommand::Interrupt).await?; }
                         else if let Some(view) = &presentation { view.handle.working(false)?; }
                     }
                     TuiInput::ToolDetails(request) => {
                         if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
-                            tool_details_from_ui(ClientContext { config, coordinator, script, directory }, ui, history_target.clone(), request);
+                            tool_details_from_ui(client, ui, history_target.clone(), request);
                         }
                     }
                     TuiInput::History => {
@@ -3588,7 +3378,7 @@ async fn request_presented(
                         let cursor = if attached { history_cursor.take() } else { view.session.as_mut().and_then(|ui| ui.history_cursor.take()) };
                         if let Some(cursor) = cursor {
                             let (task_id, agent_id) = history_target.clone().map_or((None, None), |(task, agent)| (Some(task), agent));
-                            let next = Box::pin(request_presented(arguments, ClientContext { config, coordinator, script, directory },
+                            let next = Box::pin(request_presented(arguments, client,
                                 RuntimeCommand::ReadHistory { task_id, agent_id, cursor: Some(cursor) },
                                 Some(Presentation { handle: view.handle.clone(), session: None }), PlainNoticeRoute::Direct)).await?;
                             if attached { history_cursor = next; } else if let Some(ui) = view.session.as_mut() { ui.history_cursor = next; }
@@ -3625,7 +3415,7 @@ async fn request_presented(
                             Ok(ChatCommand::History | ChatCommand::Feedback { .. }) => {}
                             Ok(command) => {
                                 let cwd = feedback_settings.as_ref().map(|(_, cwd)| Path::new(cwd)).unwrap_or_else(|| Path::new("."));
-                                if let Err(error) = local_command_plain(ClientContext { config, coordinator, script, directory }, &command, history_target.clone(), cwd, arguments.json).await { eprintln!("Local command failed: {error}"); }
+                                if let Err(error) = local_command_plain(client, &command, history_target.clone(), cwd, arguments.json).await { eprintln!("Local command failed: {error}"); }
                                 continue;
                             }
                         }
@@ -3635,21 +3425,22 @@ async fn request_presented(
                             if history_cursor.is_none() {
                                 if !arguments.json { println!("No older history."); }
                             } else {
-                                history_cursor = Box::pin(request(arguments, config, coordinator, script, directory,
+                                history_cursor = Box::pin(request(arguments, client,
                                     RuntimeCommand::ReadHistory { task_id: Some(task_id.clone()), agent_id: agent_id.clone(), cursor: history_cursor })).await?;
                             }
                         }
                     } else if let Some(description) = agent_cli::feedback::command(&line) {
                         if let Some((model, cwd)) = &feedback_settings {
                             let config = config.clone(); let coordinator = coordinator.map(str::to_owned);
-                            let script = script.to_owned(); let directory = directory.to_owned();
+                            let script = script.to_owned(); let directory = directory.to_owned(); let rex = rex.clone(); let terminal = terminal.clone();
                             let cwd = cwd.clone(); let model = model.clone(); let target = history_target.clone();
                             let description = description.to_owned(); let json = arguments.json;
                             while feedback.try_join_next().is_some() {}
                             feedback.spawn(async move {
+                                let client = ClientContext { config: &config, coordinator: coordinator.as_deref(), script: &script, directory: &directory, rex: &rex, terminal: &terminal };
                             let captured = async {
-                                let context = feedback_context(cwd, model, target).await?;
-                                exchange(&config, coordinator.as_deref(), &script, &directory, context.command(description)).await
+                                let context = feedback_context(&rex, &terminal, cwd, model, target).await?;
+                                exchange(client, context.command(description)).await
                             }.await;
                             match captured {
                                 Ok(events) => for event in events { if let Err(error) = display(&event, json) { eprintln!("Feedback receipt could not be displayed: {error}"); } },
@@ -3736,7 +3527,7 @@ async fn request_presented(
                     if *page_complete && let Some(replay)=ui.initial_replay.take() {
                         replay.page(std::mem::take(&mut ui.initial_history))?;
                         if let Some(cursor)=next_cursor {
-                            ui.history=Some(chat_history::Job::start(ClientContext{config,coordinator,script,directory},conversation_id.clone(),chat_history::Start::Older(cursor.clone()),replay));
+                            ui.history=Some(chat_history::Job::start(client,conversation_id.clone(),chat_history::Start::Older(cursor.clone()),replay));
                         }else{replay.finish()?;}
                     }
                     true
@@ -4140,12 +3931,22 @@ fn import_phase_name(phase: &ImportPhase) -> &'static str {
 }
 
 #[cfg(test)]
+#[path = "../tests/fixtures/fake_rex.rs"]
+mod fake_rex;
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
-    use crate::{Action, Arguments, ModelArgs, local_service_command};
+    use crate::{Action, Arguments, ModelArgs, fake_rex, local_service_command};
     use agent_cli::models::{ModelProvider, ModelSelection, Reasoning};
     use agent_cli::protocol::SearchMode;
+    use agent_cli::rex::RexClient;
     use clap::Parser;
     use std::path::Path;
+
+    fn personal_rex() -> RexClient {
+        RexClient::for_process(None).unwrap()
+    }
 
     #[tokio::test]
     async fn tool_details_read_uses_only_the_shared_request_and_closes_the_action_socket() {
@@ -4217,6 +4018,8 @@ mod tests {
                     coordinator: None,
                     script: Path::new("/example/unused-runtime"),
                     directory: directory.path(),
+                    rex: &personal_rex(),
+                    terminal: &personal_rex(),
                 },
                 &request,
                 scoped.then(|| {
@@ -4280,6 +4083,8 @@ mod tests {
                     coordinator: None,
                     script: Path::new("/example/unused-runtime"),
                     directory: &path,
+                    rex: &personal_rex(),
+                    terminal: &personal_rex(),
                 },
                 &request,
                 None,
@@ -4340,7 +4145,8 @@ mod tests {
                 window_id: "window:22222222-2222-4222-8222-222222222222".into(),
                 block_id: BLOCK.into(),
             };
-            let capture = crate::capture_feedback_view(directory.path(), &binding).await;
+            let capture =
+                crate::capture_feedback_view(&personal_rex(), directory.path(), &binding).await;
             if matches!(case.as_str(), "html" | "remote_limit" | "local_limit") {
                 let capture = capture.expect("feedback must retain a usable terminal attachment");
                 let (name, expected) = if case == "html" {
@@ -4574,10 +4380,14 @@ esac
             writer.write_all(b"\n").await.unwrap();
         });
         let events = crate::exchange(
-            &agent_cli::config::ClientConfig::default(),
-            None,
-            Path::new("/example/unused-runtime"),
-            directory.path(),
+            crate::ClientContext {
+                config: &agent_cli::config::ClientConfig::default(),
+                coordinator: None,
+                script: Path::new("/example/unused-runtime"),
+                directory: directory.path(),
+                rex: &personal_rex(),
+                terminal: &personal_rex(),
+            },
             command,
         )
         .await
@@ -4689,6 +4499,8 @@ esac
             coordinator: None,
             script: Path::new("/example/unused-runtime"),
             directory: directory.path(),
+            rex: &personal_rex(),
+            terminal: &personal_rex(),
         };
         assert!(
             crate::prepare_attachments(client, &mut input)
@@ -4920,6 +4732,8 @@ esac
             coordinator: None,
             script: Path::new("/unused-runtime"),
             directory: directory.path(),
+            rex: &personal_rex(),
+            terminal: &personal_rex(),
         })
         .await
         .unwrap();
@@ -4954,10 +4768,14 @@ esac
         assert!(
             crate::selected_model(
                 ModelArgs::default(),
-                &config,
-                None,
-                Path::new("/unused-runtime"),
-                directory.path()
+                crate::ClientContext {
+                    config: &config,
+                    coordinator: None,
+                    script: Path::new("/unused-runtime"),
+                    directory: directory.path(),
+                    rex: &personal_rex(),
+                    terminal: &personal_rex(),
+                },
             )
             .await
             .unwrap()
@@ -5002,10 +4820,14 @@ esac
         };
         let actual = crate::selected_model(
             selection,
-            &config,
-            None,
-            Path::new("/unused-runtime"),
-            directory.path(),
+            crate::ClientContext {
+                config: &config,
+                coordinator: None,
+                script: Path::new("/unused-runtime"),
+                directory: directory.path(),
+                rex: &personal_rex(),
+                terminal: &personal_rex(),
+            },
         )
         .await
         .unwrap()
@@ -5057,28 +4879,134 @@ esac
 
     #[test]
     fn implicit_local_startup_preserves_paths_and_selects_only_the_unix_transport() {
+        const PRIVATE: &str = "unix:///run/user/1000/rex agent/server.sock";
         let program = Path::new("/example/agent");
         let script = Path::new("/example/runtime with spaces/bridge.js");
         let state = Path::new("/example/private state");
         let config = Path::new("/example/private config.toml");
-        for selected in [None, Some(config)] {
-            let command = local_service_command(program, script, state, selected);
-            let native = command.as_std();
-            let parsed = Arguments::try_parse_from(
-                std::iter::once(native.get_program()).chain(native.get_args()),
-            )
-            .unwrap();
-            assert_eq!(parsed.runtime.as_deref(), Some(script));
-            assert_eq!(parsed.state_dir.as_deref(), Some(state));
-            assert_eq!(parsed.config.as_deref(), selected);
-            assert!(matches!(
-                parsed.command,
-                Some(Action::Serve {
-                    local_only: true,
-                    no_sources: false,
-                    ..
-                })
-            ));
+        for server in [None, Some(PRIVATE)] {
+            let rex = RexClient::for_process(server).unwrap();
+            for selected in [None, Some(config)] {
+                let command = local_service_command(&rex, program, script, state, selected);
+                let native = command.as_std();
+                let argv: Vec<_> = native.get_args().map(|arg| arg.to_str().unwrap()).collect();
+                let mut expected = Vec::new();
+                if selected.is_some() {
+                    expected.extend(["--config", "/example/private config.toml"]);
+                }
+                expected.extend([
+                    "--state-dir",
+                    "/example/private state",
+                    "--runtime",
+                    "/example/runtime with spaces/bridge.js",
+                ]);
+                if let Some(server) = server {
+                    expected.extend(["--rex-server", server]);
+                }
+                expected.extend(["serve", "--local-only"]);
+                assert_eq!(argv, expected);
+                let parsed = Arguments::try_parse_from(
+                    std::iter::once(native.get_program()).chain(native.get_args()),
+                )
+                .unwrap();
+                assert_eq!(parsed.runtime.as_deref(), Some(script));
+                assert_eq!(parsed.state_dir.as_deref(), Some(state));
+                assert_eq!(parsed.config.as_deref(), selected);
+                assert_eq!(parsed.rex_server.as_deref(), server);
+                assert!(matches!(
+                    parsed.command,
+                    Some(Action::Serve {
+                        local_only: true,
+                        no_sources: false,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_worker_a_private_node_starts_selects_the_same_rex_server() {
+        use agent_cli::{
+            host::Executor,
+            protocol::{HostCommand, HostResult, TaskId, WorkerHost},
+        };
+        const TEST: &str = "tests::every_worker_a_private_node_starts_selects_the_same_rex_server";
+        const PRIVATE: &str = "unix:///run/user/1000/rex-agent/server.sock";
+        let Some(case) = fake_rex::case() else {
+            for case in ["private", "personal"] {
+                fake_rex::run(TEST, case, &[]);
+            }
+            return;
+        };
+        let server = (case == "private").then_some(PRIVATE);
+        let directory = tempfile::tempdir().unwrap();
+        let executor = Executor::new(directory.path(), RexClient::for_process(server).unwrap());
+        let host = WorkerHost {
+            host_id: Some(fake_rex::HOST.into()),
+            name: "fixture".into(),
+            rex_server: None,
+            coordinator: Some("coordinator.example.ts.net".into()),
+            cwd: "/tmp".into(),
+            agent_program: "/example/agent".into(),
+            launch: None,
+        };
+        let task_id: TaskId = "77777777-7777-4777-8777-777777777777".parse().unwrap();
+        let HostResult::Spawned { binding: root } = executor
+            .execute(HostCommand::SpawnWorker {
+                host: host.clone(),
+                parent: None,
+                task_id: task_id.clone(),
+                allocation_id: "allocation-root".into(),
+                title: "Synthetic task".into(),
+            })
+            .await
+        else {
+            panic!("The root worker must start");
+        };
+        for command in [
+            HostCommand::SpawnSubagent {
+                host: host.clone(),
+                parent: root.clone(),
+                task_id: task_id.clone(),
+                agent_id: "review".into(),
+                allocation_id: "allocation-child".into(),
+                title: "Review".into(),
+            },
+            HostCommand::ResumeWorker {
+                host,
+                binding: root,
+                task_id,
+                allocation_id: "allocation-root".into(),
+            },
+        ] {
+            let result = executor.execute(command).await;
+            assert!(matches!(result, HostResult::Spawned { .. }), "{result:?}");
+        }
+        let launches: Vec<Vec<String>> = fake_rex::calls()
+            .iter()
+            .filter_map(|call| match call.method() {
+                "session.create" => Some(call.payload()["initial_windows"][0]["layout"].clone()),
+                "session.new_window" => Some(call.payload()["layout"].clone()),
+                _ => None,
+            })
+            .map(|layout| {
+                serde_json::from_value(layout["block"]["options"]["command"].clone()).unwrap()
+            })
+            .collect();
+        assert_eq!(launches.len(), 3, "root, child and resumed root");
+        for argv in launches {
+            let parsed = Arguments::try_parse_from(&argv).unwrap();
+            assert!(
+                matches!(parsed.command, Some(Action::RunTask { .. })),
+                "{argv:?}"
+            );
+            assert_eq!(parsed.rex_server.as_deref(), server, "{argv:?}");
+            let run_task = argv.iter().position(|arg| arg == "run-task").unwrap();
+            match server {
+                Some(server) => assert_eq!(argv[run_task - 2..run_task], ["--rex-server", server]),
+                None => assert!(!argv.iter().any(|arg| arg == "--rex-server"), "{argv:?}"),
+            }
         }
     }
 
@@ -5148,10 +5076,14 @@ esac
         };
         let actual = crate::selected_model(
             selection,
-            &client,
-            None,
-            Path::new("/unused-runtime"),
-            directory.path(),
+            crate::ClientContext {
+                config: &client,
+                coordinator: None,
+                script: Path::new("/unused-runtime"),
+                directory: directory.path(),
+                rex: &personal_rex(),
+                terminal: &personal_rex(),
+            },
         )
         .await
         .unwrap()
@@ -5394,6 +5326,8 @@ esac
                     coordinator: None,
                     script: std::path::Path::new("unused-runtime"),
                     directory: directory.path(),
+                    rex: &personal_rex(),
+                    terminal: &personal_rex(),
                 },
                 "saved-conversation",
             )

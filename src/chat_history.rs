@@ -31,8 +31,18 @@ impl Job {
         let coordinator = client.coordinator.map(str::to_owned);
         let script: PathBuf = client.script.into();
         let directory: PathBuf = client.directory.into();
+        let rex = client.rex.clone();
+        let terminal = client.terminal.clone();
         Self {
             task: tokio::spawn(async move {
+                let client = ClientContext {
+                    config: &config,
+                    coordinator: coordinator.as_deref(),
+                    script: &script,
+                    directory: &directory,
+                    rex: &rex,
+                    terminal: &terminal,
+                };
                 let (mut cursor, mut attaching) = match start {
                     Start::Recent => (None, None),
                     Start::AfterAttach(ready) => (None, Some(ready)),
@@ -41,10 +51,7 @@ impl Job {
                 let mut seen: HashSet<String> = cursor.iter().cloned().collect();
                 loop {
                     let events = match exchange(
-                        &config,
-                        coordinator.as_deref(),
-                        &script,
-                        &directory,
+                        client,
                         RuntimeCommand::ReadConversation {
                             conversation_id: conversation_id.clone(),
                             cursor: cursor.clone(),

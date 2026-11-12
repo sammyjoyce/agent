@@ -4,6 +4,7 @@ use crate::{ClientContext, UiSession, connection, exchange, write_command};
 use agent_cli::{
     config::ClientConfig,
     protocol::{ErrorCode, RuntimeCommand, RuntimeEventKind, SavedConversation},
+    rex::RexClient,
     runtime::{FrameReader, decode_coordinator_event},
     tui::{HistoryReplay, ObservationState, TuiInfo},
 };
@@ -20,6 +21,8 @@ struct Target {
     coordinator: Option<String>,
     script: PathBuf,
     directory: PathBuf,
+    rex: RexClient,
+    terminal: RexClient,
     conversation_id: String,
 }
 impl Target {
@@ -29,6 +32,8 @@ impl Target {
             coordinator: self.coordinator.as_deref(),
             script: &self.script,
             directory: &self.directory,
+            rex: &self.rex,
+            terminal: &self.terminal,
         }
     }
 }
@@ -161,10 +166,7 @@ pub(crate) async fn choices(
     // the native catalog before pagination, including original imported IDs.
     for _ in 0..10 {
         let page = exchange(
-            client.config,
-            client.coordinator,
-            client.script,
-            client.directory,
+            client,
             RuntimeCommand::ListConversations {
                 query: query.clone(),
                 cursor,
@@ -327,6 +329,8 @@ pub(crate) async fn open(
         coordinator: client.coordinator.map(str::to_owned),
         script: client.script.to_owned(),
         directory: client.directory.to_owned(),
+        rex: client.rex.clone(),
+        terminal: client.terminal.clone(),
         conversation_id: item.conversation_id.clone(),
     });
     let observer = target.clone();
@@ -341,7 +345,7 @@ pub(crate) async fn open(
             while retries.try_recv().is_ok() {}
             let result: std::result::Result<(), ViewError> = async {
             let client = observer.client();
-            let mut wire = connection(client.config, client.coordinator, client.script, client.directory, false)
+            let mut wire = connection(client, false)
                 .await
                 .map_err(ViewError::Coordinator)?;
             let input_ids = pending_inputs.borrow().clone();
@@ -438,15 +442,9 @@ pub(crate) async fn control(
     ready: &tokio::sync::watch::Receiver<Observation>,
     attachment: AttachmentId,
 ) -> std::result::Result<(), ViewError> {
-    let mut wire = connection(
-        client.config,
-        client.coordinator,
-        client.script,
-        client.directory,
-        false,
-    )
-    .await
-    .map_err(ViewError::Coordinator)?;
+    let mut wire = connection(client, false)
+        .await
+        .map_err(ViewError::Coordinator)?;
     if !matches!(*ready.borrow(), Observation::Connected(current) if current == attachment) {
         return Err(ViewError::Coordinator(anyhow::anyhow!(
             "The conversation view is disconnected; this input remains unsent."

@@ -14,7 +14,7 @@ use tokio::{
 
 use crate::{
     host,
-    protocol::{ContextMatch, ContextRepository, HostCommand, HostResult},
+    protocol::{ContextMatch, ContextRepository, HostResult},
 };
 
 #[derive(Clone, Default)]
@@ -140,9 +140,9 @@ impl ContextStore {
             Some(path) => self.path(id, path).await?,
             None => PathBuf::from(&repository.root),
         };
-        let inventory = host::execute(HostCommand::Exec {
-            program: "git".into(),
-            args: vec![
+        let inventory = host::execute_process(
+            "git",
+            &[
                 "ls-files".into(),
                 "--cached".into(),
                 "--others".into(),
@@ -150,9 +150,9 @@ impl ContextStore {
                 "--deduplicate".into(),
                 "-z".into(),
             ],
-            cwd: repository.root.clone(),
-            timeout_seconds: 15,
-        })
+            Path::new(&repository.root),
+            15,
+        )
         .await;
         let HostResult::Process {
             exit_code: 0,

@@ -297,6 +297,22 @@
             },
             "type": {
               "type": "string",
+              "const": "not_started"
+            }
+          },
+          "required": [
+            "type",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
               "const": "failed"
             }
           },
@@ -2384,6 +2400,7 @@
               "$ref": "#/$defs/WorkerHost"
             },
             "parent": {
+              "description": "Where to open the root terminal if the node allows it. A node on a\nprivate Rex server checks its host and opens a new session instead.",
               "anyOf": [
                 {
                   "$ref": "#/$defs/WorkerRef"

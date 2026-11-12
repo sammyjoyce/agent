@@ -37,7 +37,14 @@ async fn reset_client_does_not_cancel_admitted_owned_work() {
       });
     "#).unwrap();
     let runtime = Arc::new(Runtime::start(&script, directory.path()).unwrap());
-    let broker = Arc::new(Broker::new(None, directory.path()).unwrap());
+    let broker = Arc::new(
+        Broker::new(
+            None,
+            directory.path(),
+            crate::rex::RexClient::for_process(None).unwrap(),
+        )
+        .unwrap(),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut client = TcpStream::connect(listener.local_addr().unwrap())
         .await

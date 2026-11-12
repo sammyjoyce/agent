@@ -717,6 +717,7 @@ pub enum AllocationResult {
     Spawned { binding: WorkerRef },
     Presence { presence: WorkerPresence },
     CreationUncertain { session_id: Option<String> },
+    NotStarted { message: String },
     Failed { message: String },
     Rejected,
 }
@@ -956,6 +957,8 @@ pub enum HostCommand {
     },
     SpawnWorker {
         host: WorkerHost,
+        /// Where to open the root terminal if the node allows it. A node on a
+        /// private Rex server checks its host and opens a new session instead.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         parent: Option<WorkerRef>,
@@ -1046,6 +1049,10 @@ pub enum HostResult {
     },
     CreationUncertain {
         session_id: Option<String>,
+    },
+    /// Rex never received the create request, so retrying cannot duplicate a terminal.
+    NotStarted {
+        message: String,
     },
     Failed {
         message: String,
