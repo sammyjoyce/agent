@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import Testing
 
 @testable import AgentCore
@@ -313,12 +314,31 @@ func acceptedSlashControlDoesNotReturnFromAFailedComposerCheckpoint(newTyping: B
   }
 }
 
+/// What the second recipient of a two-coordinator Send does with its copy.
+enum SecondRecipient: CaseIterable, Sendable {
+  case runsIt, isNotConnected
+  /// Its session retires before the Send starts its copy, as an address edit retires it.
+  case retiresFirst
+
+  /// What `start` answers for its copy.
+  var start: StartOutcome {
+    switch self {
+    case .runsIt: .started
+    case .isNotConnected: .notSent
+    case .retiresFirst: .retired
+    }
+  }
+}
+
 /// A control sent to two coordinators misses the first, and the second runs it or misses too. The
 /// app stops before it saves a newer draft. Recovery from the checkpoint saved before the Send
 /// offers the control again only when neither ran it, since sending it again runs it twice.
-@Test(.timeLimit(.minutes(1)), arguments: [false, true])
-func recoveryOffersASendAgainOnlyWhenNoRecipientReceivedIt(secondMisses: Bool) async throws {
-  try await withCoordinator { first, _, firstOutbox in
+@Test(.timeLimit(.minutes(1)), arguments: SecondRecipient.allCases)
+func recoveryOffersASendAgainOnlyWhenNoRecipientReceivedIt(second outcome: SecondRecipient)
+  async throws
+{
+  let secondMisses = outcome != .runsIt
+  try await withCoordinator { first, firstFixture, firstOutbox in
     try await withCoordinator { second, secondFixture, secondOutbox in
       try await connected(first)
       try await connected(second)
@@ -343,13 +363,19 @@ func recoveryOffersASendAgainOnlyWhenNoRecipientReceivedIt(secondMisses: Bool) a
       #expect(try CoordinatorSession.ownsComposerInput(identity, outboxURL: firstOutbox))
       #expect(try CoordinatorSession.ownsComposerInput(identity, outboxURL: secondOutbox))
       await first.disconnect()
-      if secondMisses { await second.disconnect() }
+      switch outcome {
+      case .runsIt: break
+      case .isNotConnected: await second.disconnect()
+      case .retiresFirst:
+        #expect(await second.retire().isEmpty, "The second session had started nothing")
+      }
       #expect(await first.start(stagedFirst) == .notSent)
-      #expect(await second.start(stagedSecond) == (secondMisses ? .notSent : .started))
+      #expect(await second.start(stagedSecond) == outcome.start)
       let deadline = ContinuousClock.now + .seconds(5)
       while !secondMisses, await secondFixture.count() == 0, ContinuousClock.now < deadline {
         try await Task.sleep(for: .milliseconds(5))
       }
+      #expect(await firstFixture.count() == 0)
       #expect(await secondFixture.count() == (secondMisses ? 0 : 1))
       #expect(
         try !CoordinatorSession.ownsComposerInput(identity, outboxURL: firstOutbox),
@@ -445,5 +471,146 @@ func aCheckpointNamingOneOutboxStaysSentWhileThatOutboxHoldsTheReceipt() async t
     let recovered = try await ComposerDraftStore(url: url).load(
       from: AttachmentStore(directory: root.appending(path: "LegacyFiles")))
     #expect(recovered.draft.text.isEmpty, "The outbox holds the receipt, so /status stays sent")
+  }
+}
+
+/// Waits until `gate` holds a dial.
+private func held(_ gate: DialGate) async throws {
+  while await !gate.waiting { try await Task.sleep(for: .milliseconds(5)) }
+}
+
+/// A fixture coordinator and a session that dials it through `gate`, which can hold a Send's dial
+/// so that its exchange waits before it writes anything.
+private struct GatedCoordinator {
+  let fixture: FixtureCoordinator
+  let endpoint: NWEndpoint
+  let directory: ProfileDirectory
+  let gate: DialGate
+  let session: CoordinatorSession
+}
+
+/// Runs `body` with `count` gated coordinators whose profiles share a fresh temporary root, then
+/// opens every gate and stops them.
+@MainActor private func withGatedCoordinators(
+  _ count: Int, _ body: ([GatedCoordinator], URL) async throws -> Void
+) async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  var listeners: [NWListener] = []
+  defer {
+    for listener in listeners { listener.cancel() }
+    try? FileManager.default.removeItem(at: root)
+  }
+  var coordinators: [GatedCoordinator] = []
+  for _ in 0..<count {
+    let fixture = FixtureCoordinator()
+    let (listener, endpoint) = try await listen(fixture)
+    listeners.append(listener)
+    let gate = DialGate()
+    let directory = ProfileDirectory(ProfileID(), applicationSupport: root, caches: root)
+    let session = CoordinatorSession(
+      directory: directory, address: try CoordinatorAddress(host: "100.64.1.2"), pin: fixture.id,
+      stamps: StampSource(),
+      transport: CoordinatorTransport { _ in
+        await gate.pass()
+        return LineConnection(connection: NWConnection(to: endpoint, using: .tcp))
+      })
+    coordinators.append(
+      GatedCoordinator(
+        fixture: fixture, endpoint: endpoint, directory: directory, gate: gate, session: session))
+  }
+  func stop() async {
+    for coordinator in coordinators {
+      await coordinator.gate.open()
+      await coordinator.session.disconnect()
+      await coordinator.fixture.stop()
+    }
+  }
+  do { try await body(coordinators, root) } catch {
+    await stop()
+    throw error
+  }
+  await stop()
+}
+
+/// A Send has begun toward one coordinator, but its socket is still connecting, when an address
+/// edit retires the session. Retirement cancels the input before it left the phone. The outbox
+/// then releases a control's receipt, while a message's stays with its queued copy for the
+/// profile's next session.
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: ["/status", "An invented note"])
+func retirementReleasesTheReceiptOfAControlItsSessionNeverWrote(text: String) async throws {
+  try await withGatedCoordinators(1) { coordinators, _ in
+    let coordinator = coordinators[0]
+    let session = coordinator.session
+    try await connected(session)
+    await coordinator.gate.arm()
+    let identity = ComposerInputIdentity(composerID: UUID())
+    let staged = try #require(
+      await session.stage(
+        text, sendID: "invented-send", recipients: [session.profile], composer: identity))
+    #expect(await session.start(staged) == .started)
+    try await held(coordinator.gate)
+    #expect(
+      try CoordinatorSession.ownsComposerInput(identity, outboxURL: session.outboxURL),
+      "The outbox holds the receipt while the Send is on its way")
+    #expect(await session.retire() == [staged], "Retirement cancels the unwritten input")
+    let holds = try CoordinatorSession.ownsComposerInput(identity, outboxURL: session.outboxURL)
+    #expect(
+      holds == !text.hasPrefix("/"),
+      "The outbox releases a control's receipt and keeps a queued message's")
+    #expect(await coordinator.fixture.count() == 0, "The coordinator got nothing")
+  }
+}
+
+/// A Send of `/status` starts toward every recipient, and an address edit retires each session
+/// while its socket is still connecting, so no coordinator gets it. The checkpoint after the Send
+/// fails, as when the app stops before saving. Recovery offers `/status` again.
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: [1, 2])
+func aSendAddressEditsStoppedEverywhereIsOfferedAgainAfterACrash(recipients: Int) async throws {
+  try await withGatedCoordinators(recipients) { coordinators, root in
+    let directory = root.appending(path: "Composer")
+    let url = directory.appending(path: "draft.json")
+    let files = AttachmentStore(directory: directory.appending(path: "Files"))
+    let gate = ComposerOwnershipGate()
+    let model = ChatModel(
+      draftStore: files, persistence: ComposerDraftStore(url: url),
+      admit: { deliver in await gate.wait(after: await deliver()) })
+    await model.restoreDraft()
+    for coordinator in coordinators { model.attach(lane(coordinator.session)) }
+    await model.setActive(true)
+    for coordinator in coordinators {
+      _ = try await snapshot(of: coordinator.session, in: model) { $0.connection == .connected }
+      await coordinator.gate.arm()
+    }
+    model.draft = "/status"
+    let sending = Task { await model.send() }
+    for await admitted in gate.entered.stream {
+      try #require(admitted, "Every recipient started /status")
+      break
+    }
+    for coordinator in coordinators {
+      try await held(coordinator.gate)
+      await model.detach(coordinator.session.profile)
+      let next = CoordinatorSession(
+        directory: coordinator.directory, address: try CoordinatorAddress(host: "100.64.1.2"),
+        pin: coordinator.fixture.id, stamps: StampSource(),
+        transport: loopback(coordinator.endpoint))
+      model.attach(lane(next))
+      await next.connect()
+    }
+    try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+    defer {
+      try? FileManager.default.setAttributes(
+        [.posixPermissions: 0o700], ofItemAtPath: directory.path)
+    }
+    await gate.finish()
+    await sending.value
+    #expect(model.draftError != nil, "The checkpoint after the Send failed")
+    let cold = ChatModel(draftStore: files, persistence: ComposerDraftStore(url: url))
+    await cold.restoreDraft()
+    #expect(cold.draft == "/status", "No coordinator ran /status, so it comes back")
+    for coordinator in coordinators {
+      #expect(await coordinator.fixture.count() == 0, "A coordinator got /status")
+    }
+    await model.setActive(false)
   }
 }
