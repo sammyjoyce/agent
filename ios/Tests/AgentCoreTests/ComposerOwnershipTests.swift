@@ -461,6 +461,58 @@ func aSendBothCoordinatorsReceivedIsNotOfferedAgainWhenOneOutboxIsGone(
   }
 }
 
+/// A coordinator removed since a Send no longer counts as one of its recipients. Personal runs
+/// `/status` and is then removed, while Work, which never got it, is still dialing, and the app
+/// stops before it saves the draft after the Send. Recovery offers `/status` again, since sending
+/// it again reaches only coordinators that never ran it.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aSendOnlyARemovedCoordinatorRanIsOfferedAgainAfterACrash() async throws {
+  let workGate = DialGate()
+  let personalGate = DialGate()
+  let draft = "Composer/draft.json"
+  try await withTwoFixtures(holdingWork: workGate, holdingPersonal: personalGate, draft: draft) {
+    coordinators, workFixture, personalFixture, root in
+    let url = root.appending(path: draft)
+    let directory = url.deletingLastPathComponent()
+    let chat = coordinators.chat
+    await chat.restoreDraft()
+    let (_, personal) = try await addWorkAndPersonal(coordinators)
+    defer {
+      try? FileManager.default.setAttributes(
+        [.posixPermissions: 0o700], ofItemAtPath: directory.path)
+    }
+    let readOnly: @Sendable () throws -> Void = {
+      try FileManager.default.setAttributes(
+        [.posixPermissions: 0o500], ofItemAtPath: directory.path)
+    }
+    await workGate.arm(entering: readOnly)
+    await personalGate.arm(entering: readOnly)
+    chat.draft = "/status"
+    await chat.startSend()?.value
+    #expect(chat.draftError != nil, "The checkpoint after the Send failed")
+    try await held(workGate)
+    try await held(personalGate)
+    await personalGate.open()
+    let deadline = ContinuousClock.now + .seconds(5)
+    while await personalFixture.count() == 0, ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    try await coordinators.remove(coordinators.removal(personal))
+    await coordinators.setActive(false)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+    let cold = ChatModel(
+      draftStore: AttachmentStore(directory: root.appending(path: "Agent/Drafts")),
+      persistence: ComposerDraftStore(url: url))
+    await cold.restoreDraft()
+    #expect(await workFixture.count() == 0, "Work got nothing while it was dialing")
+    #expect(await personalFixture.count() == 1, "Personal ran /status once before its removal")
+    #expect(cold.draftError == nil, "The checkpoint restored")
+    #expect(
+      cold.draft == "/status",
+      "Only the removed Personal ran /status, so recovery offers it for Work")
+  }
+}
+
 /// A checkpoint the previous build saved during a Send names its one outbox under `outboxPath`.
 /// While that outbox holds the receipt, the Send stays sent.
 @Test(.timeLimit(.minutes(1)))

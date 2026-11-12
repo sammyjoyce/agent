@@ -134,6 +134,8 @@ required for sharing on a phone; an unsigned build does not establish that.
   survive. Controls retain receipts without becoming replayable inputs.
   A Send to several coordinators keeps its receipt in each recipient's outbox.
   Recovery offers its text again only when none of them still holds it.
+  A coordinator removed since the Send no longer counts, so recovery offers the
+  text again when no coordinator still saved received it.
   A control that never leaves the phone releases its outbox's receipt, whether
   an address edit, a disconnect or a failed dial stopped it.
   Ownership paths are relative to the composer record, allowing storage to move.

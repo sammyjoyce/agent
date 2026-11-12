@@ -409,15 +409,22 @@ private func row(
     "Each coordinator is named where its run starts, and again after your message")
 }
 
-/// Holds the next dial to Work's port once armed, as a slow tailnet would.
+/// Holds the next dial once armed, as a slow tailnet would.
 actor DialGate {
   private var armed = false
+  private var entering: (@Sendable () throws -> Void)?
   private(set) var waiting = false
   private var release: CheckedContinuation<Void, any Error>?
-  func arm() { armed = true }
+  /// Holds the next dial, which first runs `entering`.
+  func arm(entering: (@Sendable () throws -> Void)? = nil) {
+    armed = true
+    self.entering = entering
+  }
   func pass() async throws {
     guard armed else { return }
     armed = false
+    try entering?()
+    entering = nil
     waiting = true
     try await withCheckedThrowingContinuation { release = $0 }
   }
@@ -447,10 +454,11 @@ actor WorkRoute {
 }
 
 /// Two loopback coordinators, Personal at port 4002 of an invented address and Work at any
-/// other address, and a fresh `Coordinators` with nothing saved, as the app builds it.
+/// other address, and a fresh `Coordinators` with nothing saved, as the app builds it. With
+/// `draft`, the composer saves its draft at that path under the root.
 @MainActor func withTwoFixtures(
   registration: NotificationRegistration? = nil, holdingWork gate: DialGate? = nil,
-  route: WorkRoute? = nil,
+  holdingPersonal personalGate: DialGate? = nil, route: WorkRoute? = nil, draft: String? = nil,
   _ body: (Coordinators, FixtureCoordinator, FixtureCoordinator, URL) async throws -> Void
 ) async throws {
   let first = FixtureCoordinator()
@@ -468,6 +476,7 @@ actor WorkRoute {
     registration: registration, defaults: defaults, applicationSupport: root, caches: root,
     transport: CoordinatorTransport { address in
       if address.port == 4001 { try await gate?.pass() }
+      if address.port == 4002 { try await personalGate?.pass() }
       if address.port == 4002, await route?.personalsAddressDown == true {
         throw ConnectionError.timedOut
       }
@@ -476,18 +485,20 @@ actor WorkRoute {
       let personal = (address.port == 4002) != swapped || repointed
       return LineConnection(
         connection: NWConnection(to: personal ? secondPort : firstPort, using: .tcp))
-    })
+    }, persistence: draft.map { ComposerDraftStore(url: root.appending(path: $0)) })
   await coordinators.setActive(true)
   do {
     try await body(coordinators, first, second, root)
   } catch {
     await gate?.open()
+    await personalGate?.open()
     await coordinators.setActive(false)
     await first.stop()
     await second.stop()
     throw error
   }
   await gate?.open()
+  await personalGate?.open()
   await coordinators.setActive(false)
   await first.stop()
   await second.stop()
