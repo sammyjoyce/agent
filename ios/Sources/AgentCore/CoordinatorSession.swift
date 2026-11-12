@@ -133,7 +133,8 @@ public struct StagedInput: Sendable, Equatable {
   }
 }
 
-/// What `start` did with a staged input.
+/// What `start` did with a staged input. A control that never leaves the phone releases its
+/// outbox's composer receipt, whatever the outcome.
 public enum StartOutcome: Sendable, Equatable {
   /// It is on its way. A durable one may instead wait in the outbox for this lane or for Check.
   case started
@@ -190,8 +191,12 @@ public actor CoordinatorSession {
   /// connect, then sends once.
   private var unsent: [String: Unsent] = [:]
   /// Exchanges that have not written their input to the coordinator yet, by action. `started` is
-  /// the input a Send started, and nil for Check / retry of a queued one.
+  /// the input a Send started, and nil for Check / retry of a queued one. An entry dropped before
+  /// its exchange writes it never left the phone, so dropping it releases a started control's
+  /// receipt.
   private var unwritten: [(action: UUID, inputID: String, started: StagedInput?)] = []
+  /// Controls staged with a composer's receipt that `start` has not taken, by input ID.
+  private var stagedControls: [String: StagedInput] = [:]
   /// Inputs this session found in its outbox, rather than staged itself.
   private var inherited: Set<String> = []
   /// Set for good by `retire`. A retired session never connects, sends or writes again.
@@ -326,13 +331,16 @@ public actor CoordinatorSession {
   /// it cancels before they left the phone: durable ones waiting for this lane, and any an
   /// exchange had not written yet. A staged input that was not started stays its sender's:
   /// `start` then answers `.retired`, and `unstage` leaves it to the profile's next session.
+  /// Every control it will now never send, staged or started, never left the phone, so its outbox
+  /// releases their receipts before it retires and can no longer save.
   @discardableResult public func retire() async -> [StagedInput] {
     guard !retired else { return [] }
+    let waiting = pending.filter { unsent[$0.request.inputId] == .waiting }.map { staged($0) }
+    let cancelled = waiting + unwritten.compactMap(\.started)
+    releaseReceipts(of: Array(stagedControls.values) + cancelled)
     retired = true
     let satellites = liveInspectors
     inspectors = []
-    let waiting = pending.filter { unsent[$0.request.inputId] == .waiting }.map { staged($0) }
-    let cancelled = waiting + unwritten.compactMap(\.started)
     await disconnect(generation: UUID())
     for inspector in satellites { await inspector.retire() }
     return cancelled
@@ -350,6 +358,7 @@ public actor CoordinatorSession {
     flush = nil
     for action in actions.values { action.cancel() }
     actions = [:]
+    releaseReceipts(of: unwritten.compactMap(\.started))
     unwritten = []
     historyAction = nil
     let ownedConnections = Array(actionConnections.values) + [connection].compactMap { $0 }
@@ -433,13 +442,15 @@ public actor CoordinatorSession {
     }
     let request = NativeRequestSubmit(
       attachments: files.isEmpty && !feedback ? nil : files.map(\.reference),
-      inputId: composer?.inputID.uuidString ?? UUID().uuidString, mode: mode,
-      origin: inputOrigins ? .ios : nil, text: text)
+      inputId: UUID().uuidString, mode: mode, origin: inputOrigins ? .ios : nil, text: text)
     let previousComposers = composerInputs
-    if let composer { composerInputs[composer.composerID.uuidString] = request.inputId }
+    if let composer { composerInputs[composer.composerID.uuidString] = composer.inputID.uuidString }
     guard !control || feedback else {
       // Controls have no replayable payload, but their admitted composer identity
       // must survive a failed draft checkpoint just like a queued message's.
+      let staged = StagedInput(
+        inputID: request.inputId, sendID: sendID, profile: profile, control: request,
+        composer: composer)
       if composer != nil {
         do { try saveOutbox() } catch {
           composerInputs = previousComposers
@@ -447,10 +458,9 @@ public actor CoordinatorSession {
           publish()
           return nil
         }
+        stagedControls[staged.inputID] = staged
       }
-      return StagedInput(
-        inputID: request.inputId, sendID: sendID, profile: profile, control: request,
-        composer: composer)
+      return staged
     }
     guard pending.count < 32 else {
       composerInputs = previousComposers
@@ -484,6 +494,7 @@ public actor CoordinatorSession {
   @discardableResult public func start(_ staged: StagedInput) -> StartOutcome {
     guard staged.profile == profile else { return .notSent }
     guard !retired else { return .retired }
+    stagedControls[staged.inputID] = nil
     if staged.control == nil {
       guard unsent[staged.inputID] == .staged else { return .started }
       guard snapshot.connection == .connected else {
@@ -494,7 +505,7 @@ public actor CoordinatorSession {
     }
     guard actions.count < 32, snapshot.connection == .connected else {
       guard staged.control == nil else {
-        releaseReceipt(staged)
+        releaseReceipts(of: [staged])
         return .notSent
       }
       transcript.delivery(staged.inputID, .uncertain)
@@ -520,8 +531,9 @@ public actor CoordinatorSession {
     guard staged.profile == profile else { return true }
     guard !retired else { return false }
     guard staged.control == nil else {
+      stagedControls[staged.inputID] = nil
       // The receipt is in the outbox, which a session that has not connected has yet to read.
-      if loadOutbox() { releaseReceipt(staged) }
+      if loadOutbox() { releaseReceipts(of: [staged]) }
       return true
     }
     switch unsent[staged.inputID] {
@@ -536,9 +548,7 @@ public actor CoordinatorSession {
       }
     }
     let previousComposers = composerInputs
-    if let key = staged.composer?.composerID.uuidString, composerInputs[key] == staged.inputID {
-      composerInputs[key] = nil
-    }
+    if let key = receiptKey(staged) { composerInputs[key] = nil }
     guard let removal = acknowledge(staged.inputID) else {
       composerInputs = previousComposers
       publish()
@@ -550,13 +560,23 @@ public actor CoordinatorSession {
     await removal.value
     return true
   }
-  /// A control that never left the phone was not admitted, so its composer keeps its text.
-  private func releaseReceipt(_ staged: StagedInput) {
-    guard let key = staged.composer?.composerID.uuidString, composerInputs[key] == staged.inputID
-    else { return }
+  /// The controls among `inputs` never left the phone, so this outbox releases, in one save, each
+  /// one's composer receipt that it still holds. A durable input's receipt stays with its outbox
+  /// item.
+  private func releaseReceipts(of inputs: [StagedInput]) {
+    let keys = inputs.filter { $0.control != nil }.compactMap(receiptKey)
+    guard !keys.isEmpty else { return }
     let previousComposers = composerInputs
-    composerInputs[key] = nil
+    for key in keys { composerInputs[key] = nil }
     do { try saveOutbox() } catch { composerInputs = previousComposers }
+  }
+  /// The key of the composer receipt `staged` holds in this outbox, or nil when it holds none. The
+  /// receipt names the composer's submission, which every recipient's copy shares, while each
+  /// copy's input ID names that copy alone.
+  private func receiptKey(_ staged: StagedInput) -> String? {
+    guard let composer = staged.composer else { return nil }
+    let key = composer.composerID.uuidString
+    return composerInputs[key] == composer.inputID.uuidString ? key : nil
   }
 
   /// Writes a queued input again under its original ID. One the coordinator accepted is observed by
@@ -932,6 +952,7 @@ public actor CoordinatorSession {
     var failed = false
     defer {
       if historyAction?.id != id { actions.removeValue(forKey: id) }
+      releaseReceipts(of: unwritten.filter { $0.action == id }.compactMap(\.started))
       unwritten.removeAll { $0.action == id }
       transcript.abandonHistory(id)
     }

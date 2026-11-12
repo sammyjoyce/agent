@@ -25,16 +25,18 @@ public struct ComposerInputIdentity: Codable, Sendable, Equatable {
 
 public struct ComposerSubmission: Sendable, Equatable {
   public let identity: ComposerInputIdentity
-  public let outboxURL: URL
+  /// Each recipient's outbox. An outbox releases the receipt only when its own copy did not go,
+  /// so the submission went while any of them still holds it.
+  public let outboxURLs: [URL]
   public var text: String
   public var attachments: [LocalAttachment]
   public var feedbackScreenshotID: String?
   public init(
-    identity: ComposerInputIdentity, outboxURL: URL, text: String,
+    identity: ComposerInputIdentity, outboxURLs: [URL], text: String,
     attachments: [LocalAttachment], feedbackScreenshotID: String? = nil
   ) {
     self.identity = identity
-    self.outboxURL = outboxURL
+    self.outboxURLs = outboxURLs
     self.text = text
     self.attachments = attachments
     self.feedbackScreenshotID = feedbackScreenshotID
@@ -199,10 +201,35 @@ public struct ComposerDraft: Sendable, Equatable {
 public actor ComposerDraftStore {
   private struct Submission: Codable {
     let identity: ComposerInputIdentity
-    let outboxPath: String
+    let outboxPaths: [String]
     let text: String
     let attachments: [AttachmentRef]
     let feedbackScreenshotID: String?
+    /// A record from a build that kept the receipt in the first recipient's outbox alone names
+    /// that outbox under `outboxPath`, and loads as a submission held there alone.
+    private enum LegacyKeys: String, CodingKey { case outboxPath }
+
+    init(
+      identity: ComposerInputIdentity, outboxPaths: [String], text: String,
+      attachments: [AttachmentRef], feedbackScreenshotID: String?
+    ) {
+      self.identity = identity
+      self.outboxPaths = outboxPaths
+      self.text = text
+      self.attachments = attachments
+      self.feedbackScreenshotID = feedbackScreenshotID
+    }
+
+    init(from decoder: any Decoder) throws {
+      let keys = try decoder.container(keyedBy: CodingKeys.self)
+      identity = try keys.decode(ComposerInputIdentity.self, forKey: .identity)
+      outboxPaths =
+        try keys.decodeIfPresent([String].self, forKey: .outboxPaths)
+        ?? [decoder.container(keyedBy: LegacyKeys.self).decode(String.self, forKey: .outboxPath)]
+      text = try keys.decode(String.self, forKey: .text)
+      attachments = try keys.decode([AttachmentRef].self, forKey: .attachments)
+      feedbackScreenshotID = try keys.decodeIfPresent(String.self, forKey: .feedbackScreenshotID)
+    }
   }
   private struct Record: Codable {
     let revision: UInt64
@@ -232,7 +259,10 @@ public actor ComposerDraftStore {
     let references = (submitted?.attachments ?? []) + record.attachments
     guard references.count <= AttachmentLimits.maximumCount,
       Set(references.map(\.id)).count == references.count,
-      submitted.map({ !$0.outboxPath.isEmpty && !$0.outboxPath.hasPrefix("/") }) ?? true,
+      submitted.map({ value in
+        !value.outboxPaths.isEmpty
+          && value.outboxPaths.allSatisfy { !$0.isEmpty && !$0.hasPrefix("/") }
+      }) ?? true,
       submitted.map({ $0.identity.composerID == record.composerID }) ?? true,
       submitted.map({ value in
         value.feedbackScreenshotID.map { id in value.attachments.contains { $0.id == id } } ?? true
@@ -240,11 +270,12 @@ public actor ComposerDraftStore {
       record.feedbackScreenshotID.map({ id in record.attachments.contains { $0.id == id } }) ?? true
     else { throw ComposerDraftError.invalidRecord }
     let owned =
-      try submitted.map {
-        try CoordinatorSession.ownsComposerInput(
-          $0.identity,
-          outboxURL: url.deletingLastPathComponent().appending(path: $0.outboxPath)
-            .standardizedFileURL)
+      try submitted.map { value in
+        try value.outboxPaths.contains {
+          try CoordinatorSession.ownsComposerInput(
+            value.identity,
+            outboxURL: url.deletingLastPathComponent().appending(path: $0).standardizedFileURL)
+        }
       } ?? false
     var files: [LocalAttachment] = []
     for reference in (owned ? [] : submitted?.attachments ?? []) + record.attachments {
@@ -289,17 +320,19 @@ public actor ComposerDraftStore {
     }
     guard Set(references.map(\.id)).count == references.count,
       draft.submission.map({ $0.identity.composerID == draft.composerID }) ?? true,
+      draft.submission.map({ !$0.outboxURLs.isEmpty }) ?? true,
       draft.submission.map({ value in
         value.feedbackScreenshotID.map { id in value.attachments.contains { $0.id == id } } ?? true
       }) ?? true,
       draft.feedbackScreenshotID.map({ id in draft.attachments.contains { $0.id == id } }) ?? true
     else { throw ComposerDraftError.invalidRecord }
     let submission =
-      try draft.submission.map {
+      try draft.submission.map { value in
         Submission(
-          identity: $0.identity, outboxPath: try relativeOutboxPath($0.outboxURL), text: $0.text,
-          attachments: $0.attachments.map(\.reference),
-          feedbackScreenshotID: $0.feedbackScreenshotID)
+          identity: value.identity,
+          outboxPaths: try value.outboxURLs.map { try relativeOutboxPath($0) }, text: value.text,
+          attachments: value.attachments.map(\.reference),
+          feedbackScreenshotID: value.feedbackScreenshotID)
       }
     let record = Record(
       revision: revision, text: draft.text, mode: draft.mode,

@@ -409,21 +409,34 @@ private func row(
     "Each coordinator is named where its run starts, and again after your message")
 }
 
-/// Holds the next dial to Work's port once armed, as a slow tailnet would.
+/// Holds the next dial once armed, as a slow tailnet would.
 actor DialGate {
   private var armed = false
+  private var entering: (@Sendable () throws -> Void)?
   private(set) var waiting = false
-  private var release: CheckedContinuation<Void, Never>?
-  func arm() { armed = true }
-  func pass() async {
+  private var release: CheckedContinuation<Void, any Error>?
+  /// Holds the next dial, which first runs `entering`.
+  func arm(entering: (@Sendable () throws -> Void)? = nil) {
+    armed = true
+    self.entering = entering
+  }
+  func pass() async throws {
     guard armed else { return }
     armed = false
+    try entering?()
+    entering = nil
     waiting = true
-    await withCheckedContinuation { release = $0 }
+    try await withCheckedThrowingContinuation { release = $0 }
   }
   func open() {
     armed = false
     release?.resume()
+    release = nil
+  }
+  /// Fails the held dial, as when the coordinator does not answer in time.
+  func fail() {
+    armed = false
+    release?.resume(throwing: ConnectionError.timedOut)
     release = nil
   }
 }
@@ -441,10 +454,11 @@ actor WorkRoute {
 }
 
 /// Two loopback coordinators, Personal at port 4002 of an invented address and Work at any
-/// other address, and a fresh `Coordinators` with nothing saved, as the app builds it.
+/// other address, and a fresh `Coordinators` with nothing saved, as the app builds it. With
+/// `draft`, the composer saves its draft at that path under the root.
 @MainActor func withTwoFixtures(
   registration: NotificationRegistration? = nil, holdingWork gate: DialGate? = nil,
-  route: WorkRoute? = nil,
+  holdingPersonal personalGate: DialGate? = nil, route: WorkRoute? = nil, draft: String? = nil,
   _ body: (Coordinators, FixtureCoordinator, FixtureCoordinator, URL) async throws -> Void
 ) async throws {
   let first = FixtureCoordinator()
@@ -461,7 +475,8 @@ actor WorkRoute {
   let coordinators = Coordinators(
     registration: registration, defaults: defaults, applicationSupport: root, caches: root,
     transport: CoordinatorTransport { address in
-      if address.port == 4001 { await gate?.pass() }
+      if address.port == 4001 { try await gate?.pass() }
+      if address.port == 4002 { try await personalGate?.pass() }
       if address.port == 4002, await route?.personalsAddressDown == true {
         throw ConnectionError.timedOut
       }
@@ -470,18 +485,20 @@ actor WorkRoute {
       let personal = (address.port == 4002) != swapped || repointed
       return LineConnection(
         connection: NWConnection(to: personal ? secondPort : firstPort, using: .tcp))
-    })
+    }, persistence: draft.map { ComposerDraftStore(url: root.appending(path: $0)) })
   await coordinators.setActive(true)
   do {
     try await body(coordinators, first, second, root)
   } catch {
     await gate?.open()
+    await personalGate?.open()
     await coordinators.setActive(false)
     await first.stop()
     await second.stop()
     throw error
   }
   await gate?.open()
+  await personalGate?.open()
   await coordinators.setActive(false)
   await first.stop()
   await second.stop()
@@ -593,10 +610,10 @@ func anUntaggedSendReachesBothCoordinatorsAndATaggedOneOnlyItsOwn() async throws
   }
 }
 
-/// A Send to both keeps the composer's receipt in the first recipient's outbox alone, under that
-/// copy's input ID. The other copy has its own ID and no receipt.
+/// A Send to both keeps the composer's receipt in each recipient's outbox. Each copy has its own
+/// input ID, so Retry, Discard and Restore reach the coordinator that holds it.
 @MainActor @Test(.timeLimit(.minutes(1)))
-func aSendToBothKeepsItsComposerReceiptWithTheFirstRecipientAlone() async throws {
+func aSendToBothKeepsItsComposerReceiptWithEachRecipient() async throws {
   try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
     await workFixture.holdPlacements()
     await personalFixture.holdPlacements()
@@ -613,12 +630,12 @@ func aSendToBothKeepsItsComposerReceiptWithTheFirstRecipientAlone() async throws
       try Data(contentsOf: ProfileDirectory(id, applicationSupport: root, caches: root).outbox)
     }
     let atWork = try JSONDecoder().decode(WithReceipts.self, from: outbox(work))
-    #expect(atWork.pending.count == 1)
-    #expect(Array(atWork.composerInputs.values) == atWork.pending.map(\.request.inputId))
-    let atPersonal = try JSONDecoder().decode([OutboxItem].self, from: outbox(personal))
-    #expect(atPersonal.count == 1, "No receipt, so Personal's outbox stays a bare array")
-    #expect(atPersonal.first?.request.inputId != atWork.pending.first?.request.inputId)
-    #expect(atPersonal.first?.sendID == atWork.pending.first?.sendID)
+    let atPersonal = try JSONDecoder().decode(WithReceipts.self, from: outbox(personal))
+    #expect(atWork.pending.count == 1 && atPersonal.pending.count == 1)
+    #expect(atWork.composerInputs.count == 1)
+    #expect(atPersonal.composerInputs == atWork.composerInputs, "Both hold the same receipt")
+    #expect(atPersonal.pending.first?.request.inputId != atWork.pending.first?.request.inputId)
+    #expect(atPersonal.pending.first?.sendID == atWork.pending.first?.sendID)
   }
 }
 
@@ -3636,8 +3653,7 @@ func anAcknowledgementThisPhoneCouldNotSaveStillKeepsTheOriginal(placed: Bool, s
         $0.inputID == original.inputId && $0.delivery == .saved
       } == true
     }
-    let saved = try JSONDecoder().decode(
-      [OutboxItem].self, from: Data(contentsOf: directory.outbox))
+    let saved = try queuedItems(directory.outbox)
     print(
       "IF7-V1[placed=\(placed) storageFails=\(storageFails)] acknowledged: refusedOnDisk=\(saved.first?.refused == true)"
     )
