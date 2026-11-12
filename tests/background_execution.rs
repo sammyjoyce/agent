@@ -11,6 +11,7 @@ use agent_cli::{
         AgentNode, CoordinatorBootstrap, CoordinatorSettings, InputMode, RuntimeCommand,
         RuntimeEventKind, TaskId, TaskRecord, WorkerLaunch,
     },
+    rex::RexClient,
     runtime::{Runtime, RuntimeCall},
 };
 use serde::Serialize;
@@ -118,6 +119,7 @@ async fn started(path: &Path) -> i32 {
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)]
 async fn stopping_one_background_actor_drains_its_real_process_and_preserves_the_other_actor() {
     let directory = tempfile::tempdir().unwrap();
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -240,7 +242,14 @@ async fn stopping_one_background_actor_drains_its_real_process_and_preserves_the
     .await;
     let alpha = job("alpha", "JOB_ALPHA", directory.path());
     let beta = job("beta", "JOB_BETA", directory.path());
-    let broker = Arc::new(Broker::new(Some(&bootstrap), directory.path()).unwrap());
+    let broker = Arc::new(
+        Broker::new(
+            Some(&bootstrap),
+            directory.path(),
+            RexClient::for_process(None).unwrap(),
+        )
+        .unwrap(),
+    );
     let running = runtime.clone();
     let background = BackgroundOwner(tokio::spawn(async move {
         background::run(

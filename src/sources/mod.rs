@@ -553,11 +553,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
     async fn source_commands_capture_native_pages_beyond_the_model_output_budget_and_report_their_own_limit()
      {
         use crate::{
             host,
             protocol::{HostCommand, HostResult},
+            rex::RexClient,
             runtime::MAX_FRAME_BYTES,
             sources::read_command,
         };
@@ -574,14 +576,16 @@ mod tests {
         assert_eq!(source.exit_code, 0);
         assert!(!source.truncated);
         assert_eq!(source.stdout.len(), 512 * 1024);
-        let interactive = host::execute(HostCommand::Exec {
-            sender_conversation_id: None,
-            program: command[0].clone(),
-            args: command[1..].to_vec(),
-            cwd: "/".into(),
-            timeout_seconds: 900,
-        })
-        .await;
+        let interactive =
+            host::Executor::new(directory.path(), RexClient::for_process(None).unwrap())
+                .execute(HostCommand::Exec {
+                    sender_conversation_id: None,
+                    program: command[0].clone(),
+                    args: command[1..].to_vec(),
+                    cwd: "/".into(),
+                    timeout_seconds: 900,
+                })
+                .await;
         assert!(
             matches!(interactive,HostResult::Process {exit_code:0,stdout,truncated:true,..} if stdout.len()==256*1024)
         );

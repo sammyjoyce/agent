@@ -21,7 +21,12 @@ fn delivery(result: &HostResult) -> Option<String> {
 #[tokio::test]
 async fn a_node_missing_before_admission_reports_not_started() {
     let directory = tempfile::tempdir().unwrap();
-    let broker = Broker::new(None, directory.path()).unwrap();
+    let broker = Broker::new(
+        None,
+        directory.path(),
+        crate::rex::RexClient::for_process(None).unwrap(),
+    )
+    .unwrap();
     let marker = directory.path().join("must-not-run");
     let result = broker
         .execute(effect(
@@ -40,7 +45,14 @@ async fn a_node_missing_before_admission_reports_not_started() {
 #[tokio::test]
 async fn losing_a_real_write_receipt_reports_uncertain_without_replaying_the_write() {
     let (directory, runtime) = runtime().await;
-    let broker = Arc::new(Broker::new(None, directory.path()).unwrap());
+    let broker = Arc::new(
+        Broker::new(
+            None,
+            directory.path(),
+            crate::rex::RexClient::for_process(None).unwrap(),
+        )
+        .unwrap(),
+    );
     let host = "22222222-2222-4222-8222-222222222222";
     let mut worker = Worker::connect(broker.clone(), runtime.clone(), host).await;
     let marker = directory.path().join("written-once");
@@ -62,7 +74,12 @@ async fn losing_a_real_write_receipt_reports_uncertain_without_replaying_the_wri
     let RuntimeEventKind::HostCall { command, .. } = event(&mut worker.reader).await else {
         panic!("Expected an owned write")
     };
-    let result = Executor::new(directory.path()).execute(*command).await;
+    let result = Executor::new(
+        directory.path(),
+        crate::rex::RexClient::for_process(None).unwrap(),
+    )
+    .execute(*command)
+    .await;
     assert!(matches!(result, HostResult::Written));
     worker.close().await;
     let result = pending.await.unwrap();

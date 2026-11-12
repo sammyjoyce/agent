@@ -2,6 +2,7 @@
 use agent_cli::{
     host::{ACTOR_CONVERSATION_ENV, Executor},
     protocol::{HostCommand, HostResult, InputMode, InputOrigin, RuntimeCommand, RuntimeEventKind},
+    rex::RexClient,
     runtime::FrameReader,
 };
 use std::{fs, os::unix::fs::PermissionsExt, process::Stdio, time::Duration};
@@ -14,6 +15,7 @@ use tokio::{
 };
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)]
 async fn host_exec_and_real_tasks_send_preserve_explicit_actor_and_clear_inherited_actor() {
     const CHILD: &str = "BEEP_BOOP_TEST_TASK_SENDER_CHILD";
     const TEST: &str =
@@ -93,7 +95,7 @@ async fn host_exec_and_real_tasks_send_preserve_explicit_actor_and_clear_inherit
                 timeout_seconds: 5,
                 sender_conversation_id: sender.map(str::to_owned),
             };
-            let executor = Executor::new(directory.path());
+            let executor = Executor::new(directory.path(), RexClient::for_process(None).unwrap());
             let (_cancel, cancelled) = watch::channel(false);
             let result = if cancellable {
                 executor.execute_cancelled(command, cancelled).await

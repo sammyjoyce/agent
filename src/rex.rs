@@ -1,4 +1,4 @@
-//! Typed Rex CLI boundary. No routing policy and no automatic mutation retries.
+//! Typed Rex CLI boundary. No automatic mutation retries.
 //! Native schemas are discovered per server with `rex api describe`.
 
 pub mod install;
@@ -24,12 +24,18 @@ pub enum RexError {
     InvalidInput,
     InvalidId,
     Unavailable,
+    /// The selected server was not running, so the request never reached Rex.
+    ServerDown {
+        location: String,
+    },
     ReadFailed,
     OutputTooLarge,
     InvalidResponse,
     BindingMismatch,
     SessionNotFound,
-    CreationUncertain { session_id: Option<SessionId> },
+    CreationUncertain {
+        session_id: Option<SessionId>,
+    },
 }
 impl fmt::Display for RexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -37,6 +43,7 @@ impl fmt::Display for RexError {
             Self::InvalidInput => f.write_str("Invalid Rex worker request"),
             Self::InvalidId => f.write_str("Invalid Rex resource identifier"),
             Self::Unavailable => f.write_str("Rex CLI is unavailable"),
+            Self::ServerDown { location } => write!(f, "No Rex server is running at {location}"),
             Self::ReadFailed => f.write_str("Rex read failed or timed out"),
             Self::OutputTooLarge => f.write_str("Rex response exceeds the supported size limit"),
             Self::InvalidResponse => f.write_str("Rex returned an unsupported response"),
@@ -96,6 +103,19 @@ pub struct RexIdentity {
     pub rex_version: String,
     pub endpoint: Option<String>,
     pub tailscale: Option<RexTailnet>,
+}
+
+#[derive(Deserialize)]
+struct PeerInventory {
+    #[serde(default)]
+    hosts: Vec<RexPeer>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RexPeer {
+    pub host_id: Option<String>,
+    pub label: String,
+    pub endpoints: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -179,7 +199,37 @@ impl SessionView {
 
 #[derive(Clone, Debug)]
 pub struct RexClient {
-    server: Option<String>,
+    route: RexRoute,
+}
+
+#[derive(Clone, Debug)]
+enum RexRoute {
+    /// The CLI's own selection: `REX_SERVER`, else the account's local server.
+    Personal,
+    /// `REX_SERVER` is removed because Rex falls back to the personal server
+    /// when that variable names a dead socket.
+    Private(LocalRexEndpoint),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalRexEndpoint(String);
+
+impl LocalRexEndpoint {
+    fn parse(input: &str) -> anyhow::Result<Self> {
+        let path = input.strip_prefix("unix://").map(Path::new);
+        anyhow::ensure!(
+            path.is_some_and(|path| path.is_absolute() && path.file_name().is_some())
+                && !input.contains(['\0', '?', '#']),
+            "--rex-server must be unix:// followed by an absolute socket path, not {input:?}"
+        );
+        Ok(Self(input.to_owned()))
+    }
+}
+
+fn personal_messages() -> RexClient {
+    RexClient {
+        route: RexRoute::Personal,
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -232,8 +282,52 @@ impl RexClient {
         })
     }
 
-    pub fn new(server: Option<String>) -> Self {
-        Self { server }
+    pub fn for_process(server: Option<&str>) -> anyhow::Result<Self> {
+        let route = match server {
+            None => RexRoute::Personal,
+            Some(server) => RexRoute::Private(LocalRexEndpoint::parse(server)?),
+        };
+        Ok(Self { route })
+    }
+
+    pub fn is_private(&self) -> bool {
+        matches!(self.route, RexRoute::Private(_))
+    }
+
+    pub fn rex_server_args(&self) -> Vec<String> {
+        match &self.route {
+            RexRoute::Personal => Vec::new(),
+            RexRoute::Private(endpoint) => vec!["--rex-server".into(), endpoint.0.clone()],
+        }
+    }
+
+    /// `rex hosts` reads the account's home inventory and ignores `--server`,
+    /// so a private server has none of its own.
+    pub async fn peer_inventory(&self) -> Option<Vec<RexPeer>> {
+        if self.is_private() {
+            return None;
+        }
+        let args = ["--autostart=false".into(), "hosts".into(), "--json".into()];
+        let request = crate::host::ProcessRequest::new(
+            "rex",
+            &args,
+            Path::new("/"),
+            Duration::from_secs(15),
+            256 * 1024,
+        )
+        .ok()?;
+        let crate::host::ProcessOutput {
+            exit_code: 0,
+            stdout,
+            truncated: false,
+            ..
+        } = crate::host::run_process(request).await.ok()?
+        else {
+            return None;
+        };
+        serde_json::from_str::<PeerInventory>(&stdout)
+            .ok()
+            .map(|inventory| inventory.hosts)
     }
 
     pub async fn whoami(&self) -> Result<RexIdentity, RexError> {
@@ -314,9 +408,7 @@ impl RexClient {
                 },
             )
             .await
-            .map_err(|_| RexError::CreationUncertain {
-                session_id: Some(session.clone()),
-            })?;
+            .map_err(|error| creation_failure(error, Some(session.clone())))?;
         let window: CreatedWindow =
             serde_json::from_slice(&receipt).map_err(|_| RexError::CreationUncertain {
                 session_id: Some(session.clone()),
@@ -387,11 +479,7 @@ impl RexClient {
         let output = self
             .api("session.create", &request)
             .await
-            .map_err(|error| match error {
-                CallFailure::Unavailable => RexError::Unavailable,
-                CallFailure::InvalidInput => RexError::InvalidInput,
-                _ => RexError::CreationUncertain { session_id: None },
-            })?;
+            .map_err(|error| creation_failure(error, None))?;
         decode_creation(&output)
     }
 
@@ -436,9 +524,7 @@ impl RexClient {
                 },
             )
             .await
-            .map_err(|_| RexError::CreationUncertain {
-                session_id: Some(binding.session_id.clone()),
-            })?;
+            .map_err(|error| creation_failure(error, Some(binding.session_id.clone())))?;
         let window: CreatedWindow =
             serde_json::from_slice(&receipt).map_err(|_| RexError::CreationUncertain {
                 session_id: Some(binding.session_id.clone()),
@@ -518,18 +604,14 @@ impl RexClient {
         .await
     }
 
-    fn command(&self, args: &[String]) -> Result<Command, CallFailure> {
-        if self
-            .server
-            .as_ref()
-            .is_some_and(|server| server.is_empty() || server.contains('\0'))
-        {
-            return Err(CallFailure::InvalidInput);
-        }
+    fn command(&self, args: &[String]) -> Command {
         let mut command = Command::new("rex");
         command.args(["--autostart=false", "--timeout", "8s"]);
-        if let Some(server) = &self.server {
-            command.arg("--server").arg(server);
+        if let RexRoute::Private(endpoint) = &self.route {
+            command
+                .arg("--server")
+                .arg(&endpoint.0)
+                .env_remove("REX_SERVER");
         }
         command
             .args(args)
@@ -540,11 +622,11 @@ impl RexClient {
             .env_remove("REX_BLOCK")
             .env_remove("REX_CLIENT")
             .kill_on_drop(true);
-        Ok(command)
+        command
     }
 
     async fn run(&self, args: Vec<String>) -> Result<Vec<u8>, CallFailure> {
-        let mut command = self.command(&args)?;
+        let mut command = self.command(&args);
         let mut child = command.spawn().map_err(|_| CallFailure::Unavailable)?;
         let result = tokio::time::timeout(CALL_TIMEOUT, async {
             let stdout = child.stdout.take().ok_or(CallFailure::Failed)?;
@@ -562,6 +644,19 @@ impl RexClient {
                 return Err(CallFailure::Failed);
             }
             if !status.success() {
+                if status.code() == Some(4)
+                    && let Some(location) = std::str::from_utf8(&error)
+                        .ok()
+                        .and_then(|error| error.strip_prefix("Error: no Rex server is running at "))
+                {
+                    let location = location.lines().next().unwrap_or_default();
+                    return Err(CallFailure::ServerDown {
+                        location: location
+                            .strip_suffix(", and autostart is disabled")
+                            .unwrap_or(location)
+                            .to_owned(),
+                    });
+                }
                 if std::str::from_utf8(&error)
                     .is_ok_and(|error| error.trim_end().ends_with("(status=413 code=too_large)"))
                 {
@@ -607,14 +702,25 @@ enum CallFailure {
     Failed,
     OutputTooLarge,
     SessionNotFound,
+    ServerDown { location: String },
 }
 fn read_failure(error: CallFailure) -> RexError {
     match error {
         CallFailure::Unavailable => RexError::Unavailable,
+        CallFailure::ServerDown { location } => RexError::ServerDown { location },
         CallFailure::InvalidInput => RexError::InvalidInput,
         CallFailure::Failed => RexError::ReadFailed,
         CallFailure::OutputTooLarge => RexError::OutputTooLarge,
         CallFailure::SessionNotFound => RexError::SessionNotFound,
+    }
+}
+/// Only a call that never reached Rex proves that nothing was created.
+fn creation_failure(error: CallFailure, session_id: Option<SessionId>) -> RexError {
+    match error {
+        CallFailure::Unavailable => RexError::Unavailable,
+        CallFailure::ServerDown { location } => RexError::ServerDown { location },
+        CallFailure::InvalidInput => RexError::InvalidInput,
+        _ => RexError::CreationUncertain { session_id },
     }
 }
 fn decode<T: DeserializeOwned>(output: &[u8]) -> Result<T, RexError> {
@@ -836,6 +942,7 @@ fn decode_creation(output: &[u8]) -> Result<WorkerBinding, RexError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     const SESSION: &str = "session:11111111-1111-4111-8111-111111111111";
@@ -849,7 +956,8 @@ mod tests {
         const CHILD: &str = "AGENT_TEST_REX_CAPTURE_CHILD";
         const TEST: &str = "rex::tests::terminal_capture_targets_only_the_explicit_pane_and_keeps_rendered_evidence";
         if std::env::var_os(CHILD).is_some() {
-            let output = RexClient::new(None)
+            let output = RexClient::for_process(None)
+                .unwrap()
                 .capture_terminal(
                     &SessionId::parse(SESSION).unwrap(),
                     &BlockId::parse(BLOCK).unwrap(),
@@ -911,6 +1019,90 @@ printf '<pre>Current task view 🦀</pre>\n'
                 "html"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn only_a_server_that_is_not_running_proves_a_create_was_never_received() {
+        const TEST: &str =
+            "rex::tests::only_a_server_that_is_not_running_proves_a_create_was_never_received";
+        let Some(case) = fake_rex::case() else {
+            for (case, variable, method) in [
+                (
+                    "down-create",
+                    "AGENT_TEST_FAKE_REX_DOWN_AT",
+                    "session.create",
+                ),
+                (
+                    "down-window",
+                    "AGENT_TEST_FAKE_REX_DOWN_AT",
+                    "session.new_window",
+                ),
+                (
+                    "lost-create",
+                    "AGENT_TEST_FAKE_REX_FAIL_AT",
+                    "session.create",
+                ),
+                (
+                    "lost-window",
+                    "AGENT_TEST_FAKE_REX_FAIL_AT",
+                    "session.new_window",
+                ),
+            ] {
+                fake_rex::run(TEST, case, &[(variable, method)]);
+            }
+            return;
+        };
+        let client = RexClient::for_process(None).unwrap();
+        let session = SessionId::parse(fake_rex::ORIGIN_SESSION).unwrap();
+        let exited = WorkerBinding {
+            session_id: session.clone(),
+            window_id: WindowId::parse(fake_rex::ORIGIN_WINDOW).unwrap(),
+            block_id: BlockId::parse(fake_rex::ORIGIN_BLOCK).unwrap(),
+            revision: 1,
+        };
+        let cwd = Path::new("/tmp");
+        let expected = |down: bool, session_id: Option<SessionId>| {
+            if down {
+                RexError::ServerDown {
+                    location: "/run/user/1000/rex/server.sock".into(),
+                }
+            } else {
+                RexError::CreationUncertain { session_id }
+            }
+        };
+        let down = case.starts_with("down");
+        if case.ends_with("create") {
+            assert_eq!(
+                client
+                    .create_session("Task", "/example/agent", &[], cwd)
+                    .await
+                    .unwrap_err(),
+                expected(down, None)
+            );
+            assert_eq!(fake_rex::methods(), ["session.create"]);
+        } else {
+            let resumed = client
+                .resume_worker(&exited, "/example/agent", &[], cwd)
+                .await;
+            assert!(
+                matches!(&resumed, Err(error) if *error == expected(down, Some(session.clone())))
+            );
+            assert_eq!(
+                client
+                    .create_worker_window(&session, "Review", "/example/agent", &[], cwd)
+                    .await
+                    .unwrap_err(),
+                expected(down, Some(session.clone()))
+            );
+            assert_eq!(
+                fake_rex::methods(),
+                [
+                    "com.superlogical.terminal.process",
+                    "session.new_window",
+                    "session.new_window"
+                ]
+            );
+        }
     }
 
     #[test]
@@ -1010,10 +1202,9 @@ printf '<pre>Current task view 🦀</pre>\n'
 
     #[test]
     fn cli_argv_disables_autostart_and_scopes_server_without_shell_interpolation() {
-        let client = RexClient::new(Some("https://worker.example.invalid".to_owned()));
-        let command = client
-            .command(&["whoami".to_owned(), "--json".to_owned()])
-            .unwrap();
+        let client =
+            RexClient::for_process(Some("unix:///run/user/1000/agent rex/$(x).sock")).unwrap();
+        let command = client.command(&["whoami".to_owned(), "--json".to_owned()]);
         let args: Vec<_> = command
             .as_std()
             .get_args()
@@ -1026,11 +1217,43 @@ printf '<pre>Current task view 🦀</pre>\n'
                 "--timeout",
                 "8s",
                 "--server",
-                "https://worker.example.invalid",
+                "unix:///run/user/1000/agent rex/$(x).sock",
                 "whoami",
                 "--json"
             ]
         );
+    }
+
+    #[test]
+    fn local_rex_endpoint_accepts_only_an_absolute_unix_socket() {
+        for (input, accepted) in [
+            ("unix:///run/user/1000/rex-agent/server.sock", true),
+            ("unix:///tmp/a b/s.sock", true),
+            ("unix://relative/server.sock", false),
+            ("unix://", false),
+            ("unix:///", false),
+            ("/run/user/1000/rex-agent/server.sock", false),
+            ("UNIX:///run/user/1000/rex-agent/server.sock", false),
+            ("https://worker.example.invalid", false),
+            ("studio", false),
+            ("127.0.0.1:7777", false),
+            ("unix:///run/user/1000/rex.sock?mode=0600", false),
+            ("unix:///run/user/1000/rex.sock#pane", false),
+            ("unix:///run/user/1000/rex\0.sock", false),
+            ("", false),
+        ] {
+            assert_eq!(
+                LocalRexEndpoint::parse(input).is_ok(),
+                accepted,
+                "{input:?}"
+            );
+            assert_eq!(
+                RexClient::for_process(Some(input)).is_ok(),
+                accepted,
+                "{input:?}"
+            );
+        }
+        assert!(!RexClient::for_process(None).unwrap().is_private());
     }
 
     #[tokio::test]
@@ -1038,7 +1261,7 @@ printf '<pre>Current task view 🦀</pre>\n'
         const TEST: &str =
             "rex::tests::native_process_completion_evidence_prevents_duplicate_chat_windows";
         if let Ok(directory) = std::env::var("AGENT_TEST_REX_PROCESS_FIXTURE") {
-            let client = RexClient::new(None);
+            let client = RexClient::for_process(None).unwrap();
             let binding = WorkerBinding {
                 session_id: SessionId::parse(SESSION).unwrap(),
                 window_id: WindowId::parse(WINDOW).unwrap(),
@@ -1308,11 +1531,11 @@ printf '%s\n' "$value"
     }
 
     /// Opt-in only: creates and removes one synthetic session on the selected running Rex server.
-    /// Set AGENT_TEST_REX_SERVER for a remote server; omit it for the local server.
     #[tokio::test]
     #[ignore = "requires a running Rex server; creates and removes one synthetic session"]
     async fn live_native_rex_worker_contract() -> anyhow::Result<()> {
-        let client = RexClient::new(std::env::var("AGENT_TEST_REX_SERVER").ok());
+        let client =
+            RexClient::for_process(std::env::var("AGENT_TEST_REX_SERVER").ok().as_deref())?;
         let identity = client.whoami().await?;
         let before = client.list_sessions().await?;
         let title = format!("agent-rex-contract-{}", Uuid::new_v4());
@@ -1477,3 +1700,7 @@ printf '%s\n' "$value"
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/fixtures/fake_rex.rs"]
+pub(crate) mod fake_rex;

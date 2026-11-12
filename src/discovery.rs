@@ -1,56 +1,25 @@
 //! Node capabilities come from the machine, while Rex owns its peer inventory.
 
-use std::{path::Path, time::Duration};
-
-use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
+use std::path::Path;
 
 use crate::{
-    config, host,
+    config,
     protocol::{AgentNode, WorkerLaunch},
     rex::{HostId, RexClient},
 };
-
-#[derive(Deserialize)]
-struct Inventory {
-    #[serde(default)]
-    hosts: Vec<Peer>,
-}
-#[derive(Deserialize)]
-struct Peer {
-    host_id: Option<String>,
-    label: String,
-    endpoints: Option<Vec<String>>,
-}
+use anyhow::{Context, Result, ensure};
 
 pub async fn local_node(
+    rex: &RexClient,
     coordinator: Option<&str>,
     launch: WorkerLaunch,
     name: Option<&str>,
     daemon: &crate::tailnet::Daemon,
 ) -> Result<AgentNode> {
-    let identity = RexClient::new(None).whoami().await?;
-    let args = ["--autostart=false".into(), "hosts".into(), "--json".into()];
-    let output = host::run_process(host::ProcessRequest::new(
-        "rex",
-        &args,
-        Path::new("/"),
-        Duration::from_secs(15),
-        256 * 1024,
-    )?)
-    .await;
-    let inventory = match output {
-        Ok(host::ProcessOutput {
-            exit_code: 0,
-            stdout,
-            truncated: false,
-            ..
-        }) => serde_json::from_str::<Inventory>(&stdout).ok(),
-        _ => None,
-    };
-    let peer = inventory.as_ref().and_then(|inventory| {
-        inventory
-            .hosts
+    let identity = rex.whoami().await?;
+    let inventory = rex.peer_inventory().await;
+    let peer = inventory.as_ref().and_then(|hosts| {
+        hosts
             .iter()
             .find(|peer| peer.host_id.as_deref() == Some(&identity.host_id.to_string()))
     });
@@ -69,13 +38,18 @@ pub async fn local_node(
         })
         .or(native_name)
         .unwrap_or_else(|| "local".into());
-    let endpoint = identity
-        .tailscale
-        .as_ref()
-        .and_then(|tailnet| tailnet.https.as_ref())
-        .filter(|https| https.state == "available")
-        .and_then(|https| https.url.clone())
-        .or_else(|| peer.and_then(|peer| peer.endpoints.as_ref()?.first().cloned()));
+    // Apps reach a node's Rex at this address, so a private server never announces one.
+    let endpoint = if rex.is_private() {
+        None
+    } else {
+        identity
+            .tailscale
+            .as_ref()
+            .and_then(|tailnet| tailnet.https.as_ref())
+            .filter(|https| https.state == "available")
+            .and_then(|https| https.url.clone())
+            .or_else(|| peer.and_then(|peer| peer.endpoints.as_ref()?.first().cloned()))
+    };
     let node = AgentNode {
         host_id: identity.host_id.to_string(),
         name,
@@ -132,4 +106,51 @@ pub fn validate_node(node: &AgentNode) -> Result<()> {
         model.validate()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+mod tests {
+    use super::local_node;
+    use crate::{protocol::WorkerLaunch, rex::RexClient, rex::fake_rex};
+
+    #[tokio::test]
+    async fn a_private_node_announces_no_rex_address_and_reads_no_peer_inventory() {
+        const TEST: &str =
+            "discovery::tests::a_private_node_announces_no_rex_address_and_reads_no_peer_inventory";
+        let Some(case) = fake_rex::case() else {
+            for case in ["private", "personal"] {
+                fake_rex::run(TEST, case, &[]);
+            }
+            return;
+        };
+        let rex = RexClient::for_process(
+            (case == "private").then_some("unix:///run/user/1000/rex-agent/server.sock"),
+        )
+        .unwrap();
+        let daemon =
+            crate::tailnet::Daemon::new(Some(std::path::Path::new("/nonexistent/tailscaled.sock")))
+                .unwrap();
+        let launch = WorkerLaunch {
+            state_dir: None,
+            runtime: None,
+            config: None,
+            instructions: None,
+            model: None,
+        };
+        let node = local_node(&rex, None, launch, None, &daemon).await.unwrap();
+        assert_eq!(node.host_id, fake_rex::HOST);
+        if case == "private" {
+            assert_eq!(node.rex_server, None);
+            assert_eq!(node.name, "fixture-node");
+            assert_eq!(fake_rex::methods(), ["whoami"]);
+        } else {
+            assert_eq!(
+                node.rex_server.as_deref(),
+                Some("https://fixture-node.example.ts.net")
+            );
+            assert_eq!(node.name, "fixture-peer");
+            assert_eq!(fake_rex::methods(), ["whoami", "hosts"]);
+        }
+    }
 }

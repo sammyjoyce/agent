@@ -4,6 +4,7 @@ use crate::{ClientContext, UiSession, connection, exchange, write_command};
 use agent_cli::{
     config::ClientConfig,
     protocol::{ErrorCode, RuntimeCommand, RuntimeEventKind, SavedConversation},
+    rex::RexClient,
     runtime::{FrameReader, decode_coordinator_event},
     tui::{HistoryReplay, ObservationState, TuiInfo},
 };
@@ -20,6 +21,8 @@ struct Target {
     coordinator: Option<String>,
     script: PathBuf,
     directory: PathBuf,
+    rex: RexClient,
+    terminal: RexClient,
     conversation_id: String,
 }
 impl Target {
@@ -29,6 +32,8 @@ impl Target {
             coordinator: self.coordinator.as_deref(),
             script: &self.script,
             directory: &self.directory,
+            rex: &self.rex,
+            terminal: &self.terminal,
         }
     }
 }
@@ -324,6 +329,8 @@ pub(crate) async fn open(
         coordinator: client.coordinator.map(str::to_owned),
         script: client.script.to_owned(),
         directory: client.directory.to_owned(),
+        rex: client.rex.clone(),
+        terminal: client.terminal.clone(),
         conversation_id: item.conversation_id.clone(),
     });
     let observer = target.clone();

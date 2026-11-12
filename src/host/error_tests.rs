@@ -19,15 +19,18 @@ async fn process_start_failure_reports_not_started_and_keeps_its_actual_cause() 
         .to_string_lossy()
         .into_owned();
     let cwd = directory.path().to_string_lossy().into_owned();
-    let result = Executor::new(directory.path())
-        .execute(HostCommand::Exec {
-            sender_conversation_id: None,
-            program: program.clone(),
-            args: vec!["invented-sensitive-argument".into()],
-            cwd: cwd.clone(),
-            timeout_seconds: 1,
-        })
-        .await;
+    let result = Executor::new(
+        directory.path(),
+        crate::rex::RexClient::for_process(None).unwrap(),
+    )
+    .execute(HostCommand::Exec {
+        sender_conversation_id: None,
+        program: program.clone(),
+        args: vec!["invented-sensitive-argument".into()],
+        cwd: cwd.clone(),
+        timeout_seconds: 1,
+    })
+    .await;
     assert!(matches!(result, HostResult::Failed { .. }));
     let wire: FailureWire = serde_json::from_slice(&serde_json::to_vec(&result).unwrap()).unwrap();
     assert_eq!(wire.delivery.as_deref(), Some("not_started"));

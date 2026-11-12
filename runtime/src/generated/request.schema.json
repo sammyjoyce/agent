@@ -1604,6 +1604,23 @@
           ]
         },
         {
+          "description": "Rex never received the create request, so retrying cannot duplicate a terminal.",
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "not_started"
+            }
+          },
+          "required": [
+            "type",
+            "message"
+          ]
+        },
+        {
           "type": "object",
           "properties": {
             "delivery": {

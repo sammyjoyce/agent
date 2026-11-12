@@ -24,7 +24,10 @@ async fn wait_for(path: &Path) {
 #[tokio::test]
 async fn registered_worker_capacity_refuses_before_starting_an_effect() {
     let directory = tempfile::tempdir().unwrap();
-    let executor = Arc::new(Executor::new(directory.path()));
+    let executor = Arc::new(Executor::new(
+        directory.path(),
+        crate::rex::RexClient::for_process(None).unwrap(),
+    ));
     let (release, released) = watch::channel(false);
     let mut effects = HostEffects::new(Capacity::RegisteredWorker);
     for index in 0..32 {
@@ -79,7 +82,10 @@ async fn registered_worker_capacity_refuses_before_starting_an_effect() {
 #[tokio::test]
 async fn dropping_an_owner_retains_an_admitted_write_until_its_actual_result() {
     let directory = tempfile::tempdir().unwrap();
-    let executor = Arc::new(Executor::new(directory.path()));
+    let executor = Arc::new(Executor::new(
+        directory.path(),
+        crate::rex::RexClient::for_process(None).unwrap(),
+    ));
     let output = directory.path().join("output");
     let path = output.to_string_lossy().into_owned();
     let (started, running) = oneshot::channel();
@@ -120,7 +126,10 @@ async fn dropping_an_owner_retains_an_admitted_write_until_its_actual_result() {
 async fn cancel_reaps_a_running_process_and_releases_its_call_identity() {
     let directory = tempfile::tempdir().unwrap();
     let started = directory.path().join("started");
-    let executor = Arc::new(Executor::new(directory.path()));
+    let executor = Arc::new(Executor::new(
+        directory.path(),
+        crate::rex::RexClient::for_process(None).unwrap(),
+    ));
     let program = format!(
         "require('node:fs').writeFileSync({},'started');setInterval(()=>{{}},1000)",
         serde_json::to_string(&started).unwrap()
@@ -174,7 +183,10 @@ async fn cancel_reaps_a_running_process_and_releases_its_call_identity() {
 #[tokio::test]
 async fn duplicate_ids_reject_before_replacing_cancellation_or_starting_another_write() {
     let directory = tempfile::tempdir().unwrap();
-    let executor = Arc::new(Executor::new(directory.path()));
+    let executor = Arc::new(Executor::new(
+        directory.path(),
+        crate::rex::RexClient::for_process(None).unwrap(),
+    ));
     let (release, released) = oneshot::channel();
     let output = directory
         .path()

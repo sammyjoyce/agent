@@ -68,6 +68,7 @@ await import(pathToFileURL({}).href);
                 None,
                 crate::tailnet::PeerPolicy::new(&[], &[]).unwrap(),
                 crate::tailnet::Daemon::default(),
+                crate::rex::RexClient::for_process(None).unwrap(),
                 Some(CoordinatorBootstrap {
                     settings: CoordinatorSettings {
                         model: ModelSelection::default(),

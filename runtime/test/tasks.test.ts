@@ -14,6 +14,7 @@ import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
 import { createRegistry, Harness, ToolResultEntry, UserEntry } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { AllocationDecisionEntry } from "../src/allocation.js";
 import { TaskStore } from "../src/tasks.js";
 import { createAppTools, Executions, HostRequests } from "../src/tools.js";
 import type { HostCommand } from "../src/generated/HostCommand.js";
@@ -587,6 +588,79 @@ test("an interrupted create stays uncertain after reopen and cannot create a sec
     assert.equal(calls, 0); assert.equal((await app.tasks.get(task.id)).worker.state, "uncertain");
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
+
+test("a root create that Rex never received leaves the task unassigned and the next dispatch claims a new allocation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-task-")); const app = await open(directory);
+  try {
+    const task = await app.tasks.create({ title: "Start after outage", outcome: "Start once Rex is back" });
+    await app.tasks.enqueue(task.id, "Keep this request", "retained");
+    const allocations: string[] = [];
+    const spawn = (result: HostResult) => async (command: HostCommand): Promise<HostResult> => {
+      if (command.type !== "spawn_worker") throw new Error(`Unexpected ${command.type}`);
+      allocations.push(command.allocation_id); return result;
+    };
+    await assert.rejects(app.tasks.dispatch(task.id, host, spawn({ type: "not_started", message: "Rex CLI or server is unavailable" })),
+      /no terminal was created .* retried on the next dispatch/);
+    const retained = await app.tasks.get(task.id);
+    assert.deepEqual(retained.worker, { state: "unassigned" }); assert.deepEqual(retained.pending.map((input) => input.id), ["retained"]);
+    const bound = await app.tasks.dispatch(task.id, host, spawn({ type: "spawned", binding }));
+    assert.equal(allocations.length, 2); assert.notEqual(allocations[0], allocations[1]);
+    assert.ok(bound.worker.state === "bound"); assert.equal(bound.worker.allocation_id, allocations[1]);
+    const conversation = await app.tasks.conversation(task.conversation_id);
+    const receipts = (await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items.filter(AllocationDecisionEntry.is);
+    assert.deepEqual(receipts.map((entry) => [entry.data.previous.state, entry.data.current.state, entry.data.result.type, entry.data.reason]), [
+      ["unassigned", "allocating", "pending", "Claimed one new session before requesting native creation"],
+      ["allocating", "unassigned", "not_started", "Worker creation did not start; no session was created"],
+      ["unassigned", "allocating", "pending", "Claimed one new session before requesting native creation"],
+      ["allocating", "bound", "spawned", "Confirmed the new session and its terminal binding"],
+    ]);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a child create that Rex never received leaves the agent unassigned and the next dispatch claims a new allocation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-task-")); const app = await open(directory);
+  try {
+    const task = await app.tasks.create({ title: "Parent", outcome: "Finish after review", model: fixtureModel });
+    await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+    const child = await app.tasks.createAgent(task.id, { id: "review", title: "Review", outcome: "Review the change", input: "Inspect the evidence.", inputId: "review-input" });
+    const allocations: string[] = [];
+    const spawn = (result: HostResult) => async (command: HostCommand): Promise<HostResult> => {
+      if (command.type !== "spawn_subagent") throw new Error(`Unexpected ${command.type}`);
+      allocations.push(command.allocation_id); return result;
+    };
+    await assert.rejects(app.tasks.dispatchAgent(task.id, child.id, spawn({ type: "not_started", message: "Rex CLI or server is unavailable" })),
+      /no terminal was created .* retried on the next dispatch/);
+    const retained = await app.tasks.get(task.id);
+    assert.deepEqual(retained.agents[0]?.worker, { state: "unassigned" }); assert.deepEqual(retained.agents[0]?.pending, child.pending);
+    assert.ok(retained.worker.state === "bound"); assert.deepEqual(retained.worker.binding, binding);
+    const childBinding = { ...binding, block_id: "block:55555555-5555-4555-8555-555555555555" };
+    const bound = await app.tasks.dispatchAgent(task.id, child.id, spawn({ type: "spawned", binding: childBinding }));
+    assert.equal(allocations.length, 2); assert.notEqual(allocations[0], allocations[1]);
+    const agent = bound.agents[0]; assert.ok(agent?.worker.state === "bound");
+    assert.equal(agent.worker.allocation_id, allocations[1]); assert.deepEqual(agent.worker.binding, childBinding);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+for (const outcome of ["failed", "thrown"] as const) {
+  test(`a ${outcome} root or child create still leaves its allocation uncertain`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-task-")); const app = await open(directory);
+    try {
+      const fail = async (): Promise<HostResult> => {
+        if (outcome === "thrown") throw new Error("Lost reply");
+        return { type: "failed", message: "The owning node disconnected or its reply was lost" };
+      };
+      const root = await app.tasks.create({ title: "Root", outcome: "Keep root uncertainty" });
+      const created = app.tasks.dispatch(root.id, host, fail);
+      if (outcome === "thrown") await assert.rejects(created, /could not be confirmed/); else await created;
+      assert.equal((await app.tasks.get(root.id)).worker.state, "uncertain");
+      const parent = await app.tasks.create({ title: "Parent", outcome: "Keep child uncertainty", model: fixtureModel });
+      await app.tasks.dispatch(parent.id, host, async () => ({ type: "spawned", binding }));
+      const child = await app.tasks.createAgent(parent.id, { id: "review", title: "Review", outcome: "Review the change", input: "Inspect.", inputId: "review-input" });
+      await app.tasks.dispatchAgent(parent.id, child.id, fail);
+      assert.equal((await app.tasks.get(parent.id)).agents[0]?.worker.state, "uncertain");
+    } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  });
+}
 
 test("exact allocation revocation preserves pending work and rejects stale worker admission after reopen", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-recovery-")); let app = await open(directory);

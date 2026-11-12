@@ -84,6 +84,9 @@ function conversationIdentity(value: unknown): value is ConversationId {
 }
 
 export class TaskError extends Error {}
+function notStarted(message: string): TaskError {
+  return new TaskError(`Worker creation did not start, so no terminal was created (${message}); it will be retried on the next dispatch`);
+}
 export type NoticePublication = "published" | "queued";
 export type OutcomeSink = {
   prepare?(): Promise<void>;
@@ -1035,14 +1038,17 @@ export class TaskStore {
     try { result = await call({ type: "spawn_subagent", host: parent.host, parent: parent.binding,
       task_id: taskId, agent_id: agentId, allocation_id, title }); }
     catch { result = { type: "creation_uncertain", session_id: parent.binding.session_id }; }
-    return this.update(taskId, (saved) => {
+    const updated = await this.update(taskId, (saved) => {
       const agent = this.actor(saved, agentId);
       this.requireAllocation(agent.worker, allocation_id);
       if (result.type === "spawned" && result.binding.host_id === parent.binding.host_id &&
           result.binding.session_id === parent.binding.session_id) {
         agent.worker = { state: "bound", allocation_id, host: parent.host, binding: result.binding };
-      } else agent.worker = { state: "uncertain", allocation_id, host: parent.host, session_id: parent.binding.session_id };
+      } else if (result.type === "not_started") agent.worker = { state: "unassigned" };
+      else agent.worker = { state: "uncertain", allocation_id, host: parent.host, session_id: parent.binding.session_id };
     });
+    if (result.type === "not_started") throw notStarted(result.message);
+    return updated;
   }
   async reportAgent(taskId: string, agentId: string, summary: string, failure?: string,
     provenance?: { conversation_id: string; call_id: string }): Promise<TaskRecord> {
@@ -1238,14 +1244,18 @@ export class TaskStore {
       });
       throw new TaskError("Worker creation could not be confirmed; reconcile it before retrying");
     }
-    return this.allocation(id, "create", (task) => {
+    const task = await this.allocation(id, "create", (task) => {
       this.requireAllocation(task.worker, allocation_id);
       if (result.type === "spawned") task.worker = { state: "bound", allocation_id, host, binding: result.binding };
+      else if (result.type === "not_started") task.worker = { state: "unassigned" };
       else task.worker = { state: "uncertain", allocation_id, host,
         session_id: result.type === "creation_uncertain" ? result.session_id : null };
       return { result: allocationResult(result), reason: task.worker.state === "bound"
-        ? "Confirmed the new session and its terminal binding" : "New session creation remains uncertain and cannot be repeated" };
+        ? "Confirmed the new session and its terminal binding" : result.type === "not_started"
+          ? "Worker creation did not start; no session was created" : "New session creation remains uncertain and cannot be repeated" };
     });
+    if (result.type === "not_started") throw notStarted(result.message);
+    return task;
   }
   private async finishOutcome(id: string, conversationId: string, entryId: string, answer: string): Promise<TaskOutcome> {
     let outcome: TaskOutcome | undefined;

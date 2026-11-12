@@ -67,6 +67,10 @@ struct Arguments {
     /// Connect to a coordinator through Tailscale or an existing SSH host.
     #[arg(long, global = true)]
     coordinator: Option<String>,
+    /// Run Rex work on this private local server (unix:///absolute/socket)
+    /// instead of the personal one. Workers this process starts inherit it.
+    #[arg(long, global = true)]
+    rex_server: Option<String>,
     /// Emit one typed event per JSON line; a response may contain multiple events.
     #[arg(long, global = true)]
     json: bool,
@@ -449,6 +453,8 @@ fn task_message_sender() -> Result<Option<String>> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut arguments = Arguments::parse();
+    #[allow(clippy::disallowed_methods)]
+    let rex = RexClient::for_process(arguments.rex_server.as_deref())?;
     let action = arguments.command.take().unwrap_or(Action::Chat {
         prompt: None,
         selection: ModelArgs::default(),
@@ -573,11 +579,22 @@ async fn main() -> Result<()> {
         config::validate_coordinator(value)?;
     }
     let cwd = env::current_dir()?;
-    let client = crate::ClientContext {
+    // Rex tells a pane its session, not its server. A worker's pane is on the
+    // server that started it; any other terminal is on REX_SERVER, else the
+    // personal server, as Rex's own CLI assumes.
+    #[allow(clippy::disallowed_methods)]
+    let terminal = if matches!(action, Action::RunTask { .. }) {
+        rex.clone()
+    } else {
+        RexClient::for_process(None)?
+    };
+    let client = ClientContext {
         config: &config,
         coordinator: coordinator.as_deref(),
         script: &script,
         directory: &directory,
+        rex: &rex,
+        terminal: &terminal,
     };
     if let Action::Serve {
         tailnet_port,
@@ -609,6 +626,7 @@ async fn main() -> Result<()> {
             .clone()
             .unwrap_or(instructions::default_path()?);
         let node = match discovery::local_node(
+            &rex,
             None,
             config
                 .launch
@@ -620,6 +638,12 @@ async fn main() -> Result<()> {
         .await
         {
             Ok(node) => Some(node),
+            // Exit so the service manager restarts us once the private Rex is up.
+            Err(error) if rex.is_private() => {
+                return Err(
+                    error.context("The private Rex server for this coordinator is unavailable")
+                );
+            }
             Err(_) => {
                 eprintln!(
                     "Local Rex is unavailable; this coordinator has no local worker until restarted."
@@ -647,6 +671,7 @@ async fn main() -> Result<()> {
             (!local_only).then_some(tailnet_port),
             policy,
             daemon,
+            rex,
             bootstrap,
         )
         .await;
@@ -657,7 +682,7 @@ async fn main() -> Result<()> {
             "RPC must run on the selected coordinator"
         );
         return service::relay(
-            local_connection(&script, &directory, arguments.config.as_deref()).await?,
+            local_connection(&rex, &script, &directory, arguments.config.as_deref()).await?,
         )
         .await;
     }
@@ -709,7 +734,7 @@ async fn main() -> Result<()> {
         Action::Resources { command } => match command {
             ResourcesAction::List => RuntimeCommand::ListResources,
             ResourcesAction::Collect => RuntimeCommand::CollectResources {
-                host_id: RexClient::new(None).whoami().await?.host_id.to_string(),
+                host_id: rex.whoami().await?.host_id.to_string(),
             },
         },
         Action::Tasks { command } => match command {
@@ -797,7 +822,7 @@ async fn main() -> Result<()> {
             task_id,
             agent_id,
             allocation_id,
-            binding: local_worker_binding().await?,
+            binding: local_worker_binding(&rex, &terminal).await?,
             instructions: instructions::project(&cwd)?,
             model: selection.resolve(&environment(client).await?.model)?,
             cwd: cwd.to_string_lossy().into_owned(),
@@ -854,19 +879,8 @@ async fn main() -> Result<()> {
                             )
                             .await?;
                         }
-                        return local_command_plain(
-                            ClientContext {
-                                config: &config,
-                                coordinator: coordinator.as_deref(),
-                                script: &script,
-                                directory: &directory,
-                            },
-                            &command,
-                            None,
-                            &cwd,
-                            arguments.json,
-                        )
-                        .await;
+                        return local_command_plain(client, &command, None, &cwd, arguments.json)
+                            .await;
                     }
                 }
             }
@@ -882,7 +896,7 @@ async fn main() -> Result<()> {
                 )
                 .await;
             }
-            chat_command(input, model, &cwd).await?
+            chat_command(&rex, &terminal, input, model, &cwd).await?
         }
         Action::Chat {
             prompt: None,
@@ -947,12 +961,7 @@ async fn main() -> Result<()> {
                             Ok(ChatCommand::History | ChatCommand::Feedback { .. }) => {}
                             Ok(command) => {
                                 if let Err(error) = local_command_plain(
-                                    ClientContext {
-                                        config: &config,
-                                        coordinator: coordinator.as_deref(),
-                                        script: &script,
-                                        directory: &directory,
-                                    },
+                                    client,
                                     &command,
                                     None,
                                     &cwd,
@@ -974,6 +983,8 @@ async fn main() -> Result<()> {
                         let coordinator = coordinator.clone();
                         let script = script.clone();
                         let directory = directory.clone();
+                        let rex = rex.clone();
+                        let terminal = terminal.clone();
                         let cwd = cwd.to_string_lossy().into_owned();
                         let model = model.clone();
                         let description = description.to_owned();
@@ -985,9 +996,12 @@ async fn main() -> Result<()> {
                                 coordinator: coordinator.as_deref(),
                                 script: &script,
                                 directory: &directory,
+                                rex: &rex,
+                                terminal: &terminal,
                             };
                             let captured = async {
-                                let context = feedback_context(cwd, model, None).await?;
+                                let context =
+                                    feedback_context(&rex, &terminal, cwd, model, None).await?;
                                 exchange(client, context.command(description)).await
                             }
                             .await;
@@ -1026,15 +1040,11 @@ async fn main() -> Result<()> {
                         continue;
                     }
                     if !line.trim().is_empty() {
-                        let command = chat_command(line, model.clone(), &cwd).await?;
+                        let command =
+                            chat_command(&rex, &terminal, line, model.clone(), &cwd).await?;
                         request_presented(
                             &arguments,
-                            ClientContext {
-                                config: &config,
-                                coordinator: coordinator.as_deref(),
-                                script: &script,
-                                directory: &directory,
-                            },
+                            client,
                             command,
                             None,
                             PlainNoticeRoute::Watch,
@@ -1530,8 +1540,11 @@ fn selected_input(
     let coordinator = client.coordinator.map(str::to_owned);
     let script = client.script.to_owned();
     let directory = client.directory.to_owned();
+    let rex = client.rex.clone();
+    let terminal = client.terminal.clone();
     while ui.admissions.try_join_next().is_some() {}
     ui.admissions.spawn(async move {
+        let client = ClientContext { config: &config, coordinator: coordinator.as_deref(), script: &script, directory: &directory, rex: &rex, terminal: &terminal };
         loop {
         let mut attachment = None;
         let result: std::result::Result<(), chat_view::ViewError> = async {
@@ -1549,9 +1562,7 @@ fn selected_input(
                 return Ok(());
             }
             let mut input = admission.input()?;
-            let prepared = prepare_attachments(ClientContext {
-                config: &config, coordinator: coordinator.as_deref(), script: &script, directory: &directory,
-            }, &mut input).await;
+            let prepared = prepare_attachments(client, &mut input).await;
             admission.prepared(input.clone())?;
             prepared?;
             if admission.stage()? == chat_admission::Stage::Canceled {
@@ -1569,7 +1580,7 @@ fn selected_input(
                 }));
                 return Ok(());
             }
-            let context = match chat_command(String::new(), None, &cwd).await? {
+            let context = match chat_command(&rex, &terminal, String::new(), None, &cwd).await? {
                 RuntimeCommand::Chat {
                     instructions,
                     origin_host_id,
@@ -1585,12 +1596,7 @@ fn selected_input(
                 _ => return Err(anyhow::anyhow!("The main chat context is unavailable").into()),
             };
             chat_view::control(
-                ClientContext {
-                    config: &config,
-                    coordinator: coordinator.as_deref(),
-                    script: &script,
-                    directory: &directory,
-                },
+                client,
                 RuntimeCommand::ConversationInput {
                     origin: Some(agent_cli::protocol::InputOrigin::Cli),
                     conversation_id: admission.conversation_id.clone(),
@@ -1673,24 +1679,24 @@ async fn selected_interrupt(client: ClientContext<'_>, ui: &mut UiSession) -> Re
     let coordinator = client.coordinator.map(str::to_owned);
     let script = client.script.to_owned();
     let directory = client.directory.to_owned();
+    let rex = client.rex.clone();
+    let terminal = client.terminal.clone();
     let sender = ui.view_sender.clone();
     let token = ui.view.as_ref().map(|view| view.token);
     // Switching views cancels local reads, not this already requested stop.
     ui.admissions.spawn(async move {
+        let client = ClientContext {
+            config: &config,
+            coordinator: coordinator.as_deref(),
+            script: &script,
+            directory: &directory,
+            rex: &rex,
+            terminal: &terminal,
+        };
         if let Some(mut previous) = previous {
             let _ = previous.wait_for(|stopped| *stopped).await;
         }
-        match exchange(
-            crate::ClientContext {
-                config: &config,
-                coordinator: coordinator.as_deref(),
-                script: &script,
-                directory: &directory,
-            },
-            command,
-        )
-        .await
-        {
+        match exchange(client, command).await {
             Ok(events) => {
                 if let Some(token) = token {
                     for event in events {
@@ -1716,13 +1722,15 @@ async fn selected_interrupt(client: ClientContext<'_>, ui: &mut UiSession) -> Re
 }
 
 async fn feedback_context(
+    rex: &RexClient,
+    terminal: &RexClient,
     cwd: String,
     model: Option<ModelSelection>,
     target: Option<(TaskId, Option<String>)>,
 ) -> Result<FeedbackContext> {
-    let origin_host_id = RexClient::new(None).whoami().await?.host_id.to_string();
+    let origin_host_id = rex.whoami().await?.host_id.to_string();
     let binding = if env::var_os("REX_SESSION").is_some() && env::var_os("REX_BLOCK").is_some() {
-        Some(local_worker_binding().await?)
+        Some(local_worker_binding(rex, terminal).await?)
     } else {
         None
     };
@@ -1749,16 +1757,12 @@ fn feedback_from_ui(
     target: Option<(TaskId, Option<String>)>,
     input: ComposerInput,
 ) {
-    let ClientContext {
-        config,
-        coordinator,
-        script,
-        directory,
-    } = client;
-    let config = config.clone();
-    let coordinator = coordinator.map(str::to_owned);
-    let script = script.to_owned();
-    let directory = directory.to_owned();
+    let config = client.config.clone();
+    let coordinator = client.coordinator.map(str::to_owned);
+    let script = client.script.to_owned();
+    let directory = client.directory.to_owned();
+    let rex = client.rex.clone();
+    let terminal = client.terminal.clone();
     let handle = ui.handle.clone();
     let conversation_id = ui.conversation_id.clone();
     let queued_inputs = ui
@@ -1771,13 +1775,14 @@ fn feedback_from_ui(
     let client_errors = ui.errors.iter().cloned().collect();
     while ui.controls.try_join_next().is_some() {}
     ui.controls.spawn(async move {
+        let client = ClientContext { config: &config, coordinator: coordinator.as_deref(), script: &script, directory: &directory, rex: &rex, terminal: &terminal };
         let input_id = uuid::Uuid::new_v4();
         let mut input = input;
         let mut submitted = false;
         let result = async {
             let info = handle.info().await?;
             let draft = handle.draft().await?;
-            let mut context = feedback_context(info.cwd, info.model, target).await?;
+            let mut context = feedback_context(&rex, &terminal, info.cwd, info.model, target).await?;
             context.conversation_id = conversation_id;
             context.draft = draft;
             context.queued_inputs = queued_inputs;
@@ -1786,7 +1791,7 @@ fn feedback_from_ui(
             // Preserve styled HTML when it fits, otherwise bounded pane text.
             let capture = if input.attachment_count() < agent_cli::attachments::MAX_ATTACHMENTS {
                 match context.binding.as_ref() {
-                    Some(binding) => match capture_feedback_view(&directory, binding).await {
+                    Some(binding) => match capture_feedback_view(&terminal, &directory, binding).await {
                         Ok(capture) => Some(capture),
                         Err(error) => {
                             context.client_errors.push(format!("Terminal view capture unavailable: {error}"));
@@ -1805,7 +1810,7 @@ fn feedback_from_ui(
             if let Some(capture) = &capture {
                 input.files.push(agent_cli::tui::attachments::ComposerFile::read_metadata(capture.path.clone())?);
             }
-            let prepared = prepare_attachments(ClientContext {config:&config,coordinator:coordinator.as_deref(),script:&script,directory:&directory}, &mut input).await;
+            let prepared = prepare_attachments(client, &mut input).await;
             if prepared.is_err() && let Some(capture)=&capture {
                 input.files.retain(|file| file.path != capture.path);
             }
@@ -1817,9 +1822,9 @@ fn feedback_from_ui(
             }
             write_feedback_submission(&directory,input_id,&command)?;
             submitted = true;
-            let events = exchange(crate::ClientContext { config: &config, coordinator: coordinator.as_deref(), script: &script, directory: &directory },
-                command,
-            )
+            let events = exchange(
+                client,
+                command)
             .await?;
             ensure!(events.iter().any(|event|matches!(event,RuntimeEventKind::FeedbackReady{input_id:Some(id),..} if id==&input_id.to_string())),"Feedback admission was not confirmed");
             acknowledge_feedback_submission(&directory,&input_id.to_string());
@@ -1862,12 +1867,13 @@ impl Drop for FeedbackViewCapture {
     }
 }
 async fn capture_feedback_view(
+    rex: &RexClient,
     directory: &Path,
     binding: &WorkerRef,
 ) -> Result<FeedbackViewCapture> {
     use std::io::Write;
     use std::os::unix::fs::DirBuilderExt;
-    let capture = RexClient::new(None)
+    let capture = rex
         .capture_terminal(
             &SessionId::parse(&binding.session_id)?,
             &BlockId::parse(&binding.block_id)?,
@@ -2151,16 +2157,12 @@ fn local_command_from_ui(
     target: Option<(TaskId, Option<String>)>,
     command: ChatCommand,
 ) {
-    let ClientContext {
-        config,
-        coordinator,
-        script,
-        directory,
-    } = client;
-    let config = config.clone();
-    let coordinator = coordinator.map(str::to_owned);
-    let script = script.to_owned();
-    let directory = directory.to_owned();
+    let config = client.config.clone();
+    let coordinator = client.coordinator.map(str::to_owned);
+    let script = client.script.to_owned();
+    let directory = client.directory.to_owned();
+    let rex = client.rex.clone();
+    let terminal = client.terminal.clone();
     let handle = ui.handle.clone();
     let selected = ui
         .selected
@@ -2168,18 +2170,17 @@ fn local_command_from_ui(
         .map(|item| item.conversation_id.clone());
     while ui.controls.try_join_next().is_some() {}
     ui.controls.spawn(async move {
+        let client = ClientContext {
+            config: &config,
+            coordinator: coordinator.as_deref(),
+            script: &script,
+            directory: &directory,
+            rex: &rex,
+            terminal: &terminal,
+        };
         let changed = async {
             if let Some(request) = command.request() {
-                let events = exchange(
-                    crate::ClientContext {
-                        config: &config,
-                        coordinator: coordinator.as_deref(),
-                        script: &script,
-                        directory: &directory,
-                    },
-                    request,
-                )
-                .await?;
+                let events = exchange(client, request).await?;
                 for event in events {
                     let text = match &event {
                         RuntimeEventKind::Resources { resources } => {
@@ -2194,13 +2195,7 @@ fn local_command_from_ui(
                 return Ok(());
             }
             if matches!(command, ChatCommand::Machines) {
-                let inventory = machine_inventory(ClientContext {
-                    config: &config,
-                    coordinator: coordinator.as_deref(),
-                    script: &script,
-                    directory: &directory,
-                })
-                .await?;
+                let inventory = machine_inventory(client).await?;
                 return handle.notice(inventory.format(SystemTime::now()));
             }
             let info = handle.info().await?;
@@ -2215,62 +2210,26 @@ fn local_command_from_ui(
                 {
                     *selected = Some(conversation_id);
                 }
-                exchange(
-                    crate::ClientContext {
-                        config: &config,
-                        coordinator: coordinator.as_deref(),
-                        script: &script,
-                        directory: &directory,
-                    },
-                    request,
-                )
-                .await?
-                .into_iter()
-                .find_map(|event| match event {
-                    RuntimeEventKind::ConversationSettings { settings } => Some(settings),
-                    _ => None,
-                })
-                .context("The coordinator returned no conversation settings")?
+                exchange(client, request)
+                    .await?
+                    .into_iter()
+                    .find_map(|event| match event {
+                        RuntimeEventKind::ConversationSettings { settings } => Some(settings),
+                        _ => None,
+                    })
+                    .context("The coordinator returned no conversation settings")?
             } else {
-                local_settings(
-                    crate::ClientContext {
-                        config: &config,
-                        coordinator: coordinator.as_deref(),
-                        script: &script,
-                        directory: &directory,
-                    },
-                    &command,
-                    target,
-                )
-                .await?
+                local_settings(client, &command, target).await?
             };
             let mut text = settings_text(&command, &settings, &info, coordinator.as_deref());
             let provider = settings.model.provider;
             let conversation_id = settings.conversation_id.clone();
             handle.event(RuntimeEventKind::ConversationSettings { settings })?;
             if matches!(command, ChatCommand::Status) {
-                let metrics = native_conversation_usage(
-                    ClientContext {
-                        config: &config,
-                        coordinator: coordinator.as_deref(),
-                        script: &script,
-                        directory: &directory,
-                    },
-                    &conversation_id,
-                )
-                .await;
+                let metrics = native_conversation_usage(client, &conversation_id).await;
                 text.push_str("\n\n");
                 text.push_str(&native_usage_text(&metrics));
-                let usage = conversation_usage(
-                    ClientContext {
-                        config: &config,
-                        coordinator: coordinator.as_deref(),
-                        script: &script,
-                        directory: &directory,
-                    },
-                    provider,
-                )
-                .await;
+                let usage = conversation_usage(client, provider).await;
                 text.push_str("\n\n");
                 text.push_str(&usage::format_status(&usage, SystemTime::now()));
             }
@@ -2289,6 +2248,9 @@ struct ClientContext<'a> {
     coordinator: Option<&'a str>,
     script: &'a Path,
     directory: &'a Path,
+    rex: &'a RexClient,
+    /// Reaches the Rex server that owns this process's REX_SESSION.
+    terminal: &'a RexClient,
 }
 
 async fn prepare_attachments(client: ClientContext<'_>, input: &mut ComposerInput) -> Result<()> {
@@ -2719,21 +2681,22 @@ fn tool_details_from_ui(
     let coordinator = client.coordinator.map(str::to_owned);
     let script = client.script.to_owned();
     let directory = client.directory.to_owned();
+    let rex = client.rex.clone();
+    let terminal = client.terminal.clone();
     let handle = ui.handle.clone();
     while ui.controls.try_join_next().is_some() {}
     ui.tool_lookup = Some(ui.controls.spawn(async move {
-        let details = read_tool_details(
-            ClientContext {
-                config: &config,
-                coordinator: coordinator.as_deref(),
-                script: &script,
-                directory: &directory,
-            },
-            &request,
-            target,
-        )
-        .await
-        .map_err(|error| error.to_string());
+        let client = ClientContext {
+            config: &config,
+            coordinator: coordinator.as_deref(),
+            script: &script,
+            directory: &directory,
+            rex: &rex,
+            terminal: &terminal,
+        };
+        let details = read_tool_details(client, &request, target)
+            .await
+            .map_err(|error| error.to_string());
         let _ = handle.tool_details(request, details);
     }));
 }
@@ -2856,6 +2819,8 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
         coordinator,
         script,
         directory,
+        rex,
+        terminal,
     } = client;
     ensure!(
         coordinator.is_some(),
@@ -2863,7 +2828,7 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
     );
     let daemon = agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
     let executor = Arc::new(
-        host::Executor::with_tailscale(directory, daemon.clone())
+        host::Executor::with_tailscale(directory, daemon.clone(), rex.clone())
             .with_browser(script, config.browser.clone()),
     );
     let mut delay = 1;
@@ -2873,6 +2838,7 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
         // Registration owns no effects yet, so shutdown can cancel this setup.
         let register = async {
             let node = discovery::local_node(
+                rex,
                 coordinator,
                 config
                     .launch
@@ -2916,12 +2882,16 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
             let target = coordinator.map(str::to_owned);
             let runtime = script.to_owned();
             let state = directory.to_owned();
+            let collector = rex.clone();
+            let terminal = terminal.clone();
             let collection = WatchGuard(tokio::spawn(async move {
                 let client = ClientContext {
                     config: &profile,
                     coordinator: target.as_deref(),
                     script: &runtime,
                     directory: &state,
+                    rex: &collector,
+                    terminal: &terminal,
                 };
                 loop {
                     if exchange(
@@ -3004,16 +2974,22 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
 }
 
 async fn chat_command(
+    rex: &RexClient,
+    terminal: &RexClient,
     input: String,
     model: Option<ModelSelection>,
     cwd: &Path,
 ) -> Result<RuntimeCommand> {
     if let Some(description) = agent_cli::feedback::command(&input) {
-        return Ok(
-            feedback_context(cwd.to_string_lossy().into_owned(), model, None)
-                .await?
-                .command(description.to_owned()),
-        );
+        return Ok(feedback_context(
+            rex,
+            terminal,
+            cwd.to_string_lossy().into_owned(),
+            model,
+            None,
+        )
+        .await?
+        .command(description.to_owned()));
     }
     Ok(RuntimeCommand::Chat {
         origin: Some(agent_cli::protocol::InputOrigin::Cli),
@@ -3022,7 +2998,7 @@ async fn chat_command(
         input_id: None,
         instructions: instructions::project(cwd)?,
         model,
-        origin_host_id: RexClient::new(None)
+        origin_host_id: rex
             .whoami()
             .await
             .ok()
@@ -3062,15 +3038,14 @@ fn worker_launch(
     })
 }
 
-async fn local_worker_binding() -> Result<WorkerRef> {
+async fn local_worker_binding(rex: &RexClient, terminal: &RexClient) -> Result<WorkerRef> {
     let session = SessionId::parse(
         &env::var("REX_SESSION").context("Task workers must run in their assigned Rex session")?,
     )?;
     let block =
         BlockId::parse(&env::var("REX_BLOCK").context("Task worker has no assigned Rex pane")?)?;
-    let rex = RexClient::new(None);
     let identity = rex.whoami().await?;
-    let view = rex.inspect_session(&session).await?;
+    let view = terminal.inspect_session(&session).await?;
     let window = view
         .windows
         .iter()
@@ -3092,6 +3067,7 @@ async fn local_worker_binding() -> Result<WorkerRef> {
 }
 
 async fn local_connection(
+    rex: &RexClient,
     script: &Path,
     directory: &Path,
     config_path: Option<&Path>,
@@ -3111,7 +3087,8 @@ async fn local_connection(
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(directory.join("coordinator.log"))?;
-    let mut command = local_service_command(&config::program()?, script, directory, config_path);
+    let mut command =
+        local_service_command(rex, &config::program()?, script, directory, config_path);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -3148,6 +3125,7 @@ async fn local_connection(
 }
 
 fn local_service_command(
+    rex: &RexClient,
     program: &Path,
     script: &Path,
     directory: &Path,
@@ -3162,6 +3140,7 @@ fn local_service_command(
         .arg(directory)
         .arg("--runtime")
         .arg(script)
+        .args(rex.rex_server_args())
         .arg("serve")
         .arg("--local-only");
     command
@@ -3177,10 +3156,11 @@ async fn connection(client: ClientContext<'_>, login: bool) -> Result<Wire> {
         coordinator,
         script,
         directory,
+        ..
     } = client;
     let Some(coordinator) = coordinator else {
         return Ok(Wire::local(
-            local_connection(script, directory, config.path.as_deref()).await?,
+            local_connection(client.rex, script, directory, config.path.as_deref()).await?,
         ));
     };
     if let Some(address) = coordinator.strip_prefix("tailscale://") {
@@ -3307,6 +3287,8 @@ async fn request_presented(
         coordinator,
         script,
         directory,
+        rex,
+        terminal,
     } = client;
     let lifecycle = RequestLifecycle::for_command(&command)
         .context("Transport controls require an active request")?;
@@ -3336,6 +3318,7 @@ async fn request_presented(
         host::Executor::with_tailscale(
             directory,
             agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?,
+            rex.clone(),
         )
         .with_browser(script, config.browser.clone()),
     );
@@ -3492,14 +3475,15 @@ async fn request_presented(
                     } else if let Some(description) = agent_cli::feedback::command(&line) {
                         if let Some((model, cwd)) = &feedback_settings {
                             let config = config.clone(); let coordinator = coordinator.map(str::to_owned);
-                            let script = script.to_owned(); let directory = directory.to_owned();
+                            let script = script.to_owned(); let directory = directory.to_owned(); let rex = rex.clone(); let terminal = terminal.clone();
                             let cwd = cwd.clone(); let model = model.clone(); let target = history_target.clone();
                             let description = description.to_owned(); let json = arguments.json;
                             while feedback.try_join_next().is_some() {}
                             feedback.spawn(async move {
+                                let client = ClientContext { config: &config, coordinator: coordinator.as_deref(), script: &script, directory: &directory, rex: &rex, terminal: &terminal };
                             let captured = async {
-                                let context = feedback_context(cwd, model, target).await?;
-                                exchange(crate::ClientContext { config: &config, coordinator: coordinator.as_deref(), script: &script, directory: &directory }, context.command(description)).await
+                                let context = feedback_context(&rex, &terminal, cwd, model, target).await?;
+                                exchange(client, context.command(description)).await
                             }.await;
                             match captured {
                                 Ok(events) => for event in events { if let Err(error) = display(&event, json) { eprintln!("Feedback receipt could not be displayed: {error}"); } },
@@ -3988,12 +3972,22 @@ fn import_phase_name(phase: &ImportPhase) -> &'static str {
 }
 
 #[cfg(test)]
+#[path = "../tests/fixtures/fake_rex.rs"]
+mod fake_rex;
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
-    use crate::{Action, Arguments, ModelArgs, local_service_command};
+    use crate::{Action, Arguments, ModelArgs, fake_rex, local_service_command};
     use agent_cli::models::{ModelProvider, ModelSelection, Reasoning};
     use agent_cli::protocol::SearchMode;
+    use agent_cli::rex::RexClient;
     use clap::Parser;
     use std::path::Path;
+
+    fn personal_rex() -> RexClient {
+        RexClient::for_process(None).unwrap()
+    }
 
     #[tokio::test]
     async fn tool_details_read_uses_only_the_shared_request_and_closes_the_action_socket() {
@@ -4065,6 +4059,8 @@ mod tests {
                     coordinator: None,
                     script: Path::new("/example/unused-runtime"),
                     directory: directory.path(),
+                    rex: &personal_rex(),
+                    terminal: &personal_rex(),
                 },
                 &request,
                 scoped.then(|| {
@@ -4128,6 +4124,8 @@ mod tests {
                     coordinator: None,
                     script: Path::new("/example/unused-runtime"),
                     directory: &path,
+                    rex: &personal_rex(),
+                    terminal: &personal_rex(),
                 },
                 &request,
                 None,
@@ -4188,7 +4186,8 @@ mod tests {
                 window_id: "window:22222222-2222-4222-8222-222222222222".into(),
                 block_id: BLOCK.into(),
             };
-            let capture = crate::capture_feedback_view(directory.path(), &binding).await;
+            let capture =
+                crate::capture_feedback_view(&personal_rex(), directory.path(), &binding).await;
             if matches!(case.as_str(), "html" | "remote_limit" | "local_limit") {
                 let capture = capture.expect("feedback must retain a usable terminal attachment");
                 let (name, expected) = if case == "html" {
@@ -4427,6 +4426,8 @@ esac
                 coordinator: None,
                 script: Path::new("/example/unused-runtime"),
                 directory: directory.path(),
+                rex: &personal_rex(),
+                terminal: &personal_rex(),
             },
             command,
         )
@@ -4539,6 +4540,8 @@ esac
             coordinator: None,
             script: Path::new("/example/unused-runtime"),
             directory: directory.path(),
+            rex: &personal_rex(),
+            terminal: &personal_rex(),
         };
         assert!(
             crate::prepare_attachments(client, &mut input)
@@ -4770,6 +4773,8 @@ esac
             coordinator: None,
             script: Path::new("/unused-runtime"),
             directory: directory.path(),
+            rex: &personal_rex(),
+            terminal: &personal_rex(),
         })
         .await
         .unwrap();
@@ -4808,8 +4813,10 @@ esac
                     config: &config,
                     coordinator: None,
                     script: Path::new("/unused-runtime"),
-                    directory: directory.path()
-                }
+                    directory: directory.path(),
+                    rex: &personal_rex(),
+                    terminal: &personal_rex(),
+                },
             )
             .await
             .unwrap()
@@ -4859,6 +4866,8 @@ esac
                 coordinator: None,
                 script: Path::new("/unused-runtime"),
                 directory: directory.path(),
+                rex: &personal_rex(),
+                terminal: &personal_rex(),
             },
         )
         .await
@@ -4911,28 +4920,134 @@ esac
 
     #[test]
     fn implicit_local_startup_preserves_paths_and_selects_only_the_unix_transport() {
+        const PRIVATE: &str = "unix:///run/user/1000/rex agent/server.sock";
         let program = Path::new("/example/agent");
         let script = Path::new("/example/runtime with spaces/bridge.js");
         let state = Path::new("/example/private state");
         let config = Path::new("/example/private config.toml");
-        for selected in [None, Some(config)] {
-            let command = local_service_command(program, script, state, selected);
-            let native = command.as_std();
-            let parsed = Arguments::try_parse_from(
-                std::iter::once(native.get_program()).chain(native.get_args()),
-            )
-            .unwrap();
-            assert_eq!(parsed.runtime.as_deref(), Some(script));
-            assert_eq!(parsed.state_dir.as_deref(), Some(state));
-            assert_eq!(parsed.config.as_deref(), selected);
-            assert!(matches!(
-                parsed.command,
-                Some(Action::Serve {
-                    local_only: true,
-                    no_sources: false,
-                    ..
-                })
-            ));
+        for server in [None, Some(PRIVATE)] {
+            let rex = RexClient::for_process(server).unwrap();
+            for selected in [None, Some(config)] {
+                let command = local_service_command(&rex, program, script, state, selected);
+                let native = command.as_std();
+                let argv: Vec<_> = native.get_args().map(|arg| arg.to_str().unwrap()).collect();
+                let mut expected = Vec::new();
+                if selected.is_some() {
+                    expected.extend(["--config", "/example/private config.toml"]);
+                }
+                expected.extend([
+                    "--state-dir",
+                    "/example/private state",
+                    "--runtime",
+                    "/example/runtime with spaces/bridge.js",
+                ]);
+                if let Some(server) = server {
+                    expected.extend(["--rex-server", server]);
+                }
+                expected.extend(["serve", "--local-only"]);
+                assert_eq!(argv, expected);
+                let parsed = Arguments::try_parse_from(
+                    std::iter::once(native.get_program()).chain(native.get_args()),
+                )
+                .unwrap();
+                assert_eq!(parsed.runtime.as_deref(), Some(script));
+                assert_eq!(parsed.state_dir.as_deref(), Some(state));
+                assert_eq!(parsed.config.as_deref(), selected);
+                assert_eq!(parsed.rex_server.as_deref(), server);
+                assert!(matches!(
+                    parsed.command,
+                    Some(Action::Serve {
+                        local_only: true,
+                        no_sources: false,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_worker_a_private_node_starts_selects_the_same_rex_server() {
+        use agent_cli::{
+            host::Executor,
+            protocol::{HostCommand, HostResult, TaskId, WorkerHost},
+        };
+        const TEST: &str = "tests::every_worker_a_private_node_starts_selects_the_same_rex_server";
+        const PRIVATE: &str = "unix:///run/user/1000/rex-agent/server.sock";
+        let Some(case) = fake_rex::case() else {
+            for case in ["private", "personal"] {
+                fake_rex::run(TEST, case, &[]);
+            }
+            return;
+        };
+        let server = (case == "private").then_some(PRIVATE);
+        let directory = tempfile::tempdir().unwrap();
+        let executor = Executor::new(directory.path(), RexClient::for_process(server).unwrap());
+        let host = WorkerHost {
+            host_id: Some(fake_rex::HOST.into()),
+            name: "fixture".into(),
+            rex_server: None,
+            coordinator: Some("coordinator.example.ts.net".into()),
+            cwd: "/tmp".into(),
+            agent_program: "/example/agent".into(),
+            launch: None,
+        };
+        let task_id: TaskId = "77777777-7777-4777-8777-777777777777".parse().unwrap();
+        let HostResult::Spawned { binding: root } = executor
+            .execute(HostCommand::SpawnWorker {
+                host: host.clone(),
+                parent: None,
+                task_id: task_id.clone(),
+                allocation_id: "allocation-root".into(),
+                title: "Synthetic task".into(),
+            })
+            .await
+        else {
+            panic!("The root worker must start");
+        };
+        for command in [
+            HostCommand::SpawnSubagent {
+                host: host.clone(),
+                parent: root.clone(),
+                task_id: task_id.clone(),
+                agent_id: "review".into(),
+                allocation_id: "allocation-child".into(),
+                title: "Review".into(),
+            },
+            HostCommand::ResumeWorker {
+                host,
+                binding: root,
+                task_id,
+                allocation_id: "allocation-root".into(),
+            },
+        ] {
+            let result = executor.execute(command).await;
+            assert!(matches!(result, HostResult::Spawned { .. }), "{result:?}");
+        }
+        let launches: Vec<Vec<String>> = fake_rex::calls()
+            .iter()
+            .filter_map(|call| match call.method() {
+                "session.create" => Some(call.payload()["initial_windows"][0]["layout"].clone()),
+                "session.new_window" => Some(call.payload()["layout"].clone()),
+                _ => None,
+            })
+            .map(|layout| {
+                serde_json::from_value(layout["block"]["options"]["command"].clone()).unwrap()
+            })
+            .collect();
+        assert_eq!(launches.len(), 3, "root, child and resumed root");
+        for argv in launches {
+            let parsed = Arguments::try_parse_from(&argv).unwrap();
+            assert!(
+                matches!(parsed.command, Some(Action::RunTask { .. })),
+                "{argv:?}"
+            );
+            assert_eq!(parsed.rex_server.as_deref(), server, "{argv:?}");
+            let run_task = argv.iter().position(|arg| arg == "run-task").unwrap();
+            match server {
+                Some(server) => assert_eq!(argv[run_task - 2..run_task], ["--rex-server", server]),
+                None => assert!(!argv.iter().any(|arg| arg == "--rex-server"), "{argv:?}"),
+            }
         }
     }
 
@@ -5007,6 +5122,8 @@ esac
                 coordinator: None,
                 script: Path::new("/unused-runtime"),
                 directory: directory.path(),
+                rex: &personal_rex(),
+                terminal: &personal_rex(),
             },
         )
         .await
@@ -5250,6 +5367,8 @@ esac
                     coordinator: None,
                     script: std::path::Path::new("unused-runtime"),
                     directory: directory.path(),
+                    rex: &personal_rex(),
+                    terminal: &personal_rex(),
                 },
                 "saved-conversation",
             )
