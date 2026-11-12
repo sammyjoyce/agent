@@ -133,14 +133,15 @@ public struct StagedInput: Sendable, Equatable {
   }
 }
 
-/// What `start` did with a staged input.
+/// What `start` did with a staged input. A control that never leaves the phone releases its
+/// outbox's composer receipt, whatever the outcome.
 public enum StartOutcome: Sendable, Equatable {
   /// It is on its way. A durable one may instead wait in the outbox for this lane or for Check.
   case started
   /// A control that cannot go now. It is saved nowhere, so it is not sent at all.
   case notSent
   /// This session was retired first and sent nothing. A durable input stays in the outbox, for the
-  /// profile's next session or for Remove to delete. Retirement released a control's receipt.
+  /// profile's next session or for Remove to delete.
   case retired
 }
 
@@ -190,7 +191,9 @@ public actor CoordinatorSession {
   /// connect, then sends once.
   private var unsent: [String: Unsent] = [:]
   /// Exchanges that have not written their input to the coordinator yet, by action. `started` is
-  /// the input a Send started, and nil for Check / retry of a queued one.
+  /// the input a Send started, and nil for Check / retry of a queued one. An entry dropped before
+  /// its exchange writes it never left the phone, so dropping it releases a started control's
+  /// receipt.
   private var unwritten: [(action: UUID, inputID: String, started: StagedInput?)] = []
   /// Controls staged with a composer's receipt that `start` has not taken, by input ID.
   private var stagedControls: [String: StagedInput] = [:]
@@ -328,14 +331,13 @@ public actor CoordinatorSession {
   /// it cancels before they left the phone: durable ones waiting for this lane, and any an
   /// exchange had not written yet. A staged input that was not started stays its sender's:
   /// `start` then answers `.retired`, and `unstage` leaves it to the profile's next session.
-  /// Before it retires, its outbox releases the receipt of every control it will now never send,
-  /// staged or started, so recovery offers the control again. A durable input's receipt stays with
-  /// its outbox item.
+  /// Every control it will now never send, staged or started, never left the phone, so its outbox
+  /// releases their receipts before it retires and can no longer save.
   @discardableResult public func retire() async -> [StagedInput] {
     guard !retired else { return [] }
     let waiting = pending.filter { unsent[$0.request.inputId] == .waiting }.map { staged($0) }
     let cancelled = waiting + unwritten.compactMap(\.started)
-    releaseReceipts(of: Array(stagedControls.values) + cancelled.filter { $0.control != nil })
+    releaseReceipts(of: Array(stagedControls.values) + cancelled)
     retired = true
     let satellites = liveInspectors
     inspectors = []
@@ -356,6 +358,7 @@ public actor CoordinatorSession {
     flush = nil
     for action in actions.values { action.cancel() }
     actions = [:]
+    releaseReceipts(of: unwritten.compactMap(\.started))
     unwritten = []
     historyAction = nil
     let ownedConnections = Array(actionConnections.values) + [connection].compactMap { $0 }
@@ -557,10 +560,11 @@ public actor CoordinatorSession {
     await removal.value
     return true
   }
-  /// Controls that never left the phone were not admitted, so this outbox releases, in one save,
-  /// each one's composer receipt that it still holds.
-  private func releaseReceipts(of controls: [StagedInput]) {
-    let keys = controls.compactMap(receiptKey)
+  /// The controls among `inputs` never left the phone, so this outbox releases, in one save, each
+  /// one's composer receipt that it still holds. A durable input's receipt stays with its outbox
+  /// item.
+  private func releaseReceipts(of inputs: [StagedInput]) {
+    let keys = inputs.filter { $0.control != nil }.compactMap(receiptKey)
     guard !keys.isEmpty else { return }
     let previousComposers = composerInputs
     for key in keys { composerInputs[key] = nil }
@@ -948,6 +952,7 @@ public actor CoordinatorSession {
     var failed = false
     defer {
       if historyAction?.id != id { actions.removeValue(forKey: id) }
+      releaseReceipts(of: unwritten.filter { $0.action == id }.compactMap(\.started))
       unwritten.removeAll { $0.action == id }
       transcript.abandonHistory(id)
     }

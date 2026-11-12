@@ -134,8 +134,8 @@ required for sharing on a phone; an unsigned build does not establish that.
   survive. Controls retain receipts without becoming replayable inputs.
   A Send to several coordinators keeps its receipt in each recipient's outbox.
   Recovery offers its text again only when none of them still holds it.
-  An address edit that stops a control before it leaves the phone releases
-  that outbox's receipt.
+  A control that never leaves the phone releases its outbox's receipt, whether
+  an address edit, a disconnect or a failed dial stopped it.
   Ownership paths are relative to the composer record, allowing storage to move.
   Local rejection restores the unadmitted copy, preserving newer typing.
   Restoring an outbox input saves the complete replacement draft and keeps the
