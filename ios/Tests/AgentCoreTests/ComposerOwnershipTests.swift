@@ -561,6 +561,39 @@ func retirementReleasesTheReceiptOfAControlItsSessionNeverWrote(text: String) as
   }
 }
 
+/// An older `/status` is still dialing when a newer Send from the same composer reaches the
+/// coordinator, and an address edit then retires the session. The receipt names the newer Send,
+/// which went, so the outbox keeps it.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func retirementKeepsTheReceiptOfANewerSendThatWent() async throws {
+  try await withGatedCoordinators(1) { coordinators, _ in
+    let coordinator = coordinators[0]
+    let session = coordinator.session
+    try await connected(session)
+    await coordinator.gate.arm()
+    let composerID = UUID()
+    let older = try #require(
+      await session.stage(
+        "/status", sendID: "invented-older", recipients: [session.profile],
+        composer: ComposerInputIdentity(composerID: composerID)))
+    #expect(await session.start(older) == .started)
+    try await held(coordinator.gate)
+    let newer = ComposerInputIdentity(composerID: composerID)
+    let stagedNewer = try #require(
+      await session.stage(
+        "/help", sendID: "invented-newer", recipients: [session.profile], composer: newer))
+    #expect(await session.start(stagedNewer) == .started)
+    for await input in coordinator.fixture.observedInputs {
+      #expect(input.text == "/help")
+      break
+    }
+    #expect(await session.retire() == [older], "Retirement cancels only the older /status")
+    #expect(
+      try CoordinatorSession.ownsComposerInput(newer, outboxURL: session.outboxURL),
+      "The outbox keeps the receipt of /help, which went")
+  }
+}
+
 /// A Send of `/status` starts toward every recipient, and an address edit retires each session
 /// while its socket is still connecting, so no coordinator gets it. The checkpoint after the Send
 /// fails, as when the app stops before saving. Recovery offers `/status` again.
