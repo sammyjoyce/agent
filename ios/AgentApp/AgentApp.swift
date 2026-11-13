@@ -1,4 +1,5 @@
 import AgentUI
+import ScrawlKit
 import SwiftUI
 
 @main
@@ -8,15 +9,18 @@ struct AgentApp: App {
   @Environment(\.scenePhase) private var scenePhase
   var body: some Scene {
     WindowGroup {
-      #if DEBUG
-        if let fixture = InteractionFixture.fromEnvironment(notifications: notifications) {
-          fixture
-        } else {
+      Group {
+        #if DEBUG
+          if let fixture = InteractionFixture.fromEnvironment(notifications: notifications) {
+            fixture
+          } else {
+            MainChatView(notifications: notifications)
+          }
+        #else
           MainChatView(notifications: notifications)
-        }
-      #else
-        MainChatView(notifications: notifications)
-      #endif
+        #endif
+      }
+      .scrawl()
     }
     .onChange(of: scenePhase, initial: true) { _, phase in
       #if DEBUG
