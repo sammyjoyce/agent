@@ -179,6 +179,27 @@ func aHeldTakeReleasedOnTheMicSendsItsWordsExactlyOnce() async throws {
   }
 }
 
+/// A held take on a `/feedback` draft does what Send does: it starts a recording with the words
+/// and sends no coordinator the text.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aHeldTakeOnAFeedbackDraftStartsARecordingLikeSend() async throws {
+  var script = ScriptedSpeech.Script()
+  script.takes = ["the invented chip overlaps the field"]
+  try await withDictation(script, holdDelay: .milliseconds(10)) { dictation, _, chat, fixture, _ in
+    let recorder = FakeFeedbackRecorder()
+    chat.feedbackRecorder = recorder
+    chat.profiles[0].pin = fixture.id
+    chat.draft = "/feedback"
+    let target = DictationTarget(chat: chat)
+    try await hold(dictation, target)
+    dictation.mic(.up(onMic: true), in: target)
+    try await until("the words land") { dictation.take == nil }
+    #expect(recorder.starts == ["the invented chip overlaps the field"])
+    #expect(chat.draft.isEmpty && dictation.notice == nil)
+    #expect(await submitted(fixture).isEmpty, "No coordinator got the feedback text")
+  }
+}
+
 @MainActor @Test(.timeLimit(.minutes(1)), arguments: ["slid off", "cancelled by the system"])
 func aHeldTakeThatDoesNotEndOnTheMicKeepsItsWords(_ ending: String) async throws {
   try await withDictation(holdDelay: .milliseconds(10)) { dictation, _, chat, fixture, directory in
