@@ -1084,7 +1084,7 @@ public actor CoordinatorSession {
 
   /// A coordinator that predates the list advertises the origins it knew with one Boolean.
   /// Values this build does not know are skipped.
-  static func acceptedInputOrigins(_ ready: NativeEventReady) -> Set<InputOrigin> {
+  private static func acceptedInputOrigins(_ ready: NativeEventReady) -> Set<InputOrigin> {
     if let listed = ready.acceptedInputOrigins { return Set(listed.compactMap(InputOrigin.init)) }
     return ready.inputOrigins == true ? [.cli, .ios] : []
   }
