@@ -67,7 +67,8 @@ func aCoordinatorThatListsSiriAcceptsItAndAnUnknownListedOriginIsSkipped() async
     #expect(await session.accepts(.siri))
     #expect(await session.accepts(.ios))
     #expect(await session.submit("A composer message"))
-    #expect(try queuedRequests(outbox).first?.origin == .ios)
+    let requests = try queuedRequests(outbox)
+    #expect(requests.first?.origin == .ios)
     await session.disconnect()
     #expect(await !session.accepts(.siri))
   }
