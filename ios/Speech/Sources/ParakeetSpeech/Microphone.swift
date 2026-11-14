@@ -29,29 +29,21 @@ public enum Microphone {
   }
 }
 
-/// One capture: the audio session for exactly its length, and the input converted to 16 kHz mono
-/// and handed on in memory, never written to a file.
-///
 /// The session is `.record` with mode `.measurement`, which keeps the system's own signal
 /// processing to a minimum, so the model hears audio closest to what it was trained on.
 final class Capture: Sendable {
-  /// Each tap's samples, about every 90 ms, buffered until read. Ends when capture stops, after
-  /// the resampler's last samples.
   let audio: AsyncStream<[Float]>
   private let heard: AsyncStream<[Float]>.Continuation
   private let reporting: AsyncStream<Take.Event>.Continuation
   private let state: OSAllocatedUnfairLock<State>
 
   private struct State {
-    /// Nil once capture stopped.
     var engine: AVAudioEngine?
     let converter: AVAudioConverter
     var observers: [any NSObjectProtocol] = []
     var power: Float = 0
     var counted = 0
 
-    /// A level once 75 ms accumulated, which comes to about ten levels a second whatever buffer
-    /// size the hardware delivers.
     mutating func level(_ heard: [Float]) -> Float? {
       power += heard.reduce(0) { $0 + $1 * $1 }
       counted += heard.count
@@ -72,7 +64,6 @@ final class Capture: Sendable {
     state = OSAllocatedUnfairLock(uncheckedState: State(engine: engine, converter: converter))
   }
 
-  /// Levels and an interruption go to `reporting`, which capture finishes when it stops.
   static func start(reporting: AsyncStream<Take.Event>.Continuation) throws -> Capture {
     #if os(iOS)
       let session = AVAudioSession.sharedInstance()
@@ -111,7 +102,6 @@ final class Capture: Sendable {
 
   var isRunning: Bool { state.withLockUnchecked { $0.engine != nil } }
 
-  /// Stops capture if it runs. Idempotent.
   func stop() {
     halt(interrupted: false)
   }
@@ -137,8 +127,6 @@ final class Capture: Sendable {
     reporting.finish()
   }
 
-  /// Runs on the audio thread. Yielding never waits for the reader, so a slow model cannot
-  /// stall the tap, and doing it under the lock keeps every sample ahead of `halt`'s last ones.
   private func hear(_ buffer: AVAudioPCMBuffer) {
     let level = state.withLockUnchecked { state -> Float? in
       guard state.engine != nil else { return nil }
@@ -150,7 +138,6 @@ final class Capture: Sendable {
     if let level { reporting.yield(.level(level)) }
   }
 
-  /// Converts one buffer, or with nil flushes what the resampler still holds at the end.
   private static func convert(_ buffer: AVAudioPCMBuffer?, with converter: AVAudioConverter)
     -> [Float]
   {
@@ -178,8 +165,6 @@ final class Capture: Sendable {
     return heard
   }
 
-  /// A call or Siri, losing the input in use, or a media-services reset ends capture, keeping what
-  /// was heard.
   private func observe() {
     #if os(iOS)
       let center = NotificationCenter.default

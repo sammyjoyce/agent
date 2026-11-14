@@ -16,7 +16,6 @@ public struct MainChatView: View {
   private let notifications: AppNotifications?
   private let relatedWork: [SavedConversation]
   private let inspectRelated: ((SavedConversation) -> Void)?
-  /// The process's dictation. nil shows no mic.
   private let dictation: Dictation?
   @Environment(\.dismiss) private var dismiss
   @State private var settings = false
@@ -603,8 +602,6 @@ public struct MainChatView: View {
     if let detailLoader { return try await detailLoader(row) }
     return try await model.toolDetails(for: row, lane: lane)
   }
-  /// True from a take's press until its words land. The composer's own writers wait, so a held
-  /// take finds the draft it started on.
   private var dictating: Bool { dictation?.take != nil }
   #if os(iOS)
     private var dictationTarget: DictationTarget {
@@ -978,7 +975,6 @@ public struct MainChatView: View {
     }
   }
   #if os(iOS)
-    /// What Connection says about the voice model. nil hides the section.
     private func voiceModelSummary(_ dictation: Dictation) -> String? {
       let size = DictationStatus.size(dictation.diskUsage)
       switch dictation.model {

@@ -5,7 +5,6 @@ import UniformTypeIdentifiers
 @testable import AgentCore
 @testable import AgentUI
 
-/// Holds each Send where `ChatModel` hands it to the outboxes, until the test gives its outcome.
 private actor HeldAdmission {
   nonisolated let entered: AsyncStream<Void>
   private let enteredContinuation: AsyncStream<Void>.Continuation
@@ -111,8 +110,6 @@ func sendBlockerNamesWhySendIsDisabledAndTheMicWaitsForABusyDraft() async throws
   }
 }
 
-/// A connected one-coordinator composer with dictation over a scripted engine. Taps stay taps
-/// unless `holdDelay` is short.
 @MainActor private func withDictation(
   _ script: ScriptedSpeech.Script = .init(), holdDelay: Duration = .seconds(30),
   admit: ChatModel.Admit? = nil,
@@ -179,8 +176,6 @@ func aHeldTakeReleasedOnTheMicSendsItsWordsExactlyOnce() async throws {
   }
 }
 
-/// A held take on a `/feedback` draft does what Send does: it starts a recording with the words
-/// and sends no coordinator the text.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func aHeldTakeOnAFeedbackDraftStartsARecordingLikeSend() async throws {
   var script = ScriptedSpeech.Script()
@@ -200,8 +195,6 @@ func aHeldTakeOnAFeedbackDraftStartsARecordingLikeSend() async throws {
   }
 }
 
-/// An interruption in the moments capture runs on after a held release keeps the words and sends
-/// nothing, as leaving the app does.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func anInterruptionAfterAHeldReleaseKeepsTheWords() async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)

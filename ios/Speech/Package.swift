@@ -1,8 +1,6 @@
 // swift-tools-version: 6.2
 import PackageDescription
 
-// Only the Agent app target links ParakeetSpeech, so ios/Package.swift, which host tests, the
-// identity-boundary copy and the Share extension build, never resolves FluidAudio.
 let package = Package(
   name: "Speech",
   platforms: [.iOS(.v18), .macOS(.v15)],

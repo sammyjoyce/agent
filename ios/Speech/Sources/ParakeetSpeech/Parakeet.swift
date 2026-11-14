@@ -21,7 +21,6 @@ public actor Parakeet {
   }
 
   private enum Residency {
-    /// Nothing holds the model. The last unload, finished or not, runs before any new load.
     case idle(after: Task<Void, Never>?)
     case loaded(Task<Recognizer, any Error>, users: Int)
   }
@@ -31,8 +30,7 @@ public actor Parakeet {
   private var waitingForIdle: [CheckedContinuation<Void, Never>] = []
 
   /// - Parameter root: Holds one directory per model revision. Application Support, not Caches,
-  ///   which iOS empties under storage pressure, and not the App Group, which the Share extension
-  ///   never needs. `install` excludes it from backup.
+  ///   which iOS empties under storage pressure. `install` excludes it from backup.
   public init(
     root: URL = .applicationSupportDirectory.appending(
       path: "Agent/Speech", directoryHint: .isDirectory)
@@ -240,18 +238,14 @@ public enum ParakeetError: LocalizedError, Equatable, Sendable {
   }
 }
 
-/// What the files have proven, in `<revision>/receipt.json`.
 struct Receipt: Codable, Equatable {
   struct Failures: Codable, Equatable {
     var build: Build
     var count: Int
   }
 
-  /// The files FluidAudio verified complete after a download. Written only then.
   var installed: [String]?
-  /// The app and OS build of the last successful load, which left Core ML's compiled cache warm.
   var warm: Build?
-  /// Loads in a row that failed on complete files.
   var failures: Failures?
 }
 

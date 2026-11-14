@@ -2,17 +2,13 @@
   import SwiftUI
   import UIKit
 
-  /// The mic, in its own slot between the field and Send. A menu item cannot be held, and Send's
-  /// slot already turns into Stop, so a hold there would not mean the same thing every time.
   struct MicButton: View {
     let dictation: Dictation
     let target: DictationTarget
-    /// True between a touch's first change and its end, so `.down` goes once per touch.
     @State private var pressed = false
     /// Resets without `onEnded` when the system cancels the touch.
     @GestureState private var touching = false
 
-    /// A release this far outside the mic still counts as on it.
     private static let slop: CGFloat = 30
 
     var body: some View {
@@ -54,7 +50,6 @@
         .accessibilityAction { dictation.mic(.activated, in: target) }
     }
 
-    /// A press while the last take transcribes would open nothing, so the mic says so.
     private var disabled: Bool {
       switch dictation.take?.stage {
       case .opening?, .listening?: return false
@@ -102,8 +97,6 @@
     }
   }
 
-  /// One line above the composer's row: the open take, the model's download or compile, or the
-  /// latest notice. Its text changes only with the state, so VoiceOver does not chatter.
   struct DictationStatus: View {
     let dictation: Dictation
     let chat: ChatModel
@@ -175,7 +168,6 @@
     static func size(_ bytes: Int64) -> String { bytes.formatted(.byteCount(style: .file)) }
   }
 
-  /// The open take's meter and clock. The clock is visual only: VoiceOver reads "Listening".
   private struct Listening: View {
     let dictation: Dictation
     let held: Bool

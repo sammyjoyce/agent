@@ -29,8 +29,6 @@ public final class Take: Sendable {
   public let events: AsyncStream<Event>
 
   private let capture: Capture
-  /// The final text, once capture's audio ends and the model has decoded all of it. The model is
-  /// released when this ends, however it ends.
   private let words: Task<String, any Error>
   private let stage = Mutex(Stage.listening)
 
@@ -126,8 +124,6 @@ public final class Take: Sendable {
 }
 
 #if canImport(UIKit)
-  /// A finite stretch of background time, so leaving the app as a take finishes still lands the
-  /// words. The system's deadline ends it rather than the app.
   @MainActor private final class BackgroundTime {
     private var identifier = UIBackgroundTaskIdentifier.invalid
 

@@ -134,8 +134,6 @@
       return !peers.isEmpty && peers.count == ports.count ? peers : nil
     }
 
-    /// `AGENT_INTERACTION_DICTATION` is a `ScriptedSpeech.Script` as JSON, so the mic dictates
-    /// invented words without a microphone or the voice model.
     private static var requestedDictation: Dictation? {
       guard let json = environment["AGENT_INTERACTION_DICTATION"],
         let script = try? JSONDecoder().decode(ScriptedSpeech.Script.self, from: Data(json.utf8))

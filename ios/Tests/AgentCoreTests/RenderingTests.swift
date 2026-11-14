@@ -1217,7 +1217,6 @@
         try await body(model, box, work)
       }
 
-      /// A dictation target over the composer's own field, as the mic builds it.
       @MainActor private func dictationTarget(_ model: ChatModel, _ field: UITextView)
         -> DictationTarget
       {
@@ -1254,8 +1253,6 @@
         try await Task.sleep(for: .milliseconds(100))
       }
 
-      /// Words land where the caret was when the take started, even after the caret moved, and
-      /// one Undo takes back the dictation and nothing typed before it.
       @MainActor @Test func dictatedWordsLandAtTheReservedCaretAsOneUndoStep() async throws {
         let dictation = try await readyDictation()
         try await withComposer(dictation: dictation) { model, box, _ in
@@ -1277,8 +1274,6 @@
         }
       }
 
-      /// A composition the keyboard holds when the mic opens is committed then, as UIKit commits
-      /// it when a field resigns, so it is read for tags and the words land after it.
       @MainActor @Test func theMicCommitsTheKeyboardsCompositionWhenItOpens() async throws {
         let dictation = try await readyDictation()
         try await withComposer(dictation: dictation) { model, box, _ in
@@ -1295,8 +1290,6 @@
         }
       }
 
-      /// While a take is open no key, deletion or composition changes the field, and once its
-      /// words land the field takes typing again.
       @MainActor @Test func theFieldTakesNoEditDuringATake() async throws {
         let dictation = try await readyDictation()
         try await withComposer(dictation: dictation) { model, box, _ in
@@ -1319,9 +1312,6 @@
         }
       }
 
-      /// The engine's words so far show dimmed at the reserved caret, spaced as they will land,
-      /// while the draft, its save and VoiceOver's value stay as they were. The final text replaces
-      /// them, and one Undo takes back only that text.
       @MainActor @Test func liveWordsShowDimmedAtTheCaretUntilTheFinalTextReplacesThem()
         async throws
       {
@@ -1367,8 +1357,6 @@
         }
       }
 
-      /// Undo during a take has nothing to take back, so the live words stay display-only and the
-      /// draft keeps what was typed before the mic opened.
       @MainActor @Test func undoDuringATakeLeavesTheDraftAndItsLiveWordsAlone() async throws {
         let speech = ScriptedSpeech()
         let dictation = try await readyDictation(speech)
@@ -1391,7 +1379,6 @@
         }
       }
 
-      /// A take that lands no words takes its live words away and leaves the draft as it was.
       @MainActor @Test(arguments: ["nothing heard", "the model failed"])
       func aTakeThatLandsNothingClearsItsLiveWords(_ ending: String) async throws {
         var script = ScriptedSpeech.Script()
@@ -1417,8 +1404,6 @@
         }
       }
 
-      /// A take another window holds draws no live words in this field, so typing here never
-      /// commits them, and its words land at the end of the draft as it then is.
       @MainActor @Test func liveWordsStayOutOfAFieldThatDoesNotHoldTheTake() async throws {
         let speech = ScriptedSpeech()
         let dictation = try await readyDictation(speech)
@@ -1443,7 +1428,6 @@
         }
       }
 
-      /// At the largest text size the mic takes its own slot and the field keeps room to edit.
       @MainActor @Test func theComposerRowFitsTheMicAtTheLargestTextSize() async throws {
         let dictation = try await readyDictation()
         try await withComposer(dictation: dictation, size: .accessibilityExtraExtraExtraLarge) {

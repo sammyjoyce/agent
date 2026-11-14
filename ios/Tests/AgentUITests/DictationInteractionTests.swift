@@ -1,8 +1,6 @@
 import AgentCore
 import XCTest
 
-/// The mic in the real composer over a scripted speech engine, which hears no microphone and
-/// returns invented words.
 @MainActor
 final class DictationInteractionTests: XCTestCase {
   private func launch(script: String) async throws -> (XCUIApplication, InteractionPeer) {

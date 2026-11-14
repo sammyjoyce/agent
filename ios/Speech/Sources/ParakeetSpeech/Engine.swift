@@ -3,22 +3,13 @@
 import FluidAudio
 import Foundation
 
-/// Parakeet Unified English 0.6B streaming, with the int8 encoder whose window is 70 frames of
-/// left context, a 13-frame chunk and 13 frames of right context (2.08 s), on the CPU and Neural
-/// Engine. This file alone makes that decision. On an iPhone 16 Pro the spike measured a 10 to
-/// 13 s compile, a 637 MB peak, the final text within 0.08 s of the audio's end at every length,
-/// and one word wrong in 82 s of speech.
 enum Engine {
-  /// The Hugging Face commit the on-device spike measured. FluidAudio would otherwise download
-  /// `main`, which a later push could fill with files this FluidAudio cannot load.
+  /// The Hugging Face commit to download. FluidAudio would otherwise download `main`, which a
+  /// later push could fill with files this FluidAudio cannot load.
   static let revision = "d32e972dd4315f1dc3f6be28fb2aab0ab3e80358"
-  /// Everything one install fetches at `revision`: the three bundles, `vocab.json`, and FluidAudio's
-  /// `metadata.json` and `config.json`.
   static let downloadBytes: Int64 = 609_440_571
-  /// FluidAudio's folder for the repository, inside the directory handed to `download`.
   static let folder = Repo.parakeetUnified.folderName
   fileprivate static let config = UnifiedConfig(leftFrames: 70, chunkFrames: 13, rightFrames: 13)
-  /// What a load needs, and what FluidAudio checks before it decides a download is complete.
   static let files: Set<String> = [
     config.family.streamingEncoderFile(precision: .int8, contextSuffix: config.contextSuffix),
     config.family.decoderFile, config.family.jointDecisionFile, config.family.vocab,
@@ -28,7 +19,6 @@ enum Engine {
     ModelRegistry.revisionOverrides[Repo.parakeetUnified.remotePath] = revision
   }()
 
-  /// Downloads whatever `files` lack into `directory`, resuming partial files by HTTP Range.
   static func download(
     into directory: URL, progress: @escaping @Sendable (Double) -> Void
   ) async throws {
@@ -41,8 +31,7 @@ enum Engine {
       progressHandler: { progress(min(1, $0.fractionCompleted * 2)) }, load: {})
   }
 
-  /// FluidAudio's completeness rule, read from the files alone. Every bundle has its
-  /// `coremldata.bin` and no `.partial` download, and every plain file exists.
+  /// FluidAudio's completeness rule, read from the files alone.
   static func isComplete(_ repository: URL) -> Bool {
     let manager = FileManager.default
     return files.allSatisfy { file in
@@ -62,8 +51,6 @@ enum Engine {
   }
 }
 
-/// The model in memory, about 620 MB on an iPhone, until `unload` lets it go. One stream at a
-/// time: `reset` starts the next.
 struct Recognizer: Sendable {
   private let manager: StreamingUnifiedAsrManager
 
@@ -81,8 +68,6 @@ struct Recognizer: Sendable {
     try await manager.reset()
   }
 
-  /// Feeds 16 kHz mono samples, decodes every window they complete, and returns the whole
-  /// transcript so far, which the next windows can still change.
   func feed(_ samples: [Float]) async throws -> String {
     try await manager.appendAudio(try Self.buffer(samples))
     try await manager.processBufferedAudio()

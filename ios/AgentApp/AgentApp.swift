@@ -6,7 +6,6 @@ import SwiftUI
 @main
 struct AgentApp: App {
   @UIApplicationDelegateAdaptor(AppNotifications.self) private var notifications
-  /// One per process, like the coordinators, so every window shares one microphone and one model.
   @State private var dictation = Dictation(engine: .parakeet)
   @State private var feedback = ScrawlFeedback()
   // App-level phase aggregates every scene, so a second iPad window cannot fight the first.

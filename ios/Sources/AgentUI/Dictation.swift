@@ -48,9 +48,7 @@ public struct Recording: Sendable {
   }
 }
 
-/// What dictation needs from a speech engine. The app builds Parakeet's (`AgentApp/Speech.swift`),
-/// and tests and the interaction fixture build `ScriptedSpeech`'s. Text comes out as one String,
-/// so how the engine transcribes stays its own decision.
+/// What dictation needs from a speech engine.
 public struct SpeechEngine: Sendable {
   /// Reads files only, never the network.
   let model: @Sendable () async -> SpeechModel
@@ -96,8 +94,6 @@ public struct SpeechEngine: Sendable {
   }
 }
 
-/// A speech engine that hears nothing and returns scripted words, for tests and the DEBUG
-/// interaction fixture. Invented words only.
 final class ScriptedSpeech: Sendable {
   struct Script: Codable, Equatable, Sendable {
     enum Model: String, Codable, Sendable {
@@ -108,19 +104,15 @@ final class ScriptedSpeech: Sendable {
     }
     var model = Model.ready
     var download: Int64 = 609_440_571
-    /// Fractions an install reports, one every `stepMilliseconds`.
     var progress: [Double] = [0.25, 0.5, 0.75, 1]
     var stepMilliseconds = 20
     var cellular = false
     var microphone = MicrophonePermission.granted
-    /// What the system prompt answers.
     var grants = true
-    /// Each take's words, in order. The last repeats.
     var takes = ["Invented dictated words"]
 
     init() {}
 
-    /// Missing keys keep their defaults, so a UI test's JSON names only what it changes.
     init(from decoder: any Decoder) throws {
       let values = try decoder.container(keyedBy: CodingKeys.self)
       let defaults = Self()
@@ -153,11 +145,9 @@ final class ScriptedSpeech: Sendable {
     state = Mutex(State(script: script))
   }
 
-  /// Recordings started so far.
   var recordings: Int { state.withLock { $0.takes } }
   var installs: Int { state.withLock { $0.installs } }
 
-  /// Holds each `finish` until `release()`, as a slow transcription would.
   func hold() { state.withLock { $0.holding = true } }
   func release() {
     let held = state.withLock {
@@ -167,13 +157,10 @@ final class ScriptedSpeech: Sendable {
     }
     for continuation in held { continuation.resume() }
   }
-  /// The open recording's transcript so far, as the engine would publish it.
   func hear(_ partial: String) {
     state.withLock { $0.open?.events }?.yield(.partial(partial))
   }
-  /// Makes each `finish` throw, as a failed model would.
   func fail() { state.withLock { $0.failing = true } }
-  /// Stops the open recording as a phone call would.
   func interrupt() {
     let events = state.withLock {
       defer { $0.open = nil }
@@ -263,21 +250,14 @@ struct ScriptedFailure: LocalizedError {
   var errorDescription: String? { "The scripted model failed." }
 }
 
-/// Where the caret was when a take started, in the text it was read from.
 struct DictationReservation: Equatable {
   let range: NSRange
   let text: String
 }
 
-/// The composer whose mic was pressed. On iOS its closures act on the field's own text view, so
-/// words land the way typing does. Without a field, the words are appended through
-/// `ChatModel.edit`.
 @MainActor struct DictationTarget {
   let chat: ChatModel
-  /// Commits a composition, snapshots where the words go and locks the field against edits.
   let reserve: () -> DictationReservation?
-  /// Unlocks the field and inserts the words at the reservation, or at the end without one or
-  /// once the field's text changed, as one Undo step. False when no field is on screen.
   let insert: (_ words: String, _ at: DictationReservation?) -> Bool
   let unlock: () -> Void
 
@@ -293,17 +273,13 @@ struct DictationReservation: Equatable {
   }
 }
 
-/// What dictation tells the user above the field, until the next take or its ×.
 enum DictationNotice: Equatable {
   case ready
-  /// The press asked for the microphone, so it started nothing.
   case microphoneAllowed
   case microphoneDenied
-  /// The phone kept the microphone, as during a call.
   case microphoneUnavailable
   case interrupted
   case nothingHeard
-  /// A held take kept its words in the composer instead of sending them.
   case notSent(NotSent)
   case downloadFailed(String)
   case failed(String)
@@ -311,8 +287,6 @@ enum DictationNotice: Equatable {
   enum NotSent: Equatable {
     case draftChanged
     case blocked(ChatModel.SendBlocker)
-    /// `submit()` refused in its own turn, as for a `/feedback` draft that starts no recording.
-    /// `ChatModel.failure` says why.
     case refused
   }
 
@@ -337,33 +311,22 @@ enum DictationNotice: Equatable {
   }
 }
 
-/// Dictation for the composer: the voice model's lifecycle and the microphone's one take. One per
-/// process, owned by the App beside the coordinators, so every window shares one model, one
+/// Dictation for the composer. Create one per process, so every window shares one model, one
 /// audio session and one take.
-///
-/// It never owns the draft. Words reach it once, when a take lands, through the field the way
-/// typing does, and a held take sends through `ChatModel.submit`, the Send button's path, which
-/// records a `/feedback` draft with Scrawl.
 @MainActor @Observable
 public final class Dictation {
   enum ModelPhase: Equatable {
     case checking
     case missing(download: Int64)
     case downloading(Double, of: Int64)
-    /// Compiling the model for this build of the app and OS. A take captures meanwhile, and its
-    /// words land when the compile ends.
     case preparing
     case ready
     case unsupported
   }
 
-  /// How a press is going. The mic opens on the press, before tap and hold can be told apart, so
-  /// the first word is not lost.
   enum Gesture: Equatable {
     case pressing
-    /// Down past `holdDelay`. Releasing on the mic sends; sliding off first keeps.
     case holding
-    /// Started by a tap. The next tap stops it and keeps the words.
     case toggled
   }
 
@@ -372,10 +335,8 @@ public final class Dictation {
     case send
   }
 
-  /// The download the confirmation offers while it is shown.
   struct Offer: Equatable {
     let bytes: Int64
-    /// On cellular, or another expensive path, when offered.
     let cellular: Bool
 
     var question: String {
@@ -400,25 +361,18 @@ public final class Dictation {
     var stage: Stage
     var recording: Recording?
     var started: ContinuousClock.Instant?
-    /// The engine's transcript so far, which the field shows dimmed at the reservation until the
-    /// final text replaces it. Never the draft.
     var provisional = ""
   }
 
-  /// What the mic reports. One entry point, so tap and hold are told apart in one place.
   enum MicEvent: Equatable {
     case down
-    /// `onMic` is false when the finger slid off the mic first.
     case up(onMic: Bool)
-    /// The system took the touch away. Never a send.
     case cancelled
-    /// VoiceOver, Switch Control or Full Keyboard Access activated the mic, which is a tap.
     case activated
   }
 
   private(set) var model = ModelPhase.checking
   private(set) var take: Take?
-  /// The open take's loudness, apart from `take` so only the meter redraws ten times a second.
   private(set) var level: Float = 0
   private(set) var notice: DictationNotice?
   private(set) var diskUsage: Int64 = 0
@@ -426,7 +380,6 @@ public final class Dictation {
 
   @ObservationIgnored private let engine: SpeechEngine
   @ObservationIgnored private let holdDelay: Duration
-  /// The one install, prewarm, removal or file read in flight.
   @ObservationIgnored private var work: Task<Void, Never>?
   @ObservationIgnored private var timers: [Task<Void, Never>] = []
 
@@ -469,7 +422,6 @@ public final class Dictation {
       finish(.keep)
     case (.up, nil), (.activated, nil):
       switch model {
-      // Complete files left without a receipt need only the compile, so nothing to agree to.
       case .missing(let bytes): if bytes == 0 { download() } else { offer(bytes) }
       case .ready, .preparing: if event == .activated { start(.toggled, in: target) }
       case .checking, .downloading, .unsupported: break
@@ -478,7 +430,6 @@ public final class Dictation {
     }
   }
 
-  /// Reads the network path once, when the offer is made. Wi-Fi coming back starts nothing.
   private func offer(_ bytes: Int64) {
     guard work == nil else { return }
     work = Task {
@@ -489,8 +440,6 @@ public final class Dictation {
     }
   }
 
-  /// After the user confirmed the download. Asks for the microphone now if it was never asked, so
-  /// the first take is not spent on the system prompt. A download never opens the mic.
   func download() {
     guard work == nil, case .missing(let bytes) = model else { return }
     offering = nil
@@ -511,7 +460,6 @@ public final class Dictation {
         await settle()
       } catch {
         await settle()
-        // Complete files that failed to compile downloaded fine, so Try again would do nothing.
         if case .missing = model {
           notice = .downloadFailed(error.localizedDescription)
         } else {
@@ -521,12 +469,10 @@ public final class Dictation {
     }
   }
 
-  /// Partial files stay, and the next download resumes them.
   func cancelDownload() {
     if case .downloading = model { work?.cancel() }
   }
 
-  /// Removal waits for a take, a download or a compile to end.
   var canRemoveModel: Bool {
     guard take == nil, diskUsage > 0 else { return false }
     switch model {
@@ -551,9 +497,6 @@ public final class Dictation {
     model = fraction >= 1 ? .preparing : .downloading(fraction, of: bytes)
   }
 
-  /// Reads the files once an install, prewarm or removal ends. A model still stale after its
-  /// prewarm compiles on the next take's load instead. Both reads finish before either value
-  /// changes, so the phase a tap sees never comes while `work` still refuses the tap.
   private func settle() async {
     let files = await engine.model()
     let usage = await engine.diskUsage()
@@ -581,8 +524,6 @@ public final class Dictation {
     }
     notice = nil
     let reservation = target.reserve()
-    // Committing a composition can complete a leading tag. Promoting it now keeps the mark from
-    // going stale when the composer's own promotion runs after this turn.
     target.chat.promoteTypedTag()
     let take = Take(
       target: target, reservation: reservation, mark: target.chat.draftMark,
@@ -594,7 +535,6 @@ public final class Dictation {
     Task { await run(take.id) }
   }
 
-  /// Opens the microphone, then follows its events until capture stops.
   private func run(_ id: UUID) async {
     let recording: Recording
     do {
@@ -637,9 +577,6 @@ public final class Dictation {
     }
   }
 
-  /// Leaving the app or an interruption keeps the words at any stage, a held take already
-  /// transcribing included, so neither ever sends. Capture runs on briefly after a release, so an
-  /// interruption can still arrive then.
   private func keep(notice: DictationNotice? = nil) {
     switch take?.stage {
     case .opening?, .listening?: finish(.keep, notice: notice)
@@ -650,8 +587,6 @@ public final class Dictation {
     }
   }
 
-  /// Closes the mic and fixes how the take lands. The first call wins, so a release, an
-  /// interruption and leaving the app racing each other end the take once.
   private func finish(_ landing: Landing, notice: DictationNotice? = nil) {
     guard var take else { return }
     switch take.stage {
@@ -663,7 +598,6 @@ public final class Dictation {
     level = 0
     cancelTimers()
     if let notice { self.notice = notice }
-    // A take still opening transcribes once its recording arrives.
     if let recording = take.recording { transcribe(take.id, recording) }
   }
 
@@ -675,8 +609,6 @@ public final class Dictation {
     }
   }
 
-  /// The words reach the draft, then maybe Send, in one main-actor turn, so nothing can change
-  /// the draft between the check, the insertion and the send.
   private func land(_ id: UUID, _ result: Result<String, any Error>) {
     guard let take, take.id == id, case .transcribing(let landing) = take.stage else { return }
     self.take = nil
@@ -700,8 +632,6 @@ public final class Dictation {
       let text = DictationText.appended(words, to: chat.draft)
       chat.edit(text, committed: text)
     }
-    // Typed text is promoted before any Send can read it, so dictated text is too: raw parsing
-    // of "@Work @Personal note" would pick both.
     chat.promoteTypedTag()
     guard landing == .send else { return }
     if !fresh {
@@ -737,13 +667,10 @@ public final class Dictation {
   }
 }
 
-/// How dictated words join text already in the composer. Only spacing changes, never case or
-/// punctuation.
 enum DictationText {
   private static let closing: Set<Character> = [".", ",", ";", ":", "!", "?", ")", "]", "}", "…"]
   private static let opening: Set<Character> = ["(", "[", "{", "“", "‘"]
 
-  /// `words` with a space where they would touch a word before or after them.
   static func fitted(_ words: String, between before: Character?, and after: Character?) -> String {
     var fitted = words
     if let before, !before.isWhitespace, !opening.contains(before), let first = words.first,

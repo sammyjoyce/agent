@@ -4,7 +4,6 @@ import ParakeetSpeech
 import os
 
 extension SpeechEngine {
-  /// Parakeet on this iPhone. One per process, as there is one microphone and one model.
   static let parakeet: SpeechEngine = {
     let parakeet = Parakeet()
     return SpeechEngine(
@@ -18,7 +17,6 @@ extension SpeechEngine {
       requestPermission: { await Microphone.requestPermission() },
       record: {
         let take = try await parakeet.record()
-        // The relay holds the stream rather than the take, so dropping a Recording still ends it.
         let heard = take.events
         let (events, continuation) = AsyncStream.makeStream(of: RecordingEvent.self)
         let relay = Task {

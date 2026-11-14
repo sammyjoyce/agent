@@ -26,7 +26,6 @@
     /// The coordinator whose restored message the draft holds. The field's undo actions go whenever
     /// it changes.
     let restoredFrom: ProfileID?
-    /// The open take's transcript so far, shown dimmed where its words will land. Never the draft.
     let provisional: String
     let reservation: DictationReservation?
     /// Reports the field's text, and that text without what an input method is still composing.
@@ -78,8 +77,6 @@
         context.coordinator.restoredFrom = restoredFrom
         view.undoManager?.removeAllActions()
       }
-      // Every window's composer shares one take, but only the field that pressed the mic is
-      // locked. Live words drawn in any other field would reach the draft with its next key.
       if let reservation, !provisional.isEmpty, view.locked {
         let range =
           reservation.text == text
@@ -234,8 +231,6 @@
         case above(CGFloat)
       }
       let placeholder = UILabel()
-      /// True while a dictation take holds the caret. The field stays first responder, so the
-      /// keyboard does not drop the composer out from under a held mic, but no edit lands.
       var locked = false
       override func insertText(_ text: String) { if !locked { super.insertText(text) } }
       override func deleteBackward() { if !locked { super.deleteBackward() } }
@@ -250,20 +245,14 @@
       ) {
         if !locked { super.setAttributedMarkedText(text, selectedRange: selectedRange) }
       }
-      /// A take's words so far, drawn dimmed over the reserved range, and the draft text they
-      /// cover. Display only: `draft` leaves them out, and showing or clearing them registers no
-      /// Undo and calls no delegate, so they never reach the model or its save.
       private(set) var provisional: (range: NSRange, covered: String)?
 
-      /// The text without the provisional words.
       var draft: String {
         guard let provisional else { return text }
         return (text as NSString).replacingCharacters(
           in: provisional.range, with: provisional.covered)
       }
 
-      /// Shows `words` over `range` of the draft, spaced as the final text will land so it does
-      /// not jump.
       func showProvisional(_ words: String, over range: NSRange) {
         let draft = self.draft as NSString
         guard NSMaxRange(range) <= draft.length else { return }
@@ -362,8 +351,7 @@
       required init?(coder: NSCoder) { return nil }
 
       /// An empty draft reads its placeholder, as the text field before it did. A text view has
-      /// no placeholder of its own to report. During a take the value is the draft, so VoiceOver
-      /// never reads words that are not yet final.
+      /// no placeholder of its own to report.
       override var accessibilityValue: String? {
         get {
           if draft.isEmpty { return placeholder.text }
@@ -426,8 +414,6 @@
         }
         field?.edit(view.text, committed)
       }
-      /// Covers the paths the overrides miss, such as an autocorrection or the system's own
-      /// dictation.
       func textView(
         _ view: UITextView, shouldChangeTextIn range: NSRange, replacementText text: String
       ) -> Bool {

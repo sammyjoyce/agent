@@ -24,10 +24,6 @@
       return true
     }
 
-    /// Commits a composition, as UIKit does when a field resigns, snapshots where dictated words
-    /// go and locks the field until they land. The field's Undo actions go too. They were recorded
-    /// against text without the live words, and the shortcut bar, a hardware keyboard or a shake
-    /// could otherwise apply one during the take.
     func reserve() -> DictationReservation? {
       guard let view = view as? ComposerField.DraftView else { return nil }
       if view.markedTextRange != nil {
@@ -42,16 +38,12 @@
       return DictationReservation(range: range, text: text)
     }
 
-    /// Takes the take's provisional words away and unlocks the field, for a take that lands
-    /// nothing.
     func unlock() {
       guard let view = view as? ComposerField.DraftView else { return }
       view.clearProvisional()
       view.locked = false
     }
 
-    /// Replaces the provisional words with `words` through the field's own text input, so they
-    /// reach the model the way typing does and Undo takes back the dictation alone.
     func insert(_ words: String, at reservation: DictationReservation?) -> Bool {
       guard let view = view as? ComposerField.DraftView else { return false }
       view.clearProvisional()
