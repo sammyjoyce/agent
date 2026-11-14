@@ -84,12 +84,20 @@ sends the recording to Scrawl on your Mac. It does nothing until you pair the
 phone.
 
 1. Open Scrawl on the Mac.
-2. Run `/Applications/Scrawl.app/Contents/MacOS/scrawl link --scheme beepboop`.
+2. Run `/Applications/Scrawl.app/Contents/MacOS/scrawl link --scheme beepboop --url http://<mac>.<tailnet>.ts.net:47777`.
+   To get the Mac's Tailscale name, run `tailscale status --json` and copy
+   `Self.DNSName` without the trailing dot. Pair by name because iOS refuses
+   plain HTTP to IP addresses, so the default link, which carries IP
+   addresses, can't upload.
 3. Open the printed link on the iPhone, or scan its QR code.
 4. To start recording, hold three fingers on the screen for half a second. To
    stop and send, do it again.
 
 To unpair the phone, open `beepboop://scrawl?reset=1` on it.
+
+If a recording doesn't upload, Scrawl can collect it the next time you connect
+the phone by cable. To allow that, list the app's bundle ID under `usbApps` in
+`~/.config/scrawl/config.json`.
 
 ## Behavior and data
 
