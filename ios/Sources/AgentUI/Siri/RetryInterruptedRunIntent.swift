@@ -16,12 +16,6 @@ public struct RetryInterruptedRunIntent: AppIntent {
 
   public init() {}
 
-  /// For tests, which run outside the perform flow that resolves `@Dependency`.
-  init(job: JobEntity, notifications: AppNotifications) {
-    self.job = job
-    self.notifications = notifications
-  }
-
   @MainActor public func perform() async throws -> some IntentResult & ProvidesDialog {
     let retried = try await notifications.coordinators.retryInterruptedRun(job.id, title: job.title)
     return .result(dialog: "Retrying the interrupted run of \(retried.job.title).")

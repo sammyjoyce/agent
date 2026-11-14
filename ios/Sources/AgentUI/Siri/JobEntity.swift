@@ -87,11 +87,6 @@ public struct JobQuery: EnumerableEntityQuery {
 
   public init() {}
 
-  /// For tests, which run outside the perform flow that resolves `@Dependency`.
-  init(notifications: AppNotifications) {
-    self.notifications = notifications
-  }
-
   public func allEntities() async throws -> [JobEntity] {
     try await Self.allJobs(in: notifications.coordinators)
   }
