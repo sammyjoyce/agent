@@ -144,6 +144,27 @@ private func observeCount(_ fixture: FixtureCoordinator) async -> Int {
   }
 }
 
+@MainActor @Test func aCancelledTaskStillDropsItsLease() async throws {
+  try await withBackgroundedPair { coordinators, work, _, _, _ in
+    let chat = coordinators.chat
+    let entries = Entries()
+    let held = Task { @MainActor in
+      try await coordinators.withConnection(to: work) {
+        entries.count += 1
+        try await Task.sleep(for: .seconds(600))
+      }
+    }
+    try await until("the lease held") { entries.count == 1 }
+    #expect(chat.demand.leased(work))
+    held.cancel()
+    await #expect(throws: CancellationError.self) { try await held.value }
+    #expect(!chat.demand.leased(work), "The lease was dropped")
+    try await until("Work disconnected after the cancel") {
+      connection(chat, work) == .disconnected
+    }
+  }
+}
+
 @MainActor @Test func twoLeasesOnOneLaneKeepItConnectedUntilBothDrop() async throws {
   try await withBackgroundedPair { coordinators, work, _, workPeer, _ in
     let chat = coordinators.chat
