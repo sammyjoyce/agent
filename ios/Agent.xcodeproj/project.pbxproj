@@ -15,6 +15,8 @@
         D00000000000000000000003 = {isa = XCRemoteSwiftPackageReference; repositoryURL = "https://github.com/kitlangton/scrawl"; requirement = {kind = upToNextMinorVersion; minimumVersion = 0.3.14; }; };
         A00000000000000000000041 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InteractionFixture.swift; sourceTree = "<group>"; };
         A00000000000000000000042 = {isa = PBXBuildFile; fileRef = A00000000000000000000041; };
+        E00000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppShortcuts.swift; sourceTree = "<group>"; };
+        E00000000000000000000002 = {isa = PBXBuildFile; fileRef = E00000000000000000000001; };
         A00000000000000000000043 = {isa = PBXBuildFile; productRef = A00000000000000000000044; };
         A00000000000000000000044 = {isa = XCSwiftPackageProductDependency; package = A00000000000000000000006; productName = AgentUI; };
         A00000000000000000000045 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HistoryInteractionTests.swift; sourceTree = "<group>"; };
@@ -22,9 +24,9 @@
         A00000000000000000000047 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScopeInteractionTests.swift; sourceTree = "<group>"; };
         A00000000000000000000048 = {isa = PBXBuildFile; fileRef = A00000000000000000000047; };
         A00000000000000000000007 = {isa = PBXGroup; children = (A00000000000000000000008, A0000000000000000000001F, A00000000000000000000009, A00000000000000000000015, A0000000000000000000002C, B00000000000000000000006, B00000000000000000000016); sourceTree = "<group>"; };
-        A00000000000000000000008 = {isa = PBXGroup; children = (A00000000000000000000002, A00000000000000000000041, A00000000000000000000016, A00000000000000000000018, B00000000000000000000017); path = AgentApp; sourceTree = "<group>"; };
+        A00000000000000000000008 = {isa = PBXGroup; children = (A00000000000000000000002, A00000000000000000000041, E00000000000000000000001, A00000000000000000000016, A00000000000000000000018, B00000000000000000000017); path = AgentApp; sourceTree = "<group>"; };
         A00000000000000000000009 = {isa = PBXGroup; children = (A00000000000000000000003, A0000000000000000000001C, A0000000000000000000002B, B00000000000000000000003); name = Products; sourceTree = "<group>"; };
-        A0000000000000000000000A = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000001, A00000000000000000000042); runOnlyForDeploymentPostprocessing = 0; };
+        A0000000000000000000000A = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000001, A00000000000000000000042, E00000000000000000000002); runOnlyForDeploymentPostprocessing = 0; };
         A0000000000000000000000B = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000004, D00000000000000000000001); runOnlyForDeploymentPostprocessing = 0; };
         A0000000000000000000000C = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000017, A00000000000000000000019); runOnlyForDeploymentPostprocessing = 0; };
         A0000000000000000000000D = {
