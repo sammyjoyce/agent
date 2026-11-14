@@ -6,8 +6,8 @@ import Foundation
 /// Parakeet Unified English 0.6B streaming, with the int8 encoder whose window is 70 frames of
 /// left context, a 13-frame chunk and 13 frames of right context (2.08 s), on the CPU and Neural
 /// Engine. This file alone makes that decision. On an iPhone 16 Pro the spike measured a 10 to
-/// 13 s compile, a 637 MB peak, the final text 0.04 s after the audio ended at every length, and
-/// no word wrong in a 59 s clip.
+/// 13 s compile, a 637 MB peak, the final text within 0.08 s of the audio's end at every length,
+/// and one word wrong in 82 s of speech.
 enum Engine {
   /// The Hugging Face commit the on-device spike measured. FluidAudio would otherwise download
   /// `main`, which a later push could fill with files this FluidAudio cannot load.
@@ -62,7 +62,7 @@ enum Engine {
   }
 }
 
-/// The model in memory, about 610 MB on an iPhone, until `unload` lets it go. One stream at a
+/// The model in memory, about 620 MB on an iPhone, until `unload` lets it go. One stream at a
 /// time: `reset` starts the next.
 struct Recognizer: Sendable {
   private let manager: StreamingUnifiedAsrManager
