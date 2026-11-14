@@ -879,12 +879,14 @@ public struct MainChatView: View {
         }
         #if os(iOS)
           if let dictation, let summary = voiceModelSummary(dictation) {
-            Section("Dictation") {
+            Section {
               LabeledContent("Voice model", value: summary)
               if dictation.diskUsage > 0 {
                 Button("Remove voice model", role: .destructive) { dictation.removeModel() }
                   .disabled(!dictation.canRemoveModel)
               }
+            } header: {
+              Text("Dictation").foregroundStyle(Color.primary)
             }
           }
         #endif
