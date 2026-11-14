@@ -1,4 +1,5 @@
 import AgentCore
+import AppIntents
 import Foundation
 import Observation
 import UserNotifications
@@ -44,6 +45,14 @@ public final class AppNotifications: NSObject {
     }
   #endif
 
+  /// The coordinators an intent sees. Under the interaction fixture they are the fixture's.
+  var intentCoordinators: Coordinators {
+    #if DEBUG
+      if let fixtureTarget { return fixtureTarget.coordinators }
+    #endif
+    return coordinators
+  }
+
   func open(_ origin: AlertOrigin) {
     #if DEBUG
       if let fixtureTarget {
@@ -76,6 +85,7 @@ public final class AppNotifications: NSObject {
       persistence: ComposerDraftStore(
         url: URL.applicationSupportDirectory.appending(path: "Agent/Composer/draft.json")),
       sharedInbox: try? SharedDraftInbox.configured())
+    AppDependencyManager.shared.add(dependency: self)
   }
 
   init(

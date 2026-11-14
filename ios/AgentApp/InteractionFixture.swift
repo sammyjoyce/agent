@@ -99,9 +99,10 @@
       self.feedback = feedback
     }
 
-    /// The `AGENT_INTERACTION_*` values of this launch. A tap on an alert starts the app with no
-    /// environment, so a launch that names its storage and sets `AGENT_INTERACTION_ALERTS=1`
-    /// saves its values, and a launch that names no port reads them back until a cleanup launch.
+    /// The `AGENT_INTERACTION_*` values of this launch. A tap on an alert or a system-run intent
+    /// starts the app with no environment, so a launch that names its storage and sets
+    /// `AGENT_INTERACTION_ALERTS=1` or `AGENT_INTERACTION_INTENTS=1` saves its values, and a
+    /// launch that names no port reads them back until a cleanup launch.
     private static let environment: [String: String] = {
       let current = ProcessInfo.processInfo.environment
       let key = "interactionFixtureLaunch"
@@ -110,7 +111,9 @@
       }
       if current["AGENT_INTERACTION_CLEANUP"] == "1" {
         UserDefaults.standard.removeObject(forKey: key)
-      } else if current["AGENT_INTERACTION_ID"] != nil, current["AGENT_INTERACTION_ALERTS"] == "1" {
+      } else if current["AGENT_INTERACTION_ID"] != nil,
+        current["AGENT_INTERACTION_ALERTS"] == "1" || current["AGENT_INTERACTION_INTENTS"] == "1"
+      {
         UserDefaults.standard.set(
           current.filter { $0.key.hasPrefix("AGENT_INTERACTION_") }, forKey: key)
       }

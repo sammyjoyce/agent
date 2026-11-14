@@ -85,6 +85,8 @@ SWIFT
   xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
     -destination 'generic/platform=iOS Simulator' \
     -derivedDataPath "$run_dir/app" ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO build
+  python3 "$native_dir/scripts/check-intents-metadata.py" \
+    "$run_dir/app/Build/Products/Debug-iphonesimulator/Agent.app"
 fi
 if [[ "$phase" == host ]]; then
   exit 0
