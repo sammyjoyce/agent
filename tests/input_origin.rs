@@ -166,7 +166,8 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
         "cli-first": [{"tool":"exec","args":{"program":"held","args":[]},"commentary":"Checking the original CLI request before the iOS correction."}],
         "ios-steer": [{"text":"The steering correction is answered."}],
         "cli-followup": [{"text":"The next request is answered."}],
-        "legacy-ios": [{"text":"The legacy request is answered."}]
+        "legacy-ios": [{"text":"The legacy request is answered."}],
+        "siri-request": [{"text":"The Siri request is answered."}]
     }"#,
     )
     .unwrap();
@@ -237,6 +238,7 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
         panic!("Expected native main observation");
     };
     let mut observer = runtime.request(*observe).await.unwrap();
+    let mut accepted = None;
     loop {
         let event = timeout(Duration::from_secs(8), observer.events.recv())
             .await
@@ -246,10 +248,20 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
             !matches!(event, RuntimeEventKind::Failure { .. }),
             "{event:?}"
         );
-        if matches!(agent_cli::native::project(&event), Some(NativeEvent::Idle)) {
-            break;
+        match agent_cli::native::project(&event) {
+            Some(NativeEvent::Ready {
+                accepted_input_origins,
+                ..
+            }) => accepted = Some(accepted_input_origins),
+            Some(NativeEvent::Idle) => break,
+            _ => (),
         }
     }
+    assert_eq!(
+        accepted,
+        Some(Some(vec!["cli".into(), "ios".into(), "siri".into()])),
+        "The real runtime's main observation lists every origin it records"
+    );
     let listener = UnixListener::bind(directory.path().join("agent.sock")).unwrap();
     let (entered, held) = oneshot::channel();
     let owner = runtime.clone();
@@ -454,6 +466,7 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
     runtime.detach(observer.request_id).await;
     // The new decoder accepts an old native peer, and never infers iOS from text.
     native(&runtime, r#"{"type":"submit","input_id":"44444444-4444-4444-8444-444444444444","text":"legacy-ios","mode":"steer"}"#).await;
+    native(&runtime, r#"{"type":"submit","input_id":"55555555-5555-4555-8555-555555555555","text":"siri-request","mode":"steer","origin":"siri"}"#).await;
     Arc::try_unwrap(runtime)
         .ok()
         .unwrap()
@@ -465,12 +478,13 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(captures.len(), 4);
+    assert_eq!(captures.len(), 5);
     let expected = [
         vec![Some("cli")],
         vec![Some("cli"), Some("ios")],
         vec![Some("cli"), Some("ios"), Some("cli")],
         vec![Some("cli"), Some("ios"), Some("cli"), None],
+        vec![Some("cli"), Some("ios"), Some("cli"), None, Some("siri")],
     ];
     for (capture, expected) in captures.iter().zip(expected) {
         let actual = provenance(capture);
