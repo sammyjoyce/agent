@@ -110,6 +110,24 @@ final class ScriptedSpeech: Sendable {
     var grants = true
     /// Each take's words, in order. The last repeats.
     var takes = ["Invented dictated words"]
+
+    init() {}
+
+    /// Missing keys keep their defaults, so a UI test's JSON names only what it changes.
+    init(from decoder: any Decoder) throws {
+      let values = try decoder.container(keyedBy: CodingKeys.self)
+      let defaults = Self()
+      model = try values.decodeIfPresent(Model.self, forKey: .model) ?? defaults.model
+      download = try values.decodeIfPresent(Int64.self, forKey: .download) ?? defaults.download
+      progress = try values.decodeIfPresent([Double].self, forKey: .progress) ?? defaults.progress
+      stepMilliseconds =
+        try values.decodeIfPresent(Int.self, forKey: .stepMilliseconds) ?? defaults.stepMilliseconds
+      microphone =
+        try values.decodeIfPresent(MicrophonePermission.self, forKey: .microphone)
+        ?? defaults.microphone
+      grants = try values.decodeIfPresent(Bool.self, forKey: .grants) ?? defaults.grants
+      takes = try values.decodeIfPresent([String].self, forKey: .takes) ?? defaults.takes
+    }
   }
 
   private struct State {

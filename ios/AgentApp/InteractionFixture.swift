@@ -36,13 +36,15 @@
     @MainActor private struct Lifetime {
       let notifications: AppNotifications
       let defaults: UserDefaults
+      let dictation: Dictation?
 
       /// One saved coordinator per peer, in order. Two peers are saved as Work and Personal.
-      init?(peers: [Peer], storage: Storage) {
+      init?(peers: [Peer], storage: Storage, dictation: Dictation?) {
         let names = ["Work", "Personal"]
         guard peers.count <= names.count, let defaults = UserDefaults(suiteName: storage.suite)
         else { return nil }
         self.defaults = defaults
+        self.dictation = dictation
         defaults.register(defaults: ["notificationsEnabled": false])
         let root = storage.root
         let support = root.appending(path: "Support")
@@ -127,6 +129,15 @@
       return !peers.isEmpty && peers.count == ports.count ? peers : nil
     }
 
+    /// `AGENT_INTERACTION_DICTATION` is a `ScriptedSpeech.Script` as JSON, so the mic dictates
+    /// invented words without a microphone or the voice model.
+    private static var requestedDictation: Dictation? {
+      guard let json = environment["AGENT_INTERACTION_DICTATION"],
+        let script = try? JSONDecoder().decode(ScriptedSpeech.Script.self, from: Data(json.utf8))
+      else { return nil }
+      return Dictation(engine: ScriptedSpeech(script).engine)
+    }
+
     /// True when the launch asks for the fixture. Its own coordinators are then the only ones the
     /// scene phase drives, so the app delegate's never share an inbox or a registration with them.
     static var isRequested: Bool { requestedPeers != nil }
@@ -143,7 +154,10 @@
           Self(lifetime: nil, requestAlerts: requestAlerts, delegate: notifications)
         }
       }
-      guard let lifetime = Lifetime(peers: peers, storage: Storage(named ?? UUID())) else {
+      guard
+        let lifetime = Lifetime(
+          peers: peers, storage: Storage(named ?? UUID()), dictation: requestedDictation)
+      else {
         return nil
       }
       return Self(lifetime: lifetime, requestAlerts: requestAlerts, delegate: notifications)
@@ -151,9 +165,10 @@
 
     var body: some View {
       if let lifetime {
-        MainChatView(notifications: lifetime.notifications)
+        MainChatView(notifications: lifetime.notifications, dictation: lifetime.dictation)
           .defaultAppStorage(lifetime.defaults)
           .onChange(of: scenePhase, initial: true) { _, phase in
+            lifetime.dictation?.setForeground(phase != .background)
             Task { await lifetime.notifications.coordinators.setActive(phase == .active) }
           }
           .task {
