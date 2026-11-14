@@ -585,12 +585,19 @@ the keyframes, then the recording if a slot is left. A larger file is skipped.
 its original request ID until the coordinator confirms it, so a restart does
 not duplicate feedback. The coordinator deletes uploaded files after 24 hours,
 so a capture still unconfirmed a day after it was sent is refused at its next
-failed resend. A capture the coordinator rejects is refused and never resent. To see each capture's decision without sending or recording anything,
-run:
+failed resend. A capture the coordinator rejects is refused and never resent.
+
+To see what the watcher will do without sending or writing anything, run:
 
 ```sh
 beep-boop scrawl-feedback --dry-run --captures-dir /path/to/captures
 ```
+
+It prints one JSON line per capture. A capture the ledger holds shows its
+state, with the reason for a refused one. A new capture shows `deliver` with
+its destination, description and attachments, or `refused` or `incomplete`.
+Before the watcher's first start, every capture present shows `backlog`.
+Add `--state-dir` when the service uses one.
 
 ## nix-darwin service
 

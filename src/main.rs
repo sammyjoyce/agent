@@ -165,7 +165,7 @@ enum Action {
         /// Run one pass and exit.
         #[arg(long)]
         once: bool,
-        /// Print each bundle's routing decision as JSON, without network calls or ledger writes.
+        /// Print each bundle's ledger state or routing decision as JSON, without network calls or writes.
         #[arg(long)]
         dry_run: bool,
     },
@@ -543,7 +543,10 @@ async fn main() -> Result<()> {
             dry_run: true,
             ..
         } => {
-            for preview in scrawl_feedback::preview(&scrawl_captures(captures_dir)?)? {
+            for preview in scrawl_feedback::preview(
+                &scrawl_captures(captures_dir)?,
+                &state::path(arguments.state_dir.clone())?,
+            )? {
                 println!("{}", serde_json::to_string(&preview)?);
             }
             return Ok(());

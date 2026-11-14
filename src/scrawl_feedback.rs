@@ -521,6 +521,13 @@ pub struct Preview {
 #[derive(Serialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 enum PreviewDecision {
+    Backlog,
+    Submitted {
+        input_id: uuid::Uuid,
+        destination: Destination,
+        submitted_at_ms: u64,
+    },
+    Acknowledged,
     Incomplete,
     Refused {
         reason: String,
@@ -532,12 +539,52 @@ enum PreviewDecision {
     },
 }
 
-/// Decides every bundle in `captures` without a ledger or a network call.
-pub fn preview(captures: &Path) -> Result<Vec<Preview>> {
+impl From<BundleState> for PreviewDecision {
+    fn from(state: BundleState) -> Self {
+        match state {
+            BundleState::Backlog => Self::Backlog,
+            BundleState::Submitted {
+                input_id,
+                destination,
+                submitted_at_ms,
+                ..
+            } => Self::Submitted {
+                input_id,
+                destination,
+                submitted_at_ms,
+            },
+            BundleState::Acknowledged => Self::Acknowledged,
+            BundleState::Refused { reason } => Self::Refused { reason },
+        }
+    }
+}
+
+/// Reports what a watcher on `state` does with each bundle: its ledger state,
+/// or the decision for a bundle the ledger does not hold yet. It reads the
+/// ledger without the lock and makes no write or network call.
+pub fn preview(captures: &Path, state: &Path) -> Result<Vec<Preview>> {
+    let present = list_bundles(captures)?;
+    let Some(ledger) = read_ledger(&state.join(LEDGER_FILE))? else {
+        return Ok(present
+            .into_iter()
+            .map(|bundle| Preview {
+                bundle,
+                decision: PreviewDecision::Backlog,
+            })
+            .collect());
+    };
     let now = SystemTime::now();
-    Ok(list_bundles(captures)?
+    let unrecorded: Vec<BundleId> = present
         .into_iter()
-        .map(|bundle| {
+        .filter(|bundle| !ledger.contains_key(bundle))
+        .collect();
+    let mut previews: Vec<Preview> = ledger
+        .into_iter()
+        .map(|(bundle, state)| Preview {
+            bundle,
+            decision: state.into(),
+        })
+        .chain(unrecorded.into_iter().map(|bundle| {
             let decision = match read_capture(captures, &bundle, now) {
                 Reading::Incomplete => PreviewDecision::Incomplete,
                 Reading::Invalid(reason) => PreviewDecision::Refused { reason },
@@ -555,8 +602,10 @@ pub fn preview(captures: &Path) -> Result<Vec<Preview>> {
                 },
             };
             Preview { bundle, decision }
-        })
-        .collect())
+        }))
+        .collect();
+    previews.sort_by(|left, right| left.bundle.cmp(&right.bundle));
+    Ok(previews)
 }
 
 fn list_bundles(captures: &Path) -> Result<Vec<BundleId>> {
@@ -608,29 +657,18 @@ struct Ledger {
 impl Ledger {
     fn open(state: &Path, captures: &Path) -> Result<Self> {
         let path = state.join(LEDGER_FILE);
-        match fs::read(&path) {
-            Ok(bytes) => Ok(Self {
-                bundles: serde_json::from_slice(&bytes).with_context(|| {
-                    format!(
-                        "{} is not a Scrawl feedback ledger; removing it marks every capture already present as sent",
-                        path.display()
-                    )
-                })?,
-                path,
-            }),
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                let ledger = Self {
-                    bundles: list_bundles(captures)?
-                        .into_iter()
-                        .map(|bundle| (bundle, BundleState::Backlog))
-                        .collect(),
-                    path,
-                };
-                ledger.save()?;
-                Ok(ledger)
-            }
-            Err(error) => Err(error).with_context(|| format!("Could not read {}", path.display())),
+        if let Some(bundles) = read_ledger(&path)? {
+            return Ok(Self { path, bundles });
         }
+        let ledger = Self {
+            bundles: list_bundles(captures)?
+                .into_iter()
+                .map(|bundle| (bundle, BundleState::Backlog))
+                .collect(),
+            path,
+        };
+        ledger.save()?;
+        Ok(ledger)
     }
 
     fn record(&mut self, bundle: &BundleId, state: BundleState) -> Result<()> {
@@ -662,6 +700,19 @@ impl Ledger {
             .with_context(|| format!("Could not replace {}", self.path.display()))?;
         File::open(directory)?.sync_all()?;
         Ok(())
+    }
+}
+
+fn read_ledger(path: &Path) -> Result<Option<BTreeMap<BundleId, BundleState>>> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).with_context(|| {
+            format!(
+                "{} is not a Scrawl feedback ledger; removing it marks every capture already present as sent",
+                path.display()
+            )
+        }),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("Could not read {}", path.display())),
     }
 }
 
@@ -1137,7 +1188,13 @@ mod tests {
     }
 
     fn decisions(captures: &std::path::Path) -> Value {
-        preview(captures)
+        let state = tempfile::tempdir().unwrap();
+        drop(Watcher::open(tempfile::tempdir().unwrap().path(), state.path()).unwrap());
+        previews(captures, state.path())
+    }
+
+    fn previews(captures: &std::path::Path, state: &std::path::Path) -> Value {
+        preview(captures, state)
             .unwrap()
             .into_iter()
             .map(|preview| {
@@ -1346,6 +1403,53 @@ mod tests {
         fs::remove_file(bundle.join(".transcript-pending")).unwrap();
         watcher.poll(&dialer).await;
         assert_eq!(dialer.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_the_ledger_and_writes_nothing() {
+        let captures = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let unstarted = state.path().join("unstarted");
+        write(captures.path(), "old.scrawl", &manifest("", 1, None), None);
+        let unfinished = write(
+            captures.path(),
+            "unfinished.scrawl",
+            &manifest("", 1, None),
+            None,
+        );
+        fs::remove_file(unfinished.join("summary.md")).unwrap();
+
+        let first_start = previews(captures.path(), &unstarted);
+        assert_eq!(first_start["old.scrawl"]["decision"], "backlog");
+        assert_eq!(first_start["unfinished.scrawl"]["decision"], "backlog");
+        assert!(!unstarted.exists(), "A dry run creates no state directory");
+
+        let mut watcher = Watcher::open(captures.path(), state.path()).unwrap();
+        write(
+            captures.path(),
+            "no-target.scrawl",
+            &manifest("", 1, Some("iphone")),
+            Some(&json!({"app": "Other"})),
+        );
+        watcher.poll(&Unreachable(AtomicUsize::new(0))).await;
+        write(captures.path(), "new.scrawl", &manifest("", 1, None), None);
+        let ledger = fs::read(state.path().join("scrawl-feedback.json")).unwrap();
+
+        let running = previews(captures.path(), state.path());
+        assert_eq!(running["old.scrawl"]["decision"], "backlog");
+        assert_eq!(running["unfinished.scrawl"]["decision"], "backlog");
+        assert_eq!(running["no-target.scrawl"]["decision"], "refused");
+        assert_eq!(
+            running["no-target.scrawl"]["reason"],
+            "The phone recording names no Beep Boop coordinator"
+        );
+        assert_eq!(running["new.scrawl"]["decision"], "deliver");
+        assert_eq!(
+            fs::read(state.path().join("scrawl-feedback.json")).unwrap(),
+            ledger,
+            "A dry run leaves the ledger unchanged"
+        );
+        drop(watcher);
     }
 
     #[test]

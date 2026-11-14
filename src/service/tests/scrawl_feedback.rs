@@ -154,7 +154,8 @@ async fn the_coordinator_records_the_description_the_dry_run_shows() {
             "-- -h the send button\n  stays grey",
         )),
     );
-    let shown = serde_json::to_value(preview(captures.path()).unwrap().remove(0)).unwrap();
+    let shown =
+        serde_json::to_value(preview(captures.path(), state.path()).unwrap().remove(0)).unwrap();
 
     watcher.poll(&service.dialer()).await;
 
@@ -257,11 +258,13 @@ async fn unconfirmed_feedback_is_resent_identically_after_restart() {
         watcher.state("phone.scrawl"),
         Some(BundleState::Submitted { .. })
     ));
+    assert_eq!(dry_run(captures.path(), state.path()), "submitted");
     drop(watcher);
     fs::remove_file(&unconfirmed).unwrap();
 
     let mut restarted = Watcher::open(captures.path(), state.path()).unwrap();
     restarted.poll(&service.dialer()).await;
+    assert_eq!(dry_run(captures.path(), state.path()), "acknowledged");
 
     let delivered = service.delivered();
     assert_eq!(delivered.len(), 2);
@@ -272,6 +275,10 @@ async fn unconfirmed_feedback_is_resent_identically_after_restart() {
     ));
     drop(restarted);
     service.stop().await;
+}
+
+fn dry_run(captures: &Path, state: &Path) -> Value {
+    serde_json::to_value(preview(captures, state).unwrap().remove(0)).unwrap()["decision"].take()
 }
 
 fn age_submission(state: &Path, bundle: &str, by: Duration) {
