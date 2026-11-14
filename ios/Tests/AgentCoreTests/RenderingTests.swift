@@ -1172,6 +1172,7 @@
       /// The feed and composer of a model with Work and Personal saved, in a key window, with the
       /// composer's field focused.
       @MainActor private func withComposer(
+        dictation: Dictation? = nil, size: UIContentSizeCategory? = nil,
         _ body:
           @MainActor (ChatModel, ComposerField.DraftBox, CoordinatorProfile)
           async throws -> Void
@@ -1193,7 +1194,8 @@
         let appearance = defaults.object(forKey: AppAppearance.preferenceKey)
         defaults.set(AppAppearance.light.rawValue, forKey: AppAppearance.preferenceKey)
         defer { defaults.set(appearance, forKey: AppAppearance.preferenceKey) }
-        let host = UIHostingController(rootView: MainChatView(model: model))
+        let host = UIHostingController(rootView: MainChatView(model: model, dictation: dictation))
+        if let size { host.traitOverrides.preferredContentSizeCategory = size }
         let scene = try #require(
           UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let previousWindow = scene.windows.first(where: \.isKeyWindow)
@@ -1215,6 +1217,122 @@
         box.draft.becomeFirstResponder()
         try await Task.sleep(for: .milliseconds(200))
         try await body(model, box, work)
+      }
+
+      /// A dictation target over the composer's own field, as the mic builds it.
+      @MainActor private func dictationTarget(_ model: ChatModel, _ field: UITextView)
+        -> DictationTarget
+      {
+        let editor = ComposerEditor()
+        editor.view = field
+        return DictationTarget(
+          chat: model, reserve: editor.reserve, insert: editor.insert, unlock: editor.unlock)
+      }
+
+      @MainActor private func readyDictation() async throws -> Dictation {
+        let dictation = Dictation(engine: ScriptedSpeech().engine)
+        dictation.setForeground(true)
+        let deadline = ContinuousClock.now + .seconds(5)
+        while dictation.model != .ready {
+          try #require(ContinuousClock.now < deadline, "The scripted model is read")
+          try await Task.sleep(for: .milliseconds(10))
+        }
+        return dictation
+      }
+
+      @MainActor private func tapMic(_ dictation: Dictation, _ target: DictationTarget)
+        async throws
+      {
+        let open = dictation.take != nil
+        dictation.mic(.down, in: target)
+        dictation.mic(.up(onMic: true), in: target)
+        let deadline = ContinuousClock.now + .seconds(5)
+        while open ? dictation.take != nil : dictation.take?.stage != .listening(.toggled) {
+          try #require(ContinuousClock.now < deadline, "The tap took effect")
+          try await Task.sleep(for: .milliseconds(10))
+        }
+        try await Task.sleep(for: .milliseconds(100))
+      }
+
+      /// Words land where the caret was when the take started, even after the caret moved, and
+      /// one Undo takes back the dictation and nothing typed before it.
+      @MainActor @Test func dictatedWordsLandAtTheReservedCaretAsOneUndoStep() async throws {
+        let dictation = try await readyDictation()
+        try await withComposer(dictation: dictation) { model, box, _ in
+          let field = box.draft
+          field.insertText("Before after")
+          try await Task.sleep(for: .milliseconds(200))
+          field.selectedRange = NSRange(location: 7, length: 0)
+          let target = dictationTarget(model, field)
+          try await tapMic(dictation, target)
+          field.selectedRange = NSRange(location: 0, length: 0)
+          try await tapMic(dictation, target)
+          #expect(model.draft == "Before Invented dictated words after")
+          #expect(field.text == model.draft && model.committed == model.draft)
+          #expect(field.selectedRange == NSRange(location: 31, length: 0))
+          let undo = try #require(field.undoManager)
+          undo.undo()
+          try await Task.sleep(for: .milliseconds(200))
+          #expect(model.draft == "Before after", "Undo takes back only the dictation")
+        }
+      }
+
+      /// A composition the keyboard holds when the mic opens is committed then, as UIKit commits
+      /// it when a field resigns, so it is read for tags and the words land after it.
+      @MainActor @Test func theMicCommitsTheKeyboardsCompositionWhenItOpens() async throws {
+        let dictation = try await readyDictation()
+        try await withComposer(dictation: dictation) { model, box, _ in
+          let field = box.draft
+          field.insertText("Invented ")
+          field.setMarkedText("かな", selectedRange: NSRange(location: 2, length: 0))
+          try await Task.sleep(for: .milliseconds(200))
+          #expect(model.committed == "Invented " && model.draft == "Invented かな")
+          let target = dictationTarget(model, field)
+          try await tapMic(dictation, target)
+          #expect(field.markedTextRange == nil && model.committed == "Invented かな")
+          try await tapMic(dictation, target)
+          #expect(model.draft == "Invented かな Invented dictated words")
+        }
+      }
+
+      /// While a take is open no key, deletion or composition changes the field, and once its
+      /// words land the field takes typing again.
+      @MainActor @Test func theFieldTakesNoEditDuringATake() async throws {
+        let dictation = try await readyDictation()
+        try await withComposer(dictation: dictation) { model, box, _ in
+          let field = box.draft
+          field.insertText("Kept")
+          try await Task.sleep(for: .milliseconds(200))
+          let target = dictationTarget(model, field)
+          try await tapMic(dictation, target)
+          field.insertText(" typed")
+          field.deleteBackward()
+          field.setMarkedText("か", selectedRange: NSRange(location: 1, length: 0))
+          try await Task.sleep(for: .milliseconds(200))
+          #expect(field.text == "Kept" && model.draft == "Kept")
+          #expect(field.isFirstResponder, "The keyboard stays, so the composer does not move")
+          try await tapMic(dictation, target)
+          #expect(model.draft == "Kept Invented dictated words")
+          field.insertText("!")
+          try await Task.sleep(for: .milliseconds(200))
+          #expect(model.draft == "Kept Invented dictated words!")
+        }
+      }
+
+      /// At the largest text size the mic takes its own slot and the field keeps room to edit.
+      @MainActor @Test func theComposerRowFitsTheMicAtTheLargestTextSize() async throws {
+        let dictation = try await readyDictation()
+        try await withComposer(dictation: dictation, size: .accessibilityExtraExtraExtraLarge) {
+          _, box, _ in
+          let window = try #require(box.window)
+          let frame = box.convert(box.bounds, to: window)
+          #expect(frame.width >= 100, "The field keeps room to edit: \(frame)")
+          #expect(frame.minX >= 0 && frame.maxX + 88 <= window.bounds.width, "\(frame)")
+          let image = UIGraphicsImageRenderer(size: window.bounds.size).image { _ in
+            window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+          }
+          Attachment.record(try #require(image.cgImage), named: "dictation-row-AX5", as: .png)
+        }
       }
 
       /// "@Work " typed before an existing draft becomes the chip, and the caret stays at the edit,

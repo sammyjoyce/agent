@@ -341,13 +341,13 @@ func theFirstTapOffersTheDownloadWhichCompilesAndNeverOpensTheMic() async throws
     dictation.mic(.up(onMic: true), in: target)
     #expect(dictation.offering == 614_082_275)
     dictation.download()
-    #expect(dictation.offering == nil && dictation.model == .downloading(0))
+    #expect(dictation.offering == nil && dictation.model == .downloading(0, of: 614_082_275))
     var seen: [Dictation.ModelPhase] = []
     try await until("ready") {
       if seen.last != dictation.model { seen.append(dictation.model) }
       return dictation.notice == .ready
     }
-    #expect(seen.contains(.downloading(0.5)))
+    #expect(seen.contains(.downloading(0.5, of: 614_082_275)))
     #expect(dictation.model == .ready && dictation.diskUsage == 614_082_275)
     #expect(speech.engine.permission() == .granted, "Asked while downloading")
     #expect(speech.installs == 1 && speech.recordings == 0 && dictation.take == nil)
@@ -485,4 +485,17 @@ func aDictatedTagNamingNoCoordinatorKeepsTheWordsAndSaysWhy() async throws {
   #expect(DictationText.fitted("hello", between: "(", and: ")") == "hello")
   #expect(DictationText.appended("Words.", to: "") == "Words.")
   #expect(DictationText.appended("Words.", to: "Draft") == "Draft Words.")
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func completeFilesWithoutAReceiptCompileWithoutAskingToDownload() async throws {
+  var script = ScriptedSpeech.Script()
+  script.model = .missing
+  script.download = 0
+  try await withDictation(script) { dictation, speech, chat, _, _ in
+    tap(dictation, DictationTarget(chat: chat))
+    #expect(dictation.offering == nil)
+    try await until("ready") { dictation.model == .ready }
+    #expect(speech.installs == 1 && speech.recordings == 0)
+  }
 }

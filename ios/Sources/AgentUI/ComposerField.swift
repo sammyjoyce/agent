@@ -220,6 +220,29 @@
         case above(CGFloat)
       }
       let placeholder = UILabel()
+      /// True while a dictation take holds the caret. The field stays first responder, so the
+      /// keyboard does not drop the composer out from under a held mic, but no edit lands.
+      var locked = false
+      override func insertText(_ text: String) { if !locked { super.insertText(text) } }
+      override func deleteBackward() { if !locked { super.deleteBackward() } }
+      override func replace(_ range: UITextRange, withText text: String) {
+        if !locked { super.replace(range, withText: text) }
+      }
+      override func setMarkedText(_ text: String?, selectedRange: NSRange) {
+        if !locked { super.setMarkedText(text, selectedRange: selectedRange) }
+      }
+      override func setAttributedMarkedText(
+        _ text: NSAttributedString?, selectedRange: NSRange
+      ) {
+        if !locked { super.setAttributedMarkedText(text, selectedRange: selectedRange) }
+      }
+      override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        let edits: [Selector] = [
+          #selector(paste(_:)), #selector(cut(_:)), #selector(delete(_:)),
+        ]
+        return locked && edits.contains(action)
+          ? false : super.canPerformAction(action, withSender: sender)
+      }
       var chipRoom = ChipRoom.none {
         didSet {
           guard chipRoom != oldValue else { return }
@@ -325,6 +348,13 @@
             in: NSRange(location: start, length: length), with: "")
         }
         field?.edit(view.text, committed)
+      }
+      /// Covers the paths the overrides miss, such as an autocorrection or the system's own
+      /// dictation.
+      func textView(
+        _ view: UITextView, shouldChangeTextIn range: NSRange, replacementText text: String
+      ) -> Bool {
+        !((view as? DraftView)?.locked ?? false)
       }
       /// The chip moves with the first line.
       func scrollViewDidScroll(_ view: UIScrollView) { view.superview?.setNeedsLayout() }

@@ -313,7 +313,7 @@ public final class Dictation {
   enum ModelPhase: Equatable {
     case checking
     case missing(download: Int64)
-    case downloading(Double)
+    case downloading(Double, of: Int64)
     /// Compiling the model for this build of the app and OS. A take captures meanwhile, and its
     /// words land when the compile ends.
     case preparing
@@ -426,7 +426,8 @@ public final class Dictation {
       finish(.keep)
     case (.up, nil), (.activated, nil):
       switch model {
-      case .missing(let bytes): offering = bytes
+      // Complete files left without a receipt need only the compile, so nothing to agree to.
+      case .missing(let bytes): if bytes == 0 { download() } else { offering = bytes }
       case .ready, .preparing: if event == .activated { start(.toggled, in: target) }
       case .checking, .downloading, .unsupported: break
       }
@@ -437,13 +438,13 @@ public final class Dictation {
   /// After the user confirmed the download. Asks for the microphone now if it was never asked, so
   /// the first take is not spent on the system prompt. A download never opens the mic.
   func download() {
-    guard work == nil, case .missing = model else { return }
+    guard work == nil, case .missing(let bytes) = model else { return }
     offering = nil
     notice = nil
     if engine.permission() == .undetermined {
       Task { _ = await engine.requestPermission() }
     }
-    model = .downloading(0)
+    model = .downloading(0, of: bytes)
     work = Task {
       defer { work = nil }
       do {
@@ -466,8 +467,17 @@ public final class Dictation {
     if case .downloading = model { work?.cancel() }
   }
 
+  /// Removal waits for a take, a download or a compile to end.
+  var canRemoveModel: Bool {
+    guard take == nil, diskUsage > 0 else { return false }
+    switch model {
+    case .missing, .ready: return true
+    case .checking, .downloading, .preparing, .unsupported: return false
+    }
+  }
+
   func removeModel() {
-    guard work == nil, take == nil else { return }
+    guard work == nil, canRemoveModel else { return }
     work = Task {
       defer { work = nil }
       await engine.remove()
@@ -478,8 +488,8 @@ public final class Dictation {
   func dismissNotice() { notice = nil }
 
   private func progressed(_ fraction: Double) {
-    guard case .downloading = model else { return }
-    model = fraction >= 1 ? .preparing : .downloading(fraction)
+    guard case .downloading(_, let bytes) = model else { return }
+    model = fraction >= 1 ? .preparing : .downloading(fraction, of: bytes)
   }
 
   /// Reads the files once an install, prewarm or removal ends. A model still stale after its
