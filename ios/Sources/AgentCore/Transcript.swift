@@ -28,7 +28,7 @@ public struct ChatRow: Identifiable, Sendable, Equatable {
   public var noticeOrigin: NoticeOrigin?
 
   public var provenanceLabel: String? {
-    if role == .user { return inputOrigin.map { $0 == .ios ? "iOS" : "CLI" } }
+    if role == .user { return inputOrigin?.label }
     if role == .notice, let noticeOrigin { return "Job: \(noticeOrigin.title)" }
     return nil
   }
@@ -531,6 +531,16 @@ extension HistoryRole {
     switch self {
     case .assistant, .final, .commentary: true
     case .thinking, .tool, .user, .notice, .partialAnswer: false
+    }
+  }
+}
+
+extension InputOrigin {
+  var label: String {
+    switch self {
+    case .cli: "CLI"
+    case .ios: "iOS"
+    case .siri: "Siri"
     }
   }
 }
