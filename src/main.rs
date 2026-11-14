@@ -35,7 +35,7 @@ use agent_cli::{
     },
     rex::{BlockId, RexClient, SessionId},
     runtime::{FrameReader, Wire, decode_coordinator_event, lifecycle::RequestLifecycle},
-    service,
+    scrawl_feedback, service,
     tui::attachments::ComposerInput,
     tui::{Tui, TuiHandle, TuiInfo, TuiInput},
     usage,
@@ -157,6 +157,18 @@ enum Action {
     /// Bridge stdin/stdout to this machine's local coordinator.
     #[command(hide = true)]
     Rpc,
+    /// Forward finished Scrawl captures to coordinators as feedback.
+    #[command(hide = true)]
+    ScrawlFeedback {
+        #[arg(long)]
+        captures_dir: Option<PathBuf>,
+        /// Run one pass and exit.
+        #[arg(long)]
+        once: bool,
+        /// Print each bundle's routing decision as JSON, without network calls or ledger writes.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Attach the task's Rex worker to its stored conversation.
     #[command(hide = true)]
     RunTask {
@@ -526,6 +538,16 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&previews)?);
             return Ok(());
         }
+        Action::ScrawlFeedback {
+            captures_dir,
+            dry_run: true,
+            ..
+        } => {
+            for preview in scrawl_feedback::preview(&scrawl_captures(captures_dir)?)? {
+                println!("{}", serde_json::to_string(&preview)?);
+            }
+            return Ok(());
+        }
         Action::Mail { command } => {
             match command {
                 MailAction::Accounts => println!(
@@ -675,6 +697,24 @@ async fn main() -> Result<()> {
             "Worker service requires a selected remote coordinator"
         );
         return worker_service(client, interval_seconds).await;
+    }
+    if let Action::ScrawlFeedback {
+        captures_dir, once, ..
+    } = action
+    {
+        let dialer = ScrawlDialer::new(client)?;
+        let mut watcher =
+            scrawl_feedback::Watcher::open(&scrawl_captures(captures_dir)?, &directory)?;
+        if once {
+            watcher
+                .poll(&dialer)
+                .await
+                .into_iter()
+                .for_each(service_notice);
+        } else {
+            scrawl_feedback::watch(watcher, &dialer, service_notice).await;
+        }
+        return Ok(());
     }
     let command = match action {
         Action::Login => RuntimeCommand::Login,
@@ -2769,6 +2809,87 @@ async fn configure_messages(sources: &[agent_cli::sources::SourceConfig]) {
     }
 }
 
+fn scrawl_captures(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    explicit
+        .or_else(scrawl_feedback::default_captures_dir)
+        .context("Scrawl captures exist only on macOS; pass --captures-dir")
+}
+
+struct ScrawlDialer {
+    config: ClientConfig,
+    coordinator: Option<String>,
+    script: PathBuf,
+    directory: PathBuf,
+    rex: RexClient,
+    terminal: RexClient,
+    policy: agent_cli::tailnet::PeerPolicy,
+    daemon: agent_cli::tailnet::Daemon,
+}
+
+impl ScrawlDialer {
+    fn new(client: ClientContext<'_>) -> Result<Self> {
+        Ok(Self {
+            policy: agent_cli::tailnet::PeerPolicy::new(
+                &client.config.trusted_nodes,
+                &client.config.trusted_user_ids,
+            )?,
+            daemon: agent_cli::tailnet::Daemon::new(client.config.tailscale_socket.as_deref())?,
+            config: client.config.clone(),
+            coordinator: client.coordinator.map(str::to_owned),
+            script: client.script.to_owned(),
+            directory: client.directory.to_owned(),
+            rex: client.rex.clone(),
+            terminal: client.terminal.clone(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl scrawl_feedback::Dialer for ScrawlDialer {
+    async fn dial(&self, destination: &scrawl_feedback::Destination) -> Result<Wire> {
+        match destination {
+            scrawl_feedback::Destination::Configured => {
+                let client = ClientContext {
+                    config: &self.config,
+                    coordinator: self.coordinator.as_deref(),
+                    script: &self.script,
+                    directory: &self.directory,
+                    rex: &self.rex,
+                    terminal: &self.terminal,
+                };
+                connection(client, false).await
+            }
+            scrawl_feedback::Destination::Pinned { address, .. } => {
+                scrawl_feedback::dial_pinned(address, &self.policy, &self.daemon).await
+            }
+        }
+    }
+}
+
+fn scrawl_watcher(client: ClientContext<'_>) -> Option<WatchGuard> {
+    if !client.config.scrawl_feedback {
+        return None;
+    }
+    let Some(captures) = scrawl_feedback::default_captures_dir() else {
+        service_notice("scrawl_feedback is set, but Scrawl feedback runs only on macOS.");
+        return None;
+    };
+    let dialer = match ScrawlDialer::new(client) {
+        Ok(dialer) => dialer,
+        Err(error) => {
+            service_notice(format_args!("Scrawl feedback is off: {error:#}"));
+            return None;
+        }
+    };
+    let state = client.directory.to_owned();
+    Some(WatchGuard(tokio::spawn(async move {
+        match scrawl_feedback::Watcher::open(&captures, &state) {
+            Ok(watcher) => scrawl_feedback::watch(watcher, &dialer, service_notice).await,
+            Err(error) => service_notice(format_args!("Scrawl feedback is off: {error:#}")),
+        }
+    })))
+}
+
 async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> {
     let ClientContext {
         config,
@@ -2782,6 +2903,7 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
         coordinator.is_some(),
         "A worker needs a selected coordinator"
     );
+    let _scrawl = scrawl_watcher(client);
     let daemon = agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
     let executor = Arc::new(
         host::Executor::with_tailscale(directory, daemon.clone(), rex.clone())

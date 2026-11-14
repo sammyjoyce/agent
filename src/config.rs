@@ -40,6 +40,9 @@ pub struct ClientConfig {
     pub sources: Vec<SourceConfig>,
     #[serde(default = "default_poll_interval")]
     pub poll_interval_seconds: u64,
+    /// Local only: forwards this Mac's finished Scrawl captures as feedback.
+    #[serde(default)]
+    pub scrawl_feedback: bool,
 }
 
 impl Default for ClientConfig {
@@ -60,6 +63,7 @@ impl Default for ClientConfig {
             apns: None,
             sources: Vec::new(),
             poll_interval_seconds: default_poll_interval(),
+            scrawl_feedback: false,
         }
     }
 }
@@ -653,6 +657,20 @@ mod tests {
         }
         std::fs::write(&path, "").unwrap();
         assert!(load(Some(&path)).unwrap().trusted_user_ids.is_empty());
+    }
+
+    #[test]
+    fn scrawl_feedback_is_an_opt_in_setting_that_managed_preferences_cannot_set() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        assert!(!load(Some(&path)).unwrap().scrawl_feedback);
+        std::fs::write(&path, "scrawl_feedback = true\n").unwrap();
+        assert!(load(Some(&path)).unwrap().scrawl_feedback);
+        let settings = directory.path().join("managed.toml");
+        std::fs::write(&settings, "scrawl_feedback = false\n").unwrap();
+        assert!(crate::config::apply(&path, &settings).is_err());
+        assert!(load(Some(&path)).unwrap().scrawl_feedback);
     }
 
     #[test]

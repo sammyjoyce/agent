@@ -143,7 +143,7 @@ struct UserProfile {
     id: NonZeroU64,
 }
 
-fn tailnet_v4(address: IpAddr) -> Result<Ipv4Addr> {
+pub(crate) fn tailnet_v4(address: IpAddr) -> Result<Ipv4Addr> {
     let IpAddr::V4(address) = address else {
         anyhow::bail!("A Tailscale IPv4 address is required");
     };

@@ -114,7 +114,7 @@ pub async fn exchange_chunk<R: tokio::io::AsyncBufRead + Unpin>(
 }
 
 /// The caller owns its authenticated transfer connection for the entire file.
-pub async fn upload_file<F, Fut>(path: &Path, mut transfer: F) -> Result<AttachmentRef>
+pub async fn upload_file<F, Fut>(path: &Path, transfer: F) -> Result<AttachmentRef>
 where
     F: FnMut(AttachmentRequest) -> Fut + Send,
     Fut: std::future::Future<Output = Result<AttachmentResponse>> + Send,
@@ -131,22 +131,35 @@ where
     file.take(u64::from(MAX_ATTACHMENT_BYTES) + 1)
         .read_to_end(&mut bytes)
         .await?;
-    ensure!(
-        bytes.len() <= MAX_ATTACHMENT_BYTES as usize,
-        "Attachments must be at most 16 MiB"
-    );
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .context("Attachment needs a UTF-8 filename")?
         .to_owned();
-    let media_type = media_type(path, &bytes).to_owned();
+    upload_bytes(name, &bytes, transfer).await
+}
+
+/// Uploads content that has no file of its own under `name`.
+pub async fn upload_bytes<F, Fut>(
+    name: String,
+    bytes: &[u8],
+    mut transfer: F,
+) -> Result<AttachmentRef>
+where
+    F: FnMut(AttachmentRequest) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<AttachmentResponse>> + Send,
+{
+    ensure!(
+        bytes.len() <= MAX_ATTACHMENT_BYTES as usize,
+        "Attachments must be at most 16 MiB"
+    );
+    let media_type = media_type(Path::new(&name), bytes).to_owned();
     ensure!(
         name.len() <= MAX_ATTACHMENT_NAME_BYTES,
         "Attachment filename must be at most {MAX_ATTACHMENT_NAME_BYTES} UTF-8 bytes"
     );
     use sha2::{Digest, Sha256};
-    let sha256 = hex::encode(Sha256::digest(&bytes));
+    let sha256 = hex::encode(Sha256::digest(bytes));
     let id = uuid::Uuid::new_v4().to_string();
     let size_bytes = u32::try_from(bytes.len())?;
     let mut offset = 0;
