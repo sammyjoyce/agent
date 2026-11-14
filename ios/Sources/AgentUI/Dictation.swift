@@ -440,11 +440,7 @@ public final class Dictation {
   /// take still transcribing keeps them too, so leaving the app never sends.
   public func setForeground(_ foreground: Bool) {
     guard foreground else {
-      switch take?.stage {
-      case .opening?, .listening?: finish(.keep)
-      case .transcribing(.send)?: take?.stage = .transcribing(.keep)
-      case .transcribing(.keep)?, nil: break
-      }
+      keep()
       return
     }
     guard work == nil, take == nil else { return }
@@ -623,7 +619,7 @@ public final class Dictation {
       switch event {
       case .level(let loudness): level = loudness
       case .partial(let words): self.take?.provisional = words
-      case .interrupted: finish(.keep, notice: .interrupted)
+      case .interrupted: keep(notice: .interrupted)
       }
     }
   }
@@ -633,6 +629,19 @@ public final class Dictation {
     case .opening(.pressing)?: take?.stage = .opening(next)
     case .listening(.pressing)?: take?.stage = .listening(next)
     default: break
+    }
+  }
+
+  /// Leaving the app or an interruption keeps the words at any stage, a held take already
+  /// transcribing included, so neither ever sends. Capture runs on briefly after a release, so an
+  /// interruption can still arrive then.
+  private func keep(notice: DictationNotice? = nil) {
+    switch take?.stage {
+    case .opening?, .listening?: finish(.keep, notice: notice)
+    case .transcribing(.send)?:
+      take?.stage = .transcribing(.keep)
+      if let notice { self.notice = notice }
+    case .transcribing(.keep)?, nil: break
     }
   }
 
