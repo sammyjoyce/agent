@@ -132,6 +132,8 @@ func sendBlockerNamesWhySendIsDisabledAndTheMicWaitsForABusyDraft() async throws
   }
 }
 
+private func size(_ bytes: Int64) -> String { bytes.formatted(.byteCount(style: .file)) }
+
 @MainActor private func tap(_ dictation: Dictation, _ target: DictationTarget) {
   dictation.mic(.down, in: target)
   dictation.mic(.up(onMic: true), in: target)
@@ -339,7 +341,9 @@ func theFirstTapOffersTheDownloadWhichCompilesAndNeverOpensTheMic() async throws
     try await Task.sleep(for: .milliseconds(50))
     #expect(dictation.take == nil && dictation.offering == nil, "Only a release offers it")
     dictation.mic(.up(onMic: true), in: target)
-    #expect(dictation.offering == 614_082_275)
+    try await until("the offer") { dictation.offering != nil }
+    #expect(dictation.offering == Dictation.Offer(bytes: 614_082_275, cellular: false))
+    #expect(dictation.offering?.question == "Download the voice model (\(size(614_082_275)))?")
     dictation.download()
     #expect(dictation.offering == nil && dictation.model == .downloading(0, of: 614_082_275))
     var seen: [Dictation.ModelPhase] = []
@@ -361,12 +365,33 @@ func aCancelledDownloadOffersItAgain() async throws {
   script.stepMilliseconds = 500
   try await withDictation(script) { dictation, speech, chat, _, _ in
     tap(dictation, DictationTarget(chat: chat))
+    try await until("the offer") { dictation.offering != nil }
     dictation.download()
     dictation.cancelDownload()
     try await until("missing again") { dictation.model == .missing(download: 614_082_275) }
     #expect(dictation.notice == nil && speech.recordings == 0)
     tap(dictation, DictationTarget(chat: chat))
-    #expect(dictation.offering == 614_082_275)
+    try await until("the offer again") { dictation.offering != nil }
+    #expect(dictation.offering == Dictation.Offer(bytes: 614_082_275, cellular: false))
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func onCellularTheOfferSaysSoAndNotNowDownloadsNothing() async throws {
+  var script = ScriptedSpeech.Script()
+  script.model = .missing
+  script.cellular = true
+  try await withDictation(script) { dictation, speech, chat, _, _ in
+    tap(dictation, DictationTarget(chat: chat))
+    try await until("the offer") { dictation.offering != nil }
+    #expect(dictation.offering == Dictation.Offer(bytes: 614_082_275, cellular: true))
+    #expect(
+      dictation.offering?.question
+        == "This iPhone is on cellular. Download the voice model (\(size(614_082_275)))?")
+    dictation.offering = nil
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(speech.installs == 0 && dictation.model == .missing(download: 614_082_275))
+    #expect(dictation.offering == nil, "Not now stays declined until the next tap")
   }
 }
 

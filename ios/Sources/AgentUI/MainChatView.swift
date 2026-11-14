@@ -771,13 +771,13 @@ public struct MainChatView: View {
     .accessibilityIdentifier("messageComposer")
     #if os(iOS)
       .confirmationDialog(
-        "Download the voice model (\(DictationStatus.size(dictation?.offering ?? 0)))?",
+        dictation?.offering?.question ?? "",
         isPresented: Binding(
           get: { dictation?.offering != nil }, set: { if !$0 { dictation?.offering = nil } }),
         titleVisibility: .visible
       ) {
         Button("Download") { dictation?.download() }
-        Button("Cancel", role: .cancel) {}
+        Button(dictation?.offering?.cellular == true ? "Not now" : "Cancel", role: .cancel) {}
       } message: {
         Text("What you say never leaves this iPhone.")
       }

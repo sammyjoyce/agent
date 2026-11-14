@@ -60,6 +60,8 @@ public struct SpeechEngine: Sendable {
   let remove: @Sendable () async -> Void
   /// Bytes the model's files take on this phone, partial downloads included.
   let diskUsage: @Sendable () async -> Int64
+  /// Reads the network path once. True on cellular or another path the system calls expensive.
+  let onCellular: @Sendable () async -> Bool
   let permission: @Sendable () -> MicrophonePermission
   /// Shows the system prompt if it was never answered. True when allowed.
   let requestPermission: @Sendable () async -> Bool
@@ -75,6 +77,7 @@ public struct SpeechEngine: Sendable {
     prewarm: @escaping @Sendable () async -> Void,
     remove: @escaping @Sendable () async -> Void,
     diskUsage: @escaping @Sendable () async -> Int64,
+    onCellular: @escaping @Sendable () async -> Bool,
     permission: @escaping @Sendable () -> MicrophonePermission,
     requestPermission: @escaping @Sendable () async -> Bool,
     record: @escaping @Sendable () async throws -> Recording
@@ -84,6 +87,7 @@ public struct SpeechEngine: Sendable {
     self.prewarm = prewarm
     self.remove = remove
     self.diskUsage = diskUsage
+    self.onCellular = onCellular
     self.permission = permission
     self.requestPermission = requestPermission
     self.record = record
@@ -105,6 +109,7 @@ final class ScriptedSpeech: Sendable {
     /// Fractions an install reports, one every `stepMilliseconds`.
     var progress: [Double] = [0.25, 0.5, 0.75, 1]
     var stepMilliseconds = 20
+    var cellular = false
     var microphone = MicrophonePermission.granted
     /// What the system prompt answers.
     var grants = true
@@ -122,6 +127,7 @@ final class ScriptedSpeech: Sendable {
       progress = try values.decodeIfPresent([Double].self, forKey: .progress) ?? defaults.progress
       stepMilliseconds =
         try values.decodeIfPresent(Int.self, forKey: .stepMilliseconds) ?? defaults.stepMilliseconds
+      cellular = try values.decodeIfPresent(Bool.self, forKey: .cellular) ?? defaults.cellular
       microphone =
         try values.decodeIfPresent(MicrophonePermission.self, forKey: .microphone)
         ?? defaults.microphone
@@ -200,6 +206,7 @@ final class ScriptedSpeech: Sendable {
       diskUsage: { [self] in
         state.withLock { $0.script.model == .missing ? 0 : $0.script.download }
       },
+      onCellular: { [self] in state.withLock { $0.script.cellular } },
       permission: { [self] in state.withLock { $0.script.microphone } },
       requestPermission: { [self] in
         state.withLock {
@@ -352,6 +359,20 @@ public final class Dictation {
     case send
   }
 
+  /// The download the confirmation offers while it is shown.
+  struct Offer: Equatable {
+    let bytes: Int64
+    /// On cellular, or another expensive path, when offered.
+    let cellular: Bool
+
+    var question: String {
+      let size = bytes.formatted(.byteCount(style: .file))
+      return cellular
+        ? "This iPhone is on cellular. Download the voice model (\(size))?"
+        : "Download the voice model (\(size))?"
+    }
+  }
+
   enum Stage: Equatable {
     case opening(Gesture)
     case listening(Gesture)
@@ -385,8 +406,7 @@ public final class Dictation {
   private(set) var level: Float = 0
   private(set) var notice: DictationNotice?
   private(set) var diskUsage: Int64 = 0
-  /// The download size the confirmation offers while it is shown.
-  var offering: Int64?
+  var offering: Offer?
 
   @ObservationIgnored private let engine: SpeechEngine
   @ObservationIgnored private let holdDelay: Duration
@@ -438,11 +458,22 @@ public final class Dictation {
     case (.up, nil), (.activated, nil):
       switch model {
       // Complete files left without a receipt need only the compile, so nothing to agree to.
-      case .missing(let bytes): if bytes == 0 { download() } else { offering = bytes }
+      case .missing(let bytes): if bytes == 0 { download() } else { offer(bytes) }
       case .ready, .preparing: if event == .activated { start(.toggled, in: target) }
       case .checking, .downloading, .unsupported: break
       }
     default: break
+    }
+  }
+
+  /// Reads the network path once, when the offer is made. Wi-Fi coming back starts nothing.
+  private func offer(_ bytes: Int64) {
+    guard work == nil else { return }
+    work = Task {
+      defer { work = nil }
+      let cellular = await engine.onCellular()
+      guard model == .missing(download: bytes) else { return }
+      offering = Offer(bytes: bytes, cellular: cellular)
     }
   }
 

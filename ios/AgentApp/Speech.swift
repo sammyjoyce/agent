@@ -1,5 +1,7 @@
 import AgentUI
+import Network
 import ParakeetSpeech
+import os
 
 extension SpeechEngine {
   /// Parakeet on this iPhone. One per process, as there is one microphone and one model.
@@ -11,6 +13,7 @@ extension SpeechEngine {
       prewarm: { await parakeet.prewarm() },
       remove: { await parakeet.remove() },
       diskUsage: { await parakeet.diskUsage() },
+      onCellular: onCellular,
       permission: { MicrophonePermission(Microphone.permission) },
       requestPermission: { await Microphone.requestPermission() },
       record: {
@@ -27,6 +30,21 @@ extension SpeechEngine {
           events: events, finish: { try await take.finish() }, cancel: { take.cancel() })
       })
   }()
+}
+
+/// The first path a fresh monitor reports, which is the current one.
+private func onCellular() async -> Bool {
+  await withCheckedContinuation { reply in
+    let pending = OSAllocatedUnfairLock<CheckedContinuation<Bool, Never>?>(initialState: reply)
+    let monitor = NWPathMonitor()
+    monitor.pathUpdateHandler = { path in
+      guard let reply = pending.withLock({ $0.take() }) else { return }
+      monitor.cancel()
+      monitor.pathUpdateHandler = nil
+      reply.resume(returning: path.isExpensive || path.usesInterfaceType(.cellular))
+    }
+    monitor.start(queue: .global(qos: .userInitiated))
+  }
 }
 
 extension SpeechModel {
