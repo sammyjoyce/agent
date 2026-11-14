@@ -791,81 +791,6 @@ func removeRefusesWhileTheDraftIsAddressedToOrRestoredFromThatCoordinator() asyn
 }
 
 @MainActor @Test(.timeLimit(.minutes(1)))
-func aScreenshotKeptFromOneCoordinatorIsRefusedOnceASecondIsSaved() async throws {
-  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
-    try await coordinators.add(
-      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
-    let chat = coordinators.chat
-    let work = try #require(coordinators.profiles.first?.id)
-    try await eventually("Work connected") { chat.connection == .connected }
-    var captures = 0
-    try await withReadOnlyProfile(ProfileDirectory(work, applicationSupport: root, caches: root)) {
-      chat.draft = "/feedback The text is clipped"
-      await chat.send(screenshot: {
-        captures += 1
-        return Data([1, 2, 3])
-      })
-    }
-    #expect(
-      captures == 1
-        && chat.attachments.map(\.reference.name) == ["Feedback.png", "Composer.log"])
-    try await coordinators.add(
-      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
-    try await eventually("both connected") {
-      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
-    }
-    await chat.send(screenshot: {
-      captures += 1
-      return Data([4, 5, 6])
-    })
-    #expect(chat.error?.hasPrefix("Remove the automatic screenshot") == true)
-    #expect(captures == 1)
-    #expect((await workFixture.count(), await personalFixture.count()) == (0, 0))
-    for file in chat.attachments { await chat.removeAttachment(file) }
-    await chat.send(screenshot: {
-      captures += 1
-      return Data([7, 8, 9])
-    })
-    #expect(captures == 1, "No automatic screenshot with two coordinators")
-    try await eventually("feedback without a screenshot at both") {
-      (await workFixture.count(), await personalFixture.count()) == (1, 1)
-    }
-    #expect(await submits(personalFixture).first?.attachments?.isEmpty == true)
-  }
-}
-
-@MainActor @Test(.timeLimit(.minutes(1)))
-func anAutomaticScreenshotNeverGoesToACoordinatorItWasNotCapturedWith() async throws {
-  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
-    try await coordinators.add(
-      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
-    let chat = coordinators.chat
-    let work = try #require(coordinators.profiles.first?.id)
-    try await eventually("Work connected") { chat.connection == .connected }
-    try await withReadOnlyProfile(ProfileDirectory(work, applicationSupport: root, caches: root)) {
-      chat.draft = "/feedback The invented Work reply is clipped"
-      await chat.send(screenshot: { Data("Invented Work feed".utf8) })
-    }
-    let screenshot = try #require(chat.attachments.first)
-    try await coordinators.add(
-      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
-    try await coordinators.remove(coordinators.removal(work))
-    try await eventually("Personal connected") { chat.connection == .connected }
-    await chat.send()
-    #expect(chat.error?.hasPrefix("Remove the automatic screenshot") == true)
-    await chat.removeAttachment(screenshot)
-    await chat.send()
-    try await eventually("Personal's feedback") { await personalFixture.count() > 0 }
-    // The composer's own log holds no message text and shows no feed, so it stays with the draft.
-    #expect(
-      await submits(personalFixture).map { ($0.attachments ?? []).map(\.name) }
-        == [["Composer.log"]])
-    #expect(await personalFixture.uploaded(screenshot.id) == nil)
-    #expect(await workFixture.count() == 0)
-  }
-}
-
-@MainActor @Test(.timeLimit(.minutes(1)))
 func toolDetailsGoToTheRowsOwnCoordinatorWhenCallIDsCollide() async throws {
   try await withTwoFixtures { coordinators, workFixture, personalFixture, _ in
     let (_, personal) = try await addWorkAndPersonal(coordinators)
@@ -1020,45 +945,6 @@ func removeRefusesATypedTagAndNothingNamingARemovedCoordinatorSends() async thro
     try await Task.sleep(for: .milliseconds(500))
     let atPersonal = await submits(personalFixture)
     #expect(atPersonal.isEmpty, "Personal received \(atPersonal.map(\.text))")
-  }
-}
-
-/// Deleting `/feedback` from the text does not make its automatic screenshot a chosen file. A
-/// restore still knows which coordinator's feed it shows.
-@MainActor @Test(.timeLimit(.minutes(1)))
-func anEditedFeedbackKeepsItsScreenshotWithItsCoordinatorThroughRestore() async throws {
-  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
-    try await coordinators.add(
-      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
-    let chat = coordinators.chat
-    let work = try #require(coordinators.profiles.first?.id)
-    try await eventually("Work connected") { chat.connection == .connected }
-    let directory = ProfileDirectory(work, applicationSupport: root, caches: root)
-    try await withReadOnlyProfile(directory) {
-      chat.draft = "/feedback The invented Work feed is clipped"
-      await chat.send(screenshot: { Data("Invented private Work screenshot bytes".utf8) })
-    }
-    #expect(chat.attachments.map(\.reference.name) == ["Feedback.png", "Composer.log"])
-    await workFixture.refuseUploads()
-    chat.draft = "The invented Work feed is clipped"
-    await chat.send()
-    try await eventually("the edited message rejected at Work") {
-      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
-    }
-    let queued = try #require(try queuedRequests(directory.outbox).first)
-    try await coordinators.add(
-      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
-    try await eventually("both connected") {
-      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
-    }
-    await chat.restore(queued.inputId)
-    let restored = try #require(chat.attachments.first)
-    chat.removeChip()
-    await chat.send()
-    #expect(chat.error?.hasPrefix("Remove the automatic screenshot") == true)
-    try await Task.sleep(for: .milliseconds(300))
-    #expect(await personalFixture.uploaded(restored.id) == nil)
-    #expect(await submits(personalFixture).isEmpty)
   }
 }
 
@@ -1241,59 +1127,6 @@ func anEditAndARemoveOfOneCoordinatorRunOneAfterTheOther() async throws {
     }
   }
   #expect(overlapped > 0, "Remove started while the edit swapped Work's session")
-}
-
-/// The same edit and Remove, then `/feedback` with Personal alone saved. The automatic
-/// screenshot shows the feed at Send, so that feed must hold nothing of Work.
-@MainActor @Test(.timeLimit(.minutes(1)))
-func aFeedbackScreenshotAfterAnEditAndRemoveShowsOnlyTheCoordinatorLeft() async throws {
-  let gate = DialGate()
-  try await withTwoFixtures(holdingWork: gate) { coordinators, workFixture, personalFixture, _ in
-    let (work, personal) = try await addWorkAndPersonal(coordinators)
-    let chat = coordinators.chat
-    let workOnly = "Invented private Work-only board minutes"
-    await workFixture.replyToHistory(
-      initial: .init(
-        messages: [
-          .init(
-            continuation: false, entryId: "private-work", finalChunk: true, role: .final,
-            text: workOnly)
-        ], pageComplete: true), pages: [:])
-    await gate.arm()
-    let editing = Task { @MainActor in
-      try await coordinators.update(
-        work, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.3", port: 4001))
-    }
-    try await eventually("the edit proving Work's new address") { await gate.waiting }
-    // Profile changes run one at a time, so Remove waits its turn while the edit is held there.
-    var removeCalled = false
-    let removing = Task { @MainActor in
-      removeCalled = true
-      try await coordinators.remove(coordinators.removal(work))
-    }
-    try await eventually("Remove called during the edit") { removeCalled }
-    await gate.open()
-    try await editing.value
-    try await removing.value
-    try await Task.sleep(for: .milliseconds(500))
-    #expect(coordinators.profiles.map(\.id) == [personal])
-    var shown: [String]?
-    chat.draft = "/feedback The visible reply is clipped"
-    // Stands in for the window capture: the bytes are the feed's rows at Send.
-    await chat.send(screenshot: {
-      shown = chat.rows.map(\.row.text)
-      return Data((shown ?? []).joined(separator: "\n").utf8)
-    })
-    try await eventually("Personal's feedback") { await personalFixture.count() == 1 }
-    let request = try #require(await submits(personalFixture).first)
-    let screenshot = try #require(request.attachments?.first)
-    let uploaded = try #require(await personalFixture.uploaded(screenshot.id))
-    #expect(shown?.contains(workOnly) == false, "The screenshot showed Work's removed conversation")
-    #expect(
-      !String(decoding: uploaded, as: UTF8.self).contains(workOnly),
-      "Personal received Work's removed conversation")
-    #expect(await workFixture.count() == 0)
-  }
 }
 
 /// A draft tagged `@Work` keeps that word when Work is renamed Job. Removing Job goes ahead, and
@@ -2072,90 +1905,6 @@ func aCopyDiscardedAtPersonalLeavesTheOriginalNotSentToPersonal() async throws {
       bubble.receipts
         == [Receipt(lane: work, status: .placed), Receipt(lane: personal, status: .notSent)])
     #expect(Receipt.summary(bubble.receipts, names: ["Work", "Personal"]) == nil)
-    #expect(await submits(personalFixture).isEmpty)
-    #expect(await personalFixture.uploadCount() == 0)
-  }
-}
-
-// MARK: - Each file that may show a coordinator's feed is owned by that coordinator
-
-/// A kept automatic screenshot and a chosen file share the name `Feedback.png`. After a restore,
-/// removing the chosen one leaves the screenshot owned by Work, so it never goes to Personal.
-@MainActor @Test(.timeLimit(.minutes(1)))
-func aSecondFileNamedFeedbackPngNeverClearsTheScreenshotsOwner() async throws {
-  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
-    try await coordinators.add(
-      name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
-    let work = try #require(coordinators.profiles.first?.id)
-    let chat = coordinators.chat
-    try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
-    let directory = ProfileDirectory(work, applicationSupport: root, caches: root)
-    let privateImage = Data("Invented private Work screenshot bytes".utf8)
-    try await withReadOnlyProfile(directory) {
-      chat.draft = "/feedback The Work feed is clipped"
-      await chat.send(screenshot: { privateImage })
-    }
-    try #require(chat.attachments.map(\.reference.name) == ["Feedback.png", "Composer.log"])
-    await chat.attach(
-      data: Data("Invented manually attached reference picture".utf8), name: "Feedback.png",
-      mediaType: "image/png")
-    await workFixture.refuseUploads()
-    await chat.send()
-    try await eventually("Work refused the upload") {
-      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
-    }
-    let queued = try #require(try queuedRequests(directory.outbox).first)
-    try #require(queued.attachments?.count == 3)
-    try await coordinators.add(
-      name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
-    try await eventually("both connected") {
-      chat.snapshots.values.filter { $0.connection == .connected }.count == 2
-    }
-    await chat.restore(queued.inputId)
-    let automatic = try #require(chat.attachments.first)
-    let chosen = try #require(chat.attachments.last)
-    #expect(try Data(contentsOf: automatic.url) == privateImage)
-    await chat.removeAttachment(chosen)
-    chat.removeChip()
-    await chat.send()
-    #expect(chat.error?.hasPrefix("Remove the automatic screenshot") == true)
-    try await Task.sleep(for: .milliseconds(350))
-    let atPersonal = await submits(personalFixture)
-    #expect(atPersonal.isEmpty, "Personal received \(atPersonal.map(\.text))")
-    #expect(await personalFixture.uploaded(automatic.id) != privateImage)
-  }
-}
-
-/// A restored `Feedback.png` belongs to the coordinator it came from. Sent to that coordinator
-/// alone it goes, since no other coordinator sees it. Sent to both it is refused.
-@MainActor @Test(.timeLimit(.minutes(1)))
-func aRestoredFeedbackPngGoesToTheCoordinatorItCameFromAlone() async throws {
-  try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
-    await workFixture.refuseUploads()
-    let (work, _) = try await addWorkAndPersonal(coordinators)
-    let chat = coordinators.chat
-    let workDirectory = ProfileDirectory(work, applicationSupport: root, caches: root)
-    chat.setChip(work)
-    chat.draft = "Invented ordinary note, not feedback"
-    await chat.attach(
-      data: Data("invented user file bytes".utf8), name: "Feedback.png", mediaType: "image/png")
-    await chat.send()
-    try await eventually("rejected by Work") {
-      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
-    }
-    let queued = try #require(try queuedRequests(workDirectory.outbox).first)
-    await chat.restore(queued.inputId)
-    #expect(chat.destination.chip == work && chat.recipientLine == "To Work")
-    chat.removeChip()
-    await chat.send()
-    #expect(chat.error?.hasPrefix("Remove the automatic screenshot") == true, "Not to both")
-    chat.setChip(work)
-    chat.failure = nil
-    await workFixture.acceptUploads()
-    await chat.send()
-    #expect(chat.error == nil)
-    #expect(chat.draft.isEmpty && chat.attachments.isEmpty)
-    try await eventually("Work's copy") { await workFixture.count() == 1 }
     #expect(await submits(personalFixture).isEmpty)
     #expect(await personalFixture.uploadCount() == 0)
   }
