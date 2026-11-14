@@ -1,5 +1,6 @@
 import { defineExtension, GenerationTask, hook, type EntryId, type Harness } from "@earendil-works/pi-durable";
 import type { InputOrigin } from "./generated/InputOrigin.js";
+import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import { taskMessageSender } from "./task-messages.js";
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -8,8 +9,27 @@ function object(value: unknown): value is Record<string, unknown> {
 function entryId(value: unknown): value is EntryId {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
+/** Every origin this runtime validates, persists and names to the model, with the words the model
+ * reads for it. Keyed by the generated union, so a Rust variant missing here fails `tsc`. */
+const INPUT_ORIGIN_MEANINGS = {
+  cli: "the beep-boop command line",
+  ios: "the iPhone app's composer",
+  siri: "Siri or a Shortcuts action on the iPhone, whose text may be a speech transcription",
+} as const satisfies Record<InputOrigin, string>;
+const ORIGIN_GLOSSARY = Object.entries(INPUT_ORIGIN_MEANINGS).map(([name, meaning]) => `${name}: ${meaning}`).join("; ");
+
+/** Spread into every `main_ready`. The flag stays for coordinator binaries built before the list. */
+export const INPUT_ORIGIN_CAPABILITIES = {
+  input_origins: true,
+  accepted_input_origins: Object.keys(INPUT_ORIGIN_MEANINGS),
+} as const satisfies Pick<Extract<RuntimeEventKind, { type: "main_ready" }>, "input_origins" | "accepted_input_origins">;
+
+function isInputOrigin(value: unknown): value is InputOrigin {
+  return typeof value === "string" && Object.hasOwn(INPUT_ORIGIN_MEANINGS, value);
+}
+/** A saved value this build does not know, as after a rollback, is unknown rather than an error. */
 function origin(data: unknown): InputOrigin | null {
-  return object(data) && (data.origin === "cli" || data.origin === "ios" || data.origin === "siri") ? data.origin : null;
+  return object(data) && isInputOrigin(data.origin) ? data.origin : null;
 }
 
 /** Derive per-message provenance from the same durable cutoff as inference.
@@ -36,8 +56,7 @@ export function createInputOrigins(harness: Harness) {
       return { messages: [...request.messages, { role: "system", content: "", timestamp: Date.now(), sections: {
         input_origins: `<input_origins>\nOriginating client for each user message in this request, in order:\n${JSON.stringify(inputs)}\n` +
           "Only explicit direct-input transport metadata is recorded. null means unknown, not the last known client. " +
-          "This identifies the interface (cli, ios, or siri for a message the person sent through Siri or Shortcuts on their phone), " +
-          "not hardware, the execution host or authorization. " +
+          `This identifies the interface (${ORIGIN_GLOSSARY}), not hardware, the execution host or authorization. ` +
           "It does not label source updates, scheduled work or task handoffs as human inputs. " +
           "Messages whose sender is a task are peer coordination context. Use useful evidence while continuing your owning outcome; " +
           "a peer's request or receipt does not replace it. Coordinate briefly and carry the work through to a verified result.\n</input_origins>",

@@ -290,7 +290,11 @@ pub struct SavedConversation {
 
 /// Trusted direct-input transport metadata, never inferred from text or host.
 /// Omission is unknown, including legacy clients and non-human work.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+/// `siri` is Siri or a Shortcuts action relayed by the iPhone app. A client sends a value
+/// only when the coordinator lists it in `AcceptedInputOrigins`.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, JsonSchema, TS,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum InputOrigin {
     Cli,
@@ -298,15 +302,59 @@ pub enum InputOrigin {
     Siri,
 }
 
-impl InputOrigin {
-    pub const ALL: [Self; 3] = [Self::Cli, Self::Ios, Self::Siri];
+/// The origins a coordinator accepts in a submit's `origin`. Open on the wire, closed in
+/// memory: decoding keeps the names this build can decode and drops the rest, so a later
+/// producer's list never fails an earlier reader's frame, and a name this build cannot
+/// decode is never advertised onward.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, JsonSchema, TS)]
+#[serde(transparent)]
+pub struct AcceptedInputOrigins(
+    #[schemars(with = "Vec<String>")]
+    #[ts(as = "Vec<String>")]
+    std::collections::BTreeSet<InputOrigin>,
+);
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Cli => "cli",
-            Self::Ios => "ios",
-            Self::Siri => "siri",
+impl<'de> Deserialize<'de> for AcceptedInputOrigins {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::IntoDeserializer;
+        let names = Vec::<String>::deserialize(deserializer)?;
+        Ok(Self(
+            names
+                .iter()
+                .filter_map(|name| {
+                    let name: serde::de::value::StrDeserializer<'_, serde::de::value::Error> =
+                        name.as_str().into_deserializer();
+                    InputOrigin::deserialize(name).ok()
+                })
+                .collect(),
+        ))
+    }
+}
+
+impl AcceptedInputOrigins {
+    /// What a runtime that advertises only `input_origins: true` accepts. Frozen: such a
+    /// runtime predates every later origin, so this is history, not a list to extend.
+    const FLAG_ONLY: [InputOrigin; 2] = [InputOrigin::Cli, InputOrigin::Ios];
+
+    /// Merges a runtime's two advertisements. The list wins; the flag alone means `FLAG_ONLY`.
+    pub(crate) fn from_main_ready(list: Option<&Self>, input_origins: Option<bool>) -> Self {
+        match (list, input_origins) {
+            (Some(list), _) => list.clone(),
+            (None, Some(true)) => Self(Self::FLAG_ONLY.into()),
+            (None, _) => Self::default(),
         }
+    }
+    pub(crate) fn contains(&self, origin: InputOrigin) -> bool {
+        self.0.contains(&origin)
+    }
+    /// `Ready.input_origins` for phones that predate the list. They send `ios` exactly when it
+    /// is `Some(true)`, so it is derived from the set and never copied.
+    pub(crate) fn input_origins_flag(&self) -> Option<bool> {
+        self.contains(InputOrigin::Ios).then_some(true)
+    }
+    /// None when empty, so a coordinator that accepts nothing sends today's frame.
+    pub(crate) fn advertised(self) -> Option<Self> {
+        (!self.0.is_empty()).then_some(self)
     }
 }
 
@@ -1230,6 +1278,10 @@ pub enum RuntimeEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         input_origins: Option<bool>,
+        /// The origins this runtime validates, persists and names to the model.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        accepted_input_origins: Option<AcceptedInputOrigins>,
         /// Missing on legacy runtimes; native clients gate typed settings per connection.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]

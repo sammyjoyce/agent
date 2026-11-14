@@ -23,6 +23,13 @@
     "event"
   ],
   "$defs": {
+    "AcceptedInputOrigins": {
+      "description": "The origins a coordinator accepts in a submit's `origin`. Open on the wire, closed in\nmemory: decoding keeps the names this build can decode and drops the rest, so a later\nproducer's list never fails an earlier reader's frame, and a name this build cannot\ndecode is never advertised onward.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "AccountIdentity": {
       "type": "object",
       "properties": {
@@ -2727,7 +2734,7 @@
       ]
     },
     "InputOrigin": {
-      "description": "Trusted direct-input transport metadata, never inferred from text or host.\nOmission is unknown, including legacy clients and non-human work.",
+      "description": "Trusted direct-input transport metadata, never inferred from text or host.\nOmission is unknown, including legacy clients and non-human work.\n`siri` is Siri or a Shortcuts action relayed by the iPhone app. A client sends a value\nonly when the coordinator lists it in `AcceptedInputOrigins`.",
       "type": "string",
       "enum": [
         "cli",
@@ -4608,6 +4615,17 @@
         {
           "type": "object",
           "properties": {
+            "accepted_input_origins": {
+              "description": "The origins this runtime validates, persists and names to the model.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AcceptedInputOrigins"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "conversation_id": {
               "type": "string"
             },

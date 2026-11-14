@@ -249,17 +249,18 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
             "{event:?}"
         );
         match agent_cli::native::project(&event) {
-            Some(NativeEvent::Ready {
-                accepted_input_origins,
-                ..
-            }) => accepted = Some(accepted_input_origins),
+            Some(ready @ NativeEvent::Ready { .. }) => {
+                accepted = Some(serde_json::to_value(&ready).unwrap())
+            }
             Some(NativeEvent::Idle) => break,
             _ => (),
         }
     }
+    let ready = accepted.expect("The native observation starts with Ready");
+    assert_eq!(ready["input_origins"], true);
     assert_eq!(
-        accepted,
-        Some(Some(vec!["cli".into(), "ios".into(), "siri".into()])),
+        ready["accepted_input_origins"],
+        serde_json::json!(["cli", "ios", "siri"]),
         "The real runtime's main observation lists every origin it records"
     );
     let listener = UnixListener::bind(directory.path().join("agent.sock")).unwrap();

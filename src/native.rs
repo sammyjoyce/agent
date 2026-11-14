@@ -159,14 +159,16 @@ pub enum NativeEvent {
         commands: Vec<SlashCommand>,
     },
     Ready {
+        /// Phones built before `accepted_input_origins` send `ios` only when this is true.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         input_origins: Option<bool>,
-        /// Every origin this connection records. Strings, so a client skips a value it does not
-        /// know instead of failing the frame. Absent on coordinators that predate the list.
+        /// The origins a submit may carry on this connection. Missing: use `input_origins`.
+        /// Inline strings in the schema, so clients decode it as a plain list.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        accepted_input_origins: Option<Vec<String>>,
+        #[schemars(with = "Option<Vec<String>>")]
+        #[ts(optional, as = "Option<Vec<String>>")]
+        accepted_input_origins: Option<crate::protocol::AcceptedInputOrigins>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         conversation_settings: Option<bool>,
@@ -474,23 +476,26 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
         },
         RuntimeEventKind::MainReady {
             input_origins,
+            accepted_input_origins,
             conversation_settings,
             conversation_id,
             model,
             ..
-        } => NativeEvent::Ready {
-            input_origins: *input_origins,
-            accepted_input_origins: (*input_origins == Some(true)).then(|| {
-                crate::protocol::InputOrigin::ALL
-                    .map(|origin| origin.as_str().to_owned())
-                    .to_vec()
-            }),
-            conversation_settings: *conversation_settings,
-            work_inspection: Some(true),
-            working: None,
-            conversation_id: conversation_id.clone(),
-            model: model_label(model),
-        },
+        } => {
+            let accepted = crate::protocol::AcceptedInputOrigins::from_main_ready(
+                accepted_input_origins.as_ref(),
+                *input_origins,
+            );
+            NativeEvent::Ready {
+                input_origins: accepted.input_origins_flag(),
+                accepted_input_origins: accepted.advertised(),
+                conversation_settings: *conversation_settings,
+                work_inspection: Some(true),
+                working: None,
+                conversation_id: conversation_id.clone(),
+                model: model_label(model),
+            }
+        }
         RuntimeEventKind::ConversationReady {
             conversation,
             model,
@@ -625,8 +630,8 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        native::{NativeEvent, NativeRequest, Operation, prepare},
-        protocol::{InputMode, RuntimeCommand},
+        native::{NativeCommand, NativeEvent, NativeRequest, Operation, prepare},
+        protocol::{InputMode, RuntimeCommand, RuntimeEventKind},
     };
 
     #[test]
@@ -677,39 +682,19 @@ mod tests {
                 cwd: "/".into(),
                 model: crate::models::ModelSelection::default(),
                 input_origins: advertised,
+                accepted_input_origins: None,
                 conversation_settings: advertised,
             };
             let Some(NativeEvent::Ready {
                 input_origins,
-                accepted_input_origins,
                 conversation_settings,
                 ..
             }) = crate::native::project(&event)
             else {
                 panic!("Expected main ready")
             };
-            assert_eq!(input_origins, advertised);
+            assert_eq!(input_origins, advertised.filter(|value| *value));
             assert_eq!(conversation_settings, advertised);
-            assert_eq!(
-                accepted_input_origins,
-                (advertised == Some(true)).then(|| vec![
-                    "cli".to_owned(),
-                    "ios".to_owned(),
-                    "siri".to_owned()
-                ])
-            );
-        }
-        let schema =
-            serde_json::to_value(schemars::schema_for!(crate::protocol::InputOrigin)).unwrap();
-        let declared: Vec<String> = serde_json::from_value(schema["enum"].clone()).unwrap();
-        let listed: Vec<String> = crate::protocol::InputOrigin::ALL
-            .iter()
-            .map(|origin| serde_json::to_value(origin).unwrap())
-            .map(|value| serde_json::from_value(value).unwrap())
-            .collect();
-        assert_eq!(listed, declared, "InputOrigin::ALL lists every variant");
-        for origin in crate::protocol::InputOrigin::ALL {
-            assert_eq!(serde_json::to_value(origin).unwrap(), origin.as_str());
         }
         let legacy: RuntimeEventKind = serde_json::from_str(r#"{"type":"main_ready","conversation_id":"1","cwd":"/","model":{"provider":"openai","model_id":"fixture","reasoning":null,"fast":false}}"#).unwrap();
         assert!(matches!(
@@ -720,6 +705,58 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// One row per runtime the coordinator binary can be paired with: its `main_ready` bytes and
+    /// the `Ready` bytes a phone then receives.
+    #[test]
+    fn ready_advertises_only_origins_both_the_runtime_and_this_binary_accept() {
+        let model =
+            r#""model":{"provider":"openai","model_id":"fixture","reasoning":null,"fast":false}"#;
+        let rows = [
+            (r#""#, r#""#),
+            (
+                r#""input_origins":true,"#,
+                r#""input_origins":true,"accepted_input_origins":["cli","ios"],"#,
+            ),
+            (
+                r#""input_origins":true,"accepted_input_origins":["cli","ios","siri"],"#,
+                r#""input_origins":true,"accepted_input_origins":["cli","ios","siri"],"#,
+            ),
+            (
+                r#""input_origins":true,"accepted_input_origins":["watch","siri","cli","ios","siri"],"#,
+                r#""input_origins":true,"accepted_input_origins":["cli","ios","siri"],"#,
+            ),
+            (
+                r#""input_origins":true,"accepted_input_origins":["cli"],"#,
+                r#""accepted_input_origins":["cli"],"#,
+            ),
+        ];
+        for (runtime, phone) in rows {
+            let event: RuntimeEventKind = serde_json::from_str(&format!(
+                r#"{{"type":"main_ready",{runtime}"conversation_id":"1","cwd":"/",{model}}}"#
+            ))
+            .unwrap();
+            let ready = serde_json::to_string(&crate::native::project(&event).unwrap()).unwrap();
+            assert_eq!(
+                ready,
+                format!(
+                    r#"{{"type":"ready",{phone}"work_inspection":true,"conversation_id":"1","model":"openai/fixture · default"}}"#
+                ),
+                "{runtime}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_submit_rejects_an_origin_this_coordinator_does_not_advertise() {
+        let submit = |origin: &str| {
+            serde_json::from_str::<NativeCommand>(&format!(
+                r#"{{"type":"native","request":{{"type":"submit","input_id":"22222222-2222-4222-8222-222222222222","text":"x","mode":"steer","origin":"{origin}"}}}}"#
+            ))
+        };
+        assert!(submit("siri").is_ok());
+        assert!(submit("watch").is_err());
     }
 
     #[test]
