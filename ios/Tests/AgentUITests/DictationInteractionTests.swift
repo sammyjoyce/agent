@@ -21,6 +21,11 @@ final class DictationInteractionTests: XCTestCase {
     addTeardownBlock { @MainActor in app.terminate() }
     app.launch()
     XCTAssertTrue(app.textViews["Message the coordinator"].waitForExistence(timeout: 10))
+    // A hosted test run earlier on this simulator can leave the notification prompt up. It keeps
+    // the scene inactive, and the fixture connects only while the scene is active.
+    let prompt = XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts[
+      "“Beep Boop” Would Like to Send You Notifications"]
+    if prompt.exists { prompt.buttons["Allow"].tap() }
     let deadline = ContinuousClock.now + .seconds(10)
     while await work.observationCount() == 0 {
       guard ContinuousClock.now < deadline else {
