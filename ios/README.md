@@ -14,7 +14,8 @@ that identity and the existing signing configuration for updates to the same app
    root. The native protocol is additive but requires this coordinator version.
    Existing coordinator setup is described in [setup](../docs/setup.md).
 2. Open `Agent.xcodeproj` in full Xcode with an iOS 18-or-newer SDK. The `Agent`
-   scheme uses this directory's local Swift package without dependencies. For a
+   scheme uses this directory's local Swift package, and the app target also
+   links [ScrawlKit](https://github.com/kitlangton/scrawl). For a
    device build, choose a development team and use a bundle ID registered to it.
    Simulator builds do not require signing.
 3. Connect Tailscale on the device. The coordinator must authorize its peer
@@ -75,6 +76,28 @@ The app embeds `AgentShare`. For signed installs, register its bundle ID
 the group defaults to `group.$(AGENT_BUNDLE_IDENTIFIER)`. Keep the existing
 host bundle ID when updating an installed app. Provisioning both targets is
 required for sharing on a phone; an unsigned build does not establish that.
+
+## Record the app with Scrawl
+
+ScrawlKit records Beep Boop with your narration, touches and drawn ink, and
+sends the recording to Scrawl on your Mac. It does nothing until you pair the
+phone.
+
+1. Open Scrawl on the Mac.
+2. Run `/Applications/Scrawl.app/Contents/MacOS/scrawl link --scheme beepboop --url http://<mac>.<tailnet>.ts.net:47777`.
+   To get the Mac's Tailscale name, run `tailscale status --json` and copy
+   `Self.DNSName` without the trailing dot. Pair by name because iOS refuses
+   plain HTTP to IP addresses, so the default link, which carries IP
+   addresses, can't upload.
+3. Open the printed link on the iPhone, or scan its QR code.
+4. To start recording, hold three fingers on the screen for half a second. To
+   stop and send, do it again.
+
+To unpair the phone, open `beepboop://scrawl?reset=1` on it.
+
+If a recording doesn't upload, Scrawl can collect it the next time you connect
+the phone by cable. To allow that, list the app's bundle ID under `usbApps` in
+`~/.config/scrawl/config.json`.
 
 ## Behavior and data
 
