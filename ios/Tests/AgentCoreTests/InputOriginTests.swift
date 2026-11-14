@@ -92,3 +92,17 @@ func aCoordinatorThatListsNoOriginsNeverAcceptsSiri(advertised: Bool?) async thr
   }
   #expect(labels == ["CLI", "iOS", "Siri"])
 }
+
+@Test(.timeLimit(.minutes(1)))
+func aCoordinatorThatReportsOriginsButListsNoneStillGetsIOS() async throws {
+  try await withCoordinator { session, fixture, outbox in
+    await fixture.advertiseInputOrigins(true)
+    await fixture.advertiseAcceptedInputOrigins([])
+    await session.connect()
+    for await update in session.updates where update.connection == .connected { break }
+    #expect(await !session.accepts(.siri))
+    #expect(await session.submit("A composer message"))
+    let requests = try queuedRequests(outbox)
+    #expect(requests.first?.origin == .ios)
+  }
+}

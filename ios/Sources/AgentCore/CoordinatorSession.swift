@@ -1082,11 +1082,11 @@ public actor CoordinatorSession {
   /// Whether the current connection records this origin. False while disconnected.
   public func accepts(_ origin: InputOrigin) -> Bool { acceptedInputOrigins.contains(origin) }
 
-  /// A coordinator that predates the list advertises the origins it knew with one Boolean.
-  /// Values this build does not know are skipped.
+  /// The input_origins Boolean always grants cli and ios, so a list never takes them away.
+  /// Listed values this build does not know are skipped.
   private static func acceptedInputOrigins(_ ready: NativeEventReady) -> Set<InputOrigin> {
-    if let listed = ready.acceptedInputOrigins { return Set(listed.compactMap(InputOrigin.init)) }
-    return ready.inputOrigins == true ? [.cli, .ios] : []
+    let granted: Set<InputOrigin> = ready.inputOrigins == true ? [.cli, .ios] : []
+    return granted.union((ready.acceptedInputOrigins ?? []).compactMap(InputOrigin.init))
   }
 
   private func resetCapabilities() {
