@@ -11,6 +11,8 @@ pub const MAX_ATTACHMENT_BYTES: u32 = 16 * 1024 * 1024;
 pub const ATTACHMENT_CHUNK_BYTES: u32 = 64 * 1024;
 pub const MAX_ATTACHMENTS: usize = 8;
 pub const MAX_ATTACHMENT_NAME_BYTES: usize = 240;
+/// How long a coordinator keeps an upload that no saved input references.
+pub const ATTACHMENT_STAGING_MILLIS: u64 = 24 * 60 * 60 * 1000;
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
 pub struct AttachmentRef {
@@ -57,8 +59,64 @@ pub enum AttachmentResponse {
     Discarded,
 }
 
+#[derive(Clone, Copy)]
+pub enum WireEnvelope {
+    Runtime,
+    Native,
+}
+
+/// Sends one attachment request on a coordinator connection the caller owns
+/// and reads its receipt.
+pub async fn exchange_chunk<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut crate::runtime::FrameReader<R>,
+    writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+    request: AttachmentRequest,
+    envelope: WireEnvelope,
+) -> Result<AttachmentResponse> {
+    use crate::{
+        native::{NativeEvent, NativeRequest},
+        protocol::RuntimeCommand,
+    };
+    let command = match envelope {
+        WireEnvelope::Runtime => RuntimeCommand::Attachment { request },
+        WireEnvelope::Native => RuntimeCommand::Native {
+            request: NativeRequest::Attachment { request },
+        },
+    };
+    crate::service::write_frame(writer, &command).await?;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut response = None;
+        loop {
+            let frame = reader
+                .next_frame()
+                .await?
+                .context("Coordinator disconnected during attachment upload")?;
+            let event = match envelope {
+                WireEnvelope::Runtime => {
+                    crate::native::project(&crate::runtime::decode_coordinator_event(&frame)?)
+                }
+                WireEnvelope::Native => serde_json::from_slice(&frame).ok(),
+            };
+            match event {
+                Some(NativeEvent::Attachment { response: value }) if response.is_none() => {
+                    response = Some(value)
+                }
+                Some(NativeEvent::Done) => {
+                    return response.context("Attachment upload returned no receipt");
+                }
+                Some(NativeEvent::Failure { message, .. }) => {
+                    bail!("Attachment could not be uploaded: {message}")
+                }
+                _ => bail!("The coordinator returned an unexpected attachment response"),
+            }
+        }
+    })
+    .await
+    .context("Attachment upload timed out")?
+}
+
 /// The caller owns its authenticated transfer connection for the entire file.
-pub async fn upload_file<F, Fut>(path: &Path, mut transfer: F) -> Result<AttachmentRef>
+pub async fn upload_file<F, Fut>(path: &Path, transfer: F) -> Result<AttachmentRef>
 where
     F: FnMut(AttachmentRequest) -> Fut + Send,
     Fut: std::future::Future<Output = Result<AttachmentResponse>> + Send,
@@ -75,22 +133,35 @@ where
     file.take(u64::from(MAX_ATTACHMENT_BYTES) + 1)
         .read_to_end(&mut bytes)
         .await?;
-    ensure!(
-        bytes.len() <= MAX_ATTACHMENT_BYTES as usize,
-        "Attachments must be at most 16 MiB"
-    );
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .context("Attachment needs a UTF-8 filename")?
         .to_owned();
-    let media_type = media_type(path, &bytes).to_owned();
+    upload_bytes(name, &bytes, transfer).await
+}
+
+/// Uploads content that has no file of its own under `name`.
+pub async fn upload_bytes<F, Fut>(
+    name: String,
+    bytes: &[u8],
+    mut transfer: F,
+) -> Result<AttachmentRef>
+where
+    F: FnMut(AttachmentRequest) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<AttachmentResponse>> + Send,
+{
+    ensure!(
+        bytes.len() <= MAX_ATTACHMENT_BYTES as usize,
+        "Attachments must be at most 16 MiB"
+    );
+    let media_type = media_type(Path::new(&name), bytes).to_owned();
     ensure!(
         name.len() <= MAX_ATTACHMENT_NAME_BYTES,
         "Attachment filename must be at most {MAX_ATTACHMENT_NAME_BYTES} UTF-8 bytes"
     );
     use sha2::{Digest, Sha256};
-    let sha256 = hex::encode(Sha256::digest(&bytes));
+    let sha256 = hex::encode(Sha256::digest(bytes));
     let id = uuid::Uuid::new_v4().to_string();
     let size_bytes = u32::try_from(bytes.len())?;
     let mut offset = 0;

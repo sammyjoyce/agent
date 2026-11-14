@@ -632,6 +632,34 @@ pub fn decode_coordinator_event(frame: &[u8]) -> Result<RuntimeEventKind> {
     })
 }
 
+/// One client connection to a coordinator. `child` is the SSH relay that
+/// carries it, when there is one, and must outlive the streams.
+pub struct Wire {
+    pub reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    pub writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    pub child: Option<Child>,
+}
+
+impl Wire {
+    pub fn local(stream: tokio::net::UnixStream) -> Self {
+        let (reader, writer) = stream.into_split();
+        Self {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            child: None,
+        }
+    }
+
+    pub fn tcp(stream: tokio::net::TcpStream) -> Self {
+        let (reader, writer) = stream.into_split();
+        Self {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            child: None,
+        }
+    }
+}
+
 /// Framing state stays with the owner. Cancelling a select branch cannot
 /// discard bytes already consumed from a partial JSON line.
 pub struct FrameReader<R> {

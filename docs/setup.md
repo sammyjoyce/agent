@@ -541,6 +541,64 @@ conservative possible gap. `dropped_before` counts channel overflow only, so
 zero does not establish complete log coverage. No finite cap guarantees a full
 audit interval at an unbounded event rate.
 
+### Scrawl feedback
+
+On a Mac worker that runs Scrawl, add this line to the private `config.toml`
+and restart the service:
+
+```toml
+scrawl_feedback = true
+```
+
+`beep-boop maintain` then checks `~/Library/Application Support/scrawl/captures`
+every 2 seconds. Each new finished capture becomes `/feedback` on a
+coordinator, sent in the same request the phone sends. It starts the same
+background repair, and the result appears in the main chat. The setting is off by default. It belongs to this machine, so
+`beep-boop config apply` cannot set it. On other platforms the service logs one
+line and ignores it.
+
+Scrawl writes `summary.md` last, so a capture counts as finished once
+`summary.md` has not changed for 2 seconds and no `.transcript-pending` marker
+remains. Captures already in the folder the first time the watcher runs are
+never sent.
+
+The bundle decides where its feedback goes:
+
+- A phone recording whose `timeline.json` carries a version 1 `beepBoop`
+  target goes to that host and port. The watcher asks the coordinator to
+  identify itself first and sends nothing unless its ID matches the one the
+  phone pinned. A mismatch is logged and the capture is never sent.
+- A phone recording without a valid target is logged and never sent. It never
+  falls back to this Mac's coordinator.
+- A capture of this Mac's screen goes to the configured coordinator.
+
+The description is the typed `/feedback` text, or the Scrawl note for a Mac
+capture, then `Narration:` and the narration transcript. `/feedback` joins its
+words with single spaces, so the description is one line, limited to 4096
+bytes. The watcher
+attaches up to eight files of at most 16 MiB each, in this order:
+`summary.md`, the contact sheet, `scrawl.json`, the phone's `Composer.log`,
+the keyframes, then the recording if a slot is left. A larger file is skipped.
+
+`<state_dir>/scrawl-feedback.json` records each capture as `backlog`,
+`submitted`, `acknowledged` or `refused`. A submitted capture is resent with
+its original request ID until the coordinator confirms it, so a restart does
+not duplicate feedback. The coordinator deletes uploaded files after 24 hours,
+so a capture still unconfirmed a day after it was sent is refused at its next
+failed resend. A capture the coordinator rejects is refused and never resent.
+
+To see what the watcher will do without sending or writing anything, run:
+
+```sh
+beep-boop scrawl-feedback --dry-run --captures-dir /path/to/captures
+```
+
+It prints one JSON line per capture. A capture the ledger holds shows its
+state, with the reason for a refused one. A new capture shows `deliver` with
+its destination, description and attachments, or `refused` or `incomplete`.
+Before the watcher's first start, every capture present shows `backlog`.
+Add `--state-dir` when the service uses one.
+
 ## nix-darwin service
 
 The flake exports `darwinModules.default`. Import it and reference a private

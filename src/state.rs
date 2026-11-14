@@ -2,13 +2,17 @@ use std::{fs, os::unix::fs::DirBuilderExt, path::PathBuf};
 
 use anyhow::{Context, Result};
 
-pub fn directory(explicit: Option<PathBuf>) -> Result<PathBuf> {
-    let directory = match explicit {
-        Some(directory) => directory,
-        None => dirs::data_local_dir()
+pub fn path(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    match explicit {
+        Some(directory) => Ok(directory),
+        None => Ok(dirs::data_local_dir()
             .context("No application data directory is available")?
-            .join("agent"),
-    };
+            .join("agent")),
+    }
+}
+
+pub fn directory(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    let directory = path(explicit)?;
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)

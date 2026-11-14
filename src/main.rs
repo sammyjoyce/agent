@@ -34,8 +34,8 @@ use agent_cli::{
         TranscriptClassification, WorkerLaunch, WorkerRef,
     },
     rex::{BlockId, RexClient, SessionId},
-    runtime::{FrameReader, decode_coordinator_event, lifecycle::RequestLifecycle},
-    service,
+    runtime::{FrameReader, Wire, decode_coordinator_event, lifecycle::RequestLifecycle},
+    scrawl_feedback, service,
     tui::attachments::ComposerInput,
     tui::{Tui, TuiHandle, TuiInfo, TuiInput},
     usage,
@@ -43,7 +43,7 @@ use agent_cli::{
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::UnixStream,
     process::{Child, Command},
     time::{Instant, sleep, timeout},
@@ -157,6 +157,18 @@ enum Action {
     /// Bridge stdin/stdout to this machine's local coordinator.
     #[command(hide = true)]
     Rpc,
+    /// Forward finished Scrawl captures to coordinators as feedback.
+    #[command(hide = true)]
+    ScrawlFeedback {
+        #[arg(long)]
+        captures_dir: Option<PathBuf>,
+        /// Run one pass and exit.
+        #[arg(long)]
+        once: bool,
+        /// Print each bundle's ledger state or routing decision as JSON, without network calls or writes.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Attach the task's Rex worker to its stored conversation.
     #[command(hide = true)]
     RunTask {
@@ -373,12 +385,6 @@ enum MailAction {
     },
 }
 
-struct Wire {
-    reader: Box<dyn AsyncRead + Unpin + Send>,
-    writer: Box<dyn AsyncWrite + Unpin + Send>,
-    child: Option<Child>,
-}
-
 struct WatchGuard(tokio::task::JoinHandle<()>);
 impl Drop for WatchGuard {
     fn drop(&mut self) {
@@ -411,17 +417,6 @@ fn startup_jobs(config: &ClientConfig) -> Option<Vec<jobs::ScheduledJob>> {
                 "Scheduled job validation failed; previously applied jobs are retained: {error:#}"
             );
             None
-        }
-    }
-}
-
-impl Wire {
-    fn local(stream: UnixStream) -> Self {
-        let (reader, writer) = stream.into_split();
-        Self {
-            reader: Box::new(reader),
-            writer: Box::new(writer),
-            child: None,
         }
     }
 }
@@ -541,6 +536,19 @@ async fn main() -> Result<()> {
                 }
             }
             println!("{}", serde_json::to_string_pretty(&previews)?);
+            return Ok(());
+        }
+        Action::ScrawlFeedback {
+            captures_dir,
+            dry_run: true,
+            ..
+        } => {
+            for preview in scrawl_feedback::preview(
+                &scrawl_captures(captures_dir)?,
+                &state::path(arguments.state_dir.clone())?,
+            )? {
+                println!("{}", serde_json::to_string(&preview)?);
+            }
             return Ok(());
         }
         Action::Mail { command } => {
@@ -692,6 +700,24 @@ async fn main() -> Result<()> {
             "Worker service requires a selected remote coordinator"
         );
         return worker_service(client, interval_seconds).await;
+    }
+    if let Action::ScrawlFeedback {
+        captures_dir, once, ..
+    } = action
+    {
+        let dialer = ScrawlDialer::new(client)?;
+        let mut watcher =
+            scrawl_feedback::Watcher::open(&scrawl_captures(captures_dir)?, &directory)?;
+        if once {
+            watcher
+                .poll(&dialer)
+                .await
+                .into_iter()
+                .for_each(service_notice);
+        } else {
+            scrawl_feedback::watch(watcher, &dialer, service_notice).await;
+        }
+        return Ok(());
     }
     let command = match action {
         Action::Login => RuntimeCommand::Login,
@@ -2254,7 +2280,7 @@ struct ClientContext<'a> {
 }
 
 async fn prepare_attachments(client: ClientContext<'_>, input: &mut ComposerInput) -> Result<()> {
-    use agent_cli::attachments::{MAX_ATTACHMENTS, upload_file};
+    use agent_cli::attachments::{MAX_ATTACHMENTS, WireEnvelope, exchange_chunk, upload_file};
     ensure!(
         input.attachment_count() <= MAX_ATTACHMENTS,
         "Attach at most 8 files"
@@ -2280,34 +2306,7 @@ async fn prepare_attachments(client: ClientContext<'_>, input: &mut ComposerInpu
             async move {
                 let mut owned = transfer.lock().await;
                 let (reader, writer, _child) = &mut *owned;
-                write_command(&mut **writer, &RuntimeCommand::Attachment { request }).await?;
-                timeout(Duration::from_secs(30), async {
-                    let mut response = None;
-                    loop {
-                        let frame = reader
-                            .next_frame()
-                            .await?
-                            .context("Coordinator disconnected during attachment upload")?;
-                        match decode_coordinator_event(&frame)? {
-                            RuntimeEventKind::Attachment { response: value }
-                                if response.is_none() =>
-                            {
-                                response = Some(value)
-                            }
-                            RuntimeEventKind::Done => {
-                                return response.context("Attachment upload returned no receipt");
-                            }
-                            RuntimeEventKind::Failure { message, .. } => {
-                                bail!("Attachment could not be uploaded: {message}")
-                            }
-                            _ => {
-                                bail!("The coordinator returned an unexpected attachment response")
-                            }
-                        }
-                    }
-                })
-                .await
-                .context("Attachment upload timed out")?
+                exchange_chunk(reader, &mut **writer, request, WireEnvelope::Runtime).await
             }
         })
         .await?;
@@ -2813,6 +2812,87 @@ async fn configure_messages(sources: &[agent_cli::sources::SourceConfig]) {
     }
 }
 
+fn scrawl_captures(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    explicit
+        .or_else(scrawl_feedback::default_captures_dir)
+        .context("Scrawl captures exist only on macOS; pass --captures-dir")
+}
+
+struct ScrawlDialer {
+    config: ClientConfig,
+    coordinator: Option<String>,
+    script: PathBuf,
+    directory: PathBuf,
+    rex: RexClient,
+    terminal: RexClient,
+    policy: agent_cli::tailnet::PeerPolicy,
+    daemon: agent_cli::tailnet::Daemon,
+}
+
+impl ScrawlDialer {
+    fn new(client: ClientContext<'_>) -> Result<Self> {
+        Ok(Self {
+            policy: agent_cli::tailnet::PeerPolicy::new(
+                &client.config.trusted_nodes,
+                &client.config.trusted_user_ids,
+            )?,
+            daemon: agent_cli::tailnet::Daemon::new(client.config.tailscale_socket.as_deref())?,
+            config: client.config.clone(),
+            coordinator: client.coordinator.map(str::to_owned),
+            script: client.script.to_owned(),
+            directory: client.directory.to_owned(),
+            rex: client.rex.clone(),
+            terminal: client.terminal.clone(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl scrawl_feedback::Dialer for ScrawlDialer {
+    async fn dial(&self, destination: &scrawl_feedback::Destination) -> Result<Wire> {
+        match destination {
+            scrawl_feedback::Destination::Configured => {
+                let client = ClientContext {
+                    config: &self.config,
+                    coordinator: self.coordinator.as_deref(),
+                    script: &self.script,
+                    directory: &self.directory,
+                    rex: &self.rex,
+                    terminal: &self.terminal,
+                };
+                connection(client, false).await
+            }
+            scrawl_feedback::Destination::Pinned { address, .. } => {
+                scrawl_feedback::dial_pinned(address, &self.policy, &self.daemon).await
+            }
+        }
+    }
+}
+
+fn scrawl_watcher(client: ClientContext<'_>) -> Option<WatchGuard> {
+    if !client.config.scrawl_feedback {
+        return None;
+    }
+    let Some(captures) = scrawl_feedback::default_captures_dir() else {
+        service_notice("scrawl_feedback is set, but Scrawl feedback runs only on macOS.");
+        return None;
+    };
+    let dialer = match ScrawlDialer::new(client) {
+        Ok(dialer) => dialer,
+        Err(error) => {
+            service_notice(format_args!("Scrawl feedback is off: {error:#}"));
+            return None;
+        }
+    };
+    let state = client.directory.to_owned();
+    Some(WatchGuard(tokio::spawn(async move {
+        match scrawl_feedback::Watcher::open(&captures, &state) {
+            Ok(watcher) => scrawl_feedback::watch(watcher, &dialer, service_notice).await,
+            Err(error) => service_notice(format_args!("Scrawl feedback is off: {error:#}")),
+        }
+    })))
+}
+
 async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> {
     let ClientContext {
         config,
@@ -2826,6 +2906,7 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
         coordinator.is_some(),
         "A worker needs a selected coordinator"
     );
+    let _scrawl = scrawl_watcher(client);
     let daemon = agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
     let executor = Arc::new(
         host::Executor::with_tailscale(directory, daemon.clone(), rex.clone())
@@ -3168,13 +3249,9 @@ async fn connection(client: ClientContext<'_>, login: bool) -> Result<Wire> {
         let policy =
             agent_cli::tailnet::PeerPolicy::new(&config.trusted_nodes, &config.trusted_user_ids)?;
         let daemon = agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
-        let stream = agent_cli::tailnet::connect(address, &policy, &daemon).await?;
-        let (reader, writer) = stream.into_split();
-        return Ok(Wire {
-            reader: Box::new(reader),
-            writer: Box::new(writer),
-            child: None,
-        });
+        return Ok(Wire::tcp(
+            agent_cli::tailnet::connect(address, &policy, &daemon).await?,
+        ));
     }
     let mut command = Command::new("ssh");
     command.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);

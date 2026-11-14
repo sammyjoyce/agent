@@ -257,7 +257,7 @@ async fn serve_with_transport(
     result
 }
 
-pub(crate) async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
+pub(crate) async fn write_frame<W: AsyncWrite + Unpin + ?Sized, T: Serialize>(
     writer: &mut W,
     value: &T,
 ) -> Result<()> {
@@ -642,6 +642,7 @@ mod reset_tests;
 #[allow(clippy::disallowed_methods)]
 mod tests {
     mod ownership;
+    mod scrawl_feedback;
     mod startup;
     use crate::protocol::{AuthStatus, HostResult, InputMode, RuntimeCommand, RuntimeEventKind};
     use crate::runtime::{FrameReader, Runtime, ShutdownSignal};
@@ -659,9 +660,11 @@ mod tests {
     };
 
     const FIXTURE: &str = r#"
+      import { createHash } from 'node:crypto';
       import { createInterface } from 'node:readline';
-      import { existsSync, renameSync, writeFileSync } from 'node:fs';
+      import { appendFileSync, existsSync, renameSync, writeFileSync } from 'node:fs';
       import { join } from 'node:path';
+      const uploads = new Map();
       const emit = (id,event) => process.stdout.write(JSON.stringify({version:1,id,event})+'\n');
       const finish = id => { emit(id,{type:'auth_status',status:{state:'signed_out'}}); emit(id,{type:'done'}); };
       const publish = (name, value) => {
@@ -707,6 +710,24 @@ mod tests {
             type:'exec',program:'node',args:['--eval','process.stdout.write("synthetic\\n")'],cwd:'/',timeout_seconds:60}});
         } else if(command.type==='host_reply') {
           publish('reply.json',JSON.stringify(command.result)); finish(id);
+        } else if(command.type==='attachment'&&command.request.type==='upload') {
+          const upload = command.request, bytes = Buffer.from(upload.data_base64,'base64');
+          const received = Buffer.concat([uploads.get(upload.id) ?? Buffer.alloc(0), bytes]);
+          uploads.set(upload.id, received);
+          const attachment = upload.complete ? {id:upload.id,name:upload.name,media_type:upload.media_type,
+            size_bytes:upload.size_bytes,sha256:createHash('sha256').update(received).digest('hex')} : null;
+          emit(id,{type:'attachment',response:{type:'uploaded',next_offset:received.length,attachment}});
+          emit(id,{type:'done'});
+        } else if(command.type==='main_feedback') {
+          appendFileSync(join(process.argv[2],'main-feedback.jsonl'),JSON.stringify(command)+'\n');
+          if(existsSync(join(process.argv[2],'reject-feedback'))) {
+            emit(id,{type:'input_rejected',input_id:command.input_id,message:'Invented: feedback is paused here'});
+          } else if(!existsSync(join(process.argv[2],'unconfirmed-feedback'))) {
+            emit(id,{type:'input_accepted',input_id:command.input_id});
+            emit(id,{type:'feedback_ready',input_id:command.input_id,receipt:{id:command.input_id,
+              path:'feedback/'+command.input_id,task_id:'22222222-2222-4222-8222-222222222222',agent_id:null}});
+          }
+          emit(id,{type:'done'});
         } else if(command.type==='list_tasks') { process.exit(0); }
         else { finish(id); }
       });
