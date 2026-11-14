@@ -97,6 +97,15 @@ public final class Coordinators {
     for withdrawal in withdrawals { retry(withdrawal) }
   }
 
+  /// Holds coordinator `id` connected while `body` runs, with the scene in the background too. It
+  /// waits up to 8 s for the connection, then runs `body` whether or not the lane connected.
+  func withConnection<T>(to id: ProfileID, _ body: () async throws -> T) async rethrows -> T {
+    let lease = await chat.takeLease(on: id)
+    defer { await chat.dropLease(lease) }
+    await chat.awaitConnection(id, within: .seconds(8))
+    return try await body()
+  }
+
   func route(_ origin: AlertOrigin) -> ProfileID? {
     switch origin {
     case .named(let id): return chat.isSaved(id) ? id : nil
