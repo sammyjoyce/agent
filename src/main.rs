@@ -2237,7 +2237,7 @@ struct ClientContext<'a> {
 }
 
 async fn prepare_attachments(client: ClientContext<'_>, input: &mut ComposerInput) -> Result<()> {
-    use agent_cli::attachments::{MAX_ATTACHMENTS, exchange_chunk, upload_file};
+    use agent_cli::attachments::{MAX_ATTACHMENTS, WireEnvelope, exchange_chunk, upload_file};
     ensure!(
         input.attachment_count() <= MAX_ATTACHMENTS,
         "Attach at most 8 files"
@@ -2263,7 +2263,7 @@ async fn prepare_attachments(client: ClientContext<'_>, input: &mut ComposerInpu
             async move {
                 let mut owned = transfer.lock().await;
                 let (reader, writer, _child) = &mut *owned;
-                exchange_chunk(reader, &mut **writer, request).await
+                exchange_chunk(reader, &mut **writer, request, WireEnvelope::Runtime).await
             }
         })
         .await?;

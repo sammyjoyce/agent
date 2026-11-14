@@ -57,15 +57,31 @@ pub enum AttachmentResponse {
     Discarded,
 }
 
+#[derive(Clone, Copy)]
+pub enum WireEnvelope {
+    Runtime,
+    Native,
+}
+
 /// Sends one attachment request on a coordinator connection the caller owns
 /// and reads its receipt.
 pub async fn exchange_chunk<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut crate::runtime::FrameReader<R>,
     writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
     request: AttachmentRequest,
+    envelope: WireEnvelope,
 ) -> Result<AttachmentResponse> {
-    use crate::protocol::{RuntimeCommand, RuntimeEventKind};
-    crate::service::write_frame(writer, &RuntimeCommand::Attachment { request }).await?;
+    use crate::{
+        native::{NativeEvent, NativeRequest},
+        protocol::RuntimeCommand,
+    };
+    let command = match envelope {
+        WireEnvelope::Runtime => RuntimeCommand::Attachment { request },
+        WireEnvelope::Native => RuntimeCommand::Native {
+            request: NativeRequest::Attachment { request },
+        },
+    };
+    crate::service::write_frame(writer, &command).await?;
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let mut response = None;
         loop {
@@ -73,14 +89,20 @@ pub async fn exchange_chunk<R: tokio::io::AsyncBufRead + Unpin>(
                 .next_frame()
                 .await?
                 .context("Coordinator disconnected during attachment upload")?;
-            match crate::runtime::decode_coordinator_event(&frame)? {
-                RuntimeEventKind::Attachment { response: value } if response.is_none() => {
+            let event = match envelope {
+                WireEnvelope::Runtime => {
+                    crate::native::project(&crate::runtime::decode_coordinator_event(&frame)?)
+                }
+                WireEnvelope::Native => serde_json::from_slice(&frame).ok(),
+            };
+            match event {
+                Some(NativeEvent::Attachment { response: value }) if response.is_none() => {
                     response = Some(value)
                 }
-                RuntimeEventKind::Done => {
+                Some(NativeEvent::Done) => {
                     return response.context("Attachment upload returned no receipt");
                 }
-                RuntimeEventKind::Failure { message, .. } => {
+                Some(NativeEvent::Failure { message, .. }) => {
                     bail!("Attachment could not be uploaded: {message}")
                 }
                 _ => bail!("The coordinator returned an unexpected attachment response"),
