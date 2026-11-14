@@ -14,8 +14,10 @@ that identity and the existing signing configuration for updates to the same app
    root. The native protocol is additive but requires this coordinator version.
    Existing coordinator setup is described in [setup](../docs/setup.md).
 2. Open `Agent.xcodeproj` in full Xcode with an iOS 18-or-newer SDK. The `Agent`
-   scheme uses this directory's local Swift package without dependencies. For a
-   device build, choose a development team and use a bundle ID registered to it.
+   scheme uses this directory's local Swift package, which has no dependencies,
+   and `Speech/`, which pins FluidAudio for dictation and links only into the
+   app. Xcode fetches FluidAudio on the first build, at the revision in the
+   committed `Package.resolved`. For a device build, choose a development team and use a bundle ID registered to it.
    Simulator builds do not require signing.
 3. Connect Tailscale on the device. The coordinator must authorize its peer
    through the existing same-user, pinned-user or pinned-node policy. A pinned
@@ -317,6 +319,20 @@ required for sharing on a phone; an unsigned build does not establish that.
   eight files of 16 MiB each use the shared chunked attachment protocol. Photos
   are resized and encoded as JPEG. History includes file metadata; bytes are
   downloaded and verified only when opening a preview.
+- The mic beside Send dictates on the iPhone with NVIDIA Parakeet Unified
+  English 0.6B. The first tap asks before a one-time 614.1 MB download into
+  Application Support, excluded from backup, and then prepares the model for
+  this iPhone. Tap to start and tap again to stop: the words land at the caret,
+  stay in the composer, and one Undo removes them. Hold the mic to talk and
+  release to send through the same Send, with the same recipient, file and
+  admission checks. If Send is blocked, or the draft changed, the words stay
+  and the line under the field says why. Sliding off the mic before release
+  keeps them. While a take runs the field takes no edits, and the **+** menu,
+  Paste, chip removal and Send wait for it. A take stops after two minutes, on
+  an audio interruption or when the app leaves the foreground, and keeps what
+  it heard. Audio stays in memory and is never saved or sent; only text you
+  send leaves the phone. **Connection → Dictation** shows the model's size and
+  removes it.
 - **Paste images** imports clipboard images as removable **Unsent attachments**.
   Import preserves the note and existing files, and sending remains explicit.
   A failed or cancelled import removes only its newly staged files.
@@ -376,6 +392,11 @@ from suspension, which XCTest can prevent and therefore report as skipped.
 Native interaction checks also rotate a static transcript at the live tail and
 while reading older messages. Incoming output preserves that older reading
 position; following resumes when scrolling back to the live tail.
+Dictation checks drive the real `Dictation` controller, composer and outbox
+with a scripted speech engine that hears no microphone and returns invented
+words; the DEBUG interaction fixture takes the same script from
+`AGENT_INTERACTION_DICTATION`. No automated check downloads the model or
+records audio, so Parakeet itself is verified on a device.
 Expanded tool output must appear once, retaining
 richer previews when lazy details are truncated and keeping the truncation
 notice visible.
@@ -397,7 +418,7 @@ Nested block-container layout, remote image previews, math and diagrams remain
 outside this renderer. To retain the review images,
 pass `--attachments-path /absolute/existing/directory` to `swift test`.
 `bash ios/scripts/check.sh` runs strict Swift lint, macOS tests, the unsigned
-app build, package tests on iOS and app-hosted rendering tests. It requires an
+Speech package and app builds, a guard that keeps FluidAudio inside `Speech/`, package tests on iOS and app-hosted rendering tests. It requires an
 installed compatible iOS runtime and cleans up only its own simulator.
 Simulator UI checks use ad-hoc signing for real App Group entitlements; no
 Apple account or provisioning profile is needed.
