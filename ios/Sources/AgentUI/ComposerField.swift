@@ -78,7 +78,9 @@
         context.coordinator.restoredFrom = restoredFrom
         view.undoManager?.removeAllActions()
       }
-      if let reservation, !provisional.isEmpty {
+      // Every window's composer shares one take, but only the field that pressed the mic is
+      // locked. Live words drawn in any other field would reach the draft with its next key.
+      if let reservation, !provisional.isEmpty, view.locked {
         let range =
           reservation.text == text
           ? reservation.range : NSRange(location: text.utf16.count, length: 0)

@@ -1393,6 +1393,32 @@
         }
       }
 
+      /// A take another window holds draws no live words in this field, so typing here never
+      /// commits them, and its words land at the end of the draft as it then is.
+      @MainActor @Test func liveWordsStayOutOfAFieldThatDoesNotHoldTheTake() async throws {
+        let speech = ScriptedSpeech()
+        let dictation = try await readyDictation(speech)
+        try await withComposer(dictation: dictation) { model, box, _ in
+          let field = box.draft
+          field.insertText("Kept")
+          try await Task.sleep(for: .milliseconds(200))
+          let reserved = DictationReservation(range: NSRange(location: 4, length: 0), text: "Kept")
+          let elsewhere = DictationTarget(chat: model, reserve: { reserved })
+          try await tapMic(dictation, elsewhere)
+          speech.hear("Invented live")
+          try await Task.sleep(for: .milliseconds(300))
+          #expect(
+            field.text == "Kept" && model.draft == "Kept",
+            "Live words stay in the field that holds the take")
+          field.insertText("!")
+          try await Task.sleep(for: .milliseconds(200))
+          #expect(model.draft == "Kept!", "Typing here never commits another window's live words")
+          try await tapMic(dictation, elsewhere)
+          #expect(model.draft == "Kept! Invented dictated words")
+          #expect(field.text == model.draft)
+        }
+      }
+
       /// At the largest text size the mic takes its own slot and the field keeps room to edit.
       @MainActor @Test func theComposerRowFitsTheMicAtTheLargestTextSize() async throws {
         let dictation = try await readyDictation()
