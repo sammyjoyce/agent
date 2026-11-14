@@ -552,15 +552,18 @@ public final class Dictation {
   }
 
   /// Reads the files once an install, prewarm or removal ends. A model still stale after its
-  /// prewarm compiles on the next take's load instead.
+  /// prewarm compiles on the next take's load instead. Both reads finish before either value
+  /// changes, so the phase a tap sees never comes while `work` still refuses the tap.
   private func settle() async {
+    let files = await engine.model()
+    let usage = await engine.diskUsage()
     model =
-      switch await engine.model() {
+      switch files {
       case .missing(let bytes): .missing(download: bytes)
       case .stale, .ready: .ready
       case .unsupported: .unsupported
       }
-    diskUsage = await engine.diskUsage()
+    diskUsage = usage
   }
 
   private func start(_ gesture: Gesture, in target: DictationTarget) {
