@@ -311,7 +311,8 @@ enum DictationNotice: Equatable {
   enum NotSent: Equatable {
     case draftChanged
     case blocked(ChatModel.SendBlocker)
-    /// `startSend` refused in its own turn, and `ChatModel.failure` says why.
+    /// `submit()` refused in its own turn, as for a `/feedback` draft that starts no recording.
+    /// `ChatModel.failure` says why.
     case refused
   }
 
@@ -341,7 +342,8 @@ enum DictationNotice: Equatable {
 /// audio session and one take.
 ///
 /// It never owns the draft. Words reach it once, when a take lands, through the field the way
-/// typing does, and a held take sends through `ChatModel.startSend`, the Send button's path.
+/// typing does, and a held take sends through `ChatModel.submit`, the Send button's path, which
+/// records a `/feedback` draft with Scrawl.
 @MainActor @Observable
 public final class Dictation {
   enum ModelPhase: Equatable {
