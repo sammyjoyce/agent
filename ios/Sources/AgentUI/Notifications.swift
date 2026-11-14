@@ -45,6 +45,14 @@ public final class AppNotifications: NSObject {
     }
   #endif
 
+  /// The coordinators an intent sees. Under the interaction fixture they are the fixture's.
+  var intentCoordinators: Coordinators {
+    #if DEBUG
+      if let fixtureTarget { return fixtureTarget.coordinators }
+    #endif
+    return coordinators
+  }
+
   func open(_ origin: AlertOrigin) {
     #if DEBUG
       if let fixtureTarget {
