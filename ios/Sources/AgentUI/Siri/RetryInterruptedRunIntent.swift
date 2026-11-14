@@ -18,7 +18,7 @@ public struct RetryInterruptedRunIntent: AppIntent {
 
   @MainActor public func perform() async throws -> some IntentResult & ProvidesDialog {
     let retried = try await notifications.coordinators.retryInterruptedRun(job.id, title: job.title)
-    return .result(dialog: "Retrying the interrupted run of \(retried.job.title).")
+    return .result(dialog: "Retrying \(retried.job.title) on \(job.coordinator).")
   }
 }
 

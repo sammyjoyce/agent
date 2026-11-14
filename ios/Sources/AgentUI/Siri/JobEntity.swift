@@ -11,7 +11,7 @@ public enum JobRunState: String, AppEnum {
   case waiting
   case retrying
   case blocked
-  case parked
+  case interrupted
   case completed
   case failed
   case stopped
@@ -24,7 +24,7 @@ public enum JobRunState: String, AppEnum {
     .waiting: "Waiting",
     .retrying: "Retrying",
     .blocked: "Blocked",
-    .parked: "Parked",
+    .interrupted: "Interrupted",
     .completed: "Completed",
     .failed: "Failed",
     .stopped: "Stopped",
@@ -40,7 +40,7 @@ public enum JobRunState: String, AppEnum {
     case .running: self = .running
     case .waiting: self = .waiting
     case .retrying: self = .retrying
-    case .blocked(let blocked): self = blocked.message == "restart_limit" ? .parked : .blocked
+    case .blocked(let blocked): self = blocked.message == "restart_limit" ? .interrupted : .blocked
     case .completed: self = .completed
     case .failed: self = .failed
     case .stopped: self = .stopped
@@ -150,7 +150,7 @@ extension Coordinators {
 }
 
 extension JobEntity: Transferable {
-  /// One plain-text line, such as "Nightly deps, Work, Parked".
+  /// One plain-text line, such as "Nightly deps, Work, Interrupted".
   public static var transferRepresentation: some TransferRepresentation {
     ProxyRepresentation(exporting: \.summary)
   }

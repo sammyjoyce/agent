@@ -75,8 +75,8 @@ struct SiriJobTests {
     #expect(ScopedEntityID.entityIdentifier(for: string) == nil)
   }
 
-  @Test func aParkedRunMapsToParkedAndOtherBlocksStayBlocked() {
-    #expect(JobRunState(parked) == .parked)
+  @Test func aRunAtTheRestartLimitMapsToInterruptedAndOtherBlocksStayBlocked() {
+    #expect(JobRunState(parked) == .interrupted)
     #expect(JobRunState(.blocked(.init(message: "Invented: waiting on approval"))) == .blocked)
     #expect(JobRunState(nil) == .notRun)
   }
@@ -90,7 +90,7 @@ struct SiriJobTests {
       }
       let jobs = try await JobQuery.allJobs(in: coordinators)
       #expect(jobs.map(\.title).sorted() == ["Personal nightly deps", "Work nightly deps"])
-      #expect(jobs.first { $0.id.profile == work }?.state == .parked)
+      #expect(jobs.first { $0.id.profile == work }?.state == .interrupted)
       #expect(jobs.allSatisfy { $0.id.item == "nightly:deps" })
       try await until("both lanes disconnected after the read") {
         connection(chat, work) == .disconnected && connection(chat, personal) == .disconnected
