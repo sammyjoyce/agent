@@ -328,9 +328,9 @@ required for sharing on a phone; an unsigned build does not establish that.
   admission checks. If Send is blocked, or the draft changed, the words stay
   and the line under the field says why. Sliding off the mic before release
   keeps them. While a take runs the field takes no edits, and the **+** menu,
-  Paste, chip removal and Send wait for it. A take stops after two minutes, on
-  an audio interruption or when the app leaves the foreground, and keeps what
-  it heard. Audio stays in memory and is never saved or sent; only text you
+  Paste, chip removal and Send wait for it. A take runs until you stop it, an
+  audio interruption stops it or the app leaves the foreground, and it keeps
+  what it heard. Audio stays in memory and is never saved or sent; only text you
   send leaves the phone. **Connection → Dictation** shows the model's size and
   removes it.
 - **Paste images** imports clipboard images as removable **Unsent attachments**.

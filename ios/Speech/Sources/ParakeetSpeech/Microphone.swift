@@ -35,9 +35,6 @@ public enum Microphone {
 /// The session is `.record` with mode `.measurement`, which keeps the system's own signal
 /// processing to a minimum, so the model hears audio closest to what it was trained on.
 final class Capture: Sendable {
-  /// Two minutes, 7.7 MB. The controller ends a take there too.
-  static let limit = 120 * 16_000
-
   let events: AsyncStream<Take.Event>
   private let continuation: AsyncStream<Take.Event>.Continuation
   private let state: OSAllocatedUnfairLock<State>
@@ -51,10 +48,10 @@ final class Capture: Sendable {
     var power: Float = 0
     var counted = 0
 
-    /// Keeps what fits under the limit and returns a level once 75 ms accumulated, which comes to
-    /// about ten levels a second whatever buffer size the hardware delivers.
+    /// Keeps the samples and returns a level once 75 ms accumulated, which comes to about ten
+    /// levels a second whatever buffer size the hardware delivers.
     mutating func keep(_ heard: [Float]) -> Float? {
-      samples.append(contentsOf: heard.prefix(Capture.limit - samples.count))
+      samples.append(contentsOf: heard)
       power += heard.reduce(0) { $0 + $1 * $1 }
       counted += heard.count
       guard counted >= 1_200 else { return nil }

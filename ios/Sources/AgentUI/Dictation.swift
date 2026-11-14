@@ -284,7 +284,6 @@ enum DictationNotice: Equatable {
   /// The phone kept the microphone, as during a call.
   case microphoneUnavailable
   case interrupted
-  case longest
   case nothingHeard
   /// A held take kept its words in the composer instead of sending them.
   case notSent(NotSent)
@@ -305,7 +304,6 @@ enum DictationNotice: Equatable {
     case .microphoneDenied: "Dictation needs the microphone. Allow it in Settings."
     case .microphoneUnavailable: "The microphone is busy, as during a call."
     case .interrupted: "Dictation stopped because the microphone was interrupted."
-    case .longest: "Dictation stops after two minutes."
     case .nothingHeard: "Nothing heard."
     case .notSent(.draftChanged): "Not sent. The draft changed while you were dictating."
     case .notSent(.blocked(.addressing)): "Not sent. \(chat.recipientLine)."
@@ -392,18 +390,13 @@ public final class Dictation {
 
   @ObservationIgnored private let engine: SpeechEngine
   @ObservationIgnored private let holdDelay: Duration
-  @ObservationIgnored private let longestTake: Duration
   /// The one install, prewarm, removal or file read in flight.
   @ObservationIgnored private var work: Task<Void, Never>?
   @ObservationIgnored private var timers: [Task<Void, Never>] = []
 
-  public init(
-    engine: SpeechEngine, holdDelay: Duration = .milliseconds(300),
-    longestTake: Duration = .seconds(120)
-  ) {
+  public init(engine: SpeechEngine, holdDelay: Duration = .milliseconds(300)) {
     self.engine = engine
     self.holdDelay = holdDelay
-    self.longestTake = longestTake
   }
 
   /// Foreground is any phase but background. Coming forward reads the model's files and compiles
@@ -569,7 +562,6 @@ public final class Dictation {
       take.stage = .listening(gesture)
       take.started = .now
       self.take = take
-      after(longestTake, id) { [weak self] in self?.finish(.keep, notice: .longest) }
     case .transcribing:
       self.take = take
       transcribe(id, recording)

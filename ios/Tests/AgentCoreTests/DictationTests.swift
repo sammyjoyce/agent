@@ -115,7 +115,7 @@ func sendBlockerNamesWhySendIsDisabledAndTheMicWaitsForABusyDraft() async throws
 /// unless `holdDelay` is short.
 @MainActor private func withDictation(
   _ script: ScriptedSpeech.Script = .init(), holdDelay: Duration = .seconds(30),
-  longestTake: Duration = .seconds(120), admit: ChatModel.Admit? = nil,
+  admit: ChatModel.Admit? = nil,
   _ body: (Dictation, ScriptedSpeech, ChatModel, FixtureCoordinator, ProfileDirectory)
     async throws -> Void
 ) async throws {
@@ -124,7 +124,7 @@ func sendBlockerNamesWhySendIsDisabledAndTheMicWaitsForABusyDraft() async throws
   let store = AttachmentStore(directory: root.appending(path: "Drafts"))
   let chat = admit.map { ChatModel(draftStore: store, admit: $0) } ?? ChatModel(draftStore: store)
   let speech = ScriptedSpeech(script)
-  let dictation = Dictation(engine: speech.engine, holdDelay: holdDelay, longestTake: longestTake)
+  let dictation = Dictation(engine: speech.engine, holdDelay: holdDelay)
   dictation.setForeground(true)
   try await until("the model is read") { dictation.model != .checking }
   try await withConnectedCoordinator(chat) { fixture, directory in
@@ -379,17 +379,6 @@ func aModelAnUpdateLeftStaleCompilesInTheBackgroundOnForeground() async throws {
   dictation.setForeground(true)
   try await until("ready") { dictation.model == .ready }
   #expect(await speech.engine.model() == .ready, "The prewarm compiled it")
-}
-
-@MainActor @Test(.timeLimit(.minutes(1)))
-func aTakeStopsAtTheLongestAndKeepsItsWords() async throws {
-  try await withDictation(longestTake: .milliseconds(100)) { dictation, _, chat, fixture, _ in
-    tap(dictation, DictationTarget(chat: chat))
-    try await listening(dictation, .toggled)
-    try await until("the words land") { dictation.take == nil }
-    #expect(chat.draft == "Invented dictated words" && dictation.notice == .longest)
-    #expect(await submitted(fixture).isEmpty)
-  }
 }
 
 @MainActor @Test(.timeLimit(.minutes(1)))
