@@ -1,5 +1,6 @@
 import AgentCore
 import AppIntents
+import CoreTransferable
 import Foundation
 
 /// Where a job's last run stands, as Siri and Shortcuts name it.
@@ -150,5 +151,17 @@ extension Coordinators {
       guard case .list(let list) = try await chat.jobs(lane: profile) else { return [] }
       return list.jobs.map { JobEntity($0, on: profile, coordinator: coordinator) }
     }
+  }
+}
+
+extension JobEntity: Transferable {
+  /// One plain-text line, such as "Nightly deps, Work, Parked".
+  public static var transferRepresentation: some TransferRepresentation {
+    ProxyRepresentation(exporting: \.summary)
+  }
+
+  var summary: String {
+    let state = JobRunState.caseDisplayRepresentations[state].map { String(localized: $0.title) }
+    return "\(title), \(coordinator), \(state ?? self.state.rawValue)"
   }
 }
