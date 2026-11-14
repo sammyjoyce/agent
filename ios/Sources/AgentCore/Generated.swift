@@ -1101,13 +1101,15 @@ public struct NativeEventCommands: Codable, Sendable, Equatable {
 }
 
 public struct NativeEventReady: Codable, Sendable, Equatable {
+    public var `acceptedOrigins`: [String]?
     public var `conversationId`: String
     public var `conversationSettings`: Bool?
     public var `inputOrigins`: Bool?
     public var `model`: String
     public var `workInspection`: Bool?
     public var `working`: Bool?
-    public init(`conversationId`: String, `conversationSettings`: Bool? = nil, `inputOrigins`: Bool? = nil, `model`: String, `workInspection`: Bool? = nil, `working`: Bool? = nil) {
+    public init(`acceptedOrigins`: [String]? = nil, `conversationId`: String, `conversationSettings`: Bool? = nil, `inputOrigins`: Bool? = nil, `model`: String, `workInspection`: Bool? = nil, `working`: Bool? = nil) {
+        self.`acceptedOrigins` = `acceptedOrigins`
         self.`conversationId` = `conversationId`
         self.`conversationSettings` = `conversationSettings`
         self.`inputOrigins` = `inputOrigins`
@@ -1116,6 +1118,7 @@ public struct NativeEventReady: Codable, Sendable, Equatable {
         self.`working` = `working`
     }
     enum CodingKeys: String, CodingKey {
+        case `acceptedOrigins` = "accepted_origins"
         case `conversationId` = "conversation_id"
         case `conversationSettings` = "conversation_settings"
         case `inputOrigins` = "input_origins"

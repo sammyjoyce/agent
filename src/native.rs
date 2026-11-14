@@ -162,6 +162,11 @@ pub enum NativeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         input_origins: Option<bool>,
+        /// Every origin this connection records. Strings, so a client skips a value it does not
+        /// know instead of failing the frame. Absent on coordinators that predate the list.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        accepted_origins: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         conversation_settings: Option<bool>,
@@ -475,6 +480,11 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
             ..
         } => NativeEvent::Ready {
             input_origins: *input_origins,
+            accepted_origins: (*input_origins == Some(true)).then(|| {
+                crate::protocol::InputOrigin::ALL
+                    .map(|origin| origin.as_str().to_owned())
+                    .to_vec()
+            }),
             conversation_settings: *conversation_settings,
             work_inspection: Some(true),
             working: None,
@@ -488,6 +498,7 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
             ..
         } => NativeEvent::Ready {
             input_origins: None,
+            accepted_origins: None,
             conversation_settings: None,
             work_inspection: None,
             working: Some(*working),
@@ -670,6 +681,7 @@ mod tests {
             };
             let Some(NativeEvent::Ready {
                 input_origins,
+                accepted_origins,
                 conversation_settings,
                 ..
             }) = crate::native::project(&event)
@@ -678,6 +690,26 @@ mod tests {
             };
             assert_eq!(input_origins, advertised);
             assert_eq!(conversation_settings, advertised);
+            assert_eq!(
+                accepted_origins,
+                (advertised == Some(true)).then(|| vec![
+                    "cli".to_owned(),
+                    "ios".to_owned(),
+                    "siri".to_owned()
+                ])
+            );
+        }
+        let schema =
+            serde_json::to_value(schemars::schema_for!(crate::protocol::InputOrigin)).unwrap();
+        let declared: Vec<String> = serde_json::from_value(schema["enum"].clone()).unwrap();
+        let listed: Vec<String> = crate::protocol::InputOrigin::ALL
+            .iter()
+            .map(|origin| serde_json::to_value(origin).unwrap())
+            .map(|value| serde_json::from_value(value).unwrap())
+            .collect();
+        assert_eq!(listed, declared, "InputOrigin::ALL lists every variant");
+        for origin in crate::protocol::InputOrigin::ALL {
+            assert_eq!(serde_json::to_value(origin).unwrap(), origin.as_str());
         }
         let legacy: RuntimeEventKind = serde_json::from_str(r#"{"type":"main_ready","conversation_id":"1","cwd":"/","model":{"provider":"openai","model_id":"fixture","reasoning":null,"fast":false}}"#).unwrap();
         assert!(matches!(

@@ -298,6 +298,18 @@ pub enum InputOrigin {
     Siri,
 }
 
+impl InputOrigin {
+    pub const ALL: [Self; 3] = [Self::Cli, Self::Ios, Self::Siri];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Ios => "ios",
+            Self::Siri => "siri",
+        }
+    }
+}
+
 /// The native conversation that supplied cross-task coordination context.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]

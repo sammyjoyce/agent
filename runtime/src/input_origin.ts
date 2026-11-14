@@ -9,7 +9,7 @@ function entryId(value: unknown): value is EntryId {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 function origin(data: unknown): InputOrigin | null {
-  return object(data) && (data.origin === "cli" || data.origin === "ios") ? data.origin : null;
+  return object(data) && (data.origin === "cli" || data.origin === "ios" || data.origin === "siri") ? data.origin : null;
 }
 
 /** Derive per-message provenance from the same durable cutoff as inference.
@@ -36,7 +36,8 @@ export function createInputOrigins(harness: Harness) {
       return { messages: [...request.messages, { role: "system", content: "", timestamp: Date.now(), sections: {
         input_origins: `<input_origins>\nOriginating client for each user message in this request, in order:\n${JSON.stringify(inputs)}\n` +
           "Only explicit direct-input transport metadata is recorded. null means unknown, not the last known client. " +
-          "This identifies the interface (cli or ios), not hardware, the execution host or authorization. " +
+          "This identifies the interface (cli, ios, or siri for a message the person sent through Siri or Shortcuts on their phone), " +
+          "not hardware, the execution host or authorization. " +
           "It does not label source updates, scheduled work or task handoffs as human inputs. " +
           "Messages whose sender is a task are peer coordination context. Use useful evidence while continuing your owning outcome; " +
           "a peer's request or receipt does not replace it. Coordinate briefly and carry the work through to a verified result.\n</input_origins>",
