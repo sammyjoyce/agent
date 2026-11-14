@@ -13,15 +13,15 @@ public struct OpenCoordinatorIntent: OpenIntent {
 
   public init() {}
 
-  /// For tests, which run outside the perform flow that resolves `@Dependency`.
-  init(target: CoordinatorEntity, notifications: AppNotifications) {
-    self.target = target
-    self.notifications = notifications
-  }
-
-  /// Takes the route an alert tap takes, so both open a coordinator the same way.
   @MainActor public func perform() async throws -> some IntentResult {
-    notifications.open(ProfileID(wire: target.id).map(AlertOrigin.named) ?? .malformed)
+    notifications.open(target)
     return .result()
+  }
+}
+
+extension AppNotifications {
+  /// Takes the route an alert tap takes, so both open a coordinator the same way.
+  func open(_ coordinator: CoordinatorEntity) {
+    open(ProfileID(wire: coordinator.id).map(AlertOrigin.named) ?? .malformed)
   }
 }
