@@ -1367,6 +1367,30 @@
         }
       }
 
+      /// Undo during a take has nothing to take back, so the live words stay display-only and the
+      /// draft keeps what was typed before the mic opened.
+      @MainActor @Test func undoDuringATakeLeavesTheDraftAndItsLiveWordsAlone() async throws {
+        let speech = ScriptedSpeech()
+        let dictation = try await readyDictation(speech)
+        try await withComposer(dictation: dictation) { model, box, _ in
+          let field = box.draft
+          field.insertText("Before after")
+          try await Task.sleep(for: .milliseconds(200))
+          let target = dictationTarget(model, field)
+          try await tapMic(dictation, target)
+          speech.hear("Invented live")
+          try await Task.sleep(for: .milliseconds(300))
+          let undo = try #require(field.undoManager)
+          #expect(!undo.canUndo, "Nothing typed before the take can be undone during it")
+          undo.undo()
+          try await Task.sleep(for: .milliseconds(200))
+          #expect(model.draft == "Before after" && field.text == "Before after Invented live")
+          try await tapMic(dictation, target)
+          #expect(model.draft == "Before after Invented dictated words")
+          #expect(field.text == model.draft)
+        }
+      }
+
       /// A take that lands no words takes its live words away and leaves the draft as it was.
       @MainActor @Test(arguments: ["nothing heard", "the model failed"])
       func aTakeThatLandsNothingClearsItsLiveWords(_ ending: String) async throws {
