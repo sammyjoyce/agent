@@ -36,6 +36,9 @@ struct AgentApp: App {
       dictation.setForeground(phase != .background)
       Task { await notifications.coordinators.setActive(phase == .active) }
     }
+    .onChange(of: notifications.coordinators.savedNames, initial: true) {
+      AgentShortcuts.updateAppShortcutParameters()
+    }
   }
 
   private var chat: some View {
