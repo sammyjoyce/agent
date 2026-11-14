@@ -282,8 +282,9 @@ CLI, the first report creates its repair session. Results appear in the saved
 main chat. `beep-boop feedback latest` and `beep-boop feedback show <id>` read
 captures; `beep-boop feedback retry <id>` retries a saved report with its
 original identity. Inside Rex, feedback includes an HTML capture of the
-originating terminal. On iOS, it includes a screenshot of the current app
-window. Added files follow the report to the repair worker. Captures stay in
+originating terminal. On iOS, `/feedback` starts a
+[Scrawl recording](../ios/README.md#send-feedback-with-scrawl) instead. Added
+files follow the report to the repair worker. Captures stay in
 private coordinator storage.
 
 Import existing local Codex conversations after both services are connected:
