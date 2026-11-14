@@ -200,6 +200,50 @@ func aHeldTakeOnAFeedbackDraftStartsARecordingLikeSend() async throws {
   }
 }
 
+/// An interruption in the moments capture runs on after a held release keeps the words and sends
+/// nothing, as leaving the app does.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func anInterruptionAfterAHeldReleaseKeepsTheWords() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let (events, heard) = AsyncStream.makeStream(of: RecordingEvent.self)
+  let (released, release) = AsyncStream.makeStream(of: Void.self)
+  let scripted = ScriptedSpeech().engine
+  let engine = SpeechEngine(
+    model: scripted.model, install: scripted.install, prewarm: scripted.prewarm,
+    remove: scripted.remove, diskUsage: scripted.diskUsage, onCellular: scripted.onCellular,
+    permission: scripted.permission, requestPermission: scripted.requestPermission,
+    record: {
+      Recording(
+        events: events,
+        finish: {
+          for await _ in released { break }
+          return "Invented interrupted words"
+        },
+        cancel: {})
+    })
+  let chat = ChatModel(draftStore: AttachmentStore(directory: root.appending(path: "Drafts")))
+  let dictation = Dictation(engine: engine, holdDelay: .milliseconds(10))
+  dictation.setForeground(true)
+  try await until("the model is read") { dictation.model != .checking }
+  try await withConnectedCoordinator(chat) { fixture, _ in
+    let target = DictationTarget(chat: chat)
+    try await hold(dictation, target)
+    dictation.mic(.up(onMic: true), in: target)
+    #expect(dictation.take?.stage == .transcribing(.send))
+    heard.yield(.interrupted)
+    try await until("the interruption is read") {
+      dictation.take?.stage == .transcribing(.keep)
+    }
+    release.yield()
+    try await until("the words land") { dictation.take == nil }
+    heard.finish()
+    #expect(chat.draft == "Invented interrupted words")
+    #expect(dictation.notice == .interrupted)
+    #expect(await submitted(fixture).isEmpty, "An interruption never sends")
+  }
+}
+
 @MainActor @Test(.timeLimit(.minutes(1)), arguments: ["slid off", "cancelled by the system"])
 func aHeldTakeThatDoesNotEndOnTheMicKeepsItsWords(_ ending: String) async throws {
   try await withDictation(holdDelay: .milliseconds(10)) { dictation, _, chat, fixture, directory in
