@@ -89,11 +89,16 @@
     private let requestAlerts: Bool
     /// The app delegate's object. The system hands alert taps to it, never to the fixture's own.
     private let delegate: AppNotifications
+    private let feedback: ScrawlFeedback
 
-    private init(lifetime: Lifetime?, requestAlerts: Bool, delegate: AppNotifications) {
+    private init(
+      lifetime: Lifetime?, requestAlerts: Bool, delegate: AppNotifications,
+      feedback: ScrawlFeedback
+    ) {
       _lifetime = State(initialValue: lifetime)
       self.requestAlerts = requestAlerts
       self.delegate = delegate
+      self.feedback = feedback
     }
 
     /// The `AGENT_INTERACTION_*` values of this launch. A tap on an alert starts the app with no
@@ -145,13 +150,16 @@
     /// `AGENT_INTERACTION_ID` names the storage a relaunch reuses. With it,
     /// `AGENT_INTERACTION_CLEANUP=1` erases that storage and shows only that it did.
     /// `AGENT_INTERACTION_ALERTS=1` asks for permission to show alerts.
-    static func fromEnvironment(notifications: AppNotifications) -> Self? {
+    static func fromEnvironment(notifications: AppNotifications, feedback: ScrawlFeedback) -> Self?
+    {
       guard let peers = requestedPeers else { return nil }
       let requestAlerts = environment["AGENT_INTERACTION_ALERTS"] == "1"
       let named = environment["AGENT_INTERACTION_ID"].flatMap(UUID.init(uuidString:))
       if let named, environment["AGENT_INTERACTION_CLEANUP"] == "1" {
         return (try? Storage(named).erase()).map {
-          Self(lifetime: nil, requestAlerts: requestAlerts, delegate: notifications)
+          Self(
+            lifetime: nil, requestAlerts: requestAlerts, delegate: notifications, feedback: feedback
+          )
         }
       }
       guard
@@ -160,7 +168,9 @@
       else {
         return nil
       }
-      return Self(lifetime: lifetime, requestAlerts: requestAlerts, delegate: notifications)
+      return Self(
+        lifetime: lifetime, requestAlerts: requestAlerts, delegate: notifications,
+        feedback: feedback)
     }
 
     var body: some View {
@@ -171,6 +181,7 @@
             lifetime.dictation?.setForeground(phase != .background)
             Task { await lifetime.notifications.coordinators.setActive(phase == .active) }
           }
+          .onAppear { lifetime.notifications.coordinators.feedbackRecorder = feedback }
           .task {
             delegate.forwardFixtureOpens(to: lifetime.notifications)
             if requestAlerts {

@@ -280,19 +280,16 @@ struct DictationReservation: Equatable {
   /// once the field's text changed, as one Undo step. False when no field is on screen.
   let insert: (_ words: String, _ at: DictationReservation?) -> Bool
   let unlock: () -> Void
-  /// Send's `/feedback` screenshot, as the Send button passes it.
-  let screenshot: (@MainActor () throws -> Data)?
 
   init(
     chat: ChatModel, reserve: @escaping () -> DictationReservation? = { nil },
     insert: @escaping (String, DictationReservation?) -> Bool = { _, _ in false },
-    unlock: @escaping () -> Void = {}, screenshot: (@MainActor () throws -> Data)? = nil
+    unlock: @escaping () -> Void = {}
   ) {
     self.chat = chat
     self.reserve = reserve
     self.insert = insert
     self.unlock = unlock
-    self.screenshot = screenshot
   }
 }
 
@@ -695,7 +692,7 @@ public final class Dictation {
       notice = .notSent(.draftChanged)
     } else if let blocker = chat.sendBlocker {
       notice = .notSent(.blocked(blocker))
-    } else if chat.startSend(screenshot: target.screenshot) == nil {
+    } else if !chat.submit() {
       notice = .notSent(.refused)
     }
   }

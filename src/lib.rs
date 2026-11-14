@@ -13,6 +13,7 @@ pub mod protocol;
 pub mod resources;
 pub mod rex;
 pub mod runtime;
+pub mod scrawl_feedback;
 pub mod service;
 
 pub mod background;

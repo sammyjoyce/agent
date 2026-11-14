@@ -81,17 +81,6 @@ private struct Lab {
   }
 }
 
-/// Every `/feedback` submit about the chip, the report the test sends once two are saved.
-private func feedback(_ fixture: FixtureCoordinator) async -> [NativeRequestSubmit] {
-  await fixture.received().compactMap {
-    if case .submit(let input) = $0, input.text.hasPrefix("/feedback Invented: the chip") {
-      input
-    } else {
-      nil
-    }
-  }
-}
-
 private func interrupts(_ fixture: FixtureCoordinator) async -> Int {
   await fixture.received().filter { if case .interrupt = $0 { true } else { false } }.count
 }
@@ -116,15 +105,6 @@ private func tool(_ entry: String) -> HistoryMessage {
 private func replies(_ prefix: String, _ count: Int, next: String? = nil) -> NativeEventHistory {
   NativeEventHistory(
     messages: (0..<count).map { reply("\(prefix)-\($0)") }, nextCursor: next, pageComplete: true)
-}
-
-/// The window `/feedback` may capture, counting each capture.
-@MainActor private final class Screen {
-  private(set) var captures = 0
-  func capture() -> Data {
-    captures += 1
-    return Data("Invented screen".utf8)
-  }
 }
 
 @Suite struct CapturedSendTests {
@@ -187,7 +167,7 @@ private func replies(_ prefix: String, _ count: Int, next: String? = nil) -> Nat
     .timeLimit(.minutes(1)),
     arguments: [
       "begun in All", "begun in Work", "Personal's chip", "an @Personal tag",
-      "restored from Personal", "held for Personal", "a share import", "/feedback",
+      "restored from Personal", "held for Personal", "a share import",
     ])
   func aScopeSwitchNeverChangesWhereADraftGoes(_ kind: String) async throws {
     try await withLab { lab, coordinators in
@@ -196,7 +176,6 @@ private func replies(_ prefix: String, _ count: Int, next: String? = nil) -> Nat
       // Both are busy with a turn, so each Send is taken and waits on its socket to be placed, and
       // no lane reconnects between steps.
       for fixture in [lab.workFixture, lab.personalFixture] { await fixture.holdPlacements() }
-      let screen = Screen()
       var addressed: [ProfileID: [String]] = [work: [], personal: []]
       /// Builds the draft, and returns the text it sends and whom it is addressed to.
       @MainActor func build(_ text: String) async throws -> (body: String, recipients: [ProfileID])
@@ -239,13 +218,10 @@ private func replies(_ prefix: String, _ count: Int, next: String? = nil) -> Nat
           let message = try #require(chat.held.first { $0.id == queued.inputId })
           await chat.restoreHeld(message)
           return (text, [personal])
-        case "a share import":
+        default:
           try await lab.inbox.enqueue(images: [], note: text)
           await chat.receiveSharedDrafts()
           return (text, [work, personal])
-        default:
-          chat.draft = "/feedback " + text
-          return ("/feedback " + text, [work, personal])
         }
       }
       let walk: [FeedScope] = [.all, .one(work), .one(personal), .all]
@@ -263,7 +239,7 @@ private func replies(_ prefix: String, _ count: Int, next: String? = nil) -> Nat
           chat.show(scope)
           #expect(kept(), "\(kind) is unchanged in \(scope)")
         }
-        let admission = chat.startSend(screenshot: screen.capture)
+        let admission = chat.startSend()
         if walk[step].coordinator.map({ recipients == [$0] }) ?? true {
           try #require(admission != nil, "\(kind) goes from \(walk[step])")
           await admission?.value
@@ -286,7 +262,6 @@ private func replies(_ prefix: String, _ count: Int, next: String? = nil) -> Nat
       try await Task.sleep(for: .milliseconds(200))
       #expect(await submitted(lab.workFixture) == addressed[work])
       #expect(await submitted(lab.personalFixture) == addressed[personal])
-      #expect(screen.captures == 0, "With two coordinators saved nothing captures the screen")
     }
   }
 
@@ -354,74 +329,6 @@ private func replies(_ prefix: String, _ count: Int, next: String? = nil) -> Nat
       } else {
         #expect(chat.draft.isEmpty && chat.attachments.isEmpty && chat.destination == .open)
       }
-    }
-  }
-
-  /// With one coordinator saved, `/feedback` attaches the screen as its own. With two saved it
-  /// never does, in All or in either coordinator's feed, since the window can show another
-  /// coordinator's messages in any scope, and the composer says why.
-  @MainActor @Test(.timeLimit(.minutes(1)))
-  func feedbackIsWithheldWithTwoSavedInEveryScope() async throws {
-    try await withLab { lab, coordinators in
-      let chat = coordinators.chat
-      try await coordinators.add(
-        name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
-      let work = try #require(coordinators.profiles.first?.id)
-      try await eventually("Work connected") { chat.snapshots[work]?.connection == .connected }
-      let screen = Screen()
-      chat.draft = "/feedback Invented: the send button stays grey"
-      // Work cannot save the Send, so the draft keeps what Send attached.
-      try await withReadOnlyProfile(
-        ProfileDirectory(work, applicationSupport: lab.root, caches: lab.root)
-      ) {
-        await chat.send(screenshot: screen.capture)
-      }
-      #expect(screen.captures == 1)
-      #expect(chat.attachments.map(\.reference.name) == ["Feedback.png", "Composer.log"])
-      #expect(chat.draftAddressing.screenshotOwner == work, "The screenshot is Work's")
-      await chat.send(screenshot: screen.capture)
-      try await eventually("Work got the screenshot") {
-        await lab.workFixture.received().contains {
-          if case .submit(let input) = $0 {
-            input.attachments?.map(\.name) == ["Feedback.png", "Composer.log"]
-          } else {
-            false
-          }
-        }
-      }
-      #expect(screen.captures == 1, "The draft's screenshot went, with no second capture")
-
-      try await coordinators.add(
-        name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
-      let personal = try #require(coordinators.profiles.last?.id)
-      try await eventually("Personal connected") {
-        chat.snapshots[personal]?.connection == .connected
-      }
-      let withheld =
-        "Feedback was sent without a screenshot. With two or more coordinators saved, the screen can show another coordinator's messages."
-      var addressed = [work: [String](), personal: []]
-      for (scope, recipients) in [
-        (FeedScope.all, [work, personal]), (.one(work), [work]), (.one(personal), [personal]),
-      ] {
-        chat.show(scope)
-        let shown = scope.coordinator.map(chat.name) ?? "All"
-        let text = "/feedback Invented: the chip overlaps the field in \(shown)"
-        chat.draft = text
-        await chat.send(screenshot: screen.capture)
-        #expect(chat.error == withheld, "\(shown)")
-        #expect(chat.draft.isEmpty && chat.attachments.isEmpty, "\(shown)")
-        for id in recipients { addressed[id]?.append(text) }
-        try await eventually("each coordinator got what was addressed to it from \(shown)") {
-          let (atWork, atPersonal) = (
-            await feedback(lab.workFixture), await feedback(lab.personalFixture)
-          )
-          return atWork.map(\.text) == addressed[work]
-            && atPersonal.map(\.text) == addressed[personal]
-        }
-      }
-      let sent = await feedback(lab.workFixture) + feedback(lab.personalFixture)
-      #expect(sent.allSatisfy { ($0.attachments ?? []).isEmpty }, "Nothing was attached")
-      #expect(screen.captures == 1, "With two coordinators saved nothing captured the screen")
     }
   }
 

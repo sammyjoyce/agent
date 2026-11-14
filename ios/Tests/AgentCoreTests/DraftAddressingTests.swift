@@ -23,7 +23,7 @@ private struct DraftDisk {
     try await ComposerDraftStore(url: url).load(from: files).draft
   }
 
-  func screenshot() async throws -> LocalAttachment {
+  func file() async throws -> LocalAttachment {
     try await files.stage(
       data: Data("invented capture".utf8), name: "Feedback.png", mediaType: "image/png")
   }
@@ -53,16 +53,14 @@ extension DraftDisk {
   let disk = DraftDisk()
   defer { disk.erase() }
   let work = ProfileID()
-  let shot = try await disk.screenshot()
+  let file = try await disk.file()
   let addressing = DraftAddressing(
-    destination: .chip(work), restoredFrom: work, screenshotOwner: work,
+    destination: .chip(work), restoredFrom: work,
     source: RestoredSource(
-      lane: work, item: "example-item", kind: .held(queue: UUID()), text: "/feedback Invented",
-      files: [shot.id]))
+      lane: work, item: "example-item", kind: .held(queue: UUID()), text: "Invented",
+      files: [file.id]))
   try await ComposerDraftStore(url: disk.url).save(
-    ComposerDraft(
-      text: "/feedback Invented", attachments: [shot], feedbackScreenshotID: shot.id,
-      addressing: addressing), revision: 1)
+    ComposerDraft(text: "Invented", attachments: [file], addressing: addressing), revision: 1)
   #expect(try await disk.saved().addressing == addressing)
 }
 
@@ -194,10 +192,9 @@ func aSavedStampNamingNoSavedProfileBlocksInsteadOfBroadcasting() async throws {
 @MainActor @Test func anOldFormatDraftStillLoads() async throws {
   let disk = DraftDisk()
   defer { disk.erase() }
-  let shot = try await disk.screenshot()
+  let file = try await disk.file()
   try await ComposerDraftStore(url: disk.url).save(
-    ComposerDraft(text: "/feedback Invented", attachments: [shot], feedbackScreenshotID: shot.id),
-    revision: 1)
+    ComposerDraft(text: "/feedback Invented", attachments: [file]), revision: 1)
   let data = try Data(contentsOf: disk.url)
   let record = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
   #expect(
@@ -207,22 +204,37 @@ func aSavedStampNamingNoSavedProfileBlocksInsteadOfBroadcasting() async throws {
   let model = await disk.launch([only])
   #expect(model.draftError == nil)
   #expect(model.draft == "/feedback Invented")
-  #expect(model.attachments.map(\.id) == [shot.id])
-  #expect(try await disk.saved().addressing == DraftAddressing(screenshotOwner: only.id))
+  #expect(model.attachments.map(\.id) == [file.id])
+  #expect(try await disk.saved().addressing.isEmpty)
 }
 
-@MainActor @Test func theScreenshotOwnerSurvivesRelaunchWithTwoCoordinators() async throws {
+/// Earlier builds saved the automatic `/feedback` screenshot's ID and owner in the draft. Such a
+/// draft still loads, its screenshot an ordinary file, and the next save drops both keys.
+@MainActor @Test func aDraftSavedWithAFeedbackScreenshotStillLoads() async throws {
   let disk = DraftDisk()
   defer { disk.erase() }
-  let saved = try [profile("Work", "100.64.1.2"), profile("Personal", "100.64.1.3")]
-  let shot = try await disk.screenshot()
+  let work = try profile("Work", "100.64.1.2")
+  let file = try await disk.file()
   try await ComposerDraftStore(url: disk.url).save(
     ComposerDraft(
-      text: "/feedback Invented", attachments: [shot], feedbackScreenshotID: shot.id,
-      addressing: DraftAddressing(screenshotOwner: saved[1].id)), revision: 1)
-  let model = await disk.launch(saved)
+      text: "/feedback Invented", attachments: [file],
+      addressing: DraftAddressing(destination: .chip(work.id))), revision: 1)
+  var record = try #require(
+    try JSONSerialization.jsonObject(with: Data(contentsOf: disk.url)) as? [String: Any])
+  record["feedbackScreenshotID"] = file.id
+  var addressing = try #require(record["addressing"] as? [String: Any])
+  addressing["screenshotOwner"] = work.id.description
+  record["addressing"] = addressing
+  try JSONSerialization.data(withJSONObject: record).write(to: disk.url)
+
+  let model = await disk.launch([work])
   #expect(model.draftError == nil)
-  #expect(try await disk.saved().addressing.screenshotOwner == saved[1].id)
+  #expect(model.draft == "/feedback Invented")
+  #expect(model.attachments.map(\.id) == [file.id])
+  #expect(model.destination == .chip(work.id))
+  #expect(await model.saveDraft())
+  let saved = try #require(String(data: try Data(contentsOf: disk.url), encoding: .utf8))
+  #expect(!saved.contains("feedbackScreenshotID") && !saved.contains("screenshotOwner"))
 }
 
 @MainActor private final class NextLaunch {
@@ -253,26 +265,4 @@ func aSendTheOutboxHoldsTakesItsChipWithItWhenTheAppStopsThere() async throws {
   let stopped = try #require(next.draft)
   #expect(stopped.text.isEmpty)
   #expect(stopped.addressing.isEmpty)
-}
-
-@MainActor @Test(.timeLimit(.minutes(1)))
-func aFeedbackScreenshotKeepsItsOwnerWhenTheAppStopsBeforeAnOutboxHoldsTheSend() async throws {
-  let disk = DraftDisk()
-  defer { disk.erase() }
-  let next = NextLaunch()
-  let model = ChatModel(
-    draftStore: disk.files, persistence: ComposerDraftStore(url: disk.url),
-    admit: { _ in
-      next.draft = try? await disk.saved()
-      return false
-    })
-  await model.restoreDraft()
-  try await withConnectedCoordinator(model) { _, _ in
-    model.draft = "/feedback Invented"
-    await model.send(screenshot: { Data("invented capture".utf8) })
-  }
-  let stopped = try #require(next.draft)
-  #expect(stopped.text == "/feedback Invented")
-  #expect(stopped.feedbackScreenshotID != nil)
-  #expect(stopped.addressing.screenshotOwner == model.profiles[0].id)
 }

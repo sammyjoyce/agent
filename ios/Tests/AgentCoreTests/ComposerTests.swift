@@ -304,56 +304,6 @@ func rejectedAdmissionRestoresItsTextWithoutLosingNewTyping(stopping: Bool) asyn
   }
 }
 
-@MainActor @Test(.timeLimit(.minutes(1)))
-func feedbackCapturesOnceAndFailedAdmissionKeepsTheExactEvidence() async throws {
-  try await withConnectedModel { model, _, directory in
-    try await withReadOnlyProfile(directory) {
-      model.draft = "/feedback The text is clipped"
-      var captures = 0
-      await model.send(screenshot: {
-        captures += 1
-        return Data([1, 2, 3])
-      })
-      let original = model.attachments
-      #expect(original.map(\.reference.name) == ["Feedback.png", "Composer.log"])
-      let image = try #require(original.first)
-      let diagnostics = try #require(original.last)
-      let log = try String(contentsOf: diagnostics.url, encoding: .utf8)
-      #expect(log.hasPrefix("Composer diagnostics: coverage="))
-      #expect(!log.contains("The text is clipped"))
-      await model.send(screenshot: {
-        captures += 1
-        return Data([4, 5, 6])
-      })
-      #expect(captures == 1)
-      #expect(model.attachments == original)
-      #expect(try Data(contentsOf: image.url) == Data([1, 2, 3]))
-      #expect(try String(contentsOf: diagnostics.url, encoding: .utf8) == log)
-      #expect(model.draft == "/feedback The text is clipped")
-    }
-  }
-}
-
-@MainActor @Test(.timeLimit(.minutes(1)))
-func feedbackPreservesUserFilesAndReservesTheLastSlotForItsScreenshot() async throws {
-  try await withConnectedModel { model, _, directory in
-    try await withReadOnlyProfile(directory) {
-      for index in 0..<(AttachmentLimits.maximumCount - 1) {
-        await model.attach(data: Data([1]), name: "Note-\(index).txt", mediaType: "text/plain")
-      }
-      let original = model.attachments
-      model.draft = "/feedback Keep the attached notes"
-      await model.send(screenshot: { Data([2]) })
-      #expect(Array(model.attachments.dropLast()) == original)
-      #expect(model.attachments.count == AttachmentLimits.maximumCount)
-      let image = try #require(model.attachments.last)
-      #expect(image.reference.name == "Feedback.png")
-      #expect(try Data(contentsOf: image.url) == Data([2]))
-      #expect(model.draft == "/feedback Keep the attached notes")
-    }
-  }
-}
-
 @MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true])
 func attachmentOnlyAdmissionPreservesFilesAndNewTyping(admitted: Bool) async throws {
   try await withConnectedModel { model, _, directory in

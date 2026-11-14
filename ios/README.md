@@ -15,9 +15,11 @@ that identity and the existing signing configuration for updates to the same app
    Existing coordinator setup is described in [setup](../docs/setup.md).
 2. Open `Agent.xcodeproj` in full Xcode with an iOS 18-or-newer SDK. The `Agent`
    scheme uses this directory's local Swift package, which has no dependencies,
+   and the app target also links [ScrawlKit](https://github.com/kitlangton/scrawl)
    and `Speech/`, which pins FluidAudio for dictation and links only into the
-   app. Xcode fetches FluidAudio on the first build, at the revision in the
-   committed `Package.resolved`. For a device build, choose a development team and use a bundle ID registered to it.
+   app. Xcode fetches ScrawlKit and FluidAudio on the first build, at the
+   revisions in the committed `Package.resolved`. For a device build, choose a
+   development team and use a bundle ID registered to it.
    Simulator builds do not require signing.
 3. Connect Tailscale on the device. The coordinator must authorize its peer
    through the existing same-user, pinned-user or pinned-node policy. A pinned
@@ -78,6 +80,63 @@ the group defaults to `group.$(AGENT_BUNDLE_IDENTIFIER)`. Keep the existing
 host bundle ID when updating an installed app. Provisioning both targets is
 required for sharing on a phone; an unsigned build does not establish that.
 
+## Send feedback with Scrawl
+
+ScrawlKit records Beep Boop with your narration, touches and drawn ink, and
+sends the recording to Scrawl on your Mac. The watcher in `beep-boop maintain`
+then sends it to the coordinator as `/feedback`, which starts a background
+repair. Recording does nothing until you pair the phone.
+
+1. Open Scrawl on the Mac.
+2. Run `/Applications/Scrawl.app/Contents/MacOS/scrawl link --scheme beepboop --url http://<mac>.<tailnet>.ts.net:47777`.
+   To get the Mac's Tailscale name, run `tailscale status --json` and copy
+   `Self.DNSName` without the trailing dot. Pair by name because iOS refuses
+   plain HTTP to IP addresses, so the default link, which carries IP
+   addresses, can't upload.
+3. Open the printed link on the iPhone, or scan its QR code. Pairing links
+   work whatever the feed shows.
+4. Show one coordinator's conversation. To start recording, send
+   `/feedback` followed by what went wrong, or hold three fingers on the screen
+   for half a second. The typed text becomes the recording's description.
+5. To stop and send, hold three fingers again, or tap Send on the strip.
+
+To unpair the phone, open `beepboop://scrawl?reset=1` on it.
+
+A recording goes to exactly one coordinator: the one the feed shows when it
+starts. That is the only coordinator saved, or the one whose conversation you
+chose. It must be paired. Messages held from before the update that may belong
+to another coordinator count as a second one. With no coordinator or several in
+view, the three-finger hold does nothing.
+
+Typed `/feedback` never goes to a coordinator as a message, so it works while
+the coordinator is not connected. It records nothing, keeps the draft and says
+why in these cases:
+
+- The feed shows no coordinator, or more than one.
+- The draft is addressed to a coordinator other than the one shown.
+- Files are attached. A recording can't carry them, so send them as a message.
+- Scrawl isn't paired.
+- A recording is already running.
+
+Each recording's `timeline.json` names its coordinator in a `beepBoop` object
+with the coordinator's ID and address, the typed description and the
+composer's diagnostics. If the feed shows anything else when the recording
+stops, the phone leaves `beepBoop` out, and the Mac refuses the recording
+instead of sending it to another coordinator.
+
+Feedback through Scrawl has these limits:
+
+- Scrawl must be running on the Mac. A recording made while the Mac is off
+  waits on the phone until the next cable connection.
+- The strip says "Saved on your Mac", because Scrawl doesn't know about the
+  watcher. The repair result arrives in the main chat.
+- A Mac capture (Option-Shift-S) becomes feedback only on a Mac whose
+  `config.toml` sets `scrawl_feedback = true`.
+
+If a recording doesn't upload, Scrawl can collect it the next time you connect
+the phone by cable. To allow that, list the app's bundle ID under `usbApps` in
+`~/.config/scrawl/config.json`.
+
 ## Behavior and data
 
 - Saved history, streamed answer text, provider-shareable summaries, tool status,
@@ -113,7 +172,7 @@ required for sharing on a phone; an unsigned build does not establish that.
 - Slash parsing and execution use the shared Rust command parser and backend
   handlers. The phone menu lists only supported controls. `/resume` remains a
   TUI-only saved-conversation view; it never starts work from this app.
-- Messages and feedback, including immutable attachment copies, are saved to the
+- Messages, including immutable attachment copies, are saved to the
   saved coordinator's own outbox before transmission. On iOS it
   uses complete file protection and is excluded from backup. History stays in
   memory; there is no separate phone conversation database. For its newest 2000
@@ -149,10 +208,10 @@ required for sharing on a phone; an unsigned build does not establish that.
   category `Composer`. They record the build, lifecycle, send/clear/admission
   state, character/attachment counts and failure domains/codes, without message
   text or file paths.
-  `/feedback` includes up to 15 minutes of current-process metadata in a
-  private `Composer.log` attachment when a file slot is available. Collection
-  includes the OS version, stops waiting after two seconds and reports empty
-  or unavailable coverage.
+  A feedback recording's `beepBoop` object carries up to 15 minutes of
+  current-process metadata as `composerLog`, at most 256 KiB with the newest
+  lines kept. Collection includes the OS version, stops waiting after two
+  seconds and reports empty or unavailable coverage.
 - **Connection → Conversation settings** changes the main conversation's model,
   reasoning and Fast setting without submitting the draft. Configured and
   effective selections are shown separately; an unknown active selection stays
@@ -318,7 +377,9 @@ required for sharing on a phone; an unsigned build does not establish that.
   onto the chat. Up to
   eight files of 16 MiB each use the shared chunked attachment protocol. Photos
   are resized and encoded as JPEG. History includes file metadata; bytes are
-  downloaded and verified only when opening a preview.
+  downloaded and verified only when opening a preview. Pi's existing adapter
+  handles model image input; other files remain available to agent tools on the
+  execution host. No provider requests originate on iOS.
 - The mic beside Send dictates on the iPhone with NVIDIA Parakeet Unified
   English 0.6B, streaming. The first tap asks before a one-time 609.4 MB
   download into Application Support, excluded from backup, and then prepares
@@ -350,18 +411,10 @@ required for sharing on a phone; an unsigned build does not establish that.
   composer once, preserving its note and attachments. Sharing never sends or
   starts agent work. Cancel before saving leaves the composer untouched.
   An uncertain save retries the same frozen selection and transfer ID.
-- `/feedback` captures the current app window before sending and includes it
-  with the report. Failed admission keeps the exact captured evidence for retry.
-  With more than one coordinator saved nothing is captured, because the feed
-  shows every coordinator's conversation. With one saved, nothing is captured
-  while the chat shows messages held from before the update that may be another
-  coordinator's. The report then goes without a screenshot, and the line under
-  the chat says why. A kept screenshot, or any restored
-  `Feedback.png` whatever its text says, belongs to the coordinator it came from
-  and is sent to that coordinator alone; otherwise it must be removed before
-  sending.
-  Pi's existing adapter handles model image input; other files remain available
-  to agent tools on the execution host. No provider requests originate on iOS.
+- `/feedback` starts a Scrawl recording, as
+  [Send feedback with Scrawl](#send-feedback-with-scrawl) describes. A draft
+  saved by an earlier build with its automatic `Feedback.png` screenshot loads
+  with that screenshot as an ordinary attached file.
 
 ## Validation
 

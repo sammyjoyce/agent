@@ -10,10 +10,9 @@ import type { AttachmentRequest } from "./generated/AttachmentRequest.js";
 import type { AttachmentResponse } from "./generated/AttachmentResponse.js";
 import type { HostCall } from "./tasks.js";
 
-import { MAX_ATTACHMENT_BYTES, ATTACHMENT_CHUNK_BYTES, MAX_ATTACHMENTS, MAX_ATTACHMENT_NAME_BYTES } from "./generated/attachment-limits.js";
+import { MAX_ATTACHMENT_BYTES, ATTACHMENT_CHUNK_BYTES, MAX_ATTACHMENTS, MAX_ATTACHMENT_NAME_BYTES, ATTACHMENT_STAGING_MILLIS } from "./generated/attachment-limits.js";
 export class AttachmentError extends Error {}
 const QUOTA = 512 * 1024 * 1024;
-const STAGING_LIFETIME = 24 * 60 * 60 * 1000;
 export function validateInput(text: string, attachments?: readonly AttachmentRef[]): void {
   if (Buffer.byteLength(text, "utf8") > 65536 || (text.trim().length === 0 && (attachments?.length ?? 0) === 0)) {
     throw new AttachmentError("Input needs text or an attachment, with text at most 65536 UTF-8 bytes");
@@ -110,7 +109,7 @@ export class AttachmentStore {
           if (object(error) && error.code === "ENOENT") { await rm(this.folder(entry.name), { recursive: true, force: true }); continue; }
           throw error;
         }
-        if (!saved.retained && Date.now() - saved.created > STAGING_LIFETIME) await rm(this.folder(entry.name), { recursive: true });
+        if (!saved.retained && Date.now() - saved.created > ATTACHMENT_STAGING_MILLIS) await rm(this.folder(entry.name), { recursive: true });
         else reserved += saved.attachment.size_bytes + 4096;
       }
       if (reserved + request.size_bytes + 4096 > QUOTA) throw new AttachmentError("Attachment storage is full; no input was admitted");

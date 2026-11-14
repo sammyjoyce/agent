@@ -10,7 +10,8 @@ use anyhow::{Context, Result, bail};
 
 /// Persistent identity of one coordinator state directory, so a phone can tell
 /// two coordinators apart and notice when fresh state replaced the one it knew.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
 pub struct CoordinatorId(uuid::Uuid);
 
 const COORDINATOR_ID_FILE: &str = "coordinator-id";
@@ -59,6 +60,15 @@ impl CoordinatorId {
             .context("Could not save the coordinator ID")?;
         File::open(state)?.sync_all()?;
         Ok(id)
+    }
+}
+
+/// Accepts any UUID spelling, so two IDs compare by value, never by text.
+impl std::str::FromStr for CoordinatorId {
+    type Err = uuid::Error;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        uuid::Uuid::try_parse(text).map(Self)
     }
 }
 

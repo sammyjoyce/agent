@@ -30,16 +30,14 @@ public struct ComposerSubmission: Sendable, Equatable {
   public let outboxURLs: [URL]
   public var text: String
   public var attachments: [LocalAttachment]
-  public var feedbackScreenshotID: String?
   public init(
     identity: ComposerInputIdentity, outboxURLs: [URL], text: String,
-    attachments: [LocalAttachment], feedbackScreenshotID: String? = nil
+    attachments: [LocalAttachment]
   ) {
     self.identity = identity
     self.outboxURLs = outboxURLs
     self.text = text
     self.attachments = attachments
-    self.feedbackScreenshotID = feedbackScreenshotID
   }
 }
 
@@ -117,24 +115,21 @@ public struct DraftAddressing: Codable, Sendable, Equatable {
   public var destination: DraftDestination
   /// The coordinator whose restored message the draft holds.
   public var restoredFrom: ProfileID?
-  /// Whose feed the automatic `/feedback` screenshot shows.
-  public var screenshotOwner: ProfileID?
   /// The restored original, which a Send that carries it unchanged withdraws.
   public var source: RestoredSource?
 
   /// A chip keeps the `recipient` key that older records use, so they load with the meaning they
   /// had. A stamp is saved under `begunIn`.
   private enum CodingKeys: String, CodingKey {
-    case recipient, begunIn, restoredFrom, screenshotOwner, source
+    case recipient, begunIn, restoredFrom, source
   }
 
   public init(
     destination: DraftDestination = .open, restoredFrom: ProfileID? = nil,
-    screenshotOwner: ProfileID? = nil, source: RestoredSource? = nil
+    source: RestoredSource? = nil
   ) {
     self.destination = destination
     self.restoredFrom = restoredFrom
-    self.screenshotOwner = screenshotOwner
     self.source = source
   }
 
@@ -150,7 +145,6 @@ public struct DraftAddressing: Codable, Sendable, Equatable {
       destination = .open
     }
     restoredFrom = try keys.decodeIfPresent(ProfileID.self, forKey: .restoredFrom)
-    screenshotOwner = try keys.decodeIfPresent(ProfileID.self, forKey: .screenshotOwner)
     source = try keys.decodeIfPresent(RestoredSource.self, forKey: .source)
   }
 
@@ -162,7 +156,6 @@ public struct DraftAddressing: Codable, Sendable, Equatable {
     case .chip(let id): try keys.encode(id, forKey: .recipient)
     }
     try keys.encodeIfPresent(restoredFrom, forKey: .restoredFrom)
-    try keys.encodeIfPresent(screenshotOwner, forKey: .screenshotOwner)
     try keys.encodeIfPresent(source, forKey: .source)
   }
 
@@ -174,21 +167,18 @@ public struct ComposerDraft: Sendable, Equatable {
   public var mode: InputMode
   public var attachments: [LocalAttachment]
   public var consumedTransfers: Set<UUID>
-  public var feedbackScreenshotID: String?
   public var composerID: UUID?
   public var submission: ComposerSubmission?
   public var addressing: DraftAddressing
   public init(
     text: String = "", mode: InputMode = .steer, attachments: [LocalAttachment] = [],
-    consumedTransfers: Set<UUID> = [], feedbackScreenshotID: String? = nil,
-    composerID: UUID? = nil, submission: ComposerSubmission? = nil,
-    addressing: DraftAddressing = DraftAddressing()
+    consumedTransfers: Set<UUID> = [], composerID: UUID? = nil,
+    submission: ComposerSubmission? = nil, addressing: DraftAddressing = DraftAddressing()
   ) {
     self.text = text
     self.mode = mode
     self.attachments = attachments
     self.consumedTransfers = consumedTransfers
-    self.feedbackScreenshotID = feedbackScreenshotID
     self.composerID = composerID
     self.submission = submission
     self.addressing = addressing
@@ -204,20 +194,18 @@ public actor ComposerDraftStore {
     let outboxPaths: [String]
     let text: String
     let attachments: [AttachmentRef]
-    let feedbackScreenshotID: String?
     /// A record from a build that kept the receipt in the first recipient's outbox alone names
     /// that outbox under `outboxPath`, and loads as a submission held there alone.
     private enum LegacyKeys: String, CodingKey { case outboxPath }
 
     init(
       identity: ComposerInputIdentity, outboxPaths: [String], text: String,
-      attachments: [AttachmentRef], feedbackScreenshotID: String?
+      attachments: [AttachmentRef]
     ) {
       self.identity = identity
       self.outboxPaths = outboxPaths
       self.text = text
       self.attachments = attachments
-      self.feedbackScreenshotID = feedbackScreenshotID
     }
 
     init(from decoder: any Decoder) throws {
@@ -228,7 +216,6 @@ public actor ComposerDraftStore {
         ?? [decoder.container(keyedBy: LegacyKeys.self).decode(String.self, forKey: .outboxPath)]
       text = try keys.decode(String.self, forKey: .text)
       attachments = try keys.decode([AttachmentRef].self, forKey: .attachments)
-      feedbackScreenshotID = try keys.decodeIfPresent(String.self, forKey: .feedbackScreenshotID)
     }
   }
   private struct Record: Codable {
@@ -237,7 +224,6 @@ public actor ComposerDraftStore {
     let mode: InputMode
     let attachments: [AttachmentRef]
     let consumedTransfers: Set<UUID>
-    let feedbackScreenshotID: String?
     let composerID: UUID?
     let submission: Submission?
     /// Absent from records saved before addressing was stored, and whenever it is empty.
@@ -263,11 +249,7 @@ public actor ComposerDraftStore {
         !value.outboxPaths.isEmpty
           && value.outboxPaths.allSatisfy { !$0.isEmpty && !$0.hasPrefix("/") }
       }) ?? true,
-      submitted.map({ $0.identity.composerID == record.composerID }) ?? true,
-      submitted.map({ value in
-        value.feedbackScreenshotID.map { id in value.attachments.contains { $0.id == id } } ?? true
-      }) ?? true,
-      record.feedbackScreenshotID.map({ id in record.attachments.contains { $0.id == id } }) ?? true
+      submitted.map({ $0.identity.composerID == record.composerID }) ?? true
     else { throw ComposerDraftError.invalidRecord }
     let owned =
       try submitted.map { value in
@@ -297,17 +279,15 @@ public actor ComposerDraftStore {
     if let submitted, !owned, !submitted.text.isEmpty {
       text = submitted.text + (text.isEmpty ? "" : "\n\n" + text)
     }
-    let screenshot = record.feedbackScreenshotID ?? (owned ? nil : submitted?.feedbackScreenshotID)
     var addressing = record.addressing ?? DraftAddressing()
     // An outbox holds the Send this record was saved for, and whom that draft was for went with
     // it. Only a draft begun since keeps an address.
     if owned, record.text.isEmpty, record.attachments.isEmpty { addressing = DraftAddressing() }
-    if screenshot == nil { addressing.screenshotOwner = nil }
     return (
       ComposerDraft(
         text: text, mode: record.mode, attachments: files,
-        consumedTransfers: record.consumedTransfers,
-        feedbackScreenshotID: screenshot, composerID: record.composerID, addressing: addressing),
+        consumedTransfers: record.consumedTransfers, composerID: record.composerID,
+        addressing: addressing),
       record.revision, retired
     )
   }
@@ -320,25 +300,20 @@ public actor ComposerDraftStore {
     }
     guard Set(references.map(\.id)).count == references.count,
       draft.submission.map({ $0.identity.composerID == draft.composerID }) ?? true,
-      draft.submission.map({ !$0.outboxURLs.isEmpty }) ?? true,
-      draft.submission.map({ value in
-        value.feedbackScreenshotID.map { id in value.attachments.contains { $0.id == id } } ?? true
-      }) ?? true,
-      draft.feedbackScreenshotID.map({ id in draft.attachments.contains { $0.id == id } }) ?? true
+      draft.submission.map({ !$0.outboxURLs.isEmpty }) ?? true
     else { throw ComposerDraftError.invalidRecord }
     let submission =
       try draft.submission.map { value in
         Submission(
           identity: value.identity,
           outboxPaths: try value.outboxURLs.map { try relativeOutboxPath($0) }, text: value.text,
-          attachments: value.attachments.map(\.reference),
-          feedbackScreenshotID: value.feedbackScreenshotID)
+          attachments: value.attachments.map(\.reference))
       }
     let record = Record(
       revision: revision, text: draft.text, mode: draft.mode,
       attachments: draft.attachments.map(\.reference), consumedTransfers: draft.consumedTransfers,
-      feedbackScreenshotID: draft.feedbackScreenshotID, composerID: draft.composerID,
-      submission: submission, addressing: draft.addressing.isEmpty ? nil : draft.addressing)
+      composerID: draft.composerID, submission: submission,
+      addressing: draft.addressing.isEmpty ? nil : draft.addressing)
     let data = try JSONEncoder().encode(record)
     guard data.count <= Self.maximumRecordBytes else { throw ComposerDraftError.tooLarge }
     let directory = url.deletingLastPathComponent()

@@ -28,6 +28,11 @@ public final class Coordinators {
       }
     }
   }
+  /// Records the screen for the coordinator the feed shows. `chat` holds it.
+  public var feedbackRecorder: (any FeedbackRecorder)? {
+    get { chat.feedbackRecorder }
+    set { chat.feedbackRecorder = newValue }
+  }
   /// Why an unpaired profile is not paired yet.
   private(set) var pairingError: [ProfileID: String] = [:]
   /// Saved coordinators could not be loaded. Nothing is written over them.

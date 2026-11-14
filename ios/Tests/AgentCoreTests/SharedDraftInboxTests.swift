@@ -624,7 +624,7 @@ import UniformTypeIdentifiers
   #endif
 
   @Test @MainActor
-  func atomicComposerRecordPreservesFilesModeFeedbackAndTransferWhileOlderSaveCannotRollItBack()
+  func atomicComposerRecordPreservesFilesModeAndTransferWhileOlderSaveCannotRollItBack()
     async throws
   {
     let root = try temporaryRoot()
@@ -636,7 +636,7 @@ import UniformTypeIdentifiers
     let store = ComposerDraftStore(url: url)
     let current = ComposerDraft(
       text: "/feedback Keep this note", mode: .followUp,
-      attachments: [image], consumedTransfers: [id], feedbackScreenshotID: image.id)
+      attachments: [image], consumedTransfers: [id])
     #expect(try await store.save(current, revision: 2))
     #expect(try await !store.save(ComposerDraft(text: "stale"), revision: 1))
     let reopened = try await ComposerDraftStore(url: url).load(from: files)
@@ -747,47 +747,6 @@ import UniformTypeIdentifiers
     await model.receiveSharedDrafts()
     #expect(model.draft == "One shared note")
     #expect(model.attachments.count == 1)
-  }
-
-  @Test @MainActor func persistedFeedbackKeepsItsOriginalCaptureAcrossFailedAdmissionAndReopen()
-    async throws
-  {
-    let root = try temporaryRoot()
-    defer { try? FileManager.default.removeItem(at: root) }
-    let files = AttachmentStore(directory: root.appending(path: "Drafts"))
-    let url = root.appending(path: "Composer/draft.json")
-    let model = ChatModel(draftStore: files, persistence: ComposerDraftStore(url: url))
-    await model.restoreDraft()
-    let capture = try png()
-    var profile: CoordinatorProfile?
-    // A read-only profile refuses each Send, as a failed admission does.
-    try await withConnectedCoordinator(model) { _, directory in
-      profile = model.profiles[0]
-      try await withReadOnlyProfile(directory) {
-        model.draft = "/feedback Preserve this exact capture"
-        await model.send(screenshot: { capture })
-      }
-    }
-    #expect(await model.saveDraft())
-    let original = model.attachments
-    #expect(original.map(\.reference.name) == ["Feedback.png", "Composer.log"])
-    let image = try #require(original.first)
-    let diagnostics = try #require(original.last)
-    let log = try Data(contentsOf: diagnostics.url)
-    let reopened = ChatModel(draftStore: files, persistence: ComposerDraftStore(url: url))
-    try await withConnectedCoordinator(reopened, profile: profile) { _, directory in
-      await reopened.restoreDraft()
-      try await withReadOnlyProfile(directory) {
-        await reopened.send(screenshot: {
-          Issue.record("The saved feedback image must not be recaptured")
-          return capture
-        })
-      }
-    }
-    #expect(reopened.draft == model.draft)
-    #expect(reopened.attachments == original)
-    #expect(try Data(contentsOf: image.url) == capture)
-    #expect(try Data(contentsOf: diagnostics.url) == log)
   }
 
   @Test @MainActor

@@ -1,7 +1,7 @@
 import Foundation
 import OSLog
 
-/// Only the composer's metadata logger is eligible for a feedback attachment.
+/// Only the composer's metadata logger is eligible for a feedback recording's `composerLog`.
 enum ComposerDiagnostics {
   enum Coverage: String, Sendable { case available, empty, unavailable }
   struct Export: Sendable {
@@ -38,8 +38,8 @@ enum ComposerDiagnostics {
     let category = "Composer"
     let now = Date()
     let since = now.addingTimeInterval(-15 * 60)
-    let maximumBytes = 64 * 1024
-    // The fixed coverage header remains inside the attachment's byte budget.
+    let maximumBytes = 256 * 1024
+    // The fixed coverage header remains inside the log's byte budget.
     let headerBudget = 512
     do {
       let store = try OSLogStore(scope: .currentProcessIdentifier)
