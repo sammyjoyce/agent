@@ -164,7 +164,6 @@ pub enum NativeEvent {
         #[ts(optional)]
         input_origins: Option<bool>,
         /// The origins a submit may carry on this connection. Missing: use `input_origins`.
-        /// Inline strings in the schema, so clients decode it as a plain list.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[schemars(with = "Option<Vec<String>>")]
         #[ts(optional, as = "Option<Vec<String>>")]
@@ -487,8 +486,8 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
                 *input_origins,
             );
             NativeEvent::Ready {
-                input_origins: accepted.input_origins_flag(),
-                accepted_input_origins: accepted.advertised(),
+                input_origins: accepted.flag_for_phones_before_the_list(),
+                accepted_input_origins: accepted.non_empty(),
                 conversation_settings: *conversation_settings,
                 work_inspection: Some(true),
                 working: None,
@@ -707,8 +706,6 @@ mod tests {
         ));
     }
 
-    /// One row per runtime the coordinator binary can be paired with: its `main_ready` bytes and
-    /// the `Ready` bytes a phone then receives.
     #[test]
     fn ready_advertises_only_origins_both_the_runtime_and_this_binary_accept() {
         let model =

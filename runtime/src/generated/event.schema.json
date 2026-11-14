@@ -24,7 +24,7 @@
   ],
   "$defs": {
     "AcceptedInputOrigins": {
-      "description": "The origins a coordinator accepts in a submit's `origin`. Open on the wire, closed in\nmemory: decoding keeps the names this build can decode and drops the rest, so a later\nproducer's list never fails an earlier reader's frame, and a name this build cannot\ndecode is never advertised onward.",
+      "description": "The origins a coordinator accepts in a submit's `origin`. Decoding drops names this build\ncannot decode instead of failing.",
       "type": "array",
       "items": {
         "type": "string"

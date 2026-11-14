@@ -9,25 +9,21 @@ function object(value: unknown): value is Record<string, unknown> {
 function entryId(value: unknown): value is EntryId {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
-/** Every origin this runtime validates, persists and names to the model, with the words the model
- * reads for it. Keyed by the generated union, so a Rust variant missing here fails `tsc`. */
-const INPUT_ORIGIN_MEANINGS = {
+const ACCEPTED_INPUT_ORIGINS = {
   cli: "the beep-boop command line",
   ios: "the iPhone app's composer",
   siri: "Siri or a Shortcuts action on the iPhone, whose text may be a speech transcription",
 } as const satisfies Record<InputOrigin, string>;
-const ORIGIN_GLOSSARY = Object.entries(INPUT_ORIGIN_MEANINGS).map(([name, meaning]) => `${name}: ${meaning}`).join("; ");
+const ORIGIN_GLOSSARY = Object.entries(ACCEPTED_INPUT_ORIGINS).map(([name, meaning]) => `${name}: ${meaning}`).join("; ");
 
-/** Spread into every `main_ready`. The flag stays for coordinator binaries built before the list. */
 export const INPUT_ORIGIN_CAPABILITIES = {
   input_origins: true,
-  accepted_input_origins: Object.keys(INPUT_ORIGIN_MEANINGS),
+  accepted_input_origins: Object.keys(ACCEPTED_INPUT_ORIGINS),
 } as const satisfies Pick<Extract<RuntimeEventKind, { type: "main_ready" }>, "input_origins" | "accepted_input_origins">;
 
 function isInputOrigin(value: unknown): value is InputOrigin {
-  return typeof value === "string" && Object.hasOwn(INPUT_ORIGIN_MEANINGS, value);
+  return typeof value === "string" && Object.hasOwn(ACCEPTED_INPUT_ORIGINS, value);
 }
-/** A saved value this build does not know, as after a rollback, is unknown rather than an error. */
 function origin(data: unknown): InputOrigin | null {
   return object(data) && isInputOrigin(data.origin) ? data.origin : null;
 }

@@ -302,10 +302,8 @@ pub enum InputOrigin {
     Siri,
 }
 
-/// The origins a coordinator accepts in a submit's `origin`. Open on the wire, closed in
-/// memory: decoding keeps the names this build can decode and drops the rest, so a later
-/// producer's list never fails an earlier reader's frame, and a name this build cannot
-/// decode is never advertised onward.
+/// The origins a coordinator accepts in a submit's `origin`. Decoding drops names this build
+/// cannot decode instead of failing.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, JsonSchema, TS)]
 #[serde(transparent)]
 pub struct AcceptedInputOrigins(
@@ -332,28 +330,22 @@ impl<'de> Deserialize<'de> for AcceptedInputOrigins {
 }
 
 impl AcceptedInputOrigins {
-    /// What a runtime that advertises only `input_origins: true` accepts. Frozen: such a
-    /// runtime predates every later origin, so this is history, not a list to extend.
-    const FLAG_ONLY: [InputOrigin; 2] = [InputOrigin::Cli, InputOrigin::Ios];
+    const ORIGINS_BEFORE_THE_LIST: [InputOrigin; 2] = [InputOrigin::Cli, InputOrigin::Ios];
 
-    /// Merges a runtime's two advertisements. The list wins; the flag alone means `FLAG_ONLY`.
     pub(crate) fn from_main_ready(list: Option<&Self>, input_origins: Option<bool>) -> Self {
         match (list, input_origins) {
             (Some(list), _) => list.clone(),
-            (None, Some(true)) => Self(Self::FLAG_ONLY.into()),
+            (None, Some(true)) => Self(Self::ORIGINS_BEFORE_THE_LIST.into()),
             (None, _) => Self::default(),
         }
     }
     pub(crate) fn contains(&self, origin: InputOrigin) -> bool {
         self.0.contains(&origin)
     }
-    /// `Ready.input_origins` for phones that predate the list. They send `ios` exactly when it
-    /// is `Some(true)`, so it is derived from the set and never copied.
-    pub(crate) fn input_origins_flag(&self) -> Option<bool> {
+    pub(crate) fn flag_for_phones_before_the_list(&self) -> Option<bool> {
         self.contains(InputOrigin::Ios).then_some(true)
     }
-    /// None when empty, so a coordinator that accepts nothing sends today's frame.
-    pub(crate) fn advertised(self) -> Option<Self> {
+    pub(crate) fn non_empty(self) -> Option<Self> {
         (!self.0.is_empty()).then_some(self)
     }
 }
