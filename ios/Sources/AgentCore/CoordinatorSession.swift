@@ -158,7 +158,7 @@ public actor CoordinatorSession {
   nonisolated let profile: ProfileID
   private let continuation: AsyncStream<ChatSnapshot>.Continuation
   private var snapshot = ChatSnapshot()
-  private var acceptedOrigins: Set<InputOrigin> = []
+  private var acceptedInputOrigins: Set<InputOrigin> = []
   private var capabilityGeneration = UUID()
   private var transcript = Transcript()
   private let dialer: CoordinatorDialer
@@ -1080,18 +1080,18 @@ public actor CoordinatorSession {
   }
 
   /// Whether the current connection records this origin. False while disconnected.
-  public func accepts(_ origin: InputOrigin) -> Bool { acceptedOrigins.contains(origin) }
+  public func accepts(_ origin: InputOrigin) -> Bool { acceptedInputOrigins.contains(origin) }
 
   /// A coordinator that predates the list advertises the origins it knew with one Boolean.
   /// Values this build does not know are skipped.
-  static func acceptedOrigins(_ ready: NativeEventReady) -> Set<InputOrigin> {
-    if let listed = ready.acceptedOrigins { return Set(listed.compactMap(InputOrigin.init)) }
+  static func acceptedInputOrigins(_ ready: NativeEventReady) -> Set<InputOrigin> {
+    if let listed = ready.acceptedInputOrigins { return Set(listed.compactMap(InputOrigin.init)) }
     return ready.inputOrigins == true ? [.cli, .ios] : []
   }
 
   private func resetCapabilities() {
     capabilityGeneration = UUID()
-    acceptedOrigins = []
+    acceptedInputOrigins = []
     snapshot.settingsSupported = false
     snapshot.workInspectionSupported = false
     snapshot.settings = nil
@@ -1400,7 +1400,7 @@ public actor CoordinatorSession {
     case .ready(let value):
       snapshot.error = nil
       snapshot.conversationID = value.conversationId
-      acceptedOrigins = Self.acceptedOrigins(value)
+      acceptedInputOrigins = Self.acceptedInputOrigins(value)
       snapshot.settingsSupported = value.conversationSettings == true
       snapshot.workInspectionSupported = value.workInspection == true
       snapshot.model = value.model

@@ -61,7 +61,7 @@ func retryingALegacyOutboxNeverInventsAnOriginEvenAfterCapabilityIsAdvertised() 
 func aCoordinatorThatListsSiriAcceptsItAndAnUnknownListedOriginIsSkipped() async throws {
   try await withCoordinator { session, fixture, outbox in
     await fixture.advertiseInputOrigins(true)
-    await fixture.advertiseAcceptedOrigins(["cli", "ios", "siri", "invented-future-origin"])
+    await fixture.advertiseAcceptedInputOrigins(["cli", "ios", "siri", "invented-future-origin"])
     await session.connect()
     for await update in session.updates where update.connection == .connected { break }
     #expect(await session.accepts(.siri))

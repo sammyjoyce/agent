@@ -166,7 +166,7 @@ pub enum NativeEvent {
         /// know instead of failing the frame. Absent on coordinators that predate the list.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        accepted_origins: Option<Vec<String>>,
+        accepted_input_origins: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         conversation_settings: Option<bool>,
@@ -480,7 +480,7 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
             ..
         } => NativeEvent::Ready {
             input_origins: *input_origins,
-            accepted_origins: (*input_origins == Some(true)).then(|| {
+            accepted_input_origins: (*input_origins == Some(true)).then(|| {
                 crate::protocol::InputOrigin::ALL
                     .map(|origin| origin.as_str().to_owned())
                     .to_vec()
@@ -498,7 +498,7 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
             ..
         } => NativeEvent::Ready {
             input_origins: None,
-            accepted_origins: None,
+            accepted_input_origins: None,
             conversation_settings: None,
             work_inspection: None,
             working: Some(*working),
@@ -681,7 +681,7 @@ mod tests {
             };
             let Some(NativeEvent::Ready {
                 input_origins,
-                accepted_origins,
+                accepted_input_origins,
                 conversation_settings,
                 ..
             }) = crate::native::project(&event)
@@ -691,7 +691,7 @@ mod tests {
             assert_eq!(input_origins, advertised);
             assert_eq!(conversation_settings, advertised);
             assert_eq!(
-                accepted_origins,
+                accepted_input_origins,
                 (advertised == Some(true)).then(|| vec![
                     "cli".to_owned(),
                     "ios".to_owned(),
