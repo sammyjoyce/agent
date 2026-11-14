@@ -171,6 +171,10 @@ recovery; [history](history.md) describes import and retrieval.
   the parked task, and source readback separates progress from completed scans.
 - [x] Shared worktree inventory through the CLI and `/worktrees`, including
   native chat clients.
+- [ ] Bring the iPhone app's actions and content to Siri and Shortcuts through
+  App Intents. **Open Coordinator** and the coordinator entity ship first, with
+  a build check that the app carries its intents metadata and phrase. Reading
+  jobs, sending, opening a job, onscreen entities and Spotlight follow.
 
 ## Retrieval, learning and proof
 
