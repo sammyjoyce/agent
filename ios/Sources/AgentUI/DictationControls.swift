@@ -54,8 +54,13 @@
         .accessibilityAction { dictation.mic(.activated, in: target) }
     }
 
+    /// A press while the last take transcribes would open nothing, so the mic says so.
     private var disabled: Bool {
-      guard dictation.take == nil else { return false }
+      switch dictation.take?.stage {
+      case .opening?, .listening?: return false
+      case .transcribing?: return true
+      case nil: break
+      }
       switch dictation.model {
       case .checking, .downloading, .unsupported: return true
       case .missing, .preparing, .ready: return !target.chat.dictationAllowed
