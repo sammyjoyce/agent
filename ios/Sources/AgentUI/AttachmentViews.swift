@@ -25,36 +25,6 @@ struct AttachmentLabel: View {
   import UIKit
   import UniformTypeIdentifiers
 
-  @MainActor final class AppScreenshot {
-    weak var anchor: UIView?
-    func png() throws -> Data {
-      guard let window = anchor?.window else {
-        throw AttachmentError.unavailable("The current app view could not be captured.")
-      }
-      let format = UIGraphicsImageRendererFormat()
-      format.scale = min(window.screen.scale, 2)
-      format.opaque = true
-      var drawn = false
-      let image = UIGraphicsImageRenderer(bounds: window.bounds, format: format).image { _ in
-        drawn = window.drawHierarchy(in: window.bounds, afterScreenUpdates: false)
-      }
-      guard drawn, let data = image.pngData() else {
-        throw AttachmentError.unavailable("The current app view could not be captured.")
-      }
-      return data
-    }
-  }
-
-  struct ScreenshotAnchor: UIViewRepresentable {
-    let capture: AppScreenshot
-    func makeUIView(context: Context) -> UIView {
-      let view = UIView()
-      capture.anchor = view
-      return view
-    }
-    func updateUIView(_ view: UIView, context: Context) {}
-  }
-
   struct ImportedPhoto: Transferable, Sendable {
     let data: Data
     static var transferRepresentation: some TransferRepresentation {

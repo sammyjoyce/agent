@@ -33,7 +33,6 @@ public struct MainChatView: View {
   @State private var importingFiles = false
   #if os(iOS)
     @State private var selectedPhoto: PhotosPickerItem?
-    @State private var capture = AppScreenshot()
     @State private var composerEditor = ComposerEditor()
   #endif
   @AppStorage(AppAppearance.preferenceKey) private var appearance = AppAppearance.system
@@ -227,7 +226,6 @@ public struct MainChatView: View {
         return true
       }
       #if os(iOS)
-        .background(ScreenshotAnchor(capture: capture).frame(width: 0, height: 0))
         .quickLookPreview($model.previewURL)
         .onChange(of: selectedPhoto) { _, photo in
           guard let photo else { return }
@@ -709,10 +707,10 @@ public struct MainChatView: View {
             #if os(iOS)
               composerEditor.submit { text in
                 model.draft = text
-                return model.startSend(screenshot: capture.png) != nil
+                return model.submit()
               }
             #else
-              model.startSend()
+              _ = model.submit()
             #endif
           }
         } label: {
