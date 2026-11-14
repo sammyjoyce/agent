@@ -872,12 +872,40 @@ final class ChatModel {
 
   // MARK: - Send
 
-  var canSend: Bool {
-    guard draftReady, !pendingSharedImport, !admitting, !preparingAttachments,
-      case .to = addressing
-    else { return false }
-    return true
+  /// Why Send cannot go now. A held mic that cannot send names the same reason Send is disabled
+  /// for.
+  enum SendBlocker: Equatable {
+    case draftNotRestored
+    case sharedImport
+    case admitting
+    case preparingAttachments
+    /// Addressing reaches no one from the scope shown, and `recipientLine` says why.
+    case addressing(Addressing)
   }
+
+  var sendBlocker: SendBlocker? {
+    if !draftReady { return .draftNotRestored }
+    if pendingSharedImport { return .sharedImport }
+    if admitting { return .admitting }
+    if preparingAttachments { return .preparingAttachments }
+    guard case .to = addressing else { return .addressing(addressing) }
+    return nil
+  }
+
+  var canSend: Bool { sendBlocker == nil }
+
+  /// The draft as of now, to tell later whether anything changed it. Showing another scope changes
+  /// where the draft goes without changing the draft, so the mark covers the scope too.
+  struct DraftMark: Equatable {
+    fileprivate let revision: Int
+    fileprivate let scope: FeedScope
+  }
+
+  var draftMark: DraftMark { DraftMark(revision: draftRevision, scope: scope) }
+
+  /// Whether the mic may open on this draft. Words landing in a draft still being restored, sent
+  /// or merged with a shared import would race the write that follows.
+  var dictationAllowed: Bool { draftReady && !admitting && !pendingSharedImport }
 
   func send(screenshot: (@MainActor () throws -> Data)? = nil) async {
     await startSend(screenshot: screenshot)?.value
