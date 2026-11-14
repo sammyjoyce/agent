@@ -394,6 +394,16 @@ the phone by cable. To allow that, list the app's bundle ID under `usbApps` in
   saved by an earlier build with its automatic `Feedback.png` screenshot loads
   with that screenshot as an ordinary attached file.
 
+### Siri and Shortcuts
+
+**Open Coordinator** shows a saved coordinator's feed, as tapping one of its
+alerts does. Its Coordinator picker lists each saved coordinator by name, in
+saved order, and never shows an address. The composer draft is left as it was.
+Say "Open Work in Beep Boop", or add the action in the Shortcuts app. Renaming
+or removing a coordinator updates the picker and the phrases. Intents, entities
+and queries live in `ios/Sources/AgentUI/Siri/`. The shortcuts provider lives
+in the app target, because a provider inside the package ships no phrase.
+
 ## Validation
 
 ```sh
@@ -404,6 +414,7 @@ swift test --package-path ios --configuration release \
 xcodebuild -project ios/Agent.xcodeproj -scheme Agent \
   -destination 'generic/platform=iOS Simulator' \
   -derivedDataPath target/ios-app CODE_SIGNING_ALLOWED=NO build
+python3 ios/scripts/check-intents-metadata.py target/ios-app/Build/Products/Debug-iphonesimulator/Agent.app
 ```
 
 Run these from the repository root, with full Xcode selected for Apple checks.
