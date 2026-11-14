@@ -11,9 +11,9 @@ import json
 import sys
 from pathlib import Path
 
-ACTIONS = {"OpenCoordinatorIntent"}
-ENTITIES = {"CoordinatorEntity"}
-QUERIES = {"CoordinatorQuery"}
+ACTIONS = {"OpenCoordinatorIntent", "RetryInterruptedRunIntent"}
+ENTITIES = {"CoordinatorEntity", "JobEntity"}
+QUERIES = {"CoordinatorQuery", "JobQuery"}
 
 
 def metadata_path(argument: str) -> Path:

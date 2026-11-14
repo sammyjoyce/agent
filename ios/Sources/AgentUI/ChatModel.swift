@@ -322,8 +322,8 @@ final class ChatModel {
   @ObservationIgnored private var retiredDraftFiles: [LocalAttachment] = []
   @ObservationIgnored private let admit: Admit
   @ObservationIgnored private let registration: NotificationRegistration?
-  /// Whether the latest `setActive` asked for the app to be active.
-  @ObservationIgnored private(set) var active = false
+  /// The scene's activity as the latest `setActive` asked for it, and the leases on each lane.
+  @ObservationIgnored private(set) var demand = ConnectionDemand()
   @ObservationIgnored private(set) var lanes: [Lane] = []
   @ObservationIgnored private var observations: [ProfileID: Task<Void, Never>] = [:]
   /// Inputs of a Send that reached no one, staged at a session that was retired before they could
@@ -653,15 +653,44 @@ final class ChatModel {
     report(cancelled.compactMap { input in missed(id, input, .retired).map { (id, input, $0) } })
   }
 
-  /// Connects every lane while the app is active and disconnects every lane while it is not. Each
-  /// step reads the latest request and the lanes again after every await, so an older call that
-  /// finishes last never undoes a newer one, and a lane detached meanwhile is skipped.
+  /// Connects every lane while the app is active and disconnects every lane while it is not. A
+  /// leased lane is left as its lease holds it. Each step reads the latest request and the lanes
+  /// again after every await, so an older call that finishes last never undoes a newer one, and a
+  /// lane detached or leased meanwhile is skipped.
   func setActive(_ active: Bool) async {
-    self.active = active
+    demand.sceneActive = active
     logComposer(active ? .active : .inactive)
     for id in lanes.map(\.id) {
       guard let session = lanes.first(where: { $0.id == id })?.session else { continue }
-      if self.active { await session.connect() } else { await session.disconnect() }
+      // `connect` redials a connected session, which would cut the lease holder's request.
+      guard !demand.leased(id) else { continue }
+      if demand.sceneActive { await session.connect() } else { await session.disconnect() }
+    }
+  }
+
+  /// Holds lane `id` connected until the lease is dropped. Only a lane nothing wanted yet is
+  /// dialed, so a lane the scene or another lease already holds keeps its connection.
+  func takeLease(on id: ProfileID) async -> ConnectionLease {
+    let wanted = demand.wants(id)
+    let lease = demand.take(id)
+    if !wanted { await lanes.first { $0.id == id }?.session?.connect() }
+    return lease
+  }
+
+  /// Drops `lease`. Its lane disconnects once neither the scene nor another lease wants it.
+  func dropLease(_ lease: ConnectionLease) async {
+    demand.drop(lease)
+    guard !demand.wants(lease.profile) else { return }
+    await lanes.first { $0.id == lease.profile }?.session?.disconnect()
+  }
+
+  /// Returns once lane `id` reports connected, once `limit` passes, or at once without a session.
+  func awaitConnection(_ id: ProfileID, within limit: Duration) async {
+    let deadline = ContinuousClock.now + limit
+    while lanes.contains(where: { $0.id == id && $0.session != nil }), !connected(id),
+      ContinuousClock.now < deadline
+    {
+      do { try await Task.sleep(for: .milliseconds(20)) } catch { return }
     }
   }
 
@@ -729,7 +758,7 @@ final class ChatModel {
       lanes = [Lane(id: id, session: inspector)]
       snapshots[id] = nil
       observations[id] = observe(inspector, lane: id)
-      if owner.active { await inspector.connect() }
+      if owner.demand.sceneActive { await inspector.connect() }
     } catch { failure = error.localizedDescription }
   }
   /// Keeps an inspection connected until the task that owns it is cancelled.
@@ -1079,7 +1108,7 @@ final class ChatModel {
     let code = failure?.code ?? 0
     // Only state, counts and error metadata enter logs; never text, paths or addresses.
     composerLogger.notice(
-      "event=\(event.rawValue, privacy: .public) build=\(build, privacy: .public) lanes=\(self.lanes.count) revision=\(self.draftRevision) characters=\(self.draft.count) attachments=\(self.attachments.count) active=\(self.active) ready=\(self.draftReady) connected=\(self.connection == .connected) busy=\(self.busy) admitting=\(self.admitting) preparing=\(self.preparingAttachments) shared=\(self.pendingSharedImport) errorDomain=\(domain, privacy: .public) errorCode=\(code)"
+      "event=\(event.rawValue, privacy: .public) build=\(build, privacy: .public) lanes=\(self.lanes.count) revision=\(self.draftRevision) characters=\(self.draft.count) attachments=\(self.attachments.count) active=\(self.demand.sceneActive) ready=\(self.draftReady) connected=\(self.connection == .connected) busy=\(self.busy) admitting=\(self.admitting) preparing=\(self.preparingAttachments) shared=\(self.pendingSharedImport) errorDomain=\(domain, privacy: .public) errorCode=\(code)"
     )
   }
 
@@ -1504,7 +1533,7 @@ final class ChatModel {
     loadingHistory = projection.loadingHistory
     includesLatest = projection.includesLatest
     if changedShown || changed == nil { revision &+= 1 }
-    guard active else { return }
+    guard demand.sceneActive else { return }
     for id in lanes.map(\.id) where scope.shows(id) {
       if let count = snapshots[id]?.liveReplies, seen[id]?.count != count {
         seen[id]?.count = count

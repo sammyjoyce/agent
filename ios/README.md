@@ -404,6 +404,14 @@ or removing a coordinator updates the picker and the phrases. Intents, entities
 and queries live in `ios/Sources/AgentUI/Siri/`. The shortcuts provider lives
 in the app target, because a provider inside the package ships no phrase.
 
+**Retry Interrupted Run** retries a scheduled job whose last run paused after
+repeated interrupted restarts, the same rule the job screen's Recovery button
+uses. It asks to unlock the phone first. Its Job picker lists the jobs of every
+paired coordinator that answers, by title and coordinator, and leaves out the
+prompt, the working directory and the run output. The app holds each
+coordinator connected only while an intent reads or retries, so it works with
+the app in the background. It has no phrase. Add it in the Shortcuts app.
+
 ## Validation
 
 ```sh

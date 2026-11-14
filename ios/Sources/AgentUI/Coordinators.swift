@@ -92,9 +92,24 @@ public final class Coordinators {
       withdrawing = [:]
     }
     await chat.setActive(active)
-    guard chat.active else { return }
+    guard chat.demand.sceneActive else { return }
     for profile in profiles where profile.pin == nil { retryPairing(profile.id) }
     for withdrawal in withdrawals { retry(withdrawal) }
+  }
+
+  /// Holds coordinator `id` connected while `body` runs, with the scene in the background too. It
+  /// waits up to 8 s for the connection, then runs `body` whether or not the lane connected.
+  func withConnection<T>(to id: ProfileID, _ body: () async throws -> T) async rethrows -> T {
+    let lease = await chat.takeLease(on: id)
+    await chat.awaitConnection(id, within: .seconds(8))
+    do {
+      let result = try await body()
+      await chat.dropLease(lease)
+      return result
+    } catch {
+      await chat.dropLease(lease)
+      throw error
+    }
   }
 
   func route(_ origin: AlertOrigin) -> ProfileID? {
@@ -137,7 +152,7 @@ public final class Coordinators {
     pairing[id] = Task { [weak self] in
       var attempt = 0
       while !Task.isCancelled {
-        guard let self, self.chat.active, await !self.pair(id) else { return }
+        guard let self, self.chat.demand.sceneActive, await !self.pair(id) else { return }
         attempt = min(attempt + 1, 5)
         try? await Task.sleep(for: .seconds(1 << attempt))
       }
@@ -176,7 +191,9 @@ public final class Coordinators {
       _ = try admit(found, for: profile.id, in: &next, at: address)
       try save(next, answered: found, at: address)
       chat.attach(lane(next[next.count - 1]))
-      if chat.active { await chat.lanes.first { $0.id == profile.id }?.session?.connect() }
+      if chat.demand.wants(profile.id) {
+        await chat.lanes.first { $0.id == profile.id }?.session?.connect()
+      }
     }
   }
 
@@ -200,7 +217,7 @@ public final class Coordinators {
       guard found != nil, profiles[index].pin != nil else { return }
       await chat.detach(id)
       chat.attach(lane(profiles[index]))
-      if chat.active { await chat.lanes.first { $0.id == id }?.session?.connect() }
+      if chat.demand.wants(id) { await chat.lanes.first { $0.id == id }?.session?.connect() }
     }
   }
 
@@ -365,13 +382,13 @@ public final class Coordinators {
       try queue.record(in: queue.folder(applicationSupport: applicationSupport))
       queues = queues.map { $0.id == queue.id ? queue : $0 }
     }
-    if chat.active { for handover in handovers { retry(handover) } }
+    if chat.demand.sceneActive { for handover in handovers { retry(handover) } }
   }
 
   private func start(_ id: ProfileID) async {
     guard let profile = profiles.first(where: { $0.id == id }) else { return }
     chat.attach(lane(profile))
-    if chat.active { await chat.lanes.first { $0.id == id }?.session?.connect() }
+    if chat.demand.wants(id) { await chat.lanes.first { $0.id == id }?.session?.connect() }
   }
 
   /// The one place a session is built. Only a pinned profile gets one.
