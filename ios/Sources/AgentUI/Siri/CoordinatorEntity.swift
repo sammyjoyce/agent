@@ -22,6 +22,13 @@ public struct CoordinatorEntity: AppEntity {
   @MainActor static func saved(in coordinators: Coordinators) -> [CoordinatorEntity] {
     coordinators.profiles.map { CoordinatorEntity(id: "\($0.id)", name: "\($0.name)") }
   }
+
+  /// The saved coordinators among `identifiers`, in saved order. An unknown id is dropped.
+  @MainActor static func saved(in coordinators: Coordinators, matching identifiers: [String])
+    -> [CoordinatorEntity]
+  {
+    saved(in: coordinators).filter { identifiers.contains($0.id) }
+  }
 }
 
 public struct CoordinatorQuery: EnumerableEntityQuery {
@@ -29,18 +36,16 @@ public struct CoordinatorQuery: EnumerableEntityQuery {
 
   public init() {}
 
-  /// For tests, which run outside the perform flow that resolves `@Dependency`.
-  init(notifications: AppNotifications) {
-    self.notifications = notifications
-  }
-
   public func allEntities() async throws -> [CoordinatorEntity] {
     let notifications = notifications
     return await MainActor.run { CoordinatorEntity.saved(in: notifications.intentCoordinators) }
   }
 
   public func entities(for identifiers: [String]) async throws -> [CoordinatorEntity] {
-    try await allEntities().filter { identifiers.contains($0.id) }
+    let notifications = notifications
+    return await MainActor.run {
+      CoordinatorEntity.saved(in: notifications.intentCoordinators, matching: identifiers)
+    }
   }
 }
 

@@ -4,6 +4,8 @@ import Testing
 @testable import AgentCore
 @testable import AgentUI
 
+/// `@Dependency`'s setter writes one process-wide slot, and tests run in parallel. So these call the
+/// functions that the query and the intent call, and never build either with a dependency.
 @MainActor
 struct SiriCoordinatorEntityTests {
   @MainActor
@@ -29,7 +31,11 @@ struct SiriCoordinatorEntityTests {
         defaults: defaults, applicationSupport: root, caches: root, transport: .tailnet)
     }
 
-    var query: CoordinatorQuery { CoordinatorQuery(notifications: notifications) }
+    func saved() -> [CoordinatorEntity] { CoordinatorEntity.saved(in: notifications.coordinators) }
+
+    func saved(matching identifiers: [String]) -> [CoordinatorEntity] {
+      CoordinatorEntity.saved(in: notifications.coordinators, matching: identifiers)
+    }
 
     func entity(_ index: Int) -> CoordinatorEntity {
       CoordinatorEntity(id: "\(profiles[index].id)", name: "\(profiles[index].name)")
@@ -46,7 +52,7 @@ struct SiriCoordinatorEntityTests {
   @Test func theQueryReturnsEachSavedCoordinatorOnceInSavedOrder() async throws {
     let fixture = try SavedFixture()
     defer { fixture.clean() }
-    let entities = try await fixture.query.allEntities()
+    let entities = fixture.saved()
     #expect(entities.map(\.id) == fixture.profiles.map { "\($0.id)" })
     #expect(named(entities) == ["Work", "Personal", "Home"])
     #expect(entities.map { String(localized: $0.displayRepresentation.title) } == named(entities))
@@ -58,9 +64,9 @@ struct SiriCoordinatorEntityTests {
     let personal = fixture.profiles[1]
     try await fixture.notifications.coordinators.update(
       personal.id, name: TagName("Family"), address: personal.address)
-    let entities = try await fixture.query.allEntities()
+    let entities = fixture.saved()
     #expect(named(entities) == ["Work", "Family", "Home"])
-    let found = try await fixture.query.entities(for: ["\(personal.id)"])
+    let found = fixture.saved(matching: ["\(personal.id)"])
     #expect(named(found) == ["Family"])
   }
 
@@ -70,14 +76,14 @@ struct SiriCoordinatorEntityTests {
     let coordinators = fixture.notifications.coordinators
     let home = fixture.profiles[2].id
     try await coordinators.remove(coordinators.removal(home))
-    #expect(named(try await fixture.query.allEntities()) == ["Work", "Personal"])
-    #expect(try await fixture.query.entities(for: ["\(home)"]).isEmpty)
+    #expect(named(fixture.saved()) == ["Work", "Personal"])
+    #expect(fixture.saved(matching: ["\(home)"]).isEmpty)
   }
 
   @Test func entitiesForIdentifiersIgnoresAnUnknownID() async throws {
     let fixture = try SavedFixture()
     defer { fixture.clean() }
-    let found = try await fixture.query.entities(for: [
+    let found = fixture.saved(matching: [
       "\(ProfileID())", "not-a-profile", "\(fixture.profiles[0].id)",
     ])
     #expect(found.map(\.id) == ["\(fixture.profiles[0].id)"])
@@ -97,9 +103,7 @@ struct SiriCoordinatorEntityTests {
     chat.show(.one(fixture.profiles[0].id))
     chat.draft = "An invented Work draft"
     let destination = chat.destination
-    _ = try await OpenCoordinatorIntent(
-      target: fixture.entity(1), notifications: fixture.notifications
-    ).perform()
+    fixture.notifications.open(fixture.entity(1))
     #expect(chat.scope == .one(fixture.profiles[1].id))
     #expect(tapScope == .one(tapped.profiles[1].id))
     #expect(try #require(fixture.notifications.openRequest).notice == tapNotice)
