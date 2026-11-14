@@ -143,6 +143,7 @@ final class ScriptedSpeech: Sendable {
     var takes = 0
     var installs = 0
     var holding = false
+    var failing = false
     var held: [CheckedContinuation<Void, Never>] = []
     var open: (take: Int, events: AsyncStream<RecordingEvent>.Continuation)?
   }
@@ -166,6 +167,12 @@ final class ScriptedSpeech: Sendable {
     }
     for continuation in held { continuation.resume() }
   }
+  /// The open recording's transcript so far, as the engine would publish it.
+  func hear(_ partial: String) {
+    state.withLock { $0.open?.events }?.yield(.partial(partial))
+  }
+  /// Makes each `finish` throw, as a failed model would.
+  func fail() { state.withLock { $0.failing = true } }
   /// Stops the open recording as a phone call would.
   func interrupt() {
     let events = state.withLock {
@@ -245,10 +252,15 @@ final class ScriptedSpeech: Sendable {
           }
           if !waits { held.resume() }
         }
+        if state.withLock({ $0.failing }) { throw ScriptedFailure() }
         return words
       },
       cancel: stop)
   }
+}
+
+struct ScriptedFailure: LocalizedError {
+  var errorDescription: String? { "The scripted model failed." }
 }
 
 /// Where the caret was when a take started, in the text it was read from.
@@ -389,6 +401,9 @@ public final class Dictation {
     var stage: Stage
     var recording: Recording?
     var started: ContinuousClock.Instant?
+    /// The engine's transcript so far, which the field shows dimmed at the reservation until the
+    /// final text replaces it. Never the draft.
+    var provisional = ""
   }
 
   /// What the mic reports. One entry point, so tap and hold are told apart in one place.
@@ -605,7 +620,7 @@ public final class Dictation {
       guard self.take?.id == id else { break }
       switch event {
       case .level(let loudness): level = loudness
-      case .partial: break
+      case .partial(let words): self.take?.provisional = words
       case .interrupted: finish(.keep, notice: .interrupted)
       }
     }

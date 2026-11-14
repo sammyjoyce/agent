@@ -801,6 +801,7 @@ public struct MainChatView: View {
             name: badge.name, color: UIColor(badge.color),
             removable: !model.admitting && !dictating)
         }, editor: composerEditor, promotion: model.promotion, restoredFrom: model.restoredFrom,
+        provisional: dictation?.take?.provisional ?? "", reservation: dictation?.take?.reservation,
         edit: { model.edit($0, committed: $1) }, removeChip: { model.removeChip() })
     }
   #else

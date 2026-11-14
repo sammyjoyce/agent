@@ -1229,8 +1229,10 @@
           chat: model, reserve: editor.reserve, insert: editor.insert, unlock: editor.unlock)
       }
 
-      @MainActor private func readyDictation() async throws -> Dictation {
-        let dictation = Dictation(engine: ScriptedSpeech().engine)
+      @MainActor private func readyDictation(_ speech: ScriptedSpeech = ScriptedSpeech())
+        async throws -> Dictation
+      {
+        let dictation = Dictation(engine: speech.engine)
         dictation.setForeground(true)
         let deadline = ContinuousClock.now + .seconds(5)
         while dictation.model != .ready {
@@ -1316,6 +1318,80 @@
           field.insertText("!")
           try await Task.sleep(for: .milliseconds(200))
           #expect(model.draft == "Kept Invented dictated words!")
+        }
+      }
+
+      /// The engine's words so far show dimmed at the reserved caret, spaced as they will land,
+      /// while the draft, its save and VoiceOver's value stay as they were. The final text replaces
+      /// them, and one Undo takes back only that text.
+      @MainActor @Test func liveWordsShowDimmedAtTheCaretUntilTheFinalTextReplacesThem()
+        async throws
+      {
+        let speech = ScriptedSpeech()
+        let dictation = try await readyDictation(speech)
+        try await withComposer(dictation: dictation) { model, box, _ in
+          let field = box.draft
+          field.insertText("Before after")
+          try await Task.sleep(for: .milliseconds(200))
+          field.selectedRange = NSRange(location: 7, length: 0)
+          let mark = model.draftMark
+          let target = dictationTarget(model, field)
+          try await tapMic(dictation, target)
+          speech.hear("Invented live")
+          try await Task.sleep(for: .milliseconds(300))
+          #expect(field.text == "Before Invented live after")
+          #expect(model.draft == "Before after" && model.committed == "Before after")
+          #expect(model.draftMark == mark, "Live words are never saved")
+          #expect(field.accessibilityValue == "Before after")
+          func color(of words: String) -> UIColor? {
+            let range = (field.text as NSString).range(of: words)
+            guard range.location != NSNotFound else { return nil }
+            let attributes = field.textStorage.attributes(at: range.location, effectiveRange: nil)
+            let color = attributes[.foregroundColor] as? UIColor
+            return color?.resolvedColor(with: field.traitCollection)
+          }
+          let dimmed = UIColor.secondaryLabel.resolvedColor(with: field.traitCollection)
+          #expect(color(of: "Invented live") == dimmed, "The live words are dimmed")
+          #expect(color(of: "Before") != dimmed)
+          let window = try #require(field.window)
+          let image = UIGraphicsImageRenderer(size: window.bounds.size).image { _ in
+            window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+          }
+          Attachment.record(try #require(image.cgImage), named: "dictation-live-words", as: .png)
+          try await tapMic(dictation, target)
+          #expect(model.draft == "Before Invented dictated words after")
+          #expect(field.text == model.draft)
+          #expect(color(of: "Invented dictated words") != dimmed, "The final text is the draft's")
+          let undo = try #require(field.undoManager)
+          undo.undo()
+          try await Task.sleep(for: .milliseconds(200))
+          #expect(model.draft == "Before after" && field.text == "Before after")
+        }
+      }
+
+      /// A take that lands no words takes its live words away and leaves the draft as it was.
+      @MainActor @Test(arguments: ["nothing heard", "the model failed"])
+      func aTakeThatLandsNothingClearsItsLiveWords(_ ending: String) async throws {
+        var script = ScriptedSpeech.Script()
+        if ending == "nothing heard" { script.takes = [""] }
+        let speech = ScriptedSpeech(script)
+        if ending == "the model failed" { speech.fail() }
+        let dictation = try await readyDictation(speech)
+        try await withComposer(dictation: dictation) { model, box, _ in
+          let field = box.draft
+          field.insertText("Kept")
+          try await Task.sleep(for: .milliseconds(200))
+          let target = dictationTarget(model, field)
+          try await tapMic(dictation, target)
+          speech.hear("Invented live")
+          try await Task.sleep(for: .milliseconds(300))
+          #expect(field.text == "Kept Invented live" && model.draft == "Kept")
+          try await tapMic(dictation, target)
+          #expect(field.text == "Kept" && model.draft == "Kept", "\(ending)")
+          #expect(dictation.notice != nil, "The status line says why nothing landed")
+          field.insertText("!")
+          try await Task.sleep(for: .milliseconds(200))
+          #expect(model.draft == "Kept!", "The field takes typing again")
         }
       }
 

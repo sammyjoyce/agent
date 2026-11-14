@@ -407,6 +407,30 @@ func aModelAnUpdateLeftStaleCompilesInTheBackgroundOnForeground() async throws {
 }
 
 @MainActor @Test(.timeLimit(.minutes(1)))
+func partialsReachTheTakeAndNeverTheDraftOrItsSave() async throws {
+  try await withDictation { dictation, speech, chat, fixture, _ in
+    chat.edit("Invented draft", committed: "Invented draft")
+    let mark = chat.draftMark
+    let target = DictationTarget(chat: chat)
+    tap(dictation, target)
+    try await listening(dictation, .toggled)
+    speech.hear("Invented")
+    speech.hear("Invented live words")
+    try await until("the partials") { dictation.take?.provisional == "Invented live words" }
+    #expect(chat.draft == "Invented draft" && chat.draftMark == mark, "Nothing was saved")
+    speech.hold()
+    tap(dictation, target)
+    try await until("transcribing") { dictation.take?.stage == .transcribing(.keep) }
+    #expect(dictation.take?.provisional == "Invented live words", "Kept until the words land")
+    #expect(chat.draft == "Invented draft" && chat.draftMark == mark)
+    speech.release()
+    try await until("the words land") { dictation.take == nil }
+    #expect(chat.draft == "Invented draft Invented dictated words")
+    #expect(await submitted(fixture).isEmpty)
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
 func anInterruptedHeldTakeKeepsWhatWasHeard() async throws {
   try await withDictation(holdDelay: .milliseconds(10)) { dictation, speech, chat, fixture, _ in
     let target = DictationTarget(chat: chat)

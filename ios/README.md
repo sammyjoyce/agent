@@ -324,8 +324,11 @@ required for sharing on a phone; an unsigned build does not establish that.
   download into Application Support, excluded from backup, and then prepares
   the model for this iPhone. On cellular, or another network the system marks
   expensive, the question says so and offers **Not now**; nothing starts later
-  on Wi-Fi. Tap to start and tap again to stop: the words land at the caret,
-  stay in the composer, and one Undo removes them. Hold the mic to talk and
+  on Wi-Fi. While you talk, the words heard so far show dimmed at the caret,
+  about two seconds behind you. They are not the draft: nothing saves them,
+  Undo never sees them, and VoiceOver reads the draft without them. Tap to
+  start and tap again to stop: the final words replace them at the caret, stay
+  in the composer, and one Undo removes them. Hold the mic to talk and
   release to send through the same Send, with the same recipient, file and
   admission checks. If Send is blocked, or the draft changed, the words stay
   and the line under the field says why. Sliding off the mic before release

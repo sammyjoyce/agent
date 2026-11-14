@@ -39,12 +39,19 @@
       return DictationReservation(range: range, text: text)
     }
 
-    func unlock() { (view as? ComposerField.DraftView)?.locked = false }
+    /// Takes the take's provisional words away and unlocks the field, for a take that lands
+    /// nothing.
+    func unlock() {
+      guard let view = view as? ComposerField.DraftView else { return }
+      view.clearProvisional()
+      view.locked = false
+    }
 
-    /// Inserts through the field's own text input, so the words reach the model the way typing
-    /// does and Undo takes back the dictation alone.
+    /// Replaces the provisional words with `words` through the field's own text input, so they
+    /// reach the model the way typing does and Undo takes back the dictation alone.
     func insert(_ words: String, at reservation: DictationReservation?) -> Bool {
       guard let view = view as? ComposerField.DraftView else { return false }
+      view.clearProvisional()
       view.locked = false
       let text = (view.text ?? "") as NSString
       let range =
