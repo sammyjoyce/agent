@@ -13,10 +13,6 @@ public struct OpenCoordinatorIntent: OpenIntent {
 
   public init() {}
 
-  public init(target: CoordinatorEntity) {
-    self.target = target
-  }
-
   /// For tests, which run outside the perform flow that resolves `@Dependency`.
   init(target: CoordinatorEntity, notifications: AppNotifications) {
     self.target = target
