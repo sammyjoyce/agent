@@ -1,4 +1,5 @@
 import AgentCore
+import AppIntents
 import Foundation
 import Observation
 import UserNotifications
@@ -76,6 +77,7 @@ public final class AppNotifications: NSObject {
       persistence: ComposerDraftStore(
         url: URL.applicationSupportDirectory.appending(path: "Agent/Composer/draft.json")),
       sharedInbox: try? SharedDraftInbox.configured())
+    AppDependencyManager.shared.add(dependency: self)
   }
 
   init(
