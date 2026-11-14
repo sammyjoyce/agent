@@ -26,6 +26,8 @@
     /// The coordinator whose restored message the draft holds. The field's undo actions go whenever
     /// it changes.
     let restoredFrom: ProfileID?
+    let provisional: String
+    let reservation: DictationReservation?
     /// Reports the field's text, and that text without what an input method is still composing.
     let edit: (_ text: String, _ committed: String) -> Void
     let removeChip: () -> Void
@@ -48,7 +50,8 @@
       // applied here whatever the keyboard last did. The caret keeps its place in the text
       // around the change. A promoted tag's change is the range the model removed, since the
       // text alone cannot say which of two equal tags went.
-      if view.text != text {
+      if view.draft != text {
+        view.clearProvisional()
         let change =
           if let promotion, promotion.typed == view.text, promotion.rest == text {
             (
@@ -74,8 +77,16 @@
         context.coordinator.restoredFrom = restoredFrom
         view.undoManager?.removeAllActions()
       }
+      if let reservation, !provisional.isEmpty, view.locked {
+        let range =
+          reservation.text == text
+          ? reservation.range : NSRange(location: text.utf16.count, length: 0)
+        view.showProvisional(provisional, over: range)
+      } else {
+        view.clearProvisional()
+      }
       view.placeholder.text = placeholder
-      view.placeholder.isHidden = !text.isEmpty
+      view.placeholder.isHidden = !view.text.isEmpty
       // SwiftUI's `disabled` reaches a UIKit view only through the environment.
       view.isEditable = context.environment.isEnabled
       box.chip = chip
@@ -220,6 +231,80 @@
         case above(CGFloat)
       }
       let placeholder = UILabel()
+      var locked = false
+      override func insertText(_ text: String) { if !locked { super.insertText(text) } }
+      override func deleteBackward() { if !locked { super.deleteBackward() } }
+      override func replace(_ range: UITextRange, withText text: String) {
+        if !locked { super.replace(range, withText: text) }
+      }
+      override func setMarkedText(_ text: String?, selectedRange: NSRange) {
+        if !locked { super.setMarkedText(text, selectedRange: selectedRange) }
+      }
+      override func setAttributedMarkedText(
+        _ text: NSAttributedString?, selectedRange: NSRange
+      ) {
+        if !locked { super.setAttributedMarkedText(text, selectedRange: selectedRange) }
+      }
+      private(set) var provisional: (range: NSRange, covered: String)?
+
+      var draft: String {
+        guard let provisional else { return text }
+        return (text as NSString).replacingCharacters(
+          in: provisional.range, with: provisional.covered)
+      }
+
+      func showProvisional(_ words: String, over range: NSRange) {
+        let draft = self.draft as NSString
+        guard NSMaxRange(range) <= draft.length else { return }
+        let before =
+          range.location > 0
+          ? draft.substring(with: draft.rangeOfComposedCharacterSequence(at: range.location - 1))
+            .last : nil
+        let after =
+          NSMaxRange(range) < draft.length
+          ? draft.substring(with: draft.rangeOfComposedCharacterSequence(at: NSMaxRange(range)))
+            .first : nil
+        let fitted = DictationText.fitted(words, between: before, and: after)
+        if let provisional, provisional.range.location == range.location,
+          (text as NSString).substring(with: provisional.range) == fitted
+        {
+          return
+        }
+        clearProvisional()
+        var dimmed = typingAttributes
+        dimmed[.foregroundColor] = UIColor.secondaryLabel
+        replaceWithoutUndo(range, with: NSAttributedString(string: fitted, attributes: dimmed))
+        provisional = (
+          range: NSRange(location: range.location, length: fitted.utf16.count),
+          covered: draft.substring(with: range)
+        )
+        selectedRange = NSRange(location: range.location + fitted.utf16.count, length: 0)
+      }
+
+      func clearProvisional() {
+        guard let provisional else { return }
+        self.provisional = nil
+        replaceWithoutUndo(
+          provisional.range,
+          with: NSAttributedString(string: provisional.covered, attributes: typingAttributes))
+        selectedRange = NSRange(
+          location: provisional.range.location, length: provisional.covered.utf16.count)
+      }
+
+      /// Edits the storage directly. Only the text view's input paths, such as `insertText`,
+      /// register Undo or tell the delegate.
+      private func replaceWithoutUndo(_ range: NSRange, with text: NSAttributedString) {
+        textStorage.replaceCharacters(in: range, with: text)
+        invalidateIntrinsicContentSize()
+      }
+
+      override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        let edits: [Selector] = [
+          #selector(paste(_:)), #selector(cut(_:)), #selector(delete(_:)),
+        ]
+        return locked && edits.contains(action)
+          ? false : super.canPerformAction(action, withSender: sender)
+      }
       var chipRoom = ChipRoom.none {
         didSet {
           guard chipRoom != oldValue else { return }
@@ -268,7 +353,10 @@
       /// An empty draft reads its placeholder, as the text field before it did. A text view has
       /// no placeholder of its own to report.
       override var accessibilityValue: String? {
-        get { text.isEmpty ? placeholder.text : super.accessibilityValue }
+        get {
+          if draft.isEmpty { return placeholder.text }
+          return provisional == nil ? super.accessibilityValue : draft
+        }
         set { super.accessibilityValue = newValue }
       }
 
@@ -325,6 +413,11 @@
             in: NSRange(location: start, length: length), with: "")
         }
         field?.edit(view.text, committed)
+      }
+      func textView(
+        _ view: UITextView, shouldChangeTextIn range: NSRange, replacementText text: String
+      ) -> Bool {
+        !((view as? DraftView)?.locked ?? false)
       }
       /// The chip moves with the first line.
       func scrollViewDidScroll(_ view: UIScrollView) { view.superview?.setNeedsLayout() }

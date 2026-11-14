@@ -16,6 +16,7 @@ public struct MainChatView: View {
   private let notifications: AppNotifications?
   private let relatedWork: [SavedConversation]
   private let inspectRelated: ((SavedConversation) -> Void)?
+  private let dictation: Dictation?
   @Environment(\.dismiss) private var dismiss
   @State private var settings = false
   @FocusState private var composerFocused: Bool
@@ -41,7 +42,7 @@ public struct MainChatView: View {
   @Environment(\.colorScheme) private var colorScheme
   @Environment(\.displayScale) private var displayScale
 
-  public init(notifications: AppNotifications) {
+  public init(notifications: AppNotifications, dictation: Dictation? = nil) {
     _model = State(initialValue: notifications.coordinators.chat)
     coordinators = notifications.coordinators
     detailLoader = nil
@@ -49,13 +50,15 @@ public struct MainChatView: View {
     self.notifications = notifications
     relatedWork = []
     inspectRelated = nil
+    self.dictation = dictation
   }
   // Previews and hosted rendering use the real screen with a seeded model,
   // without taking ownership of a live connection or the user's saved address.
   init(
     model: ChatModel, expansion: ActivityExpansion = ActivityExpansion(),
     details: ToolDetailsLoader? = nil, initialScrollTarget: String? = nil,
-    relatedWork: [SavedConversation] = [], inspectRelated: ((SavedConversation) -> Void)? = nil
+    relatedWork: [SavedConversation] = [], inspectRelated: ((SavedConversation) -> Void)? = nil,
+    dictation: Dictation? = nil
   ) {
     _model = State(initialValue: model)
     _activityExpansion = State(initialValue: expansion)
@@ -65,6 +68,7 @@ public struct MainChatView: View {
     notifications = nil
     self.relatedWork = relatedWork
     self.inspectRelated = inspectRelated
+    self.dictation = dictation
     _followsLatest = State(initialValue: initialScrollTarget == nil)
   }
   public var body: some View {
@@ -221,7 +225,7 @@ public struct MainChatView: View {
         }
       }
       .dropDestination(for: URL.self) { urls, _ in
-        guard !inspecting, model.draftReady, !urls.isEmpty else { return false }
+        guard !inspecting, !dictating, model.draftReady, !urls.isEmpty else { return false }
         model.attach(urls: urls)
         return true
       }
@@ -598,6 +602,14 @@ public struct MainChatView: View {
     if let detailLoader { return try await detailLoader(row) }
     return try await model.toolDetails(for: row, lane: lane)
   }
+  private var dictating: Bool { dictation?.take != nil }
+  #if os(iOS)
+    private var dictationTarget: DictationTarget {
+      DictationTarget(
+        chat: model, reserve: composerEditor.reserve, insert: composerEditor.insert,
+        unlock: composerEditor.unlock)
+    }
+  #endif
   private var showsStop: Bool {
     !model.admitting && model.busy
       && model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -605,7 +617,10 @@ public struct MainChatView: View {
   }
   private var composer: some View {
     VStack(spacing: 6) {
-      if !model.pickerMatches.isEmpty { picker }
+      if !model.pickerMatches.isEmpty, !dictating { picker }
+      #if os(iOS)
+        if let dictation { DictationStatus(dictation: dictation, chat: model) }
+      #endif
       if !model.attachments.isEmpty {
         HStack {
           Text("Unsent attachments").font(.caption).foregroundStyle(.secondary)
@@ -636,7 +651,7 @@ public struct MainChatView: View {
               }
             #endif
           }.disabled(
-            model.admitting || model.preparingAttachments
+            model.admitting || model.preparingAttachments || dictating
               || model.attachments.count >= AttachmentLimits.maximumCount)
           Menu("Commands", systemImage: "command") {
             ForEach(model.commands, id: \.usage) { command in
@@ -647,11 +662,11 @@ public struct MainChatView: View {
                 Text(command.description)
               }
             }
-          }.disabled(model.admitting || model.commands.isEmpty)
+          }.disabled(model.admitting || dictating || model.commands.isEmpty)
           Picker("Delivery", selection: $model.mode) {
             Text("Steer").tag(InputMode.steer)
             Text("Follow-up").tag(InputMode.followUp)
-          }.pickerStyle(.inline).disabled(model.admitting)
+          }.pickerStyle(.inline).disabled(model.admitting || dictating)
           if model.busy {
             Button("Stop response", systemImage: "stop.fill") {
               let shown = model.scope
@@ -671,7 +686,7 @@ public struct MainChatView: View {
         .frame(minWidth: 44, minHeight: 44)
         .accessibilityLabel("Paste images")
         .disabled(
-          !model.draftReady || model.preparingAttachments || model.admitting
+          !model.draftReady || model.preparingAttachments || model.admitting || dictating
             || model.attachments.count >= AttachmentLimits.maximumCount)
         Group {
           #if os(iOS)
@@ -699,6 +714,11 @@ public struct MainChatView: View {
         // The field drops a rewrite made inside its own write, so the tag moves after it. Tags are
         // read from committed text alone, so one an input method composes moves once committed.
         .onChange(of: model.committed) { model.promoteTypedTag() }
+        #if os(iOS)
+          if let dictation, dictation.model != .unsupported {
+            MicButton(dictation: dictation, target: dictationTarget)
+          }
+        #endif
         Button {
           if showsStop {
             let shown = model.scope
@@ -723,11 +743,12 @@ public struct MainChatView: View {
             }
           }
           .foregroundStyle(.background).frame(width: 32, height: 32)
-          .background(.primary, in: Circle()).opacity(showsStop || model.canSend ? 1 : 0.25)
+          .background(.primary, in: Circle())
+          .opacity(showsStop || (model.canSend && !dictating) ? 1 : 0.25)
           .frame(width: 44, height: 44).contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .disabled(showsStop ? model.connection != .connected : !model.canSend)
+        .disabled(showsStop ? model.connection != .connected : !model.canSend || dictating)
         .accessibilityLabel(
           showsStop ? "Stop response" : model.mode == .steer ? "Send message" : "Queue follow-up")
       }
@@ -743,6 +764,19 @@ public struct MainChatView: View {
     .padding(.horizontal, 12).padding(.vertical, 8).background(.background)
     .accessibilityElement(children: .contain)
     .accessibilityIdentifier("messageComposer")
+    #if os(iOS)
+      .confirmationDialog(
+        dictation?.offering?.question ?? "",
+        isPresented: Binding(
+          get: { dictation?.offering != nil }, set: { if !$0 { dictation?.offering = nil } }),
+        titleVisibility: .visible
+      ) {
+        Button("Download") { dictation?.download() }
+        Button(dictation?.offering?.cellular == true ? "Not now" : "Cancel", role: .cancel) {}
+      } message: {
+        Text("What you say never leaves this iPhone.")
+      }
+    #endif
   }
   private var placeholder: String {
     if let shown = model.scope.coordinator {
@@ -759,8 +793,10 @@ public struct MainChatView: View {
         chip: model.shownChip.map {
           let badge = badge($0)
           return .init(
-            name: badge.name, color: UIColor(badge.color), removable: !model.admitting)
+            name: badge.name, color: UIColor(badge.color),
+            removable: !model.admitting && !dictating)
         }, editor: composerEditor, promotion: model.promotion, restoredFrom: model.restoredFrom,
+        provisional: dictation?.take?.provisional ?? "", reservation: dictation?.take?.reservation,
         edit: { model.edit($0, committed: $1) }, removeChip: { model.removeChip() })
     }
   #else
@@ -836,6 +872,19 @@ public struct MainChatView: View {
           }
           .pickerStyle(.menu).tint(.primary).accessibilityIdentifier("appearancePicker")
         }
+        #if os(iOS)
+          if let dictation, let summary = voiceModelSummary(dictation) {
+            Section {
+              LabeledContent("Voice model", value: summary)
+              if dictation.diskUsage > 0 {
+                Button("Remove voice model", role: .destructive) { dictation.removeModel() }
+                  .disabled(!dictation.canRemoveModel)
+              }
+            } header: {
+              Text("Dictation").foregroundStyle(Color.primary)
+            }
+          }
+        #endif
         if let coordinators {
           if model.multiple {
             Section("Coordinators") {
@@ -925,6 +974,20 @@ public struct MainChatView: View {
       }
     }
   }
+  #if os(iOS)
+    private func voiceModelSummary(_ dictation: Dictation) -> String? {
+      let size = DictationStatus.size(dictation.diskUsage)
+      switch dictation.model {
+      case .checking: return nil
+      case .unsupported:
+        return dictation.diskUsage > 0 ? "Not supported on this iPhone · \(size)" : nil
+      case .downloading(let fraction, _): return "Downloading · \(Int(fraction * 100))%"
+      case .missing:
+        return dictation.diskUsage > 0 ? "Partly downloaded · \(size)" : "Not downloaded"
+      case .preparing, .ready: return "On this iPhone · \(size)"
+      }
+    }
+  #endif
   private func addCoordinator(_ coordinators: Coordinators) -> some View {
     NavigationLink("Add coordinator") {
       Form { CoordinatorForm(coordinators: coordinators, profile: nil, pushed: true) }
