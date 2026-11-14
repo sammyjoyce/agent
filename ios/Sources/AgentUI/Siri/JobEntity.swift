@@ -88,11 +88,11 @@ public struct JobQuery: EnumerableEntityQuery {
   public init() {}
 
   public func allEntities() async throws -> [JobEntity] {
-    try await Self.allJobs(in: notifications.coordinators)
+    try await Self.allJobs(in: notifications.intentCoordinators)
   }
 
   public func entities(for identifiers: [ScopedEntityID]) async throws -> [JobEntity] {
-    try await Self.jobs(identifiedBy: identifiers, in: notifications.coordinators)
+    try await Self.jobs(identifiedBy: identifiers, in: notifications.intentCoordinators)
   }
 
   @MainActor static func allJobs(in coordinators: Coordinators) async throws
