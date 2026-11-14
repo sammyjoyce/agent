@@ -320,10 +320,11 @@ required for sharing on a phone; an unsigned build does not establish that.
   are resized and encoded as JPEG. History includes file metadata; bytes are
   downloaded and verified only when opening a preview.
 - The mic beside Send dictates on the iPhone with NVIDIA Parakeet Unified
-  English 0.6B. The first tap asks before a one-time 614.1 MB download into
-  Application Support, excluded from backup, and then prepares the model for
-  this iPhone. On cellular, or another network the system marks expensive, the
-  question says so and offers **Not now**; nothing starts later on Wi-Fi. Tap to start and tap again to stop: the words land at the caret,
+  English 0.6B, streaming. The first tap asks before a one-time 609.4 MB
+  download into Application Support, excluded from backup, and then prepares
+  the model for this iPhone. On cellular, or another network the system marks
+  expensive, the question says so and offers **Not now**; nothing starts later
+  on Wi-Fi. Tap to start and tap again to stop: the words land at the caret,
   stay in the composer, and one Undo removes them. Hold the mic to talk and
   release to send through the same Send, with the same recipient, file and
   admission checks. If Send is blocked, or the draft changed, the words stay

@@ -112,11 +112,14 @@ public actor Parakeet {
     Self.sizes(of: root).disk
   }
 
-  /// Takes the audio session and starts capture, then starts loading the model beside it. Throws
-  /// when the session cannot be taken, as during a call.
+  /// Takes the audio session and starts capture, then starts loading the model beside it. Audio
+  /// heard before the load ends waits for it. Throws when the session cannot be taken, as during
+  /// a call.
   public func record() throws -> Take {
-    let capture = try Capture.start()
-    return Take(capture: capture, model: acquire(), owner: self)
+    let (events, reporting) = AsyncStream.makeStream(of: Take.Event.self)
+    let capture = try Capture.start(reporting: reporting)
+    return Take(
+      capture: capture, events: events, reporting: reporting, model: acquire(), owner: self)
   }
 
   func acquire() -> Task<Recognizer, any Error> {
@@ -219,6 +222,7 @@ public enum ParakeetError: LocalizedError, Equatable, Sendable {
   case notEnoughSpace(needed: Int64, available: Int64)
   /// The audio route offers no input.
   case noMicrophone
+  case audioFormat
 
   public var errorDescription: String? {
     switch self {
@@ -226,6 +230,8 @@ public enum ParakeetError: LocalizedError, Equatable, Sendable {
       "The voice model needs \(Self.bytes(needed)) free, and \(Self.bytes(available)) is free."
     case .noMicrophone:
       "No microphone is available."
+    case .audioFormat:
+      "The audio could not be prepared for the voice model."
     }
   }
 

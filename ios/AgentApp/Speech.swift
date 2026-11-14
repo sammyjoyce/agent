@@ -72,6 +72,7 @@ extension RecordingEvent {
   fileprivate init(_ event: Take.Event) {
     switch event {
     case .level(let level): self = .level(level)
+    case .partial(let words): self = .partial(words)
     case .interrupted: self = .interrupted
     }
   }

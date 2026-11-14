@@ -21,6 +21,8 @@ public enum MicrophonePermission: String, Codable, Sendable {
 public enum RecordingEvent: Equatable, Sendable {
   /// The latest audio's loudness, 0...1, about ten times a second.
   case level(Float)
+  /// The whole transcript so far. Later audio can still change it, so each replaces the last.
+  case partial(String)
   /// A call, Siri, a route change or a media-services reset stopped capture. What was heard is
   /// kept, and `finish` still returns its words.
   case interrupted
@@ -30,8 +32,8 @@ public enum RecordingEvent: Equatable, Sendable {
 public struct Recording: Sendable {
   /// Ends when capture stops.
   let events: AsyncStream<RecordingEvent>
-  /// Stops capture, waits for the model load that `record` started (compiling a stale model),
-  /// transcribes everything heard and unloads the model. Stopping is idempotent.
+  /// Stops capture and returns the final text for everything heard, once a load that `record`
+  /// started (compiling a stale model) has ended. Then unloads the model.
   let finish: @Sendable () async throws -> String
   /// Stops capture and abandons transcription. Idempotent.
   let cancel: @Sendable () -> Void
@@ -105,7 +107,7 @@ final class ScriptedSpeech: Sendable {
       case unsupported
     }
     var model = Model.ready
-    var download: Int64 = 614_082_275
+    var download: Int64 = 609_440_571
     /// Fractions an install reports, one every `stepMilliseconds`.
     var progress: [Double] = [0.25, 0.5, 0.75, 1]
     var stepMilliseconds = 20
@@ -603,6 +605,7 @@ public final class Dictation {
       guard self.take?.id == id else { break }
       switch event {
       case .level(let loudness): level = loudness
+      case .partial: break
       case .interrupted: finish(.keep, notice: .interrupted)
       }
     }

@@ -82,7 +82,7 @@ final class DictationInteractionTests: XCTestCase {
         """#)
     mic(app, labeled: "Set up dictation").tap()
     XCTAssertTrue(
-      app.staticTexts["Download the voice model (614.1 MB)?"].waitForExistence(timeout: 5),
+      app.staticTexts["Download the voice model (609.4 MB)?"].waitForExistence(timeout: 5),
       app.debugDescription)
     XCTAssertTrue(app.staticTexts["What you say never leaves this iPhone."].exists)
     app.buttons["Download"].tap()
@@ -91,7 +91,7 @@ final class DictationInteractionTests: XCTestCase {
     ).firstMatch
     XCTAssertTrue(progress.waitForExistence(timeout: 5), app.debugDescription)
     XCTAssertTrue(mic(app, labeled: "Downloading voice model").exists)
-    XCTAssertTrue(progress.label.hasSuffix("of 614.1 MB"), progress.label)
+    XCTAssertTrue(progress.label.hasSuffix("of 609.4 MB"), progress.label)
     let ready = app.staticTexts[
       "Ready. Tap the mic to dictate, or hold it to talk and release to send."]
     XCTAssertTrue(ready.waitForExistence(timeout: 20), app.debugDescription)
