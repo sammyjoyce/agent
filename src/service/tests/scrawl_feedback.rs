@@ -1,4 +1,8 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::Result;
 use serde_json::Value;
@@ -264,6 +268,95 @@ async fn unconfirmed_feedback_is_resent_identically_after_restart() {
     assert_eq!(delivered[0], delivered[1]);
     assert!(matches!(
         restarted.state("phone.scrawl"),
+        Some(BundleState::Acknowledged)
+    ));
+    drop(restarted);
+    service.stop().await;
+}
+
+fn age_submission(state: &Path, bundle: &str, by: Duration) {
+    let path = state.join("scrawl-feedback.json");
+    let mut ledger: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let submitted_at = &mut ledger[bundle]["submitted_at_ms"];
+    *submitted_at = (submitted_at.as_u64().unwrap() - by.as_millis() as u64).into();
+    fs::write(&path, ledger.to_string()).unwrap();
+}
+
+async fn submit_unconfirmed(service: &Running, captures: &Path, state: &Path) {
+    fs::write(service.directory.path().join("unconfirmed-feedback"), "").unwrap();
+    let mut watcher = Watcher::open(captures, state).unwrap();
+    write(
+        captures,
+        "mac.scrawl",
+        &manifest("Look at this panel.", 1, None),
+        None,
+    );
+    watcher.poll(&service.dialer()).await;
+    assert!(matches!(
+        watcher.state("mac.scrawl"),
+        Some(BundleState::Submitted { .. })
+    ));
+}
+
+#[tokio::test]
+async fn feedback_unconfirmed_for_a_day_is_refused_once_its_uploads_expire() {
+    let service = Running::start().await;
+    let captures = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    submit_unconfirmed(&service, captures.path(), state.path()).await;
+    age_submission(
+        state.path(),
+        "mac.scrawl",
+        Duration::from_secs(25 * 60 * 60),
+    );
+
+    let mut restarted = Watcher::open(captures.path(), state.path()).unwrap();
+    let notices = restarted.poll(&service.dialer()).await;
+
+    assert!(matches!(
+        restarted.state("mac.scrawl"),
+        Some(BundleState::Refused { reason }) if reason.contains("24 hours")
+    ));
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|notice| notice.contains("mac.scrawl"))
+            .count(),
+        1,
+        "{notices:?}"
+    );
+    assert_eq!(service.delivered().len(), 2);
+    drop(restarted);
+
+    let mut again = Watcher::open(captures.path(), state.path()).unwrap();
+    assert!(again.poll(&service.dialer()).await.is_empty());
+    assert_eq!(
+        service.delivered().len(),
+        2,
+        "A refused capture is never resent"
+    );
+    drop(again);
+    service.stop().await;
+}
+
+#[tokio::test]
+async fn feedback_confirmed_after_a_day_still_counts_as_acknowledged() {
+    let service = Running::start().await;
+    let captures = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    submit_unconfirmed(&service, captures.path(), state.path()).await;
+    age_submission(
+        state.path(),
+        "mac.scrawl",
+        Duration::from_secs(25 * 60 * 60),
+    );
+    fs::remove_file(service.directory.path().join("unconfirmed-feedback")).unwrap();
+
+    let mut restarted = Watcher::open(captures.path(), state.path()).unwrap();
+    restarted.poll(&service.dialer()).await;
+
+    assert!(matches!(
+        restarted.state("mac.scrawl"),
         Some(BundleState::Acknowledged)
     ));
     drop(restarted);

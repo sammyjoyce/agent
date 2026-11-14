@@ -10,7 +10,7 @@ use std::{
     num::NonZeroU16,
     os::unix::fs::OpenOptionsExt,
     path::{Component, Path, PathBuf},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -23,8 +23,8 @@ use tokio::{
 
 use crate::{
     attachments::{
-        AttachmentRef, AttachmentRequest, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS, WireEnvelope,
-        exchange_chunk, upload_bytes, upload_file,
+        ATTACHMENT_STAGING_MILLIS, AttachmentRef, AttachmentRequest, MAX_ATTACHMENT_BYTES,
+        MAX_ATTACHMENTS, WireEnvelope, exchange_chunk, upload_bytes, upload_file,
     },
     coordinator_id::CoordinatorId,
     native::{NativeEvent, NativeRequest},
@@ -591,6 +591,8 @@ pub enum BundleState {
         input_id: uuid::Uuid,
         destination: Destination,
         command: Box<RuntimeCommand>,
+        /// Wall-clock Unix milliseconds, taken before the first upload.
+        submitted_at_ms: u64,
     },
     Acknowledged,
     Refused {
@@ -866,23 +868,37 @@ impl Watcher {
                     input_id,
                     destination,
                     command,
+                    submitted_at_ms,
                 } if self.due(bundle) => Some((
                     bundle.clone(),
                     *input_id,
                     destination.clone(),
                     command.clone(),
+                    *submitted_at_ms,
                 )),
                 _ => None,
             })
             .collect();
-        for (bundle, input_id, destination, command) in unconfirmed {
-            let outcome = async {
+        for (bundle, input_id, destination, command, submitted_at_ms) in unconfirmed {
+            let outcome = match async {
                 Session::open(dialer, &destination)
                     .await?
                     .submit(&command, input_id)
                     .await
             }
-            .await;
+            .await
+            {
+                Err(Failure::Transient(_))
+                    if now_unix_millis().saturating_sub(submitted_at_ms)
+                        >= ATTACHMENT_STAGING_MILLIS =>
+                {
+                    Err(Failure::Refused(format!(
+                        "The coordinator did not confirm within {} hours, and the uploaded files expired",
+                        ATTACHMENT_STAGING_MILLIS / 3_600_000
+                    )))
+                }
+                outcome => outcome,
+            };
             self.settle(&bundle, outcome, &mut notices);
         }
         let bundles = match list_bundles(&self.captures) {
@@ -916,6 +932,7 @@ impl Watcher {
         plan: Plan,
         dialer: &dyn Dialer,
     ) -> Result<(), Failure> {
+        let submitted_at_ms = now_unix_millis();
         let mut session = Session::open(dialer, &plan.destination).await?;
         let attachments = session.upload(&plan.attachments).await?;
         let input_id = uuid::Uuid::new_v4();
@@ -935,6 +952,7 @@ impl Watcher {
                 input_id,
                 destination: plan.destination,
                 command: Box::new(command.clone()),
+                submitted_at_ms,
             },
         )?;
         session.submit(&command, input_id).await
@@ -997,6 +1015,12 @@ impl Watcher {
         );
         delay
     }
+}
+
+fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
 }
 
 /// Polls forever. A failed pass is logged and the next one runs on schedule.

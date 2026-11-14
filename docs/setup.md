@@ -583,8 +583,9 @@ the keyframes, then the recording if a slot is left. A larger file is skipped.
 `<state_dir>/scrawl-feedback.json` records each capture as `backlog`,
 `submitted`, `acknowledged` or `refused`. A submitted capture is resent with
 its original request ID until the coordinator confirms it, so a restart does
-not duplicate feedback. A capture the coordinator rejects is refused and never
-resent. To see each capture's decision without sending or recording anything,
+not duplicate feedback. The coordinator deletes uploaded files after 24 hours,
+so a capture still unconfirmed a day after it was sent is refused at its next
+failed resend. A capture the coordinator rejects is refused and never resent. To see each capture's decision without sending or recording anything,
 run:
 
 ```sh

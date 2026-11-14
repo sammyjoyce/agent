@@ -11,6 +11,8 @@ pub const MAX_ATTACHMENT_BYTES: u32 = 16 * 1024 * 1024;
 pub const ATTACHMENT_CHUNK_BYTES: u32 = 64 * 1024;
 pub const MAX_ATTACHMENTS: usize = 8;
 pub const MAX_ATTACHMENT_NAME_BYTES: usize = 240;
+/// How long a coordinator keeps an upload that no saved input references.
+pub const ATTACHMENT_STAGING_MILLIS: u64 = 24 * 60 * 60 * 1000;
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
 pub struct AttachmentRef {
