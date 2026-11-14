@@ -57,6 +57,40 @@ pub enum AttachmentResponse {
     Discarded,
 }
 
+/// Sends one attachment request on a coordinator connection the caller owns
+/// and reads its receipt.
+pub async fn exchange_chunk<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut crate::runtime::FrameReader<R>,
+    writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+    request: AttachmentRequest,
+) -> Result<AttachmentResponse> {
+    use crate::protocol::{RuntimeCommand, RuntimeEventKind};
+    crate::service::write_frame(writer, &RuntimeCommand::Attachment { request }).await?;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut response = None;
+        loop {
+            let frame = reader
+                .next_frame()
+                .await?
+                .context("Coordinator disconnected during attachment upload")?;
+            match crate::runtime::decode_coordinator_event(&frame)? {
+                RuntimeEventKind::Attachment { response: value } if response.is_none() => {
+                    response = Some(value)
+                }
+                RuntimeEventKind::Done => {
+                    return response.context("Attachment upload returned no receipt");
+                }
+                RuntimeEventKind::Failure { message, .. } => {
+                    bail!("Attachment could not be uploaded: {message}")
+                }
+                _ => bail!("The coordinator returned an unexpected attachment response"),
+            }
+        }
+    })
+    .await
+    .context("Attachment upload timed out")?
+}
+
 /// The caller owns its authenticated transfer connection for the entire file.
 pub async fn upload_file<F, Fut>(path: &Path, mut transfer: F) -> Result<AttachmentRef>
 where

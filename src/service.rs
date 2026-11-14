@@ -257,7 +257,7 @@ async fn serve_with_transport(
     result
 }
 
-pub(crate) async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
+pub(crate) async fn write_frame<W: AsyncWrite + Unpin + ?Sized, T: Serialize>(
     writer: &mut W,
     value: &T,
 ) -> Result<()> {

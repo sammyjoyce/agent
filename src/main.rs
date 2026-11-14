@@ -34,7 +34,7 @@ use agent_cli::{
         TranscriptClassification, WorkerLaunch, WorkerRef,
     },
     rex::{BlockId, RexClient, SessionId},
-    runtime::{FrameReader, decode_coordinator_event, lifecycle::RequestLifecycle},
+    runtime::{FrameReader, Wire, decode_coordinator_event, lifecycle::RequestLifecycle},
     service,
     tui::attachments::ComposerInput,
     tui::{Tui, TuiHandle, TuiInfo, TuiInput},
@@ -43,7 +43,7 @@ use agent_cli::{
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::UnixStream,
     process::{Child, Command},
     time::{Instant, sleep, timeout},
@@ -373,12 +373,6 @@ enum MailAction {
     },
 }
 
-struct Wire {
-    reader: Box<dyn AsyncRead + Unpin + Send>,
-    writer: Box<dyn AsyncWrite + Unpin + Send>,
-    child: Option<Child>,
-}
-
 struct WatchGuard(tokio::task::JoinHandle<()>);
 impl Drop for WatchGuard {
     fn drop(&mut self) {
@@ -411,17 +405,6 @@ fn startup_jobs(config: &ClientConfig) -> Option<Vec<jobs::ScheduledJob>> {
                 "Scheduled job validation failed; previously applied jobs are retained: {error:#}"
             );
             None
-        }
-    }
-}
-
-impl Wire {
-    fn local(stream: UnixStream) -> Self {
-        let (reader, writer) = stream.into_split();
-        Self {
-            reader: Box::new(reader),
-            writer: Box::new(writer),
-            child: None,
         }
     }
 }
@@ -2254,7 +2237,7 @@ struct ClientContext<'a> {
 }
 
 async fn prepare_attachments(client: ClientContext<'_>, input: &mut ComposerInput) -> Result<()> {
-    use agent_cli::attachments::{MAX_ATTACHMENTS, upload_file};
+    use agent_cli::attachments::{MAX_ATTACHMENTS, exchange_chunk, upload_file};
     ensure!(
         input.attachment_count() <= MAX_ATTACHMENTS,
         "Attach at most 8 files"
@@ -2280,34 +2263,7 @@ async fn prepare_attachments(client: ClientContext<'_>, input: &mut ComposerInpu
             async move {
                 let mut owned = transfer.lock().await;
                 let (reader, writer, _child) = &mut *owned;
-                write_command(&mut **writer, &RuntimeCommand::Attachment { request }).await?;
-                timeout(Duration::from_secs(30), async {
-                    let mut response = None;
-                    loop {
-                        let frame = reader
-                            .next_frame()
-                            .await?
-                            .context("Coordinator disconnected during attachment upload")?;
-                        match decode_coordinator_event(&frame)? {
-                            RuntimeEventKind::Attachment { response: value }
-                                if response.is_none() =>
-                            {
-                                response = Some(value)
-                            }
-                            RuntimeEventKind::Done => {
-                                return response.context("Attachment upload returned no receipt");
-                            }
-                            RuntimeEventKind::Failure { message, .. } => {
-                                bail!("Attachment could not be uploaded: {message}")
-                            }
-                            _ => {
-                                bail!("The coordinator returned an unexpected attachment response")
-                            }
-                        }
-                    }
-                })
-                .await
-                .context("Attachment upload timed out")?
+                exchange_chunk(reader, &mut **writer, request).await
             }
         })
         .await?;
@@ -3168,13 +3124,9 @@ async fn connection(client: ClientContext<'_>, login: bool) -> Result<Wire> {
         let policy =
             agent_cli::tailnet::PeerPolicy::new(&config.trusted_nodes, &config.trusted_user_ids)?;
         let daemon = agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
-        let stream = agent_cli::tailnet::connect(address, &policy, &daemon).await?;
-        let (reader, writer) = stream.into_split();
-        return Ok(Wire {
-            reader: Box::new(reader),
-            writer: Box::new(writer),
-            child: None,
-        });
+        return Ok(Wire::tcp(
+            agent_cli::tailnet::connect(address, &policy, &daemon).await?,
+        ));
     }
     let mut command = Command::new("ssh");
     command.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);
