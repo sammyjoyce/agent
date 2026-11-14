@@ -36,7 +36,7 @@ public struct CoordinatorQuery: EnumerableEntityQuery {
 
   public func allEntities() async throws -> [CoordinatorEntity] {
     let notifications = notifications
-    return await MainActor.run { CoordinatorEntity.saved(in: notifications.coordinators) }
+    return await MainActor.run { CoordinatorEntity.saved(in: notifications.intentCoordinators) }
   }
 
   public func entities(for identifiers: [String]) async throws -> [CoordinatorEntity] {
