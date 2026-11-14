@@ -167,7 +167,7 @@ private func replies(_ prefix: String, _ count: Int, next: String? = nil) -> Nat
     .timeLimit(.minutes(1)),
     arguments: [
       "begun in All", "begun in Work", "Personal's chip", "an @Personal tag",
-      "restored from Personal", "held for Personal", "a share import", "/feedback",
+      "restored from Personal", "held for Personal", "a share import",
     ])
   func aScopeSwitchNeverChangesWhereADraftGoes(_ kind: String) async throws {
     try await withLab { lab, coordinators in
@@ -218,13 +218,10 @@ private func replies(_ prefix: String, _ count: Int, next: String? = nil) -> Nat
           let message = try #require(chat.held.first { $0.id == queued.inputId })
           await chat.restoreHeld(message)
           return (text, [personal])
-        case "a share import":
+        default:
           try await lab.inbox.enqueue(images: [], note: text)
           await chat.receiveSharedDrafts()
           return (text, [work, personal])
-        default:
-          chat.draft = "/feedback " + text
-          return ("/feedback " + text, [work, personal])
         }
       }
       let walk: [FeedScope] = [.all, .one(work), .one(personal), .all]

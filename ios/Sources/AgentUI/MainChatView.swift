@@ -707,10 +707,10 @@ public struct MainChatView: View {
             #if os(iOS)
               composerEditor.submit { text in
                 model.draft = text
-                return model.startSend() != nil
+                return model.submit()
               }
             #else
-              model.startSend()
+              _ = model.submit()
             #endif
           }
         } label: {

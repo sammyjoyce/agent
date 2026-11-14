@@ -32,6 +32,8 @@ public struct CoordinatorID: Hashable, Sendable, Codable {
     guard let uuid = UUID(uuidString: wire) else { return nil }
     self.uuid = uuid
   }
+  /// The ID as an uppercase hyphenated UUID, for another program to parse back into a UUID.
+  public var wire: String { uuid.uuidString }
   public init(from decoder: any Decoder) throws {
     uuid = try decoder.singleValueContainer().decode(UUID.self)
   }

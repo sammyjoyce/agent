@@ -131,10 +131,16 @@ final class ChatModel {
     didSet {
       endAnsweredQuestion()
       followScope()
+      pushFeedbackTarget()
     }
   }
   /// The scope last asked for, as saved. Only `show(_:)` changes it.
-  private var requested: FeedScope { didSet { followScope() } }
+  private var requested: FeedScope {
+    didSet {
+      followScope()
+      pushFeedbackTarget()
+    }
+  }
   @ObservationIgnored private let preference: ScopePreference
   /// The scope `rows` were built for.
   @ObservationIgnored private var projected = FeedScope.all
@@ -156,6 +162,7 @@ final class ChatModel {
     didSet {
       endAnsweredQuestion()
       followScope()
+      pushFeedbackTarget()
     }
   }
   /// What the composer holds. A draft changed in code replaces the field's text, composition
@@ -192,6 +199,7 @@ final class ChatModel {
       let known = Set(oldValue.map(\.queue.id))
       for hold in holds where !known.contains(hold.queue.id) { Task { await read(hold) } }
       endAnsweredQuestion()
+      pushFeedbackTarget()
     }
   }
   /// The saved coordinator a held message belongs to: the one its queue went to once this phone
@@ -260,7 +268,9 @@ final class ChatModel {
       ? "Messages held from before the update could not be read. They stay on this phone." : nil
   }
   /// Each queue's latest read of its messages.
-  private var reads: [UUID: Result<[LegacyItem], any Error>] = [:]
+  private var reads: [UUID: Result<[LegacyItem], any Error>] = [:] {
+    didSet { pushFeedbackTarget() }
+  }
   /// The coordinator whose restored message the draft holds. While it is set, no tag in the draft
   /// is read, so the text goes as written. It goes to that coordinator under its chip, and to every
   /// paired coordinator once the chip is removed. Only clearing the draft ends it, and the field's
@@ -769,9 +779,11 @@ final class ChatModel {
 
   /// Parses the draft over every coordinator not removed, then applies the veto of the scope shown.
   /// An empty composer with no chip or stamp in one coordinator's feed reads as begun there, since
-  /// the first character will stamp it.
+  /// the first character will stamp it. With `anyConnection`, a coordinator not connected counts
+  /// as connected.
   private func address(
-    _ text: String, hasAttachments: Bool, destination: DraftDestination, in scope: FeedScope
+    _ text: String, hasAttachments: Bool, destination: DraftDestination, in scope: FeedScope,
+    anyConnection: Bool = false
   ) -> Addressing {
     // A restored message stays its source's under any chip, so a removed source blocks it.
     if let lane = restoredFrom, let name = removed[lane] {
@@ -785,7 +797,8 @@ final class ChatModel {
       text, hasAttachments: hasAttachments, destination: effective, literal: restoredFrom != nil,
       among: lanes.filter { removed[$0.id] == nil }.map {
         .init(
-          id: $0.id, name: name($0.id), paired: $0.session != nil, connected: connected($0.id))
+          id: $0.id, name: name($0.id), paired: $0.session != nil,
+          connected: anyConnection || connected($0.id))
       }, removed: removed)
     let unbound =
       effective == .open && restoredFrom == nil && Addressing.leadingTags(text).tags.isEmpty
@@ -843,13 +856,58 @@ final class ChatModel {
     promotion = Promotion(typed: typed, rest: draft)
   }
 
+  // MARK: - Feedback
+
+  /// Records the screen for typed `/feedback` and the recording gesture. The app installs it.
+  @ObservationIgnored var feedbackRecorder: (any FeedbackRecorder)? {
+    didSet { pushFeedbackTarget() }
+  }
+
+  /// The coordinator a recording goes to: the one the feed shows, while every held message it
+  /// shows is that coordinator's.
+  var feedbackTarget: FeedbackTarget? {
+    .shown(scope: scope, profiles: profiles, removed: removed, owners: shownHeld.map(owner))
+  }
+
+  /// Runs on each change to what `feedbackTarget` reads.
+  private func pushFeedbackTarget() { feedbackRecorder?.setTarget(feedbackTarget) }
+
+  private typealias FeedbackDraft = (description: String, recipients: [ProfileID])
+
+  /// A `/feedback` draft's description and whom the draft names. Send's grammar reads the
+  /// recipients, with every coordinator counted as connected, since the recording reaches its
+  /// coordinator through the Mac, and with no scope veto, since the target is the coordinator the
+  /// feed shows. nil for any other draft.
+  private var feedbackDraft: FeedbackDraft? {
+    let parsed = address(
+      draft, hasAttachments: !attachments.isEmpty, destination: destination, in: .all,
+      anyConnection: true)
+    guard case .to(let ids, let body) = parsed else {
+      return feedbackDescription(in: draft).map { ($0, []) }
+    }
+    return feedbackDescription(in: body).map { ($0, ids) }
+  }
+
+  /// Starts a recording for the target that carries the draft's description, or says why not.
+  private func startRecording(_ feedback: FeedbackDraft) -> FeedbackRefusal? {
+    guard let target = feedbackTarget else { return .noCoordinator }
+    guard feedback.recipients == [target.profile] else {
+      return .addressedElsewhere(name(target.profile))
+    }
+    guard attachments.isEmpty else { return .files }
+    guard let recorder = feedbackRecorder, recorder.isPaired else { return .unpaired }
+    return FeedbackRefusal(recorder.start(description: feedback.description))
+  }
+
   // MARK: - Send
 
+  /// True while Send would take the draft. A `/feedback` draft can always be tried, and a tap that
+  /// starts no recording says why.
   var canSend: Bool {
-    guard draftReady, !pendingSharedImport, !admitting, !preparingAttachments,
-      case .to = addressing
-    else { return false }
-    return true
+    guard draftReady, !pendingSharedImport, !admitting, !preparingAttachments else { return false }
+    if feedbackDraft != nil { return true }
+    if case .to = addressing { return true }
+    return false
   }
 
   func send() async {
@@ -861,21 +919,44 @@ final class ChatModel {
   private typealias Target = (id: ProfileID, session: CoordinatorSession)
 
   /// A Send refused in the tap's own turn, which keeps the draft as it is.
+  @discardableResult
   private func ignoreSend(_ reason: String? = nil) -> Task<Void, Never>? {
     if let reason { failure = reason }
     logComposer(.sendIgnored)
     return nil
   }
 
+  /// Send's tap. A `/feedback` draft starts a recording and any other draft starts a Send. True
+  /// once the draft left the composer.
+  func submit() -> Bool {
+    guard let feedback = feedbackDraft else { return startSend() != nil }
+    logComposer(.sendRequested)
+    guard canSend else {
+      ignoreSend()
+      return false
+    }
+    if let refusal = startRecording(feedback) {
+      ignoreSend(refusal.message)
+      return false
+    }
+    failure = nil
+    draft = ""
+    destination = .open
+    return true
+  }
+
   /// Snapshot and clear on the button's event, before scheduling any async work. The draft, its
   /// recipients and their sessions all come from the tap, so nothing after it, whether a switch,
   /// an edit or an address change, decides where the message goes. The message is then saved in
   /// every recipient's outbox before any of them starts, so a refusal leaves nothing queued
-  /// anywhere and the text comes back to the composer.
+  /// anywhere and the text comes back to the composer. A `/feedback` draft never goes to a
+  /// coordinator, since `submit()` records it.
   @discardableResult
   func startSend() -> Task<Void, Never>? {
     logComposer(.sendRequested)
-    guard canSend, case .to(let recipients, let body) = addressing else { return ignoreSend() }
+    guard canSend, feedbackDraft == nil, case .to(let recipients, let body) = addressing else {
+      return ignoreSend()
+    }
     let text = draft
     let targets: [Target] = recipients.compactMap { id in
       lanes.first { $0.id == id }?.session.map { (id, $0) }

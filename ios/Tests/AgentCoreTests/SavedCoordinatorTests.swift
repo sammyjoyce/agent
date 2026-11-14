@@ -2126,6 +2126,53 @@ func anInstallationThePreviousBuildSavedOnTheMigratedProfileIsStillWithdrawn() a
   await fixture.stop()
 }
 
+/// The single-address build queued messages for its coordinator at its address, which answers
+/// nothing after the update. In "held for another address", the user points the one saved
+/// coordinator at Work's address, so the held messages show over Work's feed and nothing says they
+/// are Work's. Typed `/feedback` then records nothing, since the recording would show them to Work,
+/// and the composer says why. In "held for this coordinator", the build's coordinator answers at its
+/// address again and pairs, so everything on screen is its own and the recording starts for it.
+@MainActor
+@Test(
+  .timeLimit(.minutes(1)), arguments: ["held for another address", "held for this coordinator"])
+func feedbackRecordsOnlyWhenEverythingOnScreenIsOneCoordinators(_ held: String) async throws {
+  let install = try await LegacyInstall()
+  defer { install.remove() }
+  try await withTheOldAddressSilent(install) { coordinators, migrated, used, work, bringBack in
+    let chat = coordinators.chat
+    let recorder = FakeFeedbackRecorder()
+    coordinators.feedbackRecorder = recorder
+    let owner = held == "held for this coordinator"
+    if owner {
+      await bringBack()
+      coordinators.retryPairing(migrated.id)
+    } else {
+      try await coordinators.update(
+        migrated.id, name: TagName("Work"),
+        address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+    }
+    try await eventually("held rows and a connection") {
+      chat.held.count == 2 && chat.connection == .connected
+        && chat.held.allSatisfy { (chat.owner($0) != nil) == owner }
+    }
+    let text = "/feedback The invented reply is clipped"
+    chat.draft = text
+    if owner {
+      #expect(chat.submit())
+      #expect(recorder.starts == ["The invented reply is clipped"])
+      #expect(recorder.target?.coordinator == used.id)
+    } else {
+      #expect(!chat.submit())
+      #expect(recorder.starts.isEmpty && recorder.target == nil)
+      #expect(chat.error == FeedbackRefusal.noCoordinator.message)
+      #expect(chat.draft == text)
+    }
+    try await Task.sleep(for: .milliseconds(300))
+    let sent = (await used.count(), await work.count())
+    #expect(sent == (0, 0), "No coordinator got the feedback text")
+  }
+}
+
 /// The single-address build used `studio.example-tailnet.ts.net`, which does not resolve yet after
 /// the update, so the user adds the same machine as Personal by its tailnet IP. Once the name
 /// resolves, the migrated profile's own pairing finds Personal's coordinator there and is refused.

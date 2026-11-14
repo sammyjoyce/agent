@@ -679,27 +679,6 @@ func aTypedTagAfterARemovalBecomesTheChip() async throws {
 }
 
 @MainActor @Test(.timeLimit(.minutes(1)))
-func aFeedbackToBothStaysOneBubbleWithEachRecipientsStatusOnceSettled() async throws {
-  try await withTwoFixtures { coordinators, workFixture, personalFixture, _ in
-    let (work, personal) = try await addWorkAndPersonal(coordinators)
-    let chat = coordinators.chat
-    chat.draft = "/feedback The invented text is clipped"
-    await chat.send()
-    try await eventually("both settled") {
-      (await workFixture.count(), await personalFixture.count()) == (1, 1)
-        && chat.snapshots.values.allSatisfy {
-          $0.sends.count == 1 && $0.sends.values.allSatisfy { $0.progress == .placed }
-        }
-    }
-    let users = chat.rows.filter { $0.row.role == .user }
-    #expect(users.count == 1)
-    #expect(
-      users.first?.receipts
-        == [Receipt(lane: work, status: .placed), Receipt(lane: personal, status: .placed)])
-  }
-}
-
-@MainActor @Test(.timeLimit(.minutes(1)))
 func aRefusedStageLeavesNothingQueuedAnywhereAndKeepsTheDraft() async throws {
   try await withTwoFixtures { coordinators, workFixture, personalFixture, root in
     let (work, personal) = try await addWorkAndPersonal(coordinators)
@@ -4094,47 +4073,6 @@ func aHeldMessageStaysHeldWhenACommandIsSentOverItsRestoredDraft() async throws 
     )
     #expect(!left.isEmpty || chat.draft.contains("reorg"), "The held message is gone unsent")
     #expect(left.map(\.text) == [text], "The held message stays in its hold")
-  }
-}
-
-/// Work refuses a message with a file, and the user restores it. /feedback from the Commands menu
-/// replaces the restored text, and the user describes a problem. Send delivers the feedback with
-/// the file, but the restored text never went, so the original stays queued.
-@MainActor @Test(.timeLimit(.minutes(1)))
-func aFeedbackSentOverARestoredDraftKeepsTheOriginalQueued() async throws {
-  try await withTwoFixtures { coordinators, workFixture, _, root in
-    let work = try await addWork(coordinators)
-    let chat = coordinators.chat
-    await workFixture.refuseUploads()
-    let text = "Invented: here is the signed greenhouse lease, please file it"
-    chat.draft = text
-    await chat.attach(data: Data("invented lease".utf8), name: "Lease.txt", mediaType: "text/plain")
-    await chat.send()
-    try await eventually("Work refused it") {
-      chat.snapshots[work]?.rows.contains { $0.delivery == .rejected } == true
-    }
-    let outbox = ProfileDirectory(work, applicationSupport: root, caches: root).outbox
-    let original = try #require(try queuedRequests(outbox).first)
-    await chat.restore(original.inputId)
-    await workFixture.acceptUploads()
-    chat.draft = "/feedback "
-    chat.draft += "the upload button looks wrong"
-    await chat.send()
-    try await eventually("Work got the feedback") {
-      await submits(workFixture).contains { $0.text.hasPrefix("/feedback") }
-    }
-    try await Task.sleep(for: .milliseconds(300))
-    let kept = try queuedItem(outbox, original.inputId)
-    let stillQueued = kept != nil
-    let got = await submits(workFixture)
-    print(
-      "IF8-W1[feedback] Work received \(got.map(\.text)) files=\(got.map { ($0.attachments ?? []).map(\.name) }) originalQueued=\(stillQueued) refused=\(kept?.refused == true) draft=\(chat.draft.debugDescription)"
-    )
-    #expect(
-      stillQueued || got.contains { $0.text == text && $0.inputId != original.inputId },
-      "The restored text is neither queued nor sent")
-    #expect(stillQueued, "The original left the outbox, though its text was never sent")
-    #expect(kept?.refused == true, "The original is no longer withdrawable by Discard")
   }
 }
 
