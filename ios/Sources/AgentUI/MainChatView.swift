@@ -982,7 +982,9 @@ public struct MainChatView: View {
     private func voiceModelSummary(_ dictation: Dictation) -> String? {
       let size = DictationStatus.size(dictation.diskUsage)
       switch dictation.model {
-      case .checking, .unsupported: return nil
+      case .checking: return nil
+      case .unsupported:
+        return dictation.diskUsage > 0 ? "Not supported on this iPhone · \(size)" : nil
       case .downloading(let fraction, _): return "Downloading · \(Int(fraction * 100))%"
       case .missing:
         return dictation.diskUsage > 0 ? "Partly downloaded · \(size)" : "Not downloaded"

@@ -511,7 +511,12 @@ public final class Dictation {
         await settle()
       } catch {
         await settle()
-        notice = .downloadFailed(error.localizedDescription)
+        // Complete files that failed to compile downloaded fine, so Try again would do nothing.
+        if case .missing = model {
+          notice = .downloadFailed(error.localizedDescription)
+        } else {
+          notice = .failed(error.localizedDescription)
+        }
       }
     }
   }
@@ -525,8 +530,8 @@ public final class Dictation {
   var canRemoveModel: Bool {
     guard take == nil, diskUsage > 0 else { return false }
     switch model {
-    case .missing, .ready: return true
-    case .checking, .downloading, .preparing, .unsupported: return false
+    case .missing, .ready, .unsupported: return true
+    case .checking, .downloading, .preparing: return false
     }
   }
 
