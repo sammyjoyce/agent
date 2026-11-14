@@ -9,6 +9,7 @@
 {"type":"native","request":{"type":"submit","origin":"cli","input_id":"example","text":"example","mode":"steer"}}
 {"type":"native","request":{"type":"submit","origin":"cli","input_id":"example","text":"example","mode":"follow_up","attachments":[{"id":"example","name":"example","media_type":"example","size_bytes":1,"sha256":"example"}]}}
 {"type":"native","request":{"type":"submit","origin":"ios","input_id":"example","text":"example","mode":"steer","attachments":[{"id":"example","name":"example","media_type":"example","size_bytes":1,"sha256":"example"}]}}
+{"type":"native","request":{"type":"submit","origin":"siri","input_id":"example","text":"example","mode":"steer","attachments":[{"id":"example","name":"example","media_type":"example","size_bytes":1,"sha256":"example"}]}}
 {"type":"native","request":{"type":"submit","input_id":"example","text":"example","mode":"steer","attachments":[{"id":"example","name":"example","media_type":"example","size_bytes":1,"sha256":"example"}]}}
 {"type":"native","request":{"type":"history","cursor":"example","conversation_id":"example"}}
 {"type":"native","request":{"type":"history","cursor":"example"}}

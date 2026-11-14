@@ -31,7 +31,7 @@ import { activity, history, toolDetails } from "./transcript.js";
 import type { SearchMode } from "./generated/SearchMode.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { conversationSettings } from "./settings.js";
-import { createInputOrigins } from "./input_origin.js";
+import { createInputOrigins, INPUT_ORIGIN_CAPABILITIES } from "./input_origin.js";
 import { watchInputDelivery } from "./input_delivery.js";
 import { inspectMainWork, reconcileMainInput, recoverMainGeneration, watchMainNotices } from "./main_observation.js";
 import { createMainResponsePolicy, MAIN_RESPONSE_INSTRUCTIONS, mainResponse } from "./main_response.js";
@@ -750,7 +750,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
           const root = await application.harness.root(BACKGROUND_CONTEXT);
           if (observer.closed) break;
           stopNotices = await watchMainNotices(application.harness, root, (event) => observer.publish(event));
-          observer.snapshot({ type: "main_ready", input_origins: true, conversation_settings: true, conversation_id: root.id.toString(),
+          observer.snapshot({ type: "main_ready", ...INPUT_ORIGIN_CAPABILITIES, conversation_settings: true, conversation_id: root.id.toString(),
             model: await inference.legacy(root, await application.environment.model(null)), cwd: "" });
           // Reconcile optimistic rows before history exposes their saved copies.
           // Page completion makes native clients ready, so receipts must precede it.
@@ -842,7 +842,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
             executions.setModel(root.id.toString(), selected);
             if (interrupted.has(id)) { await interrupts.get(id); return; }
             if (turn === undefined) throw new TaskError("The main execution owner is unavailable");
-            turn.conversation = root; turn.info = { type: "main_ready", input_origins: true, conversation_settings: true, conversation_id: root.id.toString(), model: selected, cwd: command.cwd };
+            turn.conversation = root; turn.info = { type: "main_ready", ...INPUT_ORIGIN_CAPABILITIES, conversation_settings: true, conversation_id: root.id.toString(), model: selected, cwd: command.cwd };
             // One owner must retain every saved root input. Completing the
             // selected input can hand Pi directly to an older queued follow-up.
             await retainMainInputs(harness, root, turn);

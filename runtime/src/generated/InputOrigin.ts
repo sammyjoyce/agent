@@ -3,5 +3,7 @@
 /**
  * Trusted direct-input transport metadata, never inferred from text or host.
  * Omission is unknown, including legacy clients and non-human work.
+ * `siri` is Siri or a Shortcuts action relayed by the iPhone app. A client sends a value
+ * only when the coordinator lists it in `AcceptedInputOrigins`.
  */
-export type InputOrigin = "cli" | "ios";
+export type InputOrigin = "cli" | "ios" | "siri";

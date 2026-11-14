@@ -48,6 +48,8 @@ actor FixtureCoordinator {
   func settingsControls() -> [NativeRequestSettings] { settingsRequests }
   private var inputOrigins: Bool?
   func advertiseInputOrigins(_ value: Bool?) { inputOrigins = value }
+  private var acceptedInputOrigins: [String]?
+  func advertiseAcceptedInputOrigins(_ value: [String]?) { acceptedInputOrigins = value }
   private var workInspection: Bool?
   func advertiseWorkInspection(_ value: Bool?) { workInspection = value }
   private var servedJobs: [ScheduledJobStatus] = []
@@ -354,6 +356,7 @@ actor FixtureCoordinator {
         try await emit(
           .ready(
             .init(
+              acceptedInputOrigins: acceptedInputOrigins,
               conversationId: "fixture-root", conversationSettings: conversationSettings,
               inputOrigins: inputOrigins, model: "fixture/model", workInspection: workInspection)),
           on: socket)
