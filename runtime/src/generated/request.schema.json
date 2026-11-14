@@ -1661,7 +1661,8 @@
       "type": "string",
       "enum": [
         "cli",
-        "ios"
+        "ios",
+        "siri"
       ]
     },
     "JobId": {

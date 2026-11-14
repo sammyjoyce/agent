@@ -4,4 +4,4 @@
  * Trusted direct-input transport metadata, never inferred from text or host.
  * Omission is unknown, including legacy clients and non-human work.
  */
-export type InputOrigin = "cli" | "ios";
+export type InputOrigin = "cli" | "ios" | "siri";

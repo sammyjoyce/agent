@@ -295,6 +295,7 @@ pub struct SavedConversation {
 pub enum InputOrigin {
     Cli,
     Ios,
+    Siri,
 }
 
 /// The native conversation that supplied cross-task coordination context.

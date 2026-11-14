@@ -422,6 +422,7 @@ public enum InputMode: String, Codable, Sendable, Equatable {
 public enum InputOrigin: String, Codable, Sendable, Equatable {
     case `cli` = "cli"
     case `ios` = "ios"
+    case `siri` = "siri"
 }
 
 public struct InputWorkStateCompleted: Codable, Sendable, Equatable {
