@@ -97,7 +97,7 @@ test("the real bridge retains attached-worker origins without labeling its task 
   } finally { await session.close(BACKGROUND_CONTEXT); }
   assert.ok(task.worker.state === "bound");
   const queue = join(directory, "responses.json");
-  await writeFile(queue, JSON.stringify({ "nonhuman-worker-seed": [{ tool: "codemode", args: { code: 'return await tools.exec({ program: "held", args: [] });' } }],
+  await writeFile(queue, JSON.stringify({ "nonhuman-worker-seed": [{ tool: "exec", args: { program: "held", args: [] } }],
     "native-worker-ios": [{ text: "The actual worker correction is answered." }] }));
   const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL("./fixtures/coordinator-runtime.js", import.meta.url)), directory],
     { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, OPENAI_API_KEY: "sk-synthetic-fixture", AGENT_TEST_MODEL_QUEUE: queue } });
