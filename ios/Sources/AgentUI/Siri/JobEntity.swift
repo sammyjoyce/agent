@@ -152,34 +152,37 @@ public struct CoordinatorRefused: Error, CustomLocalizedStringResourceConvertibl
 }
 
 extension Coordinators {
-  /// How reading each of `profiles`' jobs went, in the order given, each over its own lease.
+  /// How reading each of `profiles`' jobs went, in the order given. They are read at the same
+  /// time, each over its own lease, so one that is slow to connect delays no other.
   func jobs(of profiles: [CoordinatorProfile], within limit: Duration) async -> [JobRead] {
-    var reads: [JobRead] = []
-    for profile in profiles {
-      do {
-        reads.append(.success(try await jobs(of: profile, within: limit)))
-      } catch {
-        reads.append(.failure(error))
+    await withTaskGroup(of: (ProfileID, JobRead).self) { group in
+      for profile in profiles {
+        group.addTask { (profile.id, await self.read(profile, within: limit)) }
       }
+      var reads: [ProfileID: JobRead] = [:]
+      for await (id, read) in group { reads[id] = read }
+      return profiles.compactMap { reads[$0.id] }
     }
-    return reads
   }
 
-  private func jobs(of profile: CoordinatorProfile, within limit: Duration) async throws
-    -> [JobEntity]
-  {
+  /// One coordinator's jobs, read over its own lease. Its silence and its own refusal are named
+  /// for Siri. Any other failure is passed on as it is.
+  private func read(_ profile: CoordinatorProfile, within limit: Duration) async -> JobRead {
     let name = "\(profile.name)"
     do {
-      return try await withConnection(to: profile.id, within: limit) {
-        guard case .list(let list) = try await chat.jobs(lane: profile.id) else { return [] }
-        return list.jobs.map { JobEntity($0, on: profile.id, coordinator: name) }
-      }
+      return .success(
+        try await withConnection(to: profile.id, within: limit) {
+          guard case .list(let list) = try await chat.jobs(lane: profile.id) else { return [] }
+          return list.jobs.map { JobEntity($0, on: profile.id, coordinator: name) }
+        })
     } catch let rejection as CoordinatorRejection {
-      throw CoordinatorRefused(name: name, message: rejection.message)
+      return .failure(CoordinatorRefused(name: name, message: rejection.message))
     } catch LaneError.unanswered, LaneError.interrupted, ConnectionError.closed,
       ConnectionError.timedOut, is NWError
     {
-      throw CoordinatorDidNotAnswer(name: name)
+      return .failure(CoordinatorDidNotAnswer(name: name))
+    } catch {
+      return .failure(error)
     }
   }
 }

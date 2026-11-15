@@ -145,11 +145,12 @@ struct SiriJobTests {
         connection(chat, work) == .disconnected && connection(chat, personal) == .disconnected
       }
       await personalPeer.leaveObserveUnanswered(.silent)
-      let jobs = try await JobQuery.allJobs(in: coordinators)
+      let wait = Duration.milliseconds(300)
+      let jobs = try await JobQuery.allJobs(in: coordinators, within: wait)
       #expect(jobs.map(\.title) == ["Work nightly deps"])
       let id = ScopedEntityID(profile: personal, item: "nightly:deps")
       await #expect(throws: CoordinatorDidNotAnswer.self) {
-        try await JobQuery.jobs(identifiedBy: [id], in: coordinators)
+        try await JobQuery.jobs(identifiedBy: [id], in: coordinators, within: wait)
       }
     }
   }
