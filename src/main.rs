@@ -587,9 +587,9 @@ async fn main() -> Result<()> {
         config::validate_coordinator(value)?;
     }
     let cwd = env::current_dir()?;
-    // Rex tells a pane its session, not its server. A worker's pane is on the
-    // server that started it; any other terminal is on REX_SERVER, else the
-    // personal server, as Rex's own CLI assumes.
+    // A worker's pane is on the server that started it. Any other terminal is
+    // on the server its REX_SERVER names, else the personal server, which is
+    // how Rex's own CLI chooses.
     #[allow(clippy::disallowed_methods)]
     let terminal = if matches!(action, Action::RunTask { .. }) {
         rex.clone()

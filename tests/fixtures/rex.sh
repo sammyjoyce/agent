@@ -28,7 +28,10 @@ if [ "${AGENT_TEST_FAKE_REX_DOWN_AT-}" = "$method" ]; then
   : > "$root/dead"
 fi
 if [ -e "$root/dead" ]; then
-  printf 'Error: no Rex server is running at %s, and autostart is disabled\n' "$socket" >&2
+  case $server in
+    unix://*) printf 'Error: no Rex server is running at %s, and autostart is disabled\n' "$socket" >&2 ;;
+    *) printf 'Error: REX_SERVER: connecting to Rex server: probing %s: connecting to API control: failed to WebSocket dial: connection refused\n' "$server" >&2 ;;
+  esac
   exit 4
 fi
 host=44444444-4444-4444-8444-444444444444

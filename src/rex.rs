@@ -364,7 +364,7 @@ impl RexClient {
         };
         match self.run(arguments("html")).await {
             Ok(output) => decode(output).map(TerminalCapture::Html),
-            // Styling can exceed Rex's control-response cap while the same
+            // Styling can exceed this client's output bound while the same
             // pane's text still fits. Other failures must not select a pane
             // implicitly or cause another export attempt.
             Err(CallFailure::OutputTooLarge) => self
@@ -647,15 +647,9 @@ impl RexClient {
                 if status.code() == Some(4)
                     && let Some(location) = std::str::from_utf8(&error)
                         .ok()
-                        .and_then(|error| error.strip_prefix("Error: no Rex server is running at "))
+                        .and_then(server_down_location)
                 {
-                    let location = location.lines().next().unwrap_or_default();
-                    return Err(CallFailure::ServerDown {
-                        location: location
-                            .strip_suffix(", and autostart is disabled")
-                            .unwrap_or(location)
-                            .to_owned(),
-                    });
+                    return Err(CallFailure::ServerDown { location });
                 }
                 if std::str::from_utf8(&error)
                     .is_ok_and(|error| error.trim_end().ends_with("(status=413 code=too_large)"))
@@ -686,6 +680,27 @@ impl RexClient {
         }
         result
     }
+}
+/// Where Rex says it found no server. A local socket is named by path. An
+/// address that cannot be reached is named as given, or as first probed when
+/// it has no port, and an address from `REX_SERVER` carries that prefix.
+fn server_down_location(error: &str) -> Option<String> {
+    let line = error.lines().next()?.strip_prefix("Error: ")?;
+    if let Some(socket) = line.strip_prefix("no Rex server is running at ") {
+        let socket = socket
+            .strip_suffix(", and autostart is disabled")
+            .unwrap_or(socket);
+        return Some(socket.to_owned());
+    }
+    let address = line
+        .strip_prefix("REX_SERVER: ")
+        .unwrap_or(line)
+        .strip_prefix("connecting to Rex server")?;
+    let address = address
+        .strip_prefix(": probing ")
+        .or_else(|| address.strip_prefix(' '))?;
+    let (address, _) = address.split_once(": ")?;
+    Some(address.to_owned())
 }
 async fn bounded_output(
     input: impl tokio::io::AsyncRead + Unpin,
@@ -1025,30 +1040,34 @@ printf '<pre>Current task view 🦀</pre>\n'
     async fn only_a_server_that_is_not_running_proves_a_create_was_never_received() {
         const TEST: &str =
             "rex::tests::only_a_server_that_is_not_running_proves_a_create_was_never_received";
+        const REMOTE: &str = "https://rex.example.invalid";
         let Some(case) = fake_rex::case() else {
-            for (case, variable, method) in [
+            for (case, envs) in [
                 (
                     "down-create",
-                    "AGENT_TEST_FAKE_REX_DOWN_AT",
-                    "session.create",
+                    &[("AGENT_TEST_FAKE_REX_DOWN_AT", "session.create")][..],
                 ),
                 (
                     "down-window",
-                    "AGENT_TEST_FAKE_REX_DOWN_AT",
-                    "session.new_window",
+                    &[("AGENT_TEST_FAKE_REX_DOWN_AT", "session.new_window")][..],
+                ),
+                (
+                    "down-remote-create",
+                    &[
+                        ("AGENT_TEST_FAKE_REX_DOWN_AT", "session.create"),
+                        ("REX_SERVER", REMOTE),
+                    ][..],
                 ),
                 (
                     "lost-create",
-                    "AGENT_TEST_FAKE_REX_FAIL_AT",
-                    "session.create",
+                    &[("AGENT_TEST_FAKE_REX_FAIL_AT", "session.create")][..],
                 ),
                 (
                     "lost-window",
-                    "AGENT_TEST_FAKE_REX_FAIL_AT",
-                    "session.new_window",
+                    &[("AGENT_TEST_FAKE_REX_FAIL_AT", "session.new_window")][..],
                 ),
             ] {
-                fake_rex::run(TEST, case, &[(variable, method)]);
+                fake_rex::run(TEST, case, envs);
             }
             return;
         };
@@ -1061,10 +1080,15 @@ printf '<pre>Current task view 🦀</pre>\n'
             revision: 1,
         };
         let cwd = Path::new("/tmp");
+        let location = if case == "down-remote-create" {
+            REMOTE
+        } else {
+            "/run/user/1000/rex/server.sock"
+        };
         let expected = |down: bool, session_id: Option<SessionId>| {
             if down {
                 RexError::ServerDown {
-                    location: "/run/user/1000/rex/server.sock".into(),
+                    location: location.into(),
                 }
             } else {
                 RexError::CreationUncertain { session_id }
@@ -1102,6 +1126,48 @@ printf '<pre>Current task view 🦀</pre>\n'
                     "session.new_window"
                 ]
             );
+        }
+    }
+
+    #[test]
+    fn reads_where_rex_found_no_server_from_each_unreachable_server_error() {
+        let refused = "connecting to Rex server https://rex.example.invalid: connecting to API control: failed to WebSocket dial: failed to send handshake request: Get \"https://rex.example.invalid/api/control\": dial tcp 192.0.2.1:443: connect: connection refused\n";
+        for (error, location) in [
+            (
+                "Error: no Rex server is running at /run/user/1000/rex/server.sock, and autostart is disabled\n".to_owned(),
+                Some("/run/user/1000/rex/server.sock"),
+            ),
+            (
+                "Error: no Rex server is running at /Users/example/Library/Application Support/rex/server.sock, and autostart is disabled\n".to_owned(),
+                Some("/Users/example/Library/Application Support/rex/server.sock"),
+            ),
+            (format!("Error: {refused}"), Some("https://rex.example.invalid")),
+            (
+                format!("Error: REX_SERVER: {refused}"),
+                Some("https://rex.example.invalid"),
+            ),
+            (
+                "Error: connecting to Rex server: probing https://rex.example.invalid: connecting to API control: failed to WebSocket dial: failed to send handshake request: Get \"https://rex.example.invalid/api/control\": dial tcp: lookup rex.example.invalid: no such host\nprobing https://rex.example.invalid:7297: connecting to API control: failed to WebSocket dial: connection refused\n".to_owned(),
+                Some("https://rex.example.invalid"),
+            ),
+            (
+                "Error: REX_SERVER: connecting to Rex server: probing https://rex.example.invalid: connecting to API control: failed to WebSocket dial: connection refused\n".to_owned(),
+                Some("https://rex.example.invalid"),
+            ),
+            (
+                "Error: connecting to the server timed out after 8s; increase --timeout: context deadline exceeded\n".to_owned(),
+                None,
+            ),
+            (
+                "Error: stream response \"control-1\" failed: connection reset\n".to_owned(),
+                None,
+            ),
+            (
+                "Error: stream response \"control-1\" failed: session session:11111111-1111-4111-8111-111111111111 not found (status=404 code=session_not_found)\n".to_owned(),
+                None,
+            ),
+        ] {
+            assert_eq!(server_down_location(&error).as_deref(), location, "{error}");
         }
     }
 
