@@ -49,7 +49,14 @@ export const BROWSER_TOOLS: readonly string[] = ["browser_user_tabs", "browser_c
   "browser_action", "browser_run_code", "browser_release"];
 export const CONTEXT_TOOLS: readonly string[] = ["read_context", "search_context"];
 
-export const TOOL_SURFACES: ToolSurfaces = {};
+const CHILD_DEFERRED: readonly string[] = [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "allocate_worktree", "read_resources", "read_source_events", "notify_user"];
+export const TOOL_SURFACES = {
+  main: { deferred: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "read_resources", "collect_worktrees", "revoke_allocation",
+    "read_source_events", "notify_user", "notify", "link_source_events", "dismiss_source_events"] },
+  triage: { deferred: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "revoke_allocation"], codemode: { keepDirect: ["record_task"] } },
+  worker: { deferred: CHILD_DEFERRED, codemode: { keepDirect: ["record_task"] } },
+  agent: { deferred: CHILD_DEFERRED, codemode: { keepDirect: [] } },
+} as const satisfies Record<ToolRole, ToolSurface>;
 
 export function createToolDiscovery() {
   const sandbox = new CodemodeSandbox();

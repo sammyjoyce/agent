@@ -21,7 +21,7 @@ import { openJobActor, runScheduled } from "../../src/scheduled.js";
 import { createSourceTools, SourceJournal } from "../../src/sources.js";
 import { TaskStore } from "../../src/tasks.js";
 import { createAppTools, createJobTools, Executions } from "../../src/tools.js";
-import { applyToolSurfaces, BROWSER_TOOLS, CONTEXT_TOOLS, createToolDiscovery, createToolsets, TOOL_ROLES, withActorPolicies, type ToolRole,
+import { applyToolSurfaces, BROWSER_TOOLS, CONTEXT_TOOLS, createToolDiscovery, createToolsets, TOOL_ROLES, TOOL_SURFACES, withActorPolicies, type ToolRole,
   type ToolSurface, type ToolSurfaces } from "../../src/toolsets.js";
 
 export type DiscoveryArm = ToolSurfaces;
@@ -32,12 +32,6 @@ const RARE_TOOLS: Record<ToolRole, readonly string[]> = {
   worker: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "allocate_worktree", "read_resources"],
   agent: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "allocate_worktree", "read_resources"],
 };
-const SOURCE_TOOLS: Record<ToolRole, readonly string[]> = {
-  main: ["read_source_events", "notify_user", "notify", "link_source_events", "dismiss_source_events"],
-  triage: [],
-  worker: ["read_source_events", "notify_user"],
-  agent: ["read_source_events", "notify_user"],
-};
 
 const LEAN_TOOLS: Record<ToolRole, readonly string[]> = {
   main: ["record_task"],
@@ -45,10 +39,6 @@ const LEAN_TOOLS: Record<ToolRole, readonly string[]> = {
   worker: [],
   agent: [],
 };
-
-function recordingCodemode(role: ToolRole): ToolSurface {
-  return { deferred: [...RARE_TOOLS[role], ...SOURCE_TOOLS[role]], codemode: { keepDirect: role === "agent" ? [] : ["record_task"] } };
-}
 
 function everyRole(surface: ToolSurface | ((role: ToolRole) => ToolSurface)): DiscoveryArm {
   return Object.fromEntries(TOOL_ROLES.map((role) => [role, typeof surface === "function" ? surface(role) : surface]));
@@ -58,12 +48,12 @@ export const DISCOVERY_ARMS = {
   direct: {},
   "search-browser": everyRole({ deferred: BROWSER_TOOLS }),
   "search-rare": everyRole((role) => ({ deferred: RARE_TOOLS[role] })),
-  "search-sources": everyRole((role) => ({ deferred: [...RARE_TOOLS[role], ...SOURCE_TOOLS[role]] })),
-  "search-lean": everyRole((role) => ({ deferred: [...RARE_TOOLS[role], ...SOURCE_TOOLS[role], ...LEAN_TOOLS[role]] })),
+  "search-sources": everyRole((role) => ({ deferred: TOOL_SURFACES[role].deferred })),
+  "search-lean": everyRole((role) => ({ deferred: [...TOOL_SURFACES[role].deferred, ...LEAN_TOOLS[role]] })),
   codemode: everyRole({ codemode: { keepDirect: [] } }),
-  "codemode-core": everyRole((role) => ({ deferred: [...RARE_TOOLS[role], ...SOURCE_TOOLS[role]], codemode: { keepDirect: [] } })),
-  "codemode-recording": everyRole(recordingCodemode),
-  split: { ...everyRole(recordingCodemode), main: { deferred: [...RARE_TOOLS.main, ...SOURCE_TOOLS.main] } },
+  "codemode-core": everyRole((role) => ({ deferred: TOOL_SURFACES[role].deferred, codemode: { keepDirect: [] } })),
+  "codemode-recording": everyRole((role) => ({ deferred: TOOL_SURFACES[role].deferred, codemode: { keepDirect: role === "agent" ? [] : ["record_task"] } })),
+  production: TOOL_SURFACES,
 } as const satisfies Record<string, DiscoveryArm>;
 export type DiscoveryArmName = keyof typeof DISCOVERY_ARMS;
 
