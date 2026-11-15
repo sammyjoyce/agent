@@ -82,28 +82,54 @@
       }
     }
 
-    // Reconstruction must keep the model and its settings/store identity together. It is nil
-    // once a cleanup launch erased its storage.
-    @State private var lifetime: Lifetime?
-    @Environment(\.scenePhase) private var scenePhase
-    private let requestAlerts: Bool
-    /// The app delegate's object. The system hands alert taps to it, never to the fixture's own.
-    private let delegate: AppNotifications
-    private let feedback: ScrawlFeedback
-
-    private init(
-      lifetime: Lifetime?, requestAlerts: Bool, delegate: AppNotifications,
-      feedback: ScrawlFeedback
-    ) {
-      _lifetime = State(initialValue: lifetime)
-      self.requestAlerts = requestAlerts
-      self.delegate = delegate
-      self.feedback = feedback
+    private enum Launch {
+      case running(Lifetime)
+      case cleaned
+      case unavailable
     }
 
-    /// The `AGENT_INTERACTION_*` values of this launch. A tap on an alert starts the app with no
-    /// environment, so a launch that names its storage and sets `AGENT_INTERACTION_ALERTS=1`
-    /// saves its values, and a launch that names no port reads them back until a cleanup launch.
+    /// The process's one fixture, so alert taps and intents reach it even in a launch that builds
+    /// no window.
+    private static let current: Launch? = {
+      guard environment["AGENT_INTERACTION_PORT"] != nil else { return nil }
+      let named = environment["AGENT_INTERACTION_ID"].flatMap(UUID.init(uuidString:))
+      if let named, environment["AGENT_INTERACTION_CLEANUP"] == "1" {
+        return (try? Storage(named).erase()) == nil ? .unavailable : .cleaned
+      }
+      guard let peers = requestedPeers,
+        let lifetime = Lifetime(
+          peers: peers, storage: Storage(named ?? UUID()), dictation: requestedDictation)
+      else { return .unavailable }
+      return .running(lifetime)
+    }()
+
+    static var interactionLaunch: AppNotifications.InteractionLaunch {
+      switch current {
+      case nil: .plain
+      case .running(let lifetime): .fixture(lifetime.notifications)
+      case .cleaned: .unavailable(reason: "This launch erased its interaction fixture.")
+      case .unavailable:
+        .unavailable(reason: "This launch could not build its interaction fixture.")
+      }
+    }
+
+    /// The dictation of the screen this launch shows, given the app's own. The fixture shows its
+    /// scripted dictation or none, so under it the app's own never reads its model.
+    static func shownDictation(app: Dictation) -> Dictation? {
+      switch current {
+      case nil: app
+      case .running(let lifetime): lifetime.dictation
+      case .cleaned, .unavailable: nil
+      }
+    }
+
+    private let launch: Launch
+    private let feedback: ScrawlFeedback
+
+    /// The `AGENT_INTERACTION_*` values of this launch. A tap on an alert or a system-run intent
+    /// starts the app with no environment, so a launch that names its storage and sets
+    /// `AGENT_INTERACTION_ALERTS=1` or `AGENT_INTERACTION_INTENTS=1` saves its values, and a
+    /// launch that names no port reads them back until a cleanup launch.
     private static let environment: [String: String] = {
       let current = ProcessInfo.processInfo.environment
       let key = "interactionFixtureLaunch"
@@ -112,7 +138,9 @@
       }
       if current["AGENT_INTERACTION_CLEANUP"] == "1" {
         UserDefaults.standard.removeObject(forKey: key)
-      } else if current["AGENT_INTERACTION_ID"] != nil, current["AGENT_INTERACTION_ALERTS"] == "1" {
+      } else if current["AGENT_INTERACTION_ID"] != nil,
+        current["AGENT_INTERACTION_ALERTS"] == "1" || current["AGENT_INTERACTION_INTENTS"] == "1"
+      {
         UserDefaults.standard.set(
           current.filter { $0.key.hasPrefix("AGENT_INTERACTION_") }, forKey: key)
       }
@@ -141,55 +169,28 @@
       return Dictation(engine: ScriptedSpeech(script).engine)
     }
 
-    /// True when the launch asks for the fixture. Its own coordinators are then the only ones the
-    /// scene phase drives, so the app delegate's never share an inbox or a registration with them.
-    static var isRequested: Bool { requestedPeers != nil }
-
     /// `AGENT_INTERACTION_ID` names the storage a relaunch reuses. With it,
     /// `AGENT_INTERACTION_CLEANUP=1` erases that storage and shows only that it did.
     /// `AGENT_INTERACTION_ALERTS=1` asks for permission to show alerts.
-    static func fromEnvironment(notifications: AppNotifications, feedback: ScrawlFeedback) -> Self?
-    {
-      guard let peers = requestedPeers else { return nil }
-      let requestAlerts = environment["AGENT_INTERACTION_ALERTS"] == "1"
-      let named = environment["AGENT_INTERACTION_ID"].flatMap(UUID.init(uuidString:))
-      if let named, environment["AGENT_INTERACTION_CLEANUP"] == "1" {
-        return (try? Storage(named).erase()).map {
-          Self(
-            lifetime: nil, requestAlerts: requestAlerts, delegate: notifications, feedback: feedback
-          )
-        }
-      }
-      guard
-        let lifetime = Lifetime(
-          peers: peers, storage: Storage(named ?? UUID()), dictation: requestedDictation)
-      else {
-        return nil
-      }
-      return Self(
-        lifetime: lifetime, requestAlerts: requestAlerts, delegate: notifications,
-        feedback: feedback)
+    static func fromEnvironment(feedback: ScrawlFeedback) -> Self? {
+      current.map { Self(launch: $0, feedback: feedback) }
     }
 
     var body: some View {
-      if let lifetime {
+      switch launch {
+      case .running(let lifetime):
         MainChatView(notifications: lifetime.notifications, dictation: lifetime.dictation)
           .defaultAppStorage(lifetime.defaults)
-          .onChange(of: scenePhase, initial: true) { _, phase in
-            lifetime.dictation?.setForeground(phase != .background)
-            Task { await lifetime.notifications.coordinators.setActive(phase == .active) }
-          }
           .onAppear { lifetime.notifications.coordinators.feedbackRecorder = feedback }
           .task {
-            delegate.forwardFixtureOpens(to: lifetime.notifications)
-            if requestAlerts {
+            if Self.environment["AGENT_INTERACTION_ALERTS"] == "1" {
               _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [
                 .alert, .sound,
               ])
             }
           }
-      } else {
-        Text("Interaction fixture cleaned")
+      case .cleaned: Text("Interaction fixture cleaned")
+      case .unavailable: Text("Interaction fixture unavailable")
       }
     }
   }

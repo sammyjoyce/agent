@@ -1,4 +1,5 @@
 import AgentCore
+import AppIntents
 import Foundation
 import Observation
 import UserNotifications
@@ -32,33 +33,51 @@ public final class AppNotifications: NSObject {
   public var mainVisible: MainVisibility = .hidden
   private(set) var openRequest: OpenRequest?
   #if DEBUG
-    @ObservationIgnored private weak var fixtureTarget: AppNotifications?
-    @ObservationIgnored private var pendingFixtureOrigin: AlertOrigin?
+    /// What a Debug launch asked for.
+    public enum InteractionLaunch {
+      case plain
+      /// The launch's one interaction fixture, which acts in place of the app delegate.
+      case fixture(AppNotifications)
+      case unavailable(reason: String)
+    }
 
-    func forwardFixtureOpens(to target: AppNotifications) {
-      fixtureTarget = target
-      if let origin = pendingFixtureOrigin {
-        pendingFixtureOrigin = nil
-        target.open(origin)
-      }
+    /// Set once by the app before any scene and before the app delegate finishes launching. The
+    /// app delegate exists earlier, so until then `receiver()` throws.
+    public static var interactionLaunch: InteractionLaunch?
+
+    struct InteractionFixtureUnavailable: Error, CustomLocalizedStringResourceConvertible {
+      let reason: String
+      var localizedStringResource: LocalizedStringResource { "\(reason)" }
     }
   #endif
 
-  func open(_ origin: AlertOrigin) {
+  /// The object that alert taps and intents act on, which is the interaction fixture's when the
+  /// launch has one. It throws when the launch lacks the fixture it asked for, or has not set one
+  /// yet, rather than reach the app's own saved coordinators.
+  func receiver() throws -> AppNotifications {
     #if DEBUG
-      if let fixtureTarget {
-        fixtureTarget.open(origin)
-        return
+      switch Self.interactionLaunch {
+      case .plain: return self
+      case .fixture(let fixture): return fixture
+      case .unavailable(let reason): throw InteractionFixtureUnavailable(reason: reason)
+      case nil:
+        throw InteractionFixtureUnavailable(
+          reason: "This launch has not yet chosen whether it uses the interaction fixture.")
       }
-      pendingFixtureOrigin = origin
+    #else
+      return self
     #endif
+  }
+
+  public var intentCoordinators: Coordinators {
+    get throws { try receiver().coordinators }
+  }
+
+  func open(_ origin: AlertOrigin) {
     openRequest = OpenRequest(notice: coordinators.show(opening: origin))
   }
 
   func presents(_ origin: AlertOrigin?) -> Bool {
-    #if DEBUG
-      if let fixtureTarget { return fixtureTarget.presents(origin) }
-    #endif
     guard registration.enabled else { return false }
     guard case .visible(let atLatest) = mainVisible else { return true }
     let chat = coordinators.chat
@@ -76,29 +95,18 @@ public final class AppNotifications: NSObject {
       persistence: ComposerDraftStore(
         url: URL.applicationSupportDirectory.appending(path: "Agent/Composer/draft.json")),
       sharedInbox: try? SharedDraftInbox.configured())
+    AppDependencyManager.shared.add(dependency: self)
   }
 
   init(
     defaults: UserDefaults, applicationSupport: URL, caches: URL, transport: CoordinatorTransport,
-    persistence: ComposerDraftStore? = nil, sharedInbox: SharedDraftInbox? = nil
+    persistence: ComposerDraftStore? = nil, sharedInbox: SharedDraftInbox? = nil,
+    permission: @escaping @MainActor () async throws -> Bool = AppNotifications.alertPermission
   ) {
     let registration = NotificationRegistration(
       enabled: defaults.object(forKey: "notificationsEnabled") == nil
         || defaults.bool(forKey: "notificationsEnabled"),
-      permission: {
-        let center = UNUserNotificationCenter.current()
-        let settings = await center.notificationSettings()
-        switch settings.authorizationStatus {
-        case .notDetermined:
-          return try await center.requestAuthorization(options: [.alert, .sound])
-        case .authorized, .provisional: return true
-        #if os(iOS)
-          case .ephemeral: return true
-        #endif
-        case .denied: return false
-        @unknown default: return false
-        }
-      },
+      permission: permission,
       register: {
         #if os(iOS)
           UIApplication.shared.registerForRemoteNotifications()
@@ -110,6 +118,32 @@ public final class AppNotifications: NSObject {
       registration: registration, defaults: defaults, applicationSupport: applicationSupport,
       caches: caches, transport: transport, persistence: persistence, sharedInbox: sharedInbox)
     super.init()
+  }
+
+  /// Apple's alert permission.
+  static func alertPermission() async throws -> Bool {
+    let center = UNUserNotificationCenter.current()
+    let settings = await center.notificationSettings()
+    switch settings.authorizationStatus {
+    case .notDetermined:
+      return try await center.requestAuthorization(options: [.alert, .sound])
+    case .authorized, .provisional: return true
+    #if os(iOS)
+      case .ephemeral: return true
+    #endif
+    case .denied: return false
+    @unknown default: return false
+    }
+  }
+
+  /// Asks for alerts at launch, only when this object acts for the launch. Under an interaction
+  /// fixture it stays idle like the coordinators, since a launch that the system starts has no
+  /// `-notificationsEnabled NO`, and the fixture asks for itself.
+  func startRegistration() async {
+    #if DEBUG
+      guard (try? receiver()) === self else { return }
+    #endif
+    await registration.start()
   }
 
   nonisolated static func origin(_ userInfo: [AnyHashable: Any]) -> AlertOrigin? {
@@ -135,7 +169,7 @@ public final class AppNotifications: NSObject {
       didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
       UNUserNotificationCenter.current().delegate = self
-      Task { await registration.start() }
+      Task { await startRegistration() }
       return true
     }
 
@@ -163,7 +197,8 @@ public final class AppNotifications: NSObject {
     ) {
       let origin = Self.origin(notification.request.content.userInfo)
       DispatchQueue.main.async {
-        completionHandler(self.presents(origin) ? [.banner, .sound] : [])
+        let presents = (try? self.receiver())?.presents(origin) ?? false
+        completionHandler(presents ? [.banner, .sound] : [])
       }
     }
 
@@ -174,7 +209,7 @@ public final class AppNotifications: NSObject {
     ) {
       let origin = Self.origin(response.notification.request.content.userInfo)
       DispatchQueue.main.async {
-        if let origin { self.open(origin) }
+        if let origin { try? self.receiver().open(origin) }
         completionHandler()
       }
     }

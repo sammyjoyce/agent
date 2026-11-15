@@ -99,9 +99,16 @@ SWIFT
   (cd "$native_dir/Speech" && xcodebuild -quiet -scheme Speech -destination 'generic/platform=iOS' \
     -derivedDataPath "$run_dir/speech" -onlyUsePackageVersionsFromResolvedFile \
     CODE_SIGNING_ALLOWED=NO build)
-  xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
-    -destination 'generic/platform=iOS Simulator' -onlyUsePackageVersionsFromResolvedFile \
-    -derivedDataPath "$run_dir/app" ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO build
+  # Users get the Release build, and each build extracts its own App Intents metadata.
+  for configuration in Debug Release; do
+    xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
+      -configuration "$configuration" -destination 'generic/platform=iOS Simulator' \
+      -onlyUsePackageVersionsFromResolvedFile \
+      -derivedDataPath "$run_dir/app" ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO build
+    printf 'App Intents metadata of the %s build:\n' "$configuration"
+    python3 "$native_dir/scripts/check-intents-metadata.py" \
+      "$run_dir/app/Build/Products/$configuration-iphonesimulator/Agent.app"
+  done
 fi
 if [[ "$phase" == host ]]; then
   exit 0

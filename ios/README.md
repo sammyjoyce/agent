@@ -416,6 +416,16 @@ the phone by cable. To allow that, list the app's bundle ID under `usbApps` in
   saved by an earlier build with its automatic `Feedback.png` screenshot loads
   with that screenshot as an ordinary attached file.
 
+### Siri and Shortcuts
+
+**Open Coordinator** shows a saved coordinator's feed, as tapping one of its
+alerts does. Its Coordinator picker lists each saved coordinator by name, in
+saved order, and never shows an address. The composer draft is left as it was.
+Say "Open Work in Beep Boop", or add the action in the Shortcuts app. Renaming
+or removing a coordinator updates the picker and the phrases. Intents, entities
+and queries live in `ios/Sources/AgentUI/Siri/`. The shortcuts provider lives
+in the app target, because a provider inside the package ships no phrase.
+
 ## Validation
 
 ```sh
@@ -426,6 +436,11 @@ swift test --package-path ios --configuration release \
 xcodebuild -project ios/Agent.xcodeproj -scheme Agent \
   -destination 'generic/platform=iOS Simulator' \
   -derivedDataPath target/ios-app CODE_SIGNING_ALLOWED=NO build
+python3 ios/scripts/check-intents-metadata.py target/ios-app/Build/Products/Debug-iphonesimulator/Agent.app
+xcodebuild -project ios/Agent.xcodeproj -scheme Agent -configuration Release \
+  -destination 'generic/platform=iOS Simulator' \
+  -derivedDataPath target/ios-app CODE_SIGNING_ALLOWED=NO build
+python3 ios/scripts/check-intents-metadata.py target/ios-app/Build/Products/Release-iphonesimulator/Agent.app
 ```
 
 Run these from the repository root, with full Xcode selected for Apple checks.
@@ -445,8 +460,11 @@ including when a child temporarily inherits a descriptor before exec.
 Native UI checks use the screen's production startup and scene lifecycle. A
 DEBUG-only transport redirects each saved coordinator to an owned loopback peer;
 per-test storage identities retain the composer and each coordinator's outbox
-across relaunch. Foreground recovery and process relaunch are asserted separately
-from suspension, which XCTest can prevent and therefore report as skipped.
+across relaunch. Each launch builds one fixture before any window, and every
+window, alert tap and intent uses it. A launch that asks for the fixture and
+cannot build it refuses intents instead of using the app's saved coordinators.
+Foreground recovery and process relaunch are asserted separately from
+suspension, which XCTest can prevent and therefore report as skipped.
 Native interaction checks also rotate a static transcript at the live tail and
 while reading older messages. Incoming output preserves that older reading
 position; following resumes when scrolling back to the live tail.
@@ -476,7 +494,9 @@ Nested block-container layout, remote image previews, math and diagrams remain
 outside this renderer. To retain the review images,
 pass `--attachments-path /absolute/existing/directory` to `swift test`.
 `bash ios/scripts/check.sh` runs strict Swift lint, macOS tests, the unsigned
-Speech package and app builds, a guard that keeps FluidAudio inside `Speech/`, package tests on iOS and app-hosted rendering tests. It requires an
+Speech package build, unsigned Debug and Release app builds with their App
+Intents metadata checks, a guard that keeps FluidAudio inside `Speech/`,
+package tests on iOS and app-hosted rendering tests. It requires an
 installed compatible iOS runtime and cleans up only its own simulator.
 Simulator UI checks use ad-hoc signing for real App Group entitlements; no
 Apple account or provisioning profile is needed.
