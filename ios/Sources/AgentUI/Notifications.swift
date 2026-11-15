@@ -41,8 +41,8 @@ public final class AppNotifications: NSObject {
       case unavailable(reason: String)
     }
 
-    /// Set once by the app before any scene. The app delegate exists earlier, so until then
-    /// `receiver()` throws.
+    /// Set once by the app before any scene and before the app delegate finishes launching. The
+    /// app delegate exists earlier, so until then `receiver()` throws.
     public static var interactionLaunch: InteractionLaunch?
 
     struct InteractionFixtureUnavailable: Error, CustomLocalizedStringResourceConvertible {
@@ -120,7 +120,7 @@ public final class AppNotifications: NSObject {
     super.init()
   }
 
-  /// Apple's alert permission. Only the first request of an installation shows a prompt.
+  /// Apple's alert permission.
   static func alertPermission() async throws -> Bool {
     let center = UNUserNotificationCenter.current()
     let settings = await center.notificationSettings()
@@ -136,8 +136,13 @@ public final class AppNotifications: NSObject {
     }
   }
 
-  /// Asks for alerts at launch.
+  /// Asks for alerts at launch, only when this object acts for the launch. Under an interaction
+  /// fixture it stays idle like the coordinators, since a launch that the system starts has no
+  /// `-notificationsEnabled NO`, and the fixture asks for itself.
   func startRegistration() async {
+    #if DEBUG
+      guard (try? receiver()) === self else { return }
+    #endif
     await registration.start()
   }
 
