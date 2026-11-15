@@ -1151,8 +1151,13 @@ pub enum HostCommand {
     },
     ReadFile {
         path: String,
+        /// Text window in bytes. A host never applies it to an image.
         offset: u32,
         limit: u32,
+        /// Older hosts skip this field and answer with text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        image: Option<ImageRead>,
     },
     WriteFile {
         path: String,
@@ -1195,6 +1200,34 @@ pub enum HostCommand {
         agent_id: String,
         allocation_id: String,
     },
+}
+
+pub const IMAGE_CHUNK_BYTES: u32 = 1024 * 1024;
+pub const MAX_IMAGE_READ_BYTES: u32 = crate::attachments::MAX_ATTACHMENT_BYTES;
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ImageRead {
+    /// The first image chunk when the header names a supported image, else the text window.
+    Start,
+    Next {
+        at: u32,
+        stamp: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+pub enum ImageMediaType {
+    #[serde(rename = "image/png")]
+    Png,
+    #[serde(rename = "image/jpeg")]
+    Jpeg,
+    #[serde(rename = "image/gif")]
+    Gif,
+    #[serde(rename = "image/webp")]
+    Webp,
+    #[serde(rename = "image/bmp")]
+    Bmp,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -1250,6 +1283,14 @@ pub enum HostResult {
     File {
         content: String,
         truncated: bool,
+    },
+    /// Only ever a reply to a `ReadFile` that carries `image`.
+    ImageChunk {
+        media_type: ImageMediaType,
+        size_bytes: u32,
+        stamp: String,
+        at: u32,
+        data_base64: String,
     },
     Written,
     Spawned {
@@ -1885,7 +1926,7 @@ pub enum ErrorCode {
 #[cfg(test)]
 mod tests {
     use crate::protocol::{
-        HistoryMessage, HistoryProvider, HistoryRole, ImportedConversation,
+        HistoryMessage, HistoryProvider, HistoryRole, HostCommand, ImageRead, ImportedConversation,
         ImportedConversationSummary, RuntimeCommand, RuntimeEventKind, SearchMode, ToolHistory,
         ToolStatus,
     };
@@ -1952,6 +1993,53 @@ mod tests {
             matches!(decoded, RuntimeCommand::ImportCodex { hosts, embedding_host: Some(host) }
             if hosts == ["archive"] && host == "workstation")
         );
+    }
+
+    #[test]
+    fn image_reads_stay_readable_by_hosts_and_coordinators_that_predate_them() {
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum PreImageHostCommand {
+            ReadFile {
+                path: String,
+                offset: u32,
+                limit: u32,
+            },
+        }
+        let read = |image| HostCommand::ReadFile {
+            path: "/example/shot.png".into(),
+            offset: 6,
+            limit: 5,
+            image,
+        };
+        for image in [
+            ImageRead::Start,
+            ImageRead::Next {
+                at: 1_048_576,
+                stamp: "fixture-stamp".into(),
+            },
+        ] {
+            let frame = serde_json::to_vec(&read(Some(image))).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<PreImageHostCommand>(&frame).unwrap(),
+                PreImageHostCommand::ReadFile {
+                    path: "/example/shot.png".into(),
+                    offset: 6,
+                    limit: 5,
+                },
+                "A host that predates image reads skips the field and reads text"
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(read(None)).unwrap(),
+            serde_json::json!({"type": "read_file", "path": "/example/shot.png", "offset": 6, "limit": 5}),
+            "A text read is the frame it was before image reads"
+        );
+        let old: HostCommand = serde_json::from_str(
+            r#"{"type":"read_file","path":"/example/notes.txt","offset":0,"limit":10}"#,
+        )
+        .unwrap();
+        assert!(matches!(old, HostCommand::ReadFile { image: None, .. }));
     }
 
     #[test]

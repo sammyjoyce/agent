@@ -5,13 +5,22 @@ import type { BrowserRequest } from "./BrowserRequest.js";
 import type { CleanupPlan } from "./CleanupPlan.js";
 import type { EmbeddingPurpose } from "./EmbeddingPurpose.js";
 import type { HistoryRequest } from "./HistoryRequest.js";
+import type { ImageRead } from "./ImageRead.js";
 import type { ResourceRecord } from "./ResourceRecord.js";
 import type { TaskId } from "./TaskId.js";
 import type { WorkerHost } from "./WorkerHost.js";
 import type { WorkerRef } from "./WorkerRef.js";
 import type { WorktreeAllocation } from "./WorktreeAllocation.js";
 
-export type HostCommand = { "type": "attachment_write", attachment: AttachmentRef, offset: number, data_base64: string, complete: boolean, } | { "type": "browser", host_id: string, request: BrowserRequest, } | { "type": "background", request: BackgroundRequest, } | { "type": "machine_snapshot" } | { "type": "read_usage", expected_email: string, } | { "type": "reload_guidance" } | { "type": "project_guidance", cwd: string, } | { "type": "history", request: HistoryRequest, } | { "type": "embed", texts: Array<string>, purpose: EmbeddingPurpose, } | { "type": "inspect_worker", binding: WorkerRef, } | { "type": "on_node", host_id: string, command: HostCommand, } | { "type": "read_context", repository_id: string, path: string, offset: number, limit: number, } | { "type": "search_context", repository_id: string, path: string | null, query: string, limit: number, } | { "type": "resource_allocate", request: WorktreeAllocation, } | { "type": "resource_inspect", record: ResourceRecord, } | { "type": "resource_plan_cleanup", record: ResourceRecord, } | { "type": "resource_collect", record: ResourceRecord, plan: CleanupPlan, } | { "type": "exec", program: string, args: Array<string>, cwd: string, timeout_seconds: number, sender_conversation_id?: string, } | { "type": "read_file", path: string, offset: number, limit: number, } | { "type": "write_file", path: string, content: string, } | { "type": "edit_file", path: string, old: string, new: string, } | { "type": "spawn_worker", host: WorkerHost,
+export type HostCommand = { "type": "attachment_write", attachment: AttachmentRef, offset: number, data_base64: string, complete: boolean, } | { "type": "browser", host_id: string, request: BrowserRequest, } | { "type": "background", request: BackgroundRequest, } | { "type": "machine_snapshot" } | { "type": "read_usage", expected_email: string, } | { "type": "reload_guidance" } | { "type": "project_guidance", cwd: string, } | { "type": "history", request: HistoryRequest, } | { "type": "embed", texts: Array<string>, purpose: EmbeddingPurpose, } | { "type": "inspect_worker", binding: WorkerRef, } | { "type": "on_node", host_id: string, command: HostCommand, } | { "type": "read_context", repository_id: string, path: string, offset: number, limit: number, } | { "type": "search_context", repository_id: string, path: string | null, query: string, limit: number, } | { "type": "resource_allocate", request: WorktreeAllocation, } | { "type": "resource_inspect", record: ResourceRecord, } | { "type": "resource_plan_cleanup", record: ResourceRecord, } | { "type": "resource_collect", record: ResourceRecord, plan: CleanupPlan, } | { "type": "exec", program: string, args: Array<string>, cwd: string, timeout_seconds: number, sender_conversation_id?: string, } | { "type": "read_file", path: string,
+/**
+ * Text window in bytes. A host never applies it to an image.
+ */
+offset: number, limit: number,
+/**
+ * Older hosts skip this field and answer with text.
+ */
+image?: ImageRead, } | { "type": "write_file", path: string, content: string, } | { "type": "edit_file", path: string, old: string, new: string, } | { "type": "spawn_worker", host: WorkerHost,
 /**
  * Where to open the root terminal if the node allows it. A node on a
  * private Rex server checks its host and opens a new session instead.

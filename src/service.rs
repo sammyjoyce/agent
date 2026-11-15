@@ -1502,6 +1502,7 @@ mod tests {
                 path: "/example/attached-only".into(),
                 offset: 0,
                 limit: 100,
+                image: None,
             },
         ];
         fs::write(
