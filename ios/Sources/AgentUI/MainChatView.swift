@@ -510,6 +510,11 @@ public struct MainChatView: View {
           if atTop { requestHistory() }
         }
       }
+      .onChange(of: followsLatest && !userScrolling) { _, following in
+        // Following the latest, code scrolls without updating the binding, so a row left there
+        // goes stale. A size change, such as the composer growing, would scroll back to it.
+        if following { visibleItem = nil }
+      }
       .onScrollGeometryChange(for: TranscriptEdges.self) { geometry in
         TranscriptEdges(
           top: geometry.contentOffset.y + geometry.contentInsets.top <= 80,
