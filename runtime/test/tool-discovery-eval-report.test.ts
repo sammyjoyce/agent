@@ -115,6 +115,8 @@ test("the child-agent scenario fails when the child or parent denies or replaces
   await Promise.all(cases.map(([child, parent]) => t.test(`child "${child}", parent "${parent}"`, async () => {
     const { code, stdout, rows } = await runChildAgent(child, parent);
     assert.equal(rows.length, 1); assert.equal(rows[0]?.success, false, String(rows[0]?.detail));
+    assert.deepEqual(JSON.parse(String(rows[0]?.detail)), { agents: [{ state: "done", summary: child }], state: "resolved", evidence: parent },
+      "The child finished and the parent resolved, so the oracle rejected the answers");
     assert.match(stdout, /^\s*not ok \d+ - direct t1 child-agent$/mu);
     assert.notEqual(code, 0);
   })));
@@ -130,14 +132,17 @@ test("the child-agent scenario passes when both answers state the seeded root ca
   })));
 });
 
-test("the child-agent oracle accepts the seeded root cause and rejects a contradicting one", () => {
+test("the child-agent oracle judges only root cause lines, and every one must state the seeded cause", () => {
   for (const right of ["Root cause: an expired TLS certificate on the staging relay rejected every deploy upload.",
-    "The staging relay's TLS certificate had expired, so it rejected deploy uploads."]) {
+    "The agent read the report.\n**Root cause:** The staging relay's TLS certificate had expired, so it rejected deploy uploads.",
+    "- Root cause: the TLS certificate on the staging relay was expired"]) {
     assert.equal(statesExpiredCertificateCause(right), true, right);
   }
-  for (const wrong of ["The certificate was not expired; a malformed environment variable caused the incident.",
-    "The certificate was healthy. A malformed environment variable was the root cause.",
-    "The certificate wasn't expired; the relay ran out of disk.", "A certificate was mentioned, but the cause is unknown."]) {
+  for (const wrong of ["An expired TLS certificate on the staging relay rejected every deploy upload.",
+    "Root cause: a malformed environment variable. The certificate had expired earlier but was renewed.",
+    "Root cause: an expired TLS certificate on the staging relay did not reject the uploads.",
+    "Root cause: an expired TLS certificate on the staging relay.\nRoot cause: a full disk on the build host.",
+    "Not the root cause: an expired TLS certificate on the staging relay."]) {
     assert.equal(statesExpiredCertificateCause(wrong), false, wrong);
   }
 });

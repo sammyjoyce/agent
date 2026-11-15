@@ -237,11 +237,13 @@ const scenarios: Scenario[] = [
     await writeFile(report, "# Incident 0412: staging deploys failed\n\nImpact: staging deploys failed for 47 minutes.\n\n" +
       "Timeline: 09:02 first failure; 09:20 rollback attempted; 09:49 fixed.\n\nRoot cause: an expired TLS certificate on the staging relay rejected every deploy upload.\n\n" +
       "Follow-up: add certificate expiry alerts.\n");
-    const task = await runJobTask(world, "Summarize incident 0412", "Spawn one agent to read docs/incident-0412.md and report the root cause it states. " +
-      "Wait for the agent's result, then record this task as resolved with that root cause as evidence. Do not read the file yourself.", "Start now.");
+    const task = await runJobTask(world, "Summarize incident 0412", "Spawn one agent to read docs/incident-0412.md and report the root cause it states " +
+      "on one line that begins \"Root cause:\". Wait for the agent's result, then record this task as resolved with the agent's \"Root cause:\" line as evidence. " +
+      "Do not read the file yourself.", "Start now.");
     const agent = task.agents.find((candidate) => candidate.state.state === "done" && statesExpiredCertificateCause(candidate.summary));
     const evidence = task.state.state === "resolved" ? task.state.evidence : "";
-    return { success: agent !== undefined && statesExpiredCertificateCause(evidence), detail: `agents=${task.agents.map((candidate) => candidate.state.state).join(",")}; state=${task.state.state}` };
+    return { success: agent !== undefined && statesExpiredCertificateCause(evidence), detail: JSON.stringify({
+      agents: task.agents.map((candidate) => ({ state: candidate.state.state, summary: candidate.summary })), state: task.state.state, evidence }) };
   } },
   { name: "browser-read", role: "main", async run(world) {
     const answer = await askMain(world, `Open ${STATUS_URL} in the browser and tell me which component is degraded and since when.`);
