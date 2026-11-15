@@ -28,15 +28,15 @@ import { createToolsets, withActorPolicies, type ToolRole, type Toolsets } from 
 
 export const TOOL_ROLES: readonly ToolRole[] = ["main", "triage", "worker", "agent"];
 
-/** One role's tool surface: deferred tools wait for `tool_search`, and code mode offers every tool not kept direct only through scripts. */
 export type ToolSurface = {
   readonly deferred?: readonly string[];
   readonly codemode?: { readonly keepDirect: readonly string[] };
 };
 export type DiscoveryArm = Readonly<Partial<Record<ToolRole, ToolSurface>>>;
 
-/** `finish_without_reply` must be the root generation's own final call, and scripts drop native images from nested results. */
-export const ALWAYS_DIRECT: readonly string[] = ["finish_without_reply", "read_attachment", "read_file"];
+export const ROOT_FINAL_TOOLS: readonly string[] = ["finish_without_reply"];
+export const IMAGE_RESULT_TOOLS: readonly string[] = ["read_attachment", "read_file"];
+export const ALWAYS_DIRECT: readonly string[] = [...ROOT_FINAL_TOOLS, ...IMAGE_RESULT_TOOLS];
 export const BROWSER_TOOLS: readonly string[] = ["browser_user_tabs", "browser_claim_tab", "browser_open", "browser_status",
   "browser_action", "browser_run_code", "browser_release"];
 
@@ -55,7 +55,6 @@ export function isDiscoveryArmName(value: string): value is DiscoveryArmName {
   return Object.hasOwn(DISCOVERY_ARMS, value);
 }
 
-/** Upstream discovery extensions, installed once per registry; selection decides which roles see them. */
 export function createDiscoveryExtensions() {
   const sandbox = new CodemodeSandbox();
   return { toolSearch: createToolSearchExtension(), codemode: createCodemodeExtension({ sandbox, models: false }),
@@ -63,8 +62,6 @@ export function createDiscoveryExtensions() {
 }
 export type DiscoveryExtensions = ReturnType<typeof createDiscoveryExtensions>;
 
-/** Applies an arm to production role surfaces. Wrappers live in a role-local extension, so stored agent
- * configuration keeps naming extensions and reopening a conversation keeps its surface. */
 export function applyDiscoveryArm(toolsets: Toolsets, arm: DiscoveryArm, discovery: DiscoveryExtensions): { toolsets: Toolsets; installed: Extension[] } {
   const installed: Extension[] = [];
   const surfaces = Object.fromEntries(TOOL_ROLES.map((role) => {
@@ -95,7 +92,6 @@ export function applyDiscoveryArm(toolsets: Toolsets, arm: DiscoveryArm, discove
 
 export type DeclarationSize = { tools: string[]; characters: number; estimatedTokens: number };
 
-/** What one request declares to the model: offered tool names, descriptions and schemas, plus the code mode section. */
 export function declarationSize(context: Context): DeclarationSize {
   const tools = getCurrentTools(context.messages);
   const section = /<codemode>[\s\S]*?<\/codemode>/u.exec(getCurrentSystemPrompt(context.messages))?.[0] ?? "";
@@ -106,7 +102,6 @@ export function declarationSize(context: Context): DeclarationSize {
 
 export type DiscoveryHost = { node: AgentNode; call(command: HostCommand): Promise<HostResult> };
 
-/** A coordinator with the production registry, role surfaces and background execution, bound to one invented host. */
 export async function openDiscoveryApp(directory: string, { models, model, arm, host, retry = false, compaction }: {
   models: MutableModels; model: ModelSelection; arm: DiscoveryArm; host: DiscoveryHost; retry?: boolean; compaction?: CompactionSettings;
 }) {

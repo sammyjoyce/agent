@@ -183,7 +183,9 @@ one table, `DISCOVERY_ARMS`. Each arm maps a role to its deferred tools and to
 the tools that stay direct beside code mode. `direct` is production today.
 Every arm keeps `finish_without_reply`, `read_attachment` and `read_file`
 directly offered. `finish_without_reply` must be the main turn's own final
-call, and scripts drop native images from nested results.
+call. Scripts drop native images from nested results, and `read_attachment`
+returns images. `read_file` stays direct for the image reads that pull request
+46 adds to it.
 
 `runtime/test/tool-discovery.test.ts` runs every arm on the real Harness with
 the faux provider. It checks the tools each role offers, that a tool loaded by

@@ -25,7 +25,6 @@ export function createToolsets({ guidance, tools, sourceTools, resourceTools, br
   };
 }
 
-/** Production actors also carry the main reply policy and input provenance; triage carries neither. */
 export function withActorPolicies(toolsets: Toolsets, { responsePolicy, inputOrigins }: {
   responsePolicy: Extension; inputOrigins: Extension;
 }): Toolsets {

@@ -24,8 +24,6 @@ import { DEFAULT_MODEL } from "../src/models.js";
 import type { ToolRole } from "../src/toolsets.js";
 import { declarationSize, DISCOVERY_ARMS, isDiscoveryArmName, openDiscoveryApp, type DiscoveryApp, type DiscoveryArmName } from "./fixtures/tool-discovery.js";
 
-// Opt-in live eval against a real provider. docs/performance.md#tool-discovery lists its variables.
-const enabled = process.env.AGENT_TOOL_DISCOVERY_EVAL === "1";
 
 type ProviderRequest = {
   stop: string; input: number; cache_read: number; cache_write: number; output: number; reasoning: number; total: number;
@@ -35,18 +33,9 @@ type Verdict = { success: boolean; detail: string };
 type World = { app: DiscoveryApp; host: EvalHost; workspace: string; model: ModelSelection; signal: AbortSignal };
 type Scenario = { name: string; role: ToolRole; run(world: World): Promise<Verdict> };
 
-function list(name: string, fallback: string): string[] {
-  return (process.env[name] ?? fallback).split(",").map((value) => value.trim()).filter((value) => value !== "");
-}
-function count(name: string, fallback: number): number {
-  const value = Number(process.env[name] ?? fallback);
-  assert.ok(Number.isSafeInteger(value) && value > 0, `${name} must be a positive integer`);
-  return value;
-}
+type Provider = { apiKey: string; baseUrl: string | undefined };
 
-function meteredModels(requests: Promise<ProviderRequest>[]): MutableModels {
-  const apiKey = process.env.OPENAI_API_KEY, baseUrl = process.env.OPENAI_BASE_URL;
-  assert.ok(apiKey, "Set OPENAI_API_KEY for the evaluation provider");
+function meteredModels({ apiKey, baseUrl }: Provider, requests: Promise<ProviderRequest>[]): MutableModels {
   const models = builtinModels(), openai = models.getProvider("openai");
   assert.ok(openai !== undefined, "The OpenAI provider is unavailable");
   models.setProvider({ ...openai,
@@ -76,7 +65,6 @@ const STATUS_PAGE = [`- heading "Pebble service status" [level=1] [ref=e1]`, `- 
   `- link "Subscribe to updates" [ref=e8]`].join("\n");
 const READ_ONLY_PROGRAMS = new Set(["ls", "cat", "head", "tail", "wc", "grep", "pwd"]);
 
-/** One invented machine: files live in a temporary workspace, the browser serves one fixed page, and workers spawn nowhere. */
 class EvalHost {
   readonly commands: HostCommand["type"][] = [];
   private open = false;
@@ -299,7 +287,8 @@ type UnitResult = {
   wall_ms: number; first_declared_tokens: number | null; first_offered_tools: number | null; tool_calls: string[];
 };
 
-async function runUnit(runId: string, arm: DiscoveryArmName, trial: number, scenario: Scenario, model: ModelSelection, timeoutMs: number, keep: boolean): Promise<UnitResult> {
+async function runUnit(config: EvalConfig, arm: DiscoveryArmName, trial: number, scenario: Scenario): Promise<UnitResult> {
+  const { runId, model, timeoutMs, keepFailures } = config;
   const directory = await mkdtemp(join(tmpdir(), "agent-tool-discovery-eval-")), workspace = join(directory, "workspace");
   await mkdir(workspace);
   const pending: Promise<ProviderRequest>[] = [], host = new EvalHost(workspace), controller = new AbortController();
@@ -308,7 +297,7 @@ async function runUnit(runId: string, arm: DiscoveryArmName, trial: number, scen
   let app: DiscoveryApp | undefined;
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    app = await openDiscoveryApp(join(directory, "state"), { models: meteredModels(pending), model, arm: DISCOVERY_ARMS[arm], host, retry: true });
+    app = await openDiscoveryApp(join(directory, "state"), { models: meteredModels(config.provider, pending), model, arm: DISCOVERY_ARMS[arm], host, retry: true });
     const world: World = { app, host, workspace, model, signal: controller.signal };
     const aborted = new Promise<never>((_, reject) => controller.signal.addEventListener("abort", () => reject(new Error(`Timed out after ${timeoutMs} ms`)), { once: true }));
     verdict = await Promise.race([scenario.run(world), aborted]);
@@ -317,7 +306,7 @@ async function runUnit(runId: string, arm: DiscoveryArmName, trial: number, scen
   } finally { clearTimeout(timer); controller.abort(); }
   const wall = Math.round(performance.now() - started);
   await app?.close().catch(() => {});
-  const kept = keep && !(error === null && verdict.success);
+  const kept = keepFailures && !(error === null && verdict.success);
   if (!kept) await rm(directory, { recursive: true, force: true });
   const requests = await Promise.all(pending);
   const sum = (field: keyof Omit<ProviderRequest, "stop" | "calls">) => requests.reduce((total, request) => total + request[field], 0);
@@ -335,29 +324,48 @@ function median(values: number[]): number {
   return sorted.length === 0 ? 0 : sorted.length % 2 === 1 ? sorted[middle]! : (sorted[middle - 1]! + sorted[middle]!) / 2;
 }
 
-test("live tool discovery eval measures tokens, requests and success per arm", { skip: !enabled, timeout: 6 * 60 * 60_000 }, async (t) => {
-  const arms = list("AGENT_TOOL_DISCOVERY_ARMS", "direct");
-  for (const arm of arms) assert.ok(isDiscoveryArmName(arm), `Unknown arm ${arm}; choose from ${Object.keys(DISCOVERY_ARMS).join(", ")}`);
-  const selected = list("AGENT_TOOL_DISCOVERY_SCENARIOS", scenarios.map((scenario) => scenario.name).join(","));
-  const chosen = scenarios.filter((scenario) => selected.includes(scenario.name));
-  assert.equal(chosen.length, selected.length, `Unknown scenario in ${selected.join(", ")}`);
-  const requested = process.env.AGENT_TOOL_DISCOVERY_REASONING;
+function readEvalConfig(env: NodeJS.ProcessEnv) {
+  const list = (name: string, fallback: readonly string[]) =>
+    env[name]?.split(",").map((value) => value.trim()).filter((value) => value !== "") ?? [...fallback];
+  const count = (name: string, fallback: number) => {
+    const value = Number(env[name] ?? fallback);
+    assert.ok(Number.isSafeInteger(value) && value > 0, `${name} must be a positive integer`);
+    return value;
+  };
+  const apiKey = env.OPENAI_API_KEY;
+  assert.ok(apiKey, "Set OPENAI_API_KEY for the evaluation provider");
+  const arms = list("AGENT_TOOL_DISCOVERY_ARMS", ["direct"]).map((arm) => {
+    assert.ok(isDiscoveryArmName(arm), `Unknown arm ${arm}; choose from ${Object.keys(DISCOVERY_ARMS).join(", ")}`);
+    return arm;
+  });
+  const names = list("AGENT_TOOL_DISCOVERY_SCENARIOS", scenarios.map((scenario) => scenario.name));
+  const chosen = scenarios.filter((scenario) => names.includes(scenario.name));
+  assert.equal(chosen.length, names.length, `Unknown scenario in ${names.join(", ")}`);
+  const requested = env.AGENT_TOOL_DISCOVERY_REASONING;
   const reasoning = requested === undefined ? DEFAULT_MODEL.reasoning : MODEL_THINKING_LEVELS.find((level) => level === requested);
   assert.ok(reasoning !== undefined, `Unknown reasoning ${requested}`);
-  const model: ModelSelection = { ...DEFAULT_MODEL, reasoning };
-  const trials = count("AGENT_TOOL_DISCOVERY_TRIALS", 3), concurrency = count("AGENT_TOOL_DISCOVERY_CONCURRENCY", 4);
-  const timeoutMs = count("AGENT_TOOL_DISCOVERY_TIMEOUT_SECONDS", 600) * 1000, keep = process.env.AGENT_TOOL_DISCOVERY_KEEP_FAILURES === "1";
   const runId = new Date().toISOString().replaceAll(":", "-");
-  const out = process.env.AGENT_TOOL_DISCOVERY_OUT ?? join(tmpdir(), `agent-tool-discovery-${runId}.jsonl`);
+  return { runId, arms, scenarios: chosen, model: { ...DEFAULT_MODEL, reasoning } satisfies ModelSelection,
+    trials: count("AGENT_TOOL_DISCOVERY_TRIALS", 3), concurrency: count("AGENT_TOOL_DISCOVERY_CONCURRENCY", 4),
+    timeoutMs: count("AGENT_TOOL_DISCOVERY_TIMEOUT_SECONDS", 600) * 1000, keepFailures: env.AGENT_TOOL_DISCOVERY_KEEP_FAILURES === "1",
+    out: env.AGENT_TOOL_DISCOVERY_OUT ?? join(tmpdir(), `agent-tool-discovery-${runId}.jsonl`),
+    provider: { apiKey, baseUrl: env.OPENAI_BASE_URL } satisfies Provider };
+}
+type EvalConfig = ReturnType<typeof readEvalConfig>;
+
+test("live tool discovery eval measures tokens, requests and success per arm", {
+  skip: process.env.AGENT_TOOL_DISCOVERY_EVAL !== "1", timeout: 6 * 60 * 60_000,
+}, async (t) => {
+  const config = readEvalConfig(process.env), { arms, trials, model, out } = config, chosen = config.scenarios;
   const units = Array.from({ length: trials }, (_, index) => index + 1).flatMap((trial) =>
-    (trial % 2 === 1 ? arms : [...arms].reverse()).flatMap((arm) => chosen.map((scenario) => ({ arm: arm as DiscoveryArmName, trial, scenario }))));
-  t.diagnostic(`run ${runId}: ${units.length} units (${arms.join(", ")} x ${chosen.length} scenarios x ${trials} trials) at ${model.model_id}/${reasoning}; writing ${out}`);
+    (trial % 2 === 1 ? arms : [...arms].reverse()).flatMap((arm) => chosen.map((scenario) => ({ arm, trial, scenario }))));
+  t.diagnostic(`run ${config.runId}: ${units.length} units (${arms.join(", ")} x ${chosen.length} scenarios x ${trials} trials) at ${model.model_id}/${model.reasoning}; writing ${out}`);
   const results: UnitResult[] = [];
   let next = 0;
-  await Promise.all(Array.from({ length: Math.min(concurrency, units.length) }, async () => {
+  await Promise.all(Array.from({ length: Math.min(config.concurrency, units.length) }, async () => {
     for (let index = next++; index < units.length; index = next++) {
       const unit = units[index]!;
-      const result = await runUnit(runId, unit.arm, unit.trial, unit.scenario, model, timeoutMs, keep);
+      const result = await runUnit(config, unit.arm, unit.trial, unit.scenario);
       results.push(result); await appendFile(out, JSON.stringify(result) + "\n");
       t.diagnostic(`${result.arm} t${result.trial} ${result.scenario}: ${result.success ? "ok" : "FAIL"} requests=${result.requests} total=${result.total_tokens} ` +
         `cached=${result.cache_read} wall=${result.wall_ms}ms${result.error ? " error=" + result.error : ""}`);

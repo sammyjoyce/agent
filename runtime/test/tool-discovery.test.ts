@@ -62,14 +62,13 @@ function callTool(input: Context, name: string, args: ToolArguments): AssistantM
 }
 const done: FauxResponseFactory = () => fauxAssistantMessage("Done.");
 
-/** One turn of a role through its production entry point; `close` holds the responses that end it from its first request. */
-type RoleTurn = { close: [FauxResponseFactory, ...FauxResponseFactory[]]; run(): Promise<void> };
+type RoleTurn = { responsesFromFirstRequest: [FauxResponseFactory, ...FauxResponseFactory[]]; run(): Promise<void> };
 async function backgroundTask(app: DiscoveryApp) {
   return app.tasks.create({ title: "Example job", outcome: "Finish the example job", model: fixtureModel, sources: [jobSource] });
 }
 const startRole: Record<ToolRole, (app: DiscoveryApp, input: string) => Promise<RoleTurn>> = {
   async main(app, input) {
-    return { close: [done], async run() {
+    return { responsesFromFirstRequest: [done], async run() {
       const root = await app.session.root(BACKGROUND_CONTEXT), release = app.bind(root);
       try {
         await app.inference.configure(root, fixtureModel, { extensions: app.toolsets.main });
@@ -81,7 +80,7 @@ const startRole: Record<ToolRole, (app: DiscoveryApp, input: string) => Promise<
     await app.sources.admit({ source: { provider: "mail", account: "example" }, checkpoint: null, coverage: { status: "complete" },
       events: [{ id: "example-event", version: "one", source: { provider: "mail", account: "example", thread_id: "example-thread" }, title: "Example", text: input }] }, null);
     const event = (await app.sources.events({ pending: true }))[0]; assert.ok(event);
-    return { close: [(request) => callTool(request, "dismiss_source_events", { keys: [event.key], reason: "The example needs no work." }), done],
+    return { responsesFromFirstRequest: [(request) => callTool(request, "dismiss_source_events", { keys: [event.key], reason: "The example needs no work." }), done],
       async run() {
         await app.sources.triage({ type: "triage_sources", instructions: "", model: fixtureModel, cwd: app.worker.cwd, hosts: [app.worker] },
           (conversation) => app.bind(conversation, "triage"), app.toolsets.triage);
@@ -90,11 +89,11 @@ const startRole: Record<ToolRole, (app: DiscoveryApp, input: string) => Promise<
   },
   async worker(app, input) {
     const task = await backgroundTask(app);
-    return { close: [done], async run() { await app.tasks.enqueue(task.id, input); await app.tasks.runBackground(task.id); } };
+    return { responsesFromFirstRequest: [done], async run() { await app.tasks.enqueue(task.id, input); await app.tasks.runBackground(task.id); } };
   },
   async agent(app, input) {
     const task = await backgroundTask(app);
-    return { close: [done], async run() {
+    return { responsesFromFirstRequest: [done], async run() {
       const agent = await app.tasks.createAgent(task.id, { id: "example-agent", title: "Example agent", outcome: "Finish the example check", input, inputId: "example-agent-input" });
       await app.tasks.runBackground(task.id, undefined, agent.id);
     } };
@@ -118,7 +117,7 @@ test("each arm offers its role surfaces with the always-direct tools and reports
     try {
       for (const role of TOOL_ROLES) {
         if (arm === "direct") production.set(role, modelTools(app, role));
-        const turn = await startRole[role](app, `Report the ${role} surface.`), [first, ...rest] = turn.close;
+        const turn = await startRole[role](app, `Report the ${role} surface.`), [first, ...rest] = turn.responsesFromFirstRequest;
         let size: DeclarationSize | undefined;
         env.faux.setResponses([(input, ...request) => { size = declarationSize(input); return first(input, ...request); }, ...rest]);
         await turn.run();
@@ -250,9 +249,8 @@ test("a main script gets the same task and job results the direct calls return",
   } finally { await app.close(); await env.remove(); }
 });
 
-/** Replaces the main task tools with one that waits until the Harness closes, so a reopen finds the call checkpointed mid-execution. */
-function hangingTaskTool(name: string, replay: "safe" | undefined, entered: () => void) {
-  return defineExtension({ name: "task-main", tools: [defineTool({ name, ...(replay === undefined ? {} : { replay }), description: "Use the selected task.",
+function replaceWithHangingTool(extension: string, name: string, replay: "safe" | undefined, entered: () => void) {
+  return defineExtension({ name: extension, tools: [defineTool({ name, ...(replay === undefined ? {} : { replay }), description: "Use the selected task.",
     parameters: Type.Object({}), async execute(_args, _api, context) { entered(); return await awaitWithContext(new Promise<never>(() => {}), context); } })] });
 }
 async function until(condition: () => Promise<boolean>): Promise<void> {
@@ -306,7 +304,7 @@ for (const round of interruptedRounds) {
       const created = await app.tasks.create({ title: "Example status", outcome: "Report the example status", model: fixtureModel });
       let entered = 0, resolveStarted = () => {};
       const started = new Promise<void>((resolve) => { resolveStarted = resolve; });
-      app.registry.install(hangingTaskTool(round.hang.tool, round.hang.replay, () => { entered++; resolveStarted(); }));
+      app.registry.install(replaceWithHangingTool(app.tools.main.name, round.hang.tool, round.hang.replay, () => { entered++; resolveStarted(); }));
       let root = await app.session.root(BACKGROUND_CONTEXT); release = app.bind(root);
       await app.inference.configure(root, fixtureModel, { extensions: app.toolsets.main });
       let resumed: Context | undefined;
