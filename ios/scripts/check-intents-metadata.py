@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Fails unless a built Agent.app ships every App Intents action, entity with its properties,
-query, and a phrase.
+and query, and at least one shortcut, each for an expected action. It does not check that a
+shortcut holds a phrase.
 
 A shortcuts provider in the wrong target still builds, and only the extracted metadata shows that
 the app ships no phrase.
