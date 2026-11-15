@@ -90,14 +90,14 @@ export function applyDiscoveryArm(toolsets: Toolsets, arm: DiscoveryArm, discove
   return { toolsets: surfaces, installed };
 }
 
-export type DeclarationSize = { tools: string[]; characters: number; estimatedTokens: number };
+export type DeclarationSize = { tools: string[]; perTool: Record<string, number>; section: number; characters: number; estimatedTokens: number };
 
 export function declarationSize(context: Context): DeclarationSize {
   const tools = getCurrentTools(context.messages);
-  const section = /<codemode>[\s\S]*?<\/codemode>/u.exec(getCurrentSystemPrompt(context.messages))?.[0] ?? "";
-  const characters = tools.reduce((sum, tool) => sum + tool.name.length + tool.description.length + JSON.stringify(tool.parameters).length, 0)
-    + section.length;
-  return { tools: tools.map((tool) => tool.name), characters, estimatedTokens: Math.ceil(characters / 4) };
+  const section = /<codemode>[\s\S]*?<\/codemode>/u.exec(getCurrentSystemPrompt(context.messages))?.[0].length ?? 0;
+  const perTool = Object.fromEntries(tools.map((tool) => [tool.name, tool.name.length + tool.description.length + JSON.stringify(tool.parameters).length]));
+  const characters = Object.values(perTool).reduce((sum, size) => sum + size, section);
+  return { tools: tools.map((tool) => tool.name), perTool, section, characters, estimatedTokens: Math.ceil(characters / 4) };
 }
 
 export type DiscoveryHost = { node: AgentNode; call(command: HostCommand): Promise<HostResult> };

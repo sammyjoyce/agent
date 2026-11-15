@@ -134,6 +134,17 @@ test("each arm offers its role surfaces with the always-direct tools and reports
     assert.ok(offered.includes("read_attachment") && offered.includes("read_file"), `${arm} ${role} offers attachments and files directly`);
     if (role === "main") assert.ok(offered.includes("finish_without_reply"), `${arm} main offers finish_without_reply`);
   }
+  const sizeOf = (arm: DiscoveryArmName, role: ToolRole) => {
+    const found = observed.find((entry) => entry.arm === arm && entry.role === role); assert.ok(found); return found.size;
+  };
+  for (const role of TOOL_ROLES) {
+    const direct = sizeOf("direct", role), search = sizeOf("search-browser", role), scripted = sizeOf("codemode", role);
+    const browser = BROWSER_TOOLS.reduce((sum, name) => sum + (direct.perTool[name] ?? 0), 0), toolSearch = search.perTool.tool_search ?? 0;
+    assert.equal(direct.section + search.section, 0, `${role} declares no code mode section without code mode`);
+    assert.equal(search.characters, direct.characters - browser + toolSearch, `${role} search-browser declares the browser tools' size less, plus tool_search`);
+    assert.ok(scripted.section > 0, `${role} code mode declares its tool section`);
+    for (const name of ALWAYS_DIRECT) assert.equal(scripted.perTool[name], direct.perTool[name], `${role} keeps the ${name} declaration unchanged`);
+  }
 });
 
 test("an arm cannot defer finish_without_reply or read_file", async () => {
