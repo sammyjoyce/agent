@@ -278,8 +278,8 @@ struct SiriJobTests {
     }
   }
 
-  /// Work has answered and Personal is still silent when the query is cancelled. The query is
-  /// cancelled. It does not return Work's jobs as if Personal had only been silent.
+  /// Work has answered and Personal is still silent when the query is cancelled. The query throws
+  /// the cancellation instead of returning Work's jobs as if Personal had only been silent.
   @MainActor @Test(.timeLimit(.minutes(1)))
   func aQueryCancelledAfterOneCoordinatorAnsweredIsStillCancelled() async throws {
     try await withJobPeers { coordinators, work, personal, workPeer, personalPeer in

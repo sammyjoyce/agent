@@ -324,10 +324,9 @@ final class ChatModel {
   @ObservationIgnored private let registration: NotificationRegistration?
   /// The scene's activity as the latest `setActive` asked for it, and the leases on each lane.
   @ObservationIgnored private(set) var demand = ConnectionDemand()
-  /// One lane's connection lifecycle, as `reconcile` drives it.
   private struct Lifecycle {
-    /// What a session was last told. It names the session, so one that takes the lane's place
-    /// has been told nothing, however it got there, and weakly, so it keeps no retired one.
+    /// What `session` was last told. A session that later takes the lane's place has been told
+    /// nothing, and the weak reference keeps no retired session alive.
     struct Told {
       weak var session: CoordinatorSession?
       var connect: Bool
@@ -679,10 +678,9 @@ final class ChatModel {
 
   /// Tells lane `id`'s session to connect or disconnect, as `demand` wants it, and returns once
   /// it has been told. Until the model ends, nothing else in it connects or disconnects a lane's
-  /// session. One loop per lane makes the calls, so two never overlap on one session, and a
-  /// caller that finds the loop running waits for it. A session already told what `demand` wants
-  /// is left alone, because `connect` redials a connected session and would cut the requests in
-  /// flight on it.
+  /// session. One loop per lane makes the calls, so two never overlap on one session. A session
+  /// already told what `demand` wants is left alone, because `connect` redials a connected
+  /// session and would cut the requests in flight on it.
   func reconcile(_ id: ProfileID) async {
     if let loop = lifecycles[id]?.loop { return await loop.value }
     guard pendingCall(id) != nil else { return }
@@ -703,8 +701,8 @@ final class ChatModel {
     lifecycles[id]?.loop = nil
   }
 
-  /// What lane `id`'s session must be told next, or nil once it was last told what `demand`
-  /// wants.
+  /// What lane `id`'s session must be told next: what `demand` wants, if that is not what it was
+  /// last told, or a redial "Try again" asked for. Nil when neither applies or it has no session.
   private func pendingCall(_ id: ProfileID) -> (session: CoordinatorSession, connect: Bool)? {
     guard let session = lanes.first(where: { $0.id == id })?.session else { return nil }
     let wanted = demand.wants(id)
@@ -717,8 +715,9 @@ final class ChatModel {
   /// Holds lane `id` connected while `body` runs, whatever the scene is doing. The lane is dialed
   /// only if nothing else had it connecting, and it disconnects after `body` only if nothing else
   /// wants it, before this returns. `body` runs once, and only after the lane's session itself
-  /// reported connected within `limit`. Otherwise this throws `LaneError.unanswered`, or
-  /// `CancellationError` for a cancelled task, and `body` never runs.
+  /// reported connected within `limit`. Otherwise `body` never runs, and this throws
+  /// `LaneError.gone` or `.notPaired` for a lane without a session, `.unanswered` once `limit`
+  /// passes, or `CancellationError` for a cancelled task.
   func withConnection<T>(
     to id: ProfileID, within limit: Duration, _ body: () async throws -> T
   ) async throws -> T {

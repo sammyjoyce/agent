@@ -108,7 +108,7 @@ public struct JobQuery: EnumerableEntityQuery {
     return try jobs(in: reads)
   }
 
-  /// Every job in `reads`. With none to show, a coordinator's own refusal is thrown, and a
+  /// Every job in `reads`. With none to show, a failure other than silence is thrown first, and a
   /// silence only when no coordinator answered at all.
   static func jobs(in reads: [JobRead]) throws -> [JobEntity] {
     let answers = reads.compactMap { try? $0.get() }
@@ -130,7 +130,7 @@ public struct JobQuery: EnumerableEntityQuery {
     return reads.flatMap { (try? $0.get()) ?? [] }.filter { identifiers.contains($0.id) }
   }
 
-  /// The failure to report for `reads`: a coordinator's own words before another one's silence.
+  /// The failure to report for `reads`: any other failure before a coordinator's silence.
   private static func failure(in reads: [JobRead]) -> (any Error)? {
     let failures = reads.compactMap { read -> (any Error)? in
       if case .failure(let error) = read { error } else { nil }
@@ -139,7 +139,6 @@ public struct JobQuery: EnumerableEntityQuery {
   }
 }
 
-/// How reading one coordinator's jobs went.
 typealias JobRead = Result<[JobEntity], any Error>
 
 /// A coordinator that never connected for the intent, or whose connection closed or timed out
@@ -172,8 +171,6 @@ extension Coordinators {
     }
   }
 
-  /// One coordinator's jobs, read over its own lease. Its silence and its own refusal are named
-  /// for Siri. Any other failure is passed on as it is.
   private func read(_ profile: CoordinatorProfile, within limit: Duration) async -> JobRead {
     let name = "\(profile.name)"
     do {

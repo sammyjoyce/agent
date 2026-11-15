@@ -1,10 +1,9 @@
 import AgentCore
 import Foundation
 
-/// One holder's claim that a coordinator stay connected, whatever the scene is doing. Only
-/// `ConnectionDemand.take` makes one.
+/// One holder's claim that a coordinator stay connected, whatever the scene is doing.
 struct ConnectionLease: Hashable, Sendable {
-  /// How long a new lease waits for its coordinator to connect.
+  /// The limit an App Intent gives `withConnection` unless it names its own.
   static let connectionWait = Duration.seconds(8)
 
   let profile: ProfileID

@@ -98,7 +98,7 @@ public final class Coordinators {
   }
 
   /// For App Intents: holds coordinator `id` connected while `body` runs, with the scene in the
-  /// background too. `ChatModel.withConnection` owns the lease and the wait.
+  /// background too.
   func withConnection<T>(
     to id: ProfileID, within limit: Duration = ConnectionLease.connectionWait,
     _ body: () async throws -> T
