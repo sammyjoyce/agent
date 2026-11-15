@@ -61,6 +61,10 @@ const LEAN_TOOLS: Record<ToolRole, readonly string[]> = {
   agent: [],
 };
 
+function recordingCodemode(role: ToolRole): ToolSurface {
+  return { deferred: [...RARE_TOOLS[role], ...SOURCE_TOOLS[role]], codemode: { keepDirect: role === "agent" ? [] : ["record_task"] } };
+}
+
 function everyRole(surface: ToolSurface | ((role: ToolRole) => ToolSurface)): DiscoveryArm {
   return Object.fromEntries(TOOL_ROLES.map((role) => [role, typeof surface === "function" ? surface(role) : surface]));
 }
@@ -73,6 +77,8 @@ export const DISCOVERY_ARMS = {
   "search-lean": everyRole((role) => ({ deferred: [...RARE_TOOLS[role], ...SOURCE_TOOLS[role], ...LEAN_TOOLS[role]] })),
   codemode: everyRole({ codemode: { keepDirect: [] } }),
   "codemode-core": everyRole((role) => ({ deferred: [...RARE_TOOLS[role], ...SOURCE_TOOLS[role]], codemode: { keepDirect: [] } })),
+  "codemode-recording": everyRole(recordingCodemode),
+  split: { ...everyRole(recordingCodemode), main: { deferred: [...RARE_TOOLS.main, ...SOURCE_TOOLS.main] } },
 } as const satisfies Record<string, DiscoveryArm>;
 export type DiscoveryArmName = keyof typeof DISCOVERY_ARMS;
 
