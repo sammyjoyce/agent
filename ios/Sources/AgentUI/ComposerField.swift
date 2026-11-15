@@ -245,12 +245,12 @@
       ) {
         if !locked { super.setAttributedMarkedText(text, selectedRange: selectedRange) }
       }
-      private(set) var provisional: (range: NSRange, covered: String)?
+      private(set) var provisional: (range: NSRange, covered: NSAttributedString)?
 
       var draft: String {
         guard let provisional else { return text }
         return (text as NSString).replacingCharacters(
-          in: provisional.range, with: provisional.covered)
+          in: provisional.range, with: provisional.covered.string)
       }
 
       func showProvisional(_ words: String, over range: NSRange) {
@@ -271,12 +271,13 @@
           return
         }
         clearProvisional()
+        let covered = textStorage.attributedSubstring(from: range)
         var dimmed = typingAttributes
         dimmed[.foregroundColor] = UIColor.secondaryLabel
         replaceWithoutUndo(range, with: NSAttributedString(string: fitted, attributes: dimmed))
         provisional = (
           range: NSRange(location: range.location, length: fitted.utf16.count),
-          covered: draft.substring(with: range)
+          covered: covered
         )
         selectedRange = NSRange(location: range.location + fitted.utf16.count, length: 0)
       }
@@ -286,9 +287,9 @@
         self.provisional = nil
         replaceWithoutUndo(
           provisional.range,
-          with: NSAttributedString(string: provisional.covered, attributes: typingAttributes))
+          with: provisional.covered)
         selectedRange = NSRange(
-          location: provisional.range.location, length: provisional.covered.utf16.count)
+          location: provisional.range.location, length: provisional.covered.length)
       }
 
       /// Edits the storage directly. Only the text view's input paths, such as `insertText`,

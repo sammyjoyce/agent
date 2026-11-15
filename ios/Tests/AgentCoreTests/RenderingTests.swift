@@ -1167,6 +1167,40 @@
         await notifications.coordinators.setActive(false)
       }
 
+      @MainActor @Test(arguments: ["words", "nothing"])
+      func dictatingOverASelectionLeavesNoTextDimmed(_ lands: String) async throws {
+        var script = ScriptedSpeech.Script()
+        if lands == "nothing" { script.takes = [""] }
+        let speech = ScriptedSpeech(script)
+        let dictation = try await readyDictation(speech)
+        try await withComposer(dictation: dictation) { model, box, _ in
+          let field = box.draft
+          field.insertText("Before after")
+          try await Task.sleep(for: .milliseconds(200))
+          field.selectedRange = NSRange(location: 7, length: 5)
+          let target = dictationTarget(model, field)
+          try await tapMic(dictation, target)
+          speech.hear("Invented live")
+          try await Task.sleep(for: .milliseconds(300))
+          try await tapMic(dictation, target)
+          let dimmed = UIColor.secondaryLabel.resolvedColor(with: field.traitCollection)
+          func color(of words: String) -> UIColor? {
+            let range = (field.text as NSString).range(of: words)
+            guard range.location != NSNotFound else { return nil }
+            let attributes = field.textStorage.attributes(at: range.location, effectiveRange: nil)
+            let color = attributes[.foregroundColor] as? UIColor
+            return color?.resolvedColor(with: field.traitCollection)
+          }
+          if lands == "words" {
+            #expect(model.draft == "Before Invented dictated words")
+            #expect(color(of: "Invented dictated words") != dimmed, "The final text is the draft's")
+          } else {
+            #expect(model.draft == "Before after")
+            #expect(color(of: "after") != dimmed, "The selected text comes back undimmed")
+          }
+        }
+      }
+
       /// The feed and composer of a model with Work and Personal saved, in a key window, with the
       /// composer's field focused.
       @MainActor private func withComposer(
