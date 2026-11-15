@@ -246,6 +246,8 @@ impl ModelArgs {
 #[derive(Subcommand)]
 enum TasksAction {
     List,
+    /// Show the coordinator's live work and what owns it: generations, tool calls, delegates and agents.
+    Graph,
     Search {
         query: String,
     },
@@ -765,6 +767,7 @@ async fn main() -> Result<()> {
         },
         Action::Tasks { command } => match command {
             TasksAction::List => RuntimeCommand::ListTasks,
+            TasksAction::Graph => RuntimeCommand::ReadTaskGraph,
             TasksAction::Search { query } => RuntimeCommand::SearchTasks { query },
             TasksAction::Read { task_id } => RuntimeCommand::ReadTask { task_id },
             TasksAction::Send {
@@ -4005,6 +4008,9 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
             }
         }
         RuntimeEventKind::Task { task, history } => println!("{}\n\n{history}", task.title),
+        RuntimeEventKind::TaskGraph { graph } => {
+            println!("{}", agent_cli::task_graph_view::format(graph));
+        }
         RuntimeEventKind::Environment {
             nodes,
             online_host_ids,
@@ -4226,6 +4232,28 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn tasks_graph_is_one_typed_snapshot_request() {
+        use crate::TasksAction;
+        use agent_cli::{protocol::RuntimeCommand, runtime::lifecycle::RequestLifecycle};
+        let parsed = Arguments::try_parse_from(["agent", "--json", "tasks", "graph"]).unwrap();
+        assert!(parsed.json);
+        assert!(matches!(
+            parsed.command,
+            Some(Action::Tasks {
+                command: TasksAction::Graph
+            })
+        ));
+        assert_eq!(
+            serde_json::to_string(&RuntimeCommand::ReadTaskGraph).unwrap(),
+            r#"{"type":"read_task_graph"}"#
+        );
+        assert_eq!(
+            RequestLifecycle::for_command(&RuntimeCommand::ReadTaskGraph),
+            Some(RequestLifecycle::Once)
+        );
     }
 
     #[test]

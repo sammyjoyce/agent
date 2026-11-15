@@ -68,6 +68,7 @@ impl RequestLifecycle {
             | RuntimeCommand::Logout
             | RuntimeCommand::SearchTasks { .. }
             | RuntimeCommand::ListTasks
+            | RuntimeCommand::ReadTaskGraph
             | RuntimeCommand::ListConversations { .. }
             | RuntimeCommand::ConversationInput { .. }
             | RuntimeCommand::ConversationInterrupt { .. }

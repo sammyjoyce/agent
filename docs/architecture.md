@@ -278,6 +278,45 @@ Closing a whole session is different: positive native absence fences its old
 actor before a replacement session is bound to the same task on the same
 online host. Failed inspection and offline machines never prove closure.
 
+`beep-boop tasks graph` prints one snapshot of Pi's live tasks: generations,
+tool calls and background timers, each with its state and the task that owns
+it. The runtime reads `harness.taskGraph()` once and labels each conversation
+as main, a task, a child agent or neither. A tool call takes its name from the
+conversation's live document. Native work nests under its native owner. A child
+agent prints under its task, and that edge comes from the task record, because
+Pi does not own delegate or agent conversations. An actor appears only while
+it has live work, or while it is the task of a working agent, so `tasks list`
+and `tasks read` remain the record of what exists. A snapshot holds at most
+500 tasks, shallow work first, and reports how many it left out. A snapshot
+larger than 1 MiB fails that request. `--json` prints the typed event. A live
+watch, the TUI and the phone do not show the graph yet.
+
+Delegate and child-agent conversations stay ownerless in Pi. Two prototypes ran
+against `runtime/test/delegate-lifetime.test.ts`, which drives the real
+`delegate_task` and `spawn_agent` tools on SQLite storage. Ownership by the
+spawning tool call fails three of its four tests. Main is not idle until its
+delegate is. An interrupt of main aborts the delegate's turn. After a
+coordinator kill during `delegate_task`, the delegate's next turn does not
+complete. Ownership by a background anchor task in the parent conversation
+passes all four, and is still not adopted. As prototyped, each delegate and
+agent holds one sleeping native task for as long as it exists. Pi fixes a
+conversation's owner at creation, so saved conversations could never join. An
+abort of main that includes background work, which nothing issues today, would
+end every anchor. In return the anchor gives only a native edge that the graph
+already draws from task records. Revisit the anchor when a feature needs Pi to
+own that edge: one stop that reaches a task's delegates, or a durable native
+wait in place of `wait_agents` polling. Its abort handler must then leave Rex
+sessions and remote-host allocations to their existing fencing, and the
+lifetime tests must stay green.
+
+No flow creates a Pi fork. Continued work reuses its saved conversation. A
+child agent starts a new conversation with a bounded assignment, not a copy of
+its parent's history. Imported Codex fork relationships are kept as metadata. A
+fork has no task record, outcome, allocation or Rex binding, so it cannot run
+as a worker. Add forks when a flow must continue from an earlier entry while
+the original stays unchanged, such as a second attempt at the same request, and
+decide then which task and terminal the fork gets.
+
 ## Sources and follow-through
 
 ```text
