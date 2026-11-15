@@ -685,10 +685,10 @@ final class ChatModel {
   /// Tells lane `id`'s session to connect or disconnect, as `demand` wants it, and returns once
   /// it has been told. Until the model ends, nothing else in it connects or disconnects a lane's
   /// session. A lane has one call in flight at a time, so two never overlap on one session. A
-  /// caller that waited for one reads `demand` and the lane again, and every change to either is
-  /// followed by a `reconcile`, so the lane ends at the latest of both. A session already told
-  /// what `demand` wants is left alone, because `connect` redials a connected session and would
-  /// cut the requests in flight on it.
+  /// caller that waited for one reads `demand` and the lane again, so a change made while a call
+  /// was in flight is acted on by the `reconcile` that follows it. A session already told what
+  /// `demand` wants is left alone, because `connect` redials a connected session and would cut
+  /// the requests in flight on it.
   func reconcile(_ id: ProfileID) async {
     while let call = lifecycles[id]?.inFlight { await call.value }
     guard pendingCall(id) != nil else { return }
