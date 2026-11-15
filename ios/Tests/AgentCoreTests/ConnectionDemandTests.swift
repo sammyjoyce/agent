@@ -208,6 +208,8 @@ private func observeCount(_ fixture: FixtureCoordinator) async -> Int {
   }
 }
 
+// MARK: - A lease reads the session, not what the main actor last copied from it
+
 extension CoordinatorSession {
   /// Occupies this session's actor until `released`, so a lifecycle call on it waits its turn, as
   /// one does behind a busy session.
@@ -291,6 +293,8 @@ func aLeaseWaitsForTheSessionWhenTheMainActorsCopyStillSaysConnected() async thr
     #expect(read.observes == observes + 1, "The body ran after Work's new observation")
   }
 }
+
+// MARK: - One loop per lane makes its lifecycle calls, and no redial cuts a held connection
 
 /// The scene leaves while Work's session is busy, and a lease is taken on Work before that
 /// disconnect lands. The lane's loop ends at the latest demand, so Work is dialed again for the
@@ -437,6 +441,8 @@ func aLeaseDroppedWhileItsLaneIsRedialedReturnsOnceTheLaneIsClosed() async throw
     #expect(await sessionConnection(chat, work) == .disconnected)
   }
 }
+
+// MARK: - A lease that cannot connect in time never runs its body
 
 @MainActor @Test(.timeLimit(.minutes(1)))
 func aLeaseThatDoesNotConnectInTimeNamesItsCoordinatorAndNeverRunsItsBody() async throws {
