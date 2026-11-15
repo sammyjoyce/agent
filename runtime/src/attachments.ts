@@ -2,13 +2,13 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { InputEntry, UserInput } from "@earendil-works/pi-durable";
-import { DEFAULT_IMAGE_LIMITS, type ImageProcessor } from "@earendil-works/pi-durable/tools";
-import { createNodePhotonImages } from "@earendil-works/pi-durable/images/node";
+import { DEFAULT_IMAGE_LIMITS } from "@earendil-works/pi-durable/tools";
 import type { InputOrigin } from "./generated/InputOrigin.js";
 import type { AttachmentRef } from "./generated/AttachmentRef.js";
 import type { AttachmentRequest } from "./generated/AttachmentRequest.js";
 import type { AttachmentResponse } from "./generated/AttachmentResponse.js";
 import type { HostCall } from "./tasks.js";
+import { prepareImage } from "./images.js";
 
 import { MAX_ATTACHMENT_BYTES, ATTACHMENT_CHUNK_BYTES, MAX_ATTACHMENTS, MAX_ATTACHMENT_NAME_BYTES, ATTACHMENT_STAGING_MILLIS } from "./generated/attachment-limits.js";
 export class AttachmentError extends Error {}
@@ -43,7 +43,6 @@ function same(left: AttachmentRef, right: AttachmentRef): boolean {
 export class AttachmentStore {
   private readonly directory: string;
   private serial: Promise<void> = Promise.resolve();
-  private images?: Promise<ImageProcessor>;
   constructor(state: string) { this.directory = join(state, "attachments"); }
   private folder(id: string): string { requireId(id); return join(this.directory, id); }
   private async metadata(id: string): Promise<Metadata> {
@@ -212,8 +211,7 @@ export class AttachmentStore {
       const path = await this.materialize(ref, call);
       content.push({ type: "text", text: `Attached file ${JSON.stringify(ref.name)} (attachment ID ${ref.id}, SHA-256 ${ref.sha256}): ${JSON.stringify(path)} on this execution host. If the cache path expires, use read_attachment with this attachment ID.` });
       if (ref.media_type.startsWith("image/")) {
-        this.images ??= createNodePhotonImages({ idleMs: 1000 });
-        const prepared = await (await this.images).prepare(await readFile(join(this.folder(ref.id), "content")), ref.media_type, DEFAULT_IMAGE_LIMITS);
+        const prepared = await prepareImage(await readFile(join(this.folder(ref.id), "content")), ref.media_type, DEFAULT_IMAGE_LIMITS);
         if (prepared === undefined) {
           if (["image/png", "image/jpeg", "image/gif", "image/webp"].includes(ref.media_type)) throw new AttachmentError("This image could not be prepared for the model; convert it to PNG or JPEG");
           content.push({ type: "text", text: `The original ${ref.media_type} file is available at the attachment path above; native image conversion was unavailable. Use file tools to inspect or convert the original.` });
