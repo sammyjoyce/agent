@@ -198,3 +198,89 @@ private func observeCount(_ fixture: FixtureCoordinator) async -> Int {
     }
   }
 }
+
+// MARK: - A lease reads the session, not what the main actor last copied from it
+
+extension CoordinatorSession {
+  /// Occupies this session's actor until `released`, so a lifecycle call on it waits its turn, as
+  /// one does behind a busy session.
+  fileprivate func occupy(
+    entered: AsyncStream<Void>.Continuation, until released: DispatchSemaphore
+  ) {
+    entered.finish()
+    released.wait()
+  }
+}
+
+/// Runs `work` off the main actor while the main thread is blocked, so nothing queued for the
+/// main actor runs before the caller's next line. False if `work` took longer than `limit`.
+@MainActor private func holdingTheMainActor(
+  for limit: DispatchTimeInterval = .seconds(10), _ work: @escaping @Sendable () async -> Void
+) -> Bool {
+  let finished = DispatchSemaphore(value: 0)
+  Task.detached {
+    await work()
+    finished.signal()
+  }
+  return finished.wait(timeout: .now() + limit) == .success
+}
+
+/// The scene's activation is held on Work, the first lane, when an intent takes a lease on
+/// Personal. Personal is dialed for the lease without waiting for the activation to reach it.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aLeaseTakenWhileTheSceneActivatesAnotherLaneDialsItsOwn() async throws {
+  try await withBackgroundedPair { coordinators, work, personal, _, personalPeer in
+    let chat = coordinators.chat
+    await personalPeer.advertiseWorkInspection(true)
+    let workSession = try #require(chat.lanes.first { $0.id == work }?.session)
+    let (entered, enter) = AsyncStream<Void>.makeStream()
+    let barrier = DispatchSemaphore(value: 0)
+    let occupied = Task.detached { await workSession.occupy(entered: enter, until: barrier) }
+    for await _ in entered {}
+    let activating = Task { @MainActor in await coordinators.setActive(true) }
+    try await until("the activation started") { chat.demand.sceneActive }
+    let observes = await observeCount(personalPeer)
+    let read: Result<NativeJobStatus, any Error>
+    do {
+      read = .success(
+        try await coordinators.withConnection(to: personal) {
+          try await chat.jobs(lane: personal)
+        })
+    } catch { read = .failure(error) }
+    let dialed = await observeCount(personalPeer) - observes
+    barrier.signal()
+    await occupied.value
+    await activating.value
+    #expect(dialed == 1, "The lease dialed Personal while the activation was still on Work")
+    #expect(try read.get() == .list(.init(jobs: [])), "Personal answered the job read")
+    try await until("both lanes connected for the scene") {
+      connection(chat, work) == .connected && connection(chat, personal) == .connected
+    }
+    #expect(await observeCount(personalPeer) == observes + 1, "The activation never redialed it")
+  }
+}
+
+/// Work's observation ends while the main actor is busy, so the main actor's copy still says
+/// connected when the lease is taken. The body runs only once the session reconnected.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aLeaseWaitsForTheSessionWhenTheMainActorsCopyStillSaysConnected() async throws {
+  try await withTwoFixtures { coordinators, workPeer, _, _ in
+    await workPeer.advertiseWorkInspection(true)
+    let (work, _) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let session = try #require(chat.lanes.first { $0.id == work }?.session)
+    let observes = await observeCount(workPeer)
+    let reconnecting = holdingTheMainActor {
+      try? await workPeer.emitOnObserver(.done)
+      // The session refuses a job read once it is no longer connected.
+      while (try? await session.jobs()) != nil {}
+    }
+    #expect(reconnecting, "Work's session left connected")
+    #expect(connection(chat, work) == .connected, "The main actor's copy is stale")
+    let read = try await coordinators.withConnection(to: work) {
+      (jobs: try await chat.jobs(lane: work), observes: await observeCount(workPeer))
+    }
+    #expect(read.jobs == .list(.init(jobs: [])), "Work answered the job read")
+    #expect(read.observes == observes + 1, "The body ran after Work's new observation")
+  }
+}
