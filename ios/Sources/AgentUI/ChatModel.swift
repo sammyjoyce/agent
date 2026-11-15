@@ -761,7 +761,7 @@ final class ChatModel {
   /// not connected. A lane nothing wants connected stays down.
   func reconnect(_ id: ProfileID? = nil) async {
     for lane in lanes.map(\.id) where id == lane || (id == nil && !connected(lane)) {
-      guard demand.wants(lane) else { continue }
+      guard demand.wants(lane), paired(lane) else { continue }
       lifecycles[lane, default: Lifecycle()].restart = true
       await reconcile(lane)
     }
