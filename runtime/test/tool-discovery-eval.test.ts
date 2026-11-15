@@ -24,15 +24,7 @@ import { DEFAULT_MODEL } from "../src/models.js";
 import type { ToolRole } from "../src/toolsets.js";
 import { declarationSize, DISCOVERY_ARMS, isDiscoveryArmName, openDiscoveryApp, type DiscoveryApp, type DiscoveryArmName } from "./fixtures/tool-discovery.js";
 
-// Opt in with an OpenAI-compatible Responses provider:
-// AGENT_TOOL_DISCOVERY_EVAL=1 OPENAI_API_KEY=... [OPENAI_BASE_URL=...] \
-//   [AGENT_TOOL_DISCOVERY_ARMS=direct,search-browser] [AGENT_TOOL_DISCOVERY_TRIALS=3] \
-//   [AGENT_TOOL_DISCOVERY_REASONING=low] [AGENT_TOOL_DISCOVERY_SCENARIOS=task-status,...] \
-//   [AGENT_TOOL_DISCOVERY_CONCURRENCY=4] [AGENT_TOOL_DISCOVERY_OUT=/path/outside/the/tree.jsonl] \
-//   [AGENT_TOOL_DISCOVERY_KEEP_FAILURES=1] \
-//   node --test dist/test/tool-discovery-eval.test.js
-// Every scenario uses invented data, a private SQLite file and a temporary workspace. The host refuses
-// every operation with an external effect; the provider's hosted web search stays on as in production.
+// Opt-in live eval against a real provider. docs/performance.md#tool-discovery lists its variables.
 const enabled = process.env.AGENT_TOOL_DISCOVERY_EVAL === "1";
 
 type ProviderRequest = {
