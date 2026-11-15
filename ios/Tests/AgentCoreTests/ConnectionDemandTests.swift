@@ -593,3 +593,241 @@ func aLeaseWhoseLaneReadsConnectedAfterTheDeadlineNeverRunsItsBody() async throw
   #expect(!chat.demand.leased(work.id) && !chat.demand.leased(personal.id))
   #expect(await session.connectionState == .disconnected, "Nothing was dialed")
 }
+
+// MARK: - A session whose saved outbox cannot be read starts no connection
+
+/// What a session says when its saved outbox cannot be read.
+let outboxCouldNotBeRead =
+  "The saved outbox could not be read. It was preserved; no messages were replayed."
+
+/// A saved outbox that its session cannot load.
+enum SpoiledOutbox: CaseIterable, Sendable {
+  /// An empty outbox without read permission.
+  case unreadable
+  /// Bytes that are no outbox.
+  case undecodable
+
+  func write(to outbox: URL) throws {
+    try FileManager.default.createDirectory(
+      at: outbox.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try Data((self == .unreadable ? "[]" : "not an outbox").utf8).write(to: outbox)
+    guard self == .unreadable else { return }
+    try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: outbox.path)
+    try #require(
+      (try? Data(contentsOf: outbox)) == nil, "This user reads a file without permission")
+  }
+
+  /// Leaves an empty outbox that can be read.
+  static func repair(_ outbox: URL) throws {
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: outbox.path)
+    try Data("[]".utf8).write(to: outbox)
+  }
+}
+
+/// Work and Personal, saved by one launch and then loaded by a second launch on the same folder
+/// that no scene has activated, as when the system starts the app for an intent. The second
+/// launch's sessions have never connected, so each reads its outbox when it is first told to
+/// connect.
+@MainActor func withBackgroundLaunch(
+  _ body: (Coordinators, ProfileID, ProfileID, FixtureCoordinator, FixtureCoordinator) async throws
+    -> Void
+) async throws {
+  let workPeer = FixtureCoordinator()
+  let personalPeer = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(workPeer)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personalPeer)
+  defer { personalListener.cancel() }
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "launch-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let launch = {
+    Coordinators(
+      registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+      transport: CoordinatorTransport { address in
+        LineConnection(
+          connection: NWConnection(
+            to: address.port == 4002 ? personalPort : workPort, using: .tcp))
+      })
+  }
+  let first = launch()
+  try await first.add(
+    name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4001))
+  try await first.add(
+    name: TagName("Personal"), address: CoordinatorAddress(host: "100.64.1.2", port: 4002))
+  let coordinators = launch()
+  let outcome: Result<Void, any Error>
+  do {
+    try await body(
+      coordinators, coordinators.profiles[0].id, coordinators.profiles[1].id, workPeer,
+      personalPeer)
+    outcome = .success(())
+  } catch { outcome = .failure(error) }
+  await coordinators.setActive(false)
+  await workPeer.stop()
+  await personalPeer.stop()
+  try outcome.get()
+}
+
+@MainActor private func outbox(_ chat: ChatModel, _ id: ProfileID) throws -> URL {
+  try #require(chat.lanes.first { $0.id == id }?.session).outboxURL
+}
+
+private let inspected = SavedConversation(
+  conversationId: "example-conversation", taskId: "example-task", title: "Example review")
+
+private func inspectCount(_ fixture: FixtureCoordinator) async -> Int {
+  await fixture.received().filter { if case .inspect = $0 { true } else { false } }.count
+}
+
+@MainActor @Test(.timeLimit(.minutes(2)), arguments: SpoiledOutbox.allCases)
+func aLeaseOnASessionWhoseOutboxCannotBeReadSaysSoAtOnceAndDialsNothing(_ spoiled: SpoiledOutbox)
+  async throws
+{
+  try await withBackgroundLaunch { coordinators, work, _, workPeer, _ in
+    let chat = coordinators.chat
+    try spoiled.write(to: outbox(chat, work))
+    let requests = await workPeer.received().count
+    let entries = Entries()
+    let started = ContinuousClock.now
+    let thrown = await #expect(throws: (any Error).self) {
+      try await coordinators.withConnection(to: work, within: .seconds(30)) { entries.count += 1 }
+    }
+    #expect(ContinuousClock.now - started < .seconds(10), "The lease ended well inside its limit")
+    #expect(thrown as? LaneError != .unanswered("Work"))
+    #expect(thrown?.localizedDescription == "Work: \(outboxCouldNotBeRead)")
+    #expect(entries.count == 0, "The body never ran")
+    #expect(!chat.demand.leased(work), "The lease was dropped")
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(await workPeer.received().count == requests, "Nothing was dialed")
+  }
+}
+
+/// The reason is known as soon as the session has declined, so it is given even when the limit
+/// has already passed.
+@MainActor @Test func aLeaseWithNoTimeLeftStillSaysThatItsOutboxCannotBeRead() async throws {
+  try await withBackgroundLaunch { coordinators, work, _, _, _ in
+    try SpoiledOutbox.unreadable.write(to: outbox(coordinators.chat, work))
+    let thrown = await #expect(throws: (any Error).self) {
+      try await coordinators.withConnection(to: work, within: .zero) {}
+    }
+    #expect(thrown?.localizedDescription == "Work: \(outboxCouldNotBeRead)")
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(2)), arguments: [false, true])
+func onceTheOutboxCanBeReadTheNextLeaseConnectsAndRunsItsBody(sceneActive: Bool) async throws {
+  try await withBackgroundLaunch { coordinators, work, _, workPeer, _ in
+    let chat = coordinators.chat
+    try SpoiledOutbox.unreadable.write(to: outbox(chat, work))
+    if sceneActive { await coordinators.setActive(true) }
+    await #expect(throws: (any Error).self) {
+      try await coordinators.withConnection(to: work, within: .seconds(30)) {}
+    }
+    #expect(await observeCount(workPeer) == 0, "Work was not dialed with its outbox unreadable")
+    try SpoiledOutbox.repair(outbox(chat, work))
+    let during = try await coordinators.withConnection(to: work, within: .seconds(30)) {
+      await sessionConnection(chat, work)
+    }
+    #expect(during == .connected, "The body ran on a connected lane")
+    #expect(await observeCount(workPeer) == 1, "The lease dialed Work once")
+    try await until("Work as the scene wants it once the lease dropped") {
+      await sessionConnection(chat, work) == (sceneActive ? .connected : .disconnected)
+    }
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(await observeCount(workPeer) == 1, "Nothing redialed Work")
+  }
+}
+
+/// The scene becomes active while a lease on Work is failing on the outbox, or just after it
+/// failed. Work is connected for the scene as soon as its outbox can be read.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func anActivationDuringALeaseThatFailsOnTheOutboxConnectsTheLane() async throws {
+  try await withBackgroundLaunch { coordinators, work, _, workPeer, _ in
+    let chat = coordinators.chat
+    try SpoiledOutbox.unreadable.write(to: outbox(chat, work))
+    let leasing = Task { @MainActor in
+      try await coordinators.withConnection(to: work, within: .seconds(5)) {}
+    }
+    defer { leasing.cancel() }
+    try await until("Work's session read its outbox") {
+      chat.snapshots[work]?.error == outboxCouldNotBeRead
+    }
+    try SpoiledOutbox.repair(outbox(chat, work))
+    await coordinators.setActive(true)
+    try await until("Work connected for the scene") { connection(chat, work) == .connected }
+    _ = try? await leasing.value
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(connection(chat, work) == .connected, "Work stayed connected once the lease ended")
+    #expect(await observeCount(workPeer) == 1, "Work was dialed once")
+  }
+}
+
+/// A session tells each inspection it minted to connect before its own `connect` returns, also
+/// when its outbox cannot be read. Occupying an inspection of Work therefore holds Work's connect
+/// after it has read the outbox. While it is held, the scene leaves and returns and the outbox
+/// becomes readable. The lane's loop ends at the connect that started nothing, and a scene change
+/// that waited for it still tells Work to connect.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aSceneThatLeavesAndReturnsWhileAConnectFailsOnTheOutboxConnectsTheLane() async throws {
+  try await withBackgroundLaunch { coordinators, work, _, workPeer, _ in
+    let chat = coordinators.chat
+    let session = try #require(chat.lanes.first { $0.id == work }?.session)
+    try SpoiledOutbox.unreadable.write(to: session.outboxURL)
+    await workPeer.replyToHistory(initial: .init(messages: [], pageComplete: true), pages: [:])
+    let inspector = try #require(await session.inspector(inspected))
+    let (entered, enter) = AsyncStream<Void>.makeStream()
+    let barrier = DispatchSemaphore(value: 0)
+    defer { barrier.signal() }
+    let occupied = Task.detached { await inspector.occupy(entered: enter, until: barrier) }
+    for await _ in entered {}
+    let activating = Task { @MainActor in await coordinators.setActive(true) }
+    try await until("Work's connect read its outbox") {
+      chat.snapshots[work]?.error == outboxCouldNotBeRead
+    }
+    let leaving = Task { @MainActor in await coordinators.setActive(false) }
+    try await until("the scene left") { !chat.demand.sceneActive }
+    let returning = Task { @MainActor in await coordinators.setActive(true) }
+    try await until("the scene returned") { chat.demand.sceneActive }
+    try SpoiledOutbox.repair(session.outboxURL)
+    barrier.signal()
+    await occupied.value
+    for change in [activating, leaving, returning] { await change.value }
+    try await until("Work connected for the scene") { connection(chat, work) == .connected }
+    #expect(await observeCount(workPeer) == 1, "Work was dialed once")
+  }
+}
+
+/// An inspection is told to connect whenever the session that minted it is, also when that
+/// session's outbox cannot be read. The inspections that reach Work's peer therefore count how
+/// often Work's session was told to connect. Each step waits for its inspection, since a connect
+/// that follows another at once cuts the first one's dial.
+@MainActor @Test(.timeLimit(.minutes(2)))
+func aSessionWhoseOutboxCannotBeReadIsToldToConnectOncePerDemandAndNeverInALoop() async throws {
+  try await withBackgroundLaunch { coordinators, work, _, workPeer, _ in
+    let chat = coordinators.chat
+    let session = try #require(chat.lanes.first { $0.id == work }?.session)
+    try SpoiledOutbox.undecodable.write(to: session.outboxURL)
+    await workPeer.replyToHistory(initial: .init(messages: [], pageComplete: true), pages: [:])
+    let inspector = try #require(await session.inspector(inspected))
+    let returned = Entries()
+    Task { @MainActor in
+      await coordinators.setActive(true)
+      returned.count += 1
+    }
+    try await until("the activation returned") { returned.count == 1 }
+    try await until("one connect for the activation") { await inspectCount(workPeer) == 1 }
+    await coordinators.setActive(true)
+    try await until("one more for a second activation") { await inspectCount(workPeer) == 2 }
+    await chat.reconnect(work)
+    try await until("one more for Try again") { await inspectCount(workPeer) == 3 }
+    await chat.reconcile(work)
+    try await until("one more for a reconcile") { await inspectCount(workPeer) == 4 }
+    try await Task.sleep(for: .milliseconds(500))
+    #expect(await inspectCount(workPeer) == 4, "Nothing told Work again while demand stayed put")
+    #expect(await observeCount(workPeer) == 0, "Work itself was never dialed")
+    withExtendedLifetime(inspector) {}
+  }
+}

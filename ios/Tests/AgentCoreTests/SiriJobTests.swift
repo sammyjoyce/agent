@@ -251,6 +251,61 @@ struct SiriJobTests {
     }
   }
 
+  /// Personal's outbox cannot be read when the system starts the app for the query. Its failure is
+  /// not a silence, so it is reported under Personal's name, at once, and ahead of Work's silence.
+  @MainActor @Test(.timeLimit(.minutes(3)))
+  func anUnreadableOutboxIsReportedUnderItsCoordinatorsNameAheadOfASilence() async throws {
+    try await withBackgroundLaunch { coordinators, _, personal, workPeer, personalPeer in
+      for (peer, title) in [
+        (workPeer, "Work nightly deps"), (personalPeer, "Personal nightly deps"),
+      ] {
+        await peer.advertiseWorkInspection(true)
+        await peer.serveWork(
+          jobs: [nightlyDeps(title: title, lastRun: parked)], conversations: [], pageSize: 10)
+      }
+      let outbox = try #require(
+        coordinators.chat.lanes.first { $0.id == personal }?.session
+      ).outboxURL
+      try SpoiledOutbox.unreadable.write(to: outbox)
+      let started = ContinuousClock.now
+      let jobs = try await JobQuery.allJobs(in: coordinators, within: .seconds(30))
+      #expect(jobs.map(\.title) == ["Work nightly deps"], "Work still answers")
+      #expect(ContinuousClock.now - started < .seconds(10), "Personal did not use up its limit")
+      let id = ScopedEntityID(profile: personal, item: "nightly:deps")
+      let picked = await #expect(throws: (any Error).self) {
+        try await JobQuery.jobs(identifiedBy: [id], in: coordinators, within: .seconds(30))
+      }
+      #expect(picked is any CustomLocalizedStringResourceConvertible, "Siri can say it")
+      #expect(!(picked is CoordinatorDidNotAnswer))
+      #expect(shown(picked) == "Personal: \(outboxCouldNotBeRead)")
+      await workPeer.leaveObserveUnanswered(.silent)
+      let listed = await #expect(throws: (any Error).self) {
+        try await JobQuery.allJobs(in: coordinators, within: .milliseconds(300))
+      }
+      #expect(shown(listed) == "Personal: \(outboxCouldNotBeRead)", "Ahead of Work's silence")
+      #expect(await jobReads(personalPeer) == 0, "Personal was never asked")
+    }
+  }
+
+  /// The retry intent maps no error, so it reports the lease's own.
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func aRetryOnACoordinatorWhoseOutboxCannotBeReadSaysSoAndSendsNothing() async throws {
+    try await withBackgroundLaunch { coordinators, _, personal, _, personalPeer in
+      let outbox = try #require(
+        coordinators.chat.lanes.first { $0.id == personal }?.session
+      ).outboxURL
+      try SpoiledOutbox.undecodable.write(to: outbox)
+      let job = JobEntity(
+        nightlyDeps(title: "Personal nightly deps", lastRun: parked), on: personal,
+        coordinator: "Personal")
+      let refused = await #expect(throws: (any Error).self) {
+        try await RetryInterruptedRunIntent.retry(job, in: coordinators)
+      }
+      #expect(refused?.localizedDescription == "Personal: \(outboxCouldNotBeRead)")
+      #expect(await personalPeer.retryRequests().isEmpty)
+    }
+  }
+
   /// The retry is on the wire when the intent is cancelled. The session cuts the request, and the
   /// intent reports the cancellation, not a coordinator that went away.
   @MainActor @Test(.timeLimit(.minutes(1)))
