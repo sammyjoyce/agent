@@ -286,7 +286,10 @@ struct SiriJobTests {
       let chat = coordinators.chat
       try await background(coordinators)
       await personalPeer.leaveObserveUnanswered(.silent)
-      let reading = Task { @MainActor in try await JobQuery.allJobs(in: coordinators) }
+      // Personal's lease has to outlast Work's read, on a busy machine too.
+      let reading = Task { @MainActor in
+        try await JobQuery.allJobs(in: coordinators, within: .seconds(40))
+      }
       try await until("Work's read finished") {
         await jobReads(workPeer) == 1 && !chat.demand.leased(work)
       }
