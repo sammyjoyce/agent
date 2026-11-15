@@ -326,9 +326,9 @@ final class ChatModel {
   @ObservationIgnored private(set) var demand = ConnectionDemand()
   /// One lane's connection lifecycle, as `reconcile` drives it.
   private struct Lifecycle {
-    /// What the lane's session was last told, kept with that session, so a session attached in
-    /// its place has been told nothing.
-    var told: (session: CoordinatorSession, connect: Bool)?
+    /// Whether the lane's session was last told to connect, and nil until it is told anything.
+    /// `attach` clears it, since a new session has been told nothing.
+    var toldToConnect: Bool?
     /// The one task that makes lifecycle calls on the lane.
     var loop: Task<Void, Never>?
     /// "Try again" asked for one redial.
@@ -635,6 +635,7 @@ final class ChatModel {
     if let session = lane.session {
       snapshots[lane.id] = nil
       laneEpochs[lane.id, default: 0] += 1
+      lifecycles[lane.id]?.toldToConnect = nil
       refresh()
       observations[lane.id] = observe(session, lane: lane.id)
       if let inputs = unstaging.removeValue(forKey: lane.id) {
@@ -651,7 +652,6 @@ final class ChatModel {
       laneEpochs[id, default: 0] += 1
     }
     let cancelled = await lanes.first { $0.id == id }?.session?.retire() ?? []
-    lifecycles[id]?.told = nil
     if let index = lanes.firstIndex(where: { $0.id == id }) {
       let lane = lanes.remove(at: index)
       observations.removeValue(forKey: id)?.cancel()
@@ -691,7 +691,7 @@ final class ChatModel {
   /// Reads `demand` and the lane again after every call, so it ends at the latest of both.
   private func converge(_ id: ProfileID) async {
     while let call = pendingCall(id) {
-      lifecycles[id, default: Lifecycle()].told = call
+      lifecycles[id, default: Lifecycle()].toldToConnect = call.connect
       lifecycles[id]?.restart = false
       if call.connect { await call.session.connect() } else { await call.session.disconnect() }
     }
@@ -704,9 +704,8 @@ final class ChatModel {
     guard let session = lanes.first(where: { $0.id == id })?.session else { return nil }
     let wanted = demand.wants(id)
     let lifecycle = lifecycles[id]
-    let told = lifecycle?.told.flatMap { $0.session === session ? $0.connect : nil }
     let restart = wanted && lifecycle?.restart == true
-    return told != wanted || restart ? (session, wanted) : nil
+    return lifecycle?.toldToConnect != wanted || restart ? (session, wanted) : nil
   }
 
   /// Holds lane `id` connected while `body` runs, whatever the scene is doing. The lane is dialed
@@ -736,18 +735,17 @@ final class ChatModel {
     return try outcome.get()
   }
 
-  /// Returns once lane `id`'s session reports connected with no lifecycle call on the lane in
-  /// flight. It asks the session, because `snapshots` is a copy that trails it.
+  /// Returns once lane `id`'s session reports connected. It asks the session, because `snapshots`
+  /// is a copy that trails it.
   private func awaitConnection(_ id: ProfileID, until deadline: ContinuousClock.Instant)
     async throws
   {
     while true {
-      let session = try session(on: id)
-      let connected = await session.connectionState == .connected
+      let connected = try await session(on: id).connectionState == .connected
       // Checked after the last await before the body, so a cancelled or late caller never runs it.
       try Task.checkCancellation()
       guard ContinuousClock.now < deadline else { throw LaneError.unanswered(name(id)) }
-      if connected, lifecycles[id]?.loop == nil, try self.session(on: id) === session { return }
+      if connected { return }
       try await Task.sleep(for: .milliseconds(5))
     }
   }
