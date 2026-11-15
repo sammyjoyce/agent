@@ -1,16 +1,14 @@
-//! A model-issued `read_file` of an image reaches the next model request as a
-//! native image. The real Pi runtime, Rust broker and host executor run; only
-//! the external model responses are synthetic, except in the ignored live test.
 #[path = "fixtures/fake_rex.rs"]
 mod fake_rex;
 
 use std::{
     fs,
+    hash::{BuildHasher, Hasher, RandomState},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use agent_cli::{
@@ -55,8 +53,7 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-/// An RGB PNG whose zlib stream uses stored deflate blocks.
-fn png(width: u32, height: u32, pixel: impl Fn(u32, u32) -> [u8; 3]) -> Vec<u8> {
+fn stored_png(width: u32, height: u32, pixel: impl Fn(u32, u32) -> [u8; 3]) -> Vec<u8> {
     let mut raw = Vec::new();
     for y in 0..height {
         raw.push(0);
@@ -93,13 +90,12 @@ fn png(width: u32, height: u32, pixel: impl Fn(u32, u32) -> [u8; 3]) -> Vec<u8> 
     bytes
 }
 
-/// A white seven-segment digit on a solid background, 240 pixels square.
 fn digit(value: usize, background: [u8; 3]) -> Vec<u8> {
     const SEGMENTS: [&str; 10] = [
         "abcdef", "bc", "abdeg", "abcdg", "bcfg", "acdfg", "acdefg", "abc", "abcdefg", "abcdfg",
     ];
     let lit = SEGMENTS[value];
-    png(240, 240, |x, y| {
+    stored_png(240, 240, |x, y| {
         let segment = |name: char, left: u32, top: u32, right: u32, bottom: u32| {
             lit.contains(name) && (left..right).contains(&x) && (top..bottom).contains(&y)
         };
@@ -152,8 +148,6 @@ async fn collect(mut call: RuntimeCall) -> Vec<RuntimeEventKind> {
     }
 }
 
-/// The real runtime and its background owner, which runs scheduled jobs
-/// through the real broker and this machine's host executor.
 struct Coordinator {
     runtime: Arc<Runtime>,
     background: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -276,7 +270,6 @@ impl Coordinator {
         .unwrap()
     }
 
-    /// The task's conversation once its summary satisfies `done`.
     async fn finished(
         &self,
         id: &TaskId,
@@ -329,8 +322,6 @@ impl Coordinator {
     }
 }
 
-/// Each `read_file` output in the last request recorded for `key`, by the
-/// file name the model asked for.
 fn outputs(requests: &Path, key: &str) -> Vec<(String, Value)> {
     let requests = fs::read_to_string(requests).unwrap();
     let body = requests
@@ -381,7 +372,6 @@ fn text(output: &Value) -> String {
     }
 }
 
-/// The one native image in a Responses tool output, with its PNG dimensions.
 fn image(output: &Value) -> (u32, u32) {
     let images: Vec<&str> = output
         .as_array()
@@ -426,9 +416,17 @@ fn refused_without_image(output: &Value) {
 async fn read_file_sends_host_images_natively_and_keeps_text_reads() {
     let directory = tempfile::tempdir().unwrap();
     let files = directory.path();
-    fs::write(files.join("digit.txt"), png(4, 4, |_, _| [200, 30, 30])).unwrap();
-    fs::write(files.join("wide.png"), png(2400, 8, |_, _| [20, 90, 200])).unwrap();
-    let screenshot = png(1700, 1700, |_, _| [240, 240, 236]);
+    fs::write(
+        files.join("digit.txt"),
+        stored_png(4, 4, |_, _| [200, 30, 30]),
+    )
+    .unwrap();
+    fs::write(
+        files.join("wide.png"),
+        stored_png(2400, 8, |_, _| [20, 90, 200]),
+    )
+    .unwrap();
+    let screenshot = stored_png(1700, 1700, |_, _| [240, 240, 236]);
     assert!(
         (8 * 1024 * 1024..12 * 1024 * 1024).contains(&screenshot.len()),
         "A screenshot-sized file spans several 1 MiB chunks"
@@ -560,8 +558,6 @@ async fn read_file_sends_host_images_natively_and_keeps_text_reads() {
     coordinator.close().await;
 }
 
-/// The coordinator side of one attached worker connection, standing in for
-/// the runtime: it sends direct host calls and reads the worker's replies.
 struct Attached {
     frames: FrameReader<BufReader<OwnedReadHalf>>,
     writer: OwnedWriteHalf,
@@ -608,8 +604,6 @@ impl Attached {
     }
 }
 
-/// An attached task worker or child agent answers the runtime's direct (not
-/// `on_node`) host calls with its own host executor.
 #[tokio::test]
 async fn an_attached_worker_serves_image_reads_from_its_own_host() {
     const TASK: &str = "77777777-7777-4777-8777-777777777777";
@@ -617,7 +611,7 @@ async fn an_attached_worker_serves_image_reads_from_its_own_host() {
     let directory = tempfile::tempdir().unwrap();
     let files = directory.path().to_owned();
     fs::set_permissions(&files, fs::Permissions::from_mode(0o700)).unwrap();
-    let image = png(1200, 1200, |x, y| {
+    let image = stored_png(1200, 1200, |x, y| {
         [
             u8::try_from(x % 256).unwrap(),
             u8::try_from(y % 256).unwrap(),
@@ -774,11 +768,8 @@ async fn an_attached_worker_serves_image_reads_from_its_own_host() {
     );
 }
 
-/// Run with `OPENAI_API_KEY` and `OPENAI_BASE_URL` set to an OpenAI-compatible
-/// Responses gateway. `AGENT_IMAGE_READ_PROOF` names a directory that keeps the
-/// answer and the request bodies with image data elided.
 #[tokio::test]
-#[ignore = "live model through OPENAI_BASE_URL"]
+#[ignore = "live model through OPENAI_BASE_URL; AGENT_IMAGE_READ_PROOF names a directory that keeps the evidence"]
 async fn live_model_reads_a_host_image_through_read_file() {
     assert!(
         std::env::var_os("OPENAI_API_KEY").is_some()
@@ -787,11 +778,7 @@ async fn live_model_reads_a_host_image_through_read_file() {
     );
     let directory = tempfile::tempdir().unwrap();
     let files = directory.path();
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos();
-    let seed = usize::try_from(seed).unwrap();
+    let seed = usize::try_from(RandomState::new().build_hasher().finish() % 30).unwrap();
     let colors = [
         ("red", [210, 40, 40]),
         ("green", [30, 150, 60]),
@@ -814,7 +801,8 @@ async fn live_model_reads_a_host_image_through_read_file() {
         sample.display()
     );
     let jobs = [job("live", &prompt, files, ModelSelection::default())];
-    let coordinator = Coordinator::open(files, "gateway-runtime.js", &environment, &jobs).await;
+    let coordinator =
+        Coordinator::open(files, "live-gateway-runtime.js", &environment, &jobs).await;
     let task = coordinator.run("live").await;
     let (_, answer) = coordinator
         .finished(&task, Duration::from_secs(300), |summary| {

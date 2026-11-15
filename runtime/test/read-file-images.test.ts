@@ -17,8 +17,7 @@ import { ConversationModels } from "../src/models.js";
 import { TaskStore } from "../src/tasks.js";
 import { createAppTools, Executions } from "../src/tools.js";
 
-/** An RGB PNG of one color whose pixels are stored, not compressed, so its size follows its area. */
-function png(width: number, height: number): Buffer {
+function storedPng(width: number, height: number): Buffer {
   const row = Buffer.concat([Buffer.of(0), Buffer.alloc(width * 3, 0x5a)]);
   const chunk = (kind: string, data: Buffer) => {
     const body = Buffer.concat([Buffer.from(kind, "ascii"), data]);
@@ -61,7 +60,7 @@ test("read_file prepares a host image within the model's limits and refuses one 
     { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
   registry.install(createAppTools(new TaskStore(session, new ConversationModels(models)), executions).host);
   const root = await session.root(BACKGROUND_CONTEXT, { agent: { model: { provider: "openai", modelId: "narrow" }, instructions: "Use invented fixtures." } });
-  const wide = png(1200, 400), fixture = host({ "/fixture/wide.png": wide, "/fixture/changing.png": wide }, new Set(["/fixture/changing.png"]));
+  const wide = storedPng(1200, 400), fixture = host({ "/fixture/wide.png": wide, "/fixture/changing.png": wide }, new Set(["/fixture/changing.png"]));
   const release = executions.bind(root.id.toString(), { cwd: "/fixture", hosts: [], call: fixture.call });
   const seen: Extract<Message, { role: "toolResult" }>[] = [];
   const read = (path: string) => fauxAssistantMessage(fauxToolCall("read_file", { path }), { stopReason: "toolUse" });

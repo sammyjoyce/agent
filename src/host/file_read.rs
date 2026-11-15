@@ -72,7 +72,6 @@ async fn text(mut file: fs::File, offset: u32, limit: u32) -> Result<HostResult>
     })
 }
 
-/// Only a regular file is checked, so reading its header consumes nothing.
 async fn recognize(file: &mut fs::File) -> Result<Option<ImageFile>> {
     let metadata = file.metadata().await?;
     if !metadata.is_file() {
@@ -87,7 +86,6 @@ async fn recognize(file: &mut fs::File) -> Result<Option<ImageFile>> {
     }))
 }
 
-/// Size and modification time catch a rewrite; device and inode catch a rename.
 fn stamp(metadata: &std::fs::Metadata) -> String {
     format!(
         "{}:{}:{}:{}.{:09}",
@@ -99,7 +97,6 @@ fn stamp(metadata: &std::fs::Metadata) -> String {
     )
 }
 
-/// Signatures only; Photon is the decoder that judges the rest.
 fn media_type(header: &[u8]) -> Option<ImageMediaType> {
     match header {
         [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', ..] => Some(ImageMediaType::Png),
@@ -126,17 +123,21 @@ fn media_type(header: &[u8]) -> Option<ImageMediaType> {
     }
 }
 
-/// A known DIB header size and one color plane, so text that starts with "BM" stays text.
+const BMP_CORE_HEADER_BYTES: u32 = 12;
+const BMP_INFO_HEADER_BYTES: std::ops::RangeInclusive<u32> = 40..=124;
+const BMP_CORE_PLANES_AT: usize = 22;
+const BMP_INFO_PLANES_AT: usize = 26;
+
 fn bmp_header(header: &[u8]) -> bool {
     let Some(&[a, b, c, d]) = header.get(14..18) else {
         return false;
     };
     let planes = match u32::from_le_bytes([a, b, c, d]) {
-        12 => 22,
-        40..=124 => 26,
+        BMP_CORE_HEADER_BYTES => BMP_CORE_PLANES_AT,
+        size if BMP_INFO_HEADER_BYTES.contains(&size) => BMP_INFO_PLANES_AT,
         _ => return false,
     };
-    header.len() >= 26 && header.get(planes..planes + 2) == Some(&[1, 0])
+    header.len() >= BMP_INFO_PLANES_AT && header.get(planes..planes + 2) == Some(&[1, 0])
 }
 
 async fn chunk(mut file: fs::File, seen: &ImageFile, at: u32) -> Result<HostResult> {
@@ -221,7 +222,6 @@ mod tests {
         }
     }
 
-    /// A PNG signature and IHDR header, then bytes that are not UTF-8.
     fn png_like(size: usize) -> Vec<u8> {
         let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
         bytes.extend((bytes.len()..size).map(|index| u8::try_from(index % 251).unwrap()));

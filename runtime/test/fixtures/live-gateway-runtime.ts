@@ -1,8 +1,6 @@
 import assert from "node:assert/strict";
 import { appendFileSync } from "node:fs";
 
-// Live evaluation only: the real bridge talks to a real OpenAI-compatible
-// Responses gateway. Request bodies are recorded with image data elided.
 const gateway = process.env.OPENAI_BASE_URL?.replace(/\/+$/, "");
 assert.ok(gateway, "Set OPENAI_BASE_URL to an OpenAI-compatible gateway");
 const upstream = globalThis.fetch;

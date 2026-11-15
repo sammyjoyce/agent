@@ -12,7 +12,6 @@ export type ReadFileCommand = Extract<HostCommand, { type: "read_file" }>;
 type ImageChunk = Extract<HostResult, { type: "image_chunk" }>;
 export type ImageInput = { readonly vision: boolean; readonly limits: ImageLimits };
 
-/** Shared by attachments and file reads, so the runtime runs one Photon worker. */
 let processor: Promise<ImageProcessor> | undefined;
 
 export async function prepareImage(bytes: Uint8Array, mimeType: string, limits: ImageLimits): Promise<PreparedImage | undefined> {
@@ -20,7 +19,6 @@ export async function prepareImage(bytes: Uint8Array, mimeType: string, limits: 
   return (await processor).prepare(bytes, mimeType, limits);
 }
 
-/** As upstream `read` resolves it: a model that cannot be resolved counts as one that takes images within the defaults. */
 export async function imageInput(api: Pick<ToolExecutionApi, "agent" | "models">, context: Context): Promise<ImageInput> {
   const ref = (await api.agent(context)).model;
   const model = ref === undefined ? undefined : api.models.getModel(ref.provider, ref.modelId);

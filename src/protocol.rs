@@ -1202,10 +1202,7 @@ pub enum HostCommand {
     },
 }
 
-/// 1 MiB is 1,398,104 bytes of base64: a third of a frame, and below the
-/// largest text reply (256 KiB of control bytes escaped as `\u00XX`).
 pub const IMAGE_CHUNK_BYTES: u32 = 1024 * 1024;
-/// Attachments and file reads feed the same Photon pool.
 pub const MAX_IMAGE_READ_BYTES: u32 = crate::attachments::MAX_ATTACHMENT_BYTES;
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
