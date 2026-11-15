@@ -169,3 +169,110 @@ verify bounded materialization and persistence, not machine-specific timings.
 Migration cost depends on record count as well as retained bytes. Qualify a
 consistent snapshot before activation and allow a maintenance window for the
 first open. Later starts read only the completion markers.
+
+## Tool discovery
+
+Each role offers every tool directly today. The first main request declares 30
+tools in about 14,900 characters of names, descriptions and schemas. Pi offers
+two ways to declare less. `tool_search` loads deferred tools when the model
+asks for them, and `codemode` lets the model call tools from a script. Either
+one helps only if it removes more tokens than its extra requests add.
+
+`runtime/test/fixtures/tool-discovery.ts` holds the candidate tool surfaces in
+one table, `DISCOVERY_ARMS`. Each arm maps a role to its deferred tools and to
+the tools that stay direct beside code mode. `direct` is production today.
+Every arm keeps `finish_without_reply`, `read_attachment` and `read_file`
+directly offered. `finish_without_reply` must be the main turn's own final
+call. A script receives only the text of a nested result from a tool without
+a structured output schema, and `read_attachment` returns images. `read_file`
+stays direct for the image reads that pull request 46 adds to it.
+
+`runtime/test/tool-discovery.test.ts` runs every arm on the real Harness with
+the faux provider. It checks these behaviors:
+
+- The tools each role offers, and each arm's declaration size against `direct`.
+- A tool loaded by `tool_search` stays offered after reopen and compaction.
+- A worker script cannot call the main-only `delegate_task` or record another
+  task, and a main script cannot finish the turn without a reply.
+- A main script gets the same task and job results as direct calls.
+- Reopening does not repeat a settled call or an interrupted call that is
+  unsafe to replay. An interrupted replay-safe call runs again.
+
+Scripts cannot call `record_task` yet. It attributes the saved outcome to the
+model's own tool call, and a nested call from a script has none, so the call
+fails with "Task outcome model provenance is unavailable". The suite pins this
+for a worker script.
+
+### Live eval
+
+`runtime/test/tool-discovery-eval.test.ts` runs nine invented scenarios against
+a real provider:
+
+| Scenario | Role | Passes when |
+| --- | --- | --- |
+| `direct-answer` | main | The answer contains 210, the minutes in 3.5 hours. |
+| `task-status` | main | The answer names the credit note a saved task waits for. |
+| `delegation` | main | A new release-notes task exists and a worker spawn was requested. |
+| `file-edit` | worker | One setting changed, the rest of the file is intact, and the task is resolved. |
+| `child-agent` | worker and agent | A child agent finished with a summary that mentions the certificate, and the parent resolved with evidence that mentions it. |
+| `browser-read` | main | The answer names the degraded component and its start time. |
+| `job-inspection` | main | The answer mentions Lumen Parts, purchase orders, and a weekly or Monday schedule. |
+| `source-triage` | triage | A credit-note mail links to its task and a newsletter is dismissed. |
+| `long-history` | main | The answer recalls a deposit reference from the second of 24 earlier turns. |
+
+Each unit opens a private SQLite file and a temporary workspace. The eval host
+returns invented guidance, reads, writes and edits files in that workspace,
+runs only `ls`, `cat`, `head`, `tail`, `wc`, `grep` and `pwd`, and serves one
+fixed status page to the browser tools. It returns a binding for a worker spawn
+without starting a worker and refuses every other host operation.
+Provider-hosted web search stays on, as in production. Main runs without the
+related-conversation context that the coordinator adds to live chats.
+
+To compare arms, set the provider and the arms, then run the eval:
+
+```sh
+AGENT_TOOL_DISCOVERY_EVAL=1 OPENAI_API_KEY=... OPENAI_BASE_URL=... \
+AGENT_TOOL_DISCOVERY_ARMS=direct,search-browser AGENT_TOOL_DISCOVERY_TRIALS=3 \
+AGENT_TOOL_DISCOVERY_REASONING=low AGENT_TOOL_DISCOVERY_OUT=/tmp/tool-discovery.jsonl \
+	nix develop .#ci --command node --test runtime/dist/test/tool-discovery-eval.test.js
+```
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `AGENT_TOOL_DISCOVERY_ARMS` | `direct` | Arms from `DISCOVERY_ARMS`, comma-separated. |
+| `AGENT_TOOL_DISCOVERY_TRIALS` | 3 | Trials per arm. The arm order reverses every other trial. |
+| `AGENT_TOOL_DISCOVERY_REASONING` | the product default | Reasoning level for `gpt-6.1-sol`. |
+| `AGENT_TOOL_DISCOVERY_SCENARIOS` | all | Scenario names, comma-separated. |
+| `AGENT_TOOL_DISCOVERY_CONCURRENCY` | 4 | Units that run at once. |
+| `AGENT_TOOL_DISCOVERY_TIMEOUT_SECONDS` | 600 | Limit for one unit. |
+| `AGENT_TOOL_DISCOVERY_OUT` | a file in the temp directory | JSONL output path. Keep it outside the repository. |
+| `AGENT_TOOL_DISCOVERY_KEEP_FAILURES` | off | Keep a failed unit's state directory and record its path. |
+
+A wrapper around the OpenAI provider records every logical request, including
+the requests of delegated child agents. Each JSONL row holds one scenario, arm
+and trial: success, requests, uncached input, cache reads, output, total
+tokens, the API-estimated cost, wall time, the tools the model called, and the
+estimated declaration size of the first request. For each arm, the eval prints
+the median suite total, the work count, and an error count. The error count is
+the number of units that threw or had a request end in a provider error.
+
+### Baseline
+
+Today's direct surfaces, `gpt-6.1-sol` at `low` reasoning, 8 trials of all nine
+scenarios in two runs on 2026-11-15:
+
+| Measure per suite | Median | Range |
+| --- | ---: | ---: |
+| Total tokens | 325,735 | 289,511 to 343,117 |
+| Provider requests | 39 | 35 to 41 |
+| Cache reads | 240,320 | 219,392 to 251,776 |
+| API-estimated cost | $0.215 | $0.165 to $0.250 |
+
+All 72 units passed their checks, and no unit threw or had a request end in a
+provider error. A request without tool calls costs about 7,700 tokens. About
+4,400 of those are the hosted web search tool, and about 3,700 are main's
+estimated tool declarations. Most of the suite total is the request count times
+that prefix, plus the conversation each request carries. The spread comes from
+the scenarios whose request counts vary: `child-agent` used 8 to 10 requests,
+`source-triage` 6 to 8, `task-status` 3 to 4 and `browser-read` 2 to 3. An arm
+needs a gap wider than this range to show a difference.

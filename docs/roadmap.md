@@ -213,7 +213,12 @@ recovery; [history](history.md) describes import and retrieval.
   cache hits and estimated cost for every chat, separately from subscription
   quota; keep estimates distinct from billed amounts. Native tests, review and
   live coordinator status readback pass.
-- [ ] Benchmark deferred tool discovery before adopting it for larger toolsets.
+- [x] Benchmark deferred tool discovery before adopting it for larger toolsets.
+  The [tool discovery eval](performance.md#tool-discovery) measures nine
+  scenarios across main, triage, worker and agent roles. Today's direct tools
+  use a median of 325,735 total tokens and 39 requests per suite at
+  `gpt-6.1-sol` low reasoning, with all 72 baseline units passing their
+  checks.
 
 ## Recovery
 

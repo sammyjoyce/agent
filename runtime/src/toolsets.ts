@@ -24,3 +24,10 @@ export function createToolsets({ guidance, tools, sourceTools, resourceTools, br
     agent: [guidance, tools.host, tools.agent, sourceTools.worker, resourceTools.worker, browserTools],
   };
 }
+
+export function withActorPolicies(toolsets: Toolsets, { responsePolicy, inputOrigins }: {
+  responsePolicy: Extension; inputOrigins: Extension;
+}): Toolsets {
+  return { ...toolsets, main: [...toolsets.main, responsePolicy, inputOrigins],
+    worker: [...toolsets.worker, inputOrigins], agent: [...toolsets.agent, inputOrigins] };
+}
