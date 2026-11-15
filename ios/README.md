@@ -428,12 +428,13 @@ in the app target, because a provider inside the package ships no phrase.
 
 **Retry Interrupted Run** retries a scheduled job whose last run paused after
 repeated interrupted restarts, the same rule the job screen's Recovery button
-uses. It asks to unlock the phone first. Its Job picker lists the jobs of every
-paired coordinator that answers, by title and coordinator, and leaves out the
-prompt, the working directory and the run output. A job that the action would
-retry reads Interrupted. The action reads the job again before it retries, and
-says that the job has no interrupted run when the run has recovered. It has no
-phrase. Add it in the Shortcuts app.
+uses. It declares `.requiresAuthentication`, the policy under which the system
+unlocks a locked phone before it runs the action. Its Job picker lists the jobs
+of every paired coordinator that answers, by title and coordinator, and leaves
+out the prompt, the working directory and the run output. A job that the action
+would retry reads Interrupted. The action reads the job again before it
+retries, and says that the job has no interrupted run when the run has
+recovered. It has no phrase. Add it in the Shortcuts app.
 
 An intent holds a coordinator connected with a lease, so the job action works
 with the app in the background. A leased coordinator stays connected whatever
@@ -451,7 +452,9 @@ lease, so neither reaches the app's saved coordinators. A Release build has no
 fixture. App Intents Testing runs an intent in the app and returns the
 intent's value. It returns no dialog and nothing about authentication, so a
 package test checks the retry's sentence, and the metadata check requires that
-the built app keeps the retry behind authentication and gives it no phrase.
+the built app keeps the retry behind authentication and gives it no phrase. No
+test shows the unlock itself. On a fresh simulator, which has no passcode, the
+retry ran with the lock screen showing.
 
 ## Validation
 
