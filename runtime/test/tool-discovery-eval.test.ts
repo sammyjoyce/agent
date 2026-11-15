@@ -23,9 +23,10 @@ import { MAIN_RESPONSE_INSTRUCTIONS } from "../src/main_response.js";
 import { DEFAULT_MODEL } from "../src/models.js";
 import type { ToolRole } from "../src/toolsets.js";
 import { declarationSize, DISCOVERY_ARMS, isDiscoveryArmName, openDiscoveryApp, type DiscoveryApp, type DiscoveryArmName } from "./fixtures/tool-discovery.js";
+import { statesExpiredCertificateCause } from "./fixtures/tool-discovery-oracle.js";
 
 type ProviderRequest = {
-  stop: string; input: number; cache_read: number; cache_write: number; output: number; reasoning: number; total: number;
+  context: string; tool_errors: number; stop: string; input: number; cache_read: number; cache_write: number; output: number; reasoning: number; total: number;
   cost_usd: number; duration_ms: number; declared_tokens: number; offered_tools: number; calls: string[];
 };
 type Verdict = { success: boolean; detail: string };
@@ -41,15 +42,17 @@ function meteredModels({ apiKey, baseUrl }: Provider, requests: Promise<Provider
     auth: { ...openai.auth, apiKey: { name: "Evaluation provider",
       resolve: async () => ({ auth: { apiKey, ...(baseUrl ? { baseUrl } : {}) }, source: "evaluation environment" }) } },
     streamSimple: (model, context, options) => {
-      const declared = declarationSize(context), started = performance.now();
+      const declared = declarationSize(context), started = performance.now(), sent = JSON.stringify(context.messages, (key, value: unknown) => key === "timestamp" ? undefined : value);
+      const round = context.messages.slice(context.messages.findLastIndex((message) => message.role === "assistant") + 1);
+      const toolErrors = round.filter((message) => message.role === "toolResult" && message.isError).length;
       const stream = openai.streamSimple(model, context, options);
-      requests.push(stream.result().then((message: AssistantMessage) => ({ stop: message.stopReason,
+      requests.push(stream.result().then((message: AssistantMessage) => ({ context: sent, tool_errors: message.stopReason === "error" ? 0 : toolErrors, stop: message.stopReason,
         input: message.usage.input, cache_read: message.usage.cacheRead, cache_write: message.usage.cacheWrite,
         output: message.usage.output, reasoning: message.usage.reasoning ?? 0, total: message.usage.totalTokens,
         cost_usd: message.usage.cost.total, duration_ms: Math.round(performance.now() - started),
         declared_tokens: declared.estimatedTokens, offered_tools: declared.tools.length,
         calls: message.content.flatMap((part) => part.type === "toolCall" ? [part.name] : []) }),
-      () => ({ stop: "error", input: 0, cache_read: 0, cache_write: 0, output: 0, reasoning: 0, total: 0, cost_usd: 0,
+      () => ({ context: sent, tool_errors: 0, stop: "error", input: 0, cache_read: 0, cache_write: 0, output: 0, reasoning: 0, total: 0, cost_usd: 0,
         duration_ms: Math.round(performance.now() - started), declared_tokens: declared.estimatedTokens, offered_tools: declared.tools.length, calls: [] })));
       return stream;
     } });
@@ -236,9 +239,9 @@ const scenarios: Scenario[] = [
       "Follow-up: add certificate expiry alerts.\n");
     const task = await runJobTask(world, "Summarize incident 0412", "Spawn one agent to read docs/incident-0412.md and report the root cause it states. " +
       "Wait for the agent's result, then record this task as resolved with that root cause as evidence. Do not read the file yourself.", "Start now.");
-    const agent = task.agents.find((candidate) => candidate.state.state === "done" && /certificate/iu.test(candidate.summary));
+    const agent = task.agents.find((candidate) => candidate.state.state === "done" && statesExpiredCertificateCause(candidate.summary));
     const evidence = task.state.state === "resolved" ? task.state.evidence : "";
-    return { success: agent !== undefined && /certificate/iu.test(evidence), detail: `agents=${task.agents.map((candidate) => candidate.state.state).join(",")}; state=${task.state.state}` };
+    return { success: agent !== undefined && statesExpiredCertificateCause(evidence), detail: `agents=${task.agents.map((candidate) => candidate.state.state).join(",")}; state=${task.state.state}` };
   } },
   { name: "browser-read", role: "main", async run(world) {
     const answer = await askMain(world, `Open ${STATUS_URL} in the browser and tell me which component is degraded and since when.`);
@@ -281,7 +284,7 @@ const scenarios: Scenario[] = [
 
 type UnitResult = {
   run_id: string; arm: DiscoveryArmName; trial: number; scenario: string; role: ToolRole; model: string; reasoning: string | null;
-  success: boolean; detail: string; error: string | null; kept: string | null; requests: number; provider_errors: number;
+  success: boolean; detail: string; error: string | null; kept: string | null; requests: number; provider_errors: number; retries: number; tool_errors: number;
   input: number; cache_read: number; cache_write: number; output: number; reasoning_tokens: number; total_tokens: number; cost_usd: number;
   wall_ms: number; first_declared_tokens: number | null; first_offered_tools: number | null; tool_calls: string[];
 };
@@ -308,10 +311,12 @@ async function runUnit(config: EvalConfig, arm: DiscoveryArmName, trial: number,
   const kept = keepFailures && !(error === null && verdict.success);
   if (!kept) await rm(directory, { recursive: true, force: true });
   const requests = await Promise.all(pending);
-  const sum = (field: keyof Omit<ProviderRequest, "stop" | "calls">) => requests.reduce((total, request) => total + request[field], 0);
+  const sum = (field: keyof Omit<ProviderRequest, "context" | "stop" | "calls">) => requests.reduce((total, request) => total + request[field], 0);
+  const retries = requests.filter((request, index) => request.stop === "error" &&
+    requests.slice(index + 1).some((later) => later.context === request.context)).length;
   return { run_id: runId, arm, trial, scenario: scenario.name, role: scenario.role, model: model.model_id, reasoning: model.reasoning,
     success: error === null && verdict.success, detail: verdict.detail || error || "", error, kept: kept ? directory : null, requests: requests.length,
-    provider_errors: requests.filter((request) => request.stop === "error").length,
+    provider_errors: requests.filter((request) => request.stop === "error").length, retries, tool_errors: sum("tool_errors"),
     input: sum("input"), cache_read: sum("cache_read"), cache_write: sum("cache_write"), output: sum("output"), reasoning_tokens: sum("reasoning"),
     total_tokens: sum("total"), cost_usd: Number(sum("cost_usd").toFixed(6)), wall_ms: wall,
     first_declared_tokens: requests[0]?.declared_tokens ?? null, first_offered_tools: requests[0]?.offered_tools ?? null,
@@ -377,7 +382,9 @@ test("live tool discovery eval measures tokens, requests and success per arm", {
     t.diagnostic(`${arm}: success ${perTrial.map((rows) => rows.filter((row) => row.success).length).join("/")} of ${chosen.length}; ` +
       `median suite total ${median(suite("total_tokens"))} tokens (trials ${suite("total_tokens").join(", ")}); median requests ${median(suite("requests"))}; ` +
       `median cached share ${(median(suite("cache_read")) / Math.max(1, median(suite("total_tokens")))).toFixed(3)}; median cost $${median(suite("cost_usd")).toFixed(4)}; ` +
-      `errors ${mine.filter((row) => row.error !== null || row.provider_errors > 0).length}; work ${mine.reduce((sum, row) => sum + row.requests, 0)} requests, ` +
+      `errors ${mine.filter((row) => row.error !== null || row.provider_errors > row.retries).length}; ` +
+      `recovered retries ${mine.reduce((sum, row) => sum + row.retries, 0)}; tool errors ${mine.reduce((sum, row) => sum + row.tool_errors, 0)}; ` +
+      `work ${mine.reduce((sum, row) => sum + row.requests, 0)} requests, ` +
       `${mine.reduce((sum, row) => sum + row.tool_calls.length, 0)} tool calls`);
     for (const scenario of chosen) {
       const rows = mine.filter((row) => row.scenario === scenario.name);
@@ -387,5 +394,11 @@ test("live tool discovery eval measures tokens, requests and success per arm", {
     }
   }
   assert.equal(results.length, units.length, "Every unit must report");
-  assert.ok(results.every((result) => result.requests > 0), "Every unit must reach the provider");
+  for (const unit of units) {
+    const result = results.find((row) => row.arm === unit.arm && row.trial === unit.trial && row.scenario === unit.scenario.name);
+    await t.test(`${unit.arm} t${unit.trial} ${unit.scenario.name}`, () => {
+      assert.ok(result !== undefined && result.requests > 0, "The unit reached the provider");
+      assert.ok(result.success, result.detail);
+    });
+  }
 });
