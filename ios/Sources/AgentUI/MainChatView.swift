@@ -478,9 +478,10 @@ public struct MainChatView: View {
       .defaultScrollAnchor(followsLatest ? .bottom : nil, for: .sizeChanges)
       .scrollPosition(
         id: Binding(
-          // Following the latest, code scrolls without updating this binding, so a row here would
-          // be out of date. Opening the picker reapplies it and would scroll back to that row.
-          get: { followsLatest ? nil : visibleItem },
+          // Keep the observed row binding stable when leaving the live tail. Switching from nil
+          // to an already-visible ID makes SwiftUI align that row's top, jumping across a tall
+          // message and stranding subsequent downward drags at the start of the transcript.
+          get: { visibleItem },
           set: { item in
             // Structural controls have no transcript row ID. Keep the real
             // reading anchor when a paging control temporarily leads.
@@ -508,6 +509,11 @@ public struct MainChatView: View {
           followsLatest = latestVisible
           if atTop { requestHistory() }
         }
+      }
+      .onChange(of: followsLatest && !userScrolling) { _, following in
+        // Following the latest, code scrolls without updating the binding, so a row left there
+        // goes stale. A size change, such as the composer growing, would scroll back to it.
+        if following { visibleItem = nil }
       }
       .onScrollGeometryChange(for: TranscriptEdges.self) { geometry in
         TranscriptEdges(

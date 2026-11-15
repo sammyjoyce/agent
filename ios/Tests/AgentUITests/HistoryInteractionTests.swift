@@ -531,10 +531,151 @@ final class ComposerInteractionTests: XCTestCase {
     XCTAssertFalse(
       app.staticTexts[first].isHittable, "Opening the picker scrolled back to the first row")
   }
+
+  // A reader scrolls up and taps Latest. The keyboard and then the picker shrink the feed, which
+  // keeps the newest reply rather than going back to the rows the reader had scrolled to.
+  func testTheKeyboardAndPickerAfterLatestKeepTheNewestReplyInView() async throws {
+    let reply = { (index: Int) in
+      "Reply \(index) from Work, long enough to wrap onto a second line of the feed."
+    }
+    let (app, work, _) = try await launchWithWorkAndPersonal(
+      workHistory: (1...30).map {
+        .init(
+          continuation: false, entryId: "reply-\($0)", finalChunk: true, role: .final,
+          text: reply($0))
+      })
+    defer { app.terminate() }
+    let transcript = app.scrollViews["transcript"]
+    let latest = app.buttons["latest-messages"]
+    let composer = app.descendants(matching: .any).matching(identifier: "Message the coordinator")
+      .firstMatch
+    var newest = app.staticTexts[reply(30)]
+    XCTAssertTrue(newest.waitForExistence(timeout: 5))
+    try await eventually(description: "the newest reply at launch") { newest.isHittable }
+    func visibleReplies() -> Set<String> {
+      Set(
+        app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "Reply "))
+          .allElementsBoundByIndex.filter(\.isHittable).map(\.label))
+    }
+    func openPicker() -> XCUIElement {
+      if !app.keyboards.keys["@"].exists { app.keyboards.keys["more"].tap() }
+      app.keyboards.keys["@"].tap()
+      let picker = app.buttons["Send to Work"]
+      XCTAssertTrue(picker.waitForExistence(timeout: 3))
+      return picker
+    }
+
+    for _ in 0..<3 { transcript.swipeDown() }
+    XCTAssertTrue(latest.waitForExistence(timeout: 3), "Scrolling up offers Latest")
+    XCTAssertFalse(newest.isHittable, "The reader scrolled away from the newest reply")
+    let reading = visibleReplies()
+    XCTAssertFalse(reading.isEmpty, "The reader sees older replies")
+    func assertTheFeedHoldsTheNewestReply(
+      _ newest: XCUIElement, after step: String, above picker: XCUIElement? = nil
+    ) async throws {
+      // A snap back lands only after the size change has animated, so give it time to happen.
+      try await Task.sleep(for: .milliseconds(700))
+      XCTAssertEqual(
+        visibleReplies().intersection(reading), [],
+        "\(step) snapped back to the rows the reader had scrolled to")
+      XCTAssertTrue(newest.isHittable, "\(step) scrolled away from the newest reply")
+      if let picker {
+        XCTAssertLessThanOrEqual(
+          newest.frame.maxY, picker.frame.minY - 6, "The picker covered the newest reply")
+      }
+    }
+
+    latest.tap()
+    try await assertTheFeedHoldsTheNewestReply(newest, after: "Latest")
+    composer.tap()
+    XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
+    try await assertTheFeedHoldsTheNewestReply(newest, after: "The keyboard after Latest")
+    var picker = openPicker()
+    try await assertTheFeedHoldsTheNewestReply(
+      newest, after: "The picker after Latest", above: picker)
+    app.keyboards.keys["delete"].tap()
+    XCTAssertTrue(picker.waitForNonExistence(timeout: 3))
+
+    for index in 31...34 {
+      try await work.reply(reply(index), id: "reply-\(index)")
+      newest = app.staticTexts[reply(index)]
+      XCTAssertTrue(newest.waitForExistence(timeout: 5))
+    }
+    try await eventually(description: "the feed following the newest reply") {
+      newest.isHittable
+    }
+    picker = openPicker()
+    try await assertTheFeedHoldsTheNewestReply(
+      newest, after: "The picker after new replies", above: picker)
+  }
 }
 
 @MainActor
 final class HistoryInteractionTests: XCTestCase {
+  private func drag(_ transcript: XCUIElement, down: Bool) {
+    let start = transcript.coordinate(
+      withNormalizedOffset: CGVector(dx: 0.5, dy: down ? 0.3 : 0.65))
+    let end = transcript.coordinate(
+      withNormalizedOffset: CGVector(dx: 0.5, dy: down ? 0.65 : 0.3))
+    start.press(forDuration: 0.05, thenDragTo: end)
+  }
+  func testLongSingleNoticeRemainsDraggableThroughKeyboardAndRevision() async throws {
+    continueAfterFailure = true
+    let peer = InteractionPeer()
+    addTeardownBlock { await peer.stop() }
+    let paragraphs = (0..<32).map {
+      "Scroll checkpoint \($0). This invented notice explains a separate observation in enough detail to wrap across several lines on a phone."
+    }
+    let history = NativeEventHistory(
+      messages: [
+        .init(
+          continuation: false, entryId: "long-notice", finalChunk: true,
+          role: .notice, text: paragraphs.joined(separator: "\n\n"))
+      ], nextCursor: nil, pageComplete: true)
+    await peer.history(initial: history, pages: [:], latest: history)
+    let app = XCUIApplication()
+    app.launchEnvironment["AGENT_INTERACTION_PORT"] = String(try await peer.start())
+    app.launchEnvironment["AGENT_INTERACTION_COORDINATOR"] = peer.coordinator.uuidString
+    app.launchArguments += ["-notificationsEnabled", "NO"]
+    app.launch()
+    defer { app.terminate() }
+    let transcript = app.scrollViews["transcript"]
+    XCTAssertTrue(transcript.waitForExistence(timeout: 10))
+    let marker = app.staticTexts.matching(
+      NSPredicate(format: "label BEGINSWITH %@", "Scroll checkpoint 16.")
+    ).firstMatch
+    XCTAssertTrue(marker.waitForExistence(timeout: 5))
+    let composer = app.textViews["Message the coordinator"]
+    composer.tap()
+    XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
+    drag(transcript, down: true)  // The first downward drag may only dismiss the keyboard.
+    XCTAssertTrue(app.keyboards.firstMatch.waitForNonExistence(timeout: 5))
+    for index in 0..<3 {
+      let before = marker.frame.minY
+      drag(transcript, down: true)
+      let after = marker.frame.minY
+      print("LONG_SCROLL down \(index): \(before) -> \(after)")
+      XCTAssertGreaterThan(after - before, 60, "A tall single row stopped moving downward")
+    }
+    let reading = marker.frame.minY
+    let incoming = "An invented live revision arrives outside the reading viewport."
+    try await peer.beginReply(incoming)
+    let working = app.buttons["Stop response"]
+    XCTAssertTrue(working.waitForExistence(timeout: 5))
+    XCTAssertEqual(marker.frame.minY, reading, accuracy: 3, "Streaming displaced the reader")
+    try await peer.reply(incoming)
+    XCTAssertTrue(working.waitForNonExistence(timeout: 5))
+    XCTAssertEqual(
+      marker.frame.minY, reading, accuracy: 3, "Completing output displaced the reader")
+    for index in 0..<3 {
+      let before = marker.frame.minY
+      drag(transcript, down: false)
+      let after = marker.frame.minY
+      print("LONG_SCROLL up \(index): \(before) -> \(after)")
+      XCTAssertGreaterThan(before - after, 60, "A tall single row stopped moving upward")
+    }
+  }
+
   func testRunKeepsDraftAndCoordinatorsAcrossRelaunch() async throws {
     continueAfterFailure = false
     executionTimeAllowance = 120
