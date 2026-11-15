@@ -158,7 +158,7 @@ public actor CoordinatorSession {
   nonisolated let profile: ProfileID
   private let continuation: AsyncStream<ChatSnapshot>.Continuation
   private var snapshot = ChatSnapshot()
-  private var inputOrigins = false
+  private var acceptedInputOrigins: Set<InputOrigin> = []
   private var capabilityGeneration = UUID()
   private var transcript = Transcript()
   private let dialer: CoordinatorDialer
@@ -442,7 +442,7 @@ public actor CoordinatorSession {
     }
     let request = NativeRequestSubmit(
       attachments: files.isEmpty && !feedback ? nil : files.map(\.reference),
-      inputId: UUID().uuidString, mode: mode, origin: inputOrigins ? .ios : nil, text: text)
+      inputId: UUID().uuidString, mode: mode, origin: accepts(.ios) ? .ios : nil, text: text)
     let previousComposers = composerInputs
     if let composer { composerInputs[composer.composerID.uuidString] = composer.inputID.uuidString }
     guard !control || feedback else {
@@ -1079,9 +1079,19 @@ public actor CoordinatorSession {
     } while true
   }
 
+  /// Whether the current connection records this origin. False while disconnected.
+  public func accepts(_ origin: InputOrigin) -> Bool { acceptedInputOrigins.contains(origin) }
+
+  /// The input_origins Boolean always grants cli and ios, so a list never takes them away.
+  /// Listed values this build does not know are skipped.
+  private static func acceptedInputOrigins(_ ready: NativeEventReady) -> Set<InputOrigin> {
+    let granted: Set<InputOrigin> = ready.inputOrigins == true ? [.cli, .ios] : []
+    return granted.union((ready.acceptedInputOrigins ?? []).compactMap(InputOrigin.init))
+  }
+
   private func resetCapabilities() {
     capabilityGeneration = UUID()
-    inputOrigins = false
+    acceptedInputOrigins = []
     snapshot.settingsSupported = false
     snapshot.workInspectionSupported = false
     snapshot.settings = nil
@@ -1390,7 +1400,7 @@ public actor CoordinatorSession {
     case .ready(let value):
       snapshot.error = nil
       snapshot.conversationID = value.conversationId
-      inputOrigins = value.inputOrigins == true
+      acceptedInputOrigins = Self.acceptedInputOrigins(value)
       snapshot.settingsSupported = value.conversationSettings == true
       snapshot.workInspectionSupported = value.workInspection == true
       snapshot.model = value.model

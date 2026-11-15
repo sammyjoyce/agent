@@ -422,6 +422,7 @@ public enum InputMode: String, Codable, Sendable, Equatable {
 public enum InputOrigin: String, Codable, Sendable, Equatable {
     case `cli` = "cli"
     case `ios` = "ios"
+    case `siri` = "siri"
 }
 
 public struct InputWorkStateCompleted: Codable, Sendable, Equatable {
@@ -1100,13 +1101,15 @@ public struct NativeEventCommands: Codable, Sendable, Equatable {
 }
 
 public struct NativeEventReady: Codable, Sendable, Equatable {
+    public var `acceptedInputOrigins`: [String]?
     public var `conversationId`: String
     public var `conversationSettings`: Bool?
     public var `inputOrigins`: Bool?
     public var `model`: String
     public var `workInspection`: Bool?
     public var `working`: Bool?
-    public init(`conversationId`: String, `conversationSettings`: Bool? = nil, `inputOrigins`: Bool? = nil, `model`: String, `workInspection`: Bool? = nil, `working`: Bool? = nil) {
+    public init(`acceptedInputOrigins`: [String]? = nil, `conversationId`: String, `conversationSettings`: Bool? = nil, `inputOrigins`: Bool? = nil, `model`: String, `workInspection`: Bool? = nil, `working`: Bool? = nil) {
+        self.`acceptedInputOrigins` = `acceptedInputOrigins`
         self.`conversationId` = `conversationId`
         self.`conversationSettings` = `conversationSettings`
         self.`inputOrigins` = `inputOrigins`
@@ -1115,6 +1118,7 @@ public struct NativeEventReady: Codable, Sendable, Equatable {
         self.`working` = `working`
     }
     enum CodingKeys: String, CodingKey {
+        case `acceptedInputOrigins` = "accepted_input_origins"
         case `conversationId` = "conversation_id"
         case `conversationSettings` = "conversation_settings"
         case `inputOrigins` = "input_origins"

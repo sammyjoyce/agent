@@ -56,3 +56,53 @@ func retryingALegacyOutboxNeverInventsAnOriginEvenAfterCapabilityIsAdvertised() 
     }
   }
 }
+
+@Test(.timeLimit(.minutes(1)))
+func aCoordinatorThatListsSiriAcceptsItAndAnUnknownListedOriginIsSkipped() async throws {
+  try await withCoordinator { session, fixture, outbox in
+    await fixture.advertiseInputOrigins(true)
+    await fixture.advertiseAcceptedInputOrigins(["cli", "ios", "siri", "invented-future-origin"])
+    await session.connect()
+    for await update in session.updates where update.connection == .connected { break }
+    #expect(await session.accepts(.siri))
+    #expect(await session.accepts(.ios))
+    #expect(await session.submit("A composer message"))
+    let requests = try queuedRequests(outbox)
+    #expect(requests.first?.origin == .ios)
+    await session.disconnect()
+    #expect(await !session.accepts(.siri))
+  }
+}
+
+@Test(.timeLimit(.minutes(1)), arguments: [Optional<Bool>.none, .some(false), .some(true)])
+func aCoordinatorThatListsNoOriginsNeverAcceptsSiri(advertised: Bool?) async throws {
+  try await withCoordinator { session, fixture, _ in
+    await fixture.advertiseInputOrigins(advertised)
+    await session.connect()
+    for await update in session.updates where update.connection == .connected { break }
+    #expect(await !session.accepts(.siri))
+    #expect(await session.accepts(.ios) == (advertised == true))
+  }
+}
+
+@Test func eachInputOriginHasItsOwnRowLabel() {
+  let labels = [InputOrigin.cli, .ios, .siri].map {
+    ChatRow(id: $0.rawValue, role: .user, text: "Invented message", inputOrigin: $0)
+      .provenanceLabel
+  }
+  #expect(labels == ["CLI", "iOS", "Siri"])
+}
+
+@Test(.timeLimit(.minutes(1)))
+func aCoordinatorThatReportsOriginsButListsNoneStillGetsIOS() async throws {
+  try await withCoordinator { session, fixture, outbox in
+    await fixture.advertiseInputOrigins(true)
+    await fixture.advertiseAcceptedInputOrigins([])
+    await session.connect()
+    for await update in session.updates where update.connection == .connected { break }
+    #expect(await !session.accepts(.siri))
+    #expect(await session.submit("A composer message"))
+    let requests = try queuedRequests(outbox)
+    #expect(requests.first?.origin == .ios)
+  }
+}
