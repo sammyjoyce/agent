@@ -107,12 +107,12 @@ export function declarationSize(context: Context): DeclarationSize {
 export type DiscoveryHost = { node: AgentNode; call(command: HostCommand): Promise<HostResult> };
 
 /** A coordinator with the production registry, role surfaces and background execution, bound to one invented host. */
-export async function openDiscoveryApp(directory: string, { models, model, arm, host }: {
-  models: MutableModels; model: ModelSelection; arm: DiscoveryArm; host: DiscoveryHost;
+export async function openDiscoveryApp(directory: string, { models, model, arm, host, retry = false }: {
+  models: MutableModels; model: ModelSelection; arm: DiscoveryArm; host: DiscoveryHost; retry?: boolean;
 }) {
   const registry: Registry = createRegistry();
   const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))), {
-    models, registry, identity: { attribution: null }, settings: { retry: { enabled: false }, steeringMode: "all", followUpMode: "one-at-a-time" },
+    models, registry, identity: { attribution: null }, settings: { retry: { enabled: retry }, steeringMode: "all", followUpMode: "one-at-a-time" },
   }, BACKGROUND_CONTEXT);
   const inference = new ConversationModels(models); inference.bind(session);
   const tasks = new TaskStore(session, inference), executions = new Executions();
