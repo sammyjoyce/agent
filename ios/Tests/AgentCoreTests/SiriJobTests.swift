@@ -220,6 +220,27 @@ struct SiriJobTests {
     }
   }
 
+  /// The retry is on the wire when the intent is cancelled. The session cuts the request, and the
+  /// intent reports the cancellation, not a coordinator that went away.
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func aRetryCancelledWhileItsReplyIsHeldIsCancelledAndSentOnce() async throws {
+    try await withJobPeers { coordinators, work, _, workPeer, _ in
+      let chat = coordinators.chat
+      try await background(coordinators)
+      await workPeer.holdNextRetryReply()
+      let retrying = Task { @MainActor in
+        try await coordinators.retryInterruptedRun(
+          ScopedEntityID(profile: work, item: "nightly:deps"), title: "Work nightly deps")
+      }
+      try await until("the retry reached Work") { await workPeer.retryRequests().count == 1 }
+      retrying.cancel()
+      await #expect(throws: CancellationError.self) { try await retrying.value }
+      #expect(!chat.demand.leased(work), "The lease was dropped")
+      await workPeer.releaseRetryReply()
+      #expect(await workPeer.retryRequests() == ["nightly:deps"], "Nothing sent it again")
+    }
+  }
+
   @MainActor @Test(.timeLimit(.minutes(1)))
   func aCancelledQueryIsCancelledAndNamesNoCoordinator() async throws {
     try await withJobPeers { coordinators, work, personal, workPeer, personalPeer in

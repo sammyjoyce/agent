@@ -730,7 +730,7 @@ final class ChatModel {
     }
     demand.drop(lease)
     await reconcile(id)
-    // A session reports a request that this task's cancellation cut as a closed connection.
+    // A session can report a request that this task's cancellation cut as a closed connection.
     if Task.isCancelled, case .failure = outcome { throw CancellationError() }
     return try outcome.get()
   }
