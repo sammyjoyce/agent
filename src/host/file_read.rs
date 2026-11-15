@@ -36,24 +36,14 @@ pub(super) async fn read_file(
         None => text(file, offset, limit).await,
         Some(ImageRead::Start) => match recognize(&mut file).await? {
             None => text(file, offset, limit).await,
-            Some(seen) => {
-                ensure!(
-                    seen.size_bytes <= u64::from(MAX_IMAGE_READ_BYTES),
-                    "{path} is an image ({}) of {} bytes; read_file takes images up to {MAX_IMAGE_READ_BYTES} bytes. Shrink a copy on the host with exec, then read the copy.",
-                    serde_json::to_value(seen.media_type)?
-                        .as_str()
-                        .unwrap_or_default(),
-                    seen.size_bytes,
-                );
-                chunk(file, &seen, 0).await
-            }
+            Some(seen) => chunk(file, path, &seen, 0).await,
         },
         Some(ImageRead::Next { at, stamp }) => {
             let seen = recognize(&mut file)
                 .await?
                 .filter(|seen| seen.stamp == stamp)
                 .context(CHANGED)?;
-            chunk(file, &seen, at).await
+            chunk(file, path, &seen, at).await
         }
     }
 }
@@ -140,7 +130,15 @@ fn bmp_header(header: &[u8]) -> bool {
     header.len() >= BMP_INFO_PLANES_AT && header.get(planes..planes + 2) == Some(&[1, 0])
 }
 
-async fn chunk(mut file: fs::File, seen: &ImageFile, at: u32) -> Result<HostResult> {
+async fn chunk(mut file: fs::File, path: &str, seen: &ImageFile, at: u32) -> Result<HostResult> {
+    ensure!(
+        seen.size_bytes <= u64::from(MAX_IMAGE_READ_BYTES),
+        "{path} is an image ({}) of {} bytes; read_file takes images up to {MAX_IMAGE_READ_BYTES} bytes. Shrink a copy on the host with exec, then read the copy.",
+        serde_json::to_value(seen.media_type)?
+            .as_str()
+            .unwrap_or_default(),
+        seen.size_bytes,
+    );
     let length = seen
         .size_bytes
         .checked_sub(u64::from(at))
@@ -418,18 +416,20 @@ mod tests {
     async fn an_image_over_the_cap_fails_before_any_chunk() {
         let host = Host::new();
         let path = host.file("huge.png", b"\x89PNG\r\n\x1a\n");
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_len(u64::from(MAX_ATTACHMENT_BYTES) + 1)
-            .unwrap();
-        let result = host.read(&path, 0, 64_000, Some(ImageRead::Start)).await;
-        assert!(
-            matches!(&result, HostResult::Failed { message, .. }
-                if message.contains(&path) && message.contains("image/png") && message.contains("16777217")),
-            "{result:?}"
-        );
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(u64::from(MAX_ATTACHMENT_BYTES) + 1).unwrap();
+        let next = ImageRead::Next {
+            at: 0,
+            stamp: super::stamp(&file.metadata().unwrap()),
+        };
+        for image in [ImageRead::Start, next] {
+            let result = host.read(&path, 0, 64_000, Some(image.clone())).await;
+            assert!(
+                matches!(&result, HostResult::Failed { message, .. }
+                    if message.contains(&path) && message.contains("image/png") && message.contains("16777217")),
+                "{image:?}: {result:?}"
+            );
+        }
     }
 
     #[tokio::test]
