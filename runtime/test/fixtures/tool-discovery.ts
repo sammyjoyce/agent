@@ -54,6 +54,13 @@ const SOURCE_TOOLS: Record<ToolRole, readonly string[]> = {
   agent: ["read_source_events", "notify_user"],
 };
 
+const LEAN_TOOLS: Record<ToolRole, readonly string[]> = {
+  main: ["record_task"],
+  triage: ["exec", "edit_file", "write_file", "read_job", "run_job"],
+  worker: [],
+  agent: [],
+};
+
 function everyRole(surface: ToolSurface | ((role: ToolRole) => ToolSurface)): DiscoveryArm {
   return Object.fromEntries(TOOL_ROLES.map((role) => [role, typeof surface === "function" ? surface(role) : surface]));
 }
@@ -63,7 +70,9 @@ export const DISCOVERY_ARMS = {
   "search-browser": everyRole({ deferred: BROWSER_TOOLS }),
   "search-rare": everyRole((role) => ({ deferred: RARE_TOOLS[role] })),
   "search-sources": everyRole((role) => ({ deferred: [...RARE_TOOLS[role], ...SOURCE_TOOLS[role]] })),
+  "search-lean": everyRole((role) => ({ deferred: [...RARE_TOOLS[role], ...SOURCE_TOOLS[role], ...LEAN_TOOLS[role]] })),
   codemode: everyRole({ codemode: { keepDirect: [] } }),
+  "codemode-core": everyRole((role) => ({ deferred: [...RARE_TOOLS[role], ...SOURCE_TOOLS[role]], codemode: { keepDirect: [] } })),
 } as const satisfies Record<string, DiscoveryArm>;
 export type DiscoveryArmName = keyof typeof DISCOVERY_ARMS;
 
@@ -95,10 +104,9 @@ export function applyDiscoveryArm(toolsets: Toolsets, arm: DiscoveryArm, discove
     if (pinned.length > 0) throw new Error(`${pinned.map((tool) => tool.name).join(", ")} must stay directly offered`);
     const direct = surface.codemode === undefined ? undefined : new Set([...ALWAYS_DIRECT, ...surface.codemode.keepDirect]);
     const scripted = direct === undefined ? [] : tools.filter((tool) => !direct.has(tool.name) && (tool.callers ?? ["model", "tools"]).includes("model"));
-    const wrapper = defineExtension({ name: `tool-surface-${role}`, wraps: [
-      ...deferred.map((tool) => wrapTool(tool, (selected) => ({ ...selected, deferred: true as const }))),
-      ...scripted.map((tool) => wrapTool(tool, (selected) => ({ ...selected, callers: ["tools"] as const }))),
-    ] });
+    const wrapped = new Map([...deferred, ...scripted].map((tool) => [tool.name, tool]));
+    const wrapper = defineExtension({ name: `tool-surface-${role}`, wraps: [...wrapped.values()].map((tool) => wrapTool(tool, (selected) => ({ ...selected,
+      ...(deferred.includes(tool) ? { deferred: true as const } : {}), ...(scripted.includes(tool) ? { callers: ["tools"] as const } : {}) }))) });
     installed.push(wrapper);
     const searchable = deferred.some((tool) => direct === undefined || direct.has(tool.name));
     return [role, [...base, wrapper, ...(searchable ? [discovery.toolSearch] : []), ...(direct === undefined ? [] : [discovery.codemode])]];
