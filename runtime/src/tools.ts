@@ -22,6 +22,8 @@ import type { TaskMessageSender } from "./generated/TaskMessageSender.js";
 import { TaskError, TaskStore, type HostCall, type SearchQuery } from "./tasks.js";
 import { importedSummary } from "./history.js";
 import type { BackgroundScheduler } from "./background.js";
+import { hostOutput, output } from "./host-output.js";
+import { imageInput, readImageFile, type ReadFileCommand } from "./images.js";
 
 export type Execution = { model?: ModelSelection; cwd: string; hosts: WorkerHost[]; default_host?: WorkerHost | null; call: HostCall; role?: "worker" | "triage";
   origin_host_id?: string | null; connectedHosts?: () => Promise<WorkerHost[]>;
@@ -81,16 +83,9 @@ export class Executions {
   }
 }
 
-function output(value: unknown, isError = false): ToolExecutionResult {
-  return { output: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value) ?? "" }], isError };
-}
 function agentOutput(name: string, args: ToolCall["arguments"], sender: string, value: TaskRecord | TaskAgentRecord[], targetAgentId?: string): ToolExecutionResult {
   const details: MessageContent = { role: "tool", text: "", presentation: agentPresentation({ name, arguments: args }, sender, value, targetAgentId) };
   return { ...output(value), details };
-}
-function hostOutput(result: HostResult) {
-  return output(result, result.type === "failed" || result.type === "creation_uncertain" || result.type === "not_started" ||
-    (result.type === "process" && result.exit_code !== 0));
 }
 const source = Type.Object({ provider: Type.String(), account: Type.String(), thread_id: Type.String() });
 const attachmentIds = Type.Optional(Type.Array(Type.String(), { maxItems: MAX_ATTACHMENTS }));
@@ -253,15 +248,16 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         return hostOutput(await execution.call({ type: "search_context", repository_id: args.repository_id, path: args.path ?? null,
           query: args.query, limit: args.limit ?? 20 }));
       } }),
-    defineTool({ name: "read_file", description: "Read a bounded part of a file on the attached host; offset and limit are bytes.",
+    defineTool({ name: "read_file", description: "Read a bounded part of a file on the attached host; offset and limit are bytes. A PNG, JPEG, GIF, WebP or BMP file, recognized by its content, comes back whole as an image scaled to the model's limits.",
       replay: "safe", parameters: Type.Object({ path: Type.String(),
         offset: Type.Optional(Type.Integer({ minimum: 0, maximum: 0xffff_ffff })),
         limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 262_144 })) }),
-      async execute(args, api) {
+      async execute(args, api, context) {
         const execution = executions.get(api.conversationId.toString());
-        return hostOutput(await execution.call({
-          type: "read_file", path: resolve(execution.default_host?.cwd ?? execution.cwd, args.path), offset: args.offset ?? 0, limit: args.limit ?? 64_000,
-        }));
+        const command: ReadFileCommand = { type: "read_file", path: resolve(execution.default_host?.cwd ?? execution.cwd, args.path),
+          offset: args.offset ?? 0, limit: args.limit ?? 64_000, image: { type: "start" } };
+        const result = await execution.call(command);
+        return result.type === "image_chunk" ? readImageFile(execution.call, command, result, await imageInput(api, context)) : hostOutput(result);
       } }),
     defineTool({ name: "write_file", description: "Write a UTF-8 file on the attached host.",
       parameters: Type.Object({ path: Type.String(), content: Type.String() }),
