@@ -12,14 +12,16 @@ public enum ConnectionState: Sendable, Equatable {
   }
 }
 
-struct CoordinatorRejection: LocalizedError {
-  let message: String
+/// A coordinator's own refusal of a request, in its words, or this app's refusal to send a
+/// request the coordinator does not advertise.
+public struct CoordinatorRejection: LocalizedError {
+  public let message: String
   let code: ErrorCode?
   init(message: String, code: ErrorCode? = nil) {
     self.message = message
     self.code = code
   }
-  var errorDescription: String? { message }
+  public var errorDescription: String? { message }
 }
 
 private struct OutboxNotSaved: LocalizedError {

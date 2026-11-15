@@ -2,6 +2,7 @@ import AgentCore
 import AppIntents
 import CoreTransferable
 import Foundation
+import Network
 
 /// Where a job's last run stands, as Siri and Shortcuts name it.
 public enum JobRunState: String, AppEnum {
@@ -97,44 +98,45 @@ public struct JobQuery: EnumerableEntityQuery {
     try await Self.jobs(identifiedBy: identifiers, in: notifications.intentCoordinators)
   }
 
-  @MainActor static func allJobs(in coordinators: Coordinators) async throws
-    -> [JobEntity]
-  {
-    let profiles = coordinators.profiles.filter { $0.pin != nil }
-    var jobs: [JobEntity] = []
-    var silent: [String] = []
-    for profile in profiles {
-      do {
-        jobs += try await coordinators.jobs(on: profile.id, coordinator: "\(profile.name)")
-      } catch {
-        silent.append("\(profile.name)")
-      }
-    }
-    if jobs.isEmpty, let first = silent.first, silent.count == profiles.count {
-      throw CoordinatorDidNotAnswer(name: first)
-    }
-    return jobs
+  /// Every paired coordinator's jobs, in saved order. Whatever any coordinator answered is
+  /// returned, even nothing. A failure is thrown only when none answered.
+  @MainActor static func allJobs(
+    in coordinators: Coordinators, within limit: Duration = ConnectionLease.connectionWait
+  ) async throws -> [JobEntity] {
+    let reads = await coordinators.jobs(
+      of: coordinators.profiles.filter { $0.pin != nil }, within: limit)
+    try Task.checkCancellation()
+    let answers = reads.compactMap { try? $0.get() }
+    guard answers.isEmpty, let failure = failure(in: reads) else { return answers.flatMap { $0 } }
+    throw failure
   }
 
   @MainActor static func jobs(
-    identifiedBy identifiers: [ScopedEntityID], in coordinators: Coordinators
+    identifiedBy identifiers: [ScopedEntityID], in coordinators: Coordinators,
+    within limit: Duration = ConnectionLease.connectionWait
   ) async throws -> [JobEntity] {
-    let profiles = coordinators.profiles
-    var jobs: [JobEntity] = []
-    for profileID in Set(identifiers.map(\.profile)) {
-      guard let profile = profiles.first(where: { $0.id == profileID }) else { continue }
-      do {
-        jobs += try await coordinators.jobs(on: profile.id, coordinator: "\(profile.name)")
-          .filter { identifiers.contains($0.id) }
-      } catch {
-        throw CoordinatorDidNotAnswer(name: "\(profile.name)")
-      }
+    let owners = Set(identifiers.map(\.profile))
+    let reads = await coordinators.jobs(
+      of: coordinators.profiles.filter { owners.contains($0.id) }, within: limit)
+    try Task.checkCancellation()
+    if let failure = failure(in: reads) { throw failure }
+    return reads.flatMap { (try? $0.get()) ?? [] }.filter { identifiers.contains($0.id) }
+  }
+
+  /// The failure to report for `reads`: a coordinator's own words before another one's silence.
+  private static func failure(in reads: [JobRead]) -> (any Error)? {
+    let failures = reads.compactMap { read -> (any Error)? in
+      if case .failure(let error) = read { error } else { nil }
     }
-    return jobs
+    return failures.first { !($0 is CoordinatorDidNotAnswer) } ?? failures.first
   }
 }
 
-/// A coordinator that did not return its jobs while the intent held it connected.
+/// How reading one coordinator's jobs went.
+typealias JobRead = Result<[JobEntity], any Error>
+
+/// A coordinator that never connected for the intent, or whose connection closed or timed out
+/// under its request.
 public struct CoordinatorDidNotAnswer: Error, CustomLocalizedStringResourceConvertible {
   public let name: String
   public var localizedStringResource: LocalizedStringResource {
@@ -142,11 +144,42 @@ public struct CoordinatorDidNotAnswer: Error, CustomLocalizedStringResourceConve
   }
 }
 
+/// A coordinator's own refusal of an intent's request, in its words under its name.
+public struct CoordinatorRefused: Error, CustomLocalizedStringResourceConvertible {
+  public let name: String
+  public let message: String
+  public var localizedStringResource: LocalizedStringResource { "\(name): \(message)" }
+}
+
 extension Coordinators {
-  func jobs(on profile: ProfileID, coordinator: String) async throws -> [JobEntity] {
-    try await withConnection(to: profile) {
-      guard case .list(let list) = try await chat.jobs(lane: profile) else { return [] }
-      return list.jobs.map { JobEntity($0, on: profile, coordinator: coordinator) }
+  /// How reading each of `profiles`' jobs went, in the order given, each over its own lease.
+  func jobs(of profiles: [CoordinatorProfile], within limit: Duration) async -> [JobRead] {
+    var reads: [JobRead] = []
+    for profile in profiles {
+      do {
+        reads.append(.success(try await jobs(of: profile, within: limit)))
+      } catch {
+        reads.append(.failure(error))
+      }
+    }
+    return reads
+  }
+
+  private func jobs(of profile: CoordinatorProfile, within limit: Duration) async throws
+    -> [JobEntity]
+  {
+    let name = "\(profile.name)"
+    do {
+      return try await withConnection(to: profile.id, within: limit) {
+        guard case .list(let list) = try await chat.jobs(lane: profile.id) else { return [] }
+        return list.jobs.map { JobEntity($0, on: profile.id, coordinator: name) }
+      }
+    } catch let rejection as CoordinatorRejection {
+      throw CoordinatorRefused(name: name, message: rejection.message)
+    } catch LaneError.unanswered, LaneError.interrupted, ConnectionError.closed,
+      ConnectionError.timedOut, is NWError
+    {
+      throw CoordinatorDidNotAnswer(name: name)
     }
   }
 }

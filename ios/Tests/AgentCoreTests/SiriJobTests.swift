@@ -201,6 +201,25 @@ struct SiriJobTests {
   }
 
   @MainActor @Test(.timeLimit(.minutes(1)))
+  func aCoordinatorsRejectionIsReportedBeforeAnotherOnesSilence() async throws {
+    try await withJobPeers { coordinators, _, _, workPeer, personalPeer in
+      await personalPeer.advertiseWorkInspection(false)
+      try await background(coordinators)
+      await workPeer.leaveObserveUnanswered(.silent)
+      let wait = Duration.milliseconds(300)
+      let refused = await #expect(throws: (any Error).self) {
+        try await JobQuery.allJobs(in: coordinators, within: wait)
+      }
+      #expect(shown(refused) == "Personal: \(updateTheCoordinator)")
+      await personalPeer.leaveObserveUnanswered(.silent)
+      let silent = await #expect(throws: CoordinatorDidNotAnswer.self) {
+        try await JobQuery.allJobs(in: coordinators, within: wait)
+      }
+      #expect(shown(silent) == "Work did not answer. Check that it is running and reachable.")
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
   func aCancelledQueryIsCancelledAndNamesNoCoordinator() async throws {
     try await withJobPeers { coordinators, work, personal, workPeer, personalPeer in
       let chat = coordinators.chat
