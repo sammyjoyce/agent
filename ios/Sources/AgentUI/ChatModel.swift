@@ -741,8 +741,9 @@ final class ChatModel {
     return try outcome.get()
   }
 
-  /// Returns once lane `id`'s session reports connected. It asks the session, because `snapshots`
-  /// is a copy that trails it.
+  /// Returns once lane `id`'s session reports connected with no lifecycle call on the lane in
+  /// flight, since a redial closes the connection that a read before it saw. It asks the session,
+  /// because `snapshots` is a copy that trails it.
   private func awaitConnection(_ id: ProfileID, until deadline: ContinuousClock.Instant)
     async throws
   {
@@ -751,7 +752,7 @@ final class ChatModel {
       // Checked after the last await before the body, so a cancelled or late caller never runs it.
       try Task.checkCancellation()
       guard ContinuousClock.now < deadline else { throw LaneError.unanswered(name(id)) }
-      if connected { return }
+      if connected, lifecycles[id]?.loop == nil { return }
       try await Task.sleep(for: .milliseconds(5))
     }
   }
