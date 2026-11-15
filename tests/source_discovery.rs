@@ -1,10 +1,14 @@
-use std::{fs, os::unix::fs::PermissionsExt};
+use std::fs;
 
 use agent_cli::{
     background::{self, BackgroundRequest, BackgroundResponse},
     protocol::SourceState,
     sources::{SourceConfig, SourceCoverage, SourceKey},
 };
+
+#[path = "fixtures/executable.rs"]
+mod executable_fixture;
+use executable_fixture::write_executable;
 
 const GOOGLE: [SourceConfig; 1] = [SourceConfig::Google {
     enabled: true,
@@ -26,17 +30,15 @@ impl Switchboard {
         let registry = bin.path().join("registry.json");
         let mail_fails = bin.path().join("mail-fails");
         let switchboard = bin.path().join("switchboard");
-        fs::write(
+        write_executable(
             &switchboard,
-            format!(
+            &format!(
                 "#!/bin/sh\ncase \"$1\" in\n  ns) [ -f '{}' ] || exit 1; exec cat '{}' ;;\n  google.mail.search) [ -f '{}' ] && exit 1; printf '%s' '{EMPTY_MAILBOX}' ;;\n  *) exit 1 ;;\nesac\n",
                 registry.display(),
                 registry.display(),
                 mail_fails.display(),
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&switchboard, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let path = std::env::join_paths(
             std::iter::once(bin.path().to_owned())
                 .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),

@@ -122,11 +122,14 @@ pub async fn capture(argv: &[String]) -> Result<HostResult> {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::fs::PermissionsExt, path::Path};
+    use std::path::Path;
 
     use serde::{Deserialize, Serialize};
 
-    use crate::sources::messages_read::{capture, command};
+    use crate::{
+        executable_fixture::write_executable,
+        sources::messages_read::{capture, command},
+    };
 
     #[derive(Serialize)]
     struct FixtureRequest<'a> {
@@ -156,8 +159,7 @@ mod tests {
         let executable = executable.trim();
         assert!(Path::new(executable).is_absolute());
         let program = directory.join("messages");
-        std::fs::write(&program, format!("#!{executable}\n{script}\n")).unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&program, &format!("#!{executable}\n{script}\n"));
         program.to_str().unwrap().to_owned()
     }
 

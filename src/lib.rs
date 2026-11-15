@@ -34,3 +34,7 @@ pub mod usage;
 
 pub mod native;
 pub mod notifications;
+
+#[cfg(test)]
+#[path = "../tests/fixtures/executable.rs"]
+mod executable_fixture;
