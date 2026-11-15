@@ -1,9 +1,14 @@
 //! A model-issued `read_file` of an image reaches the next model request as a
 //! native image. The real Pi runtime, Rust broker and host executor run; only
 //! the external model responses are synthetic, except in the ignored live test.
+#[path = "fixtures/fake_rex.rs"]
+mod fake_rex;
+
 use std::{
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -14,15 +19,23 @@ use agent_cli::{
     jobs::{JobSchedule, ScheduledJob},
     models::{ModelProvider, ModelSelection},
     protocol::{
-        AgentNode, CoordinatorBootstrap, CoordinatorSettings, InputMode, RuntimeCommand,
-        RuntimeEventKind, TaskId, WorkerLaunch,
+        AgentNode, CoordinatorBootstrap, CoordinatorSettings, HostCommand, HostResult, ImageRead,
+        InputMode, RuntimeCommand, RuntimeEventKind, TaskId, WorkerLaunch,
     },
     rex::RexClient,
-    runtime::{Runtime, RuntimeCall},
+    runtime::{FrameReader, Runtime, RuntimeCall},
 };
 use base64::Engine;
 use serde_json::{Value, json};
-use tokio::time::{sleep, timeout};
+use tokio::{
+    io::{AsyncWriteExt, BufReader},
+    net::{
+        UnixListener,
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+    },
+    process::Command,
+    time::{sleep, timeout},
+};
 
 const HOST_ID: &str = "11111111-1111-4111-8111-111111111111";
 const OMITTED: &str = "(tool image omitted: model does not support images)";
@@ -545,6 +558,220 @@ async fn read_file_sends_host_images_natively_and_keeps_text_reads() {
         "The saved tool image survives reopening the conversation store"
     );
     coordinator.close().await;
+}
+
+/// The coordinator side of one attached worker connection, standing in for
+/// the runtime: it sends direct host calls and reads the worker's replies.
+struct Attached {
+    frames: FrameReader<BufReader<OwnedReadHalf>>,
+    writer: OwnedWriteHalf,
+    calls: usize,
+}
+
+impl Attached {
+    async fn send(&mut self, events: impl IntoIterator<Item = RuntimeEventKind>) {
+        let mut bytes = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut bytes, &event).unwrap();
+            bytes.push(b'\n');
+        }
+        self.writer.write_all(&bytes).await.unwrap();
+    }
+
+    async fn next(&mut self) -> RuntimeCommand {
+        let frame = timeout(Duration::from_secs(10), self.frames.next_frame())
+            .await
+            .expect("The attached worker went quiet")
+            .unwrap()
+            .expect("The attached worker closed its connection");
+        serde_json::from_slice(&frame).unwrap()
+    }
+
+    async fn call(&mut self, command: HostCommand) -> HostResult {
+        self.calls += 1;
+        let call_id = format!("fixture-call-{}", self.calls);
+        self.send([RuntimeEventKind::HostCall {
+            call_id: call_id.clone(),
+            command: Box::new(command),
+        }])
+        .await;
+        loop {
+            if let RuntimeCommand::HostReply {
+                call_id: replied,
+                result,
+            } = self.next().await
+                && replied == call_id
+            {
+                return result;
+            }
+        }
+    }
+}
+
+/// An attached task worker or child agent answers the runtime's direct (not
+/// `on_node`) host calls with its own host executor.
+#[tokio::test]
+async fn an_attached_worker_serves_image_reads_from_its_own_host() {
+    const TASK: &str = "77777777-7777-4777-8777-777777777777";
+    const SERVER: &str = "unix:///run/user/1000/rex-agent/server.sock";
+    let directory = tempfile::tempdir().unwrap();
+    let files = directory.path().to_owned();
+    fs::set_permissions(&files, fs::Permissions::from_mode(0o700)).unwrap();
+    let image = png(1200, 1200, |x, y| {
+        [
+            u8::try_from(x % 256).unwrap(),
+            u8::try_from(y % 256).unwrap(),
+            90,
+        ]
+    });
+    fs::write(files.join("shot.dat"), &image).unwrap();
+    fs::write(files.join("notes.txt"), "alpha beta gamma\n").unwrap();
+    let listener = UnixListener::bind(files.join("agent.sock")).unwrap();
+    let (reads, served_reads) = tokio::sync::oneshot::channel();
+    let served = files.clone();
+    let read = move |name: &str, offset, limit, image| HostCommand::ReadFile {
+        path: served.join(name).to_string_lossy().into_owned(),
+        offset,
+        limit,
+        image: Some(image),
+    };
+    let coordinator = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, writer) = stream.into_split();
+            let mut attached = Attached {
+                frames: FrameReader::new(BufReader::new(reader)),
+                writer,
+                calls: 0,
+            };
+            match attached.next().await {
+                RuntimeCommand::Environment { .. } => {
+                    let environment = RuntimeEventKind::Environment {
+                        settings: CoordinatorSettings {
+                            model: ModelSelection::default(),
+                            instructions: String::new(),
+                            context_repositories: Vec::new(),
+                            sources: Vec::new(),
+                        },
+                        nodes: Vec::new(),
+                        online_host_ids: Vec::new(),
+                        unavailable_host_ids: None,
+                    };
+                    attached.send([environment, RuntimeEventKind::Done]).await;
+                }
+                RuntimeCommand::RunTask { .. } => {
+                    attached
+                        .send([RuntimeEventKind::TaskReady {
+                            conversation_id: "invented-task-conversation".into(),
+                            title: "Synthetic task".into(),
+                        }])
+                        .await;
+                    let mut received = Vec::new();
+                    let mut next = ImageRead::Start;
+                    loop {
+                        let result = attached.call(read("shot.dat", 0, 64_000, next)).await;
+                        let HostResult::ImageChunk {
+                            size_bytes,
+                            stamp,
+                            at,
+                            data_base64,
+                            ..
+                        } = result
+                        else {
+                            panic!("Expected an image chunk, got {result:?}");
+                        };
+                        assert_eq!(usize::try_from(at).unwrap(), received.len());
+                        received.extend(
+                            base64::engine::general_purpose::STANDARD
+                                .decode(data_base64)
+                                .unwrap(),
+                        );
+                        if received.len() == usize::try_from(size_bytes).unwrap() {
+                            break;
+                        }
+                        next = ImageRead::Next {
+                            at: u32::try_from(received.len()).unwrap(),
+                            stamp,
+                        };
+                    }
+                    let chunks = attached.calls;
+                    let text = attached
+                        .call(read("notes.txt", 6, 5, ImageRead::Start))
+                        .await;
+                    reads.send((received, chunks, text)).unwrap();
+                    while !matches!(attached.next().await, RuntimeCommand::DetachWorker) {}
+                    attached.send([RuntimeEventKind::Done]).await;
+                    return;
+                }
+                command => panic!("Unexpected worker command {command:?}"),
+            }
+        }
+    });
+    let bin = files.join("bin");
+    fs::create_dir(&bin).unwrap();
+    std::os::unix::fs::symlink(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rex.sh"),
+        bin.join("rex"),
+    )
+    .unwrap();
+    fs::write(files.join("config.toml"), "").unwrap();
+    fs::write(files.join("AGENTS.md"), "").unwrap();
+    let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let mut worker = Command::new(env!("CARGO_BIN_EXE_beep-boop"))
+        .args(["--rex-server", SERVER, "--json", "--no-tui", "--state-dir"])
+        .arg(&files)
+        .arg("--config")
+        .arg(files.join("config.toml"))
+        .arg("--instructions")
+        .arg(files.join("AGENTS.md"))
+        .args(["run-task", TASK, "--allocation-id", "allocation-root"])
+        .env("PATH", path)
+        .env("AGENT_TEST_FAKE_REX", &bin)
+        .env("AGENT_TEST_FAKE_REX_ORIGIN_SERVER", SERVER)
+        .env("REX_SERVER", SERVER)
+        .env("REX_SESSION", fake_rex::ORIGIN_SESSION)
+        .env("REX_BLOCK", fake_rex::ORIGIN_BLOCK)
+        .env_remove("REX_CLIENT")
+        .current_dir(&files)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let stdin = worker.stdin.take().unwrap();
+    let (received, chunks, text) = match timeout(Duration::from_secs(30), served_reads).await {
+        Ok(served) => served.unwrap(),
+        Err(_) => {
+            worker.start_kill().unwrap();
+            let output = worker.wait_with_output().await.unwrap();
+            panic!(
+                "The attached worker never served the reads: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    };
+    drop(stdin);
+    let output = timeout(Duration::from_secs(30), worker.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    coordinator.await.unwrap();
+    assert!(received == image, "The image arrives byte for byte");
+    assert_eq!(chunks, image.len().div_ceil(1024 * 1024));
+    assert_eq!(
+        serde_json::to_value(text).unwrap(),
+        json!({"type": "file", "content": "beta ", "truncated": true}),
+        "A text read on the same worker keeps its byte window"
+    );
 }
 
 /// Run with `OPENAI_API_KEY` and `OPENAI_BASE_URL` set to an OpenAI-compatible
