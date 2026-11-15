@@ -437,6 +437,10 @@ xcodebuild -project ios/Agent.xcodeproj -scheme Agent \
   -destination 'generic/platform=iOS Simulator' \
   -derivedDataPath target/ios-app CODE_SIGNING_ALLOWED=NO build
 python3 ios/scripts/check-intents-metadata.py target/ios-app/Build/Products/Debug-iphonesimulator/Agent.app
+xcodebuild -project ios/Agent.xcodeproj -scheme Agent -configuration Release \
+  -destination 'generic/platform=iOS Simulator' \
+  -derivedDataPath target/ios-app CODE_SIGNING_ALLOWED=NO build
+python3 ios/scripts/check-intents-metadata.py target/ios-app/Build/Products/Release-iphonesimulator/Agent.app
 ```
 
 Run these from the repository root, with full Xcode selected for Apple checks.
@@ -490,7 +494,9 @@ Nested block-container layout, remote image previews, math and diagrams remain
 outside this renderer. To retain the review images,
 pass `--attachments-path /absolute/existing/directory` to `swift test`.
 `bash ios/scripts/check.sh` runs strict Swift lint, macOS tests, the unsigned
-Speech package and app builds, a guard that keeps FluidAudio inside `Speech/`, package tests on iOS and app-hosted rendering tests. It requires an
+Speech package build, unsigned Debug and Release app builds with their App
+Intents metadata checks, a guard that keeps FluidAudio inside `Speech/`,
+package tests on iOS and app-hosted rendering tests. It requires an
 installed compatible iOS runtime and cleans up only its own simulator.
 Simulator UI checks use ad-hoc signing for real App Group entitlements; no
 Apple account or provisioning profile is needed.
