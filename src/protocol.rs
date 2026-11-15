@@ -887,8 +887,7 @@ pub struct TaskGraphSnapshot {
 pub struct TaskGraphNode {
     #[ts(type = "number")]
     pub id: u64,
-    /// Pi's task kind, such as `pi.generation`, `pi.tool` or `agent.background`.
-    pub kind: String,
+    pub kind: TaskGraphKind,
     pub conversation_id: String,
     /// The Pi task that owns this one. None for a task its conversation owns.
     #[ts(type = "number | null")]
@@ -902,8 +901,17 @@ pub struct TaskGraphNode {
     /// Conversations this task owns in Pi. Delegate and agent conversations are not owned by a
     /// Pi task; their parent is `TaskGraphActor::Agent::parent_conversation_id`.
     pub conversations: Vec<String>,
-    /// The tool's name for a `pi.tool` task whose call is still live.
-    pub tool: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TaskGraphKind {
+    /// One model turn of a conversation.
+    Generation,
+    /// A tool call. The name is absent once the call has settled.
+    Tool { name: Option<String> },
+    /// Any other Pi task kind, verbatim, such as `agent.background`.
+    Other { name: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]

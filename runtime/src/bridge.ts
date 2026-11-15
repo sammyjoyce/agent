@@ -13,6 +13,7 @@ import { ConversationModels, ModelError, modelFailureMessage } from "./models.js
 import { ChatGptAuth } from "./auth.js";
 import { validRequest, validEvent, validApnsConfig, errorEvent, invalidHostReply, protocolLines } from "./protocol.js";
 import { TaskError, TaskStore, type HostCall } from "./tasks.js";
+import { readTaskGraph } from "./task-graph.js";
 import { HistoryStore } from "./history.js";
 import { CodexImporter } from "./importer.js";
 import { ConversationCatalog } from "./catalog.js";
@@ -630,6 +631,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         emit(id, { type: "notice", task_id: task.id, text: `Opened ${task.title}` }); break;
       }
       case "list_tasks": emit(id, { type: "tasks", tasks: await (await app()).tasks.list() }); break;
+      case "read_task_graph": emit(id, { type: "task_graph", graph: await readTaskGraph((await app()).tasks) }); break;
       case "list_resources": emit(id, { type: "resources", resources: await (await app()).resources.list() }); break;
       case "collect_resources": emit(id, { type: "resources", resources: await (await app()).resources.collect(command.host_id, (operation) => hostRequests.call(id, operation)) }); break;
       case "search_tasks": emit(id, { type: "tasks", tasks: await (await app()).tasks.search(command.query) }); break;

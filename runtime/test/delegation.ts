@@ -34,7 +34,7 @@ export async function open(directory: string) {
   const executions = new Executions();
   const tools = createAppTools(tasks, executions);
   registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker); registry.install(tools.agent); registry.install(tools.legacy);
-  return { session, tasks, executions, tools, faux };
+  return { session, registry, tasks, executions, tools, faux };
 }
 export type App = Awaited<ReturnType<typeof open>>;
 

@@ -5810,6 +5810,59 @@
         "all_settled"
       ]
     },
+    "TaskGraphKind": {
+      "oneOf": [
+        {
+          "description": "One model turn of a conversation.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "generation"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "A tool call. The name is absent once the call has settled.",
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "tool"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "Any other Pi task kind, verbatim, such as `agent.background`.",
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "other"
+            }
+          },
+          "required": [
+            "type",
+            "name"
+          ]
+        }
+      ]
+    },
     "TaskGraphNode": {
       "description": "One live Pi task. `id` and `owner` are Pi task IDs, never a Beep Boop `TaskId`.",
       "type": "object",
@@ -5848,8 +5901,7 @@
           "minimum": 0
         },
         "kind": {
-          "description": "Pi's task kind, such as `pi.generation`, `pi.tool` or `agent.background`.",
-          "type": "string"
+          "$ref": "#/$defs/TaskGraphKind"
         },
         "owner": {
           "description": "The Pi task that owns this one. None for a task its conversation owns.",
@@ -5862,13 +5914,6 @@
         },
         "state": {
           "$ref": "#/$defs/TaskGraphState"
-        },
-        "tool": {
-          "description": "The tool's name for a `pi.tool` task whose call is still live.",
-          "type": [
-            "string",
-            "null"
-          ]
         }
       },
       "required": [

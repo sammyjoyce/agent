@@ -6,8 +6,11 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { defineTask, ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
 import { DEFAULT_MODEL } from "../src/models.js";
 import { validEvent } from "../src/protocol.js";
+import { readTaskGraph, TASK_GRAPH_BYTE_LIMIT, TASK_GRAPH_NODE_LIMIT } from "../src/task-graph.js";
 import type { HostCommand } from "../src/generated/HostCommand.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
@@ -16,7 +19,7 @@ import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
 import type { TaskGraphActor } from "../src/generated/TaskGraphActor.js";
 import type { TaskGraphNode } from "../src/generated/TaskGraphNode.js";
 import type { WorkerRef } from "../src/generated/WorkerRef.js";
-import { binding, host } from "./delegation.js";
+import { binding, host, open, within } from "./delegation.js";
 import type { ModelQueue } from "./fixtures/coordinator-runtime.js";
 
 type HostCall = { id: number; call_id: string; command: HostCommand };
@@ -100,10 +103,10 @@ test("the task graph request joins live generations and tool calls with main, ta
     assert.equal(omitted, 0);
     const work = (type: TaskGraphActor["type"]): TaskGraphNode[] => nodes.filter((node) =>
       conversations.find((conversation) => conversation.conversation_id === node.conversation_id)?.actor.type === type);
-    const shape = (list: readonly TaskGraphNode[]) => list.map((node) => [node.kind, node.tool, node.state.status,
+    const shape = (list: readonly TaskGraphNode[]) => list.map((node) => [node.kind, node.state.status,
       node.owner === null ? null : list.findIndex((owner) => owner.id === node.owner),
       node.state.status === "waiting" ? node.state.on.map((id) => list.findIndex((target) => target.id === id)) : null]);
-    const running = (tool: string) => [["pi.generation", null, "waiting", null, [1]], ["pi.tool", tool, "running", 0, null]];
+    const running = (name: string) => [[{ type: "generation" }, "waiting", null, [1]], [{ type: "tool", name }, "running", 0, null]];
 
     assert.deepEqual(shape(work("main")), running("delegate_task"));
     const delegate = conversations.find((conversation) => conversation.actor.type === "task"); assert.ok(delegate?.actor.type === "task");
@@ -118,4 +121,79 @@ test("the task graph request joins live generations and tool calls with main, ta
     assert.equal(nodes.every((node) => !node.background && !node.abort_requested && node.blocked === null && node.conversations.length === 0), true);
     assert.equal((await event(5, (event) => event.type === "done")).type, "done");
   } finally { lines.close(); child.stdin.end(); child.kill("SIGKILL"); await closed; await rm(directory, { recursive: true, force: true }); }
+});
+
+test("the task graph shows sleeping, blocked and background work, keeps an idle task as its agent's parent, and bounds its count and bytes", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-task-graph-")); const app = await open(directory);
+  const wake = Date.UTC(2100, 0, 1);
+  const abort = async () => {};
+  const timer = defineTask<null, { phase: "wait" }, null>({ name: "fixture.timer", version: 1, initial: () => ({ phase: "wait" }), abort, phases: {
+    wait: async (task, runtime, context) => { await runtime.commit(() => ({ status: "sleeping", until: wake, checkpoint: task.state.checkpoint }), context); },
+  } });
+  const retired = defineTask<null, { phase: "run" }, null>({ name: "fixture.retired", version: 1, initial: () => ({ phase: "run" }), abort, phases: { run: async () => {} } });
+  app.registry.install({ name: "fixture", tasks: [timer] });
+  try {
+    await app.session.root(BACKGROUND_CONTEXT);
+    const task = await app.tasks.create({ title: "Idle parent", outcome: "Keep the review moving" });
+    const agent = await app.tasks.createAgent(task.id, { id: "review", title: "Review", outcome: "Review the change", input: "Review the change", inputId: "review-input" });
+    const agentConversation = await app.tasks.conversation(agent.conversation_id);
+    const created = await app.session.commit(async (tx) => {
+      const stray = await tx.createConversation({ ownership: { kind: "ownerless" } });
+      return {
+        stray: stray.id,
+        timer: await tx.createTask(timer, null, { ownership: { kind: "conversation" }, conversationId: ROOT_CONVERSATION_ID, background: true }),
+        agent: await tx.createTask(retired, null, { ownership: { kind: "conversation" }, conversationId: agentConversation.id }),
+        parent: await tx.createTask(retired, null, { ownership: { kind: "conversation" }, conversationId: stray.id }),
+      };
+    }, BACKGROUND_CONTEXT);
+    app.session.resume();
+    const graph = await within((async () => {
+      for (;;) {
+        const graph = await readTaskGraph(app.tasks);
+        if (graph.nodes.some((node) => node.id === created.timer && node.state.status === "sleeping")) return graph;
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      }
+    })(), "The timer must reach its sleep");
+    assert.ok(validEvent({ version: 1, id: 1, event: { type: "task_graph", graph } }), "The graph must satisfy the generated event schema");
+    const blocked = { kind: { type: "other", name: "fixture.retired" }, owner: null, background: false, abort_requested: false,
+      state: { status: "pending", phase: "run" }, blocked: "missing_task", conversations: [] };
+    assert.deepEqual(graph, {
+      nodes: [
+        { id: created.timer, kind: { type: "other", name: "fixture.timer" }, conversation_id: ROOT_CONVERSATION_ID.toString(), owner: null,
+          background: true, abort_requested: false, state: { status: "sleeping", phase: "wait", until: wake }, blocked: null, conversations: [] },
+        { ...blocked, id: created.agent, conversation_id: agent.conversation_id },
+        { ...blocked, id: created.parent, conversation_id: created.stray.toString() },
+      ],
+      conversations: [
+        { conversation_id: ROOT_CONVERSATION_ID.toString(), actor: { type: "main" } },
+        { conversation_id: task.conversation_id, actor: { type: "task", task_id: task.id, title: "Idle parent" } },
+        { conversation_id: agent.conversation_id, actor: { type: "agent", task_id: task.id, agent_id: "review", title: "Review", parent_conversation_id: task.conversation_id } },
+        { conversation_id: created.stray.toString(), actor: { type: "other" } },
+      ],
+      omitted: 0,
+    });
+
+    const taskConversation = await app.tasks.conversation(task.conversation_id);
+    const nested = await app.session.commit(async (tx) => {
+      for (let index = 0; index < TASK_GRAPH_NODE_LIMIT; index += 1) {
+        await tx.createTask(retired, null, { ownership: { kind: "task", taskId: created.parent }, conversationId: created.stray });
+      }
+      return tx.createTask(retired, null, { ownership: { kind: "conversation" }, conversationId: taskConversation.id });
+    }, BACKGROUND_CONTEXT);
+    const bounded = await readTaskGraph(app.tasks);
+    assert.equal(bounded.nodes.length, TASK_GRAPH_NODE_LIMIT); assert.equal(bounded.omitted, 4);
+    assert.ok(bounded.nodes.some((node) => node.id === nested && node.conversation_id === task.conversation_id),
+      "The bound must drop nested work before another conversation's newer work");
+    assert.equal(bounded.nodes.filter((node) => node.owner === created.parent).length, TASK_GRAPH_NODE_LIMIT - 4);
+    assert.ok(validEvent({ version: 1, id: 1, event: { type: "task_graph", graph: bounded } }));
+    assert.ok(TASK_GRAPH_BYTE_LIMIT <= 4 * 1024 * 1024 / 2, "The byte limit must leave room inside the runtime's 4 MiB frame");
+    const bytes = Buffer.byteLength(JSON.stringify(bounded));
+    assert.ok(bytes < TASK_GRAPH_BYTE_LIMIT / 4, "A full snapshot of ordinary work must stay far below the byte limit, not " + bytes + " bytes");
+
+    const verbose = await app.tasks.create({ title: "Long title ".repeat(TASK_GRAPH_BYTE_LIMIT / 10), outcome: "Carry an oversized label" });
+    const verboseConversation = await app.tasks.conversation(verbose.conversation_id);
+    await app.session.commit((tx) => tx.createTask(retired, null, { ownership: { kind: "conversation" }, conversationId: verboseConversation.id }), BACKGROUND_CONTEXT);
+    await assert.rejects(readTaskGraph(app.tasks), /task graph is too large to send/,
+      "An oversized snapshot must fail its own request, not overflow the runtime frame");
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
