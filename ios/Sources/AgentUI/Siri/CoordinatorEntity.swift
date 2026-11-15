@@ -8,7 +8,7 @@ public struct CoordinatorEntity: AppEntity {
 
   /// The profile's `ProfileID`, as `ProfileID(wire:)` reads it.
   public let id: String
-  public let name: String
+  @Property(title: "Name") public var name: String
 
   public init(id: String, name: String) {
     self.id = id

@@ -57,9 +57,9 @@
 
       let definitions = IntentDefinitions(bundleIdentifier: "dev.jessfraz.Agent")
       let coordinators = try await definitions.entities["CoordinatorEntity"].allEntities()
-      XCTAssertEqual(coordinators.count, 2, "\(coordinators)")
-      // The entity exposes no properties, so Personal is found by its place in the saved order.
-      let target = coordinators[1]
+      let names = try coordinators.map { try $0.name.as(String.self) }
+      XCTAssertEqual(names, ["Work", "Personal"])
+      let target = try XCTUnwrap(names.firstIndex(of: "Personal").map { coordinators[$0] })
       try await definitions.intents["OpenCoordinatorIntent"].makeIntent(target: target).run()
 
       let personalScope = NSPredicate(format: "label CONTAINS 'Personal'")
