@@ -1,10 +1,16 @@
 import AgentCore
 import Foundation
 
-/// One holder's claim that a coordinator stay connected, whatever the scene is doing.
+/// One holder's claim that a coordinator stay connected, whatever the scene is doing. Only
+/// `ConnectionDemand.take` makes one.
 struct ConnectionLease: Hashable, Sendable {
+  /// How long a new lease waits for its coordinator to connect.
+  static let connectionWait = Duration.seconds(8)
+
   let profile: ProfileID
-  let id: UUID
+  fileprivate let id = UUID()
+
+  fileprivate init(profile: ProfileID) { self.profile = profile }
 }
 
 /// Which coordinators want a connection: every one while the scene is active, and each one that
@@ -17,7 +23,7 @@ struct ConnectionDemand: Equatable, Sendable {
   func leased(_ profile: ProfileID) -> Bool { leases[profile] != nil }
 
   mutating func take(_ profile: ProfileID) -> ConnectionLease {
-    let lease = ConnectionLease(profile: profile, id: UUID())
+    let lease = ConnectionLease(profile: profile)
     leases[profile, default: []].insert(lease.id)
     return lease
   }

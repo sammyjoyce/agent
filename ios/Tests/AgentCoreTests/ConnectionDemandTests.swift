@@ -53,6 +53,14 @@ private func observeCount(_ fixture: FixtureCoordinator) async -> Int {
   chat.snapshots[id]?.connection
 }
 
+/// The lane's state as its session reports it. A leased body runs on this, ahead of the copy
+/// `connection` reads.
+@MainActor private func sessionConnection(_ chat: ChatModel, _ id: ProfileID) async
+  -> ConnectionState?
+{
+  await chat.lanes.first { $0.id == id }?.session?.connectionState
+}
+
 /// Work and Personal paired and connected, then the scene sent to the background until both
 /// lanes report disconnected.
 @MainActor private func withBackgroundedPair(
@@ -76,7 +84,7 @@ private func observeCount(_ fixture: FixtureCoordinator) async -> Int {
     let workObserves = await observeCount(workPeer)
     let personalObserves = await observeCount(personalPeer)
     let during = try await coordinators.withConnection(to: work) {
-      (work: connection(chat, work), personal: connection(chat, personal))
+      (work: await sessionConnection(chat, work), personal: connection(chat, personal))
     }
     #expect(during.work == .connected, "The leased lane connected before the body ran")
     #expect(during.personal == .disconnected, "The other lane stayed disconnected")
@@ -111,7 +119,7 @@ private func observeCount(_ fixture: FixtureCoordinator) async -> Int {
     let entries = Entries()
     let (gate, release) = AsyncStream<Void>.makeStream()
     let held = Task { @MainActor in
-      await coordinators.withConnection(to: work) {
+      try await coordinators.withConnection(to: work) {
         entries.count += 1
         for await _ in gate {}
       }
@@ -123,7 +131,7 @@ private func observeCount(_ fixture: FixtureCoordinator) async -> Int {
     #expect(connection(chat, work) == .connected, "The leased lane stayed connected")
     #expect(await observeCount(workPeer) == observes, "Leaving the scene never redialed Work")
     release.finish()
-    await held.value
+    try await held.value
     try await until("Work disconnected once the lease dropped") {
       connection(chat, work) == .disconnected
     }
@@ -135,7 +143,7 @@ private func observeCount(_ fixture: FixtureCoordinator) async -> Int {
     let chat = coordinators.chat
     await #expect(throws: LeasedBodyFailed.self) {
       try await coordinators.withConnection(to: work) {
-        #expect(connection(chat, work) == .connected)
+        #expect(await sessionConnection(chat, work) == .connected)
         throw LeasedBodyFailed()
       }
     }
@@ -172,13 +180,13 @@ private func observeCount(_ fixture: FixtureCoordinator) async -> Int {
     let (firstGate, firstRelease) = AsyncStream<Void>.makeStream()
     let (secondGate, secondRelease) = AsyncStream<Void>.makeStream()
     let first = Task { @MainActor in
-      await coordinators.withConnection(to: work) {
+      try await coordinators.withConnection(to: work) {
         entries.count += 1
         for await _ in firstGate {}
       }
     }
     let second = Task { @MainActor in
-      await coordinators.withConnection(to: work) {
+      try await coordinators.withConnection(to: work) {
         entries.count += 1
         for await _ in secondGate {}
       }
@@ -186,12 +194,13 @@ private func observeCount(_ fixture: FixtureCoordinator) async -> Int {
     try await until("both leases held") { entries.count == 2 }
     let observes = await observeCount(workPeer)
     firstRelease.finish()
-    await first.value
+    try await first.value
     #expect(chat.demand.leased(work), "The second lease is still held")
-    #expect(connection(chat, work) == .connected, "One lease left keeps Work connected")
+    #expect(
+      await sessionConnection(chat, work) == .connected, "One lease left keeps Work connected")
     #expect(await observeCount(workPeer) == observes, "Dropping the first lease never redialed")
     secondRelease.finish()
-    await second.value
+    try await second.value
     #expect(!chat.demand.leased(work))
     try await until("Work disconnected once the last lease dropped") {
       connection(chat, work) == .disconnected

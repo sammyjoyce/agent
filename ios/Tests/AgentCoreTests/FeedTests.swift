@@ -1329,6 +1329,8 @@ func anActivationDuringRemoveNeverReconnectsTheRemovedCoordinator() async throws
             continuation: false, entryId: "p-reply", finalChunk: true, role: .final,
             text: "An invented Personal reply")
         ], nextCursor: nil, pageComplete: true), pages: [:])
+    // A return to the foreground follows an inactive scene, and only that change dials a lane.
+    await coordinators.setActive(false)
     let activating = Task { @MainActor in await coordinators.setActive(true) }
     let removing = Task { @MainActor in
       try await coordinators.remove(coordinators.removal(personal))
@@ -1363,6 +1365,8 @@ func anActivationDuringRemoveNeverSendsTheMessageRemoveDeletes() async throws {
     #expect(
       coordinators.removal(personal).message
         == "This deletes 1 queued message on this phone.")
+    // A return to the foreground follows an inactive scene, and only that change dials a lane.
+    await coordinators.setActive(false)
     let activating = Task { @MainActor in await coordinators.setActive(true) }
     let removing = Task { @MainActor in
       try await coordinators.remove(coordinators.removal(personal))

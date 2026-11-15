@@ -97,19 +97,13 @@ public final class Coordinators {
     for withdrawal in withdrawals { retry(withdrawal) }
   }
 
-  /// Holds coordinator `id` connected while `body` runs, with the scene in the background too. It
-  /// waits up to 8 s for the connection, then runs `body` whether or not the lane connected.
-  func withConnection<T>(to id: ProfileID, _ body: () async throws -> T) async rethrows -> T {
-    let lease = await chat.takeLease(on: id)
-    await chat.awaitConnection(id, within: .seconds(8))
-    do {
-      let result = try await body()
-      await chat.dropLease(lease)
-      return result
-    } catch {
-      await chat.dropLease(lease)
-      throw error
-    }
+  /// For App Intents: holds coordinator `id` connected while `body` runs, with the scene in the
+  /// background too. `ChatModel.withConnection` owns the lease and the wait.
+  func withConnection<T>(
+    to id: ProfileID, within limit: Duration = ConnectionLease.connectionWait,
+    _ body: () async throws -> T
+  ) async throws -> T {
+    try await chat.withConnection(to: id, within: limit, body)
   }
 
   func route(_ origin: AlertOrigin) -> ProfileID? {
@@ -191,9 +185,7 @@ public final class Coordinators {
       _ = try admit(found, for: profile.id, in: &next, at: address)
       try save(next, answered: found, at: address)
       chat.attach(lane(next[next.count - 1]))
-      if chat.demand.wants(profile.id) {
-        await chat.lanes.first { $0.id == profile.id }?.session?.connect()
-      }
+      await chat.reconcile(profile.id)
     }
   }
 
@@ -217,7 +209,7 @@ public final class Coordinators {
       guard found != nil, profiles[index].pin != nil else { return }
       await chat.detach(id)
       chat.attach(lane(profiles[index]))
-      if chat.demand.wants(id) { await chat.lanes.first { $0.id == id }?.session?.connect() }
+      await chat.reconcile(id)
     }
   }
 
@@ -388,7 +380,7 @@ public final class Coordinators {
   private func start(_ id: ProfileID) async {
     guard let profile = profiles.first(where: { $0.id == id }) else { return }
     chat.attach(lane(profile))
-    if chat.demand.wants(id) { await chat.lanes.first { $0.id == id }?.session?.connect() }
+    await chat.reconcile(id)
   }
 
   /// The one place a session is built. Only a pinned profile gets one.

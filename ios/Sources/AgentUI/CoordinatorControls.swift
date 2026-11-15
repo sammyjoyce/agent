@@ -8,6 +8,8 @@ enum LaneError: LocalizedError, Equatable {
   /// The coordinator's session changed, or its connection was cut, while the request ran. It may
   /// or may not have reached the coordinator.
   case interrupted(String)
+  /// The coordinator did not connect in the time its caller gave it, so the request never ran.
+  case unanswered(String)
 
   var errorDescription: String? {
     switch self {
@@ -15,6 +17,7 @@ enum LaneError: LocalizedError, Equatable {
     case .notPaired(let name): "\(name) is not paired yet."
     case .interrupted(let name):
       "The connection to \(name) was interrupted before this finished. Reload to see its current state before trying again."
+    case .unanswered(let name): "\(name) did not answer."
     }
   }
 }

@@ -324,6 +324,17 @@ final class ChatModel {
   @ObservationIgnored private let registration: NotificationRegistration?
   /// The scene's activity as the latest `setActive` asked for it, and the leases on each lane.
   @ObservationIgnored private(set) var demand = ConnectionDemand()
+  /// One lane's connection lifecycle, as `reconcile` drives it.
+  private struct Lifecycle {
+    /// What the lane's session was last told, kept with that session, so a session attached in
+    /// its place has been told nothing.
+    var told: (session: CoordinatorSession, connect: Bool)?
+    /// The one task that makes lifecycle calls on the lane.
+    var loop: Task<Void, Never>?
+    /// "Try again" asked for one redial.
+    var restart = false
+  }
+  @ObservationIgnored private var lifecycles: [ProfileID: Lifecycle] = [:]
   @ObservationIgnored private(set) var lanes: [Lane] = []
   @ObservationIgnored private var observations: [ProfileID: Task<Void, Never>] = [:]
   /// Inputs of a Send that reached no one, staged at a session that was retired before they could
@@ -609,7 +620,7 @@ final class ChatModel {
 
   /// Adds a saved coordinator's lane, or replaces an unpaired lane with its paired one.
   /// A lane whose session was live must be detached first, so two sessions never share
-  /// an outbox. A removed coordinator gets none. Connecting is `setActive`'s job.
+  /// an outbox. A removed coordinator gets none. Connecting is `reconcile`'s job.
   func attach(_ lane: Lane) {
     guard removed[lane.id] == nil else { return }
     observations.removeValue(forKey: lane.id)?.cancel()
@@ -640,6 +651,7 @@ final class ChatModel {
       laneEpochs[id, default: 0] += 1
     }
     let cancelled = await lanes.first { $0.id == id }?.session?.retire() ?? []
+    lifecycles[id]?.told = nil
     if let index = lanes.firstIndex(where: { $0.id == id }) {
       let lane = lanes.remove(at: index)
       observations.removeValue(forKey: id)?.cancel()
@@ -653,52 +665,100 @@ final class ChatModel {
     report(cancelled.compactMap { input in missed(id, input, .retired).map { (id, input, $0) } })
   }
 
-  /// Connects every lane while the app is active and disconnects every lane while it is not. A
-  /// leased lane is left as its lease holds it. Each step reads the latest request and the lanes
-  /// again after every await, so an older call that finishes last never undoes a newer one, and a
-  /// lane detached or leased meanwhile is skipped.
+  /// Connects every lane while the app is active, and disconnects every lane no lease holds while
+  /// it is not. An older call that finishes last never undoes a newer one, since `reconcile` acts
+  /// on the latest demand.
   func setActive(_ active: Bool) async {
     demand.sceneActive = active
     logComposer(active ? .active : .inactive)
-    for id in lanes.map(\.id) {
-      guard let session = lanes.first(where: { $0.id == id })?.session else { continue }
-      // `connect` redials a connected session, which would cut the lease holder's request.
-      guard !demand.leased(id) else { continue }
-      if demand.sceneActive { await session.connect() } else { await session.disconnect() }
-    }
+    for id in lanes.map(\.id) { await reconcile(id) }
   }
 
-  /// Holds lane `id` connected until the lease is dropped. Only a lane nothing wanted yet is
-  /// dialed, so a lane the scene or another lease already holds keeps its connection.
-  func takeLease(on id: ProfileID) async -> ConnectionLease {
+  /// Tells lane `id`'s session to connect or disconnect, as `demand` wants it, and returns once
+  /// it has been told. Nothing else connects or disconnects a lane's session. One loop per lane
+  /// makes the calls, so two never overlap on one session, and a caller that finds the loop
+  /// running waits for it. A session already told what `demand` wants is left alone, because
+  /// `connect` redials a connected session and would cut the requests in flight on it.
+  func reconcile(_ id: ProfileID) async {
+    if let loop = lifecycles[id]?.loop { return await loop.value }
+    guard pendingCall(id) != nil else { return }
+    // Its own task, so a cancelled caller still leaves the lane as `demand` wants it.
+    let loop = Task { await converge(id) }
+    lifecycles[id, default: Lifecycle()].loop = loop
+    await loop.value
+  }
+
+  /// Reads `demand` and the lane again after every call, so it ends at the latest of both.
+  private func converge(_ id: ProfileID) async {
+    while let call = pendingCall(id) {
+      lifecycles[id, default: Lifecycle()].told = call
+      lifecycles[id]?.restart = false
+      if call.connect { await call.session.connect() } else { await call.session.disconnect() }
+    }
+    lifecycles[id]?.loop = nil
+  }
+
+  /// What lane `id`'s session must be told next, or nil once it was last told what `demand`
+  /// wants.
+  private func pendingCall(_ id: ProfileID) -> (session: CoordinatorSession, connect: Bool)? {
+    guard let session = lanes.first(where: { $0.id == id })?.session else { return nil }
     let wanted = demand.wants(id)
-    let lease = demand.take(id)
-    if !wanted { await lanes.first { $0.id == id }?.session?.connect() }
-    return lease
+    let lifecycle = lifecycles[id]
+    let told = lifecycle?.told.flatMap { $0.session === session ? $0.connect : nil }
+    let restart = wanted && lifecycle?.restart == true
+    return told != wanted || restart ? (session, wanted) : nil
   }
 
-  /// Drops `lease`. Its lane disconnects once neither the scene nor another lease wants it.
-  func dropLease(_ lease: ConnectionLease) async {
-    demand.drop(lease)
-    guard !demand.wants(lease.profile) else { return }
-    await lanes.first { $0.id == lease.profile }?.session?.disconnect()
-  }
-
-  /// Returns once lane `id` reports connected, once `limit` passes, or at once without a session.
-  func awaitConnection(_ id: ProfileID, within limit: Duration) async {
+  /// Holds lane `id` connected while `body` runs, whatever the scene is doing. The lane is dialed
+  /// only if nothing else had it connecting, and it disconnects after `body` only if nothing else
+  /// wants it, before this returns. `body` runs once, and only after the lane's session itself
+  /// reported connected within `limit`. Otherwise this throws `LaneError.unanswered`, or
+  /// `CancellationError` for a cancelled task, and `body` never runs.
+  func withConnection<T>(
+    to id: ProfileID, within limit: Duration, _ body: () async throws -> T
+  ) async throws -> T {
+    try Task.checkCancellation()
+    _ = try session(on: id)
     let deadline = ContinuousClock.now + limit
-    while lanes.contains(where: { $0.id == id && $0.session != nil }), !connected(id),
-      ContinuousClock.now < deadline
-    {
-      do { try await Task.sleep(for: .milliseconds(20)) } catch { return }
+    let lease = demand.take(id)
+    let outcome: Result<T, any Error>
+    do {
+      await reconcile(id)
+      try await awaitConnection(id, until: deadline)
+      outcome = .success(try await body())
+    } catch {
+      outcome = .failure(error)
+    }
+    demand.drop(lease)
+    await reconcile(id)
+    // A session reports a request that this task's cancellation cut as a closed connection.
+    if Task.isCancelled, case .failure = outcome { throw CancellationError() }
+    return try outcome.get()
+  }
+
+  /// Returns once lane `id`'s session reports connected with no lifecycle call on the lane in
+  /// flight. It asks the session, because `snapshots` is a copy that trails it.
+  private func awaitConnection(_ id: ProfileID, until deadline: ContinuousClock.Instant)
+    async throws
+  {
+    while true {
+      let session = try session(on: id)
+      let connected = await session.connectionState == .connected
+      // Checked after the last await before the body, so a cancelled or late caller never runs it.
+      try Task.checkCancellation()
+      guard ContinuousClock.now < deadline else { throw LaneError.unanswered(name(id)) }
+      if connected, lifecycles[id]?.loop == nil, try self.session(on: id) === session { return }
+      try await Task.sleep(for: .milliseconds(5))
     }
   }
 
-  /// "Try again": reconnects now instead of waiting out the backoff, one lane or every lane
-  /// that is not connected.
+  /// "Try again": redials now instead of waiting out the backoff, one lane or every lane that is
+  /// not connected. A lane nothing wants connected stays down.
   func reconnect(_ id: ProfileID? = nil) async {
     for lane in lanes.map(\.id) where id == lane || (id == nil && !connected(lane)) {
-      await lanes.first { $0.id == lane }?.session?.connect()
+      guard demand.wants(lane), paired(lane) else { continue }
+      lifecycles[lane, default: Lifecycle()].restart = true
+      await reconcile(lane)
     }
   }
 
@@ -727,9 +787,7 @@ final class ChatModel {
   /// The one way a lane control reaches a session. It runs `run` once and retries nothing, and
   /// nothing comes back from a session that changed under the call.
   func onLane<T>(_ id: ProfileID, _ run: (CoordinatorSession) async throws -> T) async throws -> T {
-    if let name = removed[id] { throw LaneError.gone(name) }
-    guard let lane = lanes.first(where: { $0.id == id }) else { throw LaneError.gone(name(id)) }
-    guard let session = lane.session else { throw LaneError.notPaired(name(id)) }
+    let session = try session(on: id)
     let epoch = laneEpoch(id)
     let value: T
     do { value = try await run(session) } catch {
@@ -743,6 +801,14 @@ final class ChatModel {
     }
     guard laneEpoch(id) == epoch else { throw LaneError.interrupted(name(id)) }
     return value
+  }
+
+  /// Lane `id`'s session, or why it has none.
+  private func session(on id: ProfileID) throws -> CoordinatorSession {
+    if let name = removed[id] { throw LaneError.gone(name) }
+    guard let lane = lanes.first(where: { $0.id == id }) else { throw LaneError.gone(name(id)) }
+    guard let session = lane.session else { throw LaneError.notPaired(name(id)) }
+    return session
   }
   /// Opens this inspection on `owner`'s coordinator `id`, over a read-only session that the
   /// coordinator's own session mints and ends.
@@ -758,7 +824,8 @@ final class ChatModel {
       lanes = [Lane(id: id, session: inspector)]
       snapshots[id] = nil
       observations[id] = observe(inspector, lane: id)
-      if owner.demand.sceneActive { await inspector.connect() }
+      demand.sceneActive = owner.demand.sceneActive
+      if demand.sceneActive { await reconcile(id) }
     } catch { failure = error.localizedDescription }
   }
   /// Keeps an inspection connected until the task that owns it is cancelled.

@@ -267,6 +267,10 @@ public actor CoordinatorSession {
     continuation = pair.continuation
   }
 
+  /// This session's own connection state, ahead of the copy `updates` delivers. `.connected` is
+  /// always the current connection, since every connect and disconnect leaves it first.
+  public var connectionState: ConnectionState { snapshot.connection }
+
   public func connect() async {
     guard !retired else { return }
     let generation = UUID()
