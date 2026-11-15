@@ -28,6 +28,7 @@ pub mod machines;
 pub mod source_view;
 pub mod sources;
 pub mod tailnet;
+pub mod task_graph_view;
 pub mod tui;
 pub mod usage;
 
