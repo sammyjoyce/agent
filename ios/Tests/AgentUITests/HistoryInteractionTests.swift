@@ -531,6 +531,83 @@ final class ComposerInteractionTests: XCTestCase {
     XCTAssertFalse(
       app.staticTexts[first].isHittable, "Opening the picker scrolled back to the first row")
   }
+
+  // A reader scrolls up and taps Latest. The keyboard and then the picker shrink the feed, which
+  // keeps the newest reply rather than going back to the rows the reader had scrolled to.
+  func testTheKeyboardAndPickerAfterLatestKeepTheNewestReplyInView() async throws {
+    let reply = { (index: Int) in
+      "Reply \(index) from Work, long enough to wrap onto a second line of the feed."
+    }
+    let (app, work, _) = try await launchWithWorkAndPersonal(
+      workHistory: (1...30).map {
+        .init(
+          continuation: false, entryId: "reply-\($0)", finalChunk: true, role: .final,
+          text: reply($0))
+      })
+    defer { app.terminate() }
+    let transcript = app.scrollViews["transcript"]
+    let latest = app.buttons["latest-messages"]
+    let composer = app.descendants(matching: .any).matching(identifier: "Message the coordinator")
+      .firstMatch
+    var newest = app.staticTexts[reply(30)]
+    XCTAssertTrue(newest.waitForExistence(timeout: 5))
+    try await eventually(description: "the newest reply at launch") { newest.isHittable }
+    func visibleReplies() -> Set<String> {
+      Set(
+        app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "Reply "))
+          .allElementsBoundByIndex.filter(\.isHittable).map(\.label))
+    }
+    func openPicker() -> XCUIElement {
+      if !app.keyboards.keys["@"].exists { app.keyboards.keys["more"].tap() }
+      app.keyboards.keys["@"].tap()
+      let picker = app.buttons["Send to Work"]
+      XCTAssertTrue(picker.waitForExistence(timeout: 3))
+      return picker
+    }
+
+    for _ in 0..<3 { transcript.swipeDown() }
+    XCTAssertTrue(latest.waitForExistence(timeout: 3), "Scrolling up offers Latest")
+    XCTAssertFalse(newest.isHittable, "The reader scrolled away from the newest reply")
+    let reading = visibleReplies()
+    XCTAssertFalse(reading.isEmpty, "The reader sees older replies")
+    func assertTheFeedHoldsTheNewestReply(
+      _ newest: XCUIElement, after step: String, above picker: XCUIElement? = nil
+    ) async throws {
+      // A snap back lands only after the size change has animated, so give it time to happen.
+      try await Task.sleep(for: .milliseconds(700))
+      XCTAssertEqual(
+        visibleReplies().intersection(reading), [],
+        "\(step) snapped back to the rows the reader had scrolled to")
+      XCTAssertTrue(newest.isHittable, "\(step) scrolled away from the newest reply")
+      if let picker {
+        XCTAssertLessThanOrEqual(
+          newest.frame.maxY, picker.frame.minY - 6, "The picker covered the newest reply")
+      }
+    }
+
+    latest.tap()
+    try await assertTheFeedHoldsTheNewestReply(newest, after: "Latest")
+    composer.tap()
+    XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
+    try await assertTheFeedHoldsTheNewestReply(newest, after: "The keyboard after Latest")
+    var picker = openPicker()
+    try await assertTheFeedHoldsTheNewestReply(
+      newest, after: "The picker after Latest", above: picker)
+    app.keyboards.keys["delete"].tap()
+    XCTAssertTrue(picker.waitForNonExistence(timeout: 3))
+
+    for index in 31...34 {
+      try await work.reply(reply(index), id: "reply-\(index)")
+      newest = app.staticTexts[reply(index)]
+      XCTAssertTrue(newest.waitForExistence(timeout: 5))
+    }
+    try await eventually(description: "the feed following the newest reply") {
+      newest.isHittable
+    }
+    picker = openPicker()
+    try await assertTheFeedHoldsTheNewestReply(
+      newest, after: "The picker after new replies", above: picker)
+  }
 }
 
 @MainActor
