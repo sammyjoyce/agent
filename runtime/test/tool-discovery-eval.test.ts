@@ -24,7 +24,6 @@ import { DEFAULT_MODEL } from "../src/models.js";
 import type { ToolRole } from "../src/toolsets.js";
 import { declarationSize, DISCOVERY_ARMS, isDiscoveryArmName, openDiscoveryApp, type DiscoveryApp, type DiscoveryArmName } from "./fixtures/tool-discovery.js";
 
-
 type ProviderRequest = {
   stop: string; input: number; cache_read: number; cache_write: number; output: number; reasoning: number; total: number;
   cost_usd: number; duration_ms: number; declared_tokens: number; offered_tools: number; calls: string[];
@@ -305,7 +304,7 @@ async function runUnit(config: EvalConfig, arm: DiscoveryArmName, trial: number,
     error = caught instanceof Error ? caught.message : String(caught);
   } finally { clearTimeout(timer); controller.abort(); }
   const wall = Math.round(performance.now() - started);
-  await app?.close().catch(() => {});
+  await app?.close().catch((caught: unknown) => { error ??= `Close failed: ${caught instanceof Error ? caught.message : String(caught)}`; });
   const kept = keepFailures && !(error === null && verdict.success);
   if (!kept) await rm(directory, { recursive: true, force: true });
   const requests = await Promise.all(pending);
