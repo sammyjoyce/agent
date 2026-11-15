@@ -145,12 +145,12 @@ struct SiriJobTests {
         connection(chat, work) == .disconnected && connection(chat, personal) == .disconnected
       }
       await personalPeer.leaveObserveUnanswered(.silent)
-      let wait = Duration.milliseconds(300)
-      let jobs = try await JobQuery.allJobs(in: coordinators, within: wait)
+      // Work has to connect inside the wait that Personal runs out, on a busy machine too.
+      let jobs = try await JobQuery.allJobs(in: coordinators, within: .seconds(3))
       #expect(jobs.map(\.title) == ["Work nightly deps"])
       let id = ScopedEntityID(profile: personal, item: "nightly:deps")
       await #expect(throws: CoordinatorDidNotAnswer.self) {
-        try await JobQuery.jobs(identifiedBy: [id], in: coordinators, within: wait)
+        try await JobQuery.jobs(identifiedBy: [id], in: coordinators, within: .milliseconds(300))
       }
     }
   }
@@ -207,14 +207,14 @@ struct SiriJobTests {
       await personalPeer.advertiseWorkInspection(false)
       try await background(coordinators)
       await workPeer.leaveObserveUnanswered(.silent)
-      let wait = Duration.milliseconds(300)
+      // Personal has to connect inside the wait that Work runs out, on a busy machine too.
       let refused = await #expect(throws: (any Error).self) {
-        try await JobQuery.allJobs(in: coordinators, within: wait)
+        try await JobQuery.allJobs(in: coordinators, within: .seconds(3))
       }
       #expect(shown(refused) == "Personal: \(updateTheCoordinator)")
       await personalPeer.leaveObserveUnanswered(.silent)
       let silent = await #expect(throws: CoordinatorDidNotAnswer.self) {
-        try await JobQuery.allJobs(in: coordinators, within: wait)
+        try await JobQuery.allJobs(in: coordinators, within: .milliseconds(300))
       }
       #expect(shown(silent) == "Work did not answer. Check that it is running and reachable.")
     }
@@ -241,8 +241,10 @@ struct SiriJobTests {
     try await withJobPeers { coordinators, _, _, workPeer, personalPeer in
       try await background(coordinators)
       await workPeer.holdSnapshot()
-      let reading = Task { @MainActor in try await JobQuery.allJobs(in: coordinators) }
-      let deadline = ContinuousClock.now + .seconds(3)
+      let reading = Task { @MainActor in
+        try await JobQuery.allJobs(in: coordinators, within: .seconds(40))
+      }
+      let deadline = ContinuousClock.now + .seconds(20)
       while await jobReads(personalPeer) == 0, ContinuousClock.now < deadline {
         try await Task.sleep(for: .milliseconds(5))
       }

@@ -388,7 +388,9 @@ func aLeaseThatDoesNotConnectInTimeNamesItsCoordinatorAndNeverRunsItsBody() asyn
         entries.count += 1
       }
     }
-    #expect(ContinuousClock.now - started < .seconds(3), "The wait ended at its limit")
+    #expect(
+      ContinuousClock.now - started < ConnectionLease.connectionWait,
+      "The wait ended at the limit it was given")
     #expect(entries.count == 0, "The body never ran")
     #expect(!chat.demand.leased(work), "The lease was dropped")
     #expect(await sessionConnection(chat, work) == .disconnected, "Work was closed on return")
