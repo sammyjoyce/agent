@@ -183,18 +183,25 @@ one table, `DISCOVERY_ARMS`. Each arm maps a role to its deferred tools and to
 the tools that stay direct beside code mode. `direct` is production today.
 Every arm keeps `finish_without_reply`, `read_attachment` and `read_file`
 directly offered. `finish_without_reply` must be the main turn's own final
-call. Scripts drop native images from nested results, and `read_attachment`
-returns images. `read_file` stays direct for the image reads that pull request
-46 adds to it.
+call. A script receives only the text of a nested result from a tool without
+a structured output schema, and `read_attachment` returns images. `read_file`
+stays direct for the image reads that pull request 46 adds to it.
 
 `runtime/test/tool-discovery.test.ts` runs every arm on the real Harness with
-the faux provider. It checks the tools each role offers, that a tool loaded by
-`tool_search` stays offered after reopen and compaction, that scripts keep role
-guards, and that reopen repeats no call. It prints each arm's declaration size.
+the faux provider. It checks these behaviors:
+
+- The tools each role offers, and each arm's declaration size against `direct`.
+- A tool loaded by `tool_search` stays offered after reopen and compaction.
+- A worker script cannot call the main-only `delegate_task` or record another
+  task, and a main script cannot finish the turn without a reply.
+- A main script gets the same task and job results as direct calls.
+- Reopening does not repeat a settled call or an interrupted call that is
+  unsafe to replay. An interrupted replay-safe call runs again.
 
 Scripts cannot call `record_task` yet. It attributes the saved outcome to the
 model's own tool call, and a nested call from a script has none, so the call
-fails with "Task outcome model provenance is unavailable".
+fails with "Task outcome model provenance is unavailable". The suite pins this
+for a worker script.
 
 ### Live eval
 
@@ -203,23 +210,23 @@ a real provider:
 
 | Scenario | Role | Passes when |
 | --- | --- | --- |
-| `direct-answer` | main | The answer to a unit conversion is correct. |
+| `direct-answer` | main | The answer contains 210, the minutes in 3.5 hours. |
 | `task-status` | main | The answer names the credit note a saved task waits for. |
 | `delegation` | main | A new release-notes task exists and a worker spawn was requested. |
 | `file-edit` | worker | One setting changed, the rest of the file is intact, and the task is resolved. |
-| `child-agent` | worker and agent | A child agent reported the root cause and the parent resolved with it. |
+| `child-agent` | worker and agent | A child agent finished with a summary that mentions the certificate, and the parent resolved with evidence that mentions it. |
 | `browser-read` | main | The answer names the degraded component and its start time. |
-| `job-inspection` | main | The answer describes the configured job's check and schedule. |
+| `job-inspection` | main | The answer mentions Lumen Parts, purchase orders, and a weekly or Monday schedule. |
 | `source-triage` | triage | A credit-note mail links to its task and a newsletter is dismissed. |
-| `long-history` | main | The answer recalls a fact from 24 earlier turns. |
+| `long-history` | main | The answer recalls a deposit reference from the second of 24 earlier turns. |
 
 Each unit opens a private SQLite file and a temporary workspace. The eval host
-reads and edits files in that workspace, runs only `ls`, `cat`, `head`, `tail`,
-`wc`, `grep` and `pwd`, and serves one fixed status page to the browser tools.
-It returns a binding for a worker spawn without starting a worker and refuses
-every other host operation. Provider-hosted web search stays on, as in
-production. Main runs without the related-conversation context that the
-coordinator adds to live chats.
+returns invented guidance, reads, writes and edits files in that workspace,
+runs only `ls`, `cat`, `head`, `tail`, `wc`, `grep` and `pwd`, and serves one
+fixed status page to the browser tools. It returns a binding for a worker spawn
+without starting a worker and refuses every other host operation.
+Provider-hosted web search stays on, as in production. Main runs without the
+related-conversation context that the coordinator adds to live chats.
 
 To compare arms, set the provider and the arms, then run the eval:
 
@@ -245,8 +252,9 @@ A wrapper around the OpenAI provider records every logical request, including
 the requests of delegated child agents. Each JSONL row holds one scenario, arm
 and trial: success, requests, uncached input, cache reads, output, total
 tokens, the API-estimated cost, wall time, the tools the model called, and the
-estimated declaration size of the first request. The eval prints the median
-suite total, the error count and the work count for each arm.
+estimated declaration size of the first request. For each arm, the eval prints
+the median suite total, the work count, and an error count. The error count is
+the number of units that threw or had a request end in a provider error.
 
 ### Baseline
 
@@ -260,10 +268,11 @@ scenarios in two runs on 2026-11-15:
 | Cache reads | 240,320 | 219,392 to 251,776 |
 | API-estimated cost | $0.215 | $0.165 to $0.250 |
 
-All 72 units passed, with no provider errors. A request without tool calls
-costs about 7,700 tokens. About 4,400 of those are the hosted web search tool,
-and about 3,700 are main's estimated tool declarations. Requests times that
-prefix set the suite total. The spread comes from the scenarios whose request
-counts vary: `child-agent` used 8 to 10 requests, `source-triage` 6 to 8,
-`task-status` 3 to 4 and `browser-read` 2 to 3. An arm needs a gap wider than
-this range to show a difference.
+All 72 units passed their checks, and no unit threw or had a request end in a
+provider error. A request without tool calls costs about 7,700 tokens. About
+4,400 of those are the hosted web search tool, and about 3,700 are main's
+estimated tool declarations. Most of the suite total is the request count times
+that prefix, plus the conversation each request carries. The spread comes from
+the scenarios whose request counts vary: `child-agent` used 8 to 10 requests,
+`source-triage` 6 to 8, `task-status` 3 to 4 and `browser-read` 2 to 3. An arm
+needs a gap wider than this range to show a difference.
