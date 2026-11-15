@@ -338,8 +338,8 @@ final class ChatModel {
       var call: Call
     }
     var told: Told?
-    /// The one task that makes lifecycle calls on the lane.
-    var loop: Task<Void, Never>?
+    /// The lifecycle call in flight on the lane, if any.
+    var inFlight: Task<Void, Never>?
     /// "Try again" asked for one redial.
     var restart = false
   }
@@ -684,37 +684,33 @@ final class ChatModel {
 
   /// Tells lane `id`'s session to connect or disconnect, as `demand` wants it, and returns once
   /// it has been told. Until the model ends, nothing else in it connects or disconnects a lane's
-  /// session. One loop per lane makes the calls, so two never overlap on one session. A session
-  /// already told what `demand` wants is left alone, because `connect` redials a connected
-  /// session and would cut the requests in flight on it.
+  /// session. A lane has one call in flight at a time, so two never overlap on one session. A
+  /// caller that waited for one reads `demand` and the lane again, and every change to either is
+  /// followed by a `reconcile`, so the lane ends at the latest of both. A session already told
+  /// what `demand` wants is left alone, because `connect` redials a connected session and would
+  /// cut the requests in flight on it.
   func reconcile(_ id: ProfileID) async {
-    // A loop ends early at a connect that dialed nothing, so a caller that waited for one looks
-    // again afterwards.
-    while let loop = lifecycles[id]?.loop { await loop.value }
+    while let call = lifecycles[id]?.inFlight { await call.value }
     guard pendingCall(id) != nil else { return }
     // A task of its own, which later callers can await and a cancelled caller does not cancel.
-    let loop = Task { await converge(id) }
-    lifecycles[id, default: Lifecycle()].loop = loop
-    await loop.value
+    let call = Task { await tell(id) }
+    lifecycles[id, default: Lifecycle()].inFlight = call
+    await call.value
   }
 
-  /// Reads `demand` and the lane again after every call, so it ends at the latest of both, or at
-  /// a connect that dialed nothing for want of the outbox, which another connect would only read
-  /// again.
-  private func converge(_ id: ProfileID) async {
-    while let call = pendingCall(id) {
+  /// Makes the one call lane `id`'s session is due, and records what the session was told.
+  private func tell(_ id: ProfileID) async {
+    if let call = pendingCall(id) {
       lifecycles[id, default: Lifecycle()].told = .init(
         session: call.session, call: call.connect ? .connect : .disconnect)
       lifecycles[id]?.restart = false
-      guard call.connect else {
+      if !call.connect {
         await call.session.disconnect()
-        continue
+      } else if await call.session.connect() == .outboxUnreadable {
+        lifecycles[id]?.told = .init(session: call.session, call: .outboxUnreadable)
       }
-      guard await call.session.connect() == .outboxUnreadable else { continue }
-      lifecycles[id]?.told = .init(session: call.session, call: .outboxUnreadable)
-      break
     }
-    lifecycles[id]?.loop = nil
+    lifecycles[id]?.inFlight = nil
   }
 
   /// What lane `id`'s session must be told next: what `demand` wants, if that is not what it was
@@ -775,7 +771,7 @@ final class ChatModel {
       try Task.checkCancellation()
       if told(session, on: id) == .outboxUnreadable { throw LaneError.outboxUnreadable(name(id)) }
       guard ContinuousClock.now < deadline else { throw LaneError.unanswered(name(id)) }
-      if connected, lifecycles[id]?.loop == nil { return }
+      if connected, lifecycles[id]?.inFlight == nil { return }
       try await Task.sleep(for: .milliseconds(5))
     }
   }

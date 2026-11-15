@@ -318,10 +318,10 @@ func aLeaseWaitsForTheSessionWhenTheMainActorsCopyStillSaysConnected() async thr
   }
 }
 
-// MARK: - One loop per lane makes its lifecycle calls, and no redial cuts a held connection
+// MARK: - A lane has one lifecycle call in flight at a time, and no redial cuts a held connection
 
 /// The scene leaves while Work's session is busy, and a lease is taken on Work before that
-/// disconnect lands. The lane's loop ends at the latest demand, so Work is dialed again for the
+/// disconnect lands. The lease reads the demand again after it, so Work is dialed again for the
 /// lease and its body runs on the new connection.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func aLeaseTakenWhileTheSceneLeavesReconnectsItsLane() async throws {
@@ -419,7 +419,7 @@ func aLeaseThatReadsConnectedWhileItsLaneIsRedialedWaitsForTheRedial() async thr
 }
 
 /// "Try again" is redialing Work when the last lease on it is dropped. The lease waits for the
-/// lane's loop, so Work is closed before `withConnection` returns.
+/// redial, so Work is closed before `withConnection` returns.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func aLeaseDroppedWhileItsLaneIsRedialedReturnsOnceTheLaneIsClosed() async throws {
   try await withBackgroundedPair { coordinators, work, _, _, _ in
@@ -805,8 +805,8 @@ func anActivationWhileALeasesConnectFailsOnTheOutboxConnectsTheLane() async thro
 }
 
 /// Work's connect is held after it has read the outbox, as above. While it is held, the scene
-/// leaves and returns and the outbox becomes readable. The lane's loop ends at the connect that
-/// started nothing, and a scene change that waited for it still tells Work to connect.
+/// leaves and returns and the outbox becomes readable. A scene change that waited for the
+/// connect that started nothing still tells Work to connect.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func aSceneThatLeavesAndReturnsWhileAConnectFailsOnTheOutboxConnectsTheLane() async throws {
   try await withBackgroundLaunch { coordinators, work, _, workPeer, _ in
