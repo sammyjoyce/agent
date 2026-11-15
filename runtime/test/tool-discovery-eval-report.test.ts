@@ -106,11 +106,18 @@ function runChildAgent(childSummary: string, parentEvidence: string) {
   return runLiveEval((tools) => tools.includes("report_result") ? child() : parent() ?? { text: "The task is already resolved." }, "child-agent");
 }
 
-const DENIALS = ["There was no expired certificate; a full disk caused the deploy failure.", "the certificate was not expired",
-  "it wasn't an expired certificate", "we ruled out an expired certificate", "not caused by an expired TLS certificate"];
+const SEEDED_CAUSE = "Root cause: an expired TLS certificate on the staging relay rejected every deploy upload.";
+const DENIED_CAUSES = ["Root cause: There was no expired certificate; a full disk caused the deploy failure.", "Root cause: the certificate was not expired",
+  "Root cause: it wasn't an expired certificate", "Root cause: we ruled out an expired certificate", "Root cause: not caused by an expired TLS certificate",
+  "Root cause: a full disk, not an expired certificate.", "Root cause: unknown. An expired certificate was ruled out.",
+  "Root cause (per the doc): an expired TLS certificate — but we disproved that."];
+const RECORDED_CHILD_SUMMARIES = [
+  "Read docs/incident-0412.md without modifying files. It states: Root cause: an expired TLS certificate on the staging relay rejected every deploy upload.",
+  "Read docs/incident-0412.md without modifying files. Its stated root cause is: an expired TLS certificate on the staging relay rejected every deploy upload.",
+  "Read docs/incident-0412.md without modifying files. Root cause: an expired TLS certificate on the staging relay rejected every deploy upload."];
 
 test("the child-agent scenario fails when the child or parent denies or replaces the seeded root cause", { timeout: 180_000, concurrency: true }, async (t) => {
-  const cases = [...DENIALS.map((denial) => [`Root cause: ${denial}`, `Root cause: ${denial}`] as const),
+  const cases = [...DENIED_CAUSES.map((denial) => [denial, denial] as const),
     ["Root cause: an expired TLS certificate on the staging relay rejected the uploads.", "Root cause: we ruled out an expired certificate"] as const];
   await Promise.all(cases.map(([child, parent]) => t.test(`child "${child}", parent "${parent}"`, async () => {
     const { code, stdout, rows } = await runChildAgent(child, parent);
@@ -123,22 +130,23 @@ test("the child-agent scenario fails when the child or parent denies or replaces
 });
 
 test("the child-agent scenario passes when both answers state the seeded root cause, and keeps both answers", { timeout: 180_000, concurrency: true }, async (t) => {
-  const answers = ["Root cause: an expired TLS certificate on the staging relay rejected the uploads", "Root cause: the relay's certificate had expired"];
-  await Promise.all(answers.map((answer) => t.test(answer, async () => {
-    const { code, stdout, rows } = await runChildAgent(answer, answer);
+  const cases = [...["Root cause: an expired TLS certificate on the staging relay rejected the uploads", "Root cause: the relay's certificate had expired"]
+    .map((answer) => [answer, answer] as const), ...RECORDED_CHILD_SUMMARIES.map((summary) => [summary, SEEDED_CAUSE] as const)];
+  await Promise.all(cases.map(([child, parent]) => t.test(`child "${child}", parent "${parent}"`, async () => {
+    const { code, stdout, rows } = await runChildAgent(child, parent);
     assert.equal(rows.length, 1); assert.equal(rows[0]?.success, true, String(rows[0]?.detail));
-    assert.deepEqual(JSON.parse(String(rows[0]?.detail)), { agents: [{ state: "done", summary: answer }], state: "resolved", evidence: answer });
+    assert.deepEqual(JSON.parse(String(rows[0]?.detail)), { agents: [{ state: "done", summary: child }], state: "resolved", evidence: parent });
     assert.equal(code, 0, stdout);
   })));
 });
 
-test("the child-agent oracle judges only root cause lines, and every one must state the seeded cause", () => {
-  for (const right of ["Root cause: an expired TLS certificate on the staging relay rejected every deploy upload.",
+test("the child-agent oracle judges every root cause label, and each must state the seeded cause in a sentence without negation", () => {
+  for (const right of [SEEDED_CAUSE, ...RECORDED_CHILD_SUMMARIES,
     "The agent read the report.\n**Root cause:** The staging relay's TLS certificate had expired, so it rejected deploy uploads.",
     "- Root cause: the TLS certificate on the staging relay was expired"]) {
     assert.equal(statesExpiredCertificateCause(right), true, right);
   }
-  for (const wrong of ["An expired TLS certificate on the staging relay rejected every deploy upload.",
+  for (const wrong of [...DENIED_CAUSES, "An expired TLS certificate on the staging relay rejected every deploy upload.",
     "Root cause: a malformed environment variable. The certificate had expired earlier but was renewed.",
     "Root cause: an expired TLS certificate on the staging relay did not reject the uploads.",
     "Root cause: an expired TLS certificate on the staging relay.\nRoot cause: a full disk on the build host.",
