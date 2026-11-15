@@ -328,8 +328,14 @@ final class ChatModel {
     /// What `session` was last told. A session that later takes the lane's place has been told
     /// nothing, and the weak reference keeps no retired session alive.
     struct Told {
+      enum Call {
+        case connect, disconnect
+        /// Told to connect, the session dialed nothing, because its saved outbox could not be
+        /// read. It counts as told nothing, so the next `reconcile` tells it again.
+        case outboxUnreadable
+      }
       weak var session: CoordinatorSession?
-      var connect: Bool
+      var call: Call
     }
     var told: Told?
     /// The one task that makes lifecycle calls on the lane.
@@ -682,7 +688,9 @@ final class ChatModel {
   /// already told what `demand` wants is left alone, because `connect` redials a connected
   /// session and would cut the requests in flight on it.
   func reconcile(_ id: ProfileID) async {
-    if let loop = lifecycles[id]?.loop { return await loop.value }
+    // A loop ends early at a connect that dialed nothing, so a caller that waited for one looks
+    // again afterwards.
+    while let loop = lifecycles[id]?.loop { await loop.value }
     guard pendingCall(id) != nil else { return }
     // A task of its own, which later callers can await and a cancelled caller does not cancel.
     let loop = Task { await converge(id) }
@@ -690,13 +698,21 @@ final class ChatModel {
     await loop.value
   }
 
-  /// Reads `demand` and the lane again after every call, so it ends at the latest of both.
+  /// Reads `demand` and the lane again after every call, so it ends at the latest of both. It
+  /// also ends at a session that cannot read its outbox, which another connect would only read
+  /// again.
   private func converge(_ id: ProfileID) async {
     while let call = pendingCall(id) {
       lifecycles[id, default: Lifecycle()].told = .init(
-        session: call.session, connect: call.connect)
+        session: call.session, call: call.connect ? .connect : .disconnect)
       lifecycles[id]?.restart = false
-      if call.connect { await call.session.connect() } else { await call.session.disconnect() }
+      guard call.connect else {
+        await call.session.disconnect()
+        continue
+      }
+      guard await call.session.connect() == .outboxUnreadable else { continue }
+      lifecycles[id]?.told = .init(session: call.session, call: .outboxUnreadable)
+      break
     }
     lifecycles[id]?.loop = nil
   }
@@ -706,18 +722,23 @@ final class ChatModel {
   private func pendingCall(_ id: ProfileID) -> (session: CoordinatorSession, connect: Bool)? {
     guard let session = lanes.first(where: { $0.id == id })?.session else { return nil }
     let wanted = demand.wants(id)
-    let lifecycle = lifecycles[id]
-    let told = lifecycle?.told.flatMap { $0.session === session ? $0.connect : nil }
-    let restart = wanted && lifecycle?.restart == true
-    return told != wanted || restart ? (session, wanted) : nil
+    let restart = wanted && lifecycles[id]?.restart == true
+    return told(session, on: id) != (wanted ? .connect : .disconnect) || restart
+      ? (session, wanted) : nil
+  }
+
+  /// What `session` was last told as lane `id`'s session, or nil if it has been told nothing.
+  private func told(_ session: CoordinatorSession, on id: ProfileID) -> Lifecycle.Told.Call? {
+    lifecycles[id]?.told.flatMap { $0.session === session ? $0.call : nil }
   }
 
   /// Holds lane `id` connected while `body` runs, whatever the scene is doing. The lane is dialed
   /// only if nothing else had it connecting, and it disconnects after `body` only if nothing else
   /// wants it, before this returns. `body` runs once, and only after the lane's session itself
   /// reported connected within `limit`. Otherwise `body` never runs, and this throws
-  /// `LaneError.gone` or `.notPaired` for a lane without a session, `.unanswered` once `limit`
-  /// passes, or `CancellationError` for a cancelled task.
+  /// `LaneError.gone` or `.notPaired` for a lane without a session, `.outboxUnreadable` as soon
+  /// as the session has dialed nothing because it could not read its saved outbox, `.unanswered`
+  /// once `limit` passes, or `CancellationError` for a cancelled task.
   func withConnection<T>(
     to id: ProfileID, within limit: Duration, _ body: () async throws -> T
   ) async throws -> T {
@@ -742,16 +763,22 @@ final class ChatModel {
 
   /// Returns once lane `id`'s session reports connected with no lifecycle call on the lane in
   /// flight, since a redial closes the connection that a read before it saw. It asks the session,
-  /// because `snapshots` is a copy that trails it.
+  /// because `snapshots` is a copy that trails it. A session that dialed nothing for want of its
+  /// outbox ends the wait at once, since nothing dials it again until the next `reconcile`.
   private func awaitConnection(_ id: ProfileID, until deadline: ContinuousClock.Instant)
     async throws
   {
     while true {
-      let connected = try await session(on: id).connectionState == .connected
+      let session = try session(on: id)
+      let connected = await session.connectionState == .connected
       // Checked after the last await before the body, so a cancelled or late caller never runs it.
       try Task.checkCancellation()
+      let settled = lifecycles[id]?.loop == nil
+      if settled, told(session, on: id) == .outboxUnreadable {
+        throw LaneError.outboxUnreadable(name(id))
+      }
       guard ContinuousClock.now < deadline else { throw LaneError.unanswered(name(id)) }
-      if connected, lifecycles[id]?.loop == nil { return }
+      if connected, settled { return }
       try await Task.sleep(for: .milliseconds(5))
     }
   }

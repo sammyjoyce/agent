@@ -147,6 +147,19 @@ public enum StartOutcome: Sendable, Equatable {
   case retired
 }
 
+/// What a call to `CoordinatorSession.connect` did.
+public enum ConnectAttempt: Sendable, Equatable {
+  /// The session dials, and dials again after a failure it may retry, until it is told otherwise
+  /// or stops by itself.
+  case started
+  /// Nothing was dialed. The session is retired, or a later connect or disconnect took this
+  /// call's place.
+  case superseded
+  /// Nothing was dialed, because the saved outbox exists and could not be read or decoded. The
+  /// session is disconnected, and reads the outbox again when it is next told to connect.
+  case outboxUnreadable
+}
+
 /// Owns all network work, decoding, rendering preparation and the on-device outbox.
 /// Reconnect observes and reconciles. It never automatically replays an uncertain write.
 public actor CoordinatorSession {
@@ -273,16 +286,20 @@ public actor CoordinatorSession {
   /// always the current connection, since every connect and disconnect leaves it first.
   public var connectionState: ConnectionState { snapshot.connection }
 
-  public func connect() async {
-    guard !retired else { return }
+  /// What the snapshot's error says after a connect that returned `.outboxUnreadable`.
+  public static let outboxUnreadable =
+    "The saved outbox could not be read. It was preserved; no messages were replayed."
+
+  @discardableResult public func connect() async -> ConnectAttempt {
+    guard !retired else { return .superseded }
     let generation = UUID()
     await disconnect(generation: generation)
-    guard self.generation == generation else { return }
+    guard self.generation == generation else { return .superseded }
     identityFailure = nil
     snapshot.answeredAs = nil
     guard loadOutbox() else {
       await connectInspections(generation)
-      return
+      return .outboxUnreadable
     }
     if let newest = pending.map(\.queuedAt).max() { stamps.seed(newest) }
     // The outbox belongs to this profile and every socket proves its pinned coordinator,
@@ -295,6 +312,7 @@ public actor CoordinatorSession {
     snapshot.error = nil
     observation = Task { [weak self] in await self?.observe(generation: generation) }
     await connectInspections(generation)
+    return .started
   }
   private func connectInspections(_ generation: UUID) async {
     for inspector in liveInspectors where self.generation == generation {
@@ -313,8 +331,7 @@ public actor CoordinatorSession {
     } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
       pending = []
     } catch {
-      snapshot.error =
-        "The saved outbox could not be read. It was preserved; no messages were replayed."
+      snapshot.error = Self.outboxUnreadable
       publish()
       return false
     }

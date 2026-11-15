@@ -831,3 +831,15 @@ func aSessionWhoseOutboxCannotBeReadIsToldToConnectOncePerDemandAndNeverInALoop(
     withExtendedLifetime(inspector) {}
   }
 }
+
+@Test func aSessionSaysWhetherItsConnectStartedAnAttempt() async throws {
+  try await withCoordinator { session, _, outbox in
+    try SpoiledOutbox.undecodable.write(to: outbox)
+    #expect(await session.connect() == .outboxUnreadable)
+    #expect(await session.connectionState == .disconnected)
+    try SpoiledOutbox.repair(outbox)
+    #expect(await session.connect() == .started)
+    await session.retire()
+    #expect(await session.connect() == .superseded)
+  }
+}

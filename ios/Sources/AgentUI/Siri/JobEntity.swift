@@ -162,6 +162,15 @@ public struct CoordinatorDidNotAnswer: Error, CustomLocalizedStringResourceConve
   }
 }
 
+/// A coordinator that was not dialed for the intent, because its saved outbox on this phone could
+/// not be read.
+public struct CoordinatorOutboxUnreadable: Error, CustomLocalizedStringResourceConvertible {
+  public let name: String
+  public var localizedStringResource: LocalizedStringResource {
+    "\(name): \(CoordinatorSession.outboxUnreadable)"
+  }
+}
+
 /// A coordinator's own refusal of an intent's request, in its words under its name.
 public struct CoordinatorRefused: Error, CustomLocalizedStringResourceConvertible {
   public let name: String
@@ -193,6 +202,8 @@ extension Coordinators {
         })
     } catch let rejection as CoordinatorRejection {
       return .failure(CoordinatorRefused(name: name, message: rejection.message))
+    } catch LaneError.outboxUnreadable {
+      return .failure(CoordinatorOutboxUnreadable(name: name))
     } catch LaneError.unanswered, LaneError.interrupted, ConnectionError.closed,
       ConnectionError.timedOut, is NWError
     {

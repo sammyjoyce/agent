@@ -10,6 +10,9 @@ enum LaneError: LocalizedError, Equatable {
   case interrupted(String)
   /// The coordinator did not connect in the time its caller gave it, so the request never ran.
   case unanswered(String)
+  /// The coordinator was not dialed, because its saved outbox on this phone could not be read, so
+  /// the request never ran.
+  case outboxUnreadable(String)
 
   var errorDescription: String? {
     switch self {
@@ -18,6 +21,7 @@ enum LaneError: LocalizedError, Equatable {
     case .interrupted(let name):
       "The connection to \(name) was interrupted before this finished. Reload to see its current state before trying again."
     case .unanswered(let name): "\(name) did not answer."
+    case .outboxUnreadable(let name): "\(name): \(CoordinatorSession.outboxUnreadable)"
     }
   }
 }
