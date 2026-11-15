@@ -113,6 +113,7 @@ and skips `beep-boop serve` . On any connected machine:
 beep-boop chat
 beep-boop nodes
 beep-boop tasks list
+beep-boop tasks graph
 beep-boop sources
 beep-boop usage
 beep-boop import codex

@@ -243,7 +243,7 @@ integration and deployment are tracked separately above.
 | Typed telemetry and usage totals | In use | Native UsageDoc supplies own-conversation totals and bounded request timings in `/status`; the private native SQLite recorder keeps payload-free diagnostics. Unknown prices remain unavailable; API-equivalent estimates are separate from bills and subscription quota. |
 | Image preparation workers | In use | Pi's Photon worker prepares attached images for native model input. Beep Boop owns transfer and storage. |
 | Image-aware file readers | Not enabled | Beep Boop owns its host file tools; reuse Pi's image-aware reads when extending them. |
-| Forks, child tasks and task graphs | Partial | Pi executes native model/tool task trees. Beep Boop delegates use separate conversations; forks and graph views are not integrated. Evaluate native ownership while preserving delegates' durable lifetimes and Rex bindings. |
+| Forks, child tasks and task graphs | Graph in use | `beep-boop tasks graph` shows Pi's live task tree with task and agent identity. Delegate conversations stay ownerless: ownership by the spawning call breaks delegate lifetimes, and a background anchor adds a permanent native task per delegate before any feature needs it. No flow needs a fork. [Architecture](architecture.md#tasks-and-execution) records the evidence and when to revisit. A live watch and the TUI and iOS views remain. |
 | Deferred tool search and code mode | Not enabled | Benchmark upstream extensions against the current role-specific toolsets; adopt when they reduce total tokens or round trips. Tool search is separate from conversation search. |
 
 See [Pi Durable](https://github.com/earendil-works/pi/tree/main/packages/durable)
