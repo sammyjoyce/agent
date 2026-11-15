@@ -212,7 +212,8 @@ private func observeCount(_ fixture: FixtureCoordinator) async -> Int {
 
 extension CoordinatorSession {
   /// Occupies this session's actor until `released`, so a lifecycle call on it waits its turn, as
-  /// one does behind a busy session.
+  /// one does behind a busy session. A test also signals `released` in a `defer`, because a test
+  /// that throws first would leave the actor occupied, and the run would hang instead of failing.
   fileprivate func occupy(
     entered: AsyncStream<Void>.Continuation, until released: DispatchSemaphore
   ) {
@@ -244,6 +245,7 @@ func aLeaseTakenWhileTheSceneActivatesAnotherLaneDialsItsOwn() async throws {
     let workSession = try #require(chat.lanes.first { $0.id == work }?.session)
     let (entered, enter) = AsyncStream<Void>.makeStream()
     let barrier = DispatchSemaphore(value: 0)
+    defer { barrier.signal() }
     let occupied = Task.detached { await workSession.occupy(entered: enter, until: barrier) }
     for await _ in entered {}
     let activating = Task { @MainActor in await coordinators.setActive(true) }
@@ -309,6 +311,7 @@ func aLeaseTakenWhileTheSceneLeavesReconnectsItsLane() async throws {
     let observes = await observeCount(workPeer)
     let (entered, enter) = AsyncStream<Void>.makeStream()
     let barrier = DispatchSemaphore(value: 0)
+    defer { barrier.signal() }
     let occupied = Task.detached { await session.occupy(entered: enter, until: barrier) }
     for await _ in entered {}
     let leaving = Task { @MainActor in await coordinators.setActive(false) }
@@ -372,6 +375,7 @@ func aLeaseThatReadsConnectedWhileItsLaneIsRedialedWaitsForTheRedial() async thr
     let observes = await observeCount(workPeer)
     let (entered, enter) = AsyncStream<Void>.makeStream()
     let barrier = DispatchSemaphore(value: 0)
+    defer { barrier.signal() }
     let occupied = Task.detached { await session.occupy(entered: enter, until: barrier) }
     for await _ in entered {}
     let reading = Task { @MainActor in
@@ -411,6 +415,7 @@ func aLeaseDroppedWhileItsLaneIsRedialedReturnsOnceTheLaneIsClosed() async throw
     try await until("the lease held") { entries.count == 1 }
     let (entered, enter) = AsyncStream<Void>.makeStream()
     let barrier = DispatchSemaphore(value: 0)
+    defer { barrier.signal() }
     let occupied = Task.detached { await session.occupy(entered: enter, until: barrier) }
     for await _ in entered {}
     let redialing = Task { @MainActor in await chat.reconnect(work) }
@@ -496,6 +501,7 @@ func aLeaseCancelledAsItsLaneReadsConnectedNeverRunsItsBody() async throws {
     let entries = Entries()
     let (entered, enter) = AsyncStream<Void>.makeStream()
     let barrier = DispatchSemaphore(value: 0)
+    defer { barrier.signal() }
     let occupied = Task.detached { await session.occupy(entered: enter, until: barrier) }
     for await _ in entered {}
     let waiting = Task { @MainActor in
@@ -522,6 +528,7 @@ func aLeaseWhoseLaneReadsConnectedAfterTheDeadlineNeverRunsItsBody() async throw
     let entries = Entries()
     let (entered, enter) = AsyncStream<Void>.makeStream()
     let barrier = DispatchSemaphore(value: 0)
+    defer { barrier.signal() }
     let occupied = Task.detached { await session.occupy(entered: enter, until: barrier) }
     for await _ in entered {}
     let limit = Duration.milliseconds(100)
