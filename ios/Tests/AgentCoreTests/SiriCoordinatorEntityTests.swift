@@ -16,7 +16,10 @@ struct SiriCoordinatorEntityTests {
     let profiles: [CoordinatorProfile]
     let notifications: AppNotifications
 
-    init(names: [String] = ["Work", "Personal", "Home"]) throws {
+    init(
+      names: [String] = ["Work", "Personal", "Home"],
+      permission: @escaping @MainActor () async throws -> Bool = AppNotifications.alertPermission
+    ) throws {
       defaults = try #require(UserDefaults(suiteName: suite))
       profiles = try names.enumerated().map { index, name in
         var profile = CoordinatorProfile(
@@ -28,7 +31,8 @@ struct SiriCoordinatorEntityTests {
         JSONEncoder().encode(Coordinators.SavedProfiles(profiles: profiles)),
         to: root.appending(path: "Agent/profiles.json"))
       notifications = AppNotifications(
-        defaults: defaults, applicationSupport: root, caches: root, transport: .tailnet)
+        defaults: defaults, applicationSupport: root, caches: root, transport: .tailnet,
+        permission: permission)
     }
 
     func saved() -> [CoordinatorEntity] { CoordinatorEntity.saved(in: notifications.coordinators) }
@@ -92,7 +96,7 @@ struct SiriCoordinatorEntityTests {
   #if DEBUG
     /// No other test reads `AppNotifications.interactionLaunch`, so this test can set it while
     /// tests run in parallel.
-    @Test func intentsReadTheInteractionFixtureOrRefuse() throws {
+    @Test func intentsReadTheInteractionFixtureAndOnlyAPlainLaunchAsksForAlerts() async throws {
       let delegate = try SavedFixture(names: ["Work"])
       let fixture = try SavedFixture(names: ["Personal"])
       defer {
@@ -116,6 +120,25 @@ struct SiriCoordinatorEntityTests {
           #expect("\(error)".contains("interaction fixture"), "\(error)")
         }
       }
+
+      var asked = 0
+      let launching = try SavedFixture(names: ["Work"]) {
+        asked += 1
+        return false
+      }
+      defer { launching.clean() }
+      let idle: [AppNotifications.InteractionLaunch?] = [
+        .fixture(fixture.notifications), nil,
+        .unavailable(reason: "This launch erased its interaction fixture."),
+      ]
+      for launch in idle {
+        AppNotifications.interactionLaunch = launch
+        await launching.notifications.startRegistration()
+      }
+      #expect(asked == 0, "A launch that the app delegate does not act for asked for alerts")
+      AppNotifications.interactionLaunch = .plain
+      await launching.notifications.startRegistration()
+      #expect(asked == 1)
     }
   #endif
 

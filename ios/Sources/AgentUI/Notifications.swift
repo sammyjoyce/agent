@@ -100,25 +100,13 @@ public final class AppNotifications: NSObject {
 
   init(
     defaults: UserDefaults, applicationSupport: URL, caches: URL, transport: CoordinatorTransport,
-    persistence: ComposerDraftStore? = nil, sharedInbox: SharedDraftInbox? = nil
+    persistence: ComposerDraftStore? = nil, sharedInbox: SharedDraftInbox? = nil,
+    permission: @escaping @MainActor () async throws -> Bool = AppNotifications.alertPermission
   ) {
     let registration = NotificationRegistration(
       enabled: defaults.object(forKey: "notificationsEnabled") == nil
         || defaults.bool(forKey: "notificationsEnabled"),
-      permission: {
-        let center = UNUserNotificationCenter.current()
-        let settings = await center.notificationSettings()
-        switch settings.authorizationStatus {
-        case .notDetermined:
-          return try await center.requestAuthorization(options: [.alert, .sound])
-        case .authorized, .provisional: return true
-        #if os(iOS)
-          case .ephemeral: return true
-        #endif
-        case .denied: return false
-        @unknown default: return false
-        }
-      },
+      permission: permission,
       register: {
         #if os(iOS)
           UIApplication.shared.registerForRemoteNotifications()
@@ -130,6 +118,27 @@ public final class AppNotifications: NSObject {
       registration: registration, defaults: defaults, applicationSupport: applicationSupport,
       caches: caches, transport: transport, persistence: persistence, sharedInbox: sharedInbox)
     super.init()
+  }
+
+  /// Apple's alert permission. Only the first request of an installation shows a prompt.
+  static func alertPermission() async throws -> Bool {
+    let center = UNUserNotificationCenter.current()
+    let settings = await center.notificationSettings()
+    switch settings.authorizationStatus {
+    case .notDetermined:
+      return try await center.requestAuthorization(options: [.alert, .sound])
+    case .authorized, .provisional: return true
+    #if os(iOS)
+      case .ephemeral: return true
+    #endif
+    case .denied: return false
+    @unknown default: return false
+    }
+  }
+
+  /// Asks for alerts at launch.
+  func startRegistration() async {
+    await registration.start()
   }
 
   nonisolated static func origin(_ userInfo: [AnyHashable: Any]) -> AlertOrigin? {
@@ -155,7 +164,7 @@ public final class AppNotifications: NSObject {
       didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
       UNUserNotificationCenter.current().delegate = self
-      Task { await registration.start() }
+      Task { await startRegistration() }
       return true
     }
 
