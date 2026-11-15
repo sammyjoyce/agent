@@ -14,6 +14,7 @@ import type { HostCommand } from "../src/generated/HostCommand.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 import type { TaskRecord } from "../src/generated/TaskRecord.js";
 import type { ToolRole } from "../src/toolsets.js";
+import { UserNoticeEntry } from "../src/transcript.js";
 import { ALWAYS_DIRECT, applyDiscoveryArm, BROWSER_TOOLS, createDiscoveryExtensions, declarationSize, DISCOVERY_ARMS, openDiscoveryApp, TOOL_ROLES,
   type DeclarationSize, type DiscoveryApp, type DiscoveryArm, type DiscoveryArmName, type ToolSurface } from "./fixtures/tool-discovery.js";
 import { fixtureModel } from "./model.js";
@@ -56,9 +57,9 @@ function callsOf(input: Context, name: string) {
 }
 function script(code: string): AssistantMessage { return fauxAssistantMessage(fauxToolCall("codemode", { code }), { stopReason: "toolUse" }); }
 function scriptValue(text: string): unknown { return JSON.parse(text.slice(text.indexOf("Output:\n") + "Output:\n".length)); }
-function callTool(input: Context, name: string, args: ToolArguments): AssistantMessage {
-  return offeredNames(input).includes(name) ? fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" })
-    : script(`return await tools.${name}(${JSON.stringify(args)});`);
+function callTool(input: Context, name: string, ...calls: ToolArguments[]): AssistantMessage {
+  return offeredNames(input).includes(name) ? fauxAssistantMessage(calls.map((args) => fauxToolCall(name, args)), { stopReason: "toolUse" })
+    : script(`return [${calls.map((args) => `await tools.${name}(${JSON.stringify(args)})`).join(", ")}];`);
 }
 const done: FauxResponseFactory = () => fauxAssistantMessage("Done.");
 
@@ -198,9 +199,6 @@ const scriptGuards: { name: string; role: ToolRole; tool: string; args: (bystand
   { name: "a worker script cannot record another task", role: "worker", tool: "record_task",
     args: (bystander) => ({ task_id: bystander, summary: "Changed by another worker.", state: { state: "resolved", evidence: "Invented completion." } }),
     error: /A worker can update only its own task/ },
-  { name: "a worker script cannot record its own task yet, the known blocker for moving record_task behind code mode", role: "worker", tool: "record_task",
-    args: () => ({ summary: "Recorded through a script.", state: { state: "resolved", evidence: "Invented completion." } }),
-    error: /Task outcome model provenance is unavailable/ },
   { name: "a main script cannot finish without reply", role: "main", tool: "finish_without_reply", args: () => ({}),
     error: /Finish without reply must be the main owner's sole final tool/ },
 ];
@@ -226,6 +224,84 @@ for (const guard of scriptGuards) {
       assert.equal(result.isError, true); assert.match(result.text, guard.error);
       assert.deepEqual(await app.tasks.get(bystander.id), bystander);
       assert.deepEqual(await saved(), before, "No task was created or changed state");
+    } finally { await app.close(); await env.remove(); }
+  });
+}
+
+type Publication = { conversation_id: string; entry_id: string | null; text: string; call_id?: string | null };
+type CallerIdentity = { role: Exclude<ToolRole, "triage">; tool: string; texts: string[]; args(text: string): ToolArguments;
+  published(app: DiscoveryApp): Promise<{ caller: string; publications: Publication[] }> };
+async function ownTask(app: DiscoveryApp): Promise<TaskRecord> {
+  const tasks = await app.tasks.list(), [task] = tasks;
+  assert.ok(task !== undefined && tasks.length === 1, "The role turn owns the only task"); return task;
+}
+async function toolOutcomes(app: DiscoveryApp, task: TaskRecord): Promise<Publication[]> {
+  return (await app.sources.events({ provider: "task_outcomes", thread_id: task.id })).flatMap(({ outcome }) =>
+    outcome === undefined || outcome.tool_call_id === null ? []
+      : [{ conversation_id: outcome.conversation_id, entry_id: outcome.entry_id, text: outcome.summary, call_id: outcome.tool_call_id }]);
+}
+async function mainNotices(app: DiscoveryApp): Promise<Publication[]> {
+  const root = await app.session.root(BACKGROUND_CONTEXT);
+  return (await root.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items.flatMap((entry) =>
+    UserNoticeEntry.is(entry) && entry.data !== undefined
+      ? [{ conversation_id: entry.data.source_conversation_id, entry_id: entry.data.source_entry_id, text: entry.data.text ?? "" }] : []);
+}
+async function issuingEntry(app: DiscoveryApp, conversationId: string, name: string): Promise<{ entry_id: string; call_ids: string[] }> {
+  const conversation = await app.tasks.conversation(conversationId);
+  const issued = (await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items.flatMap((entry) => {
+    const call_ids = (entry.model ?? []).flatMap((message) => message.role !== "assistant" ? []
+      : message.content.flatMap((part) => part.type === "toolCall" && part.name === name ? [part.id] : []));
+    return call_ids.length === 0 ? [] : [{ entry_id: entry.id.toString(), call_ids }];
+  });
+  const [only] = issued; assert.ok(only !== undefined && issued.length === 1, `One assistant entry in ${conversationId} issued ${name}`);
+  return only;
+}
+const callerIdentities: CallerIdentity[] = [
+  { role: "worker", tool: "record_task", texts: ["Recorded by the worker."],
+    args: (summary) => ({ summary, state: { state: "resolved", evidence: "Invented completion." } }),
+    async published(app) {
+      const task = await ownTask(app); assert.equal(task.state.state, "resolved");
+      return { caller: task.conversation_id, publications: await toolOutcomes(app, task) };
+    } },
+  { role: "agent", tool: "report_result", texts: ["The invented check passed."], args: (summary) => ({ summary }),
+    async published(app) {
+      const task = await ownTask(app), [agent] = task.agents ?? [];
+      assert.ok(agent !== undefined); assert.deepEqual(agent.state, { state: "done" });
+      return { caller: agent.conversation_id, publications: await toolOutcomes(app, task) };
+    } },
+  { role: "main", tool: "notify", texts: ["First invented outcome.", "Second invented outcome."], args: (text) => ({ keys: [], text }),
+    async published(app) { return { caller: (await app.session.root(BACKGROUND_CONTEXT)).id.toString(), publications: await mainNotices(app) }; } },
+  { role: "worker", tool: "notify_user", texts: ["First invented update.", "Second invented update."], args: (text) => ({ text }),
+    async published(app) { return { caller: (await ownTask(app)).conversation_id, publications: await mainNotices(app) }; } },
+];
+for (const identity of callerIdentities) for (const arm of ["direct", "codemode"] as const) {
+  test(`${arm}: the ${identity.role}'s ${identity.tool} belongs to the conversation and assistant entry that issued it`, async () => {
+    const env = await lab("agent-tool-discovery-identity-"), app = await env.open(DISCOVERY_ARMS[arm]);
+    try {
+      const turn = await startRole[identity.role](app, `Use ${identity.tool}.`);
+      let errors: string[] | undefined;
+      env.faux.setResponses([
+        (input) => {
+          assert.equal(offeredNames(input).includes(identity.tool), arm === "direct");
+          return callTool(input, identity.tool, ...identity.texts.map((text) => identity.args(text)));
+        },
+        (input) => {
+          errors = input.messages.flatMap((message) => message.role === "toolResult" && message.isError
+            ? [message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n")] : []);
+          return fauxAssistantMessage("Done.");
+        },
+      ]);
+      await turn.run();
+      assert.deepEqual(errors, [], "The model saw every call succeed");
+      const { caller, publications } = await identity.published(app);
+      const issued = await issuingEntry(app, caller, arm === "direct" ? identity.tool : "codemode");
+      assert.deepEqual(publications.map(({ text }) => text).sort(), [...identity.texts].sort(), "Each call published once");
+      for (const { conversation_id, entry_id, call_id } of publications) {
+        assert.equal(conversation_id, caller, "The publication belongs to the caller's conversation");
+        assert.equal(entry_id, issued.entry_id, "The publication's origin is the assistant entry that issued the model-visible call");
+        if (call_id !== undefined) assert.ok(issued.call_ids.some((id) => call_id === id || call_id?.startsWith(id + "/")),
+          `${call_id} is the model-visible call or nested under it`);
+      }
     } finally { await app.close(); await env.remove(); }
   });
 }
