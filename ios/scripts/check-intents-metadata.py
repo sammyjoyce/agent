@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Fails unless a built Agent.app ships every App Intents action, entity with its properties,
 enum and query, at least one shortcut, each for Open Coordinator, and the retry behind
-authentication. It does not check that a shortcut holds a phrase.
+authentication. Every shortcut must hold a phrase that is not empty, and one of Open Coordinator's
+phrases must name ${target} and ${applicationName}.
 
 A shortcuts provider in the wrong target still builds, and only the extracted metadata shows that
 the app ships no phrase.
@@ -20,7 +21,8 @@ ENTITIES = {
 }
 ENUMS = {"JobRunState"}
 QUERIES = {"CoordinatorQuery", "JobQuery"}
-PHRASED = {"OpenCoordinatorIntent"}
+# Each action a phrase runs, and what one of its phrases must name.
+PHRASED = {"OpenCoordinatorIntent": {"${target}", "${applicationName}"}}
 # `authenticationPolicy` 1 is `.requiresAuthentication`.
 AUTHENTICATED = {"RetryInterruptedRunIntent": 1}
 
@@ -55,12 +57,22 @@ def problems(metadata: dict) -> list[str]:
     shortcuts = metadata.get("autoShortcuts") or []
     if not shortcuts:
         found.append("autoShortcuts is empty, so the app ships no phrase")
-    phrased = {s.get("actionIdentifier") for s in shortcuts}
-    if shortcuts and PHRASED - phrased:
-        found.append(f"no phrase runs {', '.join(sorted(PHRASED - phrased))}")
-    if phrased - PHRASED:
-        unexpected = ", ".join(sorted(map(str, phrased - PHRASED)))
+    phrases: dict[str, list[str]] = {}
+    for shortcut in shortcuts:
+        action = str(shortcut.get("actionIdentifier"))
+        keys = [t.get("key") or "" for t in shortcut.get("phraseTemplates") or []]
+        if not any(keys):
+            found.append(f"a shortcut for {action} holds no phrase")
+        phrases.setdefault(action, []).extend(keys)
+    if shortcuts and PHRASED.keys() - phrases.keys():
+        found.append(f"no phrase runs {', '.join(sorted(PHRASED.keys() - phrases.keys()))}")
+    if phrases.keys() - PHRASED.keys():
+        unexpected = ", ".join(sorted(phrases.keys() - PHRASED.keys()))
         found.append(f"a phrase runs {unexpected}, which must have none")
+    for action, named in PHRASED.items():
+        keys = [key for key in phrases.get(action, []) if key]
+        if keys and not any(all(name in key for name in named) for key in keys):
+            found.append(f"no phrase for {action} names {' and '.join(sorted(named))}: {keys}")
     actions = metadata.get("actions") or {}
     for action, policy in AUTHENTICATED.items():
         if action in actions and actions[action].get("authenticationPolicy") != policy:
