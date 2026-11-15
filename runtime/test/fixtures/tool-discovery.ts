@@ -40,13 +40,29 @@ export const ALWAYS_DIRECT: readonly string[] = [...ROOT_FINAL_TOOLS, ...IMAGE_R
 export const BROWSER_TOOLS: readonly string[] = ["browser_user_tabs", "browser_claim_tab", "browser_open", "browser_status",
   "browser_action", "browser_run_code", "browser_release"];
 
-function everyRole(surface: ToolSurface): DiscoveryArm {
-  return Object.fromEntries(TOOL_ROLES.map((role) => [role, surface]));
+export const CONTEXT_TOOLS: readonly string[] = ["read_context", "search_context"];
+const RARE_TOOLS: Record<ToolRole, readonly string[]> = {
+  main: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "read_resources", "collect_worktrees", "revoke_allocation"],
+  triage: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "revoke_allocation"],
+  worker: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "allocate_worktree", "read_resources"],
+  agent: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "allocate_worktree", "read_resources"],
+};
+const SOURCE_TOOLS: Record<ToolRole, readonly string[]> = {
+  main: ["read_source_events", "notify_user", "notify", "link_source_events", "dismiss_source_events"],
+  triage: [],
+  worker: ["read_source_events", "notify_user"],
+  agent: ["read_source_events", "notify_user"],
+};
+
+function everyRole(surface: ToolSurface | ((role: ToolRole) => ToolSurface)): DiscoveryArm {
+  return Object.fromEntries(TOOL_ROLES.map((role) => [role, typeof surface === "function" ? surface(role) : surface]));
 }
 
 export const DISCOVERY_ARMS = {
   direct: {},
   "search-browser": everyRole({ deferred: BROWSER_TOOLS }),
+  "search-rare": everyRole((role) => ({ deferred: RARE_TOOLS[role] })),
+  "search-sources": everyRole((role) => ({ deferred: [...RARE_TOOLS[role], ...SOURCE_TOOLS[role]] })),
   codemode: everyRole({ codemode: { keepDirect: [] } }),
 } as const satisfies Record<string, DiscoveryArm>;
 export type DiscoveryArmName = keyof typeof DISCOVERY_ARMS;

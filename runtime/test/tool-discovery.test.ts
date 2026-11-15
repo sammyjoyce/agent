@@ -15,7 +15,7 @@ import type { HostResult } from "../src/generated/HostResult.js";
 import type { TaskRecord } from "../src/generated/TaskRecord.js";
 import type { ToolRole } from "../src/toolsets.js";
 import { ALWAYS_DIRECT, applyDiscoveryArm, BROWSER_TOOLS, createDiscoveryExtensions, declarationSize, DISCOVERY_ARMS, openDiscoveryApp, TOOL_ROLES,
-  type DeclarationSize, type DiscoveryApp, type DiscoveryArm, type DiscoveryArmName } from "./fixtures/tool-discovery.js";
+  type DeclarationSize, type DiscoveryApp, type DiscoveryArm, type DiscoveryArmName, type ToolSurface } from "./fixtures/tool-discovery.js";
 import { fixtureModel } from "./model.js";
 
 const node: AgentNode = { host_id: "11111111-1111-4111-8111-111111111111", name: "example", rex_server: null, agent_program: "/example/agent",
@@ -104,11 +104,15 @@ function modelTools(app: DiscoveryApp, role: ToolRole): string[] {
     .filter((tool) => tool.deferred !== true && (tool.callers ?? ["model"]).includes("model")).map((tool) => tool.name))];
 }
 
-const expectedSurface: Record<DiscoveryArmName, (production: readonly string[]) => string[]> = {
-  direct: (production) => [...production],
-  "search-browser": (production) => [...production.filter((name) => !BROWSER_TOOLS.includes(name)), "tool_search"],
-  codemode: (production) => [...production.filter((name) => ALWAYS_DIRECT.includes(name)), "codemode"],
-};
+function expectedSurface(arm: DiscoveryArmName, role: ToolRole, production: readonly string[]): string[] {
+  const surface: ToolSurface | undefined = (DISCOVERY_ARMS[arm] as DiscoveryArm)[role];
+  if (surface?.codemode !== undefined) {
+    const direct = [...ALWAYS_DIRECT, ...surface.codemode.keepDirect];
+    return [...production.filter((name) => direct.includes(name)), "codemode"];
+  }
+  const deferred = surface?.deferred ?? [];
+  return [...production.filter((name) => !deferred.includes(name)), ...(deferred.length > 0 ? ["tool_search"] : [])];
+}
 
 test("each arm offers its role surfaces with the always-direct tools and reports their declaration size", async (t) => {
   const production = new Map<ToolRole, string[]>(), observed: { arm: DiscoveryArmName; role: ToolRole; size: DeclarationSize }[] = [];
@@ -130,7 +134,7 @@ test("each arm offers its role surfaces with the always-direct tools and reports
   for (const { arm, role, size } of observed) {
     const offered = size.tools, surface = production.get(role); assert.ok(surface);
     assert.equal(new Set(offered).size, offered.length, `${arm} ${role} offers a tool twice`);
-    assert.deepEqual([...offered].sort(), expectedSurface[arm](surface).sort(), `${arm} ${role} offered surface`);
+    assert.deepEqual([...offered].sort(), expectedSurface(arm, role, surface).sort(), `${arm} ${role} offered surface`);
     assert.ok(offered.includes("read_attachment") && offered.includes("read_file"), `${arm} ${role} offers attachments and files directly`);
     if (role === "main") assert.ok(offered.includes("finish_without_reply"), `${arm} main offers finish_without_reply`);
   }
