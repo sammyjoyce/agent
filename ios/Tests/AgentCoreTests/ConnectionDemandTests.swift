@@ -392,6 +392,41 @@ func aLeaseThatReadsConnectedWhileItsLaneIsRedialedWaitsForTheRedial() async thr
   }
 }
 
+/// "Try again" is redialing Work when the last lease on it is dropped. The lease waits for the
+/// lane's loop, so Work is closed before `withConnection` returns.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aLeaseDroppedWhileItsLaneIsRedialedReturnsOnceTheLaneIsClosed() async throws {
+  try await withBackgroundedPair { coordinators, work, _, _, _ in
+    let chat = coordinators.chat
+    let session = try #require(chat.lanes.first { $0.id == work }?.session)
+    let (gate, release) = AsyncStream<Void>.makeStream()
+    let entries = Entries()
+    let held = Task { @MainActor in
+      try await coordinators.withConnection(to: work) {
+        entries.count += 1
+        for await _ in gate {}
+      }
+      entries.count += 1
+    }
+    try await until("the lease held") { entries.count == 1 }
+    let (entered, enter) = AsyncStream<Void>.makeStream()
+    let barrier = DispatchSemaphore(value: 0)
+    let occupied = Task.detached { await session.occupy(entered: enter, until: barrier) }
+    for await _ in entered {}
+    let redialing = Task { @MainActor in await chat.reconnect(work) }
+    for _ in 1...10 { await Task.yield() }
+    release.finish()
+    for _ in 1...10 { await Task.yield() }
+    #expect(entries.count == 1, "The lease does not return while the redial is in flight")
+    barrier.signal()
+    await occupied.value
+    await redialing.value
+    try await held.value
+    #expect(await sessionConnection(chat, work) == .disconnected, "Work was closed on return")
+    #expect(!chat.demand.leased(work), "The lease was dropped")
+  }
+}
+
 @MainActor @Test func tryAgainRedialsOnlyALaneSomethingWants() async throws {
   try await withTwoFixtures { coordinators, workPeer, _, _ in
     let (work, _) = try await addWorkAndPersonal(coordinators)
