@@ -13,10 +13,10 @@ import type { AgentNode } from "../src/generated/AgentNode.js";
 import type { HostCommand } from "../src/generated/HostCommand.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 import type { TaskRecord } from "../src/generated/TaskRecord.js";
-import type { ToolRole } from "../src/toolsets.js";
+import { ALWAYS_DIRECT, applyToolSurfaces, BROWSER_TOOLS, createToolDiscovery, TOOL_ROLES, type ToolRole, type ToolSurface } from "../src/toolsets.js";
 import { history, toolDetails, UserNoticeEntry } from "../src/transcript.js";
-import { ALWAYS_DIRECT, applyDiscoveryArm, BROWSER_TOOLS, createDiscoveryExtensions, declarationSize, DISCOVERY_ARMS, openDiscoveryApp, TOOL_ROLES,
-  type DeclarationSize, type DiscoveryApp, type DiscoveryArm, type DiscoveryArmName, type ToolSurface } from "./fixtures/tool-discovery.js";
+import { declarationSize, DISCOVERY_ARMS, openDiscoveryApp, type DeclarationSize, type DiscoveryApp, type DiscoveryArm,
+  type DiscoveryArmName } from "./fixtures/tool-discovery.js";
 import { fixtureModel } from "./model.js";
 
 const node: AgentNode = { host_id: "11111111-1111-4111-8111-111111111111", name: "example", rex_server: null, agent_program: "/example/agent",
@@ -154,10 +154,10 @@ test("each arm offers its role surfaces with the always-direct tools and reports
 });
 
 test("an arm cannot defer finish_without_reply or read_file", async () => {
-  const env = await lab("agent-tool-discovery-pinned-"), app = await env.open(DISCOVERY_ARMS.direct), discovery = createDiscoveryExtensions();
+  const env = await lab("agent-tool-discovery-pinned-"), app = await env.open(DISCOVERY_ARMS.direct), discovery = createToolDiscovery();
   try {
-    assert.throws(() => applyDiscoveryArm(app.toolsets, { main: { deferred: ["finish_without_reply"] } }, discovery), /finish_without_reply must stay directly offered/);
-    assert.throws(() => applyDiscoveryArm(app.toolsets, { worker: { deferred: ["read_file"] } }, discovery), /read_file must stay directly offered/);
+    assert.throws(() => applyToolSurfaces(app.toolsets, { main: { deferred: ["finish_without_reply"] } }, discovery), /finish_without_reply must stay directly offered/);
+    assert.throws(() => applyToolSurfaces(app.toolsets, { worker: { deferred: ["read_file"] } }, discovery), /read_file must stay directly offered/);
   } finally { await discovery.close(); await app.close(); await env.remove(); }
 });
 

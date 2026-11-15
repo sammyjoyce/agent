@@ -24,7 +24,7 @@ import { FeedbackStore } from "./feedback.js";
 import { FeedbackDispatcher } from "./feedback-dispatch.js";
 import { createGuidance } from "./guidance.js";
 import { createAppTools, createJobTools, Executions, HostRequests } from "./tools.js";
-import { createToolsets, withActorPolicies, type Toolsets } from "./toolsets.js";
+import { applyToolSurfaces, createToolDiscovery, createToolsets, TOOL_SURFACES, withActorPolicies, type ToolDiscovery, type Toolsets } from "./toolsets.js";
 import { createSourceTools, SourceJournal } from "./sources.js";
 import { createResourceTools, ResourceStore } from "./resources.js";
 import { BrowserStore, createBrowserTools } from "./browser.js";
@@ -133,7 +133,7 @@ function backgroundCall(command: import("./generated/HostCommand.js").HostComman
 
 type Application = TriageApplication & { stopInputDelivery(): void; harness: Harness; tasks: TaskStore; resources: ResourceStore; notifications: Notifications;
   histories: HistoryStore; catalog: ConversationCatalog; attachments: AttachmentStore; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler;
-  telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics };
+  telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics; discovery: ToolDiscovery };
 async function openApplication(): Promise<Application> {
   const startup = new StartupDiagnostics(state);
   const storage = await startup.run("storage_open", async () => {
@@ -147,6 +147,7 @@ async function openApplication(): Promise<Application> {
     harness = await startup.run("harness_recovery", () => Harness.open(storage, { models, registry, identity: { attribution: null }, telemetry: telemetry.context,
       settings: { steeringMode: "all", followUpMode: "one-at-a-time" } }, BACKGROUND_CONTEXT));
   } catch (error) { await telemetry.close(); throw error; }
+  const discovery = createToolDiscovery();
   try { return await startup.run("application_recovery", async () => {
   const notifications = new Notifications(harness, registry, notificationConfig());
   const tasks = new TaskStore(harness, inference);
@@ -243,7 +244,9 @@ async function openApplication(): Promise<Application> {
   });
   const jobTools = createJobTools(background, executions); registry.install(jobTools);
   const responsePolicy = createMainResponsePolicy(harness); registry.install(responsePolicy);
-  const toolsets = withActorPolicies(createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools }), { responsePolicy, inputOrigins });
+  const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools }),
+    { responsePolicy, inputOrigins }), TOOL_SURFACES, discovery);
+  for (const extension of installed) registry.install(extension);
   tasks.useBackgroundExecution({
     available: () => backgroundAvailable,
     extensions: (agentId) => agentId === undefined ? toolsets.worker : toolsets.agent,
@@ -260,9 +263,9 @@ async function openApplication(): Promise<Application> {
     }),
   });
   if (await notifications.start()) harness.resume();
-  return { ...core, background, toolsets, startup };
+  return { ...core, background, toolsets, startup, discovery };
   }); } catch (error) {
-    await harness.close(BACKGROUND_CONTEXT).catch(() => {}); await telemetry.close(); throw error;
+    await harness.close(BACKGROUND_CONTEXT).catch(() => {}); await discovery.close().catch(() => {}); await telemetry.close(); throw error;
   }
 }
 let application: ReturnType<typeof openApplication> | undefined;
@@ -1015,6 +1018,7 @@ try {
         void opened.tasks.detachBackground();
         await opened.harness.close(BACKGROUND_CONTEXT);
         await opened.tasks.detachBackground();
+        await opened.discovery.close();
         await opened.retrieval.close();
       }
       finally { await opened.telemetry.close(); }
