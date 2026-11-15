@@ -403,6 +403,7 @@ async fn execute_inner(rex: &RexClient, command: HostCommand) -> Result<HostResu
             path,
             offset,
             limit,
+            image: _,
         } => {
             ensure!(
                 limit > 0 && limit <= 256 * 1024,
@@ -1718,6 +1719,7 @@ setInterval(() => {}, 1000);
             path,
             offset: 6,
             limit: 5,
+            image: None,
         })
         .await
         else {

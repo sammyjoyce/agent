@@ -2384,12 +2384,24 @@
         {
           "type": "object",
           "properties": {
+            "image": {
+              "description": "Older hosts skip this field and answer with text.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ImageRead"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "limit": {
               "type": "integer",
               "format": "uint32",
               "minimum": 0
             },
             "offset": {
+              "description": "Text window in bytes. A host never applies it to an image.",
               "type": "integer",
               "format": "uint32",
               "minimum": 0
@@ -2586,6 +2598,46 @@
             "task_id",
             "agent_id",
             "allocation_id"
+          ]
+        }
+      ]
+    },
+    "ImageRead": {
+      "oneOf": [
+        {
+          "description": "The first image chunk when the header names a supported image, else the text window.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "start"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "The chunk at byte `at` of the file version `stamp` names; fails once the file changed.",
+          "type": "object",
+          "properties": {
+            "at": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "stamp": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "next"
+            }
+          },
+          "required": [
+            "type",
+            "at",
+            "stamp"
           ]
         }
       ]

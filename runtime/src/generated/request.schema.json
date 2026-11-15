@@ -1558,6 +1558,43 @@
           ]
         },
         {
+          "description": "Only ever a reply to a `ReadFile` that carries `image`.",
+          "type": "object",
+          "properties": {
+            "at": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "data_base64": {
+              "type": "string"
+            },
+            "media_type": {
+              "$ref": "#/$defs/ImageMediaType"
+            },
+            "size_bytes": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "stamp": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "image_chunk"
+            }
+          },
+          "required": [
+            "type",
+            "media_type",
+            "size_bytes",
+            "stamp",
+            "at",
+            "data_base64"
+          ]
+        },
+        {
           "type": "object",
           "properties": {
             "type": {
@@ -1647,6 +1684,16 @@
             "message"
           ]
         }
+      ]
+    },
+    "ImageMediaType": {
+      "type": "string",
+      "enum": [
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "image/bmp"
       ]
     },
     "InputMode": {

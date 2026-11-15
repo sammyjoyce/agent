@@ -846,6 +846,7 @@ mod tests {
                     path: "/example/item".into(),
                     offset: 0,
                     limit: 10,
+                    image: None,
                 },
             ),
         ] {
@@ -1011,6 +1012,7 @@ mod tests {
                             path: "/example/item".into(),
                             offset: 0,
                             limit: 10,
+                            image: None,
                         },
                     ))
                     .await
@@ -1035,6 +1037,7 @@ mod tests {
                             path: "/example/item".into(),
                             offset: 0,
                             limit: 10,
+                            image: None,
                         },
                     ))
                     .await
