@@ -675,14 +675,15 @@ final class ChatModel {
   }
 
   /// Tells lane `id`'s session to connect or disconnect, as `demand` wants it, and returns once
-  /// it has been told. Nothing else connects or disconnects a lane's session. One loop per lane
-  /// makes the calls, so two never overlap on one session, and a caller that finds the loop
-  /// running waits for it. A session already told what `demand` wants is left alone, because
-  /// `connect` redials a connected session and would cut the requests in flight on it.
+  /// it has been told. Until the model ends, nothing else in it connects or disconnects a lane's
+  /// session. One loop per lane makes the calls, so two never overlap on one session, and a
+  /// caller that finds the loop running waits for it. A session already told what `demand` wants
+  /// is left alone, because `connect` redials a connected session and would cut the requests in
+  /// flight on it.
   func reconcile(_ id: ProfileID) async {
     if let loop = lifecycles[id]?.loop { return await loop.value }
     guard pendingCall(id) != nil else { return }
-    // Its own task, so a cancelled caller still leaves the lane as `demand` wants it.
+    // A task of its own, which later callers can await and a cancelled caller does not cancel.
     let loop = Task { await converge(id) }
     lifecycles[id, default: Lifecycle()].loop = loop
     await loop.value
@@ -754,7 +755,7 @@ final class ChatModel {
   /// not connected. A lane nothing wants connected stays down.
   func reconnect(_ id: ProfileID? = nil) async {
     for lane in lanes.map(\.id) where id == lane || (id == nil && !connected(lane)) {
-      guard demand.wants(lane), paired(lane) else { continue }
+      guard demand.wants(lane) else { continue }
       lifecycles[lane, default: Lifecycle()].restart = true
       await reconcile(lane)
     }
