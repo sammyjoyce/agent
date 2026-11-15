@@ -10,13 +10,11 @@ import type { HostCall } from "./tasks.js";
 
 export type ReadFileCommand = Extract<HostCommand, { type: "read_file" }>;
 type ImageChunk = Extract<HostResult, { type: "image_chunk" }>;
-/** What the conversation's model takes as image input. */
 export type ImageInput = { readonly vision: boolean; readonly limits: ImageLimits };
 
-/** One Photon worker per runtime process, shared by attachments and file reads; it exits after 1 s idle. */
+/** Shared by attachments and file reads, so the runtime runs one Photon worker. */
 let processor: Promise<ImageProcessor> | undefined;
 
-/** Undefined when Photon cannot decode the bytes or make them fit `limits`. */
 export async function prepareImage(bytes: Uint8Array, mimeType: string, limits: ImageLimits): Promise<PreparedImage | undefined> {
   processor ??= createNodePhotonImages({ idleMs: 1000 });
   return (await processor).prepare(bytes, mimeType, limits);
@@ -37,10 +35,6 @@ export async function imageInput(api: Pick<ToolExecutionApi, "agent" | "models">
   };
 }
 
-/**
- * Pulls the rest of the image `first` began and prepares it for `input`. A host failure reads as any failed host
- * result; any reply that does not continue the same file version ends the read without an image.
- */
 export async function readImageFile(call: HostCall, command: ReadFileCommand, first: ImageChunk, input: ImageInput): Promise<ToolExecutionResult> {
   const changed = imageError(`${command.path} changed while it was read; read it again.`);
   const size = first.size_bytes;

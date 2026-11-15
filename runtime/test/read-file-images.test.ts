@@ -31,7 +31,6 @@ function png(width: number, height: number): Buffer {
     chunk("IDAT", deflateSync(Buffer.concat(Array.from({ length: height }, () => row)), { level: 0 })), chunk("IEND", Buffer.alloc(0))]);
 }
 
-/** A host that serves `files` in chunks; a path in `rewritten` answers each later chunk from a new file version. */
 function host(files: Record<string, Buffer>, rewritten: ReadonlySet<string>) {
   const calls: HostCommand[] = [];
   async function call(command: HostCommand): Promise<HostResult> {

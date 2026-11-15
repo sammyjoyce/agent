@@ -2618,7 +2618,6 @@
           ]
         },
         {
-          "description": "The chunk at byte `at` of the file version `stamp` names; fails once the file changed.",
           "type": "object",
           "properties": {
             "at": {

@@ -1,4 +1,3 @@
-//! `ReadFile`: a byte window of text, or a whole image the runtime pulls in chunks.
 use std::{io::SeekFrom, os::unix::fs::MetadataExt};
 
 use anyhow::{Context, Result, ensure};
@@ -14,7 +13,6 @@ use crate::protocol::{
 
 const CHANGED: &str = "The file changed while it was read; read it again";
 
-/// An image file as one open handle saw it.
 struct ImageFile {
     media_type: ImageMediaType,
     size_bytes: u64,
@@ -274,7 +272,6 @@ mod tests {
         assert!(truncated);
     }
 
-    /// A BMP file header and DIB header of `dib_size` bytes with `planes` color planes.
     fn bmp(dib_size: u8, planes: u8) -> Vec<u8> {
         let mut bytes = b"BM".to_vec();
         bytes.resize(14, 0);

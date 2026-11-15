@@ -1213,8 +1213,10 @@ pub const MAX_IMAGE_READ_BYTES: u32 = crate::attachments::MAX_ATTACHMENT_BYTES;
 pub enum ImageRead {
     /// The first image chunk when the header names a supported image, else the text window.
     Start,
-    /// The chunk at byte `at` of the file version `stamp` names; fails once the file changed.
-    Next { at: u32, stamp: String },
+    Next {
+        at: u32,
+        stamp: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
