@@ -4,7 +4,9 @@ import Testing
 @testable import AgentCore
 @testable import AgentUI
 
-private func nightlyDeps(title: String, lastRun: JobExecutionState?) -> ScheduledJobStatus {
+private func nightlyDeps(
+  title: String, lastRun: JobExecutionState?, scheduleError: String? = nil
+) -> ScheduledJobStatus {
   ScheduledJobStatus(
     job: .init(
       cwd: "/workspace/example", id: "nightly:deps",
@@ -16,7 +18,7 @@ private func nightlyDeps(title: String, lastRun: JobExecutionState?) -> Schedule
         outputTruncated: false, revision: "example-revision", scheduleId: "example-schedule",
         scheduledAt: 1_700_000_000_000, state: $0)
     },
-    schedules: [])
+    schedules: scheduleError.map { [.init(error: $0, scheduleId: "example-schedule")] } ?? [])
 }
 
 private let parked = JobExecutionState.blocked(.init(message: "restart_limit"))
@@ -34,6 +36,29 @@ private let parked = JobExecutionState.blocked(.init(message: "restart_limit"))
 @MainActor private func connection(_ chat: ChatModel, _ id: ProfileID) -> ConnectionState? {
   chat.snapshots[id]?.connection
 }
+
+@MainActor private func background(_ coordinators: Coordinators) async throws {
+  let chat = coordinators.chat
+  await coordinators.setActive(false)
+  try await until("every lane disconnected") {
+    chat.snapshots.values.allSatisfy { $0.connection == .disconnected }
+  }
+}
+
+/// The text Siri and Shortcuts show for `error`.
+private func shown(_ error: (any Error)?) -> String? {
+  if let error = error as? any CustomLocalizedStringResourceConvertible {
+    return String(localized: error.localizedStringResource)
+  }
+  return error?.localizedDescription
+}
+
+private func jobReads(_ fixture: FixtureCoordinator) async -> Int {
+  await fixture.received().filter { if case .jobs = $0 { true } else { false } }.count
+}
+
+private let updateTheCoordinator =
+  "Update the coordinator to inspect scheduled jobs and saved work."
 
 /// Work serves an interrupted Nightly deps and Personal a healthy one, both paired and connected.
 @MainActor private func withJobPeers(
@@ -137,6 +162,72 @@ struct SiriJobTests {
           ScopedEntityID(profile: personal, item: "nightly:deps"), title: "Personal nightly deps")
       }
       #expect(await personalPeer.retryRequests().isEmpty)
+    }
+  }
+
+  /// The runtime reports a job parked at the restart limit on its schedule when no run of the
+  /// job is retained. The retry intent retries that job, so its state reads Interrupted.
+  @Test func aJobParkedOnItsScheduleWithNoLastRunReadsInterrupted() {
+    let parkedOnSchedule = nightlyDeps(
+      title: "Nightly deps", lastRun: nil,
+      scheduleError:
+        "Job model generation is parked after repeated interrupted restarts; retry the interrupted run"
+    )
+    #expect(parkedOnSchedule.canRetryInterruptedRun)
+    #expect(JobEntity(parkedOnSchedule, on: ProfileID(), coordinator: "Work").state == .interrupted)
+  }
+
+  @MainActor @Test func anOutdatedCoordinatorsRejectionKeepsItsMessageUnderItsName() async throws {
+    try await withJobPeers { coordinators, work, _, workPeer, personalPeer in
+      await workPeer.advertiseWorkInspection(false)
+      try await background(coordinators)
+      let jobs = try await JobQuery.allJobs(in: coordinators)
+      #expect(jobs.map(\.title) == ["Personal nightly deps"], "Personal still answers")
+      let id = ScopedEntityID(profile: work, item: "nightly:deps")
+      let picked = await #expect(throws: (any Error).self) {
+        try await JobQuery.jobs(identifiedBy: [id], in: coordinators)
+      }
+      #expect(shown(picked) == "Work: \(updateTheCoordinator)")
+      await personalPeer.advertiseWorkInspection(false)
+      let listed = await #expect(throws: (any Error).self) {
+        try await JobQuery.allJobs(in: coordinators)
+      }
+      #expect(shown(listed) == "Work: \(updateTheCoordinator)", "No coordinator returned jobs")
+      #expect(await jobReads(workPeer) == 0, "An outdated coordinator is never asked")
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func aCancelledQueryIsCancelledAndNamesNoCoordinator() async throws {
+    try await withJobPeers { coordinators, work, personal, workPeer, personalPeer in
+      let chat = coordinators.chat
+      try await background(coordinators)
+      for peer in [workPeer, personalPeer] { await peer.leaveObserveUnanswered(.silent) }
+      let reading = Task { @MainActor in try await JobQuery.allJobs(in: coordinators) }
+      try await until("a lease held") { chat.demand.leased(work) || chat.demand.leased(personal) }
+      reading.cancel()
+      await #expect(throws: CancellationError.self) { try await reading.value }
+      #expect(!chat.demand.leased(work) && !chat.demand.leased(personal))
+    }
+  }
+
+  /// Work is saved first and is still connecting when the query starts. Personal is read
+  /// meanwhile, and the jobs come back in saved order.
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func aCoordinatorStillConnectingDoesNotDelayTheNextOnesRead() async throws {
+    try await withJobPeers { coordinators, _, _, workPeer, personalPeer in
+      try await background(coordinators)
+      await workPeer.holdSnapshot()
+      let reading = Task { @MainActor in try await JobQuery.allJobs(in: coordinators) }
+      let deadline = ContinuousClock.now + .seconds(3)
+      while await jobReads(personalPeer) == 0, ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(5))
+      }
+      let readMeanwhile = await jobReads(personalPeer)
+      await workPeer.releaseSnapshot()
+      let jobs = try await reading.value
+      #expect(readMeanwhile == 1, "Personal was read while Work was still connecting")
+      #expect(jobs.map(\.title) == ["Work nightly deps", "Personal nightly deps"])
     }
   }
 }
