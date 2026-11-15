@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Fails unless a built Agent.app ships every App Intents action, entity and query, and a phrase.
+"""Fails unless a built Agent.app ships every App Intents action, entity with its properties,
+query, and a phrase.
 
 A shortcuts provider in the wrong target still builds, and only the extracted metadata shows that
 the app ships no phrase.
@@ -12,7 +13,7 @@ import sys
 from pathlib import Path
 
 ACTIONS = {"OpenCoordinatorIntent"}
-ENTITIES = {"CoordinatorEntity"}
+ENTITIES = {"CoordinatorEntity": {"name"}}
 QUERIES = {"CoordinatorQuery"}
 
 
@@ -25,10 +26,17 @@ def metadata_path(argument: str) -> Path:
 
 def problems(metadata: dict) -> list[str]:
     found = []
-    for kind, expected in (("actions", ACTIONS), ("entities", ENTITIES), ("queries", QUERIES)):
+    expected_kinds = (("actions", ACTIONS), ("entities", ENTITIES.keys()), ("queries", QUERIES))
+    for kind, expected in expected_kinds:
         missing = expected - set(metadata.get(kind) or {})
         if missing:
             found.append(f"missing {kind}: {', '.join(sorted(missing))}")
+    entities = metadata.get("entities") or {}
+    for entity, expected in ENTITIES.items():
+        listed = {p.get("identifier") for p in entities.get(entity, {}).get("properties") or []}
+        missing = expected - listed
+        if entity in entities and missing:
+            found.append(f"{entity} is missing properties: {', '.join(sorted(missing))}")
     shortcuts = metadata.get("autoShortcuts") or []
     if not shortcuts:
         found.append("autoShortcuts is empty, so the app ships no phrase")
@@ -53,9 +61,10 @@ def main() -> int:
         for problem in found:
             print(f"intents metadata check failed: {problem}", file=sys.stderr)
         return 1
+    properties = sum(map(len, ENTITIES.values()))
     print(
         f"intents metadata ok actions={len(ACTIONS)} entities={len(ENTITIES)}"
-        f" shortcuts={len(metadata['autoShortcuts'])}"
+        f" properties={properties} shortcuts={len(metadata['autoShortcuts'])}"
     )
     return 0
 
