@@ -359,6 +359,39 @@ func aLeaseTakenWhileTheSceneLeavesReconnectsItsLane() async throws {
   }
 }
 
+/// "Try again" redials Work while a lease waits on it, and the wait's read of the session was
+/// answered before the redial reached the session. The body runs on the new connection, not on
+/// the one the redial closes.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aLeaseThatReadsConnectedWhileItsLaneIsRedialedWaitsForTheRedial() async throws {
+  try await withTwoFixtures { coordinators, workPeer, _, _ in
+    await workPeer.advertiseWorkInspection(true)
+    let (work, _) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let session = try #require(chat.lanes.first { $0.id == work }?.session)
+    let observes = await observeCount(workPeer)
+    let (entered, enter) = AsyncStream<Void>.makeStream()
+    let barrier = DispatchSemaphore(value: 0)
+    let occupied = Task.detached { await session.occupy(entered: enter, until: barrier) }
+    for await _ in entered {}
+    let reading = Task { @MainActor in
+      try await coordinators.withConnection(to: work) {
+        (jobs: try await chat.jobs(lane: work), observes: await observeCount(workPeer))
+      }
+    }
+    try await until("the lease taken") { chat.demand.leased(work) }
+    let redialing = Task { @MainActor in await chat.reconnect(work) }
+    // The redial takes two turns of the main actor to reach the session, behind the lease's read.
+    for _ in 1...10 { await Task.yield() }
+    barrier.signal()
+    await occupied.value
+    await redialing.value
+    let read = try await reading.value
+    #expect(read.jobs == .list(.init(jobs: [])), "Work answered the job read")
+    #expect(read.observes == observes + 1, "The body ran after the redial's observation")
+  }
+}
+
 @MainActor @Test func tryAgainRedialsOnlyALaneSomethingWants() async throws {
   try await withTwoFixtures { coordinators, workPeer, _, _ in
     let (work, _) = try await addWorkAndPersonal(coordinators)
