@@ -278,6 +278,25 @@ struct SiriJobTests {
     }
   }
 
+  /// Work has answered and Personal is still silent when the query is cancelled. The query is
+  /// cancelled. It does not return Work's jobs as if Personal had only been silent.
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func aQueryCancelledAfterOneCoordinatorAnsweredIsStillCancelled() async throws {
+    try await withJobPeers { coordinators, work, personal, workPeer, personalPeer in
+      let chat = coordinators.chat
+      try await background(coordinators)
+      await personalPeer.leaveObserveUnanswered(.silent)
+      let reading = Task { @MainActor in try await JobQuery.allJobs(in: coordinators) }
+      try await until("Work's read finished") {
+        await jobReads(workPeer) == 1 && !chat.demand.leased(work)
+      }
+      #expect(chat.demand.leased(personal), "Personal's lease still waits")
+      reading.cancel()
+      await #expect(throws: CancellationError.self) { try await reading.value }
+      #expect(!chat.demand.leased(personal))
+    }
+  }
+
   /// Work is saved first and is still connecting when the query starts. Personal is read
   /// meanwhile, and the jobs come back in saved order.
   @MainActor @Test(.timeLimit(.minutes(1)))
