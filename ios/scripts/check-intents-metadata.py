@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fails unless a built Agent.app ships every App Intents action, entity with its properties,
-and query, and at least one shortcut, each for an expected action. It does not check that a
-shortcut holds a phrase.
+enum and query, at least one shortcut, each for Open Coordinator, and the retry behind
+authentication. It does not check that a shortcut holds a phrase.
 
 A shortcuts provider in the wrong target still builds, and only the extracted metadata shows that
 the app ships no phrase.
@@ -18,7 +18,11 @@ ENTITIES = {
     "CoordinatorEntity": {"name"},
     "JobEntity": {"title", "coordinator", "schedule", "state", "lastRun", "nextRun"},
 }
+ENUMS = {"JobRunState"}
 QUERIES = {"CoordinatorQuery", "JobQuery"}
+PHRASED = {"OpenCoordinatorIntent"}
+# `authenticationPolicy` 1 is `.requiresAuthentication`.
+AUTHENTICATED = {"RetryInterruptedRunIntent": 1}
 
 
 def metadata_path(argument: str) -> Path:
@@ -30,9 +34,16 @@ def metadata_path(argument: str) -> Path:
 
 def problems(metadata: dict) -> list[str]:
     found = []
-    expected_kinds = (("actions", ACTIONS), ("entities", ENTITIES.keys()), ("queries", QUERIES))
+    shipped = {kind: set(metadata.get(kind) or {}) for kind in ("actions", "entities", "queries")}
+    shipped["enums"] = {enum.get("identifier") for enum in metadata.get("enums") or []}
+    expected_kinds = (
+        ("actions", ACTIONS),
+        ("entities", ENTITIES.keys()),
+        ("enums", ENUMS),
+        ("queries", QUERIES),
+    )
     for kind, expected in expected_kinds:
-        missing = expected - set(metadata.get(kind) or {})
+        missing = expected - shipped[kind]
         if missing:
             found.append(f"missing {kind}: {', '.join(sorted(missing))}")
     entities = metadata.get("entities") or {}
@@ -44,9 +55,16 @@ def problems(metadata: dict) -> list[str]:
     shortcuts = metadata.get("autoShortcuts") or []
     if not shortcuts:
         found.append("autoShortcuts is empty, so the app ships no phrase")
-    unknown = {s.get("actionIdentifier") for s in shortcuts} - ACTIONS
-    if unknown:
-        found.append(f"shortcuts name unexpected actions: {', '.join(sorted(map(str, unknown)))}")
+    phrased = {s.get("actionIdentifier") for s in shortcuts}
+    if shortcuts and PHRASED - phrased:
+        found.append(f"no phrase runs {', '.join(sorted(PHRASED - phrased))}")
+    if phrased - PHRASED:
+        unexpected = ", ".join(sorted(map(str, phrased - PHRASED)))
+        found.append(f"a phrase runs {unexpected}, which must have none")
+    actions = metadata.get("actions") or {}
+    for action, policy in AUTHENTICATED.items():
+        if action in actions and actions[action].get("authenticationPolicy") != policy:
+            found.append(f"{action} does not require authentication")
     return found
 
 
@@ -68,7 +86,7 @@ def main() -> int:
     properties = sum(map(len, ENTITIES.values()))
     print(
         f"intents metadata ok actions={len(ACTIONS)} entities={len(ENTITIES)}"
-        f" properties={properties} shortcuts={len(metadata['autoShortcuts'])}"
+        f" properties={properties} enums={len(ENUMS)} shortcuts={len(metadata['autoShortcuts'])}"
     )
     return 0
 
