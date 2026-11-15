@@ -445,19 +445,18 @@ in that time. With no job to show, it reports a coordinator's refusal, such as
 a request to update the coordinator, and it reports silence only when no
 coordinator answered.
 
-A session loads its saved outbox the first time it connects. While that file
+A session loads its saved outbox before it first dials. While that file
 exists and cannot be read or decoded, the session dials nothing and reports
 "The saved outbox could not be read. It was preserved; no messages were
 replayed." A lease on that coordinator ends as soon as the session has
 reported it, without waiting out the 8 seconds. The Job picker reports the
 sentence under the coordinator's name, where it would report a refusal. A
 retry sends nothing and fails with an error that carries the same sentence.
-The session reads the outbox again the next time the app becomes active, an
-intent takes a lease, or "Try again" is tapped. The app saves the outbox with
-complete file protection, so an intent that the system starts on a locked
-phone may meet this whenever the file exists. That is inferred from the
-file's protection. No simulator enforces it, and it was not measured on a
-phone.
+The next activation of the app, the next lease and "Try again" each make the
+session read the outbox again. The app saves the outbox with complete file
+protection, so an intent that the system starts on a locked phone may meet
+this whenever the file exists. That is inferred from the file's protection.
+No simulator enforces it, and it was not measured on a phone.
 
 In a Debug launch that asks for the interaction fixture, a job query and a
 retry reach only the fixture's loopback peers. A launch that erased its

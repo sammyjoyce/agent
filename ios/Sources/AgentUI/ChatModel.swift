@@ -698,8 +698,8 @@ final class ChatModel {
     await loop.value
   }
 
-  /// Reads `demand` and the lane again after every call, so it ends at the latest of both. It
-  /// also ends at a session that cannot read its outbox, which another connect would only read
+  /// Reads `demand` and the lane again after every call, so it ends at the latest of both, or at
+  /// a connect that dialed nothing for want of the outbox, which another connect would only read
   /// again.
   private func converge(_ id: ProfileID) async {
     while let call = pendingCall(id) {
