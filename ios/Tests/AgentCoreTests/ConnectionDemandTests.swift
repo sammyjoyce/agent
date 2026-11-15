@@ -293,3 +293,178 @@ func aLeaseWaitsForTheSessionWhenTheMainActorsCopyStillSaysConnected() async thr
     #expect(read.observes == observes + 1, "The body ran after Work's new observation")
   }
 }
+
+// MARK: - One loop per lane makes its lifecycle calls, and no redial cuts a held connection
+
+/// The scene leaves while Work's session is busy, and a lease is taken on Work before that
+/// disconnect lands. The lane's loop ends at the latest demand, so Work is dialed again for the
+/// lease and its body runs on the new connection.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aLeaseTakenWhileTheSceneLeavesReconnectsItsLane() async throws {
+  try await withTwoFixtures { coordinators, workPeer, _, _ in
+    await workPeer.advertiseWorkInspection(true)
+    let (work, personal) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let session = try #require(chat.lanes.first { $0.id == work }?.session)
+    let observes = await observeCount(workPeer)
+    let (entered, enter) = AsyncStream<Void>.makeStream()
+    let barrier = DispatchSemaphore(value: 0)
+    let occupied = Task.detached { await session.occupy(entered: enter, until: barrier) }
+    for await _ in entered {}
+    let leaving = Task { @MainActor in await coordinators.setActive(false) }
+    try await until("the scene left") { !chat.demand.sceneActive }
+    let reading = Task { @MainActor in
+      try await coordinators.withConnection(to: work) {
+        (jobs: try await chat.jobs(lane: work), observes: await observeCount(workPeer))
+      }
+    }
+    try await until("the lease taken") { chat.demand.leased(work) }
+    barrier.signal()
+    await occupied.value
+    await leaving.value
+    let read = try await reading.value
+    #expect(read.jobs == .list(.init(jobs: [])), "Work answered the job read")
+    #expect(read.observes == observes + 1, "Work was dialed once more, for the lease")
+    #expect(await sessionConnection(chat, work) == .disconnected, "The dropped lease closed Work")
+    #expect(await sessionConnection(chat, personal) == .disconnected)
+    #expect(await observeCount(workPeer) == observes + 1)
+  }
+}
+
+@MainActor @Test func anActivationNeverRedialsALaneThatIsConnectedOrLeased() async throws {
+  try await withBackgroundedPair { coordinators, work, personal, workPeer, personalPeer in
+    let chat = coordinators.chat
+    let workObserves = await observeCount(workPeer)
+    let personalObserves = await observeCount(personalPeer)
+    let (gate, release) = AsyncStream<Void>.makeStream()
+    let entries = Entries()
+    let held = Task { @MainActor in
+      try await coordinators.withConnection(to: work) {
+        entries.count += 1
+        for await _ in gate {}
+      }
+    }
+    try await until("the lease held") { entries.count == 1 }
+    await coordinators.setActive(true)
+    try await until("Personal connected for the scene") {
+      await sessionConnection(chat, personal) == .connected
+    }
+    await coordinators.setActive(true)
+    release.finish()
+    try await held.value
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(await sessionConnection(chat, work) == .connected, "The scene keeps Work connected")
+    #expect(await observeCount(workPeer) == workObserves + 1, "Only the lease dialed Work")
+    #expect(await observeCount(personalPeer) == personalObserves + 1, "One dial for the scene")
+  }
+}
+
+@MainActor @Test func tryAgainRedialsOnlyALaneSomethingWants() async throws {
+  try await withTwoFixtures { coordinators, workPeer, _, _ in
+    let (work, _) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let observes = await observeCount(workPeer)
+    await chat.reconnect(work)
+    try await until("Work redialed") { await observeCount(workPeer) == observes + 1 }
+    await coordinators.setActive(false)
+    await chat.reconnect(work)
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(await observeCount(workPeer) == observes + 1, "Nothing wants Work connected")
+    #expect(await sessionConnection(chat, work) == .disconnected)
+  }
+}
+
+// MARK: - A lease that cannot connect in time never runs its body
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aLeaseThatDoesNotConnectInTimeNamesItsCoordinatorAndNeverRunsItsBody() async throws {
+  try await withBackgroundedPair { coordinators, work, _, workPeer, _ in
+    let chat = coordinators.chat
+    let entries = Entries()
+    await workPeer.leaveObserveUnanswered(.silent)
+    let started = ContinuousClock.now
+    await #expect(throws: LaneError.unanswered("Work")) {
+      try await coordinators.withConnection(to: work, within: .milliseconds(300)) {
+        entries.count += 1
+      }
+    }
+    #expect(ContinuousClock.now - started < .seconds(3), "The wait ended at its limit")
+    #expect(entries.count == 0, "The body never ran")
+    #expect(!chat.demand.leased(work), "The lease was dropped")
+    #expect(await sessionConnection(chat, work) == .disconnected, "Work was closed on return")
+    #expect(LaneError.unanswered("Work").localizedDescription == "Work did not answer.")
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aLeaseCancelledWhileItWaitsNeverRunsItsBody() async throws {
+  try await withBackgroundedPair { coordinators, work, _, workPeer, _ in
+    let chat = coordinators.chat
+    let entries = Entries()
+    await workPeer.leaveObserveUnanswered(.silent)
+    let observes = await observeCount(workPeer)
+    let waiting = Task { @MainActor in
+      try await coordinators.withConnection(to: work) { entries.count += 1 }
+    }
+    try await until("Work dialed for the lease") { await observeCount(workPeer) == observes + 1 }
+    waiting.cancel()
+    await #expect(throws: CancellationError.self) { try await waiting.value }
+    #expect(entries.count == 0, "The body never ran")
+    #expect(!chat.demand.leased(work), "The lease was dropped")
+    #expect(await sessionConnection(chat, work) == .disconnected, "Work was closed on return")
+  }
+}
+
+/// The lane is connected, so the wait would end on its first read of the session. The task is
+/// cancelled while that read is in flight, and the body still never runs.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aLeaseCancelledAsItsLaneReadsConnectedNeverRunsItsBody() async throws {
+  try await withTwoFixtures { coordinators, _, _, _ in
+    let (work, _) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let session = try #require(chat.lanes.first { $0.id == work }?.session)
+    let entries = Entries()
+    let (entered, enter) = AsyncStream<Void>.makeStream()
+    let barrier = DispatchSemaphore(value: 0)
+    let occupied = Task.detached { await session.occupy(entered: enter, until: barrier) }
+    for await _ in entered {}
+    let waiting = Task { @MainActor in
+      try await coordinators.withConnection(to: work) { entries.count += 1 }
+    }
+    try await until("the lease taken") { chat.demand.leased(work) }
+    waiting.cancel()
+    barrier.signal()
+    await occupied.value
+    await #expect(throws: CancellationError.self) { try await waiting.value }
+    #expect(entries.count == 0, "The body never ran")
+    #expect(!chat.demand.leased(work), "The lease was dropped")
+    #expect(await sessionConnection(chat, work) == .connected, "The scene keeps Work connected")
+  }
+}
+
+@MainActor @Test func aLeaseRefusesARemovedOrUnpairedCoordinatorBeforeItDials() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let work = CoordinatorProfile(
+    name: try TagName("Work"), address: try CoordinatorAddress(host: "100.64.1.2"))
+  let personal = CoordinatorProfile(
+    name: try TagName("Personal"), address: try CoordinatorAddress(host: "100.64.1.3"))
+  let chat = ChatModel()
+  chat.profiles = [work, personal]
+  let session = CoordinatorSession(
+    directory: ProfileDirectory(work.id, applicationSupport: root, caches: root),
+    address: work.address, pin: CoordinatorID(UUID()), stamps: StampSource())
+  chat.attach(Lane(id: work.id, session: session))
+  chat.attach(Lane(id: personal.id, session: nil))
+  chat.removed[work.id] = "Work"
+  let entries = Entries()
+  await #expect(throws: LaneError.gone("Work")) {
+    try await chat.withConnection(to: work.id, within: .seconds(1)) { entries.count += 1 }
+  }
+  await #expect(throws: LaneError.notPaired("Personal")) {
+    try await chat.withConnection(to: personal.id, within: .seconds(1)) { entries.count += 1 }
+  }
+  #expect(entries.count == 0)
+  #expect(!chat.demand.leased(work.id) && !chat.demand.leased(personal.id))
+  #expect(await session.connectionState == .disconnected, "Nothing was dialed")
+}
