@@ -245,7 +245,8 @@
       ) {
         if !locked { super.setAttributedMarkedText(text, selectedRange: selectedRange) }
       }
-      private(set) var provisional: (range: NSRange, covered: NSAttributedString)?
+      private(set) var provisional:
+        (range: NSRange, covered: NSAttributedString, typing: [NSAttributedString.Key: Any])?
 
       var draft: String {
         guard let provisional else { return text }
@@ -272,12 +273,13 @@
         }
         clearProvisional()
         let covered = textStorage.attributedSubstring(from: range)
-        var dimmed = typingAttributes
+        let typing = typingAttributes
+        var dimmed = typing
         dimmed[.foregroundColor] = UIColor.secondaryLabel
         replaceWithoutUndo(range, with: NSAttributedString(string: fitted, attributes: dimmed))
         provisional = (
           range: NSRange(location: range.location, length: fitted.utf16.count),
-          covered: covered
+          covered: covered, typing: typing
         )
         selectedRange = NSRange(location: range.location + fitted.utf16.count, length: 0)
       }
@@ -290,6 +292,9 @@
           with: provisional.covered)
         selectedRange = NSRange(
           location: provisional.range.location, length: provisional.covered.length)
+        // UIKit takes typing attributes from the text beside a new selection. An empty field has
+        // none, so the dimmed ones from the caret after the live words would stay.
+        typingAttributes = provisional.typing
       }
 
       /// Edits the storage directly. Only the text view's input paths, such as `insertText`,

@@ -1438,6 +1438,37 @@
         }
       }
 
+      @MainActor @Test func wordsDictatedIntoAnEmptyDraftAndTypingAfterThemShowInTheLabelColor()
+        async throws
+      {
+        let speech = ScriptedSpeech()
+        let dictation = try await readyDictation(speech)
+        try await withComposer(dictation: dictation) { model, box, _ in
+          let field = box.draft
+          field.resignFirstResponder()
+          let target = dictationTarget(model, field)
+          try await tapMic(dictation, target)
+          speech.hear("Invented live")
+          try await Task.sleep(for: .milliseconds(300))
+          #expect(field.text == "Invented live" && model.draft.isEmpty)
+          try await tapMic(dictation, target)
+          field.becomeFirstResponder()
+          field.insertText("!")
+          try await Task.sleep(for: .milliseconds(200))
+          #expect(model.draft == "Invented dictated words!" && field.text == model.draft)
+          @MainActor func color(of words: String) -> UIColor? {
+            let range = (field.text as NSString).range(of: words)
+            guard range.location != NSNotFound else { return nil }
+            let attributes = field.textStorage.attributes(at: range.location, effectiveRange: nil)
+            let color = attributes[.foregroundColor] as? UIColor
+            return color?.resolvedColor(with: field.traitCollection)
+          }
+          let ink = UIColor.label.resolvedColor(with: field.traitCollection)
+          #expect(color(of: "Invented dictated words") == ink, "The final text is the draft's")
+          #expect(color(of: "!") == ink, "Typing after the final text is the draft's")
+        }
+      }
+
       @MainActor @Test func liveWordsStayOutOfAFieldThatDoesNotHoldTheTake() async throws {
         let speech = ScriptedSpeech()
         let dictation = try await readyDictation(speech)
