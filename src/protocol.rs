@@ -512,6 +512,8 @@ pub enum RuntimeCommand {
         query: String,
     },
     ListTasks,
+    /// One snapshot of the coordinator's live native work, joined with task and agent identity.
+    ReadTaskGraph,
     ListConversations {
         query: String,
         cursor: Option<String>,
@@ -863,6 +865,126 @@ pub enum TaskAgentState {
     Open,
     Done,
     Failed { reason: String },
+}
+
+/// The coordinator's live Pi tasks at one moment, with the Beep Boop actor of each conversation.
+///
+/// Only live work appears. An idle delegate or agent has no node; `tasks list` and `tasks read`
+/// answer what exists. Identity is read after the native frame, so a title can be newer than the
+/// work beside it.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct TaskGraphSnapshot {
+    /// Live native tasks, an owner always before the tasks it owns.
+    pub nodes: Vec<TaskGraphNode>,
+    /// One row for each conversation a node runs in or owns, and for the task of each listed agent.
+    pub conversations: Vec<TaskGraphConversation>,
+    /// Live native tasks left out because the snapshot is bounded.
+    pub omitted: u32,
+}
+
+/// One live Pi task. `id` and `owner` are Pi task IDs, never a Beep Boop `TaskId`.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct TaskGraphNode {
+    #[ts(type = "number")]
+    pub id: u64,
+    /// Pi's task kind, such as `pi.generation`, `pi.tool` or `agent.background`.
+    pub kind: String,
+    pub conversation_id: String,
+    /// The Pi task that owns this one. None for a task its conversation owns.
+    #[ts(type = "number | null")]
+    pub owner: Option<u64>,
+    /// Pi's lifecycle boundary: an abort of the owning conversation stops here.
+    pub background: bool,
+    pub abort_requested: bool,
+    pub state: TaskGraphState,
+    /// Why this coordinator cannot run the task, when it cannot.
+    pub blocked: Option<TaskGraphBlocked>,
+    /// Conversations this task owns in Pi. Delegate and agent conversations are not owned by a
+    /// Pi task; their parent is `TaskGraphActor::Agent::parent_conversation_id`.
+    pub conversations: Vec<String>,
+    /// The tool's name for a `pi.tool` task whose call is still live.
+    pub tool: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TaskGraphState {
+    Pending {
+        phase: String,
+    },
+    Running {
+        phase: String,
+    },
+    /// Parked until the tasks in `on` settle. A settled task has already left the graph.
+    Waiting {
+        phase: String,
+        #[ts(type = "number[]")]
+        on: Vec<u64>,
+        policy: TaskGraphJoinPolicy,
+    },
+    /// Parked until the coordinator's clock reaches `until`, in epoch milliseconds.
+    Sleeping {
+        phase: String,
+        until: f64,
+    },
+    /// The outcome is decided and held until the work this task owns has ended.
+    Completing {
+        outcome: TaskGraphOutcome,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskGraphJoinPolicy {
+    FailFast,
+    AllSettled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskGraphOutcome {
+    Completed,
+    Failed,
+    Aborted,
+    Orphaned,
+    Faulted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskGraphBlocked {
+    /// No installed definition has this task's kind.
+    MissingTask,
+    TaskTooOld,
+    MigrationFailed,
+    /// Parked after repeated restarts cut it off.
+    RestartLimit,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct TaskGraphConversation {
+    pub conversation_id: String,
+    pub actor: TaskGraphActor,
+}
+
+/// Who a conversation belongs to in Beep Boop.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TaskGraphActor {
+    Main,
+    Task {
+        task_id: TaskId,
+        title: String,
+    },
+    Agent {
+        task_id: TaskId,
+        agent_id: String,
+        title: String,
+        /// The conversation of the task this agent works for. Its row is always present.
+        parent_conversation_id: String,
+    },
+    /// No task or agent owns it, as with source triage.
+    Other,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -1255,6 +1377,9 @@ pub enum RuntimeEventKind {
     Task {
         task: Box<TaskRecord>,
         history: String,
+    },
+    TaskGraph {
+        graph: TaskGraphSnapshot,
     },
     AuthorizationUrl {
         url: String,

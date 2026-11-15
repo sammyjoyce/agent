@@ -4567,6 +4567,22 @@
         {
           "type": "object",
           "properties": {
+            "graph": {
+              "$ref": "#/$defs/TaskGraphSnapshot"
+            },
+            "type": {
+              "type": "string",
+              "const": "task_graph"
+            }
+          },
+          "required": [
+            "type",
+            "graph"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "type": {
               "type": "string",
               "const": "authorization_url"
@@ -5668,6 +5684,345 @@
           "required": [
             "state",
             "reason"
+          ]
+        }
+      ]
+    },
+    "TaskGraphActor": {
+      "description": "Who a conversation belongs to in Beep Boop.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "main"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            },
+            "title": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "task"
+            }
+          },
+          "required": [
+            "type",
+            "task_id",
+            "title"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "agent_id": {
+              "type": "string"
+            },
+            "parent_conversation_id": {
+              "description": "The conversation of the task this agent works for. Its row is always present.",
+              "type": "string"
+            },
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            },
+            "title": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "agent"
+            }
+          },
+          "required": [
+            "type",
+            "task_id",
+            "agent_id",
+            "title",
+            "parent_conversation_id"
+          ]
+        },
+        {
+          "description": "No task or agent owns it, as with source triage.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "other"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        }
+      ]
+    },
+    "TaskGraphBlocked": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "task_too_old",
+            "migration_failed"
+          ]
+        },
+        {
+          "description": "No installed definition has this task's kind.",
+          "type": "string",
+          "const": "missing_task"
+        },
+        {
+          "description": "Parked after repeated restarts cut it off.",
+          "type": "string",
+          "const": "restart_limit"
+        }
+      ]
+    },
+    "TaskGraphConversation": {
+      "type": "object",
+      "properties": {
+        "actor": {
+          "$ref": "#/$defs/TaskGraphActor"
+        },
+        "conversation_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "conversation_id",
+        "actor"
+      ]
+    },
+    "TaskGraphJoinPolicy": {
+      "type": "string",
+      "enum": [
+        "fail_fast",
+        "all_settled"
+      ]
+    },
+    "TaskGraphNode": {
+      "description": "One live Pi task. `id` and `owner` are Pi task IDs, never a Beep Boop `TaskId`.",
+      "type": "object",
+      "properties": {
+        "abort_requested": {
+          "type": "boolean"
+        },
+        "background": {
+          "description": "Pi's lifecycle boundary: an abort of the owning conversation stops here.",
+          "type": "boolean"
+        },
+        "blocked": {
+          "description": "Why this coordinator cannot run the task, when it cannot.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskGraphBlocked"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "conversation_id": {
+          "type": "string"
+        },
+        "conversations": {
+          "description": "Conversations this task owns in Pi. Delegate and agent conversations are not owned by a\nPi task; their parent is `TaskGraphActor::Agent::parent_conversation_id`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "kind": {
+          "description": "Pi's task kind, such as `pi.generation`, `pi.tool` or `agent.background`.",
+          "type": "string"
+        },
+        "owner": {
+          "description": "The Pi task that owns this one. None for a task its conversation owns.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "state": {
+          "$ref": "#/$defs/TaskGraphState"
+        },
+        "tool": {
+          "description": "The tool's name for a `pi.tool` task whose call is still live.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "conversation_id",
+        "background",
+        "abort_requested",
+        "state",
+        "conversations"
+      ]
+    },
+    "TaskGraphOutcome": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "failed",
+        "aborted",
+        "orphaned",
+        "faulted"
+      ]
+    },
+    "TaskGraphSnapshot": {
+      "description": "The coordinator's live Pi tasks at one moment, with the Beep Boop actor of each conversation.\n\nOnly live work appears. An idle delegate or agent has no node; `tasks list` and `tasks read`\nanswer what exists. Identity is read after the native frame, so a title can be newer than the\nwork beside it.",
+      "type": "object",
+      "properties": {
+        "conversations": {
+          "description": "One row for each conversation a node runs in or owns, and for the task of each listed agent.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TaskGraphConversation"
+          }
+        },
+        "nodes": {
+          "description": "Live native tasks, an owner always before the tasks it owns.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TaskGraphNode"
+          }
+        },
+        "omitted": {
+          "description": "Live native tasks left out because the snapshot is bounded.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "nodes",
+        "conversations",
+        "omitted"
+      ]
+    },
+    "TaskGraphState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "phase": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "const": "pending"
+            }
+          },
+          "required": [
+            "status",
+            "phase"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "phase": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "const": "running"
+            }
+          },
+          "required": [
+            "status",
+            "phase"
+          ]
+        },
+        {
+          "description": "Parked until the tasks in `on` settle. A settled task has already left the graph.",
+          "type": "object",
+          "properties": {
+            "on": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0
+              }
+            },
+            "phase": {
+              "type": "string"
+            },
+            "policy": {
+              "$ref": "#/$defs/TaskGraphJoinPolicy"
+            },
+            "status": {
+              "type": "string",
+              "const": "waiting"
+            }
+          },
+          "required": [
+            "status",
+            "phase",
+            "on",
+            "policy"
+          ]
+        },
+        {
+          "description": "Parked until the coordinator's clock reaches `until`, in epoch milliseconds.",
+          "type": "object",
+          "properties": {
+            "phase": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "const": "sleeping"
+            },
+            "until": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "required": [
+            "status",
+            "phase",
+            "until"
+          ]
+        },
+        {
+          "description": "The outcome is decided and held until the work this task owns has ended.",
+          "type": "object",
+          "properties": {
+            "outcome": {
+              "$ref": "#/$defs/TaskGraphOutcome"
+            },
+            "status": {
+              "type": "string",
+              "const": "completing"
+            }
+          },
+          "required": [
+            "status",
+            "outcome"
           ]
         }
       ]
