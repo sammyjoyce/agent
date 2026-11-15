@@ -430,8 +430,8 @@ syncBuiltinESMExports();
       child.stdin.write(JSON.stringify({ version: 1, id: 2, command: { type: "run_background", settings: {
         poll_interval_seconds: 60, sources: false, jobs: null } } } satisfies RuntimeRequest) + "\n");
       let current = await status(4);
-      for (let id = 5; current.pending > 0 && id < 1000; id += 1) current = await status(id);
-      assert.equal(current.pending, 0); assert.deepEqual(current.errors, []);
+      for (let id = 5; current.pending > 0; id += 1) current = await status(id);
+      assert.deepEqual(current.errors, []);
       assert.equal(embeddings.filter(text => text.includes("Retained source evidence")).length, 1,
         "The original history task must index its retained evidence once after binding");
     }
