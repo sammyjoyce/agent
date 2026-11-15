@@ -415,6 +415,12 @@ async fn read_file_sends_host_images_natively_and_keeps_text_reads() {
     let files = directory.path();
     fs::write(files.join("digit.txt"), png(4, 4, |_, _| [200, 30, 30])).unwrap();
     fs::write(files.join("wide.png"), png(2400, 8, |_, _| [20, 90, 200])).unwrap();
+    let screenshot = png(1700, 1700, |_, _| [240, 240, 236]);
+    assert!(
+        (8 * 1024 * 1024..12 * 1024 * 1024).contains(&screenshot.len()),
+        "A screenshot-sized file spans several 1 MiB chunks"
+    );
+    fs::write(files.join("screenshot.png"), screenshot).unwrap();
     fs::write(files.join("notes.txt"), "alpha beta gamma\n").unwrap();
     let mut broken = b"\x89PNG\r\n\x1a\n".to_vec();
     broken.extend(b"\0\0\0\rIHDR not really an image");
@@ -437,6 +443,7 @@ async fn read_file_sends_host_images_natively_and_keeps_text_reads() {
                 read("wide.png"),
                 read("broken.png"),
                 read("huge.png"),
+                read("screenshot.png"),
                 { "text": "Vision job done." },
             ],
             "JOB_BLIND": [read("digit.txt"), { "text": "Blind job done." }],
@@ -490,6 +497,11 @@ async fn read_file_sends_host_images_natively_and_keeps_text_reads() {
     assert!(
         text(output(&seen, "wide.png")).contains("2400x8"),
         "The model learns the original size to map coordinates"
+    );
+    assert_eq!(
+        image(output(&seen, "screenshot.png")),
+        (1700, 1700),
+        "An image larger than one frame arrives whole"
     );
     refused_without_image(output(&seen, "broken.png"));
     refused_without_image(output(&seen, "huge.png"));
