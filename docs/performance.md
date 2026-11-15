@@ -240,11 +240,20 @@ a real provider:
 | `task-status` | main | The answer names the credit note a saved task waits for. |
 | `delegation` | main | A new release-notes task exists and a worker spawn was requested. |
 | `file-edit` | worker | One setting changed, the rest of the file is intact, and the task is resolved. |
-| `child-agent` | worker and agent | A child agent finished with a summary that states the seeded root cause, an expired certificate, and the parent resolved with evidence that states it. A summary that calls the certificate healthy, not expired, or blames an environment variable fails. |
+| `child-agent` | worker and agent | A child agent finished and the parent resolved the task. The child's summary and the parent's evidence each contain at least one `root cause:`, `root cause is:` or `root cause was:` label, in any case and anywhere in the text. For every label, the rest of its sentence starts with the expired certificate, and the whole sentence has no negation word, such as no, not, never, without or a word ending in n't. |
 | `browser-read` | main | The answer names the degraded component and its start time. |
 | `job-inspection` | main | The answer mentions Lumen Parts, purchase orders, and a weekly or Monday schedule. |
 | `source-triage` | triage | A credit-note mail links to its task and a newsletter is dismissed. |
 | `long-history` | main | The answer recalls a deposit reference from the second of 24 earlier turns. |
+
+The `child-agent` check does not read meaning. It rejects a denial that uses a
+negation word or that names another cause first, and it rejects an answer with
+no root cause label. It accepts a label followed by the expired certificate and
+a contradiction without a negation word, such as "but we disproved that". A
+label with words between `root cause` and the colon, such as
+`Root cause (per the doc):`, does not count. The scenario asks for a line that
+begins `Root cause:`. Each unit's `detail` keeps the child's summary and the
+parent's evidence in full.
 
 Each unit opens a private SQLite file and a temporary workspace. The eval host
 returns invented guidance, reads, writes and edits files in that workspace,
@@ -351,6 +360,22 @@ eval-arm form before it moved into `runtime/src/toolsets.ts`, with the same
 lists. The cost falls less than the tokens, because a smaller share of each
 request hits the cache. The hosted web search declaration now makes up most of
 a request without tool calls, and neither mechanism reaches it.
+
+The runs above graded `child-agent` with an earlier check. It accepted any
+answer that named an expired certificate, unless the answer matched a short list
+of contradictions, so it passed "There was no expired certificate". Those runs
+did not keep the answers, so they cannot be graded again. Two fresh runs of only
+`child-agent`, at `low` with 3 alternating trials per arm, checked equal success:
+
+| Check | `direct` | `production` |
+| --- | --- | --- |
+| Label at the start of a line | 2 of 3 passed | 1 of 3 passed |
+| Label anywhere, the current check | 3 of 3 passed, 73,377 tokens (62,857 to 81,164) | 3 of 3 passed, 59,739 tokens (59,526 to 59,863) |
+
+Every answer in both runs stated the seeded cause word for word. The three
+failures in the first run put the label after a lead-in, such as
+"It states: Root cause:", so the label-anywhere check replaced the line-start
+check before the second run. Only the second run counts.
 
 Keeping `exec`, `edit_file` and `write_file` direct in worker and agent did not
 keep those calls out of scripts. The model still made its edits in a script in
