@@ -251,9 +251,9 @@ func anInspectionIsOneCoordinatorWhateverTheOwnerHas() async throws {
   }
 }
 
-/// The inspection screen keeps its model while another screen covers it, and opens the inspection
-/// again when it shows again. The second inspection's session has been told nothing, so it is
-/// dialed as the first was.
+/// `runUntilCancelled` empties an inspection model's lane so that `connectInspection` can fill it
+/// again when the screen's task runs again on the model it kept. The second inspection's session
+/// has been told nothing, so it is dialed as the first was.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func anInspectionOpenedAgainOnTheModelItsScreenKeptIsDialedAgain() async throws {
   try await withTwoFixtures { coordinators, _, personalFixture, _ in
