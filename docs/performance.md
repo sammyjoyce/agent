@@ -172,20 +172,45 @@ first open. Later starts read only the completion markers.
 
 ## Tool discovery
 
-Each role offers every tool directly today. The first main request declares 30
-tools in about 14,900 characters of names, descriptions and schemas. Pi offers
-two ways to declare less. `tool_search` loads deferred tools when the model
-asks for them, and `codemode` lets the model call tools from a script. Either
-one helps only if it removes more tokens than its extra requests add.
+Before tool discovery, every role offered every tool directly. The first main
+request declared 30 tools in about 14,900 characters of names, descriptions
+and schemas. Pi offers two ways to declare less. `tool_search` loads deferred
+tools when the model asks for them, and `codemode` lets the model call tools
+from a script. Either one helps only if it removes more tokens than its extra
+requests add.
 
-`runtime/test/fixtures/tool-discovery.ts` holds the candidate tool surfaces in
-one table, `DISCOVERY_ARMS`. Each arm maps a role to its deferred tools and to
-the tools that stay direct beside code mode. `direct` is production today.
-Every arm keeps `finish_without_reply`, `read_attachment` and `read_file`
+Production now uses both, one per role. `TOOL_SURFACES` in
+`runtime/src/toolsets.ts` maps each role to its deferred tools and, for code
+mode roles, to the tools that stay direct beside `codemode`:
+
+| Role | Surface |
+| --- | --- |
+| main | Direct tools and `tool_search`. The browser, context repository, worktree and source tools are deferred. |
+| triage, worker, agent | `codemode`, with `read_file`, `read_attachment` and, outside agent, `record_task` direct. Scripts reach every other tool. The browser, context repository, worktree and, outside triage, source tools stay out of the script section until a script searches for them. |
+
+The [results](#hillclimb-results) below explain the choice.
+`runtime/test/fixtures/tool-discovery.ts` holds the alternatives in one table,
+`DISCOVERY_ARMS`. `direct` offers every tool directly, as before, and
+`production` is `TOOL_SURFACES`.
+
+Every surface keeps `finish_without_reply`, `read_attachment` and `read_file`
 directly offered. `finish_without_reply` must be the main turn's own final
 call. A script receives only the text of a nested result from a tool without
-a structured output schema, and `read_attachment` returns images. `read_file`
-stays direct for the image reads that pull request 46 adds to it.
+a structured output schema, and `read_attachment` and `read_file` can return
+images. Triage and worker also keep `record_task` direct. A recovery turn reconciles its input
+through the turn's own `record_task` call, and a call from a script fails that
+check.
+
+Code mode changes what a person sees in the history of a triage, worker or
+agent conversation. A command or file edit that a script makes does not get its
+own Command or File changes item. The `codemode` item lists each call the
+script made, with its status, above the script's output. The line shows the
+command for `exec`, the path for `write_file` and `edit_file`, and the tool
+name for other calls. If Pi cut the call's arguments at 200 characters, the
+line shows only the tool name. Tool details for the item show the script.
+`beep-boop tasks graph` shows a running script's calls as tool nodes under its
+`codemode` call. Main's history does not change. Rendering a script's `exec`
+and file calls as Command and File changes items is follow-up work.
 
 `runtime/test/tool-discovery.test.ts` runs every arm on the real Harness with
 the faux provider. It checks these behaviors:
@@ -195,13 +220,14 @@ the faux provider. It checks these behaviors:
 - A worker script cannot call the main-only `delegate_task` or record another
   task, and a main script cannot finish the turn without a reply.
 - A main script gets the same task and job results as direct calls.
+- A worker script's history item lists the command it ran, the path it
+  edited and the script's output.
+- `record_task`, `report_result`, `notify` and `notify_user` called from a
+  script save the same caller identity as a direct call. The saved outcome
+  names the caller's conversation and the assistant entry that issued the
+  `codemode` call.
 - Reopening does not repeat a settled call or an interrupted call that is
   unsafe to replay. An interrupted replay-safe call runs again.
-
-Scripts cannot call `record_task` yet. It attributes the saved outcome to the
-model's own tool call, and a nested call from a script has none, so the call
-fails with "Task outcome model provenance is unavailable". The suite pins this
-for a worker script.
 
 ### Live eval
 
@@ -214,7 +240,7 @@ a real provider:
 | `task-status` | main | The answer names the credit note a saved task waits for. |
 | `delegation` | main | A new release-notes task exists and a worker spawn was requested. |
 | `file-edit` | worker | One setting changed, the rest of the file is intact, and the task is resolved. |
-| `child-agent` | worker and agent | A child agent finished with a summary that mentions the certificate, and the parent resolved with evidence that mentions it. |
+| `child-agent` | worker and agent | A child agent finished with a summary that states the seeded root cause, an expired certificate, and the parent resolved with evidence that states it. A summary that calls the certificate healthy, not expired, or blames an environment variable fails. |
 | `browser-read` | main | The answer names the degraded component and its start time. |
 | `job-inspection` | main | The answer mentions Lumen Parts, purchase orders, and a weekly or Monday schedule. |
 | `source-triage` | triage | A credit-note mail links to its task and a newsletter is dismissed. |
@@ -232,7 +258,7 @@ To compare arms, set the provider and the arms, then run the eval:
 
 ```sh
 AGENT_TOOL_DISCOVERY_EVAL=1 OPENAI_API_KEY=... OPENAI_BASE_URL=... \
-AGENT_TOOL_DISCOVERY_ARMS=direct,search-browser AGENT_TOOL_DISCOVERY_TRIALS=3 \
+AGENT_TOOL_DISCOVERY_ARMS=direct,production AGENT_TOOL_DISCOVERY_TRIALS=3 \
 AGENT_TOOL_DISCOVERY_REASONING=low AGENT_TOOL_DISCOVERY_OUT=/tmp/tool-discovery.jsonl \
 	nix develop .#ci --command node --test runtime/dist/test/tool-discovery-eval.test.js
 ```
@@ -252,27 +278,80 @@ A wrapper around the OpenAI provider records every logical request, including
 the requests of delegated child agents. Each JSONL row holds one scenario, arm
 and trial: success, requests, uncached input, cache reads, output, total
 tokens, the API-estimated cost, wall time, the tools the model called, and the
-estimated declaration size of the first request. For each arm, the eval prints
-the median suite total, the work count, and an error count. The error count is
-the number of units that threw or had a request end in a provider error.
+estimated declaration size of the first request, the recovered retries and the
+tool results marked as errors. A recovered retry is a request that ended in a
+provider error and was sent again. Each unit is its own subtest, so a failed
+scenario fails the run and the TAP output names it. For each arm, the eval
+prints the median suite total, the work count, the recovered retries, the tool
+errors, and an error count. The error count is the number of units that threw
+or had a request end in a provider error that was not retried.
 
 ### Baseline
 
-Today's direct surfaces, `gpt-6.1-sol` at `low` reasoning, 8 trials of all nine
-scenarios in two runs on 2026-11-15:
+The `direct` surfaces, `gpt-6.1-sol` at `low` reasoning, 6 trials of all nine
+scenarios on 2026-11-15:
 
 | Measure per suite | Median | Range |
 | --- | ---: | ---: |
-| Total tokens | 325,735 | 289,511 to 343,117 |
-| Provider requests | 39 | 35 to 41 |
-| Cache reads | 240,320 | 219,392 to 251,776 |
-| API-estimated cost | $0.215 | $0.165 to $0.250 |
+| Total tokens | 312,738 | 289,770 to 326,359 |
+| Provider requests | 37.5 | 35 to 39 |
+| Cache reads | 243,008 | 231,808 to 252,288 |
+| API-estimated cost | $0.193 | $0.156 to $0.200 |
 
-All 72 units passed their checks, and no unit threw or had a request end in a
-provider error. A request without tool calls costs about 7,700 tokens. About
-4,400 of those are the hosted web search tool, and about 3,700 are main's
-estimated tool declarations. Most of the suite total is the request count times
-that prefix, plus the conversation each request carries. The spread comes from
-the scenarios whose request counts vary: `child-agent` used 8 to 10 requests,
-`source-triage` 6 to 8, `task-status` 3 to 4 and `browser-read` 2 to 3. An arm
-needs a gap wider than this range to show a difference.
+All 54 units passed their checks, with no errors and no retries. Each
+`file-edit` unit saw one tool error. A request without tool calls costs about
+7,700 tokens. About 4,400 of those are the hosted web search tool, and about
+3,700 are main's estimated tool declarations. Most of the suite total is the
+request count times that prefix, plus the conversation each request carries.
+The spread comes from the scenarios whose request counts vary: `child-agent`
+used 8 to 10 requests and `task-status` 3 to 4. One trial varies by about
+4% of the median, so an arm needs about 7% to show a difference in 3 trials.
+
+### Hillclimb results
+
+Eight surfaces, one mechanism each, ran at `low` reasoning with 3 trials. The
+table gives median suite tokens and the change from the baseline. Every trial
+of every surface passed all nine scenarios.
+
+| Surface | Tokens | Change | Requests |
+| --- | ---: | ---: | ---: |
+| Defer the browser tools | 278,139 | -11.1% | 38 |
+| Also defer context repository and worktree tools | 279,516 | -10.6% | 39 |
+| Also defer source tools outside triage | 263,109 | -15.9% | 38 |
+| Code mode for every tool but the always-direct ones | 256,823 | -17.9% | 28 |
+| Code mode, deferred tools out of its section | 235,808 | -24.6% | 30 |
+| Also defer main's `record_task` and triage's file and job tools | 268,056 | -14.3% | 39 |
+| Code mode, deferred tools out of its section, `record_task` direct | 232,928 | -25.5% | 29 |
+| Main with tool search, other roles as above (`production`) | 223,414 | -28.6% | 30 |
+
+The two mechanisms save in different places. Deferral shrinks every request.
+Main's request without tool calls fell from 7,742 to 6,205 tokens. Code mode
+removes requests. A script reads, edits and checks a file in one round, so
+`file-edit` fell from 8 requests to 5 and `source-triage` from 7 to 3. Its
+section costs about as much as the schemas it replaces, so code mode does not
+pay on main, whose scenarios are one or two lookups.
+
+The last surface became `TOOL_SURFACES`. A best-of-eight pick from 3 trials
+can look better than it is, so a fresh run compared the shipped table with
+`direct`, alternating, at both reasoning levels:
+
+| Measure per suite | `direct`, `low` | `production`, `low` | `direct`, `xhigh` | `production`, `xhigh` |
+| --- | ---: | ---: | ---: | ---: |
+| Trials | 4 | 4 | 3 | 3 |
+| Total tokens | 308,114 | 216,639 | 355,846 | 236,520 |
+| Token range | 290,400 to 334,370 | 214,560 to 217,273 | 337,202 to 364,132 | 236,242 to 238,544 |
+| Provider requests | 37 | 29 | 42 | 31 |
+| Cached share | 0.78 | 0.71 | 0.78 | 0.68 |
+| API-estimated cost | $0.175 | $0.159 | $0.220 | $0.197 |
+
+`production` uses 29.7% fewer tokens at `low` and 33.5% fewer at `xhigh`. Every
+`production` trial used fewer tokens than every `direct` trial, and every trial
+of both passed all nine scenarios. The `xhigh` run measured `production` at its
+eval-arm form before it moved into `runtime/src/toolsets.ts`, with the same
+lists. The cost falls less than the tokens, because a smaller share of each
+request hits the cache. The hosted web search declaration now makes up most of
+a request without tool calls, and neither mechanism reaches it.
+
+Keeping `exec`, `edit_file` and `write_file` direct in worker and agent did not
+keep those calls out of scripts. The model still made its edits in a script in
+two of three `file-edit` trials, so that variant did not ship.
