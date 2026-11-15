@@ -773,12 +773,9 @@ final class ChatModel {
       let connected = await session.connectionState == .connected
       // Checked after the last await before the body, so a cancelled or late caller never runs it.
       try Task.checkCancellation()
-      let settled = lifecycles[id]?.loop == nil
-      if settled, told(session, on: id) == .outboxUnreadable {
-        throw LaneError.outboxUnreadable(name(id))
-      }
+      if told(session, on: id) == .outboxUnreadable { throw LaneError.outboxUnreadable(name(id)) }
       guard ContinuousClock.now < deadline else { throw LaneError.unanswered(name(id)) }
-      if connected, settled { return }
+      if connected, lifecycles[id]?.loop == nil { return }
       try await Task.sleep(for: .milliseconds(5))
     }
   }
