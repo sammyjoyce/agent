@@ -30,7 +30,7 @@ fi
 if [ -e "$root/dead" ]; then
   case $server in
     unix://*) printf 'Error: no Rex server is running at %s, and autostart is disabled\n' "$socket" >&2 ;;
-    *) printf 'Error: REX_SERVER: connecting to Rex server %s: connecting to API control: failed to WebSocket dial: connection refused\n' "$server" >&2 ;;
+    *) printf 'Error: REX_SERVER: connecting to Rex server: probing %s: connecting to API control: failed to WebSocket dial: connection refused\n' "$server" >&2 ;;
   esac
   exit 4
 fi

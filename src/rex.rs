@@ -1151,6 +1151,10 @@ printf '<pre>Current task view 🦀</pre>\n'
                 Some("https://rex.example.invalid"),
             ),
             (
+                "Error: REX_SERVER: connecting to Rex server: probing https://rex.example.invalid: connecting to API control: failed to WebSocket dial: connection refused\n".to_owned(),
+                Some("https://rex.example.invalid"),
+            ),
+            (
                 "Error: connecting to the server timed out after 8s; increase --timeout: context deadline exceeded\n".to_owned(),
                 None,
             ),
