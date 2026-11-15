@@ -2294,7 +2294,8 @@ actor InteractionPeer {
   private var working = false
   private var streamsOnSubmit = false
   private var commandValues: [SlashCommand] = []
-  private var retryCount = 0
+  private var servedJobs: [ScheduledJobStatus] = []
+  private var retried: [String] = []
   private var submitCount = 0
   func observationCount() -> Int { observations }
   func streamRepliesOnSubmit() { streamsOnSubmit = true }
@@ -2323,7 +2324,11 @@ actor InteractionPeer {
     if let observer { try await emit(.sources(.init(sources: states)), to: observer) }
   }
   func submits() -> [String] { submitted.map(\.text) }
-  func retries() -> Int { retryCount }
+  func retries() -> Int { retried.count }
+  /// The job of each `retry_job` this peer received, in order.
+  func retriedJobs() -> [String] { retried }
+  /// Advertises work inspection, and answers `jobs` and `retry_job` from these.
+  func serve(jobs: [ScheduledJobStatus]) { servedJobs = jobs }
   func submitAttempts() -> Int { submitCount }
   /// Rejects each submit while set, as a coordinator that cannot take a message does.
   func rejectSubmits(_ value: Bool) { rejecting = value }
@@ -2406,7 +2411,7 @@ actor InteractionPeer {
               conversationId: "fixture-root",
               conversationSettings: settingsValue == nil ? nil : true,
               inputOrigins: settingsValue == nil ? nil : true, model: "fixture/model",
-              working: working)), to: socket)
+              workInspection: servedJobs.isEmpty ? nil : true, working: working)), to: socket)
         try await emitHistory(try XCTUnwrap(initial), to: socket)
         if !commandValues.isEmpty {
           try await emit(.commands(.init(commands: commandValues)), to: socket)
@@ -2439,8 +2444,12 @@ actor InteractionPeer {
         try await emitHistory(
           try XCTUnwrap(request.cursor == nil ? latest : pages[cursor]), to: socket)
         try await emit(.done, to: socket)
-      case .retryJob:
-        retryCount += 1
+      case .jobs(let request) where !servedJobs.isEmpty:
+        try await emit(jobStatus(request.jobId), to: socket)
+        try await emit(.done, to: socket)
+      case .retryJob(let request):
+        retried.append(request.jobId)
+        if !servedJobs.isEmpty { try await emit(jobStatus(request.jobId), to: socket) }
         try await emit(.done, to: socket)
       case .submit(let request):
         submitCount += 1
@@ -2462,6 +2471,15 @@ actor InteractionPeer {
     } catch {
       // Client cancellation owns closing both observers and history requests.
     }
+  }
+  private func jobStatus(_ id: String?) -> NativeEvent {
+    guard let id else {
+      return .notice(.init(jobStatus: .list(.init(jobs: servedJobs)), text: "Scheduled jobs"))
+    }
+    guard let job = servedJobs.first(where: { $0.job.id == id }) else {
+      return .failure(.init(message: "Invented: no scheduled job \(id)"))
+    }
+    return .notice(.init(jobStatus: .detail(.init(job: job)), text: job.job.title))
   }
   private func read(_ socket: NWConnection, _ data: inout Data) async throws -> NativeRequest {
     while !data.contains(10) { data.append(try await receive(socket)) }

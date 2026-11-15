@@ -251,6 +251,30 @@ func anInspectionIsOneCoordinatorWhateverTheOwnerHas() async throws {
   }
 }
 
+/// `runUntilCancelled` empties an inspection model's lane so that `connectInspection` can fill it
+/// again when the screen's task runs again on the model it kept. The second inspection's session
+/// has been told nothing, so it is dialed as the first was.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func anInspectionOpenedAgainOnTheModelItsScreenKeptIsDialedAgain() async throws {
+  try await withTwoFixtures { coordinators, _, personalFixture, _ in
+    await personalFixture.replyToHistory(
+      initial: .init(messages: [], pageComplete: true), pages: [:])
+    let (_, personal) = try await addWorkAndPersonal(coordinators)
+    let inspection = ChatModel(inspecting: exampleConversation)
+    for opening in 1...2 {
+      await inspection.connectInspection(using: coordinators.chat, lane: personal)
+      #expect(inspection.failure == nil)
+      try await eventually("inspection \(opening) connected") {
+        inspection.connection == .connected
+      }
+      let shown = Task { @MainActor in await inspection.runUntilCancelled() }
+      shown.cancel()
+      await shown.value
+    }
+    #expect(await inspections(personalFixture) == 2)
+  }
+}
+
 @MainActor @Test(.timeLimit(.minutes(1)))
 func renamingKeepsTheEpoch() async throws {
   try await withTwoFixtures { coordinators, _, _, _ in

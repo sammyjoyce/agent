@@ -426,6 +426,49 @@ or removing a coordinator updates the picker and the phrases. Intents, entities
 and queries live in `ios/Sources/AgentUI/Siri/`. The shortcuts provider lives
 in the app target, because a provider inside the package ships no phrase.
 
+**Retry Interrupted Run** retries a scheduled job whose last run paused after
+repeated interrupted restarts, the same rule the job screen's Recovery button
+uses. It declares `.requiresAuthentication`, which Apple documents as a policy
+that requires authentication before running the app intent. Its Job picker
+lists the jobs of every paired coordinator that answers, by title and
+coordinator, and leaves out the prompt, the working directory and the run
+output. A job that the action would retry reads Interrupted. The action reads
+the job again before it retries, and says that the job has no interrupted run
+when the run has recovered. It has no phrase. Add it in the Shortcuts app.
+
+An intent holds a coordinator connected with a lease, so the job action works
+with the app in the background. A leased coordinator stays connected whatever
+the scene does. When its last lease ends, it disconnects unless the app is
+open. The Job picker reads every paired coordinator at the same time and gives
+each 8 seconds to connect. It leaves out a coordinator that does not connect
+in that time. With no job to show, it reports a coordinator's refusal, such as
+a request to update the coordinator, and it reports silence only when no
+coordinator answered.
+
+A session loads its saved outbox before it first dials. While that file
+exists and cannot be read or decoded, the session dials nothing and reports
+"The saved outbox could not be read. It was preserved; no messages were
+replayed." A lease on that coordinator ends as soon as the session has
+reported it, without waiting out the 8 seconds. The Job picker reports the
+sentence under the coordinator's name, where it would report a refusal. A
+retry sends nothing and fails with an error that carries the same sentence.
+The next activation of the app, the next lease and "Try again" each make the
+session read the outbox again. The app saves the outbox with complete file
+protection, so an intent that the system starts on a locked phone may meet
+this whenever the file exists. That is inferred from the file's protection.
+No simulator enforces it, and it was not measured on a phone.
+
+In a Debug launch that asks for the interaction fixture, a job query and a
+retry reach only the fixture's loopback peers. A launch that erased its
+fixture, could not build it, or has not yet chosen refuses both before any
+lease, so neither reaches the app's saved coordinators. A Release build has no
+fixture. App Intents Testing runs an intent in the app and returns the
+intent's value. It returns no dialog and nothing about authentication, so a
+package test checks the retry's sentence, and the metadata check requires that
+the built app keeps the retry behind authentication and gives it no phrase. No
+test shows the authentication itself. On a fresh simulator the retry ran with
+the lock screen showing.
+
 ## Validation
 
 ```sh

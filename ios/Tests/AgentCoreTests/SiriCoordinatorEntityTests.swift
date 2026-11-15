@@ -17,7 +17,7 @@ struct SiriCoordinatorEntityTests {
     let notifications: AppNotifications
 
     init(
-      names: [String] = ["Work", "Personal", "Home"],
+      names: [String] = ["Work", "Personal", "Home"], transport: CoordinatorTransport = .tailnet,
       permission: @escaping @MainActor () async throws -> Bool = AppNotifications.alertPermission
     ) throws {
       defaults = try #require(UserDefaults(suiteName: suite))
@@ -31,7 +31,7 @@ struct SiriCoordinatorEntityTests {
         JSONEncoder().encode(Coordinators.SavedProfiles(profiles: profiles)),
         to: root.appending(path: "Agent/profiles.json"))
       notifications = AppNotifications(
-        defaults: defaults, applicationSupport: root, caches: root, transport: .tailnet,
+        defaults: defaults, applicationSupport: root, caches: root, transport: transport,
         permission: permission)
     }
 
@@ -94,10 +94,24 @@ struct SiriCoordinatorEntityTests {
   }
 
   #if DEBUG
+    /// Counts the dials of the coordinators it is the transport of, and connects none.
+    private actor DialLog {
+      private(set) var count = 0
+      private func dialed() { count += 1 }
+      nonisolated var transport: CoordinatorTransport {
+        CoordinatorTransport { _ in
+          await self.dialed()
+          throw ConnectionError.timedOut
+        }
+      }
+    }
+
     /// No other test reads `AppNotifications.interactionLaunch`, so this test can set it while
-    /// tests run in parallel.
+    /// tests run in parallel. The app delegate's Work is paired, so a lease on it would dial, and
+    /// no dial means no lease either.
     @Test func intentsReadTheInteractionFixtureAndOnlyAPlainLaunchAsksForAlerts() async throws {
-      let delegate = try SavedFixture(names: ["Work"])
+      let dials = DialLog()
+      let delegate = try SavedFixture(names: ["Work"], transport: dials.transport)
       let fixture = try SavedFixture(names: ["Personal"])
       defer {
         AppNotifications.interactionLaunch = nil
@@ -108,6 +122,15 @@ struct SiriCoordinatorEntityTests {
       #expect(try delegate.notifications.intentCoordinators.savedNames == ["Work"])
       AppNotifications.interactionLaunch = .fixture(fixture.notifications)
       #expect(try delegate.notifications.intentCoordinators.savedNames == ["Personal"])
+      let work = delegate.profiles[0].id
+      let nightlyDeps = JobEntity(
+        ScheduledJobStatus(
+          job: .init(
+            cwd: "/workspace/example", id: "nightly:deps",
+            model: .init(fast: false, modelId: "example-model", provider: .openai),
+            prompt: "Update the invented dependencies.", revision: "example-revision",
+            schedules: [], timezone: "America/Los_Angeles", title: "Nightly deps"),
+          schedules: []), on: work, coordinator: "Work")
       let refusals: [AppNotifications.InteractionLaunch?] = [
         nil, .unavailable(reason: "This launch erased its interaction fixture."),
       ]
@@ -119,7 +142,26 @@ struct SiriCoordinatorEntityTests {
         } catch {
           #expect("\(error)".contains("interaction fixture"), "\(error)")
         }
+        let app = delegate.notifications
+        let requests: [(what: String, ask: () async throws -> Void)] = [
+          ("every job", { _ = try await JobQuery.allJobs(for: app) }),
+          ("one job", { _ = try await JobQuery.jobs(identifiedBy: [nightlyDeps.id], for: app) }),
+          ("a retry", { _ = try await RetryInterruptedRunIntent.retry(nightlyDeps, for: app) }),
+        ]
+        for (what, ask) in requests {
+          await #expect(
+            throws: AppNotifications.InteractionFixtureUnavailable.self,
+            "\(what) under \(String(describing: launch))"
+          ) { try await ask() }
+        }
       }
+      #expect(await dials.count == 0, "A refused intent reached the app's own Work")
+      await #expect(throws: LaneError.self) {
+        try await delegate.notifications.coordinators.withConnection(
+          to: work, within: .milliseconds(300)
+        ) {}
+      }
+      #expect(await dials.count > 0, "A lease on Work dials it, and the log counts the dial")
 
       var asked = 0
       let launching = try SavedFixture(names: ["Work"]) {
