@@ -4055,13 +4055,20 @@ fn import_phase_name(phase: &ImportPhase) -> &'static str {
 }
 
 #[cfg(test)]
+#[path = "../tests/fixtures/executable.rs"]
+mod executable_fixture;
+
+#[cfg(test)]
 #[path = "../tests/fixtures/fake_rex.rs"]
 mod fake_rex;
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
-    use crate::{Action, Arguments, ModelArgs, fake_rex, local_service_command};
+    use crate::{
+        Action, Arguments, ModelArgs, executable_fixture::write_executable, fake_rex,
+        local_service_command,
+    };
     use agent_cli::models::{ModelProvider, ModelSelection, Reasoning};
     use agent_cli::protocol::SearchMode;
     use agent_cli::rex::RexClient;
@@ -4337,7 +4344,9 @@ mod tests {
         ] {
             let directory = tempfile::tempdir().unwrap();
             let program = directory.path().join("rex");
-            std::fs::write(&program, r#"#!/bin/sh
+            write_executable(
+                &program,
+                r#"#!/bin/sh
 set -eu
 [ -z "${REX_SESSION-}" ] && [ -z "${REX_BLOCK-}" ] && [ -z "${REX_CLIENT-}" ]
 [ "$1" = --autostart=false ] && [ "$2" = --timeout ] && [ "$3" = 8s ]
@@ -4368,8 +4377,8 @@ case "$AGENT_TEST_FEEDBACK_CAPTURE_CASE" in
   invalid_text) printf '\377' ;;
   *) printf 'Current task view 🦀\n' ;;
 esac
-"#).unwrap();
-            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+"#,
+            );
             let calls = directory.path().join("calls");
             let path = std::env::join_paths(std::iter::once(directory.path().to_owned()).chain(
                 std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),

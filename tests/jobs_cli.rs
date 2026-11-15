@@ -16,6 +16,10 @@ use agent_cli::{
 };
 use serde::{Deserialize, Serialize};
 
+#[path = "fixtures/executable.rs"]
+mod executable_fixture;
+use executable_fixture::write_executable;
+
 const JOB_ID: &str = "Daily_Review.v2";
 // Package qualification can share a host with native compilers. Keep startup
 // bounded without treating a brief scheduling delay as coordinator failure.
@@ -68,9 +72,9 @@ impl Fixture {
         .unwrap();
         fs::write(&instructions, "Use only invented fixture data.\n").unwrap();
         for name in ["rex", "tailscale"] {
-            executable(&bin.join(name), "#!/bin/sh\nexit 1\n");
+            write_executable(&bin.join(name), "#!/bin/sh\nexit 1\n");
         }
-        executable(
+        write_executable(
             &bin.join("switchboard"),
             "#!/bin/sh\nprintf '%s\\n' unexpected >> \"$AGENT_TEST_EXTERNAL_CALLS\"\nexit 1\n",
         );
@@ -347,11 +351,6 @@ impl Drop for Server {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-fn executable(path: &Path, content: &str) {
-    fs::write(path, content).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 fn definition(prompt: &str, hour: u8) -> String {
@@ -896,7 +895,7 @@ fn remote_sync_rejects_client_paths_before_connecting() {
         definition("Review the current evidence.", 9),
     )
     .unwrap();
-    executable(
+    write_executable(
         &fixture.bin.join("ssh"),
         "#!/bin/sh\nprintf '%s\\n' unexpected >> \"$AGENT_TEST_EXTERNAL_CALLS\"\nexit 1\n",
     );

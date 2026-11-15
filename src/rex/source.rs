@@ -422,9 +422,8 @@ async fn collect(client: &RexClient, expected: Uuid) -> Result<HostResult> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-
     use crate::{
+        executable_fixture::write_executable,
         protocol::HostResult,
         rex::{
             personal_messages,
@@ -538,12 +537,10 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let producer = directory.path().join("capture-producer");
-        std::fs::write(
+        write_executable(
             &producer,
             "#!/usr/bin/env node\nsetTimeout(() => process.stdout.write('native capture'), 200);\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&producer, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let program = producer.to_str().unwrap();
         let path = std::env::var("PATH").unwrap();
         let arguments = vec!["literal".into()];
@@ -633,7 +630,7 @@ return {first=a.state,busy=b.state,retained=retained.state,second=c.state,first_
         let marker = directory.path().join("cleanup");
         let marker = marker.to_str().unwrap();
         let producer = directory.path().join("capture-producer");
-        std::fs::write(
+        write_executable(
             &producer,
             r#"#!/usr/bin/env node
 const fs = require('node:fs');
@@ -655,9 +652,7 @@ if (marker === 'successor') {
   setInterval(() => {}, 1000);
 }
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&producer, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let path = std::env::var("PATH").unwrap();
         let arguments = vec![marker.into()];
         let successor = vec!["successor".into()];
@@ -756,8 +751,10 @@ return {busy_during_cleanup=busy.state,successor=next.state,old_stopped=exists(r
         };
         std::fs::write(&payload, serde_json::to_vec(&expected).unwrap()).unwrap();
         let producer = directory.path().join("capture-producer");
-        std::fs::write(&producer, "#!/usr/bin/env node\nsetTimeout(() => process.stdout.write(require('node:fs').readFileSync(JSON.parse(process.argv.at(-1)).argv.at(-1))), 31000);\n").unwrap();
-        std::fs::set_permissions(&producer, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(
+            &producer,
+            "#!/usr/bin/env node\nsetTimeout(() => process.stdout.write(require('node:fs').readFileSync(JSON.parse(process.argv.at(-1)).argv.at(-1))), 31000);\n",
+        );
         let actual = read_with(
             &personal_messages(),
             producer.to_str().unwrap(),
@@ -792,8 +789,10 @@ return {busy_during_cleanup=busy.state,successor=next.state,old_stopped=exists(r
         let directory = tempfile::tempdir().unwrap();
         let port_file = directory.path().join("port");
         let producer = directory.path().join("capture-producer");
-        std::fs::write(&producer, "#!/usr/bin/env node\nconst server = require('node:net').createServer(socket => socket.end());\nserver.listen(0, '127.0.0.1', () => require('node:fs').writeFileSync(JSON.parse(process.argv.at(-1)).argv.at(-1), String(server.address().port)));\n").unwrap();
-        std::fs::set_permissions(&producer, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(
+            &producer,
+            "#!/usr/bin/env node\nconst server = require('node:net').createServer(socket => socket.end());\nserver.listen(0, '127.0.0.1', () => require('node:fs').writeFileSync(JSON.parse(process.argv.at(-1)).argv.at(-1), String(server.address().port)));\n",
+        );
         let program = producer.to_str().unwrap().to_owned();
         let path = std::env::var("PATH").unwrap();
         let request = Request {

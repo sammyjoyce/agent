@@ -960,6 +960,7 @@ fn decode_creation(output: &[u8]) -> Result<WorkerBinding, RexError> {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use crate::executable_fixture::write_executable;
     const SESSION: &str = "session:11111111-1111-4111-8111-111111111111";
     const WINDOW: &str = "window:22222222-2222-4222-8222-222222222222";
     const BLOCK: &str = "block:33333333-3333-4333-8333-333333333333";
@@ -967,7 +968,6 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_capture_targets_only_the_explicit_pane_and_keeps_rendered_evidence() {
-        use std::os::unix::fs::PermissionsExt;
         const CHILD: &str = "AGENT_TEST_REX_CAPTURE_CHILD";
         const TEST: &str = "rex::tests::terminal_capture_targets_only_the_explicit_pane_and_keeps_rendered_evidence";
         if std::env::var_os(CHILD).is_some() {
@@ -987,7 +987,7 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let program = directory.path().join("rex");
-        std::fs::write(
+        write_executable(
             &program,
             r#"#!/bin/sh
 set -eu
@@ -995,9 +995,7 @@ set -eu
 printf '%s\n' "$@" > "$AGENT_TEST_REX_CAPTURE_ARGS"
 printf '<pre>Current task view 🦀</pre>\n'
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let arguments = directory.path().join("arguments");
         let path = std::env::join_paths(std::iter::once(directory.path().to_owned()).chain(
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
@@ -1470,9 +1468,7 @@ case "$method" in
 esac
 printf '%s\n' "$value"
 "#;
-        std::fs::write(&program, fixture).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&program, fixture);
         let paths = std::env::join_paths(
             std::iter::once(directory.path().to_path_buf())
                 .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),

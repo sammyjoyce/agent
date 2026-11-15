@@ -22,6 +22,10 @@ use tokio::{
     time::timeout,
 };
 
+#[path = "fixtures/executable.rs"]
+mod executable_fixture;
+use executable_fixture::write_executable;
+
 #[derive(Deserialize)]
 struct Capture {
     body: WireBody,
@@ -181,8 +185,7 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
     let fake_bin = directory.path().join("bin");
     fs::create_dir(&fake_bin).unwrap();
     let rex = fake_bin.join("rex");
-    fs::write(&rex, "#!/bin/sh\nexit 1\n").unwrap();
-    fs::set_permissions(&rex, fs::Permissions::from_mode(0o700)).unwrap();
+    write_executable(&rex, "#!/bin/sh\nexit 1\n");
     let runtime = Arc::new(Runtime::start(&script, directory.path()).unwrap());
     let host = "11111111-1111-4111-8111-111111111111";
     collect(
