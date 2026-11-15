@@ -430,9 +430,28 @@ in the app target, because a provider inside the package ships no phrase.
 repeated interrupted restarts, the same rule the job screen's Recovery button
 uses. It asks to unlock the phone first. Its Job picker lists the jobs of every
 paired coordinator that answers, by title and coordinator, and leaves out the
-prompt, the working directory and the run output. The app holds each
-coordinator connected only while an intent reads or retries, so it works with
-the app in the background. It has no phrase. Add it in the Shortcuts app.
+prompt, the working directory and the run output. A job that the action would
+retry reads Interrupted. The action reads the job again before it retries, and
+says that the job has no interrupted run when the run has recovered. It has no
+phrase. Add it in the Shortcuts app.
+
+An intent holds a coordinator connected with a lease, so the job action works
+with the app in the background. A leased coordinator stays connected whatever
+the scene does. When its last lease ends, it disconnects unless the app is
+open. The Job picker reads every paired coordinator at the same time and gives
+each 8 seconds to connect. It leaves out a coordinator that does not connect
+in that time. With no job to show, it reports a coordinator's refusal, such as
+a request to update the coordinator, and it reports silence only when no
+coordinator answered.
+
+In a Debug launch that asks for the interaction fixture, a job query and a
+retry reach only the fixture's loopback peers. A launch that erased its
+fixture, could not build it, or has not yet chosen refuses both before any
+lease, so neither reaches the app's saved coordinators. A Release build has no
+fixture. App Intents Testing runs an intent in the app and returns the
+intent's value. It returns no dialog and nothing about authentication, so a
+package test checks the retry's sentence, and the metadata check requires that
+the built app keeps the retry behind authentication and gives it no phrase.
 
 ## Validation
 
