@@ -23,7 +23,7 @@ import { FeedbackStore } from "./feedback.js";
 import { FeedbackDispatcher } from "./feedback-dispatch.js";
 import { createGuidance } from "./guidance.js";
 import { createAppTools, createJobTools, Executions, HostRequests } from "./tools.js";
-import { createToolsets, type Toolsets } from "./toolsets.js";
+import { createToolsets, withActorPolicies, type Toolsets } from "./toolsets.js";
 import { createSourceTools, SourceJournal } from "./sources.js";
 import { createResourceTools, ResourceStore } from "./resources.js";
 import { BrowserStore, createBrowserTools } from "./browser.js";
@@ -242,10 +242,7 @@ async function openApplication(): Promise<Application> {
   });
   const jobTools = createJobTools(background, executions); registry.install(jobTools);
   const responsePolicy = createMainResponsePolicy(harness); registry.install(responsePolicy);
-  const toolsets = createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools });
-  toolsets.main = [...toolsets.main, responsePolicy, inputOrigins];
-  toolsets.worker = [...toolsets.worker, inputOrigins];
-  toolsets.agent = [...toolsets.agent, inputOrigins];
+  const toolsets = withActorPolicies(createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools }), { responsePolicy, inputOrigins });
   tasks.useBackgroundExecution({
     available: () => backgroundAvailable,
     extensions: (agentId) => agentId === undefined ? toolsets.worker : toolsets.agent,
