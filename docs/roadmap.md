@@ -216,8 +216,8 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Benchmark deferred tool discovery before adopting it for larger toolsets.
   The [tool discovery eval](performance.md#tool-discovery) measures nine
   scenarios across main, triage, worker and agent roles. Today's direct tools
-  use a median of 334,054 total tokens and 40 requests per suite at
-  `gpt-6.1-sol` low reasoning, with all 45 baseline units passing.
+  use a median of 325,735 total tokens and 39 requests per suite at
+  `gpt-6.1-sol` low reasoning, with all 72 baseline units passing.
 
 ## Recovery
 

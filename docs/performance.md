@@ -250,19 +250,20 @@ suite total, the error count and the work count for each arm.
 
 ### Baseline
 
-Today's direct surfaces, `gpt-6.1-sol` at `low` reasoning, 5 trials of all nine
-scenarios on 2026-11-15:
+Today's direct surfaces, `gpt-6.1-sol` at `low` reasoning, 8 trials of all nine
+scenarios in two runs on 2026-11-15:
 
 | Measure per suite | Median | Range |
 | --- | ---: | ---: |
-| Total tokens | 334,054 | 306,141 to 343,117 |
-| Provider requests | 40 | 37 to 41 |
-| Cache reads | 239,488 | 219,392 to 251,776 |
-| API-estimated cost | $0.216 | $0.195 to $0.250 |
+| Total tokens | 325,735 | 289,511 to 343,117 |
+| Provider requests | 39 | 35 to 41 |
+| Cache reads | 240,320 | 219,392 to 251,776 |
+| API-estimated cost | $0.215 | $0.165 to $0.250 |
 
-All 45 units passed, with no provider errors. A request without tool calls
+All 72 units passed, with no provider errors. A request without tool calls
 costs about 7,700 tokens. About 4,400 of those are the hosted web search tool,
 and about 3,700 are main's estimated tool declarations. Requests times that
-prefix set the suite total. The spread comes from two scenarios whose request
-counts vary: `child-agent` used 8 to 10 requests and `source-triage` 6 to 8.
-The other seven scenarios varied by less than 1%.
+prefix set the suite total. The spread comes from the scenarios whose request
+counts vary: `child-agent` used 8 to 10 requests, `source-triage` 6 to 8,
+`task-status` 3 to 4 and `browser-read` 2 to 3. An arm needs a gap wider than
+this range to show a difference.
