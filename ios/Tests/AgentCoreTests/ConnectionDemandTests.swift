@@ -444,6 +444,32 @@ func aLeaseCancelledAsItsLaneReadsConnectedNeverRunsItsBody() async throws {
   }
 }
 
+/// The lane is connected, but its session answers the wait's read only after the deadline.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aLeaseWhoseLaneReadsConnectedAfterTheDeadlineNeverRunsItsBody() async throws {
+  try await withTwoFixtures { coordinators, _, _, _ in
+    let (work, _) = try await addWorkAndPersonal(coordinators)
+    let chat = coordinators.chat
+    let session = try #require(chat.lanes.first { $0.id == work }?.session)
+    let entries = Entries()
+    let (entered, enter) = AsyncStream<Void>.makeStream()
+    let barrier = DispatchSemaphore(value: 0)
+    let occupied = Task.detached { await session.occupy(entered: enter, until: barrier) }
+    for await _ in entered {}
+    let limit = Duration.milliseconds(100)
+    let waiting = Task { @MainActor in
+      try await coordinators.withConnection(to: work, within: limit) { entries.count += 1 }
+    }
+    try await until("the lease taken") { chat.demand.leased(work) }
+    try await Task.sleep(for: limit * 2)
+    barrier.signal()
+    await occupied.value
+    await #expect(throws: LaneError.unanswered("Work")) { try await waiting.value }
+    #expect(entries.count == 0, "The body never ran")
+    #expect(!chat.demand.leased(work), "The lease was dropped")
+  }
+}
+
 @MainActor @Test func aLeaseRefusesARemovedOrUnpairedCoordinatorBeforeItDials() async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
