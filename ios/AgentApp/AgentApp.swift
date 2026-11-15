@@ -10,13 +10,16 @@ struct AgentApp: App {
   @State private var feedback = ScrawlFeedback()
   // App-level phase aggregates every scene, so a second iPad window cannot fight the first.
   @Environment(\.scenePhase) private var scenePhase
+
+  #if DEBUG
+    init() { AppNotifications.interactionLaunch = InteractionFixture.interactionLaunch }
+  #endif
+
   var body: some Scene {
     WindowGroup {
       Group {
         #if DEBUG
-          if let fixture = InteractionFixture.fromEnvironment(
-            notifications: notifications, feedback: feedback)
-          {
+          if let fixture = InteractionFixture.fromEnvironment(feedback: feedback) {
             fixture
           } else {
             chat
@@ -29,14 +32,14 @@ struct AgentApp: App {
       // A disabled `.scrawl` ignores setup links, and pairing must work with no coordinator shown.
       .onOpenURL { _ = Scrawl.handleSetupURL($0) }
     }
+    // Under the interaction fixture the app delegate's coordinators stay idle, so the two never
+    // share an inbox or a registration.
     .onChange(of: scenePhase, initial: true) { _, phase in
-      #if DEBUG
-        if InteractionFixture.isRequested { return }
-      #endif
-      dictation.setForeground(phase != .background)
-      Task { await notifications.coordinators.setActive(phase == .active) }
+      guard let coordinators = try? notifications.intentCoordinators else { return }
+      shownDictation?.setForeground(phase != .background)
+      Task { await coordinators.setActive(phase == .active) }
     }
-    .onChange(of: notifications.coordinators.savedNames, initial: true) {
+    .onChange(of: (try? notifications.intentCoordinators)?.savedNames, initial: true) {
       AgentShortcuts.updateAppShortcutParameters()
     }
   }
@@ -44,6 +47,14 @@ struct AgentApp: App {
   private var chat: some View {
     MainChatView(notifications: notifications, dictation: dictation)
       .onAppear { notifications.coordinators.feedbackRecorder = feedback }
+  }
+
+  private var shownDictation: Dictation? {
+    #if DEBUG
+      return InteractionFixture.shownDictation(app: dictation)
+    #else
+      return dictation
+    #endif
   }
 }
 

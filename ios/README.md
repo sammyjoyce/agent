@@ -456,8 +456,11 @@ including when a child temporarily inherits a descriptor before exec.
 Native UI checks use the screen's production startup and scene lifecycle. A
 DEBUG-only transport redirects each saved coordinator to an owned loopback peer;
 per-test storage identities retain the composer and each coordinator's outbox
-across relaunch. Foreground recovery and process relaunch are asserted separately
-from suspension, which XCTest can prevent and therefore report as skipped.
+across relaunch. Each launch builds one fixture before any window, and every
+window, alert tap and intent uses it. A launch that asks for the fixture and
+cannot build it refuses intents instead of using the app's saved coordinators.
+Foreground recovery and process relaunch are asserted separately from
+suspension, which XCTest can prevent and therefore report as skipped.
 Native interaction checks also rotate a static transcript at the live tail and
 while reading older messages. Incoming output preserves that older reading
 position; following resumes when scrolling back to the live tail.

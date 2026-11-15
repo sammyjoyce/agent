@@ -89,6 +89,36 @@ struct SiriCoordinatorEntityTests {
     #expect(found.map(\.id) == ["\(fixture.profiles[0].id)"])
   }
 
+  #if DEBUG
+    /// No other test reads `AppNotifications.interactionLaunch`, so this test can set it while
+    /// tests run in parallel.
+    @Test func intentsReadTheInteractionFixtureOrRefuse() throws {
+      let delegate = try SavedFixture(names: ["Work"])
+      let fixture = try SavedFixture(names: ["Personal"])
+      defer {
+        AppNotifications.interactionLaunch = nil
+        delegate.clean()
+        fixture.clean()
+      }
+      AppNotifications.interactionLaunch = .plain
+      #expect(try delegate.notifications.intentCoordinators.savedNames == ["Work"])
+      AppNotifications.interactionLaunch = .fixture(fixture.notifications)
+      #expect(try delegate.notifications.intentCoordinators.savedNames == ["Personal"])
+      let refusals: [AppNotifications.InteractionLaunch?] = [
+        nil, .unavailable(reason: "This launch erased its interaction fixture."),
+      ]
+      for launch in refusals {
+        AppNotifications.interactionLaunch = launch
+        do {
+          let read = try delegate.notifications.intentCoordinators
+          Issue.record("\(String(describing: launch)) read \(read.savedNames)")
+        } catch {
+          #expect("\(error)".contains("interaction fixture"), "\(error)")
+        }
+      }
+    }
+  #endif
+
   @Test func openCoordinatorRoutesLikeAnAlertTapAndKeepsTheDraft() async throws {
     let tapped = try SavedFixture()
     defer { tapped.clean() }

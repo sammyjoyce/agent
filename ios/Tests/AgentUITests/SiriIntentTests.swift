@@ -74,6 +74,39 @@
       capture("siri-1-open-coordinator-after", app)
     }
 
+    /// Refusing keeps the query off the app's own saved coordinators. The second launch names two
+    /// ports and one coordinator, so it never has a fixture.
+    func testTheQueryRefusesWhenTheFixtureIsUnavailable() async throws {
+      guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
+      let launches: [(environment: [String: String], screen: String)] = [
+        (
+          [
+            "AGENT_INTERACTION_ID": UUID().uuidString, "AGENT_INTERACTION_PORT": "1",
+            "AGENT_INTERACTION_COORDINATOR": UUID().uuidString, "AGENT_INTERACTION_CLEANUP": "1",
+          ], "Interaction fixture cleaned"
+        ),
+        (
+          ["AGENT_INTERACTION_PORT": "1,2", "AGENT_INTERACTION_COORDINATOR": UUID().uuidString],
+          "Interaction fixture unavailable"
+        ),
+      ]
+      let definitions = IntentDefinitions(bundleIdentifier: "dev.jessfraz.Agent")
+      let app = XCUIApplication()
+      addTeardownBlock { @MainActor in app.terminate() }
+      for launch in launches {
+        app.launchEnvironment = launch.environment
+        app.launch()
+        XCTAssertTrue(app.staticTexts[launch.screen].waitForExistence(timeout: 10), launch.screen)
+        do {
+          let answered = try await definitions.entities["CoordinatorEntity"].allEntities()
+          XCTFail("\(launch.screen): the query answered without its fixture: \(answered)")
+        } catch {
+          XCTAssertTrue("\(error)".contains("interaction fixture"), "\(launch.screen): \(error)")
+        }
+        app.terminate()
+      }
+    }
+
     private func capture(_ name: String, _ app: XCUIApplication) {
       let attachment = XCTAttachment(screenshot: app.screenshot())
       attachment.name = name

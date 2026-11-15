@@ -38,13 +38,15 @@ public struct CoordinatorQuery: EnumerableEntityQuery {
 
   public func allEntities() async throws -> [CoordinatorEntity] {
     let notifications = notifications
-    return await MainActor.run { CoordinatorEntity.saved(in: notifications.intentCoordinators) }
+    return try await MainActor.run {
+      CoordinatorEntity.saved(in: try notifications.intentCoordinators)
+    }
   }
 
   public func entities(for identifiers: [String]) async throws -> [CoordinatorEntity] {
     let notifications = notifications
-    return await MainActor.run {
-      CoordinatorEntity.saved(in: notifications.intentCoordinators, matching: identifiers)
+    return try await MainActor.run {
+      CoordinatorEntity.saved(in: try notifications.intentCoordinators, matching: identifiers)
     }
   }
 }

@@ -33,41 +33,51 @@ public final class AppNotifications: NSObject {
   public var mainVisible: MainVisibility = .hidden
   private(set) var openRequest: OpenRequest?
   #if DEBUG
-    @ObservationIgnored private weak var fixtureTarget: AppNotifications?
-    @ObservationIgnored private var pendingFixtureOrigin: AlertOrigin?
+    /// What a Debug launch asked for.
+    public enum InteractionLaunch {
+      case plain
+      /// The launch's one interaction fixture, which acts in place of the app delegate.
+      case fixture(AppNotifications)
+      case unavailable(reason: String)
+    }
 
-    func forwardFixtureOpens(to target: AppNotifications) {
-      fixtureTarget = target
-      if let origin = pendingFixtureOrigin {
-        pendingFixtureOrigin = nil
-        target.open(origin)
-      }
+    /// Set once by the app before any scene. The app delegate exists earlier, so until then
+    /// `receiver()` throws.
+    public static var interactionLaunch: InteractionLaunch?
+
+    struct InteractionFixtureUnavailable: Error, CustomLocalizedStringResourceConvertible {
+      let reason: String
+      var localizedStringResource: LocalizedStringResource { "\(reason)" }
     }
   #endif
 
-  /// The coordinators an intent sees. Under the interaction fixture they are the fixture's.
-  var intentCoordinators: Coordinators {
+  /// The object that alert taps and intents act on, which is the interaction fixture's when the
+  /// launch has one. It throws when the launch lacks the fixture it asked for, or has not set one
+  /// yet, rather than reach the app's own saved coordinators.
+  func receiver() throws -> AppNotifications {
     #if DEBUG
-      if let fixtureTarget { return fixtureTarget.coordinators }
+      switch Self.interactionLaunch {
+      case .plain: return self
+      case .fixture(let fixture): return fixture
+      case .unavailable(let reason): throw InteractionFixtureUnavailable(reason: reason)
+      case nil:
+        throw InteractionFixtureUnavailable(
+          reason: "This launch has not yet chosen whether it uses the interaction fixture.")
+      }
+    #else
+      return self
     #endif
-    return coordinators
+  }
+
+  public var intentCoordinators: Coordinators {
+    get throws { try receiver().coordinators }
   }
 
   func open(_ origin: AlertOrigin) {
-    #if DEBUG
-      if let fixtureTarget {
-        fixtureTarget.open(origin)
-        return
-      }
-      pendingFixtureOrigin = origin
-    #endif
     openRequest = OpenRequest(notice: coordinators.show(opening: origin))
   }
 
   func presents(_ origin: AlertOrigin?) -> Bool {
-    #if DEBUG
-      if let fixtureTarget { return fixtureTarget.presents(origin) }
-    #endif
     guard registration.enabled else { return false }
     guard case .visible(let atLatest) = mainVisible else { return true }
     let chat = coordinators.chat
@@ -173,7 +183,8 @@ public final class AppNotifications: NSObject {
     ) {
       let origin = Self.origin(notification.request.content.userInfo)
       DispatchQueue.main.async {
-        completionHandler(self.presents(origin) ? [.banner, .sound] : [])
+        let presents = (try? self.receiver())?.presents(origin) ?? false
+        completionHandler(presents ? [.banner, .sound] : [])
       }
     }
 
@@ -184,7 +195,7 @@ public final class AppNotifications: NSObject {
     ) {
       let origin = Self.origin(response.notification.request.content.userInfo)
       DispatchQueue.main.async {
-        if let origin { self.open(origin) }
+        if let origin { try? self.receiver().open(origin) }
         completionHandler()
       }
     }

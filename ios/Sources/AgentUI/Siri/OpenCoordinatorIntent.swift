@@ -14,7 +14,7 @@ public struct OpenCoordinatorIntent: OpenIntent {
   public init() {}
 
   @MainActor public func perform() async throws -> some IntentResult {
-    notifications.open(target)
+    try notifications.receiver().open(target)
     return .result()
   }
 }
