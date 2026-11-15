@@ -215,10 +215,10 @@ recovery; [history](history.md) describes import and retrieval.
   live coordinator status readback pass.
 - [x] Benchmark deferred tool discovery before adopting it for larger toolsets.
   The [tool discovery eval](performance.md#tool-discovery) measures nine
-  scenarios across main, triage, worker and agent roles. Today's direct tools
-  use a median of 325,735 total tokens and 39 requests per suite at
-  `gpt-6.1-sol` low reasoning, with all 72 baseline units passing their
-  checks.
+  scenarios across main, triage, worker and agent roles. Offering every tool
+  directly used a median of 308,114 total tokens and 37 requests per suite
+  at `gpt-6.1-sol` low reasoning; the adopted surfaces use 216,639 and 29,
+  with every scenario passing.
 
 ## Recovery
 
@@ -244,7 +244,7 @@ integration and deployment are tracked separately above.
 | Image preparation workers | In use | One Photon worker prepares attached images and images read from hosts for native model input. Beep Boop owns transfer and storage. |
 | Image-aware file readers | In use | `read_file` recognizes PNG, JPEG, GIF, WebP and BMP files by content on any execution host, pulls them in 1 MiB chunks up to 16 MiB, and returns upstream `read`'s image result within the model's limits. Text reads keep their byte offset and limit. Upstream `read` itself stays unused, because its offsets are lines and it needs a Harness environment. |
 | Forks, child tasks and task graphs | Graph in use | `beep-boop tasks graph` shows Pi's live task tree with task and agent identity. Delegate conversations stay ownerless: ownership by the spawning call breaks delegate lifetimes, and a background anchor adds a permanent native task per delegate before any feature needs it. No flow needs a fork. [Architecture](architecture.md#tasks-and-execution) records the evidence and when to revisit. A live watch and the TUI and iOS views remain. |
-| Deferred tool search and code mode | Not enabled | Benchmark upstream extensions against the current role-specific toolsets; adopt when they reduce total tokens or round trips. Tool search is separate from conversation search. |
+| Deferred tool search and code mode | In use | Main defers its rarely used tools behind `tool_search`. Triage, worker and agent call most tools from `codemode` scripts. On the [tool discovery eval](performance.md#hillclimb-results) this uses 29.7% fewer tokens at low reasoning and 33.5% fewer at the default, with every scenario passing. The `child-agent` scenario passes when the child's summary and the parent's evidence each name the expired certificate after a root cause label, in a sentence with no negation word; a fresh run of it under that check passed 3 of 3 trials in each arm. In those roles' history, a script's commands and file edits are lines in its code mode item, not their own Command and File changes items; rendering them as those items remains. Tool search is separate from conversation search. |
 
 See [Pi Durable](https://github.com/earendil-works/pi/tree/main/packages/durable)
 and [Pi telemetry](https://github.com/earendil-works/pi/tree/main/packages/telemetry).

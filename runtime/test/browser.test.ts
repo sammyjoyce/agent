@@ -329,6 +329,7 @@ test("real bridge emits browser scripts through the generated event contract and
   const code = "async (page) => { return await page.locator('[data-custom=entry]').count(); }";
   const scriptOutput = JSON.stringify({ result: "Synthetic script value reached the model" });
   await writeFile(queue, JSON.stringify({ "browser-wire": [
+    { tool: "tool_search", args: { query: "browser" } },
     { tool: "browser_open", args: { url: "https://example.com/" } },
     { tool: "browser_run_code", args: { tab_id: 7, code } },
     { tool: "browser_release", args: {} },

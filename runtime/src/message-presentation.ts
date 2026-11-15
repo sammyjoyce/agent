@@ -63,7 +63,8 @@ function quoted(value: string): string { return /^[\w./:=+,-]+$/u.test(value) ? 
 export function commandPresentation(program: string, args: readonly string[]): Extract<MessagePresentation, { type: "command" }> {
   return { type: "command", command: bounded([quoted(program), ...args.map(quoted)].join(" "), 1024), exit_code: null, duration_ms: null };
 }
-function coordination(call: Pick<ToolCall, "name" | "arguments">): AgentAction | null | undefined {
+type NamedCall = Pick<ToolCall, "name"> & { arguments: unknown };
+function coordination(call: NamedCall): AgentAction | null | undefined {
   switch (call.name) {
     case "spawn_agent": return "spawn";
     case "message_task": return "send_message";
@@ -82,7 +83,7 @@ function coordination(call: Pick<ToolCall, "name" | "arguments">): AgentAction |
 }
 
 /** Only declared, human-readable fields become headings; arbitrary inputs remain lazy. */
-export function piToolPresentation(call: ToolCall, sender: string): MessagePresentation {
+export function piToolPresentation(call: NamedCall, sender: string): MessagePresentation {
   if (call.name === "exec") {
     const program = field(call.arguments, "program"), args = field(call.arguments, "args");
     return typeof program === "string" && Array.isArray(args) && args.every((arg: unknown) => typeof arg === "string")
@@ -96,6 +97,19 @@ export function piToolPresentation(call: ToolCall, sender: string): MessagePrese
   }
   if (call.name === "read_attachment") return { type: "media", operation: "attachment", status: null, path: null };
   return { type: "tool", namespace: null };
+}
+function scriptedCalls(details: unknown): string[] {
+  return list(field(details, "calls")).flatMap((call) => {
+    const name = string(field(call, "name")), status = string(field(call, "status"));
+    if (name === null) return [];
+    // Pi cuts long argument previews, which then show only the tool name.
+    let parsed: unknown;
+    try { parsed = JSON.parse(string(field(call, "args")) ?? ""); } catch { parsed = undefined; }
+    const shown = piToolPresentation({ name, arguments: parsed }, "");
+    const heading = shown.type === "command" && shown.command !== undefined ? shown.command
+      : shown.type === "file_changes" && shown.changes.length > 0 ? `${name} ${shown.changes.map((change) => change.path).join(", ")}` : name;
+    return [bounded(heading, 1024) + (status === null ? "" : " · " + status)];
+  });
 }
 function decodedOutput(result: ToolResultMessage): unknown {
   const first = result.content[0];
@@ -167,6 +181,8 @@ export function piToolResult(result: ToolResultMessage, sender: string, call?: T
   } else if (result.toolName === "read_attachment") {
     presentation = { type: "media", operation: "attachment", status: null, path: null };
     text = content(result.content);
+  } else if (result.toolName === "codemode") {
+    text = bounded([...scriptedCalls(result.details), content(result.content)].join("\n"));
   }
   return { role: "tool", text, presentation, tool: { call_id: result.toolCallId, name: result.toolName, status: result.isError ? "failed" : "finished" } };
 }

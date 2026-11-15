@@ -107,15 +107,16 @@ test("the task graph request joins live generations and tool calls with main, ta
       node.owner === null ? null : list.findIndex((owner) => owner.id === node.owner),
       node.state.status === "waiting" ? node.state.on.map((id) => list.findIndex((target) => target.id === id)) : null]);
     const running = (name: string) => [[{ type: "generation" }, "waiting", null, [1]], [{ type: "tool", name }, "running", 0, null]];
+    const scripted = (name: string) => [...running("codemode"), [{ type: "tool", name }, "running", 1, null]];
 
     assert.deepEqual(shape(work("main")), running("delegate_task"));
     const delegate = conversations.find((conversation) => conversation.actor.type === "task"); assert.ok(delegate?.actor.type === "task");
     assert.deepEqual(delegate.actor, { type: "task", task_id: spawned.command.task_id, title: "Board review" });
-    assert.deepEqual(shape(work("task")), running("exec"));
+    assert.deepEqual(shape(work("task")), scripted("exec"), "A worker's command runs nested in its code mode call");
     const agent = conversations.find((conversation) => conversation.actor.type === "agent"); assert.ok(agent?.actor.type === "agent");
     assert.deepEqual(agent.actor, { type: "agent", task_id: spawned.command.task_id, agent_id: subagent.command.agent_id, title: "Review",
       parent_conversation_id: delegate.conversation_id });
-    assert.deepEqual(shape(work("agent")), running("exec"));
+    assert.deepEqual(shape(work("agent")), scripted("exec"));
     assert.deepEqual(conversations.map((conversation) => conversation.actor.type).sort(), ["agent", "main", "task"],
       "A delegate with no live native work stays out of the graph");
     assert.equal(nodes.every((node) => !node.background && !node.abort_requested && node.blocked === null && node.conversations.length === 0), true);

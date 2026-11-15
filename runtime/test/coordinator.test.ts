@@ -88,6 +88,7 @@ test("real CLI, coordinator and worker retain main history across an offline lap
   }
   const effect = ["-e", "const value={host:process.env.AGENT_TEST_NODE_ID,cwd:process.cwd()};require('node:fs').appendFileSync(process.env.HOME+'/effects',JSON.stringify(value)+'\\n');process.stdout.write(JSON.stringify(value))"];
   const exec: ModelStep = { tool: "exec", args: { program: process.execPath, args: effect } };
+  const loadNotify: ModelStep = { tool: "tool_search", args: { query: "notify publish outcome" } };
   const delegate = (title: string, host?: string): ModelStep => ({ tool: "delegate_task", args: { title, outcome: title, input: title, new_task: true,
     new_task_reason: `${title} is a separate synthetic audit.`,
     ...(host === undefined ? {} : { host }) } });
@@ -402,7 +403,7 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     await script(noticeInput, [{ text: internal }]); actor.child.stdin.write(noticeInput + "\n");
     await until(async () => actor.output().includes(internal));
     assert.equal((await mainHistory()).messages.some((message) => message.text === internal), false);
-    await script("fixture-curated-worker-notice", [{ tool: "notify", args: { keys: [], text: noticeBody } }, { text: "" }]);
+    await script("fixture-curated-worker-notice", [loadNotify, { tool: "notify", args: { keys: [], text: noticeBody } }, { text: "" }]);
     await cli(0, ["chat", "fixture-curated-worker-notice"]);
     await until(async () => canonical.output().slice(noticeOffset).includes(noticeBody));
     const savedNotices = (await mainHistory()).messages.filter((message) => message.role === "notice" && message.text === noticeBody);
@@ -419,7 +420,7 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     assert.equal(persistedNotice?.entry_id, savedNotices[0]?.entry_id, "Live and reopened views must share the original native identity");
 
     const plainNotice = "A useful plaintext notice appears exactly once.", plainAnswer = "The plaintext chief handled the request.";
-    await script("fixture-plain-notice", [{ tool: "notify", args: { keys: [], text: plainNotice } }, { text: plainAnswer }]);
+    await script("fixture-plain-notice", [loadNotify, { tool: "notify", args: { keys: [], text: plainNotice } }, { text: plainAnswer }]);
     const plain = start(0, ["--no-tui"], undefined, {}, false, true, process.env.AGENT_TEST_PLAIN_BINARY ?? binary);
     await until(async () => plain.output().includes("Beep Boop> "));
     plain.child.stdin.write("fixture-plain-notice\n");

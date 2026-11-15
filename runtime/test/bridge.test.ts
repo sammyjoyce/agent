@@ -5,9 +5,10 @@ import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { HistoryStore } from "../src/history.js";
 import { DEFAULT_MODEL } from "../src/models.js";
+import { ALWAYS_DIRECT, TOOL_SURFACES } from "../src/toolsets.js";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -363,5 +364,48 @@ test("real bridge admits input before imported corpus catchup and interrupts a h
     await wait(3, (event) => event.type === "done");
     assert.ok(frames.some((frame) => frame.id === 3 && frame.event.type === "answer" && frame.event.text === "A new turn works after the lookup was interrupted."));
     assert.equal(frames.some((frame) => frame.event.type === "failure"), false, errors);
+  } finally { lines.close(); child.stdin.end(); child.kill(); await closed; await rm(directory, { recursive: true, force: true }); }
+});
+
+test("real bridge offers the main conversation its adopted tool surface", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-bridge-surface-")); await chmod(directory, 0o700);
+  const queue = join(directory, "responses.json");
+  await writeFile(queue, JSON.stringify({ "fixture-surface": [{ text: "The adopted surface answered." }] }));
+  const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL("./fixtures/coordinator-runtime.js", import.meta.url)), directory],
+    { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, OPENAI_API_KEY: "sk-synthetic-fixture", AGENT_TEST_MODEL_QUEUE: queue } });
+  const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+  const lines = createInterface({ input: child.stdout }); let errors = "";
+  child.stderr.setEncoding("utf8").on("data", (chunk: string) => { errors += chunk; });
+  const send = (id: number, command: RuntimeCommand) => child.stdin.write(JSON.stringify({ version: 1, id, command }) + "\n");
+  const events: RuntimeEventKind[] = [];
+  const finished = new Promise<void>((resolve, reject) => {
+    child.once("close", () => reject(new Error("Bridge exited before the chat finished: " + errors)));
+    lines.on("line", (line) => {
+      const frame: unknown = JSON.parse(line); assert.ok(validEvent(frame));
+      if (frame.event.type === "host_call") {
+        const command = frame.event.command;
+        if (command.type === "reload_guidance") send(frame.id, { type: "host_reply", call_id: frame.event.call_id,
+          result: { type: "shared_guidance", global: { text: "", sources: [] }, workflow_policy: "", context_repositories: [], context_sources: [] } });
+        else if (command.type === "project_guidance") send(frame.id, { type: "host_reply", call_id: frame.event.call_id,
+          result: { type: "project_guidance", snapshot: { text: "", sources: [] } } });
+      }
+      if (frame.id === 1) events.push(frame.event);
+      if (frame.id === 1 && frame.event.type === "done") resolve();
+    });
+  });
+  try {
+    send(1, { type: "chat", input: "fixture-surface", input_id: "surface-input", model: DEFAULT_MODEL, instructions: "", cwd: "/example/project", origin_host_id: null, hosts: [] });
+    await finished;
+    assert.ok(events.some((event) => event.type === "answer" && event.text === "The adopted surface answered."), JSON.stringify(events) + errors);
+    type Declared = { tools?: { name?: string }[] };
+    const requests = (await readFile(queue + ".requests", "utf8")).trim().split("\n")
+      .map((line) => JSON.parse(line) as { body: Declared & { input: (Declared & { type?: string })[] } });
+    assert.equal(requests.length, 1);
+    const body = requests[0]?.body; assert.ok(body);
+    const offered = [body, ...body.input.filter((item) => item.type === "additional_tools")].flatMap((item) => item.tools ?? [])
+      .flatMap((tool) => tool.name === undefined ? [] : [tool.name]);
+    assert.ok(offered.includes("tool_search") && !offered.includes("codemode"), `main offers ${offered.join(", ")}`);
+    for (const name of ALWAYS_DIRECT) assert.ok(offered.includes(name), `main offers ${name} directly`);
+    assert.deepEqual(offered.filter((name) => TOOL_SURFACES.main?.deferred?.includes(name) === true), [], "Deferred tools wait for tool_search");
   } finally { lines.close(); child.stdin.end(); child.kill(); await closed; await rm(directory, { recursive: true, force: true }); }
 });

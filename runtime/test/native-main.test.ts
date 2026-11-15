@@ -50,7 +50,8 @@ test("runtime EOF closes an attached native main observation", { timeout: 15_000
 test("native main observation survives idle, correlates notices, streams text and rejects stopped queued input on reconnect", { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-native-main-")), queue = join(directory, "responses.json");
   await writeFile(queue, JSON.stringify({
-    "publish-native": [{ tool: "notify", args: { keys: [], text: "A useful durable notice." } }, { text: "Published the update." }],
+    "publish-native": [{ tool: "tool_search", args: { query: "notify" } }, { tool: "notify", args: { keys: [], text: "A useful durable notice." } },
+      { text: "Published the update." }],
     "stop-native": [{ tool: "exec", args: { program: "held", args: [] } }],
     "never-run-native": [{ text: "Must never run" }],
     "attachment-native": [{ text: "The image is available." }],
@@ -176,7 +177,7 @@ test("native main observation survives idle, correlates notices, streams text an
     send(14, { type: "main_input", input_id: placed, input: "This placed retry must not run a model", mode: "steer" }); await done(14);
     assert.ok(events(14).some((event) => event.type === "input_placed" && event.input_id === placed));
     assert.equal(events(14).some((event) => event.type === "input_rejected" && event.input_id === placed), false);
-    assert.equal((await readFile(queue + ".requests", "utf8")).trim().split("\n").length, 4, "Retry, viewing and stopped input must not start inference");
+    assert.equal((await readFile(queue + ".requests", "utf8")).trim().split("\n").length, 5, "Retry, viewing and stopped input must not start inference");
     send(102, { type: "detach_main" }); await done(102);
     child.stdin.end(); assert.equal(await closed, 0, errors); await reader;
   } finally { child.kill(); await closed; await reader.catch(() => {}); await rm(directory, { recursive: true, force: true }); }

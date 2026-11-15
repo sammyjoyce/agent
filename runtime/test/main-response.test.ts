@@ -22,14 +22,15 @@ import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
 // Only the external provider and execution host are synthetic.
 for (const commentary of [false, true]) test(`main replies cover silent direct inputs and steering${commentary ? " after visible commentary" : ""} without duplicating real replies or retries`, { timeout: 15_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-main-response-")), queue = join(directory, "responses.json");
-  await writeFile(queue, JSON.stringify({
+  const steps = {
     "silent-ordinary": [{ text: "" }],
     "active-original": [{ tool: "exec", args: { program: "held", args: [] }, ...(commentary ? { commentary: "Checking the original request before the later steer." } : {}) }],
     "active-steer": [{ text: "" }],
     "real-answer": [{ text: "The requested result is ready." }],
-    "real-notice": [{ tool: "notify", args: { keys: [], text: "The requested correction is saved." } }, { text: "" }],
+    "real-notice": [{ tool: "tool_search", args: { query: "notify" } }, { tool: "notify", args: { keys: [], text: "The requested correction is saved." } }, { text: "" }],
     "queued-followup": [{ text: "" }],
-  }));
+  };
+  await writeFile(queue, JSON.stringify(steps));
   const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL("./fixtures/coordinator-runtime.js", import.meta.url)), directory],
     { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, OPENAI_API_KEY: "sk-synthetic-fixture", AGENT_TEST_MODEL_QUEUE: queue } });
   const closed = new Promise<number | null>((resolve) => child.once("close", resolve));
@@ -125,7 +126,7 @@ for (const commentary of [false, true]) test(`main replies cover silent direct i
         "Reconnect must recover the exact visible reply, not just an ephemeral receipt");
     }
     const requests = (await readFile(queue + ".requests", "utf8")).trim().split("\n");
-    assert.equal(requests.length, 7, "No extra model calls for receipts, retries or fallback replies");
+    assert.equal(requests.length, Object.values(steps).flat().length, "No extra model calls for receipts, retries or fallback replies");
     // Supplement the actual delivery assertions with the real upstream prompt
     // producer, including the generation after native steering placement.
     for (const request of requests) {

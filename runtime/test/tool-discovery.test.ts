@@ -13,9 +13,10 @@ import type { AgentNode } from "../src/generated/AgentNode.js";
 import type { HostCommand } from "../src/generated/HostCommand.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 import type { TaskRecord } from "../src/generated/TaskRecord.js";
-import type { ToolRole } from "../src/toolsets.js";
-import { ALWAYS_DIRECT, applyDiscoveryArm, BROWSER_TOOLS, createDiscoveryExtensions, declarationSize, DISCOVERY_ARMS, openDiscoveryApp, TOOL_ROLES,
-  type DeclarationSize, type DiscoveryApp, type DiscoveryArm, type DiscoveryArmName } from "./fixtures/tool-discovery.js";
+import { ALWAYS_DIRECT, applyToolSurfaces, BROWSER_TOOLS, createToolDiscovery, TOOL_ROLES, type ToolRole, type ToolSurface } from "../src/toolsets.js";
+import { history, toolDetails, UserNoticeEntry } from "../src/transcript.js";
+import { declarationSize, DISCOVERY_ARMS, openDiscoveryApp, type DeclarationSize, type DiscoveryApp, type DiscoveryArm,
+  type DiscoveryArmName } from "./fixtures/tool-discovery.js";
 import { fixtureModel } from "./model.js";
 
 const node: AgentNode = { host_id: "11111111-1111-4111-8111-111111111111", name: "example", rex_server: null, agent_program: "/example/agent",
@@ -35,6 +36,7 @@ async function lab(prefix: string) {
     if (command.type === "reload_guidance") return { type: "shared_guidance", global: { text: "", sources: [] }, workflow_policy: "", context_repositories: [], context_sources: [] };
     if (command.type === "project_guidance") return { type: "project_guidance", snapshot: { text: "", sources: [] } };
     if (command.type === "exec") return { type: "process", exit_code: 0, stdout: "EXAMPLE_EXEC_OUTPUT", stderr: "", truncated: false };
+    if (command.type === "edit_file") return { type: "written" };
     return { type: "failed", message: `The example host does not support ${command.type}` };
   }
   const open = (arm: DiscoveryArm, compaction?: CompactionSettings) =>
@@ -56,9 +58,9 @@ function callsOf(input: Context, name: string) {
 }
 function script(code: string): AssistantMessage { return fauxAssistantMessage(fauxToolCall("codemode", { code }), { stopReason: "toolUse" }); }
 function scriptValue(text: string): unknown { return JSON.parse(text.slice(text.indexOf("Output:\n") + "Output:\n".length)); }
-function callTool(input: Context, name: string, args: ToolArguments): AssistantMessage {
-  return offeredNames(input).includes(name) ? fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" })
-    : script(`return await tools.${name}(${JSON.stringify(args)});`);
+function callTool(input: Context, name: string, ...calls: ToolArguments[]): AssistantMessage {
+  return offeredNames(input).includes(name) ? fauxAssistantMessage(calls.map((args) => fauxToolCall(name, args)), { stopReason: "toolUse" })
+    : script(`return [${calls.map((args) => `await tools.${name}(${JSON.stringify(args)})`).join(", ")}];`);
 }
 const done: FauxResponseFactory = () => fauxAssistantMessage("Done.");
 
@@ -104,11 +106,15 @@ function modelTools(app: DiscoveryApp, role: ToolRole): string[] {
     .filter((tool) => tool.deferred !== true && (tool.callers ?? ["model"]).includes("model")).map((tool) => tool.name))];
 }
 
-const expectedSurface: Record<DiscoveryArmName, (production: readonly string[]) => string[]> = {
-  direct: (production) => [...production],
-  "search-browser": (production) => [...production.filter((name) => !BROWSER_TOOLS.includes(name)), "tool_search"],
-  codemode: (production) => [...production.filter((name) => ALWAYS_DIRECT.includes(name)), "codemode"],
-};
+function expectedSurface(arm: DiscoveryArmName, role: ToolRole, production: readonly string[]): string[] {
+  const surface: ToolSurface | undefined = (DISCOVERY_ARMS[arm] as DiscoveryArm)[role];
+  if (surface?.codemode !== undefined) {
+    const direct = [...ALWAYS_DIRECT, ...surface.codemode.keepDirect];
+    return [...production.filter((name) => direct.includes(name)), "codemode"];
+  }
+  const deferred = surface?.deferred ?? [];
+  return [...production.filter((name) => !deferred.includes(name)), ...(deferred.length > 0 ? ["tool_search"] : [])];
+}
 
 test("each arm offers its role surfaces with the always-direct tools and reports their declaration size", async (t) => {
   const production = new Map<ToolRole, string[]>(), observed: { arm: DiscoveryArmName; role: ToolRole; size: DeclarationSize }[] = [];
@@ -130,7 +136,7 @@ test("each arm offers its role surfaces with the always-direct tools and reports
   for (const { arm, role, size } of observed) {
     const offered = size.tools, surface = production.get(role); assert.ok(surface);
     assert.equal(new Set(offered).size, offered.length, `${arm} ${role} offers a tool twice`);
-    assert.deepEqual([...offered].sort(), expectedSurface[arm](surface).sort(), `${arm} ${role} offered surface`);
+    assert.deepEqual([...offered].sort(), expectedSurface(arm, role, surface).sort(), `${arm} ${role} offered surface`);
     assert.ok(offered.includes("read_attachment") && offered.includes("read_file"), `${arm} ${role} offers attachments and files directly`);
     if (role === "main") assert.ok(offered.includes("finish_without_reply"), `${arm} main offers finish_without_reply`);
   }
@@ -148,10 +154,10 @@ test("each arm offers its role surfaces with the always-direct tools and reports
 });
 
 test("an arm cannot defer finish_without_reply or read_file", async () => {
-  const env = await lab("agent-tool-discovery-pinned-"), app = await env.open(DISCOVERY_ARMS.direct), discovery = createDiscoveryExtensions();
+  const env = await lab("agent-tool-discovery-pinned-"), app = await env.open(DISCOVERY_ARMS.direct), discovery = createToolDiscovery();
   try {
-    assert.throws(() => applyDiscoveryArm(app.toolsets, { main: { deferred: ["finish_without_reply"] } }, discovery), /finish_without_reply must stay directly offered/);
-    assert.throws(() => applyDiscoveryArm(app.toolsets, { worker: { deferred: ["read_file"] } }, discovery), /read_file must stay directly offered/);
+    assert.throws(() => applyToolSurfaces(app.toolsets, { main: { deferred: ["finish_without_reply"] } }, discovery), /finish_without_reply must stay directly offered/);
+    assert.throws(() => applyToolSurfaces(app.toolsets, { worker: { deferred: ["read_file"] } }, discovery), /read_file must stay directly offered/);
   } finally { await discovery.close(); await app.close(); await env.remove(); }
 });
 
@@ -194,9 +200,6 @@ const scriptGuards: { name: string; role: ToolRole; tool: string; args: (bystand
   { name: "a worker script cannot record another task", role: "worker", tool: "record_task",
     args: (bystander) => ({ task_id: bystander, summary: "Changed by another worker.", state: { state: "resolved", evidence: "Invented completion." } }),
     error: /A worker can update only its own task/ },
-  { name: "a worker script cannot record its own task yet, the known blocker for moving record_task behind code mode", role: "worker", tool: "record_task",
-    args: () => ({ summary: "Recorded through a script.", state: { state: "resolved", evidence: "Invented completion." } }),
-    error: /Task outcome model provenance is unavailable/ },
   { name: "a main script cannot finish without reply", role: "main", tool: "finish_without_reply", args: () => ({}),
     error: /Finish without reply must be the main owner's sole final tool/ },
 ];
@@ -225,6 +228,107 @@ for (const guard of scriptGuards) {
     } finally { await app.close(); await env.remove(); }
   });
 }
+
+type Publication = { conversation_id: string; entry_id: string | null; text: string; call_id?: string | null };
+type CallerIdentity = { role: Exclude<ToolRole, "triage">; tool: string; texts: string[]; args(text: string): ToolArguments;
+  published(app: DiscoveryApp): Promise<{ caller: string; publications: Publication[] }> };
+async function ownTask(app: DiscoveryApp): Promise<TaskRecord> {
+  const tasks = await app.tasks.list(), [task] = tasks;
+  assert.ok(task !== undefined && tasks.length === 1, "The role turn owns the only task"); return task;
+}
+async function toolOutcomes(app: DiscoveryApp, task: TaskRecord): Promise<Publication[]> {
+  return (await app.sources.events({ provider: "task_outcomes", thread_id: task.id })).flatMap(({ outcome }) =>
+    outcome === undefined || outcome.tool_call_id === null ? []
+      : [{ conversation_id: outcome.conversation_id, entry_id: outcome.entry_id, text: outcome.summary, call_id: outcome.tool_call_id }]);
+}
+async function mainNotices(app: DiscoveryApp): Promise<Publication[]> {
+  const root = await app.session.root(BACKGROUND_CONTEXT);
+  return (await root.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items.flatMap((entry) =>
+    UserNoticeEntry.is(entry) && entry.data !== undefined
+      ? [{ conversation_id: entry.data.source_conversation_id, entry_id: entry.data.source_entry_id, text: entry.data.text ?? "" }] : []);
+}
+async function issuingEntry(app: DiscoveryApp, conversationId: string, name: string): Promise<{ entry_id: string; call_ids: string[] }> {
+  const conversation = await app.tasks.conversation(conversationId);
+  const issued = (await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items.flatMap((entry) => {
+    const call_ids = (entry.model ?? []).flatMap((message) => message.role !== "assistant" ? []
+      : message.content.flatMap((part) => part.type === "toolCall" && part.name === name ? [part.id] : []));
+    return call_ids.length === 0 ? [] : [{ entry_id: entry.id.toString(), call_ids }];
+  });
+  const [only] = issued; assert.ok(only !== undefined && issued.length === 1, `One assistant entry in ${conversationId} issued ${name}`);
+  return only;
+}
+const callerIdentities: CallerIdentity[] = [
+  { role: "worker", tool: "record_task", texts: ["Recorded by the worker."],
+    args: (summary) => ({ summary, state: { state: "resolved", evidence: "Invented completion." } }),
+    async published(app) {
+      const task = await ownTask(app); assert.equal(task.state.state, "resolved");
+      return { caller: task.conversation_id, publications: await toolOutcomes(app, task) };
+    } },
+  { role: "agent", tool: "report_result", texts: ["The invented check passed."], args: (summary) => ({ summary }),
+    async published(app) {
+      const task = await ownTask(app), [agent] = task.agents ?? [];
+      assert.ok(agent !== undefined); assert.deepEqual(agent.state, { state: "done" });
+      return { caller: agent.conversation_id, publications: await toolOutcomes(app, task) };
+    } },
+  { role: "main", tool: "notify", texts: ["First invented outcome.", "Second invented outcome."], args: (text) => ({ keys: [], text }),
+    async published(app) { return { caller: (await app.session.root(BACKGROUND_CONTEXT)).id.toString(), publications: await mainNotices(app) }; } },
+  { role: "worker", tool: "notify_user", texts: ["First invented update.", "Second invented update."], args: (text) => ({ text }),
+    async published(app) { return { caller: (await ownTask(app)).conversation_id, publications: await mainNotices(app) }; } },
+];
+for (const identity of callerIdentities) for (const arm of ["direct", "codemode"] as const) {
+  test(`${arm}: the ${identity.role}'s ${identity.tool} belongs to the conversation and assistant entry that issued it`, async () => {
+    const env = await lab("agent-tool-discovery-identity-"), app = await env.open(DISCOVERY_ARMS[arm]);
+    try {
+      const turn = await startRole[identity.role](app, `Use ${identity.tool}.`);
+      let errors: string[] | undefined;
+      env.faux.setResponses([
+        (input) => {
+          assert.equal(offeredNames(input).includes(identity.tool), arm === "direct");
+          return callTool(input, identity.tool, ...identity.texts.map((text) => identity.args(text)));
+        },
+        (input) => {
+          errors = input.messages.flatMap((message) => message.role === "toolResult" && message.isError
+            ? [message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n")] : []);
+          return fauxAssistantMessage("Done.");
+        },
+      ]);
+      await turn.run();
+      assert.deepEqual(errors, [], "The model saw every call succeed");
+      const { caller, publications } = await identity.published(app);
+      const issued = await issuingEntry(app, caller, arm === "direct" ? identity.tool : "codemode");
+      assert.deepEqual(publications.map(({ text }) => text).sort(), [...identity.texts].sort(), "Each call published once");
+      for (const { conversation_id, entry_id, call_id } of publications) {
+        assert.equal(conversation_id, caller, "The publication belongs to the caller's conversation");
+        assert.equal(entry_id, issued.entry_id, "The publication's origin is the assistant entry that issued the model-visible call");
+        if (call_id !== undefined) assert.ok(issued.call_ids.some((id) => call_id === id || call_id?.startsWith(id + "/")),
+          `${call_id} is the model-visible call or nested under it`);
+      }
+    } finally { await app.close(); await env.remove(); }
+  });
+}
+
+test("a worker's code mode item in task history shows each command, edited path and the script's output", async () => {
+  const env = await lab("agent-tool-discovery-history-"), app = await env.open(DISCOVERY_ARMS.codemode);
+  try {
+    const turn = await startRole.worker(app, "Raise the HTTP retries.");
+    const code = `const found = JSON.parse(await tools.exec({ program: "grep", args: ["-n", "max_retries", "config/limits.toml"] })).stdout;
+await tools.edit_file({ path: "config/limits.toml", old: "max_retries = 3", new: "max_retries = 5" });
+return "Raised max_retries after grep printed " + found;`;
+    env.faux.setResponses([(input) => { assert.equal(offeredNames(input).includes("edit_file"), false); return script(code); }, done]);
+    await turn.run();
+    const conversation = await app.tasks.conversation((await ownTask(app)).conversation_id);
+    const items = (await history(conversation, null, app.session)).flatMap((page) => page.messages)
+      .filter((message) => message.tool?.name === "codemode" && message.tool.status === "finished");
+    assert.equal(items.length, 1, "One finished code mode item");
+    const [item] = items; assert.ok(item?.tool !== undefined);
+    assert.match(item.text, /grep -n max_retries config\/limits\.toml/u, "The item shows the command the script ran");
+    assert.match(item.text, /edit_file config\/limits\.toml/u, "The item shows the path the script edited");
+    assert.match(item.text, /Raised max_retries after grep printed EXAMPLE_EXEC_OUTPUT/u, "The item shows the script's output");
+    const details = await toolDetails(conversation, item.entry_id, item.tool.call_id, app.session);
+    assert.ok(details.type === "available" && details.input.type === "text");
+    assert.ok(details.input.text.includes("tools.edit_file"), "Inspecting the item shows the script");
+  } finally { await app.close(); await env.remove(); }
+});
 
 test("a main script gets the same task and job results the direct calls return", async () => {
   const env = await lab("agent-tool-discovery-results-"); let app = await env.open(DISCOVERY_ARMS.direct);
