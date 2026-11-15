@@ -157,15 +157,23 @@ struct SiriJobTests {
 
   @MainActor @Test func theRetryIntentRetriesOnlyAnInterruptedRun() async throws {
     try await withJobPeers { coordinators, work, personal, workPeer, personalPeer in
-      let retried = try await coordinators.retryInterruptedRun(
-        ScopedEntityID(profile: work, item: "nightly:deps"), title: "Work nightly deps")
-      #expect(retried.job.title == "Work nightly deps")
+      try await background(coordinators)
+      let jobs = try await JobQuery.allJobs(in: coordinators)
+      let interrupted = try #require(jobs.first { $0.title == "Work nightly deps" })
+      let healthy = try #require(jobs.first { $0.title == "Personal nightly deps" })
+      let said = try await RetryInterruptedRunIntent.retry(interrupted, in: coordinators)
+      #expect(String(localized: said) == "Retrying Work nightly deps on Work.")
       #expect(await workPeer.retryRequests() == ["nightly:deps"])
-      await #expect(throws: NoInterruptedRun.self) {
-        try await coordinators.retryInterruptedRun(
-          ScopedEntityID(profile: personal, item: "nightly:deps"), title: "Personal nightly deps")
+      let refused = await #expect(throws: NoInterruptedRun.self) {
+        try await RetryInterruptedRunIntent.retry(healthy, in: coordinators)
       }
+      #expect(shown(refused) == "Personal nightly deps has no interrupted run to retry.")
       #expect(await personalPeer.retryRequests().isEmpty)
+      #expect(await workPeer.retryRequests() == ["nightly:deps"], "Nothing sent it again")
+      let chat = coordinators.chat
+      try await until("both lanes disconnected after the retries") {
+        connection(chat, work) == .disconnected && connection(chat, personal) == .disconnected
+      }
     }
   }
 
