@@ -490,10 +490,9 @@ test("real CLI, coordinator and worker retain main history across an offline lap
         waiting.child.stdin.write("/resume " + chiefConversationId + "\r");
       } else {
         waiting.child.stdin.write("\u001b[27u");
-        // Before Ready the cancel notice arrives as partial screen diffs. The
-        // client requests the stop only after it cancels the waiting input.
-        await until(async () => stat(interruptGate + ".entered").then(() => true, () => false),
-          "Esc must cancel the waiting input before its view attaches");
+        const stopRequested = interruptGate + ".entered";
+        await until(async () => stat(stopRequested).then(() => true, () => false),
+          "Esc must cancel the waiting input and request the stop before the view attaches");
       }
       await writeFile(attachGate + ".release", "Complete observation after canceling the proven-unsent input.");
       await until(async () => waiting.output().includes("Sapphire main detail retained."));
