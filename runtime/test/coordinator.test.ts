@@ -488,7 +488,13 @@ test("real CLI, coordinator and worker retain main history across an offline lap
         await until(async () => waiting.output().includes("Sapphire laptop measurement retained."));
         restoredAt = waiting.output().length;
         waiting.child.stdin.write("/resume " + chiefConversationId + "\r");
-      } else waiting.child.stdin.write("\u001b[27u");
+      } else {
+        waiting.child.stdin.write("\u001b[27u");
+        // Before Ready the cancel notice arrives as partial screen diffs. The
+        // client requests the stop only after it cancels the waiting input.
+        await until(async () => stat(interruptGate + ".entered").then(() => true, () => false),
+          "Esc must cancel the waiting input before its view attaches");
+      }
       await writeFile(attachGate + ".release", "Complete observation after canceling the proven-unsent input.");
       await until(async () => waiting.output().includes("Sapphire main detail retained."));
       await until(async () => waiting.output().slice(restoredAt).includes(unsent),
@@ -500,7 +506,6 @@ test("real CLI, coordinator and worker retain main history across an offline lap
       // redirected to the selected task or sent when the old view became ready.
       waiting.child.stdin.write("\u0001\u000b" + admitted + "\r");
       if (interrupting) {
-        await until(async () => stat(interruptGate + ".entered").then(() => true, () => false));
         await until(async () => waiting.output().includes(admitted));
         const unrelated = "fixture-worker-during-" + navigation, unrelatedAnswer = "The other conversation remains independent of " + navigation + ".";
         await script(unrelated, [{ text: unrelatedAnswer }]); actor.child.stdin.write(unrelated + "\n");
