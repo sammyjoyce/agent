@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use tokio::{
     fs,
-    io::{AsyncRead, AsyncReadExt, AsyncSeekExt},
+    io::{AsyncRead, AsyncReadExt},
     process::Command,
     time::{sleep, timeout},
 };
@@ -27,6 +27,7 @@ pub const DEFAULT_TIMEOUT_SECONDS: u16 = 15 * 60;
 pub const ACTOR_CONVERSATION_ENV: &str = "BEEP_BOOP_ACTOR_CONVERSATION";
 
 pub mod effects;
+mod file_read;
 
 /// Local process execution has one result shape; the wire enum is constructed
 /// only when serving a host request or returning a capture to another process.
@@ -403,27 +404,8 @@ async fn execute_inner(rex: &RexClient, command: HostCommand) -> Result<HostResu
             path,
             offset,
             limit,
-            image: _,
-        } => {
-            ensure!(
-                limit > 0 && limit <= 256 * 1024,
-                "Read limit must be between 1 and 262144 bytes"
-            );
-            let mut file = fs::File::open(path)
-                .await
-                .context("Could not read the requested file")?;
-            file.seek(std::io::SeekFrom::Start(offset.into())).await?;
-            let mut contents = Vec::new();
-            file.take(u64::from(limit) + 1)
-                .read_to_end(&mut contents)
-                .await?;
-            let truncated = contents.len() > usize::try_from(limit)?;
-            contents.truncate(usize::try_from(limit)?);
-            Ok(HostResult::File {
-                content: String::from_utf8_lossy(&contents).into_owned(),
-                truncated,
-            })
-        }
+            image,
+        } => file_read::read_file(&path, offset, limit, image).await,
         HostCommand::WriteFile { path, content } => {
             fs::write(path, content)
                 .await
