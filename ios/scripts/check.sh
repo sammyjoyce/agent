@@ -36,6 +36,20 @@ if [[ "$phase" == all || "$phase" == host ]]; then
   find "$native_dir/AgentApp" "$native_dir/ShareExtension" "$native_dir/Sources" "$native_dir/Tests" \
     -name '*.swift' ! -name Generated.swift -print0 \
     | xargs -0 xcrun swift-format lint --strict
+  xcrun swift-format lint --strict --recursive "$native_dir/Speech/Package.swift" "$native_dir/Speech/Sources"
+  import_of='^[[:space:]]*(@[[:alnum:]_]+[[:space:]]+)*import[[:space:]]+([[:alpha:]]+[[:space:]]+)?'
+  stray=$(
+    find "$native_dir" -name '*.swift' -not -path '*/.build/*' -not -path "$native_dir/Speech/*" -print0 \
+      | xargs -0 grep -lE "${import_of}FluidAudio([^[:alnum:]_]|\$)" || true
+    find "$native_dir" -name '*.swift' -not -path '*/.build/*' \
+      -not -path "$native_dir/AgentApp/Speech.swift" -print0 \
+      | xargs -0 grep -lE "${import_of}ParakeetSpeech([^[:alnum:]_]|\$)" || true
+  )
+  if [[ -n "$stray" ]]; then
+    printf 'Only ios/Speech may import FluidAudio, and only AgentApp/Speech.swift ParakeetSpeech:\n%s\n' \
+      "$stray" >&2
+    exit 1
+  fi
 
   # Access control is the identity gate. In a copy of the package, an AgentCore file
   # other than Connection.swift must fail on each line below; without it the copy builds.
@@ -82,8 +96,11 @@ SWIFT
   swift test --configuration release --package-path "$native_dir" \
     --scratch-path "$run_dir/macos" --filter "$performance_test" \
     --attachments-path "$run_dir/macos-rendered"
+  (cd "$native_dir/Speech" && xcodebuild -quiet -scheme Speech -destination 'generic/platform=iOS' \
+    -derivedDataPath "$run_dir/speech" -onlyUsePackageVersionsFromResolvedFile \
+    CODE_SIGNING_ALLOWED=NO build)
   xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
-    -destination 'generic/platform=iOS Simulator' \
+    -destination 'generic/platform=iOS Simulator' -onlyUsePackageVersionsFromResolvedFile \
     -derivedDataPath "$run_dir/app" ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO build
 fi
 if [[ "$phase" == host ]]; then
@@ -240,6 +257,7 @@ for suite in "${suites[@]}"; do
       # supplies real entitlements without an Apple account or profile.
       xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
         -destination "platform=iOS Simulator,id=$simulator_id" -destination-timeout 60 \
+        -onlyUsePackageVersionsFromResolvedFile \
         -parallel-testing-enabled NO -test-timeouts-enabled YES -derivedDataPath "$run_dir/app" \
         -resultBundlePath "$run_dir/ios-rendering-tests.xcresult" \
         CODE_SIGNING_ALLOWED=YES CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= test

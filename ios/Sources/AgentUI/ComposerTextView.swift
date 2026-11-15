@@ -23,6 +23,50 @@
       )
       return true
     }
+
+    func reserve() -> DictationReservation? {
+      guard let view = view as? ComposerField.DraftView else { return nil }
+      if view.markedTextRange != nil {
+        view.unmarkText()
+        view.delegate?.textViewDidChange?(view)
+      }
+      view.undoManager?.removeAllActions()
+      view.locked = true
+      let text = view.text ?? ""
+      let range =
+        view.isFirstResponder ? view.selectedRange : NSRange(location: text.utf16.count, length: 0)
+      return DictationReservation(range: range, text: text)
+    }
+
+    func unlock() {
+      guard let view = view as? ComposerField.DraftView else { return }
+      view.clearProvisional()
+      view.locked = false
+    }
+
+    func insert(_ words: String, at reservation: DictationReservation?) -> Bool {
+      guard let view = view as? ComposerField.DraftView else { return false }
+      view.clearProvisional()
+      view.locked = false
+      let text = (view.text ?? "") as NSString
+      let range =
+        reservation.flatMap { $0.text == view.text ? $0.range : nil }
+        ?? NSRange(location: text.length, length: 0)
+      let before =
+        range.location > 0
+        ? text.substring(with: text.rangeOfComposedCharacterSequence(at: range.location - 1)).last
+        : nil
+      let after =
+        NSMaxRange(range) < text.length
+        ? text.substring(with: text.rangeOfComposedCharacterSequence(at: NSMaxRange(range))).first
+        : nil
+      view.selectedRange = range
+      view.undoManager?.beginUndoGrouping()
+      view.insertText(DictationText.fitted(words, between: before, and: after))
+      view.undoManager?.endUndoGrouping()
+      view.scrollRangeToVisible(view.selectedRange)
+      return true
+    }
   }
 
   struct ComposerTextView: UIViewRepresentable {

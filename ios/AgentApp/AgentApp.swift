@@ -6,6 +6,7 @@ import SwiftUI
 @main
 struct AgentApp: App {
   @UIApplicationDelegateAdaptor(AppNotifications.self) private var notifications
+  @State private var dictation = Dictation(engine: .parakeet)
   @State private var feedback = ScrawlFeedback()
   // App-level phase aggregates every scene, so a second iPad window cannot fight the first.
   @Environment(\.scenePhase) private var scenePhase
@@ -32,12 +33,13 @@ struct AgentApp: App {
       #if DEBUG
         if InteractionFixture.isRequested { return }
       #endif
+      dictation.setForeground(phase != .background)
       Task { await notifications.coordinators.setActive(phase == .active) }
     }
   }
 
   private var chat: some View {
-    MainChatView(notifications: notifications)
+    MainChatView(notifications: notifications, dictation: dictation)
       .onAppear { notifications.coordinators.feedbackRecorder = feedback }
   }
 }

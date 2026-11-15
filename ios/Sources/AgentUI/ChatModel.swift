@@ -901,14 +901,36 @@ final class ChatModel {
 
   // MARK: - Send
 
+  enum SendBlocker: Equatable {
+    case draftNotRestored
+    case sharedImport
+    case admitting
+    case preparingAttachments
+    case addressing(Addressing)
+  }
+
+  var sendBlocker: SendBlocker? {
+    if !draftReady { return .draftNotRestored }
+    if pendingSharedImport { return .sharedImport }
+    if admitting { return .admitting }
+    if preparingAttachments { return .preparingAttachments }
+    if feedbackDraft != nil { return nil }
+    guard case .to = addressing else { return .addressing(addressing) }
+    return nil
+  }
+
   /// True while Send would take the draft. A `/feedback` draft can always be tried, and a tap that
   /// starts no recording says why.
-  var canSend: Bool {
-    guard draftReady, !pendingSharedImport, !admitting, !preparingAttachments else { return false }
-    if feedbackDraft != nil { return true }
-    if case .to = addressing { return true }
-    return false
+  var canSend: Bool { sendBlocker == nil }
+
+  struct DraftMark: Equatable {
+    fileprivate let revision: Int
+    fileprivate let scope: FeedScope
   }
+
+  var draftMark: DraftMark { DraftMark(revision: draftRevision, scope: scope) }
+
+  var dictationAllowed: Bool { draftReady && !admitting && !pendingSharedImport }
 
   func send() async {
     await startSend()?.value

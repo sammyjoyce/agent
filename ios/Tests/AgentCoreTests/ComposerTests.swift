@@ -231,6 +231,7 @@ func savedAdmissionStaysRetiredWhenTheConnectionOwnerStops(newerDraft: Bool) asy
     await sending.value
     let expected = newerDraft ? "The same text in a different draft" : ""
     #expect(await model.draft == expected)
+    try #require(await model.saveDraft())
     let restored = try await ComposerDraftStore(url: draftURL).load(from: files)
     #expect(restored.draft.text == expected)
     #expect(await !model.admitting)
