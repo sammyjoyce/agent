@@ -326,9 +326,13 @@ final class ChatModel {
   @ObservationIgnored private(set) var demand = ConnectionDemand()
   /// One lane's connection lifecycle, as `reconcile` drives it.
   private struct Lifecycle {
-    /// Whether the lane's session was last told to connect, and nil until it is told anything.
-    /// `attach` clears it, since a new session has been told nothing.
-    var toldToConnect: Bool?
+    /// What a session was last told. It names the session, so one that takes the lane's place
+    /// has been told nothing, however it got there, and weakly, so it keeps no retired one.
+    struct Told {
+      weak var session: CoordinatorSession?
+      var connect: Bool
+    }
+    var told: Told?
     /// The one task that makes lifecycle calls on the lane.
     var loop: Task<Void, Never>?
     /// "Try again" asked for one redial.
@@ -635,7 +639,6 @@ final class ChatModel {
     if let session = lane.session {
       snapshots[lane.id] = nil
       laneEpochs[lane.id, default: 0] += 1
-      lifecycles[lane.id]?.toldToConnect = nil
       refresh()
       observations[lane.id] = observe(session, lane: lane.id)
       if let inputs = unstaging.removeValue(forKey: lane.id) {
@@ -692,7 +695,8 @@ final class ChatModel {
   /// Reads `demand` and the lane again after every call, so it ends at the latest of both.
   private func converge(_ id: ProfileID) async {
     while let call = pendingCall(id) {
-      lifecycles[id, default: Lifecycle()].toldToConnect = call.connect
+      lifecycles[id, default: Lifecycle()].told = .init(
+        session: call.session, connect: call.connect)
       lifecycles[id]?.restart = false
       if call.connect { await call.session.connect() } else { await call.session.disconnect() }
     }
@@ -705,8 +709,9 @@ final class ChatModel {
     guard let session = lanes.first(where: { $0.id == id })?.session else { return nil }
     let wanted = demand.wants(id)
     let lifecycle = lifecycles[id]
+    let told = lifecycle?.told.flatMap { $0.session === session ? $0.connect : nil }
     let restart = wanted && lifecycle?.restart == true
-    return lifecycle?.toldToConnect != wanted || restart ? (session, wanted) : nil
+    return told != wanted || restart ? (session, wanted) : nil
   }
 
   /// Holds lane `id` connected while `body` runs, whatever the scene is doing. The lane is dialed
