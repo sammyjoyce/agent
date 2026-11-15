@@ -29,21 +29,23 @@ public enum JobRunState: String, AppEnum {
     .failed: "Failed",
     .stopped: "Stopped",
   ]
+}
 
-  init(_ state: JobExecutionState?) {
-    guard let state else {
-      self = .notRun
-      return
-    }
-    switch state {
-    case .queued: self = .queued
-    case .running: self = .running
-    case .waiting: self = .waiting
-    case .retrying: self = .retrying
-    case .blocked(let blocked): self = blocked.message == "restart_limit" ? .interrupted : .blocked
-    case .completed: self = .completed
-    case .failed: self = .failed
-    case .stopped: self = .stopped
+extension ScheduledJobStatus {
+  /// Interrupted exactly when the retry intent would retry the job, by the job screen's rule.
+  /// Otherwise where the last run stands.
+  var runState: JobRunState {
+    if canRetryInterruptedRun { return .interrupted }
+    guard let state = lastRun?.state else { return .notRun }
+    return switch state {
+    case .queued: .queued
+    case .running: .running
+    case .waiting: .waiting
+    case .retrying: .retrying
+    case .blocked: .blocked
+    case .completed: .completed
+    case .failed: .failed
+    case .stopped: .stopped
     }
   }
 }
@@ -67,7 +69,7 @@ public struct JobEntity: AppEntity {
     title = status.job.title
     self.coordinator = coordinator
     schedule = status.job.schedules.map(\.recurrence).joined(separator: "; ")
-    state = JobRunState(status.lastRun?.state)
+    state = status.runState
     lastRun = (status.lastRun.map { $0.startedAt ?? $0.scheduledAt }).map(Self.date)
     nextRun = status.schedules.compactMap(\.nextAt).min().map(Self.date)
   }

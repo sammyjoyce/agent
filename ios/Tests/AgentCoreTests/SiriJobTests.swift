@@ -101,9 +101,12 @@ struct SiriJobTests {
   }
 
   @Test func aRunAtTheRestartLimitMapsToInterruptedAndOtherBlocksStayBlocked() {
-    #expect(JobRunState(parked) == .interrupted)
-    #expect(JobRunState(.blocked(.init(message: "Invented: waiting on approval"))) == .blocked)
-    #expect(JobRunState(nil) == .notRun)
+    let state = { (lastRun: JobExecutionState?) in
+      nightlyDeps(title: "Nightly deps", lastRun: lastRun).runState
+    }
+    #expect(state(parked) == .interrupted)
+    #expect(state(.blocked(.init(message: "Invented: waiting on approval"))) == .blocked)
+    #expect(state(nil) == .notRun)
   }
 
   @MainActor @Test func aReadFromTheBackgroundConnectsReturnsTheJobsAndDisconnects() async throws {

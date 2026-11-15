@@ -310,7 +310,7 @@ extension ScheduledJobStatus {
   var canRetryInterruptedRun: Bool {
     if let state = lastRun?.state {
       switch state {
-      case .blocked(let blocked): return blocked.message == "restart_limit"
+      case .blocked(let blocked): return blocked.atRestartLimit
       case .queued, .running, .waiting, .retrying: return false
       case .completed, .failed, .stopped: break
       }
@@ -319,6 +319,12 @@ extension ScheduledJobStatus {
       $0.error?.contains("parked after repeated interrupted restarts") == true
     }
   }
+}
+
+extension JobExecutionStateBlocked {
+  /// The run paused after repeated interrupted restarts. A job's block carries its reason as the
+  /// message.
+  var atRestartLimit: Bool { message == InputBlockReason.restartLimit.rawValue }
 }
 
 struct JobDiagnosticSections: View {
@@ -392,7 +398,7 @@ extension JobExecutionState {
     case .running: "Running"
     case .waiting: "Waiting"
     case .retrying: "Retrying"
-    case .blocked(let blocked): blocked.message == "restart_limit" ? "Parked" : "Blocked"
+    case .blocked(let blocked): blocked.atRestartLimit ? "Parked" : "Blocked"
     case .completed: "Completed"
     case .failed: "Failed"
     case .stopped: "Stopped"
@@ -402,7 +408,7 @@ extension JobExecutionState {
     switch self {
     case .retrying(let retry): retry.message
     case .blocked(let blocked):
-      blocked.message == "restart_limit"
+      blocked.atRestartLimit
         ? "This run paused after repeated interrupted restarts. Retry resumes its saved work."
         : blocked.message
     case .failed(let failed): failed.message
