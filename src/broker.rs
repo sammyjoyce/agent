@@ -520,7 +520,8 @@ mod tests {
         broker::Broker,
         models::ModelSelection,
         protocol::{
-            AgentNode, HostCommand, HostResult, RuntimeCommand, RuntimeEventKind, WorkerLaunch,
+            AgentNode, HostCommand, HostResult, ImageMediaType, ImageRead, RuntimeCommand,
+            RuntimeEventKind, WorkerLaunch,
         },
         runtime::{FrameReader, Runtime},
         service::write_frame,
@@ -983,6 +984,73 @@ mod tests {
                 operation.await.unwrap(),
                 HostResult::Browser { .. }
             ));
+        }
+        worker.close().await;
+        drop(broker);
+        close(runtime).await;
+    }
+
+    #[tokio::test]
+    async fn a_peer_answers_an_image_read_with_a_chunk_and_keeps_its_connection() {
+        let (_directory, runtime) = runtime().await;
+        let broker = Arc::new(
+            Broker::new(
+                None,
+                std::path::Path::new("/tmp"),
+                crate::rex::RexClient::for_process(None).unwrap(),
+            )
+            .unwrap(),
+        );
+        let id = "11111111-1111-4111-8111-111111111111";
+        let mut worker = Worker::connect(broker.clone(), runtime.clone(), id).await;
+        let chunk = HostResult::ImageChunk {
+            media_type: ImageMediaType::Png,
+            size_bytes: 3,
+            stamp: "fixture-stamp".into(),
+            at: 0,
+            data_base64: "iVBO".into(),
+        };
+        let text = HostResult::File {
+            content: "after the image".into(),
+            truncated: false,
+        };
+        for (image, reply) in [(Some(ImageRead::Start), chunk), (None, text)] {
+            let operation = {
+                let (broker, image) = (broker.clone(), image.clone());
+                tokio::spawn(async move {
+                    broker
+                        .execute(effect(
+                            id,
+                            HostCommand::ReadFile {
+                                path: "/example/shot.png".into(),
+                                offset: 0,
+                                limit: 10,
+                                image,
+                            },
+                        ))
+                        .await
+                })
+            };
+            let RuntimeEventKind::HostCall { call_id, command } = event(&mut worker.reader).await
+            else {
+                panic!("Expected the forwarded read");
+            };
+            assert!(
+                matches!(*command, HostCommand::ReadFile { image: ref forwarded, .. } if *forwarded == image)
+            );
+            write_frame(
+                &mut worker.writer,
+                &RuntimeCommand::HostReply {
+                    call_id,
+                    result: reply.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(operation.await.unwrap()).unwrap(),
+                serde_json::to_value(reply).unwrap()
+            );
         }
         worker.close().await;
         drop(broker);
