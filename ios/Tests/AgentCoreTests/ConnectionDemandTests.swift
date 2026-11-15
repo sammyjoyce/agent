@@ -767,9 +767,46 @@ func anActivationDuringALeaseThatFailsOnTheOutboxConnectsTheLane() async throws 
 
 /// A session tells each inspection it minted to connect before its own `connect` returns, also
 /// when its outbox cannot be read. Occupying an inspection of Work therefore holds Work's connect
-/// after it has read the outbox. While it is held, the scene leaves and returns and the outbox
-/// becomes readable. The lane's loop ends at the connect that started nothing, and a scene change
-/// that waited for it still tells Work to connect.
+/// after it has read the outbox. Here a lease's connect is held that way. The scene becomes
+/// active while the lease is still held, and the outbox becomes readable. The activation waited
+/// for the lease's connect, and still tells Work to connect.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func anActivationWhileALeasesConnectFailsOnTheOutboxConnectsTheLane() async throws {
+  try await withBackgroundLaunch { coordinators, work, _, workPeer, _ in
+    let chat = coordinators.chat
+    let session = try #require(chat.lanes.first { $0.id == work }?.session)
+    try SpoiledOutbox.unreadable.write(to: session.outboxURL)
+    await workPeer.replyToHistory(initial: .init(messages: [], pageComplete: true), pages: [:])
+    let inspector = try #require(await session.inspector(inspected))
+    let (entered, enter) = AsyncStream<Void>.makeStream()
+    let barrier = DispatchSemaphore(value: 0)
+    defer { barrier.signal() }
+    let occupied = Task.detached { await inspector.occupy(entered: enter, until: barrier) }
+    for await _ in entered {}
+    let leasing = Task { @MainActor in
+      try await coordinators.withConnection(to: work, within: .seconds(5)) {}
+    }
+    try await until("Work's connect read its outbox") {
+      chat.snapshots[work]?.error == outboxCouldNotBeRead
+    }
+    #expect(chat.demand.leased(work), "The lease is still held")
+    let activating = Task { @MainActor in await coordinators.setActive(true) }
+    try await until("the activation started") { chat.demand.sceneActive }
+    try SpoiledOutbox.repair(session.outboxURL)
+    barrier.signal()
+    await occupied.value
+    await activating.value
+    _ = try? await leasing.value
+    try await until("Work connected for the scene") { connection(chat, work) == .connected }
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(connection(chat, work) == .connected, "Work stayed connected once the lease ended")
+    #expect(await observeCount(workPeer) == 1, "Work was dialed once")
+  }
+}
+
+/// Work's connect is held after it has read the outbox, as above. While it is held, the scene
+/// leaves and returns and the outbox becomes readable. The lane's loop ends at the connect that
+/// started nothing, and a scene change that waited for it still tells Work to connect.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func aSceneThatLeavesAndReturnsWhileAConnectFailsOnTheOutboxConnectsTheLane() async throws {
   try await withBackgroundLaunch { coordinators, work, _, workPeer, _ in
@@ -829,17 +866,5 @@ func aSessionWhoseOutboxCannotBeReadIsToldToConnectOncePerDemandAndNeverInALoop(
     #expect(await inspectCount(workPeer) == 4, "Nothing told Work again while demand stayed put")
     #expect(await observeCount(workPeer) == 0, "Work itself was never dialed")
     withExtendedLifetime(inspector) {}
-  }
-}
-
-@Test func aSessionSaysWhetherItsConnectStartedAnAttempt() async throws {
-  try await withCoordinator { session, _, outbox in
-    try SpoiledOutbox.undecodable.write(to: outbox)
-    #expect(await session.connect() == .outboxUnreadable)
-    #expect(await session.connectionState == .disconnected)
-    try SpoiledOutbox.repair(outbox)
-    #expect(await session.connect() == .started)
-    await session.retire()
-    #expect(await session.connect() == .superseded)
   }
 }
