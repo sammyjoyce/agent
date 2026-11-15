@@ -3,7 +3,7 @@ import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import type { Context, MutableModels } from "@earendil-works/pi-ai";
 import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
-import { createRegistry, defineExtension, Harness, wrapTool, type Conversation, type Extension, type Registry } from "@earendil-works/pi-durable";
+import { createRegistry, defineExtension, Harness, wrapTool, type CompactionSettings, type Conversation, type Extension, type Registry } from "@earendil-works/pi-durable";
 import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { createToolSearchExtension } from "@earendil-works/pi-durable/tool-search";
@@ -107,12 +107,13 @@ export function declarationSize(context: Context): DeclarationSize {
 export type DiscoveryHost = { node: AgentNode; call(command: HostCommand): Promise<HostResult> };
 
 /** A coordinator with the production registry, role surfaces and background execution, bound to one invented host. */
-export async function openDiscoveryApp(directory: string, { models, model, arm, host, retry = false }: {
-  models: MutableModels; model: ModelSelection; arm: DiscoveryArm; host: DiscoveryHost; retry?: boolean;
+export async function openDiscoveryApp(directory: string, { models, model, arm, host, retry = false, compaction }: {
+  models: MutableModels; model: ModelSelection; arm: DiscoveryArm; host: DiscoveryHost; retry?: boolean; compaction?: CompactionSettings;
 }) {
   const registry: Registry = createRegistry();
   const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))), {
-    models, registry, identity: { attribution: null }, settings: { retry: { enabled: retry }, steeringMode: "all", followUpMode: "one-at-a-time" },
+    models, registry, identity: { attribution: null },
+    settings: { retry: { enabled: retry }, steeringMode: "all", followUpMode: "one-at-a-time", ...(compaction === undefined ? {} : { compaction }) },
   }, BACKGROUND_CONTEXT);
   const inference = new ConversationModels(models); inference.bind(session);
   const tasks = new TaskStore(session, inference), executions = new Executions();

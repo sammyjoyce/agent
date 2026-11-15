@@ -1,0 +1,327 @@
+import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
+import { awaitWithContext, BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type AssistantMessage, type Context, type FauxResponseFactory, type Message } from "@earendil-works/pi-ai";
+import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
+import { defineExtension, defineTool, type CompactionSettings } from "@earendil-works/pi-durable";
+import { Type } from "typebox";
+import type { AgentNode } from "../src/generated/AgentNode.js";
+import type { HostCommand } from "../src/generated/HostCommand.js";
+import type { HostResult } from "../src/generated/HostResult.js";
+import type { TaskRecord } from "../src/generated/TaskRecord.js";
+import type { ToolRole } from "../src/toolsets.js";
+import { ALWAYS_DIRECT, applyDiscoveryArm, BROWSER_TOOLS, createDiscoveryExtensions, declarationSize, DISCOVERY_ARMS, openDiscoveryApp, TOOL_ROLES,
+  type DeclarationSize, type DiscoveryApp, type DiscoveryArm, type DiscoveryArmName } from "./fixtures/tool-discovery.js";
+import { fixtureModel } from "./model.js";
+
+const node: AgentNode = { host_id: "11111111-1111-4111-8111-111111111111", name: "example", rex_server: null, agent_program: "/example/agent",
+  home_directory: "/workspace/example", coordinator: null, launch: { state_dir: null, runtime: null, config: null, instructions: null, model: fixtureModel } };
+const jobSource = { provider: "scheduled_jobs", account: "local", thread_id: "example-job" };
+type ToolArguments = Parameters<typeof fauxToolCall>[1];
+
+async function lab(prefix: string) {
+  const directory = await mkdtemp(join(tmpdir(), prefix));
+  const models = createModels(), faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }], tokensPerSecond: 1_000_000 });
+  models.setProvider(faux.provider);
+  const commands: HostCommand[] = [];
+  async function call(request: HostCommand): Promise<HostResult> {
+    let command = request;
+    while (command.type === "on_node") command = command.command;
+    commands.push(command);
+    if (command.type === "reload_guidance") return { type: "shared_guidance", global: { text: "", sources: [] }, workflow_policy: "", context_repositories: [], context_sources: [] };
+    if (command.type === "project_guidance") return { type: "project_guidance", snapshot: { text: "", sources: [] } };
+    if (command.type === "exec") return { type: "process", exit_code: 0, stdout: "EXAMPLE_EXEC_OUTPUT", stderr: "", truncated: false };
+    return { type: "failed", message: `The example host does not support ${command.type}` };
+  }
+  const open = (arm: DiscoveryArm, compaction?: CompactionSettings) =>
+    openDiscoveryApp(directory, { models, model: fixtureModel, arm, host: { node, call }, ...(compaction === undefined ? {} : { compaction }) });
+  return { faux, commands, open, remove: () => rm(directory, { recursive: true, force: true }) };
+}
+
+function offeredNames(input: Context): string[] { return getCurrentTools(input.messages).map((tool) => tool.name); }
+function toolResult(input: Context, name: string) {
+  const result = input.messages.findLast((message) => message.role === "toolResult" && message.toolName === name);
+  assert.ok(result?.role === "toolResult", `Missing result from ${name}`);
+  return { isError: result.isError, text: result.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n") };
+}
+function resultCount(messages: readonly Message[], name: string): number {
+  return messages.filter((message) => message.role === "toolResult" && message.toolName === name).length;
+}
+function callsOf(input: Context, name: string) {
+  return input.messages.flatMap((message) => message.role === "assistant" ? message.content.filter((part) => part.type === "toolCall" && part.name === name) : []);
+}
+function script(code: string): AssistantMessage { return fauxAssistantMessage(fauxToolCall("codemode", { code }), { stopReason: "toolUse" }); }
+function scriptValue(text: string): unknown { return JSON.parse(text.slice(text.indexOf("Output:\n") + "Output:\n".length)); }
+function callTool(input: Context, name: string, args: ToolArguments): AssistantMessage {
+  return offeredNames(input).includes(name) ? fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" })
+    : script(`return await tools.${name}(${JSON.stringify(args)});`);
+}
+const done: FauxResponseFactory = () => fauxAssistantMessage("Done.");
+
+/** One turn of a role through its production entry point; `close` holds the responses that end it from its first request. */
+type RoleTurn = { close: [FauxResponseFactory, ...FauxResponseFactory[]]; run(): Promise<void> };
+async function backgroundTask(app: DiscoveryApp) {
+  return app.tasks.create({ title: "Example job", outcome: "Finish the example job", model: fixtureModel, sources: [jobSource] });
+}
+const startRole: Record<ToolRole, (app: DiscoveryApp, input: string) => Promise<RoleTurn>> = {
+  async main(app, input) {
+    return { close: [done], async run() {
+      const root = await app.session.root(BACKGROUND_CONTEXT), release = app.bind(root);
+      try {
+        await app.inference.configure(root, fixtureModel, { extensions: app.toolsets.main });
+        assert.equal((await (await root.submit({ type: "input", content: input }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
+      } finally { release(); }
+    } };
+  },
+  async triage(app, input) {
+    await app.sources.admit({ source: { provider: "mail", account: "example" }, checkpoint: null, coverage: { status: "complete" },
+      events: [{ id: "example-event", version: "one", source: { provider: "mail", account: "example", thread_id: "example-thread" }, title: "Example", text: input }] }, null);
+    const event = (await app.sources.events({ pending: true }))[0]; assert.ok(event);
+    return { close: [(request) => callTool(request, "dismiss_source_events", { keys: [event.key], reason: "The example needs no work." }), done],
+      async run() {
+        await app.sources.triage({ type: "triage_sources", instructions: "", model: fixtureModel, cwd: app.worker.cwd, hosts: [app.worker] },
+          (conversation) => app.bind(conversation, "triage"), app.toolsets.triage);
+        assert.equal(await app.sources.hasWork(), false);
+      } };
+  },
+  async worker(app, input) {
+    const task = await backgroundTask(app);
+    return { close: [done], async run() { await app.tasks.enqueue(task.id, input); await app.tasks.runBackground(task.id); } };
+  },
+  async agent(app, input) {
+    const task = await backgroundTask(app);
+    return { close: [done], async run() {
+      const agent = await app.tasks.createAgent(task.id, { id: "example-agent", title: "Example agent", outcome: "Finish the example check", input, inputId: "example-agent-input" });
+      await app.tasks.runBackground(task.id, undefined, agent.id);
+    } };
+  },
+};
+function modelTools(app: DiscoveryApp, role: ToolRole): string[] {
+  return [...new Set(app.toolsets[role].flatMap((extension) => extension.tools ?? [])
+    .filter((tool) => tool.deferred !== true && (tool.callers ?? ["model"]).includes("model")).map((tool) => tool.name))];
+}
+
+const expectedSurface: Record<DiscoveryArmName, (production: readonly string[]) => string[]> = {
+  direct: (production) => [...production],
+  "search-browser": (production) => [...production.filter((name) => !BROWSER_TOOLS.includes(name)), "tool_search"],
+  codemode: (production) => [...production.filter((name) => ALWAYS_DIRECT.includes(name)), "codemode"],
+};
+
+test("each arm offers its role surfaces with the always-direct tools and reports their declaration size", async (t) => {
+  const production = new Map<ToolRole, string[]>(), observed: { arm: DiscoveryArmName; role: ToolRole; size: DeclarationSize }[] = [];
+  for (const arm of Object.keys(DISCOVERY_ARMS) as DiscoveryArmName[]) {
+    const env = await lab("agent-tool-discovery-surface-"), app = await env.open(DISCOVERY_ARMS[arm]);
+    try {
+      for (const role of TOOL_ROLES) {
+        if (arm === "direct") production.set(role, modelTools(app, role));
+        const turn = await startRole[role](app, `Report the ${role} surface.`), [first, ...rest] = turn.close;
+        let size: DeclarationSize | undefined;
+        env.faux.setResponses([(input, ...request) => { size = declarationSize(input); return first(input, ...request); }, ...rest]);
+        await turn.run();
+        assert.ok(size !== undefined, `${arm} ${role} made no request`);
+        t.diagnostic(`${arm} ${role}: ${size.tools.length} tools, ${size.characters} characters, ~${size.estimatedTokens} tokens`);
+        observed.push({ arm, role, size });
+      }
+    } finally { await app.close(); await env.remove(); }
+  }
+  for (const { arm, role, size } of observed) {
+    const offered = size.tools, surface = production.get(role); assert.ok(surface);
+    assert.equal(new Set(offered).size, offered.length, `${arm} ${role} offers a tool twice`);
+    assert.deepEqual([...offered].sort(), expectedSurface[arm](surface).sort(), `${arm} ${role} offered surface`);
+    assert.ok(offered.includes("read_attachment") && offered.includes("read_file"), `${arm} ${role} offers attachments and files directly`);
+    if (role === "main") assert.ok(offered.includes("finish_without_reply"), `${arm} main offers finish_without_reply`);
+  }
+});
+
+test("an arm cannot defer finish_without_reply or read_file", async () => {
+  const env = await lab("agent-tool-discovery-pinned-"), app = await env.open(DISCOVERY_ARMS.direct), discovery = createDiscoveryExtensions();
+  try {
+    assert.throws(() => applyDiscoveryArm(app.toolsets, { main: { deferred: ["finish_without_reply"] } }, discovery), /finish_without_reply must stay directly offered/);
+    assert.throws(() => applyDiscoveryArm(app.toolsets, { worker: { deferred: ["read_file"] } }, discovery), /read_file must stay directly offered/);
+  } finally { await discovery.close(); await app.close(); await env.remove(); }
+});
+
+test("tool_search loads browser tools for the next request, and they stay offered after reopen and compaction", async () => {
+  const env = await lab("agent-tool-discovery-search-"), arm = DISCOVERY_ARMS["search-browser"], compaction = { keepRecentTokens: 1 };
+  let app = await env.open(arm, compaction);
+  try {
+    let before: string[] = [], loaded: string[] = [];
+    env.faux.setResponses([
+      (input) => { before = offeredNames(input); return fauxAssistantMessage(fauxToolCall("tool_search", { query: "browser open" }), { stopReason: "toolUse" }); },
+      (input) => { loaded = offeredNames(input).filter((name) => !before.includes(name)); return fauxAssistantMessage("Loaded the browser tools."); },
+    ]);
+    await (await startRole.main(app, "Find a tool that opens a browser page.")).run();
+    assert.equal(before.some((name) => BROWSER_TOOLS.includes(name)), false, "Browser tools wait for tool_search");
+    assert.ok(loaded.includes("browser_open"), `tool_search loaded ${loaded.join(", ")}`);
+    assert.deepEqual(loaded.filter((name) => !BROWSER_TOOLS.includes(name)), []);
+    await app.close(); app = await env.open(arm, compaction);
+    let reopened: string[] = [];
+    env.faux.setResponses([(input) => { reopened = offeredNames(input); return fauxAssistantMessage("Still loaded."); }]);
+    await (await startRole.main(app, "Continue after the restart.")).run();
+    assert.deepEqual(loaded.filter((name) => !reopened.includes(name)), [], "Loaded tools stay offered after reopen");
+    const root = await app.session.root(BACKGROUND_CONTEXT);
+    env.faux.setResponses([() => fauxAssistantMessage("The user asked for browser tools and tool_search loaded them.")]);
+    const { outcome } = (await app.session.waitForTask(await root.compact(undefined, BACKGROUND_CONTEXT), BACKGROUND_CONTEXT)).state;
+    assert.ok(outcome.status === "completed" && (outcome.result.entryId ?? outcome.result.submissionId) !== undefined, "Compaction placed a summary");
+    let compacted: string[] = [], searchResults = -1;
+    env.faux.setResponses([(input) => {
+      compacted = offeredNames(input); searchResults = resultCount(input.messages, "tool_search");
+      return fauxAssistantMessage("Still loaded after compaction.");
+    }]);
+    await (await startRole.main(app, "Continue after compaction.")).run();
+    assert.equal(searchResults, 0, "Compaction summarized the search");
+    assert.deepEqual(loaded.filter((name) => !compacted.includes(name)), [], "Loaded tools stay offered after compaction");
+  } finally { await app.close(); await env.remove(); }
+});
+
+const scriptGuards: { name: string; role: ToolRole; tool: string; args: (bystander: string) => ToolArguments; error: RegExp }[] = [
+  { name: "a worker script cannot call the main-only delegate_task", role: "worker", tool: "delegate_task",
+    args: (bystander) => ({ task_id: bystander, input: "Take over the bystander task." }), error: /tools\.delegate_task does not exist/ },
+  { name: "a worker script cannot record another task", role: "worker", tool: "record_task",
+    args: (bystander) => ({ task_id: bystander, summary: "Changed by another worker.", state: { state: "resolved", evidence: "Invented completion." } }),
+    error: /A worker can update only its own task/ },
+  { name: "a worker script cannot record its own task yet, the known blocker for moving record_task behind code mode", role: "worker", tool: "record_task",
+    args: () => ({ summary: "Recorded through a script.", state: { state: "resolved", evidence: "Invented completion." } }),
+    error: /Task outcome model provenance is unavailable/ },
+  { name: "a main script cannot finish without reply", role: "main", tool: "finish_without_reply", args: () => ({}),
+    error: /Finish without reply must be the main owner's sole final tool/ },
+];
+for (const guard of scriptGuards) {
+  test(`code mode: ${guard.name}`, async () => {
+    const env = await lab("agent-tool-discovery-guard-"), app = await env.open(DISCOVERY_ARMS.codemode);
+    try {
+      const bystander = await app.tasks.create({ title: "Bystander", outcome: "Stay untouched by other actors", model: fixtureModel });
+      const turn = await startRole[guard.role](app, "Try the guarded call.");
+      const saved = async () => (await app.tasks.list()).map(({ id, state, sources }) => ({ id, state, sources }))
+        .sort((left, right) => left.id.localeCompare(right.id));
+      const before = await saved();
+      let result: ReturnType<typeof toolResult> | undefined;
+      env.faux.setResponses([
+        (input) => {
+          assert.equal(offeredNames(input).includes(guard.tool), ALWAYS_DIRECT.includes(guard.tool));
+          return script(`return await tools.${guard.tool}(${JSON.stringify(guard.args(bystander.id))});`);
+        },
+        (input) => { result = toolResult(input, "codemode"); return fauxAssistantMessage("The guarded call was refused."); },
+      ]);
+      await turn.run();
+      assert.ok(result !== undefined, "The model saw the script result and the turn went on");
+      assert.equal(result.isError, true); assert.match(result.text, guard.error);
+      assert.deepEqual(await app.tasks.get(bystander.id), bystander);
+      assert.deepEqual(await saved(), before, "No task was created or changed state");
+    } finally { await app.close(); await env.remove(); }
+  });
+}
+
+test("a main script gets the same task and job results the direct calls return", async () => {
+  const env = await lab("agent-tool-discovery-results-"); let app = await env.open(DISCOVERY_ARMS.direct);
+  try {
+    const task = await app.tasks.create({ title: "Example review", outcome: "Keep the example evidence", model: fixtureModel });
+    await (await app.tasks.conversation(task.conversation_id)).submit({ type: "write", entry: { kind: "fixture.evidence",
+      model: [{ role: "user", content: "EXAMPLE_TASK_EVIDENCE", timestamp: Date.now() }] } }, BACKGROUND_CONTEXT);
+    const read = { task_id: task.id, include_history: true };
+    let direct: unknown;
+    env.faux.setResponses([
+      () => fauxAssistantMessage([fauxToolCall("read_task", read), fauxToolCall("list_jobs", {})], { stopReason: "toolUse" }),
+      (input) => {
+        const [task, jobs] = [toolResult(input, "read_task"), toolResult(input, "list_jobs")];
+        assert.equal(task.isError || jobs.isError, false);
+        direct = { task: JSON.parse(task.text), jobs: JSON.parse(jobs.text) };
+        return fauxAssistantMessage("Read directly.");
+      },
+    ]);
+    await (await startRole.main(app, "Read the example task and the jobs.")).run();
+    assert.match(JSON.stringify(direct), /EXAMPLE_TASK_EVIDENCE/);
+    await app.close(); app = await env.open(DISCOVERY_ARMS.codemode);
+    let scripted: ReturnType<typeof toolResult> | undefined;
+    env.faux.setResponses([
+      (input) => {
+        assert.equal(offeredNames(input).some((name) => name === "read_task" || name === "list_jobs"), false);
+        return script(`return { task: JSON.parse(await tools.read_task(${JSON.stringify(read)})), jobs: JSON.parse(await tools.list_jobs({})) };`);
+      },
+      (input) => { scripted = toolResult(input, "codemode"); return fauxAssistantMessage("Read through a script."); },
+    ]);
+    await (await startRole.main(app, "Read the example task and the jobs again.")).run();
+    assert.ok(scripted !== undefined); assert.equal(scripted.isError, false);
+    assert.deepEqual(scriptValue(scripted.text), direct);
+  } finally { await app.close(); await env.remove(); }
+});
+
+/** Replaces the main task tools with one that waits until the Harness closes, so a reopen finds the call checkpointed mid-execution. */
+function hangingTaskTool(name: string, replay: "safe" | undefined, entered: () => void) {
+  return defineExtension({ name: "task-main", tools: [defineTool({ name, ...(replay === undefined ? {} : { replay }), description: "Use the selected task.",
+    parameters: Type.Object({}), async execute(_args, _api, context) { entered(); return await awaitWithContext(new Promise<never>(() => {}), context); } })] });
+}
+async function until(condition: () => Promise<boolean>): Promise<void> {
+  for (let attempt = 0; !(await condition()); attempt++) {
+    assert.ok(attempt < 500, "The condition did not hold in time"); await delay(10);
+  }
+}
+
+type InterruptedRound = { name: string; arm: DiscoveryArmName; hang: { tool: string; replay?: "safe" }; round(taskId: string): AssistantMessage;
+  settled(messages: readonly Message[]): boolean; resumed(input: Context, observed: { commands: readonly HostCommand[]; created: TaskRecord; current: TaskRecord }): void };
+const interruptedRounds: InterruptedRound[] = [
+  { name: "a reopened code mode script replays its settled nested call and reruns its interrupted replay-safe one", arm: "codemode",
+    hang: { tool: "read_task", replay: "safe" },
+    round: (taskId) => script(`const ran = JSON.parse(await tools.exec({ program: "example", args: [] })).stdout;
+return { ran, read: JSON.parse(await tools.read_task(${JSON.stringify({ task_id: taskId, include_history: false })})) };`),
+    settled: () => true,
+    resumed(input, { commands, created }) {
+      assert.equal(commands.filter((command) => command.type === "exec").length, 1, "The settled nested exec ran once across the restart");
+      assert.equal(callsOf(input, "codemode").length, 1);
+      const result = toolResult(input, "codemode"); assert.equal(result.isError, false);
+      const value = scriptValue(result.text);
+      assert.ok(typeof value === "object" && value !== null && "ran" in value && "read" in value);
+      assert.equal(value.ran, "EXAMPLE_EXEC_OUTPUT"); assert.match(JSON.stringify(value.read), new RegExp(created.id));
+    } },
+  { name: "a reopened code mode script does not rerun its interrupted unsafe nested call", arm: "codemode", hang: { tool: "record_task" },
+    round: (taskId) => script(`return await tools.record_task(${JSON.stringify({ task_id: taskId, summary: "Recorded once.", state: { state: "open" } })});`),
+    settled: () => true,
+    resumed(input, { created, current }) {
+      assert.equal(callsOf(input, "codemode").length, 1);
+      const result = toolResult(input, "codemode"); assert.equal(result.isError, true);
+      assert.match(result.text, /record_task was interrupted and may have partially run/);
+      assert.deepEqual(current, created, "The interrupted record_task did not run again after reopen");
+    } },
+  { name: "a reopened round keeps its settled tool_search load and resumes the interrupted call", arm: "search-browser",
+    hang: { tool: "read_task", replay: "safe" },
+    round: (taskId) => fauxAssistantMessage([fauxToolCall("tool_search", { query: "browser open" }),
+      fauxToolCall("read_task", { task_id: taskId, include_history: false })], { stopReason: "toolUse" }),
+    settled: (messages) => resultCount(messages, "tool_search") === 1,
+    resumed(input, { created }) {
+      assert.ok(offeredNames(input).includes("browser_open"), "The settled load survives the restart");
+      assert.equal(callsOf(input, "tool_search").length, 1); assert.equal(resultCount(input.messages, "tool_search"), 1);
+      const search = toolResult(input, "tool_search"); assert.equal(search.isError, false); assert.match(search.text, /browser_open/);
+      const read = toolResult(input, "read_task"); assert.equal(read.isError, false); assert.match(read.text, new RegExp(created.id));
+    } },
+];
+for (const round of interruptedRounds) {
+  test(round.name, { timeout: 10_000 }, async () => {
+    const env = await lab("agent-tool-discovery-reopen-"); let app = await env.open(DISCOVERY_ARMS[round.arm]);
+    let release = () => {};
+    try {
+      const created = await app.tasks.create({ title: "Example status", outcome: "Report the example status", model: fixtureModel });
+      let entered = 0, resolveStarted = () => {};
+      const started = new Promise<void>((resolve) => { resolveStarted = resolve; });
+      app.registry.install(hangingTaskTool(round.hang.tool, round.hang.replay, () => { entered++; resolveStarted(); }));
+      let root = await app.session.root(BACKGROUND_CONTEXT); release = app.bind(root);
+      await app.inference.configure(root, fixtureModel, { extensions: app.toolsets.main });
+      let resumed: Context | undefined;
+      env.faux.setResponses([round.round(created.id), (input) => { resumed = input; return fauxAssistantMessage("Resumed once."); }]);
+      const submission = await root.submit({ type: "input", content: "Run the example round once." }, BACKGROUND_CONTEXT);
+      await started; await until(async () => round.settled((await root.context(BACKGROUND_CONTEXT)).messages));
+      assert.equal(env.faux.state.callCount, 1);
+      release(); release = () => {}; await app.close(); app = await env.open(DISCOVERY_ARMS[round.arm]);
+      root = await app.session.root(BACKGROUND_CONTEXT); release = app.bind(root);
+      const reopened = await app.session.submission(submission.id, BACKGROUND_CONTEXT); assert.ok(reopened);
+      assert.equal((await reopened.wait(BACKGROUND_CONTEXT)).status, "done");
+      assert.equal(entered, 1);
+      assert.equal(env.faux.state.callCount, 2, "Reopen asks the model only for the response after the saved round");
+      assert.ok(resumed !== undefined);
+      round.resumed(resumed, { commands: env.commands, created, current: await app.tasks.get(created.id) });
+    } finally { release(); await app.close(); await env.remove(); }
+  });
+}
