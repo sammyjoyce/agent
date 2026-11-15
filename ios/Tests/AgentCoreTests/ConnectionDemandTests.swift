@@ -173,6 +173,28 @@ private func observeCount(_ fixture: FixtureCoordinator) async -> Int {
   }
 }
 
+/// A session can report a request that its task's cancellation cut as a closed connection. The
+/// lease reports the cancellation, whichever error its body threw.
+@MainActor @Test func aCancelledLeaseWhoseBodyFailsAsClosedIsStillCancelled() async throws {
+  try await withBackgroundedPair { coordinators, work, _, _, _ in
+    let chat = coordinators.chat
+    let entries = Entries()
+    let (gate, release) = AsyncStream<Void>.makeStream()
+    let held = Task { @MainActor in
+      try await coordinators.withConnection(to: work) {
+        entries.count += 1
+        for await _ in gate {}
+        throw ConnectionError.closed
+      }
+    }
+    try await until("the lease held") { entries.count == 1 }
+    held.cancel()
+    await #expect(throws: CancellationError.self) { try await held.value }
+    release.finish()
+    #expect(!chat.demand.leased(work), "The lease was dropped")
+  }
+}
+
 @MainActor @Test func twoLeasesOnOneLaneKeepItConnectedUntilBothDrop() async throws {
   try await withBackgroundedPair { coordinators, work, _, workPeer, _ in
     let chat = coordinators.chat
