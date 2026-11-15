@@ -1184,7 +1184,7 @@
           try await Task.sleep(for: .milliseconds(300))
           try await tapMic(dictation, target)
           let dimmed = UIColor.secondaryLabel.resolvedColor(with: field.traitCollection)
-          func color(of words: String) -> UIColor? {
+          @MainActor func color(of words: String) -> UIColor? {
             let range = (field.text as NSString).range(of: words)
             guard range.location != NSNotFound else { return nil }
             let attributes = field.textStorage.attributes(at: range.location, effectiveRange: nil)
@@ -1365,7 +1365,7 @@
           #expect(model.draft == "Before after" && model.committed == "Before after")
           #expect(model.draftMark == mark, "Live words are never saved")
           #expect(field.accessibilityValue == "Before after")
-          func color(of words: String) -> UIColor? {
+          @MainActor func color(of words: String) -> UIColor? {
             let range = (field.text as NSString).range(of: words)
             guard range.location != NSNotFound else { return nil }
             let attributes = field.textStorage.attributes(at: range.location, effectiveRange: nil)
