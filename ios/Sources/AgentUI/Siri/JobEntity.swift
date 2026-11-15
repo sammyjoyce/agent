@@ -91,11 +91,23 @@ public struct JobQuery: EnumerableEntityQuery {
   public init() {}
 
   public func allEntities() async throws -> [JobEntity] {
-    try await Self.allJobs(in: notifications.intentCoordinators)
+    try await Self.allJobs(for: notifications)
   }
 
   public func entities(for identifiers: [ScopedEntityID]) async throws -> [JobEntity] {
-    try await Self.jobs(identifiedBy: identifiers, in: notifications.intentCoordinators)
+    try await Self.jobs(identifiedBy: identifiers, for: notifications)
+  }
+
+  /// The query's answer for the app's `notifications`. It reads the coordinators an intent may
+  /// reach, so a launch without the interaction fixture it asked for is refused before any lease.
+  @MainActor static func allJobs(for notifications: AppNotifications) async throws -> [JobEntity] {
+    try await allJobs(in: notifications.intentCoordinators)
+  }
+
+  @MainActor static func jobs(
+    identifiedBy identifiers: [ScopedEntityID], for notifications: AppNotifications
+  ) async throws -> [JobEntity] {
+    try await jobs(identifiedBy: identifiers, in: notifications.intentCoordinators)
   }
 
   /// Every paired coordinator's jobs, in saved order.

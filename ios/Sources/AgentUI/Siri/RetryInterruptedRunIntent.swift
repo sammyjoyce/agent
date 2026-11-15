@@ -17,9 +17,23 @@ public struct RetryInterruptedRunIntent: AppIntent {
   public init() {}
 
   @MainActor public func perform() async throws -> some IntentResult & ProvidesDialog {
-    let retried = try await notifications.intentCoordinators.retryInterruptedRun(
-      job.id, title: job.title)
-    return .result(dialog: "Retrying \(retried.job.title) on \(job.coordinator).")
+    .result(dialog: IntentDialog(try await Self.retry(job, for: notifications)))
+  }
+
+  /// The intent's work for the app's `notifications`, on the coordinators an intent may reach.
+  @MainActor static func retry(_ job: JobEntity, for notifications: AppNotifications) async throws
+    -> LocalizedStringResource
+  {
+    try await retry(job, in: notifications.intentCoordinators)
+  }
+
+  /// Retries `job`'s interrupted run on its coordinator in `coordinators`, and returns what the
+  /// intent then says.
+  @MainActor static func retry(_ job: JobEntity, in coordinators: Coordinators) async throws
+    -> LocalizedStringResource
+  {
+    let retried = try await coordinators.retryInterruptedRun(job.id, title: job.title)
+    return "Retrying \(retried.job.title) on \(job.coordinator)."
   }
 }
 
