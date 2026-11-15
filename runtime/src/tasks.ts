@@ -410,9 +410,12 @@ export class TaskStore {
         : { state: "failed", reason: failure } };
   }
   async origin(conversation: Conversation, callId: string): Promise<EntryRecord> {
+    // A nested call's ID is `<caller's call ID>/<key>` with no `/` in the key; only the outermost call is in the transcript.
+    const lineage = [callId];
+    for (let end = callId.lastIndexOf("/"); end > 0; end = callId.lastIndexOf("/", end - 1)) lineage.push(callId.slice(0, end));
     for await (const entries of this.historyPages(conversation, { order: "descending" })) {
       const entry = entries.find((entry) => entry.model?.some((message) => message.role === "assistant" &&
-        message.content.some((part) => part.type === "toolCall" && part.id === callId)));
+        message.content.some((part) => part.type === "toolCall" && lineage.includes(part.id))));
       if (entry !== undefined) return entry;
     }
     throw new TaskError("Task outcome model provenance is unavailable");
