@@ -181,6 +181,21 @@ struct SiriJobTests {
     #expect(JobEntity(parkedOnSchedule, on: ProfileID(), coordinator: "Work").state == .interrupted)
   }
 
+  @Test func withNoJobToShowARefusalIsThrownAndASilenceOnlyWhenNoOneAnswered() throws {
+    let job = JobEntity(
+      nightlyDeps(title: "Nightly deps", lastRun: .completed), on: ProfileID(),
+      coordinator: "Personal")
+    let silence = JobRead.failure(CoordinatorDidNotAnswer(name: "Work"))
+    let refusal = JobRead.failure(CoordinatorRefused(name: "Work", message: updateTheCoordinator))
+    #expect(try JobQuery.jobs(in: []).isEmpty)
+    #expect(try JobQuery.jobs(in: [silence, .success([job])]).map(\.title) == ["Nightly deps"])
+    #expect(try JobQuery.jobs(in: [refusal, .success([job])]).map(\.title) == ["Nightly deps"])
+    #expect(try JobQuery.jobs(in: [silence, .success([])]).isEmpty, "Someone answered")
+    #expect(throws: CoordinatorRefused.self) { try JobQuery.jobs(in: [refusal, .success([])]) }
+    #expect(throws: CoordinatorRefused.self) { try JobQuery.jobs(in: [silence, refusal]) }
+    #expect(throws: CoordinatorDidNotAnswer.self) { try JobQuery.jobs(in: [silence, silence]) }
+  }
+
   @MainActor @Test func anOutdatedCoordinatorsRejectionKeepsItsMessageUnderItsName() async throws {
     try await withJobPeers { coordinators, work, _, workPeer, personalPeer in
       await workPeer.advertiseWorkInspection(false)
@@ -198,6 +213,14 @@ struct SiriJobTests {
       }
       #expect(shown(listed) == "Work: \(updateTheCoordinator)", "No coordinator returned jobs")
       #expect(await jobReads(workPeer) == 0, "An outdated coordinator is never asked")
+      await personalPeer.advertiseWorkInspection(true)
+      await personalPeer.serveWork(jobs: [], conversations: [], pageSize: 10)
+      let hidden = await #expect(throws: (any Error).self) {
+        try await JobQuery.allJobs(in: coordinators)
+      }
+      #expect(
+        shown(hidden) == "Work: \(updateTheCoordinator)",
+        "Personal's empty list does not hide what Work said")
     }
   }
 

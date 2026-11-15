@@ -98,16 +98,23 @@ public struct JobQuery: EnumerableEntityQuery {
     try await Self.jobs(identifiedBy: identifiers, in: notifications.intentCoordinators)
   }
 
-  /// Every paired coordinator's jobs, in saved order. Whatever any coordinator answered is
-  /// returned, even nothing. A failure is thrown only when none answered.
+  /// Every paired coordinator's jobs, in saved order.
   @MainActor static func allJobs(
     in coordinators: Coordinators, within limit: Duration = ConnectionLease.connectionWait
   ) async throws -> [JobEntity] {
     let reads = await coordinators.jobs(
       of: coordinators.profiles.filter { $0.pin != nil }, within: limit)
     try Task.checkCancellation()
+    return try jobs(in: reads)
+  }
+
+  /// Every job in `reads`. With none to show, a coordinator's own refusal is thrown, and a
+  /// silence only when no coordinator answered at all.
+  static func jobs(in reads: [JobRead]) throws -> [JobEntity] {
     let answers = reads.compactMap { try? $0.get() }
-    guard answers.isEmpty, let failure = failure(in: reads) else { return answers.flatMap { $0 } }
+    let jobs = answers.flatMap { $0 }
+    guard jobs.isEmpty, let failure = failure(in: reads) else { return jobs }
+    if failure is CoordinatorDidNotAnswer, !answers.isEmpty { return [] }
     throw failure
   }
 
