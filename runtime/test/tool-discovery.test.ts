@@ -14,7 +14,7 @@ import type { HostCommand } from "../src/generated/HostCommand.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 import type { TaskRecord } from "../src/generated/TaskRecord.js";
 import type { ToolRole } from "../src/toolsets.js";
-import { UserNoticeEntry } from "../src/transcript.js";
+import { history, toolDetails, UserNoticeEntry } from "../src/transcript.js";
 import { ALWAYS_DIRECT, applyDiscoveryArm, BROWSER_TOOLS, createDiscoveryExtensions, declarationSize, DISCOVERY_ARMS, openDiscoveryApp, TOOL_ROLES,
   type DeclarationSize, type DiscoveryApp, type DiscoveryArm, type DiscoveryArmName, type ToolSurface } from "./fixtures/tool-discovery.js";
 import { fixtureModel } from "./model.js";
@@ -36,6 +36,7 @@ async function lab(prefix: string) {
     if (command.type === "reload_guidance") return { type: "shared_guidance", global: { text: "", sources: [] }, workflow_policy: "", context_repositories: [], context_sources: [] };
     if (command.type === "project_guidance") return { type: "project_guidance", snapshot: { text: "", sources: [] } };
     if (command.type === "exec") return { type: "process", exit_code: 0, stdout: "EXAMPLE_EXEC_OUTPUT", stderr: "", truncated: false };
+    if (command.type === "edit_file") return { type: "written" };
     return { type: "failed", message: `The example host does not support ${command.type}` };
   }
   const open = (arm: DiscoveryArm, compaction?: CompactionSettings) =>
@@ -305,6 +306,29 @@ for (const identity of callerIdentities) for (const arm of ["direct", "codemode"
     } finally { await app.close(); await env.remove(); }
   });
 }
+
+test("a worker's code mode item in task history shows each command, edited path and the script's output", async () => {
+  const env = await lab("agent-tool-discovery-history-"), app = await env.open(DISCOVERY_ARMS.codemode);
+  try {
+    const turn = await startRole.worker(app, "Raise the HTTP retries.");
+    const code = `const found = JSON.parse(await tools.exec({ program: "grep", args: ["-n", "max_retries", "config/limits.toml"] })).stdout;
+await tools.edit_file({ path: "config/limits.toml", old: "max_retries = 3", new: "max_retries = 5" });
+return "Raised max_retries after grep printed " + found;`;
+    env.faux.setResponses([(input) => { assert.equal(offeredNames(input).includes("edit_file"), false); return script(code); }, done]);
+    await turn.run();
+    const conversation = await app.tasks.conversation((await ownTask(app)).conversation_id);
+    const items = (await history(conversation, null, app.session)).flatMap((page) => page.messages)
+      .filter((message) => message.tool?.name === "codemode" && message.tool.status === "finished");
+    assert.equal(items.length, 1, "One finished code mode item");
+    const [item] = items; assert.ok(item?.tool !== undefined);
+    assert.match(item.text, /grep -n max_retries config\/limits\.toml/u, "The item shows the command the script ran");
+    assert.match(item.text, /edit_file config\/limits\.toml/u, "The item shows the path the script edited");
+    assert.match(item.text, /Raised max_retries after grep printed EXAMPLE_EXEC_OUTPUT/u, "The item shows the script's output");
+    const details = await toolDetails(conversation, item.entry_id, item.tool.call_id, app.session);
+    assert.ok(details.type === "available" && details.input.type === "text");
+    assert.ok(details.input.text.includes("tools.edit_file"), "Inspecting the item shows the script");
+  } finally { await app.close(); await env.remove(); }
+});
 
 test("a main script gets the same task and job results the direct calls return", async () => {
   const env = await lab("agent-tool-discovery-results-"); let app = await env.open(DISCOVERY_ARMS.direct);
