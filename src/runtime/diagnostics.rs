@@ -1789,6 +1789,70 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_line_is_placed_before_the_window_only_while_receipt_timestamps_never_go_back() {
+        let line = |timestamp| serde_json::to_string(&at(timestamp, Event::Heartbeat)).unwrap();
+        let unplaced = |segments: &[(&str, String)]| {
+            let state = tempfile::tempdir().unwrap();
+            let directory = state.path().join("diagnostics");
+            fs::create_dir(&directory).unwrap();
+            for (name, content) in segments {
+                fs::write(directory.join(name), content).unwrap();
+            }
+            read_window(state.path(), (500, 2_000), 100, u64::MAX)
+                .unwrap()
+                .unplaced_lines
+        };
+        let ordered = format!("{}\nbad\n{}\n{}\n", line(100), line(200), line(1_000));
+        assert_eq!(unplaced(&[("runtime.jsonl", ordered)]), 0);
+
+        let rolled_back = format!("{}\nbad\n{}\n{}\n", line(1_000), line(100), line(1_100));
+        assert_eq!(
+            unplaced(&[("runtime.jsonl", rolled_back)]),
+            1,
+            "A receipt whose clock went back proves nothing about the line before it"
+        );
+        let rolled_back_elsewhere = format!(
+            "{}\n{}\n{}\nbad\n{}\n{}\n",
+            line(400),
+            line(100),
+            line(150),
+            line(200),
+            line(1_000)
+        );
+        assert_eq!(
+            unplaced(&[("runtime.jsonl", rolled_back_elsewhere)]),
+            1,
+            "Any timestamp that goes back in a segment removes the proof for that segment"
+        );
+        assert_eq!(
+            unplaced(&[
+                ("runtime.jsonl.1", format!("{}\nbad\n", line(100))),
+                ("runtime.jsonl", format!("{}\n{}\n", line(200), line(1_000))),
+            ]),
+            0,
+            "The next segment's older receipt places a segment's last line"
+        );
+        assert_eq!(
+            unplaced(&[
+                ("runtime.jsonl.1", format!("{}\nbad\n", line(300))),
+                ("runtime.jsonl", format!("{}\n{}\n", line(200), line(1_000))),
+            ]),
+            1,
+            "A timestamp that goes back across segments removes the proof too"
+        );
+        let unfinished = format!(
+            "{}\n{}\n{{\"timestamp_ms\":1200,\"event\":",
+            line(100),
+            line(1_000)
+        );
+        assert_eq!(
+            unplaced(&[("runtime.jsonl", unfinished)]),
+            1,
+            "An unfinished last line may be a receipt that a crashed writer lost"
+        );
+    }
+
+    #[test]
     fn a_window_read_counts_only_bad_lines_that_may_hide_a_receipt_in_the_window() {
         let state = tempfile::tempdir().unwrap();
         let directory = state.path().join("diagnostics");
@@ -1816,8 +1880,8 @@ mod tests {
         let read = read_window(state.path(), (500, 2_000), 100, u64::MAX).unwrap();
         assert_eq!(read.records.len(), 3);
         assert_eq!(
-            read.unplaced_lines, 2,
-            "An old bad line and a half-written last line are not gaps"
+            read.unplaced_lines, 3,
+            "Only the bad line that ordered receipts place before the window is no gap"
         );
         assert!(
             read.retention.is_none(),

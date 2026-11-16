@@ -975,12 +975,21 @@ mod tests {
             ProtectedPaths, RunId,
         },
         protocol::HostResult,
+        runtime::diagnostics,
     };
 
     const BROKEN: &str = "Run `make test-all` before finishing.\n";
     const FIXED: &str = "Run `make test` before finishing.\n";
     const EVIDENCE: &str = "t:task-1@7";
     const CHECK: &str = "for target in $(grep -o 'make [a-z-]*' AGENTS.md | cut -d' ' -f2); do grep -q \"^$target:\" Makefile || { echo \"missing make target: $target\"; exit 1; }; done\n";
+
+    const MINUTE: u64 = 60_000;
+
+    fn heartbeat(timestamp_ms: u64) -> String {
+        format!(
+            "{{\"timestamp_ms\":{timestamp_ms},\"request_id\":0,\"elapsed_ms\":null,\"event\":\"heartbeat\"}}"
+        )
+    }
 
     fn git(repository: &Path, arguments: &[&str]) -> String {
         let output = Command::new("git")
@@ -1066,6 +1075,34 @@ mod tests {
                 repository,
                 root,
             }
+        }
+
+        /// A heartbeat every five minutes over the last two hours, then `tail`,
+        /// with a watermark that reports no loss.
+        fn seed_receipts(&self, tail: &str) {
+            let directory = self.dreams.state.join("diagnostics");
+            fs::create_dir(&directory).unwrap();
+            let now = diagnostics::now_ms();
+            let mut log: String = (now - 120 * MINUTE..=now - MINUTE / 2)
+                .step_by(5 * MINUTE as usize)
+                .map(|at| heartbeat(at) + "\n")
+                .collect();
+            log.push_str(tail);
+            fs::write(directory.join("runtime.jsonl"), log).unwrap();
+            fs::write(
+                directory.join("retention.json"),
+                r#"{"version":1,"policy":{"segment_bytes":1048576,"horizon_ms":172800000,"max_total_bytes":134217728},"prior_history_unknown":false,"expired_through_ms":null,"capacity_loss":null}"#,
+            )
+            .unwrap();
+        }
+
+        async fn abstain_as_quiet(&self, run: &str) -> DreamsReply {
+            self.send(DreamsRequest::Abstain {
+                run: run.into(),
+                reason: DreamsAbstainReason::Quiet,
+                note: "Nothing failed.".into(),
+            })
+            .await
         }
 
         async fn send(&self, request: DreamsRequest) -> DreamsReply {
@@ -1280,5 +1317,46 @@ mod tests {
             .unwrap(),
             sealed
         );
+    }
+
+    #[tokio::test]
+    async fn a_witnessed_night_is_complete_and_a_malformed_receipt_that_nothing_places_is_a_gap() {
+        let quiet = Night::new();
+        quiet.seed_receipts("");
+        assert!(
+            quiet
+                .review("night")
+                .await
+                .text
+                .contains("Coverage: complete")
+        );
+        assert!(quiet.abstain_as_quiet("night").await.decided);
+
+        let now = diagnostics::now_ms();
+        let malformed = format!(
+            "{{\"timestamp_ms\":{},\"request_id\":7,\"event\":",
+            now - MINUTE
+        );
+        for (name, tail) in [
+            (
+                "a receipt whose clock went back follows the malformed line",
+                format!(
+                    "{malformed}\n{}\n{}\n",
+                    heartbeat(now - 26 * 60 * MINUTE),
+                    heartbeat(now - MINUTE / 2)
+                ),
+            ),
+            (
+                "the malformed line is the unfinished last line",
+                malformed.clone(),
+            ),
+        ] {
+            let night = Night::new();
+            night.seed_receipts(&tail);
+            let page = night.review("night").await.text;
+            assert!(page.contains("gap unparseable"), "{name}: {page}");
+            let quiet = night.abstain_as_quiet("night").await;
+            assert!(!quiet.decided, "{name}: {}", quiet.text);
+        }
     }
 }
