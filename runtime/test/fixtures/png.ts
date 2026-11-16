@@ -2,7 +2,6 @@ import { crc32, deflateSync } from "node:zlib";
 
 const stripes: [number, number, number][] = [[0xd0, 0x30, 0x30], [0x30, 0xa0, 0x40], [0x30, 0x50, 0xd0]];
 
-/** An invented page capture: one vertical stripe per color, stored without compression. */
 export function capturePng(width: number, height: number): Buffer {
   const row = Buffer.alloc(1 + width * 3);
   for (let x = 0; x < width; x++) row.set(stripes[Math.floor(x * stripes.length / width)] ?? [0, 0, 0], 1 + x * 3);

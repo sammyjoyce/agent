@@ -2371,9 +2371,7 @@ actor InteractionPeer {
   private var files: [String: Data] = [:]
   private var downloaded: [String] = []
   func observationCount() -> Int { observations }
-  /// Serves these bytes to attachment downloads of this ID, as a coordinator serves a retained file.
   func retain(_ data: Data, id: String) { files[id] = data }
-  /// The attachment ID of each download chunk this peer served, in order.
   func downloads() -> [String] { downloaded }
   func streamRepliesOnSubmit() { streamsOnSubmit = true }
   func toolDetails(_ values: [String: ToolDetails]) { toolReplies = values }

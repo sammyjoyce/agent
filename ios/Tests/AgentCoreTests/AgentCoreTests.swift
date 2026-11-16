@@ -437,7 +437,6 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
   }
 }
 
-/// An invented 96 by 48 page capture: one vertical stripe each of red, green and blue.
 private func screenshotPNG() throws -> Data {
   let context = try #require(
     CGContext(
