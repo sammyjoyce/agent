@@ -3,6 +3,8 @@ import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
+import { AuthorityDenied } from "../src/failover/authority-client.js";
+import { AuthorityUnreachable } from "../src/failover/authority-link.js";
 import { INLINE_BATCH_LIMIT_BYTES, sha256Hex } from "../src/failover/log-entry.js";
 import { OwnerFenced } from "../src/failover/replicated-storage.js";
 import { UnloggedWrite } from "../src/failover/scoped-database.js";
@@ -54,7 +56,7 @@ for (const [name, connect] of Object.entries(authorities)) {
       if (command.op !== "append") return;
       link.after = () => {};
       crash.abort();
-      throw new Error("The process stopped before it read the reply");
+      throw new AuthorityUnreachable("The process stopped before it read the reply");
     };
     await assert.rejects(crashed.root.submit(note("appended then crashed", "request-2"), context));
     await crashed.harness.close(context).catch(() => {});
@@ -78,7 +80,7 @@ for (const [name, connect] of Object.entries(authorities)) {
     link.after = (command) => {
       if (command.op !== "append") return;
       appends += 1;
-      if (appends === 1) throw new Error("The reply was lost");
+      if (appends === 1) throw new AuthorityUnreachable("The reply was lost");
     };
     const before = owner.log.head;
     await owner.root.submit(note("sent twice", "request-1"), context);
@@ -98,7 +100,7 @@ for (const [name, connect] of Object.entries(authorities)) {
       if (command.op !== "append") return;
       link.after = () => {};
       await link.command({ op: "promote", candidate: STANDBY, expected_epoch: epoch, attestation: null });
-      throw new Error("The reply was lost");
+      throw new AuthorityUnreachable("The reply was lost");
     };
     await assert.rejects(owner.root.submit(note("sealed away", "request-2"), context), OwnerFenced);
     assert.deepEqual(tables(directory), before);
@@ -129,7 +131,7 @@ for (const [name, connect] of Object.entries(authorities)) {
     link.before = () => {
       if (reachable) return;
       refusedExchanges += 1;
-      throw new Error("The authority is unreachable");
+      throw new AuthorityUnreachable("The authority is unreachable");
     };
     let settled = false;
     const waiting = owner.root.submit(note("waited", "request-2"), context).finally(() => { settled = true; });
@@ -151,12 +153,26 @@ for (const [name, connect] of Object.entries(authorities)) {
     t.after(() => owner.harness.close(context).catch(() => {}));
     const before = tables(directory);
     let refusedExchanges = 0;
-    link.before = () => { refusedExchanges += 1; throw new Error("The authority is unreachable"); };
+    link.before = () => { refusedExchanges += 1; throw new AuthorityUnreachable("The authority is unreachable"); };
     const waiting = owner.root.submit(note("never sent", "request-1"), context);
     await until(() => refusedExchanges >= 2, "the commit keeps retrying");
     stop.abort();
     await assert.rejects(waiting, /authority/);
     link.before = () => {};
+    assert.deepEqual(tables(directory), before);
+    assert.deepEqual(await loggedNotes(link), []);
+  });
+
+  test(`${name}: a rejection that is not a lost exchange ends the commit at once, with nothing on disk or in the log`, async (t) => {
+    const link = await connect(), epoch = await enroll(link), directory = await stateDirectory(t);
+    const owner = await openOwner(directory, link, { epoch });
+    t.after(() => owner.harness.close(context).catch(() => {}));
+    const before = tables(directory);
+    let exchanges = 0;
+    link.before = () => { exchanges += 1; throw new AuthorityDenied(403, "Invented: this credential was revoked"); };
+    await assert.rejects(owner.root.submit(note("denied", "request-1"), context), AuthorityDenied);
+    link.before = () => {};
+    assert.equal(exchanges, 1, "a denied exchange is not repeated");
     assert.deepEqual(tables(directory), before);
     assert.deepEqual(await loggedNotes(link), []);
   });

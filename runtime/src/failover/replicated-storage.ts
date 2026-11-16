@@ -6,7 +6,7 @@ import type { AuthorityState } from "../generated/AuthorityState.js";
 import type { BatchBody } from "../generated/BatchBody.js";
 import type { FileRecord } from "../generated/FileRecord.js";
 import type { LogEntry } from "../generated/LogEntry.js";
-import type { AuthorityLink } from "./authority-link.js";
+import { AuthorityUnreachable, type AuthorityLink } from "./authority-link.js";
 import { INLINE_BATCH_LIMIT_BYTES, logEntryDigest, sha256Hex, versions } from "./log-entry.js";
 import type { ScopedDatabase } from "./scoped-database.js";
 import { followLog, publishFile, replicatedFilePath, type LogFollower } from "./standby.js";
@@ -161,9 +161,9 @@ class OwnerLog implements LogWriter {
   }
 
   /**
-   * Repeats an exchange until the authority answers. Only a transport failure
-   * rejects an exchange, and the authority takes a repeated append from the
-   * current owner as the same append, so a repeat is safe.
+   * Repeats an exchange until the authority answers. The authority takes a
+   * repeated append from the current owner as the same append, so a repeat
+   * after a lost exchange is safe. Any other rejection is final.
    */
   async #untilReachable<T>(exchange: () => Promise<T>): Promise<T> {
     const { signal } = this.#options;
@@ -171,6 +171,7 @@ class OwnerLog implements LogWriter {
       try {
         return await exchange();
       } catch (error) {
+        if (!(error instanceof AuthorityUnreachable)) throw error;
         if (signal?.aborted) throw new Error("Stopped waiting for the authority, which was unreachable", { cause: error });
       }
       await sleep(wait, undefined, signal === undefined ? {} : { signal }).catch((error: unknown) => {

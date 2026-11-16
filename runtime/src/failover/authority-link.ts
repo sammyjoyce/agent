@@ -3,9 +3,12 @@ import type { AuthorityRecord } from "../generated/AuthorityRecord.js";
 import type { AuthorityReply } from "../generated/AuthorityReply.js";
 import type { LogPage } from "../generated/LogPage.js";
 
+/** The authority did not answer: a transport failure, a timeout or a server error. Only this rejection is safe to repeat. */
+export class AuthorityUnreachable extends Error {}
+
 /** One coordinator's authority and blob store, as a holder reaches them. */
 export interface AuthorityLink {
-  /** Runs one command. A refusal is a reply, and only a transport failure rejects. */
+  /** Runs one command. A refusal is a reply. An authority that did not answer rejects with `AuthorityUnreachable`. */
   command(command: AuthorityCommand): Promise<AuthorityReply>;
   /** The record, or undefined before enrollment. */
   record(): Promise<AuthorityRecord | undefined>;

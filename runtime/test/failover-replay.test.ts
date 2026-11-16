@@ -14,6 +14,7 @@ import { applyLog } from "../src/failover/standby.js";
 import type { LogEntry } from "../src/generated/LogEntry.js";
 import { HistoryStore, ImportedItemEntry } from "../src/history.js";
 import type { HistoryImportBatch } from "../src/generated/HistoryImportBatch.js";
+import { AuthorityUnreachable } from "../src/failover/authority-link.js";
 import { authorities, enroll, follow, logBatches, logEntries, note, openOwner, openScoped, OWNER, replaceOwner, sessionPath, stage, STANDBY,
   stateDirectory, tables } from "./fixtures/failover-state.js";
 
@@ -260,7 +261,7 @@ for (const [name, connect] of Object.entries(authorities)) {
       if (command.op !== "append") return;
       link.after = () => {};
       crash.abort();
-      throw new Error("The process stopped before it read the reply");
+      throw new AuthorityUnreachable("The process stopped before it read the reply");
     };
     await assert.rejects(crashed.log.appendFiles([await stage(directory, link, "feedback/bundle.json", bytes)]));
     await crashed.harness.close(context).catch(() => {});
