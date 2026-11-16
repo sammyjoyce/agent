@@ -921,7 +921,7 @@ func anOlderControlComesBackOnceWhileANewerSendIsAdmitting(newerRefused: Bool) a
     #expect(await model.saveDraft())
     let files = AttachmentStore(directory: root.appending(path: "Composer/Files"))
     let url = root.appending(path: "Composer/draft.json")
-    let both = "An invented newer note\n\n/status"
+    let both = "/status\n\nAn invented newer note"
     let recovered = try await ComposerDraftStore(url: url).load(from: files)
     #expect(
       recovered.draft.text == (newerRefused ? both : "/status"),
@@ -941,6 +941,77 @@ func anOlderControlComesBackOnceWhileANewerSendIsAdmitting(newerRefused: Bool) a
       }
     }
     #expect(await coordinator.fixture.count() == (newerRefused ? 0 : 1), "/status never went")
+    await model.setActive(false)
+  }
+}
+
+/// What recovery would offer from the composer record under `root` now.
+private func recoveredText(under root: URL) async throws -> String {
+  try await ComposerDraftStore(url: root.appending(path: "Composer/draft.json"))
+    .load(from: AttachmentStore(directory: root.appending(path: "Composer/Files"))).draft.text
+}
+
+/// `/status` is still dialing when a newer note's Send starts, and the app goes to the background
+/// at once, as when the user switches away. Whatever comes back keeps the order it was sent in.
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: 0..<10)
+func aBackgroundStopDuringANewerSendKeepsTheOrderTheyWereSent(attempt: Int) async throws {
+  try await withGatedCoordinators(1) { coordinators, root in
+    let coordinator = coordinators[0]
+    let model = try await connectedModel(to: coordinators, under: root)
+    await coordinator.gate.arm()
+    model.draft = "/status"
+    await model.send()
+    try await held(coordinator.gate)
+    model.draft = "An invented newer note"
+    let newer = try #require(model.startSend())
+    await model.setActive(false)
+    await newer.value
+    let deadline = ContinuousClock.now + .seconds(5)
+    while !model.draft.contains("/status"), ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    let queued = try queuedRequests(coordinator.session.outboxURL).map(\.text)
+    let expected = queued.isEmpty ? "/status\n\nAn invented newer note" : "/status"
+    #expect(model.draft == expected, "/status comes back ahead of the newer note")
+    #expect(await model.saveDraft())
+    #expect(try await recoveredText(under: root) == expected, "Recovery offers the same order")
+    #expect(await coordinator.fixture.count() == 0, "The coordinator got nothing")
+    await coordinator.gate.open()
+  }
+}
+
+/// `/status` and then `/help` are each dialing their own coordinator, and a note is typed, when
+/// both dials fail, in either order. Both come back in the order they were sent, ahead of the note.
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true])
+func twoControlsThatComeBackKeepTheOrderTheyWereSent(newerFailsFirst: Bool) async throws {
+  try await withGatedCoordinators(2) { coordinators, root in
+    let (first, second) = (coordinators[0], coordinators[1])
+    let model = try await connectedModel(to: coordinators, under: root)
+    await first.gate.arm()
+    await second.gate.arm()
+    model.setChip(first.profile.id)
+    model.draft = "/status"
+    await model.send()
+    try await held(first.gate)
+    model.setChip(second.profile.id)
+    model.draft = "/help"
+    await model.send()
+    try await held(second.gate)
+    model.draft = "An invented latest note"
+    for coordinator in newerFailsFirst ? [second, first] : [first, second] {
+      let before = model.draft
+      await coordinator.gate.fail()
+      let deadline = ContinuousClock.now + .seconds(5)
+      while model.draft == before, ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(5))
+      }
+    }
+    let expected = "/status\n\n/help\n\nAn invented latest note"
+    #expect(model.draft == expected, "Older Sends come back first, then the note typed since")
+    #expect(await model.saveDraft())
+    #expect(try await recoveredText(under: root) == expected, "Recovery offers the same order")
+    #expect(await first.fixture.count() == 0, "The first coordinator got nothing")
+    #expect(await second.fixture.count() == 0, "The second coordinator got nothing")
     await model.setActive(false)
   }
 }
