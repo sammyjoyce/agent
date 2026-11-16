@@ -141,7 +141,6 @@ enum ApplyEvidence {
 /// `read_patch` makes one, so apply can give Git nothing else.
 struct VerifiedPatch(Vec<u8>);
 
-/// The patch file, read once.
 enum PatchFile {
     Verified(VerifiedPatch),
     Changed {

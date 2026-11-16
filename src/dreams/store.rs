@@ -32,7 +32,6 @@ const VERDICT_FILE: &str = "verdict.json";
 const OUTCOME_FILE: &str = "outcome.json";
 const APPLIED_FILE: &str = "applied.json";
 
-/// How one proposal attempt ended.
 pub(crate) enum Verdict<'a> {
     Accepted,
     Rejected { reason: &'a str },

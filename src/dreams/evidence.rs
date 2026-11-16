@@ -407,7 +407,6 @@ pub fn quote(lines: &mut Vec<String>, text: &str) {
     }
 }
 
-/// Whether a check ran on the base or on the candidate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CheckPhase {
     Before,

@@ -739,7 +739,6 @@ impl Diagnostics {
     pub fn start(state: &Path) -> Self {
         Self::start_with_heartbeat(state, HEARTBEAT)
     }
-    /// The producer side for `directory`, with its ledger visible to readers.
     fn open_channel(directory: &Path, capacity: usize) -> (Self, mpsc::Receiver<Record>) {
         let (sender, records) = mpsc::channel(capacity);
         let drops = SharedDrops::default();
