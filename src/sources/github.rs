@@ -18,6 +18,63 @@ use crate::{
 #[derive(Debug)]
 pub struct GitHubSource {
     namespace: String,
+    owner_filter: Option<GitHubOwnerFilter>,
+}
+
+/// Partition notifications using repository.full_name, never subject/title text.
+#[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema, ts_rs::TS)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GitHubOwnerFilter {
+    Include { owners: Vec<String> },
+    Exclude { owners: Vec<String> },
+}
+
+fn valid_owner(owner: &str) -> bool {
+    !owner.is_empty()
+        && owner.len() <= 39
+        && owner
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        && !owner.starts_with('-')
+        && !owner.ends_with('-')
+        && !owner.contains("--")
+}
+
+impl GitHubOwnerFilter {
+    fn checkpoint_policy(&self) -> String {
+        let (Self::Include { owners } | Self::Exclude { owners }) = self;
+        let mut owners: Vec<_> = owners
+            .iter()
+            .map(|owner| owner.to_ascii_lowercase())
+            .collect();
+        owners.sort();
+        owners.dedup();
+        let mode = match self {
+            Self::Include { .. } => "include",
+            Self::Exclude { .. } => "exclude",
+        };
+        format!("{mode}:{}", owners.join(","))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let (Self::Include { owners } | Self::Exclude { owners }) = self;
+        ensure!(
+            !owners.is_empty() && owners.iter().all(|owner| valid_owner(owner)),
+            "GitHub owner filter needs nonempty exact owner names"
+        );
+        Ok(())
+    }
+
+    fn accepts(&self, owner: &str) -> bool {
+        let (Self::Include { owners } | Self::Exclude { owners }) = self;
+        let found = owners
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(owner));
+        match self {
+            Self::Include { .. } => found,
+            Self::Exclude { .. } => !found,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -35,6 +92,8 @@ struct Window {
     since: u64,
     until: u64,
     not_before: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_policy: Option<String>,
 }
 #[derive(Deserialize, Serialize)]
 struct Envelope {
@@ -86,10 +145,24 @@ impl GitHubSource {
             !namespace.trim().is_empty(),
             "GitHub source needs an explicit namespace"
         );
-        Ok(Self { namespace })
+        Ok(Self {
+            namespace,
+            owner_filter: None,
+        })
     }
 
     pub async fn discover(selected: Option<&[String]>) -> Result<Vec<Self>> {
+        Self::discover_filtered(selected, None).await
+    }
+
+    pub async fn discover_filtered(
+        selected: Option<&[String]>,
+        filter: Option<GitHubOwnerFilter>,
+    ) -> Result<Vec<Self>> {
+        if let Some(filter) = &filter {
+            filter.validate()?;
+        }
+
         let output = read_command(&[
             "switchboard".into(),
             "ns".into(),
@@ -98,7 +171,11 @@ impl GitHubSource {
         ])
         .await?;
         output.check_discovery()?;
-        Self::from_registry(&output.stdout, selected)
+        let mut sources = Self::from_registry(&output.stdout, selected)?;
+        for source in &mut sources {
+            source.owner_filter = filter.clone();
+        }
+        Ok(sources)
     }
 
     fn from_registry(output: &str, selected: Option<&[String]>) -> Result<Vec<Self>> {
@@ -133,12 +210,26 @@ impl GitHubSource {
                 since: now.saturating_sub(7 * 86_400),
                 until: 0,
                 not_before: 0,
+                owner_policy: None,
             },
         };
         ensure!(
             window.account == self.namespace,
             "GitHub checkpoint belongs to another account"
         );
+        let policy = self
+            .owner_filter
+            .as_ref()
+            .map(GitHubOwnerFilter::checkpoint_policy);
+        if window.owner_policy != policy {
+            // A broader/different partition must not inherit the old partition's
+            // consumed window or throttle. Replay the normal seven-day intake
+            // horizon; journal event identity deduplicates already-admitted rows.
+            // This is notification intake, not a historical repository backfill.
+            window.since = now.saturating_sub(7 * 86_400);
+            window.not_before = 0;
+            window.owner_policy = policy;
+        }
         // Every native scan starts from the last committed baseline. Legacy
         // before/page fields are ignored rather than carrying their stuck keyset.
         window.until = now.saturating_add(1);
@@ -175,9 +266,34 @@ impl GitHubSource {
             .notifications
             .into_iter()
             .filter_map(|notification| {
-                let (Some(repository), Some(subject)) =
-                    (notification.repository, notification.subject)
-                else {
+                let Some(repository) = notification.repository else {
+                    invalid = true;
+                    return None;
+                };
+                // Unknown ownership cannot truthfully be assigned to the complement.
+                // Retain the checkpoint so a repaired feed can be retried.
+                let Some((owner, repo)) = repository.full_name.split_once('/') else {
+                    invalid = true;
+                    return None;
+                };
+                if !valid_owner(owner)
+                    || repo.is_empty()
+                    || repo.contains('/')
+                    || !repo
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+                {
+                    invalid = true;
+                    return None;
+                }
+                if self
+                    .owner_filter
+                    .as_ref()
+                    .is_some_and(|filter| !filter.accepts(owner))
+                {
+                    return None;
+                }
+                let Some(subject) = notification.subject else {
                     invalid = true;
                     return None;
                 };
@@ -416,6 +532,48 @@ mod tests {
         ReadOutput, Source, SourceCoverage,
         github::{Envelope, Fields, GitHubSource, Window, utc_timestamp},
     };
+
+    #[test]
+    fn owner_policy_changes_replay_the_intake_horizon_without_crossing_accounts() {
+        use crate::sources::{SourceCheckpoint, github::GitHubOwnerFilter};
+        let now = 1_800_000_000;
+        let legacy = SourceCheckpoint {
+            value: format!(
+                r#"{{"account":"github.example","since":{},"until":0,"not_before":{}}}"#,
+                now - 120,
+                now + 600
+            ),
+        };
+        let mut filtered = source();
+        filtered.owner_filter = Some(GitHubOwnerFilter::Include {
+            owners: vec!["Example-Collective".into()],
+        });
+        let replay = filtered.window(Some(&legacy), now).unwrap();
+        assert_eq!(replay.since, now - 7 * 86_400);
+        assert_eq!(replay.not_before, 0);
+        let checkpoint = SourceCheckpoint {
+            value: serde_json::to_string(&replay).unwrap(),
+        };
+        filtered.owner_filter = Some(GitHubOwnerFilter::Include {
+            owners: vec!["EXAMPLE-COLLECTIVE".into()],
+        });
+        let continued = filtered.window(Some(&checkpoint), now + 60).unwrap();
+        assert_eq!(continued.since, replay.since);
+        assert_eq!(continued.owner_policy, replay.owner_policy);
+        filtered.owner_filter = Some(GitHubOwnerFilter::Exclude {
+            owners: vec!["example-collective".into()],
+        });
+        assert_eq!(
+            filtered.window(Some(&checkpoint), now + 60).unwrap().since,
+            now + 60 - 7 * 86_400
+        );
+        assert!(
+            GitHubSource::new("github.other".into())
+                .unwrap()
+                .window(Some(&checkpoint), now)
+                .is_err()
+        );
+    }
 
     const NOTIFICATION: &str = r#"[{"id":"123456","updated_at":"2023-11-14T21:00:00Z","reason":"review_requested","repository":{"full_name":"example/board"},"subject":{"title":"Verify board change","type":"PullRequest","url":"https://api.github.com/repos/example/board/pulls/7","latest_comment_url":null}}]"#;
     fn source() -> GitHubSource {

@@ -80,6 +80,8 @@ pub struct ManagedSettings {
     pub context_repositories: Option<Vec<PathBuf>>,
     pub job_directories: Option<Vec<PathBuf>>,
     pub sources: Option<Vec<SourceConfig>>,
+    /// Apply only ownership routing, preserving account selection and other intake.
+    pub github_owner_filter: Option<crate::sources::github::GitHubOwnerFilter>,
     pub poll_interval_seconds: Option<u64>,
 }
 
@@ -119,6 +121,20 @@ pub fn apply(path: &Path, settings_path: &Path) -> Result<ApplyResult> {
     }
     if let Some(sources) = managed.sources {
         config.sources = sources;
+    }
+    if let Some(filter) = managed.github_owner_filter {
+        filter.validate()?;
+        let mut found = false;
+        for source in &mut config.sources {
+            if let SourceConfig::GitHub { owner_filter, .. } = source {
+                *owner_filter = Some(filter.clone());
+                found = true;
+            }
+        }
+        ensure!(
+            found,
+            "GitHub ownership preferences require an existing GitHub source and account selection"
+        );
     }
     if let Some(interval) = managed.poll_interval_seconds {
         config.poll_interval_seconds = interval;
@@ -312,6 +328,13 @@ fn validate(config: &mut ClientConfig) -> Result<()> {
         validate_coordinator(coordinator)?;
     }
     for source in &config.sources {
+        if let SourceConfig::GitHub {
+            owner_filter: Some(filter),
+            ..
+        } = source
+        {
+            filter.validate()?;
+        }
         if source.enabled()
             && let SourceConfig::Slack {
                 command, account, ..
@@ -579,6 +602,39 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "[[hosts]]\nname='Desktop'\ncwd='/workspace'\nagent_program='agent'\n[[hosts]]\nname='desktop'\ncwd='/workspace'\nagent_program='agent'\n").unwrap();
         assert!(load(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn managed_github_partition_preserves_accounts_and_unrelated_intake() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let settings = directory.path().join("settings.toml");
+        std::fs::write(&path, "[[sources]]\nprovider='google'\nenabled=false\nnamespaces=['google.fixture']\n[[sources]]\nprovider='github'\nenabled=true\nnamespaces=['github.fixture']\n").unwrap();
+        std::fs::write(
+            &settings,
+            "[github_owner_filter]\nmode='exclude'\nowners=['Example-Collective']\n",
+        )
+        .unwrap();
+        let before = load(Some(&path)).unwrap();
+        assert!(super::apply(&path, &settings).unwrap().changed);
+        let after = load(Some(&path)).unwrap();
+        assert_eq!(
+            serde_json::to_value(&before.sources[0]).unwrap(),
+            serde_json::to_value(&after.sources[0]).unwrap()
+        );
+        let github = serde_json::to_value(&after.sources[1]).unwrap();
+        assert_eq!(github["namespaces"], serde_json::json!(["github.fixture"]));
+        assert_eq!(github["enabled"], true);
+        assert_eq!(github["owner_filter"]["mode"], "exclude");
+        assert!(!super::apply(&path, &settings).unwrap().changed);
+        let retained = std::fs::read(&path).unwrap();
+        std::fs::write(
+            &settings,
+            "[github_owner_filter]\nmode='exclude'\nowners=['Example/NotOwner']\n",
+        )
+        .unwrap();
+        assert!(super::apply(&path, &settings).is_err());
+        assert_eq!(retained, std::fs::read(&path).unwrap());
     }
 
     #[test]

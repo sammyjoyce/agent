@@ -905,6 +905,51 @@
         "client_errors"
       ]
     },
+    "GitHubOwnerFilter": {
+      "description": "Partition notifications using repository.full_name, never subject/title text.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "include"
+            },
+            "owners": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "owners"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "exclude"
+            },
+            "owners": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "owners"
+          ]
+        }
+      ]
+    },
     "GuidanceSnapshot": {
       "type": "object",
       "properties": {
@@ -4208,6 +4253,17 @@
               "items": {
                 "type": "string"
               }
+            },
+            "owner_filter": {
+              "description": "Exact repository owner partition; omitted preserves unfiltered intake.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/GitHubOwnerFilter"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "provider": {
               "type": "string",

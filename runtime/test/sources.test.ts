@@ -1,8 +1,8 @@
 import { fixtureModel } from "./model.js";
 import { ConversationModels } from "../src/models.js";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { spawn, spawnSync } from "node:child_process";
+import { mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -594,4 +594,84 @@ test("partial source judgment resumes its exact admitted Pi input after a proces
     child.kill("SIGKILL"); if (app !== undefined) await app.session.close(BACKGROUND_CONTEXT);
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+// Runs the production Rust discovery/notification adapter against an invented
+// provider boundary, then the real durable journal and triage dispatcher.
+// Build first: cargo build --example source_poll_fixture
+// Run with AGENT_SOURCE_POLL_FIXTURE=$PWD/target/debug/examples/source_poll_fixture.
+test("GitHub owner partitions cross the production adapter and durable dispatch without overlap", {
+  skip: process.env.AGENT_SOURCE_POLL_FIXTURE ? false : "Requires explicitly built Rust source_poll_fixture adapter harness",
+}, async () => {
+  const binary = process.env.AGENT_SOURCE_POLL_FIXTURE;
+  assert.ok(binary, "Build and set AGENT_SOURCE_POLL_FIXTURE; do not silently skip adapter evidence");
+  const directory = await mkdtemp(join(tmpdir(), "github-partition-"));
+  const feed = join(directory, "feed"), log = join(directory, "argv");
+  const rows = ["Example-Collective/current", "Example-Collective/future-repo", "eXaMpLe-CoLlEcTiVe/mixed",
+    "other/current", "Example-Collective-extra/near", "Example-Collectives/near"];
+  const notifications = (repos: string[]) => repos.map((full_name, index) => ({ id: String(index),
+    updated_at: "2026-01-01T00:00:00Z", reason: "review_requested", repository: { full_name },
+    subject: { title: "Example-Collective is a misleading title", type: "PullRequest", url: null, latest_comment_url: null } }));
+  async function setFeed(repos: string[]) {
+    await writeFile(feed, JSON.stringify({ status: "executed", fields: { status: "ok",
+      stdout_text: "HTTP/2.0 200 OK\nX-Poll-Interval: 120\n\n" + JSON.stringify(notifications(repos)) } }));
+  }
+  await writeFile(join(directory, "switchboard"), `#!/bin/sh
+printf '%s\n' "$*" >> '${log}'
+case "$1" in
+ ns) printf '%s' '{"namespaces":[{"id":"github.fixture","provider":"github"},{"id":"github.unselected","provider":"github"}]}' ;;
+ github.cli.read) [ "$2" = --ns ] && [ "$3" = github.fixture ] && exec cat '${feed}' ;;
+ *) exit 91 ;;
+esac
+`, { mode: 0o700 });
+  function poll(mode: "include" | "exclude", owners = ["Example-Collective"], checkpoint: SourceBatch["checkpoint"] = null) {
+    const result = spawnSync(binary!, [], { encoding: "utf8", env: { ...process.env, PATH: directory + ":" + process.env.PATH },
+      input: JSON.stringify({ type: "poll_sources", states: checkpoint ? [{ source: { provider: "github", account: "github.fixture" },
+          checkpoint, coverage: { status: "complete" }, checked_at: 0, last_completed_at: null, progress: null }] : [], cursor: null,
+        sources: [{ provider: "github", enabled: true, namespaces: ["github.fixture"], owner_filter: { mode, owners } }] }) });
+    assert.equal(result.status, 0, result.stderr);
+    const response = JSON.parse(result.stdout) as { reads: { batch: SourceBatch }[] };
+    assert.equal(response.reads.length, 1); return response.reads[0]!.batch;
+  }
+  try {
+    await setFeed(rows);
+    const partitions = [poll("include"), poll("exclude")];
+    assert.deepEqual(partitions.map(part => part.events.map(event => event.id)), [["0", "1", "2"], ["3", "4", "5"]]);
+    for (const [index, part] of partitions.entries()) {
+      assert.equal(part.coverage.status, "complete"); assert.ok(part.checkpoint);
+      const root = await mkdtemp(join(directory, String(index))); let app = await open(root);
+      await app.sources.admit(part, null); await app.session.close(BACKGROUND_CONTEXT);
+      app = await open(root); // Fresh SQLite session, not a screenshot or an in-memory assertion.
+      try {
+        const records = await claimedRecords(app, await accountForBatch(app));
+        assert.deepEqual(records.map(record => record.event.id).sort(), part.events.map(event => event.id).sort());
+        assert.ok(records.every(record => record.event.source.account === "github.fixture"));
+        assert.equal((await app.sources.states()).find(state => state.source.provider === "github")?.checkpoint?.value, part.checkpoint.value);
+      } finally { await app.session.close(BACKGROUND_CONTEXT); }
+    }
+    // Unknown ownership belongs to neither side, cannot claim complete coverage.
+    for (const malformed of ["missing-boundary", "/repo", "Example-Collective/", "Example-Collective/repo/extra"]) {
+      await setFeed([malformed]);
+      for (const mode of ["include", "exclude"] as const) {
+        const part = poll(mode); assert.deepEqual(part.events, []);
+        assert.equal(part.coverage.status, "partial"); assert.equal(part.checkpoint, null);
+      }
+    }
+    await setFeed(rows.slice(3));
+    const excluded = poll("include"); assert.deepEqual(excluded.events, []);
+    assert.equal(excluded.coverage.status, "complete"); assert.ok(excluded.checkpoint);
+    // Excluded-only scans progress, and the next owned update is still admitted.
+    await setFeed(["Example-Collective/brand-new-after-checkpoint"]);
+    const nextCheckpoint = { value: JSON.stringify({ ...JSON.parse(excluded.checkpoint!.value), not_before: 0 }) };
+    const next = poll("include", ["EXAMPLE-COLLECTIVE"], nextCheckpoint);
+    assert.equal(next.events.length, 1); assert.equal(next.coverage.status, "complete");
+    // Legacy unfiltered checkpoints with a future throttle must not suppress
+    // a newly assigned partition's seven-day replay.
+    const legacy = { value: JSON.stringify({ account: "github.fixture", since: 1, until: 0, not_before: 9_999_999_999 }) };
+    assert.equal(poll("include", ["Example-Collective"], legacy).events.length, 1);
+    const calls = await readFile(log, "utf8");
+    assert.ok(calls.includes("github.cli.read --ns github.fixture --json -- api notifications --method GET --include --paginate"));
+    assert.ok(!/PATCH|POST|DELETE|mark|github.unselected --json/.test(calls));
+    console.log("production adapter -> fresh SQLite journal -> triage: include=3 complement=3 overlap=0; malformed retained; GET only");
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });
