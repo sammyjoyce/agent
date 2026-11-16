@@ -56,6 +56,7 @@ pub struct AppliedRecord {
 pub struct RunView {
     pub id: RunId,
     pub review: Review,
+    pub evidence: Vec<EvidenceItem>,
     /// The digest of the review record and its evidence as this view read them.
     pub review_sha256: ContentDigest,
     pub outcome: Option<Outcome>,
@@ -92,6 +93,13 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(write_private(path, &serde_json::to_vec_pretty(value)?)?)
+}
+
+fn review_digest(review: &[u8], evidence: &[u8]) -> Result<ContentDigest> {
+    let mut sealed = u64::try_from(review.len())?.to_be_bytes().to_vec();
+    sealed.extend(review);
+    sealed.extend(evidence);
+    Ok(ContentDigest::of(&sealed))
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
@@ -166,12 +174,18 @@ impl DreamsStore {
         Ok(runs)
     }
 
+    /// Reads the review record and its evidence once each, so the evidence a
+    /// view returns is the evidence its digest covers.
     pub fn read(&self, run: &RunId) -> Result<Option<RunView>> {
-        let Some(review) = read_json::<Review>(&self.review_directory(run).join(REVIEW_FILE))?
-        else {
-            return Ok(None);
+        let directory = self.review_directory(run);
+        let review = match fs::read(directory.join(REVIEW_FILE)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("Could not read the sealed Dreams review"),
         };
-        ensure!(&review.run == run, "Dreams review belongs to another run");
+        let evidence =
+            fs::read(directory.join(EVIDENCE_FILE)).context("Could not read Dreams evidence")?;
+        let review_sha256 = review_digest(&review, &evidence)?;
         let sealed = match fs::read(self.outcome_path(run)) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -182,13 +196,20 @@ impl DreamsStore {
             .map(serde_json::from_slice::<SealedOutcome>)
             .transpose()
             .context("Dreams outcome is unreadable")?;
-        let review_sha256 = self.review_digest(run)?;
         if let Some(outcome) = &outcome {
             ensure!(
                 review_sha256 == outcome.review_sha256,
                 "Dreams review changed since it was sealed"
             );
         }
+        let review: Review =
+            serde_json::from_slice(&review).context("Dreams review is unreadable")?;
+        ensure!(&review.run == run, "Dreams review belongs to another run");
+        let evidence = std::str::from_utf8(&evidence)
+            .context("Dreams evidence is unreadable")?
+            .lines()
+            .map(|line| serde_json::from_str(line).context("Dreams evidence is unreadable"))
+            .collect::<Result<_>>()?;
         let attempts_used = match fs::read_dir(self.run_directory(run).join(ATTEMPTS_DIRECTORY)) {
             Ok(entries) => u8::try_from(entries.count()).unwrap_or(u8::MAX),
             Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
@@ -197,32 +218,12 @@ impl DreamsStore {
         Ok(Some(RunView {
             id: run.clone(),
             review,
+            evidence,
             review_sha256,
             outcome: outcome.map(|sealed| sealed.outcome),
             outcome_sha256: sealed.as_deref().map(ContentDigest::of),
             attempts_used,
         }))
-    }
-
-    pub fn evidence(&self, run: &RunId) -> Result<Vec<EvidenceItem>> {
-        let path = self.review_directory(run).join(EVIDENCE_FILE);
-        fs::read_to_string(&path)
-            .with_context(|| format!("Could not read Dreams evidence {path:?}"))?
-            .lines()
-            .map(|line| serde_json::from_str(line).context("Dreams evidence is unreadable"))
-            .collect()
-    }
-
-    pub(crate) fn review_digest(&self, run: &RunId) -> Result<ContentDigest> {
-        let directory = self.review_directory(run);
-        let review = fs::read(directory.join(REVIEW_FILE))
-            .context("Could not read the sealed Dreams review")?;
-        let evidence =
-            fs::read(directory.join(EVIDENCE_FILE)).context("Could not read Dreams evidence")?;
-        let mut sealed = u64::try_from(review.len())?.to_be_bytes().to_vec();
-        sealed.extend(review);
-        sealed.extend(evidence);
-        Ok(ContentDigest::of(&sealed))
     }
 
     pub(crate) fn files(&self, run: &RunId) -> Result<Vec<(String, String)>> {

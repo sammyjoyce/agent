@@ -193,12 +193,7 @@ impl Dreams {
         Ok(Self::reply(
             &run,
             view.outcome.is_some(),
-            evidence::render_page(
-                &view.review,
-                &self.store.evidence(&run)?,
-                &self.store.files(&run)?,
-                page,
-            ),
+            evidence::render_page(&view.review, &view.evidence, &self.store.files(&run)?, page),
         ))
     }
 
@@ -444,10 +439,9 @@ impl Dreams {
                 "a proposal cites 1 to {MAX_EVIDENCE_CITATIONS} evidence ids"
             )));
         }
-        let reviewed = self.store.evidence(&view.id)?;
         let mut evidence = Vec::new();
         for cited in draft.evidence {
-            let Some(item) = reviewed.iter().find(|item| item.id.as_str() == cited) else {
+            let Some(item) = view.evidence.iter().find(|item| item.id.as_str() == cited) else {
                 let shown: String = cited.chars().take(MAX_EVIDENCE_ID_CHARS).collect();
                 return Err(reject(format!(
                     "evidence id {shown:?} is not in this review"

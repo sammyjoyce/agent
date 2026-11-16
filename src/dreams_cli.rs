@@ -824,7 +824,6 @@ pub async fn run(
                 .with_context(|| format!("Unknown Dreams run {run}"))?;
             let (status, patch) = status_of(&store, policy.as_ref(), &view).await?.unzip();
             let patch = patch.map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-            let evidence = store.evidence(&run)?;
             let sealed = view.outcome.clone().map(|outcome| SealedOutcome {
                 review_sha256: view.review_sha256.clone(),
                 outcome,
@@ -832,7 +831,7 @@ pub async fn run(
             let report = RunReport {
                 run: &view.id,
                 review: &view.review,
-                evidence: &evidence,
+                evidence: &view.evidence,
                 outcome: sealed.as_ref(),
                 outcome_sha256: view.outcome_sha256.as_ref(),
                 status: status.as_ref(),
@@ -994,7 +993,6 @@ mod tests {
             &status,
             ProposalStatus::Pending { interrupted: true }
         ));
-        let evidence = store.evidence(&run).unwrap();
         let sealed = view.outcome.clone().map(|outcome| SealedOutcome {
             review_sha256: view.review_sha256.clone(),
             outcome,
@@ -1002,7 +1000,7 @@ mod tests {
         let shown = render(&RunReport {
             run: &view.id,
             review: &view.review,
-            evidence: &evidence,
+            evidence: &view.evidence,
             outcome: sealed.as_ref(),
             outcome_sha256: view.outcome_sha256.as_ref(),
             status: Some(&status),
