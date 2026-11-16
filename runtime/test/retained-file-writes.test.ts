@@ -17,7 +17,7 @@ const LOCAL_ON_PURPOSE: Record<string, string> = {
   "telemetry.ts": "Diagnostics belong to the host that recorded them.",
   "startup-diagnostics.ts": "Diagnostics belong to the host that recorded them.",
   "failover/retained-files.ts": "The one writer of retained files, local and replicated.",
-  "failover/standby.ts": "Applies logged files through the retained-file writer and removes its own temporary file on failure.",
+  "failover/standby.ts": "The steps the retained-file writer and the log follower share: a synced temporary file, and its rename to the name a log entry gives it.",
 };
 
 /** Files allowed exactly these write calls and no other. */
@@ -25,6 +25,7 @@ const PINNED: Record<string, { readonly why: string; readonly calls: Readonly<Re
   "attachment-upload.ts": { why: "An upload before it completes, which no reader takes as real until RetainedFiles writes its complete metadata.",
     calls: { mkdir: 2, chmod: 1, writeFile: 2, open: 2, rename: 1, write: 1 } },
   "protocol.ts": { why: "StringDecoder.write decodes the input stream and writes no file.", calls: { write: 1 } },
+  "failover/ownership.ts": { why: "writeSync puts the fenced owner's last line on stderr before the exit that follows it, and writes no file.", calls: { write: 1 } },
 };
 
 /** Receivers of a write-named method that write no file. */
