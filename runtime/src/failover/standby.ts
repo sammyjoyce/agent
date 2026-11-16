@@ -114,7 +114,7 @@ async function materializeFile(link: AuthorityLink, stateDirectory: string, file
   if (present !== undefined && matches(present, file)) return;
   const bytes = await link.getBlob(file.sha256);
   if (!matches(bytes, file)) throw new Error(`The blob for ${file.path} does not match its record`);
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  await makeDirectory(dirname(path));
   const temporary = join(dirname(path), `.${randomUUID()}.tmp`);
   try {
     const handle = await open(temporary, "wx", 0o600);
@@ -126,11 +126,25 @@ async function materializeFile(link: AuthorityLink, stateDirectory: string, file
   }
 }
 
-/** Renames a synced file to its final name and syncs the directory, so the name survives a crash. */
+/** Gives a synced file its final name, in a way that survives a crash. */
 export async function publishFile(synced: string, path: string): Promise<void> {
-  if (synced !== path) await rename(synced, path);
-  const directory = await open(dirname(path), "r");
-  try { await directory.sync(); } finally { await directory.close(); }
+  await makeDirectory(dirname(path));
+  await rename(synced, path);
+  await syncDirectory(dirname(path));
+}
+
+async function makeDirectory(directory: string): Promise<void> {
+  const created = await mkdir(directory, { recursive: true, mode: 0o700 });
+  if (created === undefined) return;
+  for (let made = directory; ; made = dirname(made)) {
+    await syncDirectory(dirname(made));
+    if (relative(created, made) === "") return;
+  }
+}
+
+async function syncDirectory(directory: string): Promise<void> {
+  const handle = await open(directory, "r");
+  try { await handle.sync(); } finally { await handle.close(); }
 }
 
 function matches(bytes: Uint8Array, file: FileRecord): boolean {

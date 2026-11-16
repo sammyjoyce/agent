@@ -1,5 +1,3 @@
-import { mkdir } from "node:fs/promises";
-import { dirname } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import type { Seq, Storage, StorageWrite } from "@earendil-works/pi-durable";
@@ -39,6 +37,8 @@ export interface StagedFile {
 
 /** The owner's side of the replication log. Its first failure is final, as a failed Pi Session is. */
 export interface LogWriter {
+  readonly holder: string;
+  readonly epoch: number;
   /** The position of the last entry this owner appended and applied. */
   readonly head: number;
   /** Logs a file-only entry, then gives each file its final name. */
@@ -100,6 +100,8 @@ class OwnerLog implements LogWriter {
     this.#options = options; this.#storage = storage; this.#head = head;
   }
 
+  get holder(): string { return this.#options.holder; }
+  get epoch(): number { return this.#options.epoch; }
   get head(): number { return this.#head; }
 
   carry(files: readonly StagedFile[]): void { this.#carried.push(...files); }
@@ -151,11 +153,7 @@ class OwnerLog implements LogWriter {
 
   /** The files have their final names only now that the log names them, and before the position says the entry is applied. */
   async #publish(files: readonly StagedFile[]): Promise<void> {
-    for (const { record, staged } of files) {
-      const path = replicatedFilePath(this.#options.stateDirectory, record);
-      await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-      await publishFile(staged, path);
-    }
+    for (const { record, staged } of files) await publishFile(staged, replicatedFilePath(this.#options.stateDirectory, record));
   }
 
   /**

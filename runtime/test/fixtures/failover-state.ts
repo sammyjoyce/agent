@@ -1,6 +1,7 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { TestContext } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -9,12 +10,14 @@ import { createModels, fauxProvider } from "@earendil-works/pi-ai";
 import { createRegistry, Harness, type Registry, type Storage, type StorageWrite } from "@earendil-works/pi-durable";
 import { openConversationDatabase } from "../../src/conversation-database.js";
 import type { AuthorityLink } from "../../src/failover/authority-link.js";
-import { openReplicatedStorage } from "../../src/failover/replicated-storage.js";
+import { sha256Hex } from "../../src/failover/log-entry.js";
+import { openReplicatedStorage, type StagedFile } from "../../src/failover/replicated-storage.js";
 import { ScopedDatabase } from "../../src/failover/scoped-database.js";
 import { applyLog } from "../../src/failover/standby.js";
 import type { AuthorityCommand } from "../../src/generated/AuthorityCommand.js";
 import type { AuthorityState } from "../../src/generated/AuthorityState.js";
 import type { LogEntry } from "../../src/generated/LogEntry.js";
+import { fixtureModel } from "../model.js";
 import { MemoryAuthority } from "./failover-memory-authority.js";
 
 export const OWNER = "11111111-1111-4111-8111-111111111111";
@@ -56,10 +59,11 @@ export function tables(directory: string): Record<string, string[]> {
 
 export async function openPi(storage: Storage, options: { registry?: Registry; tokensPerSecond?: number } = {}) {
   const models = createModels();
-  const faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }], tokensPerSecond: options.tokensPerSecond ?? 1_000_000 });
+  const { provider, model_id: modelId } = fixtureModel;
+  const faux = fauxProvider({ provider, models: [{ id: modelId }], tokensPerSecond: options.tokensPerSecond ?? 1_000_000 });
   models.setProvider(faux.provider);
   const harness = await Harness.open(storage, { models, registry: options.registry ?? createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
-  const root = await harness.root(BACKGROUND_CONTEXT, { agent: { model: { provider: "openai", modelId: "fixture" } } });
+  const root = await harness.root(BACKGROUND_CONTEXT, { agent: { model: { provider, modelId } } });
   return { harness, root, faux };
 }
 
@@ -85,6 +89,15 @@ export async function openOwner(directory: string, link: AuthorityLink, options:
     stateDirectory: directory, ...(options.signal === undefined ? {} : { signal: options.signal }) });
   try { return { database, storage, log, ...await openPi(storage, options) }; }
   catch (error) { await storage.close(BACKGROUND_CONTEXT).catch(() => {}); throw error; }
+}
+
+/** A replicated file as its writer hands it to the log: bytes in the blob store and a temporary file beside its final path. */
+export async function stage(directory: string, link: AuthorityLink, path: string, bytes: Uint8Array): Promise<StagedFile> {
+  const sha256 = sha256Hex(bytes), staged = join(directory, dirname(path), `.${randomUUID()}.tmp`);
+  await link.putBlob(sha256, bytes);
+  await mkdir(dirname(staged), { recursive: true });
+  await writeFile(staged, bytes);
+  return { record: { path, sha256, size: bytes.byteLength }, staged };
 }
 
 /** A standby's follow of the log into its own state directory. Returns the position it reached. */
@@ -133,18 +146,14 @@ export async function logBatches(link: AuthorityLink): Promise<StorageWrite[][]>
 
 export const note = (data: string, requestId: string) => ({ type: "write", entry: { kind: "app.note", data }, requestId }) as const;
 
-function noteData(writes: readonly StorageWrite[]): string[] {
-  return writes.flatMap((write) => write.type === "entry" && write.value.kind === "app.note" ? [String(write.value.data)] : []);
-}
+const noteData = (entries: readonly { kind?: unknown; data?: unknown }[]) => entries.flatMap((entry) => entry.kind === "app.note" ? [String(entry.data)] : []);
 
 export async function loggedNotes(link: AuthorityLink): Promise<string[]> {
-  return noteData((await logBatches(link)).flat());
+  return noteData((await logBatches(link)).flat().flatMap((write) => write.type === "entry" ? [write.value] : []));
 }
 
 export function localNotes(directory: string): string[] {
   const database = new DatabaseSync(sessionPath(directory), { readOnly: true });
-  try {
-    return noteData(database.prepare("SELECT record FROM entries ORDER BY rowid").all()
-      .map((row) => ({ type: "entry", value: JSON.parse(String(row.record)) }) as StorageWrite));
-  } finally { database.close(); }
+  try { return noteData(database.prepare("SELECT record FROM entries ORDER BY rowid").all().map((row) => JSON.parse(String(row.record)))); }
+  finally { database.close(); }
 }

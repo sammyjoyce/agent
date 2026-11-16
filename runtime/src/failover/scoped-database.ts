@@ -44,8 +44,13 @@ export class ScopedDatabase implements SqliteDatabase {
 
   /** Takes ownership of `database`, which no other code may keep using. */
   static async over(database: SqliteDatabase): Promise<ScopedDatabase> {
-    await database.exec(REFUSE_WRITES);
-    return new ScopedDatabase(database);
+    try {
+      await database.exec(REFUSE_WRITES);
+      return new ScopedDatabase(database);
+    } catch (error) {
+      await database.close().catch(() => {});
+      throw error;
+    }
   }
 
   /**

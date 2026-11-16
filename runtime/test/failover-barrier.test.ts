@@ -214,6 +214,18 @@ for (const [name, connect] of Object.entries(authorities)) {
     assert.deepEqual(tables(directory), before);
   });
 
+  test(`${name}: an empty batch takes a sequence as it does in plain storage, and a standby follows it`, async (t) => {
+    const link = await connect(), epoch = await enroll(link), directory = await stateDirectory(t), standby = await stateDirectory(t);
+    const owner = await openOwner(directory, link, { epoch });
+    const head = owner.log.head;
+    const first = await owner.storage.commit([], context);
+    assert.equal(await owner.storage.commit([], context), first + 1);
+    assert.equal(owner.log.head, head + 2);
+    await owner.harness.close(context);
+    assert.equal(await follow(standby, link), head + 2);
+    assert.deepEqual(tables(standby), tables(directory));
+  });
+
   test(`${name}: a write to the owner's database outside the barrier throws`, async (t) => {
     const link = await connect(), epoch = await enroll(link), directory = await stateDirectory(t);
     const owner = await openOwner(directory, link, { epoch });
