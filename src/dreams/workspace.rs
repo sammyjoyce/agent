@@ -1,6 +1,9 @@
 //! Every Git and process effect Dreams has. The operator's repository is only
 //! read here; candidates live in clones under the private run directory.
 use std::{
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -9,7 +12,10 @@ use anyhow::{Context, Result, bail, ensure};
 use tokio::sync::watch;
 
 use crate::{
-    dreams::{CheckResult, Revision, policy::CheckSpec},
+    dreams::{
+        CheckResult, ContentDigest, Revision,
+        policy::{CheckSpec, EditablePath},
+    },
     host::{ProcessFailure, ProcessOutput, ProcessRequest, run_process_until},
 };
 
@@ -244,4 +250,201 @@ pub(crate) async fn run_checks(
         });
     }
     Ok(results)
+}
+
+/// What Git derived from a candidate's edits.
+pub(crate) struct Patch {
+    pub digest: ContentDigest,
+    pub files: Vec<String>,
+}
+
+/// Writes one whole-file edit, refusing anything that could land outside the
+/// candidate or change what kind of file the path is.
+fn write_edit(candidate: &Path, path: &EditablePath, content: &str) -> Result<Option<String>> {
+    let mut current = candidate.to_owned();
+    let mut parts: Vec<&str> = path.as_str().split('/').collect();
+    let name = parts.pop().context("An editable path has a file name")?;
+    for part in parts {
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_dir() => {}
+            // A symlinked parent would carry the write out of the candidate.
+            Ok(_) => return Ok(Some(format!("{path} has a parent that is not a directory"))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(&current)?,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    current.push(name);
+    match fs::symlink_metadata(&current) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Ok(Some(format!("{path} is not a regular file")));
+        }
+        Ok(_) if String::from_utf8(fs::read(&current)?).is_err() => {
+            return Ok(Some(format!("{path} is not UTF-8 text")));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&current)?
+        .write_all(content.as_bytes())?;
+    Ok(None)
+}
+
+/// Applies whole-file edits in the candidate and lets Git derive the patch
+/// against `base`, written to `patch`. The inner error is a reason the model
+/// can act on.
+pub(crate) async fn write_candidate(
+    candidate: &Path,
+    base: &Revision,
+    edits: &[(EditablePath, &str)],
+    patch: &Path,
+) -> Result<std::result::Result<Patch, String>> {
+    let git = Git::writing(candidate);
+    for (path, content) in edits {
+        let entry = git
+            .text(&["ls-tree", "-z", base.as_str(), "--", path.as_str()])
+            .await?;
+        let mode = entry.split(' ').next().unwrap_or_default();
+        if !matches!(mode, "" | "100644") {
+            return Ok(Err(format!(
+                "{path} is a symlink, a submodule or an executable at the base"
+            )));
+        }
+        if let Some(reason) = write_edit(candidate, path, content)? {
+            return Ok(Err(reason));
+        }
+    }
+    let mut add = vec!["add", "--"];
+    add.extend(edits.iter().map(|(path, _)| path.as_str()));
+    if git.run(&add).await?.exit_code != 0 {
+        return Ok(Err(
+            "Git could not stage these paths; an ignored path cannot be proposed".into(),
+        ));
+    }
+    let raw = git
+        .text(&[
+            "diff",
+            "--cached",
+            "--raw",
+            "-z",
+            "--no-renames",
+            "--no-abbrev",
+            base.as_str(),
+        ])
+        .await?;
+    let mut files = Vec::new();
+    let mut fields = raw.split('\0').filter(|field| !field.is_empty());
+    while let (Some(change), Some(path)) = (fields.next(), fields.next()) {
+        let parts: Vec<&str> = change.split(' ').collect();
+        let plain = matches!(
+            parts.as_slice(),
+            [":100644" | ":000000", "100644", _, _, "M" | "A"]
+        );
+        ensure!(
+            plain && edits.iter().any(|(edited, _)| edited.as_str() == path),
+            "A Dreams candidate changed more than the contents of its edited files"
+        );
+        files.push(path.to_owned());
+    }
+    if files.is_empty() {
+        return Ok(Err("the edits change nothing at the base".into()));
+    }
+    let output = format!(
+        "--output={}",
+        patch.to_str().context("Dreams state path is not UTF-8")?
+    );
+    // Fixed prefixes and context, so the operator's diff settings cannot
+    // change the bytes a reviewer approves.
+    git.text(&[
+        "diff",
+        "--cached",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--no-color",
+        "--full-index",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "-U3",
+        &output,
+        base.as_str(),
+    ])
+    .await?;
+    Ok(Ok(Patch {
+        digest: ContentDigest::of(&fs::read(patch)?),
+        files,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::sync::watch;
+
+    use crate::dreams::{policy::CheckSpec, workspace::run_checks};
+
+    fn check(name: &str, argv: &[&str], seconds: u64) -> CheckSpec {
+        CheckSpec {
+            name: name.into(),
+            argv: argv.iter().map(|argument| (*argument).to_owned()).collect(),
+            timeout: Duration::from_secs(seconds),
+        }
+    }
+
+    #[tokio::test]
+    async fn checks_run_in_the_candidate_with_a_cleared_environment_and_a_hard_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path().canonicalize().unwrap();
+        assert!(
+            std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+            "The test needs an inherited variable to prove it is not passed on"
+        );
+        let (_owner, cancelled) = watch::channel(false);
+        let results = run_checks(
+            &directory,
+            &[
+                check("environment", &["/bin/sh", "-c", "pwd; env"], 10),
+                check("fails", &["/bin/sh", "-c", "echo no; exit 124"], 10),
+                check("hangs", &["/bin/sh", "-c", "sleep 30 & wait"], 1),
+                check("missing", &["/example/no-such-program"], 10),
+            ],
+            &cancelled,
+        )
+        .await
+        .unwrap();
+        let [environment, fails, hangs, missing] = results.as_slice() else {
+            panic!("Every check reports a result");
+        };
+        assert!(environment.passed());
+        assert!(
+            environment
+                .stdout
+                .starts_with(&format!("{}\n", directory.display()))
+        );
+        assert!(environment.stdout.contains("PATH="));
+        assert!(!environment.stdout.contains("CARGO_MANIFEST_DIR"));
+        assert_eq!((fails.exit_code, fails.timed_out), (Some(124), false));
+        assert!(!fails.passed());
+        assert_eq!((hangs.exit_code, hangs.timed_out), (None, true));
+        assert_eq!(hangs.verdict(), "timed out");
+        assert_eq!(missing.verdict(), "did not start");
+        assert!(!missing.passed());
+
+        let (owner, cancelled) = watch::channel(false);
+        owner.send(true).unwrap();
+        let stopped = run_checks(
+            &directory,
+            &[check("hangs", &["/bin/sh", "-c", "sleep 30"], 20)],
+            &cancelled,
+        )
+        .await;
+        assert!(stopped.unwrap_err().to_string().contains("Dreams stopped"));
+    }
 }

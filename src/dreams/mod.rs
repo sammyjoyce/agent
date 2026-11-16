@@ -20,7 +20,9 @@ use tokio::sync::watch;
 use ts_rs::TS;
 
 pub use evidence::{EvidenceItem, EvidenceKind, Finding};
-pub use policy::{CheckSpec, DreamsCheckFile, DreamsPolicy, DreamsPolicyFile, ProtectedPaths};
+pub use policy::{
+    CheckSpec, DreamsCheckFile, DreamsPolicy, DreamsPolicyFile, EditablePath, ProtectedPaths,
+};
 pub use store::{DreamsStore, RunView};
 
 use crate::{protocol::HostResult, runtime::diagnostics};
@@ -551,7 +553,26 @@ fn now_ms() -> u64 {
 }
 
 /// Why one proposal attempt was not sealed, in words the model can act on.
-type Rejection = String;
+struct Rejection {
+    reason: String,
+    /// Quoted check output, when a check is the reason.
+    output: Vec<String>,
+}
+impl Rejection {
+    fn because(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            output: Vec::new(),
+        }
+    }
+}
+
+/// What the model submitted for one attempt, before any of it is trusted.
+struct Draft<'a> {
+    edits: &'a [DreamsFileEdit],
+    rationale: &'a str,
+    evidence: &'a [String],
+}
 
 /// Coordinator-local executor. One per broker, built only when `[dreams]` is configured.
 pub struct Dreams {
@@ -836,10 +857,13 @@ impl Dreams {
                 &self.store.seal_outcome(&run, &exhausted)?,
             ));
         };
-        let reason = match self
-            .attempt(
-                &view, attempt, &directory, edits, rationale, evidence, cancelled,
-            )
+        let draft = Draft {
+            edits,
+            rationale,
+            evidence,
+        };
+        let rejection = match self
+            .attempt(&view, attempt, &directory, &draft, cancelled)
             .await?
         {
             Ok(proposal) => {
@@ -848,75 +872,447 @@ impl Dreams {
                     .seal_outcome(&run, &Outcome::Proposed(Box::new(proposal)))?;
                 return Ok(Self::decided(&run, &outcome));
             }
-            Err(reason) => reason,
+            Err(rejection) => rejection,
         };
         store::write_json(
             &directory.join("verdict.json"),
-            &serde_json::json!({ "accepted": false, "reason": reason }),
+            &serde_json::json!({ "accepted": false, "reason": rejection.reason }),
         )?;
-        let rejected =
-            format!("Dreams proposal attempt {attempt} of {MAX_ATTEMPTS} rejected: {reason}.");
+        let mut lines = vec![format!(
+            "Dreams proposal attempt {attempt} of {MAX_ATTEMPTS} rejected: {}. {} of {MAX_ATTEMPTS} attempts remain.",
+            rejection.reason,
+            MAX_ATTEMPTS - attempt
+        )];
+        lines.extend(rejection.output);
         if attempt < MAX_ATTEMPTS {
-            return Ok(Self::reply(
-                &run,
-                false,
-                format!(
-                    "{rejected} {} of {MAX_ATTEMPTS} attempts remain.",
-                    MAX_ATTEMPTS - attempt
-                ),
-            ));
+            return Ok(Self::reply(&run, false, lines.join("\n")));
         }
         let outcome = self.store.seal_outcome(&run, &exhausted)?;
-        let mut reply = Self::decided(&run, &outcome);
-        reply.text = format!("{rejected}\n{}", reply.text);
-        Ok(reply)
+        lines.push(outcome.sealed_line(&run));
+        Ok(Self::reply(&run, true, lines.join("\n")))
     }
 
-    /// Validates one attempt against the policy and the sealed review.
-    #[allow(clippy::too_many_arguments)]
+    /// One attempt: validate it against the policy and the sealed review,
+    /// build the candidate, derive the patch and run the after checks.
     async fn attempt(
         &self,
         view: &RunView,
-        _attempt: u8,
-        _directory: &Path,
-        edits: &[DreamsFileEdit],
-        _rationale: &str,
-        evidence: &[String],
-        _cancelled: &watch::Receiver<bool>,
+        attempt: u8,
+        directory: &Path,
+        draft: &Draft<'_>,
+        cancelled: &watch::Receiver<bool>,
     ) -> Result<std::result::Result<Proposal, Rejection>> {
-        if edits.is_empty() || edits.len() > MAX_EDITS {
-            return Ok(Err(format!("a proposal changes 1 to {MAX_EDITS} files")));
-        }
-        let mut paths = Vec::new();
-        for edit in edits {
-            let path = match self.policy.editable(&edit.path) {
-                Ok(path) => path,
-                Err(reason) => return Ok(Err(reason)),
-            };
-            if edit.content.len() > MAX_EDIT_BYTES {
-                return Ok(Err(format!(
-                    "{} is larger than {MAX_EDIT_BYTES} bytes",
-                    edit.path
-                )));
-            }
-            if paths.contains(&path) {
-                return Ok(Err(format!("{} is edited twice", edit.path)));
-            }
-            paths.push(path);
-        }
-        if evidence.is_empty() || evidence.len() > MAX_EVIDENCE_CITATIONS {
-            return Ok(Err(format!(
-                "a proposal cites 1 to {MAX_EVIDENCE_CITATIONS} evidence ids"
+        let review = &view.review;
+        if review.policy_digest != self.policy.digest() {
+            return Ok(Err(Rejection::because(
+                "the Dreams policy changed after this review was sealed",
             )));
         }
-        let reviewed = self.store.evidence(&view.id)?;
-        if let Some(unknown) = evidence
-            .iter()
-            .find(|cited| !reviewed.iter().any(|item| item.id.as_str() == *cited))
-        {
-            let shown: String = unknown.chars().take(96).collect();
-            return Ok(Err(format!("evidence id {shown:?} is not in this review")));
+        if draft.edits.is_empty() || draft.edits.len() > MAX_EDITS {
+            return Ok(Err(Rejection::because(format!(
+                "a proposal changes 1 to {MAX_EDITS} files"
+            ))));
         }
-        anyhow::bail!("Dreams cannot build candidates yet")
+        let mut edits: Vec<(EditablePath, &str)> = Vec::new();
+        for edit in draft.edits {
+            let path = match self.policy.editable(&edit.path) {
+                Ok(path) => path,
+                Err(reason) => return Ok(Err(Rejection::because(reason))),
+            };
+            if edit.content.len() > MAX_EDIT_BYTES {
+                return Ok(Err(Rejection::because(format!(
+                    "{path} is larger than {MAX_EDIT_BYTES} bytes"
+                ))));
+            }
+            if edits.iter().any(|(edited, _)| edited == &path) {
+                return Ok(Err(Rejection::because(format!("{path} is edited twice"))));
+            }
+            edits.push((path, &edit.content));
+        }
+        if draft.evidence.is_empty() || draft.evidence.len() > MAX_EVIDENCE_CITATIONS {
+            return Ok(Err(Rejection::because(format!(
+                "a proposal cites 1 to {MAX_EVIDENCE_CITATIONS} evidence ids"
+            ))));
+        }
+        let reviewed = self.store.evidence(&view.id)?;
+        let mut evidence = Vec::new();
+        for cited in draft.evidence {
+            match reviewed.iter().find(|item| item.id.as_str() == cited) {
+                Some(item) => evidence.push(item.id.clone()),
+                None => {
+                    let shown: String = cited.chars().take(96).collect();
+                    return Ok(Err(Rejection::because(format!(
+                        "evidence id {shown:?} is not in this review"
+                    ))));
+                }
+            }
+        }
+
+        let candidate = directory.join("candidate");
+        let patch_path = directory.join("patch.diff");
+        workspace::checkout(&review.repository, &review.base, &candidate).await?;
+        let patch = match workspace::write_candidate(&candidate, &review.base, &edits, &patch_path)
+            .await?
+        {
+            Ok(patch) => patch,
+            Err(reason) => return Ok(Err(Rejection::because(reason))),
+        };
+        let after = workspace::run_checks(&candidate, self.policy.checks(), cancelled).await?;
+        store::write_json(&directory.join("after.json"), &after)?;
+        // A check runs beside the patch it judges. The bytes a reviewer will
+        // approve must still be the bytes Git derived before it ran.
+        ensure!(
+            ContentDigest::of(&std::fs::read(&patch_path)?) == patch.digest,
+            "The Dreams patch changed while its checks ran"
+        );
+        if let Some(failed) = after.iter().find(|check| !check.passed()) {
+            let mut output = Vec::new();
+            evidence::check_lines(&mut output, "After", failed);
+            return Ok(Err(Rejection {
+                reason: format!("after check {} did not pass", failed.name),
+                output,
+            }));
+        }
+        store::write_json(
+            &directory.join("verdict.json"),
+            &serde_json::json!({ "accepted": true }),
+        )?;
+        Ok(Ok(Proposal {
+            run: view.id.clone(),
+            attempt,
+            repository: review.repository.clone(),
+            base: review.base.clone(),
+            patch_sha256: patch.digest,
+            files: patch.files,
+            evidence,
+            rationale: UntrustedText::bounded(draft.rationale, 4_000),
+            before: review.before.clone(),
+            after,
+            policy_digest: review.policy_digest.clone(),
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        os::unix::fs::{PermissionsExt, symlink},
+        path::{Path, PathBuf},
+        process::Command,
+    };
+
+    use tokio::sync::watch;
+
+    use crate::{
+        dreams::{
+            ContentDigest, Dreams, DreamsAbstainReason, DreamsCheckFile, DreamsFileEdit,
+            DreamsPolicy, DreamsPolicyFile, DreamsReply, DreamsRequest, DreamsTaskSummary, Outcome,
+            ProtectedPaths, RunId,
+        },
+        protocol::HostResult,
+    };
+
+    const BROKEN: &str = "Run `make test-all` before finishing.\n";
+    const FIXED: &str = "Run `make test` before finishing.\n";
+    const EVIDENCE: &str = "t:task-1@7";
+    const CHECK: &str = "for target in $(grep -o 'make [a-z-]*' AGENTS.md | cut -d' ' -f2); do grep -q \"^$target:\" Makefile || { echo \"missing make target: $target\"; exit 1; }; done\n";
+
+    fn git(repository: &Path, arguments: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(arguments)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    struct Night {
+        root: tempfile::TempDir,
+        repository: PathBuf,
+        dreams: Dreams,
+    }
+
+    impl Night {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let base = root.path().canonicalize().unwrap();
+            let (repository, state, outside) = (
+                base.join("guidance"),
+                base.join("state"),
+                base.join("outside"),
+            );
+            for directory in [&repository, &state, &outside] {
+                fs::create_dir(directory).unwrap();
+            }
+            fs::write(base.join("check.sh"), CHECK).unwrap();
+            fs::write(repository.join("AGENTS.md"), BROKEN).unwrap();
+            fs::write(repository.join("Makefile"), "test:\n\t@echo ok\n").unwrap();
+            fs::create_dir(repository.join("playbooks")).unwrap();
+            symlink("../Makefile", repository.join("playbooks/link.md")).unwrap();
+            fs::write(repository.join("playbooks/tool.md"), "#!/bin/sh\n").unwrap();
+            fs::set_permissions(
+                repository.join("playbooks/tool.md"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            symlink(&outside, repository.join("linked")).unwrap();
+            git(&repository, &["init", "--quiet", "--initial-branch=main"]);
+            git(&repository, &["config", "user.name", "Example"]);
+            git(&repository, &["config", "user.email", "example@invalid"]);
+            git(&repository, &["add", "."]);
+            git(
+                &repository,
+                &["commit", "--quiet", "-m", "Add example guidance"],
+            );
+            let policy = DreamsPolicy::parse(
+                &DreamsPolicyFile {
+                    repository: repository.clone(),
+                    editable: vec![
+                        "AGENTS.md".into(),
+                        "playbooks/*.md".into(),
+                        "linked/*.md".into(),
+                    ],
+                    window_hours: Some(1),
+                    checks: vec![DreamsCheckFile {
+                        name: "commands-exist".into(),
+                        argv: vec![
+                            "/bin/sh".into(),
+                            base.join("check.sh").to_string_lossy().into_owned(),
+                        ],
+                        timeout_seconds: 30,
+                    }],
+                },
+                &ProtectedPaths {
+                    config: None,
+                    job_directories: &[],
+                },
+            )
+            .unwrap();
+            Self {
+                dreams: Dreams::open(&state, policy).unwrap(),
+                repository,
+                root,
+            }
+        }
+
+        async fn send(&self, request: DreamsRequest) -> DreamsReply {
+            let (_owner, cancelled) = watch::channel(false);
+            match self.dreams.execute(request, cancelled).await {
+                HostResult::Dreams { reply } => reply,
+                other => panic!("Dreams failed: {other:?}"),
+            }
+        }
+
+        async fn review(&self, run: &str) -> DreamsReply {
+            self.send(DreamsRequest::Review {
+                run: run.into(),
+                summaries: vec![DreamsTaskSummary {
+                    task_id: "task-1".into(),
+                    title: "Example build".into(),
+                    summary: "make test-all failed: no such target.".into(),
+                    updated_at: 7,
+                }],
+                summaries_omitted: 0,
+                page: 1,
+            })
+            .await
+        }
+
+        async fn propose(
+            &self,
+            run: &str,
+            path: &str,
+            content: &str,
+            evidence: &str,
+        ) -> DreamsReply {
+            self.send(DreamsRequest::Propose {
+                run: run.into(),
+                edits: vec![DreamsFileEdit {
+                    path: path.into(),
+                    content: content.into(),
+                }],
+                rationale: "The guidance names a missing target.".into(),
+                evidence: vec![evidence.into()],
+            })
+            .await
+        }
+
+        fn target(&self) -> (String, String) {
+            (
+                git(&self.repository, &["rev-parse", "HEAD"]),
+                git(&self.repository, &["status", "--porcelain"]),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn a_proposal_is_refused_for_each_way_it_could_exceed_its_policy_or_its_review() {
+        let night = Night::new();
+        let before = night.target();
+        assert!(
+            night
+                .propose("unreviewed", "AGENTS.md", FIXED, EVIDENCE)
+                .await
+                .text
+                .contains("Call dreams_review before deciding")
+        );
+        for (run, path, content, evidence, reason) in [
+            (
+                "symlink",
+                "playbooks/link.md",
+                "x",
+                EVIDENCE,
+                "is a symlink, a submodule or an executable",
+            ),
+            (
+                "executable",
+                "playbooks/tool.md",
+                "x",
+                EVIDENCE,
+                "is a symlink, a submodule or an executable",
+            ),
+            (
+                "escape",
+                "linked/escape.md",
+                "x",
+                EVIDENCE,
+                "has a parent that is not a directory",
+            ),
+            (
+                "uneditable",
+                "Makefile",
+                "test-all:\n",
+                EVIDENCE,
+                "path Makefile is not editable",
+            ),
+            (
+                "uncited",
+                "AGENTS.md",
+                FIXED,
+                "t:task-2@7",
+                "is not in this review",
+            ),
+            (
+                "unchanged",
+                "AGENTS.md",
+                BROKEN,
+                EVIDENCE,
+                "change nothing at the base",
+            ),
+        ] {
+            night.review(run).await;
+            let reply = night.propose(run, path, content, evidence).await;
+            assert!(
+                !reply.decided && reply.text.contains("rejected") && reply.text.contains(reason),
+                "{run}: {}",
+                reply.text
+            );
+        }
+        assert!(!night.root.path().join("outside/escape.md").exists());
+        assert_eq!(night.target(), before);
+    }
+
+    #[tokio::test]
+    async fn the_third_failed_attempt_seals_the_run_and_every_later_decision_returns_it() {
+        let night = Night::new();
+        night.review("night").await;
+        let still_broken = "Run `make test-all` and then `make test`.\n";
+        for attempt in 1..=2 {
+            let reply = night
+                .propose("night", "AGENTS.md", still_broken, EVIDENCE)
+                .await;
+            assert!(!reply.decided);
+            assert!(
+                reply.text.contains(&format!(
+                    "attempt {attempt} of 3 rejected: after check commands-exist did not pass"
+                )) && reply.text.contains("> missing make target: test-all"),
+                "{}",
+                reply.text
+            );
+        }
+        let third = night
+            .propose("night", "AGENTS.md", still_broken, EVIDENCE)
+            .await;
+        assert!(third.decided, "{}", third.text);
+        assert!(third.text.contains("sealed: abstained: attempts_exhausted"));
+        let late = night.propose("night", "AGENTS.md", FIXED, EVIDENCE).await;
+        assert!(late.decided && late.text.contains("abstained: attempts_exhausted"));
+        let abstained = night
+            .send(DreamsRequest::Abstain {
+                run: "night".into(),
+                reason: DreamsAbstainReason::NoSupportedChange,
+                note: String::new(),
+            })
+            .await;
+        assert!(abstained.text.contains("abstained: attempts_exhausted"));
+    }
+
+    #[tokio::test]
+    async fn a_passing_proposal_seals_a_git_derived_patch_and_leaves_the_target_alone() {
+        let night = Night::new();
+        let before = night.target();
+        let first = night.review("night").await;
+        assert!(
+            first.text.contains(EVIDENCE)
+                && first.text.contains("Before check commands-exist: exit 1")
+        );
+        let reply = night.propose("night", "AGENTS.md", FIXED, EVIDENCE).await;
+        assert!(reply.decided, "{}", reply.text);
+        let run = RunId::from_request("night").unwrap();
+        let view = night.dreams.store.read(&run).unwrap().unwrap();
+        let Some(Outcome::Proposed(proposal)) = view.outcome else {
+            panic!("The run must hold a proposal");
+        };
+        let patch = fs::read(night.dreams.store.patch_path(&run, proposal.attempt)).unwrap();
+        assert_eq!(proposal.patch_sha256, ContentDigest::of(&patch));
+        let patch = String::from_utf8(patch).unwrap();
+        assert!(patch.contains("-Run `make test-all`") && patch.contains("+Run `make test`"));
+        assert!(patch.starts_with("diff --git a/AGENTS.md b/AGENTS.md\n"));
+        assert_eq!(proposal.files, vec!["AGENTS.md"]);
+        assert_eq!(proposal.base.as_str(), before.0.trim());
+        assert!(!proposal.before[0].passed() && proposal.after[0].passed());
+        assert_eq!(proposal.evidence[0].as_str(), EVIDENCE);
+        assert_eq!(night.target(), before, "Only apply may touch the target");
+
+        // A later review of the same run rereads what was sealed.
+        let sealed = fs::read(
+            night
+                .dreams
+                .store
+                .root()
+                .join("runs")
+                .join(run.as_str())
+                .join("review/review.json"),
+        )
+        .unwrap();
+        git(
+            &night.repository,
+            &["commit", "--quiet", "--allow-empty", "-m", "Move on"],
+        );
+        let again = night.review("night").await;
+        assert!(again.decided);
+        assert_eq!(again.text, first.text);
+        assert_eq!(
+            fs::read(
+                night
+                    .dreams
+                    .store
+                    .root()
+                    .join("runs")
+                    .join(run.as_str())
+                    .join("review/review.json")
+            )
+            .unwrap(),
+            sealed
+        );
     }
 }
