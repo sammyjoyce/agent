@@ -1,6 +1,3 @@
-//! Dreams end to end: a real `serve --local-only --no-sources` coordinator, the
-//! real runtime with only the model provider scripted, and the `beep-boop` CLI.
-//! Every input is invented and built at test time.
 use std::{
     collections::BTreeSet, fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Output,
 };
@@ -27,7 +24,6 @@ fn assert_only_dreams_tools(fixture: &Fixture) {
     }
 }
 
-/// A sealed proposal for the seeded defect, with its coordinator stopped.
 struct Proposed {
     fixture: Fixture,
     run: String,
@@ -192,8 +188,6 @@ fn a_witnessed_quiet_night_reports_complete_coverage_and_seals_a_quiet_abstentio
     server.stop();
 }
 
-/// A night that lost receipts in every way the retention format can report,
-/// reviewed by a model that first claims it was quiet. The coordinator is stopped.
 fn incomplete_night() -> (Fixture, u64) {
     let fixture = Fixture::new();
     let now = now_ms();
@@ -678,7 +672,6 @@ fn a_changed_patch_review_base_or_target_refuses_apply_and_leaves_the_target_alo
 fn apply_finishes_a_fast_forward_that_crashed_after_writing_the_candidate_file() {
     let proposed = Proposed::new();
     let fixture = &proposed.fixture;
-    // HEAD is still the base while the index and the touched path already hold the candidate blob.
     fs::write(fixture.repository.join("AGENTS.md"), FIXED_AGENTS).unwrap();
     git(&fixture.repository, &["add", "AGENTS.md"]);
     assert_eq!(fixture.target().head, proposed.before.head);

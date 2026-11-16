@@ -1,13 +1,3 @@
-//! Opt-in live-model eval for Dreams. It measures whether a real model, given
-//! the shipped Dreams prompt, proposes the fix for a seeded defect, abstains on
-//! a quiet night, and ignores injected text. A pass rate here is a measurement
-//! of model behavior. The security boundary is proven by `tests/dreams_cli.rs`,
-//! and this test asserts only that boundary.
-//!
-//! Run it with `AGENT_DREAMS_EVAL=1`, `OPENAI_API_KEY`, `OPENAI_BASE_URL` and
-//! `AGENT_DREAMS_EVAL_OUTPUT=<directory>`:
-//! `cargo test --locked --test dreams_eval -- --ignored --nocapture`.
-//! `AGENT_DREAMS_EVAL_TRIALS` (default 3) and `AGENT_DREAMS_EVAL_MODEL` are optional.
 use std::{
     fs,
     io::Write,
@@ -28,7 +18,6 @@ const LIVE_JOB_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 struct Scenario {
     name: &'static str,
-    /// The target's guidance is already correct, so no change is supported.
     healthy_target: bool,
     summary: Option<String>,
     injected_receipts: bool,
@@ -84,7 +73,6 @@ fn seed(fixture: &Fixture, scenario: &Scenario) {
     lines.extend(heartbeats(now - HOUR + 2 * MINUTE, now - MINUTE / 2));
     fixture.seed_receipts(&lines, &retention(None, None));
 
-    // The shipped job and prompt are what is being measured.
     let shipped = fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/scheduled_jobs/dreams.toml"
@@ -101,7 +89,6 @@ fn copy_artifacts(from: &Path, to: &Path) {
     let mut pending = vec![from.to_owned()];
     while let Some(path) = pending.pop() {
         let relative = path.strip_prefix(from).unwrap();
-        // A candidate or base checkout is a whole clone; the patch already records its change.
         if relative
             .components()
             .any(|part| ["candidate", "base"].contains(&part.as_os_str().to_str().unwrap_or("")))
@@ -121,15 +108,11 @@ fn copy_artifacts(from: &Path, to: &Path) {
     }
 }
 
-/// One night with a live model. Returns the graded record and whether the
-/// boundary held, which does not depend on what the model chose.
 fn trial(scenario: &Scenario, number: u32, output: &Path) -> (Value, bool) {
     let fixture = Fixture::new();
     seed(&fixture, scenario);
     let before = fixture.target();
     if let Some(summary) = &scenario.summary {
-        // The scripted provider writes the summary, so the evidence is exact
-        // and no live model ever holds the ordinary worker's shell.
         let mut server = fixture.start();
         fixture.summarized(summary);
         server.stop();

@@ -24,7 +24,6 @@ use crate::{
 
 const MAX_BYTES: u64 = 1024 * 1024;
 const CAPACITY: usize = 256;
-/// A reader treats silence longer than twice this as unwitnessed time.
 pub(crate) const HEARTBEAT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -144,7 +143,6 @@ pub(crate) enum Event {
     RuntimeStopped {
         code: ErrorCode,
     },
-    /// Proves the writer was alive at this time, so quiet differs from blind.
     Heartbeat,
 }
 
@@ -1102,7 +1100,6 @@ impl Writer {
     }
 }
 
-/// Loss the retention watermark reports for removed segments.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RetentionFacts {
     pub prior_history_unknown: bool,
@@ -1118,19 +1115,13 @@ pub(crate) struct CapacityLossFacts {
     pub bytes: u64,
 }
 
-/// What one pass over the retained segments found for `[start, end)`.
 #[derive(Debug)]
 pub(crate) struct ReceiptWindow {
-    /// Receipts inside the window, oldest segment first.
     pub records: Vec<Record>,
-    /// None when retention.json is missing or unreadable, so loss is unknown.
     pub retention: Option<RetentionFacts>,
     pub oldest_retained_ms: Option<u64>,
-    /// Lines that are not receipts and cannot be placed before the window.
     pub unparseable: u32,
-    /// The first in-window timestamp left out by the record or byte budget.
     pub truncated_at_ms: Option<u64>,
-    /// Segments were rotated or pruned during both read attempts.
     pub rotated_during_read: bool,
 }
 
@@ -1163,7 +1154,6 @@ fn segment_files(directory: &Path) -> io::Result<Vec<(u32, File)>> {
                     "Diagnostics segment is not a regular file",
                 ));
             }
-            // The writer renames and prunes without waiting for readers.
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
@@ -1227,8 +1217,6 @@ fn read_once(
         truncated_at_ms: None,
         rotated_during_read: false,
     };
-    // Segments are append ordered, so a bad line followed by a receipt older
-    // than the window is provably outside it. Any other bad line may hide one.
     let mut unplaced = 0_u32;
     let mut bytes = 0_u64;
     for (index, file) in &files {
@@ -1236,7 +1224,6 @@ fn read_once(
         let mut line = Vec::new();
         while reader.read_until(b'\n', &mut line)? != 0 {
             bytes = bytes.saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX));
-            // The writer may be mid-append on the live segment's last line.
             let complete = line.last() == Some(&b'\n') || *index != 0;
             match serde_json::from_slice::<Record>(&line) {
                 Ok(record) => {
@@ -1279,9 +1266,6 @@ fn read_once(
     Ok((window, before == after))
 }
 
-/// Reads retention.json, then every retained segment oldest first, keeping
-/// receipts inside `window`. Retries once when segments moved underneath it.
-/// Never takes writer.lock, so diagnostics never wait on a reader.
 pub(crate) fn read_window(
     state: &Path,
     window: (u64, u64),
@@ -1950,7 +1934,6 @@ mod tests {
             writer.append(&at(timestamp, Event::Heartbeat)).unwrap();
         }
         assert!(writer.archives.len() > 3, "The fixture must span segments");
-        // The writer still holds writer.lock while the reader runs.
         let all = read_window(state.path(), (0, 20_000), 1_000, u64::MAX).unwrap();
         assert_eq!(all.records.len(), 81);
         assert_eq!(all.oldest_retained_ms, Some(1_000));

@@ -1,5 +1,3 @@
-//! The operator's private Dreams policy. It comes only from the config file,
-//! which no Dreams path writes.
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
@@ -19,7 +17,6 @@ const MAX_PATH_BYTES: usize = 512;
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DreamsPolicyFile {
-    /// Private Git repository Dreams may propose edits to.
     pub repository: PathBuf,
     /// Repository-relative globs; `*` matches within one path component.
     pub editable: Vec<String>,
@@ -43,7 +40,6 @@ pub struct ProtectedPaths<'a> {
     pub job_directories: &'a [PathBuf],
 }
 
-/// One operator command that judges a checkout before and after a proposal.
 #[derive(Clone, Debug)]
 pub struct CheckSpec {
     pub name: String,
@@ -105,8 +101,6 @@ fn components<'a>(path: &'a str, extra: &[u8]) -> Result<Vec<&'a str>, String> {
     Ok(parts)
 }
 
-/// Canonical form of a path that may not exist yet: its nearest existing
-/// ancestor is resolved, so a symlinked parent cannot hide a protected path.
 fn resolved(path: &Path) -> PathBuf {
     for ancestor in path.ancestors() {
         if let Ok(canonical) = ancestor.canonicalize() {
@@ -230,7 +224,6 @@ impl DreamsPolicy {
                 "Dreams check {} needs a timeout between 1 and {MAX_CHECK_SECONDS} seconds",
                 check.name
             );
-            // An approved edit must not be able to rewrite the program that judges the next one.
             for argument in &check.argv {
                 let relative = Path::new(argument)
                     .strip_prefix(&policy.repository)
@@ -270,7 +263,6 @@ impl DreamsPolicy {
         })
     }
 
-    /// The one place a path from a model or a patch becomes an editable path.
     pub fn editable(&self, path: &str) -> Result<EditablePath, String> {
         let parts = components(path, b"").map_err(|reason| format!("path {path:?} {reason}"))?;
         if self.editable.iter().any(|glob| glob.matches(&parts)) {
@@ -280,7 +272,6 @@ impl DreamsPolicy {
         }
     }
 
-    /// A state directory inside the target would let a proposal edit its own evidence.
     pub fn refuse_state_inside(&self, state: &Path) -> Result<()> {
         ensure!(
             !resolved(state).starts_with(&self.repository),

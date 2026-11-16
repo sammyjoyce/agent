@@ -61,7 +61,6 @@ export type ActorExecution = {
   call(command: HostCommand, host: WorkerHost, signal: AbortSignal): Promise<HostResult>;
   prepare?(model: ModelSelection): Promise<void>;
 };
-/** Returns the only extensions a confined task's actor may use, or undefined for an ordinary task. */
 export type ActorConfinement = (task: TaskRecord) => readonly Extension[] | undefined;
 /** A terminal's view of its actor. Its signal ends the observation only, never the actor's work. */
 export type WorkerSession = {
@@ -264,7 +263,6 @@ export class TaskStore {
   useHistory(history: HistoryStore): void { this.histories = history; }
   useAttachments(attachments: AttachmentStore): void { this.attachments = attachments; }
   useActorExecution(execution: ActorExecution): void { this.execution = execution; }
-  /** A confined task's tools come only from this rule, on every actor path. */
   useConfinement(rule: ActorConfinement): void { this.confinement = rule; }
   isBackgroundTask(task: TaskRecord): boolean {
     return task.sources.some((source) => source.provider === "scheduled_jobs" && source.account === "local");
@@ -1689,7 +1687,6 @@ export class TaskStore {
       let actor = this.actor(task, input.agent_id);
       const confined = this.confinement(task);
       if (confined !== undefined && (active.mode !== "job" || input.agent_id !== undefined)) throw new TaskError(CONFINED_ACTOR_ONLY);
-      // Every configure call below reads this, so no execution can widen a confined task.
       const extensions = () => confined ?? execution.extensions(input.agent_id);
       const conversation = await this.conversation(actor.conversation_id);
       if (active.mode === "job") active.conversation = conversation;

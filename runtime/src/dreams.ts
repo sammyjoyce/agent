@@ -12,15 +12,10 @@ import type { Executions } from "./tools.js";
 
 export const DREAMS_TOOL_NAMES: readonly string[] = ["dreams_review", "dreams_propose", "dreams_abstain"];
 
-/** The Dreams marker is the scheduler-assigned job source. Tools can neither add nor remove it. */
 export function isDreamsTask(task: { sources: readonly SourceRef[] }): boolean {
   return task.sources.some((source) => source.provider === "scheduled_jobs" && source.account === "local" && source.thread_id === DREAMS_JOB_ID);
 }
 
-/**
- * The run is the request id of the first input in this conversation's live
- * native run. Trusted code supplies it; the model never does.
- */
 export async function currentRunRequest(session: Harness, conversationId: ConversationId): Promise<string> {
   const first = (await session.snapshot(LiveDoc, conversationId, BACKGROUND_CONTEXT))?.run?.inputs[0];
   if (first === undefined) throw new TaskError("Dreams tools run only inside a live turn");
@@ -29,7 +24,6 @@ export async function currentRunRequest(session: Harness, conversationId: Conver
   return record.requestId;
 }
 
-/** Tasks updated within the widest Dreams window, newest first, Dreams tasks excluded, bounded by count and bytes. */
 async function recentSummaries(tasks: TaskStore): Promise<{ summaries: DreamsTaskSummary[]; omitted: number }> {
   const cutoff = Date.now() - DREAMS_MAX_WINDOW_MS;
   const recent = (await tasks.list()).filter((task) => !isDreamsTask(task) && task.updated_at >= cutoff && task.summary.trim().length > 0);
@@ -48,7 +42,6 @@ function dreamsOutput(result: HostResult): ToolExecutionResult {
   return output(result.type === "failed" ? result.message : "Dreams received an unexpected host reply", true);
 }
 
-/** dreams_review, dreams_propose and dreams_abstain. Each sends one `dreams` host command and nothing else. */
 export function createDreamsTools(session: Harness, tasks: TaskStore, executions: Executions): Extension {
   const send = async (conversationId: ConversationId, request: (run: string) => Promise<DreamsRequest>) =>
     dreamsOutput(await executions.get(conversationId.toString()).call({ type: "dreams", request: await request(await currentRunRequest(session, conversationId)) }));
@@ -79,11 +72,6 @@ export function createDreamsTools(session: Harness, tasks: TaskStore, executions
   ] });
 }
 
-/**
- * The closed Dreams toolset. guidance and input_origins contribute sections and
- * hooks only. Throws at startup unless the toolset's tools are exactly the Dreams
- * tools, so a later edit that adds any tool fails before the coordinator serves.
- */
 export function createDreamsToolset(parts: { guidance: Extension; inputOrigins: Extension; dreams: Extension }): readonly Extension[] {
   const toolset = [parts.guidance, parts.dreams, parts.inputOrigins];
   const offered = toolset.flatMap((extension) => (extension.tools ?? []).map((tool) => tool.name));

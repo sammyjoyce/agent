@@ -1,5 +1,3 @@
-# The reserved id "dreams" makes this job's actor proposal-only: it can call
-# dreams_review, dreams_propose and dreams_abstain, and nothing else.
 id = "dreams"
 title = "Dreams"
 prompt = """

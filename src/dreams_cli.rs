@@ -1,7 +1,3 @@
-//! `beep-boop dreams`: a human reads a sealed Dreams run and, by naming the
-//! digest of the exact review, applies its patch once. This module is part of
-//! the binary only. The coordinator library cannot link it, so no host command
-//! and no model tool can reach `apply`.
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -34,14 +30,9 @@ pub enum DreamsAction {
     },
 }
 
-/// Where a proposal stands against its patch file, the current policy and the
-/// target's Git state. Derived on every read and never stored, so the status a
-/// reviewer sees is exactly what apply acts on.
 #[derive(Debug, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum ProposalStatus {
-    /// HEAD is the base and every touched path holds its base content or, after
-    /// a crashed apply, its proposed content.
     Pending {
         #[serde(skip)]
         half_applied: Vec<TouchedPath>,
@@ -81,17 +72,13 @@ impl ProposalStatus {
     }
 }
 
-/// One file of the patch with the blob ids Git recorded for both sides.
 #[derive(Clone, Debug)]
 struct TouchedPath {
     path: String,
-    /// None when the patch adds the file.
     base_blob: Option<String>,
     proposed_blob: String,
 }
 
-/// Reads `diff --git` and `index` headers. The executor writes them with fixed
-/// prefixes and full object ids, so anything else means the file is not its patch.
 fn touched_paths(patch: &str) -> Result<Vec<TouchedPath>> {
     let mut touched = Vec::new();
     let mut current: Option<String> = None;
@@ -172,7 +159,6 @@ async fn classify(
             &range,
         ])
         .await?;
-    // A base this repository no longer has cannot be fast-forwarded from.
     if history.exit_code != 0 {
         return Ok(ProposalStatus::Stale { head: head.into() });
     }
@@ -225,8 +211,6 @@ async fn classify(
     Ok(ProposalStatus::Pending { half_applied })
 }
 
-/// Control characters in model-written text could repaint a terminal and hide
-/// what is being approved. They are shown as escapes instead.
 fn visible(text: &str) -> String {
     text.chars()
         .flat_map(|character| match character {
@@ -266,10 +250,8 @@ struct RunReport<'a> {
     review: &'a Review,
     evidence: &'a [EvidenceItem],
     outcome: Option<&'a Outcome>,
-    /// The digest `apply --approve` takes: sha256 of the sealed outcome's exact bytes.
     review_sha256: Option<&'a ContentDigest>,
     status: Option<&'a ProposalStatus>,
-    /// The patch file's current bytes. Its hash is checked again by apply.
     patch: Option<&'a str>,
     apply: Option<String>,
     attempts_used: u8,
@@ -405,7 +387,6 @@ fn render(report: &RunReport) -> String {
     text
 }
 
-/// A private index outside the target, removed when apply ends either way.
 struct ScratchIndex(PathBuf);
 impl Drop for ScratchIndex {
     fn drop(&mut self) {
@@ -416,10 +397,6 @@ impl Drop for ScratchIndex {
     }
 }
 
-/// The only code that writes the target. It builds the commit from the base
-/// and the approved patch in a scratch index, returns any half-applied path to
-/// its base content, and fast-forwards. A crash at any point leaves a state
-/// that the next apply classifies as pending or applied, never both.
 async fn fast_forward(
     store: &DreamsStore,
     policy: &DreamsPolicy,
@@ -795,7 +772,6 @@ mod tests {
             ProposalStatus::Pending { half_applied } if half_applied.is_empty()
         ));
 
-        // An interrupted fast-forward wrote and staged the new file while HEAD stayed at the base.
         fs::create_dir(repository.join("playbooks")).unwrap();
         fs::write(repository.join("playbooks/build.md"), playbook).unwrap();
         git(&repository, &["add", "playbooks/build.md"]);

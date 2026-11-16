@@ -155,7 +155,6 @@ export class SourceJournal {
         await this.decideIn(tx, record, { type: "dismissed", reason: "Superseded by a newer outcome from the same task conversation" });
       }
     }
-    // Triage holds a shell. Text a Dreams actor wrote from untrusted evidence must never reach it.
     const decision: Decision | null = settled ? { type: "dismissed", reason: "Already handled by the coordinator" }
       : isDreamsTask(outcome) ? { type: "dismissed", reason: "Dreams results are reviewed with beep-boop dreams and never enter triage" } : null;
     const record = await this.records.insertIn(tx, key, { key, event, outcome, decision });

@@ -88,7 +88,6 @@ impl<'a> ProcessRequest<'a> {
         })
     }
 
-    /// The child sees exactly these variables and nothing inherited.
     pub fn with_only_environment(mut self, environment: &'a [(String, String)]) -> Self {
         self.environment = Some(environment);
         self

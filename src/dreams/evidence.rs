@@ -1,5 +1,3 @@
-//! Pure evidence logic: what a window of receipts covers, what it shows, and
-//! how a review is worded for the model. No I/O happens here.
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -17,12 +15,10 @@ use crate::{
 const SAMPLES: usize = 5;
 const SLOW_HOST_CALL_MS: u64 = 30_000;
 const MAX_TITLE_CHARS: usize = 200;
-/// The runtime keeps the last 4000 characters of a task's answer.
 const SUMMARY_RETENTION_CHARS: usize = 4000;
 const PAGE_BYTES: usize = 12_000;
 const QUOTED_LINE_CHARS: usize = 1_000;
 
-/// A deterministic observation over the window's receipts.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Finding {
     pub kind: String,
@@ -38,7 +34,6 @@ pub enum EvidenceKind {
     Summary,
 }
 
-/// One citable piece of evidence, stored as a line of the sealed evidence file.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EvidenceItem {
     pub id: EvidenceId,
@@ -68,8 +63,6 @@ fn redact(value: &mut serde_json::Value) {
     }
 }
 
-/// Re-serializes a parsed receipt, which drops unknown fields, and keeps only
-/// identifier-shaped strings. Free text in a receipt never reaches the model.
 pub(crate) fn canonical(record: &Record) -> EvidenceItem {
     let mut value = serde_json::to_value(record).unwrap_or(serde_json::Value::Null);
     redact(&mut value);
@@ -102,8 +95,6 @@ fn subtract(window: Interval, gaps: &[Gap]) -> Vec<Interval> {
     covered
 }
 
-/// Every way the window may be missing receipts. A night is quiet only when
-/// this finds nothing, so a blind night can never be recorded as a quiet one.
 pub(crate) fn receipt_coverage(window: Interval, receipts: &ReceiptWindow) -> ReceiptCoverage {
     let mut gaps = Vec::new();
     let within =
@@ -187,9 +178,6 @@ pub(crate) fn receipt_coverage(window: Interval, receipts: &ReceiptWindow) -> Re
             cause: GapCause::ConcurrentRotation,
         });
     }
-    // A live writer leaves a heartbeat every interval. Twice that with no
-    // receipt means nothing witnessed the time: a dead writer, a stopped
-    // coordinator, or history from before heartbeats existed.
     let silence = u64::try_from(2 * HEARTBEAT.as_millis()).unwrap_or(u64::MAX);
     let witnessed_until = receipts.truncated_at_ms.unwrap_or(window.end_ms);
     let mut previous = window.start_ms;
@@ -222,8 +210,6 @@ fn clean(text: &str, limit: usize) -> (String, bool) {
     (kept, cut)
 }
 
-/// Bounds the runtime's summaries into evidence. A summary is a snapshot of
-/// the task's current text, so anything left out or cut is a gap.
 pub(crate) fn summaries(
     summaries: &[DreamsTaskSummary],
     omitted: u32,
@@ -270,8 +256,6 @@ pub(crate) fn summaries(
     (snapshot, items)
 }
 
-/// Failures, rejected inputs, failed compactions, slow host calls, backpressure
-/// and rejected peers, each with a few sample receipts. Deterministic order.
 pub(crate) fn findings(records: &[Record]) -> (Vec<Finding>, Vec<EvidenceItem>) {
     let mut groups: BTreeMap<(&'static str, String), Vec<&Record>> = BTreeMap::new();
     let mut replies: BTreeMap<String, Vec<(u64, &Record)>> = BTreeMap::new();
@@ -366,8 +350,6 @@ pub(crate) fn coverage(
     }
 }
 
-/// Untrusted text becomes lines that each start with `> `. A line break of any
-/// kind inside the text cannot start an unquoted line.
 fn quote(lines: &mut Vec<String>, text: &str) {
     let flat: String = text
         .chars()
@@ -398,7 +380,6 @@ pub(crate) fn check_lines(lines: &mut Vec<String>, phase: &str, check: &CheckRes
     }
 }
 
-/// The whole review as lines; `render_page` cuts it into pages.
 fn review_lines(
     review: &Review,
     items: &[EvidenceItem],
@@ -475,7 +456,6 @@ fn review_lines(
     lines
 }
 
-/// One page of the review, 1-based, with the page count in its last line.
 pub(crate) fn render_page(
     review: &Review,
     items: &[EvidenceItem],

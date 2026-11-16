@@ -49,7 +49,6 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
-    /// The parsed Dreams policy, when this machine configures one.
     pub fn dreams_policy(&self) -> Result<Option<crate::dreams::DreamsPolicy>> {
         self.dreams
             .as_ref()

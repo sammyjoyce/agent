@@ -22,7 +22,6 @@ use crate::{
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 const GIT_OUTPUT_BYTES: usize = 1024 * 1024;
 const CHECK_OUTPUT_BYTES: usize = 16 * 1024;
-/// A path argument names exactly one path, never a glob or pathspec magic.
 const LITERAL_PATHS: (&str, &str) = ("GIT_LITERAL_PATHSPECS", "1");
 
 /// Only PATH, HOME, LANG and TMPDIR survive. An inherited GIT_* variable could
@@ -69,7 +68,6 @@ impl Git {
         }
     }
 
-    /// For a clone this process owns, and for the apply command's target.
     pub fn writing(directory: &Path) -> Self {
         Self {
             directory: directory.to_owned(),
@@ -139,8 +137,6 @@ pub(crate) async fn resolve_base(repository: &Path) -> Result<Revision> {
     Revision::parse(head.trim())
 }
 
-/// A private clone detached at `base`. It shares the target's objects and
-/// writes nothing to the target.
 pub(crate) async fn checkout(repository: &Path, base: &Revision, directory: &Path) -> Result<()> {
     let parent = directory
         .parent()
@@ -180,8 +176,6 @@ pub(crate) async fn tracked_files(directory: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Runs the policy's commands in `directory`, one at a time. Nothing in a
-/// Dreams request can choose a program, an argument or the directory's name.
 pub(crate) async fn run_checks(
     directory: &Path,
     checks: &[CheckSpec],
@@ -234,8 +228,6 @@ pub(crate) async fn run_checks(
                 if *cancelled.borrow() {
                     bail!("Dreams stopped while check {} was running", check.name);
                 }
-                // The runner reports its own timeout as 124; a check that
-                // exits 124 before the deadline is an ordinary failure.
                 let timed_out = output.exit_code == 124 && started.elapsed() >= check.timeout;
                 result(
                     (!timed_out).then_some(output.exit_code),
@@ -254,14 +246,11 @@ pub(crate) async fn run_checks(
     Ok(results)
 }
 
-/// What Git derived from a candidate's edits.
 pub(crate) struct Patch {
     pub digest: ContentDigest,
     pub files: Vec<String>,
 }
 
-/// Writes one whole-file edit, refusing anything that could land outside the
-/// candidate or change what kind of file the path is.
 fn write_edit(candidate: &Path, path: &EditablePath, content: &str) -> Result<Option<String>> {
     let mut current = candidate.to_owned();
     let mut parts: Vec<&str> = path.as_str().split('/').collect();
@@ -270,7 +259,6 @@ fn write_edit(candidate: &Path, path: &EditablePath, content: &str) -> Result<Op
         current.push(part);
         match fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.is_dir() => {}
-            // A symlinked parent would carry the write out of the candidate.
             Ok(_) => return Ok(Some(format!("{path} has a parent that is not a directory"))),
             Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(&current)?,
             Err(error) => return Err(error.into()),
@@ -298,9 +286,6 @@ fn write_edit(candidate: &Path, path: &EditablePath, content: &str) -> Result<Op
     Ok(None)
 }
 
-/// Applies whole-file edits in the candidate and lets Git derive the patch
-/// against `base`, written to `patch`. The inner error is a reason the model
-/// can act on.
 pub(crate) async fn write_candidate(
     candidate: &Path,
     base: &Revision,

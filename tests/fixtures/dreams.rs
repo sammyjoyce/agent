@@ -1,5 +1,3 @@
-//! A real coordinator for Dreams tests: private state, an invented target
-//! repository, the shipped example check, and a scripted or live runtime.
 #![allow(dead_code)]
 
 use std::{
@@ -53,7 +51,6 @@ pub fn heartbeat(timestamp_ms: u64) -> String {
         .to_string()
 }
 
-/// One witness every five minutes over `[from, to]`.
 pub fn heartbeats(from: u64, to: u64) -> Vec<String> {
     (from..=to)
         .step_by(usize::try_from(5 * MINUTE).unwrap())
@@ -133,7 +130,6 @@ impl Fixture {
 
     pub fn without_policy() -> Self {
         let directory = tempfile::tempdir().unwrap();
-        // The policy canonicalizes its repository; compare against the same spelling.
         let root = directory.path().canonicalize().unwrap();
         let config = root.join("config.toml");
         let state = root.join("state");
@@ -147,8 +143,6 @@ impl Fixture {
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
         fs::write(&instructions, "Use only invented fixture data.\n").unwrap();
-        // Background jobs run on the coordinator's own node, which exists only
-        // when the local Rex answers with an identity.
         write_executable(
             &bin.join("rex"),
             "#!/bin/sh\nfor argument do\n  if [ \"$argument\" = whoami ]; then\n    printf '%s\\n' '{\"host_id\":\"44444444-4444-4444-8444-444444444444\",\"instance_id\":\"66666666-6666-4666-8666-666666666666\",\"rex_version\":\"fixture\"}'\n    exit 0\n  fi\ndone\nexit 1\n",
@@ -158,7 +152,6 @@ impl Fixture {
             &bin.join("switchboard"),
             "#!/bin/sh\nprintf '%s\\n' unexpected >> \"$AGENT_TEST_EXTERNAL_CALLS\"\nexit 1\n",
         );
-        // The shipped example check, kept outside the repository it judges.
         let check = checks.join("commands-exist.sh");
         fs::copy(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/dreams/commands-exist.sh"),
@@ -247,8 +240,6 @@ impl Fixture {
         .unwrap();
     }
 
-    /// Replaces the scripted provider with the live gateway fixture, which
-    /// records each request body as one line of `requests`.
     pub fn use_live_runtime(&self, requests: &Path) {
         let live = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("runtime/dist/test/fixtures/live-gateway-runtime.js");
@@ -264,7 +255,6 @@ impl Fixture {
         .unwrap();
     }
 
-    /// Receipts and retention metadata exist before the coordinator's writer opens them.
     pub fn seed_receipts(&self, lines: &[String], retention: &Value) {
         let diagnostics = self.state.join("diagnostics");
         fs::create_dir(&diagnostics).unwrap();
@@ -312,7 +302,6 @@ impl Fixture {
             .arg(&self.instructions)
             .args(args)
             .env("PATH", std::env::join_paths(paths).unwrap())
-            // The developer's Git identity and settings must not decide a test.
             .env("HOME", self.directory.path())
             .env(
                 "AGENT_TEST_EXTERNAL_CALLS",
@@ -354,7 +343,6 @@ impl Fixture {
         String::from_utf8(output.stdout).unwrap()
     }
 
-    /// A refusal exits nonzero and says why on stderr.
     pub fn refused(&self, args: &[&str]) -> String {
         let output = self.cli(args, false);
         assert!(
@@ -417,13 +405,11 @@ impl Fixture {
             .expect("Get must return the applied job definition")
     }
 
-    /// Admits one manual run and waits for the same run to finish.
     pub fn run_job(&self, id: &str) -> (JobRunReceipt, ScheduledJobStatus) {
         self.try_run_job(id, JOB_TIMEOUT)
             .unwrap_or_else(|failure| panic!("{failure}"))
     }
 
-    /// Like `run_job`, but reports a failed, blocked or overdue run instead of panicking.
     pub fn try_run_job(
         &self,
         id: &str,
@@ -475,8 +461,6 @@ impl Fixture {
             .expect("The job's task is retained")
     }
 
-    /// Runs the ordinary notes job so its final answer becomes a task summary,
-    /// and returns that task once its record has stopped changing.
     pub fn summarized(&self, summary: &str) -> TaskRecord {
         self.script(NOTES_KEY, vec![text(summary)]);
         let (run, _) = self.run_job("notes");
@@ -506,7 +490,6 @@ impl Fixture {
             .collect()
     }
 
-    /// Each scripted call's name with the output the model was shown for it.
     pub fn tool_outputs(&self, key: &str) -> Vec<(String, String)> {
         let requests = self.requests(key);
         let input = requests
@@ -582,7 +565,6 @@ impl Fixture {
     }
 }
 
-/// Every tool name a model request offers, including later additions.
 pub fn offered_tools(body: &Value) -> BTreeSet<String> {
     let later = body["input"]
         .as_array()
@@ -605,7 +587,6 @@ pub struct Server(Option<Child>);
 impl Server {
     pub fn stop(&mut self) {
         if let Some(mut child) = self.0.take() {
-            // Only the coordinator process started by this fixture is signalled.
             let pid = libc::pid_t::try_from(child.id()).unwrap();
             unsafe { libc::kill(pid, libc::SIGTERM) };
             let deadline = Instant::now() + Duration::from_secs(10);

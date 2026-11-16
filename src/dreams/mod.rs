@@ -27,27 +27,20 @@ pub use store::{DreamsStore, RunView};
 
 use crate::{protocol::HostResult, runtime::diagnostics};
 
-/// Reserved job id. Rust owns it; `make bindings` writes it to the runtime.
 pub const DREAMS_JOB_ID: &str = "dreams";
 pub const MAX_WINDOW_HOURS: u8 = 48;
 pub const MAX_SUMMARIES: usize = 200;
-/// Keeps one review request well inside the runtime frame limit.
 pub const MAX_SUMMARY_BYTES: usize = 1024 * 1024;
 pub const MAX_EDITS: usize = 4;
 pub const MAX_EDIT_BYTES: usize = 64 * 1024;
-/// Sealed proposal attempts per run. A constant, so no policy edit can raise it.
 pub const MAX_ATTEMPTS: u8 = 3;
-/// Upper bound on one Dreams host call; policy keeps total check time below it.
 pub const HOST_TIMEOUT_MS: u64 = 21 * 60 * 1000;
 pub const NOT_CONFIGURED: &str = "Dreams is not configured";
 
 const MAX_EVIDENCE_CITATIONS: usize = 20;
 const MAX_SHOWN_FILES: usize = 32;
-/// Above the 128 MiB retention cap, so a healthy log is always read whole.
 const MAX_RECEIPT_BYTES: u64 = 160 * 1024 * 1024;
 const MAX_RECEIPTS: usize = 400_000;
-
-// ---- Wire: TypeScript-exported, never reachable from the Swift roots ----
 
 /// Everything a Dreams actor can ask the coordinator to do.
 /// Invariant: no variant applies, executes a caller-chosen command, names a
@@ -110,8 +103,6 @@ pub struct DreamsReply {
     pub text: String,
 }
 
-// ---- Domain: parsed at the broker boundary, trusted inside ----
-
 fn is_lower_hex(text: &str, lengths: &[usize]) -> bool {
     lengths.contains(&text.len())
         && text
@@ -135,7 +126,6 @@ impl RunId {
             .finalize();
         Ok(Self(hex::encode(&digest[..8])))
     }
-    /// For a run named on the command line or found on disk.
     pub fn parse(text: &str) -> Result<Self> {
         ensure!(
             is_lower_hex(text, &[16]),
@@ -469,7 +459,6 @@ pub enum Outcome {
     Abstained(Abstention),
 }
 impl Outcome {
-    /// The short form `dreams list` shows.
     pub fn label(&self) -> String {
         match self {
             Self::Proposed(_) => "proposed".into(),
@@ -552,10 +541,8 @@ fn now_ms() -> u64 {
         })
 }
 
-/// Why one proposal attempt was not sealed, in words the model can act on.
 struct Rejection {
     reason: String,
-    /// Quoted check output, when a check is the reason.
     output: Vec<String>,
 }
 impl Rejection {
@@ -567,14 +554,12 @@ impl Rejection {
     }
 }
 
-/// What the model submitted for one attempt, before any of it is trusted.
 struct Draft<'a> {
     edits: &'a [DreamsFileEdit],
     rationale: &'a str,
     evidence: &'a [String],
 }
 
-/// Coordinator-local executor. One per broker, built only when `[dreams]` is configured.
 pub struct Dreams {
     state: PathBuf,
     store: DreamsStore,
@@ -643,7 +628,6 @@ impl Dreams {
         Self::reply(run, true, outcome.sealed_line(run))
     }
 
-    /// The sealed review, or the reply that tells the model to make one.
     fn reviewed(&self, run: &RunId) -> Result<std::result::Result<RunView, DreamsReply>> {
         Ok(self.store.read(run)?.ok_or_else(|| {
             Self::reply(
@@ -718,8 +702,6 @@ impl Dreams {
             let base = workspace::resolve_base(self.policy.repository()).await?;
             let checkout = staged.join("base");
             workspace::checkout(self.policy.repository(), &base, &checkout).await?;
-            // Captured before the checks run, so a check that writes into its
-            // directory cannot change what the model is shown.
             store::write_json(
                 &staged.join("files.json"),
                 &self.editable_files(&checkout).await?,
@@ -761,8 +743,6 @@ impl Dreams {
         built.map(|_| ())
     }
 
-    /// Current contents of the tracked editable files, so the model can return
-    /// each changed file whole.
     async fn editable_files(&self, checkout: &Path) -> Result<Vec<(String, String)>> {
         let mut files = Vec::new();
         for path in workspace::tracked_files(checkout).await? {
@@ -886,8 +866,6 @@ impl Dreams {
         Ok(Self::reply(&run, true, lines.join("\n")))
     }
 
-    /// One attempt: validate it against the policy and the sealed review,
-    /// build the candidate, derive the patch and run the after checks.
     async fn attempt(
         &self,
         view: &RunView,
@@ -953,8 +931,6 @@ impl Dreams {
         };
         let after = workspace::run_checks(&candidate, self.policy.checks(), cancelled).await?;
         store::write_json(&directory.join("after.json"), &after)?;
-        // A check runs beside the patch it judges. The bytes a reviewer will
-        // approve must still be the bytes Git derived before it ran.
         ensure!(
             ContentDigest::of(&std::fs::read(&patch_path)?) == patch.digest,
             "The Dreams patch changed while its checks ran"

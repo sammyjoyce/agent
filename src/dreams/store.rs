@@ -1,6 +1,3 @@
-//! The private run directory. Each record is written once: a review by an
-//! atomic directory rename, an attempt by an exclusive create, an outcome by a
-//! hard link. A rerun finds what was sealed and never rewrites it.
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
@@ -21,12 +18,10 @@ pub struct DreamsStore {
     root: PathBuf,
 }
 
-/// Everything sealed for one run.
 pub struct RunView {
     pub id: RunId,
     pub review: Review,
     pub outcome: Option<Outcome>,
-    /// sha256 of the exact outcome bytes: what a reviewer approves.
     pub review_sha256: Option<ContentDigest>,
     pub attempts_used: u8,
 }
@@ -175,8 +170,6 @@ impl DreamsStore {
         Ok(read_json(&self.review_directory(run).join("files.json"))?.unwrap_or_default())
     }
 
-    /// A private directory to build a review in. Staging left by a crashed
-    /// review of this run is removed once it is an hour old.
     pub(crate) fn stage_review(&self, run: &RunId) -> Result<PathBuf> {
         let directory = self.run_directory(run);
         private_directory(&directory)?;
@@ -199,8 +192,6 @@ impl DreamsStore {
         Ok(staged)
     }
 
-    /// Returns false when another review of this run was sealed first; the
-    /// staged copy is discarded and the sealed one stands.
     pub(crate) fn seal_review(&self, staged: &Path, run: &RunId) -> Result<bool> {
         let sealed = self.review_directory(run);
         // Renaming onto a directory that already holds a review fails, so the first seal wins.
@@ -216,8 +207,6 @@ impl DreamsStore {
         Ok(won)
     }
 
-    /// The first free attempt number, or None when every attempt is used. A
-    /// crashed attempt keeps its number, so the bound holds across restarts.
     pub(crate) fn allocate_attempt(&self, run: &RunId) -> Result<Option<(u8, PathBuf)>> {
         private_directory(&self.run_directory(run).join("attempts"))?;
         for attempt in 1..=MAX_ATTEMPTS {
@@ -231,8 +220,6 @@ impl DreamsStore {
         Ok(None)
     }
 
-    /// Seals the run's single outcome and returns whichever outcome is sealed:
-    /// this one, or the one that was linked first.
     pub(crate) fn seal_outcome(&self, run: &RunId, outcome: &Outcome) -> Result<Outcome> {
         let directory = self.run_directory(run);
         let temporary = directory.join(format!(".outcome-{}", Uuid::new_v4()));
