@@ -72,7 +72,7 @@ final class PhoneSession {
   }
 
   /// Shows the coordinator's conversation through the title menu.
-  func selectCoordinator() throws {
+  private func selectCoordinator() throws {
     guard scopeMenu.waitForExistence(timeout: 15) else {
       throw PhoneAcceptanceFailure(
         "The app shows no coordinator menu, so it cannot show \(configuration.coordinator) alone")
@@ -107,7 +107,7 @@ final class PhoneSession {
   // MARK: Guards
 
   /// Refuses to start a scenario over any draft: the composer must show its placeholder.
-  func requireEmptyComposer() throws {
+  private func requireEmptyComposer() throws {
     let value = composer.value as? String
     guard let value, placeholders.contains(value) else {
       throw PhoneAcceptanceFailure(

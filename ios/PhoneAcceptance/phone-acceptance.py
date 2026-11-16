@@ -80,11 +80,8 @@ def app_baseline(apps, bundle):
     """The target app's entries in `devicectl device info apps` JSON, with version and build."""
     matches = [app for app in apps.get("result", {}).get("apps", [])
                if app.get("bundleIdentifier") == bundle]
-    return {
-        "count": len(matches),
-        "version": matches[0].get("version") if len(matches) == 1 else None,
-        "build": matches[0].get("bundleVersion") if len(matches) == 1 else None,
-    }
+    only = matches[0] if len(matches) == 1 else {}
+    return {"count": len(matches), "version": only.get("version"), "build": only.get("bundleVersion")}
 
 
 def baseline_problems(before, after):
@@ -402,7 +399,7 @@ class PushWatcher:
         self.request = Path(f"/tmp/phone-acceptance-{simulator}-push.json")
         self.watching = Path(f"/tmp/phone-acceptance-{simulator}.watching")
         self.stopped = threading.Event()
-        self.delivered = []
+        self.delivered = set()
         self.thread = threading.Thread(target=self.watch, daemon=True)
 
     def __enter__(self):
@@ -424,7 +421,7 @@ class PushWatcher:
                 key = (request["stage"], request["codeword"])
                 if key not in self.delivered:
                     self.push(request)
-                    self.delivered.append(key)
+                    self.delivered.add(key)
             except (OSError, KeyError, json.JSONDecodeError, subprocess.CalledProcessError):
                 pass
 

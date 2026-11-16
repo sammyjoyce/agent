@@ -62,7 +62,7 @@ final class NotificationDeliveryTests: XCTestCase {
     try session.pressHome()
     try session.expectAlert(stage: "mid-job", codeword: codeword)
     var (banner, element) = session.awaitBanner(codeword, timeout: alertDeadline)
-    var observations: [AlertEvidence] = []
+    let observations: [AlertEvidence]
     if banner.alertLabel != nil, element.exists, element.isHittable {
       session.tap(&banner, element)
       observations = [banner]
