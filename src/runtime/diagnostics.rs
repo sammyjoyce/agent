@@ -7,7 +7,7 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,8 @@ use crate::{
 
 const MAX_BYTES: u64 = 1024 * 1024;
 const CAPACITY: usize = 256;
+/// A reader treats silence longer than twice this as unwitnessed time.
+pub(crate) const HEARTBEAT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Record {
@@ -47,6 +49,11 @@ fn is_zero(value: &u64) -> bool {
 }
 fn millis(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, millis)
 }
 fn token(value: &str) -> Option<String> {
     (!value.is_empty()
@@ -137,6 +144,8 @@ pub(crate) enum Event {
     RuntimeStopped {
         code: ErrorCode,
     },
+    /// Proves the writer was alive at this time, so quiet differs from blind.
+    Heartbeat,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -615,7 +624,33 @@ impl Diagnostics {
         }
     }
     pub fn start(state: &Path) -> Self {
+        Self::start_with_heartbeat(state, HEARTBEAT)
+    }
+    fn start_with_heartbeat(state: &Path, heartbeat: Duration) -> Self {
         let (sender, mut records) = mpsc::channel(CAPACITY);
+        // A weak sender lets the writer end when its last real producer does.
+        let witness = sender.downgrade();
+        tokio::spawn(async move {
+            let mut ticks =
+                tokio::time::interval_at(tokio::time::Instant::now() + heartbeat, heartbeat);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticks.tick().await;
+                let Some(sender) = witness.upgrade() else {
+                    return;
+                };
+                let _ = sender.try_send(Record {
+                    timestamp_ms: now_ms(),
+                    request_id: 0,
+                    elapsed_ms: None,
+                    conversation_id: None,
+                    task_id: None,
+                    agent_id: None,
+                    dropped_before: 0,
+                    event: Event::Heartbeat,
+                });
+            }
+        });
         let directory = state.join("diagnostics");
         tokio::task::spawn_blocking(move || {
             let result = (|| -> io::Result<()> {
@@ -633,9 +668,7 @@ impl Diagnostics {
     }
     pub fn record(&mut self, request_id: u32, trace: &Trace, event: Event) {
         let record = Record {
-            timestamp_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, millis),
+            timestamp_ms: now_ms(),
             request_id,
             elapsed_ms: trace.started.map(|started| millis(started.elapsed())),
             conversation_id: trace.conversation_id.clone(),
@@ -1069,12 +1102,208 @@ impl Writer {
     }
 }
 
+/// Loss the retention watermark reports for removed segments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RetentionFacts {
+    pub prior_history_unknown: bool,
+    pub expired_through_ms: Option<u64>,
+    pub capacity_loss: Option<CapacityLossFacts>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CapacityLossFacts {
+    pub first_timestamp_ms: Option<u64>,
+    pub last_timestamp_ms: Option<u64>,
+    pub unknown_timestamps: bool,
+    pub segments: u64,
+    pub bytes: u64,
+}
+
+/// What one pass over the retained segments found for `[start, end)`.
+#[derive(Debug)]
+pub(crate) struct ReceiptWindow {
+    /// Receipts inside the window, oldest segment first.
+    pub records: Vec<Record>,
+    /// None when retention.json is missing or unreadable, so loss is unknown.
+    pub retention: Option<RetentionFacts>,
+    pub oldest_retained_ms: Option<u64>,
+    /// Lines that are not receipts and cannot be placed before the window.
+    pub unparseable: u32,
+    /// The first in-window timestamp left out by the record or byte budget.
+    pub truncated_at_ms: Option<u64>,
+    /// Segments were rotated or pruned during both read attempts.
+    pub rotated_during_read: bool,
+}
+
+type SegmentIdentity = (u32, u64, u64);
+
+fn segment_files(directory: &Path) -> io::Result<Vec<(u32, File)>> {
+    let mut indexes = vec![0];
+    for entry in fs::read_dir(directory)? {
+        let name = entry?.file_name();
+        if let Some(index) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("runtime.jsonl."))
+            .and_then(|suffix| suffix.parse::<u32>().ok())
+            .filter(|index| *index > 0 && name == format!("runtime.jsonl.{index}").as_str())
+        {
+            indexes.push(index);
+        }
+    }
+    indexes.sort_unstable_by_key(|index| Reverse(*index));
+    let mut files = Vec::new();
+    for index in indexes {
+        match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(Segment::path(directory, index))
+        {
+            Ok(file) if file.metadata()?.is_file() => files.push((index, file)),
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "Diagnostics segment is not a regular file",
+                ));
+            }
+            // The writer renames and prunes without waiting for readers.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(files)
+}
+
+fn identities(files: &[(u32, File)]) -> io::Result<Vec<SegmentIdentity>> {
+    use std::os::unix::fs::MetadataExt;
+    files
+        .iter()
+        .map(|(index, file)| {
+            let metadata = file.metadata()?;
+            Ok((*index, metadata.dev(), metadata.ino()))
+        })
+        .collect()
+}
+
+fn read_retention(directory: &Path) -> Option<RetentionFacts> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(directory.join("retention.json"))
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > WATERMARK_BYTES {
+        return None;
+    }
+    let watermark: RetentionWatermark = serde_json::from_reader(file).ok()?;
+    (watermark.version == 1).then(|| RetentionFacts {
+        prior_history_unknown: watermark.prior_history_unknown,
+        expired_through_ms: watermark.expired_through_ms,
+        capacity_loss: watermark.capacity_loss.map(|loss| CapacityLossFacts {
+            first_timestamp_ms: loss.first_timestamp_ms,
+            last_timestamp_ms: loss.last_timestamp_ms,
+            unknown_timestamps: loss.unknown_timestamps,
+            segments: loss.segments,
+            bytes: loss.bytes,
+        }),
+    })
+}
+
+fn read_once(
+    directory: &Path,
+    (start, end): (u64, u64),
+    max_records: usize,
+    max_bytes: u64,
+) -> io::Result<(ReceiptWindow, bool)> {
+    let retention = read_retention(directory);
+    let files = match segment_files(directory) {
+        Ok(files) => files,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let before = identities(&files)?;
+    let mut window = ReceiptWindow {
+        records: Vec::new(),
+        retention,
+        oldest_retained_ms: None,
+        unparseable: 0,
+        truncated_at_ms: None,
+        rotated_during_read: false,
+    };
+    // Segments are append ordered, so a bad line followed by a receipt older
+    // than the window is provably outside it. Any other bad line may hide one.
+    let mut unplaced = 0_u32;
+    let mut bytes = 0_u64;
+    for (index, file) in &files {
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        while reader.read_until(b'\n', &mut line)? != 0 {
+            bytes = bytes.saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX));
+            // The writer may be mid-append on the live segment's last line.
+            let complete = line.last() == Some(&b'\n') || *index != 0;
+            match serde_json::from_slice::<Record>(&line) {
+                Ok(record) => {
+                    let timestamp = record.timestamp_ms;
+                    window.oldest_retained_ms = Some(
+                        window
+                            .oldest_retained_ms
+                            .map_or(timestamp, |oldest| oldest.min(timestamp)),
+                    );
+                    if timestamp < start {
+                        unplaced = 0;
+                    } else {
+                        window.unparseable = window.unparseable.saturating_add(unplaced);
+                        unplaced = 0;
+                        if timestamp < end {
+                            if window.records.len() < max_records && bytes <= max_bytes {
+                                window.records.push(record);
+                            } else {
+                                window.truncated_at_ms = Some(
+                                    window
+                                        .truncated_at_ms
+                                        .map_or(timestamp, |cut| cut.min(timestamp)),
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(_) if complete => unplaced = unplaced.saturating_add(1),
+                Err(_) => {}
+            }
+            line.clear();
+        }
+    }
+    window.unparseable = window.unparseable.saturating_add(unplaced);
+    let after = match segment_files(directory) {
+        Ok(files) => identities(&files)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    Ok((window, before == after))
+}
+
+/// Reads retention.json, then every retained segment oldest first, keeping
+/// receipts inside `window`. Retries once when segments moved underneath it.
+/// Never takes writer.lock, so diagnostics never wait on a reader.
+pub(crate) fn read_window(
+    state: &Path,
+    window: (u64, u64),
+    max_records: usize,
+    max_bytes: u64,
+) -> io::Result<ReceiptWindow> {
+    let directory = state.join("diagnostics");
+    let (first, stable) = read_once(&directory, window, max_records, max_bytes)?;
+    if stable {
+        return Ok(first);
+    }
+    let (mut second, stable) = read_once(&directory, window, max_records, max_bytes)?;
+    second.rotated_during_read = !stable;
+    Ok(second)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::protocol::{InputMode, MainInputContext, RuntimeCommand, RuntimeRequest};
     use crate::runtime::diagnostics::{
         Diagnostics, Event, Record, RetentionPolicy, RetentionWatermark, Trace, WATERMARK_BYTES,
-        Writer, command_kind,
+        Writer, command_kind, read_window,
     };
     use std::{
         fs,
@@ -1668,5 +1897,157 @@ mod tests {
                 serde_json::to_string(&expected).unwrap()
             );
         }
+    }
+
+    fn at(timestamp_ms: u64, event: Event) -> Record {
+        Record {
+            timestamp_ms,
+            event,
+            ..record(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeats_witness_an_idle_writer_without_keeping_it_alive() {
+        let state = tempfile::tempdir().unwrap();
+        let diagnostics =
+            Diagnostics::start_with_heartbeat(state.path(), std::time::Duration::from_millis(20));
+        let directory = state.path().join("diagnostics");
+        let heartbeats = || {
+            receipts(&directory)
+                .iter()
+                .filter(|record| matches!(record.event, Event::Heartbeat))
+                .count()
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !directory.join("runtime.jsonl").exists() || heartbeats() < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("An idle writer must still record heartbeats");
+        drop(diagnostics);
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.join("writer.lock"))
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("The heartbeat must not keep the writer alive after its last producer");
+    }
+
+    #[test]
+    fn a_window_read_spans_segments_and_reports_loss_without_the_writer_lock() {
+        let state = tempfile::tempdir().unwrap();
+        let directory = state.path().join("diagnostics");
+        let mut writer = Writer::open_at(directory.clone(), policy(1_000_000), 10_000).unwrap();
+        for timestamp in (1_000..=9_000).step_by(100) {
+            writer.append(&at(timestamp, Event::Heartbeat)).unwrap();
+        }
+        assert!(writer.archives.len() > 3, "The fixture must span segments");
+        // The writer still holds writer.lock while the reader runs.
+        let all = read_window(state.path(), (0, 20_000), 1_000, u64::MAX).unwrap();
+        assert_eq!(all.records.len(), 81);
+        assert_eq!(all.oldest_retained_ms, Some(1_000));
+        assert_eq!(all.unparseable, 0);
+        assert!(!all.rotated_during_read);
+        assert_eq!(all.truncated_at_ms, None);
+        let facts = all.retention.unwrap();
+        assert!(!facts.prior_history_unknown);
+        assert_eq!(facts.expired_through_ms, None);
+        assert_eq!(facts.capacity_loss, None);
+
+        let middle = read_window(state.path(), (3_000, 5_000), 1_000, u64::MAX).unwrap();
+        let timestamps: Vec<u64> = middle
+            .records
+            .iter()
+            .map(|record| record.timestamp_ms)
+            .collect();
+        assert_eq!(timestamps, (3_000..5_000).step_by(100).collect::<Vec<_>>());
+        assert_eq!(middle.oldest_retained_ms, Some(1_000));
+
+        let cut = read_window(state.path(), (3_000, 5_000), 5, u64::MAX).unwrap();
+        assert_eq!(cut.records.len(), 5);
+        assert_eq!(cut.truncated_at_ms, Some(3_500));
+    }
+
+    #[test]
+    fn a_window_read_counts_only_bad_lines_that_may_hide_a_receipt_in_the_window() {
+        let state = tempfile::tempdir().unwrap();
+        let directory = state.path().join("diagnostics");
+        fs::create_dir(&directory).unwrap();
+        let line = |timestamp| serde_json::to_string(&at(timestamp, Event::Heartbeat)).unwrap();
+        fs::write(
+            directory.join("runtime.jsonl.1"),
+            format!(
+                "{}\nnot a receipt, provably old\n{}\nmaybe in the window\n{}\n",
+                line(100),
+                line(200),
+                line(1_000)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("runtime.jsonl"),
+            format!(
+                "{}\n{{\"timestamp_ms\":1200,\"event\":\"from_a_newer_writer\"}}\n{}\n{{\"timestamp_ms\":",
+                line(1_100),
+                line(1_300)
+            ),
+        )
+        .unwrap();
+        let read = read_window(state.path(), (500, 2_000), 100, u64::MAX).unwrap();
+        assert_eq!(read.records.len(), 3);
+        assert_eq!(
+            read.unparseable, 2,
+            "An old bad line and a half-written last line are not gaps"
+        );
+        assert!(
+            read.retention.is_none(),
+            "A missing watermark means loss is unknown"
+        );
+
+        fs::write(
+            directory.join("retention.json"),
+            serde_json::to_vec(&RetentionWatermark {
+                version: 1,
+                policy: RetentionPolicy::default(),
+                prior_history_unknown: true,
+                expired_through_ms: Some(90),
+                capacity_loss: Some(super::CapacityLoss {
+                    first_timestamp_ms: Some(10),
+                    last_timestamp_ms: Some(20),
+                    unknown_timestamps: false,
+                    segments: 2,
+                    bytes: 1_200,
+                }),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let facts = read_window(state.path(), (500, 2_000), 100, u64::MAX)
+            .unwrap()
+            .retention
+            .unwrap();
+        assert!(facts.prior_history_unknown);
+        assert_eq!(facts.expired_through_ms, Some(90));
+        let loss = facts.capacity_loss.unwrap();
+        assert_eq!(
+            (
+                loss.first_timestamp_ms,
+                loss.last_timestamp_ms,
+                loss.segments,
+                loss.bytes
+            ),
+            (Some(10), Some(20), 2, 1_200)
+        );
+        let empty = tempfile::tempdir().unwrap();
+        let none = read_window(empty.path(), (0, 10), 10, u64::MAX).unwrap();
+        assert!(none.records.is_empty() && none.retention.is_none());
     }
 }

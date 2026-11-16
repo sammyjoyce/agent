@@ -43,6 +43,27 @@ pub struct ClientConfig {
     /// Local only: forwards this Mac's finished Scrawl captures as feedback.
     #[serde(default)]
     pub scrawl_feedback: bool,
+    /// Coordinator-local: where Dreams may propose edits and how it checks them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dreams: Option<crate::dreams::DreamsPolicyFile>,
+}
+
+impl ClientConfig {
+    /// The parsed Dreams policy, when this machine configures one.
+    pub fn dreams_policy(&self) -> Result<Option<crate::dreams::DreamsPolicy>> {
+        self.dreams
+            .as_ref()
+            .map(|file| {
+                crate::dreams::DreamsPolicy::parse(
+                    file,
+                    &crate::dreams::ProtectedPaths {
+                        config: self.path.as_deref(),
+                        job_directories: &self.job_directories,
+                    },
+                )
+            })
+            .transpose()
+    }
 }
 
 impl Default for ClientConfig {
@@ -64,6 +85,7 @@ impl Default for ClientConfig {
             sources: Vec::new(),
             poll_interval_seconds: default_poll_interval(),
             scrawl_feedback: false,
+            dreams: None,
         }
     }
 }
@@ -312,6 +334,10 @@ fn validate(config: &mut ClientConfig) -> Result<()> {
     for directory in &mut config.job_directories {
         *directory = context_repository_path(directory, home.as_deref())?;
     }
+    if let Some(dreams) = &mut config.dreams {
+        dreams.repository = context_repository_path(&dreams.repository, home.as_deref())?;
+    }
+    config.dreams_policy()?;
     crate::tailnet::PeerPolicy::new(&config.trusted_nodes, &config.trusted_user_ids)?;
     crate::tailnet::Daemon::new(config.tailscale_socket.as_deref())?;
     ensure!(

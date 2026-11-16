@@ -61,6 +61,7 @@ pub(crate) struct ProcessRequest<'a> {
     deadline: Duration,
     output_limit: usize,
     sender_conversation_id: Option<&'a str>,
+    environment: Option<&'a [(String, String)]>,
 }
 
 impl<'a> ProcessRequest<'a> {
@@ -83,7 +84,14 @@ impl<'a> ProcessRequest<'a> {
             deadline,
             output_limit,
             sender_conversation_id: None,
+            environment: None,
         })
+    }
+
+    /// The child sees exactly these variables and nothing inherited.
+    pub fn with_only_environment(mut self, environment: &'a [(String, String)]) -> Self {
+        self.environment = Some(environment);
+        self
     }
 
     pub fn with_sender_conversation(mut self, sender_conversation_id: Option<&'a str>) -> Self {
@@ -927,8 +935,12 @@ pub(crate) async fn run_process_until(
         deadline,
         output_limit,
         sender_conversation_id,
+        environment,
     } = request;
     let mut command = Command::new(program);
+    if let Some(environment) = environment {
+        command.env_clear().envs(environment.iter().cloned());
+    }
     // Actor identity belongs to this effect, never to the long-lived host's
     // inherited environment or an earlier task.
     if let Some(sender) = sender_conversation_id {

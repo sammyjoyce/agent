@@ -22,7 +22,7 @@ use tokio::{
     time::timeout,
 };
 
-mod diagnostics;
+pub(crate) mod diagnostics;
 pub mod lifecycle;
 use crate::runtime::diagnostics::{Diagnostics, Event as DiagnosticEvent, HostTiming, Trace};
 use crate::runtime::lifecycle::RequestLifecycle;
