@@ -181,9 +181,9 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Shared worktree inventory through the CLI and `/worktrees`, including
   native chat clients.
 - [ ] Bring the iPhone app's actions and content to Siri and Shortcuts through
-  App Intents. **Open Coordinator** and the coordinator entity ship first, with
-  a build check that the app carries its intents metadata and phrase. Reading
-  jobs, sending, opening a job, onscreen entities and Spotlight follow.
+  App Intents. **Open Coordinator**, **Open Job**, **Retry Interrupted Run**,
+  reading jobs, and onscreen coordinators and jobs ship, with a build check that
+  the app carries its intents metadata and phrase. Sending and Spotlight follow.
 - [ ] A macOS menu bar app that shows Beep Boop's status on the Mac, including
   whether the service is running and its installed and running versions.
 - [ ] Typed read and write access to Apple Notes, Reminders, Mail and Messages
