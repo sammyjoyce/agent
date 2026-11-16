@@ -225,6 +225,13 @@ recovery; [history](history.md) describes import and retrieval.
   Accessibility grant. Whether to run agent-desktop or build on its design is
   open. Snapshots, screenshots and clipboard reads can hold private desktop
   content.
+- [ ] Reply to a specific message in the iPhone app, as Apple Messages does.
+  Choose **Reply** on a message, and the composer shows that message above the
+  draft until you send or cancel. The sent input names the message it answers,
+  so the transcript shows that message quoted with the reply and the model
+  knows which message the reply is about. Today a message's menu offers only
+  **Copy message**, **Select text** and **Share text**, and an input cannot
+  name an earlier message.
 
 ## Retrieval, learning and proof
 
