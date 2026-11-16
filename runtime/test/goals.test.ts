@@ -581,6 +581,51 @@ async function pauseKeepsQueuedInput(interactive: boolean): Promise<void> {
 test("pause stops only the goal's turn of a non-interactive actor and its queued input still runs", () => pauseKeepsQueuedInput(false));
 test("pause stops only the goal's turn of an interactive worker and its queued input still runs", () => pauseKeepsQueuedInput(true));
 
+async function queuedInputRunsAfterPauseAndRestart(settledBeforeRestart: boolean): Promise<void> {
+  await scenario(undefined, async (fixture) => {
+    const first = fixture.app;
+    const task = await first.task("Paused before a restart");
+    const target = inTask(task.id);
+    await first.goal(target, { type: "set", request_id: "set-restart-queue", objective: "Build the fixture report" });
+    first.script([call("exec", { program: "make", args: ["report"] }, "restart-queue-exec")]);
+    let cut = () => {};
+    const atCut = new Promise<void>((resolve) => { cut = resolve; });
+    const observer: WorkerSession = { signal: new AbortController().signal, async ready() {}, idle() {}, answer() {},
+      async beforeTurn() {
+        if (goalOf(await first.goal(target, show)).state.state !== "paused") return;
+        cut();
+        await new Promise<never>(() => {});
+      } };
+    const held = fixture.host.hold("exec");
+    const prior = first.run(await first.command(task.id), observer);
+    prior.catch(() => {});
+    await held.entered;
+    await first.tasks.enqueue(task.id, "Answer the unrelated question.", "unrelated", undefined, "follow_up");
+    assert.equal((await first.submission(task.id, "unrelated"))?.status, "queued");
+    await first.goal(target, { type: "pause", request_id: "pause-restart-queue" });
+    let app: App;
+    if (settledBeforeRestart) {
+      held.release();
+      await Promise.race([atCut, prior.then(() => { throw new Error("The actor went idle before the restart cut"); })]);
+      app = await fixture.reopen();
+    } else {
+      const reopening = fixture.reopen();
+      held.release();
+      app = await reopening;
+    }
+
+    app.script([fauxAssistantMessage("Answered the unrelated question."), fauxAssistantMessage("A goal turn must not run.")]);
+    const running = app.run(await app.command(task.id));
+    running.catch(() => {});
+    await until(async () => (await app.submission(task.id, "unrelated"))?.status === "done");
+    await running;
+    assert.deepEqual(app.prompts, ["Answer the unrelated question."]);
+    assert.deepEqual(goalOf(await app.goal(target, show)).state, { state: "paused", reason: "requested" });
+  });
+}
+test("an input queued behind a paused goal turn runs after a restart without another message", () => queuedInputRunsAfterPauseAndRestart(true));
+test("an input queued behind a goal turn still stopping at a restart runs after it", () => queuedInputRunsAfterPauseAndRestart(false));
+
 test("continuations stop at the budget and exhaustion pauses the goal", async () => {
   await scenario(undefined, async ({ app }) => {
     const task = await app.task("Budget task");
