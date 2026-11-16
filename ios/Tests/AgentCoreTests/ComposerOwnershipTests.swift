@@ -945,14 +945,11 @@ func anOlderControlComesBackOnceWhileANewerSendIsAdmitting(newerRefused: Bool) a
   }
 }
 
-/// What recovery would offer from the composer record under `root` now.
 private func recoveredText(under root: URL) async throws -> String {
   try await ComposerDraftStore(url: root.appending(path: "Composer/draft.json"))
     .load(from: AttachmentStore(directory: root.appending(path: "Composer/Files"))).draft.text
 }
 
-/// `/status` is still dialing when a newer note's Send starts, and the app goes to the background
-/// at once, as when the user switches away. Whatever comes back keeps the order it was sent in.
 @MainActor @Test(.timeLimit(.minutes(1)), arguments: 0..<10)
 func aBackgroundStopDuringANewerSendKeepsTheOrderTheyWereSent(attempt: Int) async throws {
   try await withGatedCoordinators(1) { coordinators, root in
@@ -980,8 +977,6 @@ func aBackgroundStopDuringANewerSendKeepsTheOrderTheyWereSent(attempt: Int) asyn
   }
 }
 
-/// `/status` and then `/help` are each dialing their own coordinator, and a note is typed, when
-/// both dials fail, in either order. Both come back in the order they were sent, ahead of the note.
 @MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true])
 func twoControlsThatComeBackKeepTheOrderTheyWereSent(newerFailsFirst: Bool) async throws {
   try await withGatedCoordinators(2) { coordinators, root in
@@ -1011,6 +1006,83 @@ func twoControlsThatComeBackKeepTheOrderTheyWereSent(newerFailsFirst: Bool) asyn
     #expect(await model.saveDraft())
     #expect(try await recoveredText(under: root) == expected, "Recovery offers the same order")
     #expect(await first.fixture.count() == 0, "The first coordinator got nothing")
+    #expect(await second.fixture.count() == 0, "The second coordinator got nothing")
+    await model.setActive(false)
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func typingOntoAReturnedControlKeepsItFirst() async throws {
+  try await withGatedCoordinators(2) { coordinators, root in
+    let (first, second) = (coordinators[0], coordinators[1])
+    let model = try await connectedModel(to: coordinators, under: root)
+    await first.gate.arm()
+    await second.gate.arm()
+    model.setChip(first.profile.id)
+    model.draft = "/status"
+    await model.send()
+    try await held(first.gate)
+    model.setChip(second.profile.id)
+    model.draft = "/help"
+    await model.send()
+    try await held(second.gate)
+    await first.gate.fail()
+    let firstDeadline = ContinuousClock.now + .seconds(5)
+    while model.draft.isEmpty, ContinuousClock.now < firstDeadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    model.draft += " invented"
+    await second.gate.fail()
+    let secondDeadline = ContinuousClock.now + .seconds(5)
+    while !model.draft.contains("/help"), ContinuousClock.now < secondDeadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(model.draft == "/status invented\n\n/help", "/status keeps what was typed onto it")
+    await model.setActive(false)
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: 0..<10)
+func aRestoreWhileSendsComeBackKeepsTheirOrder(attempt: Int) async throws {
+  try await withGatedCoordinators(2) { coordinators, root in
+    let (first, second) = (coordinators[0], coordinators[1])
+    let model = try await connectedModel(to: coordinators, under: root)
+    await first.fixture.rejectSubmits()
+    model.setChip(first.profile.id)
+    model.draft = "An invented refused note"
+    await model.send()
+    let refused = try #require(
+      try await snapshot(of: first.session, in: model) { snapshot in
+        snapshot.rows.contains { $0.delivery == .rejected }
+      }.rows.first { $0.delivery == .rejected }?.inputID)
+    await first.fixture.rejectSubmits(false)
+    await first.gate.arm()
+    await second.gate.arm()
+    model.setChip(first.profile.id)
+    model.draft = "/status"
+    await model.send()
+    try await held(first.gate)
+    model.setChip(second.profile.id)
+    model.draft = "/help"
+    await model.send()
+    try await held(second.gate)
+    let restoring = Task { @MainActor in await model.restore(refused) }
+    await first.session.disconnect()
+    await restoring.value
+    let firstDeadline = ContinuousClock.now + .seconds(5)
+    while !model.draft.contains("/status"), ContinuousClock.now < firstDeadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    await second.gate.fail()
+    let secondDeadline = ContinuousClock.now + .seconds(5)
+    while !model.draft.contains("/help"), ContinuousClock.now < secondDeadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    let expected = "/status\n\n/help\n\nAn invented refused note"
+    #expect(model.draft == expected, "The Sends come back in order, ahead of the restored note")
+    #expect(await model.saveDraft())
+    #expect(try await recoveredText(under: root) == expected, "Recovery offers the same order")
+    #expect(await first.fixture.count() == 0, "The first coordinator kept nothing")
     #expect(await second.fixture.count() == 0, "The second coordinator got nothing")
     await model.setActive(false)
   }
