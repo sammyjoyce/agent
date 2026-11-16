@@ -275,7 +275,7 @@ export class TaskStore {
   useConfinement(rule: ActorConfinement): void { this.confinement = rule; }
   isConfined(task: Pick<TaskRecord, "sources">): boolean { return this.confinement(task) !== undefined; }
   /** A confined task admits only a scheduled occurrence: no other input, child agent or terminal. */
-  private requireSchedulerAdmission(task: Pick<TaskRecord, "sources">, scheduled: ScheduledOccurrence | undefined): void {
+  private requireSchedulerAdmission(task: Pick<TaskRecord, "sources">, scheduled?: ScheduledOccurrence): void {
     if (this.isConfined(task) && scheduled === undefined) throw new TaskError(CONFINED_ACTOR_ONLY);
   }
   isBackgroundTask(task: TaskRecord): boolean { return isJobTask(task); }
@@ -1090,7 +1090,7 @@ export class TaskStore {
     } catch { /* The durable outbox still owns admission through this actor. */ }
   }
   async createAgent(taskId: string, input: { id: string; title: string; outcome: string; input: string; inputId: string; model?: ModelSelection; attachments?: AttachmentRef[] }): Promise<TaskAgentRecord> {
-    this.requireSchedulerAdmission(await this.get(taskId), undefined);
+    this.requireSchedulerAdmission(await this.get(taskId));
     if (input.title.trim().length === 0 || input.title.length > 80 || input.outcome.trim().length === 0 ||
         input.outcome.length > 4000) {
       throw new TaskError("An agent needs a title, bounded outcome, and instruction");
@@ -1646,7 +1646,7 @@ export class TaskStore {
     const ref: ActorRef = { task_id: input.task_id, ...(input.agent_id === undefined ? {} : { agent_id: input.agent_id }) };
     const key = this.actorKey(ref.task_id, ref.agent_id);
     if (observer === undefined && (this.running.get(key)?.phase ?? "closing") !== "closing") throw new TaskError("This task already has an attached worker");
-    this.requireSchedulerAdmission(await this.get(input.task_id), undefined);
+    this.requireSchedulerAdmission(await this.get(input.task_id));
     const { task, worker } = await this.confirmBinding(input, call);
     const record = this.actor(task, ref.agent_id);
     const attached: ActorObserver | undefined = observer === undefined ? undefined
