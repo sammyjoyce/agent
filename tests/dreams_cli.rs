@@ -1160,6 +1160,64 @@ async fn show_quotes_each_cited_evidence_body_and_bounds_each_one_and_their_tota
     );
 }
 
+#[tokio::test]
+async fn a_changed_evidence_body_or_review_record_refuses_show_and_apply_and_leaves_the_target_alone()
+ {
+    for (file, sealed_text, swapped_text) in [
+        (
+            "evidence.jsonl",
+            "The command failed",
+            "The command passed after an approved example change",
+        ),
+        (
+            "review.json",
+            "missing make target: test-all",
+            "every make target exists",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fixture.seed_witnessed_night();
+        let before = fixture.target();
+        let sealed =
+            Sealed::new(&fixture, "AGENTS.md", FIXED_AGENTS, "Name the real target.").await;
+        let path = fixture
+            .state
+            .join("dreams/runs")
+            .join(&sealed.run)
+            .join("review")
+            .join(file);
+        let original = fs::read_to_string(&path).unwrap();
+        let swapped = original.replace(sealed_text, swapped_text);
+        assert_ne!(swapped, original, "{file} must hold {sealed_text:?}");
+        fs::write(&path, &swapped).unwrap();
+
+        let shown = fixture.cli(&["dreams", "show", &sealed.run], true);
+        let applied = fixture.cli(&sealed.apply_arguments(), false);
+        for (command, output) in [("show --json", &shown), ("apply", &applied)] {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success()
+                    && stderr.contains("Dreams review changed since it was sealed"),
+                "{command} accepted a changed {file}: exit {:?} {stderr}{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+        assert_eq!(
+            fixture.target(),
+            before,
+            "A refused apply changed the target"
+        );
+
+        fs::write(&path, &original).unwrap();
+        let applied = fixture.ok(&sealed.apply_arguments(), false);
+        assert!(
+            applied.contains("Applied Dreams run"),
+            "The sealed bytes apply: {applied}"
+        );
+    }
+}
+
 fn changed_paths(
     before: &std::collections::BTreeMap<PathBuf, (u32, Vec<u8>)>,
     after: &std::collections::BTreeMap<PathBuf, (u32, Vec<u8>)>,
