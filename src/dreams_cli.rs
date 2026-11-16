@@ -118,14 +118,19 @@ fn touched_paths(patch: &str) -> Result<Vec<TouchedPath>> {
     Ok(touched)
 }
 
+/// The patch file is read once. The digest check and Git both use those bytes,
+/// so the file cannot change between the two.
+fn read_patch(store: &DreamsStore, proposal: &Proposal) -> Result<Vec<u8>> {
+    fs::read(store.patch_path(&proposal.run, proposal.attempt))
+        .context("The Dreams patch file is missing")
+}
+
 async fn classify(
-    store: &DreamsStore,
     policy: Option<&DreamsPolicy>,
     proposal: &Proposal,
+    patch: &[u8],
 ) -> Result<ProposalStatus> {
-    let patch = fs::read(store.patch_path(&proposal.run, proposal.attempt))
-        .context("The Dreams patch file is missing")?;
-    let actual = ContentDigest::of(&patch);
+    let actual = ContentDigest::of(patch);
     if actual != proposal.patch_sha256 {
         return Ok(ProposalStatus::PatchChanged { actual });
     }
@@ -141,7 +146,7 @@ async fn classify(
         return Ok(ProposalStatus::PolicyChanged);
     }
     let touched =
-        touched_paths(&String::from_utf8(patch).context("The Dreams patch is not text")?)?;
+        touched_paths(std::str::from_utf8(patch).context("The Dreams patch is not text")?)?;
     ensure!(
         touched.iter().map(|file| &file.path).eq(&proposal.files),
         "The Dreams patch does not touch the files its record names"
@@ -286,13 +291,17 @@ struct RunSummary {
     status: Option<ProposalStatus>,
 }
 
+/// The status of a proposal with the patch bytes it was derived from.
 async fn status_of(
     store: &DreamsStore,
     policy: Option<&DreamsPolicy>,
     view: &RunView,
-) -> Result<Option<ProposalStatus>> {
+) -> Result<Option<(ProposalStatus, Vec<u8>)>> {
     match &view.outcome {
-        Some(Outcome::Proposed(proposal)) => Ok(Some(classify(store, policy, proposal).await?)),
+        Some(Outcome::Proposed(proposal)) => {
+            let patch = read_patch(store, proposal)?;
+            Ok(Some((classify(policy, proposal, &patch).await?, patch)))
+        }
         _ => Ok(None),
     }
 }
@@ -423,10 +432,10 @@ async fn fast_forward(
     store: &DreamsStore,
     policy: &DreamsPolicy,
     proposal: &Proposal,
+    patch: &[u8],
     half_applied: &[TouchedPath],
 ) -> Result<String> {
     let base = proposal.base.as_str();
-    let patch = store.patch_path(&proposal.run, proposal.attempt);
     let scratch = ScratchIndex(
         store
             .run_directory(&proposal.run)
@@ -437,16 +446,14 @@ async fn fast_forward(
         scratch.0.to_str().context("State path is not UTF-8")?,
     );
     staging.text(&["read-tree", base]).await?;
-    staging
-        .text(&[
-            "apply",
-            "--cached",
-            "--whitespace=nowarn",
-            "--",
-            patch.to_str().context("State path is not UTF-8")?,
-        ])
-        .await
-        .context("The approved patch does not apply to its base")?;
+    let applied = staging
+        .run_with_input(&["apply", "--cached", "--whitespace=nowarn"], patch)
+        .await?;
+    ensure!(
+        applied.exit_code == 0,
+        "The approved patch does not apply to its base: {}",
+        applied.stderr.trim()
+    );
     let tree = staging.text(&["write-tree"]).await?;
     let tree = tree.trim();
 
@@ -560,7 +567,8 @@ async fn apply(
     let Some(Outcome::Proposed(proposal)) = &view.outcome else {
         bail!("Dreams run did not propose a change");
     };
-    match classify(store, policy, proposal).await? {
+    let patch = read_patch(store, proposal)?;
+    match classify(policy, proposal, &patch).await? {
         ProposalStatus::PatchChanged { .. } => bail!("Dreams patch changed since it was proposed"),
         ProposalStatus::PolicyChanged => bail!("Dreams policy changed since this proposal"),
         ProposalStatus::Stale { head } => bail!(
@@ -574,7 +582,7 @@ async fn apply(
         )),
         ProposalStatus::Pending { half_applied } => {
             let policy = policy.context("Dreams policy changed since this proposal")?;
-            let commit = fast_forward(store, policy, proposal, &half_applied).await?;
+            let commit = fast_forward(store, policy, proposal, &patch, &half_applied).await?;
             Ok(format!(
                 "Applied Dreams run {run} as commit {} to {}.",
                 short(&commit),
@@ -600,7 +608,9 @@ pub async fn run(
             let mut runs = Vec::new();
             for view in store.list()? {
                 runs.push(RunSummary {
-                    status: status_of(&store, policy.as_ref(), &view).await?,
+                    status: status_of(&store, policy.as_ref(), &view)
+                        .await?
+                        .map(|(status, _)| status),
                     window_end_ms: view.review.coverage.window.end_ms,
                     coverage: coverage_word(&view.review),
                     outcome: view
@@ -635,15 +645,8 @@ pub async fn run(
             let view = store
                 .read(&run)?
                 .with_context(|| format!("Unknown Dreams run {run}"))?;
-            let status = status_of(&store, policy.as_ref(), &view).await?;
-            let patch = match &view.outcome {
-                Some(Outcome::Proposed(proposal)) => {
-                    fs::read(store.patch_path(&run, proposal.attempt))
-                        .ok()
-                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                }
-                _ => None,
-            };
+            let (status, patch) = status_of(&store, policy.as_ref(), &view).await?.unzip();
+            let patch = patch.map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
             let evidence = store.evidence(&run)?;
             let report = RunReport {
                 run: &view.id,
@@ -695,7 +698,7 @@ mod tests {
 
     use crate::dreams_cli::{
         ProposalStatus, RunReport, apply, apply_command, classify, escape_terminal_controls,
-        render, touched_paths,
+        read_patch, render, touched_paths,
     };
 
     fn git(repository: &Path, arguments: &[&str]) -> String {
@@ -791,14 +794,20 @@ mod tests {
         };
         let approval = view.review_sha256.clone().unwrap();
         assert!(matches!(
-            classify(&store, Some(&policy), proposal).await.unwrap(),
+            classify(Some(&policy), proposal, &read_patch(&store, proposal).unwrap()).await.unwrap(),
             ProposalStatus::Pending { half_applied } if half_applied.is_empty()
         ));
 
         fs::create_dir(repository.join("playbooks")).unwrap();
         fs::write(repository.join("playbooks/build.md"), playbook).unwrap();
         git(&repository, &["add", "playbooks/build.md"]);
-        let status = classify(&store, Some(&policy), proposal).await.unwrap();
+        let status = classify(
+            Some(&policy),
+            proposal,
+            &read_patch(&store, proposal).unwrap(),
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(&status, ProposalStatus::Pending { half_applied } if half_applied.len() == 1)
         );
@@ -840,7 +849,9 @@ mod tests {
 
         assert!(
             matches!(
-                classify(&store, None, proposal).await.unwrap(),
+                classify(None, proposal, &read_patch(&store, proposal).unwrap())
+                    .await
+                    .unwrap(),
                 ProposalStatus::PolicyChanged
             ),
             "Without the private policy, nothing is admitted"

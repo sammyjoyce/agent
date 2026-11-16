@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use tokio::{
     fs,
-    io::{AsyncRead, AsyncReadExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
     time::{sleep, timeout},
 };
@@ -83,6 +83,7 @@ pub(crate) struct ProcessRequest<'a> {
     output_limit: usize,
     sender_conversation_id: Option<&'a str>,
     environment: Option<&'a [(String, String)]>,
+    stdin: Option<&'a [u8]>,
 }
 
 impl<'a> ProcessRequest<'a> {
@@ -106,7 +107,14 @@ impl<'a> ProcessRequest<'a> {
             output_limit,
             sender_conversation_id: None,
             environment: None,
+            stdin: None,
         })
+    }
+
+    /// The child reads exactly these bytes and then end of input.
+    pub fn with_stdin(mut self, bytes: &'a [u8]) -> Self {
+        self.stdin = Some(bytes);
+        self
     }
 
     pub fn with_only_environment(mut self, environment: &'a [(String, String)]) -> Self {
@@ -956,6 +964,7 @@ pub(crate) async fn run_process_ending(
         output_limit,
         sender_conversation_id,
         environment,
+        stdin,
     } = request;
     let mut command = Command::new(program);
     if let Some(environment) = environment {
@@ -971,7 +980,11 @@ pub(crate) async fn run_process_ending(
     let mut child = command
         .args(args)
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
@@ -1000,6 +1013,18 @@ pub(crate) async fn run_process_ending(
             .context("Command error pipe is unavailable")?;
         let mut output = tokio::spawn(captured(stdout, output_limit));
         let mut errors = tokio::spawn(captured(stderr, output_limit));
+        if let Some(input) = stdin {
+            let mut pipe = child
+                .stdin
+                .take()
+                .context("Command input pipe is unavailable")?;
+            let input = input.to_vec();
+            // Written beside the output readers, so a child that prints before
+            // it reads cannot stall. Dropping the pipe ends its input.
+            tokio::spawn(async move {
+                let _ = pipe.write_all(&input).await;
+            });
+        }
         let finished = tokio::select! {
             result = timeout(deadline, exited_unreaped(group.0)) => Some(result),
             _ = cancelled => None,

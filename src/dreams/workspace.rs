@@ -84,6 +84,15 @@ impl Git {
     }
 
     pub async fn run(&self, arguments: &[&str]) -> Result<GitOutput> {
+        self.spawn(arguments, None).await
+    }
+
+    /// Runs Git with exactly `input` on its standard input.
+    pub async fn run_with_input(&self, arguments: &[&str], input: &[u8]) -> Result<GitOutput> {
+        self.spawn(arguments, Some(input)).await
+    }
+
+    async fn spawn(&self, arguments: &[&str], input: Option<&[u8]>) -> Result<GitOutput> {
         let arguments: Vec<String> = [
             "-c",
             "core.hooksPath=/dev/null",
@@ -103,6 +112,10 @@ impl Git {
         )
         .map_err(failure)?
         .with_only_environment(&self.environment);
+        let request = match input {
+            Some(input) => request.with_stdin(input),
+            None => request,
+        };
         let ProcessOutput {
             exit_code,
             stdout,
