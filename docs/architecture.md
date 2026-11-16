@@ -775,10 +775,9 @@ and neither does program text that names a readback.
 
 A ledger receipt counts only when it matches one line of the ledger's own call
 log. The ledger writes each call to that log, with the time, when the call
-starts. The checks
-list the receipts of `exec` calls whose program names the fixture ledger, made
-directly or from a codemode program. They resolve the program as the host
-does. An absolute path stands as written. A path with a slash resolves against
+starts. The checks list the receipts of `exec` calls whose program names the
+fixture ledger, made directly or from a codemode program. They resolve the
+program as the host does. An absolute path stands as written. A path with a slash resolves against
 the call's `cwd` argument, or else against the job's directory for a task
 worker and `/` for triage. A bare name resolves through `PATH`. The checks
 then compare the `realpath` of the result with the `realpath` of the fixture
@@ -856,8 +855,8 @@ These are the only differences from the expected store that pass:
 - The text of a mail event and the envelope of an outcome event are not
   compared. Neither are the documents `agent.background`,
   `agent.environment`, `agent.models`, `agent.notifications`,
-  `agent.notice_lineage` and `agent.transcript.visibility`. No tool in these
-  cases writes them.
+  `agent.notice_lineage` and `agent.transcript.visibility`. They hold product
+  configuration and delivery bookkeeping, and no tool writes them directly.
 
 The checks do not judge model wording or program text. They trust the fixture
 ledger program, its log and the closed store. An agent that rewrites those
@@ -870,17 +869,16 @@ also counts model requests during the outage.
 A table of wrong agents tests the checks themselves. Each row is a scripted
 agent that breaks a rule, such as a readback that never runs, a readback from
 a stale copy of the ledger, a link that names a stale copy for one call and
-the ledger afterwards, a booking made before the worker resumes, an
-outcome linked to the decoy, a notice published under the decoy or published
-twice, a resolution
-that adds the decoy's supplier thread to the task, a follow-up that carries an
-unrelated attachment, or a file left beside the ledger.
+the ledger afterwards, a booking made before the worker resumes, an outcome
+linked to the decoy, a notice published under the decoy or published twice, a
+resolution that adds the decoy's supplier thread to the task, a follow-up that
+carries an unrelated attachment, or a file left beside the ledger.
 `oracles_reject_wrong_agents` requires the named check to reject every row.
 `oracles_accept_legal_alternatives` requires every check to pass for legal
-variants. In them the coordinator reconciles the user's booking without a
-worker, or dismisses the user's own message, or the worker runs the ledger as
-`./ledger` or through a symlink, or the agents use the read tools and the
-notice that the live model used.
+variants. Among them, the coordinator reconciles the user's booking without a
+worker, the coordinator dismisses the user's own message, the worker runs the
+ledger as `./ledger` or through a symlink, and the agents use the read tools
+and the notice that the live model used.
 
 CI runs these cases with scripted inference. The same table runs against a
 live model as an opt-in evaluation. Scripted inference seeds each case, and the
@@ -912,7 +910,7 @@ the ledger. They hold no entries, document kinds or whole task records.
 Scored again from those records, every part they hold matches the expected
 store in the same six cases and differs in the same one. For the parts they
 do not hold, the receipts show no tool call that could have changed them.
-The live run has no crash case. No
-case reads a real mailbox. Fixture effects stay in each case's temporary
-directory, but the local host is not a sandbox, so the checks do not confine
-a model's commands.
+Those records also keep no time for a ledger call, so the re-score cannot
+apply the time check. The live run has no crash case. No case reads a real
+mailbox. Fixture effects stay in each case's temporary directory, but the
+local host is not a sandbox, so the checks do not confine a model's commands.
