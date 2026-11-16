@@ -456,8 +456,7 @@ actor WorkRoute {
 
 /// Two loopback coordinators, Personal at port 4002 of an invented address and Work at any
 /// other address, and a fresh `Coordinators` with nothing saved, as the app builds it. With
-/// `draft`, the composer saves its draft at that path under the root. With `spotlight`, the
-/// coordinators index into it.
+/// `draft`, the composer saves its draft at that path under the root.
 @MainActor func withTwoFixtures(
   registration: NotificationRegistration? = nil, holdingWork gate: DialGate? = nil,
   holdingPersonal personalGate: DialGate? = nil, route: WorkRoute? = nil, draft: String? = nil,

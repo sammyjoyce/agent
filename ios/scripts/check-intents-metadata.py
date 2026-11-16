@@ -6,9 +6,7 @@ entity. Every shortcut must hold a phrase that is not empty. One of Open Coordin
 must name ${target} and ${applicationName}, and one of Send Message's must name ${coordinator}
 and ${applicationName}. No other action has a phrase. Open Job has none, because a phrase on its
 job would make each refresh of the app's phrases read every coordinator's jobs. Send Message
-takes exactly a message and one saved coordinator, and runs without opening the app. Spotlight
-indexes exactly the coordinator and job entities, and no entity property names a Spotlight
-attribute, so only the attribute sets the app writes reach the index.
+takes exactly a message and one saved coordinator, and runs without opening the app.
 
 A shortcuts provider in the wrong target still builds, and only the extracted metadata shows that
 the app ships no phrase.

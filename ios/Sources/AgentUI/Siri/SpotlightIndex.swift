@@ -3,15 +3,10 @@ import AppIntents
 import CoreSpotlight
 import UniformTypeIdentifiers
 
-/// One entry of the Spotlight index, and all that Spotlight may know: a saved coordinator's name,
-/// and a job's title, coordinator and run state. A prompt, working directory, schedule, run time or
-/// output has no case, so none can reach the index.
 enum SpotlightEntry: Hashable, Sendable {
   case coordinator(ProfileID, name: String)
   case job(ScopedEntityID, title: String, coordinator: String, state: JobRunState)
 
-  /// The identifier `CoordinatorQuery` or `JobQuery` resolves, so a result opens through Open
-  /// Coordinator or Open Job.
   enum Key: Hashable, Sendable {
     case coordinator(ProfileID)
     case job(ScopedEntityID)
@@ -35,21 +30,15 @@ enum SpotlightEntry: Hashable, Sendable {
   }
 }
 
-/// Core Spotlight in the app, a fake in tests. Package initializers default to none, so no test on
-/// a Mac host writes the Mac's own Spotlight.
 protocol SpotlightStore: Sendable {
-  /// Deletes every entry in the index, whichever launch wrote it.
   func deleteAll() async throws
-  /// Adds each entry, or replaces the one with its key.
   func index(_ entries: [SpotlightEntry]) async throws
   func delete(_ keys: [SpotlightEntry.Key]) async throws
 }
 
-/// The app's own named index.
 struct CoreSpotlightStore: SpotlightStore {
-  /// `.complete` keeps every name and title unreadable while the phone is locked. A write while
-  /// locked fails, and the next activation resets the index. A handle per call keeps the store
-  /// Sendable.
+  /// `.complete` keeps every name and title unreadable while the phone is locked. A handle per
+  /// call keeps the store Sendable.
   private var searchable: CSSearchableIndex {
     CSSearchableIndex(name: "coordinators-and-jobs", protectionClass: .complete)
   }
@@ -101,11 +90,6 @@ extension JobEntity: IndexedEntity {
   }
 }
 
-/// What Spotlight should hold, and its one writer. `ChatModel` tells it which coordinators are
-/// saved and each job list a coordinator answers with. It writes nothing until its coordinators are
-/// first activated, so under the interaction fixture the app delegate's idle coordinators never
-/// touch the index. Its first write in each process resets the index, so a launch after a stop
-/// anywhere converges without a record of what an earlier launch wrote.
 @MainActor final class SpotlightIndex {
   private struct JobLine: Equatable {
     let item: String
@@ -113,22 +97,18 @@ extension JobEntity: IndexedEntity {
     let state: JobRunState
   }
 
-  /// A saved coordinator's name, and the job list it last answered with in this process.
   private struct Saved {
     var name: String
     var jobs: [JobLine] = []
   }
 
   private enum Mirror {
-    /// No scene has activated the coordinators yet.
     case dormant
-    /// The next write resets the index first.
-    case unknown
+    case resetFirst
     case known([SpotlightEntry.Key: SpotlightEntry])
   }
 
   private let store: any SpotlightStore
-  /// Saved coordinators, without one being removed. A job list only lands on one of these.
   private var saved: [ProfileID: Saved] = [:]
   private var mirror = Mirror.dormant
   private var writing: Task<Void, Never>?
@@ -143,7 +123,6 @@ extension JobEntity: IndexedEntity {
     write()
   }
 
-  /// A list that lands after Remove began finds its coordinator gone and puts nothing back.
   func list(_ jobs: [ScheduledJobStatus], of profile: ProfileID) {
     saved[profile]?.jobs = jobs.map {
       JobLine(item: $0.job.id, title: $0.job.title, state: $0.runState)
@@ -151,11 +130,8 @@ extension JobEntity: IndexedEntity {
     write()
   }
 
-  /// Starts writing, and reads every paired coordinator's job list, so Spotlight finds jobs
-  /// nobody opened Jobs and work for. Each list reaches `list(_:of:)` through
-  /// `ChatModel.jobs(_:lane:)`, the one read path.
   func activate(listing coordinators: Coordinators) {
-    if case .dormant = mirror { mirror = .unknown }
+    if case .dormant = mirror { mirror = .resetFirst }
     write()
     reading?.cancel()
     let paired = coordinators.profiles.filter { $0.pin != nil }
@@ -169,14 +145,11 @@ extension JobEntity: IndexedEntity {
     reading = nil
   }
 
-  /// Returns once the activation's read and every write since have finished.
   func settled() async {
     await reading?.value
     while let writing { await writing.value }
   }
 
-  /// A job carries its coordinator's saved name at this moment, so a rename rewrites the
-  /// coordinator's jobs without reading them again.
   private var wanted: [SpotlightEntry.Key: SpotlightEntry] {
     var entries: [SpotlightEntry.Key: SpotlightEntry] = [:]
     for (profile, coordinator) in saved {
@@ -193,13 +166,11 @@ extension JobEntity: IndexedEntity {
   private func step(toward wanted: [SpotlightEntry.Key: SpotlightEntry]) -> SpotlightWrite? {
     switch mirror {
     case .dormant: nil
-    case .unknown: SpotlightWrite(held: nil, wanted: wanted)
+    case .resetFirst: SpotlightWrite(held: nil, wanted: wanted)
     case .known(let held): SpotlightWrite(held: held, wanted: wanted)
     }
   }
 
-  /// A running writer plans again after each step, so a change made meanwhile is written next. A
-  /// failed step stops it, and the next change or activation starts over with a reset.
   private func write() {
     guard writing == nil, step(toward: wanted) != nil else { return }
     writing = Task {
@@ -210,7 +181,7 @@ extension JobEntity: IndexedEntity {
           try await step.run(on: store)
           mirror = .known(target)
         } catch {
-          mirror = .unknown
+          mirror = .resetFirst
           break
         }
       }
@@ -219,14 +190,11 @@ extension JobEntity: IndexedEntity {
   }
 }
 
-/// One step from what the index holds to what it should hold.
 private struct SpotlightWrite {
   let reset: Bool
   let index: [SpotlightEntry]
   let delete: [SpotlightEntry.Key]
 
-  /// nil once `held` is `wanted`. An index whose contents are unknown is reset, then given every
-  /// entry.
   init?(held: [SpotlightEntry.Key: SpotlightEntry]?, wanted: [SpotlightEntry.Key: SpotlightEntry]) {
     guard let held else {
       reset = true

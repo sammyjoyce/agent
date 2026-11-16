@@ -75,7 +75,6 @@ actor FixtureCoordinator {
   func retryRequests() -> [String] { retried }
   private var holdsJobsReply = false
   private var jobsReplyRelease: CheckedContinuation<Void, Never>?
-  /// Holds the answer to the next jobs read until `releaseJobsReply`.
   func holdNextJobsReply() { holdsJobsReply = true }
   func releaseJobsReply() {
     holdsJobsReply = false
