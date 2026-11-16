@@ -6,9 +6,8 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
-use crate::dreams::{HOST_TIMEOUT_MS, MAX_WINDOW_HOURS};
+use crate::dreams::{HOST_TIMEOUT_MS, MAX_WINDOW_HOURS, PolicyDigest};
 
 const DEFAULT_WINDOW_HOURS: u8 = 24;
 const MAX_CHECK_SECONDS: u16 = 600;
@@ -74,7 +73,7 @@ pub struct DreamsPolicy {
     editable: Vec<Glob>,
     window: Duration,
     checks: Vec<CheckSpec>,
-    digest: String,
+    digest: PolicyDigest,
 }
 
 /// A small ASCII alphabet keeps a path free of controls, of the ignorable code
@@ -323,12 +322,12 @@ impl DreamsPolicy {
             (HOST_TIMEOUT_MS - 60_000) / 1000
         );
 
-        let digest = hex::encode(Sha256::digest(serde_json::to_vec(&(
+        let digest = PolicyDigest::of(&serde_json::to_vec(&(
             &repository,
             &file.editable,
             hours,
             &file.checks,
-        ))?));
+        ))?);
         Ok(Self {
             repository,
             editable,
@@ -360,7 +359,7 @@ impl DreamsPolicy {
         &self.checks
     }
     /// Identifies the repository, editable set, window and checks a review was made under.
-    pub fn digest(&self) -> &str {
+    pub fn digest(&self) -> &PolicyDigest {
         &self.digest
     }
 }
@@ -446,7 +445,7 @@ mod tests {
         let digest = DreamsPolicy::parse(&valid, &UNPROTECTED)
             .unwrap()
             .digest()
-            .to_owned();
+            .clone();
 
         let config = repository.join("config.toml");
         fs::write(&config, "").unwrap();
@@ -493,7 +492,7 @@ mod tests {
             DreamsPolicy::parse(&changed, &UNPROTECTED)
                 .unwrap()
                 .digest(),
-            digest
+            &digest
         );
         for broken in [
             DreamsPolicyFile {

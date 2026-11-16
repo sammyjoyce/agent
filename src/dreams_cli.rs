@@ -59,6 +59,18 @@ enum ProposalStatus {
 }
 
 impl ProposalStatus {
+    /// The name this status has in JSON and in the `list` table.
+    fn wire_name(&self) -> &'static str {
+        match self {
+            Self::Pending { .. } => "pending",
+            Self::Applied { .. } => "applied",
+            Self::Stale { .. } => "stale",
+            Self::TargetDirty => "target_dirty",
+            Self::PatchChanged { .. } => "patch_changed",
+            Self::PolicyChanged => "policy_changed",
+        }
+    }
+
     fn explain(&self) -> String {
         match self {
             Self::Pending { interrupted: false } => {
@@ -298,7 +310,7 @@ async fn inspect(
     if actual != proposal.patch_sha256 {
         return Ok(Inspection::PatchChanged { actual });
     }
-    let admitted = policy.digest() == proposal.policy_digest
+    let admitted = policy.digest() == &proposal.policy_digest
         && policy.repository() == proposal.repository
         && proposal
             .files
@@ -498,10 +510,7 @@ fn render(report: &RunReport) -> String {
         "Target      {} at base {} (policy {})\n",
         review.repository.display(),
         review.base,
-        review
-            .policy_digest
-            .get(..12)
-            .unwrap_or(&review.policy_digest)
+        review.policy_digest.short()
     );
     for check in &review.before {
         text += &check_line("Before", check);
@@ -793,14 +802,13 @@ pub async fn run(
                     "RUN", "WINDOW END", "COVERAGE", "OUTCOME"
                 );
                 for run in runs {
-                    let status = serde_json::to_value(&run.status)?;
                     println!(
                         "{:<17} {:<24} {:<11} {:<33} {}",
                         run.run,
                         format_utc(run.window_end_ms),
                         run.coverage,
                         run.outcome,
-                        status["state"].as_str().unwrap_or("-")
+                        run.status.as_ref().map_or("-", ProposalStatus::wire_name)
                     );
                 }
             }
@@ -1035,6 +1043,30 @@ mod tests {
             ),
             "A recorded apply stays applied without the policy, and Git is not consulted"
         );
+    }
+
+    #[test]
+    fn every_status_label_is_the_name_its_json_uses() {
+        let digest = agent_cli::dreams::ContentDigest::of(b"example");
+        for status in [
+            ProposalStatus::Pending { interrupted: false },
+            ProposalStatus::Applied {
+                commit: "a".repeat(40),
+                reachable: Some(true),
+            },
+            ProposalStatus::Stale {
+                head: "b".repeat(40),
+            },
+            ProposalStatus::TargetDirty,
+            ProposalStatus::PatchChanged { actual: digest },
+            ProposalStatus::PolicyChanged,
+        ] {
+            assert_eq!(
+                serde_json::to_value(&status).unwrap()["state"],
+                status.wire_name()
+            );
+            assert!(status.explain().starts_with(status.wire_name()));
+        }
     }
 
     #[test]

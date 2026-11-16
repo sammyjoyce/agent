@@ -359,8 +359,8 @@ mod tests {
     use std::fs;
 
     use crate::dreams::{
-        Abstention, Coverage, DreamsAbstainReason, Interval, Outcome, ReceiptCoverage, Review,
-        Revision, RunId, SummarySnapshot, UntrustedText,
+        Abstention, Coverage, DreamsAbstainReason, Interval, Outcome, PolicyDigest,
+        ReceiptCoverage, Review, Revision, RunId, SummarySnapshot, UntrustedText,
         store::{DreamsStore, RUNS_DIRECTORY, ReviewSeal},
     };
 
@@ -386,7 +386,7 @@ mod tests {
             },
             repository: "/example/guidance".into(),
             base: Revision::parse(&"a".repeat(40)).unwrap(),
-            policy_digest: "example".into(),
+            policy_digest: PolicyDigest::of(b"example"),
             before: vec![],
             findings: vec![],
         }

@@ -264,8 +264,8 @@ pub(crate) fn findings(records: &[Record]) -> (Vec<Finding>, Vec<EvidenceItem>) 
     let mut replies: BTreeMap<String, Vec<(u64, &Record)>> = BTreeMap::new();
     for record in records {
         let group = match &record.event {
-            Event::Failure { code } => Some(("failure", wire_name(code))),
-            Event::RuntimeStopped { code } => Some(("runtime_stopped", wire_name(code))),
+            Event::Failure { code } => Some(("failure", error_code_name(code))),
+            Event::RuntimeStopped { code } => Some(("runtime_stopped", error_code_name(code))),
             Event::InputRejected { .. } => Some(("input_rejected", String::new())),
             Event::Compaction { failed: true, .. } => Some(("compaction_failed", String::new())),
             Event::WriteBackpressure { .. } => Some(("write_backpressure", String::new())),
@@ -334,7 +334,7 @@ pub(crate) fn findings(records: &[Record]) -> (Vec<Finding>, Vec<EvidenceItem>) 
     (found, items)
 }
 
-fn wire_name(code: &ErrorCode) -> String {
+fn error_code_name(code: &ErrorCode) -> String {
     serde_json::to_value(code)
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
