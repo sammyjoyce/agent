@@ -334,7 +334,6 @@ async function triageSources(application: TriageApplication, id: number, command
     notify: (task_id, text) => emit(id, { type: "notice", task_id, text }),
   }), toolsets.triage, signal);
 }
-/** Esc stops the conversation. A goal pause names one run, so the conversation keeps its other queued inputs. */
 async function interrupt(id: number, run?: { harness: Harness; task: NativeTaskId }): Promise<void> {
   interrupted.add(id);
   if (interrupts.has(id)) return interrupts.get(id);
@@ -348,7 +347,6 @@ async function interrupt(id: number, run?: { harness: Harness; task: NativeTaskI
   })();
   interrupts.set(id, operation); await operation;
 }
-/** An attached worker also gets Esc's host-call cancel and interrupted frame. */
 async function stopGoalTurn(harness: Harness, taskId: string, run: NativeTaskId): Promise<void> {
   const owner = [...workers].find(([request, worker]) => !ending.has(request) &&
     worker.command.task_id === taskId && worker.command.agent_id === undefined)?.[0];

@@ -1072,14 +1072,15 @@ pub enum TaskOutcomeState {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GoalTarget {
-    /// The root conversation. The phone always sends this.
+    /// The root conversation.
     Main,
     Task {
         task_id: TaskId,
         agent_id: Option<String>,
     },
-    /// A saved conversation selected in the TUI.
-    Conversation { conversation_id: String },
+    Conversation {
+        conversation_id: String,
+    },
 }
 
 impl From<Option<(TaskId, Option<String>)>> for GoalTarget {

@@ -33,8 +33,6 @@ type GoalView = {
 type GoalStatus = { conversation_id: string; goal: GoalView | null };
 type NativeFrame = { type: string; text?: string };
 
-// Only inference and Rex are synthetic. The real CLI, coordinator, Pi bridge,
-// task workers and host effects run unchanged against one private state directory.
 test("a /goal persists, pauses across a coordinator restart, resumes once and completes only on a verified file", { timeout: 120_000 }, async (t) => {
   const directory = await realpath(await mkdtemp("/tmp/agent-goal-e2e-"));
   const binary = process.env.AGENT_TEST_BINARY ?? fileURLToPath(new URL("../../../target/debug/beep-boop", import.meta.url));
@@ -269,11 +267,11 @@ test("a /goal persists, pauses across a coordinator restart, resumes once and co
     throw error;
   } finally {
     for (const owned of children.slice().reverse()) if (owned.child.pid !== undefined && owned.child.exitCode === null && owned.child.signalCode === null) {
-      try { process.kill(-owned.child.pid, "SIGTERM"); } catch { /* This owned group already exited. */ }
+      try { process.kill(-owned.child.pid, "SIGTERM"); } catch {}
     }
     await Promise.race([Promise.allSettled(children.map((owned) => owned.exited)), new Promise((resolve) => setTimeout(resolve, 2000).unref())]);
     for (const owned of children) if (owned.child.pid !== undefined && owned.child.exitCode === null && owned.child.signalCode === null) {
-      try { process.kill(-owned.child.pid, "SIGKILL"); } catch { /* This owned group already exited. */ }
+      try { process.kill(-owned.child.pid, "SIGKILL"); } catch {}
     }
     await Promise.allSettled(children.map((owned) => owned.exited)); await rm(directory, { recursive: true, force: true });
   }

@@ -60,7 +60,6 @@ async function until(predicate: () => Promise<boolean>): Promise<void> {
   }
 }
 
-/** An in-memory execution host. A held command type blocks its next call until released. */
 class FixtureHost {
   readonly files = new Map<string, string>();
   readonly calls: HostCommand[] = [];
@@ -120,7 +119,6 @@ async function open(directory: string, host: FixtureHost, budget: number | undef
   const prompts: string[] = [];
   const app = {
     session, tasks, sources, faux, goals, stops, prompts,
-    /** Each model request records the latest user text it saw. */
     script(steps: Step[]) {
       faux.setResponses(steps.map((step) => (context: { messages: Message[] }) => {
         const user = context.messages.findLast((message) => message.role === "user");
@@ -169,7 +167,6 @@ async function open(directory: string, host: FixtureHost, budget: number | undef
       return (await session.inspect(BACKGROUND_CONTEXT)).tasks.some((task) => task.record.conversationId === conversation.id &&
         task.record.kind === GenerationTask.definition.name && task.record.abortRequested);
     },
-    /** One main-chat turn with main's tools. */
     async mainTurn(content: string, steps: Step[]) {
       const root = await session.root(BACKGROUND_CONTEXT);
       await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [tools.host, tools.main] }, BACKGROUND_CONTEXT);
@@ -200,7 +197,6 @@ async function scenario(budget: number | undefined, body: (fixture: Fixture) => 
     await rm(directory, { recursive: true, force: true });
   }
 }
-/** An interactive client that records answers and stops after its first idle. */
 function client() {
   const controller = new AbortController();
   const answers: string[] = [], rejected: string[] = [];

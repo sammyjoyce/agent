@@ -1070,7 +1070,7 @@
       "description": "The conversation a `/goal` control addresses. The runtime resolves every form\nto main or to exactly one existing task, and refuses an agent conversation.",
       "oneOf": [
         {
-          "description": "The root conversation. The phone always sends this.",
+          "description": "The root conversation.",
           "type": "object",
           "properties": {
             "type": {
@@ -1105,7 +1105,6 @@
           ]
         },
         {
-          "description": "A saved conversation selected in the TUI.",
           "type": "object",
           "properties": {
             "conversation_id": {

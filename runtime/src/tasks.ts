@@ -183,7 +183,6 @@ function text(entry: EntryRecord, toolLimit?: number): string {
     return message.role === "toolResult" && toolLimit !== undefined ? content.slice(0, toolLimit) : content;
   }).join("\n") ?? "";
 }
-/** Whether the actor already holds this input. A reused ID must carry the same input. */
 function holds(actor: TaskRecord | TaskAgentRecord, input: TaskInput): boolean {
   const previous = actor.pending.find((saved) => saved.id === input.id);
   if (previous === undefined) return false;
@@ -503,7 +502,6 @@ export class TaskStore {
     }
     throw new TaskError("Task outcome model provenance is unavailable");
   }
-  /** Only complete_goal holds a `proof`, after its check passed. */
   async record(id: string, input: { summary: string; state: TaskState; sources?: SourceRef[]; remove_sources?: SourceRef[]; reconciles_input?: string },
     provenance: { conversation_id: string; call_id: string; settled: boolean; native_task_id?: NativeTaskId }, proof?: GoalProof): Promise<TaskRecord> {
     await this.prepare();
@@ -558,7 +556,6 @@ export class TaskStore {
       if (state.state === "resolved" && this.goals !== undefined) {
         const verdict = await this.goals.resolutionIn(tx, task, { ...(proof === undefined ? {} : { proof }),
           origin: { conversation_id: provenance.conversation_id, entry_id: origin.id.toString(), tool_call_id: provenance.call_id } });
-        // A refusal commits only the rejection the policy recorded, never a task change.
         if (verdict.type === "rejected") return verdict.message;
         if (verdict.evidence !== undefined) state = { state: "resolved", evidence: verdict.evidence };
       }
@@ -978,7 +975,6 @@ export class TaskStore {
     if (active !== undefined) { active.revision += 1; active.wake?.(); }
     return task;
   }
-  /** The one way into an actor's outbox. Admission reopens the actor and its task. */
   private pushIn(task: TaskRecord, actor: TaskRecord | TaskAgentRecord, input: TaskInput): void {
     if (!holds(actor, input)) actor.pending.push(input);
     actor.state = { state: "open" };
@@ -1438,8 +1434,6 @@ export class TaskStore {
       (await tx.doc(LiveDoc, conversation.id)).run === undefined, BACKGROUND_CONTEXT);
     if (stranded) await conversation.submit({ type: "write", entry: { kind: "agent.inbox_boundary", model: [] } }, BACKGROUND_CONTEXT);
   }
-  /** The goal's next continuation and its count commit together, so a crash leaves both or neither. Returns whether
-   * the actor has input to run. */
   private async continueGoal(id: string): Promise<boolean> {
     const goals = this.goals;
     if (goals === undefined) return false;
@@ -1774,7 +1768,6 @@ export class TaskStore {
         if (active.fenced) { await conversation.waitForIdle(BACKGROUND_CONTEXT); break; }
         if (settled.type === "input" && settled.status === "unanswered" && settled.reason === "aborted" && input.agent_id === undefined &&
             await this.goals?.stopped(input.task_id, next.id) === true) {
-          // /goal pause stopped only this turn. The failure path would abort the conversation and withdraw its other inputs.
           await conversation.waitForIdle(BACKGROUND_CONTEXT);
           continue;
         }

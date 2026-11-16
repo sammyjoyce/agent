@@ -1,4 +1,3 @@
-//! The `/goal` text shown by the TUI, the plain CLI and the phone.
 use crate::{
     protocol::{
         GoalCheck, GoalCheckFailure, GoalPause, GoalRejection, GoalState, GoalStatus, ObservedFile,
@@ -149,7 +148,6 @@ mod tests {
         json!({ "type": "file_contains", "path": "/work/notes.md", "text": "GOAL-DONE" })
     }
 
-    /// Decodes the event the runtime sends, so each case renders a real wire status.
     fn render(goal: Option<(Value, Value)>) -> String {
         let goal = goal.map(|(goal, task)| {
             let mut record = json!({

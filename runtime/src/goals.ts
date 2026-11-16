@@ -24,17 +24,14 @@ import type { Execution, Executions } from "./tools.js";
 
 /** Automatic continuations one activation may admit before the goal pauses itself. */
 export const GOAL_CONTINUATION_BUDGET = 5;
-/** The check reads one window, the same bound as the read_file tool. */
 const CHECK_READ_BYTES = 262_144;
 const OBJECTIVE_LIMIT = 4000;
 const TITLE_LIMIT = 80;
 const RETAINED_REQUESTS = 32;
 
-/** The goal one task executes, keyed by task ID, with the control request IDs it accepted. */
 type GoalSlot = { goal: Goal | null; requests: string[] };
 const GoalDoc = defineDocFamily<GoalSlot, null>({ kind: "agent.goal", scope: "session", family: true, version: 1,
   initial: () => ({ goal: null, requests: [] }), checkpointWhen: () => true });
-/** Main executes its goal in a task it created. `goal_id` tells main's goal from a later one set inside that task. */
 type MainPointer = { task_id: string | null; goal_id: string | null; requests: string[] };
 const MainGoal = defineDoc<MainPointer>({ kind: "agent.goal.main", scope: "session", version: 1,
   initial: () => ({ task_id: null, goal_id: null, requests: [] }), checkpointWhen: () => true });
@@ -47,7 +44,6 @@ type Origin = { conversation_id: string; entry_id: string; tool_call_id: string 
 /** Stops one exact native run of the goal's task. The bridge owns the worker's host-call cancellation. */
 export type StopTurn = (taskId: string, run: NativeTaskId) => Promise<void>;
 
-/** A passing check. The class is not exported, so only this module can claim a verification it ran. */
 class Proof {
   constructor(readonly goal_id: string, readonly activation: number, readonly check: GoalCheck, readonly observed: ObservedFile) {}
 }
@@ -117,7 +113,6 @@ export class GoalStore implements GoalPolicy {
     return { kind: "task", task };
   }
 
-  /** Main follows its pointer only while the task still holds the goal main set. */
   private async goalIn(tx: Tx, selected: Selected): Promise<Goal | null> {
     if (selected.kind === "task") return (await tx.doc(GoalDoc, selected.task.id, null)).goal;
     const pointer = await tx.doc(MainGoal);
@@ -135,7 +130,6 @@ export class GoalStore implements GoalPolicy {
     if (selected.kind === "main") remember((await tx.doc(MainGoal)).requests, request);
   }
 
-  /** The committed form of goalIn. */
   private async read(selected: Selected): Promise<Goal | null> {
     if (selected.kind === "task") return (await this.session.snapshot(GoalDoc, selected.task.id, BACKGROUND_CONTEXT))?.goal ?? null;
     const pointer = await this.session.snapshot(MainGoal, BACKGROUND_CONTEXT);
@@ -149,12 +143,10 @@ export class GoalStore implements GoalPolicy {
     return { conversation_id, goal: goal === null ? null : { goal, task: await this.tasks.get(goal.task_id) } };
   }
 
-  /** One commit holds the task main creates, main's pointer, the goal and its first input. */
   private async set(selected: Selected, request: string, objective: string, call: HostCall): Promise<GoalStatus> {
     const text = objective.trim();
     if (text.length === 0 || text.length > OBJECTIVE_LIMIT) throw new TaskError(`A goal needs an objective of 1 to ${OBJECTIVE_LIMIT} characters`);
     if (await this.session.commit((tx) => this.acceptedIn(tx, selected, request), BACKGROUND_CONTEXT)) return this.replayed(selected, call);
-    // Main checks its host and model before anything commits, so an unusable model never leaves a task behind.
     const host = selected.kind === "main" ? await this.defaultHost() : undefined;
     const model = host === undefined ? undefined : host.launch?.model ?? await this.environment.model(null);
     if (model !== undefined) await this.tasks.inference.preflight(model);
@@ -184,15 +176,12 @@ export class GoalStore implements GoalPolicy {
     return this.status(selected);
   }
 
-  /** A replayed control changes nothing. An active goal still gets its worker, so a crash before dispatch converges. */
   private async replayed(selected: Selected, call: HostCall): Promise<GoalStatus> {
     const goal = await this.read(selected);
     if (goal !== null && goal.state.state === "active") await this.ensureRunning(goal.task_id, undefined, call);
     return this.status(selected);
   }
 
-  /** Commit the pause and withdraw the goal's unsubmitted inputs, then stop the goal's own live turn. Unrelated inputs
-   * stay queued. A paused goal repeats only the stop, so a crash between the commit and the stop converges. */
   private async pause(selected: Selected, request: string): Promise<GoalStatus> {
     const paused = await this.session.commit(async (tx) => {
       const goal = await this.goalIn(tx, selected);
@@ -211,8 +200,6 @@ export class GoalStore implements GoalPolicy {
     return this.status(selected);
   }
 
-  /** Only one goal input is outstanding, the activation's latest. Queued in Pi, it is withdrawn. Placed, it belongs to
-   * the live run, which is aborted alone. */
   private async stopInput(taskId: string, latest: string): Promise<void> {
     const conversation = await this.tasks.conversation((await this.tasks.get(taskId)).conversation_id);
     const native = await this.session.commit((tx) => tx.submissionByRequest(conversation.id, latest), BACKGROUND_CONTEXT);
@@ -222,7 +209,6 @@ export class GoalStore implements GoalPolicy {
     if (run !== undefined && run.inputs.includes(native.id)) await this.stopTurn(taskId, run.taskId);
   }
 
-  /** A paused goal starts activation n+1 on the same task with exactly one input. An active goal only gets its worker. */
   private async resume(selected: Selected, request: string, call: HostCall): Promise<GoalStatus> {
     const known = await this.read(selected);
     if (known === null) throw new TaskError(NO_GOAL);
@@ -241,7 +227,6 @@ export class GoalStore implements GoalPolicy {
     return this.status(selected);
   }
 
-  /** Dispatch through TaskStore's ordinary path. An attached worker is left alone. */
   private async ensureRunning(taskId: string, chosen: WorkerHost | undefined, call: HostCall): Promise<void> {
     try {
       const task = await this.tasks.get(taskId);
@@ -261,9 +246,7 @@ export class GoalStore implements GoalPolicy {
   async continuationIn(tx: Tx, task: TaskRecord, conversationId: ConversationId): Promise<TaskInput | undefined> {
     const goal = (await tx.doc(GoalDoc, task.id, null)).goal;
     if (goal === null || goal.state.state !== "active") return undefined;
-    // A worker that waits on another actor is not nudged. That actor's next input reaches this hook again.
     if (task.state.state === "waiting") return undefined;
-    // Pi's own record of the latest generation, so a stopped turn pauses the goal across a restart too.
     const latest = (await tx.scanTasks({ conversationId, kind: GenerationTask.definition.name, order: "descending" }, 1)).items[0];
     if (latest?.state.status === "terminal" && latest.state.outcome.status === "aborted") return pauseIn(goal, "interrupted");
     if (goal.activation.continuations >= goal.activation.budget) return pauseIn(goal, "budget_exhausted");
@@ -302,15 +285,12 @@ export class GoalStore implements GoalPolicy {
     return { type: "allowed", evidence: `Goal verified by the runtime. ${describe(proof.check)} (verification entry ${entry.id}, sha256 ${proof.observed.sha256})` };
   }
 
-  /** A resume can land before the actor sees its aborted input, so an input of an earlier activation was stopped too. */
   async stopped(taskId: string, inputId: string): Promise<boolean> {
     const goal = (await this.session.snapshot(GoalDoc, taskId, BACKGROUND_CONTEXT))?.goal ?? null;
     if (goal === null || !inputId.startsWith(inputPrefix(goal))) return false;
     return goal.state.state === "paused" || !inputId.startsWith(`${inputPrefix(goal)}${goal.activation.number}:`);
   }
 
-  /** The complete_goal tool. Runs the check on the task's own host, then records the failure, or resolves the task
-   * through TaskStore.record with the proof so the passed entry, the completion and the resolution share one commit. */
   async complete(origin: { conversation_id: string; call_id: string; native_task_id: NativeTaskId },
     request: { check: GoalCheck; summary: string }, execution: Execution): Promise<GoalCheckReply> {
     const owner = await this.tasks.owner(origin.conversation_id);
@@ -336,7 +316,6 @@ export class GoalStore implements GoalPolicy {
     }
   }
 
-  /** A failed check retains its entry, pins the check and records the rejection in one commit. The goal stays active. */
   private async recordFailure(task: TaskRecord, checked: Goal, check: GoalCheck, failure: GoalCheckFailure,
     origin: { conversation_id: string; call_id: string }): Promise<GoalCheckReply> {
     const conversation = await this.tasks.conversation(task.conversation_id);
@@ -384,7 +363,6 @@ function requestId(value: string): string {
   return value;
 }
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-/** Main's set request ID becomes the new task's ID, so it must be a task ID. */
 function taskRequestId(value: string): string {
   if (!UUID.test(value) || /^[0-]+$/.test(value)) throw new TaskError("A main goal request ID must be a non-nil UUID");
   return value;
@@ -395,7 +373,6 @@ function remember(requests: string[], request: string): void {
 }
 
 function inputPrefix(goal: Goal): string { return `goal:${goal.id}:`; }
-/** Sequence 0 starts an activation. Sequences 1 to budget are its continuations. */
 function inputId(goal: Goal, sequence: number): string { return `${inputPrefix(goal)}${goal.activation.number}:${sequence}`; }
 function pauseIn(goal: Goal, reason: GoalPause): undefined {
   goal.state = { state: "paused", reason }; goal.updated_at = Date.now(); return undefined;
@@ -444,7 +421,6 @@ function describe(check: GoalCheck): string { return `${check.path} contains ${J
 function sameCheck(left: GoalCheck, right: GoalCheck): boolean {
   return left.type === right.type && left.path === right.path && left.text === right.text;
 }
-/** The path resolves the way read_file resolves it, so pinned checks compare absolute paths. */
 function pinnable(check: GoalCheck, execution: Execution): GoalCheck {
   return { ...check, path: resolve(execution.default_host?.cwd ?? execution.cwd, check.path) };
 }
