@@ -629,12 +629,16 @@ remains at the same build with the same saved coordinators. Evidence goes to
 `attachments/`, `manifest.json`, and `report.md`, which has one table for Send
 records and one for alert records.
 
-Rehearse on a simulator before unlocking the phone:
+Rehearse on a simulator before unlocking the phone. The script installs the
+app on the simulator it is given, so boot that simulator first:
 
 ```sh
-xcrun simctl create phone-rehearsal com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro
+simulator=$(xcrun simctl create phone-rehearsal com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro)
+xcrun simctl bootstatus "$simulator" -b
 python3 ios/PhoneAcceptance/phone-acceptance.py simulator \
-  --simulator 6F1C0E2A-0000-4000-8000-00000000A11E --out target/phone-acceptance/rehearsal
+  --simulator "$simulator" --out target/phone-acceptance/rehearsal
+xcrun simctl shutdown "$simulator"
+xcrun simctl delete "$simulator"
 ```
 
 The rehearsal builds and installs the Debug app, launches it with two loopback
