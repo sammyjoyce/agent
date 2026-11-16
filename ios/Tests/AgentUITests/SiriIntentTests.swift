@@ -324,7 +324,7 @@
       XCTAssertEqual(state.generations["Check the build"], 1)
       XCTAssertEqual(state.submits.map(\.origin), ["siri"])
 
-      try await world.holdNextSubmitReply()
+      try await world.loseNextSubmitReply()
       let saved = try await send("Rotate the Work logs", to: work, answering: "Send")
       XCTAssertEqual(saved.value, "saved")
       let again = try await send("Rotate the Work logs", to: work, answering: "Send")
@@ -332,6 +332,7 @@
       state = try await world.state()
       let rotations = state.submits.filter { $0.text == "Rotate the Work logs" }
       XCTAssertEqual(Set(rotations.map(\.inputId)).count, 1, "\(rotations)")
+      XCTAssertEqual(rotations.map(\.replyLost).filter { $0 }.count, 1, "\(rotations)")
       XCTAssertEqual(state.generations["Rotate the Work logs"], 1)
 
       let cancelled = try await send("Check the build", to: work, answering: "Cancel")
@@ -684,6 +685,7 @@
       let inputId: String
       let text: String
       let origin: String?
+      let replyLost: Bool
     }
     struct State: Decodable {
       let submits: [Submit]
@@ -705,8 +707,8 @@
       return try decoder.decode(State.self, from: try await request("GET", "/state"))
     }
 
-    func holdNextSubmitReply() async throws {
-      _ = try await request("POST", "/hold-next-submit-reply")
+    func loseNextSubmitReply() async throws {
+      _ = try await request("POST", "/lose-next-submit-reply")
     }
 
     /// HTTP/1.0 over Network.framework, which App Transport Security leaves alone.
