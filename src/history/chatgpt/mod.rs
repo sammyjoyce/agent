@@ -1119,6 +1119,52 @@ mod tests {
         assert!(!page.complete);
     }
 
+    fn refusal(path: &Path) -> PackageError {
+        match ChatGptHistory::open(&[path.to_path_buf()], &mut |_| {}) {
+            Ok(_) => panic!("the damaged export was admitted"),
+            Err(error) => error,
+        }
+    }
+
+    fn damaged(directory: &Path, flipped: &str) -> PathBuf {
+        let attachment = b"Invented attachment bytes";
+        Forge::new(
+            &Export::new()
+                .conversations(&[Conversation::new(1, "Notes")
+                    .node("u1", Some("root"), upload(&[("file_0g01", "notes.txt")]))
+                    .build()])
+                .stored("file_0g01-notes.txt", attachment)
+                .stored("file_0g02-spare.txt", attachment)
+                .stored("chat.html", attachment),
+        )
+        .flip(flipped, 3)
+        .write(&directory.join("export.zip"))
+    }
+
+    #[test]
+    fn a_referenced_attachment_that_fails_its_checksum_refuses_the_export() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = refusal(&damaged(directory.path(), "file_0g01-notes.txt"));
+        assert!(
+            matches!(&error, PackageError::Corrupt { member, reason: Corruption::CrcMismatch }
+                if member == "file_0g01-notes.txt"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_unreferenced_member_that_fails_its_checksum_refuses_the_export() {
+        for flipped in ["file_0g02-spare.txt", "chat.html"] {
+            let directory = tempfile::tempdir().unwrap();
+            let error = refusal(&damaged(directory.path(), flipped));
+            assert!(
+                matches!(&error, PackageError::Corrupt { member, reason: Corruption::CrcMismatch }
+                    if member == flipped),
+                "{flipped}: {error}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn asset_chunks_cover_the_file_and_repeat_the_whole_file_digest() {
         let directory = tempfile::tempdir().unwrap();

@@ -5,11 +5,11 @@ use std::{
 };
 
 use agent_cli::history::chatgpt::ChatGptPackageSummary;
-use serde_json::json;
+use serde_json::{Value, json};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-fn export(path: &Path, extra: Option<(&str, &[u8])>) -> PathBuf {
-    let conversation = json!({
+fn picnic(attachment: Option<&str>) -> Value {
+    let mut conversation = json!({
         "id": "00000000-0000-4000-8000-000000000001",
         "title": "Picnic",
         "create_time": 1_767_225_600.0,
@@ -23,17 +23,57 @@ fn export(path: &Path, extra: Option<(&str, &[u8])>) -> PathBuf {
                 "content": {"content_type": "text", "parts": ["Here is a plan for six."]}}},
         },
     });
+    if let Some(file) = attachment {
+        conversation["mapping"]["u1"]["message"]["metadata"] =
+            json!({"attachments": [{"id": file, "name": "notes.txt"}]});
+    }
+    conversation
+}
+
+fn zip(
+    path: &Path,
+    conversation: Value,
+    extra: Option<(&str, &[u8], CompressionMethod)>,
+) -> PathBuf {
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     writer.start_file("conversations.json", options).unwrap();
     writer
         .write_all(&serde_json::to_vec(&[conversation]).unwrap())
         .unwrap();
-    if let Some((name, bytes)) = extra {
-        writer.start_file(name, options).unwrap();
+    if let Some((name, bytes, method)) = extra {
+        writer
+            .start_file(name, options.compression_method(method))
+            .unwrap();
         writer.write_all(bytes).unwrap();
     }
     std::fs::write(path, writer.finish().unwrap().into_inner()).unwrap();
+    path.to_path_buf()
+}
+
+fn export(path: &Path, extra: Option<(&str, &[u8])>) -> PathBuf {
+    zip(
+        path,
+        picnic(None),
+        extra.map(|(name, bytes)| (name, bytes, CompressionMethod::Deflated)),
+    )
+}
+
+/// A stored attachment with one payload byte flipped and both CRC fields left as written.
+fn damaged_export(path: &Path) -> PathBuf {
+    let attachment: &[u8] = b"Invented attachment bytes";
+    zip(
+        path,
+        picnic(Some("file_0g01")),
+        Some(("file_0g01-notes.txt", attachment, CompressionMethod::Stored)),
+    );
+    let mut bytes = std::fs::read(path).unwrap();
+    let payload = bytes
+        .windows(attachment.len())
+        .position(|window| window == attachment)
+        .unwrap();
+    bytes[payload] ^= 0x01;
+    std::fs::write(path, bytes).unwrap();
     path.to_path_buf()
 }
 
@@ -119,4 +159,29 @@ fn invalid_export_exits_nonzero_before_admission() {
     assert!(stderr.contains("Nothing was imported."), "{stderr}");
     assert!(!directory.path().join("escape.json").exists());
     untouched(&state);
+}
+
+#[test]
+fn damaged_attachment_refuses_check_and_import_before_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("state");
+    let path = damaged_export(&directory.path().join("export.zip"));
+    let path = path.to_str().unwrap();
+    for arguments in [
+        ["import", "chatgpt", "--check", path].as_slice(),
+        ["import", "chatgpt", path].as_slice(),
+    ] {
+        let output = run(directory.path(), &state, arguments);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}: {stderr}");
+        assert!(
+            stderr.contains("file_0g01-notes.txt fails its checksum"),
+            "{arguments:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("Nothing was imported."),
+            "{arguments:?}: {stderr}"
+        );
+        untouched(&state);
+    }
 }
