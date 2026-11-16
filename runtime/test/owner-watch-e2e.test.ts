@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import type { FailoverReport } from "../src/generated/FailoverReport.js";
 import { coordinatorWorld, held } from "./fixtures/coordinator-world.js";
 import { answer, candidate, claimed, enableFailover, floorFile, helperRuns, holder, record } from "./fixtures/owner-floor.js";
@@ -21,7 +22,7 @@ test("a watching worker ends the link of an owner the authority replaced, and no
     await answer(homes[0], { claim: claimed(5) });
     await enableFailover(homes[1], { watchSeconds: 1 });
     await answer(homes[1], { record: active(5) });
-  });
+  }, fileURLToPath(new URL("./fixtures/coordinator-runtime-local-pi.js", import.meta.url)));
   const { directory, coordinator: desktop, laptop, homes, start, until, online, script, cli } = world;
   const floor = floorFile(homes[1], coordinatorId), action = join(directory, "watched-action");
   const reads = async (answer: FailoverReport | "fail") =>

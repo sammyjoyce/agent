@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { coordinatorWorld, type OwnedProcess } from "./fixtures/coordinator-world.js";
 import { answer, claimed, enableFailover, floorFile, holder } from "./fixtures/owner-floor.js";
 
-const runtime = fileURLToPath(new URL("./fixtures/coordinator-runtime.js", import.meta.url));
+const runtime = fileURLToPath(new URL("./fixtures/coordinator-runtime-local-pi.js", import.meta.url));
 const exists = (path: string) => stat(path).then(() => true, () => false);
 const lines = (path: string) => readFile(path, "utf8").then((text) => text.split("\n").filter(Boolean), () => []);
 
@@ -35,7 +35,7 @@ async function olderCoordinator(t: TestContext, path: string, target: string): P
 }
 
 test("a worker host serves no coordinator below the highest owner epoch it has served", { timeout: 120_000 }, async (t) => {
-  const world = await coordinatorWorld(t);
+  const world = await coordinatorWorld(t, undefined, runtime);
   const { directory, coordinator: desktop, laptop, homes, socket, start, until, online, script, cli } = world;
   const id = await readFile(join(homes[0], "state", "coordinator-id"), "utf8");
   const floor = floorFile(homes[1], id), ledger = join(homes[1], "effects"), older = join(directory, "older.sock");
