@@ -214,6 +214,20 @@ for (const [name, connect] of Object.entries(authorities)) {
     assert.deepEqual(tables(directory), before);
   });
 
+  test(`${name}: the owner's disk holds the batch as the log holds it, also when JSON changes a value`, async (t) => {
+    const link = await connect(), epoch = await enroll(link), directory = await stateDirectory(t), standby = await stateDirectory(t);
+    const owner = await openOwner(directory, link, { epoch });
+    await owner.root.submit(note("first", "request-1"), context);
+    const logged = (await logBatches(link)).flat().findLast((write) => write.type === "entry");
+    assert.ok(logged);
+    let serialized = 0;
+    const unstable = { toJSON: () => `serialized ${serialized += 1} times` } as unknown as string;
+    await owner.storage.commit([{ type: "entry", value: { ...logged.value, id: await owner.storage.mintId(), data: unstable } }], context);
+    await owner.harness.close(context);
+    await follow(standby, link);
+    assert.deepEqual(tables(standby), tables(directory));
+  });
+
   test(`${name}: an empty batch takes a sequence as it does in plain storage, and a standby follows it`, async (t) => {
     const link = await connect(), epoch = await enroll(link), directory = await stateDirectory(t), standby = await stateDirectory(t);
     const owner = await openOwner(directory, link, { epoch });

@@ -119,9 +119,13 @@ class OwnerLog implements LogWriter {
     const { database } = this.#options;
     const piSeq = await database.dryRun(() => this.#storage.commit(writes, context));
     const files = this.#carried.splice(0);
-    const at = await this.#append(piSeq, files, JSON.stringify(writes));
+    const json = JSON.stringify(writes);
+    const at = await this.#append(piSeq, files, json);
     await this.#publish(files);
-    const committed = await database.apply(at, piSeq, () => this.#storage.commit(writes, context));
+    // A standby commits the logged JSON, so the owner commits it too. Then a
+    // value that JSON changes cannot differ between the two disks.
+    const logged = JSON.parse(json) as StorageWrite[];
+    const committed = await database.apply(at, piSeq, () => this.#storage.commit(logged, context));
     this.#head = at;
     return committed;
   });
