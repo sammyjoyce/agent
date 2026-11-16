@@ -688,7 +688,9 @@ It also flags unknown history when upgrading legacy rotations. Read actual
 receipt files to establish the available interval; the watermark is coverage
 evidence, not an inventory of retained files. An interrupted prune can report a
 conservative possible gap. `dropped_before` counts channel overflow only, so
-zero does not establish complete log coverage. No finite cap guarantees a full
+zero does not establish complete log coverage. Every sender of one writer
+shares that count, so the next receipt written carries it, whether that is
+another sender's receipt, a heartbeat or the writer's last line at shutdown. No finite cap guarantees a full
 audit interval at an unbounded event rate. The writer also records a
 `heartbeat` receipt every five minutes, so an interval with no receipt at all
 means that nothing was written, not that nothing happened.

@@ -1359,4 +1359,86 @@ mod tests {
             assert!(!quiet.decided, "{name}: {}", quiet.text);
         }
     }
+
+    /// Holds writer.lock so that the new writer waits and the bounded channel
+    /// overflows, as it does while a retired runtime still drains its queue.
+    async fn overflow(night: &Night, sender: &mut diagnostics::Diagnostics, records: u32) -> usize {
+        let directory = night.dreams.state.join("diagnostics");
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join("writer.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        let trace = diagnostics::Trace::unowned();
+        for id in 1..=records {
+            sender.record(id, &trace, diagnostics::Event::RequestReceived);
+        }
+        fs2::FileExt::unlock(&lock).unwrap();
+        let written = || {
+            fs::read_to_string(directory.join("runtime.jsonl"))
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains("request_received"))
+                .count()
+        };
+        let mut seen = 0;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if written() > 0 && written() == seen {
+                    return;
+                }
+                seen = written();
+            }
+        })
+        .await
+        .expect("The writer drains its queue once the lock is free");
+        seen
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receipts_dropped_on_a_full_channel_are_a_gap_whoever_records_next_or_nobody_does() {
+        for (name, dropping_fork, records_again) in [
+            ("another fork records next", true, true),
+            ("the sender that dropped never records again", false, false),
+            ("a fork dropped and nothing records again", true, false),
+        ] {
+            let night = Night::new();
+            night.seed_receipts("");
+            let mut actor = diagnostics::Diagnostics::start(&night.dreams.state);
+            let mut service = actor.fork();
+            let sent = 400;
+            let written = overflow(
+                &night,
+                if dropping_fork {
+                    &mut service
+                } else {
+                    &mut actor
+                },
+                sent,
+            )
+            .await;
+            assert!(written < sent as usize, "{name}: the channel must overflow");
+            if records_again {
+                actor.record(1, &diagnostics::Trace::unowned(), diagnostics::Event::Done);
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+            let page = night.review("night").await.text;
+            assert!(
+                page.contains("gap channel_overflow"),
+                "{name}: {} receipts were dropped, but the review lists no gap:\n{}",
+                sent as usize - written,
+                page.lines()
+                    .filter(|line| line.starts_with("Coverage") || line.starts_with("gap "))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            let quiet = night.abstain_as_quiet("night").await;
+            assert!(!quiet.decided, "{name}: {}", quiet.text);
+            drop((actor, service));
+        }
+    }
 }

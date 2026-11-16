@@ -150,6 +150,14 @@ pub(crate) fn receipt_coverage(window: Interval, receipts: &ReceiptWindow) -> Re
         }
         previous = record.timestamp_ms;
     }
+    if receipts.undelivered_drops > 0 {
+        gaps.push(Gap {
+            interval: None,
+            cause: GapCause::ChannelOverflow {
+                dropped: receipts.undelivered_drops,
+            },
+        });
+    }
     if receipts.unplaced_lines > 0 {
         gaps.push(Gap {
             interval: None,
@@ -526,6 +534,7 @@ mod tests {
             unplaced_lines: 0,
             truncated_at_ms: None,
             rotated_during_read: false,
+            undelivered_drops: 0,
         }
     }
 

@@ -8,7 +8,7 @@ use std::{
     path::Path,
 };
 
-use super::{Record, RetentionWatermark, Segment, WATERMARK_BYTES};
+use super::{Record, RetentionWatermark, Segment, WATERMARK_BYTES, undelivered_drops};
 
 /// The segment the writer appends to. Its last line may be half written.
 const LIVE_SEGMENT: u32 = 0;
@@ -23,6 +23,9 @@ pub(crate) struct ReceiptWindow {
     pub unplaced_lines: u32,
     pub truncated_at_ms: Option<u64>,
     pub rotated_during_read: bool,
+    /// Receipts a live writer in this process dropped on a full channel and no
+    /// written receipt reports yet.
+    pub undelivered_drops: u64,
 }
 
 /// Decides which lines that are not receipts may hide a receipt inside the
@@ -165,6 +168,7 @@ fn read_once(
         unplaced_lines: 0,
         truncated_at_ms: None,
         rotated_during_read: false,
+        undelivered_drops: 0,
     };
     let mut placement = Placement::default();
     let mut unfinished_last_line = false;
@@ -228,11 +232,17 @@ pub(crate) fn read_window(
     max_bytes: u64,
 ) -> io::Result<ReceiptWindow> {
     let directory = state.join("diagnostics");
+    // A sender takes the count just before it sends the receipt that reports
+    // it. Reading on both sides of the pass keeps that moment from hiding it.
+    let dropped_before_pass = undelivered_drops(&directory);
     let first = read_once(&directory, window, max_records, max_bytes)?;
-    if !first.segments_moved && !first.unfinished_last_line {
-        return Ok(first.window);
-    }
-    let mut second = read_once(&directory, window, max_records, max_bytes)?;
-    second.window.rotated_during_read = second.segments_moved;
-    Ok(second.window)
+    let mut read = if first.segments_moved || first.unfinished_last_line {
+        let mut second = read_once(&directory, window, max_records, max_bytes)?;
+        second.window.rotated_during_read = second.segments_moved;
+        second.window
+    } else {
+        first.window
+    };
+    read.undelivered_drops = dropped_before_pass.max(undelivered_drops(&directory));
+    Ok(read)
 }

@@ -7,6 +7,10 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex, PoisonError, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -621,51 +625,110 @@ fn host_kind(bytes: &[u8]) -> Option<String> {
         .leaf()
 }
 
+/// Live writers in this process, by diagnostics directory. A reader in the same
+/// process uses it to count drops that no written receipt reports yet.
+static LIVE_DROP_COUNTS: Mutex<Vec<(PathBuf, Weak<AtomicU64>)>> = Mutex::new(Vec::new());
+
+fn registry_key(directory: &Path) -> PathBuf {
+    std::path::absolute(directory).unwrap_or_else(|_| directory.to_owned())
+}
+
+/// Receipts that writers of `directory` in this process dropped on a full
+/// channel and have not reported in a written receipt.
+fn undelivered_drops(directory: &Path) -> u64 {
+    let key = registry_key(directory);
+    LIVE_DROP_COUNTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .filter(|(live, _)| *live == key)
+        .filter_map(|(_, count)| count.upgrade())
+        .fold(0, |total, count| {
+            total.saturating_add(count.load(Ordering::Relaxed))
+        })
+}
+
+fn heartbeat(dropped_before: u64) -> Record {
+    Record {
+        timestamp_ms: now_ms(),
+        request_id: 0,
+        elapsed_ms: None,
+        conversation_id: None,
+        task_id: None,
+        agent_id: None,
+        dropped_before,
+        event: Event::Heartbeat,
+    }
+}
+
+/// Sends without waiting. A receipt that gets through carries the count of
+/// those that did not, whichever sender dropped them. Returns whether the
+/// channel was full.
+fn deliver(sender: &mpsc::Sender<Record>, dropped: &AtomicU64, mut record: Record) -> bool {
+    // Taken before the send, so two senders never report the same drops.
+    let pending = dropped.swap(0, Ordering::Relaxed);
+    record.dropped_before = pending;
+    let Err(refused) = sender.try_send(record) else {
+        return false;
+    };
+    dropped.fetch_add(pending, Ordering::Relaxed);
+    matches!(refused, mpsc::error::TrySendError::Full(_))
+}
+
 pub(crate) struct Diagnostics {
     sender: mpsc::Sender<Record>,
-    dropped: u64,
+    /// Shared by every fork and the heartbeat, so a drop is reported even when
+    /// the sender that dropped never records again.
+    dropped: Arc<AtomicU64>,
 }
 impl Diagnostics {
     pub fn fork(&self) -> Self {
         Self {
             sender: self.sender.clone(),
-            dropped: 0,
+            dropped: self.dropped.clone(),
         }
     }
     pub fn start(state: &Path) -> Self {
         Self::start_with_heartbeat(state, HEARTBEAT)
     }
-    fn start_with_heartbeat(state: &Path, heartbeat: Duration) -> Self {
+    fn start_with_heartbeat(state: &Path, interval: Duration) -> Self {
         let (sender, mut records) = mpsc::channel(CAPACITY);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let directory = state.join("diagnostics");
+        {
+            let mut live = LIVE_DROP_COUNTS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            live.retain(|(_, count)| count.strong_count() > 0);
+            live.push((registry_key(&directory), Arc::downgrade(&dropped)));
+        }
         // A weak sender lets the writer end when its last real producer does.
         let witness = sender.downgrade();
+        let pending = dropped.clone();
         tokio::spawn(async move {
             let mut ticks =
-                tokio::time::interval_at(tokio::time::Instant::now() + heartbeat, heartbeat);
+                tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticks.tick().await;
                 let Some(sender) = witness.upgrade() else {
                     return;
                 };
-                let _ = sender.try_send(Record {
-                    timestamp_ms: now_ms(),
-                    request_id: 0,
-                    elapsed_ms: None,
-                    conversation_id: None,
-                    task_id: None,
-                    agent_id: None,
-                    dropped_before: 0,
-                    event: Event::Heartbeat,
-                });
+                // A heartbeat that does not fit is no lost receipt, so it is not counted.
+                deliver(&sender, &pending, heartbeat(0));
             }
         });
-        let directory = state.join("diagnostics");
+        let pending = dropped.clone();
         tokio::task::spawn_blocking(move || {
             let result = (|| -> io::Result<()> {
                 let mut writer = Writer::open(directory, MAX_BYTES)?;
                 while let Some(record) = records.blocking_recv() {
                     writer.append(&record)?;
+                }
+                // The last sender is gone, so nothing else can report these.
+                let unreported = pending.swap(0, Ordering::Relaxed);
+                if unreported > 0 {
+                    writer.append(&heartbeat(unreported))?;
                 }
                 Ok(())
             })();
@@ -673,7 +736,7 @@ impl Diagnostics {
                 eprintln!("Runtime diagnostics unavailable; chat continues.");
             }
         });
-        Self { sender, dropped: 0 }
+        Self { sender, dropped }
     }
     pub fn record(&mut self, request_id: u32, trace: &Trace, event: Event) {
         let record = Record {
@@ -683,15 +746,11 @@ impl Diagnostics {
             conversation_id: trace.conversation_id.clone(),
             task_id: trace.task_id.clone(),
             agent_id: trace.agent_id.clone(),
-            dropped_before: self.dropped,
+            dropped_before: 0,
             event,
         };
-        match self.sender.try_send(record) {
-            Ok(()) => self.dropped = 0,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.dropped = self.dropped.saturating_add(1)
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        if deliver(&self.sender, &self.dropped, record) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -1508,7 +1567,10 @@ mod tests {
     #[tokio::test]
     async fn a_full_nonblocking_channel_reports_its_dropped_count_after_recovery() {
         let (sender, mut records) = mpsc::channel(1);
-        let mut log = Diagnostics { sender, dropped: 0 };
+        let mut log = Diagnostics {
+            sender,
+            dropped: Default::default(),
+        };
         let trace = Trace::new(&RuntimeCommand::Status);
         log.record(1, &trace, Event::RequestReceived);
         log.record(2, &trace, Event::RequestReceived);
@@ -1589,7 +1651,10 @@ mod tests {
         let directory = state.path().join("diagnostics");
         let mut writer = Writer::open(directory.clone(), 8192).unwrap();
         let (sender, mut received) = mpsc::channel(16);
-        let mut diagnostics = Diagnostics { sender, dropped: 0 };
+        let mut diagnostics = Diagnostics {
+            sender,
+            dropped: Default::default(),
+        };
         let commands = [
             RuntimeCommand::MainInput {
                 origin: None,
@@ -1752,6 +1817,96 @@ mod tests {
         })
         .await
         .expect("The heartbeat must not keep the writer alive after its last producer");
+    }
+
+    /// Starts a writer that waits on writer.lock while `records` overflow its channel.
+    fn overflowed(
+        state: &std::path::Path,
+        heartbeat: std::time::Duration,
+        records: u32,
+    ) -> Diagnostics {
+        let directory = state.join("diagnostics");
+        fs::create_dir(&directory).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join("writer.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        let mut log = Diagnostics::start_with_heartbeat(state, heartbeat);
+        let trace = Trace::new(&RuntimeCommand::Status);
+        for id in 1..=records {
+            log.record(id, &trace, Event::RequestReceived);
+        }
+        fs2::FileExt::unlock(&lock).unwrap();
+        log
+    }
+
+    async fn reported_drops(directory: &std::path::Path) -> u64 {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let reported: u64 = receipts(directory)
+                    .iter()
+                    .map(|record| record.dropped_before)
+                    .sum();
+                if reported > 0 {
+                    return reported;
+                }
+            }
+        })
+        .await
+        .expect("Dropped receipts must be reported without another record() call")
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_reports_receipts_that_a_silent_sender_dropped() {
+        let state = tempfile::tempdir().unwrap();
+        let log = overflowed(state.path(), std::time::Duration::from_millis(50), 300);
+        let directory = state.path().join("diagnostics");
+        let reported = reported_drops(&directory).await;
+        let written = receipts(&directory)
+            .iter()
+            .filter(|record| matches!(record.event, Event::RequestReceived))
+            .count() as u64;
+        assert_eq!(
+            reported + written,
+            300,
+            "Every receipt is written or counted"
+        );
+        assert_eq!(
+            read_window(state.path(), (0, u64::MAX), 1_000, u64::MAX)
+                .unwrap()
+                .undelivered_drops,
+            0,
+            "A reported drop is no longer pending"
+        );
+        drop(log);
+    }
+
+    #[tokio::test]
+    async fn a_reader_sees_drops_that_no_record_has_reported_yet_and_the_last_sender_leaves_them_on_disk()
+     {
+        let state = tempfile::tempdir().unwrap();
+        let log = overflowed(state.path(), std::time::Duration::from_secs(3_600), 300);
+        let directory = state.path().join("diagnostics");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while receipts(&directory).len() < 256 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            read_window(state.path(), (0, u64::MAX), 1_000, u64::MAX)
+                .unwrap()
+                .undelivered_drops,
+            44
+        );
+        drop(log);
+        assert_eq!(reported_drops(&directory).await, 44);
     }
 
     #[test]
