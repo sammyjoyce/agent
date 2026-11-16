@@ -17,6 +17,7 @@ import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import type { TaskRecord } from "../src/generated/TaskRecord.js";
 import type { NativeRequest } from "../src/generated/NativeRequest.js";
 import { sessions } from "./fixtures/coordinator-native.js";
+import { pidsMatching } from "./fixtures/coordinator-world.js";
 import type { ModelQueue, ModelStep } from "./fixtures/coordinator-runtime.js";
 
 type GoalCheck = { type: "file_contains"; path: string; text: string };
@@ -274,6 +275,11 @@ test("a /goal persists, pauses across a coordinator restart, resumes once and co
     for (const owned of children) if (owned.child.pid !== undefined && owned.child.exitCode === null && owned.child.signalCode === null) {
       try { process.kill(-owned.child.pid, "SIGKILL"); } catch {}
     }
-    await Promise.allSettled(children.map((owned) => owned.exited)); await rm(directory, { recursive: true, force: true });
+    await Promise.allSettled(children.map((owned) => owned.exited));
+    // A held host action runs in its own process group, so the owner group kills above cannot reach it.
+    for (const pid of await pidsMatching(directory).catch(() => [])) {
+      try { process.kill(pid, "SIGKILL"); } catch {}
+    }
+    await rm(directory, { recursive: true, force: true });
   }
 });
