@@ -9,7 +9,7 @@ import { OWNER_FENCED_EXIT } from "../src/generated/owner-fenced-exit.js";
 import { DEFAULT_MODEL } from "../src/models.js";
 import { chat, failoverCoordinator, startBridge } from "./fixtures/failover-bridge.js";
 import { commands } from "./fixtures/failover-fault-proxy.js";
-import { enroll, filesUnder, follow, logBatches, loggedFiles, OWNER, retainedFiles, STANDBY, stateDirectory, tables } from "./fixtures/failover-state.js";
+import { enroll, filesUnder, follow, logBatches, loggedFiles, OWNER, retainedFiles, STANDBY, stateDirectory, tables, unstampedDirectory } from "./fixtures/failover-state.js";
 import { until } from "./fixtures/until.js";
 
 /** How many submissions the log holds for the input with this id. Each one is an admission of it. */
@@ -89,7 +89,7 @@ test("the Pi bridge as a replicated owner, against the Worker on local workerd",
   });
 
   await t.test("without a session the bridge asks the authority nothing and keeps no replication position", async (t) => {
-    const coordinator = await failoverCoordinator(t), directory = await stateDirectory(t);
+    const coordinator = await failoverCoordinator(t), directory = await unstampedDirectory(t);
     const bridge = await startBridge(t, { directory, queue: { "fixture-local": [{ text: "The local owner answered." }] } });
     bridge.send(1, chat("fixture-local", "local-input"));
     await bridge.wait(1, (event) => event.type === "done");
@@ -111,6 +111,19 @@ test("the Pi bridge as a replicated owner, against the Worker on local workerd",
     assert.deepEqual(bridge.frames, []);
     assert.match(bridge.errors(), /fenced/);
     assert.equal(coordinator.proxy.seen.some(commands()), false, "a fenced start sends no command");
+  });
+
+  await t.test("a replicated owner whose directory was never enrolled or joined does not start, names both commands, and its exit is not the fenced one", async (t) => {
+    const coordinator = await failoverCoordinator(t), directory = await unstampedDirectory(t);
+    const epoch = await enroll(coordinator.owner);
+    const bridge = await startBridge(t, { directory, session: await coordinator.session(OWNER, epoch) });
+    bridge.send(1, { type: "status" });
+    const ended = await bridge.exited();
+    assert.ok(ended.code !== 0 && ended.code !== OWNER_FENCED_EXIT, `the bridge exited ${ended.code}`);
+    assert.deepEqual(bridge.frames, []);
+    assert.match(bridge.errors(), /holds no replication position\. Run `beep-boop failover enroll`.*or `beep-boop failover join`/);
+    assert.deepEqual(tables(directory), {}, "a refused start leaves the database without Pi's schema");
+    assert.equal(coordinator.proxy.seen.some(commands()), false, "a refused start sends no command");
   });
 
   await t.test("a bridge that cannot reach the authority at start does not start, and its exit is not the fenced one", async (t) => {
