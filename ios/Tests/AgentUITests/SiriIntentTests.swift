@@ -511,6 +511,236 @@
         becomes(field, "value == %@", "Keep this Work draft"), String(describing: field.value))
     }
 
+    /// Spotlight finds what the activation read indexed, with no job query first. Each search's
+    /// answer is attached, so the run shows exactly which text is searchable.
+    func testSpotlightFindsEachSavedCoordinatorAndJobAndNothingElse() async throws {
+      guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
+      _ = try await launchWithJobs()
+
+      try await assertSpotlight(
+        coordinators: ["Work", "Personal"],
+        jobs: ["Nightly deps": "Work", "Weekly report": "Personal"], "after launch")
+      var found: [String] = []
+      for search in Self.searchable.keys.sorted() + Self.private {
+        let answer = try await spotlightAnswer(search)
+        found.append("\(search): \(answer)")
+        XCTAssertEqual(answer, Self.searchable[search] ?? [], "Spotlight search \(search)")
+      }
+      attach("spotlight-searches", found.joined(separator: "\n"))
+    }
+
+    func testSpotlightFollowsARenameAndARemoval() async throws {
+      guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
+      let (app, _, _) = try await launchWithJobs()
+      try await assertSpotlight(
+        coordinators: ["Work", "Personal"],
+        jobs: ["Nightly deps": "Work", "Weekly report": "Personal"], "after launch")
+
+      try editCoordinator("Work", in: app) { form in
+        let name = form.textFields["coordinatorName"]
+        self.replaceText(of: name, with: "Office", in: app)
+        app.buttons["Save"].tap()
+      }
+      try await assertSpotlight(
+        coordinators: ["Office", "Personal"],
+        jobs: ["Nightly deps": "Office", "Weekly report": "Personal"], "after the rename")
+      XCTAssertEqual(try await spotlightAnswer("Work"), [], "Spotlight still finds the old name")
+
+      try editCoordinator("Personal", in: app) { _ in
+        app.buttons["Remove coordinator"].tap()
+        let confirm = app.buttons.matching(NSPredicate(format: "label == %@", "Remove")).firstMatch
+        XCTAssertTrue(confirm.waitForExistence(timeout: 5), app.debugDescription)
+        confirm.tap()
+      }
+      try await assertSpotlight(
+        coordinators: ["Office"], jobs: ["Nightly deps": "Office"], "after the removal")
+      XCTAssertEqual(try await spotlightAnswer("Personal"), [], "Spotlight still finds Personal")
+      XCTAssertEqual(try await spotlightAnswer("Weekly"), [], "Spotlight still finds its job")
+    }
+
+    /// The relaunch is a restart: its first activation rebuilds the index from what is saved and
+    /// what each coordinator answers now.
+    func testSpotlightDropsAJobItsCoordinatorNoLongerHasAfterARelaunch() async throws {
+      guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
+      let (app, work, _) = try await launchWithJobs()
+      try await assertSpotlight(
+        coordinators: ["Work", "Personal"],
+        jobs: ["Nightly deps": "Work", "Weekly report": "Personal"], "after launch")
+      terminate(app)
+      await work.serve(jobs: [scheduledJob("docs:sweep", "Docs sweep", .completed)])
+
+      app.launch()
+
+      XCTAssertTrue(app.textViews["Message the coordinator"].waitForExistence(timeout: 10))
+      try await assertSpotlight(
+        coordinators: ["Work", "Personal"],
+        jobs: ["Docs sweep": "Work", "Weekly report": "Personal"], "after the relaunch")
+      XCTAssertEqual(try await spotlightAnswer("Nightly"), [], "Spotlight still finds the old job")
+    }
+
+    /// A result is the entity Open Job and Open Coordinator already take, so it opens where they
+    /// open and keeps the draft.
+    func testASpotlightResultOpensThroughTheOpenIntentsAndKeepsTheDraft() async throws {
+      guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
+      let (app, _, _) = try await launchWithJobs()
+      try chooseWorkAndType("Keep this Work draft", in: app)
+      let weeklyReport = try await spotlightResult(of: "JobEntity", for: "Weekly report")
+
+      try await definitions.intents["OpenJobIntent"].makeIntent(target: weeklyReport).run()
+
+      XCTAssertTrue(
+        app.navigationBars["Weekly report"].waitForExistence(timeout: 15), app.debugDescription)
+      assertBackShowsTheFeed(app, from: "Weekly report")
+      let field = app.textViews["Message the coordinator"]
+      XCTAssertTrue(
+        becomes(field, "value == %@", "Keep this Work draft"), String(describing: field.value))
+      let personal = try await spotlightResult(of: "CoordinatorEntity", for: "Personal")
+
+      try await definitions.intents["OpenCoordinatorIntent"].makeIntent(target: personal).run()
+
+      assertShowsPersonalWithTheWorkDraft(app)
+    }
+
+    /// A tap on the system's own Spotlight result, with the app terminated.
+    func testASpotlightTapOpensTheJobFromAColdLaunchAndKeepsTheDraft() async throws {
+      guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
+      let (app, _, _) = try await launchWithJobs()
+      try chooseWorkAndType("Keep this Work draft", in: app)
+      try await assertSpotlight(
+        coordinators: ["Work", "Personal"],
+        jobs: ["Nightly deps": "Work", "Weekly report": "Personal"], "after launch")
+      XCUIDevice.shared.press(.home)
+      let home = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+      XCTAssertTrue(home.wait(for: .runningForeground, timeout: 10))
+      terminate(app)
+
+      let result = try searchHome(home, for: "Weekly report")
+      capture("spotlight-search-weekly-report", home)
+      result.tap()
+
+      XCTAssertTrue(app.wait(for: .runningForeground, timeout: 15), "state \(app.state.rawValue)")
+      XCTAssertTrue(
+        app.navigationBars["Weekly report"].waitForExistence(timeout: 15), app.debugDescription)
+      capture("spotlight-tap-opened-weekly-report", app)
+      assertBackShowsTheFeed(app, from: "Weekly report")
+      let menu = app.buttons["scopeMenu"]
+      XCTAssertTrue(becomes(menu, "label BEGINSWITH %@", "Work"), menu.label)
+      let field = app.textViews["Message the coordinator"]
+      XCTAssertTrue(
+        becomes(field, "value == %@", "Keep this Work draft"), String(describing: field.value))
+    }
+
+    /// What each search finds under `launchWithJobs`, by entity: titles of jobs, names of
+    /// coordinators.
+    private static let searchable: [String: [String]] = [
+      "Nightly": ["job Nightly deps"],
+      "Nightly deps": ["job Nightly deps"],
+      "Weekly report": ["job Weekly report"],
+      "Personal": ["coordinator Personal", "job Weekly report"],
+      "Work": ["coordinator Work", "job Nightly deps"],
+      "Interrupted": ["job Nightly deps"],
+      "Completed": ["job Weekly report"],
+    ]
+    /// Text each job carries that Spotlight must never find: its prompt, directory, model,
+    /// time zone, ID and schedule.
+    private static let `private` = [
+      "invented prompt", "workspace", "example-model", "America", "nightly:deps",
+      "example-schedule",
+    ]
+
+    @available(iOS 27, *)
+    private func spotlightAnswer(_ search: String) async throws -> [String] {
+      let jobs = try await definitions.entities["JobEntity"].spotlightQuery(search)
+      let coordinators = try await definitions.entities["CoordinatorEntity"].spotlightQuery(search)
+      return try
+        (coordinators.map { "coordinator \(try $0.name.as(String.self))" }
+        + jobs.map { "job \(try $0.title.as(String.self))" }).sorted()
+    }
+
+    @available(iOS 27, *)
+    private func spotlightResult(of entity: String, for search: String) async throws
+      -> AnyAppEntity
+    {
+      let deadline = ContinuousClock.now + .seconds(20)
+      repeat {
+        if let first = try await definitions.entities[entity].spotlightQuery(search).first {
+          return first
+        }
+        try await Task.sleep(for: .milliseconds(500))
+      } while ContinuousClock.now < deadline
+      return try XCTUnwrap(nil as AnyAppEntity?, "Spotlight found no \(entity) for \(search)")
+    }
+
+    /// Waits until Spotlight holds exactly these coordinators, and these jobs under their
+    /// coordinators, and nothing else of the app's.
+    @available(iOS 27, *)
+    private func assertSpotlight(
+      coordinators: Set<String>, jobs: [String: String], _ moment: String
+    ) async throws {
+      let deadline = ContinuousClock.now + .seconds(20)
+      var shown: (coordinators: Set<String>, jobs: [String: String]) = ([], [:])
+      repeat {
+        let foundCoordinators = try await definitions.entities["CoordinatorEntity"]
+          .spotlightQuery(nil)
+        let foundJobs = try await definitions.entities["JobEntity"].spotlightQuery(nil)
+        shown.coordinators = Set(try foundCoordinators.map { try $0.name.as(String.self) })
+        shown.jobs = Dictionary(
+          try foundJobs.map {
+            (try $0.title.as(String.self), try $0.coordinator.as(String.self))
+          }, uniquingKeysWith: { first, _ in first })
+        if shown.coordinators == coordinators, shown.jobs == jobs, foundJobs.count == jobs.count {
+          return
+        }
+        try await Task.sleep(for: .milliseconds(500))
+      } while ContinuousClock.now < deadline
+      XCTFail("\(moment): Spotlight holds \(shown), expected \(coordinators) and \(jobs)")
+    }
+
+    /// Opens the saved coordinator's page under Connection, runs `body` there, and closes the sheet.
+    private func editCoordinator(
+      _ name: String, in app: XCUIApplication, _ body: (XCUIApplication) throws -> Void
+    ) throws {
+      app.buttons["Connection"].tap()
+      let row = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", name)).firstMatch
+      XCTAssertTrue(row.waitForExistence(timeout: 10), app.debugDescription)
+      row.tap()
+      XCTAssertTrue(app.navigationBars[name].waitForExistence(timeout: 10), app.debugDescription)
+      try body(app)
+      let done = app.buttons["dismissConnection"]
+      if !done.waitForExistence(timeout: 10) {
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+      }
+      XCTAssertTrue(done.waitForExistence(timeout: 10), app.debugDescription)
+      done.tap()
+    }
+
+    private func replaceText(of field: XCUIElement, with text: String, in app: XCUIApplication) {
+      XCTAssertTrue(field.waitForExistence(timeout: 10), app.debugDescription)
+      field.press(forDuration: 1)
+      let selectAll = app.menuItems["Select All"]
+      XCTAssertTrue(selectAll.waitForExistence(timeout: 3), app.debugDescription)
+      selectAll.tap()
+      field.typeText(text)
+      XCTAssertTrue(becomes(field, "value == %@", text), String(describing: field.value))
+    }
+
+    /// Pulls down Spotlight on the home screen, types `search`, and returns the app's result.
+    private func searchHome(_ home: XCUIApplication, for search: String) throws -> XCUIElement {
+      home.swipeDown()
+      home.typeText(search)
+      let result = home.descendants(matching: .any)
+        .matching(NSPredicate(format: "label CONTAINS %@", search)).element(boundBy: 0)
+      XCTAssertTrue(result.waitForExistence(timeout: 15), home.debugDescription)
+      return result
+    }
+
+    private func attach(_ name: String, _ text: String) {
+      let attachment = XCTAttachment(string: text)
+      attachment.name = name
+      attachment.lifetime = .keepAlways
+      add(attachment)
+    }
+
     private func assertTheQueryRefusesWithoutItsFixture(of entity: String) async throws {
       guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
       let launches: [(environment: [String: String], screen: String)] = [
