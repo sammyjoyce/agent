@@ -578,7 +578,9 @@ the [roadmap](../docs/roadmap.md#finish-the-current-pass).
 `ios/PhoneAcceptance` drives a Beep Boop build already installed on a phone and
 keeps evidence for two roadmap rows. The composer row covers clearing on Send
 with the keyboard up, sent text that never comes back, and newer typing that
-survives admission and relaunch. The alert row covers a completed main-chat
+survives admission and relaunch. On a phone nothing holds admission back, so
+identical newer typing may start after admission rather than race it. The
+alert row covers a completed main-chat
 reply and a mid-job `notify_user` notice that reach the phone as visible alerts.
 The project's one target is a UI-test runner with no target app, so
 `xcodebuild` installs only the runner and never installs or replaces Beep Boop.
@@ -586,12 +588,14 @@ On a phone the runner attaches to the installed app by bundle ID, with no launch
 arguments or environment.
 
 The runner proves what the phone showed. Each Send record is the first composer
-screenshot after the tap, read by Vision OCR, with the keyboard state. Each
+screenshot after the tap, read by Vision OCR, with the keyboard state. A record
+whose screenshot did not reach the result bundle's export fails the run. Each
 alert record is a SpringBoard banner or Notification Center entry that shows a
 fresh codeword, with the app's state and wall-clock times in epoch
 milliseconds: `sentAt` for each Send, `seenAt` when the runner found an alert,
 and `tappedAt` when it opened one. Compare those times with the coordinator's
-task times to show that a notice arrived while its job still ran. An alert test
+task times, as [Verify on a phone](../docs/notifications.md#verify-on-a-phone)
+describes, to show that a notice arrived while its job still ran. An alert test
 passes when the banner or the Notification Center entry shows the codeword,
 since Focus or the banner style can hide banners. The report keeps both
 observations. The runner does not prove how the coordinator produced an alert,
@@ -599,8 +603,8 @@ and `seenAt` can trail the alert by the runner's poll interval.
 
 The runner refuses to start over a draft, and it sends only text it typed. Every
 message starts with the run label and asks for a short reply. Before each Send it
-checks that the title shows the chosen coordinator and that the recipient line
-reads `To <coordinator>`. It clears the drafts it left and shows the original
+checks that the title shows the chosen coordinator. When the app shows a
+recipient line, it also checks that the line reads `To <coordinator>`. It clears the drafts it left and shows the original
 conversation again when it finishes.
 
 Prerequisites for a phone run:
