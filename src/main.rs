@@ -29,11 +29,12 @@ use agent_cli::{
     host::effects::{Admission, Capacity, HostEffects},
     instructions, jobs,
     models::{ModelProvider, ModelSelection, Reasoning},
+    owner_floor::{OwnerFloor, OwnerLink},
     protocol::{
         AuthStatus, ConversationChange, ConversationSettings, CoordinatorBootstrap,
-        CoordinatorSettings, ImportPhase, InputMode, MainInputContext, RuntimeCommand,
-        RuntimeEventKind, SavedConversation, SearchMode, TaskId, TranscriptAnnotation,
-        TranscriptClassification, WorkerLaunch, WorkerRef,
+        CoordinatorSettings, HostDelivery, HostResult, ImportPhase, InputMode, MainInputContext,
+        RuntimeCommand, RuntimeEventKind, SavedConversation, SearchMode, TaskId,
+        TranscriptAnnotation, TranscriptClassification, WorkerLaunch, WorkerRef,
     },
     rex::{BlockId, RexClient, SessionId},
     runtime::{
@@ -3016,6 +3017,7 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
         host::Executor::with_tailscale(directory, daemon.clone(), rex.clone())
             .with_browser(script, config.browser.clone()),
     );
+    let floor = OwnerFloor::for_user()?;
     let mut delay = 1;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -3046,20 +3048,27 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
                 .next_frame()
                 .await?
                 .context("Coordinator closed the worker registration")?;
-            ensure!(
-                matches!(
-                    decode_coordinator_event(&frame)?,
-                    RuntimeEventKind::WorkerReady { .. }
-                ),
-                "Coordinator did not accept this worker"
-            );
-            Ok::<_, anyhow::Error>((node, reader, wire.writer, wire.child))
+            let RuntimeEventKind::WorkerReady {
+                coordinator_id,
+                owner_epoch,
+                ..
+            } = decode_coordinator_event(&frame)?
+            else {
+                bail!("Coordinator did not accept this worker");
+            };
+            let link = OwnerLink::new(coordinator_id, owner_epoch);
+            if let Err(error) = floor.admit(link) {
+                service_notice(format_args!("{error:#}"));
+                let _ = close_connection(&mut *wire.writer, wire.child).await;
+                return Err(error);
+            }
+            Ok::<_, anyhow::Error>((node, reader, wire.writer, wire.child, link))
         };
         let registered = tokio::select! {
             registered = register => registered,
             signal = &mut shutdown => { signal?; return Ok(()); }
         };
-        if let Ok((node, mut reader, mut writer, child)) = registered {
+        if let Ok((node, mut reader, mut writer, child, link)) = registered {
             delay = 1;
             service_notice(format_args!("Worker connected as {}.", node.name));
             // Collection needs another connection while this one serves effects.
@@ -3109,6 +3118,15 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
                             match decode_coordinator_event(&frame)? {
                                 RuntimeEventKind::HostCancel { call_id } => { effects.cancel(&call_id); }
                                 RuntimeEventKind::HostCall { call_id, command } => {
+                                    if let Err(error) = floor.check(link) {
+                                        service_notice(format_args!("{error:#}"));
+                                        let result = HostResult::Failed {
+                                            delivery: Some(HostDelivery::NotStarted),
+                                            message: format!("{error:#}; no command was started"),
+                                        };
+                                        write_command(&mut *writer, &RuntimeCommand::HostReply { call_id, result }).await?;
+                                        return Err(error);
+                                    }
                                     let executor = executor.clone();
                                     if let Admission::Rejected(reply) = effects.spawn(call_id, |cancelled| async move {
                                         executor.execute_cancelled(*command, cancelled).await

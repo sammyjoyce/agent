@@ -740,6 +740,8 @@ async fn a_registered_worker_serves_image_reads_from_its_own_host() {
         .arg(files.join("AGENTS.md"))
         .arg("maintain")
         .env("PATH", path)
+        .env("HOME", &files)
+        .env("XDG_DATA_HOME", files.join("data"))
         .env("AGENT_TEST_FAKE_REX", &bin)
         .env("AGENT_TEST_FAKE_REX_ORIGIN_SERVER", SERVER)
         .env("AGENT_TEST_COORDINATOR_SOCKET", files.join("agent.sock"))
