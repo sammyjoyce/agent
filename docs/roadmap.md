@@ -71,6 +71,11 @@ recovery; [history](history.md) describes import and retrieval.
   asynchronous admission work. Native checks cover marked text, consecutive
   sends, foreground recovery and active responses. The replacement is available
   in TestFlight; physical-phone verification of the recurrence remains open.
+- [ ] Return a control's text, such as `/status`, to the live iOS composer when
+  no recipient of its Send wrote it, as crash recovery already does, and keep
+  newer typing. A control that any recipient wrote does not come back. A
+  `ChatModel` test drives a dial that fails after the start. See
+  [issue #34](https://github.com/sammyjoyce/agent/issues/34).
 - [x] Use shared typed cells for live and imported messages, with Codex-style
   terminal formatting and retained command output on reopen.
 - [x] Retain the live tail and older reading position through native rotation.
@@ -181,6 +186,15 @@ recovery; [history](history.md) describes import and retrieval.
   jobs, sending, opening a job, onscreen entities and Spotlight follow.
 - [ ] A macOS menu bar app that shows Beep Boop's status on the Mac, including
   whether the service is running and its installed and running versions.
+- [ ] Typed read and write access to Apple Notes, Reminders, Mail and Messages
+  through macctl, a signed Swift daemon whose source moves into `macos/macctl/`.
+  `HostCommand::Apple` reaches only the configured Mac that owns the data, and
+  that Mac's tiers decide which `apple_read`, `apple_change` and `apple_send`
+  methods exist. Each write commits an operation record before dispatch; an
+  unknown outcome blocks further writes to that app until it is settled. macctl
+  first needs four guarantees it lacks today. Per-send approval, triage writes
+  and the design's other open questions are the owner's decisions. See the
+  [design](https://github.com/sammyjoyce/agent/issues/31).
 
 ## Retrieval, learning and proof
 
@@ -239,6 +253,39 @@ recovery; [history](history.md) describes import and retrieval.
 - [ ] Tested coordinator backups and restoration, including retained assets.
 - [ ] Replicated coordinator state and failover, retaining one active owner so
   additional coordinators do not duplicate work or external effects.
+
+## Upstream reuse follow-ups
+
+Verifiers found these while qualifying the upstream reuse rows below and judged
+none a blocker. See [issue #52](https://github.com/sammyjoyce/agent/issues/52).
+
+- [ ] Show a code mode script's nested `exec`, `write_file` and `edit_file`
+  calls as their own Command and File changes items in triage, worker and agent
+  history. Today they are lines inside the code mode item, although the
+  result's `details.calls` already carries them.
+- [ ] Make the tool discovery eval's `child-agent` oracle check meaning instead
+  of wording, then requalify it with a fresh run. It still accepts a denial in
+  the sentence after the root cause label, and denials worded as "ruled out",
+  "excluded", "instead of" or "discarded theory".
+- [ ] Rerun the full nine-scenario tool discovery confirmation under the current
+  oracle at low and default reasoning, retaining every answer. The published
+  full-suite numbers came from the earlier, weaker oracle.
+- [ ] Shrink the worker's `codemode` prompt section with tool namespaces or a
+  smaller inline budget.
+- [ ] End-to-end image read tests for the triage and child-agent routes, across
+  two machines, and for cancelling a slow transfer.
+- [ ] Prepare attachments with the conversation model's image limits instead of
+  the defaults.
+- [ ] A bridge-level test that an oversized task graph request fails without
+  breaking the bridge.
+- [ ] Print JSON errors when a `--json` CLI request fails.
+- [ ] A live task graph watch, plus task graph views in the TUI and iOS app.
+- [ ] Make waits in `runtime/test/native-main.test.ts` cancellation-aware, so a
+  missing event fails at its timeout instead of hanging. Trunk hangs the same
+  way.
+- [ ] Restore Linux real-browser coverage. The pinned Chromium needs
+  `libglib-2.0` on NixOS hosts, and the gate must pass the browser fixture's
+  `GITHUB_ENV` on.
 
 ## Reuse upstream
 
