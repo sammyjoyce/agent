@@ -17,7 +17,7 @@ jobs:
   conversation-render:
     name: Conversation rendering
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7.0.1
         with:

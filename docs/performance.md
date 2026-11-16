@@ -54,13 +54,21 @@ the runtime counts as application delay. Overlapping holds count once. A
 missing or reversed mark fails the sample, and a negative result is an error
 rather than zero.
 
-Seven measured pairs run per scenario. For every scenario and gate, each
+Fifteen measured pairs run per scenario. For every scenario and gate, each
 candidate gets the greater of a 25% or 20-millisecond allowance over its
 paired baseline. CI fails when the median fraction of that budget exceeds 1.
 Pairing prevents uneven runner stalls from turning separate medians into a
 false regression. The first pair warms the services and is recorded but
 excluded from the gate. There are no automatic retries or discarded slow
 samples.
+
+Visible marks move in steps of about 41 ms, so one pair can exceed its budget
+with no change. How often varies between runs on the same host. Resampling
+three same-build Linux runs put the chance that a whole run fails with no
+change at 8 to 13% with seven pairs and 2 to 5% with fifteen. Three later runs
+on the same host put it under 1% with either count. Keep the count odd,
+because with an even count the gate reads the upper of the two middle
+fractions.
 
 ## Loopback model provider
 
@@ -191,7 +199,9 @@ Two runs on one build show the gates' range:
   commits a streamed partial on a trailing 100 ms timer. Both count as
   application delay. Visible marks land on steps of about 41 ms, so a sample
   near a step boundary can move by a whole step, and a gate can fail with no
-  change. Which gates sit near a boundary depends on the platform.
+  change. Which gates sit near a boundary depends on the platform. CI gates on
+  Linux only. On macOS, resampling three local runs put the chance that a
+  whole run fails with no change at about 3 to 5% with fifteen pairs.
 - Rex is a shell stand-in, and the model provider is a local script.
 - Token counts are synthetic.
 - Scrolling to older text in a long history, and foreground work during search

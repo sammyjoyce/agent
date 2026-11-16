@@ -45,7 +45,7 @@ struct Arguments {
     /// version's runtime against the loopback model provider.
     #[arg(long)]
     runtime_shim: PathBuf,
-    #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u8).range(3..=31))]
+    #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u8).range(3..=31))]
     samples: u8,
     /// Run only these scenarios; repeat the flag for several. Defaults to all.
     #[arg(long = "scenario", value_enum)]
