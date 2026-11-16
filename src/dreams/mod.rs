@@ -235,7 +235,7 @@ impl Dreams {
             std::fs::remove_dir_all(&reading)?;
             let checking = DreamsStore::base_clone(&staged);
             workspace::clone_detached(repository, &base, &checking).await?;
-            let before = workspace::run_checks(&checking, self.policy.checks(), cancelled).await?;
+            let before = self.run_checks(&checking, cancelled).await?;
             DreamsStore::write_review(
                 &staged,
                 &Review {
@@ -258,6 +258,17 @@ impl Dreams {
             let _ = std::fs::remove_dir_all(&staged);
         }
         built.map(|_: ReviewSeal| ())
+    }
+
+    /// The only way Dreams runs the policy's checks. A check whose arguments
+    /// name an editable path in this clone is never started.
+    async fn run_checks(
+        &self,
+        clone: &Path,
+        cancelled: &watch::Receiver<bool>,
+    ) -> Result<Vec<CheckResult>> {
+        self.policy.refuse_editable_check_arguments(clone)?;
+        workspace::run_checks(clone, self.policy.checks(), cancelled).await
     }
 
     async fn editable_files(&self, checkout: &Path) -> Result<Vec<(String, String)>> {
@@ -438,7 +449,7 @@ impl Dreams {
         let candidate = DreamsStore::candidate_clone(directory);
         workspace::clone_detached(&review.repository, &review.base, &candidate).await?;
         let patch = workspace::write_candidate(&candidate, &review.base, &edits).await?;
-        let after = workspace::run_checks(&candidate, self.policy.checks(), cancelled).await?;
+        let after = self.run_checks(&candidate, cancelled).await?;
         DreamsStore::write_after(directory, &after)?;
         DreamsStore::write_patch(directory, &patch.bytes)?;
         if let Some(failed) = after.iter().find(|check| !check.passed()) {
@@ -870,6 +881,78 @@ mod tests {
             let quiet = night.abstain_as_quiet("night").await;
             assert!(!quiet.decided, "{name}: {}", quiet.text);
         }
+    }
+
+    #[tokio::test]
+    async fn a_check_argument_that_became_a_symlink_to_an_editable_file_fails_the_run_unrun() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let (repository, state) = (base.join("guidance"), base.join("state"));
+        fs::create_dir(&repository).unwrap();
+        fs::create_dir(&state).unwrap();
+        let ran = base.join("editable-file-ran");
+        fs::write(
+            repository.join("AGENTS.md"),
+            format!("touch {}\n", ran.display()),
+        )
+        .unwrap();
+        git(&repository, &["init", "--quiet", "--initial-branch=main"]);
+        git(&repository, &["config", "user.name", "Example"]);
+        git(&repository, &["config", "user.email", "example@invalid"]);
+        git(&repository, &["add", "."]);
+        git(
+            &repository,
+            &["commit", "--quiet", "-m", "Add example guidance"],
+        );
+        let policy = DreamsPolicy::parse(
+            &DreamsPolicyFile {
+                repository: repository.clone(),
+                editable: vec!["AGENTS.md".into()],
+                window_hours: Some(1),
+                checks: vec![DreamsCheckFile {
+                    name: "alias".into(),
+                    argv: vec!["/bin/sh".into(), "alias.txt".into()],
+                    timeout_seconds: 30,
+                }],
+            },
+            &ProtectedPaths {
+                config: None,
+                job_directories: &[],
+            },
+        )
+        .unwrap();
+        let dreams = Dreams::open(&state, policy).unwrap();
+        symlink("AGENTS.md", repository.join("alias.txt")).unwrap();
+        git(&repository, &["add", "alias.txt"]);
+        git(
+            &repository,
+            &["commit", "--quiet", "-m", "Point the check at the guidance"],
+        );
+        let (_owner, cancelled) = watch::channel(false);
+        let result = dreams
+            .execute(
+                DreamsRequest::Review {
+                    run: "night".into(),
+                    summaries: vec![],
+                    summaries_omitted: 0,
+                    page: 1,
+                },
+                cancelled,
+            )
+            .await;
+        assert!(!ran.exists(), "The before check ran the editable file");
+        let HostResult::Failed { message, .. } = result else {
+            panic!("A refused check must fail the run: {result:?}");
+        };
+        assert!(message.contains("names an editable path"), "{message}");
+        assert!(
+            dreams
+                .store
+                .read(&RunId::from_request("night").unwrap())
+                .unwrap()
+                .is_none(),
+            "No review is sealed"
+        );
     }
 
     #[tokio::test]

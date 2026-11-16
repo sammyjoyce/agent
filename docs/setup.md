@@ -487,10 +487,18 @@ before and after results. See the
 The policy loader refuses a repository that contains the configuration file, a
 job directory or the state directory. It also refuses a check whose arguments
 name an editable path. The loader follows each argument as the check would see
-it, from the repository root, through symlinks and without regard to case, and
-it refuses a relative argument that contains `..`. That rule catches a path
-written in the configuration. It cannot see a file that a check program opens
-by itself, so the rule about checks below still applies. Keep check programs
+it, from the repository root, through symlinks and without regard to case. It
+treats the value of a `name=value` argument, such as `--file=AGENTS.md`, the
+same way. It refuses a relative argument that contains `..`, and a relative
+argument that is not ASCII, because a volume can fold other characters into an
+editable name. The coordinator applies the same rule again before each run's
+checks, in the clone that they run in, because a later commit can turn a
+harmless argument into a symlink to an editable file. A refused check fails
+that run with the same message, and no check starts. That rule catches a path
+written in the configuration. It does
+not see a short option with an attached value, such as `-fAGENTS.md`, a path
+inside a `-c` string, or a file that a check program opens by itself, so the
+rule about checks below still applies. Keep check programs
 outside the repository. Restart the coordinator after you change the policy.
 
 Copy the [example job](../examples/scheduled_jobs/dreams.toml) into a job

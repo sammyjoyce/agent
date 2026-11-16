@@ -154,7 +154,7 @@ fn editable_in(globs: &[Glob], path: &str) -> Result<EditablePath, String> {
     }
 }
 
-fn normalize(path: &Path) -> PathBuf {
+fn normalize_lexically(path: &Path) -> PathBuf {
     let mut normal = PathBuf::new();
     for component in path.components() {
         match component {
@@ -168,24 +168,48 @@ fn normalize(path: &Path) -> PathBuf {
     normal
 }
 
-/// Each argument is followed both by name and through the file system, which
+/// A `..` after a symlink lands somewhere its spelling does not say, and a
+/// relative `..` can leave the clone a check runs in.
+fn climbs_past_what_was_followed(written: &Path, lands_in_tree: bool) -> bool {
+    written
+        .components()
+        .any(|part| part == Component::ParentDir)
+        && (written.is_relative() || lands_in_tree)
+}
+
+/// The argument itself, and the value of each `name=value` form in it.
+fn path_candidates(argument: &str) -> impl Iterator<Item = &str> {
+    std::iter::once(argument).chain(
+        argument
+            .match_indices('=')
+            .map(|(index, _)| &argument[index + 1..]),
+    )
+}
+
+/// Refuses a check argument that names an editable path in `tree`, which is
+/// the repository or a clone of it that the check is about to run in.
+///
+/// Each candidate is followed both by name and through the file system, which
 /// resolves symlinks and, on a volume that folds case, the stored spelling.
 /// Names are compared without case, so a file that does not exist yet is
-/// covered on such a volume too.
-fn refuse_editable_argv(
-    repository: &Path,
+/// covered on such a volume too. A volume can also fold other Unicode
+/// characters into ASCII. Editable paths are ASCII, so a candidate inside the
+/// tree must be ASCII as well.
+fn refuse_editable_argument(
+    tree: &Path,
     editable: &[Glob],
-    check: &DreamsCheckFile,
+    check: &str,
+    argument: &str,
 ) -> Result<()> {
-    for argument in &check.argv {
-        let written = Path::new(argument);
-        let anchored = repository.join(written);
+    for candidate in path_candidates(argument) {
+        let written = Path::new(candidate);
+        let anchored = tree.join(written);
         let landings: Vec<PathBuf> = [
-            normalize(&anchored),
-            normalize(&canonicalize_existing_ancestor(&anchored)),
+            normalize_lexically(&anchored),
+            normalize_lexically(&canonicalize_existing_ancestor(&anchored)),
         ]
         .into_iter()
-        .filter_map(|landing| Some(landing.strip_prefix(repository).ok()?.to_owned()))
+        .filter_map(|landing| Some(landing.strip_prefix(tree).ok()?.to_owned()))
         .collect();
         let names_editable = landings.iter().any(|relative| {
             let parts: Vec<String> = relative
@@ -198,18 +222,16 @@ fn refuse_editable_argv(
                     .any(|glob| glob.matches_ignoring_case(&parts))
         });
         if names_editable {
+            bail!("Dreams check {check} names an editable path: {argument}");
+        }
+        if !landings.is_empty() && !candidate.is_ascii() {
             bail!(
-                "Dreams check {} names an editable path: {argument}",
-                check.name
+                "Dreams check {check} has a non-ASCII argument inside the repository, which a volume may fold into an editable path: {argument}. Use ASCII, or an absolute path outside the repository"
             );
         }
-        let climbs = written
-            .components()
-            .any(|part| part == Component::ParentDir);
-        if climbs && (written.is_relative() || !landings.is_empty()) {
+        if climbs_past_what_was_followed(written, !landings.is_empty()) {
             bail!(
-                "Dreams check {} reaches a path through `..`: {argument}. Write the path without `..`",
-                check.name
+                "Dreams check {check} reaches a path through `..`: {argument}. Write the path without `..`"
             );
         }
     }
@@ -294,7 +316,9 @@ impl DreamsPolicy {
                 "Dreams check {} needs a timeout between 1 and {MAX_CHECK_SECONDS} seconds",
                 check.name
             );
-            refuse_editable_argv(&repository, &editable, check)?;
+            for argument in &check.argv {
+                refuse_editable_argument(&repository, &editable, &check.name, argument)?;
+            }
             checks.push(CheckSpec {
                 name: check.name.clone(),
                 argv: check.argv.clone(),
@@ -325,6 +349,23 @@ impl DreamsPolicy {
 
     pub fn editable(&self, path: &str) -> Result<EditablePath, String> {
         editable_in(&self.editable, path)
+    }
+
+    /// The guard that ran when the policy was loaded, run again where the
+    /// checks are about to run. The repository changes after the load: a commit
+    /// can turn a harmless argument into a symlink to an editable file.
+    pub(crate) fn refuse_editable_check_arguments(&self, clone: &Path) -> Result<()> {
+        let clone = clone
+            .canonicalize()
+            .context("The clone for the Dreams checks is unavailable")?;
+        for tree in [self.repository.as_path(), clone.as_path()] {
+            for check in &self.checks {
+                for argument in &check.argv {
+                    refuse_editable_argument(tree, &self.editable, &check.name, argument)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn refuse_state_inside(&self, state: &Path) -> Result<()> {
@@ -586,6 +627,78 @@ mod tests {
         ] {
             assert!(
                 parsed(&argument).is_ok(),
+                "{argument:?} names no editable file and must stay allowed"
+            );
+        }
+    }
+
+    fn with_argument(repository: &Path, argument: &str) -> anyhow::Result<DreamsPolicy> {
+        let mut policy = file(repository);
+        policy.checks[0].argv.push(argument.to_owned());
+        DreamsPolicy::parse(&policy, &UNPROTECTED)
+    }
+
+    #[test]
+    fn a_check_argument_that_a_unicode_folding_volume_reads_as_an_editable_path_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = repository(root.path());
+        fs::write(repository.join("AGENTS.md"), "Example guidance.\n").unwrap();
+        let accepted: Vec<&str> = [
+            "AGENT\u{17f}.md",
+            "playbook\u{17f}/new.md",
+            "PLAYBOOK\u{17f}/New.md",
+            "playbooks/\u{212a}eep.md",
+        ]
+        .into_iter()
+        .filter(|argument| with_argument(&repository, argument).is_ok())
+        .collect();
+        assert!(
+            accepted.is_empty(),
+            "The policy accepted arguments that fold to an editable path: {accepted:?}"
+        );
+        assert!(
+            with_argument(&repository, "playbook\u{17f}/new.md")
+                .unwrap_err()
+                .to_string()
+                .contains("non-ASCII argument")
+        );
+        let outside = root.path().join("checks/caf\u{e9}.sh");
+        assert!(
+            with_argument(&repository, outside.to_str().unwrap()).is_ok(),
+            "An absolute path outside the repository may use any characters"
+        );
+    }
+
+    #[test]
+    fn an_option_value_that_names_an_editable_path_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = repository(root.path());
+        fs::create_dir(repository.join("playbooks")).unwrap();
+        fs::write(repository.join("playbooks/patterns.md"), "^before$\n").unwrap();
+        let inside = repository.canonicalize().unwrap().join("AGENTS.md");
+        let accepted: Vec<String> = [
+            "--file=playbooks/patterns.md".to_owned(),
+            "--file=./AGENTS.md".into(),
+            "PATTERNS=agents.md".into(),
+            "--first=x=AGENTS.md".into(),
+            format!("--file={}", inside.display()),
+        ]
+        .into_iter()
+        .filter(|argument| with_argument(&repository, argument).is_ok())
+        .collect();
+        assert!(
+            accepted.is_empty(),
+            "The policy accepted option values that name an editable path: {accepted:?}"
+        );
+        for argument in [
+            "--range=1..3",
+            "--color=never",
+            "LANG=C",
+            "--file=Makefile",
+            "=",
+        ] {
+            assert!(
+                with_argument(&repository, argument).is_ok(),
                 "{argument:?} names no editable file and must stay allowed"
             );
         }
