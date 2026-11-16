@@ -12,7 +12,10 @@
     private static let slop: CGFloat = 30
 
     var body: some View {
-      icon
+      // The icon switches branches when dictation opens. Keep the active touch's host
+      // independent of that visual identity; genuine system cancellation still goes through
+      // the GestureState reset below.
+      ZStack { icon }
         .frame(width: 44, height: 44).contentShape(Circle())
         .gesture(
           DragGesture(minimumDistance: 0)

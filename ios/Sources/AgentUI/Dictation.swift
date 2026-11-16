@@ -110,6 +110,7 @@ final class ScriptedSpeech: Sendable {
     var microphone = MicrophonePermission.granted
     var grants = true
     var takes = ["Invented dictated words"]
+    var partials: [String] = []
 
     init() {}
 
@@ -127,6 +128,7 @@ final class ScriptedSpeech: Sendable {
         ?? defaults.microphone
       grants = try values.decodeIfPresent(Bool.self, forKey: .grants) ?? defaults.grants
       takes = try values.decodeIfPresent([String].self, forKey: .takes) ?? defaults.takes
+      partials = try values.decodeIfPresent([String].self, forKey: .partials) ?? defaults.partials
     }
   }
 
@@ -224,6 +226,15 @@ final class ScriptedSpeech: Sendable {
       return ($0.takes, $0.script.takes[min($0.takes, $0.script.takes.count - 1)])
     }
     continuation.yield(.level(0.5))
+    let (partials, step) = state.withLock { ($0.script.partials, $0.script.stepMilliseconds) }
+    let updates = Task {
+      for (index, words) in partials.enumerated() {
+        do { try await Task.sleep(for: .milliseconds(step)) } catch { return }
+        continuation.yield(.level(index.isMultiple(of: 2) ? 0.9 : 0.1))
+        continuation.yield(.partial(words))
+      }
+    }
+    continuation.onTermination = { _ in updates.cancel() }
     let stop: @Sendable () -> Void = { [self] in
       state.withLock { if $0.open?.take == take { $0.open = nil } }
       continuation.finish()
