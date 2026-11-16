@@ -642,7 +642,12 @@ A check runs with only `PATH`, `HOME`, `LANG` and `TMPDIR` in its environment,
 in a private clone under `<state_dir>/dreams/runs/`. Write checks that read
 candidate files as data. A check that executes or sources an editable file
 runs proposed content before you have approved it. Dreams keeps every run
-under `<state_dir>/dreams/runs/` and does not prune them.
+under `<state_dir>/dreams/runs/` and does not prune them. A backup leaves
+`<state_dir>/dreams` out. A coordinator restored from a backup has no earlier
+runs, reviews, evidence, patches, proposals or applied-run records. Its
+`dreams list` is empty, and it cannot show or apply an old run ID or approve an
+old digest. The target repository is outside the state directory, so the backup
+does not copy it either.
 
 To measure a model on Dreams, run the opt-in eval against your provider. It
 writes one JSON line per trial, with each patch and check result, to the output
@@ -871,7 +876,13 @@ directory, never a partial destination. Delete it when no backup is running.
 
 The backup leaves out credentials (`auth.json`), the search index, diagnostics,
 logs, sockets, locks and this machine's client state: worker caches, the Scrawl
-ledger, the feedback outbox and saved TUI drafts. The private TOML configuration
+ledger, the feedback outbox and saved TUI drafts. It also leaves out Dreams
+state: `<state_dir>/dreams` with every run, review, patch, proposal and
+applied-run record, and `<state_dir>/unrecorded-start`. The receipt lists both
+as not included. The restored coordinator starts a new diagnostics log, so a
+Dreams review that covers the time between the backup and the restored
+coordinator's first start shows it as an `unwitnessed` gap and never seals a
+quiet night. Dreams runs wait for `backup release`. The private TOML configuration
 is outside the state directory, so keep a separate copy of it. The command
 lists any other name in the state directory as not included. A backup contains
 private conversations, attachments and feedback; keep it as private as the
