@@ -77,7 +77,7 @@ recovery; [history](history.md) describes import and retrieval.
   newer typing and a relaunch with a newer draft. Restoring a started control
   that never left the phone remains open
   ([#34](https://github.com/sammyjoyce/agent/issues/34)).
-- [ ] Return a control's text, such as `/status`, to the live iOS composer when
+- [x] Return a control's text, such as `/status`, to the live iOS composer when
   no recipient of its Send wrote it, as crash recovery already does, and keep
   newer typing. A control that any recipient wrote does not come back. A
   `ChatModel` test drives a dial that fails after the start. See
