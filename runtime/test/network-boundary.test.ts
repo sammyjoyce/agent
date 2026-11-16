@@ -49,3 +49,14 @@ test("no module of the Pi child opens a connection outside the listed, gated pla
   assert.deepEqual(ALLOWED.filter((entry) => !found.some((use) => use.file === entry.file && use.use === entry.use)).map(({ file, use }) => `${file} no longer uses ${use}`), [],
     "An allowlist entry nothing uses. Remove it.");
 });
+
+test("a host_call frame is built in one place, where HostRequests emits it after the owner gate", async () => {
+  const files = (await readdir(source, { recursive: true, withFileTypes: true })).filter((entry) => entry.isFile())
+    .map((entry) => relative(source, `${entry.parentPath}/${entry.name}`)).filter((file) => !file.startsWith("generated/")).sort();
+  const built: string[] = [];
+  for (const file of files) {
+    for (const text of (await readFile(`${source}/${file}`, "utf8")).split("\n")) if (/["']host_call["']/.test(text)) built.push(`${file}: ${text.trim()}`);
+  }
+  assert.deepEqual(built, ['bridge.ts: const hostRequests = new HostRequests((id, call_id, command) => emit(id, { type: "host_call", call_id, command }),'],
+    "Every host call, the dreams call included, must go through HostRequests.call, which waits at the owner gate before this frame is written.");
+});
