@@ -1829,8 +1829,15 @@ printf '%s\n' "$value"
         cleanup?;
         result
             .map_err(|_| anyhow::anyhow!("Native Rex contract exceeded its two-minute limit"))??;
+        let closed = client
+            .worker_presence(&binding, Some(identity.instance_id), &identity.host_id)
+            .await?;
+        anyhow::ensure!(
+            matches!(closed, crate::protocol::WorkerPresence::MissingSession),
+            "Rex's answer for a closed session did not read as missing: {closed:?}"
+        );
         eprintln!(
-            "Native Rex contract verified: three successful marker processes, two named windows in one session, parent reuse, sidebar promotion, and independent cleanup readback."
+            "Native Rex contract verified: three successful marker processes, two named windows in one session, parent reuse, sidebar promotion, independent cleanup readback, and a closed session read as missing."
         );
         Ok(())
     }
