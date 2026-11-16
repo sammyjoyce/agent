@@ -572,8 +572,8 @@ pub struct Proposal {
     pub files: Vec<String>,
     pub changes: Vec<ProposedFile>,
     pub evidence: Vec<EvidenceId>,
-    /// The sealed review record and evidence bytes, so that approving this
-    /// outcome approves the evidence that the review showed.
+    /// Digest of the sealed review record and its evidence, so that approving
+    /// this outcome approves the evidence that the review showed.
     pub review_sha256: ContentDigest,
     pub rationale: UntrustedText,
     pub before: Vec<CheckResult>,

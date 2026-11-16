@@ -71,7 +71,7 @@ fn seed(fixture: &Fixture, scenario: &Scenario) {
         ));
     }
     lines.extend(heartbeats(now - HOUR + 2 * MINUTE, now - MINUTE / 2));
-    fixture.seed_receipts(&lines, &retention(None, None));
+    fixture.seed_cleanly_stopped_receipts(&lines, &retention(None, None));
 
     let shipped = fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),

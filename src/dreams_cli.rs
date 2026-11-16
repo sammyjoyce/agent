@@ -12,7 +12,6 @@ use agent_cli::{
         RunView, check_lines, escape_controls, format_utc, quote, review_summary,
         workspace::{Git, plain_changes},
     },
-    protocol::TASK_SUMMARY_MAX_UTF16_UNITS,
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::Subcommand;
@@ -484,9 +483,7 @@ fn apply_command(view: &RunView) -> Option<String> {
     }
 }
 
-/// A whole ASCII task summary prints uncut.
-const SHOWN_EVIDENCE_BYTES: usize = TASK_SUMMARY_MAX_UTF16_UNITS;
-/// Four whole summaries, so twenty citations still leave the patch a short scroll away.
+const SHOWN_EVIDENCE_BYTES: usize = 4_000;
 const SHOWN_EVIDENCE_TOTAL_BYTES: usize = 4 * SHOWN_EVIDENCE_BYTES;
 
 fn cited_evidence(lines: &mut Vec<String>, cited: &[EvidenceId], reviewed: &[EvidenceItem]) {

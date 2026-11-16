@@ -30,10 +30,13 @@ pub(crate) struct ReceiptWindow {
     /// window. A receipt near such a move may be stamped outside the window
     /// although it was written inside it, so the window cannot be trusted whole.
     pub clock_moves: Option<ClockMoves>,
-    /// For each writer start whose previous receipt is not a clean stop, the
-    /// timestamps of that receipt and of the start. Anything the writer before
-    /// had queued or counted as dropped was lost between them.
-    pub unclean_restarts: Vec<(u64, u64)>,
+    pub unclean_restarts: Vec<UncleanRestart>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UncleanRestart {
+    pub last_receipt_ms: u64,
+    pub started_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -274,7 +277,10 @@ fn read_once(
                     placement.receipt(timestamp, start);
                     clock.receipt(timestamp);
                     if let (Event::WriterStarted, Some((last, false))) = (&record.event, previous) {
-                        window.unclean_restarts.push((last, timestamp));
+                        window.unclean_restarts.push(UncleanRestart {
+                            last_receipt_ms: last,
+                            started_ms: timestamp,
+                        });
                     }
                     previous = Some((timestamp, matches!(record.event, Event::WriterStopped)));
                     if timestamp >= end {

@@ -206,16 +206,15 @@ impl DreamsStore {
             .collect()
     }
 
-    /// One digest over the review record and its evidence. A NUL separates
-    /// them because neither JSON file can hold one.
     pub(crate) fn review_digest(&self, run: &RunId) -> Result<ContentDigest> {
         let directory = self.review_directory(run);
-        let mut sealed = fs::read(directory.join(REVIEW_FILE))
+        let review = fs::read(directory.join(REVIEW_FILE))
             .context("Could not read the sealed Dreams review")?;
-        sealed.push(0);
-        sealed.extend(
-            fs::read(directory.join(EVIDENCE_FILE)).context("Could not read Dreams evidence")?,
-        );
+        let evidence =
+            fs::read(directory.join(EVIDENCE_FILE)).context("Could not read Dreams evidence")?;
+        let mut sealed = u64::try_from(review.len())?.to_be_bytes().to_vec();
+        sealed.extend(review);
+        sealed.extend(evidence);
         Ok(ContentDigest::of(&sealed))
     }
 

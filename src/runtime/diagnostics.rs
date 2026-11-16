@@ -159,8 +159,6 @@ pub(crate) enum Event {
         code: ErrorCode,
     },
     Heartbeat,
-    /// A start that does not follow a `WriterStopped` shows that the writer
-    /// before it lost whatever it held in memory.
     WriterStarted,
     WriterStopped,
 }

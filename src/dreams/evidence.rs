@@ -193,7 +193,8 @@ pub(crate) fn receipt_coverage(window: Interval, receipts: &ReceiptWindow) -> Re
             cause: GapCause::ConcurrentRotation,
         });
     }
-    for &(last, started) in &receipts.unclean_restarts {
+    for restart in &receipts.unclean_restarts {
+        let (last, started) = (restart.last_receipt_ms, restart.started_ms);
         if let Some(interval) = within(last.min(started), last.max(started).saturating_add(1)) {
             gaps.push(Gap {
                 interval: Some(interval),

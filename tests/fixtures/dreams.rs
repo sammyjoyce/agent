@@ -262,8 +262,7 @@ impl Fixture {
         .unwrap();
     }
 
-    /// Seeds the receipts of a coordinator that then stopped cleanly.
-    pub fn seed_receipts(&self, lines: &[String], retention: &Value) {
+    pub fn seed_cleanly_stopped_receipts(&self, lines: &[String], retention: &Value) {
         let diagnostics = self.state.join("diagnostics");
         fs::create_dir(&diagnostics).unwrap();
         fs::set_permissions(&diagnostics, fs::Permissions::from_mode(0o700)).unwrap();
@@ -282,7 +281,7 @@ impl Fixture {
 
     pub fn seed_witnessed_night(&self) {
         let now = now_ms();
-        self.seed_receipts(
+        self.seed_cleanly_stopped_receipts(
             &heartbeats(now - 25 * HOUR, now - MINUTE / 2),
             &retention(None, None),
         );

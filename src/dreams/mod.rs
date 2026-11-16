@@ -1151,8 +1151,7 @@ mod tests {
         }
     }
 
-    /// Starts a writer as a coordinator does, and returns once its receipts reach the disk.
-    async fn writing(night: &Night) -> diagnostics::Diagnostics {
+    async fn start_writer_until_ready(night: &Night) -> diagnostics::Diagnostics {
         let log = night.dreams.state.join("diagnostics/runtime.jsonl");
         let ready = || {
             fs::read_to_string(&log)
@@ -1176,11 +1175,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_writer_restarted_after_one_that_never_stopped_cleanly_is_a_gap_that_refuses_quiet() {
         let now = diagnostics::now_ms();
-        // The previous writer wrote a heartbeat five minutes ago and was then
-        // killed, taking the drops it counted in memory with it.
         let killed = Night::new();
         killed.seed_receipts("");
-        let restarted = writing(&killed).await;
+        let restarted = start_writer_until_ready(&killed).await;
         let page = killed.review("night").await.text;
         let quiet = killed.abstain_as_quiet("night").await;
         assert!(
@@ -1195,8 +1192,8 @@ mod tests {
             "{{\"timestamp_ms\":{},\"request_id\":0,\"elapsed_ms\":null,\"event\":\"writer_stopped\"}}\n",
             now - 4 * MINUTE
         ));
-        drop(writing(&stopped).await);
-        let restarted = writing(&stopped).await;
+        drop(start_writer_until_ready(&stopped).await);
+        let restarted = start_writer_until_ready(&stopped).await;
         let page = stopped.review("night").await.text;
         assert!(page.contains("Coverage: complete"), "{page}");
         let quiet = stopped.abstain_as_quiet("night").await;

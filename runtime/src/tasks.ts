@@ -50,7 +50,6 @@ export type HostCall = (command: HostCommand) => Promise<HostResult>;
 export type SearchQuery = (query: string, sourceRefs: string[], limit: number, mode?: SearchMode) => Promise<SearchResult>;
 export function sourceReference(source: SourceRef): string { return JSON.stringify([source.provider, source.account, source.thread_id]); }
 type TaskIndex = { tasks: TaskRecord[] };
-/** `job_id` names the scheduled job that owns the task. Only the scheduler sets it; `sources` only link. */
 type TaskCreate = { id?: string; title: string; outcome: string; sources?: SourceRef[]; job_id?: string; model?: ModelSelection; scheduled_run?: JobRunReceipt };
 type WorkerInput = Extract<RuntimeCommand, { type: "run_task" }>;
 type ActorRef = { task_id: string; agent_id?: string };
@@ -274,7 +273,6 @@ export class TaskStore {
   useActorExecution(execution: ActorExecution): void { this.execution = execution; }
   useConfinement(rule: ActorConfinement): void { this.confinement = rule; }
   isConfined(task: Pick<TaskRecord, "sources">): boolean { return this.confinement(task) !== undefined; }
-  /** A confined task admits only a scheduled occurrence: no other input, child agent or terminal. */
   private requireSchedulerAdmission(task: Pick<TaskRecord, "sources">, scheduled?: ScheduledOccurrence): void {
     if (this.isConfined(task) && scheduled === undefined) throw new TaskError(CONFINED_ACTOR_ONLY);
   }
