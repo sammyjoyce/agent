@@ -1,36 +1,36 @@
-//! Paired process-to-visible-conversation benchmarks, using the real CLI and Pi.
+//! Paired benchmarks of the real CLI and Pi: conversation launch, input
+//! admission, first visible activity, steering and stop, each gated on
+//! application delay with a loopback model provider's holds removed.
 
+mod coordinator;
 mod gate;
+mod provider;
+mod report;
+mod resources;
 mod scenario;
+mod session;
+mod terminal;
 
 use std::{
-    fs,
-    io::Write,
-    num::NonZeroU16,
-    os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
-    process::Stdio,
-    time::{Duration, Instant},
+    collections::BTreeMap, fs, io::Write, os::unix::fs::PermissionsExt, path::PathBuf,
+    time::Duration,
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context as _, Result, anyhow, ensure};
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
+use tokio::{process::Command, time::timeout};
 
-use gate::{
-    ABSOLUTE_ALLOWANCE_MS, Comparison, Mark, Marks, Observation, RELATIVE_ALLOWANCE, Span, Version,
-};
-use scenario::Scenario;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::{Child, Command},
-    time::{sleep, timeout},
-};
+use coordinator::{Coordinator, Receipts, isolated};
+use gate::Version;
+use report::Sample;
+use scenario::{Lifetime, Scenario};
+use session::Context;
 
 const DEADLINE: Duration = Duration::from_secs(20);
 
 #[derive(Parser)]
-#[command(about = "Measure actual CLI conversation rendering against a paired baseline")]
+#[command(about = "Measure the real CLI's application delay against a paired baseline")]
 struct Arguments {
     #[arg(long)]
     baseline: PathBuf,
@@ -47,6 +47,9 @@ struct Arguments {
     seed: PathBuf,
     #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u8).range(3..=31))]
     samples: u8,
+    /// Run only these scenarios; repeat the flag for several. Defaults to all.
+    #[arg(long = "scenario", value_enum)]
+    scenarios: Vec<Scenario>,
     #[arg(long, default_value = "performance/results.json")]
     output: PathBuf,
 }
@@ -57,283 +60,19 @@ struct Seed {
     long_history: String,
 }
 
-#[derive(Serialize)]
-struct Sample {
-    scenario: Scenario,
-    version: Version,
-    pair: u8,
-    warmup: bool,
-    spans: Vec<Span>,
-    received_bytes: usize,
+struct Versions {
+    baseline: (PathBuf, PathBuf),
+    candidate: (PathBuf, PathBuf),
 }
 
-#[derive(Serialize)]
-struct Report {
-    schema: u8,
-    metric: &'static str,
-    terminal_rows: u16,
-    terminal_columns: u16,
-    long_history_messages: u32,
-    unrelated_saved_conversations: u32,
-    relative_allowance: f64,
-    absolute_allowance_ms: f64,
-    samples: Vec<Sample>,
-    comparisons: Vec<Comparison>,
-}
-
-/// The emulator owns actual cursor position, including printed characters and
-/// scrolling. Cursor replies travel through the fixture's existing input owner.
-#[derive(Default)]
-struct Replies(Vec<u8>);
-impl vt100::Callbacks for Replies {
-    fn unhandled_csi(
-        &mut self,
-        screen: &mut vt100::Screen,
-        first: Option<u8>,
-        second: Option<u8>,
-        parameters: &[&[u16]],
-        command: char,
-    ) {
-        if first.is_none()
-            && second.is_none()
-            && command == 'n'
-            && parameters.len() == 1
-            && parameters[0] == [6]
-        {
-            let (row, column) = screen.cursor_position();
-            self.0
-                .extend(format!("\x1b[{};{}R", row + 1, column + 1).bytes());
-        }
+impl Versions {
+    fn of(&self, version: Version) -> (&PathBuf, &PathBuf) {
+        let (binary, runtime) = match version {
+            Version::Baseline => &self.baseline,
+            Version::Candidate => &self.candidate,
+        };
+        (binary, runtime)
     }
-}
-
-fn terminal() -> Result<vt100::Parser<Replies>> {
-    Ok(vt100::Parser::new_with_callbacks(
-        NonZeroU16::new(32).context("Invalid terminal height")?,
-        NonZeroU16::new(100).context("Invalid terminal width")?,
-        0,
-        Replies::default(),
-    ))
-}
-
-fn isolated(command: &mut Command, directory: &Path) -> Result<()> {
-    let bin = directory.join("bin");
-    if !bin.exists() {
-        fs::create_dir(&bin)?;
-        let paths = std::env::var_os("PATH").context("PATH is required")?;
-        let node = std::env::split_paths(&paths)
-            .map(|path| path.join("node"))
-            .find(|path| path.is_file())
-            .context("Node is required")?;
-        std::os::unix::fs::symlink(fs::canonicalize(node)?, bin.join("node"))?;
-    }
-    command
-        .env_clear()
-        .env("PATH", bin)
-        .env("HOME", directory)
-        .env("XDG_CONFIG_HOME", directory.join("config"))
-        .env("XDG_DATA_HOME", directory.join("data"))
-        .env("TERM", "xterm-256color")
-        .env("LANG", "C.UTF-8")
-        .current_dir(directory)
-        .kill_on_drop(true);
-    Ok(())
-}
-
-struct Coordinator {
-    child: Child,
-    directory: tempfile::TempDir,
-}
-
-impl Coordinator {
-    async fn start(binary: &Path, seed: &Path, runtime: &Path, snapshot: &Path) -> Result<Self> {
-        let directory = tempfile::tempdir()?;
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
-        for entry in fs::read_dir(snapshot)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                fs::copy(entry.path(), directory.path().join(entry.file_name()))?;
-            }
-        }
-        fs::write(directory.path().join("config.toml"), "")?;
-        fs::write(directory.path().join("AGENTS.md"), "")?;
-        let mut command = Command::new(binary);
-        command
-            .arg("--state-dir")
-            .arg(directory.path())
-            .arg("--config")
-            .arg(directory.path().join("config.toml"))
-            .arg("--instructions")
-            .arg(directory.path().join("AGENTS.md"))
-            .arg("--runtime")
-            .arg(seed)
-            .arg("serve")
-            .arg("--local-only")
-            .arg("--no-sources")
-            .arg("--coordinator-only")
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        isolated(&mut command, directory.path())?;
-        // isolated clears inherited credentials; this is the one explicit runtime.
-        command.env("AGENT_PERFORMANCE_RUNTIME", runtime);
-        let child = command.spawn()?;
-        let mut coordinator = Self { child, directory };
-        timeout(DEADLINE, async {
-            loop {
-                if agent_cli::service::connect(coordinator.directory.path())
-                    .await
-                    .is_ok()
-                {
-                    return Ok::<_, anyhow::Error>(());
-                }
-                if let Some(status) = coordinator.child.try_wait()? {
-                    bail!("Synthetic coordinator exited before binding: {status}");
-                }
-                sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .context("Synthetic coordinator did not bind")??;
-        Ok(coordinator)
-    }
-
-    async fn close(self) -> Result<()> {
-        if let Some(pid) = self.child.id() {
-            // Only this fixture-owned coordinator is signaled and reaped.
-            ensure!(unsafe { libc::kill(i32::try_from(pid)?, libc::SIGTERM) } == 0);
-        }
-        let output = timeout(DEADLINE, self.child.wait_with_output())
-            .await
-            .context("Synthetic coordinator did not shut down")??;
-        ensure!(
-            output.status.success(),
-            "Synthetic coordinator failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        Ok(())
-    }
-}
-
-async fn sample(
-    options: &Arguments,
-    coordinator: &Coordinator,
-    binary: &Path,
-    scenario: Scenario,
-    seed: &Seed,
-    version: Version,
-    pair: u8,
-) -> Result<Sample> {
-    let directory = coordinator.directory.path();
-    let mut command = Command::new(&options.terminal);
-    command
-        .arg(binary)
-        .arg("--state-dir")
-        .arg(directory)
-        .arg("--config")
-        .arg(directory.join("config.toml"))
-        .arg("--instructions")
-        .arg(directory.join("AGENTS.md"))
-        .arg("--runtime")
-        .arg(match version {
-            Version::Baseline => &options.baseline_runtime,
-            Version::Candidate => &options.candidate_runtime,
-        })
-        .arg("chat");
-    if scenario == Scenario::LongHistory {
-        command.arg(format!("/resume {}", seed.long_history));
-    }
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    isolated(&mut command, directory)?;
-    let mut marks = Marks::default();
-    marks.record(Mark::Spawn, Instant::now())?;
-    let mut child = command.spawn()?;
-    let mut input = child.stdin.take().context("Missing terminal input")?;
-    let mut output = child.stdout.take().context("Missing terminal output")?;
-    let mut screen = terminal()?;
-    let mut received = 0;
-    let measured = timeout(DEADLINE, async {
-        let mut buffer = [0; 8192];
-        loop {
-            let length = output.read(&mut buffer).await?;
-            ensure!(
-                length != 0,
-                "CLI exited before showing stored conversation text"
-            );
-            screen.process(&buffer[..length]);
-            received += length;
-            if !screen.callbacks().0.is_empty() {
-                input
-                    .write_all(&std::mem::take(&mut screen.callbacks_mut().0))
-                    .await?;
-            }
-            if screen.screen().contents().contains(scenario.sentence()) {
-                return Ok::<_, anyhow::Error>(Instant::now());
-            }
-        }
-    })
-    .await
-    .context("Stored conversation text did not become visible")
-    .and_then(|result| result);
-    let visible = match measured {
-        Ok(visible) => visible,
-        Err(error) => {
-            if child.try_wait()?.is_none() {
-                child.start_kill()?;
-            }
-            let status = child.wait_with_output().await?;
-            bail!(
-                "{error:#}; terminal status: {}; stderr: {}; visible screen: {}",
-                status.status,
-                String::from_utf8_lossy(&status.stderr),
-                screen.screen().contents()
-            );
-        }
-    };
-    marks.record(Mark::StoredTextVisible, visible)?;
-    // Keep output draining during terminal cleanup and any final cursor query.
-    input.write_all(b"/exit\r").await?;
-    let drain = async {
-        let mut buffer = [0; 8192];
-        loop {
-            let length = output.read(&mut buffer).await?;
-            if length == 0 {
-                return Ok::<_, anyhow::Error>(());
-            }
-            screen.process(&buffer[..length]);
-            received += length;
-            input
-                .write_all(&std::mem::take(&mut screen.callbacks_mut().0))
-                .await?;
-        }
-    };
-    let (status, drained) = timeout(DEADLINE, async {
-        tokio::join!(child.wait_with_output(), drain)
-    })
-    .await
-    .context("CLI terminal cleanup did not finish")?;
-    drained?;
-    let status = status?;
-    ensure!(
-        status.status.success(),
-        "CLI failed: {}; screen: {}",
-        String::from_utf8_lossy(&status.stderr),
-        screen.screen().contents()
-    );
-    Ok(Sample {
-        scenario,
-        version,
-        pair,
-        warmup: pair == 0,
-        spans: scenario
-            .gates()
-            .iter()
-            .map(|definition| gate::span(definition, &marks, &[]))
-            .collect::<Result<_>>()?,
-        received_bytes: received,
-    })
 }
 
 async fn run(mut options: Arguments) -> Result<()> {
@@ -362,6 +101,17 @@ async fn run(mut options: Arguments) -> Result<()> {
         *path = fs::canonicalize(&*path)
             .with_context(|| format!("Could not locate {}", path.display()))?;
     }
+    let mut scenarios = if options.scenarios.is_empty() {
+        Scenario::value_variants().to_vec()
+    } else {
+        options.scenarios.clone()
+    };
+    scenarios.sort();
+    scenarios.dedup();
+    let versions = Versions {
+        baseline: (options.baseline.clone(), options.baseline_runtime.clone()),
+        candidate: (options.candidate.clone(), options.candidate_runtime.clone()),
+    };
     let snapshot = tempfile::tempdir()?;
     fs::set_permissions(snapshot.path(), fs::Permissions::from_mode(0o700))?;
     let mut command = Command::new("node");
@@ -380,32 +130,35 @@ async fn run(mut options: Arguments) -> Result<()> {
         !seed.chief.is_empty(),
         "The native chief conversation is missing"
     );
-    let baseline = Coordinator::start(
-        &options.baseline,
-        &options.seed,
-        &options.baseline_runtime,
-        snapshot.path(),
-    )
-    .await?;
-    let candidate = match Coordinator::start(
-        &options.candidate,
-        &options.seed,
-        &options.candidate_runtime,
-        snapshot.path(),
-    )
-    .await
-    {
-        Ok(candidate) => candidate,
-        Err(error) => {
-            if let Err(cleanup) = baseline.close().await {
-                return Err(error.context(format!("Baseline cleanup failed: {cleanup:#}")));
-            }
-            return Err(error);
-        }
+    let start = async |version| {
+        let (binary, runtime) = versions.of(version);
+        Coordinator::start(binary, &options.seed, runtime, snapshot.path(), &[]).await
     };
+    let mut shared = BTreeMap::new();
+    if scenarios
+        .iter()
+        .any(|scenario| scenario.definition().coordinator == Lifetime::SharedPerVersion)
+    {
+        for version in [Version::Baseline, Version::Candidate] {
+            match start(version).await {
+                Ok(coordinator) => {
+                    shared.insert(version, coordinator);
+                }
+                Err(error) => {
+                    for (_, coordinator) in shared {
+                        if let Err(cleanup) = Coordinator::close(coordinator).await {
+                            return Err(error.context(format!("Cleanup failed: {cleanup:#}")));
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
     let measured = async {
         let mut samples = Vec::new();
-        for scenario in Scenario::value_variants() {
+        for scenario in &scenarios {
+            let definition = scenario.definition();
             for pair in 0..=options.samples {
                 let order = if pair % 2 == 0 {
                     [Version::Baseline, Version::Candidate]
@@ -413,38 +166,52 @@ async fn run(mut options: Arguments) -> Result<()> {
                     [Version::Candidate, Version::Baseline]
                 };
                 for version in order {
-                    let (coordinator, binary, runtime) = match version {
-                        Version::Baseline => {
-                            (&baseline, &options.baseline, &options.baseline_runtime)
-                        }
-                        Version::Candidate => {
-                            (&candidate, &options.candidate, &options.candidate_runtime)
-                        }
+                    let (binary, runtime) = versions.of(version);
+                    let owned = match definition.coordinator {
+                        Lifetime::PerSample => Some(
+                            Coordinator::start(
+                                binary,
+                                &options.seed,
+                                runtime,
+                                snapshot.path(),
+                                definition.turns,
+                            )
+                            .await?,
+                        ),
+                        Lifetime::SharedPerVersion => None,
                     };
-                    let cold = if *scenario == Scenario::ChiefCold {
-                        Some(
-                            Coordinator::start(binary, &options.seed, runtime, snapshot.path())
-                                .await?,
-                        )
-                    } else {
-                        None
-                    };
-                    let measured = sample(
-                        &options,
-                        cold.as_ref().unwrap_or(coordinator),
-                        binary,
+                    let coordinator = owned
+                        .as_ref()
+                        .or(shared.get(&version))
+                        .context("The shared coordinator is missing")?;
+                    let outcome = scenario::drive(
                         *scenario,
-                        &seed,
-                        version,
-                        pair,
+                        &Context {
+                            terminal: &options.terminal,
+                            binary,
+                            runtime,
+                            coordinator,
+                            seed: &seed,
+                        },
                     )
                     .await;
-                    let closed = match cold {
-                        Some(coordinator) => coordinator.close().await,
-                        None => Ok(()),
+                    let (requests, receipts, closed) = match owned {
+                        Some(owned) => match owned.close().await {
+                            Ok(closed) => (closed.requests, closed.receipts, Ok(())),
+                            Err(error) => (Vec::new(), Receipts::default(), Err(error)),
+                        },
+                        None => (coordinator.requests()?, Receipts::default(), Ok(())),
                     };
-                    let sample = measured?;
+                    let outcome = outcome?;
                     closed?;
+                    scenario::verify(*scenario, &outcome, &requests).map_err(|error| {
+                        anyhow!(
+                            "{scenario:?} {version:?} pair {pair}: {error:#}\nmarks: {:?}\nprovider requests: {requests:?}\nvisible screen:\n{}",
+                            outcome.marks,
+                            outcome.screen
+                        )
+                    })?;
+                    let sample = Sample::new((*scenario, version, pair), outcome, &requests, receipts)?;
                     serde_json::to_writer(&mut raw, &sample)?;
                     raw.write_all(b"\n")?;
                     raw.flush()?;
@@ -455,56 +222,25 @@ async fn run(mut options: Arguments) -> Result<()> {
         Ok::<_, anyhow::Error>(samples)
     }
     .await;
-    let closed_baseline = baseline.close().await;
-    let closed_candidate = candidate.close().await;
-    let samples = measured?;
-    closed_baseline?;
-    closed_candidate?;
-    let report = Report {
-        schema: 2,
-        metric: "process_spawn_to_visible_conversation",
-        terminal_rows: 32,
-        terminal_columns: 100,
-        long_history_messages: 5_000,
-        unrelated_saved_conversations: 3_000,
-        relative_allowance: RELATIVE_ALLOWANCE,
-        absolute_allowance_ms: ABSOLUTE_ALLOWANCE_MS,
-        comparisons: gate::comparisons(
-            Scenario::value_variants(),
-            &samples
-                .iter()
-                .flat_map(|sample| {
-                    sample.spans.iter().map(|span| Observation {
-                        scenario: sample.scenario,
-                        version: sample.version,
-                        pair: sample.pair,
-                        warmup: sample.warmup,
-                        span: *span,
-                    })
-                })
-                .collect::<Vec<_>>(),
-        )?,
-        samples,
-    };
-    fs::write(&options.output, serde_json::to_vec_pretty(&report)?)?;
-    for comparison in &report.comparisons {
-        println!(
-            "{:?} {:?}: base {:.1} ms, candidate {:.1} ms, paired budget {:.3} (limit 1.000), {}",
-            comparison.scenario,
-            comparison.gate,
-            comparison.baseline_median_ms,
-            comparison.candidate_median_ms,
-            comparison.paired_budget_median,
-            if comparison.passed {
-                "pass"
-            } else {
-                "REGRESSION"
-            }
-        );
+    let mut closed = Vec::new();
+    for (version, coordinator) in shared {
+        closed.push(coordinator.close().await.and_then(|closed| {
+            ensure!(
+                closed.requests.is_empty(),
+                "The {version:?} launch coordinator contacted the provider: {:?}",
+                closed.requests
+            );
+            Ok(())
+        }));
     }
+    let samples = measured?;
+    closed.into_iter().collect::<Result<Vec<_>>>()?;
+    let report = report::build(&scenarios, samples)?;
+    fs::write(&options.output, serde_json::to_vec_pretty(&report)?)?;
+    report::print(&report);
     ensure!(
-        report.comparisons.iter().all(|result| result.passed),
-        "CLI rendering regressed; raw samples are in {}",
+        report.passed(),
+        "CLI responsiveness regressed; raw samples are in {}",
         options.output.display()
     );
     Ok(())
@@ -528,23 +264,4 @@ async fn main() -> Result<()> {
         )?;
     }
     result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn screen_observation_requires_visible_cells_and_replies_from_the_real_cursor() {
-        let mut screen = terminal().unwrap();
-        let sentence = Scenario::Chief.sentence();
-        screen.process(sentence.as_bytes());
-        screen.process(b"\x1b[2J\x1b[H");
-        assert!(!screen.screen().contents().contains(sentence));
-        screen.process(b"Storedchief");
-        screen.process(b"\x1b[1;7H chief conversation is ready.");
-        assert!(screen.screen().contents().contains(sentence));
-        screen.process(b"\x1b[6n");
-        assert_eq!(screen.callbacks().0, b"\x1b[1;36R");
-    }
 }

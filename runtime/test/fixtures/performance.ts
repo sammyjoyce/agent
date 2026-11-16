@@ -1,5 +1,6 @@
-// Native retained history only. Neither seeding nor viewing may call a provider.
-import { mkdir } from "node:fs/promises";
+// Native retained history. Seeding never calls a provider; the runtime reaches
+// only the benchmark's loopback provider.
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
@@ -9,10 +10,24 @@ import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { HistoryStore } from "../../src/history.js";
 import type { HistoryItem } from "../../src/generated/HistoryItem.js";
 
+const providerFetch = globalThis.fetch;
 globalThis.fetch = async () => { throw new Error("Performance scenarios must not contact a provider"); };
 
 const runtime = process.env.AGENT_PERFORMANCE_RUNTIME;
 if (runtime !== undefined) {
+  const provider = process.env.AGENT_PERFORMANCE_PROVIDER;
+  const pidFile = process.env.AGENT_PERFORMANCE_RUNTIME_PID;
+  if (provider === undefined || pidFile === undefined) throw new Error("The benchmark provider and runtime PID file are required");
+  process.env.OPENAI_API_KEY = "sk-synthetic-performance";
+  await writeFile(pidFile, String(process.pid));
+  // Only the model provider moves to the benchmark's loopback server, which
+  // owns its delays and clock. Pi's request, headers and abort signal are unchanged.
+  globalThis.fetch = async (input, init) => {
+    const url = input instanceof Request ? input.url : input.toString();
+    if (url !== "https://api.openai.com/v1/responses") throw new Error(`Performance scenarios must not contact ${url}`);
+    const target = `${provider}/v1/responses`;
+    return providerFetch(input instanceof Request ? new Request(target, input) : target, init);
+  };
   // Runtime.start gives this process the same state argument as bridge.js.
   await import(runtime);
 } else {

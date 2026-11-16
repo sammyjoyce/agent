@@ -42,14 +42,15 @@ pub enum Gate {
 }
 
 /// Which provider holds a gate may subtract from its wall-clock span.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Discount {
     None,
     FirstChunkHolds,
     AllHoldsAfter(Mark),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize)]
 pub struct GateDefinition {
     pub gate: Gate,
     pub from: Mark,
@@ -90,6 +91,10 @@ impl Marks {
             .get(&mark)
             .copied()
             .with_context(|| format!("{mark:?} was never recorded"))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (Mark, Instant)> + '_ {
+        self.0.iter().map(|(mark, at)| (*mark, *at))
     }
 }
 
@@ -155,7 +160,7 @@ fn milliseconds(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Version {
     Baseline,
