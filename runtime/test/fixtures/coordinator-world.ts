@@ -106,8 +106,8 @@ export async function coordinatorWorld(t: TestContext, prepare: (homes: readonly
   async function cli(host: number, args: string[], input = "", clientBinary = binary) {
     const process = start(host, args, input, {}, false, false, clientBinary); assert.equal(await process.exited, 0, process.errors()); return events(process.output());
   }
-  async function exchange(command: RuntimeCommand, observe?: (event: RuntimeEventKind) => void): Promise<RuntimeEventKind[]> {
-    const channel = createConnection(socket); let output = "", done = false, observed = 0;
+  async function exchange(command: RuntimeCommand, observe?: (event: RuntimeEventKind) => void, path = socket): Promise<RuntimeEventKind[]> {
+    const channel = createConnection(path); let output = "", done = false, observed = 0;
     try {
       return await new Promise<RuntimeEventKind[]>((resolve, reject) => {
         channel.on("error", reject).on("data", (bytes: Buffer) => {
