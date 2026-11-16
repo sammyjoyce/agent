@@ -10,11 +10,7 @@ export type ChatGptEnvelope = { conversation_id: string, node_id: string, parent
 /**
  * The whole normalized message text, citations removed. `HistoryItem.text` is its excerpt.
  */
-text: string,
-/**
- * Null for a `library:file` item, which has no message.
- */
-message: ChatGptMessage | null,
+text: string, message: ChatGptMessage | null,
 /**
  * The files the item references, up to its attachment limit. The checked digest is part of
  * the evidence, so other bytes under the same file id are a new item version, never a

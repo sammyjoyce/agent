@@ -2178,12 +2178,20 @@ mod tests {
 
     #[test]
     fn import_chatgpt_command_round_trips_on_the_wire() {
-        let wire = r#"{"type":"import_chatgpt","package":{"digest":"3f2a9c1b","parts":["export.zip"],"conversations":2,"archived":1,"shards":1,"attachments":3,"missing_attachments":1,"excluded_messages":4,"notes":["1 broken characters are replaced with U+FFFD"],"problems":[]}}"#;
+        let wire = r#"{"type":"import_chatgpt","package":{"digest":"3f2a9c1b","parts":["export.zip"],"conversations":2,"archived":1,"shards":1,"attachments":3,"missing_attachments":1,"excluded_messages":4,"unsupported":[{"content":"message future_widget","count":2}],"dropped_library_files":1,"unreferenced_files":5,"notes":["1 broken characters are replaced with U+FFFD"],"problems":[]}}"#;
         let command: RuntimeCommand = serde_json::from_str(wire).unwrap();
         let RuntimeCommand::ImportChatGpt { package } = &command else {
             panic!("expected import_chatgpt, got {command:?}");
         };
         assert_eq!((package.conversations, package.missing_attachments), (2, 1));
+        assert_eq!(
+            (
+                package.unsupported[0].count,
+                package.dropped_library_files,
+                package.unreferenced_files
+            ),
+            (2, 1, 5)
+        );
         assert_eq!(serde_json::to_string(&command).unwrap(), wire);
     }
 

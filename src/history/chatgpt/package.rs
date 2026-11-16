@@ -10,7 +10,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ChatGptPackageSummary, Corruption, Incompleteness, PackageError, PackageProgress, UnsafeReason,
+    ChatGptPackageSummary, ChatGptUnsupported, Corruption, Incompleteness, PackageError,
+    PackageProgress, UnsafeReason,
     archive::{
         self, Admission, Hashing, Limits, MemberDigest, MemberPath, Method, Region, Spool, Tee,
         ZipMember,
@@ -23,6 +24,7 @@ use crate::history::HistoryThread;
 const PACKAGE_FORMAT: u32 = 1;
 const THREAD_FORMAT: u32 = 1;
 const MAXIMUM_PROBLEMS: usize = 100;
+const MAXIMUM_UNSUPPORTED_LABELS: usize = 32;
 const MAXIMUM_ID_BYTES: usize = 256;
 const MANIFEST: &str = "export_manifest.json";
 
@@ -140,6 +142,8 @@ impl Package {
         }
         let shard_members = builder.shard_members()?;
         let mut scan = Scan::default();
+        let (library, original_names) = sidecars(&builder.members, &limits, &mut scan);
+        scan.library = library;
         let mut shards = Vec::new();
         let count = shard_members.len() as u32;
         for (index, member) in shard_members.into_iter().enumerate() {
@@ -159,16 +163,7 @@ impl Package {
             ..
         } = builder;
         let files = verify(&members, file_index(&members), &read_whole, progress)?;
-        let (library, original_names) = sidecars(&members, &limits, &mut scan);
-        Ok(scan.finish(
-            members,
-            shards,
-            files,
-            library,
-            original_names,
-            parts,
-            count,
-        ))
+        Ok(scan.finish(members, shards, files, original_names, parts, count))
     }
 
     pub fn conversations(&self) -> &[ConversationEntry] {
@@ -750,6 +745,8 @@ struct Surveyed {
 
 #[derive(Default)]
 struct Scan {
+    /// Every live library entry, by the conversation it names.
+    library: HashMap<String, Vec<LibraryFile>>,
     conversations: Vec<ConversationEntry>,
     by_id: HashMap<String, usize>,
     surveys: HashMap<String, Surveyed>,
@@ -825,8 +822,9 @@ impl Scan {
             },
             content,
         };
+        let library = self.library.get(id).map_or(&[][..], Vec::as_slice);
         let survey = Surveyed {
-            survey: conversation::survey(&value),
+            survey: conversation::survey(&value, library),
             repairs,
         };
         if let Some(existing) = self.by_id.get(id).copied() {
@@ -852,29 +850,35 @@ impl Scan {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn finish(
         mut self,
         members: Vec<Member>,
         shards: Vec<Region>,
         files: HashMap<FileId, IndexedFile>,
-        mut library: HashMap<String, Vec<LibraryFile>>,
         original_names: HashMap<String, String>,
         parts: Vec<String>,
         shard_count: u32,
     ) -> Package {
-        library.retain(|conversation, entries| {
-            let Some(surveyed) = self.surveys.get(conversation) else {
-                return false;
-            };
-            entries.retain(|file| surveyed.survey.keeps(file));
-            !entries.is_empty()
-        });
+        let mut dropped_library_files: u32 = self
+            .library
+            .iter()
+            .filter(|(conversation, _)| !self.surveys.contains_key(*conversation))
+            .map(|(_, entries)| entries.len() as u32)
+            .sum();
+        let mut library = HashMap::new();
+        let mut unsupported: BTreeMap<String, u32> = BTreeMap::new();
         let mut referenced = BTreeSet::new();
         let (mut excluded, mut repaired) = (0, 0);
-        for Surveyed { survey, repairs } in self.surveys.values() {
+        for (conversation, Surveyed { survey, repairs }) in &mut self.surveys {
             excluded += survey.excluded;
-            repaired += repairs;
+            repaired += *repairs;
+            dropped_library_files += survey.dropped_library_files;
+            for (label, count) in &survey.unsupported {
+                *unsupported.entry(label.clone()).or_default() += count;
+            }
+            if !survey.library.is_empty() {
+                library.insert(conversation.clone(), std::mem::take(&mut survey.library));
+            }
         }
         for entry in &mut self.conversations {
             let library_files = library.get(&entry.thread.id).map_or(&[][..], Vec::as_slice);
@@ -930,6 +934,10 @@ impl Scan {
             .iter()
             .filter(|file| !files.contains_key(*file))
             .count();
+        let unreferenced = files
+            .keys()
+            .filter(|file| !referenced.contains(*file))
+            .count();
         let mut notes = Vec::new();
         if self.skipped > 0 {
             notes.push(format!(
@@ -971,6 +979,9 @@ impl Scan {
             attachments: referenced.len() as u32,
             missing_attachments: missing as u32,
             excluded_messages: excluded,
+            unsupported: unsupported_labels(unsupported),
+            dropped_library_files,
+            unreferenced_files: unreferenced as u32,
             notes,
             problems: self.problems,
         };
@@ -985,6 +996,23 @@ impl Scan {
             summary,
         }
     }
+}
+
+fn unsupported_labels(counts: BTreeMap<String, u32>) -> Vec<ChatGptUnsupported> {
+    let mut labels = counts.into_iter();
+    let mut listed: Vec<ChatGptUnsupported> = labels
+        .by_ref()
+        .take(MAXIMUM_UNSUPPORTED_LABELS)
+        .map(|(content, count)| ChatGptUnsupported { content, count })
+        .collect();
+    let other: u32 = labels.map(|(_, count)| count).sum();
+    if other > 0 {
+        listed.push(ChatGptUnsupported {
+            content: "other".into(),
+            count: other,
+        });
+    }
+    listed
 }
 
 fn digest(value: &Value) -> String {
@@ -1743,7 +1771,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let library = json!([{
             "file_id": "file_00cc", "file_name": "chart.png", "mime_type": "image/png",
-            "origination_thread_id": fixture::id(1), "created_at": 1_767_300_000.0,
+            "origination_thread_id": fixture::id(1), "origination_message_id": "a1",
+            "created_at": 1_767_300_000.0,
         }, {
             "file_id": "file_00dd", "file_name": "gone.png",
             "origination_thread_id": fixture::id(1), "trashed_at": 1_767_300_001.0,

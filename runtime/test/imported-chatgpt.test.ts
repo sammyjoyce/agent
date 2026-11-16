@@ -116,9 +116,8 @@ const kinds: ChatGptNode[] = [
   { id: "progress", parent: "output", turn: "prompt", kind: "assistant:text", role: "commentary", text: "Checking the weather" },
   { id: "drawing", parent: "progress", turn: "prompt", kind: "tool:multimodal_text", role: "tool", text: "",
     message: { author: { role: "tool", name: "image_gen" } } },
-  { id: "widget", parent: "drawing", turn: "prompt", kind: "assistant:future_widget", role: "assistant", text: "Widget caption" },
-  { id: "answer", parent: "widget", turn: "prompt", kind: "assistant:text", role: "final", text: "Bring sixteen sandwiches." },
-  { id: "library:file_00aa", parent: null, turn: "library:file_00aa", kind: "library:file", role: "tool", text: "picnic-menu.pdf" },
+  { id: "quote", parent: "drawing", turn: "prompt", kind: "assistant:tether_quote", role: "assistant", text: "A quoted page" },
+  { id: "answer", parent: "quote", turn: "prompt", kind: "assistant:text", role: "final", text: "Bring sixteen sandwiches." },
 ];
 
 test("chatgpt kinds render with the right roles and presentations", () => withApp("kinds", async (app) => {
@@ -133,9 +132,8 @@ test("chatgpt kinds render with the right roles and presentations", () => withAp
     ["tool", MALICIOUS, "tool", "python"],
     ["commentary", "Checking the weather", null, null],
     ["tool", "", "media", null],
-    ["assistant", "Widget caption", "unknown", null],
+    ["assistant", "A quoted page", "unknown", null],
     ["final", "Bring sixteen sandwiches.", null, null],
-    ["tool", "picnic-menu.pdf", "media", null],
   ]);
 }));
 

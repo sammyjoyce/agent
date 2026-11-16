@@ -5,7 +5,7 @@ import type { ImportedAdapter } from "./imported-history.js";
 import { bounded, field, historyToolId, string, type MessageContent } from "./message-presentation.js";
 
 const MESSAGE_CONTENT = new Set(["text", "multimodal_text", "thoughts", "reasoning_recap"]);
-const MEDIA_KINDS: Readonly<Record<string, MediaOperation>> = { "tool:multimodal_text": "generate", "library:file": "attachment" };
+const MEDIA_KINDS: Readonly<Record<string, MediaOperation>> = { "tool:multimodal_text": "generate" };
 const DETAIL_CHARACTERS = 32_768;
 
 function author(item: HistoryItem): string { return item.kind.slice(0, item.kind.indexOf(":")); }

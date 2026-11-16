@@ -4215,9 +4215,33 @@ async fn check_chatgpt_export(
         summary.attachments, summary.missing_attachments
     );
     eprintln!(
-        "  {} system and custom-instruction messages are left out",
+        "  {} system, custom-instruction and hidden messages are left out",
         summary.excluded_messages
     );
+    if !summary.unsupported.is_empty() {
+        let total: u32 = summary.unsupported.iter().map(|kind| kind.count).sum();
+        let kinds: Vec<String> = summary
+            .unsupported
+            .iter()
+            .map(|kind| format!("{} × {}", kind.count, kind.content))
+            .collect();
+        eprintln!(
+            "  {total} messages or parts are of a kind this import does not read: {}",
+            kinds.join(", ")
+        );
+    }
+    if summary.dropped_library_files > 0 {
+        eprintln!(
+            "  {} library files have no kept message in this export and are left out",
+            summary.dropped_library_files
+        );
+    }
+    if summary.unreferenced_files > 0 {
+        eprintln!(
+            "  {} files in this export are not named by any imported message and are left out",
+            summary.unreferenced_files
+        );
+    }
     for note in &summary.notes {
         eprintln!("  {note}");
     }

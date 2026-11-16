@@ -565,8 +565,14 @@
           "description": "Equal for a ZIP and its extracted folder. The coordinator's single-flight key.",
           "type": "string"
         },
+        "dropped_library_files": {
+          "description": "Library files whose origin is no kept message in this export.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
         "excluded_messages": {
-          "description": "System, developer and custom-instruction messages left out on purpose.",
+          "description": "System, developer, custom-instruction and hidden messages left out on purpose.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0
@@ -600,6 +606,19 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0
+        },
+        "unreferenced_files": {
+          "description": "Files in this export that no imported message names.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "unsupported": {
+          "description": "Messages, parts, outputs, attachments and metadata of a kind this import does not read,\ncounted by label. Each one is also an import gap of its conversation.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ChatGptUnsupported"
+          }
         }
       },
       "required": [
@@ -611,8 +630,29 @@
         "attachments",
         "missing_attachments",
         "excluded_messages",
+        "unsupported",
+        "dropped_library_files",
+        "unreferenced_files",
         "notes",
         "problems"
+      ]
+    },
+    "ChatGptUnsupported": {
+      "description": "How often one kind of export content that this import does not read occurs, such as\n`message future_widget` or `part image_asset_pointer (hidden)`. Past 32 labels, the rest\ncount under `other`.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "content",
+        "count"
       ]
     },
     "CleanupPlan": {

@@ -1024,7 +1024,7 @@ test("changed or unreliable first-read failures replace stale completeness befor
 const DISCONNECTED: HostResult = { type: "failed", delivery: "outcome_uncertain", message: "The execution client disconnected; no command ran on a fallback host." };
 function exported(digest: string, problems: string[] = []): ChatGptPackageSummary {
   return { digest, parts: ["export.zip"], conversations: 3, archived: 0, shards: 1, attachments: 0, missing_attachments: 0,
-    excluded_messages: 0, notes: [], problems };
+    excluded_messages: 0, unsupported: [], dropped_library_files: 0, unreferenced_files: 0, notes: [], problems };
 }
 type ClientReader = (request: HistoryRequest) => HostResult | Promise<HostResult>;
 function client(reader: ClientReader, seen: string[] = []): HostCall {

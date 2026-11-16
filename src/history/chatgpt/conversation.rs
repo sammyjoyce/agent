@@ -3,10 +3,14 @@ use std::{
     sync::Arc,
 };
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{ChatGptAttachment, ChatGptAuthor, ChatGptEnvelope, ChatGptMessage, archive, json};
+use super::{
+    ChatGptAttachment, ChatGptEnvelope, archive, json,
+    message::{self, Kept, Origin, Reading},
+};
 use crate::{
     history::{
         HistoryAssetKind, HistoryAssetRef, HistoryBranch, HistoryBranchState, HistoryGap,
@@ -17,9 +21,9 @@ use crate::{
 
 const DEFAULT_TITLE: &str = "ChatGPT conversation";
 const FILE_ID_CHARACTERS: usize = 64;
-const KIND_PART_CHARACTERS: usize = 64;
 const MEDIA_TYPE_BYTES: usize = 127;
 const MAXIMUM_REFERENCES: usize = 64;
+const MAXIMUM_UNREAD_GAPS: usize = 32;
 
 /// "file_<hex>" or "file-<base62>": the export's name for an uploaded or generated file.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -47,102 +51,6 @@ impl FileId {
     }
 }
 
-pub(super) enum Disposition {
-    Excluded,
-    Skipped,
-    Emit { kind: String, role: HistoryRole },
-}
-
-fn flag(object: &Value, name: &str) -> bool {
-    object
-        .get("metadata")
-        .and_then(|metadata| metadata.get(name))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
-fn emitted(message: &Value) -> Disposition {
-    let author = message
-        .pointer("/author/role")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let content_type = content_type(message);
-    let recipient = message
-        .get("recipient")
-        .and_then(Value::as_str)
-        .unwrap_or("all");
-    let channel = message.get("channel").and_then(Value::as_str);
-    let role = match author {
-        "user" => HistoryRole::User,
-        "assistant" if recipient != "all" => HistoryRole::Tool,
-        "assistant"
-            if matches!(content_type, "thoughts" | "reasoning_recap")
-                || flag(message, "is_thinking_preamble_message") =>
-        {
-            HistoryRole::Thinking
-        }
-        "assistant" if channel == Some("commentary") => HistoryRole::Commentary,
-        "assistant" if channel == Some("final") => HistoryRole::Final,
-        "assistant" => HistoryRole::Assistant,
-        _ => HistoryRole::Tool,
-    };
-    let part = |text: &str| text.chars().take(KIND_PART_CHARACTERS).collect::<String>();
-    Disposition::Emit {
-        kind: format!("{}:{}", part(author), part(content_type)),
-        role,
-    }
-}
-
-fn content_type(message: &Value) -> &str {
-    message
-        .pointer("/content/content_type")
-        .and_then(Value::as_str)
-        .unwrap_or("text")
-}
-
-pub(super) fn visible_text(message: &Value) -> String {
-    if let Some(markdown) = message
-        .pointer("/metadata/model_dil_v2/fallbackMarkdown")
-        .and_then(Value::as_str)
-    {
-        return markdown.replace("<escape>", "").replace("</escape>", "");
-    }
-    let content = message.get("content").unwrap_or(&Value::Null);
-    let mut pieces: Vec<&str> = Vec::new();
-    if let Some(parts) = content.get("parts").and_then(Value::as_array) {
-        for part in parts {
-            match part {
-                Value::String(text) => pieces.push(text),
-                Value::Object(object) => {
-                    if let Some(text) = object.get("text").and_then(Value::as_str) {
-                        pieces.push(text);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    if let Some(thoughts) = content.get("thoughts").and_then(Value::as_array) {
-        for thought in thoughts {
-            for field in ["summary", "content"] {
-                if let Some(text) = thought.get(field).and_then(Value::as_str) {
-                    pieces.push(text);
-                }
-            }
-        }
-    }
-    for field in ["text", "content", "result"] {
-        if let Some(text) = content.get(field).and_then(Value::as_str) {
-            pieces.push(text);
-        }
-    }
-    pieces
-        .into_iter()
-        .filter(|piece| !piece.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct FileRef {
     pub file: FileId,
@@ -159,234 +67,117 @@ pub(super) struct LibraryFile {
     pub created_at: Option<f64>,
 }
 
-mod screening {
-    use serde_json::Value;
-
-    use super::{
-        Disposition, FileId, FileRef, LibraryFile, content_type, emitted, flag, visible_text,
-    };
-
-    const INSTRUCTION_CONTENT: [&str; 4] = [
-        "user_editable_context",
-        "model_editable_context",
-        "about_user_message",
-        "about_model_message",
-    ];
-
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    pub(super) enum Policy {
-        Kept,
-        Excluded,
+pub(super) fn add(found: &mut Vec<FileRef>, reference: FileRef) {
+    if let Some(existing) = found.iter_mut().find(|known| known.file == reference.file) {
+        existing.name = existing.name.take().or(reference.name);
+        existing.mime_type = existing.mime_type.take().or(reference.mime_type);
+        return;
     }
+    found.push(reference);
+}
 
-    pub(super) struct Screened<'a> {
-        pub disposition: Disposition,
-        pub excluded: u32,
-        pub ids: Vec<(&'a str, Policy)>,
-        references: Vec<FileRef>,
-    }
+/// Each id a library file can name as its origin, resolved to the node whose item the file
+/// joins. An id that an excluded message or output uses resolves to nothing, whatever else
+/// uses it.
+struct Origins<'r, 'a>(HashMap<&'r str, Option<&'a str>>);
 
-    impl<'a> Screened<'a> {
-        pub fn empty() -> Self {
-            Self {
-                disposition: Disposition::Skipped,
-                excluded: 0,
-                ids: Vec::new(),
-                references: Vec::new(),
-            }
-        }
-
-        pub fn screen(node: &'a str, message: &'a Value) -> Self {
-            let (mut references, mut ids, mut excluded) = (Vec::new(), Vec::new(), 0);
-            let mut pending = vec![(message, Policy::Kept)];
-            while let Some((value, around)) = pending.pop() {
-                match value {
-                    Value::Object(object) => {
-                        let policy = match around {
-                            Policy::Excluded => Policy::Excluded,
-                            Policy::Kept => policy_for(value),
-                        };
-                        if around == Policy::Kept && policy == Policy::Excluded {
-                            excluded += 1;
-                        }
-                        if let Some(id) = object.get("id").and_then(Value::as_str) {
-                            ids.push((id, policy));
-                        }
-                        if policy == Policy::Kept {
-                            add_own_references(value, &mut references);
-                        }
-                        pending.extend(object.values().rev().map(|nested| (nested, policy)));
+impl<'r, 'a> Origins<'r, 'a> {
+    fn new(readings: impl Iterator<Item = (&'a str, &'r Reading)>) -> Self {
+        let mut ids: HashMap<&'r str, Option<&'a str>> = HashMap::new();
+        for (node, reading) in readings {
+            for (id, origin) in reading.origins() {
+                match origin {
+                    Origin::Excluded => {
+                        ids.insert(id, None);
                     }
-                    Value::Array(values) => {
-                        pending.extend(values.iter().rev().map(|nested| (nested, around)));
+                    Origin::Kept => {
+                        ids.entry(id).or_insert(Some(node));
                     }
-                    _ => {}
                 }
             }
-            let own = policy_for(message);
-            if message.get("id").and_then(Value::as_str).is_none() {
-                ids.push((node, own));
-            }
-            let disposition = match own {
-                Policy::Excluded => Disposition::Excluded,
-                Policy::Kept
-                    if visible_text(message).trim().is_empty() && references.is_empty() =>
-                {
-                    Disposition::Skipped
-                }
-                Policy::Kept => emitted(message),
-            };
-            Self {
-                disposition,
-                excluded,
-                ids,
-                references,
-            }
         }
-
-        pub fn files(&self) -> impl Iterator<Item = &FileId> {
-            self.references.iter().map(|reference| &reference.file)
-        }
-
-        pub fn with_library(&self, library: &[&LibraryFile]) -> Vec<FileRef> {
-            let mut found = self.references.clone();
-            for entry in library {
-                add(
-                    &mut found,
-                    Some(entry.file.clone()),
-                    entry.name.as_deref(),
-                    entry.mime_type.as_deref(),
-                );
-            }
-            found
-        }
+        Self(ids)
     }
 
-    fn policy_for(object: &Value) -> Policy {
-        let instruction_part = object
-            .pointer("/content/parts")
-            .and_then(Value::as_array)
-            .is_some_and(|parts| {
-                parts.iter().any(|part| {
-                    part.get("content_type")
-                        .and_then(Value::as_str)
-                        .is_some_and(|kind| INSTRUCTION_CONTENT.contains(&kind))
-                })
-            });
-        let excluded = matches!(
-            object.pointer("/author/role").and_then(Value::as_str),
-            Some("system" | "developer")
-        ) || INSTRUCTION_CONTENT.contains(&content_type(object))
-            || instruction_part
-            || flag(object, "is_user_system_message")
-            || flag(object, "is_visually_hidden_from_conversation");
-        if excluded {
-            Policy::Excluded
-        } else {
-            Policy::Kept
-        }
-    }
-
-    fn add(
-        found: &mut Vec<FileRef>,
-        file: Option<FileId>,
-        name: Option<&str>,
-        mime_type: Option<&str>,
-    ) {
-        let Some(file) = file else { return };
-        if let Some(existing) = found.iter_mut().find(|known| known.file == file) {
-            existing.name = existing.name.take().or(name.map(str::to_owned));
-            existing.mime_type = existing.mime_type.take().or(mime_type.map(str::to_owned));
-            return;
-        }
-        found.push(FileRef {
-            file,
-            name: name.map(str::to_owned),
-            mime_type: mime_type.map(str::to_owned),
-        });
-    }
-
-    fn add_own_references(object: &Value, found: &mut Vec<FileRef>) {
-        fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-            value.get(key).and_then(Value::as_str)
-        }
-        for attachment in object
-            .pointer("/metadata/attachments")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|attachment| policy_for(attachment) == Policy::Kept)
-        {
-            add(
-                found,
-                text(attachment, "id").and_then(FileId::find),
-                text(attachment, "name"),
-                text(attachment, "mime_type"),
-            );
-        }
-        for key in ["asset_pointer", "image_url"] {
-            add(found, text(object, key).and_then(FileId::find), None, None);
-        }
+    fn node(&self, file: &LibraryFile) -> Option<&'a str> {
+        let origin = file.origination_message.as_deref()?;
+        self.0.get(origin).copied().flatten()
     }
 }
 
-use screening::{Policy, Screened};
+fn mapping(raw: &Value) -> Option<&serde_json::Map<String, Value>> {
+    raw.get("mapping").and_then(Value::as_object)
+}
+
+fn message_of(node: &Value) -> Option<&Value> {
+    node.get("message").filter(|message| message.is_object())
+}
 
 pub(super) struct Survey {
+    /// Messages and outputs left out on purpose.
     pub excluded: u32,
+    /// The files kept messages name.
     pub files: BTreeSet<FileId>,
-    excluded_ids: BTreeSet<String>,
+    /// The library files that attach to a kept origin, in library order.
+    pub library: Vec<LibraryFile>,
+    pub dropped_library_files: u32,
+    /// Each label of content this import does not read, with how often it occurs.
+    pub unsupported: BTreeMap<String, u32>,
 }
 
-impl Survey {
-    pub fn keeps(&self, file: &LibraryFile) -> bool {
-        file.origination_message
-            .as_deref()
-            .is_none_or(|origin| !self.excluded_ids.contains(origin))
-    }
-}
-
-pub(super) fn survey(raw: &Value) -> Survey {
+pub(super) fn survey(raw: &Value, library: &[LibraryFile]) -> Survey {
+    let readings: Vec<(&str, Reading)> = mapping(raw)
+        .into_iter()
+        .flatten()
+        .filter_map(|(node, entry)| Some((node.as_str(), message::read(node, message_of(entry)?))))
+        .collect();
+    let origins = Origins::new(readings.iter().map(|(node, reading)| (*node, reading)));
+    let (attached, dropped): (Vec<&LibraryFile>, Vec<&LibraryFile>) = library
+        .iter()
+        .partition(|file| origins.node(file).is_some());
     let mut survey = Survey {
         excluded: 0,
         files: BTreeSet::new(),
-        excluded_ids: BTreeSet::new(),
+        library: attached.into_iter().cloned().collect(),
+        dropped_library_files: dropped.len() as u32,
+        unsupported: BTreeMap::new(),
     };
-    let Some(mapping) = raw.get("mapping").and_then(Value::as_object) else {
-        return survey;
-    };
-    for (node, entry) in mapping {
-        let Some(message) = entry.get("message").filter(|message| message.is_object()) else {
-            continue;
-        };
-        let screened = Screened::screen(node, message);
-        survey.excluded += screened.excluded;
-        survey.excluded_ids.extend(
-            screened
-                .ids
-                .iter()
-                .filter(|(_, policy)| *policy == Policy::Excluded)
-                .map(|(id, _)| (*id).to_owned()),
-        );
-        if matches!(screened.disposition, Disposition::Emit { .. }) {
-            survey.files.extend(screened.files().cloned());
+    for (_, reading) in &readings {
+        survey.excluded += reading.excluded();
+        for entry in &reading.left_out {
+            *survey.unsupported.entry(entry.label()).or_default() += 1;
+        }
+        if let Some(kept) = reading.kept() {
+            survey
+                .files
+                .extend(kept.files().into_iter().map(|reference| reference.file));
         }
     }
     survey
 }
 
-pub(super) fn seconds(value: &Value) -> Option<f64> {
-    match value {
-        Value::Number(number) => {
-            let value = number.as_f64()?;
-            Some(if value > 1e12 { value / 1000.0 } else { value })
+/// A time as the export writes it: seconds or milliseconds since the epoch, or RFC 3339 text.
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(super) enum Time {
+    Number(f64),
+    Text(String),
+}
+
+impl Time {
+    pub fn seconds(self) -> Option<f64> {
+        match self {
+            Self::Number(value) => Some(if value > 1e12 { value / 1000.0 } else { value }),
+            Self::Text(text) => chrono::DateTime::parse_from_rfc3339(&text)
+                .ok()
+                .map(|time| time.timestamp_millis() as f64 / 1000.0),
         }
-        Value::String(text) => chrono::DateTime::parse_from_rfc3339(text)
-            .ok()
-            .map(|time| time.timestamp_millis() as f64 / 1000.0),
-        _ => None,
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
     }
-    .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+}
+
+pub(super) fn seconds(value: &Value) -> Option<f64> {
+    Time::deserialize(value).ok()?.seconds()
 }
 
 pub(super) fn thread(id: &str, raw: &Value, version: String) -> HistoryThread {
@@ -469,13 +260,21 @@ struct Tree<'a> {
 
 struct Node<'a> {
     parent: Option<&'a str>,
-    message: Option<&'a Value>,
     created: f64,
-    screened: Screened<'a>,
+    reading: Option<Reading>,
+    library: Vec<&'a LibraryFile>,
+    emits: bool,
+}
+
+impl Node<'_> {
+    fn shown(&self) -> Option<(&Reading, &Kept)> {
+        let reading = self.reading.as_ref().filter(|_| self.emits)?;
+        Some((reading, reading.kept()?))
+    }
 }
 
 impl<'a> Tree<'a> {
-    fn build(mapping: &'a serde_json::Map<String, Value>) -> Self {
+    fn build(mapping: &'a serde_json::Map<String, Value>, library: &'a [LibraryFile]) -> Self {
         let mut adopted: HashMap<&str, &str> = HashMap::new();
         for (id, node) in mapping {
             for child in node
@@ -490,7 +289,7 @@ impl<'a> Tree<'a> {
         }
         let mut nodes = BTreeMap::new();
         for (id, node) in mapping {
-            let message = node.get("message").filter(|message| message.is_object());
+            let reading = message_of(node).map(|message| message::read(id, message));
             let parent = node
                 .get("parent")
                 .and_then(Value::as_str)
@@ -500,15 +299,35 @@ impl<'a> Tree<'a> {
                 id.as_str(),
                 Node {
                     parent,
-                    message,
-                    created: message
-                        .and_then(|message| message.get("create_time"))
-                        .and_then(seconds)
+                    created: reading
+                        .as_ref()
+                        .and_then(|reading| reading.created)
                         .unwrap_or(0.0),
-                    screened: message
-                        .map_or_else(Screened::empty, |message| Screened::screen(id, message)),
+                    reading,
+                    library: Vec::new(),
+                    emits: false,
                 },
             );
+        }
+        let attached: Vec<(&str, &LibraryFile)> = {
+            let origins = Origins::new(
+                nodes
+                    .iter()
+                    .filter_map(|(id, node)| Some((*id, node.reading.as_ref()?))),
+            );
+            library
+                .iter()
+                .filter_map(|file| Some((origins.node(file)?, file)))
+                .collect()
+        };
+        for (id, file) in attached {
+            if let Some(node) = nodes.get_mut(id) {
+                node.library.push(file);
+            }
+        }
+        for node in nodes.values_mut() {
+            let kept = node.reading.as_ref().and_then(Reading::kept);
+            node.emits = kept.is_some_and(|kept| !node.library.is_empty() || !kept.is_empty());
         }
         let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
         let mut roots = Vec::new();
@@ -536,10 +355,21 @@ impl<'a> Tree<'a> {
     }
 
     fn emitted(&self, id: &str) -> bool {
-        matches!(
-            self.nodes[id].screened.disposition,
-            Disposition::Emit { .. }
-        )
+        self.nodes[id].emits
+    }
+
+    fn draft(&self, node: &'a str, turn: &'a str, branch: HistoryBranch) -> Option<Draft<'_>> {
+        let entry = &self.nodes[node];
+        let (reading, kept) = entry.shown()?;
+        Some(Draft {
+            node,
+            parent: entry.parent,
+            kept,
+            created: reading.created,
+            library: &entry.library,
+            turn,
+            branch,
+        })
     }
 
     fn children(&self, id: &str) -> &[&'a str] {
@@ -656,13 +486,10 @@ impl<'a> Turns<'a> {
                     break None;
                 }
                 path.push(node);
-                if matches!(
-                    tree.nodes[node].screened.disposition,
-                    Disposition::Emit {
-                        role: HistoryRole::User,
-                        ..
-                    }
-                ) {
+                if tree.nodes[node]
+                    .shown()
+                    .is_some_and(|(_, kept)| matches!(kept.role, HistoryRole::User))
+                {
                     break Some(node);
                 }
                 cursor = tree.nodes[node].parent;
@@ -686,42 +513,9 @@ pub(super) fn normalize(
     files: &dyn FileLookup,
 ) -> Normalized {
     let empty = serde_json::Map::new();
-    let mapping = raw
-        .get("mapping")
-        .and_then(Value::as_object)
-        .unwrap_or(&empty);
-    let tree = Tree::build(mapping);
+    let tree = Tree::build(mapping(raw).unwrap_or(&empty), library);
     let placement = Placement::place(&tree, raw.get("current_node").and_then(Value::as_str));
     let turns = Turns::find(&tree);
-    let mut origins: HashMap<&str, Option<&str>> = HashMap::new();
-    for (node, entry) in &tree.nodes {
-        let shown = tree.emitted(node);
-        for &(id, policy) in &entry.screened.ids {
-            match policy {
-                Policy::Excluded => {
-                    origins.insert(id, None);
-                }
-                Policy::Kept if shown => {
-                    origins.entry(id).or_insert(Some(node));
-                }
-                Policy::Kept => {}
-            }
-        }
-    }
-    let mut attached: HashMap<&str, Vec<&LibraryFile>> = HashMap::new();
-    let mut standalone = Vec::new();
-    for file in library {
-        match file
-            .origination_message
-            .as_deref()
-            .and_then(|origin| origins.get(origin))
-        {
-            Some(Some(node)) => attached.entry(node).or_default().push(file),
-            Some(None) => {}
-            None => standalone.push(file),
-        }
-    }
-    let attached_to = |node: &str| attached.get(node).map_or(&[][..], Vec::as_slice);
     let mut output = Normalized {
         items: Vec::new(),
         gaps: Vec::new(),
@@ -729,66 +523,14 @@ pub(super) fn normalize(
     };
     let mut chain: Option<String> = None;
     for node in &placement.current {
-        let Some(message) = tree.nodes[node].message else {
-            continue;
-        };
-        let Disposition::Emit { kind, role } = &tree.nodes[node].screened.disposition else {
-            continue;
-        };
         let branch = HistoryBranch {
             state: HistoryBranchState::Current,
             alternates: placement.alternates.get(node).copied().unwrap_or(0),
             follows: chain.clone(),
         };
-        let version = output.push(Draft {
-            conversation: id,
-            node,
-            parent: tree.nodes[node].parent,
-            message: Some(message),
-            kind: kind.clone(),
-            role: role.clone(),
-            turn: turns.of(node),
-            branch,
-            references: tree.nodes[node].screened.with_library(attached_to(node)),
-            text: visible_text(message),
-            files,
-        });
-        chain = Some(version);
-    }
-    let last_turn = placement
-        .current
-        .iter()
-        .rev()
-        .find(|node| tree.emitted(node))
-        .map(|node| turns.of(node));
-    for file in standalone {
-        let node = format!("library:{}", file.file.as_str());
-        let branch = HistoryBranch {
-            state: HistoryBranchState::Current,
-            alternates: 0,
-            follows: chain.clone(),
-        };
-        let version = output.push(Draft {
-            conversation: id,
-            node: &node,
-            parent: None,
-            message: None,
-            kind: "library:file".into(),
-            role: HistoryRole::Tool,
-            turn: last_turn.unwrap_or(&node),
-            branch,
-            references: vec![FileRef {
-                file: file.file.clone(),
-                name: file.name.clone(),
-                mime_type: file.mime_type.clone(),
-            }],
-            text: file
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("Generated file {}", file.file.as_str())),
-            files,
-        });
-        chain = Some(version);
+        if let Some(draft) = tree.draft(node, turns.of(node), branch) {
+            chain = Some(output.push(id, files, draft));
+        }
     }
     let off_path = placement
         .alternate
@@ -801,28 +543,37 @@ pub(super) fn normalize(
                 .map(|node| (*node, HistoryBranchState::Detached)),
         );
     for (node, state) in off_path {
-        let Some(message) = tree.nodes[node].message else {
-            continue;
+        let branch = HistoryBranch {
+            state,
+            alternates: 0,
+            follows: None,
         };
-        let Disposition::Emit { kind, role } = &tree.nodes[node].screened.disposition else {
-            continue;
-        };
-        output.push(Draft {
-            conversation: id,
-            node,
-            parent: tree.nodes[node].parent,
-            message: Some(message),
-            kind: kind.clone(),
-            role: role.clone(),
-            turn: turns.of(node),
-            branch: HistoryBranch {
-                state,
-                alternates: 0,
-                follows: None,
-            },
-            references: tree.nodes[node].screened.with_library(attached_to(node)),
-            text: visible_text(message),
-            files,
+        if let Some(draft) = tree.draft(node, turns.of(node), branch) {
+            output.push(id, files, draft);
+        }
+    }
+    let mut unread = placement
+        .current
+        .iter()
+        .chain(&placement.alternate)
+        .chain(&placement.detached)
+        .filter_map(|node| tree.nodes[node].reading.as_ref())
+        .flat_map(|reading| reading.left_out.iter().map(move |entry| (reading, entry)));
+    for (reading, entry) in unread.by_ref().take(MAXIMUM_UNREAD_GAPS) {
+        output.gaps.push(HistoryGap {
+            code: HistoryGapCode::Unsupported,
+            item_id: None,
+            message: entry.gap(&reading.id),
+        });
+    }
+    let more = unread.count();
+    if more > 0 {
+        output.gaps.push(HistoryGap {
+            code: HistoryGapCode::Unsupported,
+            item_id: None,
+            message: format!(
+                "{more} more entries of this conversation that were not read are not listed"
+            ),
         });
     }
     if let Some(first) = placement.detached.first() {
@@ -838,29 +589,42 @@ pub(super) fn normalize(
 }
 
 struct Draft<'a> {
-    conversation: &'a str,
     node: &'a str,
     parent: Option<&'a str>,
-    message: Option<&'a Value>,
-    kind: String,
-    role: HistoryRole,
+    kept: &'a Kept,
+    created: Option<f64>,
+    library: &'a [&'a LibraryFile],
     turn: &'a str,
     branch: HistoryBranch,
-    references: Vec<FileRef>,
-    text: String,
-    files: &'a dyn FileLookup,
+}
+
+impl Draft<'_> {
+    fn references(&self) -> Vec<FileRef> {
+        let mut found = self.kept.files();
+        for file in self.library {
+            add(
+                &mut found,
+                FileRef {
+                    file: file.file.clone(),
+                    name: file.name.clone(),
+                    mime_type: file.mime_type.clone(),
+                },
+            );
+        }
+        found
+    }
 }
 
 impl Normalized {
-    fn push(&mut self, draft: Draft<'_>) -> String {
-        let text = without_citations(&draft.text);
-        let omitted = draft.references.len().saturating_sub(MAXIMUM_REFERENCES);
-        let considered: Vec<_> = draft
-            .references
+    fn push(&mut self, conversation: &str, files: &dyn FileLookup, draft: Draft<'_>) -> String {
+        let text = without_citations(&draft.kept.text());
+        let references = draft.references();
+        let omitted = references.len().saturating_sub(MAXIMUM_REFERENCES);
+        let considered: Vec<_> = references
             .into_iter()
             .take(MAXIMUM_REFERENCES)
             .map(|reference| {
-                let found = draft.files.stored(&reference.file);
+                let found = files.stored(&reference.file);
                 (reference, found)
             })
             .collect();
@@ -874,23 +638,21 @@ impl Normalized {
             })
             .collect();
         let envelope = serde_json::to_value(ChatGptEnvelope {
-            conversation_id: draft.conversation.to_owned(),
+            conversation_id: conversation.to_owned(),
             node_id: draft.node.to_owned(),
             parent_id: draft.parent.map(str::to_owned),
             text: text.clone(),
-            message: draft.message.map(retained),
+            message: Some(draft.kept.header.clone()),
             attachments,
         })
         .unwrap_or(Value::Null);
         let timestamp_ms = draft
-            .message
-            .and_then(|message| message.get("create_time"))
-            .and_then(seconds)
+            .created
             .map(|seconds| (seconds * 1000.0).round() as i64);
         let version = digest(&json!([
             ITEM_FORMAT,
-            draft.kind,
-            draft.role,
+            draft.kept.kind,
+            draft.kept.role,
             draft.branch,
             envelope,
             draft.turn,
@@ -922,7 +684,7 @@ impl Normalized {
                 .mime_type
                 .filter(|mime_type| mime_type.len() <= MEDIA_TYPE_BYTES)
                 .or_else(|| reference.name.as_deref().and_then(media_type))
-                .or_else(|| draft.files.original_name(stored).and_then(media_type))
+                .or_else(|| files.original_name(stored).and_then(media_type))
                 .or_else(|| media_type(stored))
                 .or_else(|| checked.sniffed.map(str::to_owned))
                 .unwrap_or_else(|| UNKNOWN_MEDIA.to_owned());
@@ -970,8 +732,8 @@ impl Normalized {
         self.items.push(HistoryItem {
             id: draft.node.to_owned(),
             turn_id: draft.turn.to_owned(),
-            kind: draft.kind,
-            role: draft.role,
+            kind: draft.kept.kind.clone(),
+            role: draft.kept.role.clone(),
             text: excerpt(&text, TEXT_EXCERPT_BYTES),
             version: version.clone(),
             order: self.items.len() as u64,
@@ -1006,26 +768,6 @@ fn media_type(name: &str) -> Option<String> {
         _ => return None,
     };
     Some(known.to_owned())
-}
-
-fn retained(message: &Value) -> ChatGptMessage {
-    let text = |pointer: &str| {
-        message
-            .pointer(pointer)
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    };
-    ChatGptMessage {
-        id: text("/id"),
-        author: ChatGptAuthor {
-            role: text("/author/role"),
-            name: text("/author/name"),
-        },
-        recipient: text("/recipient"),
-        channel: text("/channel"),
-        status: text("/status"),
-        content_type: text("/content/content_type"),
-    }
 }
 
 /// Drops citation markers (`U+E200 … U+E201`, payload included) and the highlight markers
@@ -1325,7 +1067,18 @@ mod tests {
                 .unwrap()
                 .contains(MARKER)
         );
-        assert_eq!(survey(&raw).excluded, 6);
+        let unread: Vec<&str> = normalized
+            .gaps
+            .iter()
+            .map(|gap| gap.message.as_str())
+            .collect();
+        assert_eq!(
+            unread,
+            [
+                "A part of message about has type about_model_message, which this import does not read"
+            ]
+        );
+        assert_eq!(survey(&raw, &[]).excluded, 5);
     }
 
     #[test]
@@ -1424,17 +1177,159 @@ mod tests {
     }
 
     #[test]
-    fn unknown_content_type_is_retained_with_its_text() {
+    fn unknown_content_type_is_reported_instead_of_imported() {
         let widget = json!({"author": {"role": "assistant"},
             "content": {"content_type": "future_widget", "text": "Widget caption", "shape": [1, 2]}});
-        let normalized = run(&Conversation::new(1, "Widget")
+        let raw = Conversation::new(1, "Widget")
             .node("w", Some("root"), widget)
-            .build());
-        let widget = item(&normalized, "w");
-        assert_eq!(widget.kind, "assistant:future_widget");
-        assert_eq!(widget.text, "Widget caption");
-        assert_eq!(widget.data["message"]["content_type"], "future_widget");
-        assert_eq!(widget.data["text"], "Widget caption");
+            .build();
+        let normalized = run(&raw);
+        assert!(normalized.items.is_empty());
+        assert_eq!(normalized.gaps.len(), 1);
+        assert!(matches!(
+            normalized.gaps[0].code,
+            HistoryGapCode::Unsupported
+        ));
+        assert_eq!(
+            normalized.gaps[0].message,
+            "Message w has content type future_widget, which this import does not read"
+        );
+        assert_eq!(
+            survey(&raw, &[]).unsupported,
+            BTreeMap::from([("message future_widget".to_owned(), 1)])
+        );
+    }
+
+    #[test]
+    fn a_supported_type_with_a_mistyped_field_is_unreadable() {
+        let rows = [
+            ("code", json!({"content_type": "code", "text": 7})),
+            (
+                "parts",
+                json!({"content_type": "text", "parts": "not a list"}),
+            ),
+            (
+                "thought",
+                json!({"content_type": "thoughts", "thoughts": [{"summary": ["Weighing"]}]}),
+            ),
+            ("array", json!(["text", ["Hello"]])),
+        ];
+        let mut conversation = Conversation::new(1, "Mistyped");
+        for (node, content) in &rows {
+            conversation = conversation.node(
+                node,
+                Some("root"),
+                json!({"author": {"role": "assistant"}, "content": content}),
+            );
+        }
+        let raw = conversation.build();
+        assert!(run(&raw).items.is_empty());
+        assert_eq!(
+            survey(&raw, &[]).unsupported,
+            BTreeMap::from([
+                ("message (none) (unreadable)".to_owned(), 1),
+                ("message code (unreadable)".to_owned(), 1),
+                ("message text (unreadable)".to_owned(), 1),
+                ("message thoughts (unreadable)".to_owned(), 1),
+            ])
+        );
+    }
+
+    #[test]
+    fn unreadable_markers_make_a_message_unsupported_and_a_true_flag_excludes_it() {
+        let message = |author: Value, metadata: Value| {
+            json!({"author": author, "metadata": metadata,
+                "content": {"content_type": "text", "parts": [MARKER]}})
+        };
+        let user = json!({"role": "user"});
+        let rows = [
+            message(json!({"name": "no role"}), json!({})),
+            message(json!({"role": 7}), json!({})),
+            message(user.clone(), json!(["metadata as a list"])),
+            message(user.clone(), json!({"is_user_system_message": "yes"})),
+            message(
+                user.clone(),
+                json!({"is_visually_hidden_from_conversation": 1}),
+            ),
+            message(
+                json!({"role": 7}),
+                json!({"is_visually_hidden_from_conversation": true}),
+            ),
+            json!({"author": user, "content": "text"}),
+        ];
+        let mut conversation = Conversation::new(1, "Markers");
+        for (index, message) in rows.into_iter().enumerate() {
+            conversation = conversation.node(&format!("m{index}"), Some("root"), message);
+        }
+        let raw = conversation.build();
+        let normalized = run(&raw);
+        assert!(normalized.items.is_empty());
+        assert!(
+            !serde_json::to_string(&normalized.gaps)
+                .unwrap()
+                .contains(MARKER)
+        );
+        let surveyed = survey(&raw, &[]);
+        assert_eq!(surveyed.excluded, 1);
+        assert_eq!(
+            surveyed.unsupported,
+            BTreeMap::from([
+                ("message (none) (unreadable)".to_owned(), 1),
+                ("message text (unreadable)".to_owned(), 5),
+            ])
+        );
+    }
+
+    #[test]
+    fn parts_read_only_their_own_shape() {
+        let parts = json!([
+            "Plain",
+            {"content_type": "text", "text": "Typed", "metadata": {"is_visually_hidden_from_conversation": false}},
+            {"content_type": "audio_transcription", "text": "Spoken", "direction": "in", "decoding_id": null},
+            {"asset_pointer": "sediment://file_00f1", "text": "Bare caption"},
+            {"content_type": "audio_asset_pointer", "asset_pointer": "sediment://file_00f2", "format": "wav"},
+            {"content_type": "audio_transcription", "text": MARKER, "speaker": "invented"},
+            {"content_type": "text", "text": MARKER, "metadata": {"is_visually_hidden_from_conversation": "yes"}},
+            {"content_type": "image_asset_pointer", "asset_pointer": "sediment://no-file-id", "text": MARKER},
+            {"content_type": "image_asset_pointer", "asset_pointer": "sediment://file_00f3", "text": 7},
+            {"content_type": "future_bundle", "asset_pointer": "sediment://file_00f4", "text": MARKER},
+            ["image_asset_pointer", "sediment://file_00f5", MARKER, null],
+            7,
+        ]);
+        let message = json!({"author": {"role": "user"},
+            "content": {"content_type": "multimodal_text", "parts": parts}});
+        let raw = Conversation::new(1, "Parts")
+            .node("u1", Some("root"), message)
+            .build();
+        let normalized = run_with(
+            &raw,
+            &[],
+            &Files::new(&[
+                "file_00f1-a.dat",
+                "file_00f2-b.dat",
+                "file_00f3-c.dat",
+                "file_00f4-d.dat",
+                "file_00f5-e.dat",
+            ]),
+        );
+        let upload = item(&normalized, "u1");
+        assert_eq!(upload.text, "Plain\n\nTyped\n\nSpoken\n\nBare caption");
+        assert_eq!(paths(upload), ["file_00f1", "file_00f2"]);
+        assert!(
+            !serde_json::to_string(&(&normalized.items, &normalized.gaps))
+                .unwrap()
+                .contains(MARKER)
+        );
+        assert_eq!(
+            survey(&raw, &[]).unsupported,
+            BTreeMap::from([
+                ("part (none)".to_owned(), 2),
+                ("part audio_transcription".to_owned(), 1),
+                ("part future_bundle".to_owned(), 1),
+                ("part image_asset_pointer".to_owned(), 2),
+                ("part text".to_owned(), 1),
+            ])
+        );
     }
 
     #[test]
@@ -1544,6 +1439,31 @@ mod tests {
     }
 
     #[test]
+    fn an_attachment_entry_that_names_no_file_is_reported() {
+        let message = json!({"author": {"role": "user"},
+            "content": {"content_type": "text", "parts": ["Look"]},
+            "metadata": {"attachments": [{"id": "upload-7", "name": "beach.png"}, {"name": "dune.png"},
+                {"id": "file_00ab12", "name": "shore.png"}]}});
+        let raw = Conversation::new(1, "Upload")
+            .node("u1", Some("root"), message)
+            .build();
+        let normalized = run_with(&raw, &[], &Files::new(&["file_00ab12-shore.dat"]));
+        assert_eq!(paths(item(&normalized, "u1")), ["file_00ab12"]);
+        let unread: Vec<&str> = normalized
+            .gaps
+            .iter()
+            .filter(|gap| matches!(gap.code, HistoryGapCode::Unsupported))
+            .map(|gap| gap.message.as_str())
+            .collect();
+        assert_eq!(unread.len(), 2, "{unread:?}");
+        assert!(unread.iter().all(|gap| gap.contains("u1")), "{unread:?}");
+        assert_eq!(
+            survey(&raw, &[]).unsupported.get("attachment (unreadable)"),
+            Some(&2)
+        );
+    }
+
+    #[test]
     fn code_interpreter_chart_is_an_asset() {
         let output = json!({"author": {"role": "tool", "name": "python"},
             "content": {"content_type": "execution_output", "text": "<Figure>"},
@@ -1592,18 +1512,21 @@ mod tests {
     fn library_file_follows_the_message_id_before_the_mapping_key() {
         let mut answer = text_message("assistant", "Here is the plan");
         answer["id"] = json!("message-a1");
+        let raw = Conversation::new(1, "Report")
+            .say("u1", "root", "user", "Make a plan")
+            .node("a1", Some("u1"), answer)
+            .say("empty", "a1", "assistant", "")
+            .build();
+        let library = [
+            library("file_00e1", Some("message-a1")),
+            library("file_00e2", Some("u1")),
+            library("file_00e3", Some("a1")),
+            library("file_00e4", Some("empty")),
+        ];
+        let surveyed = survey(&raw, &library);
         let normalized = run_with(
-            &Conversation::new(1, "Report")
-                .say("u1", "root", "user", "Make a plan")
-                .node("a1", Some("u1"), answer)
-                .say("empty", "a1", "assistant", "")
-                .build(),
-            &[
-                library("file_00e1", Some("message-a1")),
-                library("file_00e2", Some("u1")),
-                library("file_00e3", Some("a1")),
-                library("file_00e4", Some("empty")),
-            ],
+            &raw,
+            &library,
             &Files::new(&[
                 "file_00e1-plan.dat",
                 "file_00e2-plan.dat",
@@ -1613,12 +1536,19 @@ mod tests {
         );
         assert_eq!(paths(item(&normalized, "a1")), ["file_00e1"]);
         assert_eq!(paths(item(&normalized, "u1")), ["file_00e2"]);
-        let ids: Vec<&str> = normalized
-            .items
+        assert_eq!(paths(item(&normalized, "empty")), ["file_00e4"]);
+        assert_eq!(
+            placed(&normalized),
+            [("u1", Current), ("a1", Current), ("empty", Current)]
+        );
+        assert!(!normalized.assets.contains_key("file_00e3"));
+        let attached: Vec<&str> = surveyed
+            .library
             .iter()
-            .map(|item| item.id.as_str())
+            .map(|file| file.file.as_str())
             .collect();
-        assert_eq!(ids, ["u1", "a1", "library:file_00e3", "library:file_00e4"]);
+        assert_eq!(attached, ["file_00e1", "file_00e2", "file_00e4"]);
+        assert_eq!(surveyed.dropped_library_files, 1);
     }
 
     #[test]
@@ -1672,7 +1602,7 @@ mod tests {
         let hidden = json!({"is_visually_hidden_from_conversation": true});
         let system = with(nested("n", "system", json!({})), "image_url", image.clone());
         let cases = [
-            ("nested system", answer_carrying(system.clone())),
+            ("nested system", answer_carrying(system.clone()), 1, 0),
             (
                 "nested developer",
                 answer_carrying(with(
@@ -1680,6 +1610,8 @@ mod tests {
                     "image_url",
                     image.clone(),
                 )),
+                1,
+                0,
             ),
             (
                 "nested hidden",
@@ -1688,6 +1620,8 @@ mod tests {
                     "image_url",
                     image.clone(),
                 )),
+                1,
+                0,
             ),
             (
                 "inside a kept nested message",
@@ -1696,6 +1630,8 @@ mod tests {
                     "metadata",
                     json!({"aggregate_result": {"messages": [system]}}),
                 )),
+                0,
+                0,
             ),
             (
                 "inside a content part",
@@ -1706,26 +1642,32 @@ mod tests {
                         {"content_type": "future_bundle", "message": with(nested("n", "system", json!({})),
                             "asset_pointer", json!("sediment://file-PrivateNested"))}]}),
                 ),
+                0,
+                1,
             ),
         ];
         let (mut observed, mut expected) = (Vec::new(), Vec::new());
-        for (case, answer) in cases {
+        for (case, answer, excluded, unread) in cases {
             let raw = one_answer(answer);
             let normalized = run_with(&raw, &[], &Files::new(&["file-PrivateNested-data.txt"]));
             assert_eq!(shown(&normalized), ["Public response"], "{case}");
-            let surveyed = survey(&raw);
+            let surveyed = survey(&raw, &[]);
+            let items = serde_json::to_string(&normalized.items).unwrap();
             observed.push(format!(
-                "{case}: assets {}, gaps {}, named {}, surveyed files {}, excluded {}",
+                "{case}: assets {}, unread {}, named {}, text {}, surveyed files {}, excluded {}",
                 normalized.assets.len(),
-                normalized.gaps.len(),
-                serde_json::to_string(&normalized.items)
-                    .unwrap()
-                    .contains("PrivateNested"),
+                normalized
+                    .gaps
+                    .iter()
+                    .filter(|gap| matches!(gap.code, HistoryGapCode::Unsupported))
+                    .count(),
+                items.contains("PrivateNested"),
+                items.contains(MARKER),
                 surveyed.files.len(),
                 surveyed.excluded,
             ));
             expected.push(format!(
-                "{case}: assets 0, gaps 0, named false, surveyed files 0, excluded 1"
+                "{case}: assets 0, unread {unread}, named false, text false, surveyed files 0, excluded {excluded}"
             ));
         }
         assert_eq!(observed, expected);
@@ -1743,7 +1685,7 @@ mod tests {
         let raw = one_answer(answer);
         let normalized = run_with(&raw, &[], &Files::new(&["file-Shared-chart.dat"]));
         assert_eq!(paths(item(&normalized, "a")), ["file-Shared"]);
-        let surveyed = survey(&raw);
+        let surveyed = survey(&raw, &[]);
         assert_eq!(
             surveyed
                 .files
@@ -1798,7 +1740,7 @@ mod tests {
         let (mut observed, mut expected) = (Vec::new(), Vec::new());
         for (case, raw) in cases {
             let file = library("file_00e7", Some("origin"));
-            let kept = survey(&raw).keeps(&file);
+            let kept = !survey(&raw, std::slice::from_ref(&file)).library.is_empty();
             let normalized = run_with(&raw, &[file], &Files::new(&["file_00e7-plan.dat"]));
             let ids: Vec<&str> = normalized
                 .items
@@ -1816,40 +1758,51 @@ mod tests {
 
     #[test]
     fn library_file_whose_origin_is_a_kept_nested_message_attaches_to_its_message() {
-        let chart = json!({"id": "chart-output", "message_type": "image"});
+        let chart = json!({"id": "chart-output", "message_type": "image",
+            "image_url": "file-service://file-Chart1"});
+        let unmodeled = json!({"id": "table-output", "message_type": "table"});
         let raw = one_answer(answer_carrying(chart));
-        let file = library("file_00e8", Some("chart-output"));
-        assert!(survey(&raw).keeps(&file));
-        let normalized = run_with(&raw, &[file], &Files::new(&["file_00e8-plan.dat"]));
+        let library = [
+            library("file_00e8", Some("chart-output")),
+            library("file_00e9", Some("table-output")),
+        ];
+        let surveyed = survey(&raw, &library);
+        assert_eq!(surveyed.library.len(), 1);
+        assert_eq!(surveyed.dropped_library_files, 1);
+        let normalized = run_with(
+            &raw,
+            &library,
+            &Files::new(&["file-Chart1-chart.dat", "file_00e8-plan.dat"]),
+        );
         assert_eq!(placed(&normalized), [("a", Current)]);
-        assert_eq!(paths(item(&normalized, "a")), ["file_00e8"]);
+        assert_eq!(paths(item(&normalized, "a")), ["file-Chart1", "file_00e8"]);
+        let raw = one_answer(answer_carrying(unmodeled));
+        let normalized = run_with(&raw, &library, &Files::new(&["file_00e9-plan.dat"]));
+        assert!(paths(item(&normalized, "a")).is_empty());
+        assert_eq!(
+            normalized.gaps[0].message,
+            "An output of message a has type table, which this import does not read"
+        );
     }
 
     #[test]
-    fn library_only_generated_file_gets_its_own_item() {
-        let normalized = run_with(
-            &Conversation::new(1, "Generated")
-                .say("u1", "root", "user", "Draw a map")
-                .say("a1", "u1", "assistant", "Here it is")
-                .say("alt", "u1", "assistant", "Another map")
-                .current("a1")
-                .build(),
-            &[library("file_00ef", None)],
-            &Files::new(&["file_00ef-map.dat"]),
-        );
+    fn library_file_without_an_origin_is_dropped() {
+        let raw = Conversation::new(1, "Generated")
+            .say("u1", "root", "user", "Draw a map")
+            .say("a1", "u1", "assistant", "Here it is")
+            .say("alt", "u1", "assistant", "Another map")
+            .current("a1")
+            .build();
+        let library = [library("file_00ef", None)];
+        let normalized = run_with(&raw, &library, &Files::new(&["file_00ef-map.dat"]));
         assert_eq!(
             placed(&normalized),
-            [
-                ("u1", Current),
-                ("a1", Current),
-                ("library:file_00ef", Current),
-                ("alt", Alternate)
-            ]
+            [("u1", Current), ("a1", Current), ("alt", Alternate)]
         );
-        let generated = item(&normalized, "library:file_00ef");
-        assert_eq!(generated.kind, "library:file");
-        assert_eq!(role(generated), "tool");
-        assert_eq!(paths(generated), ["file_00ef"]);
+        assert!(normalized.assets.is_empty());
+        let surveyed = survey(&raw, &library);
+        assert!(surveyed.library.is_empty());
+        assert_eq!(surveyed.dropped_library_files, 1);
     }
 
     #[test]

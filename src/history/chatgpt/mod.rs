@@ -5,6 +5,7 @@ mod conversation;
 #[cfg(test)]
 mod fixture;
 mod json;
+mod message;
 mod package;
 
 use std::{
@@ -38,12 +39,28 @@ pub struct ChatGptPackageSummary {
     pub shards: u32,
     pub attachments: u32,
     pub missing_attachments: u32,
-    /// System, developer and custom-instruction messages left out on purpose.
+    /// System, developer, custom-instruction and hidden messages left out on purpose.
     pub excluded_messages: u32,
+    /// Messages, parts, outputs, attachments and metadata of a kind this import does not read,
+    /// counted by label. Each one is also an import gap of its conversation.
+    pub unsupported: Vec<ChatGptUnsupported>,
+    /// Library files whose origin is no kept message in this export.
+    pub dropped_library_files: u32,
+    /// Files in this export that no imported message names.
+    pub unreferenced_files: u32,
     /// Repairs and skips that lose no conversation data. Printed, never gaps.
     pub notes: Vec<String>,
     /// Export data that will not be imported. Each becomes an import gap.
     pub problems: Vec<String>,
+}
+
+/// How often one kind of export content that this import does not read occurs, such as
+/// `message future_widget` or `part image_asset_pointer (hidden)`. Past 32 labels, the rest
+/// count under `other`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ChatGptUnsupported {
+    pub content: String,
+    pub count: u32,
 }
 
 /// The inert evidence stored as `HistoryItem.data` for one ChatGPT item. It is built from
@@ -55,7 +72,6 @@ pub struct ChatGptEnvelope {
     pub parent_id: Option<String>,
     /// The whole normalized message text, citations removed. `HistoryItem.text` is its excerpt.
     pub text: String,
-    /// Null for a `library:file` item, which has no message.
     pub message: Option<ChatGptMessage>,
     /// The files the item references, up to its attachment limit. The checked digest is part of
     /// the evidence, so other bytes under the same file id are a new item version, never a
@@ -1850,6 +1866,124 @@ mod tests {
             assert!(import.serves(file).await.is_none(), "{file}");
         }
         assert!(!import.shows("LIBRARY_"));
+        let summary = import.history.summary();
+        assert_eq!(
+            (
+                summary.attachments,
+                summary.dropped_library_files,
+                summary.unreferenced_files
+            ),
+            (0, 3, 3)
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_counts_everything_the_import_leaves_out() {
+        let directory = tempfile::tempdir().unwrap();
+        let widget = |id: &str| {
+            json!({"id": id, "author": {"role": "assistant"},
+                "content": {"content_type": "future_widget", "text": "Widget"}})
+        };
+        let mut briefing = fixture::text_message("system", "Invented briefing");
+        briefing["metadata"] = json!({"aggregate_result": {"messages": [
+            fixture::text_message("developer", "Not counted inside an excluded message"),
+        ]}});
+        let answer = json!({"author": {"role": "assistant"},
+        "content": {"content_type": "multimodal_text", "parts": ["Answer",
+            {"content_type": "future_part"},
+            {"content_type": "text", "text": "Hidden",
+                "metadata": {"is_visually_hidden_from_conversation": true}}]},
+        "metadata": {
+            "attachments": [{"id": "file_0b31", "name": "kept.txt"},
+                {"id": "file_0b32", "metadata": {"is_visually_hidden_from_conversation": true}}],
+            "aggregate_result": {"messages": [
+                fixture::text_message("system", "Excluded output"),
+                {"message_type": "stream", "text": "stdout"},
+                {"message_type": "table"},
+            ]},
+        }});
+        let shaped = json!({"author": {"role": "user"},
+            "content": {"content_type": "text", "parts": ["Question"]},
+            "metadata": {"content": {"content_type": "text"}, "attachments": [{"id": "file_0b33"}]}});
+        let import = imported(
+            directory.path(),
+            Export::new()
+                .json(
+                    "library_files.json",
+                    &json!([{"origination_thread_id": fixture::id(1), "file_id": "file_0b34"}]),
+                )
+                .stored("file_0b31-kept.txt", b"Kept")
+                .stored("file_0b32-hidden.txt", b"Hidden")
+                .stored("file_0b33-shaped.txt", b"Shaped")
+                .stored("file_0b34-library.txt", b"Library"),
+            Conversation::new(1, "Everything")
+                .node("briefing", Some("root"), briefing)
+                .node("u1", Some("briefing"), shaped)
+                .node("a1", Some("u1"), answer)
+                .node("w1", Some("a1"), widget("w1"))
+                .node("w2", Some("w1"), widget("w2"))
+                .build(),
+        )
+        .await;
+        let summary = import.history.summary();
+        let counted: Vec<(&str, u32)> = summary
+            .unsupported
+            .iter()
+            .map(|kind| (kind.content.as_str(), kind.count))
+            .collect();
+        assert_eq!(
+            counted,
+            [
+                ("attachment (hidden)", 1),
+                ("message future_widget", 2),
+                ("metadata (message-shaped)", 1),
+                ("output table", 1),
+                ("part future_part", 1),
+                ("part text (hidden)", 1),
+            ]
+        );
+        assert_eq!(
+            (
+                summary.excluded_messages,
+                summary.attachments,
+                summary.dropped_library_files,
+                summary.unreferenced_files
+            ),
+            (2, 1, 1, 3)
+        );
+        assert_eq!(import.unread().len(), 7);
+        assert_eq!(import.items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unsupported_labels_past_32_are_counted_as_other() {
+        let directory = tempfile::tempdir().unwrap();
+        let parts: Vec<Value> = (0..40)
+            .map(|index| json!({"content_type": format!("future_part_{index:02}")}))
+            .collect();
+        let import = imported(
+            directory.path(),
+            Export::new(),
+            Conversation::new(1, "Parts")
+                .node(
+                    "u1",
+                    Some("root"),
+                    json!({"author": {"role": "user"},
+                        "content": {"content_type": "multimodal_text", "parts": parts}}),
+                )
+                .build(),
+        )
+        .await;
+        let unsupported = &import.history.summary().unsupported;
+        assert_eq!(unsupported.len(), 33);
+        assert_eq!(unsupported[31].content, "part future_part_31");
+        assert_eq!(
+            unsupported[32],
+            ChatGptUnsupported {
+                content: "other".into(),
+                count: 8
+            }
+        );
     }
 
     #[tokio::test]
@@ -2127,11 +2261,17 @@ mod tests {
                 "kind",
                 Some("root"),
                 json!({"author": {"role": huge("r")},
+                    "content": {"content_type": "code", "text": "Widget"}}),
+            )
+            .node(
+                "widget",
+                Some("kind"),
+                json!({"id": huge("i"), "author": {"role": "assistant"},
                     "content": {"content_type": huge("c"), "text": "Widget"}}),
             )
             .node(
                 "id",
-                Some("kind"),
+                Some("widget"),
                 attachment(json!({"id": format!("file_{}", huge("a"))})),
             )
             .node(
@@ -2154,9 +2294,27 @@ mod tests {
         let (items, gaps) = read_all(&history, &fixture::id(1)).await;
         let ids: Vec<&str> = items.iter().map(|item| item.id.as_str()).collect();
         assert_eq!(ids, ["kind", "id", "name", "mime"]);
+        assert_eq!(items[0].kind, format!("{}:code", "r".repeat(64)));
         assert_eq!(items[3].assets[0].media_type, "image/png");
-        assert_eq!(gaps.len(), 1);
-        assert_eq!(gaps[0].item_id.as_deref(), Some("name"));
+        assert_eq!(gaps.len(), 3);
+        for unread in &gaps[..2] {
+            assert!(matches!(unread.code, HistoryGapCode::Unsupported));
+            assert!(unread.message.len() < 1024, "{}", unread.message.len());
+        }
+        assert_eq!(gaps[2].item_id.as_deref(), Some("name"));
+        assert_eq!(
+            history.summary().unsupported,
+            [
+                ChatGptUnsupported {
+                    content: "attachment (unreadable)".into(),
+                    count: 1
+                },
+                ChatGptUnsupported {
+                    content: format!("message {}", "c".repeat(64)),
+                    count: 1
+                }
+            ]
+        );
     }
 
     #[tokio::test]
