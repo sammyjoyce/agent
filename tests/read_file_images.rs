@@ -1,3 +1,5 @@
+#[path = "fixtures/executable.rs"]
+mod executable_fixture;
 #[path = "fixtures/fake_rex.rs"]
 mod fake_rex;
 
@@ -704,14 +706,17 @@ async fn a_registered_worker_serves_image_reads_from_its_own_host() {
         bin.join("rex"),
     )
     .unwrap();
-    let ssh = bin.join("ssh");
+    let relay = bin.join("relay.cjs");
     fs::write(
-        &ssh,
-        "#!/usr/bin/env node\nconst socket=require('node:net').connect(process.env.AGENT_TEST_COORDINATOR_SOCKET);\n\
+        &relay,
+        "const socket=require('node:net').connect(process.env.AGENT_TEST_COORDINATOR_SOCKET);\n\
          process.stdin.pipe(socket);socket.pipe(process.stdout);socket.on('close',()=>process.exit(0));\n",
     )
     .unwrap();
-    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    executable_fixture::write_executable(
+        &bin.join("ssh"),
+        "#!/bin/sh\nexec node \"$AGENT_TEST_SSH_RELAY\"\n",
+    );
     fs::write(
         files.join("config.toml"),
         "coordinator = \"synthetic-coordinator\"\n",
@@ -734,6 +739,7 @@ async fn a_registered_worker_serves_image_reads_from_its_own_host() {
         .env("AGENT_TEST_FAKE_REX", &bin)
         .env("AGENT_TEST_FAKE_REX_ORIGIN_SERVER", SERVER)
         .env("AGENT_TEST_COORDINATOR_SOCKET", files.join("agent.sock"))
+        .env("AGENT_TEST_SSH_RELAY", &relay)
         .env("REX_SERVER", SERVER)
         .env_remove("REX_CLIENT")
         .current_dir(&files)
