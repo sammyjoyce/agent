@@ -90,8 +90,10 @@ CHROME_GUEST_LAB=~/.chrome-guest-lab BEEP_BOOP=/nix/store/...-beep-boop-0.1.0 \
 Provisioning creates the VM, installs Chrome and Nix, copies the packages and
 loads the login agents. Install the Playwright extension once by hand in the
 guest's Chrome. Open its Chrome Web Store page over the guest's Screen Sharing
-and confirm Chrome's dialog. A managed policy cannot install it, because macOS
-clears that policy at boot and Chrome then removes the extension.
+and confirm Chrome's dialog. The lab first installed the extension with an
+`ExtensionInstallForcelist` policy that it wrote by hand. That policy did not
+survive a guest reboot, and Chrome then removed the extension. So the lab uses
+a one-time Chrome Web Store install instead.
 
 Build the runtime and install Chrome for Testing:
 
