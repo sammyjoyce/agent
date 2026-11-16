@@ -537,7 +537,9 @@ the window may be missing evidence: expired or evicted segments, dropped or
 unparseable receipts, a read that stopped early, or more than ten minutes with
 no receipt. The coordinator writes a `heartbeat` receipt every five minutes, so
 a stopped coordinator or a failed log writer appears as an `unwitnessed` gap
-instead of a quiet night. Task summaries are the text retained when the review
+instead of a quiet night. A machine that sleeps for more than ten minutes
+leaves the same gap. A gap never blocks a proposal. It blocks only the claim
+that the night was quiet. Task summaries are the text retained when the review
 was sealed. They are a snapshot, not a history of the window.
 
 A check runs with only `PATH`, `HOME`, `LANG` and `TMPDIR` in its environment,
