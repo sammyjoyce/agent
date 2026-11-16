@@ -21,6 +21,7 @@ import type { DreamsRequest } from "../src/generated/DreamsRequest.js";
 import type { HostCommand } from "../src/generated/HostCommand.js";
 import type { ScheduledOccurrence } from "../src/generated/ScheduledOccurrence.js";
 import { exampleJob, pump } from "./fixtures/background-runtime.js";
+import { runAdmitted } from "./fixtures/run-admitted.js";
 import { binding, openScheduled, scheduledOccurrence } from "./fixtures/scheduled-runtime.js";
 import { fixtureModel } from "./model.js";
 
@@ -110,7 +111,7 @@ test("a Dreams task refuses an attached worker, a child agent and any change to 
       instructions: "", model: fixtureModel, cwd: "/workspace/example" }, () => () => {}, [app.guidance]), confined);
     const agent = await app.tasks.createAgent(task.id, { id: "example-agent", title: "Example agent", outcome: "Run a command.",
       input: "Run a command.", inputId: "example-agent-input" });
-    await assert.rejects(app.tasks.runBackground(task.id, undefined, agent.id), confined);
+    await assert.rejects(runAdmitted(app.tasks, task.id, agent.id), confined);
     assert.equal(app.faux.state.callCount, 1, "Neither refused actor reached the model");
 
     const scheduler = { provider: "scheduled_jobs", account: "local", thread_id: "dreams" };
