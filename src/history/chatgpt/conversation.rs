@@ -30,10 +30,18 @@ const MAXIMUM_UNREAD_GAPS: usize = 32;
 pub(super) struct FileId(String);
 
 impl FileId {
-    /// Finds the id in a pointer (`sediment://file_…`, `file-service://file-…`), an
-    /// attachment id, or a stored member name (`file_…-photo.dat`).
     pub fn find(text: &str) -> Option<Self> {
-        let rest = text.rsplit("://").next().unwrap_or(text);
+        Self::leading(text.rsplit("://").next().unwrap_or(text))
+    }
+
+    pub fn from_pointer(pointer: &str) -> Option<Self> {
+        ["sediment://", "file-service://"]
+            .into_iter()
+            .find_map(|scheme| pointer.strip_prefix(scheme))
+            .and_then(Self::leading)
+    }
+
+    fn leading(rest: &str) -> Option<Self> {
         ["file_", "file-"].into_iter().find_map(|prefix| {
             let tail = rest.strip_prefix(prefix)?;
             let run: String = tail
@@ -620,7 +628,7 @@ impl Draft<'_> {
 
 impl Normalized {
     fn push(&mut self, conversation: &str, files: &dyn FileLookup, draft: Draft<'_>) -> String {
-        let text = without_citations(&draft.kept.text());
+        let text = draft.kept.text();
         let references = draft.references();
         let omitted = references.len().saturating_sub(MAXIMUM_REFERENCES);
         let considered: Vec<_> = references
@@ -771,23 +779,6 @@ fn media_type(name: &str) -> Option<String> {
         _ => return None,
     };
     Some(known.to_owned())
-}
-
-/// Drops citation markers (`U+E200 … U+E201`, payload included) and the highlight markers
-/// `U+E203`/`U+E204`, which only make sense to ChatGPT's own renderer.
-fn without_citations(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut citation = false;
-    for character in text.chars() {
-        match character {
-            '\u{E200}' => citation = true,
-            '\u{E201}' => citation = false,
-            '\u{E202}'..='\u{E204}' => {}
-            _ if citation => {}
-            _ => output.push(character),
-        }
-    }
-    output
 }
 
 fn digest(value: &Value) -> String {

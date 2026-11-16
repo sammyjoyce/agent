@@ -175,10 +175,7 @@ impl Reading {
 
 impl Kept {
     pub fn text(&self) -> String {
-        if let Some(markdown) = &self.fallback {
-            return markdown.replace("<escape>", "").replace("</escape>", "");
-        }
-        shown_text(&self.contributions)
+        stored_text(&self.contributions, self.fallback.as_deref())
     }
 
     pub fn files(&self) -> Vec<FileRef> {
@@ -209,13 +206,34 @@ impl Kept {
     }
 }
 
-fn shown_text(contributions: &[Contribution]) -> String {
-    contributions
-        .iter()
-        .filter_map(|contribution| contribution.text.as_deref())
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n")
+fn stored_text(contributions: &[Contribution], fallback: Option<&str>) -> String {
+    let text = match fallback {
+        Some(markdown) => markdown.replace("<escape>", "").replace("</escape>", ""),
+        None => contributions
+            .iter()
+            .filter_map(|contribution| contribution.text.as_deref())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    };
+    without_citations(&text)
+}
+
+/// Drops ChatGPT's private-use render markers: citations (`U+E200 … U+E201`, payload
+/// included) and the stray markers `U+E202` to `U+E204`.
+fn without_citations(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut citation = false;
+    for character in text.chars() {
+        match character {
+            '\u{E200}' => citation = true,
+            '\u{E201}' => citation = false,
+            '\u{E202}'..='\u{E204}' => {}
+            _ if citation => {}
+            _ => output.push(character),
+        }
+    }
+    output
 }
 
 pub(super) fn read(node: &str, message: &Value) -> Reading {
@@ -304,15 +322,15 @@ pub(super) fn read(node: &str, message: &Value) -> Reading {
         && contributions
             .iter()
             .all(|contribution| contribution.file.is_none());
-    let shown = shown_text(&contributions);
-    let mut extras = match flags {
-        Field::Read(_) => MetadataExtras::read(message, &shown, &mut reading.left_out),
+    let extras = match flags {
+        Field::Read(_) => MetadataExtras::read(
+            message,
+            &contributions,
+            text_stands_alone,
+            &mut reading.left_out,
+        ),
         Field::Absent | Field::Unreadable => MetadataExtras::default(),
     };
-    if extras.fallback.is_some() && !text_stands_alone {
-        extras.fallback = None;
-        reading.left_out.push(LeftOut::UnusedFallback);
-    }
     let recipient = recipient.value();
     let channel = channel.value();
     let part = |text: &str| text.chars().take(KIND_PART_CHARACTERS).collect::<String>();
@@ -633,7 +651,7 @@ fn contribution(part: Part) -> Result<Contribution, LeftOut> {
         text => text.value(),
     };
     let file = match pointer {
-        Some(pointer) => Some(FileId::find(&pointer).ok_or_else(unsupported)?),
+        Some(pointer) => Some(FileId::from_pointer(&pointer).ok_or_else(unsupported)?),
         None => None,
     };
     Ok(Contribution { text, file })
@@ -658,9 +676,16 @@ struct Metadata {
     attachments: Field<Vec<Record<Attachment>>>,
     aggregate_result: Field<Record<Aggregate>>,
     model_dil_v2: Field<Record<Widget>>,
-    author: Option<IgnoredAny>,
-    content: Option<IgnoredAny>,
-    metadata: Option<IgnoredAny>,
+    #[serde(default, deserialize_with = "present")]
+    author: bool,
+    #[serde(default, deserialize_with = "present")]
+    content: bool,
+    #[serde(default, deserialize_with = "present")]
+    metadata: bool,
+}
+
+fn present<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    IgnoredAny::deserialize(deserializer).map(|_| true)
 }
 
 #[derive(Deserialize)]
@@ -699,14 +724,19 @@ struct Widget {
 }
 
 impl MetadataExtras {
-    fn read(message: &Value, shown: &str, left_out: &mut Vec<LeftOut>) -> Self {
+    fn read(
+        message: &Value,
+        contributions: &[Contribution],
+        text_stands_alone: bool,
+        left_out: &mut Vec<LeftOut>,
+    ) -> Self {
         let Ok(Record(MetadataOf {
             metadata: Field::Read(Record(metadata)),
         })) = Record::<MetadataOf>::deserialize(message)
         else {
             return Self::default();
         };
-        if metadata.author.is_some() || metadata.content.is_some() || metadata.metadata.is_some() {
+        if metadata.author || metadata.content || metadata.metadata {
             left_out.push(LeftOut::MessageShapedMetadata);
             return Self::default();
         }
@@ -737,6 +767,16 @@ impl MetadataExtras {
             }
         }
         match metadata
+            .model_dil_v2
+            .then(|Record(widget)| widget.fallback_markdown)
+        {
+            Field::Absent => {}
+            Field::Read(markdown) if text_stands_alone => extras.fallback = Some(markdown),
+            Field::Read(_) => left_out.push(LeftOut::UnusedFallback),
+            Field::Unreadable => left_out.push(LeftOut::UnreadableFallback),
+        }
+        let stored = stored_text(contributions, extras.fallback.as_deref());
+        match metadata
             .aggregate_result
             .then(|Record(aggregate)| aggregate.messages)
         {
@@ -744,20 +784,12 @@ impl MetadataExtras {
             Field::Unreadable => left_out.push(LeftOut::UnreadableOutputs),
             Field::Read(entries) => {
                 for Record(entry) in entries {
-                    match read_aggregate_output(entry, shown) {
+                    match read_aggregate_output(entry, &stored) {
                         Ok(output) => extras.outputs.push(output),
                         Err(entry) => left_out.push(entry),
                     }
                 }
             }
-        }
-        match metadata
-            .model_dil_v2
-            .then(|Record(widget)| widget.fallback_markdown)
-        {
-            Field::Absent => {}
-            Field::Read(markdown) => extras.fallback = Some(markdown),
-            Field::Unreadable => left_out.push(LeftOut::UnreadableFallback),
         }
         extras
     }
@@ -765,7 +797,7 @@ impl MetadataExtras {
 
 fn read_aggregate_output(
     entry: AggregateOutputEntry,
-    shown: &str,
+    stored: &str,
 ) -> Result<AggregateOutput, LeftOut> {
     let id = entry.id.value();
     let role = entry.author.then(|Record(author)| author.role);
@@ -784,18 +816,20 @@ fn read_aggregate_output(
             .image_url
             .value()
             .as_deref()
-            .and_then(FileId::find)
+            .and_then(FileId::from_pointer)
             .map(|file| AggregateOutput::Kept {
                 id,
                 file: Some(file),
             })
             .ok_or(LeftOut::Output(name)),
         Some("stream") => match entry.text {
-            Field::Unreadable => Err(LeftOut::Output(format!("{name} (unreadable)"))),
-            Field::Read(text) if !shown.contains(text.trim()) => {
-                Err(LeftOut::Output(format!("{name} (text not in the message)")))
+            Field::Read(text) if stored.contains(text.trim()) => {
+                Ok(AggregateOutput::Kept { id, file: None })
             }
-            Field::Read(_) | Field::Absent => Ok(AggregateOutput::Kept { id, file: None }),
+            Field::Read(_) => Err(LeftOut::Output(format!("{name} (text not in the message)"))),
+            Field::Absent | Field::Unreadable => {
+                Err(LeftOut::Output(format!("{name} (unreadable)")))
+            }
         },
         _ => Err(LeftOut::Output(name)),
     }
