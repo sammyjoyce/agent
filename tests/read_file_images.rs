@@ -23,7 +23,7 @@ use agent_cli::{
         InputMode, RuntimeCommand, RuntimeEventKind, TaskId, WorkerLaunch,
     },
     rex::RexClient,
-    runtime::{FrameReader, Runtime, RuntimeCall},
+    runtime::{FrameReader, OwnerClaim, Runtime, RuntimeCall},
 };
 use base64::Engine;
 use serde_json::{Value, json};
@@ -199,7 +199,9 @@ impl Coordinator {
             },
             background: None,
         };
-        let runtime = Arc::new(Runtime::start(&script, files).unwrap());
+        let runtime = Arc::new(
+            Runtime::start(&script, OwnerClaim::acquire(files, &script, None).unwrap()).unwrap(),
+        );
         for command in [
             RuntimeCommand::ConfigureCoordinator {
                 bootstrap: bootstrap.clone(),

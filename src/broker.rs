@@ -557,7 +557,7 @@ mod tests {
             AgentNode, HostCommand, HostResult, ImageMediaType, ImageRead, RuntimeCommand,
             RuntimeEventKind, WorkerLaunch,
         },
-        runtime::{FrameReader, Runtime},
+        runtime::{FrameReader, OwnerClaim, Runtime},
         service::write_frame,
     };
     use std::{fs, sync::Arc, time::Duration};
@@ -692,7 +692,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("fixture.mjs");
         fs::write(&script, FIXTURE).unwrap();
-        let runtime = Runtime::start(&script, directory.path()).unwrap();
+        let runtime = Runtime::start(
+            &script,
+            OwnerClaim::acquire(directory.path(), &script, None).unwrap(),
+        )
+        .unwrap();
         (directory, Arc::new(runtime))
     }
     fn effect(id: &str, command: HostCommand) -> HostCommand {

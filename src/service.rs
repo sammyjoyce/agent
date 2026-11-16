@@ -22,7 +22,7 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::runtime::{FrameReader, Runtime, ShutdownSignal, StartRecord};
+use crate::runtime::{FrameReader, OwnerClaim, Runtime, ShutdownSignal, StartRecord};
 
 const SOCKET_NAME: &str = "agent.sock";
 
@@ -55,7 +55,7 @@ pub async fn relay(stream: UnixStream) -> Result<()> {
 
 pub async fn serve_configured(
     script: &Path,
-    state: &Path,
+    claim: OwnerClaim,
     port: Option<u16>,
     policy: crate::tailnet::PeerPolicy,
     daemon: crate::tailnet::Daemon,
@@ -64,7 +64,7 @@ pub async fn serve_configured(
 ) -> Result<()> {
     serve_with_transport(
         script,
-        state,
+        claim,
         port,
         policy,
         daemon,
@@ -100,7 +100,7 @@ async fn serve_until(
 ) -> Result<()> {
     serve_with_transport(
         script,
-        state,
+        OwnerClaim::acquire(state, script, None)?,
         None,
         crate::tailnet::PeerPolicy::new(&[], &[])?,
         crate::tailnet::Daemon::default(),
@@ -114,7 +114,7 @@ async fn serve_until(
 #[allow(clippy::too_many_arguments)]
 async fn serve_with_transport(
     script: &Path,
-    state: &Path,
+    claim: OwnerClaim,
     port: Option<u16>,
     policy: crate::tailnet::PeerPolicy,
     daemon: crate::tailnet::Daemon,
@@ -123,7 +123,7 @@ async fn serve_with_transport(
     shutdown: impl Future<Output = Result<ShutdownReason>>,
 ) -> Result<()> {
     tokio::pin!(shutdown);
-    // Claim the writer before deciding an old socket is stale.
+    let state = &claim.state().to_owned();
     let background = bootstrap
         .as_ref()
         .and_then(|value| value.background.clone());
@@ -135,7 +135,7 @@ async fn serve_with_transport(
         .transpose()?;
     let owner = Runtime::start_with_notifications(
         script,
-        state,
+        claim,
         config.as_ref().and_then(|config| config.apns.as_ref()),
         StartRecord::for_config(config.as_ref()),
     )?;
@@ -651,7 +651,7 @@ mod tests {
     mod scrawl_feedback;
     mod startup;
     use crate::protocol::{AuthStatus, HostResult, InputMode, RuntimeCommand, RuntimeEventKind};
-    use crate::runtime::{FrameReader, Runtime, ShutdownSignal};
+    use crate::runtime::{FrameReader, OwnerClaim, Runtime, ShutdownSignal};
     use crate::service::{
         SOCKET_NAME, ShutdownReason, SocketOwner, authenticated, connect, serve_until, write_frame,
     };
@@ -1756,7 +1756,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("fixture.mjs");
         fs::write(&script, FIXTURE).unwrap();
-        let runtime = Arc::new(Runtime::start(&script, directory.path()).unwrap());
+        let runtime = Arc::new(
+            Runtime::start(
+                &script,
+                OwnerClaim::acquire(directory.path(), &script, None).unwrap(),
+            )
+            .unwrap(),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut denied_client = TcpStream::connect(listener.local_addr().unwrap())
             .await

@@ -12,7 +12,7 @@ use std::{
     io::{ErrorKind, IsTerminal},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitCode, Stdio},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -23,6 +23,7 @@ use agent_cli::{
     config::{self, ClientConfig},
     context::ContextStore,
     discovery,
+    failover::OWNER_FENCED_EXIT,
     feedback::FeedbackContext,
     host,
     host::effects::{Admission, Capacity, HostEffects},
@@ -35,7 +36,10 @@ use agent_cli::{
         TranscriptClassification, WorkerLaunch, WorkerRef,
     },
     rex::{BlockId, RexClient, SessionId},
-    runtime::{FrameReader, Wire, decode_coordinator_event, lifecycle::RequestLifecycle},
+    runtime::{
+        FrameReader, OwnerClaim, OwnerFenced, Wire, decode_coordinator_event,
+        lifecycle::RequestLifecycle,
+    },
     scrawl_feedback, service,
     tui::attachments::ComposerInput,
     tui::{Tui, TuiHandle, TuiInfo, TuiInput},
@@ -479,7 +483,17 @@ fn task_message_sender() -> Result<Option<String>> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<ExitCode> {
+    match run().await {
+        Err(error) if error.downcast_ref::<OwnerFenced>().is_some() => {
+            eprintln!("Error: {error:?}");
+            Ok(ExitCode::from(OWNER_FENCED_EXIT))
+        }
+        result => result.map(|()| ExitCode::SUCCESS),
+    }
+}
+
+async fn run() -> Result<()> {
     let mut arguments = Arguments::parse();
     #[allow(clippy::disallowed_methods)]
     let rex = RexClient::for_process(arguments.rex_server.as_deref())?;
@@ -693,6 +707,8 @@ async fn main() -> Result<()> {
             );
             return worker_service(client, 300).await;
         }
+        // A host that does not own the coordinator must set up nothing, not even Messages.
+        let claim = OwnerClaim::acquire(&directory, &script, config.failover.as_ref())?;
         if !no_sources {
             configure_messages(&config.sources).await;
         }
@@ -746,7 +762,7 @@ async fn main() -> Result<()> {
         };
         return service::serve_configured(
             &script,
-            &directory,
+            claim,
             (!local_only).then_some(tailnet_port),
             policy,
             daemon,
