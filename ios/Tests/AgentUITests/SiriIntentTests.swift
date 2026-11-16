@@ -694,7 +694,8 @@
       _ name: String, in app: XCUIApplication, _ body: (XCUIApplication) throws -> Void
     ) throws {
       app.buttons["Connection"].tap()
-      let row = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", name)).firstMatch
+      let row = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "\(name), "))
+        .firstMatch
       XCTAssertTrue(row.waitForExistence(timeout: 10), app.debugDescription)
       row.tap()
       XCTAssertTrue(app.navigationBars[name].waitForExistence(timeout: 10), app.debugDescription)
