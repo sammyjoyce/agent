@@ -17,7 +17,6 @@ export const entry = (epoch: number, at: number, digest: string): LogEntry =>
 
 export type Outcome = "accepted" | AuthorityRefusal;
 
-/** The log every enrolled cell state holds: entries 1 and 2. */
 export const cellLog = { 1: digests[0], 2: digests[1] } as const;
 export const cellCheckpoint = { through: 0, manifest };
 /** The enrolled states each cell runs against, in the order of the table's columns. */
