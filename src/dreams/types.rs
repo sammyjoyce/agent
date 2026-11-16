@@ -521,6 +521,16 @@ impl Outcome {
     }
 }
 
+/// The record `outcome.json` holds. The digest of the sealed review record and
+/// its evidence binds every outcome, so approving a proposal approves the
+/// evidence it cites and a changed review refuses an abstention too.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedOutcome {
+    pub review_sha256: ContentDigest,
+    #[serde(flatten)]
+    pub outcome: Outcome,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Abstention {
@@ -572,9 +582,6 @@ pub struct Proposal {
     pub files: Vec<String>,
     pub changes: Vec<ProposedFile>,
     pub evidence: Vec<EvidenceId>,
-    /// Digest of the sealed review record and its evidence, so that approving
-    /// this outcome approves the evidence that the review showed.
-    pub review_sha256: ContentDigest,
     pub rationale: UntrustedText,
     pub before: Vec<CheckResult>,
     pub after: Vec<CheckResult>,

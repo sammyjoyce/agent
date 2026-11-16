@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::dreams::{
     CheckResult, ContentDigest, EvidenceItem, MAX_ATTEMPTS, Outcome, Review, Revision, RunId,
+    SealedOutcome,
 };
 
 const STALE_STAGING: Duration = Duration::from_secs(60 * 60);
@@ -55,6 +56,8 @@ pub struct AppliedRecord {
 pub struct RunView {
     pub id: RunId,
     pub review: Review,
+    /// The digest of the review record and its evidence as this view read them.
+    pub review_sha256: ContentDigest,
     pub outcome: Option<Outcome>,
     pub outcome_sha256: Option<ContentDigest>,
     pub attempts_used: u8,
@@ -144,7 +147,9 @@ impl DreamsStore {
         for entry in fs::read_dir(self.root.join(RUNS_DIRECTORY))? {
             let name = entry?.file_name();
             if let Some(run) = name.to_str().and_then(|name| RunId::parse(name).ok())
-                && let Some(view) = self.read(&run)?
+                && let Some(view) = self
+                    .read(&run)
+                    .with_context(|| format!("Dreams run {run} is unreadable"))?
             {
                 runs.push(view);
             }
@@ -174,12 +179,13 @@ impl DreamsStore {
         };
         let outcome = sealed
             .as_deref()
-            .map(serde_json::from_slice::<Outcome>)
+            .map(serde_json::from_slice::<SealedOutcome>)
             .transpose()
             .context("Dreams outcome is unreadable")?;
-        if let Some(Outcome::Proposed(proposal)) = &outcome {
+        let review_sha256 = self.review_digest(run)?;
+        if let Some(outcome) = &outcome {
             ensure!(
-                self.review_digest(run)? == proposal.review_sha256,
+                review_sha256 == outcome.review_sha256,
                 "Dreams review changed since it was sealed"
             );
         }
@@ -191,7 +197,8 @@ impl DreamsStore {
         Ok(Some(RunView {
             id: run.clone(),
             review,
-            outcome,
+            review_sha256,
+            outcome: outcome.map(|sealed| sealed.outcome),
             outcome_sha256: sealed.as_deref().map(ContentDigest::of),
             attempts_used,
         }))
@@ -325,8 +332,15 @@ impl DreamsStore {
         Ok(None)
     }
 
-    pub(crate) fn seal_outcome(&self, run: &RunId, outcome: &Outcome) -> Result<Outcome> {
-        self.seal_once(run, OUTCOME_FILE, outcome)
+    /// Seals the first outcome of a run with the review digest of the view it
+    /// decided from.
+    pub(crate) fn seal_outcome(&self, view: &RunView, outcome: &Outcome) -> Result<Outcome> {
+        let sealed = SealedOutcome {
+            review_sha256: view.review_sha256.clone(),
+            outcome: outcome.clone(),
+        };
+        self.seal_once(&view.id, OUTCOME_FILE, &sealed)
+            .map(|sealed| sealed.outcome)
             .context("Could not seal the Dreams outcome")
     }
 
@@ -445,10 +459,10 @@ mod tests {
         assert!(view.outcome.is_none() && view.outcome_sha256.is_none());
 
         let won = store
-            .seal_outcome(&run, &abstained(DreamsAbstainReason::Quiet))
+            .seal_outcome(&view, &abstained(DreamsAbstainReason::Quiet))
             .unwrap();
         let lost = store
-            .seal_outcome(&run, &abstained(DreamsAbstainReason::NoSupportedChange))
+            .seal_outcome(&view, &abstained(DreamsAbstainReason::NoSupportedChange))
             .unwrap();
         assert_eq!(won, abstained(DreamsAbstainReason::Quiet));
         assert_eq!(lost, won, "A later decision returns the sealed one");

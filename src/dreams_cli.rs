@@ -9,7 +9,7 @@ use agent_cli::{
     dreams::{
         Abstention, CheckPhase, ContentDigest, DreamsPolicy, DreamsStore, EvidenceId, EvidenceItem,
         FileChange, MAX_ATTEMPTS, Outcome, Proposal, ProposedFile, Review, Revision, RunId,
-        RunView, check_lines, escape_controls, format_utc, quote, review_summary,
+        RunView, SealedOutcome, check_lines, escape_controls, format_utc, quote, review_summary,
         workspace::{Git, plain_changes},
     },
 };
@@ -429,7 +429,7 @@ struct RunReport<'a> {
     run: &'a RunId,
     review: &'a Review,
     evidence: &'a [EvidenceItem],
-    outcome: Option<&'a Outcome>,
+    outcome: Option<&'a SealedOutcome>,
     outcome_sha256: Option<&'a ContentDigest>,
     status: Option<&'a ProposalStatus>,
     patch: Option<&'a str>,
@@ -524,7 +524,7 @@ fn render(report: &RunReport) -> String {
         review.repository.display(),
         review.policy_digest.short()
     ));
-    match report.outcome {
+    match report.outcome.map(|sealed| &sealed.outcome) {
         None => lines.push(format!(
             "Outcome: undecided ({} of {MAX_ATTEMPTS} attempts used)",
             report.attempts_used
@@ -825,11 +825,15 @@ pub async fn run(
             let (status, patch) = status_of(&store, policy.as_ref(), &view).await?.unzip();
             let patch = patch.map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
             let evidence = store.evidence(&run)?;
+            let sealed = view.outcome.clone().map(|outcome| SealedOutcome {
+                review_sha256: view.review_sha256.clone(),
+                outcome,
+            });
             let report = RunReport {
                 run: &view.id,
                 review: &view.review,
                 evidence: &evidence,
-                outcome: view.outcome.as_ref(),
+                outcome: sealed.as_ref(),
                 outcome_sha256: view.outcome_sha256.as_ref(),
                 status: status.as_ref(),
                 patch: patch.as_deref(),
@@ -867,7 +871,7 @@ mod tests {
     use agent_cli::{
         dreams::{
             Dreams, DreamsCheckFile, DreamsFileEdit, DreamsPolicy, DreamsPolicyFile, DreamsRequest,
-            DreamsStore, DreamsTaskSummary, ProtectedPaths, RunId,
+            DreamsStore, DreamsTaskSummary, ProtectedPaths, RunId, SealedOutcome,
         },
         protocol::HostResult,
     };
@@ -991,11 +995,15 @@ mod tests {
             ProposalStatus::Pending { interrupted: true }
         ));
         let evidence = store.evidence(&run).unwrap();
+        let sealed = view.outcome.clone().map(|outcome| SealedOutcome {
+            review_sha256: view.review_sha256.clone(),
+            outcome,
+        });
         let shown = render(&RunReport {
             run: &view.id,
             review: &view.review,
             evidence: &evidence,
-            outcome: view.outcome.as_ref(),
+            outcome: sealed.as_ref(),
             outcome_sha256: view.outcome_sha256.as_ref(),
             status: Some(&status),
             patch: Some("+new\n"),

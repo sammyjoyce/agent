@@ -25,7 +25,7 @@ pub use types::{
     Abstention, CheckResult, ContentDigest, Coverage, DreamsAbstainReason, DreamsFileEdit,
     DreamsReply, DreamsRequest, DreamsTaskSummary, EvidenceId, FileChange, Gap, GapCause, Interval,
     Outcome, PolicyDigest, Proposal, ProposedFile, ReceiptCoverage, Review, Revision, RunId,
-    SummarySnapshot, UntrustedText, count, format_utc,
+    SealedOutcome, SummarySnapshot, UntrustedText, count, format_utc,
 };
 
 use crate::{protocol::HostResult, runtime::diagnostics};
@@ -335,7 +335,7 @@ impl Dreams {
             ));
         }
         let outcome = self.store.seal_outcome(
-            &run,
+            &view,
             &Outcome::Abstained(Abstention::Chosen {
                 reason,
                 note: UntrustedText::bounded(note, MAX_NOTE_CHARS),
@@ -366,7 +366,7 @@ impl Dreams {
         let Some((attempt, directory)) = self.store.allocate_attempt(&run)? else {
             return Ok(Self::decided(
                 &run,
-                &self.store.seal_outcome(&run, &exhausted)?,
+                &self.store.seal_outcome(&view, &exhausted)?,
             ));
         };
         let draft = Draft {
@@ -382,7 +382,7 @@ impl Dreams {
                 DreamsStore::write_verdict(&directory, Verdict::Accepted)?;
                 let outcome = self
                     .store
-                    .seal_outcome(&run, &Outcome::Proposed(Box::new(proposal)))?;
+                    .seal_outcome(&view, &Outcome::Proposed(Box::new(proposal)))?;
                 return Ok(Self::decided(&run, &outcome));
             }
             Err(AttemptError::HostFailed(error)) => return Err(error),
@@ -403,7 +403,7 @@ impl Dreams {
         if attempt < MAX_ATTEMPTS {
             return Ok(Self::reply(&run, false, lines.join("\n")));
         }
-        let outcome = self.store.seal_outcome(&run, &exhausted)?;
+        let outcome = self.store.seal_outcome(&view, &exhausted)?;
         lines.push(outcome.sealed_line(&run));
         Ok(Self::reply(&run, true, lines.join("\n")))
     }
@@ -484,7 +484,6 @@ impl Dreams {
                 .collect(),
             changes: patch.changes,
             evidence,
-            review_sha256: self.store.review_digest(&view.id)?,
             rationale: UntrustedText::bounded(draft.rationale, MAX_RATIONALE_CHARS),
             before: review.before.clone(),
             after,
