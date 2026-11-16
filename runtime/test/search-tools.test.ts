@@ -15,7 +15,7 @@ import type { HistoryItem } from "../src/generated/HistoryItem.js";
 import type { HistoryGap } from "../src/generated/HistoryGap.js";
 import type { RuntimeEvent } from "../src/generated/RuntimeEvent.js";
 import { HistoryStore, ImportedItemEntry } from "../src/history.js";
-import { CodexImporter } from "../src/importer.js";
+import { HistoryImports } from "../src/importer.js";
 import { ConversationModels, DEFAULT_MODEL } from "../src/models.js";
 import { Retrieval } from "../src/retrieval.js";
 import { TaskStore, type HostCall } from "../src/tasks.js";
@@ -202,7 +202,7 @@ test("main and worker search retain fresh matching tasks while an import fills t
   const history = new HistoryStore(session); const tasks = new TaskStore(session, new ConversationModels(models)); tasks.useHistory(history);
   const executions = new Executions(), tools = createAppTools(tasks, executions); registry.install(tools.main); registry.install(tools.worker);
   const retrieval = new Retrieval(session, history, tasks, join(directory, "search.sqlite"));
-  const importer = new CodexImporter(session, history, join(directory, "assets"));
+  const importer = new HistoryImports(session, history, join(directory, "assets"));
   const node: AgentNode = { host_id: "fixture-source", name: "Desktop", rex_server: "https://desktop.example.test", coordinator: null,
     agent_program: "agent", home_directory: "/example/home", launch: { state_dir: null, runtime: null, config: null, instructions: null, model: null } };
   const query = "connector decisions";
@@ -224,7 +224,7 @@ test("main and worker search retain fresh matching tasks while an import fills t
     const old = await retrieval.search(query, [], 8, call, true); assert.equal(old.candidates.length, 8);
     const fresh = await tasks.create({ title: "Connector decisions", outcome: "Continue the connector decision audit", model: DEFAULT_MODEL });
     const unrelated = await tasks.create({ title: "Unrelated transport repair", outcome: "Fix a bicycle tire", model: DEFAULT_MODEL });
-    importing = importer.run([node], [node.host_id], [], call, () => {}, async () => { indexed(); await gate; });
+    importing = importer.codex([node], [node.host_id], [], call, () => {}, async () => { indexed(); await gate; });
     await began; assert.equal(importer.isRunning(), true);
     const root = await session.root(BACKGROUND_CONTEXT);
     for (const role of ["main", "worker"]) {
@@ -242,7 +242,7 @@ test("main and worker search retain fresh matching tasks while an import fills t
         assert.ok(found.matches.some((match: unknown) => match !== null && typeof match === "object" && "entry_ids" in match && Array.isArray(match.entry_ids) && match.entry_ids.length > 0),
           "Historical originals must remain available beside live task metadata");
         assert.ok(found.matches.every((match: unknown) => match !== null && typeof match === "object" && "title" in match && match.title !== "Unrelated transport repair"));
-        assert.ok("gaps" in found); assert.deepEqual(found.gaps, ["Codex history import and indexing are in progress"]);
+        assert.ok("gaps" in found); assert.deepEqual(found.gaps, ["History import and indexing are in progress"]);
         const exact = await invoke(session, conversation, { type: "toolCall", id: "exact-search-" + role, name: "search_tasks",
           arguments: { query, sources: [{ provider: "task_outcomes", account: "local", thread_id: unrelated.id }] } });
         assert.ok(exact !== null && typeof exact === "object" && "matches" in exact && Array.isArray(exact.matches));
