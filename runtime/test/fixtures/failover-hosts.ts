@@ -218,6 +218,16 @@ export async function ownerActivity(owner: Host, notes: readonly string[], files
   return epoch;
 }
 
+/** An enrolled owner that has logged notes and a file, and a standby that joined at the checkpoint and has not followed. */
+export async function replicatedPair(world: World, urls: { standby?: string } = {}) {
+  const coordinator = world.coordinator(), owner = await world.host(coordinator, HOLDERS[0]), standby = await world.host(coordinator, HOLDERS[1], urls.standby);
+  await owner.create();
+  await owner.receipt<EnrolledReceipt>("enroll");
+  await standby.receipt<JoinedReceipt>("join", coordinator);
+  const epoch = await ownerActivity(owner, ["first", "second"], { "feedback/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.json": "Invented feedback bundle" });
+  return { coordinator, owner, standby, epoch, head: (await owner.authorityState()).head };
+}
+
 /** The bytes of every replicated file of a state directory, by path. */
 export async function replicatedFiles(state: string): Promise<Map<string, string>> {
   const files = new Map<string, string>();
