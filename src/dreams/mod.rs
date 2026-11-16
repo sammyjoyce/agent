@@ -1000,16 +1000,25 @@ mod tests {
         }
     }
 
-    async fn overflow(night: &Night, sender: &mut diagnostics::Diagnostics, records: u32) -> usize {
-        let directory = night.dreams.state.join("diagnostics");
+    fn held_writer_lock(night: &Night) -> fs::File {
         let lock = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(directory.join("writer.lock"))
+            .open(night.dreams.state.join("diagnostics/writer.lock"))
             .unwrap();
         fs2::FileExt::lock_exclusive(&lock).unwrap();
+        lock
+    }
+
+    async fn overflow(
+        night: &Night,
+        lock: fs::File,
+        sender: &mut diagnostics::Diagnostics,
+        records: u32,
+    ) -> usize {
+        let directory = night.dreams.state.join("diagnostics");
         let trace = diagnostics::Trace::unowned();
         for id in 1..=records {
             sender.record(id, &trace, diagnostics::Event::RequestReceived);
@@ -1044,14 +1053,7 @@ mod tests {
             let night = Night::new();
             night.seed_receipts("");
             let directory = night.dreams.state.join("diagnostics");
-            let lock = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(directory.join("writer.lock"))
-                .unwrap();
-            fs2::FileExt::lock_exclusive(&lock).unwrap();
+            let lock = held_writer_lock(&night);
             let (mut actor, _) = diagnostics::Diagnostics::start(&night.dreams.state);
             let trace = diagnostics::Trace::unowned();
             for id in 1..=300 {
@@ -1110,11 +1112,13 @@ mod tests {
         ] {
             let night = Night::new();
             night.seed_receipts("");
+            let lock = held_writer_lock(&night);
             let (mut actor, _) = diagnostics::Diagnostics::start(&night.dreams.state);
             let mut service = actor.fork();
             let sent = 400;
             let written = overflow(
                 &night,
+                lock,
                 if dropping_fork {
                     &mut service
                 } else {
