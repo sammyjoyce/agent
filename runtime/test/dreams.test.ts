@@ -13,16 +13,19 @@ import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import { defineExtension, defineTool, ProviderDoc } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
+import { BackgroundScheduler } from "../src/background.js";
 import { createDreamsTools, createDreamsToolset, DREAMS_TOOL_NAMES, isDreamsTask } from "../src/dreams.js";
 import { HistoryStore } from "../src/history.js";
 import { createInputOrigins } from "../src/input_origin.js";
-import { runScheduled } from "../src/scheduled.js";
+import { openJobActor, runScheduled } from "../src/scheduled.js";
 import { TaskError } from "../src/tasks.js";
 import type { DreamsRequest } from "../src/generated/DreamsRequest.js";
 import type { HistoryImportBatch } from "../src/generated/HistoryImportBatch.js";
 import type { HostCommand } from "../src/generated/HostCommand.js";
+import type { JobRunReceipt } from "../src/generated/JobRunReceipt.js";
 import type { ScheduledOccurrence } from "../src/generated/ScheduledOccurrence.js";
-import { exampleJob, pump } from "./fixtures/background-runtime.js";
+import type { TaskRecord } from "../src/generated/TaskRecord.js";
+import { exampleJob, planned, pump } from "./fixtures/background-runtime.js";
 import { binding, openScheduled, scheduledOccurrence } from "./fixtures/scheduled-runtime.js";
 import { fixtureModel } from "./model.js";
 
@@ -170,6 +173,79 @@ test("only the scheduler sends input to a Dreams task: main, a task, a native cl
     assert.deepEqual(after.agents, []);
     assert.equal(app.offered.length, 1, "Only the scheduled turn reached the Dreams model");
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+type ScheduledApp = Awaited<ReturnType<typeof openScheduled>>;
+function jobScheduler(app: ScheduledApp) {
+  return new BackgroundScheduler(app.session, app.registry, app.tasks, {
+    plan: async (cadence, after, now) => planned(cadence, after, now), refreshSources: async () => {}, triageSources: async () => {},
+    collectResources: async () => {}, indexHistory: async () => {},
+    jobActor: (job) => openJobActor(job, app.tasks), runJob: (occurrence, signal, actor) => runScheduled(occurrence, signal, app, actor),
+  });
+}
+async function submissionStatus(app: ScheduledApp, taskId: string, requestId: string) {
+  const conversation = await app.tasks.conversation((await app.tasks.get(taskId)).conversation_id);
+  return (await app.session.commit((tx) => tx.submissionByRequest(conversation.id, requestId), BACKGROUND_CONTEXT))?.status;
+}
+async function finished(app: ScheduledApp, scheduler: BackgroundScheduler, receipt: JobRunReceipt) {
+  await pump(async () => await submissionStatus(app, receipt.task_id, "manual:" + receipt.request_id) === "done");
+  await pump(async () => (await scheduler.status()).pending === 0 && (await app.tasks.list()).every((task) => !app.tasks.isRunning(task.id)));
+}
+
+test("a job named dreams from before the upgrade never runs its saved input on the Dreams model, and Dreams starts in a new conversation", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-dreams-"));
+  const ordinary = { ...dreamsOccurrence.job, revision: "main-era", prompt: "EXAMPLE_MAIN_ERA_PROMPT Summarize the example journal." };
+  const mainEra = async (): Promise<TaskRecord> => { const before = await openScheduled(directory); try {
+    const scheduler = jobScheduler(before);
+    await scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: [ordinary] });
+    before.faux.setResponses([() => fauxAssistantMessage("EXAMPLE_MAIN_ERA_ANSWER The example journal is summarized.")]);
+    const receipt = await scheduler.runJob({ type: "run_job", job_id: ordinary.id, schedule_id: null, request_id: "main-era" });
+    await finished(before, scheduler, receipt);
+    await before.tasks.enqueue(receipt.task_id, "EXAMPLE_SAVED_FOLLOW_UP Rewrite the example guidance.", "example-saved-follow-up");
+    const old = await before.tasks.get(receipt.task_id);
+    assert.equal(isDreamsTask(old), true);
+    assert.deepEqual(old.pending.map((input) => input.id), ["example-saved-follow-up"]);
+    return old;
+  } finally { await before.close(); } };
+  try {
+    const old = await mainEra();
+    const app = await openDreams(directory);
+    try {
+      const seen: string[] = [];
+      app.scripted(...Array.from({ length: 4 }, (): FauxResponseFactory => (context) => {
+        seen.push(JSON.stringify(context.messages)); return fauxAssistantMessage("Dreams reviewed the night.");
+      }));
+      await app.tasks.resumeActors(); await app.settled();
+      assert.equal(app.faux.state.callCount, 0, "The saved main-era input reached the Dreams model");
+      const refused = await app.tasks.get(old.id);
+      assert.deepEqual(refused.pending, [], "The saved input is withdrawn");
+      assert.equal(await submissionStatus(app, old.id, "example-saved-follow-up"), "unanswered");
+      const outcomes = await app.sources.events({ provider: "task_outcomes", thread_id: old.id });
+      const latest = outcomes[0]?.outcome?.state;
+      assert.ok(latest?.state === "failed", "The refusal is the task's latest outcome");
+      assert.match(latest.reason, /held work before Dreams reserved its job id/);
+      await app.tasks.resumeActors(); await app.settled();
+      assert.equal((await app.sources.events({ provider: "task_outcomes", thread_id: old.id })).length, outcomes.length, "A second resume finds no work");
+      assert.equal(app.faux.state.callCount, 0);
+
+      const scheduler = jobScheduler(app);
+      await scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: [dreamsOccurrence.job] });
+      const first = await scheduler.runJob({ type: "run_job", job_id: "dreams", schedule_id: null, request_id: "first-night" });
+      assert.notEqual(first.task_id, old.id, "Dreams never adopts the main-era task");
+      await finished(app, scheduler, first);
+      const fresh = await app.tasks.get(first.task_id);
+      assert.equal(isDreamsTask(fresh), true);
+      assert.notEqual(fresh.conversation_id, old.conversation_id);
+      const next = await scheduler.runJob({ type: "run_job", job_id: "dreams", schedule_id: null, request_id: "next-night" });
+      assert.equal(next.task_id, fresh.id, "Later nights keep the new task");
+      await finished(app, scheduler, next);
+      assert.equal(app.offered.length, 2);
+      for (const tools of app.offered) assert.deepEqual(tools, [...DREAMS_TOOL_NAMES].sort());
+      assert.deepEqual(seen.filter((messages) => /EXAMPLE_MAIN_ERA|EXAMPLE_SAVED_FOLLOW_UP/.test(messages)), [], "Main-era history reached a Dreams request");
+      assert.equal((await app.tasks.get(old.id)).conversation_id, old.conversation_id);
+      assert.match(await app.tasks.history(old.id), /EXAMPLE_MAIN_ERA_ANSWER/, "The main-era task stays readable by id");
+    } finally { await app.close(); }
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 function importedBatch(id: string): HistoryImportBatch {
