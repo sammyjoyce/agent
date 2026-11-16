@@ -6,7 +6,6 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { fetchCheckpoint, parseCheckpointManifest, readCheckpointManifest, storeCheckpoint } from "../src/failover/checkpoint-store.js";
 import { sha256Hex } from "../src/failover/log-entry.js";
-import { parseOperatorSession } from "../src/failover/operator.js";
 import { CHECKPOINT_PART_BYTES } from "../src/generated/failover-operator.js";
 import { fingerprint } from "./fixtures/failover-hosts.js";
 import { MemoryAuthority } from "./fixtures/failover-memory-authority.js";
@@ -89,21 +88,4 @@ test("a checkpoint manifest is parsed strictly", () => {
     ["a coordinator that is no UUID", { ...manifest, coordinator_id: "invented" }],
   ];
   for (const [label, value] of refused) assert.throws(() => parseCheckpointManifest(value), /The checkpoint manifest/, label);
-});
-
-test("the operator takes only a failover session it knows every field of", () => {
-  const session = { url: "http://127.0.0.1:8787", token_file: "/invented/token", coordinator_id: COORDINATOR };
-  assert.deepEqual(parseOperatorSession(JSON.stringify(session)), session, "a session without a holder reads the record only");
-  assert.deepEqual(parseOperatorSession(JSON.stringify({ ...session, holder: HOLDER, epoch: 4 })), { ...session, holder: HOLDER, epoch: 4 });
-  const refused: [RegExp, unknown][] = [
-    [/unknown field secret/, { ...session, secret: "invented" }],
-    [/authority url/, { ...session, url: "ftp://invented" }],
-    [/absolute token_file/, { ...session, token_file: "token" }],
-    [/coordinator_id/, { ...session, coordinator_id: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA" }],
-    [/holder/, { ...session, holder: "invented" }],
-    [/epoch/, { ...session, epoch: 1.5 }],
-    [/not a failover session/, [session]],
-  ];
-  for (const [pattern, value] of refused) assert.throws(() => parseOperatorSession(JSON.stringify(value)), pattern);
-  assert.throws(() => parseOperatorSession(undefined), /needs AGENT_FAILOVER/);
 });

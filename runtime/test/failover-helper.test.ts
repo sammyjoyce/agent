@@ -3,7 +3,7 @@ import { once } from "node:events";
 import { createServer } from "node:net";
 import { test } from "node:test";
 import type { FailoverReport } from "../src/generated/FailoverReport.js";
-import { failoverCoordinator, runHelper } from "./fixtures/failover-bridge.js";
+import { failoverCoordinator, runHelper, runScript } from "./fixtures/failover-bridge.js";
 import { enroll, OWNER, STANDBY } from "./fixtures/failover-state.js";
 
 const CLAIM = JSON.stringify({ op: "claim" }), RECORD = JSON.stringify({ op: "record" });
@@ -116,5 +116,32 @@ test("the failover helper against the Worker on local workerd", { timeout: 120_0
       assert.match(run.stderr, expected);
     }
     assert.deepEqual(coordinator.proxy.seen, []);
+  });
+
+  await t.test("the operator reads the session the helper reads, and refuses the same ones before any exchange", async (t) => {
+    const coordinator = await failoverCoordinator(t);
+    await enroll(coordinator.owner);
+    const session = JSON.parse(await coordinator.session(OWNER)) as Record<string, unknown>;
+    const status = JSON.stringify({ op: "status", state: null });
+    const cases: [string | undefined, RegExp][] = [
+      [undefined, /AGENT_FAILOVER is not set/],
+      ["not json", /AGENT_FAILOVER is not JSON/],
+      [JSON.stringify({ ...session, extra: true }), /AGENT_FAILOVER\.extra is not known/],
+      [JSON.stringify({ ...session, epoch: 3 }), /AGENT_FAILOVER\.epoch is not known/],
+      [JSON.stringify({ ...session, coordinator_id: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA" }), /AGENT_FAILOVER\.coordinator_id is not a lowercase UUID/],
+      [JSON.stringify({ ...session, token_file: "/nonexistent/invented-token" }), /token file/],
+    ];
+    for (const [given, expected] of cases) {
+      const run = await runScript("operator", given, status);
+      assert.equal(run.code, 1, `${given}: ${run.stderr}`);
+      assert.equal(run.stdout, "");
+      assert.match(run.stderr, expected);
+    }
+    assert.deepEqual(coordinator.proxy.seen, []);
+    for (const holder of [OWNER, null]) {
+      const run = await runScript("operator", await coordinator.session(holder), status);
+      assert.equal(run.code, 0, run.stderr);
+      assert.deepEqual(JSON.parse(run.stdout), { result: "status", record: await coordinator.reader.record(), applied: null });
+    }
   });
 });

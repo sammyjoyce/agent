@@ -19,9 +19,10 @@ export interface OwnerSession {
   readonly epoch: number;
 }
 
-/** How the one-shot helper reaches the authority. A session without a holder can only read the record. */
-export interface HelperSession {
+/** How a one-shot script, the helper or the operator, reaches the authority. A session without a holder can only read the record. */
+export interface ScriptSession {
   readonly link: AuthorityClient;
+  readonly coordinatorId: string;
   readonly holder: string | undefined;
 }
 
@@ -38,12 +39,12 @@ export async function ownerSession(value: string, options: SessionOptions = {}):
   return { link: await client(session, options), holder: session.holder, epoch: session.epoch };
 }
 
-/** Parses the helper's session, which never names an epoch and names a holder unless its host only watches the record. */
-export async function helperSession(value: string | undefined, options: SessionOptions = {}): Promise<HelperSession> {
+/** Parses a one-shot script's session, which never names an epoch and names a holder unless its host only watches the record. */
+export async function scriptSession(value: string | undefined, options: SessionOptions = {}): Promise<ScriptSession> {
   if (value === undefined) throw new Error(`${VARIABLE} is not set`);
   const session = parse(value, (given, path): Reach & { holder?: string } =>
     typeof given === "object" && given !== null && "holder" in given ? holderSession(given, path) : watcherSession(given, path));
-  return { link: await client(session, options), holder: session.holder };
+  return { link: await client(session, options), coordinatorId: session.coordinator_id, holder: session.holder };
 }
 
 function parse<T>(value: string, field: Field<T>): T {

@@ -1,7 +1,7 @@
 import type { FailoverReport } from "../generated/FailoverReport.js";
 import type { FailoverRequest } from "../generated/FailoverRequest.js";
 import { tagged } from "./authority-wire.js";
-import { helperSession, type HelperSession } from "./session.js";
+import { scriptSession, type ScriptSession } from "./session.js";
 
 /** Rust puts no limit on a claim, so the helper bounds its one request itself. */
 const REQUEST_TIMEOUT_MS = 10_000;
@@ -17,7 +17,7 @@ function parseRequest(argument: string | undefined): FailoverRequest {
 }
 
 /** One exchange with the authority. An authority that refuses is a report. One that does not answer rejects. */
-async function answer(session: HelperSession, request: FailoverRequest): Promise<FailoverReport> {
+async function answer(session: ScriptSession, request: FailoverRequest): Promise<FailoverReport> {
   switch (request.op) {
     case "claim": {
       if (session.holder === undefined) throw new Error("A claim needs a holder, and this host's failover session names none");
@@ -34,7 +34,7 @@ async function answer(session: HelperSession, request: FailoverRequest): Promise
 
 try {
   const request = parseRequest(process.argv[2]);
-  const report = await answer(await helperSession(process.env.AGENT_FAILOVER, { timeoutMs: REQUEST_TIMEOUT_MS }), request);
+  const report = await answer(await scriptSession(process.env.AGENT_FAILOVER, { timeoutMs: REQUEST_TIMEOUT_MS }), request);
   process.stdout.write(`${JSON.stringify(report)}\n`);
 } catch (error) {
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);

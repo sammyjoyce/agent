@@ -176,10 +176,10 @@ export async function connectHost(bridge: Bridge): Promise<void> {
 export const chat = (input: string, input_id: string): RuntimeCommand => ({ type: "chat", input, input_id, model: DEFAULT_MODEL,
   instructions: "Brief answers.", cwd: "/example/project", origin_host_id: null, hosts: [] });
 
-/** Runs the one-shot failover helper as Rust does and returns what it printed. */
-export async function runHelper(session: string | undefined, request: string) {
+/** Runs a one-shot failover script as Rust does and returns what it printed. */
+export async function runScript(script: "helper" | "operator", session: string | undefined, request: string) {
   const { AGENT_FAILOVER: _inherited, ...inherited } = process.env;
-  const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL("../../src/failover/helper.js", import.meta.url)), request],
+  const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL(`../../src/failover/${script}.js`, import.meta.url)), request],
     { stdio: ["ignore", "pipe", "pipe"], env: { ...inherited, ...(session === undefined ? {} : { AGENT_FAILOVER: session }) } });
   let stdout = "", stderr = "";
   child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
@@ -188,3 +188,5 @@ export async function runHelper(session: string | undefined, request: string) {
   const code = await new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
   return { code, stdout, stderr, elapsedMs: Date.now() - started };
 }
+
+export const runHelper = (session: string | undefined, request: string) => runScript("helper", session, request);
