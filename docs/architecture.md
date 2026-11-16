@@ -698,8 +698,8 @@ narrow: the actor that reads untrusted nightly evidence holds no shell and no
 channel to an actor that holds one. Tests cover each link.
 
 - `TaskStore.runActor` gives the task of the job `dreams` exactly
-  `dreams_review`, `dreams_propose` and `dreams_abstain` on every path, and it
-  refuses an attached worker or a child agent on that task.
+  `dreams_review`, `dreams_propose` and `dreams_abstain` on every path. The
+  task refuses a terminal that attaches to it, and it refuses a child agent.
 - The same confinement withholds hosted provider tools, web search included,
   from every request of that conversation on the `openai` and `openai-codex`
   providers. The record is durable and is never removed, so a turn that resumes
