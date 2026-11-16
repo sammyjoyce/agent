@@ -179,6 +179,8 @@ class ReportTests(unittest.TestCase):
             (attachments / "A.json").write_text(json.dumps(envelope))
             (attachments / "B.json").write_text(json.dumps({"work": 0, "personal": 0}))
             (attachments / "E.json").write_text(json.dumps({"work": 9, "personal": 9}))
+            for image in ("C.png", "D.png"):
+                (attachments / image).write_bytes(b"invented image")
             (attachments / "manifest.json").write_text(json.dumps([{"testIdentifier": test, "attachments": [
                 {"exportedFileName": "A.json", "suggestedHumanReadableName": "send-first_0_A.json"},
                 {"exportedFileName": "E.json", "suggestedHumanReadableName": "first-composer_0_E.json"},

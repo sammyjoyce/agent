@@ -191,14 +191,18 @@ def attachment_name(exported):
 
 
 def load_records(attachments):
-    """The JSON records the runner attached, each with the files its attachment names point to."""
+    """The JSON records the runner attached, each with the files its attachment names point to.
+
+    A record whose image is not on disk gets a problem, so the run cannot pass without it.
+    """
     manifest_path = attachments / "manifest.json"
     if not manifest_path.exists():
         return []
     records = []
     for test in read_json(manifest_path):
         named = [(attachment_name(item), item["exportedFileName"]) for item in test["attachments"]]
-        images = {name: f"attachments/{file}" for (name, extension), file in named if extension != "json"}
+        images = {name: f"attachments/{file}" for (name, extension), file in named
+                  if extension != "json" and (attachments / file).exists()}
         for (name, extension), file in named:
             if extension != "json":
                 continue
@@ -209,6 +213,8 @@ def load_records(attachments):
                 continue
             body["files"] = {key: images.get(value) for key, value in body["record"].items()
                              if key == "attachment" or key.endswith("Attachment")}
+            body["problems"] += [f"the {key} image {body['record'][key]!r} is missing"
+                                 for key, path in body["files"].items() if path is None]
             body["test"] = test["testIdentifier"]
             records.append(body)
     return records
