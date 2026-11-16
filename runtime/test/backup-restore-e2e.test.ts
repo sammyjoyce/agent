@@ -12,9 +12,12 @@ import { AttachmentStore } from "../src/attachments.js";
 import { FeedbackStore } from "../src/feedback.js";
 import { HistoryStore } from "../src/history.js";
 import { protocolLines, validEvent } from "../src/protocol.js";
+import { ResourceStore } from "../src/resources.js";
 import { runScheduled } from "../src/scheduled.js";
 import type { AttachmentRef } from "../src/generated/AttachmentRef.js";
 import type { HistoryItem } from "../src/generated/HistoryItem.js";
+import type { HostCommand } from "../src/generated/HostCommand.js";
+import type { HostResult } from "../src/generated/HostResult.js";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
 import { ATTACHMENT_CHUNK_BYTES } from "../src/generated/attachment-limits.js";
@@ -30,9 +33,24 @@ const FOLLOW_UP_ID = "a2222222-2222-4222-8222-222222222222";
 const AGENT_INPUT_ID = "a3333333-3333-4333-8333-333333333333";
 const ATTACHMENT_ID = "a4444444-4444-4444-8444-444444444444";
 const HELD_JOB = "invented-held-review";
+const RESOURCE_ID = "a5555555-5555-4555-8555-555555555555";
+const WORKTREE = { primary: "/workspace/example", top: "/workspace/example-review", common_dir: "/workspace/example/.git",
+  git_dir: "/workspace/example/.git/worktrees/review", branch: "invented-review", head: "a".repeat(40) };
 
 function sha256(bytes: Buffer): string { return createHash("sha256").update(bytes).digest("hex"); }
 async function exists(path: string): Promise<boolean> { return stat(path).then(() => true, () => false); }
+
+function acknowledgeCollection(command: HostCommand): HostResult {
+  if (command.type === "resource_inspect") return { type: "resource", report: { type: "observed", record: command.record } };
+  if (command.type === "resource_plan_cleanup") return { type: "resource", report: { type: "planned",
+    record: { ...command.record, state: { state: "retiring", identity: WORKTREE, plan_id: RESOURCE_ID } },
+    plan: { id: RESOURCE_ID, resource_id: RESOURCE_ID, identity: WORKTREE, path: "/workspace/example/.invented-cleanup.json", fingerprint: "invented" } } };
+  if (command.type === "resource_collect") return { type: "resource", report: { type: "collected",
+    record: { ...command.record, state: { state: "removed", identity: WORKTREE } },
+    receipt: { status: "removed", worktree_removed: true, branch_deleted: WORKTREE.branch, primary_worktree: WORKTREE.primary,
+      retained_submodules: null, summary: "Invented acknowledged removal" } } };
+  return { type: "failed", message: "The invented worker only acknowledges worktree collection" };
+}
 
 async function fingerprint(root: string): Promise<Map<string, string>> {
   const files = new Map<string, string>();
@@ -88,6 +106,13 @@ async function seed(state: string): Promise<Seeded> {
       queued_inputs: [], client_errors: [] });
     await attachments.retain(bundle.context.attachments);
 
+    const resources = new ResourceStore(app.session, app.tasks); app.tasks.guardResources(resources);
+    const finished = await app.tasks.create({ title: "Invented finished review", outcome: "Leave an eligible worktree behind" });
+    await resources.allocate({ allocation_id: RESOURCE_ID, task_id: finished.id, host_id: node.host_id, repository: WORKTREE.primary, branch: WORKTREE.branch },
+      async () => ({ type: "resource", report: { type: "observed", record: { id: RESOURCE_ID, task_id: finished.id, host_id: node.host_id,
+        repository: WORKTREE.primary, branch: WORKTREE.branch, consumers: [], state: { state: "ready", identity: WORKTREE } } } }));
+    await app.tasks.update(finished.id, (saved) => { saved.state = { state: "resolved", evidence: "Invented verified completion" }; });
+
     return { taskId: task.id, agentId: agent.id, scheduledTaskId: scheduledTask.id, importedConversation: imported.conversation.conversation_id,
       attachment, attachmentBytes, feedbackId: bundle.id, fullOriginal, inputIds: [STEER_ID, FOLLOW_UP_ID, AGENT_INPUT_ID] };
   } finally { await app.close(); }
@@ -100,12 +125,13 @@ test("an offline backup restores into a new directory that the production coordi
   const plainConfig = join(directory, "plain.toml"), jobConfig = join(directory, "jobs.toml"), instructions = join(directory, "AGENTS.md");
   const binary = process.env.AGENT_TEST_BINARY ?? fileURLToPath(new URL("../../../target/debug/beep-boop", import.meta.url));
   const runtime = fileURLToPath(new URL("../src/bridge.js", import.meta.url));
+  const linkedRuntime = join(directory, "linked-runtime", "src", "bridge.js");
   const servers: Server[] = [];
   const env = { PATH: bin, HOME: directory, XDG_CONFIG_HOME: join(directory, "config"), XDG_DATA_HOME: join(directory, "data"),
     TMPDIR: directory, AGENT_SQLITE_VEC: process.env.AGENT_SQLITE_VEC };
 
   function cli(args: string[]): Promise<Run> {
-    const child = spawn(binary, ["--runtime", runtime, ...args], { cwd: directory, env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(binary, ["--runtime", linkedRuntime, ...args], { cwd: directory, env, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "", stderr = "";
     child.stdout.setEncoding("utf8").on("data", (value: string) => { stdout += value; });
     child.stderr.setEncoding("utf8").on("data", (value: string) => { stderr += value; });
@@ -155,6 +181,27 @@ test("an offline backup restores into a new directory that the production coordi
       throw new Error(`The coordinator closed before finishing ${command.type}`);
     } finally { channel.destroy(); }
   }
+  async function registerWorker(state: string): Promise<{ calls: string[]; close(): Promise<void> }> {
+    const channel = createConnection({ path: join(state, "agent.sock"), signal: t.signal });
+    const lines = protocolLines(channel), calls: string[] = [];
+    channel.write(JSON.stringify({ type: "connect_worker", node: { ...node, coordinator: "coordinator.example" } } satisfies RuntimeCommand) + "\n");
+    const ready = await lines.next();
+    assert.ok(!ready.done && (JSON.parse(ready.value) as RuntimeEventKind).type === "worker_ready", `the coordinator registers the invented worker: ${String(ready.value)}`);
+    const serving = (async () => {
+      for await (const line of lines) {
+        const event = JSON.parse(line) as RuntimeEventKind;
+        if (event.type !== "host_call") continue;
+        calls.push(event.command.type);
+        channel.write(JSON.stringify({ type: "host_reply", call_id: event.call_id, result: acknowledgeCollection(event.command) } satisfies RuntimeCommand) + "\n");
+      }
+    })();
+    return { calls, async close() { channel.destroy(); await serving.catch(() => {}); } };
+  }
+  async function resourceState(state: string): Promise<string | undefined> {
+    const [listed] = await request(state, { type: "list_resources" });
+    assert.ok(listed?.type === "resources", JSON.stringify(listed));
+    return listed.resources.find((resource) => resource.id === RESOURCE_ID)?.state.state;
+  }
   async function download(state: string, id: string): Promise<Buffer> {
     const chunks: Buffer[] = []; let offset: number | null = 0;
     while (offset !== null) {
@@ -180,6 +227,7 @@ test("an offline backup restores into a new directory that the production coordi
   try {
     await mkdir(original, { mode: 0o700 }); await mkdir(bin, { mode: 0o700 }); await mkdir(jobs, { mode: 0o700 });
     await symlink(process.execPath, join(bin, "node"));
+    await symlink(fileURLToPath(new URL("..", import.meta.url)), join(directory, "linked-runtime"));
     await writeFile(instructions, "Use only invented test data.\n");
     await writeFile(plainConfig, 'node_name = "backup-e2e"\njob_directories = []\n');
     await writeFile(jobConfig, `node_name = "backup-e2e"\njob_directories = [${JSON.stringify(jobs)}]\n`);
@@ -352,6 +400,12 @@ test("an offline backup restores into a new directory that the production coordi
       instructions: "", cwd: "/workspace/example", model: { provider: "openai", model_id: "invented-model", reasoning: null, fast: false } });
     await assert.rejects(Promise.race([heldWorker, delay(10_000).then((): never => { throw new Error("run_task was admitted"); })]),
       /held after a restore/, "a held store refuses a task worker that could resume a backed-up turn");
+    const heldCollector = await registerWorker(restored);
+    await assert.rejects(request(restored, { type: "collect_resources", host_id: node.host_id }), /held after a restore/,
+      "a held store refuses the worktree collection each registered worker requests on its own");
+    assert.equal(await resourceState(restored), "ready", "a held store keeps its worktree record");
+    assert.deepEqual(heldCollector.calls, [], "a held store sends no worktree effect to a registered worker");
+    await heldCollector.close();
     assert.match(server.errors(), /backup release/, "the held coordinator says how to release it");
     await stop(server);
 
@@ -369,6 +423,14 @@ test("an offline backup restores into a new directory that the production coordi
       await delay(100);
     }
     assert.deepEqual(await readBack(restored, seeded), baseline, "release keeps the restored history");
+    const releasedCollector = await registerWorker(restored);
+    await request(restored, { type: "collect_resources", host_id: node.host_id });
+    for (const deadline = Date.now() + 30_000; await resourceState(restored) !== "removed";) {
+      assert.ok(Date.now() < deadline, "a released store collects the eligible worktree");
+      await delay(100);
+    }
+    assert.ok(releasedCollector.calls.includes("resource_collect"), `the registered worker carried out the collection: ${releasedCollector.calls.join(", ")}`);
+    await releasedCollector.close();
     await stop(server);
   } finally {
     for (const server of servers) {
