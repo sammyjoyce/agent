@@ -1089,6 +1089,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_folder_parent_swapped_for_a_link_after_the_check_serves_nothing_outside_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = Export::new()
+            .conversations(&[Conversation::new(1, "Notes")
+                .node("u1", Some("root"), upload(&[("file_0c04", "notes.txt")]))
+                .build()])
+            .stored("files/file_0c04-notes.txt", b"Exported attachment")
+            .folder(&directory.path().join("export"));
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("file_0c04-notes.txt"), b"Outside attachment!").unwrap();
+        let history = open(&root);
+        std::fs::rename(root.join("files"), root.join("checked-files")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("files")).unwrap();
+        let served = fetch(&history, &fixture::id(1), "file_0c04").await;
+        assert!(
+            served.is_err(),
+            "served {:?}",
+            served.map(|(bytes, _, _)| String::from_utf8_lossy(&bytes).into_owned())
+        );
+    }
+
     fn refusal(path: &Path) -> PackageError {
         match ChatGptHistory::open(&[path.to_path_buf()], &mut |_| {}) {
             Ok(_) => panic!("the damaged export was admitted"),
