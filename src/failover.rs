@@ -20,6 +20,16 @@ pub struct OwnerEpoch(#[ts(type = "number")] u64);
 #[serde(try_from = "u64", into = "u64")]
 pub struct LogPosition(#[ts(type = "number")] u64);
 
+/// The sequence Pi assigns a commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct PiSequence(#[ts(type = "number")] u64);
+
+/// The size of a file or a blob, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct ByteSize(#[ts(type = "number")] u64);
+
 macro_rules! exact_counter {
     ($name:ident) => {
         impl $name {
@@ -54,6 +64,8 @@ macro_rules! exact_counter {
 
 exact_counter!(OwnerEpoch);
 exact_counter!(LogPosition);
+exact_counter!(PiSequence);
+exact_counter!(ByteSize);
 
 /// One host's right to hold ownership.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
@@ -205,8 +217,7 @@ pub struct Versions {
 pub struct FileRecord {
     pub path: StatePath,
     pub sha256: Sha256Hex,
-    #[ts(type = "number")]
-    pub size: u64,
+    pub size: ByteSize,
 }
 
 /// Pi's `StorageWrite[]` for one commit, as JSON. A large batch is stored in
@@ -214,20 +225,9 @@ pub struct FileRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BatchBody {
-    Inline {
-        json: String,
-    },
-    Blob {
-        sha256: Sha256Hex,
-        #[ts(type = "number")]
-        size: u64,
-    },
+    Inline { json: String },
+    Blob { sha256: Sha256Hex, size: ByteSize },
 }
-
-/// The sequence Pi assigns a commit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
-#[serde(transparent)]
-pub struct PiSequence(#[ts(type = "number")] u64);
 
 /// Pi's `StorageWrite[]` for one commit, and the sequence Pi assigns it. A
 /// standby commits it only there.
@@ -410,6 +410,36 @@ mod tests {
         assert!(serde_json::from_value::<Sha256Hex>("ab".repeat(32).into()).is_ok());
         assert!(serde_json::from_value::<Sha256Hex>("AB".repeat(32).into()).is_err());
         assert!(serde_json::from_value::<Sha256Hex>("ab".repeat(31).into()).is_err());
+    }
+
+    #[test]
+    fn sizes_and_pi_sequences_parse_only_exact_values() {
+        let file = |size: u64| {
+            serde_json::from_value::<FileRecord>(serde_json::json!({
+                "path": "feedback/latest",
+                "sha256": "ab".repeat(32),
+                "size": size,
+            }))
+        };
+        let blob = |size: u64| {
+            serde_json::from_value::<BatchBody>(serde_json::json!({
+                "kind": "blob",
+                "sha256": "ab".repeat(32),
+                "size": size,
+            }))
+        };
+        let batch = |pi_seq: u64| {
+            serde_json::from_value::<LoggedBatch>(serde_json::json!({
+                "pi_seq": pi_seq,
+                "body": { "kind": "inline", "json": "[]" },
+            }))
+        };
+        assert!(file(MAX_EXACT + 1).is_err());
+        assert!(blob(MAX_EXACT + 1).is_err());
+        assert!(batch(MAX_EXACT + 1).is_err());
+        assert!(file(MAX_EXACT).is_ok());
+        assert!(blob(MAX_EXACT).is_ok());
+        assert!(batch(MAX_EXACT).is_ok());
     }
 
     #[test]
