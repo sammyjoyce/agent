@@ -149,7 +149,8 @@ runs the command. Pass the downloaded ZIP, every part of a split download, an
 extracted folder or a conversations JSON file. Numbered sibling parts beside
 the first part are found automatically.
 
-The command checks the whole export before anything is saved. It refuses an
+The command reads every file in the export and checks it before anything is
+saved. It refuses an
 export with missing or unlisted conversation shards, a gap in its part
 numbering, member names that leave the export, symlinks or special files,
 encrypted members, sizes or CRCs that do not match the bytes, or more expansion
@@ -163,8 +164,9 @@ as one JSON object.
 Once checked, the coordinator imports the export through the same checkpointed
 importer as Codex. The client that ran the command serves every read, so the
 export never needs to be on the coordinator's disk. Keep the command running
-until it finishes. If it stops, the
-import ends partial; run the same command again. Finished conversations are
+until it finishes, and leave the export unchanged meanwhile. An attachment whose
+bytes no longer match the check is not kept; it becomes a gap. If the command
+stops, the import ends partial; run the same command again. Finished conversations are
 skipped, an interrupted one resumes from its committed page, and retained
 attachments are reused by digest. `import status` reports Codex and ChatGPT on
 separate lines.
@@ -180,14 +182,24 @@ newer one does not replace the newer view.
 
 Attachments referenced by `sediment://` or `file-service://` pointers,
 `metadata.attachments` and the export's file library are copied from the export
-with a verified size and SHA-256. A referenced file that is not in the export
-is an explicit `missing` gap; nothing is downloaded.
+with a verified size and SHA-256. Those bytes are part of the message's
+version, so a later export whose file has different bytes, or has a file the
+earlier export lacked, adds a new version of the message and keeps the earlier
+one. A referenced file that is not in the
+export is an explicit `missing` gap; nothing is downloaded.
 
-System, developer, custom-instruction and hidden messages are never imported.
-Historical tool calls and their output are inert text. ChatGPT and Codex keys
+System, developer, custom-instruction and hidden messages are never imported,
+and neither is a file-library entry that belongs to one. Each imported message
+stores its text, author, recipient, channel, status, content type, IDs and the
+names and types of its attachments. Other export metadata, including messages
+nested inside it, is not stored. Historical tool calls and their output are inert text. ChatGPT and Codex keys
 are separate, so a ChatGPT conversation never merges with a Codex thread that
 has the same ID. Imported text is indexed with the same local embedding model
 as Codex history; no chat model, tool or Rex session runs.
+
+A build from before ChatGPT import misreads ChatGPT records after a rollback.
+It looks up a ChatGPT conversation's link as a Codex one, so it shows the Codex
+conversation with the same native ID, or nothing.
 
 ## Native Pi storage, inert history
 
