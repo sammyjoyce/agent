@@ -135,6 +135,12 @@ async fn serve_with_transport(
         .transpose()?
         .and_then(|config| config.apns);
     let owner = Runtime::start_with_notifications(script, state, apns.as_ref())?;
+    let background = if owner.restore_held() {
+        eprintln!("{}", crate::backup::hold_notice(state));
+        None
+    } else {
+        background
+    };
     let broker = match Broker::with_tailscale(bootstrap.as_ref(), state, daemon.clone(), rex) {
         Ok(broker) => Arc::new(broker),
         Err(error) => {
@@ -427,6 +433,15 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         !lifecycle.is_service_owned(),
         "Coordinator metadata is owned by its local service"
     );
+    if runtime.restore_held()
+        && let Some(message) = crate::backup::held_after_restore(&command)
+    {
+        let refusal = RuntimeEventKind::Failure {
+            code: crate::protocol::ErrorCode::CoordinatorUnavailable,
+            message: message.into(),
+        };
+        return write_client_frame(&mut writer, &refusal, &runtime).await;
+    }
     if native && lifecycle.is_view() {
         write_client_frame(
             &mut writer,

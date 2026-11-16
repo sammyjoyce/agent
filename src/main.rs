@@ -138,6 +138,12 @@ enum Action {
         #[command(subcommand)]
         command: FeedbackAction,
     },
+    /// Back up a stopped coordinator, restore one into a new directory, or
+    /// release a restored coordinator's background work.
+    Backup {
+        #[command(subcommand)]
+        command: BackupAction,
+    },
     /// Run this machine's coordinator or registered worker service.
     Serve {
         #[arg(long, default_value_t = agent_cli::tailnet::DEFAULT_PORT, value_parser = clap::value_parser!(u16).range(1..))]
@@ -332,6 +338,16 @@ enum FeedbackAction {
 }
 
 #[derive(Subcommand)]
+enum BackupAction {
+    /// Copy the stopped coordinator's state into DESTINATION, which must not exist.
+    Create { destination: PathBuf },
+    /// Rebuild a state directory at TARGET, which must be absent or empty, from ARCHIVE.
+    Restore { archive: PathBuf, target: PathBuf },
+    /// Let a restored coordinator run background work again.
+    Release,
+}
+
+#[derive(Subcommand)]
 enum ConfigAction {
     Apply { settings: PathBuf },
 }
@@ -421,6 +437,15 @@ fn startup_jobs(config: &ClientConfig) -> Option<Vec<jobs::ScheduledJob>> {
             None
         }
     }
+}
+
+fn print_receipt(json: bool, receipt: &(impl serde::Serialize + std::fmt::Display)) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(receipt)?);
+    } else {
+        println!("{receipt}");
+    }
+    Ok(())
 }
 
 fn runtime_script(explicit: Option<PathBuf>) -> PathBuf {
@@ -571,6 +596,34 @@ async fn main() -> Result<()> {
                             .await?
                     )?
                 ),
+            }
+            return Ok(());
+        }
+        Action::Backup { command } => {
+            let runtime = runtime_script(arguments.runtime.clone());
+            match command {
+                BackupAction::Create { destination } => print_receipt(
+                    arguments.json,
+                    &agent_cli::backup::create(
+                        &state::path(arguments.state_dir.clone())?,
+                        &destination,
+                        &runtime,
+                    )?,
+                )?,
+                BackupAction::Restore { archive, target } => {
+                    ensure!(
+                        arguments.state_dir.is_none(),
+                        "backup restore writes TARGET; it does not take --state-dir"
+                    );
+                    print_receipt(
+                        arguments.json,
+                        &agent_cli::backup::restore(&archive, &target, &runtime)?,
+                    )?
+                }
+                BackupAction::Release => print_receipt(
+                    arguments.json,
+                    &agent_cli::backup::release(&state::path(arguments.state_dir.clone())?)?,
+                )?,
             }
             return Ok(());
         }

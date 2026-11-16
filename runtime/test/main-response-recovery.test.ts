@@ -12,6 +12,7 @@ import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { createMainResponsePolicy } from "../src/main_response.js";
 import { history } from "../src/transcript.js";
+import { HistoryStore } from "../src/history.js";
 import { protocolLines, validEvent } from "../src/protocol.js";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import type { RuntimeEvent } from "../src/generated/RuntimeEvent.js";
@@ -34,7 +35,7 @@ for (const first of ["retry", "reconnect"]) test(`terminal native silence surviv
     faux.setResponses([fauxAssistantMessage([{ type: "thinking", thinking: "Synthetic retained reasoning is not the requested visible reply." }, { type: "text", text: "" }])]);
     const settled = await (await root.submit({ type: "input", requestId: "terminal", content: "The direct request whose owner disappeared." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
     assert.ok(settled.type === "input" && settled.status === "done"); answer = settled.answer.toString();
-    assert.equal(faux.state.callCount, 1); assert.equal((await history(root, null, seeded)).flatMap((frame) => frame.messages).some((row) => row.text === diagnostic), false);
+    assert.equal(faux.state.callCount, 1); assert.equal((await history(root, null, new HistoryStore(seeded))).flatMap((frame) => frame.messages).some((row) => row.text === diagnostic), false);
   } finally { await seeded.close(BACKGROUND_CONTEXT); }
   try {
     for (const mode of [first, first === "retry" ? "reconnect" : "retry", "reconnect"]) {
@@ -66,7 +67,7 @@ for (const first of ["retry", "reconnect"]) test(`terminal native silence surviv
       } finally { child.kill(); await closed; await reader.catch(() => {}); }
       const reopened = await open();
       try {
-        const root = await reopened.root(BACKGROUND_CONTEXT), rows = (await history(root, null, reopened)).flatMap((frame) => frame.messages);
+        const root = await reopened.root(BACKGROUND_CONTEXT), rows = (await history(root, null, new HistoryStore(reopened))).flatMap((frame) => frame.messages);
         assert.equal(rows.filter((row) => row.entry_id === answer && row.text === diagnostic).length, 1,
           "Repeated reopen and repair must retain exactly one canonical diagnostic");
         const original = await root.commit((tx) => tx.submissionByRequest(root.id, "terminal"), BACKGROUND_CONTEXT);

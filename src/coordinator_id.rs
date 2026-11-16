@@ -21,6 +21,13 @@ impl CoordinatorId {
     /// Reads `<state>/coordinator-id`, or mints one. Call only while holding the
     /// state directory's writer lock, so two processes cannot mint two IDs.
     pub fn load_or_mint(state: &Path) -> Result<Self> {
+        match Self::read(state)? {
+            Some(id) => Ok(id),
+            None => Self::mint(state),
+        }
+    }
+
+    pub fn read(state: &Path) -> Result<Option<Self>> {
         let path = state.join(COORDINATOR_ID_FILE);
         match OpenOptions::new()
             .read(true)
@@ -31,14 +38,14 @@ impl CoordinatorId {
                 let text = std::io::read_to_string(file)
                     .with_context(|| format!("Could not read {}", path.display()))?;
                 match uuid::Uuid::try_parse(&text).map(Self) {
-                    Ok(id) if id.to_string() == text => Ok(id),
+                    Ok(id) if id.to_string() == text => Ok(Some(id)),
                     _ => bail!(
                         "{} is not a coordinator ID; restore it instead of deleting it, because a new ID unpairs every phone",
                         path.display()
                     ),
                 }
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => Self::mint(state),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error).with_context(|| format!("Could not open {}", path.display())),
         }
     }
@@ -130,6 +137,15 @@ mod tests {
             );
             assert_eq!(fs::read_to_string(&path).unwrap(), malformed);
         }
+    }
+
+    #[test]
+    fn read_never_mints() {
+        let state = tempfile::tempdir().unwrap();
+        assert_eq!(CoordinatorId::read(state.path()).unwrap(), None);
+        assert!(!state.path().join(COORDINATOR_ID_FILE).exists());
+        let minted = CoordinatorId::load_or_mint(state.path()).unwrap();
+        assert_eq!(CoordinatorId::read(state.path()).unwrap(), Some(minted));
     }
 
     #[test]

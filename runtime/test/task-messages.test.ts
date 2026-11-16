@@ -19,6 +19,7 @@ import { ConversationModels, DEFAULT_MODEL } from "../src/models.js";
 import { TaskStore, type HostCall } from "../src/tasks.js";
 import { createAppTools, Executions } from "../src/tools.js";
 import { history, transcript } from "../src/transcript.js";
+import { HistoryStore } from "../src/history.js";
 import { FakeClock, pump } from "./fixtures/background-runtime.js";
 
 const binding: WorkerRef = { host_id: "11111111-1111-4111-8111-111111111111",
@@ -166,7 +167,7 @@ test("peer messages retain their sender through native steering and reopening wi
     releaseSender(); releaseSender = () => {};
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory, clock);
     conversation = await app.tasks.conversation(owner.conversation_id);
-    const restored = (await history(conversation, null, app.session)).flatMap(frame => frame.messages);
+    const restored = (await history(conversation, null, new HistoryStore(app.session))).flatMap(frame => frame.messages);
     assert.deepEqual(restored.filter(message => message.entry_id === peerEntry.id.toString()), peerMessages);
     assert.deepEqual(restored.filter(message => message.entry_id === humanEntry.id.toString()), humanMessages);
     assert.equal((await app.tasks.get(owner.id)).outcome, owner.outcome);

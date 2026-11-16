@@ -10,6 +10,7 @@ import { BackgroundScheduler } from "../src/background.js";
 import { watchMainNotices } from "../src/main_observation.js";
 import { runScheduled } from "../src/scheduled.js";
 import { history, UserNoticeEntry } from "../src/transcript.js";
+import { HistoryStore } from "../src/history.js";
 import { validEvent } from "../src/protocol.js";
 import type { HistoryMessage } from "../src/generated/HistoryMessage.js";
 import type { TaskRecord } from "../src/generated/TaskRecord.js";
@@ -79,11 +80,11 @@ test("actual concurrent scheduler publications retain run titles live and after 
     const count = live.length, calls = app.faux.state.callCount;
     await background.runJob({ type: "run_job", job_id: packages.id, schedule_id: null, request_id: "packages" });
     assert.equal(live.length, count); assert.equal(app.faux.state.callCount, calls, "Replay must not generate an extra publication");
-    const durable = (await history(root, null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
+    const durable = (await history(root, null, new HistoryStore(app.session))).flatMap((event) => event.messages).filter((row) => row.role === "notice");
     assert.deepEqual(durable, live, "Live and historical native rows carry the same captured snapshot");
     stop(); stop = () => {}; await app.session.close(BACKGROUND_CONTEXT);
     app = await openScheduled(directory, "original", clock); scheduler(app, []);
-    const reopened = (await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
+    const reopened = (await history(await app.session.root(BACKGROUND_CONTEXT), null, new HistoryStore(app.session))).flatMap((event) => event.messages).filter((row) => row.role === "notice");
     assert.deepEqual(reopened, durable, "Historical rows must not look up renamed or deleted job/task titles");
     origin(reopened.find((row) => row.text.includes("parcel")), packages);
   } finally { stop(); await app.close(); await rm(directory, { recursive: true, force: true }); }
@@ -114,15 +115,15 @@ test("a scheduled child inherits its trusted lineage through deletion and its ow
     const task = await app.tasks.get(run.task_id), child = task.agents[0]; assert.ok(child); assert.equal(child.worker.state, "unassigned");
     await background.syncJobs([]); await app.tasks.update(task.id, (saved) => { saved.title = "Wrong renamed parent title"; });
     release(); await eventually(() => !app.tasks.isRunning(task.id));
-    const root = await app.session.root(BACKGROUND_CONTEXT), rows = (await history(root, null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
+    const root = await app.session.root(BACKGROUND_CONTEXT), rows = (await history(root, null, new HistoryStore(app.session))).flatMap((event) => event.messages).filter((row) => row.role === "notice");
     assert.equal(rows.length, 1); origin(rows[0], job);
     await app.close(); app = await openScheduled(directory, "original", new FakeClock()); scheduler(app, []);
-    const saved = (await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
+    const saved = (await history(await app.session.root(BACKGROUND_CONTEXT), null, new HistoryStore(app.session))).flatMap((event) => event.messages).filter((row) => row.role === "notice");
     assert.deepEqual(saved, rows);
     app.faux.setResponses([notice("The same child has a second necessary decision."), fauxAssistantMessage(fauxToolCall("report_result", { summary: "Rechecked the same evidence." }), { stopReason: "toolUse" }), fauxAssistantMessage("")]);
     await app.tasks.continueAgent(task.id, child.id, "Recheck this same workflow.", "child-followup", app.call);
     await runAdmitted(app.tasks, task.id, child.id);
-    const continuedRows = (await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
+    const continuedRows = (await history(await app.session.root(BACKGROUND_CONTEXT), null, new HistoryStore(app.session))).flatMap((event) => event.messages).filter((row) => row.role === "notice");
     assert.equal(continuedRows.length, 2); origin(continuedRows[1], job);
   } finally { release(); await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
@@ -144,7 +145,7 @@ test("main, generic and legacy notices never guess a job from titles, source lin
     for (const metadata of [{ job_id: "", title: "Package tracking" }, { job_id: "package-tracking", title: "  " }]) {
       await root.submit({ type: "write", entry: { kind: UserNoticeEntry.kind, data: { task_id: null, source_conversation_id: "legacy", source_entry_id: "1", text: "Unreliable legacy metadata", notice_origin: metadata } } }, BACKGROUND_CONTEXT);
     }
-    const rows = (await history(root, null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
+    const rows = (await history(root, null, new HistoryStore(app.session))).flatMap((event) => event.messages).filter((row) => row.role === "notice");
     assert.equal(rows.length, 5); for (const row of rows) assert.equal("notice_origin" in row, false);
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
 });

@@ -3191,7 +3191,7 @@ try{
   created_at:1,updated_at:2,forked_from_id:null,parent_thread_id:null,version:'one',version_reliable:true,archived:true},
   items:evidence.items,next_cursor:null,gaps:[],complete:true});
  const conversation=await store.conversation(receipt.conversation.conversation_id);assert.ok(conversation);
- const frames=await history(conversation,null,session);for(const frame of frames)assert.ok(validEvent({version:1,id:1,event:frame}));
+ const frames=await history(conversation,null,store);for(const frame of frames)assert.ok(validEvent({version:1,id:1,event:frame}));
  const messages=frames.flatMap(frame=>frame.messages);assert.equal(messages.length,20);
  assert.ok(messages.every(message=>message.text.trim().length>0||message.presentation!==undefined));
  const command=messages.find(message=>message.presentation?.type==='command');assert.ok(command);

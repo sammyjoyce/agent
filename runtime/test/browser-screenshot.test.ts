@@ -27,6 +27,7 @@ import { DEFAULT_MODEL } from "../src/models.js";
 import { protocolLines, validEvent } from "../src/protocol.js";
 import { Executions } from "../src/tools.js";
 import { history } from "../src/transcript.js";
+import { HistoryStore } from "../src/history.js";
 import { capturePng, pngSize } from "./fixtures/png.js";
 
 const hostId = "11111111-1111-4111-8111-111111111111";
@@ -83,7 +84,7 @@ async function turn(app: Awaited<ReturnType<typeof open>>, observe: (result: Ext
 }
 
 async function screenshotRows(app: Awaited<ReturnType<typeof open>>): Promise<HistoryMessage[]> {
-  return (await history(app.root, null, app.session)).flatMap((frame) => frame.messages)
+  return (await history(app.root, null, new HistoryStore(app.session))).flatMap((frame) => frame.messages)
     .filter((message) => message.role === "tool" && message.tool?.name === "browser_screenshot");
 }
 

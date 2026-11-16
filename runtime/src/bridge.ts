@@ -606,7 +606,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
       }
       case "read_conversation": {
         const application = await app();
-        for (const frame of await history(await application.tasks.conversation(command.conversation_id), command.cursor, application.harness)) emit(id, frame);
+        for (const frame of await history(await application.tasks.conversation(command.conversation_id), command.cursor, application.histories)) emit(id, frame);
         break;
       }
       case "list_conversations": {
@@ -660,15 +660,15 @@ async function handle(request: RuntimeRequest): Promise<void> {
       }
       case "read_history":
       case "read_tool_details": {
-        const { harness, tasks } = await app();
+        const { harness, tasks, histories } = await app();
         const taskId = command.task_id ?? null, agentId = command.agent_id ?? null;
         if (taskId === null && agentId !== null) throw new TaskError("Choose a task for agent history");
         const task = taskId === null ? undefined : await tasks.get(taskId);
         const conversation = task === undefined ? await harness.root(BACKGROUND_CONTEXT)
           : await tasks.conversation(agentId === null ? task.conversation_id
             : task.agents.find((agent) => agent.id === agentId)?.conversation_id ?? "");
-        if (command.type === "read_history") for (const frame of await history(conversation, command.cursor, harness)) emit(id, frame);
-        else emit(id, { type: "tool_details", details: await toolDetails(conversation, command.entry_id, command.call_id, harness) });
+        if (command.type === "read_history") for (const frame of await history(conversation, command.cursor, histories)) emit(id, frame);
+        else emit(id, { type: "tool_details", details: await toolDetails(conversation, command.entry_id, command.call_id, histories) });
         break;
       }
       case "revoke_allocation": {
@@ -691,7 +691,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
       }
       case "run_task": {
         const application = await app();
-        const { tasks, executions, serviceExecution } = application;
+        const { tasks, executions, serviceExecution, histories } = application;
         let stop: (() => Promise<void>) | undefined;
         try {
         const worker = workers.get(id);
@@ -709,7 +709,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
           async ready(conversation, title) {
             activeConversations.set(id, conversation);
             await configured(conversation, title);
-            for (const frame of await history(conversation, null, tasks.session)) emit(id, frame);
+            for (const frame of await history(conversation, null, histories)) emit(id, frame);
             stop = await activity(tasks.session, conversation, (activity) => emit(id, { type: "activity", activity }),
               (message) => emit(id, { type: "message", message }));
           },
@@ -764,7 +764,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
             for (const event of await reconcileMainInput(root, input_id, application.harness, receiptWork) ?? []) observer.snapshot(event);
           }
           if (observer.closed) break;
-          for (const frame of await history(root, null, application.harness)) observer.snapshot(frame);
+          for (const frame of await history(root, null, application.histories)) observer.snapshot(frame);
           if (!observer.open()) break;
           stopSources = await application.sources.watchStates((sources) => observer.publish({ type: "sources", sources }),
             () => failure(id, "internal", "Integration status could not be read. Reconnect to check source coverage."));
@@ -788,7 +788,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const application = await app();
         const snapshot = async () => {
           const root = await application.harness.root(BACKGROUND_CONTEXT);
-          for (const frame of await history(root, null, application.harness)) emit(id, frame);
+          for (const frame of await history(root, null, application.histories)) emit(id, frame);
         };
         const [owner, turn] = [...mainTurns].find(([owner]) => !ending.has(owner)) ?? [];
         if (owner === undefined || turn === undefined) { await snapshot(); break; }
