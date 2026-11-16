@@ -228,6 +228,12 @@ export async function replicatedPair(world: World, urls: { standby?: string } = 
   return { coordinator, owner, standby, epoch, head: (await owner.authorityState()).head };
 }
 
+/** Whether the log is sealed for `candidate`, which a promotion that waits for stop evidence has reached. */
+export async function sealedFor(host: Host, candidate: string): Promise<boolean> {
+  const state = await host.authorityState();
+  return state.kind === "sealed" && state.candidate === candidate;
+}
+
 /** The bytes of every replicated file of a state directory, by path. */
 export async function replicatedFiles(state: string): Promise<Map<string, string>> {
   const files = new Map<string, string>();
