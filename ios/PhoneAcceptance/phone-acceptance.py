@@ -191,10 +191,7 @@ def attachment_name(exported):
 
 
 def load_records(attachments):
-    """The JSON records the runner attached, each with the files its attachment names point to.
-
-    A record whose image is not on disk gets a problem, so the run cannot pass without it.
-    """
+    """The JSON records the runner attached, each with the files its attachment names point to."""
     manifest_path = attachments / "manifest.json"
     if not manifest_path.exists():
         return []

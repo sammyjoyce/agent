@@ -121,8 +121,6 @@ class PlanTests(unittest.TestCase):
 
 
 class RunnerLaunchTests(unittest.TestCase):
-    """The runner refuses a coordinator its menu lacks, so the name must reach it unchanged."""
-
     def launched_with(self, argv):
         with tempfile.TemporaryDirectory() as directory:
             arguments = phone.parse_arguments([*argv, "--out", str(Path(directory) / "run")])
