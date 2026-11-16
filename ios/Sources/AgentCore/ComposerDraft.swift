@@ -169,11 +169,14 @@ public struct ComposerDraft: Sendable, Equatable {
   public var consumedTransfers: Set<UUID>
   public var composerID: UUID?
   public var submission: ComposerSubmission?
+  /// The start of `text` that older Sends returned while `submission` was admitting.
+  public var returnedText: String
   public var addressing: DraftAddressing
   public init(
     text: String = "", mode: InputMode = .steer, attachments: [LocalAttachment] = [],
     consumedTransfers: Set<UUID> = [], composerID: UUID? = nil,
-    submission: ComposerSubmission? = nil, addressing: DraftAddressing = DraftAddressing()
+    submission: ComposerSubmission? = nil, returnedText: String = "",
+    addressing: DraftAddressing = DraftAddressing()
   ) {
     self.text = text
     self.mode = mode
@@ -181,6 +184,7 @@ public struct ComposerDraft: Sendable, Equatable {
     self.consumedTransfers = consumedTransfers
     self.composerID = composerID
     self.submission = submission
+    self.returnedText = returnedText
     self.addressing = addressing
   }
 }
@@ -226,6 +230,7 @@ public actor ComposerDraftStore {
     let consumedTransfers: Set<UUID>
     let composerID: UUID?
     let submission: Submission?
+    let returnedText: String?
     /// Absent from records saved before addressing was stored, and whenever it is empty.
     let addressing: DraftAddressing?
   }
@@ -275,10 +280,10 @@ public actor ComposerDraftStore {
     guard try contents() == data else { throw ComposerDraftError.staleOwner }
     savedData = data
     savedRevision = max(savedRevision ?? record.revision, record.revision)
-    var text = record.text
-    if let submitted, !owned, !submitted.text.isEmpty {
-      text = submitted.text + (text.isEmpty ? "" : "\n\n" + text)
-    }
+    let returned = record.returnedText.flatMap { record.text.hasPrefix($0) ? $0 : nil } ?? ""
+    let typed = record.text.dropFirst(returned.count).dropFirst(returned.isEmpty ? 0 : 2)
+    let text = [returned[...], owned ? "" : submitted?.text[...] ?? "", typed]
+      .filter { !$0.isEmpty }.joined(separator: "\n\n")
     var addressing = record.addressing ?? DraftAddressing()
     // An outbox holds the Send this record was saved for, and whom that draft was for went with
     // it. Only a draft begun since keeps an address.
@@ -313,6 +318,7 @@ public actor ComposerDraftStore {
       revision: revision, text: draft.text, mode: draft.mode,
       attachments: draft.attachments.map(\.reference), consumedTransfers: draft.consumedTransfers,
       composerID: draft.composerID, submission: submission,
+      returnedText: draft.returnedText.isEmpty ? nil : draft.returnedText,
       addressing: draft.addressing.isEmpty ? nil : draft.addressing)
     let data = try JSONEncoder().encode(record)
     guard data.count <= Self.maximumRecordBytes else { throw ComposerDraftError.tooLarge }

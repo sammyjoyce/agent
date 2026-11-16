@@ -198,7 +198,18 @@ the phone by cable. To allow that, list the app's bundle ID under `usbApps` in
   A coordinator removed since the Send no longer counts, so recovery offers the
   text again when no coordinator still saved received it.
   A control that never leaves the phone releases its outbox's receipt, whether
-  an address edit, a disconnect or a failed dial stopped it.
+  an address edit, a disconnect or a failed dial stopped it. When no recipient
+  wrote it, its text also comes back to the live composer ahead of newer typing,
+  under its chip if the composer is still empty.
+  Texts that come back, after a local rejection or a stopped control, keep the
+  order they were sent in, ahead of anything typed or restored since. Typing
+  onto a returned text's last paragraph stays with it, and an edit inside one
+  counts as new typing. The composer tells returned texts apart by their words
+  alone. If you delete one returned text and another begins with the deleted
+  text's words, a text that comes back later can land out of Send order.
+  Nothing is lost or duplicated. While a newer Send is still being admitted,
+  the composer record keeps the returned text ahead of it, so recovery after a
+  crash offers the same order.
   Ownership paths are relative to the composer record, allowing storage to move.
   Local rejection restores the unadmitted copy, preserving newer typing.
   Restoring an outbox input saves the complete replacement draft and keeps the
@@ -250,7 +261,7 @@ the phone by cable. To allow that, list the app's bundle ID under `usbApps` in
   Commands are never queued, so one a coordinator did not get because its
   connection dropped, or because you removed it meanwhile, is named under the
   feed ("Work did not get /status. It was removed."). If no coordinator got it,
-  the draft stays. That note stays until your next Send, beside any other
+  its text comes back, even when it stopped after Send. That note stays until your next Send, beside any other
   error, with one coordinator left too.
 - Adding, editing, pairing and removing coordinators run one at a time. Remove
   refuses while the draft is addressed to that coordinator or restored from it.

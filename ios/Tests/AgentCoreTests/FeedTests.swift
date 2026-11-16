@@ -430,13 +430,14 @@ actor DialGate {
   }
   func open() {
     armed = false
+    waiting = false
     release?.resume()
     release = nil
   }
-  /// Fails the held dial, as when the coordinator does not answer in time.
-  func fail() {
+  func fail(_ error: any Error = ConnectionError.timedOut) {
     armed = false
-    release?.resume(throwing: ConnectionError.timedOut)
+    waiting = false
+    release?.resume(throwing: error)
     release = nil
   }
 }
