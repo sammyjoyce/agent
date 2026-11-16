@@ -202,6 +202,8 @@ actor FixtureCoordinator {
   }
   func uploadCount() -> Int { uploads }
   func uploaded(_ id: String) -> Data? { files[id] }
+  /// Holds bytes the coordinator retained without an upload, such as a browser screenshot.
+  func retain(_ data: Data, id: String) { files[id] = data }
   func count() -> Int { submissions.count }
   private var busy = false
   /// Submits the busy turn has not placed, each with the socket still waiting for it.

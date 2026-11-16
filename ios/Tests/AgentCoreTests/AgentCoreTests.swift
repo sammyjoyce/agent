@@ -434,6 +434,72 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
   }
 }
 
+private func screenshotReference(_ bytes: Data) -> AttachmentRef {
+  AttachmentRef(
+    id: "33333333-3333-4333-8333-333333333333", mediaType: "image/png",
+    name: "browser-screenshot-invented.png",
+    sha256: SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined(),
+    sizeBytes: bytes.count)
+}
+
+private func screenshotMessages(_ reference: AttachmentRef) -> [HistoryMessage] {
+  [
+    HistoryMessage(
+      continuation: false, entryId: "41", finalChunk: true, role: .tool, text: "",
+      tool: .init(callId: "screenshot-call", name: "browser_screenshot", status: .running)),
+    HistoryMessage(
+      attachments: [reference], continuation: false, entryId: "42", finalChunk: true, role: .tool,
+      text: "Saved the screenshot of tab 7.",
+      tool: .init(callId: "screenshot-call", name: "browser_screenshot", status: .finished)),
+  ]
+}
+
+@Test func aToolResultAttachmentStaysOnItsToolRowLiveAndInHistory() {
+  let reference = screenshotReference(Data("Invented screenshot bytes".utf8))
+  let messages = screenshotMessages(reference)
+  var live = Transcript()
+  live.activity(.toolStarted(.init(callId: "screenshot-call", name: "browser_screenshot")))
+  for message in messages { live.message(message) }
+  var saved = Transcript()
+  saved.history(.init(messages: messages, nextCursor: nil, pageComplete: true))
+  for var transcript in [live, saved] {
+    let rows = transcript.rows.filter { $0.tool?.callId == "screenshot-call" }
+    #expect(rows.count == 1)
+    #expect(rows.first?.attachments == [reference])
+    #expect(rows.first?.tool?.status == ToolStatus.finished)
+  }
+}
+
+@Test(.timeLimit(.minutes(1))) func aBrowserScreenshotOnAToolRowPreviewsOnlyItsVerifiedBytes()
+  async throws
+{
+  try await withCoordinator { session, fixture, _ in
+    let bytes = Data("Invented screenshot bytes".utf8)
+    let reference = screenshotReference(bytes)
+    let changed = AttachmentRef(
+      id: "44444444-4444-4444-8444-444444444444", mediaType: reference.mediaType,
+      name: reference.name, sha256: reference.sha256, sizeBytes: bytes.count)
+    await fixture.retain(bytes, id: reference.id)
+    await fixture.retain(Data("Invented screenshot BYTES".utf8), id: changed.id)
+    await fixture.replyToHistory(
+      initial: .init(
+        messages: screenshotMessages(reference), nextCursor: nil, pageComplete: true),
+      pages: [:])
+    await session.connect()
+    let snapshot = try await until(session) {
+      $0.connection == .connected && $0.rows.contains { $0.tool?.callId == "screenshot-call" }
+    }
+    let row = try #require(snapshot.rows.first { $0.tool?.callId == "screenshot-call" })
+    #expect(row.attachments == [reference])
+    let preview = try await session.preview(reference)
+    #expect(try Data(contentsOf: preview) == bytes)
+    do {
+      _ = try await session.preview(changed)
+      Issue.record("Bytes that do not match the screenshot's digest previewed")
+    } catch AttachmentError.changed {}
+  }
+}
+
 @Test(.timeLimit(.minutes(1))) func feedbackReceiptAcknowledgesTheOriginalDurableInput()
   async throws
 {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -14,6 +14,7 @@ import { chromium, type Browser } from "playwright-core";
 import type { BrowserAction } from "../src/generated/BrowserAction.js";
 import type { BrowserReply } from "../src/generated/BrowserReply.js";
 import type { BrowserRequest } from "../src/generated/BrowserRequest.js";
+import { MAX_SCREENSHOT_BYTES } from "../src/generated/screenshot-limits.js";
 
 const chrome = process.env.AGENT_TEST_CHROME;
 const skip = chrome === undefined && process.env.CI !== "true";
@@ -93,8 +94,11 @@ function reply(value: unknown): value is BrowserReply {
   if (["failed", "disconnected", "uncertain"].includes(String(response.type))) return typeof response.message === "string";
   if (response.type === "user_tabs") return Array.isArray(response.tabs) && response.tabs.every((tab: unknown) =>
     object(tab) && typeof tab.target_id === "string" && typeof tab.url === "string" && typeof tab.title === "string");
-  return (response.type === "closed" || response.type === "ready" && typeof response.is_error === "boolean")
-    && typeof response.output === "string" && Array.isArray(response.tabs)
+  const capture = response.capture;
+  return (response.type === "closed" || response.type === "ready" && typeof response.is_error === "boolean"
+      ? typeof response.output === "string"
+      : response.type === "screenshot" && object(capture) && typeof capture.data_base64 === "string" && typeof capture.sha256 === "string")
+    && Array.isArray(response.tabs)
     && response.tabs.every((tab: unknown) => object(tab) && typeof tab.id === "number"
       && typeof tab.url === "string" && typeof tab.title === "string");
 }
@@ -560,4 +564,93 @@ document.addEventListener('focusin', event => {
     assert.equal(popup.isClosed(), true, "Disposable popup cleanup belongs to its opener");
     assert.equal((await execute(second, { type: "release" })).type, "closed");
   });
+});
+
+test("a native screenshot carries the owned tab's real pixels with their digest and refuses an oversized page without losing the tab",
+  { skip, timeout: 60_000 }, async t => {
+  assert.ok(chrome, "AGENT_TEST_CHROME must select an explicit disposable test binary");
+  const directory = await mkdtemp(join(tmpdir(), "agent-native-screenshot-"));
+  const profile = join(directory, "profile");
+  const blocks = [{ color: "rgb(208, 48, 48)", label: "Invented red block" }, { color: "rgb(48, 160, 64)", label: "Invented green block" },
+    { color: "rgb(48, 80, 208)", label: "Invented blue block" }];
+  const server = createServer((request, response) => {
+    response.setHeader("Content-Type", "text/html; charset=utf-8");
+    if (request.url === "/blocks") {
+      response.end(`<!doctype html><title>Invented color blocks</title><style>body{margin:0;display:flex}
+        div{width:200px;height:300px;color:white;font:24px sans-serif}</style>`
+        + blocks.map(block => `<div style="background:${block.color}">${block.label}</div>`).join(""));
+    } else if (request.url === "/tall") {
+      response.end(`<!doctype html><title>Invented tall noise</title><body style="margin:0"><canvas width="1200" height="4000"></canvas>
+        <script>const context = document.querySelector('canvas').getContext('2d'), image = context.createImageData(1200, 4000);
+        let seed = 7; for (let i = 0; i < image.data.length; i++) { seed = (seed * 1103515245 + 12345) >>> 0; image.data[i] = i % 4 === 3 ? 255 : seed >>> 24; }
+        context.putImageData(image, 0, 0);</script>`);
+    } else response.end("<!doctype html><h1>Unrelated page</h1>");
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address(); assert.ok(address !== null && typeof address !== "string");
+  const origin = `http://127.0.0.1:${address.port}`;
+  const args = [`--user-data-dir=${profile}`, "--remote-debugging-port=0", "--headless=new", "--window-size=800,600",
+    "--use-mock-keychain", "--password-store=basic", "--disable-background-networking", "--no-first-run", "--no-default-browser-check", "about:blank"];
+  if (process.platform === "linux" || process.getuid?.() === 0) args.unshift("--no-sandbox");
+  const processChrome = spawn(chrome, args, { stdio: "ignore", detached: true });
+  processChrome.once("error", () => {});
+  const exited = new Promise<void>(resolve => processChrome.once("close", () => resolve()));
+  const group = processChrome.pid; assert.ok(group !== undefined && group > 0);
+  let host: NativeHelper | undefined, observer: Browser | undefined;
+  t.after(async () => {
+    await host?.close(); await observer?.close().catch(() => {});
+    try { process.kill(-group, "SIGTERM"); } catch { /* The owned group already exited. */ }
+    for (let attempt = 0; attempt < 120 && await groupAlive(group); attempt++) await setTimeout(25);
+    if (await groupAlive(group)) process.kill(-group, "SIGKILL");
+    await exited;
+    server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
+    await rm(directory, { recursive: true, force: true });
+  });
+  let port = 0;
+  for (let attempt = 0; attempt < 200 && port === 0; attempt++) {
+    try { port = Number((await readFile(join(profile, "DevToolsActivePort"), "utf8")).split("\n")[0]); }
+    catch { await setTimeout(50); }
+  }
+  assert.ok(Number.isInteger(port) && port > 0, "Disposable Chrome must publish its native endpoint");
+  host = new NativeHelper(port);
+  const owner = { owner_id: randomUUID(), session_id: randomUUID() };
+  const execute = async (action: BrowserAction) => (await host!.execute({ ...owner, operation_id: randomUUID(), action })).response;
+
+  const opened = await execute({ type: "open", url: `${origin}/blocks` });
+  assert.equal(opened.type, "ready", JSON.stringify(opened));
+  const tab = opened.type === "ready" ? opened.tabs[0]?.id : undefined; assert.ok(tab !== undefined);
+  const shot = await execute({ type: "screenshot", tab_id: tab, full_page: false });
+  assert.ok(shot.type === "screenshot", JSON.stringify(shot).slice(0, 400));
+  const bytes = Buffer.from(shot.capture.data_base64, "base64");
+  assert.equal(bytes.toString("base64"), shot.capture.data_base64, "The capture is canonical base64");
+  assert.ok(bytes.subarray(0, 8).equals(Buffer.from("\x89PNG\r\n\x1a\n", "latin1")), "Chrome produced a PNG");
+  assert.equal(createHash("sha256").update(bytes).digest("hex"), shot.capture.sha256, "The digest names the delivered bytes");
+  assert.ok(bytes.length <= MAX_SCREENSHOT_BYTES);
+  assert.deepEqual(shot.tabs.map(owned => owned.title), ["Invented color blocks"]);
+
+  observer = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout: 10_000 });
+  const viewer = await observer.contexts()[0]!.newPage();
+  await viewer.setContent(`<img src="data:image/png;base64,${shot.capture.data_base64}">`);
+  const pixels: unknown = await viewer.evaluate(`(async () => {
+    const image = document.querySelector("img"); await image.decode();
+    const canvas = document.createElement("canvas"); canvas.width = image.naturalWidth; canvas.height = image.naturalHeight;
+    const context = canvas.getContext("2d"); context.drawImage(image, 0, 0);
+    return { width: image.naturalWidth, height: image.naturalHeight,
+      samples: [100, 300, 500].map(x => [...context.getImageData(x, 250, 1, 1).data.slice(0, 3)]) };
+  })()`);
+  await viewer.close();
+  assert.ok(object(pixels) && Array.isArray(pixels.samples));
+  assert.deepEqual([pixels.width, pixels.height], [800, 600], "The capture is the viewport at CSS scale");
+  assert.deepEqual(pixels.samples, [[208, 48, 48], [48, 160, 64], [48, 80, 208]], "Each block's color appears where the page drew it");
+
+  assert.equal((await execute({ type: "navigate", tab_id: tab, url: `${origin}/tall` })).type, "ready");
+  const oversized = await execute({ type: "screenshot", tab_id: tab, full_page: true });
+  assert.ok(oversized.type === "failed", JSON.stringify(oversized).slice(0, 400));
+  assert.match(oversized.message, new RegExp(String(MAX_SCREENSHOT_BYTES)), "The refusal names the byte limit");
+  const missing = await execute({ type: "screenshot", tab_id: tab + 1000, full_page: false });
+  assert.equal(missing.type, "failed", "A tab this connection does not own cannot be captured");
+  const kept = await execute({ type: "status" });
+  assert.ok(kept.type === "ready" && kept.tabs.some(owned => owned.id === tab), "Refused captures keep the owned tab and connection");
+  const released = await execute({ type: "release" });
+  assert.ok(released.type === "closed" && released.tabs.length === 0, JSON.stringify(released));
 });

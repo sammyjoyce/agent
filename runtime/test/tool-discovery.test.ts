@@ -139,6 +139,7 @@ test("each arm offers its role surfaces with the always-direct tools and reports
     assert.equal(new Set(offered).size, offered.length, `${arm} ${role} offers a tool twice`);
     assert.deepEqual([...offered].sort(), expectedSurface(arm, role, surface).sort(), `${arm} ${role} offered surface`);
     assert.ok(offered.includes("read_attachment") && offered.includes("read_file"), `${arm} ${role} offers attachments and files directly`);
+    assert.ok(offered.includes("browser_screenshot"), `${arm} ${role} offers browser screenshots directly`);
     if (role === "main") assert.ok(offered.includes("finish_without_reply"), `${arm} main offers finish_without_reply`);
   }
   const sizeOf = (arm: DiscoveryArmName, role: ToolRole) => {
@@ -203,6 +204,8 @@ const scriptGuards: { name: string; role: ToolRole; tool: string; args: (bystand
     error: /A worker can update only its own task/ },
   { name: "a main script cannot finish without reply", role: "main", tool: "finish_without_reply", args: () => ({}),
     error: /Finish without reply must be the main owner's sole final tool/ },
+  { name: "a worker script cannot take a screenshot whose image only a direct call delivers", role: "worker", tool: "browser_screenshot",
+    args: () => ({ tab_id: 1 }), error: /tools\.browser_screenshot does not exist/ },
 ];
 for (const guard of scriptGuards) {
   test(`code mode: ${guard.name}`, async () => {

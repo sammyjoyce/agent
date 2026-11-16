@@ -916,6 +916,7 @@ mod tests {
                 resume_agent: true,
                 browser: true,
                 browser_user_tabs: true,
+                browser_screenshots: false,
             }),
         )
         .await;
@@ -986,6 +987,113 @@ mod tests {
             ));
         }
         worker.close().await;
+        drop(broker);
+        close(runtime).await;
+    }
+
+    #[tokio::test]
+    async fn a_screenshot_reaches_only_a_worker_that_negotiated_it() {
+        let (_directory, runtime) = runtime().await;
+        let broker = Arc::new(
+            Broker::new(
+                None,
+                std::path::Path::new("/tmp"),
+                crate::rex::RexClient::for_process(None).unwrap(),
+            )
+            .unwrap(),
+        );
+        let legacy = "11111111-1111-4111-8111-111111111111";
+        let current = "22222222-2222-4222-8222-222222222222";
+        let capabilities: crate::protocol::WorkerCapabilities = serde_json::from_str(
+            r#"{"resume_agent":true,"browser":true,"browser_user_tabs":true}"#,
+        )
+        .unwrap();
+        assert!(!capabilities.browser_screenshots);
+        let old = Worker::connect_with_capabilities(
+            broker.clone(),
+            runtime.clone(),
+            legacy,
+            Some(capabilities),
+        )
+        .await;
+        let mut new = Worker::connect_with_capabilities(
+            broker.clone(),
+            runtime.clone(),
+            current,
+            Some(crate::protocol::WorkerCapabilities {
+                resume_agent: true,
+                browser: true,
+                browser_user_tabs: true,
+                browser_screenshots: true,
+            }),
+        )
+        .await;
+        let session_id = Uuid::new_v4();
+        let screenshot = move |host: &str| HostCommand::Browser {
+            host_id: host.into(),
+            request: crate::browser::BrowserRequest {
+                owner_id: "fixture-owner".into(),
+                session_id,
+                operation_id: Uuid::new_v4().to_string(),
+                action: crate::browser::BrowserAction::Screenshot {
+                    tab_id: 1,
+                    full_page: false,
+                },
+            },
+        };
+        let refused = timeout(Duration::from_secs(2), broker.execute(screenshot(legacy)))
+            .await
+            .expect("An old worker's screenshot must fail before reaching its effect stream");
+        assert!(
+            matches!(&refused, HostResult::Browser { response: crate::browser::BrowserResponse::Failed { session_id: actual, message } }
+                if *actual == session_id && message.contains("Update Beep Boop on this host before taking browser screenshots")),
+            "{refused:?}"
+        );
+        let capture = crate::browser::BrowserCapture {
+            data_base64: "iVBORw0KGgo=".into(),
+            sha256: "4c4b6a3be1314ab86138bef4314dde022e600960d8689a2c8f8631802d20dab6".into(),
+        };
+        let operation = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.execute(screenshot(current)).await })
+        };
+        let RuntimeEventKind::HostCall { call_id, command } = event(&mut new.reader).await else {
+            panic!("Expected the negotiated screenshot call");
+        };
+        assert!(matches!(
+            *command,
+            HostCommand::Browser {
+                request: crate::browser::BrowserRequest {
+                    action: crate::browser::BrowserAction::Screenshot {
+                        tab_id: 1,
+                        full_page: false
+                    },
+                    ..
+                },
+                ..
+            }
+        ));
+        write_frame(
+            &mut new.writer,
+            &RuntimeCommand::HostReply {
+                call_id,
+                result: HostResult::Browser {
+                    response: crate::browser::BrowserResponse::Screenshot {
+                        session_id,
+                        tabs: Vec::new(),
+                        capture: capture.clone(),
+                    },
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            operation.await.unwrap(),
+            HostResult::Browser { response: crate::browser::BrowserResponse::Screenshot { capture: received, .. } } if received == capture
+        ));
+        old.close().await;
+        new.close().await;
         drop(broker);
         close(runtime).await;
     }

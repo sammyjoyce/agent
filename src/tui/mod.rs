@@ -5256,6 +5256,75 @@ mod tests {
         }
     }
     #[test]
+    fn a_tool_result_attachment_shows_on_its_tool_row_live_and_in_reopened_history() {
+        use crate::protocol::{ToolHistory, ToolStatus};
+        let attachment = crate::attachments::AttachmentRef {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "browser-screenshot-invented.png".into(),
+            media_type: "image/png".into(),
+            size_bytes: 4242,
+            sha256: "b".repeat(64),
+        };
+        let tool = |status| {
+            Some(ToolHistory {
+                call_id: "screenshot-call".into(),
+                name: "browser_screenshot".into(),
+                status,
+            })
+        };
+        let call = HistoryMessage {
+            notice_origin: None,
+            entry_id: "call-entry".into(),
+            role: HistoryRole::Tool,
+            text: String::new(),
+            continuation: false,
+            final_chunk: true,
+            tool: tool(ToolStatus::Running),
+            presentation: None,
+            attachments: None,
+        };
+        let result = HistoryMessage {
+            entry_id: "result-entry".into(),
+            text: "Saved the screenshot of tab 7.".into(),
+            tool: tool(ToolStatus::Finished),
+            attachments: Some(vec![attachment.clone()]),
+            ..call.clone()
+        };
+        for historical in [false, true] {
+            let mut view = state();
+            if historical {
+                view.event(RuntimeEventKind::History {
+                    conversation_id: "saved".into(),
+                    messages: vec![call.clone(), result.clone()],
+                    next_cursor: None,
+                    page_complete: true,
+                });
+            } else {
+                view.event(RuntimeEventKind::Message {
+                    message: call.clone(),
+                });
+                view.event(RuntimeEventKind::Message {
+                    message: result.clone(),
+                });
+            }
+            assert_eq!(view.messages.len(), 1, "historical={historical}");
+            assert_eq!(
+                view.messages[0]
+                    .attachments
+                    .iter()
+                    .map(|label| label.id.clone())
+                    .collect::<Vec<_>>(),
+                vec![Some(attachment.id.clone())],
+                "historical={historical}"
+            );
+            let screen = rendered(&mut view, 120, 28);
+            assert!(
+                screen.contains("Attachment: browser-screenshot-invented.png · 4242 bytes"),
+                "historical={historical}: {screen}"
+            );
+        }
+    }
+    #[test]
     fn explicit_stopped_tool_facts_are_not_replaced_by_generic_finish_activity() {
         use crate::protocol::{ToolHistory, ToolStatus};
         for status in [ToolStatus::Declined, ToolStatus::Interrupted] {

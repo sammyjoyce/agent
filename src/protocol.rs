@@ -113,6 +113,8 @@ pub struct WorkerCapabilities {
     pub browser: bool,
     #[serde(default)]
     pub browser_user_tabs: bool,
+    #[serde(default)]
+    pub browser_screenshots: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]

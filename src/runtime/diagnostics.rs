@@ -298,6 +298,9 @@ impl BrowserCall {
                 BrowserResponse::Closed { tabs, .. } => {
                     (BrowserOutcome::Closed, !tabs.is_empty(), Some(tabs.len()))
                 }
+                BrowserResponse::Screenshot { tabs, .. } => {
+                    (BrowserOutcome::Ready, false, Some(tabs.len()))
+                }
                 BrowserResponse::Disconnected { .. } => (BrowserOutcome::Disconnected, true, None),
                 BrowserResponse::Failed { .. } => (BrowserOutcome::Failed, true, None),
                 BrowserResponse::Uncertain { .. } => (BrowserOutcome::Uncertain, true, None),
