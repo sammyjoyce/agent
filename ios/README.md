@@ -508,6 +508,22 @@ The feed of one coordinator, Jobs and work, and a job's screen tell the system
 which coordinator or jobs they show, by identifier alone, so no message text
 is part of it.
 
+**Spotlight** finds each saved coordinator by name, and each scheduled job by
+title, with its coordinator and its run state, such as "Work, Interrupted". A
+result opens through Open Coordinator or Open Job, so the composer draft stays
+as it is. Nothing else is indexed: no message, prompt, working directory,
+schedule, run time or output. The app writes one named index,
+`coordinators-and-jobs`, with the complete file protection class, so its
+contents cannot be read while the phone is locked. It writes once the app is
+active, never from a launch the system starts in the background. Each launch's
+first activation clears the index, indexes the saved coordinators, and reads
+each paired coordinator's job list once, so a stop part way through a rename or
+removal leaves nothing stale past the next launch. After that, a rename updates
+the coordinator and its jobs, a removal deletes both, and each job list the app
+reads replaces that coordinator's jobs. A coordinator that does not answer has
+no jobs in Spotlight until it does. `SpotlightIndex` in
+`ios/Sources/AgentUI/Siri/` is the only writer.
+
 An intent holds a coordinator connected with a lease, so the Job picker and
 Retry Interrupted Run work with the app in the background. A leased
 coordinator stays connected whatever the scene does. When its last lease ends,
