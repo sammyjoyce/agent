@@ -1,5 +1,7 @@
+import { AUTHORITY_UNREACHABLE_EXIT } from "../generated/authority-unreachable-exit.js";
 import type { FailoverReport } from "../generated/FailoverReport.js";
 import type { FailoverRequest } from "../generated/FailoverRequest.js";
+import { AuthorityUnreachable } from "./authority-link.js";
 import { tagged } from "./authority-wire.js";
 import { scriptSession, type ScriptSession } from "./session.js";
 
@@ -16,7 +18,7 @@ function parseRequest(argument: string | undefined): FailoverRequest {
   return failoverRequest(given, "");
 }
 
-/** One exchange with the authority. An authority that refuses is a report. One that does not answer rejects. */
+/** One exchange with the authority. An authority that refuses is a report. One that does not answer rejects with `AuthorityUnreachable`. */
 async function answer(session: ScriptSession, request: FailoverRequest): Promise<FailoverReport> {
   switch (request.op) {
     case "claim": {
@@ -38,5 +40,5 @@ try {
   process.stdout.write(`${JSON.stringify(report)}\n`);
 } catch (error) {
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  process.exitCode = 1;
+  process.exitCode = error instanceof AuthorityUnreachable ? AUTHORITY_UNREACHABLE_EXIT : 1;
 }

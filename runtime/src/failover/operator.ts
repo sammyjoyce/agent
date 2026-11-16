@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { openConversationDatabase } from "../conversation-database.js";
-import { AUTHORITY_UNREACHABLE_EXIT } from "../generated/failover-operator.js";
+import { AUTHORITY_UNREACHABLE_EXIT } from "../generated/authority-unreachable-exit.js";
 import type { OperatorReport } from "../generated/OperatorReport.js";
 import type { OperatorRequest } from "../generated/OperatorRequest.js";
 import { AuthorityUnreachable, type AuthorityLink } from "./authority-link.js";

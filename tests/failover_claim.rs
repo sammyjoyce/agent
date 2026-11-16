@@ -531,8 +531,9 @@ fn an_unreachable_authority_is_an_ordinary_failure_with_the_helper_error() {
         (
             Value::String(String::new()),
             "invented authority unreachable",
-            1,
+            69,
         ),
+        (Value::String(String::new()), "invented helper failure", 1),
         (
             Value::String("not a report\n".into()),
             "invented garbled answer",

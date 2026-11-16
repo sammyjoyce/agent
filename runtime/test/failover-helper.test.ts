@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createServer } from "node:net";
 import { test } from "node:test";
+import { AUTHORITY_UNREACHABLE_EXIT } from "../src/generated/authority-unreachable-exit.js";
 import type { FailoverReport } from "../src/generated/FailoverReport.js";
 import { failoverCoordinator, runHelper, runScript } from "./fixtures/failover-bridge.js";
 import { enroll, OWNER, STANDBY } from "./fixtures/failover-state.js";
@@ -74,14 +75,15 @@ test("the failover helper against the Worker on local workerd", { timeout: 120_0
     assert.deepEqual(coordinator.proxy.seen, []);
   });
 
-  await t.test("an authority that does not answer is a failure, never a refusal", async (t) => {
+  await t.test("an authority that does not answer is a failure with one exit status for both scripts, never a refusal", async (t) => {
     const coordinator = await failoverCoordinator(t);
-    for (const request of [CLAIM, RECORD]) {
-      const run = await runHelper(await coordinator.session(OWNER, undefined, await closedPort()), request);
-      assert.notEqual(run.code, 0);
-      assert.equal(run.stdout, "", "a failed helper prints no report");
+    const requests: ["helper" | "operator", string][] = [["helper", CLAIM], ["helper", RECORD], ["operator", JSON.stringify({ op: "status", state: null })]];
+    for (const [script, request] of requests) {
+      const run = await runScript(script, await coordinator.session(OWNER, undefined, await closedPort()), request);
+      assert.equal(run.code, AUTHORITY_UNREACHABLE_EXIT, `${script} ${request}: ${run.stderr}`);
+      assert.equal(run.stdout, "", "a failed script prints no report");
       assert.match(run.stderr, /authority did not answer/);
-      assert.ok(run.elapsedMs < 10_000, `the helper ended after ${run.elapsedMs} ms`);
+      assert.ok(run.elapsedMs < 10_000, `the ${script} ended after ${run.elapsedMs} ms`);
     }
   });
 

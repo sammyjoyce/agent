@@ -28,8 +28,9 @@ const MAX_EXACT: u64 = 9_007_199_254_740_991;
 /// and from its Pi child alike, so a service manager can leave it stopped.
 pub const OWNER_FENCED_EXIT: u8 = 75;
 
-/// The exit status of `failover/operator.js` when the authority did not
-/// answer, so a caller can tell a request that is safe to repeat from a failure.
+/// The exit status of `failover/helper.js` and `failover/operator.js` when the
+/// authority did not answer, so a caller can tell a request that is safe to
+/// repeat from a failure.
 pub const AUTHORITY_UNREACHABLE_EXIT: u8 = 69;
 
 /// The largest part of a checkpoint file. One Worker request body holds at
@@ -604,8 +605,8 @@ pub enum FailoverRequest {
     Record,
 }
 
-/// The helper's one line of output. An authority it could not reach is a
-/// helper failure, never a refusal.
+/// The helper's one line of output. An authority it could not reach is an
+/// exit with `AUTHORITY_UNREACHABLE_EXIT`, never a refusal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FailoverReport {
@@ -742,7 +743,7 @@ pub struct UnfinishedDelivery {
     pub apns_id: String,
 }
 
-/// The authority did not answer the operator. The same request is safe to repeat.
+/// The authority did not answer the helper or the operator. The same request is safe to repeat.
 #[derive(Debug)]
 pub struct AuthorityUnreachable(String);
 
