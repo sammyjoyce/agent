@@ -1,0 +1,83 @@
+// !$*UTF8*$!
+{
+    archiveVersion = 1;
+    classes = {};
+    objectVersion = 60;
+    objects = {
+        F00000000000000000000001 = {
+            isa = PBXProject;
+            attributes = {BuildIndependentTargetsInParallel = YES; LastSwiftUpdateCheck = 2600; LastUpgradeCheck = 2600; };
+            buildConfigurationList = F00000000000000000000037;
+            compatibilityVersion = "Xcode 15.0";
+            developmentRegion = en;
+            hasScannedForEncodings = 0;
+            knownRegions = (en, Base);
+            mainGroup = F00000000000000000000002;
+            packageReferences = (F00000000000000000000020);
+            productRefGroup = F00000000000000000000005;
+            projectDirPath = "";
+            projectRoot = "";
+            targets = (F00000000000000000000033);
+        };
+        F00000000000000000000002 = {isa = PBXGroup; children = (F00000000000000000000003, F00000000000000000000004, F00000000000000000000005); sourceTree = "<group>"; };
+        F00000000000000000000003 = {isa = PBXGroup; children = (F00000000000000000000010, F00000000000000000000012, F00000000000000000000014, F00000000000000000000016, F00000000000000000000018, F0000000000000000000001A); path = PhoneAcceptanceTests; sourceTree = "<group>"; };
+        F00000000000000000000004 = {isa = PBXGroup; children = (F0000000000000000000001C); name = AgentUITests; path = ../Tests/AgentUITests; sourceTree = "<group>"; };
+        F00000000000000000000005 = {isa = PBXGroup; children = (F00000000000000000000006); name = Products; sourceTree = "<group>"; };
+        F00000000000000000000006 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = PhoneAcceptanceTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+        F00000000000000000000010 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneAcceptanceConfiguration.swift; sourceTree = "<group>"; };
+        F00000000000000000000011 = {isa = PBXBuildFile; fileRef = F00000000000000000000010; };
+        F00000000000000000000012 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Evidence.swift; sourceTree = "<group>"; };
+        F00000000000000000000013 = {isa = PBXBuildFile; fileRef = F00000000000000000000012; };
+        F00000000000000000000014 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneSession.swift; sourceTree = "<group>"; };
+        F00000000000000000000015 = {isa = PBXBuildFile; fileRef = F00000000000000000000014; };
+        F00000000000000000000016 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Rehearsal.swift; sourceTree = "<group>"; };
+        F00000000000000000000017 = {isa = PBXBuildFile; fileRef = F00000000000000000000016; };
+        F00000000000000000000018 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposerRecurrenceTests.swift; sourceTree = "<group>"; };
+        F00000000000000000000019 = {isa = PBXBuildFile; fileRef = F00000000000000000000018; };
+        F0000000000000000000001A = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationDeliveryTests.swift; sourceTree = "<group>"; };
+        F0000000000000000000001B = {isa = PBXBuildFile; fileRef = F0000000000000000000001A; };
+        F0000000000000000000001C = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InteractionPeer.swift; sourceTree = "<group>"; };
+        F0000000000000000000001D = {isa = PBXBuildFile; fileRef = F0000000000000000000001C; };
+        F00000000000000000000020 = {isa = XCLocalSwiftPackageReference; relativePath = ..; };
+        F00000000000000000000021 = {isa = XCSwiftPackageProductDependency; package = F00000000000000000000020; productName = AgentCore; };
+        F00000000000000000000022 = {isa = PBXBuildFile; productRef = F00000000000000000000021; };
+        F00000000000000000000030 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (F00000000000000000000011, F00000000000000000000013, F00000000000000000000015, F00000000000000000000017, F00000000000000000000019, F0000000000000000000001B, F0000000000000000000001D); runOnlyForDeploymentPostprocessing = 0; };
+        F00000000000000000000031 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (F00000000000000000000022); runOnlyForDeploymentPostprocessing = 0; };
+        F00000000000000000000032 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+        F00000000000000000000033 = {
+            isa = PBXNativeTarget;
+            buildConfigurationList = F00000000000000000000034;
+            buildPhases = (F00000000000000000000030, F00000000000000000000031, F00000000000000000000032);
+            buildRules = ();
+            dependencies = ();
+            name = PhoneAcceptanceTests;
+            packageProductDependencies = (F00000000000000000000021);
+            productName = PhoneAcceptanceTests;
+            productReference = F00000000000000000000006;
+            productType = "com.apple.product-type.bundle.ui-testing";
+        };
+        F00000000000000000000034 = {isa = XCConfigurationList; buildConfigurations = (F00000000000000000000035, F00000000000000000000036); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+        F00000000000000000000035 = {
+            isa = XCBuildConfiguration;
+            buildSettings = {CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = "$(CI_TEAM_ID)"; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = dev.example.PhoneAcceptanceTests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; TARGETED_DEVICE_FAMILY = "1,2"; };
+            name = Debug;
+        };
+        F00000000000000000000036 = {
+            isa = XCBuildConfiguration;
+            buildSettings = {CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = "$(CI_TEAM_ID)"; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = dev.example.PhoneAcceptanceTests; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; TARGETED_DEVICE_FAMILY = "1,2"; };
+            name = Release;
+        };
+        F00000000000000000000037 = {isa = XCConfigurationList; buildConfigurations = (F00000000000000000000038, F00000000000000000000039); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+        F00000000000000000000038 = {
+            isa = XCBuildConfiguration;
+            buildSettings = {CLANG_ENABLE_MODULES = YES; IPHONEOS_DEPLOYMENT_TARGET = 18.0; SDKROOT = iphoneos; SWIFT_VERSION = 6.0; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) DEBUG"; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; ONLY_ACTIVE_ARCH = YES; };
+            name = Debug;
+        };
+        F00000000000000000000039 = {
+            isa = XCBuildConfiguration;
+            buildSettings = {CLANG_ENABLE_MODULES = YES; IPHONEOS_DEPLOYMENT_TARGET = 18.0; SDKROOT = iphoneos; SWIFT_VERSION = 6.0; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_COMPILATION_MODE = wholemodule; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; };
+            name = Release;
+        };
+    };
+    rootObject = F00000000000000000000001;
+}

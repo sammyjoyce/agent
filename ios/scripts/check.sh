@@ -27,6 +27,7 @@ printf 'Native validation phase: %s\n' "$phase"
 performance_test=pagedHistoryAndStreamingPreparationRemainBoundedAndKeepCanonicalIdentity
 if [[ "$phase" == all || "$phase" == host ]]; then
   plutil -lint "$native_dir/Agent.xcodeproj/project.pbxproj" \
+    "$native_dir/PhoneAcceptance/PhoneAcceptance.xcodeproj/project.pbxproj" \
     "$native_dir/AgentApp/PrivacyInfo.xcprivacy" "$native_dir/TestFlightExport.plist" \
     "$native_dir/AgentApp/Info.plist" "$native_dir/AgentApp/Agent.entitlements" \
     "$native_dir/ShareExtension/Info.plist" "$native_dir/ShareExtension/Share.entitlements"
@@ -34,7 +35,7 @@ if [[ "$phase" == all || "$phase" == host ]]; then
   # Rust's exporter owns Generated.swift and its formatting.
   xcrun swift-format lint --strict "$native_dir/Package.swift"
   find "$native_dir/AgentApp" "$native_dir/ShareExtension" "$native_dir/Sources" "$native_dir/Tests" \
-    -name '*.swift' ! -name Generated.swift -print0 \
+    "$native_dir/PhoneAcceptance" -name '*.swift' ! -name Generated.swift -print0 \
     | xargs -0 xcrun swift-format lint --strict
   xcrun swift-format lint --strict --recursive "$native_dir/Speech/Package.swift" "$native_dir/Speech/Sources"
   import_of='^[[:space:]]*(@[[:alnum:]_]+[[:space:]]+)*import[[:space:]]+([[:alpha:]]+[[:space:]]+)?'
@@ -99,6 +100,9 @@ SWIFT
   (cd "$native_dir/Speech" && xcodebuild -quiet -scheme Speech -destination 'generic/platform=iOS' \
     -derivedDataPath "$run_dir/speech" -onlyUsePackageVersionsFromResolvedFile \
     CODE_SIGNING_ALLOWED=NO build)
+  xcodebuild -quiet -project "$native_dir/PhoneAcceptance/PhoneAcceptance.xcodeproj" \
+    -scheme PhoneAcceptance -destination 'generic/platform=iOS' \
+    -derivedDataPath "$run_dir/phone-acceptance" CODE_SIGNING_ALLOWED=NO build-for-testing
   # Users get the Release build, and each build extracts its own App Intents metadata.
   for configuration in Debug Release; do
     xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
