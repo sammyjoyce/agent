@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ChatGptPackageSummary, Corruption, Incompleteness, PackageError, PackageProgress, UnsafeReason,
-    archive::{self, Limits, MemberPath, Method, Region, Spool, Tee, ZipMember},
+    archive::{self, Admission, Limits, MemberPath, Method, Region, Spool, Tee, ZipMember},
     conversation::{self, FileId, FileLookup, LibraryFile},
     json::{self, Element, Split, SplitError},
 };
@@ -101,15 +101,19 @@ impl Package {
     ) -> Result<Self, PackageError> {
         let mut builder = Builder {
             limits,
+            admission: Admission::new(limits),
             members: Vec::new(),
             parts: Vec::new(),
             zip_parts: Vec::new(),
-            declared: 0,
             spool_remaining: limits.spool_bytes,
         };
-        for (name, input) in resolve(paths, &limits)? {
+        for path in resolve(paths)? {
+            let name = path
+                .file_name()
+                .map(|name| archive::shown(&name.to_string_lossy()))
+                .unwrap_or_default();
             progress(PackageProgress::Part { name: name.clone() });
-            builder.add_part(name, input)?;
+            builder.add_part(name, path)?;
         }
         if !builder.has_conversation_data() {
             builder.open_nested(progress)?;
@@ -188,67 +192,66 @@ impl FileLookup for Package {
     }
 }
 
-fn resolve(paths: &[PathBuf], limits: &Limits) -> Result<Vec<(String, Input)>, PackageError> {
-    let unreadable = |path: &Path, error: io::Error| PackageError::Unreadable {
+fn unreadable(path: &Path, error: io::Error) -> PackageError {
+    PackageError::Unreadable {
         path: archive::shown(&path.to_string_lossy()),
         reason: error.to_string(),
-    };
+    }
+}
+
+fn resolve(paths: &[PathBuf]) -> Result<Vec<PathBuf>, PackageError> {
     let mut seen = BTreeSet::new();
-    let mut inputs = Vec::new();
+    let mut parts = Vec::new();
     for path in paths {
         let canonical = std::fs::canonicalize(path).map_err(|error| unreadable(path, error))?;
         for part in archive::sibling_parts(&canonical)? {
-            if !seen.insert(part.clone()) {
-                continue;
+            if seen.insert(part.clone()) {
+                parts.push(part);
             }
-            if seen.len() > limits.parts {
-                return Err(PackageError::Bounds {
-                    what: "parts",
-                    limit: limits.parts as u64,
-                    found: seen.len() as u64,
-                });
-            }
-            let name = part
-                .file_name()
-                .map(|name| archive::shown(&name.to_string_lossy()))
-                .unwrap_or_default();
-            let metadata = std::fs::metadata(&part).map_err(|error| unreadable(&part, error))?;
-            let input = if metadata.is_dir() {
-                Input::Folder(part)
-            } else {
-                let file =
-                    archive::open_regular(&part).map_err(|error| unreadable(&part, error))?;
-                let mut magic = [0; 4];
-                let zip = std::os::unix::fs::FileExt::read_exact_at(&file, &mut magic, 0).is_ok()
-                    && (magic == *b"PK\x03\x04" || magic == *b"PK\x05\x06");
-                if zip {
-                    Input::Zip(Region::whole(file).map_err(|error| unreadable(&part, error))?)
-                } else {
-                    Input::Json(part)
-                }
-            };
-            inputs.push((name, input));
         }
     }
-    Ok(inputs)
+    Ok(parts)
+}
+
+fn input(part: PathBuf) -> Result<Input, PackageError> {
+    let metadata = std::fs::metadata(&part).map_err(|error| unreadable(&part, error))?;
+    if metadata.is_dir() {
+        return Ok(Input::Folder(part));
+    }
+    let file = archive::open_regular(&part).map_err(|error| unreadable(&part, error))?;
+    let mut magic = [0; 4];
+    let zip = std::os::unix::fs::FileExt::read_exact_at(&file, &mut magic, 0).is_ok()
+        && (magic == *b"PK\x03\x04" || magic == *b"PK\x05\x06");
+    if zip {
+        Ok(Input::Zip(
+            Region::whole(file).map_err(|error| unreadable(&part, error))?,
+        ))
+    } else {
+        Ok(Input::Json(part))
+    }
 }
 
 struct Builder {
     limits: Limits,
+    admission: Admission,
     members: Vec<Member>,
     parts: Vec<String>,
     zip_parts: Vec<usize>,
-    declared: u64,
     spool_remaining: u64,
 }
 
 impl Builder {
-    fn add_part(&mut self, name: String, input: Input) -> Result<(), PackageError> {
-        let part = self.parts.len();
-        self.parts.push(name.clone());
-        match input {
+    fn part(&mut self, name: String) -> Result<usize, PackageError> {
+        self.admission.part()?;
+        self.parts.push(name);
+        Ok(self.parts.len() - 1)
+    }
+
+    fn add_part(&mut self, name: String, path: PathBuf) -> Result<(), PackageError> {
+        let part = self.part(name.clone())?;
+        match input(path)? {
             Input::Folder(root) => {
-                for member in archive::walk_folder(&root, &self.limits, &mut self.declared)? {
+                for member in archive::walk_folder(&root, &mut self.admission)? {
                     self.members.push(Member {
                         path: member.path,
                         size: member.size,
@@ -264,7 +267,7 @@ impl Builder {
                         reason: error.to_string(),
                     })?
                     .len();
-                self.declared = self.declared.saturating_add(size);
+                self.admission.member(size)?;
                 self.members.push(Member {
                     path: MemberPath::parse(b"conversations.json", &self.limits)?,
                     size,
@@ -281,7 +284,7 @@ impl Builder {
     }
 
     fn add_zip(&mut self, part: usize, name: &str, region: Region) -> Result<(), PackageError> {
-        for entry in archive::zip_members(name, &region, &self.limits, &mut self.declared)? {
+        for entry in archive::zip_members(name, &region, &mut self.admission)? {
             self.members.push(Member {
                 path: entry.path.clone(),
                 size: entry.size,
@@ -319,6 +322,8 @@ impl Builder {
             .collect();
         for index in nested {
             let name = self.members[index].path.as_str().to_owned();
+            progress(PackageProgress::Part { name: name.clone() });
+            let part = self.part(name.clone())?;
             let damaged = |error: io::Error| member_error(&name, error);
             let region = match self.members[index].region().map_err(damaged)? {
                 Some(region) => region,
@@ -330,9 +335,6 @@ impl Builder {
                     spool.into_region()
                 }
             };
-            progress(PackageProgress::Part { name: name.clone() });
-            let part = self.parts.len();
-            self.parts.push(name.clone());
             self.add_zip(part, &name, region)?;
         }
         Ok(())
@@ -1408,6 +1410,82 @@ mod tests {
             ..Limits::default()
         };
         assert_eq!(bound(refused(open_with(&[path], limits))), "package size");
+    }
+
+    #[test]
+    fn every_input_form_is_admitted_by_the_same_size_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let conversations = [picnic(1), picnic(2)];
+        let export = Export::new().conversations(&conversations);
+        let json = directory.path().join("conversations.json");
+        std::fs::write(&json, serde_json::to_vec(&conversations).unwrap()).unwrap();
+        let folder = directory.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        export.folder(&folder);
+        let zip = export.zip(&directory.path().join("export.zip"));
+        let size = std::fs::metadata(&json).unwrap().len();
+        let member = Limits {
+            member_bytes: size - 1,
+            ..Limits::default()
+        };
+        let package = Limits {
+            package_bytes: size - 1,
+            ..Limits::default()
+        };
+        let found: Vec<(&str, Option<&str>)> =
+            [("json", &json), ("folder", &folder), ("zip", &zip)]
+                .into_iter()
+                .flat_map(|(form, path)| {
+                    [member, package].map(|limits| {
+                        (
+                            form,
+                            open_with(std::slice::from_ref(path), limits)
+                                .err()
+                                .map(bound),
+                        )
+                    })
+                })
+                .collect();
+        assert_eq!(
+            found,
+            [
+                ("json", Some("member size")),
+                ("json", Some("package size")),
+                ("folder", Some("member size")),
+                ("folder", Some("package size")),
+                ("zip", Some("member size")),
+                ("zip", Some("package size")),
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_archives_count_against_the_parts_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = Export::new()
+            .stored(
+                "Conversations__x.zip",
+                &Export::new().conversations(&[picnic(1)]).zip_bytes(),
+            )
+            .stored(
+                "Files__x.zip",
+                &Export::new()
+                    .stored("file_00ab12-beach.dat", fixture::PNG)
+                    .zip_bytes(),
+            )
+            .zip(&directory.path().join("portal.zip"));
+        let limits = |parts| Limits {
+            parts,
+            ..Limits::default()
+        };
+        assert_eq!(
+            bound(refused(open_with(std::slice::from_ref(&path), limits(2)))),
+            "parts"
+        );
+        assert_eq!(
+            open_with(&[path], limits(3)).unwrap().summary.parts.len(),
+            3
+        );
     }
 
     #[test]

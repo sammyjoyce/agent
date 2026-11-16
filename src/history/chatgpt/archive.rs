@@ -23,6 +23,40 @@ pub(super) struct Limits {
 
 const RATIO_FLOOR: u64 = 1024 * 1024;
 
+pub(super) struct Admission {
+    pub limits: Limits,
+    parts: usize,
+    declared: u64,
+}
+
+impl Admission {
+    pub fn new(limits: Limits) -> Self {
+        Self {
+            limits,
+            parts: 0,
+            declared: 0,
+        }
+    }
+
+    pub fn part(&mut self) -> Result<(), PackageError> {
+        self.parts += 1;
+        within("parts", self.limits.parts as u64, self.parts as u64)
+    }
+
+    pub fn member(&mut self, size: u64) -> Result<(), PackageError> {
+        within("member size", self.limits.member_bytes, size)?;
+        self.declared = self.declared.saturating_add(size);
+        within("package size", self.limits.package_bytes, self.declared)
+    }
+}
+
+fn within(what: &'static str, limit: u64, found: u64) -> Result<(), PackageError> {
+    if found > limit {
+        return Err(PackageError::Bounds { what, limit, found });
+    }
+    Ok(())
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
@@ -404,9 +438,9 @@ const REGULAR: u32 = 0o100_000;
 pub(super) fn zip_members(
     name: &str,
     archive: &Region,
-    limits: &Limits,
-    total: &mut u64,
+    admission: &mut Admission,
 ) -> Result<Vec<ZipMember>, PackageError> {
+    let limits = admission.limits;
     let unreadable = |error: &dyn std::fmt::Display| PackageError::Unreadable {
         path: name.to_owned(),
         reason: error.to_string(),
@@ -435,7 +469,7 @@ pub(super) fn zip_members(
         if entry.is_dir() || mode == Some(DIRECTORY) {
             continue;
         }
-        let path = MemberPath::parse(&raw_name, limits)?;
+        let path = MemberPath::parse(&raw_name, &limits)?;
         let refuse = |reason| PackageError::Unsafe {
             member: shown(path.as_str()),
             reason,
@@ -455,13 +489,7 @@ pub(super) fn zip_members(
         };
         let size = entry.size();
         let compressed = entry.compressed_size();
-        if size > limits.member_bytes {
-            return Err(PackageError::Bounds {
-                what: "member size",
-                limit: limits.member_bytes,
-                found: size,
-            });
-        }
+        admission.member(size)?;
         if size > RATIO_FLOOR && size / compressed.max(1) > limits.ratio {
             return Err(PackageError::Bounds {
                 what: "compression ratio",
@@ -469,7 +497,6 @@ pub(super) fn zip_members(
                 found: size / compressed.max(1),
             });
         }
-        count_bytes(total, size, limits)?;
         let data_start = entry
             .data_start()
             .ok_or_else(|| unreadable(&"a member has no data offset"))?;
@@ -485,18 +512,6 @@ pub(super) fn zip_members(
     Ok(members)
 }
 
-fn count_bytes(total: &mut u64, size: u64, limits: &Limits) -> Result<(), PackageError> {
-    *total = total.saturating_add(size);
-    if *total > limits.package_bytes {
-        return Err(PackageError::Bounds {
-            what: "package size",
-            limit: limits.package_bytes,
-            found: *total,
-        });
-    }
-    Ok(())
-}
-
 pub(super) struct FolderMember {
     pub path: MemberPath,
     pub size: u64,
@@ -505,9 +520,9 @@ pub(super) struct FolderMember {
 
 pub(super) fn walk_folder(
     root: &Path,
-    limits: &Limits,
-    total: &mut u64,
+    admission: &mut Admission,
 ) -> Result<Vec<FolderMember>, PackageError> {
+    let limits = admission.limits;
     let unreadable = |path: &Path, error: io::Error| PackageError::Unreadable {
         path: shown(&path.to_string_lossy()),
         reason: error.to_string(),
@@ -539,22 +554,15 @@ pub(super) fn walk_folder(
                 return Err(refuse(UnsafeReason::Symlink));
             }
             if kind.is_dir() {
-                MemberPath::parse(name.as_bytes(), limits)?;
+                MemberPath::parse(name.as_bytes(), &limits)?;
                 pending.push(path);
                 continue;
             }
             if !kind.is_file() {
                 return Err(refuse(UnsafeReason::SpecialFile));
             }
-            let member = MemberPath::parse(name.as_bytes(), limits)?;
-            if metadata.len() > limits.member_bytes {
-                return Err(PackageError::Bounds {
-                    what: "member size",
-                    limit: limits.member_bytes,
-                    found: metadata.len(),
-                });
-            }
-            count_bytes(total, metadata.len(), limits)?;
+            let member = MemberPath::parse(name.as_bytes(), &limits)?;
+            admission.member(metadata.len())?;
             members.push(FolderMember {
                 path: member,
                 size: metadata.len(),
