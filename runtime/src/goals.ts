@@ -27,14 +27,18 @@ import { MAX_FILE_READ_BYTES, resolveHostPath, type Execution, type Executions }
 export const GOAL_CONTINUATION_BUDGET = 5;
 const OBJECTIVE_LIMIT = 4000;
 const TITLE_LIMIT = 80;
-const RETAINED_REQUESTS = 32;
 
-type GoalSlot = { goal: Goal | null; requests: string[] };
+type GoalSlot = { goal: Goal | null };
 const GoalDoc = defineDocFamily<GoalSlot, null>({ kind: "agent.goal", scope: "session", family: true, version: 1,
-  initial: () => ({ goal: null, requests: [] }), checkpointWhen: () => true });
-type MainPointer = { task_id: string | null; goal_id: string | null; requests: string[] };
+  initial: () => ({ goal: null }), checkpointWhen: () => true });
+type MainPointer = { task_id: string | null; goal_id: string | null };
 const MainGoal = defineDoc<MainPointer>({ kind: "agent.goal.main", scope: "session", version: 1,
-  initial: () => ({ task_id: null, goal_id: null, requests: [] }), checkpointWhen: () => true });
+  initial: () => ({ task_id: null, goal_id: null }), checkpointWhen: () => true });
+type GoalControl = { action: "set" | "pause" | "resume"; objective: string | null };
+/** The control one request ID was accepted for, kept for good so a replay at any later time changes nothing. */
+type GoalRequest = GoalControl & { main: boolean; task_id: string; goal_id: string };
+const GoalRequests = defineDocFamily<{ request: GoalRequest | null }, null>({ kind: "agent.goal.request", scope: "session", family: true,
+  version: 1, initial: () => ({ request: null }), checkpointWhen: () => true });
 /** Retained in the owning task's conversation for every check the runtime runs. */
 export const GoalVerificationEntry = defineEntry<GoalVerification>("agent.goal_verification");
 
@@ -75,6 +79,7 @@ const NO_GOAL = "No goal is set for this conversation. Set one with /goal OBJECT
 const COMPLETE = "This goal is already complete. Set a new one with /goal OBJECTIVE.";
 const AGENT = "An agent reports to its task. Set the goal from the task's conversation.";
 const CHANGED = "The goal was paused or resumed during verification. Check it again in the current activation.";
+const REUSED = "This goal request ID was already used for another control. Send the control again with a new request ID.";
 
 export class GoalStore implements GoalPolicy {
   constructor(private readonly session: Harness, private readonly tasks: TaskStore, private readonly environment: CoordinatorEnvironment,
@@ -123,14 +128,14 @@ export class GoalStore implements GoalPolicy {
     const goal = (await tx.doc(GoalDoc, pointer.task_id, null)).goal;
     return goal !== null && goal.id === pointer.goal_id ? goal : null;
   }
-  private async acceptedIn(tx: Tx, selected: Selected, request: string): Promise<boolean> {
-    const goal = await this.goalIn(tx, selected);
-    if (goal !== null && (await tx.doc(GoalDoc, goal.task_id, null)).requests.includes(request)) return true;
-    return selected.kind === "main" && (await tx.doc(MainGoal)).requests.includes(request);
+  /** The receipt of this request, created empty for the commit to fill. A commit that accepts nothing throws, so an
+   * empty receipt is never kept. */
+  private async receiptIn(tx: Tx, selected: Selected, request: string, control: GoalControl) {
+    const receipt = await tx.doc(GoalRequests, request, null);
+    return { receipt, replay: replayOf(receipt.request, selected, control) };
   }
-  private async acceptIn(tx: Tx, selected: Selected, taskId: string, request: string): Promise<void> {
-    remember((await tx.doc(GoalDoc, taskId, null)).requests, request);
-    if (selected.kind === "main") remember((await tx.doc(MainGoal)).requests, request);
+  private async committedReplay(selected: Selected, request: string, control: GoalControl): Promise<GoalRequest | undefined> {
+    return replayOf((await this.session.snapshot(GoalRequests, request, BACKGROUND_CONTEXT))?.request, selected, control);
   }
 
   /** The goal and its task come from one transaction, so a status never pairs a goal with another moment's task. */
@@ -151,14 +156,17 @@ export class GoalStore implements GoalPolicy {
   private async set(selected: Selected, request: string, objective: string, call: HostCall): Promise<GoalStatus> {
     const text = objective.trim();
     if (text.length === 0 || text.length > OBJECTIVE_LIMIT) throw new TaskError(`A goal needs an objective of 1 to ${OBJECTIVE_LIMIT} characters`);
-    if (await this.session.commit((tx) => this.acceptedIn(tx, selected, request), BACKGROUND_CONTEXT)) return this.replayed(selected, call);
+    const control: GoalControl = { action: "set", objective: text };
+    const known = await this.committedReplay(selected, request, control);
+    if (known !== undefined) return this.replayed(selected, known.goal_id, call);
     const host = selected.kind === "main" ? await this.defaultHost() : undefined;
     const model = host === undefined ? undefined : host.launch?.model ?? await this.environment.model(null);
     if (model !== undefined) await this.tasks.inference.preflight(model);
     const taskId = selected.kind === "task" ? selected.task.id : taskRequestId(request);
-    type Admission = { created: ConversationId | undefined } | undefined;
+    type Admission = { type: "replayed"; goal_id: string } | { type: "set"; created: ConversationId | undefined };
     const admitted = await this.tasks.admitWith(taskId, async (tx): Promise<{ value: Admission; input?: TaskInput }> => {
-      if (await this.acceptedIn(tx, selected, request)) return { value: undefined };
+      const { receipt, replay } = await this.receiptIn(tx, selected, request, control);
+      if (replay !== undefined) return { value: { type: "replayed", goal_id: replay.goal_id } };
       let created: ConversationId | undefined;
       const current = await this.goalIn(tx, selected);
       if (current !== null && current.state.state !== "complete") throw new TaskError(UNFINISHED);
@@ -172,33 +180,37 @@ export class GoalStore implements GoalPolicy {
       const goal: Goal = { id: request, task_id: taskId, objective: text, state: { state: "active" }, last_rejection: null,
         activation: { number: 1, request_id: request, continuations: 0, budget: this.budget, check: null }, created_at: now, updated_at: now };
       (await tx.doc(GoalDoc, taskId, null)).goal = goal;
-      await this.acceptIn(tx, selected, taskId, request);
-      return { value: { created }, input: { id: inputId(goal, 0), content: objectiveText(goal), mode: "follow_up" } };
+      receipt.request = { ...control, main: selected.kind === "main", task_id: taskId, goal_id: goal.id };
+      return { value: { type: "set", created }, input: { id: inputId(goal, 0), content: objectiveText(goal), mode: "follow_up" } };
     });
-    if (admitted === undefined) return this.replayed(selected, call);
+    if (admitted.type === "replayed") return this.replayed(selected, admitted.goal_id, call);
     if (admitted.created !== undefined) this.tasks.rememberConversation(admitted.created);
     await this.ensureRunning(taskId, host, call);
     return this.status(selected);
   }
 
-  private async replayed(selected: Selected, call: HostCall): Promise<GoalStatus> {
+  /** A replay changes nothing. The goal it named still gets its worker while active, so a crash before dispatch converges. */
+  private async replayed(selected: Selected, goalId: string, call: HostCall): Promise<GoalStatus> {
     const status = await this.status(selected);
     const goal = status.goal?.goal;
-    if (goal === undefined || goal.state.state !== "active") return status;
+    if (goal === undefined || goal.id !== goalId || goal.state.state !== "active") return status;
     await this.ensureRunning(goal.task_id, undefined, call);
     return this.status(selected);
   }
 
+  /** A replayed pause on the goal it paused repeats only the stop, so a crash between the commit and the stop converges. */
   private async pause(selected: Selected, request: string): Promise<GoalStatus> {
+    const control: GoalControl = { action: "pause", objective: null };
     const paused = await this.session.commit(async (tx) => {
       const goal = await this.goalIn(tx, selected);
-      if (goal === null) throw new TaskError(NO_GOAL);
-      if (!await this.acceptedIn(tx, selected, request)) {
+      const { receipt, replay } = await this.receiptIn(tx, selected, request, control);
+      if (replay === undefined) {
+        if (goal === null) throw new TaskError(NO_GOAL);
         if (goal.state.state === "complete") throw new TaskError(COMPLETE);
         if (goal.state.state === "active") pauseIn(goal, "requested");
-        await this.acceptIn(tx, selected, goal.task_id, request);
+        receipt.request = { ...control, main: selected.kind === "main", task_id: goal.task_id, goal_id: goal.id };
       }
-      if (goal.state.state !== "paused") return undefined;
+      if (goal === null || goal.state.state !== "paused" || (replay !== undefined && replay.goal_id !== goal.id)) return undefined;
       // Pi's unplaced-abort receipt claims each request ID, so an actor that read the outbox earlier starts no turn.
       await this.tasks.withdrawIn(tx, goal.task_id, undefined, (input) => input.id.startsWith(inputPrefix(goal)));
       return { task_id: goal.task_id, latest: inputId(goal, goal.activation.continuations) };
@@ -217,20 +229,25 @@ export class GoalStore implements GoalPolicy {
   }
 
   private async resume(selected: Selected, request: string, call: HostCall): Promise<GoalStatus> {
+    const control: GoalControl = { action: "resume", objective: null };
+    const replayed = await this.committedReplay(selected, request, control);
+    if (replayed !== undefined) return this.replayed(selected, replayed.goal_id, call);
     const known = (await this.status(selected)).goal?.goal;
     if (known === undefined) throw new TaskError(NO_GOAL);
-    const resumed = await this.tasks.admitWith(known.task_id, async (tx): Promise<{ value: boolean; input?: TaskInput }> => {
+    const replay = await this.tasks.admitWith(known.task_id, async (tx): Promise<{ value: string | undefined; input?: TaskInput }> => {
       const goal = await this.goalIn(tx, selected);
+      const { receipt, replay } = await this.receiptIn(tx, selected, request, control);
+      if (replay !== undefined) return { value: replay.goal_id };
       if (goal === null || goal.id !== known.id) throw new TaskError("The goal changed. Show it with /goal.");
-      if (await this.acceptedIn(tx, selected, request)) return { value: goal.state.state === "active" };
       if (goal.state.state === "complete") throw new TaskError(COMPLETE);
-      await this.acceptIn(tx, selected, goal.task_id, request);
-      if (goal.state.state === "active") return { value: true };
+      receipt.request = { ...control, main: selected.kind === "main", task_id: goal.task_id, goal_id: goal.id };
+      if (goal.state.state === "active") return { value: undefined };
       goal.activation = { number: goal.activation.number + 1, request_id: request, continuations: 0, budget: this.budget, check: null };
       goal.state = { state: "active" }; goal.updated_at = Date.now();
-      return { value: true, input: { id: inputId(goal, 0), content: resumeText(goal), mode: "follow_up" } };
+      return { value: undefined, input: { id: inputId(goal, 0), content: resumeText(goal), mode: "follow_up" } };
     });
-    if (resumed) await this.ensureRunning(known.task_id, undefined, call);
+    if (replay !== undefined) return this.replayed(selected, replay, call);
+    await this.ensureRunning(known.task_id, undefined, call);
     return this.status(selected);
   }
 
@@ -375,9 +392,12 @@ function taskRequestId(value: string): string {
   if (!UUID.test(value) || /^[0-]+$/.test(value)) throw new TaskError("A main goal request ID must be a non-nil UUID");
   return value;
 }
-function remember(requests: string[], request: string): void {
-  requests.push(request);
-  if (requests.length > RETAINED_REQUESTS) requests.splice(0, requests.length - RETAINED_REQUESTS);
+/** A request ID names one control on one target. Its replay returns the receipt, and any other use is refused. */
+function replayOf(saved: Readonly<GoalRequest> | null | undefined, selected: Selected, control: GoalControl): GoalRequest | undefined {
+  if (saved === null || saved === undefined) return undefined;
+  const sameTarget = selected.kind === "main" ? saved.main : !saved.main && saved.task_id === selected.task.id;
+  if (saved.action !== control.action || saved.objective !== control.objective || !sameTarget) throw new TaskError(REUSED);
+  return { action: saved.action, objective: saved.objective, main: saved.main, task_id: saved.task_id, goal_id: saved.goal_id };
 }
 
 function inputPrefix(goal: Goal): string { return `goal:${goal.id}:`; }

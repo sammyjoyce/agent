@@ -492,6 +492,33 @@ test("pause withdraws only goal inputs, survives a restart and ignores replayed 
   });
 });
 
+test("a control replayed after many later controls and a restart changes nothing", async () => {
+  await scenario(undefined, async (fixture) => {
+    let app = fixture.app;
+    const task = await app.task("Many controls");
+    const target = inTask(task.id);
+    await app.goal(target, { type: "set", request_id: "set-many", objective: "Keep the notes current" });
+    await app.goal(target, { type: "pause", request_id: "pause-0" });
+    assert.equal(goalOf(await app.goal(target, { type: "resume", request_id: "resume-old" })).activation.number, 2);
+    for (let index = 1; index <= 17; index += 1) {
+      await app.goal(target, { type: "pause", request_id: `pause-${index}` });
+      if (index < 17) await app.goal(target, { type: "resume", request_id: `resume-${index}` });
+    }
+
+    app = await fixture.reopen();
+    const before = goalOf(await app.goal(target, show));
+    assert.deepEqual(before.state, { state: "paused", reason: "requested" });
+    assert.equal(before.activation.number, 18);
+    assert.deepEqual(goalOf(await app.goal(target, { type: "resume", request_id: "resume-old" })), before);
+    assert.deepEqual(goalOf(await app.goal(target, { type: "set", request_id: "set-many", objective: "Keep the notes current" })), before);
+    assert.deepEqual((await app.tasks.get(task.id)).pending, []);
+    await assert.rejects(app.goal(target, { type: "pause", request_id: "resume-old" }), /already used for another control/);
+    await assert.rejects(app.goal(target, { type: "set", request_id: "set-many", objective: "Another objective" }), /already used for another control/);
+    await assert.rejects(app.goal(MAIN, { type: "resume", request_id: "resume-old" }), /already used for another control/);
+    assert.deepEqual(goalOf(await app.goal(target, show)), before);
+  });
+});
+
 async function pauseKeepsQueuedInput(interactive: boolean): Promise<void> {
   await scenario(undefined, async ({ app, host }) => {
     const task = await app.task("Busy goal task");
