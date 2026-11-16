@@ -7,7 +7,7 @@ use std::{
 };
 
 use super::{
-    Record, RetentionWatermark, STAMP_REORDER_TOLERANCE, Segment, WATERMARK_BYTES, now_ms,
+    Event, Record, RetentionWatermark, STAMP_REORDER_TOLERANCE, Segment, WATERMARK_BYTES, now_ms,
     undelivered_drops,
 };
 
@@ -30,6 +30,10 @@ pub(crate) struct ReceiptWindow {
     /// window. A receipt near such a move may be stamped outside the window
     /// although it was written inside it, so the window cannot be trusted whole.
     pub clock_moves: Option<ClockMoves>,
+    /// For each writer start whose previous receipt is not a clean stop, the
+    /// timestamps of that receipt and of the start. Anything the writer before
+    /// had queued or counted as dropped was lost between them.
+    pub unclean_restarts: Vec<(u64, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,7 +247,9 @@ fn read_once(
         undelivered_drops: 0,
         drops_reported_after_window: 0,
         clock_moves: None,
+        unclean_restarts: Vec::new(),
     };
+    let mut previous: Option<(u64, bool)> = None;
     let mut clock = ClockWatch {
         window: (start, end),
         previous_ms: None,
@@ -267,6 +273,10 @@ fn read_once(
                     );
                     placement.receipt(timestamp, start);
                     clock.receipt(timestamp);
+                    if let (Event::WriterStarted, Some((last, false))) = (&record.event, previous) {
+                        window.unclean_restarts.push((last, timestamp));
+                    }
+                    previous = Some((timestamp, matches!(record.event, Event::WriterStopped)));
                     if timestamp >= end {
                         window.drops_reported_after_window = window
                             .drops_reported_after_window

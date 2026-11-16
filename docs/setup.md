@@ -570,18 +570,28 @@ to withdraw it.
 
 A run abstains as `quiet` only when its coverage has no gaps. A gap is any way
 the window may be missing evidence: expired or evicted segments, dropped or
-unparseable receipts, a read that stopped early, or more than ten minutes with
-no receipt. The coordinator writes a `heartbeat` receipt every five minutes, so
-a stopped coordinator or a failed log writer appears as an `unwitnessed` gap
-instead of a quiet night. A machine that sleeps for more than ten minutes
-leaves the same gap. A `clock_moved` gap means that receipt timestamps went
-back by more than a minute around the window, or that a receipt is stamped
-ahead of the present. A receipt near such a move can carry a time outside the
-window although it was written inside it, so the night is not counted whole.
+unparseable receipts, a read that stopped early, a restart after a crash, or
+more than ten minutes with no receipt. The coordinator writes a `heartbeat`
+receipt every five minutes, so a stopped coordinator or a failed log writer
+appears as an `unwitnessed` gap instead of a quiet night. A machine that sleeps
+for more than ten minutes leaves the same gap. A `clock_moved` gap means that
+receipt timestamps went back by more than a minute around the window, or that
+a receipt is stamped ahead of the present. A receipt near such a move can carry
+a time outside the window although it was written inside it, so the night is
+not counted whole.
 Smaller steps back are normal, because several senders stamp a receipt before
 they enqueue it. A gap never blocks a proposal. It blocks only the claim
 that the night was quiet. Task summaries are the text retained when the review
 was sealed. They are a snapshot, not a history of the window.
+
+The log writer also records when it starts and when it stops cleanly. A writer
+holds queued receipts and its count of dropped receipts in memory, so a crash
+loses them. When a writer starts and the receipt before its start is not a
+clean stop, the review shows an `unclean_restart` gap from that receipt to the
+start, even when the restart came within ten minutes. The first start after
+you upgrade from a version without these records shows this gap once. A crash
+in the first moments of startup, before the new writer has recorded its start,
+leaves no gap for the receipts of that moment.
 
 A check runs with only `PATH`, `HOME`, `LANG` and `TMPDIR` in its environment,
 in a private clone under `<state_dir>/dreams/runs/`. Write checks that read

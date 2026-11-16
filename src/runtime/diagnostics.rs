@@ -159,6 +159,10 @@ pub(crate) enum Event {
         code: ErrorCode,
     },
     Heartbeat,
+    /// A start that does not follow a `WriterStopped` shows that the writer
+    /// before it lost whatever it held in memory.
+    WriterStarted,
+    WriterStopped,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -663,7 +667,7 @@ fn undelivered_drops(directory: &Path) -> u64 {
         })
 }
 
-fn heartbeat(dropped_before: u64) -> Record {
+fn writer_receipt(event: Event, dropped_before: u64) -> Record {
     Record {
         timestamp_ms: now_ms(),
         request_id: 0,
@@ -672,7 +676,7 @@ fn heartbeat(dropped_before: u64) -> Record {
         task_id: None,
         agent_id: None,
         dropped_before,
-        event: Event::Heartbeat,
+        event,
     }
 }
 
@@ -764,22 +768,26 @@ impl Diagnostics {
                 let Some(sender) = witness.upgrade() else {
                     return;
                 };
-                deliver(&sender, &drops, heartbeat(0), WhenFull::Forget);
+                deliver(
+                    &sender,
+                    &drops,
+                    writer_receipt(Event::Heartbeat, 0),
+                    WhenFull::Forget,
+                );
             }
         });
         let drops = diagnostics.drops.clone();
         tokio::task::spawn_blocking(move || {
             let result = (|| -> io::Result<()> {
                 let mut writer = Writer::open(directory, MAX_BYTES)?;
+                writer.append(&writer_receipt(Event::WriterStarted, 0))?;
                 while let Some(record) = records.blocking_recv() {
                     append_reported(&mut writer, &drops, &record)?;
                 }
                 // The last sender is gone, so nothing else can report these.
                 let mut ledger = drops.lock().unwrap_or_else(PoisonError::into_inner);
-                if ledger.unreported > 0 {
-                    writer.append(&heartbeat(ledger.unreported))?;
-                    ledger.unreported = 0;
-                }
+                writer.append(&writer_receipt(Event::WriterStopped, ledger.unreported))?;
+                ledger.unreported = 0;
                 Ok(())
             })();
             if result.is_err() {

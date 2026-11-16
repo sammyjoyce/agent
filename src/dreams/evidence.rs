@@ -193,6 +193,14 @@ pub(crate) fn receipt_coverage(window: Interval, receipts: &ReceiptWindow) -> Re
             cause: GapCause::ConcurrentRotation,
         });
     }
+    for &(last, started) in &receipts.unclean_restarts {
+        if let Some(interval) = within(last.min(started), last.max(started).saturating_add(1)) {
+            gaps.push(Gap {
+                interval: Some(interval),
+                cause: GapCause::UncleanRestart,
+            });
+        }
+    }
     let silence = u64::try_from(UNWITNESSED_AFTER.as_millis()).unwrap_or(u64::MAX);
     let witnessed_until = receipts.truncated_at_ms.unwrap_or(window.end_ms);
     let mut previous = window.start_ms;
@@ -603,6 +611,7 @@ mod tests {
             undelivered_drops: 0,
             drops_reported_after_window: 0,
             clock_moves: None,
+            unclean_restarts: Vec::new(),
         }
     }
 

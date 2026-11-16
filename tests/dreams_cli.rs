@@ -168,10 +168,11 @@ fn a_dreams_job_runs_confined_and_cannot_reach_a_shell_a_file_or_another_task() 
 }
 
 #[test]
-fn a_witnessed_quiet_night_reports_complete_coverage_and_seals_a_quiet_abstention() {
+fn a_witnessed_quiet_night_across_a_clean_restart_is_complete_and_seals_a_quiet_abstention() {
     let fixture = Fixture::new();
     fixture.seed_witnessed_night();
     let before = fixture.target();
+    fixture.start().stop();
     let mut server = fixture.start();
     fixture.script(
         DREAMS_KEY,

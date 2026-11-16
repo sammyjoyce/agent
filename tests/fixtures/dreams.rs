@@ -262,11 +262,17 @@ impl Fixture {
         .unwrap();
     }
 
+    /// Seeds the receipts of a coordinator that then stopped cleanly.
     pub fn seed_receipts(&self, lines: &[String], retention: &Value) {
         let diagnostics = self.state.join("diagnostics");
         fs::create_dir(&diagnostics).unwrap();
         fs::set_permissions(&diagnostics, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(diagnostics.join("runtime.jsonl"), lines.join("\n") + "\n").unwrap();
+        let stopped = json!({ "timestamp_ms": now_ms(), "request_id": 0, "elapsed_ms": null, "event": "writer_stopped" });
+        fs::write(
+            diagnostics.join("runtime.jsonl"),
+            format!("{}\n{stopped}\n", lines.join("\n")),
+        )
+        .unwrap();
         fs::write(
             diagnostics.join("retention.json"),
             serde_json::to_vec(retention).unwrap(),

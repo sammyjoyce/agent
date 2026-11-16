@@ -243,6 +243,9 @@ pub enum GapCause {
     ConcurrentRotation,
     /// No receipt, not even a heartbeat, for longer than two heartbeat intervals.
     Unwitnessed,
+    /// A receipt writer started after one that ended without its clean stop,
+    /// which loses the receipts and drop counts that it held in memory.
+    UncleanRestart,
     /// Receipt timestamps went back by more than senders can reorder them, or
     /// run ahead of the present. A receipt near the move may be stamped outside
     /// the window although it was written inside it.
@@ -266,6 +269,7 @@ impl GapCause {
             Self::ReadBudget => "read_budget",
             Self::ConcurrentRotation => "concurrent_rotation",
             Self::Unwitnessed => "unwitnessed",
+            Self::UncleanRestart => "unclean_restart",
             Self::ClockMoved { .. } => "clock_moved",
             Self::SummariesOmitted { .. } => "summaries_omitted",
             Self::SummariesTruncated { .. } => "summaries_truncated",
@@ -316,6 +320,10 @@ impl fmt::Display for Gap {
             GapCause::Unwitnessed => {
                 write!(formatter, "no receipt or heartbeat was written{between}")
             }
+            GapCause::UncleanRestart => write!(
+                formatter,
+                "the receipt writer restarted without a clean stop{between}, so receipts that it held in memory are lost"
+            ),
             GapCause::ClockMoved {
                 times,
                 largest_back_ms,
@@ -640,6 +648,7 @@ mod tests {
             GapCause::ReadBudget,
             GapCause::ConcurrentRotation,
             GapCause::Unwitnessed,
+            GapCause::UncleanRestart,
             GapCause::ClockMoved {
                 times: 1,
                 largest_back_ms: 1,
