@@ -8,7 +8,6 @@ import { parseArgs } from "node:util";
 const ROOT_CONVERSATION_ID = 1;
 const ENTRY_KINDS = { "pi.assistant": "assistant", "agent.user_notice": "notice" };
 const DELIVERY_KIND = JSON.stringify("agent.notification-delivery");
-// notifications.ts stamps expires_at as Date.now() + 24h when it queues a delivery.
 const DELIVERY_LIFETIME_MS = 86_400_000;
 
 function usage(message) {
@@ -35,10 +34,6 @@ function parseOptions() {
   return { database: parsed.database, needles, sinceEntry };
 }
 
-/**
- * Current value of one delivery document. pi-durable materializes the latest base plus later deltas, and
- * NotificationDeliveries checkpoints every change as a base, so a delta here means the producer changed.
- */
 function materializeDocument(db, documentId) {
   const base = db.prepare(`SELECT seq, content FROM document_revisions
     WHERE document_id = ? AND kind = 'base' ORDER BY seq DESC LIMIT 1`).get(documentId);
@@ -55,7 +50,6 @@ function visibleText(record) {
     .flatMap((message) => message.content ?? []).filter((part) => part.type === "text").map((part) => part.text).join("\n");
 }
 
-// A coordinator database holds hundreds of megabytes of history, so SQLite selects the candidate entries.
 function readEntries(db, needles, sinceEntry) {
   const rows = new Map();
   const byText = db.prepare(`SELECT id, commit_seq, record FROM entries WHERE conversation_id = ? AND instr(record, ?) > 0`);
@@ -102,13 +96,14 @@ function deliveryRecords(needles, entries, deliveries) {
   return lines;
 }
 
-/**
- * Durable tasks around one entry. Entries carry no wall-clock time and task rows keep only their current state, but
- * record ids come from one increasing counter. A task created before the entry was live when it committed if it is
- * still non-terminal, or if it ended after a delivery of the entry was queued, which happens after the commit. For a
- * notice, tasks its worker conversation created after the entry show the job kept running. APNs acceptance time is
- * not recorded, so the queue time is the latest moment these records can place a delivery.
- */
+function taskEvidence(row, ended, entryId, source, bound) {
+  const createdAfterEntry = row.id > entryId;
+  if (createdAfterEntry) return String(row.conversation_id) === source ? "source_ran_after_entry" : undefined;
+  if (row.status !== "terminal") return "live_at_entry_non_terminal_now";
+  if (bound !== null && ended !== null && ended > bound) return "live_at_entry_ended_after_delivery_queued";
+  return undefined;
+}
+
 function taskRecords(db, entryId, entries, deliveries) {
   const entry = entries.find((candidate) => candidate.id === entryId);
   if (entry === undefined) return [{ record: "since_entry", entry_id: String(entryId), found: false }];
@@ -122,10 +117,9 @@ function taskRecords(db, entryId, entries, deliveries) {
     ORDER BY id`).all(entryId, source === null ? null : Number(source), bound);
   for (const row of candidates) {
     const record = JSON.parse(row.record), ended = record.endedAt ?? null, fromSource = String(row.conversation_id) === source;
-    const outlived = row.status !== "terminal" ? true : bound === null || ended === null ? null : ended > bound;
-    const evidence = row.id > entryId ? (fromSource ? "source_ran_after_entry" : undefined)
-      : row.status !== "terminal" ? "live_at_entry_non_terminal_now" : outlived === true ? "live_at_entry_ended_after_delivery_queued" : undefined;
+    const evidence = taskEvidence(row, ended, entryId, source, bound);
     if (evidence === undefined) continue;
+    const outlived = row.status !== "terminal" ? true : bound === null || ended === null ? null : ended > bound;
     lines.push({ record: "task", since_entry: String(entryId), task_id: String(row.id), kind: JSON.parse(row.kind), status: row.status,
       background: row.background === 1, conversation_id: String(row.conversation_id), started_at: record.startedAt ?? null, ended_at: ended,
       evidence, outlived_delivery_queue: outlived, notice_source: fromSource });

@@ -35,6 +35,7 @@ const host = { host_id: null, name: "fixture", rex_server: null, coordinator: nu
 const script = fileURLToPath(new URL("../../scripts/notification-deliveries.mjs", import.meta.url));
 
 type Line = Record<string, unknown>;
+const waitForTheNextMillisecond = () => delay(5);
 async function waitFor(signal: AbortSignal, condition: () => Promise<boolean>): Promise<void> {
   while (!(await condition())) await delay(5, undefined, { signal });
 }
@@ -134,9 +135,7 @@ test("the delivery record reader reports each alert's durable APNs outcome read-
   const notice = (await root.entries({ order: "descending" }, 20, undefined, BACKGROUND_CONTEXT)).items.find(isUserNotice); assert.ok(notice);
   await accepted(notice);
   assert.equal(tasks.isRunning(job.id), true, "The notice must be delivered while its job still runs");
-  // Task end times and delivery queue times are wall-clock milliseconds; a
-  // shared millisecond would leave their order unprovable.
-  await delay(5);
+  await waitForTheNextMillisecond();
   release(); await execution; execution = undefined;
   await shutdown();
 

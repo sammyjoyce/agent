@@ -20,8 +20,6 @@
       URL(fileURLWithPath: "/tmp/phone-acceptance-\(simulator).watching")
     }
 
-    /// Launches the app the way the notification-tap test does, so plain relaunches and alert
-    /// taps reuse the same fixture, and registers the cleanup launch that erases it.
     static func launch(_ app: XCUIApplication, for test: XCTestCase) async throws -> Rehearsal {
       let simulator = try XCTUnwrap(ProcessInfo.processInfo.environment["SIMULATOR_UDID"])
       let rehearsal = Rehearsal(
@@ -81,7 +79,6 @@
       try JSONSerialization.data(withJSONObject: request).write(to: pushRequest, options: .atomic)
     }
 
-    /// Keeps how many submits each peer took, so a refused run shows that none reached them.
     private func keepSubmitCounts(in test: XCTestCase) async throws {
       let counts = [
         "work": await work.submitAttempts(), "personal": await personal.submitAttempts(),

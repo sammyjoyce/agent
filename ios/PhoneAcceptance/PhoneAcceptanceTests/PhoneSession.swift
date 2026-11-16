@@ -7,12 +7,10 @@ final class PhoneSession {
   let configuration: PhoneAcceptanceConfiguration
   let app: XCUIApplication
   private unowned let test: XCTestCase
-  /// The title before the runner chose the coordinator, which teardown shows again.
   private var originalScope: String?
   #if targetEnvironment(simulator)
     private var rehearsal: Rehearsal?
   #endif
-  /// Check numbers count up across the whole run, so no two messages read alike.
   private static var checks = 0
 
   private init(configuration: PhoneAcceptanceConfiguration, test: XCTestCase) {
@@ -58,7 +56,6 @@ final class PhoneSession {
     app.buttons.matching(NSPredicate(format: "label IN %@", ["Send message", "Queue follow-up"]))
       .firstMatch
   }
-  /// What the empty composer reads in the coordinator's conversation, in Steer and Follow-up.
   private var placeholders: [String] {
     let name = configuration.coordinator
     return ["Message \(name)", "Queue a follow-up for \(name)"]
@@ -71,7 +68,6 @@ final class PhoneSession {
     scopeMenu.exists ? scopeMenu.label.components(separatedBy: ", ").first : nil
   }
 
-  /// Shows the coordinator's conversation through the title menu.
   private func selectCoordinator() throws {
     guard scopeMenu.waitForExistence(timeout: 15) else {
       throw PhoneAcceptanceFailure(
@@ -106,7 +102,6 @@ final class PhoneSession {
 
   // MARK: Guards
 
-  /// Refuses to start a scenario over any draft: the composer must show its placeholder.
   private func requireEmptyComposer() throws {
     let value = composer.value as? String
     guard let value, placeholders.contains(value) else {
@@ -115,7 +110,6 @@ final class PhoneSession {
     }
   }
 
-  /// Refuses a Send unless the runner typed the draft and only the coordinator can receive it.
   private func requireSendToCoordinator(_ draft: String) throws {
     guard draft.hasPrefix(configuration.run + " ") else {
       throw PhoneAcceptanceFailure(
@@ -136,7 +130,6 @@ final class PhoneSession {
 
   // MARK: Typing and sending
 
-  /// A message that starts with the run label and check number.
   func message(_ ask: String) -> String {
     Self.checks += 1
     return "\(configuration.run) phone check \(Self.checks): \(ask)"
@@ -161,13 +154,11 @@ final class PhoneSession {
     }
   }
 
-  /// A draft the runner sent, and when it tapped Send.
   struct Sent {
     let text: String
     let at: Int64
   }
 
-  /// Taps Send once the guards pass, and returns the draft it sent.
   @discardableResult func tapSend() throws -> Sent {
     let draft = composer.value as? String ?? ""
     try requireSendToCoordinator(draft)
@@ -328,7 +319,6 @@ final class PhoneSession {
 
   // MARK: Alerts
 
-  /// A codeword no earlier run used: the run label and four random letters.
   func codeword() -> String {
     configuration.run
       + String((0..<4).compactMap { _ in "abcdefghijklmnopqrstuvwxyz".randomElement() })
@@ -357,20 +347,17 @@ final class PhoneSession {
     return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
   }
 
-  /// Waits for a banner that shows the codeword and keeps the screen it showed on.
   func awaitBanner(_ codeword: String, timeout: TimeInterval) -> (AlertEvidence, XCUIElement) {
     let element = alertElement(codeword)
     let found = wait(element, shown: true, timeout: timeout)
     return (keepAlert(codeword, element: found ? element : nil, surface: .banner), element)
   }
 
-  /// Opens the app from the alert and records when.
   func tap(_ alert: inout AlertEvidence, _ element: XCUIElement) {
     alert.tappedAt = epochMilliseconds()
     element.tap()
   }
 
-  /// Opens Notification Center from the top-left edge and finds the codeword's entry there.
   func findInNotificationCenter(_ codeword: String) -> (AlertEvidence, XCUIElement) {
     // A banner still on screen would be found in its place.
     _ = wait(alertElement(codeword), shown: false, timeout: 15)

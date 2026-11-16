@@ -88,7 +88,6 @@ struct DraftEvidence: Codable, Sendable {
   let expected: String
   let composerValue: String?
   let expectedShown: Bool
-  /// Sent text that must not come back, unless it is the expected draft itself.
   let sent: String?
   let sentGlyphsAbsent: Bool
   let ocrText: String
@@ -185,7 +184,6 @@ private struct EvidenceEnvelope<Record: Encodable>: Encodable {
 }
 
 extension XCTestCase {
-  /// Keeps a screenshot in the result bundle under `name`, which records refer to.
   @MainActor func keep(_ screenshot: XCUIScreenshot, as name: String) {
     let attachment = XCTAttachment(screenshot: screenshot)
     attachment.name = name
