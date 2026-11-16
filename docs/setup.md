@@ -602,18 +602,36 @@ they enqueue it. A gap never blocks a proposal. It blocks only the claim
 that the night was quiet. Task summaries are the text retained when the review
 was sealed. They are a snapshot, not a history of the window.
 
-The log writer also records when it starts and when it stops cleanly. The
-coordinator starts no work until the writer has written its start record. If
-the writer cannot write it, the coordinator exits with an error instead. One
-cause is another process that holds `<state_dir>/diagnostics/writer.lock` for
-10 seconds, and the error names that file. A writer holds queued receipts and
-its count of dropped receipts in memory, so a crash loses them. When a writer
-starts and the receipt before its start is not a clean stop, the review shows
-an `unclean_restart` gap from that receipt to the start, even when the restart
-came within ten minutes. The writer leaves flushing to the operating system.
-After an operating-system crash or a power loss, the receipts written just
-before it can be gone, a recent start record included, so a review of that
-time can miss the restart.
+The log writer also records when it starts and when it stops cleanly. When
+`[dreams]` is configured, the coordinator starts no work until the writer has
+written its start record. If the writer cannot write it, the coordinator exits
+with an error that names `<state_dir>/diagnostics`. Causes include a read-only
+`runtime.jsonl`, a file where the directory should be, a malformed
+`retention.json`, and another process that holds
+`<state_dir>/diagnostics/writer.lock` for 10 seconds, which the error also
+names. Fix that path, or remove `[dreams]` from the config to run chat without
+nightly review. While it waits, startup takes as long as the writer needs to
+read the retained log, which is a few seconds when the log is near its 128 MiB
+cap.
+
+Without `[dreams]`, startup does not wait for the writer. A writer that cannot
+start prints `Runtime diagnostics unavailable; chat continues.` and the
+coordinator serves chat, as it did before Dreams. That run leaves no receipts.
+So a coordinator without `[dreams]` writes its start time to
+`<state_dir>/unrecorded-start` before it serves, and the writer removes the
+file once the log holds the start record. A writer that finds the file left by
+an earlier start records an `unclean_restart` gap from that time to its own
+start, so a review after you add `[dreams]` back does not call that time quiet.
+If the state directory refuses that file, only the ten-minute rule above
+catches the run.
+
+A writer holds queued receipts and its count of dropped receipts in memory, so
+a crash loses them. When a writer starts and the receipt before its start is
+not a clean stop, the review shows an `unclean_restart` gap from that receipt
+to the start, even when the restart came within ten minutes. The writer leaves
+flushing to the operating system. After an operating-system crash or a power
+loss, the receipts written just before it can be gone, a recent start record
+included, so a review of that time can miss the restart.
 
 The first start after an upgrade from a version without these records leaves
 one `unclean_restart` gap. Every review whose window covers that start shows
@@ -734,7 +752,8 @@ coverage metadata and its atomic replacement. Whole expired segments leave
 first; capacity pressure can remove younger segments. These record
 input placement, activity, host-call timing and interruption without message
 bodies, reasoning, tool arguments or credentials. The files are private to the
-user; logging failure does not block chat.
+user; logging failure does not block chat. With `[dreams]` configured, a
+coordinator whose log cannot record its start exits instead; see Dreams above.
 
 Browser host-call records correlate the conversation, session, operation and
 local tab handle with duration, outcome and owned-tab count. Cancellation keeps
