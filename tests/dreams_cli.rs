@@ -1017,11 +1017,11 @@ impl Sealed {
 }
 
 /// Puts a wrapper ahead of Git that changes no argument or result. It creates
-/// the first returned file when `git apply` starts, and holds that command
-/// until the second file exists.
-fn hold_git_apply_until_released(fixture: &Fixture) -> (PathBuf, PathBuf) {
-    let ready = fixture.directory.path().join("git-apply-ready");
-    let release = fixture.directory.path().join("git-apply-release");
+/// the first returned file when a Git command with the `held` argument starts,
+/// and holds that command until the second file exists.
+fn hold_git_until_released(fixture: &Fixture, held: &str) -> (PathBuf, PathBuf) {
+    let ready = fixture.directory.path().join(format!("git-{held}-ready"));
+    let release = fixture.directory.path().join(format!("git-{held}-release"));
     let real_git = Command::new("/bin/sh")
         .args(["-c", "command -v git"])
         .output()
@@ -1029,7 +1029,7 @@ fn hold_git_apply_until_released(fixture: &Fixture) -> (PathBuf, PathBuf) {
     fixture.shadow_program(
         "git",
         &format!(
-            "#!/bin/sh\nfor argument do\n  if [ \"$argument\" = apply ]; then\n    : > '{}'\n    while [ ! -f '{}' ]; do sleep 0.01; done\n  fi\ndone\nexec '{}' \"$@\"\n",
+            "#!/bin/sh\nfor argument do\n  if [ \"$argument\" = {held} ]; then\n    : > '{}'\n    while [ ! -f '{}' ]; do sleep 0.01; done\n  fi\ndone\nexec '{}' \"$@\"\n",
             ready.display(),
             release.display(),
             String::from_utf8(real_git.stdout).unwrap().trim()
@@ -1055,7 +1055,7 @@ async fn apply_gives_git_the_bytes_it_verified_even_when_the_patch_file_changes_
     );
     assert_ne!(altered, approved);
 
-    let (ready, release) = hold_git_apply_until_released(&fixture);
+    let (ready, release) = hold_git_until_released(&fixture, "apply");
     let child = fixture
         .command(&sealed.apply_arguments(), false)
         .stdout(Stdio::piped())
@@ -1371,6 +1371,63 @@ async fn a_changed_evidence_body_or_review_record_refuses_show_and_apply_and_lea
         assert!(
             applied.contains("Applied Dreams run"),
             "The sealed bytes apply: {applied}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn show_prints_only_the_evidence_it_verified_even_if_the_evidence_changes_while_it_runs() {
+    let fixture = Fixture::new();
+    fixture.seed_witnessed_night();
+    let sealed = Sealed::new(&fixture, "AGENTS.md", FIXED_AGENTS, "Name the real target.").await;
+    let path = fixture
+        .state
+        .join("dreams/runs")
+        .join(&sealed.run)
+        .join("review/evidence.jsonl");
+    let original = fs::read_to_string(&path).unwrap();
+    let replaced: String = original
+        .lines()
+        .map(|line| {
+            let mut item: Value = serde_json::from_str(line).unwrap();
+            item["body"] = json!("REPLACED AFTER DIGEST CHECK");
+            format!("{item}\n")
+        })
+        .collect();
+    assert!(!replaced.is_empty(), "The sealed review holds evidence");
+
+    let (ready, release) = hold_git_until_released(&fixture, "rev-parse");
+    let child = fixture
+        .command(&["dreams", "show", &sealed.run], true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !ready.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let reached = ready.exists();
+    fs::write(&path, &replaced).unwrap();
+    fs::write(&release, "").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(reached, "show never ran git rev-parse");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains("REPLACED AFTER DIGEST CHECK"),
+        "show printed evidence it never verified beside approval {}: {stdout}",
+        sealed.approval
+    );
+    if output.status.success() {
+        let shown: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(shown["evidence"], sealed.shown["evidence"]);
+        assert_eq!(shown["outcome_sha256"], sealed.approval.as_str());
+    } else {
+        assert!(
+            stderr.contains("Dreams review changed since it was sealed"),
+            "{stderr}"
         );
     }
 }
