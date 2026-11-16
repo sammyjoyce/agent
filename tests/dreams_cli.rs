@@ -430,9 +430,10 @@ fn a_coordinator_admits_no_command_until_its_log_records_its_start() {
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut admitted = 0;
+    let listening_so_no_command_autostarts_another =
+        || UnixStream::connect(fixture.state.join("agent.sock")).is_ok();
     while Instant::now() < deadline && blocked.try_wait().unwrap().is_none() {
-        // A command sent before the socket exists could start a second coordinator.
-        if UnixStream::connect(fixture.state.join("agent.sock")).is_ok() {
+        if listening_so_no_command_autostarts_another() {
             admitted = (0..20)
                 .filter(|_| fixture.cli(&["tasks", "list"], true).status.success())
                 .count();
@@ -1016,10 +1017,12 @@ impl Sealed {
     }
 }
 
-/// Puts a wrapper ahead of Git that changes no argument or result. It creates
-/// the first returned file when a Git command with the `held` argument starts,
-/// and holds that command until the second file exists.
-fn hold_git_until_released(fixture: &Fixture, held: &str) -> (PathBuf, PathBuf) {
+struct HeldGit {
+    ready: PathBuf,
+    release: PathBuf,
+}
+
+fn hold_git_until_released(fixture: &Fixture, held: &str) -> HeldGit {
     let ready = fixture.directory.path().join(format!("git-{held}-ready"));
     let release = fixture.directory.path().join(format!("git-{held}-release"));
     let real_git = Command::new("/bin/sh")
@@ -1035,7 +1038,7 @@ fn hold_git_until_released(fixture: &Fixture, held: &str) -> (PathBuf, PathBuf) 
             String::from_utf8(real_git.stdout).unwrap().trim()
         ),
     );
-    (ready, release)
+    HeldGit { ready, release }
 }
 
 #[tokio::test]
@@ -1055,7 +1058,7 @@ async fn apply_gives_git_the_bytes_it_verified_even_when_the_patch_file_changes_
     );
     assert_ne!(altered, approved);
 
-    let (ready, release) = hold_git_until_released(&fixture, "apply");
+    let HeldGit { ready, release } = hold_git_until_released(&fixture, "apply");
     let child = fixture
         .command(&sealed.apply_arguments(), false)
         .stdout(Stdio::piped())
@@ -1396,7 +1399,7 @@ async fn show_prints_only_the_evidence_it_verified_even_if_the_evidence_changes_
         .collect();
     assert!(!replaced.is_empty(), "The sealed review holds evidence");
 
-    let (ready, release) = hold_git_until_released(&fixture, "rev-parse");
+    let HeldGit { ready, release } = hold_git_until_released(&fixture, "rev-parse");
     let child = fixture
         .command(&["dreams", "show", &sealed.run], true)
         .stdout(Stdio::piped())

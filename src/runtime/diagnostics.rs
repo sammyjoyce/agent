@@ -733,8 +733,6 @@ pub(crate) struct Diagnostics {
     drops: SharedDrops,
 }
 
-/// Resolves once the writer has appended `writer_started`, or with the error
-/// that stopped it first. A coordinator admits no work before it resolves.
 #[must_use]
 pub(crate) struct WriterStart(std::sync::mpsc::Receiver<io::Result<()>>);
 impl WriterStart {
@@ -989,9 +987,6 @@ impl Writer {
             return Err(io::Error::other("Diagnostics directory is unavailable"));
         }
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-        // A retired runtime may still be draining its bounded queue. The
-        // coordinator admits no work until this writer records its start, so
-        // the wait is bounded and a holder that never lets go fails startup.
         let path = directory.join("writer.lock");
         let lock = OpenOptions::new()
             .read(true)

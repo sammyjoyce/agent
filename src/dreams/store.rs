@@ -57,7 +57,6 @@ pub struct RunView {
     pub id: RunId,
     pub review: Review,
     pub evidence: Vec<EvidenceItem>,
-    /// The digest of the review record and its evidence as this view read them.
     pub review_sha256: ContentDigest,
     pub outcome: Option<Outcome>,
     pub outcome_sha256: Option<ContentDigest>,
@@ -174,8 +173,6 @@ impl DreamsStore {
         Ok(runs)
     }
 
-    /// Reads the review record and its evidence once each, so the evidence a
-    /// view returns is the evidence its digest covers.
     pub fn read(&self, run: &RunId) -> Result<Option<RunView>> {
         let directory = self.review_directory(run);
         let review = match fs::read(directory.join(REVIEW_FILE)) {
@@ -333,8 +330,6 @@ impl DreamsStore {
         Ok(None)
     }
 
-    /// Seals the first outcome of a run with the review digest of the view it
-    /// decided from.
     pub(crate) fn seal_outcome(&self, view: &RunView, outcome: &Outcome) -> Result<Outcome> {
         let sealed = SealedOutcome {
             review_sha256: view.review_sha256.clone(),

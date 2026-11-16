@@ -521,9 +521,6 @@ impl Outcome {
     }
 }
 
-/// The record `outcome.json` holds. The digest of the sealed review record and
-/// its evidence binds every outcome, so approving a proposal approves the
-/// evidence it cites and a changed review refuses an abstention too.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SealedOutcome {
     pub review_sha256: ContentDigest,

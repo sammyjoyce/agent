@@ -277,7 +277,6 @@ export class TaskStore {
   useActorExecution(execution: ActorExecution): void { this.execution = execution; }
   useConfinement(rule: ActorConfinement): void { this.confinement = rule; }
   isConfined(task: Pick<TaskRecord, "sources">): boolean { return this.confinement(task) !== undefined; }
-  /** A confined task whose conversation was not created confined may hold history and input from before its confinement. */
   async predatesConfinementIn(tx: Tx, id: string): Promise<boolean> {
     const task = await this.taskIn(tx, id);
     return task !== undefined && this.isConfined(task) && !(await tx.doc(ConfinedConversation, task.conversation_id, null)).confined;
