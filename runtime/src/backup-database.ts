@@ -1,6 +1,5 @@
 import { readFile } from "node:fs/promises";
 import { backup, DatabaseSync } from "node:sqlite";
-import { pathToFileURL } from "node:url";
 import { CURRENT_SQLITE_SCHEMA_VERSION } from "@earendil-works/pi-durable/storage/sqlite";
 import type { DatabaseReport } from "./generated/DatabaseReport.js";
 import type { DatabaseRequest } from "./generated/DatabaseRequest.js";
@@ -67,7 +66,7 @@ async function main(): Promise<void> {
   process.stdout.write(JSON.stringify(await answerDatabaseRequest(parseRequest(process.argv[2]))) + "\n");
 }
 
-if (process.argv[1] !== undefined && pathToFileURL(process.argv[1]).href === import.meta.url) {
+if (import.meta.main) {
   void main().catch((error: unknown) => {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;
