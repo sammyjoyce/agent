@@ -39,7 +39,6 @@ const FOLLOW_UP_KEY: &str = "Northwind confirmed PO-1042 for 2030-03-14";
 const SEED_KEY: &str = "Scheduled occurrence: manual:loop-seed";
 const WAITING_OUTCOME: &str = r#""title":"Task waiting""#;
 const RESOLVED_OUTCOME: &str = r#""title":"Task resolved""#;
-const BOOKED_LINE: &str = r#""po":"PO-1042""#;
 
 static SWITCHBOARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -100,6 +99,7 @@ macro_rules! booked_line {
     };
 }
 const PROTECTED: &str = protected_line!();
+const BOOKED_LINE: &str = booked_line!();
 const PROTECTED_AND_BOOKED: &str = concat!(protected_line!(), booked_line!());
 
 enum Feed {
@@ -124,7 +124,7 @@ enum Decision {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum TaskEnd {
     Resolved,
-    NotResolved,
+    StillWaiting,
 }
 
 enum LedgerAfter {
@@ -177,7 +177,7 @@ const SCENARIOS: &[Scenario] = &[
             followups: 0..=0,
             mutations: 0,
             ledger_after: LedgerAfter::Unchanged,
-            task: TaskEnd::NotResolved,
+            task: TaskEnd::StillWaiting,
         },
     },
     Scenario {
@@ -205,7 +205,7 @@ const SCENARIOS: &[Scenario] = &[
             followups: 0..=1,
             mutations: 0,
             ledger_after: LedgerAfter::Unchanged,
-            task: TaskEnd::NotResolved,
+            task: TaskEnd::StillWaiting,
         },
     },
     Scenario {
@@ -1022,6 +1022,30 @@ fn resolves(call: &Value) -> bool {
     program.contains("record_task") && program.contains("resolved")
 }
 
+fn runs_ledger_show(call: &Value) -> bool {
+    let arguments = call["arguments"]
+        .as_str()
+        .or(call["input"].as_str())
+        .unwrap_or_default();
+    if call["name"] == "exec" {
+        return serde_json::from_str::<Value>(arguments).is_ok_and(|arguments| {
+            arguments["program"]
+                .as_str()
+                .is_some_and(|program| Path::new(program).ends_with("ledger"))
+                && arguments["args"]
+                    .as_array()
+                    .is_some_and(|args| args.iter().any(|arg| arg == "show"))
+        });
+    }
+    let program = arguments.replace('\\', "");
+    call["name"] == "codemode"
+        && program.contains("tools.exec")
+        && program.contains("/ledger")
+        && ["\"show\"", "'show'"]
+            .iter()
+            .any(|show| program.contains(show))
+}
+
 fn mentions(output: &Value, needle: &str) -> bool {
     output.to_string().replace('\\', "").contains(needle)
 }
@@ -1166,8 +1190,10 @@ fn oracles(
     let resolved = matches!(state, Some(TaskState::Resolved { .. }));
     checks.push(oracle(
         "task_state",
-        resolved == (expect.task == TaskEnd::Resolved)
-            && task.is_some_and(|task| task.pending.is_empty()),
+        match expect.task {
+            TaskEnd::Resolved => resolved,
+            TaskEnd::StillWaiting => matches!(state, Some(TaskState::Waiting { .. })),
+        } && task.is_some_and(|task| task.pending.is_empty()),
         json!(state),
     ));
     let resolutions = saved
@@ -1196,15 +1222,15 @@ fn oracles(
             .any(|(index, call)| call == "show" && last_mutation.is_none_or(|last| index > last));
         let calls = trace(requests);
         let readback = calls.iter().position(|(call, output)| {
-            call["name"] != "record_task"
+            runs_ledger_show(call)
                 && output
                     .as_ref()
-                    .is_some_and(|output| mentions(output, BOOKED_LINE))
+                    .is_some_and(|output| mentions(output, BOOKED_LINE.trim_end()))
         });
         let resolution = calls.iter().position(|(call, _)| resolves(call));
         checks.push(oracle(
             "resolved_after_readback",
-            read_back && readback.zip(resolution).is_some_and(|(readback, resolution)| readback <= resolution),
+            read_back && readback.zip(resolution).is_some_and(|(readback, resolution)| readback < resolution),
             json!({ "ledger_calls": world.ledger_calls(), "readback_call": readback, "resolution_call": resolution }),
         ));
     }
