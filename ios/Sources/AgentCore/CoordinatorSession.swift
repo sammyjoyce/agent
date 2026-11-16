@@ -229,7 +229,7 @@ public actor CoordinatorSession {
   private var siriReceipts: [SiriReceipt] = []
   /// Siri sends waiting for the coordinator's first word, by input ID, each with the exchange that
   /// writes it once one does.
-  private var siriWaits: [String: (answer: SiriAnswer, action: UUID?)] = [:]
+  private var siriWaits: [String: (answer: SiriAnswer, action: UUID)] = [:]
   private enum Unsent { case staged, waiting }
   /// Durable inputs this session staged that have not left the phone. A staged one can be
   /// unstaged, as can an inherited one no session has written. A started one waits for this lane to
@@ -554,46 +554,28 @@ public actor CoordinatorSession {
     stampRows()
   }
 
-  /// What this phone holds of earlier Siri copies of `message`: the newest one in the outbox, else
-  /// the newest receipt from the last hour.
+  /// What this phone holds of earlier Siri copies of `message`.
   public func siriEarlier(_ message: SiriMessage) throws(SiriNotSent) -> SiriEarlier {
     guard !retired, inspectedConversation == nil else { throw .removed }
     guard loadOutbox() else { throw .outboxUnreadable }
-    if let item = pending.last(where: {
-      $0.request.origin == .siri && $0.request.text == message.text
-    }) {
-      let savedAt = Date(timeIntervalSince1970: item.queuedAt)
-      return item.accepted == true
-        ? .accepted(savedAt: savedAt) : .waiting(inputID: item.request.inputId, savedAt: savedAt)
-    }
-    let digest = SiriReceipt.digest(message.text)
-    let now = Date().timeIntervalSince1970
-    if let receipt = siriReceipts.last(where: {
-      $0.digest == digest && now - $0.sentAt < SiriReceipt.lifetime
-    }) {
-      return .delivered(sentAt: Date(timeIntervalSince1970: receipt.sentAt))
-    }
-    return .none
+    return .find(message, pending: pending, receipts: siriReceipts, now: Date())
   }
 
-  /// Writes `copy` of `message` and waits until `deadline` for the coordinator's first word on
-  /// it. `earlier` is what the person confirmed against. For a new copy, when the outbox now says
-  /// otherwise, nothing is saved. An earlier copy the coordinator accepted or placed is not
-  /// written again. Once saved, a copy stays in the outbox until the coordinator places it, and a
-  /// cancelled wait reads `saved`.
+  /// Sends `message` as the person confirmed it against `confirmed`, and waits until `deadline`
+  /// for the coordinator's first word on it. A waiting copy is written again under its own ID,
+  /// unless the coordinator has it by now. Otherwise a new copy is saved under `newInputID`, and
+  /// only while the outbox still says what the person confirmed. Once saved, a copy stays in the
+  /// outbox until the coordinator places it, and a cancelled wait reads `saved`.
   public func sendFromSiri(
-    _ message: SiriMessage, copy: SiriCopy, earlier: SiriEarlier,
+    _ message: SiriMessage, confirmed: SiriEarlier, newInputID: String,
     until deadline: ContinuousClock.Instant
   ) async -> SiriSendResult {
     guard !retired, inspectedConversation == nil else { return .notSent(.unanswered) }
     let inputID: String
-    switch copy {
-    case .new(let id):
-      do {
-        guard try siriEarlier(message) == earlier else { return .notSent(.changed) }
-      } catch { return .notSent(error) }
-      inputID = id
-    case .earlier(let id):
+    var copy: NativeRequestSubmit?
+    switch confirmed {
+    case .accepted(let savedAt): return .alreadyDelivered(savedAt)
+    case .waiting(let id, _):
       // Two asks that confirmed this copy write one ID, which the coordinator dedupes, so only
       // what became of the copy itself decides.
       guard loadOutbox() else { return .notSent(.outboxUnreadable) }
@@ -610,26 +592,31 @@ public actor CoordinatorSession {
         return .alreadyDelivered(Date(timeIntervalSince1970: item.queuedAt))
       }
       inputID = id
+    case .none, .delivered:
+      do {
+        guard try siriEarlier(message) == confirmed else { return .notSent(.changed) }
+      } catch { return .notSent(error) }
+      inputID = newInputID
+      copy = NativeRequestSubmit(
+        attachments: nil, inputId: inputID, mode: .steer, origin: .siri, text: message.text)
     }
     guard snapshot.connection == .connected else { return .notSent(.unanswered) }
     // Never sent as `ios` or with no origin, so the coordinator always knows Siri sent it.
     guard accepts(.siri) else { return .notSent(.notAdvertised) }
     guard actions.count < 32, siriWaits[inputID] == nil else { return .notSent(.busy) }
-    if case .new = copy {
-      let request = NativeRequestSubmit(
-        attachments: nil, inputId: inputID, mode: .steer, origin: .siri, text: message.text)
+    if let copy {
       do throws(OutboxAdmission) {
-        try admit(request, sendID: UUID().uuidString, recipients: [profile])
+        try admit(copy, sendID: UUID().uuidString, recipients: [profile])
       } catch {
         publish()
         return .notSent(error == .full ? .outboxFull : .outboxNotSaved)
       }
     }
-    let answer = SiriAnswer()
-    siriWaits[inputID] = (answer, nil)
     // Check / retry's write, which also takes a copy still staged. The coordinator dedupes by
-    // input ID, so writing an earlier copy again starts no second turn.
-    retry(inputID)
+    // input ID, so writing a waiting copy again starts no second turn.
+    guard let action = retry(inputID) else { return .saved }
+    let answer = SiriAnswer()
+    siriWaits[inputID] = (answer, action)
     let result = await answer.first(until: deadline)
     if siriWaits[inputID]?.answer === answer { siriWaits[inputID] = nil }
     return result
@@ -731,15 +718,17 @@ public actor CoordinatorSession {
   }
 
   /// Writes a queued input again under its original ID. One the coordinator accepted is observed by
-  /// that ID until placed, never written again.
-  public func retry(_ inputID: String) {
+  /// that ID until placed, never written again. Returns the exchange that writes it, or nil when
+  /// none started.
+  @discardableResult public func retry(_ inputID: String) -> UUID? {
     guard !retired, actions.count < 32, snapshot.connection == .connected,
       let item = pending.first(where: { $0.request.inputId == inputID }), item.accepted != true
-    else { return }
+    else { return nil }
     unsent[inputID] = nil
     transcript.delivery(inputID, .sending)
-    perform(.submit(item.request), inputID: inputID)
+    let action = perform(.submit(item.request), inputID: inputID)
     publish()
+    return action
   }
   /// Copies a queued item into a draft. The item stays queued until `discard`, so a draft
   /// lost before it is sent loses nothing. An item the coordinator accepted is never copied, so a
@@ -1060,19 +1049,17 @@ public actor CoordinatorSession {
     }
   }
   /// Runs `request` on its own socket. `sending` is the started input it writes, if any.
-  private func perform(
+  @discardableResult private func perform(
     _ request: NativeRequest, inputID: String? = nil, sending: StagedInput? = nil
-  ) {
+  ) -> UUID {
     let id = UUID()
     let generation = generation
-    if let written = sending?.inputID ?? inputID {
-      unwritten.append((id, written, sending))
-      if siriWaits[written]?.action == nil { siriWaits[written]?.action = id }
-    }
+    if let written = sending?.inputID ?? inputID { unwritten.append((id, written, sending)) }
     actions[id] = Task { [weak self] in
       _ = await self?.exchange(
         id: id, request: request, inputID: inputID, generation: generation)
     }
+    return id
   }
   private struct HistoryPage {
     var rows = 0
@@ -1718,14 +1705,12 @@ public actor CoordinatorSession {
         snapshot.error = "This phone could not record a delivered message. It stays queued."
         return
       }
-      // One save removes the item and adds its receipt, so the next ask finds one or the other.
-      let receipts = siriReceipts
-      if item.request.origin == .siri {
-        siriReceipts.append(
-          SiriReceipt(
-            text: item.request.text, inputID: inputID, sentAt: Date().timeIntervalSince1970))
-      }
-      if acknowledge(inputID) == nil { siriReceipts = receipts }
+      let receipt =
+        item.request.origin == .siri
+        ? SiriReceipt(
+          text: item.request.text, inputID: inputID, sentAt: Date().timeIntervalSince1970)
+        : nil
+      acknowledge(inputID, receipt: receipt)
     } else if let sendID = withdrawal(of: inputID), let send = ledger.sends[sendID] {
       record(
         inputID, entryID: entryID, sendID: sendID, recipients: send.recipients,
@@ -1868,16 +1853,20 @@ public actor CoordinatorSession {
       throw OutboxNotSaved()
     }
   }
-  /// Removes an item from the outbox. Returns the removal of its files, or nil when the outbox
-  /// could not be saved and the item stays.
-  @discardableResult private func acknowledge(_ inputID: String) -> Task<Void, Never>? {
-    let previous = pending
+  /// Removes an item from the outbox, and adds `receipt` in the same save, so the next Siri ask
+  /// finds one or the other. Returns the removal of its files, or nil when the outbox could not be
+  /// saved and the item stays.
+  @discardableResult private func acknowledge(_ inputID: String, receipt: SiriReceipt? = nil)
+    -> Task<Void, Never>?
+  {
+    let previous = (pending, siriReceipts)
     let completed = pending.filter { $0.request.inputId == inputID }.flatMap {
       $0.request.attachments ?? []
     }
     pending.removeAll { $0.request.inputId == inputID }
+    if let receipt { siriReceipts.append(receipt) }
     do { try saveOutbox() } catch {
-      pending = previous
+      (pending, siriReceipts) = previous
       snapshot.error = "The saved outbox could not be updated. Original files were preserved."
       return nil
     }
@@ -1896,15 +1885,15 @@ public actor CoordinatorSession {
   private func saveOutbox() throws {
     guard !retired else { throw CancellationError() }
     let now = Date().timeIntervalSince1970
-    siriReceipts = Array(
+    let receipts = Array(
       siriReceipts.filter { now - $0.sentAt < SiriReceipt.lifetime }.suffix(SiriReceipt.limit))
     let data =
-      try composerInputs.isEmpty && siriReceipts.isEmpty
+      try composerInputs.isEmpty && receipts.isEmpty
       ? JSONEncoder().encode(pending)
       : JSONEncoder().encode(
         Outbox(
-          pending: pending, composerInputs: composerInputs,
-          siri: siriReceipts.isEmpty ? nil : siriReceipts))
+          pending: pending, composerInputs: composerInputs, siri: receipts.isEmpty ? nil : receipts
+        ))
     try writePrivately(data, to: outboxURL)
   }
 

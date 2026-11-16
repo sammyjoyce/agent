@@ -192,13 +192,13 @@ private let acceptedTexts = [
       let message = try SiriMessage(parsing: build)
       let id = UUID().uuidString
       let first = await session.sendFromSiri(
-        message, copy: .new(inputID: id), earlier: .none, until: .now + .milliseconds(500))
+        message, confirmed: .none, newInputID: id, until: .now + .milliseconds(500))
       #expect(first == .saved)
       try await eventually("Work got the first write") { await fixture.count() == 1 }
       let earlier = try await session.siriEarlier(message)
       #expect(waitingID(earlier) == id, "The saved copy is found before the confirmation")
       let again = await session.sendFromSiri(
-        message, copy: .earlier(inputID: id), earlier: earlier, until: .now + .seconds(5))
+        message, confirmed: earlier, newInputID: UUID().uuidString, until: .now + .seconds(5))
       #expect(again == .delivered)
       let written = await submits(fixture)
       #expect(written.count == 2)
@@ -215,8 +215,9 @@ private let acceptedTexts = [
       let message = try SiriMessage(parsing: build)
       let id = UUID().uuidString
       let first = await session.sendFromSiri(
-        message, copy: .new(inputID: id), earlier: .none, until: .now + .milliseconds(500))
+        message, confirmed: .none, newInputID: id, until: .now + .milliseconds(500))
       #expect(first == .saved)
+      try await eventually("Work got the write") { await fixture.count() == 1 }
       let waiting = try await session.siriEarlier(message)
       #expect(waitingID(waiting) == id)
       await session.disconnect()
@@ -225,7 +226,7 @@ private let acceptedTexts = [
         try queuedItems(directory.outbox).isEmpty
       }
       let again = await session.sendFromSiri(
-        message, copy: .earlier(inputID: id), earlier: waiting, until: .now + .seconds(5))
+        message, confirmed: waiting, newInputID: UUID().uuidString, until: .now + .seconds(5))
       #expect(isAlreadyDelivered(again), "\(again)")
       #expect(await submits(fixture).map(\.inputId) == [id], "Nothing was written again")
     }
@@ -237,7 +238,7 @@ private let acceptedTexts = [
       let message = try SiriMessage(parsing: build)
       let id = UUID().uuidString
       let sent = await session.sendFromSiri(
-        message, copy: .new(inputID: id), earlier: .none, until: .now + .seconds(5))
+        message, confirmed: .none, newInputID: id, until: .now + .seconds(5))
       #expect(sent == .delivered)
       try await eventually("Work placed it") { try queuedItems(directory.outbox).isEmpty }
       #expect(isDelivered(try await session.siriEarlier(message)))
@@ -245,10 +246,12 @@ private let acceptedTexts = [
       let next = reopen()
       let earlier = try await next.siriEarlier(message)
       #expect(isDelivered(earlier), "The receipt is in the outbox")
+      try await connected(next)
+      let second = UUID().uuidString
       let again = await next.sendFromSiri(
-        message, copy: .earlier(inputID: id), earlier: earlier, until: .now + .seconds(5))
-      #expect(isAlreadyDelivered(again))
-      #expect(await submits(fixture).count == 1, "Nothing was written again")
+        message, confirmed: earlier, newInputID: second, until: .now + .seconds(5))
+      #expect(again == .delivered, "Confirmed against the delivered copy, a second one goes")
+      #expect(await submits(fixture).map(\.inputId) == [id, second])
     }
   }
 
@@ -259,12 +262,12 @@ private let acceptedTexts = [
       let message = try SiriMessage(parsing: build)
       let id = UUID().uuidString
       let sent = await session.sendFromSiri(
-        message, copy: .new(inputID: id), earlier: .none, until: .now + .seconds(5))
+        message, confirmed: .none, newInputID: id, until: .now + .seconds(5))
       #expect(sent == .delivered)
       let earlier = try await session.siriEarlier(message)
       #expect(earlier != .none && waitingID(earlier) == nil && !isDelivered(earlier))
       let again = await session.sendFromSiri(
-        message, copy: .earlier(inputID: id), earlier: earlier, until: .now + .seconds(5))
+        message, confirmed: earlier, newInputID: UUID().uuidString, until: .now + .seconds(5))
       #expect(isAlreadyDelivered(again))
       #expect(await submits(fixture).count == 1, "Nothing was written again")
     }
@@ -278,7 +281,7 @@ private let acceptedTexts = [
       let id = UUID().uuidString
       let sending = Task {
         await session.sendFromSiri(
-          message, copy: .new(inputID: id), earlier: .none, until: .now + .seconds(30))
+          message, confirmed: .none, newInputID: id, until: .now + .seconds(30))
       }
       try await eventually("Work got the write") { await fixture.count() == 1 }
       sending.cancel()
@@ -385,6 +388,39 @@ private let acceptedTexts = [
       String(localized: rejected.dialog)
         == "Work did not accept the message. It stays on this iPhone, and asking again retries this copy."
     )
+  }
+
+  @Test func theNewestCopyInTheOutboxWinsAndAReceiptLastsAnHour() throws {
+    let message = try SiriMessage(parsing: build)
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+    let at = { (seconds: TimeInterval) in now.timeIntervalSince1970 - seconds }
+    func item(_ id: String, origin: InputOrigin?, text: String = build, accepted: Bool? = nil)
+      -> OutboxItem
+    {
+      OutboxItem(
+        request: .init(inputId: id, mode: .steer, origin: origin, text: text),
+        sendID: "invented-send", recipients: [], queuedAt: at(60), accepted: accepted)
+    }
+    let receipt = SiriReceipt(text: build, inputID: "invented-placed", sentAt: at(3599))
+    let find = { (pending: [OutboxItem], receipts: [SiriReceipt]) in
+      SiriEarlier.find(message, pending: pending, receipts: receipts, now: now)
+    }
+    #expect(find([], []) == .none)
+    #expect(find([], [receipt]) == .delivered(sentAt: Date(timeIntervalSince1970: at(3599))))
+    let expired = SiriReceipt(text: build, inputID: "invented-old", sentAt: at(3601))
+    #expect(find([], [expired]) == .none, "A receipt lasts an hour")
+    let other = SiriReceipt(text: "Another invented note", inputID: "invented", sentAt: at(1))
+    #expect(find([], [other]) == .none)
+    let waiting = [item("invented-older", origin: .siri), item("invented-newer", origin: .siri)]
+    #expect(
+      find(waiting, [receipt])
+        == .waiting(inputID: "invented-newer", savedAt: Date(timeIntervalSince1970: at(60))))
+    #expect(
+      find([item("invented", origin: .siri, accepted: true)], [])
+        == .accepted(savedAt: Date(timeIntervalSince1970: at(60))))
+    #expect(
+      find([item("invented", origin: .ios)], []) == .none, "The composer's copy is not Siri's")
+    #expect(find([item("invented", origin: .siri, text: "Another invented note")], []) == .none)
   }
 
   // MARK: V2. The confirmation shows what the agent reads
@@ -515,6 +551,37 @@ private let acceptedTexts = [
     }
   }
 
+  /// Shortcuts reads these codes, so a renamed case must not change one.
+  @Test func everyOutcomeCodeIsPinned() {
+    let notSent = Dictionary(
+      uniqueKeysWithValues: SiriNotSent.allCases.map {
+        ($0, SiriSendOutcome(.notSent($0), to: "Work").code)
+      })
+    #expect(
+      notSent == [
+        .locked: "notSent.locked", .unanswered: "notSent.unanswered",
+        .outboxUnreadable: "notSent.outboxUnreadable", .outboxNotSaved: "notSent.outboxNotSaved",
+        .notAdvertised: "notSent.notAdvertised", .outboxFull: "notSent.outboxFull",
+        .busy: "notSent.busy", .removed: "notSent.removed", .notPaired: "notSent.notPaired",
+        .copyGone: "notSent.copyGone", .changed: "notSent.changed",
+      ])
+    let refusals = Dictionary(
+      uniqueKeysWithValues: SiriMessage.Refusal.allCases.map { ($0, SiriSendOutcome($0).code) })
+    #expect(
+      refusals == [
+        .blank: "refusal.blank", .tooLong: "refusal.tooLong", .command: "refusal.command",
+        .hidden: "refusal.hidden", .lineBreak: "refusal.lineBreak",
+      ])
+    let at = Date(timeIntervalSince1970: 1_700_000_000)
+    let results: [SiriSendResult] = [
+      .delivered, .alreadyDelivered(at), .saved, .rejected, .failed("Invented"),
+    ]
+    #expect(
+      results.map { SiriSendOutcome($0, to: "Work").code } == [
+        "delivered", "alreadyDelivered", "saved", "refused", "refused",
+      ])
+  }
+
   @Test(arguments: SiriNotSent.allCases)
   func aNotSentSentenceSaysNothingWasSentAndBlamesNoOne(_ reason: SiriNotSent) {
     let said = String(localized: SiriSendOutcome(.notSent(reason), to: "Work").dialog)
@@ -533,7 +600,7 @@ private let acceptedTexts = [
       let id = UUID().uuidString
       let started = ContinuousClock.now
       let result = await session.sendFromSiri(
-        message, copy: .new(inputID: id), earlier: .none, until: .now + .seconds(3))
+        message, confirmed: .none, newInputID: id, until: .now + .seconds(3))
       #expect(result == .failed("Invented: the execution host is offline"))
       #expect(ContinuousClock.now - started < .seconds(1))
       #expect(waitingID(try await session.siriEarlier(message)) == id, "Asking again retries it")
@@ -564,7 +631,7 @@ private let acceptedTexts = [
     try await withSiriPeer(siri: false) { session, fixture, directory, _ in
       let message = try SiriMessage(parsing: build)
       let result = await session.sendFromSiri(
-        message, copy: .new(inputID: UUID().uuidString), earlier: .none,
+        message, confirmed: .none, newInputID: UUID().uuidString,
         until: .now + .seconds(3))
       #expect(result == .notSent(.notAdvertised))
       #expect(!FileManager.default.fileExists(atPath: directory.outbox.path))

@@ -584,10 +584,10 @@ func aLeaseWhoseLaneReadsConnectedAfterTheDeadlineNeverRunsItsBody() async throw
   chat.removed[work.id] = "Work"
   let entries = Entries()
   await #expect(throws: LaneError.gone("Work")) {
-    try await chat.withConnection(to: work.id, within: .seconds(1)) { entries.count += 1 }
+    try await chat.withConnection(to: work.id, within: .seconds(1)) { _ in entries.count += 1 }
   }
   await #expect(throws: LaneError.notPaired("Personal")) {
-    try await chat.withConnection(to: personal.id, within: .seconds(1)) { entries.count += 1 }
+    try await chat.withConnection(to: personal.id, within: .seconds(1)) { _ in entries.count += 1 }
   }
   #expect(entries.count == 0)
   #expect(!chat.demand.leased(work.id) && !chat.demand.leased(personal.id))

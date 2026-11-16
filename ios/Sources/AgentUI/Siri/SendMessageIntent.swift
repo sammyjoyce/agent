@@ -48,20 +48,19 @@ public struct SendMessageIntent: AppIntent {
     do {
       guard let id = ProfileID(wire: coordinator.id) else { throw SiriNotSent.removed }
       let earlier = try await coordinators.siriEarlier(message, to: id)
-      let copy: SiriCopy
-      switch earlier {
-      case .accepted(let savedAt): return SiriSendOutcome(.alreadyDelivered(savedAt), to: name)
-      case .waiting(let inputID, _): copy = .earlier(inputID: inputID)
-      case .none, .delivered: copy = .new(inputID: UUID().uuidString)
+      // A copy the coordinator accepted needs no confirmation and no connection.
+      if case .accepted(let savedAt) = earlier {
+        return SiriSendOutcome(.alreadyDelivered(savedAt), to: name)
       }
       if let dialog = confirmation(earlier, to: name, reading: message) {
         try await confirm(dialog)
       }
-      result = try await coordinators.sendFromSiri(message, copy: copy, earlier: earlier, to: id)
+      result = try await coordinators.sendFromSiri(
+        message, confirmed: earlier, newInputID: UUID().uuidString, to: id)
     } catch let reason as SiriNotSent { result = .notSent(reason) }
-    if case .notSent(.outboxUnreadable) = result, !protectedDataAvailable() {
-      result = .notSent(.locked)
-    } else if case .notSent(.outboxNotSaved) = result, !protectedDataAvailable() {
+    if result == .notSent(.outboxUnreadable) || result == .notSent(.outboxNotSaved),
+      !protectedDataAvailable()
+    {
       result = .notSent(.locked)
     }
     return SiriSendOutcome(result, to: name)
@@ -169,30 +168,29 @@ extension SiriNotSent {
 
 extension Coordinators {
   /// What coordinator `id`'s outbox holds of earlier Siri copies of `message`. It reads the
-  /// outbox, and dials nothing.
-  func siriEarlier(_ message: SiriMessage, to id: ProfileID) async throws(SiriNotSent)
-    -> SiriEarlier
-  {
-    let session: CoordinatorSession
-    do { session = try chat.session(on: id) } catch let error as LaneError {
+  /// outbox, and dials nothing. It throws `SiriNotSent`.
+  func siriEarlier(_ message: SiriMessage, to id: ProfileID) async throws -> SiriEarlier {
+    do {
+      return try await chat.onLane(id) { try await $0.siriEarlier(message) }
+    } catch let error as LaneError {
       throw SiriNotSent(error)
-    } catch { throw .removed }
-    return try await session.siriEarlier(message)
+    }
   }
 
-  /// Sends `copy` of `message` to coordinator `id` over a lease. One limit covers the connection
-  /// and the coordinator's answer. The session that connected answers, even if an address edit
-  /// replaces it meanwhile, so what it saved is reported. It throws `SiriNotSent` when nothing was
-  /// sent, and `CancellationError` for a task cancelled before the send.
+  /// Sends `message` to coordinator `id` over a lease, as the person confirmed it against
+  /// `confirmed`. One limit covers the connection and the coordinator's answer. The session that
+  /// connected answers, even if an address edit replaces it meanwhile, so what it saved is
+  /// reported. It throws `SiriNotSent` when nothing was sent, and `CancellationError` for a task
+  /// cancelled before the send.
   func sendFromSiri(
-    _ message: SiriMessage, copy: SiriCopy, earlier: SiriEarlier, to id: ProfileID
+    _ message: SiriMessage, confirmed: SiriEarlier, newInputID: String, to id: ProfileID
   ) async throws -> SiriSendResult {
     let limit = ConnectionLease.connectionWait
     let deadline = ContinuousClock.now + limit
     do {
-      return try await withConnection(to: id, within: limit) {
-        try await chat.session(on: id).sendFromSiri(
-          message, copy: copy, earlier: earlier, until: deadline)
+      return try await chat.withConnection(to: id, within: limit) { session in
+        await session.sendFromSiri(
+          message, confirmed: confirmed, newInputID: newInputID, until: deadline)
       }
     } catch let error as LaneError {
       throw SiriNotSent(error)

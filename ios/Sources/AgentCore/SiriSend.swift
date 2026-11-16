@@ -64,12 +64,26 @@ public enum SiriEarlier: Sendable, Equatable {
   case accepted(savedAt: Date)
   /// Placed within the last hour, from the outbox's Siri receipts.
   case delivered(sentAt: Date)
-}
 
-/// Which copy a confirmed send writes. `new` is minted before the confirmation.
-public enum SiriCopy: Sendable, Equatable {
-  case new(inputID: String)
-  case earlier(inputID: String)
+  /// The newest Siri copy of `message` in `pending`, else the newest of `receipts` from the hour
+  /// before `now`.
+  static func find(
+    _ message: SiriMessage, pending: [OutboxItem], receipts: [SiriReceipt], now: Date
+  ) -> SiriEarlier {
+    if let item = pending.last(where: {
+      $0.request.origin == .siri && $0.request.text == message.text
+    }) {
+      let savedAt = Date(timeIntervalSince1970: item.queuedAt)
+      return item.accepted == true
+        ? .accepted(savedAt: savedAt) : .waiting(inputID: item.request.inputId, savedAt: savedAt)
+    }
+    let digest = SiriReceipt.digest(message.text)
+    let since = now.timeIntervalSince1970 - SiriReceipt.lifetime
+    guard let receipt = receipts.last(where: { $0.digest == digest && $0.sentAt > since }) else {
+      return .none
+    }
+    return .delivered(sentAt: Date(timeIntervalSince1970: receipt.sentAt))
+  }
 }
 
 /// Why a Siri send saved nothing.
