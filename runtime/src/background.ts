@@ -146,8 +146,8 @@ export class BackgroundScheduler {
               case "manual_job": {
                 const occurrence = input.work.occurrence;
                 const memoized = await runtime.memo<string>("job_actor_task_id", context);
-                let actorId = memoized;
-                if (memoized === undefined || await this.session.commit((tx) => this.tasks.predatesConfinementIn(tx, memoized), context)) {
+                let actorId = memoized !== undefined && !await this.session.commit((tx) => this.tasks.predatesConfinementIn(tx, memoized), context) ? memoized : undefined;
+                if (actorId === undefined) {
                   // Work admitted before actor reuse still owns its original task.
                   const legacy = await this.session.commit(async (tx) =>
                     (await this.tasks.findIn(tx, scheduledTaskId(occurrence.id)))?.id, context);
