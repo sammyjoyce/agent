@@ -20,7 +20,7 @@ import type { JobExecution } from "./generated/JobExecution.js";
 import type { JobExecutionState } from "./generated/JobExecutionState.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { TaskError, TaskStore } from "./tasks.js";
-import { scheduledTaskId } from "./scheduled.js";
+import { ScheduledReconciliationPending, scheduledTaskId } from "./scheduled.js";
 
 type Trigger = { key: BackgroundTriggerKey; generation: number; revision: string;
   task: NativeTaskId<null> | null; cursor: number | null; last: number | null; next: number | null; enabled: boolean;
@@ -172,7 +172,13 @@ export class BackgroundScheduler {
               const state = await tx.doc(State), saved = state.triggers.find((trigger) => same(trigger.key, input.key));
               if (saved !== undefined) { saved.error = failure(error); saved.error_scope = "work"; }
               // Retain the same admitted work. Its consumer reconciles its stable request identity.
-              return { status: "sleeping", until: runtime.now() + Math.min(3_600_000, 60_000 * 2 ** Math.min(task.state.checkpoint.attempt, 6)),
+              // An unanswered receipt is rechecked without invoking the actor.
+              // Exponential backoff here stranded verified recoveries behind an
+              // unrelated hour-long execution retry deadline. Real execution
+              // failures retain their existing backoff and visible error.
+              const delay = error instanceof ScheduledReconciliationPending ? 60_000
+                : Math.min(3_600_000, 60_000 * 2 ** Math.min(task.state.checkpoint.attempt, 6));
+              return { status: "sleeping", until: runtime.now() + delay,
                 checkpoint: { phase: "execute", attempt: task.state.checkpoint.attempt + 1 } };
             }, context);
             return;

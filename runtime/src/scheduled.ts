@@ -29,11 +29,18 @@ export async function openJobActor(job: ScheduledJob, tasks: TaskStore): Promise
     source.provider === "scheduled_jobs" && source.account === "local" && source.thread_id === job.id))?.id;
 }
 
+/** An evidence-only recheck, not another execution attempt. Keep it responsive
+ * to a recovery turn rather than backing off business work for up to an hour. */
+export class ScheduledReconciliationPending extends TaskError {}
+
 async function requireReconciledTask(session: Harness, tasks: TaskStore, sources: SourceJournal, id: string, requestId: string): Promise<void> {
   const conversation = await tasks.conversation((await tasks.get(id)).conversation_id);
-  if (!await session.commit(async (tx) => await tasks.canSettleScheduledIn(tx, id, conversation.id) &&
-      (await tasks.canReleaseIn(tx, id) || await sources.reconcilesIn(tx, id, conversation.id, requestId)), BACKGROUND_CONTEXT)) {
-    throw new TaskError("The scheduled turn stopped without an answer; resolve its task or explicitly reconcile its exact input in a successful recovery turn before this occurrence can settle");
+  // Exact successful recovery is occurrence-scoped. Unrelated later work in
+  // this long-lived task must not keep the recovered occurrence open. Without
+  // that proof, whole-task resolution still requires native/task quiescence.
+  if (!await session.commit(async (tx) => await sources.reconcilesIn(tx, id, conversation.id, requestId) ||
+      await tasks.canSettleScheduledIn(tx, id, conversation.id) && await tasks.canReleaseIn(tx, id), BACKGROUND_CONTEXT)) {
+    throw new ScheduledReconciliationPending("The scheduled turn stopped without an answer; resolve its task or explicitly reconcile its exact input in a successful recovery turn before this occurrence can settle");
   }
 }
 
