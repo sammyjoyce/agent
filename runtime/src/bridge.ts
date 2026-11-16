@@ -12,7 +12,7 @@ import { CoordinatorEnvironment, EnvironmentError } from "./environment.js";
 import { ConversationModels, ModelError, modelFailureMessage } from "./models.js";
 import { ChatGptAuth } from "./auth.js";
 import { validRequest, validEvent, validApnsConfig, errorEvent, invalidHostReply, protocolLines } from "./protocol.js";
-import { TaskError, TaskStore, type HostCall } from "./tasks.js";
+import { TaskError, TaskStore, type ActorExecution, type HostCall } from "./tasks.js";
 import { readTaskGraph } from "./task-graph.js";
 import { HistoryStore } from "./history.js";
 import { CodexImporter } from "./importer.js";
@@ -133,7 +133,7 @@ function backgroundCall(command: import("./generated/HostCommand.js").HostComman
 
 type Application = TriageApplication & { stopInputDelivery(): void; harness: Harness; tasks: TaskStore; resources: ResourceStore; notifications: Notifications;
   histories: HistoryStore; catalog: ConversationCatalog; attachments: AttachmentStore; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler;
-  telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics; discovery: ToolDiscovery };
+  telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics; discovery: ToolDiscovery; serviceExecution: ActorExecution };
 async function openApplication(): Promise<Application> {
   const startup = new StartupDiagnostics(state);
   const storage = await startup.run("storage_open", async () => {
@@ -247,23 +247,24 @@ async function openApplication(): Promise<Application> {
   const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools }),
     { responsePolicy, inputOrigins }), TOOL_SURFACES, discovery);
   for (const extension of installed) registry.install(extension);
-  tasks.useBackgroundExecution({
+  const serviceExecution: ActorExecution = {
     available: () => backgroundAvailable,
     extensions: (agentId) => agentId === undefined ? toolsets.worker : toolsets.agent,
     call: (operation, host, signal) => backgroundCall(environment.route(operation, host), signal),
     prepare: (selected) => inference.preflight(selected),
-    bind: (conversation, host, model, signal) => executions.bind(conversation.id.toString(), {
+    bind: (conversation, host, model, scope) => executions.bind(conversation.id.toString(), {
       model, cwd: host.cwd, hosts: [host], default_host: host, origin_host_id: host.host_id,
       connectedHosts: () => environment.hosts(host.cwd, host.host_id, [host]), role: "worker",
       project: () => backgroundCall(host.host_id === null ? { type: "project_guidance", cwd: host.cwd }
-        : { type: "on_node", host_id: host.host_id, command: { type: "project_guidance", cwd: host.cwd } }, signal),
+        : { type: "on_node", host_id: host.host_id, command: { type: "project_guidance", cwd: host.cwd } }, scope()),
       search: (query, refs, limit, mode = "semantic") => retrieval.search(query, refs, limit,
-        (operation) => backgroundCall(operation, signal), importer.isRunning(), mode),
-      call: (operation) => backgroundCall(environment.route(operation, host), signal),
+        (operation) => backgroundCall(operation, scope()), importer.isRunning(), mode),
+      call: (operation) => backgroundCall(environment.route(operation, host), scope()),
     }),
-  });
+  };
+  tasks.useActorExecution(serviceExecution);
   if (await notifications.start()) harness.resume();
-  return { ...core, background, toolsets, startup, discovery };
+  return { ...core, background, toolsets, startup, discovery, serviceExecution };
   }); } catch (error) {
     await harness.close(BACKGROUND_CONTEXT).catch(() => {}); await discovery.close().catch(() => {}); await telemetry.close(); throw error;
   }
@@ -394,9 +395,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
   const inputMode = initial.type === "main_input" || initial.type === "conversation_input" ? initial.mode : undefined;
   if (initial.type === "chat" || initial.type === "run_task" || initial.type === "attach_main" || initial.type === "attach_conversation") activeCommands.add(id);
   if (initial.type === "chat") mainTurns.set(id, mainTurn());
-  if (initial.type === "run_task" && initial.interactive === true) {
-    workers.set(id, { command: initial, controller: new AbortController() });
-  }
+  if (initial.type === "run_task") workers.set(id, { command: initial, controller: new AbortController() });
   try {
     if (effective.type === "conversation_input" && effective.conversation_id === ROOT_CONVERSATION_ID.toString()) {
       effective = { type: "main_input", ...(effective.origin === undefined ? {} : { origin: effective.origin }), input_id: effective.input_id, input: effective.input, mode: effective.mode,
@@ -447,13 +446,13 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const stopped = new Promise<void>((resolve) => { stopBackground = resolve; });
         try {
           const application = await app();
-          await application.tasks.resumeBackground();
+          await application.tasks.resumeActors();
           await application.background.start(command.settings);
           admissions.delete(id);
           await stopped;
         } finally {
           backgroundAvailable = false;
-          void (await app()).tasks.detachBackground();
+          void (await app()).tasks.detachActors();
           backgroundOwner = undefined; stopBackground = undefined;
         }
         break;
@@ -474,8 +473,13 @@ async function handle(request: RuntimeRequest): Promise<void> {
         await application.startup.run("node_registration", () => application.environment.register(command.node));
         emit(id, { type: "node_registered", host_id: command.node.host_id }); break;
       }
-      case "set_connected_nodes":
-        (await app()).environment.setConnected(command.host_ids); emit(id, { type: "configured" }); break;
+      case "set_connected_nodes": {
+        const { environment, tasks } = await app();
+        const arrived = new Set(command.host_ids.filter((hostId) => !environment.isConnected(hostId)));
+        environment.setConnected(command.host_ids); emit(id, { type: "configured" });
+        if (arrived.size > 0) void tasks.resumeActors(arrived).catch(() => {});
+        break;
+      }
       case "environment": emit(id, await (await app()).environment.environment(command.telemetry ? (operation) => hostRequests.call(id, operation) : undefined)); break;
       case "login": {
         try {
@@ -609,9 +613,12 @@ async function handle(request: RuntimeRequest): Promise<void> {
       case "conversation_interrupt": {
         const { tasks } = await app();
         const conversation = await tasks.conversation(command.conversation_id);
-        if (await tasks.interruptBackground(command.conversation_id)) { emit(id, { type: "interrupted" }); break; }
+        const actor = await tasks.findOwner(command.conversation_id);
+        if (actor !== undefined && await tasks.stop({ task_id: actor.task.id, ...(actor.agent === undefined ? {} : { agent_id: actor.agent.id }) })) {
+          emit(id, { type: "interrupted" }); break;
+        }
         const owner = [...activeConversations].find(([request, active]) => !ending.has(request) &&
-          active.id === conversation.id && (workers.has(request) || mainTurns.has(request)))?.[0];
+          active.id === conversation.id && mainTurns.has(request))?.[0];
         if (owner === undefined) await conversation.abort(BACKGROUND_CONTEXT);
         else await interrupt(owner);
         emit(id, { type: "interrupted" }); break;
@@ -676,36 +683,21 @@ async function handle(request: RuntimeRequest): Promise<void> {
       }
       case "run_task": {
         const application = await app();
-        const { tasks, executions, toolsets, environment } = application;
+        const { tasks, executions, serviceExecution } = application;
         let stop: (() => Promise<void>) | undefined;
         try {
         const worker = workers.get(id);
+        if (worker === undefined) throw new TaskError("This worker's request has ended");
         const configured = async (conversation: Conversation, title: string) => {
-          if (interrupted.has(id)) await interrupt(id);
           emit(id, { type: "task_ready", conversation_id: conversation.id.toString(), title });
           const model = executions.model(conversation.id.toString());
           if (model === undefined) throw new TaskError("The worker execution model is unavailable");
           emit(id, { type: "conversation_settings", settings: { conversation_id: conversation.id.toString(),
             task_id: command.task_id, agent_id: command.agent_id ?? null, model, catalog: [] } });
         };
-        const answer = await tasks.run(command, (conversation, host, model) => executions.bind(conversation.id.toString(), {
-          model, cwd: host.cwd, hosts: [host], default_host: host, origin_host_id: host.host_id ?? null,
-          connectedHosts: () => environment.hosts(host.cwd, host.host_id ?? null, [host]),
-          role: "worker", search: searchFor(application, id), call: (operation) => hostRequests.call(id, operation),
-        }),
-        command.agent_id === undefined ? toolsets.worker : toolsets.agent, (operation) => hostRequests.call(id, operation), (selected) => inference.preflight(selected),
-        worker === undefined ? undefined : {
+        const answer = await tasks.run(command, serviceExecution.bind, serviceExecution.extensions(command.agent_id),
+        serviceExecution.call, serviceExecution.prepare, command.interactive !== true ? undefined : {
           signal: worker.controller.signal,
-          async fence() { await interrupt(id); },
-          async beforeTurn() {
-            for (;;) {
-              const stopping = interrupts.get(id);
-              if (stopping === undefined) return;
-              await stopping;
-              if (interrupts.get(id) !== stopping) continue;
-              interrupts.delete(id); interrupted.delete(id); hostRequests.resumeRequest(id);
-            }
-          },
           async ready(conversation, title) {
             activeConversations.set(id, conversation);
             await configured(conversation, title);
@@ -716,8 +708,10 @@ async function handle(request: RuntimeRequest): Promise<void> {
           configured,
           answer(conversation_id, text, entry_id) { emit(id, { type: "answer", conversation_id, text, ...(entry_id === undefined ? {} : { entry_id }) }); },
           idle() { emit(id, { type: "worker_idle" }); },
+          working() { emit(id, { type: "conversation_state", working: true }); },
+          interrupted() { emit(id, { type: "interrupted" }); },
         });
-        if (worker === undefined) emit(id, { type: "answer", ...answer });
+        if (command.interactive !== true) emit(id, { type: "answer", ...answer });
         } finally { await stop?.(); }
         break;
       }
@@ -964,6 +958,16 @@ try {
     if (request.command.type === "interrupt") {
       // Done may already be buffered while Rust still owns the request and sends its last control.
       if (!activeCommands.has(request.id)) continue;
+      const worker = workers.get(request.id);
+      if (worker !== undefined) {
+        const { task_id, agent_id } = worker.command;
+        void app().then(({ tasks }) => tasks.stop({ task_id, ...(agent_id === undefined ? {} : { agent_id }) })).then((stopped) => {
+          if (!stopped && activeCommands.has(request.id)) emit(request.id, { type: "interrupted" });
+        }, () => {
+          if (activeCommands.has(request.id)) failure(request.id, "internal", "Interruption could not be confirmed; inspect current work");
+        });
+        continue;
+      }
       void interrupt(mainViews.get(request.id)?.owner ?? request.id).catch(() => {
         if (activeCommands.has(request.id)) failure(request.id, "internal", "Interruption could not be confirmed; inspect current work");
       });
@@ -1002,7 +1006,7 @@ try {
     pending.add(operation);
   }
   const opened = application === undefined ? undefined : await application.catch(() => undefined);
-  if (opened !== undefined) void opened.tasks.detachBackground();
+  if (opened !== undefined) void opened.tasks.detachActors();
   if (backgroundOwner !== undefined) hostRequests.finish(backgroundOwner);
   stopBackground?.();
   conversationViews.close();
@@ -1015,9 +1019,9 @@ try {
     if (opened !== undefined) {
       opened.notifications.close(); opened.stopInputDelivery();
       try {
-        void opened.tasks.detachBackground();
+        void opened.tasks.detachActors();
         await opened.harness.close(BACKGROUND_CONTEXT);
-        await opened.tasks.detachBackground();
+        await opened.tasks.detachActors();
         await opened.discovery.close();
         await opened.retrieval.close();
       }

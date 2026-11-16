@@ -16,6 +16,7 @@ import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
 import { pump } from "./fixtures/background-runtime.js";
 import { binding, node, openScheduled, scheduledOccurrence } from "./fixtures/scheduled-runtime.js";
 import { fixtureModel } from "./model.js";
+import { runAdmitted } from "./fixtures/run-admitted.js";
 
 test("background children execute, report and continue through their original saved conversations after reopen", { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-background-children-")); let app = await openScheduled(directory);
@@ -147,7 +148,7 @@ test("stop during asynchronous preflight fences the admitted input before infere
   try {
     let entered = () => {}; const preparing = new Promise<void>((resolve) => { entered = resolve; });
     const held = new Promise<void>((resolve) => { release = resolve; });
-    app.tasks.useBackgroundExecution({ available: () => true, extensions: () => [], prepare: async () => { entered(); await held; },
+    app.tasks.useActorExecution({ available: () => true, extensions: () => [], prepare: async () => { entered(); await held; },
       call: (command) => app.call(command), bind: (conversation, host, model) => app.executions.bind(conversation.id.toString(), {
         cwd: host.cwd, hosts: [host], model, role: "worker", call: app.call,
       }) });
@@ -155,11 +156,11 @@ test("stop during asynchronous preflight fences the admitted input before infere
       sources: [{ provider: "scheduled_jobs", account: "local", thread_id: scheduledOccurrence.job.id }] });
     await app.tasks.enqueue(task.id, "Stop this queued turn", "preparing-input");
     app.faux.setResponses([fauxAssistantMessage("Must never execute after the interrupted receipt.")]);
-    running = app.tasks.runBackground(task.id);
+    running = runAdmitted(app.tasks, task.id);
     const stopped = assert.rejects(running, /Background execution stopped/);
     await preparing;
     const interrupt = (async () => {
-      const matched = await app.tasks.interruptBackground(task.conversation_id);
+      const matched = await app.tasks.stop({ task_id: task.id });
       if (!matched) await (await app.tasks.conversation(task.conversation_id)).abort(BACKGROUND_CONTEXT);
       return matched;
     })();
@@ -178,7 +179,7 @@ test("stop during asynchronous preflight fences the admitted input before infere
     await app.views.input({ type: "conversation_input", conversation_id: task.conversation_id, input_id: "preparing-input",
       input: "Stop this queued turn", mode: "steer" }, app.call, (event) => frames.push(event));
     assert.equal(frames[0]?.type, "input_rejected");
-    await app.tasks.resumeBackground(); await setImmediate();
+    await app.tasks.resumeActors(); await setImmediate();
     assert.equal(app.faux.state.callCount, 0, "Owner recovery cannot revive a stopped preflight input");
   } finally { release(); await running?.catch(() => {}); await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
@@ -209,10 +210,10 @@ for (const shutdown of ["SIGKILL", "graceful"]) for (const phase of ["child", "c
         const live = await app.session.snapshot(LiveDoc, conversation.id, BACKGROUND_CONTEXT); assert.ok(live?.run);
         const generation = await app.session.getTask(live.run.taskId, BACKGROUND_CONTEXT); assert.ok(generation);
         let bindings = 0;
-        app.tasks.useBackgroundExecution({ available: () => true, extensions: () => [],
+        app.tasks.useActorExecution({ available: () => true, extensions: () => [],
           prepare: async () => { throw new Error("Fixture credentials are unavailable"); }, call: app.call,
           bind: () => { bindings += 1; return () => {}; } });
-        await assert.rejects(app.tasks.runBackground(task.id, undefined, phase === "child" ? actor.id : undefined), /credentials are unavailable/);
+        await assert.rejects(runAdmitted(app.tasks, task.id, phase === "child" ? actor.id : undefined), /credentials are unavailable/);
         const retained = await app.session.getTask(generation.id, BACKGROUND_CONTEXT); assert.ok(retained);
         assert.deepEqual(retained.state, generation.state); assert.equal(retained.abortRequested, false);
         assert.deepEqual(await app.session.commit((tx) => tx.submissionByRequest(conversation.id, inputId), BACKGROUND_CONTEXT), original);
@@ -225,7 +226,7 @@ for (const shutdown of ["SIGKILL", "graceful"]) for (const phase of ["child", "c
         // Exercise native timer-driven streaming beyond a one-line answer.
         return fauxAssistantMessage("Recovered the original placed work. " + "The retained host result was checked without replaying the owned tool. ".repeat(20));
       }, fauxAssistantMessage("The parent retained its recovered child result.")]);
-      await app.tasks.resumeBackground();
+      await app.tasks.resumeActors();
       const restored = app;
       // Native streaming uses timers. A count of immediate turns can expire
       // before those timers; retain the test's existing total deadline instead.

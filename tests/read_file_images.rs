@@ -1,3 +1,5 @@
+#[path = "fixtures/executable.rs"]
+mod executable_fixture;
 #[path = "fixtures/fake_rex.rs"]
 mod fake_rex;
 
@@ -577,9 +579,9 @@ impl Attached {
     async fn next(&mut self) -> RuntimeCommand {
         let frame = timeout(Duration::from_secs(10), self.frames.next_frame())
             .await
-            .expect("The attached worker went quiet")
+            .expect("The registered worker went quiet")
             .unwrap()
-            .expect("The attached worker closed its connection");
+            .expect("The registered worker closed its connection");
         serde_json::from_slice(&frame).unwrap()
     }
 
@@ -605,8 +607,7 @@ impl Attached {
 }
 
 #[tokio::test]
-async fn an_attached_worker_serves_image_reads_from_its_own_host() {
-    const TASK: &str = "77777777-7777-4777-8777-777777777777";
+async fn a_registered_worker_serves_image_reads_from_its_own_host() {
     const SERVER: &str = "unix:///run/user/1000/rex-agent/server.sock";
     let directory = tempfile::tempdir().unwrap();
     let files = directory.path().to_owned();
@@ -653,11 +654,10 @@ async fn an_attached_worker_serves_image_reads_from_its_own_host() {
                     };
                     attached.send([environment, RuntimeEventKind::Done]).await;
                 }
-                RuntimeCommand::RunTask { .. } => {
+                RuntimeCommand::ConnectWorker { .. } => {
                     attached
-                        .send([RuntimeEventKind::TaskReady {
-                            conversation_id: "invented-task-conversation".into(),
-                            title: "Synthetic task".into(),
+                        .send([RuntimeEventKind::WorkerReady {
+                            connection_id: "invented-connection".into(),
                         }])
                         .await;
                     let mut received = Vec::new();
@@ -693,8 +693,6 @@ async fn an_attached_worker_serves_image_reads_from_its_own_host() {
                         .call(read("notes.txt", 6, 5, ImageRead::Start))
                         .await;
                     reads.send((received, chunks, text)).unwrap();
-                    while !matches!(attached.next().await, RuntimeCommand::DetachWorker) {}
-                    attached.send([RuntimeEventKind::Done]).await;
                     return;
                 }
                 command => panic!("Unexpected worker command {command:?}"),
@@ -708,7 +706,22 @@ async fn an_attached_worker_serves_image_reads_from_its_own_host() {
         bin.join("rex"),
     )
     .unwrap();
-    fs::write(files.join("config.toml"), "").unwrap();
+    let relay = bin.join("relay.cjs");
+    fs::write(
+        &relay,
+        "const socket=require('node:net').connect(process.env.AGENT_TEST_COORDINATOR_SOCKET);\n\
+         process.stdin.pipe(socket);socket.pipe(process.stdout);socket.on('close',()=>process.exit(0));\n",
+    )
+    .unwrap();
+    executable_fixture::write_executable(
+        &bin.join("ssh"),
+        "#!/bin/sh\nexec node \"$AGENT_TEST_SSH_RELAY\"\n",
+    );
+    fs::write(
+        files.join("config.toml"),
+        "coordinator = \"synthetic-coordinator\"\n",
+    )
+    .unwrap();
     fs::write(files.join("AGENTS.md"), "").unwrap();
     let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
@@ -721,43 +734,30 @@ async fn an_attached_worker_serves_image_reads_from_its_own_host() {
         .arg(files.join("config.toml"))
         .arg("--instructions")
         .arg(files.join("AGENTS.md"))
-        .args(["run-task", TASK, "--allocation-id", "allocation-root"])
+        .arg("maintain")
         .env("PATH", path)
         .env("AGENT_TEST_FAKE_REX", &bin)
         .env("AGENT_TEST_FAKE_REX_ORIGIN_SERVER", SERVER)
+        .env("AGENT_TEST_COORDINATOR_SOCKET", files.join("agent.sock"))
+        .env("AGENT_TEST_SSH_RELAY", &relay)
         .env("REX_SERVER", SERVER)
-        .env("REX_SESSION", fake_rex::ORIGIN_SESSION)
-        .env("REX_BLOCK", fake_rex::ORIGIN_BLOCK)
         .env_remove("REX_CLIENT")
         .current_dir(&files)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let stdin = worker.stdin.take().unwrap();
-    let (received, chunks, text) = match timeout(Duration::from_secs(30), served_reads).await {
-        Ok(served) => served.unwrap(),
-        Err(_) => {
-            worker.start_kill().unwrap();
-            let output = worker.wait_with_output().await.unwrap();
-            panic!(
-                "The attached worker never served the reads: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+    let served = timeout(Duration::from_secs(30), served_reads).await;
+    worker.start_kill().unwrap();
+    let output = worker.wait_with_output().await.unwrap();
+    let Ok(Ok((received, chunks, text))) = served else {
+        panic!(
+            "The registered worker never served the reads: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     };
-    drop(stdin);
-    let output = timeout(Duration::from_secs(30), worker.wait_with_output())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     coordinator.await.unwrap();
     assert!(received == image, "The image arrives byte for byte");
     assert_eq!(chunks, image.len().div_ceil(1024 * 1024));

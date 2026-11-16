@@ -15,6 +15,7 @@ import type { HistoryMessage } from "../src/generated/HistoryMessage.js";
 import type { TaskRecord } from "../src/generated/TaskRecord.js";
 import { DAY, exampleJob, FakeClock } from "./fixtures/background-runtime.js";
 import { openScheduled } from "./fixtures/scheduled-runtime.js";
+import { runAdmitted } from "./fixtures/run-admitted.js";
 
 function scheduler(app: Awaited<ReturnType<typeof openScheduled>>, completed: string[]) {
   return new BackgroundScheduler(app.session, app.registry, app.tasks, {
@@ -35,7 +36,7 @@ function origin(row: HistoryMessage | undefined, job: { id: string; title: strin
 }
 async function continued(app: Awaited<ReturnType<typeof openScheduled>>, task: TaskRecord, id: string, text: string): Promise<void> {
   app.faux.setResponses([notice(text), fauxAssistantMessage("")]);
-  await app.tasks.enqueue(task.id, "Continue this saved workflow.", id); await app.tasks.runBackground(task.id);
+  await app.tasks.enqueue(task.id, "Continue this saved workflow.", id); await runAdmitted(app.tasks, task.id);
 }
 
 test("actual concurrent scheduler publications retain run titles live and after rename, deletion and reopen", { timeout: 20_000 }, async () => {
@@ -120,7 +121,7 @@ test("a scheduled child inherits its trusted lineage through deletion and its ow
     assert.deepEqual(saved, rows);
     app.faux.setResponses([notice("The same child has a second necessary decision."), fauxAssistantMessage(fauxToolCall("report_result", { summary: "Rechecked the same evidence." }), { stopReason: "toolUse" }), fauxAssistantMessage("")]);
     await app.tasks.continueAgent(task.id, child.id, "Recheck this same workflow.", "child-followup", app.call);
-    await app.tasks.runBackground(task.id, undefined, child.id);
+    await runAdmitted(app.tasks, task.id, child.id);
     const continuedRows = (await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
     assert.equal(continuedRows.length, 2); origin(continuedRows[1], job);
   } finally { release(); await app.close(); await rm(directory, { recursive: true, force: true }); }
@@ -132,7 +133,7 @@ test("main, generic and legacy notices never guess a job from titles, source lin
     const task = await app.tasks.create({ title: "Morning brief", outcome: "An ordinary task", sources: [{ provider: "scheduled_jobs", account: "local", thread_id: "morning-brief" }] });
     const host = await app.environment.defaultHost(await app.environment.hosts("/workspace/example", null, [])); assert.ok(host);
     await app.tasks.enqueue(task.id, "Package tracking: a claimed job name is not transport metadata.", "generic"); await app.tasks.dispatch(task.id, host, app.call);
-    app.faux.setResponses([notice("Morning brief: actionable generic work."), fauxAssistantMessage("")]); await app.tasks.runBackground(task.id);
+    app.faux.setResponses([notice("Morning brief: actionable generic work."), fauxAssistantMessage("")]); await runAdmitted(app.tasks, task.id);
     const root = await app.session.root(BACKGROUND_CONTEXT);
     await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [app.sourceTools.main] }, BACKGROUND_CONTEXT);
     const unbind = app.executions.bind(root.id.toString(), { cwd: host.cwd, hosts: [host], call: app.call });

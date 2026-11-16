@@ -15,6 +15,7 @@ import type { ScheduledOccurrence } from "../src/generated/ScheduledOccurrence.j
 import { createAppTools } from "../src/tools.js";
 import { DAY, FakeClock, exampleJob, planned, pump } from "./fixtures/background-runtime.js";
 import { binding, openScheduled, scheduledOccurrence } from "./fixtures/scheduled-runtime.js";
+import { runAdmitted } from "./fixtures/run-admitted.js";
 
 test("scheduled work uses the existing task actor, current guidance and exact native input", { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-scheduled-task-")), app = await openScheduled(directory);
@@ -51,7 +52,7 @@ for (const scenario of ["absent", "unknown", "wrong", "failed", "foreign"]) {
       if (scenario === "wrong") {
         await app.tasks.enqueue(task.id, "An independent request.", "other-unanswered", undefined, "follow_up");
         app.faux.setResponses([() => { throw new Error("The independent request also failed before tools"); }]);
-        await assert.rejects(app.tasks.runBackground(task.id), /did not complete/);
+        await assert.rejects(runAdmitted(app.tasks, task.id), /did not complete/);
       }
       app.faux.setResponses([
         fauxAssistantMessage(fauxToolCall("record_task", {
@@ -77,8 +78,8 @@ for (const scenario of ["absent", "unknown", "wrong", "failed", "foreign"]) {
         } finally { unbind(); }
       } else {
         await app.tasks.enqueue(task.id, "Review the previous failure.", "recovery", undefined, "follow_up");
-        if (scenario === "failed") await assert.rejects(app.tasks.runBackground(task.id), /did not complete/);
-        else await app.tasks.runBackground(task.id);
+        if (scenario === "failed") await assert.rejects(runAdmitted(app.tasks, task.id), /did not complete/);
+        else await runAdmitted(app.tasks, task.id);
       }
       await assert.rejects(runScheduled(scheduledOccurrence, controller.signal, app, task.id), /scheduled turn/);
       const claimed = (await app.sources.events({ provider: "task_outcomes", thread_id: task.id, limit: 100 }))
@@ -137,7 +138,7 @@ for (const recoveredState of ["waiting", "resolved"]) {
       const task = (await app.tasks.list())[0]; assert.ok(task); assert.ok(first); const occurrence = first;
       const conversation = await app.tasks.conversation(task.conversation_id);
       assert.equal(await readFile(effectPath, "utf8"), "performed once\n");
-      assert.equal(await app.tasks.interruptBackground(task.conversation_id), true);
+      assert.equal(await app.tasks.stop({ task_id: task.id }), true);
       const original = await app.session.commit((tx) => tx.submissionByRequest(conversation.id, occurrence.id), BACKGROUND_CONTEXT);
       assert.ok(original); assert.equal(original.status, "unanswered");
       await pump(async () => (await scheduler.status()).errors.some((error) => /scheduled turn/.test(error.message)));

@@ -19,6 +19,7 @@ import { Executions, createAppTools } from "../src/tools.js";
 import { history } from "../src/transcript.js";
 import { fixtureModel } from "./model.js";
 import { CoordinatorEnvironment } from "../src/environment.js";
+import { until } from "./fixtures/until.js";
 
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==", "base64");
 async function upload(store: AttachmentStore, bytes: Buffer, name = "evidence.txt", media_type = "text/plain"): Promise<AttachmentRef> {
@@ -235,15 +236,18 @@ test("Pi receives native images and delegation keeps immutable files on each act
     const workerMessages = (await history(await tasks.conversation(task.conversation_id), null, session)).flatMap((frame) => frame.messages);
     assert.ok(workerMessages.some((message) => message.role === "notice" && message.text === "" && message.attachments?.length === 2 &&
       message.presentation?.type === "agent_coordination" && message.presentation.sender_thread_id === root.id.toString()));
-    const stopped = await tasks.create({ title: "Cancel during transfer", outcome: "Keep queued evidence", model: fixtureModel });
-    await tasks.enqueue(stopped.id, "Stop before inference", randomUUID(), undefined, undefined, [file]);
-    await tasks.dispatch(stopped.id, host, async () => ({ type: "spawned", binding }));
-    const stoppedTask = await tasks.get(stopped.id); assert.ok(stoppedTask.worker.state === "bound");
+    const detached = await tasks.create({ title: "Detach during transfer", outcome: "Deliver queued evidence", model: fixtureModel });
+    await tasks.enqueue(detached.id, "Read the evidence with no terminal", randomUUID(), undefined, undefined, [file]);
+    await tasks.dispatch(detached.id, host, async () => ({ type: "spawned", binding }));
+    const detachedTask = await tasks.get(detached.id); assert.ok(detachedTask.worker.state === "bound");
     const controller = new AbortController(), calls = faux.state.callCount;
-    await tasks.run({ type: "run_task", task_id: stopped.id, allocation_id: stoppedTask.worker.allocation_id, binding, instructions: "", model: fixtureModel, cwd: host.cwd },
-      () => () => {}, [], async (command) => { const result = await call("stopped")(command); controller.abort(); return result; }, undefined,
+    faux.setResponses([fauxAssistantMessage("Read the evidence after the terminal detached.")]);
+    await tasks.run({ type: "run_task", task_id: detached.id, allocation_id: detachedTask.worker.allocation_id, binding, instructions: "", model: fixtureModel, cwd: host.cwd },
+      () => () => {}, [], async (command) => { const result = await call("detached")(command); controller.abort(); return result; }, undefined,
       { signal: controller.signal, async ready() {}, answer() {}, idle() {} });
-    assert.equal(faux.state.callCount, calls, "Detach during attachment preparation must not start inference");
-    assert.equal((await tasks.get(stopped.id)).pending.length, 1);
-  } finally { await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+    await until(async () => !tasks.isRunning(detached.id) && (await tasks.get(detached.id)).pending.length === 0,
+      "A terminal that detaches during attachment preparation must not strand the admitted input");
+    assert.equal(faux.state.callCount, calls + 1); assert.ok(writes.includes("detached:" + file.id));
+    assert.equal((await tasks.get(detached.id)).summary, "Read the evidence after the terminal detached.");
+  } finally { await tasks.detachActors(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

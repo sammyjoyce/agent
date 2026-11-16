@@ -3392,16 +3392,7 @@ async fn request_presented(
     let mut ready = false;
     let mut history_cursor = None;
     let mut input = BufReader::new(tokio::io::stdin()).lines();
-    let mut operations = HostEffects::new(Capacity::Unbounded);
     let mut feedback = tokio::task::JoinSet::new();
-    let executor = Arc::new(
-        host::Executor::with_tailscale(
-            directory,
-            agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?,
-            rex.clone(),
-        )
-        .with_browser(script, config.browser.clone()),
-    );
     let mut thinking = false;
     let mut wire = connection(client, lifecycle == RequestLifecycle::Login).await?;
     let relay_needed = match (
@@ -3513,7 +3504,6 @@ async fn request_presented(
                             ui.exiting = true;
                         }
                         if lifecycle == RequestLifecycle::Chat || lifecycle.is_view() { return Ok(history_cursor); }
-                        if active_turn { write_command(&mut *wire.writer, &RuntimeCommand::Interrupt).await?; }
                         if lifecycle.is_worker() { write_command(&mut *wire.writer, &RuntimeCommand::DetachWorker).await?; }
                         ui_controls = false;
                     }
@@ -3584,12 +3574,6 @@ async fn request_presented(
                 signal?;
                 write_command(&mut *wire.writer, &RuntimeCommand::DetachWorker).await?;
                 interactive = false;
-                continue;
-            }
-            completed = operations.next(), if !operations.is_empty() => {
-                if let Some(reply) = completed? {
-                    write_command(&mut *wire.writer, &RuntimeCommand::HostReply { call_id: reply.call_id, result: reply.result }).await?;
-                }
                 continue;
             }
         };
@@ -3665,21 +3649,16 @@ async fn request_presented(
             view.handle.event(event.clone())?;
         }
         match event {
-            RuntimeEventKind::HostCall { call_id, command } => {
-                ensure!(
-                    lifecycle.delegates_host_call(&command),
-                    "Only an attached task worker may execute coordinator host calls"
-                );
-                let executor = executor.clone();
-                if let Admission::Rejected(reply) = operations.spawn(call_id, |cancelled| async move {
-                    executor.execute_cancelled(*command, cancelled).await
-                })? {
-                    write_command(&mut *wire.writer, &RuntimeCommand::HostReply { call_id: reply.call_id, result: reply.result }).await?;
+            RuntimeEventKind::HostCall { call_id, .. } => {
+                write_command(&mut *wire.writer, &RuntimeCommand::HostReply { call_id, result: outdated_coordinator_effect() }).await?;
+                let notice = "Update the coordinator so this task's host runs its commands.";
+                match &presentation {
+                    Some(view) => view.handle.event(RuntimeEventKind::Notice { task_id: None, text: notice.into() })?,
+                    None if !arguments.json => eprintln!("{notice}"),
+                    None => {}
                 }
             }
-            RuntimeEventKind::HostCancel { call_id } => {
-                operations.cancel(&call_id);
-            }
+            RuntimeEventKind::HostCancel { .. } => {}
             RuntimeEventKind::Interrupted => {
                 outcome = true;
                 if presentation.is_none() {
@@ -3852,27 +3831,16 @@ async fn request_presented(
     ensure!(outcome || lifecycle.is_view(), "Coordinator completed without a result");
     Ok(history_cursor)
     }.await;
-    let mut draining = operations.shutdown();
-    let mut drained = Ok(());
-    while let Some(reply) = draining.next().await {
-        let delivery = match reply {
-            Ok(reply) => {
-                write_command(
-                    &mut *wire.writer,
-                    &RuntimeCommand::HostReply {
-                        call_id: reply.call_id,
-                        result: reply.result,
-                    },
-                )
-                .await
-            }
-            Err(error) => Err(error),
-        };
-        drained = drained.and(delivery);
-    }
     let closed = close_connection(&mut *wire.writer, wire.child).await;
     finish_controls(&mut feedback).await;
-    result.and_then(|cursor| drained.and(closed).map(|()| cursor))
+    result.and_then(|cursor| closed.map(|()| cursor))
+}
+
+fn outdated_coordinator_effect() -> agent_cli::protocol::HostResult {
+    agent_cli::protocol::HostResult::Failed {
+        delivery: Some(agent_cli::protocol::HostDelivery::NotStarted),
+        message: "This terminal no longer runs task commands, so nothing was started. Update the coordinator so the task's host runs them.".into(),
+    }
 }
 
 fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {

@@ -65,14 +65,14 @@ export async function openScheduled(directory: string, guidanceVersion = "origin
     return { type: "failed", message: "The fixture received an unsupported host command" };
   };
   function configureBackground(hostCall: (command: HostCommand, signal: AbortSignal) => Promise<HostResult> = call) {
-    tasks.useBackgroundExecution({
+    tasks.useActorExecution({
       available: () => true,
       extensions: (agentId) => [guidance, tools.host, agentId === undefined ? tools.worker : tools.agent, sourceTools.worker],
       call: (command, host, signal) => hostCall(environment.route(command, host), signal),
-      bind: (conversation, host, model, signal) => executions.bind(conversation.id.toString(), {
+      bind: (conversation, host, model, scope) => executions.bind(conversation.id.toString(), {
         cwd: host.cwd, hosts: [host], default_host: host, model, role: "worker",
-        project: () => hostCall({ type: "on_node", host_id: node.host_id, command: { type: "project_guidance", cwd: host.cwd } }, signal),
-        call: (command) => hostCall(environment.route(command, host), signal),
+        project: () => hostCall({ type: "on_node", host_id: node.host_id, command: { type: "project_guidance", cwd: host.cwd } }, scope()),
+        call: (command) => hostCall(environment.route(command, host), scope()),
       }),
     });
   }
@@ -81,7 +81,7 @@ export async function openScheduled(directory: string, guidanceVersion = "origin
   const views = new ConversationViews(async () => ({ harness: session, tasks, sources, histories, inference, environment, catalog }), () => () => {});
   const close = async () => {
     views.close(); catalog.close();
-    const detached = tasks.detachBackground();
+    const detached = tasks.detachActors();
     await session.close(BACKGROUND_CONTEXT); await detached;
   };
   return { session, tasks, sources, environment, call, commands, faux, executions, registry, sourceTools, configureBackground, views, close };

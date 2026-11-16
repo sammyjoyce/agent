@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,17 +8,20 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
-import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type FauxResponseFactory } from "@earendil-works/pi-ai";
 import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { AttachmentStore } from "../src/attachments.js";
 import { ConversationModels, DEFAULT_MODEL } from "../src/models.js";
-import { TaskStore } from "../src/tasks.js";
+import { TaskStore, type ActorExecution, type WorkerSession } from "../src/tasks.js";
 import { createAppTools, Executions } from "../src/tools.js";
 import { protocolLines, validEvent } from "../src/protocol.js";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
+import type { HostCommand } from "../src/generated/HostCommand.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 import { fixtureModel } from "./model.js";
+import { until } from "./fixtures/until.js";
 
 test("attached worker admits native steering before the current tool finishes and queues a separate turn", { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-native-steer-")); const registry = createRegistry();
@@ -91,13 +95,14 @@ test("attached worker admits native steering before the current tool finishes an
     await submit(command, "Keep accepted follow-up owned", "detach-queued", "follow_up");
     await submit(command, "Refine the held detach turn", "detach-steer", "steer");
     const beforeDetach = effects; controller.abort(); release(); await running; running = undefined;
+    await until(async () => !tasks.isRunning(task.id) && (await tasks.get(task.id)).pending.length === 0,
+      "The actor must drain its admitted inputs after its terminal detached");
     assert.equal(effects, beforeDetach + 1, "An already-admitted native follow-up keeps its execution binding while detached work drains");
-    assert.deepEqual((await tasks.get(task.id)).pending.map((input) => input.id), ["detach-queued", "detach-steer"]);
     const beforeRecovery = faux.state.callCount;
     const recovered = await tasks.run({ ...command, interactive: false }, () => () => {});
     assert.equal(recovered.text, "Queued answer after detach"); assert.equal(faux.state.callCount, beforeRecovery);
     assert.deepEqual((await tasks.get(task.id)).pending, []);
-  } finally { release(); controller.abort(); await running?.catch(() => {}); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  } finally { release(); controller.abort(); await running?.catch(() => {}); await tasks.detachActors(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("main native steering keeps the execution lease until queued inputs finish and emits each answer once", { timeout: 10_000 }, async () => {
@@ -182,4 +187,144 @@ test("main native steering keeps the execution lease until queued inputs finish 
     await Promise.race([fresh, reader]); assert.ok(frames.some((event) => event.type === "answer" && event.text === "Fresh work after stop"));
     child.stdin.end(); assert.equal(await closed, 0, errors); await reader;
   } finally { child.kill(); await closed; await reader.catch(() => {}); await rm(directory, { recursive: true, force: true }); }
+});
+
+function gate() {
+  let enter = () => {}, release = () => {};
+  const entered = new Promise<void>((resolve) => { enter = resolve; }), released = new Promise<void>((resolve) => { release = resolve; });
+  return { entered, enter, released, release };
+}
+const answerLastInput: FauxResponseFactory = (context) => {
+  const content = context.messages.findLast((message) => message.role === "user")?.content ?? "";
+  return fauxAssistantMessage("Answered: " + (typeof content === "string" ? content : content.flatMap((part) => part.type === "text" ? [part.text] : [])[0]));
+};
+async function openStopFixture() {
+  const directory = await mkdtemp(join(tmpdir(), "agent-stop-before-pi-")), registry = createRegistry();
+  const faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }], tokensPerSecond: 1_000_000 });
+  const models = createModels(); models.setProvider(faux.provider);
+  const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+    { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  const tasks = new TaskStore(session, new ConversationModels(models)), executions = new Executions(), tools = createAppTools(tasks, executions);
+  const attachments = new AttachmentStore(directory); registry.install(tools.host); tasks.useAttachments(attachments);
+  const host = { host_id: null, rex_server: null, coordinator: null, name: "fixture", cwd: "/tmp", agent_program: "/fixture/agent" };
+  const binding = { host_id: "11111111-1111-4111-8111-111111111111", session_id: "session:22222222-2222-4222-8222-222222222222",
+    window_id: "window:33333333-3333-4333-8333-333333333333", block_id: "block:44444444-4444-4444-8444-444444444444" };
+  const allocation_id = "55555555-5555-4555-8555-555555555555";
+  const task = await tasks.create({ title: "Stop before Pi", outcome: "Run only the work that was not stopped", model: fixtureModel });
+  await tasks.update(task.id, (saved) => { saved.worker = { state: "bound", allocation_id, host, binding }; });
+  const command: Extract<RuntimeCommand, { type: "run_task" }> = { type: "run_task", task_id: task.id, binding, allocation_id,
+    cwd: host.cwd, instructions: "", model: fixtureModel, interactive: true };
+  const conversation = await tasks.conversation(task.conversation_id);
+  const receipt = (id: string) => session.commit((tx) => tx.submissionByRequest(conversation.id, id), BACKGROUND_CONTEXT);
+  const bytes = Buffer.from("Invented evidence");
+  const uploaded = await attachments.request({ type: "upload", id: randomUUID(), name: "evidence.txt", media_type: "text/plain",
+    size_bytes: bytes.length, offset: 0, data_base64: bytes.toString("base64"), complete: true });
+  assert.ok(uploaded.type === "uploaded" && uploaded.attachment !== null);
+  const commands: HostCommand[] = [], transfer = gate();
+  const call = async (operation: HostCommand): Promise<HostResult> => {
+    commands.push(operation);
+    if (operation.type === "exec") return { type: "process", exit_code: 0, stdout: "complete", stderr: "", truncated: false };
+    if (operation.type !== "attachment_write") return { type: "failed", message: "The fixture received an unsupported host command" };
+    transfer.enter(); await transfer.released;
+    return { type: "attachment_written", next_offset: operation.offset + Buffer.from(operation.data_base64, "base64").length,
+      path: operation.complete ? `/invented/private/${operation.attachment.id}` : null };
+  };
+  const bind: ActorExecution["bind"] = (bound) => executions.bind(bound.id.toString(), { cwd: host.cwd, hosts: [], call });
+  const controller = new AbortController(), events: string[] = []; let idle = () => {}, attached: Promise<unknown> | undefined;
+  const terminal: WorkerSession = { signal: controller.signal, async ready() {}, answer(_id, text) { events.push("answer " + text); },
+    idle() { idle(); }, interrupted() { events.push("interrupted"); }, rejected(id) { events.push("rejected " + id); } };
+  return { tasks, faux, task, command, receipt, file: uploaded.attachment, commands, transfer, call, bind, extensions: [tools.host], events,
+    nextIdle: () => new Promise<void>((resolve) => { idle = resolve; }),
+    attach(ready: WorkerSession["ready"] = terminal.ready) { attached = tasks.run(command, bind, [tools.host], call, undefined, { ...terminal, ready }); },
+    async close() {
+      transfer.release(); controller.abort(); await attached?.catch(() => {}); await tasks.detachActors();
+      await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
+    } };
+}
+
+test("Stop while an interactive actor starts withdraws its admitted input before any model request or host command", { timeout: 10_000 }, async () => {
+  const app = await openStopFixture(), preflight = gate(), ref = { task_id: app.task.id };
+  try {
+    await app.tasks.enqueue(app.task.id, "Run the command", "stopped-in-start");
+    app.tasks.useActorExecution({ available: () => true, extensions: () => app.extensions, call: app.call, bind: app.bind,
+      prepare: async () => { preflight.enter(); await preflight.released; } });
+    app.faux.setResponses([fauxAssistantMessage(fauxToolCall("exec", { program: "invented", args: [] }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("Ran the command.")]);
+    const start = await app.tasks.ensureActor(ref); assert.ok(start.state === "started");
+    await preflight.entered;
+    assert.equal(await app.tasks.stop(ref), true);
+    preflight.release(); await start.exit;
+    assert.equal(app.faux.state.callCount, 0, "An acknowledged Stop must keep the input it landed on away from the model");
+    assert.deepEqual(app.commands.map((operation) => operation.type), [], "An acknowledged Stop must keep the input it landed on away from the host");
+    const stopped = await app.receipt("stopped-in-start");
+    assert.ok(stopped?.type === "input" && stopped.status === "unanswered");
+    assert.equal(stopped.reason, "aborted"); assert.equal(stopped.entry, undefined);
+    assert.deepEqual((await app.tasks.get(app.task.id)).pending, []);
+    assert.equal((await app.tasks.ensureActor(ref)).state, "no_work", "The withdrawn input leaves no actor and no work to start one");
+    await app.tasks.enqueue(app.task.id, "Run the command now", "after-stop");
+    const next = await app.tasks.ensureActor(ref); assert.ok(next.state === "started"); await next.exit;
+    assert.equal((await app.receipt("after-stop"))?.status, "done");
+    assert.deepEqual(app.commands.map((operation) => operation.type), ["exec"], "An input admitted after the Stop runs with its effects");
+  } finally { preflight.release(); await app.close(); }
+});
+
+test("Stop from a terminal's initial ready withdraws the admitted input before the actor's first turn", { timeout: 10_000 }, async () => {
+  const app = await openStopFixture();
+  try {
+    await app.tasks.enqueue(app.task.id, "Run the command", "stopped-in-ready");
+    app.faux.setResponses([fauxAssistantMessage(fauxToolCall("exec", { program: "invented", args: [] }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("Ran the command.")]);
+    const idle = app.nextIdle(); let acknowledged: boolean | undefined;
+    app.attach(async () => { acknowledged = await app.tasks.stop({ task_id: app.task.id }); }); await idle;
+    assert.equal(acknowledged, true);
+    assert.equal(app.faux.state.callCount, 0, "An acknowledged Stop must keep the input it landed on away from the model");
+    assert.deepEqual(app.events, ["interrupted"], "The terminal hears the interruption and no answer");
+    assert.deepEqual(app.commands.map((operation) => operation.type), []);
+    const stopped = await app.receipt("stopped-in-ready");
+    assert.ok(stopped?.type === "input" && stopped.status === "unanswered"); assert.equal(stopped.reason, "aborted");
+    assert.deepEqual((await app.tasks.get(app.task.id)).pending, []);
+  } finally { await app.close(); }
+});
+
+test("Stop while an attached actor prepares an input rejects that input, and later inputs are answered in the same conversation", { timeout: 10_000 }, async () => {
+  const app = await openStopFixture(), ref = { task_id: app.task.id };
+  try {
+    app.faux.setResponses([answerLastInput, answerLastInput]);
+    let idle = app.nextIdle(); app.attach(); await idle;
+    idle = app.nextIdle();
+    await app.tasks.input(app.command, "Review the evidence", "stopped-in-preparation", "follow_up", [app.file]); await app.transfer.entered;
+    assert.equal(await app.tasks.stop(ref), true);
+    app.transfer.release(); await idle;
+    assert.equal(app.faux.state.callCount, 0, "An acknowledged Stop must keep the input it landed on away from the model");
+    assert.deepEqual(app.events, ["interrupted", "rejected stopped-in-preparation"]);
+    const stopped = await app.receipt("stopped-in-preparation");
+    assert.ok(stopped?.type === "input" && stopped.status === "unanswered"); assert.equal(stopped.reason, "aborted");
+    idle = app.nextIdle(); await app.tasks.input(app.command, "Continue after the stop", "after-stop", "follow_up"); await idle;
+    assert.deepEqual(app.events.slice(2), ["answer Answered: Continue after the stop"]);
+    assert.equal((await app.receipt("after-stop"))?.status, "done");
+    assert.equal(await app.tasks.stop(ref), true);
+    idle = app.nextIdle(); await app.tasks.input(app.command, "Continue after an idle stop", "after-idle-stop", "follow_up"); await idle;
+    assert.deepEqual(app.events.slice(3), ["interrupted", "answer Answered: Continue after an idle stop"],
+      "A Stop that lands on an idle actor withdraws nothing");
+  } finally { await app.close(); }
+});
+
+test("Stop takes only the input an attached actor is preparing, and the next input in its outbox is answered", { timeout: 10_000 }, async () => {
+  const app = await openStopFixture();
+  try {
+    app.faux.setResponses([answerLastInput, answerLastInput]);
+    let idle = app.nextIdle(); app.attach(); await idle;
+    idle = app.nextIdle();
+    await app.tasks.input(app.command, "Review the evidence", "first", "follow_up", [app.file]); await app.transfer.entered;
+    await app.tasks.input(app.command, "Summarize the plan", "second", "follow_up");
+    assert.deepEqual((await app.tasks.get(app.task.id)).pending.map((input) => input.id), ["first", "second"]);
+    assert.equal(await app.tasks.stop({ task_id: app.task.id }), true);
+    app.transfer.release(); await idle;
+    assert.deepEqual(app.events, ["interrupted", "rejected first", "answer Answered: Summarize the plan"]);
+    assert.equal(app.faux.state.callCount, 1);
+    const first = await app.receipt("first");
+    assert.ok(first?.type === "input" && first.status === "unanswered"); assert.equal(first.reason, "aborted");
+    assert.equal((await app.receipt("second"))?.status, "done");
+    assert.deepEqual((await app.tasks.get(app.task.id)).pending, []);
+  } finally { await app.close(); }
 });

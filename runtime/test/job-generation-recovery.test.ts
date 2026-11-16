@@ -148,7 +148,7 @@ for (const mode of ["queued", "legacy", "stopped"]) test(`job inspection and ret
     { signal: controller.signal, async ready() {}, answer() { assert.fail("The retained retry deadline has not elapsed"); }, idle() {} });
     await pump(() => app.tasks.isRunning(actor.id));
     if (mode === "stopped") {
-      controller.abort();
+      void app.tasks.detachActors();
       await assert.rejects(app.scheduler.retryJob(job.id), /existing worker must attach/);
       assert.deepEqual(await app.session.getTask(current.generation, BACKGROUND_CONTEXT), originalBefore,
         "A stopped execution owner must not grant another model attempt");
@@ -174,7 +174,7 @@ for (const mode of ["queued", "legacy", "stopped"]) test(`job inspection and ret
   } finally {
     controller.abort();
     if (worker !== undefined && actorConversation !== undefined) await (await app.tasks.conversation(actorConversation)).abort(BACKGROUND_CONTEXT);
-    await worker?.catch(() => {});
+    await worker?.catch(() => {}); await app.tasks.detachActors();
     await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
   }
 });

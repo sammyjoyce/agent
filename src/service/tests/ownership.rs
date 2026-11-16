@@ -97,14 +97,20 @@ createInterface({{input:process.stdin}}).on('line',line=>{{
 
 #[tokio::test]
 async fn noninteractive_worker_interrupt_reaches_its_own_request() {
-    let service = Running::start().await;
+    let service = fixture(
+        r#"
+ if(command.type==='run_task') emit(id,{type:'notice',task_id:null,text:'Working'});
+ else if(command.type==='interrupt') emit(id,{type:'done'});
+"#,
+    )
+    .await;
     let mut client = service.client().await;
     write_frame(&mut client, &attached_command()).await.unwrap();
     let (reader, mut writer) = client.into_split();
     let mut reader = FrameReader::new(BufReader::new(reader));
     let event: RuntimeEventKind =
         serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
-    assert!(matches!(event, RuntimeEventKind::HostCall { .. }));
+    assert!(matches!(event, RuntimeEventKind::Notice { .. }));
     write_frame(&mut writer, &RuntimeCommand::Interrupt)
         .await
         .unwrap();
@@ -124,6 +130,90 @@ async fn noninteractive_worker_interrupt_reaches_its_own_request() {
         completed.is_ok(),
         "The service admitted an interrupt that the runtime ignored"
     );
+}
+
+#[tokio::test]
+async fn a_client_host_reply_is_rejected_and_cannot_answer_an_effect_the_service_owns() {
+    let service = fixture(
+        r#"
+ if(command.type==='run_task') emit(id,{type:'task_ready',conversation_id:'fixture',title:'Attached'});
+ else if(command.type==='logout') emit(id,{type:'host_call',call_id:'owned',command:{type:'exec',program:process.execPath,
+  args:['--eval',`const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(join(state,'started'))},'yes');
+   const wait=()=>fs.existsSync(${JSON.stringify(join(state,'release'))})?process.stdout.write('owned result'):setTimeout(wait,5);wait()`],
+  cwd:state,timeout_seconds:30}});
+ else if(command.type==='host_reply') {
+  writeFileSync(join(state,'replies'),JSON.stringify({id,result:command.result})+'\n',{flag:'a'});
+  emit(id,{type:'auth_status',status:{state:'signed_out'}});emit(id,{type:'done'});
+ } else if(command.type==='detach_worker') { writeFileSync(join(state,'detached'),String(id));emit(id,{type:'done'}); }
+ "#,
+    )
+    .await;
+    let state = service.directory.path().to_owned();
+    let mut owner = service.client().await;
+    write_frame(&mut owner, &RuntimeCommand::Logout)
+        .await
+        .unwrap();
+    service.wait_for("started").await;
+
+    let mut terminal = service.client().await;
+    let mut attached = attached_command();
+    if let RuntimeCommand::RunTask { interactive, .. } = &mut attached {
+        *interactive = Some(true);
+    }
+    write_frame(&mut terminal, &attached).await.unwrap();
+    let (reader, mut writer) = terminal.into_split();
+    let mut reader = BufReader::new(reader);
+    reader.read_line(&mut String::new()).await.unwrap();
+    write_frame(
+        &mut writer,
+        &RuntimeCommand::HostReply {
+            call_id: "owned".into(),
+            result: HostResult::Written,
+        },
+    )
+    .await
+    .unwrap();
+    let mut rest = Vec::new();
+    timeout(Duration::from_secs(3), reader.read_to_end(&mut rest))
+        .await
+        .expect("The service must close a client that sends a host reply")
+        .unwrap();
+    service.wait_for("detached").await;
+    assert!(
+        !state.join("replies").exists(),
+        "A client's host reply must never reach the runtime"
+    );
+
+    std::fs::write(state.join("release"), "").unwrap();
+    let mut owner = FrameReader::new(BufReader::new(owner));
+    loop {
+        let event: RuntimeEventKind =
+            serde_json::from_slice(&owner.next_frame().await.unwrap().unwrap()).unwrap();
+        if matches!(event, RuntimeEventKind::Done) {
+            break;
+        }
+    }
+    #[derive(serde::Deserialize)]
+    struct Reply {
+        result: HostResult,
+    }
+    let replies = std::fs::read_to_string(state.join("replies")).unwrap();
+    let replies: Vec<Reply> = replies
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        replies.len(),
+        1,
+        "The owned effect is answered exactly once"
+    );
+    assert!(
+        matches!(&replies[0].result, HostResult::Process { exit_code: 0, stdout, .. } if stdout == "owned result"),
+        "{:?}",
+        replies[0].result
+    );
+    drop((owner, writer));
+    service.stop().await;
 }
 
 #[tokio::test]
