@@ -323,15 +323,9 @@ impl Coordinator {
             // Only this fixture-owned coordinator is signaled and reaped.
             ensure!(unsafe { libc::kill(i32::try_from(pid)?, libc::SIGTERM) } == 0);
         }
-        let status = timeout(DEADLINE, self.child.wait()).await;
-        // A tool that outlived its stop is this sample's own leak; the stop
-        // check has already failed the sample.
-        if let Ok(pid) = read_pid(&self.tool_pid_file())
-            && unsafe { libc::kill(pid, 0) } == 0
-        {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-        }
-        let status = status.context("Synthetic coordinator did not shut down")??;
+        let status = timeout(DEADLINE, self.child.wait())
+            .await
+            .context("Synthetic coordinator did not shut down")??;
         let Self {
             directory,
             provider,

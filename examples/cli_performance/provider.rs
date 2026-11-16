@@ -23,7 +23,8 @@ use crate::{
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 
 /// The `exec` turn's program. Node writes its pid to `pid_file` and idles
-/// until the stop kills it.
+/// until the stop kills it. A tool the stop missed exits once its parent
+/// does, so the benchmark never signals a pid that may have been reused.
 #[derive(Clone)]
 pub struct ToolFixture {
     pub node: PathBuf,
@@ -320,7 +321,7 @@ async fn respond(
     })
 }
 
-pub const TOOL_SCRIPT: &str = "require('node:fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000);";
+pub const TOOL_SCRIPT: &str = "require('node:fs').writeFileSync(process.argv[1], String(process.pid)); const parent = process.ppid; setInterval(() => { if (process.ppid !== parent) process.exit(1); }, 200);";
 
 fn with(base: &Value, extra: Value) -> Value {
     let mut merged = base.clone();
