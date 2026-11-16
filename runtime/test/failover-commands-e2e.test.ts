@@ -3,6 +3,7 @@ import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { CheckpointManifest } from "../src/generated/CheckpointManifest.js";
+import { OWNER_FENCED_EXIT } from "../src/generated/owner-fenced-exit.js";
 import { blobs, startFaultProxy } from "./fixtures/failover-fault-proxy.js";
 import { crash, exists, fingerprint, HOLDERS, ownerActivity, replicatedFiles, until, World, type EnrolledReceipt, type FollowedReceipt,
   type JoinedReceipt, type StatusReceipt } from "./fixtures/failover-hosts.js";
@@ -142,6 +143,22 @@ test("the failover commands enroll an owner and keep a standby of it", { timeout
     proxy.heal();
     assert.equal(await owner.record(), undefined, "nothing reached the authority");
     assert.equal(tables(owner.state).beep_boop_failover, undefined, "an enrollment that reached nobody stamps nothing");
+  });
+
+  await t.test("serve does not start as the replicated owner on a directory that was never stamped, and enroll says how to rebuild it", async () => {
+    const coordinator = world.coordinator(), owner = await world.host(coordinator, OWNER), unstamped = await world.host(coordinator, OWNER);
+    await owner.create();
+    await owner.receipt<EnrolledReceipt>("enroll");
+    await unstamped.create();
+    const before = tables(unstamped.state);
+    const served = await unstamped.serve().done;
+    assert.ok(served.code !== 0 && served.code !== OWNER_FENCED_EXIT, `serve exited ${served.code}: ${served.stderr}`);
+    assert.equal(await exists(join(unstamped.state, "agent.sock")), false, "a start that was refused leaves no socket");
+    assert.deepEqual(tables(unstamped.state), before, "a start that was refused changes nothing in the session database");
+    const refused = await unstamped.failover("enroll");
+    assert.notEqual(refused.code, 0);
+    assert.match(refused.stderr, /already enrolled coordinator \S+ from another state directory: \S+ holds no log position\. Run `beep-boop failover join --replace`/);
+    assert.equal((await unstamped.receipt<StatusReceipt>("status")).applied, null);
   });
 
   await t.test("status needs the coordinator named when the state directory names none", async () => {
