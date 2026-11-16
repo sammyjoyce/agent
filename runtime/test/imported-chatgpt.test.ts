@@ -38,7 +38,7 @@ async function transcript(app: App, conversationId: string): Promise<HistoryMess
   const conversation = await app.store.conversation(conversationId); assert.ok(conversation);
   const pages: HistoryMessage[][] = []; let cursor: string | null = null;
   do {
-    const frames = await history(conversation, cursor, app.session);
+    const frames = await history(conversation, cursor, app.store);
     pages.unshift(frames.flatMap((frame) => frame.messages)); cursor = frames.at(-1)?.next_cursor ?? null;
   } while (cursor !== null);
   return pages.flat();
@@ -143,7 +143,7 @@ async function details(app: App, conversationId: string, node: string) {
   const conversation = await app.store.conversation(conversationId); assert.ok(conversation);
   const entries = (await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items.filter(ImportedItemEntry.is);
   const entry = entries.find((candidate) => candidate.data.item.id === node); assert.ok(entry);
-  return { call_id: historyToolId(entry.id.toString()), details: await toolDetails(conversation, entry.id.toString(), historyToolId(entry.id.toString()), app.session) };
+  return { call_id: historyToolId(entry.id.toString()), details: await toolDetails(conversation, entry.id.toString(), historyToolId(entry.id.toString()), app.store) };
 }
 
 test("tool details for a chatgpt code call show code and output", () => withApp("tool-details", async (app) => {

@@ -641,7 +641,7 @@ test("a branch flip is never folded into the old version as an alias", async () 
     assert.equal(second.added_items, 1, "Placement is part of an item's context");
     assert.equal((await importedEntries(app, first.conversation.conversation_id)).length, 2);
     const conversation = await app.imported.conversation(first.conversation.conversation_id); assert.ok(conversation);
-    const shown = (await history(conversation, null, app.session)).flatMap((frame) => frame.messages);
+    const shown = (await history(conversation, null, app.imported)).flatMap((frame) => frame.messages);
     assert.equal(shown.some((message) => message.text.includes("Plan a picnic")), false, "An alternate branch is never shown");
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -668,7 +668,7 @@ test("importing chatgpt history never runs work", async () => {
       { id: "output", parent: "call", turn: "prompt", kind: "tool:execution_output", role: "tool", text: hostile },
     ]));
     const conversation = await app.imported.conversation(saved.conversation.conversation_id); assert.ok(conversation);
-    await history(conversation, null, app.session);
+    await history(conversation, null, app.imported);
     const records = []; for await (const record of app.tasks.records(saved.conversation.conversation_id)) records.push(record);
     assert.ok(records.length > 0);
     await app.tasks.readConversation(saved.conversation.conversation_id);
