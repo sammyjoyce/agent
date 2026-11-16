@@ -284,6 +284,8 @@ const conversationViews = new ConversationViews(async () => ({ ...await app(), i
 const activeCommands = new Set<number>();
 const interrupted = new Set<number>();
 const interrupts = new Map<number, Promise<void>>();
+/** Interrupts that aborted one exact run. A conversation abort escalates them, so Esc still withdraws queued inputs. */
+const runInterrupts = new WeakSet<Promise<void>>();
 const workers = new Map<number, { command: Extract<RuntimeCommand, { type: "run_task" }>; controller: AbortController }>();
 type MainTurn = { conversation?: Conversation; accepting: boolean; admissions: number; wake?: () => void;
   info?: Extract<RuntimeEventKind, { type: "main_ready" }>;
@@ -336,15 +338,20 @@ async function triageSources(application: TriageApplication, id: number, command
 }
 async function interrupt(id: number, run?: { harness: Harness; task: NativeTaskId }): Promise<void> {
   interrupted.add(id);
-  if (interrupts.has(id)) return interrupts.get(id);
+  const pending = interrupts.get(id);
+  if (pending !== undefined && (run !== undefined || !runInterrupts.has(pending))) return pending;
   hostRequests.cancelRequest(id);
   const conversation = activeConversations.get(id);
-  if (conversation === undefined) return;
+  if (conversation === undefined) return pending;
+  let current: Promise<void> | undefined;
   const operation = (async () => {
     if (run === undefined) await conversation.abort(BACKGROUND_CONTEXT);
     else await run.harness.abortTask(run.task, BACKGROUND_CONTEXT);
-    emit(id, { type: "interrupted" });
+    await pending;
+    if (interrupts.get(id) === current) emit(id, { type: "interrupted" });
   })();
+  current = operation;
+  if (run !== undefined) runInterrupts.add(operation);
   interrupts.set(id, operation); await operation;
 }
 async function stopGoalTurn(harness: Harness, taskId: string, run: NativeTaskId): Promise<void> {
