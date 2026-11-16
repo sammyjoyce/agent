@@ -1081,7 +1081,9 @@ export class TaskStore {
     // The outbox is committed first. A crash between these commits retries
     // the same native request ID instead of injecting the input twice.
     try {
-      const queued = this.actor(await this.get(active.ref.task_id), active.ref.agent_id).pending;
+      const task = await this.get(active.ref.task_id);
+      if (this.isConfined(task)) return;
+      const queued = this.actor(task, active.ref.agent_id).pending;
       let scheduled = false;
       for (const input of queued) {
         // Scheduled turns and later follow-ups wait for their captured
@@ -1824,6 +1826,10 @@ export class TaskStore {
             await new Promise<void>((resolve) => { active.wake = resolve; });
           }
           delete active.wake;
+          continue;
+        }
+        if (confined !== undefined && next.scheduled === undefined && (await this.withdrawUnplaced(input, conversation, [next])).length > 0) {
+          this.publish(active, (session) => session.rejected?.(next.id, CONFINED_ACTOR_ONLY));
           continue;
         }
         const previousAnswer = answer, previousEntry = answerEntry;
