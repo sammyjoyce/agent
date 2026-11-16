@@ -160,6 +160,7 @@ pub(crate) enum Event {
         code: ErrorCode,
     },
     Heartbeat,
+    UnrecordedStart,
     WriterStarted,
     WriterStopped,
 }
@@ -733,6 +734,28 @@ pub(crate) struct Diagnostics {
     drops: SharedDrops,
 }
 
+/// A run that may serve before its log records it leaves its start time here,
+/// outside the log, and the writer that records a start removes it. A time
+/// still here at the next start belongs to runs the log never saw.
+const UNRECORDED_START: &str = "unrecorded-start";
+
+fn unrecorded_since(stamp: &Path, may_serve_unrecorded: bool) -> Option<u64> {
+    let since = fs::read_to_string(stamp)
+        .ok()
+        .and_then(|text| text.trim().parse().ok());
+    if since.is_none() && may_serve_unrecorded {
+        let _ = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(stamp)
+            .and_then(|mut file| file.write_all(now_ms().to_string().as_bytes()));
+    }
+    since
+}
+
 #[must_use]
 pub(crate) struct WriterStart(std::sync::mpsc::Receiver<io::Result<()>>);
 impl WriterStart {
@@ -774,6 +797,8 @@ impl Diagnostics {
         started: Option<std::sync::mpsc::SyncSender<io::Result<()>>>,
     ) -> Self {
         let directory = state.join("diagnostics");
+        let stamp = state.join(UNRECORDED_START);
+        let unrecorded_since = unrecorded_since(&stamp, started.is_none());
         let (diagnostics, mut records) = Self::open_channel(&directory, CAPACITY);
         // A weak sender lets the writer end when its last real producer does.
         let witness = diagnostics.sender.downgrade();
@@ -798,9 +823,15 @@ impl Diagnostics {
         let drops = diagnostics.drops.clone();
         tokio::task::spawn_blocking(move || {
             let opened = Writer::open(directory, MAX_BYTES).and_then(|mut writer| {
-                writer
-                    .append(&writer_receipt(Event::WriterStarted, 0))
-                    .map(|()| writer)
+                if let Some(since) = unrecorded_since {
+                    writer.append(&Record {
+                        timestamp_ms: since,
+                        ..writer_receipt(Event::UnrecordedStart, 0)
+                    })?;
+                }
+                writer.append(&writer_receipt(Event::WriterStarted, 0))?;
+                let _ = fs::remove_file(&stamp);
+                Ok(writer)
             });
             let mut writer = match opened {
                 Ok(writer) => writer,

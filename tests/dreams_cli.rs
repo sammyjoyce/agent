@@ -481,6 +481,11 @@ fn a_coordinator_admits_no_command_until_its_log_records_its_start() {
     );
     assert!(stderr.contains("writer.lock"), "{stderr}");
     assert_eq!(admitted, 0);
+    assert!(
+        sealed_quiet,
+        "A start refused before it served must leave the next night quiet: {}",
+        fixture.output_of(DREAMS_KEY, "dreams_review", 0)
+    );
 }
 
 const DIAGNOSTICS_FAULTS: [&str; 3] = [
@@ -571,6 +576,36 @@ fn with_dreams_a_coordinator_that_cannot_record_its_start_names_the_path_and_the
             "{fault}: the error must say how to run chat without Dreams: {stderr}"
         );
     }
+}
+
+#[test]
+fn a_recorded_run_without_dreams_leaves_the_next_night_quiet() {
+    let fixture = Fixture::new();
+    fixture.seed_witnessed_night();
+    fixture.write_config(None);
+    fixture.start().stop();
+    fixture.write_policy(
+        &fixture.repository,
+        &["/bin/sh", fixture.check.to_str().unwrap()],
+    );
+    let mut server = fixture.start();
+    fixture.script(
+        DREAMS_KEY,
+        vec![
+            tool("dreams_review", json!({ "page": 1 })),
+            tool(
+                "dreams_abstain",
+                json!({ "reason": "quiet", "note": "Nothing failed in the window." }),
+            ),
+            text("Dreams abstained."),
+        ],
+    );
+    fixture.run_job("dreams");
+    server.stop();
+    let page = fixture.output_of(DREAMS_KEY, "dreams_review", 0);
+    assert!(page.contains("Coverage: complete"), "{page}");
+    let sealed = fixture.output_of(DREAMS_KEY, "dreams_abstain", 0);
+    assert!(sealed.contains("sealed: abstained: quiet"), "{sealed}");
 }
 
 #[test]

@@ -244,7 +244,8 @@ pub enum GapCause {
     /// No receipt, not even a heartbeat, for longer than two heartbeat intervals.
     Unwitnessed,
     /// A receipt writer started after one that ended without its clean stop,
-    /// which loses the receipts and drop counts that it held in memory.
+    /// which loses the receipts and drop counts that it held in memory, or
+    /// after runs that served without recording their start.
     UncleanRestart,
     /// Receipt timestamps went back by more than senders can reorder them, or
     /// run ahead of the present. A receipt near the move may be stamped outside
@@ -322,7 +323,7 @@ impl fmt::Display for Gap {
             }
             GapCause::UncleanRestart => write!(
                 formatter,
-                "the receipt writer restarted without a clean stop{between}, so receipts that it held in memory are lost"
+                "the receipt writer restarted without a clean stop{between}, so receipts that it held in memory or never wrote are lost"
             ),
             GapCause::ClockMoved {
                 times,
