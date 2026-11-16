@@ -68,7 +68,15 @@ export async function failoverCoordinator(t: TestContext) {
 
 export type FailoverCoordinator = Awaited<ReturnType<typeof failoverCoordinator>>;
 
-const guidance = (command: Extract<RuntimeEventKind, { type: "host_call" }>["command"]): HostResult | undefined =>
+type HostCommand = Extract<RuntimeEventKind, { type: "host_call" }>["command"];
+
+/** The operation a host call asks for, on whichever node it is routed to. */
+function operation(command: HostCommand): HostCommand {
+  while (command.type === "on_node") command = command.command;
+  return command;
+}
+
+const guidance = (command: HostCommand): HostResult | undefined =>
   command.type === "reload_guidance" ? { type: "shared_guidance", global: { text: "", sources: [] }, workflow_policy: "", context_repositories: [], context_sources: [] }
     : command.type === "project_guidance" ? { type: "project_guidance", snapshot: { text: "", sources: [] } } : undefined;
 
@@ -80,8 +88,8 @@ export interface BridgeOptions {
   readonly env?: Record<string, string>;
   /** Modules the child loads before the bridge. */
   readonly imports?: readonly string[];
-  /** Answers a host call that is not a guidance read. A call it leaves unanswered stays pending. */
-  readonly host?: (command: Extract<RuntimeEventKind, { type: "host_call" }>["command"]) => HostResult | undefined;
+  /** Answers a host call that is not a guidance read, given its operation. A call it leaves unanswered stays pending. */
+  readonly host?: (operation: HostCommand) => HostResult | undefined;
 }
 
 /**
@@ -110,7 +118,8 @@ export async function startBridge(t: TestContext, options: BridgeOptions) {
     assert.ok(validEvent(frame), `The bridge wrote an invalid frame: ${line}`);
     frames.push(frame);
     if (frame.event.type === "host_call") {
-      const result = guidance(frame.event.command) ?? options.host?.(frame.event.command);
+      const asked = operation(frame.event.command);
+      const result = guidance(asked) ?? options.host?.(asked);
       if (result !== undefined) send(frame.id, { type: "host_reply", call_id: frame.event.call_id, result });
     }
     for (const notify of listeners) notify();
@@ -141,12 +150,28 @@ export async function startBridge(t: TestContext, options: BridgeOptions) {
         check();
       });
     },
+    /** The host_call frames so far that ask for this operation. */
+    hostCalls: (type: HostCommand["type"]) => frames.filter((frame) => frame.event.type === "host_call" && operation(frame.event.command).type === type),
     /** Every frame of request `id` so far. */
     of: (id: number) => frames.filter((frame) => frame.id === id).map((frame) => frame.event),
   };
 }
 
 export type Bridge = Awaited<ReturnType<typeof startBridge>>;
+
+const node = { host_id: "33333333-3333-4333-8333-333333333333", name: "fixture", rex_server: null, home_directory: "/home/fixture",
+  agent_program: "/example/agent", coordinator: null, launch: { state_dir: null, runtime: null, config: null, instructions: null, model: null } };
+
+/** Gives the coordinator one connected execution host, as Rust does at start, so a tool can reach a host. */
+export async function connectHost(bridge: Bridge): Promise<void> {
+  const requests: RuntimeCommand[] = [
+    { type: "configure_coordinator", bootstrap: { node, settings: { model: DEFAULT_MODEL, instructions: "", context_repositories: [], sources: [] } } },
+    { type: "register_node", node }, { type: "set_connected_nodes", host_ids: [node.host_id] }];
+  for (const [index, command] of requests.entries()) {
+    bridge.send(900 + index, command);
+    await bridge.wait(900 + index, (event) => event.type === "done");
+  }
+}
 
 export const chat = (input: string, input_id: string): RuntimeCommand => ({ type: "chat", input, input_id, model: DEFAULT_MODEL,
   instructions: "Brief answers.", cwd: "/example/project", origin_host_id: null, hosts: [] });

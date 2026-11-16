@@ -48,7 +48,7 @@ import { DiagnosticsTelemetry } from "./telemetry.js";
 import { conversationUsage } from "./usage.js";
 import { StartupDiagnostics } from "./startup-diagnostics.js";
 import { openConversationDatabase } from "./conversation-database.js";
-import { exitFenced, openReplicatedOwnership, type Ownership } from "./failover/ownership.js";
+import { effectGate, exitFenced, openReplicatedOwnership, type Ownership } from "./failover/ownership.js";
 
 function notificationConfig(): ApnsConfig | undefined {
   const saved = process.env.AGENT_APNS_CONFIG;
@@ -123,7 +123,7 @@ function writeEvent(id: number, event: RuntimeEventKind): void {
 }
 function failure(id: number, code: ErrorCode, message: string): void { emit(id, { type: "failure", code, message }); }
 const hostRequests = new HostRequests((id, call_id, command) => emit(id, { type: "host_call", call_id, command }),
-  (id, call_id) => emit(id, { type: "host_cancel", call_id }));
+  (id, call_id) => emit(id, { type: "host_cancel", call_id }), effectGate(ownership));
 const inference = new ConversationModels(undefined, auth);
 const models = inference.models;
 let backgroundOwner: number | undefined;
