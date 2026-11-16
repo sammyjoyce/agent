@@ -29,7 +29,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
     { coordinator: readOnlyCoordinator, holder: null },
   ] });
   let used = 1;
-  const fresh = () => coordinatorIds[used++]!;
+  const fresh = () => coordinatorIds[used++] ?? assert.fail("the test ran out of coordinator ids");
   const token = (coordinator: string, holder: string | null) =>
     authority.credentials.find((credential) => credential.coordinator === coordinator && credential.holder === holder)!.token;
   const link = (coordinator: string, holder: string | null = tarantula) =>
@@ -89,18 +89,21 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
     }
   });
 
-  await t.test("of two appends for one position sent at the same time, one is accepted and one is a conflict", async () => {
+  await t.test("of appends for one position sent at the same time, one is accepted and the rest are conflicts", async () => {
     const coordinator = fresh();
     const bytes = Buffer.from("invented bytes that make each append wait on the blob store");
     await link(coordinator).putBlob(sha256(bytes), bytes);
     await play(coordinator, [[enroll, "accepted"]]);
     const files = [{ path: "attachments/a1/content", sha256: sha256(bytes), size: bytes.length }];
+    const winners: Record<number, string> = {};
     for (let at = 1; at <= 20; at += 1) {
-      const replies = await Promise.all(digests.map((digest) => link(coordinator).command(append(at, { digest, files }))));
-      assert.deepEqual(replies.map(outcome).sort(), ["accepted", "conflict"], `position ${at}`);
+      const contenders = Array.from({ length: 6 }, (_, index) => sha256(Buffer.from(`invented entry ${at}.${index}`)));
+      const replies = await Promise.all(contenders.map((digest) => link(coordinator).command(append(at, { digest, files }))));
+      assert.deepEqual(replies.map(outcome).sort(), ["accepted", ...Array<Outcome>(5).fill("conflict")], `position ${at}`);
+      winners[at] = contenders[replies.findIndex((reply) => reply.result === "accepted")]!;
     }
     assert.equal(await head(coordinator), 20);
-    assert.deepEqual(Object.keys(await logDigests(coordinator)).map(Number), Array.from({ length: 20 }, (_, index) => index + 1));
+    assert.deepEqual(await logDigests(coordinator), winners);
   });
 
   await t.test("one hundred sequential appends leave the head at 100 with no gap", async () => {
