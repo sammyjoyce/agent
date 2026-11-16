@@ -101,7 +101,9 @@ fn components<'a>(path: &'a str, extra: &[u8]) -> Result<Vec<&'a str>, String> {
     Ok(parts)
 }
 
-fn resolved(path: &Path) -> PathBuf {
+/// A path may not exist yet. Its nearest existing ancestor is resolved through
+/// the file system, so a symlinked parent cannot hide where the path lands.
+fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
     for ancestor in path.ancestors() {
         if let Ok(canonical) = ancestor.canonicalize() {
             return match path.strip_prefix(ancestor) {
@@ -139,6 +141,38 @@ impl Glob {
     }
 }
 
+fn editable_in(globs: &[Glob], path: &str) -> Result<EditablePath, String> {
+    let parts = components(path, b"").map_err(|reason| format!("path {path:?} {reason}"))?;
+    if globs.iter().any(|glob| glob.matches(&parts)) {
+        Ok(EditablePath(path.to_owned()))
+    } else {
+        Err(format!("path {path} is not editable"))
+    }
+}
+
+/// An approved edit must not be able to rewrite the program that judges the
+/// next proposal, so no argument of a check may name an editable path.
+fn refuse_editable_argv(
+    repository: &Path,
+    editable: &[Glob],
+    check: &DreamsCheckFile,
+) -> Result<()> {
+    for argument in &check.argv {
+        let relative = Path::new(argument)
+            .strip_prefix(repository)
+            .ok()
+            .and_then(Path::to_str)
+            .unwrap_or(argument.trim_start_matches("./"));
+        if editable_in(editable, relative).is_ok() {
+            bail!(
+                "Dreams check {} names an editable path: {argument}",
+                check.name
+            );
+        }
+    }
+    Ok(())
+}
+
 impl DreamsPolicy {
     pub fn parse(file: &DreamsPolicyFile, protected: &ProtectedPaths) -> Result<Self> {
         ensure!(
@@ -153,7 +187,7 @@ impl DreamsPolicy {
             repository.join(".git").exists(),
             "Dreams repository {repository:?} is not the root of a Git work tree"
         );
-        let inside = |path: &Path| resolved(path).starts_with(&repository);
+        let inside = |path: &Path| canonicalize_existing_ancestor(path).starts_with(&repository);
         ensure!(
             !protected.config.is_some_and(inside),
             "Dreams repository must not contain the configuration file"
@@ -188,13 +222,6 @@ impl DreamsPolicy {
         );
         let mut names = BTreeSet::new();
         let mut checks = Vec::new();
-        let policy = Self {
-            repository,
-            editable,
-            window: Duration::from_secs(u64::from(hours) * 60 * 60),
-            checks: Vec::new(),
-            digest: String::new(),
-        };
         for check in &file.checks {
             ensure!(
                 !check.name.is_empty()
@@ -224,19 +251,7 @@ impl DreamsPolicy {
                 "Dreams check {} needs a timeout between 1 and {MAX_CHECK_SECONDS} seconds",
                 check.name
             );
-            for argument in &check.argv {
-                let relative = Path::new(argument)
-                    .strip_prefix(&policy.repository)
-                    .ok()
-                    .and_then(Path::to_str)
-                    .unwrap_or(argument.trim_start_matches("./"));
-                if policy.editable(relative).is_ok() {
-                    bail!(
-                        "Dreams check {} names an editable path: {argument}",
-                        check.name
-                    );
-                }
-            }
+            refuse_editable_argv(&repository, &editable, check)?;
             checks.push(CheckSpec {
                 name: check.name.clone(),
                 argv: check.argv.clone(),
@@ -251,30 +266,27 @@ impl DreamsPolicy {
         );
 
         let digest = hex::encode(Sha256::digest(serde_json::to_vec(&(
-            &policy.repository,
+            &repository,
             &file.editable,
             hours,
             &file.checks,
         ))?));
         Ok(Self {
+            repository,
+            editable,
+            window: Duration::from_secs(u64::from(hours) * 60 * 60),
             checks,
             digest,
-            ..policy
         })
     }
 
     pub fn editable(&self, path: &str) -> Result<EditablePath, String> {
-        let parts = components(path, b"").map_err(|reason| format!("path {path:?} {reason}"))?;
-        if self.editable.iter().any(|glob| glob.matches(&parts)) {
-            Ok(EditablePath(path.to_owned()))
-        } else {
-            Err(format!("path {path} is not editable"))
-        }
+        editable_in(&self.editable, path)
     }
 
     pub fn refuse_state_inside(&self, state: &Path) -> Result<()> {
         ensure!(
-            !resolved(state).starts_with(&self.repository),
+            !canonicalize_existing_ancestor(state).starts_with(&self.repository),
             "Dreams repository must not contain the state directory"
         );
         Ok(())
