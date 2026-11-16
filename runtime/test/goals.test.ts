@@ -137,7 +137,7 @@ async function open(directory: string, host: FixtureHost, budget: number | undef
     goal(target: GoalTarget, action: GoalAction) { return goals.handle({ type: "goal", target, action }, host.call); },
     async task(title: string, sourced = false) {
       return tasks.create({ title, outcome: title, model: fixtureModel,
-        ...(sourced ? { sources: [{ provider: "scheduled_jobs", account: "local", thread_id: "fixture-job" }] } : {}) });
+        ...(sourced ? { job_id: "fixture-job" } : {}) });
     },
     async command(taskId: string, interactive = false): Promise<RunTask> {
       const task = await tasks.get(taskId);
