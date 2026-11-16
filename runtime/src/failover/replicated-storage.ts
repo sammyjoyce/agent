@@ -9,7 +9,7 @@ import type { LogEntry } from "../generated/LogEntry.js";
 import { AuthorityUnreachable, type AuthorityLink } from "./authority-link.js";
 import { INLINE_BATCH_LIMIT_BYTES, logEntryDigest, parseBatch, sha256Hex, versions } from "./log-entry.js";
 import type { ScopedDatabase } from "./scoped-database.js";
-import { followLog, publishFile, replicatedFilePath, type LogFollower } from "./standby.js";
+import { followLog, publishFiles, replicatedFilePath, type LogFollower } from "./standby.js";
 
 const FIRST_RETRY_MS = 50;
 const RETRY_CAP_MS = 5_000;
@@ -108,8 +108,7 @@ class OwnerLog implements LogWriter {
   appendFiles(files: readonly StagedFile[]): Promise<void> {
     return this.#serialized(async () => {
       const at = await this.#append(null, files, null);
-      await this.#publish(files);
-      await this.#options.database.applyWithoutBatch(at);
+      await this.#options.database.applyWithoutBatch(at, () => this.#publish(files));
       this.#head = at;
     });
   }
@@ -120,9 +119,8 @@ class OwnerLog implements LogWriter {
     const files = this.#carried.splice(0);
     const json = JSON.stringify(writes);
     const at = await this.#append(piSeq, files, json);
-    await this.#publish(files);
     const logged = parseBatch(json, at);
-    const committed = await database.apply(at, piSeq, () => this.#storage.commit(logged, context));
+    const committed = await database.apply(at, piSeq, { publish: () => this.#publish(files), commit: () => this.#storage.commit(logged, context) });
     this.#head = at;
     return committed;
   });
@@ -152,8 +150,8 @@ class OwnerLog implements LogWriter {
     return { kind: "blob", sha256, size: bytes.byteLength };
   }
 
-  async #publish(files: readonly StagedFile[]): Promise<void> {
-    for (const { record, staged } of files) await publishFile(staged, replicatedFilePath(this.#options.stateDirectory, record));
+  #publish(files: readonly StagedFile[]): Promise<void> {
+    return publishFiles(files.map(({ record, staged }) => ({ synced: staged, path: replicatedFilePath(this.#options.stateDirectory, record) })));
   }
 
   async #repeatUntilAnswered<T>(exchange: () => Promise<T>): Promise<T> {

@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { readdir, readFile, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import type { SqliteDatabase } from "@earendil-works/chord/sqlite";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import { createRegistry, defineDoc, defineExtension, defineTool, ROOT_CONVERSATION_ID, type StorageWrite } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
@@ -151,9 +153,11 @@ for (const [name, connect] of Object.entries(authorities)) {
     assert.deepEqual(tables(standby), tables(directory));
   });
 
-  test(`${name}: two appliers that read the same next entry apply it once and skip nothing`, async (t) => {
-    const link = await connect(), epoch = await enroll(link), directory = await stateDirectory(t), standby = await stateDirectory(t);
+  test(`${name}: two appliers that read the same next entry apply it once, skip nothing, and leave the newer file`, async (t) => {
+    const link = await connect(), epoch = await enroll(link), directory = await stateDirectory(t);
     const owner = await openOwner(directory, link, { epoch, registry: gardenRegistry({ started() {} }) });
+    const older = Buffer.from("invented older feedback pointer"), newer = Buffer.from("invented newer feedback pointer");
+    for (const bytes of [older, newer]) await owner.log.appendFiles([await stage(directory, link, "feedback/latest", bytes)]);
     owner.faux.setResponses([
       fauxAssistantMessage([fauxText("Noting it."), fauxToolCall("note", { text: "invented note", lines: 3 })], { stopReason: "toolUse" }),
       fauxAssistantMessage("The final invented answer."),
@@ -164,28 +168,35 @@ for (const [name, connect] of Object.entries(authorities)) {
     const entries = await logEntries(link), batches = await logBatches(link);
     const upsertsOnly = (batch: StorageWrite[]) => batch.every((write) => write.type === "task" || write.type === "submission" || write.type === "document.change");
     const index = batches.findLastIndex((batch, at) => upsertsOnly(batch) && (batches[at + 1]?.some((write) => write.type === "entry") ?? false));
-    const contested = entries[index];
-    assert.ok(contested, "the turn logged an entry of upserts followed by its final answer");
-    assert.equal(await follow(standby, logThrough(link, contested.at - 1)), contested.at - 1);
+    const contestedBatch = entries.filter((entry) => entry.batch !== null)[index];
+    assert.ok(contestedBatch, "the turn logged an entry of upserts followed by its final answer");
+    const contestedFile = entries.find((entry) => entry.files.some((file) => file.sha256 === sha256Hex(older)));
+    assert.ok(contestedFile, "the log holds the older feedback pointer");
 
-    const bothRead = resolvable(), firstDone = resolvable();
-    let readers = 0;
-    const page = link.log(contested.at - 1, 64);
-    const sameRead = (release: Promise<void>): AuthorityLink => ({ ...logThrough(link, entries.length), log: async (after, limit) => {
-      if (after !== contested.at - 1) return link.log(after, limit);
-      readers += 1;
-      if (readers === 2) bothRead.resolve();
-      await release;
-      return page;
-    } });
-    const first = applyLog({ database: await openScoped(standby), link: sameRead(bothRead.promise), stateDirectory: standby });
-    const second = applyLog({ database: await openScoped(standby), link: sameRead(firstDone.promise), stateDirectory: standby });
-    assert.equal(await first, entries.length);
-    firstDone.resolve();
-    await assert.rejects(second, new RegExp(`Log entry ${contested.at} does not apply to a directory at position ${entries.length}`));
-    assert.deepEqual(tables(standby), tables(directory));
-    assert.equal(await follow(standby, link), entries.length);
-    assert.deepEqual(tables(standby), tables(directory));
+    for (const contested of [contestedFile, contestedBatch]) {
+      const standby = await stateDirectory(t);
+      assert.equal(await follow(standby, logThrough(link, contested.at - 1)), contested.at - 1);
+      const bothRead = resolvable(), firstDone = resolvable();
+      let readers = 0;
+      const page = link.log(contested.at - 1, 64);
+      const sameRead = (release: Promise<void>): AuthorityLink => ({ ...logThrough(link, entries.length), log: async (after, limit) => {
+        if (after !== contested.at - 1) return link.log(after, limit);
+        readers += 1;
+        if (readers === 2) bothRead.resolve();
+        await release;
+        return page;
+      } });
+      const first = applyLog({ database: await openScoped(standby), link: sameRead(bothRead.promise), stateDirectory: standby });
+      const second = applyLog({ database: await openScoped(standby), link: sameRead(firstDone.promise), stateDirectory: standby });
+      assert.equal(await first, entries.length);
+      firstDone.resolve();
+      await assert.rejects(second, new RegExp(`Log entry ${contested.at} does not apply to a directory at position ${entries.length}`));
+      assert.deepEqual(await readFile(join(standby, "feedback/latest")), newer, `the applier refused at entry ${contested.at} left the newer file`);
+      assert.deepEqual(await readdir(join(standby, "feedback")), ["latest"], "no temporary file is left");
+      assert.deepEqual(tables(standby), tables(directory));
+      assert.equal(await follow(standby, link), entries.length);
+      assert.deepEqual(tables(standby), tables(directory));
+    }
   });
 
   test(`${name}: a standby holds each logged file at its path, and a blob that does not match its record is refused`, async (t) => {
@@ -238,6 +249,33 @@ for (const [name, connect] of Object.entries(authorities)) {
     t.after(() => reopened.harness.close(context));
     assert.deepEqual(await readFile(join(directory, "feedback/bundle.json")), bytes);
     assert.equal(reopened.log.head, (await link.record())?.state.head);
+  });
+
+  test(`${name}: a standby that stops after an entry's rename and before its commit finds the file present on the next follow`, async (t) => {
+    const link = await connect(), epoch = await enroll(link), directory = await stateDirectory(t), standby = await stateDirectory(t);
+    const bytes = Buffer.from("invented feedback bundle"), path = join(standby, "feedback/bundle.json");
+    const owner = await openOwner(directory, link, { epoch });
+    await owner.log.appendFiles([await stage(directory, link, "feedback/bundle.json", bytes)]);
+    await owner.harness.close(context);
+
+    let stopped = false;
+    const stopsAfterRename = (database: SqliteDatabase): SqliteDatabase => ({ exec: (sql) => database.exec(sql), run: (sql, ...params) => database.run(sql, ...params),
+      get: (sql, ...params) => database.get(sql, ...params), all: (sql, ...params) => database.all(sql, ...params), close: () => database.close(),
+      transaction: (callback) => database.transaction(async (transaction) => {
+        const value = await callback(transaction);
+        if (!stopped && existsSync(path)) { stopped = true; throw new Error("Invented: the process stopped before the transaction committed"); }
+        return value;
+      }) });
+    await assert.rejects(applyLog({ database: await openScoped(standby, stopsAfterRename), link, stateDirectory: standby }), /stopped before the transaction committed/);
+    assert.deepEqual(await readFile(path), bytes, "the rename happened inside the transaction");
+    const fileEntry = (await logEntries(link)).find((entry) => entry.files.length > 0);
+    assert.ok(fileEntry);
+    assert.equal(await position(standby), fileEntry.at - 1, "the position did not move");
+
+    assert.equal(await follow(standby, link), (await link.record())?.state.head);
+    assert.deepEqual(await readFile(path), bytes);
+    assert.deepEqual(await readdir(join(standby, "feedback")), ["bundle.json"]);
+    assert.deepEqual(tables(standby), tables(directory));
   });
 
   test(`${name}: an entry written by another Pi Durable or Chord is refused and the position does not move`, async (t) => {

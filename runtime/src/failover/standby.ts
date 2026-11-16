@@ -72,14 +72,20 @@ async function applyEntry({ database, link, stateDirectory }: LogFollower, stora
     throw new Error(`Log entry ${entry.at} was written by Pi Durable ${body.versions.pi_durable} and Chord ${body.versions.chord}, and this host runs Pi Durable ${installed.pi_durable} and Chord ${installed.chord}`);
   }
   if (logEntryDigest(body) !== digest) throw new Error(`Log entry ${entry.at} does not match its digest`);
-  for (const file of body.files) await materializeFile(link, stateDirectory, file);
-  if (body.batch === null) {
-    if (body.pi_seq !== null) throw new Error(`Log entry ${entry.at} names Pi sequence ${body.pi_seq} and carries no batch`);
-    return database.applyWithoutBatch(entry.at);
+  const pending = await downloadFiles(link, stateDirectory, body.files);
+  const publish = () => publishFiles(pending);
+  try {
+    if (body.batch === null) {
+      if (body.pi_seq !== null) throw new Error(`Log entry ${entry.at} names Pi sequence ${body.pi_seq} and carries no batch`);
+      return await database.applyWithoutBatch(entry.at, publish);
+    }
+    if (body.pi_seq === null) throw new Error(`Log entry ${entry.at} carries a batch and names no Pi sequence`);
+    const writes = parseBatch(await batchJson(link, entry.at, body.batch), entry.at);
+    await database.apply(entry.at, body.pi_seq, { publish, commit: () => storage.commit(writes, BACKGROUND_CONTEXT) });
+  } catch (error) {
+    await removeFiles(pending);
+    throw error;
   }
-  if (body.pi_seq === null) throw new Error(`Log entry ${entry.at} carries a batch and names no Pi sequence`);
-  const writes = parseBatch(await batchJson(link, entry.at, body.batch), entry.at);
-  await database.apply(entry.at, body.pi_seq, () => storage.commit(writes, BACKGROUND_CONTEXT));
 }
 
 async function batchJson(link: AuthorityLink, at: number, batch: BatchBody): Promise<string> {
@@ -101,32 +107,53 @@ export function replicatedFilePath(stateDirectory: string, file: FileRecord): st
   return path;
 }
 
-async function materializeFile(link: AuthorityLink, stateDirectory: string, file: FileRecord): Promise<void> {
-  const path = replicatedFilePath(stateDirectory, file);
-  const present = await readFile(path).catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") return undefined;
-    throw error;
-  });
-  if (present !== undefined && matches(present, file)) return;
-  const bytes = await link.getBlob(file.sha256);
-  if (!matches(bytes, file)) throw new Error(`The blob for ${file.path} does not match its record`);
-  await makeDirectory(dirname(path));
-  const temporary = join(dirname(path), `.${randomUUID()}.tmp`);
+/** A synced file at a temporary name, waiting for its log entry's transaction to rename it to `path`. */
+export interface PendingFile {
+  readonly synced: string;
+  readonly path: string;
+}
+
+/**
+ * Downloads and verifies each file of an entry that the directory lacks, to a
+ * temporary name beside its final path. A file already present with the
+ * recorded bytes, such as one renamed before a crash, needs nothing.
+ */
+async function downloadFiles(link: AuthorityLink, stateDirectory: string, files: readonly FileRecord[]): Promise<PendingFile[]> {
+  const pending: PendingFile[] = [];
   try {
-    const handle = await open(temporary, "wx", 0o600);
-    try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
-    await publishFile(temporary, path);
+    for (const file of files) {
+      const path = replicatedFilePath(stateDirectory, file);
+      const present = await readFile(path).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      });
+      if (present !== undefined && matches(present, file)) continue;
+      const bytes = await link.getBlob(file.sha256);
+      if (!matches(bytes, file)) throw new Error(`The blob for ${file.path} does not match its record`);
+      await makeDirectory(dirname(path));
+      const synced = join(dirname(path), `.${randomUUID()}.tmp`);
+      pending.push({ synced, path });
+      const handle = await open(synced, "wx", 0o600);
+      try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
+    }
+    return pending;
   } catch (error) {
-    await rm(temporary, { force: true });
+    await removeFiles(pending);
     throw error;
   }
 }
 
-/** Gives a synced file its final name, in a way that survives a crash. */
-export async function publishFile(synced: string, path: string): Promise<void> {
-  await makeDirectory(dirname(path));
-  await rename(synced, path);
-  await syncDirectory(dirname(path));
+async function removeFiles(files: readonly PendingFile[]): Promise<void> {
+  await Promise.all(files.map(({ synced }) => rm(synced, { force: true })));
+}
+
+/** Gives each synced file its final name, in a way that survives a crash. */
+export async function publishFiles(files: readonly PendingFile[]): Promise<void> {
+  for (const { synced, path } of files) {
+    await makeDirectory(dirname(path));
+    await rename(synced, path);
+    await syncDirectory(dirname(path));
+  }
 }
 
 async function makeDirectory(directory: string): Promise<void> {
