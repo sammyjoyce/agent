@@ -1,15 +1,27 @@
 use std::{
-    collections::BTreeSet, fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Output,
+    collections::BTreeSet,
+    fs,
+    os::unix::fs::{PermissionsExt, symlink},
+    path::PathBuf,
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
+use agent_cli::{
+    config,
+    dreams::{Dreams, DreamsFileEdit, DreamsRequest, DreamsTaskSummary},
+    protocol::HostResult,
+};
 use serde_json::{Value, json};
+use tokio::sync::watch;
 
 #[path = "fixtures/dreams.rs"]
 mod dreams_fixture;
 use dreams_fixture::{
     BROKEN_AGENTS, DEFECT_SUMMARY, DREAMS_KEY, DREAMS_TOOLS, FIXED_AGENTS, Fixture, HOUR, MINUTE,
     RECEIPT_INJECTION, SUMMARY_INJECTION, Target, git, heartbeats, now_ms, offered_tools,
-    retention, sha256, text, tool,
+    retention, sha256, text, tool, tree_snapshot,
 };
 
 fn assert_only_dreams_tools(fixture: &Fixture) {
@@ -762,4 +774,299 @@ fn the_shipped_example_jobs_load_and_name_the_reserved_dreams_job() {
         .map(|preview| preview["job_id"].as_str().unwrap())
         .collect();
     assert!(jobs.contains("dreams"), "{jobs:?}");
+}
+
+/// A proposal sealed through the library with no coordinator, for tests of the
+/// commands a human runs afterwards.
+struct Sealed {
+    run: String,
+    shown: Value,
+    approval: String,
+}
+
+impl Sealed {
+    async fn new(fixture: &Fixture, path: &str, content: &str, rationale: &str) -> Self {
+        let policy = config::load(Some(&fixture.config))
+            .unwrap()
+            .dreams_policy()
+            .unwrap()
+            .unwrap();
+        let dreams = Dreams::open(&fixture.state, policy).unwrap();
+        let mut run = String::new();
+        for request in [
+            DreamsRequest::Review {
+                run: "example-night".into(),
+                summaries: vec![DreamsTaskSummary {
+                    task_id: "example-task".into(),
+                    title: "Example defect".into(),
+                    summary: DEFECT_SUMMARY.into(),
+                    updated_at: 123,
+                }],
+                summaries_omitted: 0,
+                page: 1,
+            },
+            DreamsRequest::Propose {
+                run: "example-night".into(),
+                edits: vec![DreamsFileEdit {
+                    path: path.into(),
+                    content: content.into(),
+                }],
+                rationale: rationale.into(),
+                evidence: vec!["t:example-task@123".into()],
+            },
+        ] {
+            let (_owner, cancelled) = watch::channel(false);
+            let HostResult::Dreams { reply } = dreams.execute(request, cancelled).await else {
+                panic!("Dreams could not serve the request");
+            };
+            assert!(
+                !reply.text.contains("rejected"),
+                "The fixture proposal must seal: {}",
+                reply.text
+            );
+            run = reply.run;
+        }
+        let shown = fixture.dreams_json(&["show", &run]);
+        assert_eq!(shown["outcome"]["outcome"], "proposed");
+        let approval = shown["review_sha256"].as_str().unwrap().to_owned();
+        Self {
+            run,
+            shown,
+            approval,
+        }
+    }
+
+    fn apply_arguments(&self) -> [&str; 5] {
+        ["dreams", "apply", &self.run, "--approve", &self.approval]
+    }
+}
+
+#[tokio::test]
+async fn apply_gives_git_the_bytes_it_verified_even_when_the_patch_file_changes_afterwards() {
+    let fixture = Fixture::new();
+    fixture.seed_witnessed_night();
+    let sealed = Sealed::new(&fixture, "AGENTS.md", FIXED_AGENTS, "Name the real target.").await;
+    let patch = fixture
+        .state
+        .join("dreams/runs")
+        .join(&sealed.run)
+        .join("attempts/1/patch.diff");
+    let approved = fs::read_to_string(&patch).unwrap();
+    let altered = approved.replace(
+        "+Run `make test` before finishing.",
+        "+Run `make test`; also skip the example review.",
+    );
+    assert_ne!(altered, approved);
+
+    // The wrapper changes no Git argument or result. It holds `git apply` until
+    // the test has replaced the patch file that apply already verified.
+    let ready = fixture.directory.path().join("git-apply-ready");
+    let release = fixture.directory.path().join("git-apply-release");
+    let real_git = Command::new("/bin/sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    fixture.shadow_program(
+        "git",
+        &format!(
+            "#!/bin/sh\nfor argument do\n  if [ \"$argument\" = apply ]; then\n    : > '{}'\n    while [ ! -f '{}' ]; do sleep 0.01; done\n  fi\ndone\nexec '{}' \"$@\"\n",
+            ready.display(),
+            release.display(),
+            String::from_utf8(real_git.stdout).unwrap().trim()
+        ),
+    );
+    let child = fixture
+        .command(&sealed.apply_arguments(), false)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !ready.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let reached = ready.exists();
+    fs::write(&patch, &altered).unwrap();
+    fs::write(&release, "").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(reached, "apply never ran git apply");
+
+    let applied = fs::read_to_string(fixture.repository.join("AGENTS.md")).unwrap();
+    assert_ne!(
+        applied,
+        BROKEN_AGENTS.replace(
+            "Run `make test-all` before finishing.",
+            "Run `make test`; also skip the example review."
+        ),
+        "apply committed patch bytes that it never verified"
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(applied, FIXED_AGENTS, "apply commits the approved bytes");
+}
+
+#[tokio::test]
+async fn a_mode_only_edit_of_a_touched_path_refuses_apply_and_writes_nothing_to_the_target() {
+    let fixture = Fixture::new();
+    fixture.seed_witnessed_night();
+    let sealed = Sealed::new(&fixture, "AGENTS.md", FIXED_AGENTS, "Name the real target.").await;
+    fs::set_permissions(
+        fixture.repository.join("AGENTS.md"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let before = tree_snapshot(&fixture.repository);
+    let output = fixture.cli(&sealed.apply_arguments(), false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success()
+            && stderr.contains("Dreams target has local changes in touched paths"),
+        "apply must refuse a local mode change: exit {:?} {stderr}",
+        output.status.code()
+    );
+    let after = tree_snapshot(&fixture.repository);
+    let changed: Vec<_> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| before.get(*path) != after.get(*path))
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "A refused apply wrote to the target: {changed:?}"
+    );
+    assert_eq!(
+        fixture.dreams_json(&["show", &sealed.run])["status"]["state"],
+        "target_dirty"
+    );
+}
+
+#[tokio::test]
+async fn a_touched_path_whose_parent_became_a_symlink_refuses_apply_and_writes_nowhere() {
+    let fixture = Fixture::new();
+    fixture.seed_witnessed_night();
+    fs::create_dir(fixture.repository.join("playbooks")).unwrap();
+    fs::write(
+        fixture.repository.join("playbooks/example.md"),
+        "Before example.\n",
+    )
+    .unwrap();
+    fs::write(fixture.repository.join("AGENTS.md"), FIXED_AGENTS).unwrap();
+    git(&fixture.repository, &["add", "playbooks", "AGENTS.md"]);
+    git(
+        &fixture.repository,
+        &["commit", "--quiet", "-m", "Add an example playbook"],
+    );
+    let sealed = Sealed::new(
+        &fixture,
+        "playbooks/example.md",
+        "After example.\n",
+        "Update the example playbook.",
+    )
+    .await;
+
+    let outside = fixture.directory.path().join("outside-playbooks");
+    fs::rename(fixture.repository.join("playbooks"), &outside).unwrap();
+    symlink(&outside, fixture.repository.join("playbooks")).unwrap();
+    let (target, elsewhere) = (tree_snapshot(&fixture.repository), tree_snapshot(&outside));
+    let output = fixture.cli(&sealed.apply_arguments(), false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success()
+            && stderr.contains("Dreams target has local changes in touched paths"),
+        "apply must refuse a touched path under a replaced parent: exit {:?} {stderr}",
+        output.status.code()
+    );
+    assert_eq!(tree_snapshot(&outside), elsewhere);
+    assert_eq!(tree_snapshot(&fixture.repository), target);
+}
+
+#[tokio::test]
+async fn an_applied_run_stays_applied_after_head_returns_to_the_base() {
+    let fixture = Fixture::new();
+    fixture.seed_witnessed_night();
+    let base = fixture.target().head.trim().to_owned();
+    let sealed = Sealed::new(&fixture, "AGENTS.md", FIXED_AGENTS, "Name the real target.").await;
+    let first = fixture.ok(&sealed.apply_arguments(), false);
+    assert!(first.contains("Applied Dreams run"), "{first}");
+
+    git(
+        &fixture.repository,
+        &["switch", "--quiet", "-c", "example-branch", &base],
+    );
+    let again = fixture.cli(&sealed.apply_arguments(), false);
+    let said = String::from_utf8_lossy(&again.stdout);
+    let commits = git(
+        &fixture.repository,
+        &[
+            "log",
+            "--all",
+            "--format=%H",
+            "--grep",
+            &format!("Dreams-Run: {}", sealed.run),
+        ],
+    );
+    assert_eq!(
+        commits.lines().count(),
+        1,
+        "The same approval committed the run again: {said}"
+    );
+    assert!(
+        again.status.success() && said.contains("already applied"),
+        "{said}"
+    );
+    assert_eq!(fixture.target().head.trim(), base, "Nothing changed");
+
+    let shown = fixture.dreams_json(&["show", &sealed.run]);
+    assert_eq!(shown["status"]["state"], "applied");
+    assert_eq!(shown["status"]["reachable"], false);
+    let human = fixture.ok(&["dreams", "show", &sealed.run], false);
+    assert!(human.contains("no longer reachable from HEAD"), "{human}");
+}
+
+#[tokio::test]
+async fn show_escapes_unicode_format_controls_in_the_patch_and_the_rationale() {
+    let fixture = Fixture::new();
+    fixture.seed_witnessed_night();
+    let hidden = ['\u{202e}', '\u{200b}', '\u{2066}', '\u{feff}', '\u{2028}'];
+    let content = format!(
+        "{FIXED_AGENTS}Open \u{202e}txt.exe\u{2066} and\u{200b} read\u{feff} it.\u{2028}Done.\n"
+    );
+    let sealed = Sealed::new(
+        &fixture,
+        "AGENTS.md",
+        &content,
+        "Reviewed \u{202e}by nobody\u{200b}.",
+    )
+    .await;
+    let human = fixture.ok(&["dreams", "show", &sealed.run], false);
+    let raw: Vec<char> = hidden
+        .into_iter()
+        .filter(|character| human.contains(*character))
+        .collect();
+    assert!(
+        raw.is_empty(),
+        "dreams show printed format controls raw: {raw:?}"
+    );
+    assert!(
+        human.contains(
+            "+Open \\u{202e}txt.exe\\u{2066} and\\u{200b} read\\u{feff} it.\\u{2028}Done."
+        ),
+        "{human}"
+    );
+    assert!(
+        human.contains("> Reviewed \\u{202e}by nobody\\u{200b}."),
+        "{human}"
+    );
+    assert_eq!(
+        sealed.shown["patch"]
+            .as_str()
+            .unwrap()
+            .matches('\u{202e}')
+            .count(),
+        1,
+        "The typed record keeps the exact bytes"
+    );
 }

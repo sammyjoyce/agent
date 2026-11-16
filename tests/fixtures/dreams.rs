@@ -221,6 +221,11 @@ impl Fixture {
         fs::write(&self.config, toml::to_string(&config).unwrap()).unwrap();
     }
 
+    /// Puts a program ahead of the real one on the PATH of every CLI this fixture starts.
+    pub fn shadow_program(&self, name: &str, script: &str) {
+        write_executable(&self.bin.join(name), script);
+    }
+
     pub fn write_policy(&self, repository: &Path, argv: &[&str]) {
         self.write_config(Some(json!({
             "repository": repository,
@@ -587,6 +592,39 @@ pub fn offered_tools(body: &Value) -> BTreeSet<String> {
                 .map_or_else(|| tool.to_string(), str::to_owned)
         })
         .collect()
+}
+
+/// Every file below `root` with its mode and bytes, and every symlink with its
+/// target. Nothing is followed, so `.git` and a symlinked directory are compared as they are.
+pub fn tree_snapshot(root: &Path) -> BTreeMap<PathBuf, (u32, Vec<u8>)> {
+    let mut snapshot = BTreeMap::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let bytes = if metadata.file_type().is_symlink() {
+            fs::read_link(&path)
+                .unwrap()
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec()
+        } else if metadata.is_file() {
+            fs::read(&path).unwrap()
+        } else {
+            Vec::new()
+        };
+        snapshot.insert(
+            path.strip_prefix(root).unwrap().to_owned(),
+            (metadata.permissions().mode(), bytes),
+        );
+        if metadata.is_dir() {
+            pending.extend(
+                fs::read_dir(&path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path()),
+            );
+        }
+    }
+    snapshot
 }
 
 pub struct Server(Option<Child>);
