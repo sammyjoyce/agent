@@ -5,22 +5,15 @@ import type { AuthorityCommand } from "../../src/generated/AuthorityCommand.js";
 import type { AuthorityRecord } from "../../src/generated/AuthorityRecord.js";
 import type { LogEntry } from "../../src/generated/LogEntry.js";
 
-/**
- * The authority's real rules over in-process storage, for tests that need to
- * stop between two steps. It has no row limit and no transport, so the Worker
- * tests on local workerd stay the proof of the deployed object.
- */
 export class MemoryAuthority implements AuthorityLink {
   current: AuthorityRecord | undefined;
   readonly entries = new Map<number, LogEntry>();
   readonly blobs = new Map<string, Uint8Array>();
-  /** Runs before each command reaches the rules. Throw to fail the exchange. */
-  before: (command: AuthorityCommand) => void | Promise<void> = () => {};
-  /** Runs after a command was applied and before its reply returns. Throw to lose the reply. */
-  after: (command: AuthorityCommand) => void | Promise<void> = () => {};
+  beforeCommand: (command: AuthorityCommand) => void | Promise<void> = () => {};
+  afterApplied: (command: AuthorityCommand) => void | Promise<void> = () => {};
 
   async command(command: AuthorityCommand) {
-    await this.before(command);
+    await this.beforeCommand(command);
     if (command.op === "append") {
       const { batch, files } = command.entry;
       const named = [...files.map((file) => file.sha256), ...(batch?.kind === "blob" ? [batch.sha256] : [])];
@@ -32,7 +25,7 @@ export class MemoryAuthority implements AuthorityLink {
     if (decision.write?.type === "checkpoint") {
       for (const at of this.entries.keys()) if (at <= decision.write.record.through) this.entries.delete(at);
     }
-    await this.after(command);
+    await this.afterApplied(command);
     return structuredClone(decision.reply);
   }
 

@@ -7,7 +7,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** Who may use one credential: a holder, or `null` for a read-only credential. */
 export interface AuthorityGrant {
   readonly coordinator: string;
   readonly holder: string | null;
@@ -20,9 +19,7 @@ export interface LocalCredential extends AuthorityGrant {
 export interface LocalAuthority {
   readonly url: string;
   readonly credentials: readonly LocalCredential[];
-  /** Stops workerd and deletes its state. */
   stop(): Promise<void>;
-  /** Stops workerd and starts it again on the same port and the same persisted state. */
   restart(): Promise<void>;
 }
 
@@ -65,7 +62,6 @@ function signalGroup(group: number, signal: NodeJS.Signals | 0): boolean {
   }
 }
 
-/** Stops a process group and waits until no member is left, so the port and the persisted state are free. */
 async function stopGroup(group: number): Promise<void> {
   signalGroup(group, "SIGTERM");
   const force = Date.now() + 5_000, deadline = force + 10_000;
@@ -77,14 +73,10 @@ async function stopGroup(group: number): Promise<void> {
 }
 
 /**
- * Runs the real authority Worker under `wrangler dev --local` on a free
- * loopback port, with a temporary persistence directory and no Cloudflare
- * account: every `CLOUDFLARE_*` and `CF_*` variable is removed and HOME points
- * at the temporary directory, so wrangler can find no login. It also skips the
+ * Every `CLOUDFLARE_*` and `CF_*` variable is removed and HOME points at the
+ * temporary directory, so wrangler can find no login. It also skips the
  * banner's npm update check and the download of request.cf data from
- * Cloudflare, so a run makes no network request at all. Each grant gets a
- * fresh random token. The test's `after` hook stops workerd even when the test
- * fails, and it never skips: without wrangler on PATH it throws.
+ * Cloudflare.
  */
 export async function startAuthority(options: {
   readonly context: { after(hook: () => Promise<void>): void };

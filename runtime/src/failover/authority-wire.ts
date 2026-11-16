@@ -4,6 +4,9 @@ import type { CheckpointRecord } from "../generated/CheckpointRecord.js";
 import type { FileRecord } from "../generated/FileRecord.js";
 import type { LogEntry } from "../generated/LogEntry.js";
 import type { Versions } from "../generated/Versions.js";
+import { REPLICATED_FILE_ROOTS } from "../generated/replicated-file-roots.js";
+
+export const COMMAND_BODY_LIMIT_BYTES = 1024 * 1024;
 
 type Field<T> = (value: unknown, path: string) => T;
 type Fields<T> = { readonly [K in keyof T]-?: Field<T[K]> };
@@ -13,8 +16,6 @@ type Variants<U, Tag extends keyof U> = {
 
 const LOWERCASE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
-/** `REPLICATED_FILE_ROOTS` in `src/failover.rs`. */
-const REPLICATED_FILE_ROOTS = ["attachments", "history/assets", "feedback"];
 
 export const isLowercaseUuid = (value: string) => LOWERCASE_UUID.test(value);
 export const isSha256Hex = (value: string) => SHA256_HEX.test(value);
@@ -38,7 +39,6 @@ const textWhere = (check: (value: string) => boolean, problem: string): Field<st
 const statement = textWhere((value) => /\S/.test(value), "is blank");
 const uuid = textWhere(isLowercaseUuid, "is not a lowercase UUID");
 const sha256 = textWhere(isSha256Hex, "is not 64 lowercase hexadecimal characters");
-/** `StatePath` in `src/failover.rs`. */
 const statePath = textWhere((value) =>
   value.split("/").every((segment) => segment !== "" && segment !== "." && segment !== ".." && !/[\\\0]/.test(segment))
     && REPLICATED_FILE_ROOTS.some((root) => value.startsWith(`${root}/`)),

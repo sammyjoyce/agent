@@ -19,18 +19,15 @@ export type Outcome = "accepted" | AuthorityRefusal;
 
 export const cellLog = { 1: digests[0], 2: digests[1] } as const;
 export const cellCheckpoint = { through: 0, manifest };
-/** The enrolled states each cell runs against, in the order of the table's columns. */
 export const cellStates: readonly AuthorityState[] = [
   { kind: "active", epoch: 3, holder: tarantula, head: 2 },
   { kind: "sealed", epoch: 3, holder: tarantula, candidate: orion, head: 2 },
   { kind: "vacant", epoch: 3, candidate: orion, evidence: { kind: "released" }, head: 2 },
 ];
 
-/**
- * The answer to each operation before enrollment, then on each of `cellStates`
- * by the old owner, the candidate and a third holder.
- */
-export const cells: Record<string, readonly [none: Outcome, active: readonly Outcome[], sealed: readonly Outcome[], vacant: readonly Outcome[]]> = {
+type ByCaller = readonly [owner: Outcome, candidate: Outcome, third: Outcome];
+
+export const cells: Record<string, readonly [none: Outcome, active: ByCaller, sealed: ByCaller, vacant: ByCaller]> = {
   enroll: ["accepted", ["accepted", "enrolled", "enrolled"], ["enrolled", "enrolled", "enrolled"], ["enrolled", "enrolled", "enrolled"]],
   claim: ["not_enrolled", ["accepted", "fenced", "fenced"], ["sealed", "sealed", "sealed"], ["sealed", "sealed", "sealed"]],
   append: ["not_enrolled", ["accepted", "fenced", "fenced"], ["sealed", "sealed", "sealed"], ["sealed", "sealed", "sealed"]],
@@ -59,7 +56,6 @@ export function cellCommand(name: string, caller: string): AuthorityCommand {
 
 export type Script = readonly (readonly [AuthorityCommand, Outcome])[];
 
-/** A sequence from an empty authority, with the record and the log digests it ends with. */
 export interface ScriptedSequence {
   readonly steps: Script;
   readonly record: AuthorityRecord | undefined;

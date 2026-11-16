@@ -11,7 +11,6 @@ import { note, openPi, openScoped, sessionPath, stateDirectory, tables } from ".
 
 const Tally = defineDoc<{ count: number }>({ kind: "fixture.tally", scope: "session", version: 1, initial: () => ({ count: 0 }), checkpointWhen: () => false });
 
-/** The batches Pi commits for two notes and a document change, taken from a real Harness over plain storage. */
 async function piBatches(t: TestContext): Promise<StorageWrite[][]> {
   const inner = await SqliteStorage.open(await openConversationDatabase(sessionPath(await stateDirectory(t))));
   const batches: StorageWrite[][] = [];

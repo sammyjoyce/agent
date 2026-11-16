@@ -55,8 +55,7 @@ macro_rules! exact_counter {
 exact_counter!(OwnerEpoch);
 exact_counter!(LogPosition);
 
-/// One host's right to hold ownership. It lives in the private config file and
-/// never in the state directory, so a copied state directory owns nothing.
+/// One host's right to hold ownership.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(transparent)]
 pub struct HolderId(Uuid);

@@ -26,22 +26,16 @@ import { startAuthority, type LocalAuthority } from "./failover-workerd.js";
 export const OWNER = "11111111-1111-4111-8111-111111111111";
 export const STANDBY = "22222222-2222-4222-8222-222222222222";
 
-/** An authority a test can stop between two steps of one exchange. */
-export type TestAuthority = AuthorityLink & Pick<MemoryAuthority, "before" | "after">;
+export type TestAuthority = AuthorityLink & Pick<MemoryAuthority, "beforeCommand" | "afterApplied">;
 
-/**
- * The Worker over HTTP with the same two stops: before a command leaves, and
- * after the Worker applied it. Each command goes out under its own holder's
- * credential, as it does from that holder's host.
- */
 class HookedLink implements TestAuthority {
-  before: TestAuthority["before"] = () => {};
-  after: TestAuthority["after"] = () => {};
-  constructor(private readonly reader: AuthorityLink, private readonly as: (holder: string) => AuthorityLink) {}
+  beforeCommand: TestAuthority["beforeCommand"] = () => {};
+  afterApplied: TestAuthority["afterApplied"] = () => {};
+  constructor(private readonly reader: AuthorityLink, private readonly clientForHolder: (holder: string) => AuthorityLink) {}
   async command(command: AuthorityCommand) {
-    await this.before(command);
-    const reply = await this.as(commandHolder(command)).command(command);
-    await this.after(command);
+    await this.beforeCommand(command);
+    const reply = await this.clientForHolder(commandHolder(command)).command(command);
+    await this.afterApplied(command);
     return reply;
   }
   record() { return this.reader.record(); }
@@ -56,25 +50,23 @@ let workerLinks = 0;
 // Registered while the test file loads, so the Worker outlives the test that first asks for it.
 after(async () => { await (await worker)?.stop(); });
 
-/** A coordinator nobody has enrolled, on one Worker under local workerd that the test file shares. */
-async function workerAuthority(): Promise<TestAuthority> {
+async function freshWorkerCoordinator(): Promise<TestAuthority> {
   worker ??= startAuthority({ context: { after: () => {} },
     grants: workerCoordinators.flatMap((coordinator) => [OWNER, STANDBY].map((holder) => ({ coordinator, holder }))) });
   const { url, credentials } = await worker;
   const coordinatorId = workerCoordinators[workerLinks++];
   if (coordinatorId === undefined) throw new Error("The test file ran out of Worker coordinators");
-  const as = (holder: string) => {
+  const clientForHolder = (holder: string) => {
     const credential = credentials.find((candidate) => candidate.coordinator === coordinatorId && candidate.holder === holder);
     if (credential === undefined) throw new Error(`The fixture holds no credential for holder ${holder}`);
     return new AuthorityClient({ url, coordinatorId, token: credential.token });
   };
-  return new HookedLink(as(OWNER), as);
+  return new HookedLink(clientForHolder(OWNER), clientForHolder);
 }
 
-/** Every failover case runs once per entry: against the rules in process, and against the Worker that deploys them. */
 export const authorities: Record<string, () => TestAuthority | Promise<TestAuthority>> = {
   "memory authority": () => new MemoryAuthority(),
-  "Worker on local workerd": workerAuthority,
+  "Worker on local workerd": freshWorkerCoordinator,
 };
 
 export async function stateDirectory(t: TestContext): Promise<string> {
@@ -85,12 +77,10 @@ export async function stateDirectory(t: TestContext): Promise<string> {
 
 export const sessionPath = (directory: string) => join(directory, "session.sqlite");
 
-/** Enrolls `holder` as the first owner and returns its epoch. */
 export async function enroll(link: AuthorityLink, holder = OWNER): Promise<number> {
   return (await accepted(link, { op: "enroll", holder, checkpoint: { through: 0, manifest: "0".repeat(64) } })).epoch;
 }
 
-/** Every table's rows in rowid order, read through a separate connection. */
 export function tables(directory: string): Record<string, string[]> {
   const database = new DatabaseSync(sessionPath(directory), { readOnly: true });
   try {
@@ -110,7 +100,6 @@ export async function openPi(storage: Storage, options: { registry?: Registry; t
   return { harness, root, faux };
 }
 
-/** The session database of a state directory, opened as the application opens it and then scoped. */
 export async function openScoped(directory: string, observe: (database: SqliteDatabase) => SqliteDatabase = (database) => database): Promise<ScopedDatabase> {
   return ScopedDatabase.over(observe(await openConversationDatabase(sessionPath(directory))));
 }
@@ -123,7 +112,6 @@ export interface OwnerOptions {
   readonly tokensPerSecond?: number;
 }
 
-/** An owner's replicated storage with a real Harness over it. */
 export async function openOwner(directory: string, link: AuthorityLink, options: OwnerOptions) {
   const database = await openScoped(directory);
   const { storage, log } = await openReplicatedStorage({ database, link, holder: options.holder ?? OWNER, epoch: options.epoch,
@@ -132,7 +120,6 @@ export async function openOwner(directory: string, link: AuthorityLink, options:
   catch (error) { await storage.close(BACKGROUND_CONTEXT).catch(() => {}); throw error; }
 }
 
-/** A replicated file as its writer hands it to the log: bytes in the blob store and a temporary file beside its final path. */
 export async function stage(directory: string, link: AuthorityLink, path: string, bytes: Uint8Array): Promise<StagedFile> {
   const sha256 = sha256Hex(bytes), staged = join(directory, dirname(path), `.${randomUUID()}.tmp`);
   await link.putBlob(sha256, bytes);
@@ -141,19 +128,16 @@ export async function stage(directory: string, link: AuthorityLink, path: string
   return { record: { path, sha256, size: bytes.byteLength }, staged };
 }
 
-/** A standby's follow of the log into its own state directory. Returns the position it reached. */
 export async function follow(directory: string, link: AuthorityLink): Promise<number> {
   return applyLog({ database: await openScoped(directory), link, stateDirectory: directory });
 }
 
-/** The sealed holder takes ownership back, as `promote` on itself does. Returns the new epoch. */
 export async function takeBack(link: AuthorityLink, holder: string, epoch: number): Promise<number> {
   await accepted(link, { op: "promote", candidate: holder, expected_epoch: epoch, attestation: null });
   const { head } = await accepted(link, { op: "release", holder, epoch, evidence: "released" });
   return (await accepted(link, { op: "activate", candidate: holder, applied: head })).epoch;
 }
 
-/** Another holder replaces the owner on an invented attestation. Returns the new epoch. */
 export async function replaceOwner(link: AuthorityLink, candidate: string, epoch: number): Promise<number> {
   const { head } = await accepted(link, { op: "promote", candidate, expected_epoch: epoch, attestation: "Invented: the old host is powered off" });
   return (await accepted(link, { op: "activate", candidate, applied: head })).epoch;
@@ -174,7 +158,6 @@ export async function logEntries(link: AuthorityLink): Promise<LogEntry[]> {
   }
 }
 
-/** The Pi batch each log entry carries, read back from the log and the blob store. */
 export async function logBatches(link: AuthorityLink): Promise<StorageWrite[][]> {
   const batches: StorageWrite[][] = [];
   for (const { batch } of await logEntries(link)) {

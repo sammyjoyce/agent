@@ -1,15 +1,18 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import type { StorageWrite } from "@earendil-works/pi-durable";
 import type { BatchBody } from "../generated/BatchBody.js";
 import type { LogEntry } from "../generated/LogEntry.js";
 import type { Versions } from "../generated/Versions.js";
+import { COMMAND_BODY_LIMIT_BYTES } from "./authority-wire.js";
 
 /**
  * A Pi batch whose JSON is longer than this goes to the blob store, and its
- * log entry names it by hash. One authority row holds at most 8 MiB, and an
- * input with three large images is a batch of about 12 MB.
+ * log entry names it by hash. An inline batch is a JSON string inside the
+ * entry, where escaping can double it, and the entry must fit in one command
+ * body.
  */
-export const INLINE_BATCH_LIMIT_BYTES = 256 * 1024;
+export const INLINE_BATCH_LIMIT_BYTES = COMMAND_BODY_LIMIT_BYTES / 4;
 
 export function sha256Hex(bytes: Uint8Array | string): string {
   return createHash("sha256").update(bytes).digest("hex");
@@ -23,6 +26,12 @@ export function logEntryDigest(entry: Omit<LogEntry, "digest">): string {
     files: entry.files.map(({ path, sha256, size }) => ({ path, sha256, size })),
     batch: entry.batch === null ? null : canonicalBatch(entry.batch),
   }));
+}
+
+export function parseBatch(json: string, at: number): StorageWrite[] {
+  const writes: unknown = JSON.parse(json);
+  if (!Array.isArray(writes)) throw new Error(`The batch of log entry ${at} is not a list of writes`);
+  return writes as StorageWrite[];
 }
 
 function canonicalBatch(batch: BatchBody): BatchBody {

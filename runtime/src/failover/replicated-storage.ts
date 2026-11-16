@@ -7,7 +7,7 @@ import type { BatchBody } from "../generated/BatchBody.js";
 import type { FileRecord } from "../generated/FileRecord.js";
 import type { LogEntry } from "../generated/LogEntry.js";
 import { AuthorityUnreachable, type AuthorityLink } from "./authority-link.js";
-import { INLINE_BATCH_LIMIT_BYTES, logEntryDigest, sha256Hex, versions } from "./log-entry.js";
+import { INLINE_BATCH_LIMIT_BYTES, logEntryDigest, parseBatch, sha256Hex, versions } from "./log-entry.js";
 import type { ScopedDatabase } from "./scoped-database.js";
 import { followLog, publishFile, replicatedFilePath, type LogFollower } from "./standby.js";
 
@@ -93,8 +93,7 @@ class OwnerLog implements LogWriter {
   readonly #storage: SqliteStorage;
   #head: number;
   #carried: StagedFile[] = [];
-  /** Rejected by the first failure, so nothing is appended once the head and the local position may differ. */
-  #line: Promise<unknown> = Promise.resolve();
+  #serialUntilFirstFailure: Promise<unknown> = Promise.resolve();
 
   constructor(options: ReplicatedStorageOptions, storage: SqliteStorage, head: number) {
     this.#options = options; this.#storage = storage; this.#head = head;
@@ -122,17 +121,15 @@ class OwnerLog implements LogWriter {
     const json = JSON.stringify(writes);
     const at = await this.#append(piSeq, files, json);
     await this.#publish(files);
-    // A standby commits the logged JSON, so the owner commits it too. Then a
-    // value that JSON changes cannot differ between the two disks.
-    const logged = JSON.parse(json) as StorageWrite[];
+    const logged = parseBatch(json, at);
     const committed = await database.apply(at, piSeq, () => this.#storage.commit(logged, context));
     this.#head = at;
     return committed;
   });
 
   #serialized<T>(step: () => Promise<T>): Promise<T> {
-    const result = this.#line.then(step);
-    this.#line = result;
+    const result = this.#serialUntilFirstFailure.then(step);
+    this.#serialUntilFirstFailure = result;
     return result;
   }
 
@@ -141,7 +138,7 @@ class OwnerLog implements LogWriter {
     const body = { at: this.#head + 1, epoch, versions: await versions(), pi_seq: piSeq, files: files.map(({ record }) => record),
       batch: json === null ? null : await this.#batch(json) };
     const entry: LogEntry = { ...body, digest: logEntryDigest(body) };
-    const reply = await this.#untilReachable(() => link.command({ op: "append", holder, entry }));
+    const reply = await this.#repeatUntilAnswered(() => link.command({ op: "append", holder, entry }));
     if (reply.result === "accepted") return entry.at;
     if (reply.reason === "sealed" || reply.reason === "fenced") throw new OwnerFenced(reply.reason, reply.state);
     throw new Error(`The authority refused log entry ${entry.at} as ${reply.reason}: this owner's head is ${this.#head}, and the authority's is ${reply.state?.head ?? "unknown"}`);
@@ -151,21 +148,15 @@ class OwnerLog implements LogWriter {
     const bytes = Buffer.from(json, "utf8");
     if (bytes.byteLength <= INLINE_BATCH_LIMIT_BYTES) return { kind: "inline", json };
     const sha256 = sha256Hex(bytes);
-    await this.#untilReachable(() => this.#options.link.putBlob(sha256, bytes));
+    await this.#repeatUntilAnswered(() => this.#options.link.putBlob(sha256, bytes));
     return { kind: "blob", sha256, size: bytes.byteLength };
   }
 
-  /** The files have their final names only now that the log names them, and before the position says the entry is applied. */
   async #publish(files: readonly StagedFile[]): Promise<void> {
     for (const { record, staged } of files) await publishFile(staged, replicatedFilePath(this.#options.stateDirectory, record));
   }
 
-  /**
-   * Repeats an exchange until the authority answers. The authority takes a
-   * repeated append from the current owner as the same append, so a repeat
-   * after a lost exchange is safe. Any other rejection is final.
-   */
-  async #untilReachable<T>(exchange: () => Promise<T>): Promise<T> {
+  async #repeatUntilAnswered<T>(exchange: () => Promise<T>): Promise<T> {
     const { signal } = this.#options;
     for (let wait = FIRST_RETRY_MS; ; wait = Math.min(wait * 2, RETRY_CAP_MS)) {
       try {
