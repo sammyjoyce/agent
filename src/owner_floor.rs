@@ -8,14 +8,24 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 
-use crate::{coordinator_id::CoordinatorId, failover::OwnerEpoch};
+use crate::{
+    coordinator_id::CoordinatorId,
+    failover::{
+        AuthorityRecord, AuthorityState, FailoverConfig, FailoverHelper, FailoverReport,
+        FailoverRequest, FailoverSession, OwnerEpoch,
+    },
+};
 
 const OWNER_FLOORS: &str = "beep-boop-owner-floors";
+
+/// A record read that takes longer than this counts as a failed read.
+const RECORD_READ_LIMIT: Duration = Duration::from_secs(30);
 
 /// The floor files of this user, one per coordinator id, holding the epoch as decimal text.
 pub struct OwnerFloor {
@@ -119,8 +129,8 @@ impl OwnerFloor {
         self.update(coordinator, epoch).map(drop)
     }
 
-    /// Rechecks an admitted link, which another daemon may have left below
-    /// the floor since. Writes nothing.
+    /// Rechecks an admitted link, which another daemon or the owner watch may
+    /// have left below the floor since. Writes nothing.
     pub fn check(&self, link: OwnerLink) -> Result<()> {
         let (floored, floor) = match link {
             OwnerLink::Unidentified => match self.any()? {
@@ -244,6 +254,68 @@ impl OwnerFloor {
             Err(error) => {
                 Err(error).with_context(|| format!("Could not create {}", self.directory.display()))
             }
+        }
+    }
+}
+
+/// A worker's watch on the authority's owner record, from its `[failover]` section.
+pub struct OwnerWatch {
+    helper: FailoverHelper,
+    failover: FailoverConfig,
+}
+
+impl OwnerWatch {
+    pub fn new(failover: &FailoverConfig, script: &Path) -> Result<Self> {
+        Ok(Self {
+            helper: FailoverHelper::locate(script)?,
+            failover: failover.clone(),
+        })
+    }
+
+    /// Reads the record now and then once per interval. Returns only when the
+    /// link is below this host's floor, because a record named a newer owner
+    /// or another daemon raised the floor. A failed read changes nothing.
+    pub async fn ended(&self, floor: &OwnerFloor, link: OwnerLink) -> anyhow::Error {
+        let OwnerLink::Identified { coordinator, .. } = link else {
+            return std::future::pending().await;
+        };
+        let session = FailoverSession {
+            url: self.failover.url.clone(),
+            token_file: self.failover.token_file.clone(),
+            coordinator_id: coordinator,
+            holder: self.failover.holder,
+            epoch: None,
+        };
+        let mut ticks = tokio::time::interval(self.failover.watch_interval());
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            if let Some(epoch) = self.owner_epoch(&session).await
+                && let Err(error) = floor.raise(coordinator, epoch)
+            {
+                return error;
+            }
+            if let Err(error) = floor.check(link) {
+                return error;
+            }
+        }
+    }
+
+    /// Only an active record names an owner. A sealed or vacant one is between owners.
+    async fn owner_epoch(&self, session: &FailoverSession) -> Option<OwnerEpoch> {
+        match self
+            .helper
+            .run_within(session, FailoverRequest::Record, RECORD_READ_LIMIT)
+            .await
+        {
+            Ok(FailoverReport::Record {
+                record:
+                    Some(AuthorityRecord {
+                        state: AuthorityState::Active { epoch, .. },
+                        ..
+                    }),
+            }) => Some(epoch),
+            _ => None,
         }
     }
 }

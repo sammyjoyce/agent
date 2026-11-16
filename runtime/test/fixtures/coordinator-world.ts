@@ -25,7 +25,8 @@ export const held = (path: string): ModelStep => ({ tool: "exec", args: { progra
   'async function run(){while(!fs.existsSync(path+".release"))await new Promise(resolve=>setTimeout(resolve,20));' +
   'fs.appendFileSync(path+".finished","once\\n");process.stdout.write("Completed the held action.");}void run();', path] } });
 
-export async function coordinatorWorld(t: TestContext) {
+/** `prepare` runs after each home has its default files and before either service starts. */
+export async function coordinatorWorld(t: TestContext, prepare: (homes: readonly [string, string]) => Promise<void> = async () => {}) {
   const directory = await realpath(await mkdtemp("/tmp/agent-e2e-"));
   const binary = process.env.AGENT_TEST_BINARY ?? fileURLToPath(new URL("../../../../target/debug/beep-boop", import.meta.url));
   const terminalFixture = fileURLToPath(new URL("../../../../target/debug/examples/terminal-fixture", import.meta.url));
@@ -145,6 +146,7 @@ export async function coordinatorWorld(t: TestContext) {
     await writeFile(join(home, "agent.toml"), `node_name = "${index === 0 ? "desktop" : "laptop"}"\n` +
       (index === 0 ? "" : "coordinator = \"synthetic-coordinator\"\n"));
   }
+  await prepare(homes);
   const server = start(0, ["serve", "--local-only", "--no-sources"]);
   await until(async () => { try { return (await stat(socket)).isSocket(); } catch { return false; } });
   const worker = start(1, ["maintain"]); await online([coordinator, laptop]);

@@ -29,7 +29,7 @@ use agent_cli::{
     host::effects::{Admission, Capacity, HostEffects},
     instructions, jobs,
     models::{ModelProvider, ModelSelection, Reasoning},
-    owner_floor::{OwnerFloor, OwnerLink},
+    owner_floor::{OwnerFloor, OwnerLink, OwnerWatch},
     protocol::{
         AuthStatus, ConversationChange, ConversationSettings, CoordinatorBootstrap,
         CoordinatorSettings, HostDelivery, HostResult, ImportPhase, InputMode, MainInputContext,
@@ -3018,6 +3018,11 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
             .with_browser(script, config.browser.clone()),
     );
     let floor = OwnerFloor::for_user()?;
+    let watch = config
+        .failover
+        .as_ref()
+        .map(|failover| OwnerWatch::new(failover, script))
+        .transpose()?;
     let mut delay = 1;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -3104,11 +3109,22 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
                     sleep(Duration::from_secs(interval.into())).await;
                 }
             }));
+            let watched = async {
+                match &watch {
+                    Some(watch) => watch.ended(&floor, link).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(watched);
             let mut effects = HostEffects::new(Capacity::RegisteredWorker);
             let result = async {
                 loop {
                     tokio::select! {
                         signal = &mut shutdown => { signal?; return Ok::<_, anyhow::Error>(true); }
+                        error = &mut watched => {
+                            service_notice(format_args!("{error:#}"));
+                            return Err(error);
+                        }
                         completed = effects.next(), if !effects.is_empty() => {
                             let reply = completed?.context("Worker effect queue closed")?;
                             write_command(&mut *writer, &RuntimeCommand::HostReply { call_id: reply.call_id, result: reply.result }).await?;
