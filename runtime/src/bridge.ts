@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { AttachmentStore, AttachmentError, validateInput } from "./attachments.js";
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { createRegistry, Harness, ROOT_CONVERSATION_ID, type Conversation, type Submission, type TaskId as NativeTaskId } from "@earendil-works/pi-durable";
+import { createRegistry, Harness, ROOT_CONVERSATION_ID, type Conversation, type Submission } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { RuntimeRequest } from "./generated/RuntimeRequest.js";
 import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
@@ -244,7 +244,7 @@ async function openApplication(): Promise<Application> {
     async runJob(occurrence, signal, actor) { await runScheduled(occurrence, signal, { session: harness, tasks, sources }, actor); },
   });
   const jobTools = createJobTools(background, executions); registry.install(jobTools);
-  const goals = new GoalStore(harness, tasks, environment, (taskId, run) => stopGoalTurn(harness, taskId, run));
+  const goals = new GoalStore(harness, tasks, environment);
   const goalTools = createGoalTools(goals, executions); registry.install(goalTools);
   const responsePolicy = createMainResponsePolicy(harness); registry.install(responsePolicy);
   const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools, goalTools }),
@@ -284,8 +284,6 @@ const conversationViews = new ConversationViews(async () => ({ ...await app(), i
 const activeCommands = new Set<number>();
 const interrupted = new Set<number>();
 const interrupts = new Map<number, Promise<void>>();
-/** Interrupts that aborted one exact run. A conversation abort escalates them, so Esc still withdraws queued inputs. */
-const runInterrupts = new WeakSet<Promise<void>>();
 const workers = new Map<number, { command: Extract<RuntimeCommand, { type: "run_task" }>; controller: AbortController }>();
 type MainTurn = { conversation?: Conversation; accepting: boolean; admissions: number; wake?: () => void;
   info?: Extract<RuntimeEventKind, { type: "main_ready" }>;
@@ -336,29 +334,14 @@ async function triageSources(application: TriageApplication, id: number, command
     notify: (task_id, text) => emit(id, { type: "notice", task_id, text }),
   }), toolsets.triage, signal);
 }
-async function interrupt(id: number, run?: { harness: Harness; task: NativeTaskId }): Promise<void> {
+async function interrupt(id: number): Promise<void> {
   interrupted.add(id);
-  const pending = interrupts.get(id);
-  if (pending !== undefined && (run !== undefined || !runInterrupts.has(pending))) return pending;
+  if (interrupts.has(id)) return interrupts.get(id);
   hostRequests.cancelRequest(id);
   const conversation = activeConversations.get(id);
-  if (conversation === undefined) return pending;
-  let current: Promise<void> | undefined;
-  const operation = (async () => {
-    if (run === undefined) await conversation.abort(BACKGROUND_CONTEXT);
-    else await run.harness.abortTask(run.task, BACKGROUND_CONTEXT);
-    await pending;
-    if (interrupts.get(id) === current) emit(id, { type: "interrupted" });
-  })();
-  current = operation;
-  if (run !== undefined) runInterrupts.add(operation);
+  if (conversation === undefined) return;
+  const operation = (async () => { await conversation.abort(BACKGROUND_CONTEXT); emit(id, { type: "interrupted" }); })();
   interrupts.set(id, operation); await operation;
-}
-async function stopGoalTurn(harness: Harness, taskId: string, run: NativeTaskId): Promise<void> {
-  const owner = [...workers].find(([request, worker]) => !ending.has(request) &&
-    worker.command.task_id === taskId && worker.command.agent_id === undefined)?.[0];
-  if (owner !== undefined) await interrupt(owner, { harness, task: run });
-  else await harness.abortTask(run, BACKGROUND_CONTEXT);
 }
 function submitInput(id: number, command: Extract<RuntimeCommand, { type: "submit_input" }>, responseId = id): Promise<void> {
   if (!activeCommands.has(id) || ending.has(id)) {

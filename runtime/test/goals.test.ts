@@ -111,10 +111,7 @@ async function open(directory: string, host: FixtureHost, budget: number | undef
   const executions = new Executions();
   const sources = new SourceJournal(session, tasks);
   const tools = createAppTools(tasks, executions);
-  const stops: string[] = [];
-  const goals = new GoalStore(session, tasks, environment, async (taskId, run) => {
-    stops.push(taskId); await session.abortTask(run, BACKGROUND_CONTEXT);
-  }, budget);
+  const goals = new GoalStore(session, tasks, environment, budget);
   const goalTools = createGoalTools(goals, executions);
   const forgery = defineExtension({ name: "goal-forgery", tools: [defineTool({ name: "forge_goal_proof", description: "Resolve with a copied proof.",
     parameters: Type.Object({ task_id: Type.String(), goal_id: Type.String(), activation: Type.Integer() }),
@@ -129,7 +126,7 @@ async function open(directory: string, host: FixtureHost, budget: number | undef
   for (const extension of [tools.host, tools.main, tools.worker, goalTools, forgery]) registry.install(extension);
   const prompts: string[] = [];
   const app = {
-    session, tasks, sources, faux, goals, stops, prompts, forgery,
+    session, tasks, sources, faux, goals, prompts, forgery,
     script(steps: Step[]) {
       faux.setResponses(steps.map((step) => (context: { messages: Message[] }) => {
         const user = context.messages.findLast((message) => message.role === "user");
@@ -363,11 +360,11 @@ test("a check that passes after a pause and resume does not complete the new act
     const running = app.run(await app.command(task.id));
     await read.entered;
     await app.goal(target, { type: "pause", request_id: "pause-stale" });
+    assert.ok(await app.abortMarked(await app.conversation(task.id)), "Pause aborted the goal's run");
     const resumed = goalOf(await app.goal(target, { type: "resume", request_id: "resume-stale" }));
     assert.equal(resumed.activation.number, 2);
     read.release();
     await running;
-    assert.deepEqual(app.stops, [task.id]);
     assert.equal(host.count("read_file"), 1, "The check ran and passed after the activation changed");
     const goal = goalOf(await app.goal(target, show));
     assert.equal(goal.activation.number, 2);
@@ -564,7 +561,7 @@ async function pauseKeepsQueuedInput(interactive: boolean): Promise<void> {
     await app.tasks.enqueue(task.id, "Answer the unrelated follow-up.", "u1", undefined, "follow_up");
     assert.equal((await app.submission(task.id, "u1"))?.status, "queued");
     assert.deepEqual(goalOf(await app.goal(target, { type: "pause", request_id: "pause-busy" })).state, { state: "paused", reason: "requested" });
-    assert.deepEqual(app.stops, [task.id]);
+    assert.ok(await app.abortMarked(await app.conversation(task.id)), "Pause aborted the goal's run");
     held.release();
     if (watcher !== undefined) { await watcher.idle; watcher.stop(); }
     const result = await running;
@@ -760,10 +757,12 @@ test("an interrupted goal turn pauses the goal after a restart", async () => {
     const conversation = await app.conversation(task.id);
     const aborting = conversation.abort(BACKGROUND_CONTEXT);
     await until(() => app.abortMarked(conversation));
+    const detaching = app.tasks.detachActors();
     held.release();
     await aborting;
-    await assert.rejects(running, /did not complete/);
-    assert.deepEqual(goalOf(await app.goal(inTask(task.id), show)).state, { state: "active" });
+    await detaching;
+    await running;
+    assert.deepEqual(goalOf(await app.goal(inTask(task.id), show)).state, { state: "active" }, "Shutdown came before the actor saw the stopped turn");
 
     app = await fixture.reopen();
     app.script([fauxAssistantMessage("A continuation must not run.")]);

@@ -102,7 +102,7 @@ export async function openDiscoveryApp(directory: string, { models, model, arm, 
   });
   const jobTools = createJobTools(scheduler, executions);
   const attachments = new AttachmentStore(directory);
-  const goals = new GoalStore(session, tasks, environment, async (_task, run) => { await session.abortTask(run, BACKGROUND_CONTEXT); });
+  const goals = new GoalStore(session, tasks, environment);
   const production = withActorPolicies(createToolsets({ guidance: createGuidance(executions), tools, sourceTools,
     resourceTools: createResourceTools(resources, tasks, executions), browserTools: createBrowserTools(new BrowserStore(session), executions, attachments), jobTools,
     goalTools: createGoalTools(goals, executions),

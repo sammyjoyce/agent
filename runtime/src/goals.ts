@@ -45,8 +45,6 @@ export const GoalVerificationEntry = defineEntry<GoalVerification>("agent.goal_v
 type GoalCommand = Extract<RuntimeCommand, { type: "goal" }>;
 type Selected = { kind: "main" } | { kind: "task"; task: TaskRecord };
 type Origin = { conversation_id: string; entry_id: string; tool_call_id: string };
-/** Stops one exact native run of the goal's task. The bridge owns the worker's host-call cancellation. */
-export type StopTurn = (taskId: string, run: NativeTaskId) => Promise<void>;
 
 class Proof {
   readonly #brand = true;
@@ -82,7 +80,7 @@ const REUSED = "This goal request ID was already used for another control. Send 
 
 export class GoalStore implements GoalPolicy {
   constructor(private readonly session: Harness, private readonly tasks: TaskStore, private readonly environment: CoordinatorEnvironment,
-    private readonly stopTurn: StopTurn, private readonly budget = GOAL_CONTINUATION_BUDGET) {
+    private readonly budget = GOAL_CONTINUATION_BUDGET) {
     tasks.useGoals(this);
   }
 
@@ -222,7 +220,7 @@ export class GoalStore implements GoalPolicy {
     if (native === undefined || native.status === "done" || native.status === "unanswered") return;
     if (native.status === "queued" && await this.session.abortSubmission(native.id, BACKGROUND_CONTEXT, conversation.id) !== "already_placed") return;
     const run = (await this.session.snapshot(LiveDoc, conversation.id, BACKGROUND_CONTEXT))?.run;
-    if (run !== undefined && run.inputs.includes(native.id)) await this.stopTurn(taskId, run.taskId);
+    if (run !== undefined && run.inputs.includes(native.id)) await this.tasks.stopRun(taskId, run.taskId);
   }
 
   private async resume(selected: Selected, request: string, call: HostCall): Promise<GoalStatus> {

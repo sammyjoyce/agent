@@ -103,7 +103,7 @@ async function open(directory: string, guidanceText = "CURRENT_PROFILE_GUIDANCE"
     async runJob() { throw new Error("No scheduled execution is requested by this fixture"); },
   });
   const discovery = createToolDiscovery();
-  const goals = new GoalStore(session, tasks, new CoordinatorEnvironment(session), async (_task, run) => { await session.abortTask(run, BACKGROUND_CONTEXT); });
+  const goals = new GoalStore(session, tasks, new CoordinatorEnvironment(session));
   const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance: createGuidance(executions), tools, sourceTools,
     resourceTools: createResourceTools(resources, tasks, executions), browserTools: createBrowserTools(new BrowserStore(session), executions, new AttachmentStore(directory)),
     jobTools: createJobTools(background, executions), goalTools: createGoalTools(goals, executions) }),

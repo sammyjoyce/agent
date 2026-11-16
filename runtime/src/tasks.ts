@@ -352,6 +352,15 @@ export class TaskStore {
     }
     return actor.turn.finished;
   }
+  /** Stops one native run of the task's primary actor and cancels its host calls until that run is idle. The turn
+   * stays open, so inputs admitted behind the run still reach Pi and a later Esc still withdraws them. */
+  async stopRun(taskId: string, run: NativeTaskId): Promise<void> {
+    const actor = this.running.get(this.actorKey(taskId));
+    const open = actor?.turn.phase === "open" && !actor.turn.controller.signal.aborted ? actor : undefined;
+    open?.turn.controller.abort();
+    await this.session.abortTask(run, BACKGROUND_CONTEXT);
+    if (open !== undefined) this.publish(open, (session) => session.interrupted?.());
+  }
   /**
    * A job actor ends and withdraws its unplaced inputs. An interactive actor loses its current turn only,
    * and with it the input of that turn when the input has not reached Pi.
@@ -1553,9 +1562,9 @@ export class TaskStore {
     return false;
   }
   private async reopenTurn(actor: TaskActor): Promise<void> {
-    while (actor.turn.phase === "stopping" && actor.mode === "interactive" && !actor.fenced) {
+    while ((actor.turn.phase === "stopping" || actor.turn.controller.signal.aborted) && actor.mode === "interactive" && !actor.fenced) {
       const stopping = actor.turn;
-      await stopping.finished.catch(() => {});
+      if (stopping.phase === "stopping") await stopping.finished.catch(() => {});
       await actor.conversation?.waitForIdle(BACKGROUND_CONTEXT);
       if (actor.turn === stopping) actor.turn = { phase: "open", controller: new AbortController() };
     }

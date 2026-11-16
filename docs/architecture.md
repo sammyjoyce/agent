@@ -322,9 +322,10 @@ live generation through Pi, so other queued inputs stay. Pi ends an aborted run
 without placing the inputs queued behind it. While the actor waits on an input
 that is still queued with no live run, it writes an empty boundary entry so Pi
 places it. The actor reads that state from Pi on every wait, so the repair
-survives a restart between the abort and the placement. The bridge cancels host
-calls only for a connected worker, so without one a running host call finishes
-after the pause. The worker tool `complete_goal` reads the file on the execution
+survives a restart between the abort and the placement. Pause cancels the
+aborted run's host calls as a Stop does, but keeps the actor's turn open, so
+inputs admitted behind the run still reach Pi and a later Esc withdraws them.
+The worker tool `complete_goal` reads the file on the execution
 host. A result whose turn still runs in the live activation is retained as an
 `agent.goal_verification` entry. A passed or failed result that returns after a
 pause, Esc or a new activation is discarded without one, through the same

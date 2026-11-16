@@ -140,16 +140,15 @@ error, does not continue. Neither does a turn that leaves the task waiting on
 someone else, until a new message reaches the task. `/goal` shows the
 objective, its state and continuations, the task's latest summary and the last
 refused attempt. `/goal pause` stops the goal's current turn and queues no more
-goal turns. Other messages already queued in the task still run. If the task's
-worker is connected in its Rex session, pause also cancels the host action the
-turn is running. Otherwise an action already under way, such as a command or a
-file write, can finish after the pause. `/goal resume` starts a new activation
-in the same task. A goal completes only when the runtime itself finds the
-required text in the named file on the task's host. The task's history keeps
-the result of each check that returns while its turn and activation are still
-running. A check, passed or failed, that returns after a pause, Esc or a new
-activation is discarded. While
-a goal is open, the task cannot mark itself resolved. The phone accepts the
+goal turns. Other messages already queued in the task still run. Pause also
+cancels the host action the turn is running, as Esc does, but it cannot undo
+an effect that already happened, such as a file write. `/goal resume` starts a
+new activation in the same task. A goal completes only when the runtime itself
+finds the required text in the named file on the task's host. The task's
+history keeps the result of each check that returns while its turn and
+activation are still running. A check, passed or failed, that returns after a
+pause, Esc or a new activation is discarded. While a goal is open, the task
+cannot mark itself resolved. The phone accepts the
 same commands for main.
 
 OpenAI Responses models have hosted web search enabled, including page opening

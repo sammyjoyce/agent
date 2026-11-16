@@ -225,8 +225,9 @@ test("a /goal persists, pauses across a coordinator restart, resumes once and co
     const resumeId = "7a0c2b9e-1d1f-4c3a-9a51-0f6a3d1c2b02";
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const resumed = await native([{ type: "identify" }, { type: "submit", input_id: resumeId, text: "/goal resume", mode: "follow_up" }]);
-      assert.ok(resumed.some((frame) => frame.type === "notice" && frame.text?.includes("State: active · activation 2 · continuations 0 of 5")),
-        "A replayed native resume must return the same single activation: " + JSON.stringify(resumed));
+      const notice = resumed.find((frame) => frame.type === "notice")?.text ?? "";
+      assert.match(notice, /State: active · activation 2 · continuations [01] of 5|Verified: activation 2 /,
+        "A replayed native resume must return the same single activation, which its actor may already have verified: " + JSON.stringify(resumed));
     }
     const resumedTask = (await tasks()).find((task) => task.id === goalTask.id); assert.ok(resumedTask);
     assert.equal(resumedTask.conversation_id, goalTask.conversation_id, "Resume continues the same task conversation");
