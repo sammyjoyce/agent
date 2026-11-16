@@ -487,28 +487,38 @@ private func savedQueue<Item: Decodable>(_: Item.Type, from data: Data) throws -
 }
 private struct SavedQueue<Item: Decodable>: Decodable { let pending: [Item] }
 
-/// Atomic, readable only by this app, excluded from backup.
+/// Atomic, readable only by this app, excluded from backup. A throw leaves `url` as it was, since
+/// only a file written, protected and excluded in full replaces it.
 func writePrivately(
   _ data: Data, to url: URL, readableAfterFirstUnlock: Bool = false,
   excludingFromBackup: (inout URL) throws -> Void = excludeFromBackup
 ) throws {
+  let directory = url.deletingLastPathComponent()
   try FileManager.default.createDirectory(
-    at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
-    attributes: [.posixPermissions: 0o700])
-  #if os(iOS)
-    try data.write(
-      to: url,
-      options: [
-        .atomic,
-        readableAfterFirstUnlock
-          ? .completeFileProtectionUntilFirstUserAuthentication : .completeFileProtection,
-      ])
-  #else
-    try data.write(to: url, options: .atomic)
-    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-  #endif
-  var url = url
-  try excludingFromBackup(&url)
+    at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+  var temporary = directory.appending(path: ".\(url.lastPathComponent).\(UUID().uuidString).tmp")
+  do {
+    #if os(iOS)
+      try data.write(
+        to: temporary,
+        options: [
+          .withoutOverwriting,
+          readableAfterFirstUnlock
+            ? .completeFileProtectionUntilFirstUserAuthentication : .completeFileProtection,
+        ])
+    #else
+      try data.write(to: temporary, options: .withoutOverwriting)
+      try FileManager.default.setAttributes(
+        [.posixPermissions: 0o600], ofItemAtPath: temporary.path)
+    #endif
+    try excludingFromBackup(&temporary)
+    guard rename(temporary.path, url.path) == 0 else {
+      throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+  } catch {
+    try? FileManager.default.removeItem(at: temporary)
+    throw error
+  }
 }
 
 private func excludeFromBackup(_ url: inout URL) throws {
