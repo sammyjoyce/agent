@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { Type } from "typebox";
+import { copyJson } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { defineDoc, defineDocFamily, defineEntry, defineExtension, defineTool, GenerationTask, LiveDoc, ROOT_CONVERSATION_ID,
   type ConversationId, type Extension, type Harness, type TaskId as NativeTaskId, type Tx } from "@earendil-works/pi-durable";
@@ -18,6 +19,7 @@ import type { TaskInput } from "./generated/TaskInput.js";
 import type { TaskRecord } from "./generated/TaskRecord.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
 import { output } from "./host-output.js";
+import { validEvent } from "./protocol.js";
 import { nativeConversationId, TaskError, type HostCall, type TaskStore } from "./tasks.js";
 import { MAX_FILE_READ_BYTES, resolveHostPath, type Execution, type Executions } from "./tools.js";
 
@@ -131,17 +133,19 @@ export class GoalStore implements GoalPolicy {
     if (selected.kind === "main") remember((await tx.doc(MainGoal)).requests, request);
   }
 
-  private async read(selected: Selected): Promise<Goal | null> {
-    if (selected.kind === "task") return (await this.session.snapshot(GoalDoc, selected.task.id, BACKGROUND_CONTEXT))?.goal ?? null;
-    const pointer = await this.session.snapshot(MainGoal, BACKGROUND_CONTEXT);
-    if (pointer === undefined || pointer.task_id === null) return null;
-    const goal = (await this.session.snapshot(GoalDoc, pointer.task_id, BACKGROUND_CONTEXT))?.goal ?? null;
-    return goal !== null && goal.id === pointer.goal_id ? goal : null;
-  }
+  /** The goal and its task come from one transaction, so a status never pairs a goal with another moment's task. */
   private async status(selected: Selected): Promise<GoalStatus> {
     const conversation_id = selected.kind === "main" ? ROOT_CONVERSATION_ID.toString() : selected.task.conversation_id;
-    const goal = await this.read(selected);
-    return { conversation_id, goal: goal === null ? null : { goal, task: await this.tasks.get(goal.task_id) } };
+    const view = await this.session.commit(async (tx) => {
+      const goal = await this.goalIn(tx, selected);
+      if (goal === null) return null;
+      const task = await this.tasks.findIn(tx, goal.task_id);
+      if (task === undefined) throw new TaskError("Unknown task");
+      return copyJson({ goal, task });
+    }, BACKGROUND_CONTEXT);
+    const frame: unknown = { version: 1, id: 0, event: { type: "goal", status: { conversation_id, goal: view } } };
+    if (!validEvent(frame) || frame.event.type !== "goal") throw new TaskError("The saved goal does not match the goal protocol");
+    return frame.event.status;
   }
 
   private async set(selected: Selected, request: string, objective: string, call: HostCall): Promise<GoalStatus> {
@@ -178,8 +182,10 @@ export class GoalStore implements GoalPolicy {
   }
 
   private async replayed(selected: Selected, call: HostCall): Promise<GoalStatus> {
-    const goal = await this.read(selected);
-    if (goal !== null && goal.state.state === "active") await this.ensureRunning(goal.task_id, undefined, call);
+    const status = await this.status(selected);
+    const goal = status.goal?.goal;
+    if (goal === undefined || goal.state.state !== "active") return status;
+    await this.ensureRunning(goal.task_id, undefined, call);
     return this.status(selected);
   }
 
@@ -211,8 +217,8 @@ export class GoalStore implements GoalPolicy {
   }
 
   private async resume(selected: Selected, request: string, call: HostCall): Promise<GoalStatus> {
-    const known = await this.read(selected);
-    if (known === null) throw new TaskError(NO_GOAL);
+    const known = (await this.status(selected)).goal?.goal;
+    if (known === undefined) throw new TaskError(NO_GOAL);
     const resumed = await this.tasks.admitWith(known.task_id, async (tx): Promise<{ value: boolean; input?: TaskInput }> => {
       const goal = await this.goalIn(tx, selected);
       if (goal === null || goal.id !== known.id) throw new TaskError("The goal changed. Show it with /goal.");
