@@ -21,6 +21,7 @@ import { Retrieval } from "../src/retrieval.js";
 import { TaskStore, type HostCall } from "../src/tasks.js";
 import { createAppTools, Executions } from "../src/tools.js";
 import { validEvent } from "../src/protocol.js";
+import { chatGptBatch } from "./fixtures/chatgpt-history.js";
 
 const space: EmbeddingSpace = { id: "synthetic-tool-search", model_revision: "fixture", model_digest: "fixture",
   dimensions: 3, pooling: "last", normalization: "l2", instruction_version: 1 };
@@ -346,4 +347,24 @@ test("semantic reads after reopen bypass an owned full catchup and retain increm
     if (!closed) { await app.retrieval.close(); await app.session.close(BACKGROUND_CONTEXT); }
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("chatgpt provenance refs are chatgpt/export and codex refs are unchanged", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-search-provenance-"));
+  const models = createModels();
+  const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+    { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  const history = new HistoryStore(session), tasks = new TaskStore(session, new ConversationModels(models)); tasks.useHistory(history);
+  try {
+    const shared = "00000000-0000-4000-8000-0000000000c1";
+    const codex = await history.import(batch(shared, 1, [item("note", "Codex note about deployment", 1)]));
+    const chatgpt = await history.import(chatGptBatch(shared, 2, [
+      { id: "prompt", parent: null, turn: "prompt", kind: "user:text", role: "user", text: "Plan a picnic for eight" }]));
+    const refs = async (conversation: string) => {
+      const found = new Set<string>(); for await (const record of tasks.records(conversation)) for (const ref of record.source_refs) found.add(ref);
+      return [...found];
+    };
+    assert.deepEqual(await refs(codex.conversation.conversation_id), [JSON.stringify(["codex", "local", shared])]);
+    assert.deepEqual(await refs(chatgpt.conversation.conversation_id), [JSON.stringify(["chatgpt", "export", shared])]);
+  } finally { await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
