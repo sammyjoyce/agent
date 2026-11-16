@@ -582,7 +582,7 @@ test("two missing child folders share parent recovery and retain both admitted i
   } finally { releaseInspections(); releaseCreation(); await Promise.allSettled(pending); app.views.close(); app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("a detaching parent claims folder ownership before inspection so child recovery cannot overtake its read", async () => {
+test("presenting a parent whose terminal detached claims folder ownership so child recovery cannot overtake its read", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-parent-guard-")), app = await open(directory);
   const controller = new AbortController(); let releaseReady = () => {}, releaseInspection = () => {};
   let running: Promise<unknown> | undefined, recovering: Promise<unknown> | undefined;
@@ -595,7 +595,7 @@ test("a detaching parent claims folder ownership before inspection so child reco
     let enteredReady = () => {}; const ready = new Promise<void>((resolve) => { enteredReady = resolve; }), readyGate = new Promise<void>((resolve) => { releaseReady = resolve; });
     const worker = (await app.tasks.get(task.id)).worker; assert.ok(worker.state === "bound");
     running = app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: worker.allocation_id, binding, instructions: "Current rules", model: fixtureModel, cwd: host.cwd, interactive: true },
-      () => () => {}, [], undefined, undefined, { signal: controller.signal, async ready() { enteredReady(); await readyGate; }, async fence() { releaseReady(); }, answer() {}, idle() {} });
+      () => () => {}, [], undefined, undefined, { signal: controller.signal, async ready() { enteredReady(); await readyGate; }, answer() {}, idle() {} });
     await ready; controller.abort();
     let inspected = () => {}; const entered = new Promise<void>((resolve) => { inspected = resolve; }), held = new Promise<void>((resolve) => { releaseInspection = resolve; });
     recovering = app.tasks.dispatch(task.id, host, async () => { inspected(); await held; return { type: "worker_presence", presence: { state: "present", running: true } }; }).catch((error: unknown) => error);
@@ -609,7 +609,7 @@ test("a detaching parent claims folder ownership before inspection so child reco
     assert.ok((await app.tasks.get(task.id)).agents[0]?.pending.some((item) => item.id === "retained"));
     releaseInspection(); await recovering; releaseReady(); await running; running = undefined;
     assert.equal(app.faux.state.callCount, 0);
-  } finally { releaseInspection(); releaseReady(); controller.abort(); await recovering; await running;
+  } finally { releaseInspection(); releaseReady(); controller.abort(); await recovering; await running; await app.tasks.detachBackground();
     app.views.close(); app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 

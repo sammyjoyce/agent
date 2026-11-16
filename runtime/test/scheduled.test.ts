@@ -137,7 +137,7 @@ for (const recoveredState of ["waiting", "resolved"]) {
       const task = (await app.tasks.list())[0]; assert.ok(task); assert.ok(first); const occurrence = first;
       const conversation = await app.tasks.conversation(task.conversation_id);
       assert.equal(await readFile(effectPath, "utf8"), "performed once\n");
-      assert.equal(await app.tasks.interruptBackground(task.conversation_id), true);
+      assert.equal(await app.tasks.stop({ task_id: task.id }), true);
       const original = await app.session.commit((tx) => tx.submissionByRequest(conversation.id, occurrence.id), BACKGROUND_CONTEXT);
       assert.ok(original); assert.equal(original.status, "unanswered");
       await pump(async () => (await scheduler.status()).errors.some((error) => /scheduled turn/.test(error.message)));

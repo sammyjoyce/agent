@@ -12,7 +12,7 @@ import { CoordinatorEnvironment, EnvironmentError } from "./environment.js";
 import { ConversationModels, ModelError, modelFailureMessage } from "./models.js";
 import { ChatGptAuth } from "./auth.js";
 import { validRequest, validEvent, validApnsConfig, errorEvent, invalidHostReply, protocolLines } from "./protocol.js";
-import { TaskError, TaskStore, type BackgroundExecution, type HostCall } from "./tasks.js";
+import { TaskError, TaskStore, type ActorExecution, type HostCall } from "./tasks.js";
 import { readTaskGraph } from "./task-graph.js";
 import { HistoryStore } from "./history.js";
 import { CodexImporter } from "./importer.js";
@@ -31,7 +31,6 @@ import { BrowserStore, createBrowserTools } from "./browser.js";
 import { activity, history, toolDetails } from "./transcript.js";
 import type { SearchMode } from "./generated/SearchMode.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
-import type { WorkerHost } from "./generated/WorkerHost.js";
 import { conversationSettings } from "./settings.js";
 import { createInputOrigins, INPUT_ORIGIN_CAPABILITIES } from "./input_origin.js";
 import { watchInputDelivery } from "./input_delivery.js";
@@ -134,7 +133,7 @@ function backgroundCall(command: import("./generated/HostCommand.js").HostComman
 
 type Application = TriageApplication & { stopInputDelivery(): void; harness: Harness; tasks: TaskStore; resources: ResourceStore; notifications: Notifications;
   histories: HistoryStore; catalog: ConversationCatalog; attachments: AttachmentStore; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler;
-  telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics; discovery: ToolDiscovery; serviceExecution: BackgroundExecution };
+  telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics; discovery: ToolDiscovery; serviceExecution: ActorExecution };
 async function openApplication(): Promise<Application> {
   const startup = new StartupDiagnostics(state);
   const storage = await startup.run("storage_open", async () => {
@@ -248,7 +247,7 @@ async function openApplication(): Promise<Application> {
   const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools }),
     { responsePolicy, inputOrigins }), TOOL_SURFACES, discovery);
   for (const extension of installed) registry.install(extension);
-  const serviceExecution: BackgroundExecution = {
+  const serviceExecution: ActorExecution = {
     available: () => backgroundAvailable,
     extensions: (agentId) => agentId === undefined ? toolsets.worker : toolsets.agent,
     call: (operation, host, signal) => backgroundCall(environment.route(operation, host), signal),
@@ -282,9 +281,8 @@ const conversationViews = new ConversationViews(async () => ({ ...await app(), i
 const activeCommands = new Set<number>();
 const interrupted = new Set<number>();
 const interrupts = new Map<number, Promise<void>>();
+/** A terminal attached to its task's actor. Aborting the controller ends the observation, never the actor's work. */
 const workers = new Map<number, { command: Extract<RuntimeCommand, { type: "run_task" }>; controller: AbortController }>();
-/** One host-call scope per worker turn, so Stop cancels this worker's calls and no other actor's. */
-const workerTurns = new Map<number, AbortController>();
 type MainTurn = { conversation?: Conversation; accepting: boolean; admissions: number; wake?: () => void;
   info?: Extract<RuntimeEventKind, { type: "main_ready" }>;
   ready: Promise<boolean>; start(ready: boolean): void; inputs: { input_id?: string; submission: Submission }[] };
@@ -338,7 +336,6 @@ async function interrupt(id: number): Promise<void> {
   interrupted.add(id);
   if (interrupts.has(id)) return interrupts.get(id);
   hostRequests.cancelRequest(id);
-  workerTurns.get(id)?.abort();
   const conversation = activeConversations.get(id);
   if (conversation === undefined) return;
   const operation = (async () => { await conversation.abort(BACKGROUND_CONTEXT); emit(id, { type: "interrupted" }); })();
@@ -399,9 +396,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
   const inputMode = initial.type === "main_input" || initial.type === "conversation_input" ? initial.mode : undefined;
   if (initial.type === "chat" || initial.type === "run_task" || initial.type === "attach_main" || initial.type === "attach_conversation") activeCommands.add(id);
   if (initial.type === "chat") mainTurns.set(id, mainTurn());
-  if (initial.type === "run_task" && initial.interactive === true) {
-    workers.set(id, { command: initial, controller: new AbortController() });
-  }
+  if (initial.type === "run_task") workers.set(id, { command: initial, controller: new AbortController() });
   try {
     if (effective.type === "conversation_input" && effective.conversation_id === ROOT_CONVERSATION_ID.toString()) {
       effective = { type: "main_input", ...(effective.origin === undefined ? {} : { origin: effective.origin }), input_id: effective.input_id, input: effective.input, mode: effective.mode,
@@ -614,9 +609,12 @@ async function handle(request: RuntimeRequest): Promise<void> {
       case "conversation_interrupt": {
         const { tasks } = await app();
         const conversation = await tasks.conversation(command.conversation_id);
-        if (await tasks.interruptBackground(command.conversation_id)) { emit(id, { type: "interrupted" }); break; }
+        const actor = await tasks.findOwner(command.conversation_id);
+        if (actor !== undefined && await tasks.stop({ task_id: actor.task.id, ...(actor.agent === undefined ? {} : { agent_id: actor.agent.id }) })) {
+          emit(id, { type: "interrupted" }); break;
+        }
         const owner = [...activeConversations].find(([request, active]) => !ending.has(request) &&
-          active.id === conversation.id && (workers.has(request) || mainTurns.has(request)))?.[0];
+          active.id === conversation.id && mainTurns.has(request))?.[0];
         if (owner === undefined) await conversation.abort(BACKGROUND_CONTEXT);
         else await interrupt(owner);
         emit(id, { type: "interrupted" }); break;
@@ -685,38 +683,17 @@ async function handle(request: RuntimeRequest): Promise<void> {
         let stop: (() => Promise<void>) | undefined;
         try {
         const worker = workers.get(id);
-        workerTurns.set(id, new AbortController());
-        const turn = () => {
-          const scope = workerTurns.get(id);
-          if (scope === undefined) throw new TaskError("This worker's request has ended");
-          return scope.signal;
-        };
-        let host: WorkerHost | undefined;
+        if (worker === undefined) throw new TaskError("This worker's request has ended");
         const configured = async (conversation: Conversation, title: string) => {
-          if (interrupted.has(id)) await interrupt(id);
           emit(id, { type: "task_ready", conversation_id: conversation.id.toString(), title });
           const model = executions.model(conversation.id.toString());
           if (model === undefined) throw new TaskError("The worker execution model is unavailable");
           emit(id, { type: "conversation_settings", settings: { conversation_id: conversation.id.toString(),
             task_id: command.task_id, agent_id: command.agent_id ?? null, model, catalog: [] } });
         };
-        // Allocation checks inspect a pane before the actor binds its host. Those commands name their own node.
-        const answer = await tasks.run(command, (conversation, bound, model) => { host = bound; return serviceExecution.bind(conversation, bound, model, turn); },
-        serviceExecution.extensions(command.agent_id), (operation) => host === undefined ? backgroundCall(operation, turn())
-          : serviceExecution.call(operation, host, turn()), serviceExecution.prepare,
-        worker === undefined ? undefined : {
+        const answer = await tasks.run(command, serviceExecution.bind, serviceExecution.extensions(command.agent_id),
+        serviceExecution.call, serviceExecution.prepare, command.interactive !== true ? undefined : {
           signal: worker.controller.signal,
-          async fence() { await interrupt(id); },
-          async beforeTurn() {
-            for (;;) {
-              const stopping = interrupts.get(id);
-              if (stopping === undefined) return;
-              await stopping;
-              if (interrupts.get(id) !== stopping) continue;
-              interrupts.delete(id); interrupted.delete(id); hostRequests.resumeRequest(id);
-              workerTurns.set(id, new AbortController());
-            }
-          },
           async ready(conversation, title) {
             activeConversations.set(id, conversation);
             await configured(conversation, title);
@@ -727,8 +704,9 @@ async function handle(request: RuntimeRequest): Promise<void> {
           configured,
           answer(conversation_id, text, entry_id) { emit(id, { type: "answer", conversation_id, text, ...(entry_id === undefined ? {} : { entry_id }) }); },
           idle() { emit(id, { type: "worker_idle" }); },
+          interrupted() { emit(id, { type: "interrupted" }); },
         });
-        if (worker === undefined) emit(id, { type: "answer", ...answer });
+        if (command.interactive !== true) emit(id, { type: "answer", ...answer });
         } finally { await stop?.(); }
         break;
       }
@@ -940,7 +918,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
     await Promise.allSettled([...(inputControls.get(id) ?? [])]); inputControls.delete(id);
     await interrupts.get(id)?.catch(() => {});
     activeCommands.delete(id); activeConversations.delete(id); interrupted.delete(id); interrupts.delete(id);
-    workers.delete(id); workerTurns.delete(id);
+    workers.delete(id);
     hostRequests.finish(id);
     emit(id, { type: "done" });
     mainTurns.delete(id);
@@ -975,6 +953,16 @@ try {
     if (request.command.type === "interrupt") {
       // Done may already be buffered while Rust still owns the request and sends its last control.
       if (!activeCommands.has(request.id)) continue;
+      const worker = workers.get(request.id);
+      if (worker !== undefined) {
+        const { task_id, agent_id } = worker.command;
+        void app().then(({ tasks }) => tasks.stop({ task_id, ...(agent_id === undefined ? {} : { agent_id }) })).then((stopped) => {
+          if (!stopped && activeCommands.has(request.id)) emit(request.id, { type: "interrupted" });
+        }, () => {
+          if (activeCommands.has(request.id)) failure(request.id, "internal", "Interruption could not be confirmed; inspect current work");
+        });
+        continue;
+      }
       void interrupt(mainViews.get(request.id)?.owner ?? request.id).catch(() => {
         if (activeCommands.has(request.id)) failure(request.id, "internal", "Interruption could not be confirmed; inspect current work");
       });

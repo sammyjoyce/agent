@@ -3504,7 +3504,7 @@ async fn request_presented(
                             ui.exiting = true;
                         }
                         if lifecycle == RequestLifecycle::Chat || lifecycle.is_view() { return Ok(history_cursor); }
-                        if active_turn { write_command(&mut *wire.writer, &RuntimeCommand::Interrupt).await?; }
+                        // Leaving the pane stops watching. The task keeps working, and Esc is the Stop.
                         if lifecycle.is_worker() { write_command(&mut *wire.writer, &RuntimeCommand::DetachWorker).await?; }
                         ui_controls = false;
                     }

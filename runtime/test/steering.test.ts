@@ -18,6 +18,7 @@ import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 import { fixtureModel } from "./model.js";
+import { until } from "./fixtures/until.js";
 
 test("attached worker admits native steering before the current tool finishes and queues a separate turn", { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-native-steer-")); const registry = createRegistry();
@@ -91,13 +92,14 @@ test("attached worker admits native steering before the current tool finishes an
     await submit(command, "Keep accepted follow-up owned", "detach-queued", "follow_up");
     await submit(command, "Refine the held detach turn", "detach-steer", "steer");
     const beforeDetach = effects; controller.abort(); release(); await running; running = undefined;
+    await until(async () => !tasks.isRunning(task.id) && (await tasks.get(task.id)).pending.length === 0,
+      "The actor must drain its admitted inputs after its terminal detached");
     assert.equal(effects, beforeDetach + 1, "An already-admitted native follow-up keeps its execution binding while detached work drains");
-    assert.deepEqual((await tasks.get(task.id)).pending.map((input) => input.id), ["detach-queued", "detach-steer"]);
     const beforeRecovery = faux.state.callCount;
     const recovered = await tasks.run({ ...command, interactive: false }, () => () => {});
     assert.equal(recovered.text, "Queued answer after detach"); assert.equal(faux.state.callCount, beforeRecovery);
     assert.deepEqual((await tasks.get(task.id)).pending, []);
-  } finally { release(); controller.abort(); await running?.catch(() => {}); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  } finally { release(); controller.abort(); await running?.catch(() => {}); await tasks.detachBackground(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("main native steering keeps the execution lease until queued inputs finish and emits each answer once", { timeout: 10_000 }, async () => {

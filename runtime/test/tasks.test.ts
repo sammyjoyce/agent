@@ -24,6 +24,7 @@ import type { WorkerRef } from "../src/generated/WorkerRef.js";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import type { ModelActivity } from "../src/generated/ModelActivity.js";
 import { activity, history } from "../src/transcript.js";
+import { until } from "./fixtures/until.js";
 
 const host: WorkerHost = { host_id: null, name: "fixture", rex_server: null, coordinator: null,
   cwd: "/workspace/example", agent_program: "/example/agent" };
@@ -89,7 +90,7 @@ test("interrupt drains the current native turn before admitting queued steering 
   } finally { release(); controller.abort(); await running?.catch(() => {}); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("confirmed session loss fences the old actor before reopening the same history and preserves child assignments", { timeout: 10_000 }, async () => {
+test("confirmed session loss reopens the same history while its actor keeps working, and preserves child assignments", { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-session-reopen-")); const app = await open(directory);
   const controller = new AbortController(); let running: Promise<unknown> | undefined; let release = () => {};
   try {
@@ -103,37 +104,36 @@ test("confirmed session loss fences the old actor before reopening the same hist
       binding, instructions: "Current rules", model: fixtureModel, cwd: host.cwd, interactive: true };
     const conversation = await app.tasks.conversation(task.conversation_id);
     let started = () => {}; const startedTurn = new Promise<void>((resolve) => { started = resolve; });
-    let cancelled = () => {}; const cancelSeen = new Promise<void>((resolve) => { cancelled = resolve; });
     const drain = new Promise<void>((resolve) => { release = resolve; });
-    app.faux.setResponses([async (_context, options) => {
-      const signal = options?.signal; assert.ok(signal); started();
-      await new Promise<void>((resolve) => { if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true }); });
-      cancelled(); await drain; return fauxAssistantMessage("A late stale result");
-    }, fauxAssistantMessage("Continued after the closed tab")]);
-    let fenced = false;
-    running = app.tasks.run(old, () => () => {}, [], undefined, undefined, {
-      signal: controller.signal, async ready() {}, answer() {}, idle() {}, async fence() { fenced = true; await conversation.abort(BACKGROUND_CONTEXT); },
-    });
-    await startedTurn; controller.abort();
+    app.faux.setResponses([async () => { started(); await drain; return fauxAssistantMessage("Finished after the tab closed"); },
+      fauxAssistantMessage("Continued after the closed tab")]);
+    const observer = { signal: controller.signal, async ready() {}, answer() {}, idle() {} };
+    running = app.tasks.run(old, () => () => {}, [], undefined, undefined, observer);
+    await startedTurn; controller.abort(); await running; running = undefined;
     await app.tasks.enqueue(task.id, "Continue after closing the session", "after-close");
     const replacement = { ...binding, session_id: "session:66666666-6666-4666-8666-666666666666", block_id: "block:77777777-7777-4777-8777-777777777777" };
     let creates = 0;
-    const recovering = app.tasks.dispatch(task.id, host, async (command) => {
+    const reopened = await app.tasks.dispatch(task.id, host, async (command) => {
       if (command.type === "on_node") { assert.equal(command.host_id, binding.host_id); assert.equal(command.command.type, "inspect_worker"); return { type: "worker_presence", presence: { state: "missing_session" } }; }
-      assert.equal(command.type, "spawn_worker"); creates += 1; assert.equal(fenced, true); return { type: "spawned", binding: replacement };
+      if (command.type === "resume_worker") return { type: "failed", message: "The session no longer exists", delivery: "not_started" };
+      assert.equal(command.type, "spawn_worker"); creates += 1; return { type: "spawned", binding: replacement };
     });
-    await cancelSeen; assert.equal(creates, 0); assert.equal(app.tasks.isRunning(task.id), true);
-    release(); const reopened = await recovering; await running; running = undefined;
+    assert.equal(app.tasks.isRunning(task.id), true, "Presenting a new session must not stop the actor that is still working");
+    assert.equal(app.faux.state.callCount, 1);
     assert.equal(creates, 1); assert.equal(reopened.conversation_id, task.conversation_id); assert.equal(reopened.id, task.id);
     assert.deepEqual(reopened.model, fixtureModel); assert.equal(reopened.agents[0]?.conversation_id, child.conversation_id);
     assert.equal(reopened.agents[0]?.worker.state, "unassigned"); assert.equal(reopened.agents[0]?.pending[0]?.content, "Keep the assignment");
     assert.equal(reopened.pending[0]?.id, "after-close"); assert.equal(reopened.summary, ""); assert.ok(reopened.worker.state === "bound");
     assert.notEqual(reopened.worker.allocation_id, old.allocation_id);
-    await assert.rejects(app.tasks.run(old, () => () => {}), /binding is not confirmed/);
+    await assert.rejects(app.tasks.run(old, () => () => {}, [], undefined, undefined, observer), /binding is not confirmed/);
+    release();
+    await until(async () => !app.tasks.isRunning(task.id) && (await app.tasks.get(task.id)).pending.length === 0,
+      "The actor must finish its turn and the queued input with no terminal attached");
     const result = await app.tasks.run({ ...old, allocation_id: reopened.worker.allocation_id, binding: replacement, interactive: false }, () => () => {});
     assert.equal(result.text, "Continued after the closed tab"); assert.equal(app.faux.state.callCount, 2);
     const visible = (await history(conversation, null, app.session)).flatMap((frame) => frame.messages);
-    assert.equal(visible.some((message) => message.text === "A late stale result"), false);
+    assert.deepEqual(visible.filter((message) => message.role === "final").map((message) => message.text),
+      ["Finished after the tab closed", "Continued after the closed tab"]);
     assert.equal((await app.tasks.get(task.id)).pending.length, 0);
     let childCreates = 0;
     const continued = await app.tasks.continueAgent(task.id, child.id, "Continue the retained review", "review-after-close", async (command) => {
@@ -251,7 +251,7 @@ test("an interactive task serializes local and chief inputs, wakes while idle an
     controller.abort(); await running; running = undefined; await stop?.(); stop = undefined;
     assert.equal(live.flatMap((event) => event.type === "thinking" ? [event.text] : []).join(""), "Published reasoning summary.");
     assert.deepEqual(inputs, ["Initial chief instruction", "Chief follow-up while the tab is idle", "Reply typed directly in the task tab", "Chief input while the local turn runs"]);
-    await assert.rejects(app.tasks.input(command, "Late detached input", "late"), /no longer attached/);
+    await app.tasks.detachBackground();
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
     const reopened = await app.tasks.get(task.id); assert.equal(reopened.conversation_id, task.conversation_id);
     const frames = await history(await app.tasks.conversation(reopened.conversation_id), null, app.session);
@@ -285,11 +285,12 @@ test("an idle interactive child delivers its result and accepts another assignme
     ]);
     let idleCount = 0; let wake = () => {};
     const idle = async (count: number) => { while (idleCount < count) await new Promise<void>((resolve) => { wake = resolve; }); };
-    running = app.tasks.run(command, (conversation) => app.executions.bind(conversation.id.toString(), {
+    const attach = (signal: AbortSignal) => app.tasks.run(command, (conversation) => app.executions.bind(conversation.id.toString(), {
       cwd: host.cwd, hosts: [host], call: async () => { throw new Error("No Rex effects expected"); },
     }), [app.tools.agent], undefined, undefined, {
-      signal: controller.signal, async ready() {}, answer() {}, idle() { idleCount += 1; wake(); },
+      signal, async ready() {}, answer() {}, idle() { idleCount += 1; wake(); },
     });
+    running = attach(controller.signal);
     await idle(1);
     assert.equal((await app.tasks.get(task.id)).pending.length, 1, "The parent gets the result before the tab closes");
     assert.equal((await app.tasks.waitAgents(task.id, 0))[0]?.state.state, "done");
@@ -298,13 +299,16 @@ test("an idle interactive child delivers its result and accepts another assignme
     await idle(2);
     assert.equal((await app.tasks.get(task.id)).pending.length, 2);
     assert.equal(app.tasks.canResolve(await app.tasks.get(task.id)), true);
-    controller.abort(); await running; running = undefined;
-    assert.equal((await app.tasks.get(task.id)).pending.length, 2, "Detach does not publish the child result again");
-    await assert.rejects(app.tasks.continueAgent(task.id, child.id, "Detached follow-up", "review-third"), /no longer attached/);
-  } finally { controller.abort(); await running?.catch(() => {}); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+    controller.abort(); await running;
+    const reattached = new AbortController();
+    running = attach(reattached.signal); await idle(3);
+    assert.equal((await app.tasks.get(task.id)).pending.length, 2, "Detaching and reattaching does not publish the child result again");
+    assert.equal(app.faux.state.callCount, 4);
+    reattached.abort(); await running; running = undefined;
+  } finally { controller.abort(); await running?.catch(() => {}); await app.tasks.detachBackground(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("detaching before a child's first turn preserves its pending assignment without publishing a fake result", async () => {
+test("a child whose terminal detaches before its first turn still runs its assignment and reports it once", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-detached-child-")); const app = await open(directory);
   try {
     const task = await app.tasks.create({ title: "Parent", outcome: "Complete after review" });
@@ -314,15 +318,18 @@ test("detaching before a child's first turn preserves its pending assignment wit
     const childBinding = { ...binding, block_id: "block:55555555-5555-4555-8555-555555555555" };
     await app.tasks.dispatchAgent(task.id, child.id, async () => ({ type: "spawned", binding: childBinding }));
     const saved = (await app.tasks.get(task.id)).agents[0]; assert.ok(saved?.worker.state === "bound");
+    app.faux.setResponses([fauxAssistantMessage("Reviewed with no terminal attached")]);
     const controller = new AbortController(); controller.abort();
     await app.tasks.run({ type: "run_task", task_id: task.id, agent_id: child.id,
       allocation_id: saved.worker.allocation_id, binding: childBinding, instructions: "", model: fixtureModel, cwd: host.cwd, interactive: true },
     () => () => {}, [], undefined, undefined, { signal: controller.signal, async ready() {}, answer() {}, idle() {} });
-    const retained = await app.tasks.get(task.id);
-    assert.equal(retained.pending.length, 0); assert.equal(retained.agents[0]?.pending.length, 1);
-    assert.equal(retained.agents[0]?.state.state, "open"); assert.equal(app.faux.state.callCount, 0);
-    assert.equal(app.tasks.isRunning(task.id), false);
-  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+    await until(async () => !app.tasks.isRunning(task.id) && (await app.tasks.get(task.id)).agents[0]?.state.state === "done",
+      "The child must finish its assignment after its terminal detached");
+    const finished = await app.tasks.get(task.id);
+    assert.equal(finished.agents[0]?.pending.length, 0); assert.equal(finished.agents[0]?.summary, "Reviewed with no terminal attached");
+    assert.equal(finished.pending.filter((input) => input.id.startsWith("agent-result:review:")).length, 1, "The parent receives the child's result once");
+    assert.equal(app.faux.state.callCount, 1);
+  } finally { await app.tasks.detachBackground(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("task agents own conversations and named terminals in one Rex session, then wake their parent", async () => {
@@ -493,7 +500,8 @@ test("input arriving during recovered history finalization is drained by the att
       return conversation;
     };
     app.faux.setResponses([fauxAssistantMessage("Follow-up drained without another dispatch.")]);
-    const running = app.tasks.run({ ...command, type: "run_task" }, () => () => {});
+    const running = app.tasks.run({ ...command, type: "run_task" }, () => () => {}, [], undefined, undefined,
+      { signal: new AbortController().signal, async ready() {}, answer() {}, idle() {} });
     await started;
     await app.tasks.enqueue(task.id, "Follow-up during finalization");
     await app.tasks.dispatch(task.id, host, async () => { throw new Error("The attached actor must drain this input"); });
@@ -908,7 +916,7 @@ test("an actor stop cancels only its calls and retains an external write until i
   assert.equal(emitted.length, 2);
 });
 
-test("worker host tools execute through the attached client while the main conversation stays available", async () => {
+test("worker host tools execute through the actor's bound adapter while the main conversation stays available", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-task-")); const app = await open(directory);
   let releaseHost: (result: HostResult) => void = () => {};
   try {
@@ -930,7 +938,7 @@ test("worker host tools execute through the attached client while the main conve
     (conversation) => app.executions.bind(conversation.id.toString(), { cwd: host.cwd, hosts: [], call: async (command) => {
       assert.deepEqual(command, { type: "exec", sender_conversation_id: conversation.id.toString(), program: "inspect", args: ["literal value"], cwd: host.cwd, timeout_seconds: 900 });
       started(); return hostResult;
-    } }), [app.tools.host, app.tools.worker]);
+    } }), [app.tools.host, app.tools.worker], undefined, undefined, { signal: new AbortController().signal, async ready() {}, answer() {}, idle() {} });
     await hostStarted;
     await app.tasks.enqueue(task.id, "Also inspect the follow-up.");
     await app.tasks.dispatch(task.id, host, async () => { throw new Error("An active worker must be reused"); });

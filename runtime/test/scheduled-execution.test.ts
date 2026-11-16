@@ -159,7 +159,7 @@ test("stop during asynchronous preflight fences the admitted input before infere
     const stopped = assert.rejects(running, /Background execution stopped/);
     await preparing;
     const interrupt = (async () => {
-      const matched = await app.tasks.interruptBackground(task.conversation_id);
+      const matched = await app.tasks.stop({ task_id: task.id });
       if (!matched) await (await app.tasks.conversation(task.conversation_id)).abort(BACKGROUND_CONTEXT);
       return matched;
     })();
