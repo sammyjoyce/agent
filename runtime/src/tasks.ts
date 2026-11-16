@@ -183,16 +183,17 @@ function text(entry: EntryRecord, toolLimit?: number): string {
     return message.role === "toolResult" && toolLimit !== undefined ? content.slice(0, toolLimit) : content;
   }).join("\n") ?? "";
 }
-function holds(actor: TaskRecord | TaskAgentRecord, input: TaskInput): boolean {
+/** The queued input with this input's ID. Throws when that ID already carries a different input. */
+function queuedInput(actor: TaskRecord | TaskAgentRecord, input: TaskInput): TaskInput | undefined {
   const previous = actor.pending.find((saved) => saved.id === input.id);
-  if (previous === undefined) return false;
+  if (previous === undefined) return undefined;
   if (previous.content !== input.content || (previous.mode ?? "follow_up") !== (input.mode ?? "follow_up") ||
       JSON.stringify(previous.attachments ?? []) !== JSON.stringify(input.attachments ?? []) ||
       JSON.stringify(previous.scheduled) !== JSON.stringify(input.scheduled) || previous.origin !== input.origin ||
       !sameSender(previous.sender, input.sender)) {
     throw new TaskError("A task input ID cannot be reused with different content or mode");
   }
-  return true;
+  return previous;
 }
 function sameBinding(left: WorkerRef, right: WorkerRef): boolean {
   return left.host_id === right.host_id && left.session_id === right.session_id &&
@@ -955,7 +956,7 @@ export class TaskStore {
       ...(attachments === undefined ? {} : { attachments }),
       ...(scheduled === undefined ? {} : { scheduled }), ...(origin === undefined ? {} : { origin }),
       ...(sender === undefined ? {} : { sender }) };
-    holds(this.actor(await this.get(id), agentId), input);
+    queuedInput(this.actor(await this.get(id), agentId), input);
     const active = this.running.get(this.actorKey(id, agentId));
     if (active !== undefined) active.admissions += 1;
     try {
@@ -976,7 +977,7 @@ export class TaskStore {
     return task;
   }
   private pushIn(task: TaskRecord, actor: TaskRecord | TaskAgentRecord, input: TaskInput): void {
-    if (!holds(actor, input)) actor.pending.push(input);
+    if (queuedInput(actor, input) === undefined) actor.pending.push(input);
     actor.state = { state: "open" };
     task.state = { state: "open" };
   }
