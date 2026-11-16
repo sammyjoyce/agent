@@ -34,6 +34,8 @@ async function olderCoordinator(t: TestContext, path: string, target: string): P
   t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
 }
 
+// The scripted helper grants the epochs, because this test needs a replaced owner that keeps serving beside its
+// successor. An owner the real authority replaced ends itself at its next owner check.
 test("a worker host serves no coordinator below the highest owner epoch it has served", { timeout: 120_000 }, async (t) => {
   const world = await coordinatorWorld(t, undefined, runtime);
   const { directory, coordinator: desktop, laptop, homes, socket, start, until, online, script, cli } = world;

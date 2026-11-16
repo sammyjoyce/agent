@@ -37,6 +37,8 @@ input.on("line", line => {
 });
 "#;
 
+/// Scripted, because these tests need what no authority can be made to give:
+/// a chosen exit status, a garbled report, and a record of each run.
 const HELPER: &str = r#"
 const { appendFileSync, readFileSync } = require("node:fs");
 const { join } = require("node:path");

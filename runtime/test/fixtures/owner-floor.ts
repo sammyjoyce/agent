@@ -13,6 +13,7 @@ export function floorFile(home: string, coordinator: string): string {
   return join(data, "beep-boop-owner-floors", coordinator);
 }
 
+/** Scripts what the fixture helper on `home` answers from now on. */
 export async function answer(home: string, answers: FailoverAnswers): Promise<void> {
   const path = join(home, "failover-answers.json");
   await writeFile(path + ".tmp", JSON.stringify(answers));

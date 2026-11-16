@@ -20,7 +20,6 @@ import { protocolLines } from "../../src/protocol.js";
 import { note, openOwner, stage } from "./failover-state.js";
 import { startAuthority } from "./failover-workerd.js";
 
-export const OWNER_FENCED_EXIT = 75;
 export const HOLDERS = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"] as const;
 const COORDINATORS = Array.from({ length: 24 }, (_, index) => `aaaaaaaa-aaaa-4aaa-8aaa-${index.toString(16).padStart(12, "0")}`);
 
@@ -206,17 +205,14 @@ export class World {
   }
 }
 
-/**
- * The runtime directory the binary is pointed at. The claim helper is a
- * fixture until the lane's `failover/helper.js` exists beside the bridge.
- */
+/** The runtime directory the binary is pointed at: `bridge` beside the built database, helper and operator scripts. */
 async function linkRuntime(runtime: string, bridge: string): Promise<void> {
   const built = (path: string) => fileURLToPath(new URL(path, import.meta.url));
   await mkdir(join(runtime, "failover"), { recursive: true, mode: 0o700 });
   await symlink(bridge, join(runtime, "bridge.js"));
   await symlink(built("../../src/backup-database.js"), join(runtime, "backup-database.js"));
   await symlink(built("../../src/failover/operator.js"), join(runtime, "failover", "operator.js"));
-  await symlink(built("./failover-claim-helper.js"), join(runtime, "failover", "helper.js"));
+  await symlink(built("../../src/failover/helper.js"), join(runtime, "failover", "helper.js"));
 }
 
 /** What a running owner does between two commands: it claims its start, commits notes and logs files. Returns the epoch it ran at. */

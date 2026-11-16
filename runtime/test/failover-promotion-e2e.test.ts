@@ -7,8 +7,9 @@ import { Type } from "typebox";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { createRegistry, defineExtension, defineTool } from "@earendil-works/pi-durable";
+import { OWNER_FENCED_EXIT } from "../src/generated/owner-fenced-exit.js";
 import { NotificationDeliveries } from "../src/notifications.js";
-import { exists, HOLDERS, OWNER_FENCED_EXIT, replicatedPair, until, World, type Host, type PromotedReceipt, type ReleasedReceipt,
+import { exists, HOLDERS, replicatedPair, until, World, type Host, type PromotedReceipt, type ReleasedReceipt,
   type StatusReceipt } from "./fixtures/failover-hosts.js";
 import { openOwner, tables } from "./fixtures/failover-state.js";
 import { fixtureModel } from "./model.js";

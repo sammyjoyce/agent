@@ -15,6 +15,8 @@ function alive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
+// The scripted helper answers the watcher, because this test counts the reads of each answer and checks the session
+// Rust hands the helper. The real authority shows neither, and its owner would end itself before the watcher acts.
 test("a watching worker ends the link of an owner the authority replaced, and nothing else ends it", { timeout: 90_000 }, async (t) => {
   const world = await coordinatorWorld(t, async (homes) => {
     await writeFile(join(homes[0], "state", "coordinator-id"), coordinatorId);

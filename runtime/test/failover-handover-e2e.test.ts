@@ -3,8 +3,9 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { OWNER_FENCED_EXIT } from "../src/generated/owner-fenced-exit.js";
 import { commands, startFaultProxy } from "./fixtures/failover-fault-proxy.js";
-import { exists, HOLDERS, OWNER_FENCED_EXIT, sealedFor, until, World, type Host, type JoinedReceipt, type PromotedReceipt } from "./fixtures/failover-hosts.js";
+import { exists, HOLDERS, sealedFor, until, World, type Host, type JoinedReceipt, type PromotedReceipt } from "./fixtures/failover-hosts.js";
 
 const [OWNER, STANDBY] = HOLDERS;
 
