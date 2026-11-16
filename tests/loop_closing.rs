@@ -166,6 +166,7 @@ enum Decision {
 enum TaskEnd {
     Resolved,
     StillWaiting,
+    Untouched,
 }
 
 enum LedgerAfter {
@@ -220,7 +221,7 @@ const SCENARIOS: &[Scenario] = &[
             followups: 0..=0,
             mutations: 0,
             ledger_after: LedgerAfter::Unchanged,
-            task: TaskEnd::StillWaiting,
+            task: TaskEnd::Untouched,
             silent: true,
         },
     },
@@ -628,12 +629,6 @@ fn code(program: String) -> Value {
     json!({ "code": program })
 }
 
-fn shell(command: String) -> Value {
-    json!({ "tool": "exec", "args": {
-        "program": "/bin/sh", "args": ["-c", command], "timeout_seconds": 30,
-    } })
-}
-
 fn stale_show(world: &World) -> Value {
     let stale = world.host.join("stale").join("ledger");
     fs::create_dir_all(stale.parent().unwrap()).unwrap();
@@ -644,7 +639,11 @@ fn stale_show(world: &World) -> Value {
 }
 
 fn late_real_show(world: &World) -> Value {
-    shell(format!("'{}' show", world.ledger().display()))
+    json!({ "tool": "exec", "args": {
+        "program": "/bin/sh",
+        "args": ["-c", format!("'{}' show", world.ledger().display())],
+        "timeout_seconds": 30,
+    } })
 }
 
 fn link_pending(task: &TaskId) -> Value {
@@ -1165,7 +1164,7 @@ impl LedgerRun<'_> {
     }
 }
 
-fn ledger_runs(receipts: &[Receipt]) -> Vec<LedgerRun<'_>> {
+fn ledger_runs<'a>(receipts: &'a [Receipt], ledger: &Path) -> Vec<LedgerRun<'a>> {
     let mut runs: Vec<LedgerRun> = receipts
         .iter()
         .flat_map(|receipt| {
@@ -1185,9 +1184,7 @@ fn ledger_runs(receipts: &[Receipt]) -> Vec<LedgerRun<'_>> {
                 });
             direct.chain(nested).filter_map(|(args, nested, ok)| {
                 let args: Value = args?;
-                Path::new(args["program"].as_str()?)
-                    .ends_with("ledger")
-                    .then_some(())?;
+                (Path::new(args["program"].as_str()?) == ledger).then_some(())?;
                 let command: Option<Vec<&str>> =
                     args["args"].as_array()?.iter().map(Value::as_str).collect();
                 Some(LedgerRun {
@@ -1367,11 +1364,9 @@ fn oracles(
         json!({ "task": followups(seeded), "decoy": followups(decoy) }),
     ));
     checks.push(oracle(
-        "decoy_still_waiting",
-        decoy_after.is_some_and(|after| {
-            json!(after.state) == json!(decoy.state) && after.pending.is_empty()
-        }),
-        json!(decoy_after.map(|after| (&after.state, &after.pending))),
+        "decoy_untouched",
+        decoy_after.is_some_and(|after| json!(after) == json!(decoy)),
+        json!(decoy_after),
     ));
     let calls = world.ledger_calls();
     checks.push(oracle(
@@ -1396,14 +1391,14 @@ fn oracles(
             },
         json!(ledger),
     ));
-    let runs = ledger_runs(&saved.receipts);
-    let mut receipted: Vec<&str> = runs.iter().map(|run| run.command.as_str()).collect();
-    let mut logged: Vec<&str> = calls.iter().map(String::as_str).collect();
-    receipted.sort_unstable();
-    logged.sort_unstable();
+    let runs = ledger_runs(&saved.receipts, &world.ledger());
+    let bound = runs
+        .iter()
+        .map(|run| run.command.as_str())
+        .eq(calls.iter().map(String::as_str));
     checks.push(oracle(
         "ledger_calls_have_receipts",
-        receipted == logged,
+        bound,
         json!({ "receipts": runs, "ledger_calls": calls }),
     ));
     let worker = seeded.conversation_id.as_str();
@@ -1416,14 +1411,16 @@ fn oracles(
         let follow_up = inputs(seeded).get(1).copied();
         checks.push(oracle(
             "worker_acts_after_follow_up",
-            follow_up.is_some_and(|follow_up| {
-                runs.iter()
-                    .filter(|run| run.mutates())
-                    .all(|run| run.conversation == worker && run.at.0 > follow_up)
-            }) && last_mutation.is_some_and(|last| {
-                runs.iter()
-                    .any(|run| run.reads_back() && run.conversation == worker && run.at > last)
-            }),
+            bound
+                && follow_up.is_some_and(|follow_up| {
+                    runs.iter()
+                        .filter(|run| run.mutates())
+                        .all(|run| run.conversation == worker && run.at.0 > follow_up)
+                })
+                && last_mutation.is_some_and(|last| {
+                    runs.iter()
+                        .any(|run| run.reads_back() && run.conversation == worker && run.at > last)
+                }),
             json!({ "worker": worker, "follow_up_entry": follow_up, "receipts": runs }),
         ));
     }
@@ -1444,8 +1441,9 @@ fn oracles(
                 json!(task.state) == json!(seeded.state)
                     && json!(task.sources) == json!(seeded.sources)
             }),
+            TaskEnd::Untouched => task.is_some_and(|task| json!(task) == json!(seeded)),
         } && task.is_some_and(|task| task.pending.is_empty()),
-        json!(task.map(|task| (&task.state, &task.sources))),
+        json!(task.map(|task| (&task.state, &task.summary, &task.sources))),
     ));
     let resolutions = saved
         .outcomes
@@ -1464,11 +1462,6 @@ fn oracles(
         json!(resolutions),
     ));
     if resolved {
-        let logged_mutation = calls.iter().rposition(|call| mutating(call));
-        let logged_readback = calls
-            .iter()
-            .enumerate()
-            .any(|(index, call)| call == "show" && logged_mutation.is_none_or(|last| index > last));
         let readbacks: Vec<&LedgerRun> = runs
             .iter()
             .filter(|run| {
@@ -1492,7 +1485,7 @@ fn oracles(
             .collect();
         checks.push(oracle(
             "resolved_after_readback",
-            logged_readback
+            bound
                 && !resolutions.is_empty()
                 && resolutions.iter().all(|resolution| {
                     resolution.is_some_and(|entry| readbacks.iter().any(|run| run.at.0 < entry))
