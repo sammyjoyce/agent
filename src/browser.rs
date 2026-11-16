@@ -572,7 +572,7 @@ impl BrowserHost {
         }
         let Some(process) = sessions.get(&request.owner_id).cloned() else {
             return Ok(BrowserResponse::Disconnected { session_id: request.session_id,
-                message: "This host has no live browser connection for this conversation. Previous tab handles are stale; open a new connection to continue.".into() });
+                message: "This host has no live browser connection for this conversation. Native tabs that an earlier connection did not confirm closed may still be open, and their cleanup was not verified. Previous tab handles are stale; inspect Chrome or open a new connection to continue.".into() });
         };
         drop(sessions);
         let mut live = process.lock().await;
@@ -1104,20 +1104,42 @@ input.on('close', () => { writeFileSync(join(directory, 'closed'), 'closed'); })
         assert_eq!(session_id, session);
         assert!(!message.contains("PRIVATE_FIXTURE_SENTINEL"));
         wait_for(&directory.path().join("closed")).await;
-        assert!(matches!(
-            host.execute(
+        let inspected = host
+            .execute(
                 request(owner, session, "inspect", BrowserAction::Status),
-                cancelled
+                cancelled,
             )
-            .await,
-            BrowserResponse::Disconnected { .. }
-        ));
+            .await;
+        assert!(
+            matches!(&inspected, BrowserResponse::Disconnected { message, .. } if message.contains("cleanup was not verified")),
+            "The tab the lost helper opened may still be open: {inspected:?}"
+        );
         assert_eq!(
             fs::read_to_string(directory.path().join("effects"))
                 .await
                 .unwrap(),
             "wrong-receipt\n"
         );
+    }
+
+    #[tokio::test]
+    async fn a_host_that_lost_a_conversations_connection_reports_unverified_tab_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let restarted = host(directory.path()).await;
+        let (_stop, cancelled) = watch::channel(false);
+        let session = Uuid::new_v4();
+        for action in [BrowserAction::Status, BrowserAction::Release] {
+            let reply = restarted
+                .execute(
+                    request(Uuid::new_v4(), session, "after-restart", action),
+                    cancelled.clone(),
+                )
+                .await;
+            assert!(
+                matches!(&reply, BrowserResponse::Disconnected { session_id, message } if *session_id == session && message.contains("cleanup was not verified")),
+                "A restarted host cannot know whether an earlier helper's tabs closed: {reply:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -955,7 +955,9 @@ configuration file that already exists outside the Nix store:
 Include Rex, Switchboard and enabled provider CLIs in `extraPackages` as well.
 The worker's TOML must set `coordinator`; the coordinator's must omit it.
 The macOS module installs a user LaunchAgent: it starts at login and launchd
-restarts it after exit. It does not run before a user logs in after reboot.
+restarts it after exit. It waits for the Nix store volume to mount, because
+launchd never retries a program that is missing at login. It does not run
+before a user logs in after reboot.
 Model settings, source configuration, credentials and context stay in private
 runtime files. Restart the service after changing its settings.
 
