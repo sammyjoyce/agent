@@ -127,11 +127,7 @@ async function downloadFiles(link: AuthorityLink, stateDirectory: string, files:
       if (present !== undefined && matches(present, file)) continue;
       const bytes = await link.getBlob(file.sha256);
       if (!matches(bytes, file)) throw new Error(`The blob for ${file.path} does not match its record`);
-      await makeDirectory(dirname(path));
-      const synced = join(dirname(path), `.${randomUUID()}.tmp`);
-      pending.push({ synced, path });
-      const handle = await open(synced, "wx", 0o600);
-      try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
+      pending.push({ synced: await writeTemporary(dirname(path), bytes), path });
     }
     return pending;
   } catch (error) {
@@ -153,7 +149,31 @@ export async function publishFiles(files: readonly PendingFile[]): Promise<void>
   }
 }
 
-async function makeDirectory(directory: string): Promise<void> {
+/** A name no replicated file takes, so a file under it is one a crash left before its log entry named it. */
+export function isTemporaryName(name: string): boolean {
+  return name.startsWith(".") || name.endsWith(".tmp");
+}
+
+export function temporaryPath(directory: string): string {
+  return join(directory, `.${randomUUID()}.tmp`);
+}
+
+/** Writes and syncs a file at a temporary name in `directory`, and returns its path. */
+export async function writeTemporary(directory: string, bytes: Uint8Array): Promise<string> {
+  await makeDirectory(directory);
+  const path = temporaryPath(directory);
+  try {
+    const handle = await open(path, "wx", 0o600);
+    try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
+    return path;
+  } catch (error) {
+    await rm(path, { force: true });
+    throw error;
+  }
+}
+
+/** Creates a private directory and syncs each parent it had to create an entry in. */
+export async function makeDirectory(directory: string): Promise<void> {
   const created = await mkdir(directory, { recursive: true, mode: 0o700 });
   if (created === undefined) return;
   for (let made = directory; ; made = dirname(made)) {

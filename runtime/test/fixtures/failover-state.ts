@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, type TestContext } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -77,6 +77,14 @@ export async function stateDirectory(t: TestContext): Promise<string> {
 }
 
 export const sessionPath = (directory: string) => join(directory, "session.sqlite");
+
+export async function filesUnder(directory: string): Promise<string[]> {
+  const entries = await readdir(directory, { recursive: true, withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  });
+  return entries.filter((entry) => entry.isFile()).map((entry) => relative(directory, join(entry.parentPath, entry.name))).sort();
+}
 
 export async function enroll(link: AuthorityLink, holder = OWNER): Promise<number> {
   await link.putBlob(manifest, manifestBytes);

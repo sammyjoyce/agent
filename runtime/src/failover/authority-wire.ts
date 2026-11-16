@@ -47,10 +47,12 @@ const textWhere = (check: (value: string) => boolean, problem: string): Field<st
 const statement = textWhere((value) => /\S/.test(value), "is blank");
 export const uuid = textWhere(isLowercaseUuid, "is not a lowercase UUID");
 const sha256 = textWhere(isSha256Hex, "is not 64 lowercase hexadecimal characters");
-const statePath = textWhere((value) =>
-  value.split("/").every((segment) => segment !== "" && segment !== "." && segment !== ".." && !/[\\\0]/.test(segment))
-    && REPLICATED_FILE_ROOTS.some((root) => value.startsWith(`${root}/`)),
-  "is not a relative path under attachments, history/assets or feedback");
+/** The rule of `StatePath` in `src/failover.rs`: relative, plain segments, under one of the replicated file trees. */
+export function isStatePath(value: string): boolean {
+  return value.split("/").every((segment) => segment !== "" && segment !== "." && segment !== ".." && !/[\\\0]/.test(segment))
+    && REPLICATED_FILE_ROOTS.some((root) => value.startsWith(`${root}/`));
+}
+const statePath = textWhere(isStatePath, "is not a relative path under attachments, history/assets or feedback");
 
 const nullable = <T>(field: Field<T>): Field<T | null> => (value, path) => value === null ? null : field(value, path);
 
