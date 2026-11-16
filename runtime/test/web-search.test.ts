@@ -16,6 +16,7 @@ import { Type } from "typebox";
 import { ConversationModels, DEFAULT_MODEL, modelFailureMessage } from "../src/models.js";
 import { TaskStore } from "../src/tasks.js";
 import { history } from "../src/transcript.js";
+import { HistoryStore } from "../src/history.js";
 import type { ModelSelection } from "../src/generated/ModelSelection.js";
 import type { WorkerHost } from "../src/generated/WorkerHost.js";
 import type { WorkerRef } from "../src/generated/WorkerRef.js";
@@ -128,7 +129,7 @@ test("native hosted search keeps existing tools, fast policy, replay data and ci
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory, wire.url);
     assert.equal((await answer(app)).content.find((part) => part.type === "text")?.text, content.text);
     assert.equal((await answer(app)).content.find((part) => part.type === "text")?.textSignature, content.textSignature);
-    const rendered = (await history(app.root, null, app.session)).flatMap((frame) => frame.messages).filter((item) => item.role === "final");
+    const rendered = (await history(app.root, null, new HistoryStore(app.session))).flatMap((frame) => frame.messages).filter((item) => item.role === "final");
     assert.equal(rendered.length, 1); assert.equal(rendered[0]?.text, content.text); assert.equal(wire.requests.length, 3);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await wire.close(); await rm(directory, { recursive: true, force: true }); }
 });
@@ -152,7 +153,7 @@ test("enabled reasoning requests detailed explanations and preserves every parag
     assert.ok(wire.requests.some((request) => object(request.reasoning) && request.reasoning.summary === "detailed"));
     const thinking = (await answer(app)).content.find((part) => part.type === "thinking");
     assert.equal(thinking?.thinking, exposedReasoning);
-    const rendered = (await history(app.root, null, app.session)).flatMap((frame) => frame.messages).filter((message) => message.role === "thinking");
+    const rendered = (await history(app.root, null, new HistoryStore(app.session))).flatMap((frame) => frame.messages).filter((message) => message.role === "thinking");
     assert.equal(rendered.map((message) => message.text).join(""), exposedReasoning);
     assert.equal(JSON.stringify(rendered).includes("synthetic-encrypted-replay"), false);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await wire.close(); await rm(directory, { recursive: true, force: true }); }
@@ -274,7 +275,7 @@ test("subscription-sharing limits explain credit permission while retaining the 
       assert.deepEqual((await app.tasks.list()).map((item) => item.id), [task.id]);
       const conversation = await app.tasks.conversation(retained.conversation_id);
       assert.equal(await modelFailureMessage(conversation, "Generic failure"), expected);
-      assert.ok((await history(conversation, null, app.session)).some((frame) => frame.messages.some((message) => message.role === "user" && message.text === "Continue this original request.")));
+      assert.ok((await history(conversation, null, new HistoryStore(app.session))).some((frame) => frame.messages.some((message) => message.role === "user" && message.text === "Continue this original request.")));
       const input = await app.root.submit({ type: "input", content: "Continue the main conversation." }, BACKGROUND_CONTEXT);
       assert.equal((await input.wait(BACKGROUND_CONTEXT)).status, "unanswered");
       assert.equal(await modelFailureMessage(app.root, "Generic main failure"), expected);

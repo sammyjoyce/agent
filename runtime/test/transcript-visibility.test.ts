@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { watchMainNotices } from "../src/main_observation.js";
 import { history, transcript } from "../src/transcript.js";
+import { HistoryStore } from "../src/history.js";
 import { annotateTranscript, readTranscriptVisibility, TranscriptVisibility } from "../src/transcript_visibility.js";
 
 async function open(directory: string) {
@@ -31,22 +32,22 @@ test("exact transcript classifications hide only selected legacy entries after r
     }, BACKGROUND_CONTEXT);
     const original = (await root.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items;
     const context = await root.context(BACKGROUND_CONTEXT);
-    assert.equal(visible(await history(root, null, session)).filter((message) => message.text === "The state is recorded.").length, 2);
+    assert.equal(visible(await history(root, null, new HistoryStore(session))).filter((message) => message.text === "The state is recorded.").length, 2);
     await annotateTranscript(session, root, [
       { entry_id: saved.receipt.id.toString(), classification: "internal_receipt" },
       { entry_id: saved.control.id.toString(), classification: "maintenance_control" },
       { entry_id: saved.answer.id.toString(), classification: "maintenance_control" },
     ]);
-    let rendered = visible(await history(root, null, session));
+    let rendered = visible(await history(root, null, new HistoryStore(session)));
     assert.deepEqual(rendered.map((message) => message.entry_id), [saved.useful.id.toString()]);
     assert.deepEqual((await root.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items, original);
     assert.deepEqual(await root.context(BACKGROUND_CONTEXT), context, "Visibility must not edit model context or immutable source evidence");
     assert.equal(original.flatMap(transcript).length, 4);
     await session.close(BACKGROUND_CONTEXT); session = await open(directory); root = await session.root(BACKGROUND_CONTEXT);
-    assert.deepEqual(visible(await history(root, null, session)), rendered);
+    assert.deepEqual(visible(await history(root, null, new HistoryStore(session))), rendered);
     assert.deepEqual((await root.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items, original);
     await annotateTranscript(session, root, [{ entry_id: saved.receipt.id.toString(), classification: "visible" }]);
-    rendered = visible(await history(root, null, session));
+    rendered = visible(await history(root, null, new HistoryStore(session)));
     assert.equal(rendered.filter((message) => message.text === "The state is recorded.").length, 2, "Exact-ID reversal must preserve same-text distinct entries");
     const hidden = await session.commit(async (tx) => {
       const items: EntryRecord[] = [];
@@ -55,7 +56,7 @@ test("exact transcript classifications hide only selected legacy entries after r
       return items;
     }, BACKGROUND_CONTEXT);
     await annotateTranscript(session, root, hidden.map((entry) => ({ entry_id: entry.id.toString(), classification: "internal_receipt" })));
-    assert.deepEqual(visible(await history(root, null, session)), rendered, "Hidden-only native pages must not conceal older visible history");
+    assert.deepEqual(visible(await history(root, null, new HistoryStore(session))), rendered, "Hidden-only native pages must not conceal older visible history");
     assert.deepEqual((await session.inspect(BACKGROUND_CONTEXT)).tasks, [], "Classification and browsing must not start model work");
   } finally { await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -81,9 +82,9 @@ test("annotation validation is atomic, conversation-scoped and respects native f
     ]));
     await assert.rejects(annotateTranscript(session, fork, [{ entry_id: later.id.toString(), classification: "internal_receipt" }]));
     await annotateTranscript(session, fork, [{ entry_id: first.id.toString(), classification: "internal_receipt" }]);
-    assert.deepEqual(visible(await history(fork, null, session)), []);
-    assert.equal(visible(await history(root, null, session)).length, 2, "A fork's classification must not hide its parent's original");
-    assert.equal(visible(await history(other, null, session)).length, 1);
+    assert.deepEqual(visible(await history(fork, null, new HistoryStore(session))), []);
+    assert.equal(visible(await history(root, null, new HistoryStore(session))).length, 2, "A fork's classification must not hide its parent's original");
+    assert.equal(visible(await history(other, null, new HistoryStore(session))).length, 1);
   } finally { await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -100,10 +101,10 @@ test("live notice projection honors the same native classification while leaving
       return { internal, useful };
     }, BACKGROUND_CONTEXT);
     assert.deepEqual(live, [saved.useful.id.toString()]);
-    assert.deepEqual(visible(await history(root, null, session)).map((message) => message.entry_id), live);
+    assert.deepEqual(visible(await history(root, null, new HistoryStore(session))).map((message) => message.entry_id), live);
     stop();
     await annotateTranscript(session, root, [{ entry_id: saved.internal.id.toString(), classification: "visible" }]);
-    assert.equal(visible(await history(root, null, session)).length, 2);
+    assert.equal(visible(await history(root, null, new HistoryStore(session))).length, 2);
     assert.deepEqual(live, [saved.useful.id.toString()], "Changing visibility never replays an old notice as a new live alert");
   } finally { stop(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

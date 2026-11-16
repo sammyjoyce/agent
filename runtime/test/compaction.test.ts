@@ -9,6 +9,7 @@ import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-work
 import { CompactionEntry, createRegistry, Harness, watchEvents } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { activity, history, transcript } from "../src/transcript.js";
+import { HistoryStore } from "../src/history.js";
 import { validEvent } from "../src/protocol.js";
 import type { ModelActivity } from "../src/generated/ModelActivity.js";
 import type { HistoryMessage } from "../src/generated/HistoryMessage.js";
@@ -67,7 +68,7 @@ test("native compaction status survives overlapping work, reattachment and one c
     const summaries = (await app.root.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items.filter(CompactionEntry.is);
     assert.equal(summaries.length, 2, "Both actual native compaction tasks must have written their summaries");
     assert.deepEqual(summaries.flatMap(transcript), [], "Internal checkpoint summaries are not chat messages");
-    const visible = await history(app.root, null, app.session);
+    const visible = await history(app.root, null, new HistoryStore(app.session));
     for (const value of [events, restored, messages, visible]) assert.equal(JSON.stringify(value).includes("PRIVATE_"), false);
     assert.equal(app.faux.state.callCount, 5);
   } finally { releaseFirst(); releaseSecond(); await stop(); await detach(); await app.close(); }

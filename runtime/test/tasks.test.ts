@@ -25,6 +25,7 @@ import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import type { ModelActivity } from "../src/generated/ModelActivity.js";
 import { activity, history } from "../src/transcript.js";
 import { until } from "./fixtures/until.js";
+import { HistoryStore } from "../src/history.js";
 
 const host: WorkerHost = { host_id: null, name: "fixture", rex_server: null, coordinator: null,
   cwd: "/workspace/example", agent_program: "/example/agent" };
@@ -80,7 +81,7 @@ test("interrupt drains the current native turn before admitting queued steering 
     await app.tasks.input(command, "Correct that direction too", "second-steering"); await interrupt; await idleAgain;
     assert.deepEqual(answers, ["Corrected direction completed", "Second correction completed"]); assert.equal(app.faux.state.callCount, 4);
     assert.deepEqual((await app.tasks.get(task.id)).pending, []);
-    const visible = (await history(conversation, null, app.session)).flatMap((frame) => frame.messages);
+    const visible = (await history(conversation, null, new HistoryStore(app.session))).flatMap((frame) => frame.messages);
     assert.deepEqual(visible.filter((message) => message.role === "user").map((message) => message.text),
       ["Start the old direction", "Use the corrected direction instead", "Start another direction", "Correct that direction too"]);
     assert.equal(visible.some((message) => message.text === "Discarded old direction"), false);
@@ -131,7 +132,7 @@ test("confirmed session loss reopens the same history while its actor keeps work
       "The actor must finish its turn and the queued input with no terminal attached");
     const result = await app.tasks.run({ ...old, allocation_id: reopened.worker.allocation_id, binding: replacement, interactive: false }, () => () => {});
     assert.equal(result.text, "Continued after the closed tab"); assert.equal(app.faux.state.callCount, 2);
-    const visible = (await history(conversation, null, app.session)).flatMap((frame) => frame.messages);
+    const visible = (await history(conversation, null, new HistoryStore(app.session))).flatMap((frame) => frame.messages);
     assert.deepEqual(visible.filter((message) => message.role === "final").map((message) => message.text),
       ["Finished after the tab closed", "Continued after the closed tab"]);
     assert.equal((await app.tasks.get(task.id)).pending.length, 0);
@@ -254,7 +255,7 @@ test("an interactive task serializes local and chief inputs, wakes while idle an
     await app.tasks.detachActors();
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
     const reopened = await app.tasks.get(task.id); assert.equal(reopened.conversation_id, task.conversation_id);
-    const frames = await history(await app.tasks.conversation(reopened.conversation_id), null, app.session);
+    const frames = await history(await app.tasks.conversation(reopened.conversation_id), null, new HistoryStore(app.session));
     const visible = frames.flatMap((frame) => frame.messages);
     assert.deepEqual(visible.filter((message) => message.role === "user").map((message) => message.text),
       ["Initial chief instruction", "Chief follow-up while the tab is idle", "Reply typed directly in the task tab", "Chief input while the local turn runs"]);
@@ -950,7 +951,7 @@ test("worker host tools execute through the actor's bound adapter while the main
     assert.equal((await main.wait(BACKGROUND_CONTEXT)).status, "done");
     releaseHost({ type: "process", exit_code: 0, stdout: "verified", stderr: "", truncated: false });
     assert.match((await running).text, /follow-up was verified/);
-    const workerHistory = (await history(await app.tasks.conversation(task.conversation_id), null, app.session)).flatMap((frame) => frame.messages);
+    const workerHistory = (await history(await app.tasks.conversation(task.conversation_id), null, new HistoryStore(app.session))).flatMap((frame) => frame.messages);
     assert.deepEqual(workerHistory.filter((message) => message.role === "final").map((message) => message.text),
       ["Worker verified the source.", "The follow-up was verified too."]);
     assert.equal((await app.tasks.get(task.id)).pending.length, 0);

@@ -34,7 +34,7 @@ function batch(items: HistoryItem[]): HistoryImportBatch {
 }
 async function read(app: Awaited<ReturnType<typeof fixture>>, id: string): Promise<HistoryMessage[]> {
   const conversation = await app.store.conversation(id); assert.ok(conversation);
-  const frames = await history(conversation, null, app.session);
+  const frames = await history(conversation, null, app.store);
   for (const frame of frames) assert.ok(validEvent({ version: 1, id: 1, event: frame }), "Actual projection must satisfy the Rust-owned wire schema");
   return frames.flatMap((frame) => frame.messages);
 }
@@ -112,7 +112,7 @@ test("verified cold originals supply canonical details and deleted evidence rema
     const before = (await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items;
     let rows = await read(app, id); assert.equal(rows[0]?.presentation?.type, "file_changes"); assert.match(rows[0]?.text ?? "", /Original native diff/);
     assert.ok(rows[0]?.tool);
-    const details = await toolDetails(conversation, rows[0].entry_id, rows[0].tool.call_id, app.session);
+    const details = await toolDetails(conversation, rows[0].entry_id, rows[0].tool.call_id, app.store);
     assert.equal(details.type, "available");
     if (details.type === "available") { assert.equal(details.status, "finished"); assert.equal(details.input.type, "text"); if (details.input.type === "text") assert.equal(details.input.truncated, true); }
     await rm(path); rows = await read(app, id);
@@ -137,7 +137,7 @@ test("actual live Pi command activity and retained Codex commands use the same c
     app.faux.setResponses([fauxAssistantMessage(call, { stopReason: "toolUse" }), fauxAssistantMessage("Verified final")]);
     const live: HistoryMessage[] = []; stop = await activity(app.session, root, () => {}, (message) => live.push(message));
     const turn = await root.submit({ type: "input", content: "Run the synthetic check" }, BACKGROUND_CONTEXT); await started;
-    const native = (await history(root, null, app.session)).flatMap((frame) => frame.messages).find((message) => message.tool?.call_id === call.id); assert.ok(native);
+    const native = (await history(root, null, app.store)).flatMap((frame) => frame.messages).find((message) => message.tool?.call_id === call.id); assert.ok(native);
     const imported = await app.store.import(batch([item("commandExecution", { command: "printf fixture", cwd: "/example", status: "inProgress", exitCode: null, durationMs: null })]));
     const historic = (await read(app, imported.conversation.conversation_id))[0]; assert.ok(historic);
     assert.equal(native.presentation?.type, "command"); assert.equal(historic.presentation?.type, native.presentation?.type);
@@ -146,7 +146,7 @@ test("actual live Pi command activity and retained Codex commands use the same c
     assert.equal(historic.text, native.text, "Both sources must use the common renderer rather than source-specific labels");
     release(); assert.equal((await turn.wait(BACKGROUND_CONTEXT)).status, "done"); await stop();
     assert.ok(live.some((message) => message.tool?.call_id === call.id && message.presentation?.type === "command" && message.text === native.text));
-    assert.ok((await history(root, null, app.session)).flatMap((frame) => frame.messages).some((message) => message.tool?.call_id === call.id && message.tool.status === "finished"));
+    assert.ok((await history(root, null, app.store)).flatMap((frame) => frame.messages).some((message) => message.tool?.call_id === call.id && message.tool.status === "finished"));
     assert.equal(app.faux.state.callCount, 2, "Import, history and live observation must not generate another turn");
   } finally { release(); await stop(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -163,7 +163,7 @@ test("distinct retained tool versions keep separate canonical identities and ins
     assert.equal(new Set(rows.map((row) => row.tool?.call_id)).size, 2);
     for (const [index, row] of rows.entries()) {
       assert.ok(row.tool);
-      const details = await toolDetails(conversation, row.entry_id, row.tool.call_id, app.session);
+      const details = await toolDetails(conversation, row.entry_id, row.tool.call_id, app.store);
       assert.equal(details.type, "available");
       if (details.type === "available") assert.deepEqual(details.input, { type: "text", text: "printf " + (index === 0 ? "first" : "second"), truncated: false });
     }
@@ -206,7 +206,7 @@ test("MCP structured results survive native import, bounded display, lazy inspec
         assert.equal(Buffer.from(display, "utf8").toString("utf8"), display);
       }
       assert.ok(rows[0]?.tool);
-      const details = await toolDetails(conversation, entry.id.toString(), rows[0].tool.call_id, app.session);
+      const details = await toolDetails(conversation, entry.id.toString(), rows[0].tool.call_id, app.store);
       assert.equal(details.type, "available");
       if (details.type === "available") {
         assert.equal(details.output.type, "text");
@@ -230,7 +230,7 @@ test("MCP structured results survive native import, bounded display, lazy inspec
     const reopened = await app.store.conversation(id); assert.ok(reopened);
     for (const [index, entry] of entries.entries()) {
       const row = messages.find((message) => message.entry_id === entry.id.toString()); assert.ok(row?.tool);
-      const details = await toolDetails(reopened, entry.id.toString(), row.tool.call_id, app.session);
+      const details = await toolDetails(reopened, entry.id.toString(), row.tool.call_id, app.store);
       assert.equal(details.type, "available");
       if (details.type === "available" && details.output.type === "text") {
         assert.match(details.output.text, /Structured result:/);
