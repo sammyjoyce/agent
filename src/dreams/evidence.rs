@@ -9,7 +9,7 @@ use crate::{
         ReceiptCoverage, Review, SummarySnapshot, count, format_utc,
     },
     protocol::ErrorCode,
-    runtime::diagnostics::{Event, HEARTBEAT, ReceiptWindow, Record},
+    runtime::diagnostics::{Event, ReceiptWindow, Record, UNWITNESSED_AFTER, is_token},
 };
 
 const SAMPLES: usize = 5;
@@ -44,14 +44,6 @@ pub struct EvidenceItem {
     pub title: Option<String>,
     /// Canonical receipt JSON, or the summary text.
     pub body: String,
-}
-
-fn is_token(text: &str) -> bool {
-    !text.is_empty()
-        && text.len() <= 128
-        && text
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_-.:|".contains(&byte))
 }
 
 fn redact(value: &mut serde_json::Value) {
@@ -158,11 +150,11 @@ pub(crate) fn receipt_coverage(window: Interval, receipts: &ReceiptWindow) -> Re
         }
         previous = record.timestamp_ms;
     }
-    if receipts.unparseable > 0 {
+    if receipts.unplaced_lines > 0 {
         gaps.push(Gap {
             interval: None,
             cause: GapCause::Unparseable {
-                lines: receipts.unparseable,
+                lines: receipts.unplaced_lines,
             },
         });
     }
@@ -178,7 +170,7 @@ pub(crate) fn receipt_coverage(window: Interval, receipts: &ReceiptWindow) -> Re
             cause: GapCause::ConcurrentRotation,
         });
     }
-    let silence = u64::try_from(2 * HEARTBEAT.as_millis()).unwrap_or(u64::MAX);
+    let silence = u64::try_from(UNWITNESSED_AFTER.as_millis()).unwrap_or(u64::MAX);
     let witnessed_until = receipts.truncated_at_ms.unwrap_or(window.end_ms);
     let mut previous = window.start_ms;
     for timestamp in records
@@ -493,7 +485,9 @@ mod tests {
             evidence::{canonical, findings, receipt_coverage, summaries},
         },
         protocol::ErrorCode,
-        runtime::diagnostics::{CapacityLossFacts, Event, ReceiptWindow, Record, RetentionFacts},
+        runtime::diagnostics::{
+            CapacityLoss, Event, ReceiptWindow, Record, RetentionPolicy, RetentionWatermark,
+        },
     };
 
     const MINUTE: u64 = 60_000;
@@ -521,13 +515,15 @@ mod tests {
                 .into_iter()
                 .map(|minute| record(minute, Event::Heartbeat))
                 .collect(),
-            retention: Some(RetentionFacts {
+            retention: Some(RetentionWatermark {
+                version: 1,
+                policy: RetentionPolicy::default(),
                 prior_history_unknown: false,
                 expired_through_ms: None,
                 capacity_loss: None,
             }),
             oldest_retained_ms: Some(900 * MINUTE),
-            unparseable: 0,
+            unplaced_lines: 0,
             truncated_at_ms: None,
             rotated_during_read: false,
         }
@@ -593,12 +589,14 @@ mod tests {
 
         let mut receipts = witnessed((1_000..1_100).step_by(5));
         receipts.records[4].dropped_before = 7;
-        receipts.unparseable = 2;
+        receipts.unplaced_lines = 2;
         receipts.rotated_during_read = true;
-        receipts.retention = Some(RetentionFacts {
+        receipts.retention = Some(RetentionWatermark {
+            version: 1,
+            policy: RetentionPolicy::default(),
             prior_history_unknown: true,
             expired_through_ms: Some(1_010 * MINUTE),
-            capacity_loss: Some(CapacityLossFacts {
+            capacity_loss: Some(CapacityLoss {
                 first_timestamp_ms: Some(990 * MINUTE),
                 last_timestamp_ms: Some(1_020 * MINUTE - 1),
                 unknown_timestamps: true,
@@ -636,10 +634,12 @@ mod tests {
         );
 
         let mut receipts = witnessed((1_000..1_100).step_by(5));
-        receipts.retention = Some(RetentionFacts {
+        receipts.retention = Some(RetentionWatermark {
+            version: 1,
+            policy: RetentionPolicy::default(),
             prior_history_unknown: true,
             expired_through_ms: Some(999 * MINUTE),
-            capacity_loss: Some(CapacityLossFacts {
+            capacity_loss: Some(CapacityLoss {
                 first_timestamp_ms: Some(900 * MINUTE),
                 last_timestamp_ms: Some(950 * MINUTE),
                 unknown_timestamps: false,

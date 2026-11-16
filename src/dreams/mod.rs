@@ -9,7 +9,6 @@ pub mod workspace;
 use std::{
     fmt,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -30,7 +29,9 @@ use crate::{protocol::HostResult, runtime::diagnostics};
 pub const DREAMS_JOB_ID: &str = "dreams";
 pub const MAX_WINDOW_HOURS: u8 = 48;
 pub const MAX_SUMMARIES: usize = 200;
-pub const MAX_SUMMARY_BYTES: usize = 1024 * 1024;
+/// One review request carries the summaries as JSON, which can expand them.
+pub const MAX_SUMMARY_BYTES: usize = crate::runtime::MAX_FRAME_BYTES / 4;
+const _: () = assert!(MAX_SUMMARY_BYTES * 4 <= crate::runtime::MAX_FRAME_BYTES);
 pub const MAX_EDITS: usize = 4;
 pub const MAX_EDIT_BYTES: usize = 64 * 1024;
 pub const MAX_ATTEMPTS: u8 = 3;
@@ -39,7 +40,8 @@ pub const NOT_CONFIGURED: &str = "Dreams is not configured";
 
 const MAX_EVIDENCE_CITATIONS: usize = 20;
 const MAX_SHOWN_FILES: usize = 32;
-const MAX_RECEIPT_BYTES: u64 = 160 * 1024 * 1024;
+const MAX_RECEIPT_BYTES: u64 = diagnostics::RETENTION_CAP_BYTES + 32 * 1024 * 1024;
+const _: () = assert!(MAX_RECEIPT_BYTES > diagnostics::RETENTION_CAP_BYTES);
 const MAX_RECEIPTS: usize = 400_000;
 
 /// Everything a Dreams actor can ask the coordinator to do.
@@ -533,14 +535,6 @@ pub fn count(number: usize, noun: &str) -> String {
     format!("{number} {noun}{}", if number == 1 { "" } else { "s" })
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-        })
-}
-
 struct Rejection {
     reason: String,
     output: Vec<String>,
@@ -677,7 +671,7 @@ impl Dreams {
         omitted: u32,
         cancelled: &watch::Receiver<bool>,
     ) -> Result<()> {
-        let end_ms = now_ms();
+        let end_ms = diagnostics::now_ms();
         let span = u64::try_from(self.policy.window().as_millis()).unwrap_or(u64::MAX);
         let window = Interval::new(end_ms.saturating_sub(span), end_ms)
             .context("The Dreams window is empty")?;
