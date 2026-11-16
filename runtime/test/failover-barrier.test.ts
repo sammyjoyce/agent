@@ -184,14 +184,15 @@ for (const [name, connect] of Object.entries(authorities)) {
     const large = "invented ".repeat(40_000);
     await owner.root.submit(note(large, "request-2"), context);
     const entries = await logEntries(link);
-    assert.equal(entries.filter(({ batch }) => batch?.kind === "blob").length, 1);
+    assert.equal(entries.filter(({ batch }) => batch?.body.kind === "blob").length, 1);
     for (const { batch } of entries) {
       assert.ok(batch);
-      if (batch.kind === "inline") { assert.ok(Buffer.byteLength(batch.json) <= INLINE_BATCH_LIMIT_BYTES); continue; }
-      const bytes = await link.getBlob(batch.sha256);
-      assert.ok(batch.size > INLINE_BATCH_LIMIT_BYTES);
-      assert.equal(bytes.byteLength, batch.size);
-      assert.equal(sha256Hex(bytes), batch.sha256);
+      const { body } = batch;
+      if (body.kind === "inline") { assert.ok(Buffer.byteLength(body.json) <= INLINE_BATCH_LIMIT_BYTES); continue; }
+      const bytes = await link.getBlob(body.sha256);
+      assert.ok(body.size > INLINE_BATCH_LIMIT_BYTES);
+      assert.equal(bytes.byteLength, body.size);
+      assert.equal(sha256Hex(bytes), body.sha256);
     }
     assert.deepEqual(await loggedNotes(link), ["small", large]);
     assert.deepEqual(localNotes(directory), ["small", large]);
@@ -209,7 +210,7 @@ for (const [name, connect] of Object.entries(authorities)) {
     await owner.root.submit({ type: "input", content, requestId: "request-images" }, context);
     assert.equal(owner.log.head, head, "the repeated request commits nothing");
     await owner.harness.close(context);
-    const blobs = (await logEntries(link)).flatMap(({ batch }) => batch?.kind === "blob" ? [batch] : []);
+    const blobs = (await logEntries(link)).flatMap(({ batch }) => batch?.body.kind === "blob" ? [batch.body] : []);
     assert.equal(blobs.filter(({ size }) => size > 12_000_000).length, 1, "the input is one batch of 12 MB in the blob store");
     assert.equal(await follow(standby, link), (await link.record())?.state.head);
     assert.deepEqual(tables(standby), tables(directory));

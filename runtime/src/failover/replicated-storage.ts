@@ -107,7 +107,7 @@ class OwnerLog implements LogWriter {
 
   appendFiles(files: readonly StagedFile[]): Promise<void> {
     return this.#serialized(async () => {
-      const at = await this.#append(null, files, null);
+      const at = await this.#append(files, null);
       await this.#options.database.applyWithoutBatch(at, () => this.#publish(files));
       this.#head = at;
     });
@@ -119,7 +119,7 @@ class OwnerLog implements LogWriter {
     const logged = parseBatch(json, this.#head + 1);
     const piSeq = await database.dryRun(() => this.#storage.commit(logged, context));
     const files = this.#carried.splice(0);
-    const at = await this.#append(piSeq, files, json);
+    const at = await this.#append(files, { piSeq, json });
     const committed = await database.apply(at, piSeq, { publish: () => this.#publish(files), commit: () => this.#storage.commit(logged, context) });
     this.#head = at;
     return committed;
@@ -131,10 +131,10 @@ class OwnerLog implements LogWriter {
     return result;
   }
 
-  async #append(piSeq: number | null, files: readonly StagedFile[], json: string | null): Promise<number> {
+  async #append(files: readonly StagedFile[], batch: { readonly piSeq: number; readonly json: string } | null): Promise<number> {
     const { link, holder, epoch } = this.#options;
-    const body = { at: this.#head + 1, epoch, versions: await versions(), pi_seq: piSeq, files: files.map(({ record }) => record),
-      batch: json === null ? null : await this.#batch(json) };
+    const body = { at: this.#head + 1, epoch, versions: await versions(), files: files.map(({ record }) => record),
+      batch: batch === null ? null : { pi_seq: batch.piSeq, body: await this.#batchBody(batch.json) } };
     const entry: LogEntry = { ...body, digest: logEntryDigest(body) };
     const reply = await this.#repeatUntilAnswered(() => link.command({ op: "append", holder, entry }));
     if (reply.result === "accepted") return entry.at;
@@ -142,7 +142,7 @@ class OwnerLog implements LogWriter {
     throw new Error(`The authority refused log entry ${entry.at} as ${reply.reason}: this owner's head is ${this.#head}, and the authority's is ${reply.state?.head ?? "unknown"}`);
   }
 
-  async #batch(json: string): Promise<BatchBody> {
+  async #batchBody(json: string): Promise<BatchBody> {
     const bytes = Buffer.from(json, "utf8");
     if (bytes.byteLength <= INLINE_BATCH_LIMIT_BYTES) return { kind: "inline", json };
     const sha256 = sha256Hex(bytes);

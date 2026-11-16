@@ -224,8 +224,22 @@ pub enum BatchBody {
     },
 }
 
+/// The sequence Pi assigns a commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[serde(transparent)]
+pub struct PiSequence(#[ts(type = "number")] u64);
+
+/// Pi's `StorageWrite[]` for one commit, and the sequence Pi assigns it. A
+/// standby commits it only there.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct LoggedBatch {
+    pub pi_seq: PiSequence,
+    pub body: BatchBody,
+}
+
 /// One replication log entry: the files a commit needs, then the commit. A
-/// file-only entry has neither `pi_seq` nor `batch`.
+/// file-only entry has no batch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct LogEntry {
@@ -234,11 +248,8 @@ pub struct LogEntry {
     /// SHA-256 over every other field, which tells a repeat from a conflict.
     pub digest: Sha256Hex,
     pub versions: Versions,
-    /// The sequence Pi assigns this batch. A standby commits it only there.
-    #[ts(type = "number | null")]
-    pub pi_seq: Option<u64>,
     pub files: Vec<FileRecord>,
-    pub batch: Option<BatchBody>,
+    pub batch: Option<LoggedBatch>,
 }
 
 /// A snapshot of the whole replicated state. The log holds only entries after `through`.
@@ -399,6 +410,29 @@ mod tests {
         assert!(serde_json::from_value::<Sha256Hex>("ab".repeat(32).into()).is_ok());
         assert!(serde_json::from_value::<Sha256Hex>("AB".repeat(32).into()).is_err());
         assert!(serde_json::from_value::<Sha256Hex>("ab".repeat(31).into()).is_err());
+    }
+
+    #[test]
+    fn a_log_entry_names_a_pi_sequence_only_with_its_batch() {
+        let entry = |fields: serde_json::Value| {
+            let mut entry = serde_json::json!({
+                "at": 1,
+                "epoch": 1,
+                "digest": "ab".repeat(32),
+                "versions": { "application": "0.1.0", "pi_durable": "1.4.0", "chord": "1.4.0" },
+                "files": [],
+            });
+            if let (Some(entry), Some(fields)) = (entry.as_object_mut(), fields.as_object()) {
+                entry.extend(fields.clone());
+            }
+            serde_json::from_value::<LogEntry>(entry)
+        };
+        let inline = serde_json::json!({ "kind": "inline", "json": "[]" });
+        assert!(entry(serde_json::json!({ "pi_seq": 4, "batch": null })).is_err());
+        assert!(entry(serde_json::json!({ "pi_seq": null, "batch": inline.clone() })).is_err());
+        assert!(entry(serde_json::json!({ "batch": { "body": inline.clone() } })).is_err());
+        assert!(entry(serde_json::json!({ "batch": { "pi_seq": 4, "body": inline } })).is_ok());
+        assert!(entry(serde_json::json!({ "batch": null })).is_ok());
     }
 
     #[test]

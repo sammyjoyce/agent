@@ -61,7 +61,7 @@ async function position(directory: string): Promise<number> {
 }
 
 async function appendStamped(link: AuthorityLink, epoch: number, at: number, stamped: Partial<LogEntry["versions"]>): Promise<void> {
-  const body = { at, epoch, versions: { ...await versions(), ...stamped }, pi_seq: null, files: [], batch: null };
+  const body = { at, epoch, versions: { ...await versions(), ...stamped }, files: [], batch: null };
   assert.equal((await link.command({ op: "append", holder: OWNER, entry: { ...body, digest: logEntryDigest(body) } })).result, "accepted");
 }
 
@@ -300,9 +300,9 @@ for (const [name, connect] of Object.entries(authorities)) {
     await owner.harness.close(context);
     const altered: AuthorityLink = { ...logThrough(link, (await link.record())?.state.head ?? 0), async log(after, limit) {
       const page = await link.log(after, limit);
-      return { ...page, entries: page.entries.map((entry) => entry.batch?.kind === "inline" ? { ...entry, batch: { kind: "inline", json: entry.batch.json.replace("first", "other") } } : entry) };
+      return { ...page, entries: page.entries.map((entry) => entry.batch?.body.kind === "inline" ? { ...entry, batch: { ...entry.batch, body: { kind: "inline", json: entry.batch.body.json.replace("first", "other") } } } : entry) };
     } };
-    const alteredAt = (await logEntries(link)).find((entry) => entry.batch?.kind === "inline" && entry.batch.json.includes("first"))?.at;
+    const alteredAt = (await logEntries(link)).find((entry) => entry.batch?.body.kind === "inline" && entry.batch.body.json.includes("first"))?.at;
     assert.ok(alteredAt);
     await assert.rejects(applyLog({ database: await openScoped(standby), link: altered, stateDirectory: standby }), new RegExp(`Log entry ${alteredAt} does not match its digest`));
     assert.equal(await position(standby), alteredAt - 1);

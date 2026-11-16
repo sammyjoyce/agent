@@ -22,9 +22,9 @@ export function sha256Hex(bytes: Uint8Array | string): string {
 export function logEntryDigest(entry: Omit<LogEntry, "digest">): string {
   const { application, pi_durable, chord } = entry.versions;
   return sha256Hex(JSON.stringify({
-    at: entry.at, epoch: entry.epoch, versions: { application, pi_durable, chord }, pi_seq: entry.pi_seq,
+    at: entry.at, epoch: entry.epoch, versions: { application, pi_durable, chord },
     files: entry.files.map(({ path, sha256, size }) => ({ path, sha256, size })),
-    batch: entry.batch === null ? null : canonicalBatch(entry.batch),
+    batch: entry.batch === null ? null : { pi_seq: entry.batch.pi_seq, body: canonicalBody(entry.batch.body) },
   }));
 }
 
@@ -34,11 +34,11 @@ export function parseBatch(json: string, at: number): StorageWrite[] {
   return writes as StorageWrite[];
 }
 
-function canonicalBatch(batch: BatchBody): BatchBody {
-  switch (batch.kind) {
-    case "inline": return { kind: batch.kind, json: batch.json };
-    case "blob": return { kind: batch.kind, sha256: batch.sha256, size: batch.size };
-    default: return batch satisfies never;
+function canonicalBody(body: BatchBody): BatchBody {
+  switch (body.kind) {
+    case "inline": return { kind: body.kind, json: body.json };
+    case "blob": return { kind: body.kind, sha256: body.sha256, size: body.size };
+    default: return body satisfies never;
   }
 }
 

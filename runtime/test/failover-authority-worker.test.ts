@@ -134,7 +134,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
     const attachment = Buffer.from("invented attachment bytes");
     const batch = Buffer.from(JSON.stringify([{ invented: "batch" }]));
     const withFile = append(1, { files: [{ path: "attachments/a1/content", sha256: sha256(attachment), size: attachment.length }] });
-    const withBatch = append(2, { batch: { kind: "blob", sha256: sha256(batch), size: batch.length } });
+    const withBatch = append(2, { batch: { pi_seq: 2, body: { kind: "blob", sha256: sha256(batch), size: batch.length } } });
     await play(coordinator, [[enroll, "accepted"], [withFile, "missing_blob"]]);
     assert.equal(await head(coordinator), 0);
     await link(coordinator).putBlob(sha256(attachment), attachment);
@@ -182,10 +182,10 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
   await t.test("a command body over 1 MiB is refused and an inline batch of 256 KiB is accepted", async () => {
     const coordinator = await fresh();
     await play(coordinator, [[enroll, "accepted"]]);
-    const oversized = append(1, { batch: { kind: "inline", json: "x".repeat(1024 * 1024) } });
+    const oversized = append(1, { batch: { pi_seq: 1, body: { kind: "inline", json: "x".repeat(1024 * 1024) } } });
     await assert.rejects(link(coordinator).command(oversized), status(413, AuthorityRejected));
     assert.equal(await head(coordinator), 0);
-    const largest = append(1, { batch: { kind: "inline", json: "x".repeat(256 * 1024) } });
+    const largest = append(1, { batch: { pi_seq: 1, body: { kind: "inline", json: "x".repeat(256 * 1024) } } });
     await play(coordinator, [[largest, "accepted"]]);
     const [stored] = (await link(coordinator).log(0, 64)).entries;
     assert.deepEqual(stored, largest.entry);
@@ -236,7 +236,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
     assert.deepEqual((await pages(coordinator, 7)).flat(), capped.flat());
 
     const heavy = await fresh();
-    const large = (at: number) => append(at, { batch: { kind: "inline", json: "y".repeat(900 * 1024) } });
+    const large = (at: number) => append(at, { batch: { pi_seq: at, body: { kind: "inline", json: "y".repeat(900 * 1024) } } });
     await play(heavy, [[enroll, "accepted"], ...[1, 2, 3, 4, 5].map((at) => [large(at), "accepted"] as const)]);
     const sized = await pages(heavy);
     assert.ok(sized.length > 1, "five entries of 900 KiB came back in one page");
