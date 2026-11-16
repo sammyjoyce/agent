@@ -61,6 +61,8 @@ export type ActorExecution = {
   call(command: HostCommand, host: WorkerHost, signal: AbortSignal): Promise<HostResult>;
   prepare?(model: ModelSelection): Promise<void>;
 };
+/** Returns the only extensions a confined task's actor may use, or undefined for an ordinary task. */
+export type ActorConfinement = (task: TaskRecord) => readonly Extension[] | undefined;
 /** A terminal's view of its actor. Its signal ends the observation only, never the actor's work. */
 export type WorkerSession = {
   signal: AbortSignal;
@@ -94,6 +96,7 @@ type TaskActor = { readonly ref: ActorRef; readonly mode: ActorMode; readonly ex
   readonly bound: Promise<void>; started(): void; readonly exit: Promise<ActorAnswer>; wake?: () => void; drained?: () => void };
 type ActorPlacement = { type: "placed"; host: WorkerHost } | { type: "host_at_start" } | { type: "unplaced" | "host_offline"; reason: string };
 function isAbortedJob(actor: TaskActor): boolean { return actor.mode === "job" && actor.turn.controller.signal.aborted; }
+const CONFINED_ACTOR_ONLY = "A confined task runs only as coordinator background work, without agents";
 const STOPPED_INPUT_WITHDRAWN = "The stopped turn withdrew this input; submit it again to continue.";
 function recordedHostId(worker: Exclude<WorkerState, { state: "unassigned" }>): string | null {
   return worker.host.host_id ?? ("binding" in worker ? worker.binding.host_id : null);
@@ -222,6 +225,7 @@ export class TaskStore {
   private attachments: AttachmentStore | undefined;
   private execution: ActorExecution | undefined;
   private goals: GoalPolicy | undefined;
+  private confinement: ActorConfinement = () => undefined;
   constructor(readonly session: Harness, readonly inference = new ConversationModels()) { inference.bind(session); }
   async prepare(): Promise<void> {
     await this.recordsStore.prepare(this.session, async () => (await this.session.snapshot(Tasks, BACKGROUND_CONTEXT))?.tasks ?? [], task => task.id,
@@ -260,6 +264,8 @@ export class TaskStore {
   useHistory(history: HistoryStore): void { this.histories = history; }
   useAttachments(attachments: AttachmentStore): void { this.attachments = attachments; }
   useActorExecution(execution: ActorExecution): void { this.execution = execution; }
+  /** A confined task's tools come only from this rule, on every actor path. */
+  useConfinement(rule: ActorConfinement): void { this.confinement = rule; }
   isBackgroundTask(task: TaskRecord): boolean {
     return task.sources.some((source) => source.provider === "scheduled_jobs" && source.account === "local");
   }
@@ -924,6 +930,7 @@ export class TaskStore {
   }
   /** Journal decisions and current routing change atomically; immutable receipts advance every affected index tail. */
   async relinkSourcesIn(tx: Tx, id: string, add: readonly SourceRef[], remove: readonly SourceRef[]): Promise<void> {
+    if ([...add, ...remove].some((source) => source.provider === "scheduled_jobs")) throw new TaskError("Scheduled job ownership is assigned only by the scheduler");
     const task = await this.taskIn(tx, id);
     if (task === undefined) throw new TaskError("Unknown task");
     const added = add.filter((source, index) => !task.sources.some((saved) => related(saved, source)) &&
@@ -1621,6 +1628,7 @@ export class TaskStore {
     const ref: ActorRef = { task_id: input.task_id, ...(input.agent_id === undefined ? {} : { agent_id: input.agent_id }) };
     const key = this.actorKey(ref.task_id, ref.agent_id);
     if (observer === undefined && (this.running.get(key)?.phase ?? "closing") !== "closing") throw new TaskError("This task already has an attached worker");
+    if (this.confinement(await this.get(input.task_id)) !== undefined) throw new TaskError(CONFINED_ACTOR_ONLY);
     const { task, worker } = await this.confirmBinding(input, call);
     const record = this.actor(task, ref.agent_id);
     const attached: ActorObserver | undefined = observer === undefined ? undefined
@@ -1679,6 +1687,10 @@ export class TaskStore {
     try {
       let task = await this.get(input.task_id);
       let actor = this.actor(task, input.agent_id);
+      const confined = this.confinement(task);
+      if (confined !== undefined && (active.mode !== "job" || input.agent_id !== undefined)) throw new TaskError(CONFINED_ACTOR_ONLY);
+      // Every configure call below reads this, so no execution can widen a confined task.
+      const extensions = () => confined ?? execution.extensions(input.agent_id);
       const conversation = await this.conversation(actor.conversation_id);
       if (active.mode === "job") active.conversation = conversation;
       if (isAbortedJob(active)) throw new TaskError("Background execution stopped; its native input is retained");
@@ -1708,7 +1720,7 @@ export class TaskStore {
             : "\nComplete this bounded assignment and return the final evidence. Use report_result for an explicit failure or a structured report. The parent owns the overall task.");
       const initial = {
         instructions: await instructions(bootstrap?.job.prompt ?? actor.outcome),
-        cwd: executionHost.cwd, extensions: execution.extensions(input.agent_id),
+        cwd: executionHost.cwd, extensions: extensions(),
       };
       if (bootstrap === undefined) selected = await this.inference.configureCurrent(conversation, selected, initial);
       else await this.inference.configure(conversation, selected, initial);
@@ -1800,7 +1812,7 @@ export class TaskStore {
           await conversation.waitForIdle(BACKGROUND_CONTEXT);
           await execution.prepare?.(job.model);
           if (isAbortedJob(active)) break;
-          await this.inference.configure(conversation, job.model, { instructions: await instructions(job.prompt), cwd: job.cwd, extensions: execution.extensions(input.agent_id) });
+          await this.inference.configure(conversation, job.model, { instructions: await instructions(job.prompt), cwd: job.cwd, extensions: extensions() });
           await this.session.commit(async (tx) => {
             (await tx.doc(NoticeLineage, conversation.id)).origin = readNoticeOrigin({ job_id: job.id, title: job.title }) ?? null;
             await this.updateIn(tx, task.id, (current) => {

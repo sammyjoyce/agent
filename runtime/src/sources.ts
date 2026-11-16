@@ -15,6 +15,7 @@ import type { TaskOutcome } from "./generated/TaskOutcome.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { publishMainNotice, sourceReference, TaskError, TaskStore, type NoticePublication } from "./tasks.js";
 import { Executions } from "./tools.js";
+import { isDreamsTask } from "./dreams.js";
 import { PartitionedRecords } from "./partitioned-records.js";
 
 type Decision = { type: "task"; task_id: string } | { type: "dismissed"; reason: string };
@@ -154,8 +155,10 @@ export class SourceJournal {
         await this.decideIn(tx, record, { type: "dismissed", reason: "Superseded by a newer outcome from the same task conversation" });
       }
     }
-    const record = await this.records.insertIn(tx, key, { key, event, outcome,
-      decision: settled ? { type: "dismissed", reason: "Already handled by the coordinator" } : null });
+    // Triage holds a shell. Text a Dreams actor wrote from untrusted evidence must never reach it.
+    const decision: Decision | null = settled ? { type: "dismissed", reason: "Already handled by the coordinator" }
+      : isDreamsTask(outcome) ? { type: "dismissed", reason: "Dreams results are reviewed with beep-boop dreams and never enter triage" } : null;
+    const record = await this.records.insertIn(tx, key, { key, event, outcome, decision });
     await this.indexIn(tx, record.value, record.inserted);
     const previous = journal.sources.find((state) => sameSource(state.source, OUTCOMES));
     const state = { ...outcomeState(), checked_at: Date.now() };

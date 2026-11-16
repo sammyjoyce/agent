@@ -284,6 +284,12 @@ impl Broker {
                 HostCommand::Background { request } => crate::background::execute(request)
                     .await
                     .map(|response| HostResult::Background { response }),
+                HostCommand::Dreams { .. } => {
+                    return HostResult::Failed {
+                        delivery: Some(HostDelivery::NotStarted),
+                        message: crate::dreams::NOT_CONFIGURED.into(),
+                    };
+                }
                 HostCommand::ReadUsage { expected_email } => {
                     return HostResult::Usage {
                         usage: crate::usage::account(&expected_email).await,
@@ -334,6 +340,7 @@ impl Broker {
                         *command,
                         HostCommand::OnNode { .. }
                             | HostCommand::Background { .. }
+                            | HostCommand::Dreams { .. }
                             | HostCommand::ReloadGuidance
                             | HostCommand::ReadContext { .. }
                             | HostCommand::SearchContext { .. }

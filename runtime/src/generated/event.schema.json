@@ -1425,6 +1425,156 @@
         }
       ]
     },
+    "DreamsAbstainReason": {
+      "description": "Model-selectable reasons. Exhausted attempts are absent: only the executor seals them.",
+      "type": "string",
+      "enum": [
+        "quiet",
+        "insufficient_coverage",
+        "no_supported_change"
+      ]
+    },
+    "DreamsFileEdit": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ]
+    },
+    "DreamsRequest": {
+      "description": "Everything a Dreams actor can ask the coordinator to do.\nInvariant: no variant applies, executes a caller-chosen command, names a\ntarget, or carries policy. Adding one is a security change, not a feature.",
+      "oneOf": [
+        {
+          "description": "Seal (or reread) this run's window, coverage, base, before checks and evidence.\n`summaries` is used only by the first, sealing call of a run.",
+          "type": "object",
+          "properties": {
+            "page": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "run": {
+              "type": "string"
+            },
+            "summaries": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/DreamsTaskSummary"
+              }
+            },
+            "summaries_omitted": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "review"
+            }
+          },
+          "required": [
+            "type",
+            "run",
+            "summaries",
+            "summaries_omitted",
+            "page"
+          ]
+        },
+        {
+          "description": "One proposal attempt. Edits are full file contents; the patch is derived by git.",
+          "type": "object",
+          "properties": {
+            "edits": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/DreamsFileEdit"
+              }
+            },
+            "evidence": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "rationale": {
+              "type": "string"
+            },
+            "run": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "propose"
+            }
+          },
+          "required": [
+            "type",
+            "run",
+            "edits",
+            "rationale",
+            "evidence"
+          ]
+        },
+        {
+          "description": "Seal an explicit abstention.",
+          "type": "object",
+          "properties": {
+            "note": {
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/$defs/DreamsAbstainReason"
+            },
+            "run": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "abstain"
+            }
+          },
+          "required": [
+            "type",
+            "run",
+            "reason",
+            "note"
+          ]
+        }
+      ]
+    },
+    "DreamsTaskSummary": {
+      "type": "object",
+      "properties": {
+        "summary": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "task_id",
+        "title",
+        "summary",
+        "updated_at"
+      ]
+    },
     "EmbeddingPurpose": {
       "type": "string",
       "enum": [
@@ -2513,6 +2663,23 @@
             "type": {
               "type": "string",
               "const": "background"
+            }
+          },
+          "required": [
+            "type",
+            "request"
+          ]
+        },
+        {
+          "description": "Coordinator-local Dreams review. Its request type has no apply variant.",
+          "type": "object",
+          "properties": {
+            "request": {
+              "$ref": "#/$defs/DreamsRequest"
+            },
+            "type": {
+              "type": "string",
+              "const": "dreams"
             }
           },
           "required": [

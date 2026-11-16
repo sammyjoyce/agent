@@ -5,6 +5,7 @@ pub mod config;
 pub mod context;
 pub mod coordinator_id;
 pub mod discovery;
+pub mod dreams;
 pub mod embeddings;
 pub mod feedback;
 pub mod goal_view;

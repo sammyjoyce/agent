@@ -1298,6 +1298,10 @@ pub enum HostCommand {
     Background {
         request: crate::background::BackgroundRequest,
     },
+    /// Coordinator-local Dreams review. Its request type has no apply variant.
+    Dreams {
+        request: crate::dreams::DreamsRequest,
+    },
     MachineSnapshot,
     ReadUsage {
         expected_email: String,
@@ -1447,6 +1451,9 @@ pub enum HostResult {
     },
     Background {
         response: crate::background::BackgroundResponse,
+    },
+    Dreams {
+        reply: crate::dreams::DreamsReply,
     },
     MachineSnapshot {
         snapshot: MachineSnapshot,

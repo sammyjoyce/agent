@@ -23,6 +23,7 @@ import { Retrieval } from "./retrieval.js";
 import { FeedbackStore } from "./feedback.js";
 import { FeedbackDispatcher } from "./feedback-dispatch.js";
 import { createGuidance } from "./guidance.js";
+import { createDreamsTools, createDreamsToolset, isDreamsTask } from "./dreams.js";
 import { createAppTools, createJobTools, Executions, HostRequests } from "./tools.js";
 import { createGoalTools, GoalStore } from "./goals.js";
 import { applyToolSurfaces, createToolDiscovery, createToolsets, TOOL_SURFACES, withActorPolicies, type ToolDiscovery, type Toolsets } from "./toolsets.js";
@@ -250,6 +251,9 @@ async function openApplication(): Promise<Application> {
   const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools, goalTools }),
     { responsePolicy, inputOrigins }), TOOL_SURFACES, discovery);
   for (const extension of installed) registry.install(extension);
+  const dreams = createDreamsTools(harness, tasks, executions); registry.install(dreams);
+  const dreamsToolset = createDreamsToolset({ guidance, inputOrigins, dreams });
+  tasks.useConfinement((task) => isDreamsTask(task) ? dreamsToolset : undefined);
   const serviceExecution: ActorExecution = {
     available: () => backgroundAvailable,
     extensions: (agentId) => agentId === undefined ? toolsets.worker : toolsets.agent,

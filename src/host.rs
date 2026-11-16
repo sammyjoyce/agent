@@ -350,6 +350,7 @@ async fn execute_inner(rex: &RexClient, command: HostCommand) -> Result<HostResu
         }
         HostCommand::OnNode { .. }
         | HostCommand::Background { .. }
+        | HostCommand::Dreams { .. }
         | HostCommand::ReadContext { .. }
         | HostCommand::SearchContext { .. } => {
             anyhow::bail!("This operation requires the coordinator's registered host broker")
