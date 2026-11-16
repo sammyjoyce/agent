@@ -713,20 +713,7 @@ func aSendStoppedEverywhereBeforeItLeftThePhoneIsOfferedAgainAfterACrash(
       break
     }
     for coordinator in coordinators { try await held(coordinator.gate) }
-    switch stop {
-    case .addressEdit:
-      for coordinator in coordinators {
-        await model.detach(coordinator.session.profile)
-        let next = CoordinatorSession(
-          directory: coordinator.directory, address: try CoordinatorAddress(host: "100.64.1.2"),
-          pin: coordinator.fixture.id, stamps: StampSource(),
-          transport: loopback(coordinator.endpoint))
-        model.attach(lane(next))
-        await next.connect()
-      }
-    case .disconnect: await model.setActive(false)
-    case .dialFails: for coordinator in coordinators { await coordinator.gate.fail() }
-    }
+    try await stopEveryCopy(stop, of: coordinators, in: model)
     let deadline = ContinuousClock.now + .seconds(5)
     while try await ComposerDraftStore(url: url).load(from: files).draft.text.isEmpty,
       ContinuousClock.now < deadline
@@ -747,6 +734,103 @@ func aSendStoppedEverywhereBeforeItLeftThePhoneIsOfferedAgainAfterACrash(
     for coordinator in coordinators {
       #expect(await coordinator.fixture.count() == 0, "A coordinator got /status")
     }
+    await model.setActive(false)
+  }
+}
+
+/// Stops each coordinator's copy of a Send while its dial is held, the way `stop` names.
+@MainActor private func stopEveryCopy(
+  _ stop: UnwrittenStop, of coordinators: [GatedCoordinator], in model: ChatModel
+) async throws {
+  switch stop {
+  case .addressEdit:
+    for coordinator in coordinators {
+      await model.detach(coordinator.session.profile)
+      let next = CoordinatorSession(
+        directory: coordinator.directory, address: try CoordinatorAddress(host: "100.64.1.2"),
+        pin: coordinator.fixture.id, stamps: StampSource(),
+        transport: loopback(coordinator.endpoint))
+      model.attach(lane(next))
+      await next.connect()
+    }
+  case .disconnect: await model.setActive(false)
+  case .dialFails: for coordinator in coordinators { await coordinator.gate.fail() }
+  }
+}
+
+/// A model that saves its draft under `root`, as the app does, connected to every coordinator.
+@MainActor private func connectedModel(
+  to coordinators: [GatedCoordinator], under root: URL
+) async throws -> ChatModel {
+  let directory = root.appending(path: "Composer")
+  let model = ChatModel(
+    draftStore: AttachmentStore(directory: directory.appending(path: "Files")),
+    persistence: ComposerDraftStore(url: directory.appending(path: "draft.json")))
+  await model.restoreDraft()
+  for coordinator in coordinators { model.attach(lane(coordinator.session)) }
+  await model.setActive(true)
+  for coordinator in coordinators {
+    _ = try await snapshot(of: coordinator.session, in: model) { $0.connection == .connected }
+  }
+  return model
+}
+
+/// A Send of `/status` starts toward every recipient and leaves the composer, and the user types
+/// a newer note. Each copy then stops while its socket is still connecting, so no coordinator gets
+/// it. The live composer gets `/status` back ahead of the newer note, as recovery would offer it.
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: UnwrittenStop.allCases, [1, 2])
+func aControlNoRecipientWroteComesBackToTheLiveComposer(
+  stop: UnwrittenStop, recipients: Int
+) async throws {
+  try await withGatedCoordinators(recipients) { coordinators, root in
+    let model = try await connectedModel(to: coordinators, under: root)
+    for coordinator in coordinators { await coordinator.gate.arm() }
+    model.draft = "/status"
+    await model.send()
+    #expect(model.draft.isEmpty, "Send took /status from the composer")
+    for coordinator in coordinators { try await held(coordinator.gate) }
+    model.draft = "An invented newer note"
+    try await stopEveryCopy(stop, of: coordinators, in: model)
+    let restored = "/status\n\nAn invented newer note"
+    let deadline = ContinuousClock.now + .seconds(5)
+    while model.draft != restored, ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(model.draft == restored, "/status comes back ahead of the newer note")
+    for coordinator in coordinators {
+      #expect(await coordinator.fixture.count() == 0, "A coordinator got /status")
+    }
+    await model.setActive(false)
+  }
+}
+
+/// A Send of `/status` goes to two coordinators. The dial to the second fails, and the first then
+/// gets `/status` and may run it. The composer keeps only the newer note, since sending `/status`
+/// again would run it twice.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aControlOneRecipientWroteDoesNotComeBack() async throws {
+  try await withGatedCoordinators(2) { coordinators, root in
+    let (first, second) = (coordinators[0], coordinators[1])
+    let model = try await connectedModel(to: coordinators, under: root)
+    await first.gate.arm()
+    await second.gate.arm()
+    model.draft = "/status"
+    await model.send()
+    try await held(first.gate)
+    try await held(second.gate)
+    model.draft = "An invented newer note"
+    await second.gate.fail()
+    await first.gate.open()
+    for await input in first.fixture.observedInputs {
+      #expect(input.text == "/status")
+      break
+    }
+    let settled = ContinuousClock.now + .milliseconds(500)
+    while model.draft == "An invented newer note", ContinuousClock.now < settled {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(model.draft == "An invented newer note", "/status does not come back")
+    #expect(await second.fixture.count() == 0, "The second coordinator got nothing")
     await model.setActive(false)
   }
 }
