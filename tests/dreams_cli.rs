@@ -784,22 +784,42 @@ struct Sealed {
 
 impl Sealed {
     async fn new(fixture: &Fixture, path: &str, content: &str, rationale: &str) -> Self {
+        Self::citing(fixture, &[DEFECT_SUMMARY], path, content, rationale).await
+    }
+
+    /// Seals a proposal that cites one task summary for each text, in order.
+    async fn citing(
+        fixture: &Fixture,
+        summaries: &[&str],
+        path: &str,
+        content: &str,
+        rationale: &str,
+    ) -> Self {
         let policy = config::load(Some(&fixture.config))
             .unwrap()
             .dreams_policy()
             .unwrap()
             .unwrap();
         let dreams = Dreams::open(&fixture.state, policy).unwrap();
+        let summaries: Vec<DreamsTaskSummary> = summaries
+            .iter()
+            .enumerate()
+            .map(|(index, summary)| DreamsTaskSummary {
+                task_id: format!("example-task-{index}"),
+                title: "Example defect".into(),
+                summary: (*summary).into(),
+                updated_at: 123,
+            })
+            .collect();
+        let evidence = summaries
+            .iter()
+            .map(|summary| format!("t:{}@123", summary.task_id))
+            .collect();
         let mut run = String::new();
         for request in [
             DreamsRequest::Review {
                 run: "example-night".into(),
-                summaries: vec![DreamsTaskSummary {
-                    task_id: "example-task".into(),
-                    title: "Example defect".into(),
-                    summary: DEFECT_SUMMARY.into(),
-                    updated_at: 123,
-                }],
+                summaries,
                 summaries_omitted: 0,
                 page: 1,
             },
@@ -810,7 +830,7 @@ impl Sealed {
                     content: content.into(),
                 }],
                 rationale: rationale.into(),
-                evidence: vec!["t:example-task@123".into()],
+                evidence,
             },
         ] {
             let (_owner, cancelled) = watch::channel(false);
@@ -1072,6 +1092,71 @@ async fn show_escapes_unicode_format_controls_in_the_patch_and_the_rationale() {
             .count(),
         1,
         "The typed record keeps the exact bytes"
+    );
+}
+
+#[tokio::test]
+async fn show_quotes_each_cited_evidence_body_and_bounds_each_one_and_their_total() {
+    let fixture = Fixture::new();
+    fixture.seed_witnessed_night();
+    let prefix = "EXAMPLE-CITED-MARKER \u{1b}[2K ";
+    let oversized = format!("{prefix}{}", "\u{e9}".repeat(3_000));
+    assert_eq!(oversized.len(), 6_026);
+    let sealed = Sealed::citing(
+        &fixture,
+        &[&oversized, &oversized, &oversized, &oversized, &oversized],
+        "AGENTS.md",
+        FIXED_AGENTS,
+        "Name the real target.",
+    )
+    .await;
+    let human = fixture.ok(&["dreams", "show", &sealed.run], false);
+    assert!(
+        !human.contains('\u{1b}'),
+        "dreams show printed a control character from evidence raw"
+    );
+    let lines: Vec<&str> = human.lines().collect();
+    let at = |wanted: &str| {
+        lines
+            .iter()
+            .position(|line| *line == wanted)
+            .unwrap_or_else(|| panic!("Missing line {wanted:?} in:\n{human}"))
+    };
+    let label = at("Cited evidence (untrusted, quoted):");
+    let patch = at("--- patch ---");
+    let cut =
+        |more: usize| format!("[... {more} more bytes; dreams show --json has the exact record]");
+
+    let first_4_000_bytes = format!(
+        "EXAMPLE-CITED-MARKER \\u{{1b}}[2K {}",
+        "\u{e9}".repeat(1_987)
+    );
+    for index in 0..4 {
+        let header = at(&format!("evidence t:example-task-{index}@123"));
+        assert!(label < header && header < patch, "{human}");
+        let quoted: Vec<&str> = lines[header + 1..]
+            .iter()
+            .map_while(|line| line.strip_prefix("> "))
+            .collect();
+        assert_eq!(
+            quoted.concat(),
+            first_4_000_bytes,
+            "The body follows its id as quoted, escaped text"
+        );
+        assert_eq!(lines[header + 1 + quoted.len()], cut(6_026 - 4_000));
+    }
+    let spent = at("evidence t:example-task-4@123");
+    assert_eq!(
+        lines[spent + 1],
+        cut(6_026),
+        "The total bound leaves nothing for the fifth body: {human}"
+    );
+    assert!(spent < patch);
+
+    let typed = sealed.shown["evidence"].as_array().unwrap();
+    assert!(
+        typed.iter().all(|item| item["body"] == oversized.as_str()),
+        "The typed record keeps every exact body"
     );
 }
 
