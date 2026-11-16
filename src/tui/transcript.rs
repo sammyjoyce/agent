@@ -149,6 +149,10 @@ impl CachedText {
         result
     }
 
+    pub(super) fn is_tool_preview(&self) -> bool {
+        self.preview.is_some()
+    }
+
     pub(super) fn append_line(&mut self, line: Line<'static>) {
         let paragraph = Paragraph::new(line).wrap(Wrap { trim: false });
         if self.markdown.is_some() {

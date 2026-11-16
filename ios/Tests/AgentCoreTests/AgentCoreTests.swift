@@ -1,7 +1,10 @@
+import CoreGraphics
 import CryptoKit
 import Foundation
+import ImageIO
 import Network
 import Testing
+import UniformTypeIdentifiers
 
 @testable import AgentCore
 
@@ -431,6 +434,97 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
     #expect(await fixture.count() == 1)
     #expect(
       try queuedRequests(outbox).isEmpty)
+  }
+}
+
+private func screenshotPNG() throws -> Data {
+  let context = try #require(
+    CGContext(
+      data: nil, width: 96, height: 48, bitsPerComponent: 8, bytesPerRow: 96 * 4,
+      space: CGColorSpaceCreateDeviceRGB(),
+      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+  for (index, color) in [(0.82, 0.19, 0.19), (0.19, 0.63, 0.25), (0.19, 0.31, 0.82)].enumerated() {
+    context.setFillColor(CGColor(red: color.0, green: color.1, blue: color.2, alpha: 1))
+    context.fill(CGRect(x: index * 32, y: 0, width: 32, height: 48))
+  }
+  let data = NSMutableData()
+  let image = try #require(
+    CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil))
+  CGImageDestinationAddImage(image, try #require(context.makeImage()), nil)
+  try #require(CGImageDestinationFinalize(image))
+  return data as Data
+}
+
+private func screenshotReference(_ bytes: Data) -> AttachmentRef {
+  AttachmentRef(
+    id: "33333333-3333-4333-8333-333333333333", mediaType: "image/png",
+    name: "browser-screenshot-invented.png",
+    sha256: SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined(),
+    sizeBytes: bytes.count)
+}
+
+private func screenshotMessages(_ reference: AttachmentRef) -> [HistoryMessage] {
+  [
+    HistoryMessage(
+      continuation: false, entryId: "41", finalChunk: true, role: .tool, text: "",
+      tool: .init(callId: "screenshot-call", name: "browser_screenshot", status: .running)),
+    HistoryMessage(
+      attachments: [reference], continuation: false, entryId: "42", finalChunk: true, role: .tool,
+      text: "Saved the screenshot of tab 7.",
+      tool: .init(callId: "screenshot-call", name: "browser_screenshot", status: .finished)),
+  ]
+}
+
+@Test func aToolResultAttachmentStaysOnItsToolRowLiveAndInHistory() throws {
+  let reference = screenshotReference(try screenshotPNG())
+  let messages = screenshotMessages(reference)
+  var live = Transcript()
+  live.activity(.toolStarted(.init(callId: "screenshot-call", name: "browser_screenshot")))
+  for message in messages { live.message(message) }
+  var saved = Transcript()
+  saved.history(.init(messages: messages, nextCursor: nil, pageComplete: true))
+  for var transcript in [live, saved] {
+    let rows = transcript.rows.filter { $0.tool?.callId == "screenshot-call" }
+    #expect(rows.count == 1)
+    #expect(rows.first?.attachments == [reference])
+    #expect(rows.first?.tool?.status == ToolStatus.finished)
+  }
+}
+
+@Test(.timeLimit(.minutes(1))) func aBrowserScreenshotOnAToolRowPreviewsOnlyItsVerifiedBytes()
+  async throws
+{
+  try await withCoordinator { session, fixture, _ in
+    let bytes = try screenshotPNG()
+    let reference = screenshotReference(bytes)
+    let changed = AttachmentRef(
+      id: "44444444-4444-4444-8444-444444444444", mediaType: reference.mediaType,
+      name: reference.name, sha256: reference.sha256, sizeBytes: bytes.count)
+    var altered = bytes
+    altered[altered.count / 2] ^= 0xff
+    await fixture.retain(bytes, id: reference.id)
+    await fixture.retain(altered, id: changed.id)
+    await fixture.replyToHistory(
+      initial: .init(
+        messages: screenshotMessages(reference), nextCursor: nil, pageComplete: true),
+      pages: [:])
+    await session.connect()
+    let snapshot = try await until(session) {
+      $0.connection == .connected && $0.rows.contains { $0.tool?.callId == "screenshot-call" }
+    }
+    let row = try #require(snapshot.rows.first { $0.tool?.callId == "screenshot-call" })
+    #expect(row.attachments == [reference])
+    let preview = try await session.preview(reference)
+    #expect(try Data(contentsOf: preview) == bytes)
+    let image = try #require(
+      CGImageSourceCreateWithURL(preview as CFURL, nil).flatMap {
+        CGImageSourceCreateImageAtIndex($0, 0, nil)
+      })
+    #expect(image.width == 96 && image.height == 48)
+    do {
+      _ = try await session.preview(changed)
+      Issue.record("Bytes that do not match the screenshot's digest previewed")
+    } catch AttachmentError.changed {}
   }
 }
 

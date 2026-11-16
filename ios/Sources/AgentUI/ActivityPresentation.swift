@@ -156,6 +156,7 @@ struct ActivityGroupView: View {
   @Binding var expansion: ActivityExpansion
   let details: ToolDetailsLoader
   var onExpand: () -> Void = {}
+  var preview: (AttachmentRef) -> Void = { _ in }
   @State private var queue = ActivityDetailQueue()
 
   private var expanded: Bool { expansion.groups.contains(group.id) }
@@ -209,6 +210,14 @@ struct ActivityGroupView: View {
           }
         }
         .padding(.leading, 8)
+      }
+      ForEach(group.rows.flatMap(\.row.attachments), id: \.id) { reference in
+        Button {
+          preview(reference)
+        } label: {
+          AttachmentLabel(reference: reference)
+        }
+        .buttonStyle(.plain).accessibilityHint("Download and preview attachment")
       }
     }
     .frame(maxWidth: .infinity, alignment: .leading)

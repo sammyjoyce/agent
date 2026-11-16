@@ -139,7 +139,7 @@ recovery; [history](history.md) describes import and retrieval.
   drafts; return explicit browser-script results without automatic page dumps.
 - [ ] Complete unattended Chrome lifecycle acceptance across OS reboots,
   ordinary browser relaunch and interruption recovery with autofill enabled.
-- [ ] Deliver browser screenshot attachments.
+- [x] Deliver browser screenshot attachments.
 - [x] A phone client for the main conversation, using the same submission,
   steering and queueing path as the CLI. The native iPhone app fulfills the
   planned WhatsApp/iMessage client use case. System appearance is the default,

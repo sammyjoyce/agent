@@ -297,6 +297,23 @@
         "sources"
       ]
     },
+    "BrowserCapture": {
+      "description": "One PNG capture of an owned tab, with the SHA-256 of its decoded bytes.",
+      "type": "object",
+      "properties": {
+        "data_base64": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "data_base64",
+        "sha256"
+      ]
+    },
     "BrowserResponse": {
       "oneOf": [
         {
@@ -384,6 +401,35 @@
             "session_id",
             "tabs",
             "output"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capture": {
+              "$ref": "#/$defs/BrowserCapture"
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "tabs": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/BrowserTab"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "screenshot"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "session_id",
+            "tabs",
+            "capture"
           ]
         },
         {
@@ -4725,6 +4771,10 @@
       "type": "object",
       "properties": {
         "browser": {
+          "type": "boolean",
+          "default": false
+        },
+        "browser_screenshots": {
           "type": "boolean",
           "default": false
         },

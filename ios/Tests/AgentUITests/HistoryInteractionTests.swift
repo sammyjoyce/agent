@@ -1,5 +1,6 @@
 import AgentCore
 import CoreImage
+import CryptoKit
 import Network
 import UIKit
 import Vision
@@ -1705,6 +1706,76 @@ final class HistoryInteractionTests: XCTestCase {
     }
   }
 
+  func testATapOnAScreenshotUnderItsToolActivityPreviewsTheRetainedImage() async throws {
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = 1
+    let png = UIGraphicsImageRenderer(size: CGSize(width: 96, height: 48), format: format)
+      .pngData { context in
+        for (index, color) in [UIColor.systemRed, .systemGreen, .systemBlue].enumerated() {
+          color.setFill()
+          context.fill(CGRect(x: index * 32, y: 0, width: 32, height: 48))
+        }
+      }
+    let screenshot = AttachmentRef(
+      id: "33333333-3333-4333-8333-333333333333", mediaType: "image/png",
+      name: "browser-screenshot-invented.png",
+      sha256: SHA256.hash(data: png).map { String(format: "%02x", $0) }.joined(),
+      sizeBytes: png.count)
+    let peer = InteractionPeer()
+    await peer.retain(png, id: screenshot.id)
+    let app = try await launchMessages(
+      [
+        .init(
+          continuation: false, entryId: "41", finalChunk: true, role: .tool, text: "",
+          tool: .init(callId: "screenshot-call", name: "browser_screenshot", status: .running)),
+        .init(
+          attachments: [screenshot], continuation: false, entryId: "42", finalChunk: true,
+          role: .tool, text: "Captured tab 7 as attachment \(screenshot.id).",
+          tool: .init(callId: "screenshot-call", name: "browser_screenshot", status: .finished)),
+      ], peer: peer)
+    XCTAssertTrue(
+      feedButton("activity", row: "tool:screenshot-call", app: app).waitForExistence(timeout: 5))
+    let attachment = app.buttons.matching(
+      NSPredicate(format: "label CONTAINS %@", screenshot.name)
+    ).firstMatch
+    XCTAssertTrue(
+      attachment.waitForExistence(timeout: 5), "The screenshot is listed under its tool's activity")
+    attachment.tap()
+    // QuickLook may hide its title and Done button, so the drawn image is the proof.
+    let image = app.otherElements["QLPreviewControllerView"].images.firstMatch
+    let opened = image.waitForExistence(timeout: 10)
+    let hierarchy = XCTAttachment(string: app.debugDescription)
+    hierarchy.name = "screenshot-preview-hierarchy"
+    add(hierarchy)
+    XCTAssertTrue(opened, "The preview opens on the screenshot")
+    XCTAssertFalse(app.alerts.firstMatch.exists, "The download did not fail")
+    let downloads = await peer.downloads()
+    XCTAssertEqual(downloads, [screenshot.id], "The preview downloads the retained screenshot")
+    let frame = image.frame
+    XCTAssertEqual(frame.width, frame.height * 2, accuracy: 1, "The image is 2:1")
+    let shown = app.screenshot()
+    let capture = try XCTUnwrap(shown.image.cgImage)
+    let scale = CGFloat(capture.width) / app.frame.width
+    var pixels = [UInt8](repeating: 0, count: capture.width * capture.height * 4)
+    let context = try XCTUnwrap(
+      CGContext(
+        data: &pixels, width: capture.width, height: capture.height, bitsPerComponent: 8,
+        bytesPerRow: capture.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+    context.draw(capture, in: CGRect(x: 0, y: 0, width: capture.width, height: capture.height))
+    let strongest = (0..<3).map { stripe in
+      let x = Int((frame.minX + frame.width * CGFloat(stripe * 2 + 1) / 6) * scale)
+      let pixel = (Int(frame.midY * scale) * capture.width + x) * 4
+      let rgb = pixels[pixel..<pixel + 3]
+      return rgb.firstIndex(of: rgb.max() ?? 0).map { $0 - pixel }
+    }
+    XCTAssertEqual(strongest, [0, 1, 2], "The preview draws the red, green and blue stripes")
+    let evidence = XCTAttachment(screenshot: shown)
+    evidence.name = "browser-screenshot-preview-from-tool-activity"
+    evidence.lifetime = .keepAlways
+    add(evidence)
+  }
+
   func testOneActivityExpansionShowsEverySuppliedSummaryWithoutFetchingHiddenThinking()
     async throws
   {
@@ -2297,7 +2368,11 @@ actor InteractionPeer {
   private var servedJobs: [ScheduledJobStatus] = []
   private var retried: [String] = []
   private var submitCount = 0
+  private var files: [String: Data] = [:]
+  private var downloaded: [String] = []
   func observationCount() -> Int { observations }
+  func retain(_ data: Data, id: String) { files[id] = data }
+  func downloads() -> [String] { downloaded }
   func streamRepliesOnSubmit() { streamsOnSubmit = true }
   func toolDetails(_ values: [String: ToolDetails]) { toolReplies = values }
   func commands(_ values: [SlashCommand]) { commandValues = values }
@@ -2443,6 +2518,22 @@ actor InteractionPeer {
         if held.contains(cursor) { await withCheckedContinuation { releases[cursor] = $0 } }
         try await emitHistory(
           try XCTUnwrap(request.cursor == nil ? latest : pages[cursor]), to: socket)
+        try await emit(.done, to: socket)
+      case .attachment(let value):
+        guard case .download(let chunk) = value.request, let file = files[chunk.id] else {
+          try await emit(.failure(.init(message: "Invented: no such attachment")), to: socket)
+          try await emit(.done, to: socket)
+          break
+        }
+        downloaded.append(chunk.id)
+        let end = min(chunk.offset + chunk.limit, file.count)
+        try await emit(
+          .attachment(
+            .init(
+              response: .download(
+                .init(
+                  dataBase64: file.subdata(in: chunk.offset..<end).base64EncodedString(),
+                  nextOffset: end < file.count ? end : nil)))), to: socket)
         try await emit(.done, to: socket)
       case .jobs(let request) where !servedJobs.isEmpty:
         try await emit(jobStatus(request.jobId), to: socket)

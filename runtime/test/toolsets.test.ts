@@ -10,6 +10,7 @@ import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai/u
 import { createRegistry, defineExtension, defineTool, Harness, type Conversation } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { Type } from "typebox";
+import { AttachmentStore } from "../src/attachments.js";
 import { BackgroundScheduler } from "../src/background.js";
 import { BrowserStore, createBrowserTools } from "../src/browser.js";
 import { createGuidance } from "../src/guidance.js";
@@ -38,10 +39,10 @@ const taskNames = ["search_tasks", "read_task", "revoke_allocation", "delegate_t
 const sourceDecisions = ["link_source_events", "dismiss_source_events", "notify"];
 const ADOPTED_SURFACES: Record<ToolRole, readonly string[]> = {
   main: ["exec", "read_attachment", "read_file", "write_file", "edit_file", "search_tasks", "read_task", "delegate_task", "record_task",
-    "list_jobs", "read_job", "run_job", "finish_without_reply", "tool_search"],
-  triage: ["read_attachment", "read_file", "record_task", "codemode"],
-  worker: ["read_attachment", "read_file", "record_task", "codemode"],
-  agent: ["read_attachment", "read_file", "codemode"],
+    "list_jobs", "read_job", "run_job", "finish_without_reply", "tool_search", "browser_screenshot"],
+  triage: ["read_attachment", "read_file", "browser_screenshot", "record_task", "codemode"],
+  worker: ["read_attachment", "read_file", "browser_screenshot", "record_task", "codemode"],
+  agent: ["read_attachment", "read_file", "browser_screenshot", "codemode"],
 };
 type ToolArguments = Parameters<typeof fauxToolCall>[1];
 function offeredNames(input: Context): string[] { return getCurrentTools(input.messages).map((tool) => tool.name); }
@@ -99,7 +100,7 @@ async function open(directory: string, guidanceText = "CURRENT_PROFILE_GUIDANCE"
   });
   const discovery = createToolDiscovery();
   const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance: createGuidance(executions), tools, sourceTools,
-    resourceTools: createResourceTools(resources, tasks, executions), browserTools: createBrowserTools(new BrowserStore(session), executions),
+    resourceTools: createResourceTools(resources, tasks, executions), browserTools: createBrowserTools(new BrowserStore(session), executions, new AttachmentStore(directory)),
     jobTools: createJobTools(background, executions) }), { responsePolicy: createMainResponsePolicy(session), inputOrigins: createInputOrigins(session) }),
   surfaces, discovery);
   for (const extension of new Set([...Object.values(toolsets).flat(), ...installed])) registry.install(extension);

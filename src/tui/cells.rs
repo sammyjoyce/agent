@@ -94,17 +94,20 @@ pub(super) fn render(message: Content<'_>) -> CachedText {
     if message.role == Role::PartialAnswer {
         rendered.append_line(Line::styled("Response incomplete", dim()));
     }
-    for file in message.attachments {
-        rendered.append_line(Line::styled(
-            format!(
-                "Attachment: {} · {} bytes",
-                markdown::plain(&file.name),
-                file.size_bytes
-            ),
-            dim(),
-        ));
+    if !rendered.is_tool_preview() {
+        for file in message.attachments {
+            rendered.append_line(Line::styled(attachment(file), dim()));
+        }
     }
     rendered
+}
+
+fn attachment(file: &AttachmentLabel) -> String {
+    format!(
+        "Attachment: {} · {} bytes",
+        markdown::plain(&file.name),
+        file.size_bytes
+    )
 }
 
 fn dim() -> Style {
@@ -459,6 +462,9 @@ fn tool(message: &Content<'_>, title: Line<'static>, status: ToolStatus) -> Cach
     }
     if status == ToolStatus::Unknown && matches!(message.kind, MessageKind::Tool { .. }) {
         lines.push(Line::styled("└ Status unavailable", dim()));
+    }
+    for file in message.attachments {
+        lines.push(Line::styled(format!("└ {}", attachment(file)), dim()));
     }
     lines.push(Line::default());
     CachedText::tool_preview(lines, marker(status), body_start..body_end, notice)

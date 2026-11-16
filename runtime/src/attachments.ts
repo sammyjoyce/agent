@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { InputEntry, UserInput } from "@earendil-works/pi-durable";
@@ -162,6 +162,23 @@ export class AttachmentStore {
       return canonical;
     });
     this.serial = operation.then(() => {}, () => {}); return operation;
+  }
+  async retainBytes(name: string, mediaType: string, bytes: Buffer): Promise<AttachmentRef> {
+    const id = randomUUID();
+    const operation = this.serial.catch(() => {}).then(async () => {
+      let attachment: AttachmentRef | null = null;
+      for (let offset = 0; attachment === null; offset += ATTACHMENT_CHUNK_BYTES) {
+        const end = Math.min(offset + ATTACHMENT_CHUNK_BYTES, bytes.length);
+        const response = await this.transfer({ type: "upload", id, name, media_type: mediaType, size_bytes: bytes.length, offset,
+          data_base64: bytes.subarray(offset, end).toString("base64"), complete: end === bytes.length });
+        if (response.type !== "uploaded") throw new AttachmentError("Attachment storage did not confirm the upload");
+        attachment = response.attachment;
+      }
+      await this.keep([attachment]);
+      return attachment;
+    });
+    this.serial = operation.then(() => {}, () => {});
+    return operation;
   }
   private async keep(refs: readonly AttachmentRef[]): Promise<void> {
     for (const ref of refs) { const saved = await this.metadata(ref.id); saved.retained = true; await this.save(saved); }

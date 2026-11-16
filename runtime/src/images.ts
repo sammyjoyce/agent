@@ -16,7 +16,9 @@ let processor: Promise<ImageProcessor> | undefined;
 
 export async function prepareImage(bytes: Uint8Array, mimeType: string, limits: ImageLimits): Promise<PreparedImage | undefined> {
   processor ??= createNodePhotonImages({ idleMs: 1000 });
-  return (await processor).prepare(bytes, mimeType, limits);
+  // The processor transfers bytes.slice().buffer to its worker. Buffer#slice is a
+  // view, so a pooled Buffer would offer Node's untransferable pool; copy first.
+  return (await processor).prepare(Buffer.isBuffer(bytes) ? new Uint8Array(bytes) : bytes, mimeType, limits);
 }
 
 export async function imageInput(api: Pick<ToolExecutionApi, "agent" | "models">, context: Context): Promise<ImageInput> {

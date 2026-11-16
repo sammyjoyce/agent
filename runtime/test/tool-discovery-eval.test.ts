@@ -93,6 +93,7 @@ class EvalHost {
       case "snapshot": case "wait_for": case "click": case "fill": case "press_key": case "handle_dialog":
         return this.open ? ready(STATUS_PAGE) : { type: "ready", session_id, tabs: [], output: "No owned tab is open", is_error: true };
       case "run_code": return this.open ? ready(JSON.stringify(STATUS_PAGE.replaceAll(/ \[ref=e\d+\]/gu, ""))) : ready("No owned tab is open");
+      case "screenshot": return { type: "failed", session_id, message: "Screenshots are unavailable on this evaluation host" };
       case "status": return ready(this.open ? "Connected with one owned tab" : "Connected without owned tabs");
       case "close_tab": case "retain_tab": this.open = false; return ready("");
       case "release": this.open = false; return { type: "closed", session_id, tabs: [], output: "" };

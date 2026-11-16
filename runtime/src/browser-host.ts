@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
@@ -19,6 +19,7 @@ import type { BrowserUserTab } from "./generated/BrowserUserTab.js";
 import type { BrowserHelperInput } from "./generated/BrowserHelperInput.js";
 import type { BrowserNativeControlAction } from "./generated/BrowserNativeControlAction.js";
 import type { BrowserNativeControlRequest } from "./generated/BrowserNativeControlRequest.js";
+import { MAX_SCREENSHOT_BYTES } from "./generated/screenshot-limits.js";
 
 const OUTPUT_LIMIT = 64 * 1024;
 const ACTION_TIMEOUT = 30_000;
@@ -223,7 +224,7 @@ function allowedUrl(value: string): boolean {
 }
 
 function mutates(action: BrowserAction): boolean {
-  return action.type !== "status" && action.type !== "snapshot" && action.type !== "wait_for" && action.type !== "retain_tab";
+  return action.type !== "status" && action.type !== "snapshot" && action.type !== "screenshot" && action.type !== "wait_for" && action.type !== "retain_tab";
 }
 
 function connector(page: Page, name: string): boolean {
@@ -258,7 +259,8 @@ export class BrowserHost {
     private readonly options: BrowserHostOptions = {}) {}
 
   execute(request: BrowserRequest): Promise<BrowserReply> {
-    const repeatable = request.action.type === "status" || request.action.type === "snapshot" || request.action.type === "wait_for" || request.action.type === "list_user_tabs";
+    const repeatable = request.action.type === "status" || request.action.type === "snapshot" || request.action.type === "screenshot"
+      || request.action.type === "wait_for" || request.action.type === "list_user_tabs";
     if (!repeatable && this.operations.has(request.operation_id)) return Promise.resolve({ operation_id: request.operation_id,
       response: { type: "failed", session_id: request.session_id, message: "This browser operation ID was already used; its effect will not run again." } });
     if (!repeatable) this.operations.add(request.operation_id);
@@ -689,6 +691,26 @@ export class BrowserHost {
     return result;
   }
 
+  private async screenshot(session_id: string, tab: OwnedTab, fullPage: boolean): Promise<BrowserResponse> {
+    if (tab.dialog !== undefined) return { type: "failed", session_id, message: "Handle the owned tab's current dialog before taking a screenshot." };
+    let bytes: Buffer;
+    try {
+      await tab.page.bringToFront();
+      bytes = await tab.page.screenshot({ type: "png", fullPage, scale: "css", timeout: ACTION_TIMEOUT });
+    } catch (error) {
+      await this.refresh();
+      this.liveBrowser();
+      const detail = error instanceof Error ? this.redact(error.message.split("\n")[0] ?? "").slice(0, 1024) : "no detail";
+      return { type: "failed", session_id, message: `Chrome could not capture the owned tab (${detail}). The tab and its connection are unchanged.` };
+    }
+    if (bytes.length > MAX_SCREENSHOT_BYTES) return { type: "failed", session_id,
+      message: `The screenshot is ${bytes.length} bytes, over the ${MAX_SCREENSHOT_BYTES} byte limit. Capture the viewport instead of the full page, or scroll to the part you need.` };
+    await this.refresh();
+    this.liveBrowser();
+    return { type: "screenshot", session_id, tabs: this.tabs(),
+      capture: { data_base64: bytes.toString("base64"), sha256: createHash("sha256").update(bytes).digest("hex") } };
+  }
+
   private async effect(tab: OwnedTab, action: () => Promise<unknown>): Promise<void> {
     if (tab.dialog !== undefined) throw new Error("Handle the current browser dialog first");
     const pending = action().then(() => {
@@ -747,6 +769,7 @@ export class BrowserHost {
         const owned = this.owned.get(action.tab_id);
         if (owned === undefined) return { type: "failed", session_id, message: "The owned tab was closed or removed. Its handle is no longer valid." };
         tab = owned;
+        if (action.type === "screenshot") return await this.screenshot(session_id, tab, action.full_page);
         if (action.type === "retain_tab") {
           if (tab.dialog !== undefined || tab.pending !== undefined) return { type: "failed", session_id, message: "Resolve the owned tab's pending action or dialog before retaining it." };
           await this.retain(tab);

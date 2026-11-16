@@ -43,7 +43,7 @@ export type ToolSurface = {
 export type ToolSurfaces = Readonly<Partial<Record<ToolRole, ToolSurface>>>;
 
 export const ROOT_FINAL_TOOLS: readonly string[] = ["finish_without_reply"];
-export const IMAGE_RESULT_TOOLS: readonly string[] = ["read_attachment", "read_file"];
+export const IMAGE_RESULT_TOOLS: readonly string[] = ["read_attachment", "read_file", "browser_screenshot"];
 export const ALWAYS_DIRECT: readonly string[] = [...ROOT_FINAL_TOOLS, ...IMAGE_RESULT_TOOLS];
 export const BROWSER_TOOLS: readonly string[] = ["browser_user_tabs", "browser_claim_tab", "browser_open", "browser_status",
   "browser_action", "browser_run_code", "browser_release"];

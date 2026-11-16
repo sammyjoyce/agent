@@ -949,6 +949,29 @@
         {
           "type": "object",
           "properties": {
+            "full_page": {
+              "type": "boolean"
+            },
+            "tab_id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "screenshot"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "tab_id",
+            "full_page"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "accept": {
               "type": "boolean"
             },
@@ -6849,6 +6872,10 @@
       "type": "object",
       "properties": {
         "browser": {
+          "type": "boolean",
+          "default": false
+        },
+        "browser_screenshots": {
           "type": "boolean",
           "default": false
         },

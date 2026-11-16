@@ -90,6 +90,10 @@ pub enum BrowserAction {
         tab_id: u32,
         text: String,
     },
+    Screenshot {
+        tab_id: u32,
+        full_page: bool,
+    },
     HandleDialog {
         tab_id: u32,
         accept: bool,
@@ -138,6 +142,11 @@ pub enum BrowserResponse {
         tabs: Vec<BrowserTab>,
         output: String,
     },
+    Screenshot {
+        session_id: Uuid,
+        tabs: Vec<BrowserTab>,
+        capture: BrowserCapture,
+    },
     Disconnected {
         session_id: Uuid,
         message: String,
@@ -158,11 +167,24 @@ impl BrowserResponse {
             Self::UserTabs { session_id, .. }
             | Self::Ready { session_id, .. }
             | Self::Closed { session_id, .. }
+            | Self::Screenshot { session_id, .. }
             | Self::Disconnected { session_id, .. }
             | Self::Failed { session_id, .. }
             | Self::Uncertain { session_id, .. } => *session_id,
         }
     }
+}
+
+/// The most PNG bytes one screenshot may carry. Its base64 form and the
+/// reply around it must fit one 4 MiB host frame.
+pub const MAX_SCREENSHOT_BYTES: u32 = 2 * 1024 * 1024;
+
+/// One PNG capture of an owned tab, with the SHA-256 of its decoded bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserCapture {
+    pub data_base64: String,
+    pub sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -661,8 +683,34 @@ mod tests {
     use uuid::Uuid;
 
     use crate::browser::{
-        BrowserAction, BrowserConfig, BrowserHost, BrowserRequest, BrowserResponse,
+        BrowserAction, BrowserCapture, BrowserConfig, BrowserHost, BrowserRequest, BrowserResponse,
+        BrowserTab, MAX_SCREENSHOT_BYTES,
     };
+
+    #[test]
+    fn the_largest_screenshot_reply_fits_one_host_frame() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let reply = crate::protocol::RuntimeCommand::HostReply {
+            call_id: Uuid::new_v4().to_string(),
+            result: crate::protocol::HostResult::Browser {
+                response: BrowserResponse::Screenshot {
+                    session_id: Uuid::new_v4(),
+                    tabs: (0..32)
+                        .map(|id| BrowserTab {
+                            id,
+                            url: format!("https://example.com/{}", "a".repeat(8192)),
+                            title: "Invented title ".repeat(64),
+                        })
+                        .collect(),
+                    capture: BrowserCapture {
+                        data_base64: STANDARD.encode(vec![0xa5; MAX_SCREENSHOT_BYTES as usize]),
+                        sha256: "0".repeat(64),
+                    },
+                },
+            },
+        };
+        assert!(serde_json::to_vec(&reply).unwrap().len() < crate::runtime::MAX_FRAME_BYTES);
+    }
 
     const FIXTURE: &str = r#"
 import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
