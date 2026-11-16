@@ -18,6 +18,10 @@ enum FeedScope: Hashable, Sendable {
     }
   }
 
+  func shownCoordinator(among profiles: [CoordinatorProfile]) -> ProfileID? {
+    coordinator ?? (profiles.count == 1 ? profiles[0].id : nil)
+  }
+
   init(sending ids: [ProfileID]) {
     self = ids.count == 1 ? .one(ids[0]) : .all
   }

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Fails unless a built Agent.app ships every App Intents action, entity with its properties,
-enum and query, at least one shortcut, each for Open Coordinator, and the retry behind
-authentication. Every shortcut must hold a phrase that is not empty, and one of Open Coordinator's
-phrases must name ${target} and ${applicationName}.
+enum and query, at least one shortcut, each for Open Coordinator, the retry behind
+authentication, and each open action as the system's open intent for its entity. Every shortcut
+must hold a phrase that is not empty, and one of Open Coordinator's phrases must name ${target}
+and ${applicationName}. No other action has a phrase. Open Job has none, because a phrase on its
+job would make each refresh of the app's phrases read every coordinator's jobs.
 
 A shortcuts provider in the wrong target still builds, and only the extracted metadata shows that
 the app ships no phrase.
@@ -14,7 +16,7 @@ import json
 import sys
 from pathlib import Path
 
-ACTIONS = {"OpenCoordinatorIntent", "RetryInterruptedRunIntent"}
+ACTIONS = {"OpenCoordinatorIntent", "OpenJobIntent", "RetryInterruptedRunIntent"}
 ENTITIES = {
     "CoordinatorEntity": {"name"},
     "JobEntity": {"title", "coordinator", "schedule", "state", "lastRun", "nextRun"},
@@ -25,6 +27,8 @@ QUERIES = {"CoordinatorQuery", "JobQuery"}
 PHRASED = {"OpenCoordinatorIntent": {"${target}", "${applicationName}"}}
 # `authenticationPolicy` 1 is `.requiresAuthentication`.
 AUTHENTICATED = {"RetryInterruptedRunIntent": 1}
+OPENS = {"OpenCoordinatorIntent": "CoordinatorEntity", "OpenJobIntent": "JobEntity"}
+OPEN_ENTITY = "com.apple.link.systemProtocol.OpenEntity"
 
 
 def metadata_path(argument: str) -> Path:
@@ -77,6 +81,19 @@ def problems(metadata: dict) -> list[str]:
     for action, policy in AUTHENTICATED.items():
         if action in actions and actions[action].get("authenticationPolicy") != policy:
             found.append(f"{action} does not require authentication")
+    for action, entity in OPENS.items():
+        if action not in actions:
+            continue
+        metadata = actions[action]
+        targets = [
+            ((p.get("valueType") or {}).get("entity") or {}).get("wrapper", {}).get("typeName")
+            for p in metadata.get("parameters") or []
+            if p.get("name") == "target"
+        ]
+        if OPEN_ENTITY not in (metadata.get("systemProtocols") or []) or targets != [entity]:
+            found.append(f"{action} is not the open intent for {entity}: targets {targets}")
+        if metadata.get("openAppWhenRun") is not True:
+            found.append(f"{action} does not open the app")
     return found
 
 

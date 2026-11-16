@@ -14,9 +14,14 @@ enum AlertOrigin: Equatable {
   case malformed
 }
 
+enum OpenDestination: Hashable {
+  case feed(notice: String?)
+  case job(ScopedEntityID)
+}
+
 struct OpenRequest: Equatable {
   let id = UUID()
-  let notice: String?
+  let destination: OpenDestination
 }
 
 public enum MainVisibility: Equatable {
@@ -74,7 +79,11 @@ public final class AppNotifications: NSObject {
   }
 
   func open(_ origin: AlertOrigin) {
-    openRequest = OpenRequest(notice: coordinators.show(opening: origin))
+    openRequest = OpenRequest(destination: .feed(notice: coordinators.show(opening: origin)))
+  }
+
+  func open(_ job: JobEntity) {
+    openRequest = OpenRequest(destination: .job(job.id))
   }
 
   func presents(_ origin: AlertOrigin?) -> Bool {

@@ -90,6 +90,109 @@
       XCTAssertEqual(retried, [])
     }
 
+    func testOpenJobStartsTheTerminatedAppOnTheJob() async throws {
+      guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
+      let (app, _, _) = try await launchWithJobs()
+      try chooseWorkAndType("Keep this Work draft", in: app)
+      XCUIDevice.shared.press(.home)
+      let home = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+      XCTAssertTrue(home.wait(for: .runningForeground, timeout: 10))
+      terminate(app)
+      let weeklyReport = try await job(titled: "Weekly report")
+      terminate(app)
+
+      try await definitions.intents["OpenJobIntent"].makeIntent(target: weeklyReport).run()
+
+      XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10), "state \(app.state.rawValue)")
+      XCTAssertTrue(
+        app.navigationBars["Weekly report"].waitForExistence(timeout: 15), app.debugDescription)
+      let state = app.descendants(matching: .any)["jobRunState"]
+      XCTAssertTrue(becomes(state, "label CONTAINS %@", "Completed"), app.debugDescription)
+      capture("siri-open-job-cold-start", app)
+      assertBackShowsTheFeed(app, from: "Weekly report")
+      let menu = app.buttons["scopeMenu"]
+      XCTAssertTrue(becomes(menu, "label BEGINSWITH %@", "Work"), menu.label)
+      let field = app.textViews["Message the coordinator"]
+      XCTAssertTrue(
+        becomes(field, "value == %@", "Keep this Work draft"), String(describing: field.value))
+    }
+
+    func testOpenJobFromTheForegroundKeepsTheFeedAndTheDraft() async throws {
+      guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
+      let (app, _, _) = try await launchWithJobs()
+      try chooseWorkAndType("Keep this Work draft", in: app)
+      let weeklyReport = try await job(titled: "Weekly report")
+
+      try await definitions.intents["OpenJobIntent"].makeIntent(target: weeklyReport).run()
+
+      XCTAssertTrue(
+        app.navigationBars["Weekly report"].waitForExistence(timeout: 15), app.debugDescription)
+      capture("siri-open-job-foreground", app)
+      assertBackShowsTheFeed(app, from: "Weekly report")
+      let menu = app.buttons["scopeMenu"]
+      XCTAssertTrue(becomes(menu, "label BEGINSWITH %@", "Work"), menu.label)
+      let field = app.textViews["Message the coordinator"]
+      XCTAssertTrue(
+        becomes(field, "value == %@", "Keep this Work draft"), String(describing: field.value))
+    }
+
+    func testOpenJobSaysWhenTheJobIsNoLongerOnItsCoordinator() async throws {
+      guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
+      let (app, work, _) = try await launchWithJobs()
+      let nightlyDeps = try await job(titled: "Nightly deps")
+      await work.serve(jobs: [scheduledJob("docs:sweep", "Docs sweep", .completed)])
+      terminate(app)
+
+      let intent = definitions.intents["OpenJobIntent"].makeIntent(target: nightlyDeps)
+      do {
+        try await intent.run()
+        XCTFail("The intent opened a job that Work no longer has")
+      } catch {
+        XCTAssertTrue(
+          "\(error)".contains("The scheduled job nightly:deps is no longer on Work."), "\(error)")
+      }
+    }
+
+    func testOnscreenEntitiesMatchWhatEachScreenShows() async throws {
+      guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
+      let (app, _, _) = try await launchWithJobs()
+      let work = try await coordinator(named: "Work").identifier.instanceIdentifier
+      let nightlyDeps = try await job(titled: "Nightly deps").identifier.instanceIdentifier
+      let coordinators = definitions.entities["CoordinatorEntity"]
+      let jobs = definitions.entities["JobEntity"]
+
+      XCTAssertTrue(app.buttons["scopeMenu"].label.contains("All coordinators"))
+      try await assertAnnotations(of: coordinators, become: [], "the feed of every coordinator")
+      try chooseWorkAndType(nil, in: app)
+      try await assertAnnotations(of: coordinators, become: [work], "Work's feed")
+      try await assertAnnotations(of: jobs, become: [], "Work's feed")
+      capture("siri-onscreen-work-feed", app)
+
+      app.buttons["Connection"].tap()
+      try await assertAnnotations(of: coordinators, become: [], "Connection over the feed")
+      app.buttons["Jobs and work"].tap()
+      XCTAssertTrue(
+        app.buttons["job-nightly:deps"].waitForExistence(timeout: 15), app.debugDescription)
+      try await assertAnnotations(of: jobs, become: [nightlyDeps], "Work's Jobs and work")
+      capture("siri-onscreen-jobs-and-work", app)
+
+      app.buttons["job-nightly:deps"].tap()
+      XCTAssertTrue(app.navigationBars["Nightly deps"].waitForExistence(timeout: 15))
+      try await assertAnnotations(of: jobs, become: [nightlyDeps], "the job's screen")
+      capture("siri-onscreen-job", app)
+
+      assertBackStepsToTheFeed(app, from: "Nightly deps", through: "Work · Jobs and work")
+      try await assertAnnotations(of: jobs, become: [], "Work's feed after Back")
+      try await assertAnnotations(of: coordinators, become: [work], "Work's feed after Back")
+
+      let weeklyReport = try await job(titled: "Weekly report")
+      try await definitions.intents["OpenJobIntent"].makeIntent(target: weeklyReport).run()
+      XCTAssertTrue(app.navigationBars["Weekly report"].waitForExistence(timeout: 15))
+      let personalJob = weeklyReport.identifier.instanceIdentifier
+      try await assertAnnotations(of: jobs, become: [personalJob], "the opened job's screen")
+      try await assertAnnotations(of: coordinators, become: [], "the opened job over the feed")
+    }
+
     private func assertTheQueryRefusesWithoutItsFixture(of entity: String) async throws {
       guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
       let launches: [(environment: [String: String], screen: String)] = [
@@ -148,35 +251,45 @@
       return app
     }
 
-    /// Launches the app on two fixture peers. Work serves Nightly deps, parked at the restart
-    /// limit, and Personal serves Weekly report, whose last run completed. Then the app is sent to
-    /// the background and terminated.
-    private func launchWithJobsThenTerminate() async throws -> (
+    private func launchWithJobs() async throws -> (
       app: XCUIApplication, work: InteractionPeer, personal: InteractionPeer
     ) {
       let work = InteractionPeer()
       let personal = InteractionPeer()
       let empty = NativeEventHistory(messages: [], nextCursor: nil, pageComplete: true)
-      let served: [(InteractionPeer, String, String, JobExecutionState)] = [
-        (work, "nightly:deps", "Nightly deps", .blocked(.init(message: "restart_limit"))),
-        (personal, "weekly:report", "Weekly report", .completed),
+      let served: [(InteractionPeer, ScheduledJobStatus)] = [
+        (
+          work,
+          scheduledJob("nightly:deps", "Nightly deps", .blocked(.init(message: "restart_limit")))
+        ),
+        (personal, scheduledJob("weekly:report", "Weekly report", .completed)),
       ]
-      for (peer, id, title, lastRun) in served {
+      for (peer, job) in served {
         await peer.history(initial: empty, pages: [:], latest: empty)
-        await peer.serve(jobs: [
-          ScheduledJobStatus(
-            job: .init(
-              cwd: "/workspace/example", id: id,
-              model: .init(fast: false, modelId: "example-model", provider: .openai),
-              prompt: "An invented prompt.", revision: "example-revision", schedules: [],
-              timezone: "America/Los_Angeles", title: title),
-            lastRun: JobExecution(
-              outputTruncated: false, revision: "example-revision", scheduleId: "example-schedule",
-              scheduledAt: 1_700_000_000_000, state: lastRun),
-            schedules: [])
-        ])
+        await peer.serve(jobs: [job])
       }
-      let app = try await launch(work: work, personal: personal)
+      return (try await launch(work: work, personal: personal), work, personal)
+    }
+
+    private func scheduledJob(_ id: String, _ title: String, _ lastRun: JobExecutionState)
+      -> ScheduledJobStatus
+    {
+      ScheduledJobStatus(
+        job: .init(
+          cwd: "/workspace/example", id: id,
+          model: .init(fast: false, modelId: "example-model", provider: .openai),
+          prompt: "An invented prompt.", revision: "example-revision", schedules: [],
+          timezone: "America/Los_Angeles", title: title),
+        lastRun: JobExecution(
+          outputTruncated: false, revision: "example-revision", scheduleId: "example-schedule",
+          scheduledAt: 1_700_000_000_000, state: lastRun),
+        schedules: [])
+    }
+
+    private func launchWithJobsThenTerminate() async throws -> (
+      app: XCUIApplication, work: InteractionPeer, personal: InteractionPeer
+    ) {
+      let (app, work, personal) = try await launchWithJobs()
       XCUIDevice.shared.press(.home)
       let home = XCUIApplication(bundleIdentifier: "com.apple.springboard")
       XCTAssertTrue(home.wait(for: .runningForeground, timeout: 10))
@@ -229,6 +342,55 @@
       let titles = try jobs.map { try $0.title.as(String.self) }
       XCTAssertEqual(titles, ["Nightly deps", "Weekly report"])
       return try XCTUnwrap(titles.firstIndex(of: title).map { jobs[$0] }, "\(titles)")
+    }
+
+    private func chooseWorkAndType(_ draft: String?, in app: XCUIApplication) throws {
+      let menu = app.buttons["scopeMenu"]
+      XCTAssertTrue(menu.waitForExistence(timeout: 10))
+      menu.tap()
+      let choice = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Work"))
+        .firstMatch
+      XCTAssertTrue(choice.waitForExistence(timeout: 5), app.debugDescription)
+      choice.tap()
+      XCTAssertTrue(becomes(menu, "label BEGINSWITH %@", "Work"), menu.label)
+      guard let draft else { return }
+      let field = app.textViews["Message the coordinator"]
+      XCTAssertTrue(field.wait(for: \.isEnabled, toEqual: true, timeout: 10))
+      field.tap()
+      field.typeText(draft)
+    }
+
+    private func assertBackStepsToTheFeed(
+      _ app: XCUIApplication, from job: String, through jobsAndWork: String
+    ) {
+      var shown = job
+      for screen in [jobsAndWork, "Connection"] {
+        app.navigationBars[shown].buttons.element(boundBy: 0).tap()
+        XCTAssertTrue(app.navigationBars[screen].waitForExistence(timeout: 5), app.debugDescription)
+        shown = screen
+      }
+      app.buttons["dismissConnection"].tap()
+      XCTAssertTrue(app.buttons["scopeMenu"].waitForExistence(timeout: 5), app.debugDescription)
+    }
+
+    @available(iOS 27, *)
+    private func assertAnnotations(
+      of entity: AppEntityDefinition, become identifiers: Set<String>, _ screen: String
+    ) async throws {
+      let deadline = ContinuousClock.now + .seconds(10)
+      var shown: Set<String> = []
+      repeat {
+        shown = Set(try await entity.viewAnnotations().map(\.entity.identifier.instanceIdentifier))
+        if shown == identifiers { return }
+        try await Task.sleep(for: .milliseconds(250))
+      } while ContinuousClock.now < deadline
+      XCTFail("\(screen): annotations \(shown), expected \(identifiers)")
+    }
+
+    private func assertBackShowsTheFeed(_ app: XCUIApplication, from job: String) {
+      app.navigationBars[job].buttons.element(boundBy: 0).tap()
+      XCTAssertTrue(app.buttons["scopeMenu"].waitForExistence(timeout: 5), app.debugDescription)
+      XCTAssertFalse(app.navigationBars["Connection"].exists, app.debugDescription)
     }
 
     private func terminate(_ app: XCUIApplication) {

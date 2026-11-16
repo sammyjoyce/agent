@@ -7,6 +7,11 @@ import UniformTypeIdentifiers
   import QuickLook
 #endif
 
+private struct OpenedJob: Hashable {
+  let job: ScopedEntityID
+  let request: UUID
+}
+
 public struct MainChatView: View {
   @State private var model: ChatModel
   @State private var activityExpansion = ActivityExpansion()
@@ -21,6 +26,8 @@ public struct MainChatView: View {
   @State private var settings = false
   @FocusState private var composerFocused: Bool
   @State private var sourceDetails = false
+  @State private var opened: [OpenedJob] = []
+  @State private var handledOpen: OpenRequest?
   @State private var followsLatest = true
   @State private var transcriptWidth: CGFloat = 0
   @State private var userScrolling = false
@@ -72,7 +79,7 @@ public struct MainChatView: View {
     _followsLatest = State(initialValue: initialScrollTarget == nil)
   }
   public var body: some View {
-    NavigationStack {
+    NavigationStack(path: $opened) {
       VStack(spacing: 0) {
         if model.namesLanes {
           ForEach(model.profiles) { profile in laneStatus(profile) }
@@ -167,6 +174,7 @@ public struct MainChatView: View {
         }
       }
       .background(.background)
+      .onscreenEntity(covered ? nil : .feed(of: model))
       .safeAreaInset(edge: .bottom, spacing: 0) { if !inspecting { composer } }
       .navigationTitle("Beep Boop")
       #if os(iOS)
@@ -215,6 +223,11 @@ public struct MainChatView: View {
               }
             }
         }.preferredColorScheme(appearance.colorScheme)
+      }
+      .navigationDestination(for: OpenedJob.self) { opened in
+        LaneScreen(model: model, lane: opened.job.profile) {
+          JobDetailView(jobID: opened.job.item, model: model, lane: opened.job.profile)
+        }
       }
       .fileImporter(
         isPresented: $importingFiles, allowedContentTypes: [.item], allowsMultipleSelection: true
@@ -276,6 +289,7 @@ public struct MainChatView: View {
       }
       .onChange(of: settings) { _, _ in notifications?.mainVisible = mainVisible }
       .onChange(of: sourceDetails) { _, _ in notifications?.mainVisible = mainVisible }
+      .onChange(of: opened) { _, _ in notifications?.mainVisible = mainVisible }
       .onChange(of: latestVisible) { _, _ in notifications?.mainVisible = mainVisible }
       .onChange(of: model.includesLatest) { _, _ in notifications?.mainVisible = mainVisible }
       .onChange(of: model.connection) { _, connection in
@@ -284,21 +298,31 @@ public struct MainChatView: View {
         historyRequest = .latest(UUID(), scope: model.scope)
       }
       .onChange(of: notifications?.openRequest, initial: true) { _, request in
-        guard let request else { return }
+        // The initial call runs again whenever the feed reappears, as after Back from an opened
+        // job, so each request is handled once.
+        guard let request, request != handledOpen else { return }
+        handledOpen = request
         settings = false
         sourceDetails = false
-        followsLatest = true
-        alertNotice = request.notice
-        pendingAlertLatest = model.connection == .connected ? nil : model.scope
-        historyRequest = .latest(UUID(), scope: model.scope)
+        switch request.destination {
+        case .job(let job):
+          opened = [OpenedJob(job: job, request: request.id)]
+        case .feed(let notice):
+          opened = []
+          followsLatest = true
+          alertNotice = notice
+          pendingAlertLatest = model.connection == .connected ? nil : model.scope
+          historyRequest = .latest(UUID(), scope: model.scope)
+        }
       }
     }
     .preferredColorScheme(appearance.colorScheme)
   }
   private var mainVisible: MainVisibility {
-    scenePhase == .active && !settings && !sourceDetails
+    scenePhase == .active && !covered
       ? .visible(atLatest: latestVisible && model.includesLatest) : .hidden
   }
+  private var covered: Bool { settings || sourceDetails || !opened.isEmpty }
   private var inspecting: Bool { model.inspectedConversation != nil }
   /// A saved profile that is not paired yet. It shows its held messages and takes no sends.
   private var unpaired: CoordinatorProfile? { coordinators?.profiles.first { $0.pin == nil } }
@@ -553,11 +577,10 @@ public struct MainChatView: View {
           scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
         }
       }
-      .onChange(of: notifications?.openRequest, initial: true) { _, request in
-        if request != nil {
-          followsLatest = true
-          scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
-        }
+      .onChange(of: handledOpen) { _, request in
+        guard case .feed? = request?.destination else { return }
+        followsLatest = true
+        scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
       }
       .overlay(alignment: .bottomTrailing) {
         if (!latestVisible || !model.includesLatest) && !model.rows.isEmpty {
