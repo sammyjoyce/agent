@@ -1272,6 +1272,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_thousand_attachments_on_one_message_read_in_bounded_pages() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = "n".repeat(256);
+        let files: Vec<String> = (0..1000).map(|index| format!("file_{index:04x}")).collect();
+        let references: Vec<(&str, &str)> =
+            files.iter().map(|file| (file.as_str(), "photo")).collect();
+        let export = files.iter().fold(
+            Export::new().conversations(&[Conversation::new(1, "Album")
+                .node(&node, Some("root"), upload(&references))
+                .build()]),
+            |export, file| export.stored(&format!("{file}-photo.dat"), fixture::PNG),
+        );
+        let history = open(&export.zip(&directory.path().join("export.zip")));
+        let (items, gaps) = read_all(&history, &fixture::id(1)).await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].assets.len(), 64);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].item_id.as_deref(), Some(node.as_str()));
+        assert!(gaps[0].message.contains("936"), "{}", gaps[0].message);
+    }
+
+    #[tokio::test]
+    async fn over_long_conversation_and_node_ids_are_problems_not_stranded_pages() {
+        let directory = tempfile::tempdir().unwrap();
+        let long = "9".repeat(600 * 1024);
+        let long_conversation = Conversation::new(2, "Long id")
+            .set("id", json!(long))
+            .set("conversation_id", json!(long))
+            .say("u1", "root", "user", "Hello")
+            .build();
+        let long_node = Conversation::new(3, "Long node")
+            .say(&long, "root", "user", "Hello")
+            .build();
+        let history = open(
+            &Export::new()
+                .conversations(&[picnic(1), long_conversation, long_node])
+                .zip(&directory.path().join("export.zip")),
+        );
+        let (threads, _) = list(&history, false, None).await.unwrap();
+        let listed: Vec<&str> = threads.iter().map(|thread| thread.id.as_str()).collect();
+        assert_eq!(listed, [fixture::id(1)]);
+        assert_eq!(history.summary().problems.len(), 2);
+        assert!(
+            history
+                .summary()
+                .problems
+                .iter()
+                .all(|problem| problem.len() < 1024 && problem.contains("256 bytes")),
+            "{:?}",
+            history.summary().problems
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_export_strings_stay_inside_one_page() {
+        let directory = tempfile::tempdir().unwrap();
+        let huge = |letter: &str| letter.repeat(600 * 1024);
+        let attachment = |attachment: Value| {
+            json!({"author": {"role": "user"},
+                "content": {"content_type": "text", "parts": ["Files attached"]},
+                "metadata": {"attachments": [attachment]}})
+        };
+        let conversation = Conversation::new(1, "Hostile")
+            .node(
+                "kind",
+                Some("root"),
+                json!({"author": {"role": huge("r")},
+                    "content": {"content_type": huge("c"), "text": "Widget"}}),
+            )
+            .node(
+                "id",
+                Some("kind"),
+                attachment(json!({"id": format!("file_{}", huge("a"))})),
+            )
+            .node(
+                "name",
+                Some("id"),
+                attachment(json!({"id": "file_0b01", "name": huge("x")})),
+            )
+            .node(
+                "mime",
+                Some("name"),
+                attachment(json!({"id": "file_0b02", "mime_type": huge("m")})),
+            )
+            .build();
+        let history = open(
+            &Export::new()
+                .conversations(&[conversation])
+                .stored("file_0b02-photo.dat", fixture::PNG)
+                .zip(&directory.path().join("export.zip")),
+        );
+        let (items, gaps) = read_all(&history, &fixture::id(1)).await;
+        let ids: Vec<&str> = items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["kind", "id", "name", "mime"]);
+        assert_eq!(items[3].assets[0].media_type, "image/png");
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].item_id.as_deref(), Some("name"));
+    }
+
+    #[tokio::test]
+    async fn many_parent_cycles_report_one_thread_gap() {
+        let directory = tempfile::tempdir().unwrap();
+        let conversation = (0..500).fold(
+            Conversation::new(1, "Cycles").say("u1", "root", "user", "Hello"),
+            |conversation, index| {
+                let (left, right) = (format!("a{index:03}"), format!("b{index:03}"));
+                conversation.say(&left, &right, "user", "Loop").say(
+                    &right,
+                    &left,
+                    "assistant",
+                    "Loop",
+                )
+            },
+        );
+        let history = open(
+            &Export::new()
+                .conversations(&[conversation.current("u1").build()])
+                .zip(&directory.path().join("export.zip")),
+        );
+        let (items, gaps) = read_all(&history, &fixture::id(1)).await;
+        assert_eq!(items.len(), 1001);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].item_id, None);
+        assert!(matches!(gaps[0].code, HistoryGapCode::Invalid));
+    }
+
+    #[tokio::test]
     async fn an_uploaded_zip_is_served_as_an_opaque_attachment() {
         let directory = tempfile::tempdir().unwrap();
         let report = Export::new().conversations(&[picnic(9)]).zip_bytes();

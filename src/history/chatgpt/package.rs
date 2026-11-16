@@ -18,6 +18,7 @@ use crate::history::HistoryThread;
 const PACKAGE_FORMAT: u32 = 1;
 const THREAD_FORMAT: u32 = 1;
 const MAXIMUM_PROBLEMS: usize = 100;
+const MAXIMUM_ID_BYTES: usize = 256;
 const MANIFEST: &str = "export_manifest.json";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -716,12 +717,19 @@ impl Scan {
             .or_else(|| object.get("conversation_id"))
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty());
-        let (Some(id), true) = (id, object.get("mapping").is_some_and(Value::is_object)) else {
+        let (Some(id), Some(mapping)) = (id, object.get("mapping").and_then(Value::as_object))
+        else {
             self.problem(format!(
                 "The entry at byte {offset} of {name} has no conversation id or messages and was not imported"
             ));
             return Ok(());
         };
+        if id.len() > MAXIMUM_ID_BYTES || mapping.keys().any(|node| node.len() > MAXIMUM_ID_BYTES) {
+            self.problem(format!(
+                "The conversation at byte {offset} of {name} has a conversation or message id over {MAXIMUM_ID_BYTES} bytes and was not imported"
+            ));
+            return Ok(());
+        }
         let content: [u8; 32] = Sha256::digest(json::canonical(&value)).into();
         let entry = ConversationEntry {
             thread: conversation::thread(id, &value, String::new()),

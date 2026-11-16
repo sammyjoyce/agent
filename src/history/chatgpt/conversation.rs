@@ -6,7 +6,7 @@ use std::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{ChatGptEnvelope, json};
+use super::{ChatGptEnvelope, archive, json};
 use crate::{
     history::{
         HistoryAssetKind, HistoryAssetRef, HistoryBranch, HistoryBranchState, HistoryGap,
@@ -16,6 +16,10 @@ use crate::{
 };
 
 const DEFAULT_TITLE: &str = "ChatGPT conversation";
+const FILE_ID_CHARACTERS: usize = 64;
+const KIND_PART_CHARACTERS: usize = 64;
+const MEDIA_TYPE_BYTES: usize = 127;
+const MAXIMUM_REFERENCES: usize = 64;
 
 /// "file_<hex>" or "file-<base62>": the export's name for an uploaded or generated file.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -31,8 +35,10 @@ impl FileId {
             let run: String = tail
                 .chars()
                 .take_while(char::is_ascii_alphanumeric)
+                .take(FILE_ID_CHARACTERS + 1)
                 .collect();
-            (!run.is_empty()).then(|| Self(format!("{prefix}{run}")))
+            (!run.is_empty() && run.len() <= FILE_ID_CHARACTERS)
+                .then(|| Self(format!("{prefix}{run}")))
         })
     }
 
@@ -106,8 +112,9 @@ pub(super) fn classify(message: &Value) -> Disposition {
         "assistant" => HistoryRole::Assistant,
         _ => HistoryRole::Tool,
     };
+    let part = |text: &str| text.chars().take(KIND_PART_CHARACTERS).collect::<String>();
     Disposition::Emit {
-        kind: format!("{author}:{content_type}"),
+        kind: format!("{}:{}", part(author), part(content_type)),
         role,
     }
 }
@@ -757,12 +764,13 @@ impl Normalized {
             timestamp_ms,
         ]));
         let mut assets = Vec::new();
-        for reference in draft.references {
+        let omitted = draft.references.len().saturating_sub(MAXIMUM_REFERENCES);
+        for reference in draft.references.into_iter().take(MAXIMUM_REFERENCES) {
             let Some(stored) = draft.files.stored_name(&reference.file) else {
                 let named = reference
                     .name
                     .as_deref()
-                    .map(|name| format!(" ({name})"))
+                    .map(|name| format!(" ({})", archive::shown(name)))
                     .unwrap_or_default();
                 self.gaps.push(HistoryGap {
                     code: HistoryGapCode::Missing,
@@ -776,6 +784,7 @@ impl Normalized {
             };
             let media_type = reference
                 .mime_type
+                .filter(|mime_type| mime_type.len() <= MEDIA_TYPE_BYTES)
                 .or_else(|| reference.name.as_deref().and_then(media_type))
                 .or_else(|| draft.files.original_name(stored).and_then(media_type))
                 .or_else(|| media_type(stored))
@@ -793,6 +802,15 @@ impl Normalized {
                 reference.file.as_str().to_owned(),
                 AssetSource::File(reference.file),
             );
+        }
+        if omitted > 0 {
+            self.gaps.push(HistoryGap {
+                code: HistoryGapCode::Oversized,
+                item_id: Some(draft.node.to_owned()),
+                message: format!(
+                    "{omitted} more attachments of this message are over the import limit of {MAXIMUM_REFERENCES} and were not imported"
+                ),
+            });
         }
         let evidence = json::canonical(&envelope);
         let data = if evidence.len() > INLINE_EVIDENCE_BYTES {
