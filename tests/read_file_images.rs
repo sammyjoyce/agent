@@ -660,6 +660,8 @@ async fn a_registered_worker_serves_image_reads_from_its_own_host() {
                     attached
                         .send([RuntimeEventKind::WorkerReady {
                             connection_id: "invented-connection".into(),
+                            coordinator_id: None,
+                            owner_epoch: None,
                         }])
                         .await;
                     let mut received = Vec::new();

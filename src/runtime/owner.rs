@@ -3,16 +3,15 @@
 use std::{
     fmt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail};
 
 use crate::{
     coordinator_id::CoordinatorId,
     failover::{
-        AuthorityRefusal, AuthorityState, FailoverConfig, FailoverReport, FailoverRequest,
-        FailoverSession, OwnerEpoch,
+        AuthorityRefusal, AuthorityState, FailoverConfig, FailoverHelper, FailoverReport,
+        FailoverRequest, FailoverSession, OwnerEpoch,
     },
     runtime::WriterLock,
 };
@@ -64,7 +63,7 @@ impl OwnerClaim {
             url: failover.url.clone(),
             token_file: failover.token_file.clone(),
             coordinator_id,
-            holder,
+            holder: Some(holder),
             epoch: None,
         };
         match FailoverHelper::locate(script)?.run(&session, FailoverRequest::Claim)? {
@@ -77,6 +76,9 @@ impl OwnerClaim {
             FailoverReport::Refused { reason, state } => {
                 Err(OwnerFenced::Refused { reason, state }.into())
             }
+            FailoverReport::Record { .. } => {
+                bail!("The failover helper answered a claim with the owner record")
+            }
         }
     }
 
@@ -86,6 +88,14 @@ impl OwnerClaim {
 
     pub fn coordinator_id(&self) -> CoordinatorId {
         self.coordinator_id
+    }
+
+    /// The epoch the authority granted this start, under a replicated claim.
+    pub fn epoch(&self) -> Option<OwnerEpoch> {
+        match &self.authority {
+            Authority::Local => None,
+            Authority::Replicated { epoch, .. } => Some(*epoch),
+        }
     }
 
     pub(crate) fn lock(&self) -> &WriterLock {
@@ -164,41 +174,3 @@ impl fmt::Display for OwnerFenced {
 }
 
 impl std::error::Error for OwnerFenced {}
-
-/// `failover/helper.js` beside the runtime script, run once per request.
-struct FailoverHelper(PathBuf);
-
-impl FailoverHelper {
-    fn locate(script: &Path) -> Result<Self> {
-        let helper = script.with_file_name("failover").join("helper.js");
-        ensure!(
-            helper.is_file(),
-            "Pi runtime is not built; build the runtime first"
-        );
-        Ok(Self(helper))
-    }
-
-    fn run(&self, session: &FailoverSession, request: FailoverRequest) -> Result<FailoverReport> {
-        let output = Command::new("node")
-            .arg("--no-warnings")
-            .arg(&self.0)
-            .arg(serde_json::to_string(&request)?)
-            .env("AGENT_FAILOVER", serde_json::to_string(session)?)
-            .stdin(Stdio::null())
-            .output()
-            .context("Could not start the failover helper")?;
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        ensure!(
-            output.status.success(),
-            "The failover helper failed ({}): {}",
-            output.status,
-            stderr.trim()
-        );
-        serde_json::from_slice(&output.stdout).with_context(|| {
-            format!(
-                "The failover helper returned an invalid report: {}",
-                stderr.trim()
-            )
-        })
-    }
-}

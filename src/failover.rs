@@ -6,7 +6,9 @@ use std::{
     fs,
     net::{Ipv4Addr, Ipv6Addr},
     os::unix::fs::MetadataExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::{Command, Output, Stdio},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -470,11 +472,22 @@ pub struct FailoverConfig {
     pub holder: Option<HolderId>,
     /// The holder's credential for the authority.
     pub token_file: PathBuf,
+    /// How often a worker daemon reads the owner record. 30 when absent.
+    pub watch_interval_seconds: Option<u64>,
 }
 
 impl FailoverConfig {
+    pub fn watch_interval(&self) -> Duration {
+        Duration::from_secs(self.watch_interval_seconds.unwrap_or(30))
+    }
+
     /// Checks `token_file` once `~/` is expanded: a private regular file outside the Nix store.
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.watch_interval_seconds
+                .is_none_or(|seconds| (1..=3600).contains(&seconds)),
+            "The failover watch_interval_seconds must be between 1 and 3600"
+        );
         ensure!(
             self.token_file.is_absolute() && !self.token_file.starts_with("/nix/store"),
             "The failover token_file must be an absolute private file outside the Nix store"
@@ -497,6 +510,7 @@ impl FailoverConfig {
 /// What the Pi child and the failover helper need to reach the authority,
 /// passed as private JSON in `AGENT_FAILOVER`. The helper's session has no
 /// epoch. The child's carries the epoch its coordinator start was granted.
+/// A worker that only watches the owner record has no holder.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct FailoverSession {
@@ -504,7 +518,9 @@ pub struct FailoverSession {
     #[ts(type = "string")]
     pub token_file: PathBuf,
     pub coordinator_id: CoordinatorId,
-    pub holder: HolderId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub holder: Option<HolderId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub epoch: Option<OwnerEpoch>,
@@ -516,6 +532,8 @@ pub struct FailoverSession {
 pub enum FailoverRequest {
     /// Raise the epoch for a coordinator start by the current owner.
     Claim,
+    /// Read the owner record. Writes nothing.
+    Record,
 }
 
 /// The helper's one line of output. An authority it could not reach is a
@@ -531,6 +549,77 @@ pub enum FailoverReport {
         reason: AuthorityRefusal,
         state: Option<AuthorityState>,
     },
+    /// The owner record, or null before enrollment.
+    Record { record: Option<AuthorityRecord> },
+}
+
+/// `failover/helper.js` beside the runtime script, run once per request.
+pub struct FailoverHelper(PathBuf);
+
+impl FailoverHelper {
+    pub fn locate(script: &Path) -> Result<Self> {
+        let helper = script.with_file_name("failover").join("helper.js");
+        ensure!(
+            helper.is_file(),
+            "Pi runtime is not built; build the runtime first"
+        );
+        Ok(Self(helper))
+    }
+
+    pub fn run(
+        &self,
+        session: &FailoverSession,
+        request: FailoverRequest,
+    ) -> Result<FailoverReport> {
+        let output = self
+            .command(session, request)?
+            .output()
+            .context("Could not start the failover helper")?;
+        Self::report(output)
+    }
+
+    /// Runs the helper without blocking a runtime thread, and kills it after `limit`.
+    pub async fn run_within(
+        &self,
+        session: &FailoverSession,
+        request: FailoverRequest,
+        limit: Duration,
+    ) -> Result<FailoverReport> {
+        let mut command = tokio::process::Command::from(self.command(session, request)?);
+        command.kill_on_drop(true);
+        let output = tokio::time::timeout(limit, command.output())
+            .await
+            .context("The failover helper did not answer in time")?
+            .context("Could not start the failover helper")?;
+        Self::report(output)
+    }
+
+    fn command(&self, session: &FailoverSession, request: FailoverRequest) -> Result<Command> {
+        let mut command = Command::new("node");
+        command
+            .arg("--no-warnings")
+            .arg(&self.0)
+            .arg(serde_json::to_string(&request)?)
+            .env("AGENT_FAILOVER", serde_json::to_string(session)?)
+            .stdin(Stdio::null());
+        Ok(command)
+    }
+
+    fn report(output: Output) -> Result<FailoverReport> {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        ensure!(
+            output.status.success(),
+            "The failover helper failed ({}): {}",
+            output.status,
+            stderr.trim()
+        );
+        serde_json::from_slice(&output.stdout).with_context(|| {
+            format!(
+                "The failover helper returned an invalid report: {}",
+                stderr.trim()
+            )
+        })
+    }
 }
 
 #[cfg(test)]

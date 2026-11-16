@@ -8,5 +8,6 @@ import type { OwnerEpoch } from "./OwnerEpoch.js";
  * What the Pi child and the failover helper need to reach the authority,
  * passed as private JSON in `AGENT_FAILOVER`. The helper's session has no
  * epoch. The child's carries the epoch its coordinator start was granted.
+ * A worker that only watches the owner record has no holder.
  */
-export type FailoverSession = { url: AuthorityUrl, token_file: string, coordinator_id: CoordinatorId, holder: HolderId, epoch?: OwnerEpoch, };
+export type FailoverSession = { url: AuthorityUrl, token_file: string, coordinator_id: CoordinatorId, holder?: HolderId, epoch?: OwnerEpoch, };

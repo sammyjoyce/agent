@@ -1608,6 +1608,17 @@ pub enum RuntimeEventKind {
     },
     WorkerReady {
         connection_id: String,
+        /// Missing from coordinators older than owner floors.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "Option<Uuid>")]
+        #[ts(optional)]
+        coordinator_id: Option<crate::coordinator_id::CoordinatorId>,
+        /// The epoch the failover authority granted this coordinator start.
+        /// Absent for a coordinator without a `[failover]` section.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "Option<u64>")]
+        #[ts(optional)]
+        owner_epoch: Option<crate::failover::OwnerEpoch>,
     },
     Environment {
         settings: CoordinatorSettings,

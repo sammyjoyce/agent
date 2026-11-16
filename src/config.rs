@@ -655,6 +655,38 @@ mod tests {
     }
 
     #[test]
+    fn the_owner_watch_interval_defaults_to_30_seconds_and_stays_between_1_and_3600() {
+        use std::{os::unix::fs::PermissionsExt, time::Duration};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let token = directory.path().join("token");
+        std::fs::write(&token, "invented-token").unwrap();
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let section = |extra: &str| {
+            format!(
+                "[failover]\nurl = 'https://authority.example.invalid'\ntoken_file = '{}'\n{extra}",
+                token.display()
+            )
+        };
+        for (extra, interval) in [
+            ("", 30),
+            ("watch_interval_seconds = 1\n", 1),
+            ("watch_interval_seconds = 3600\n", 3600),
+        ] {
+            std::fs::write(&path, section(extra)).unwrap();
+            let failover = load(Some(&path)).unwrap().failover.unwrap();
+            assert_eq!(failover.watch_interval(), Duration::from_secs(interval));
+        }
+        for extra in [
+            "watch_interval_seconds = 0\n",
+            "watch_interval_seconds = 3601\n",
+        ] {
+            std::fs::write(&path, section(extra)).unwrap();
+            assert!(load(Some(&path)).is_err(), "{extra}");
+        }
+    }
+
+    #[test]
     fn initialization_publishes_real_private_settings_and_never_overwrites() {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();

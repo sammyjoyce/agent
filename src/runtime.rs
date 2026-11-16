@@ -91,6 +91,7 @@ pub struct Runtime {
     service_diagnostics: Mutex<Diagnostics>,
     stopping: watch::Sender<bool>,
     coordinator_id: CoordinatorId,
+    owner_epoch: Option<crate::failover::OwnerEpoch>,
     restore_held: bool,
 }
 
@@ -147,6 +148,7 @@ impl Runtime {
         let state = claim.state();
         let restore_held = crate::backup::restore_held(claim.lock(), state);
         let coordinator_id = claim.coordinator_id();
+        let owner_epoch = claim.epoch();
         let diagnostics = match start_record {
             StartRecord::BestEffort => Diagnostics::start(state),
             StartRecord::RequiredByDreams => {
@@ -236,12 +238,18 @@ impl Runtime {
             service_diagnostics,
             stopping: quiescing,
             coordinator_id,
+            owner_epoch,
             restore_held,
         })
     }
 
     pub fn coordinator_id(&self) -> CoordinatorId {
         self.coordinator_id
+    }
+
+    /// The epoch the failover authority granted this start, under a replicated claim.
+    pub fn owner_epoch(&self) -> Option<crate::failover::OwnerEpoch> {
+        self.owner_epoch
     }
 
     /// Whether this store waits for `backup release`, read once under this
