@@ -135,6 +135,15 @@ async fn serve_with_transport(
         .transpose()?
         .and_then(|config| config.apns);
     let owner = Runtime::start_with_notifications(script, state, apns.as_ref())?;
+    // Decided under the writer lock, so `backup release` cannot lift the hold
+    // between this check and the decision.
+    let background = match background {
+        Some(_) if crate::backup::restore_held(state) => {
+            eprintln!("{}", crate::backup::hold_notice(state));
+            None
+        }
+        background => background,
+    };
     let broker = match Broker::with_tailscale(bootstrap.as_ref(), state, daemon.clone(), rex) {
         Ok(broker) => Arc::new(broker),
         Err(error) => {
