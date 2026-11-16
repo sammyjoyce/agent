@@ -265,7 +265,12 @@ recovery; [history](history.md) describes import and retrieval.
   terminal only stops observation. A task terminal from an older build that ran
   host effects itself still stops the turn when you leave its TUI, until that
   host updates.
-- [ ] Tested coordinator backups and restoration, including retained assets.
+- [x] Tested coordinator backups and restoration, including retained assets.
+  `beep-boop backup create` copies a stopped coordinator's database,
+  coordinator ID, attachments, history assets and feedback with a checksummed
+  manifest. `backup restore` checks the archive and rebuilds the store in a new
+  directory with background work held until `backup release`. See
+  [backups and restore](setup.md#backups-and-restore).
 - [ ] Replicated coordinator state and failover, retaining one active owner so
   additional coordinators do not duplicate work or external effects.
 
