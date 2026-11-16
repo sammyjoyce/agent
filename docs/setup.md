@@ -534,11 +534,15 @@ coordinator's state directory, so run them on the coordinator's machine.
 Read the patch before you approve it. The outcome digest, which `dreams show`
 prints as `Outcome sha256`, is the SHA-256 of the exact bytes of the sealed
 `outcome.json`. That record holds the patch hash, the base commit, the changed
-files with their blob ids, the cited evidence ids and the check results.
-`apply` recomputes the digest and the patch hash and refuses with one of these
-messages, without changing the repository:
+files with their blob ids, the cited evidence ids, the check results, and one
+hash of the sealed review record and all of its evidence. So the digest you
+approve covers the evidence bodies that `dreams show` printed, not only their
+ids. `dreams show` refuses a run whose review or evidence changed, and
+`dreams list` fails while any run has such a change. `apply` recomputes the outcome digest, the review hash and the patch
+hash, and refuses with one of these messages, without changing the repository:
 
 - `Dreams approval does not match the review`
+- `Dreams review changed since it was sealed`
 - `Dreams patch changed since it was proposed`
 - `Dreams policy changed since this proposal`
 - `Dreams base is stale: target HEAD is <commit>, proposal base is <commit>`

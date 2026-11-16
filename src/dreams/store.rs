@@ -177,6 +177,12 @@ impl DreamsStore {
             .map(serde_json::from_slice::<Outcome>)
             .transpose()
             .context("Dreams outcome is unreadable")?;
+        if let Some(Outcome::Proposed(proposal)) = &outcome {
+            ensure!(
+                self.review_digest(run)? == proposal.review_sha256,
+                "Dreams review changed since it was sealed"
+            );
+        }
         let attempts_used = match fs::read_dir(self.run_directory(run).join(ATTEMPTS_DIRECTORY)) {
             Ok(entries) => u8::try_from(entries.count()).unwrap_or(u8::MAX),
             Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
@@ -198,6 +204,19 @@ impl DreamsStore {
             .lines()
             .map(|line| serde_json::from_str(line).context("Dreams evidence is unreadable"))
             .collect()
+    }
+
+    /// One digest over the review record and its evidence. A NUL separates
+    /// them because neither JSON file can hold one.
+    pub(crate) fn review_digest(&self, run: &RunId) -> Result<ContentDigest> {
+        let directory = self.review_directory(run);
+        let mut sealed = fs::read(directory.join(REVIEW_FILE))
+            .context("Could not read the sealed Dreams review")?;
+        sealed.push(0);
+        sealed.extend(
+            fs::read(directory.join(EVIDENCE_FILE)).context("Could not read Dreams evidence")?,
+        );
+        Ok(ContentDigest::of(&sealed))
     }
 
     pub(crate) fn files(&self, run: &RunId) -> Result<Vec<(String, String)>> {

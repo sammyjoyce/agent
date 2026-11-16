@@ -484,6 +484,7 @@ impl Dreams {
                 .collect(),
             changes: patch.changes,
             evidence,
+            review_sha256: self.store.review_digest(&view.id)?,
             rationale: UntrustedText::bounded(draft.rationale, MAX_RATIONALE_CHARS),
             before: review.before.clone(),
             after,
