@@ -42,6 +42,7 @@ import type { AllocationResult } from "./generated/AllocationResult.js";
 import { AllocationDecisionEntry, allocationResult } from "./allocation.js";
 import { PartitionedRecords } from "./partitioned-records.js";
 import type { TaskInput } from "./generated/TaskInput.js";
+import type { GoalPolicy, GoalProof } from "./goals.js";
 
 export type HostCall = (command: HostCommand) => Promise<HostResult>;
 export type SearchQuery = (query: string, sourceRefs: string[], limit: number, mode?: SearchMode) => Promise<SearchResult>;
@@ -211,6 +212,7 @@ export class TaskStore {
   private histories: HistoryStore | undefined;
   private attachments: AttachmentStore | undefined;
   private execution: ActorExecution | undefined;
+  private goals: GoalPolicy | undefined;
   constructor(readonly session: Harness, readonly inference = new ConversationModels()) { inference.bind(session); }
   async prepare(): Promise<void> {
     await this.recordsStore.prepare(this.session, async () => (await this.session.snapshot(Tasks, BACKGROUND_CONTEXT))?.tasks ?? [], task => task.id,
@@ -482,6 +484,7 @@ export class TaskStore {
     return model;
   }
   trackOutcomes(outcomes: OutcomeSink): void { this.outcomes = outcomes; }
+  useGoals(goals: GoalPolicy): void { this.goals = goals; }
   private outcome(task: TaskRecord, conversationId: string, entryId: string | null, callId: string | null,
     failure?: string): TaskOutcome {
     return { task_id: task.id, conversation_id: conversationId, entry_id: entryId, tool_call_id: callId,
@@ -500,8 +503,9 @@ export class TaskStore {
     }
     throw new TaskError("Task outcome model provenance is unavailable");
   }
+  /** Only complete_goal holds a `proof`, after its check passed. */
   async record(id: string, input: { summary: string; state: TaskState; sources?: SourceRef[]; remove_sources?: SourceRef[]; reconciles_input?: string },
-    provenance: { conversation_id: string; call_id: string; settled: boolean; native_task_id?: NativeTaskId }): Promise<TaskRecord> {
+    provenance: { conversation_id: string; call_id: string; settled: boolean; native_task_id?: NativeTaskId }, proof?: GoalProof): Promise<TaskRecord> {
     await this.prepare();
     if (input.sources?.some((source) => input.remove_sources?.some((removed) => related(source, removed)))) {
       throw new TaskError("Choose separate source references to add and remove");
@@ -527,7 +531,7 @@ export class TaskStore {
         recoveryInputs.push({ request_id: record.requestId, submission_id: record.id.toString() });
       }
     }
-    await this.session.commit(async (tx) => {
+    const refused = await this.session.commit(async (tx) => {
       this.assertSource(provenance.conversation_id);
       const task = await this.taskIn(tx, id);
       this.assertSource(provenance.conversation_id);
@@ -550,15 +554,25 @@ export class TaskStore {
         reconciliation = { original: { request_id: input.reconciles_input, submission_id: original.id.toString() }, recovery_inputs: recoveryInputs };
       }
       if (input.state.state === "resolved" && !this.canResolve(task)) throw new TaskError("Wait for unfinished task agents before resolving the task");
+      let state = input.state;
+      if (state.state === "resolved" && this.goals !== undefined) {
+        const verdict = await this.goals.resolutionIn(tx, task, { ...(proof === undefined ? {} : { proof }),
+          origin: { conversation_id: provenance.conversation_id, entry_id: origin.id.toString(), tool_call_id: provenance.call_id } });
+        // A refusal commits only the rejection the policy recorded, never a task change.
+        if (verdict.type === "rejected") return verdict.message;
+        if (verdict.evidence !== undefined) state = { state: "resolved", evidence: verdict.evidence };
+      }
       if (input.remove_sources !== undefined && input.remove_sources.length > 0) {
         await this.outcomes?.assertSourceRemovalIn(tx, id, input.remove_sources);
       }
-      task.summary = input.summary.slice(-4000); task.state = input.state; task.updated_at = Date.now();
+      task.summary = input.summary.slice(-4000); task.state = state; task.updated_at = Date.now();
       await this.relinkSourcesIn(tx, id, input.sources ?? [], input.remove_sources ?? []);
       const outcome = this.outcome(task, provenance.conversation_id, origin.id.toString(), provenance.call_id);
       if (reconciliation !== undefined) outcome.reconciliation = reconciliation;
       await this.outcomes?.recordIn(tx, outcome, provenance.settled);
+      return undefined;
     }, BACKGROUND_CONTEXT);
+    if (refused !== undefined) throw new TaskError(refused);
     return this.get(id);
   }
   guardResources(resources: { attach(taskId: string): Promise<void> }): void { this.resources = resources; }
@@ -859,8 +873,13 @@ export class TaskStore {
     const task = await this.taskIn(tx, id);
     if (task === undefined) throw new TaskError("Unknown task");
     Object.assign(task, this.savedTask(task));
+    const resolved = task.state.state === "resolved";
     const sources = task.sources.map(source => ({ ...source }));
     await change(task);
+    if (!resolved && task.state.state === "resolved" && this.goals !== undefined) {
+      const verdict = await this.goals.resolutionIn(tx, task, {});
+      if (verdict.type === "rejected") throw new TaskError(verdict.message);
+    }
     await this.indexTaskIn(tx, task, sources);
     task.updated_at = Date.now();
   }
@@ -964,6 +983,28 @@ export class TaskStore {
     if (!holds(actor, input)) actor.pending.push(input);
     actor.state = { state: "open" };
     task.state = { state: "open" };
+  }
+  /** Commit the caller's change and the primary-actor input it returns in one transaction, then let an attached actor
+   * see the input. The change may create the task. */
+  async admitWith<T>(id: string, change: (tx: Tx) => Promise<{ value: T; input?: TaskInput }>): Promise<T> {
+    await this.prepare();
+    const active = this.running.get(this.actorKey(id));
+    if (active !== undefined) active.admissions += 1;
+    let admitted: { value: T; input?: TaskInput };
+    try {
+      await this.resources?.attach(id);
+      admitted = await this.session.commit(async (tx) => {
+        const result = await change(tx);
+        const input = result.input;
+        if (input !== undefined) await this.updateIn(tx, id, (task) => this.pushIn(task, task, input));
+        return result;
+      }, BACKGROUND_CONTEXT);
+      if (admitted.input?.mode !== undefined && active !== undefined) await this.admitActiveInputs(active);
+    } finally {
+      if (active !== undefined) { active.admissions -= 1; if (active.admissions === 0) active.drained?.(); }
+    }
+    if (active !== undefined && admitted.input !== undefined) { active.revision += 1; active.wake?.(); }
+    return admitted.value;
   }
   private async admitActiveInputs(active: TaskActor): Promise<void> {
     const conversation = active.conversation;
@@ -1390,6 +1431,28 @@ export class TaskStore {
     else await this.ensureActor({ task_id: saved.id });
     return outcome;
   }
+  /** An exact-run abort, which /goal pause uses, ends Pi's run without the boundary that places queued inputs. An
+   * empty passive write runs that boundary and changes nothing the model sees. */
+  private async placeStranded(conversation: Conversation, requestId: string): Promise<void> {
+    const stranded = await this.session.commit(async (tx) => (await tx.submissionByRequest(conversation.id, requestId))?.status === "queued" &&
+      (await tx.doc(LiveDoc, conversation.id)).run === undefined, BACKGROUND_CONTEXT);
+    if (stranded) await conversation.submit({ type: "write", entry: { kind: "agent.inbox_boundary", model: [] } }, BACKGROUND_CONTEXT);
+  }
+  /** The goal's next continuation and its count commit together, so a crash leaves both or neither. Returns whether
+   * the actor has input to run. */
+  private async continueGoal(id: string): Promise<boolean> {
+    const goals = this.goals;
+    if (goals === undefined) return false;
+    return this.session.commit(async (tx) => {
+      const task = await this.taskIn(tx, id);
+      if (task === undefined) return false;
+      if (task.pending.length > 0) return true;
+      const input = await goals.continuationIn(tx, task, nativeConversationId(task.conversation_id));
+      if (input === undefined) return false;
+      await this.updateIn(tx, id, (current) => this.pushIn(current, current, input));
+      return true;
+    }, BACKGROUND_CONTEXT);
+  }
   private async confirmBinding(input: WorkerInput, call?: ActorExecution["call"]): Promise<{ task: TaskRecord; worker: Extract<WorkerState, { state: "bound" }> }> {
     const deadline = Date.now() + 10_000;
     let task = await this.get(input.task_id);
@@ -1642,6 +1705,7 @@ export class TaskStore {
             childResultPending = false;
           }
           if (active.revision !== revision) continue;
+          if (input.agent_id === undefined && !active.fenced && await this.continueGoal(input.task_id)) continue;
           active.busy = false; turnInHand = undefined;
           if (!this.hasInteractiveObserver(active)) break;
           this.publish(active, (session) => session.idle());
@@ -1705,8 +1769,15 @@ export class TaskStore {
         // Inputs admitted during configuration could not enter Pi yet. Drain
         // them now rather than waiting for this turn's answer to wake the actor.
         await this.admitActiveInputs(active);
+        await this.placeStranded(conversation, next.id);
         const settled = await submission.wait(BACKGROUND_CONTEXT).finally(() => { active.nativeActive = false; });
         if (active.fenced) { await conversation.waitForIdle(BACKGROUND_CONTEXT); break; }
+        if (settled.type === "input" && settled.status === "unanswered" && settled.reason === "aborted" && input.agent_id === undefined &&
+            await this.goals?.stopped(input.task_id, next.id) === true) {
+          // /goal pause stopped only this turn. The failure path would abort the conversation and withdraw its other inputs.
+          await conversation.waitForIdle(BACKGROUND_CONTEXT);
+          continue;
+        }
         if (settled.type === "input" && settled.status === "unanswered" && settled.reason === "aborted" &&
             (active.mode === "interactive" || settled.entry === undefined)) {
           if (settled.entry === undefined && next.mode !== undefined) {
