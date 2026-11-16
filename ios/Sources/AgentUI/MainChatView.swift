@@ -176,6 +176,7 @@ public struct MainChatView: View {
         }
       }
       .background(.background)
+      .onscreenEntity(covered ? nil : .feed(of: model))
       .safeAreaInset(edge: .bottom, spacing: 0) { if !inspecting { composer } }
       .navigationTitle("Beep Boop")
       #if os(iOS)
@@ -320,9 +321,10 @@ public struct MainChatView: View {
     .preferredColorScheme(appearance.colorScheme)
   }
   private var mainVisible: MainVisibility {
-    scenePhase == .active && !settings && !sourceDetails && opened.isEmpty
+    scenePhase == .active && !covered
       ? .visible(atLatest: latestVisible && model.includesLatest) : .hidden
   }
+  private var covered: Bool { settings || sourceDetails || !opened.isEmpty }
   private var inspecting: Bool { model.inspectedConversation != nil }
   /// A saved profile that is not paired yet. It shows its held messages and takes no sends.
   private var unpaired: CoordinatorProfile? { coordinators?.profiles.first { $0.pin == nil } }

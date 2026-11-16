@@ -153,7 +153,9 @@ struct WorkCatalogSections: View {
             }
             .font(.caption)
           }
-        }.accessibilityIdentifier("job-\(status.job.id)")
+        }
+        .accessibilityIdentifier("job-\(status.job.id)")
+        .onscreenEntity(.job(ScopedEntityID(profile: lane, item: status.job.id)))
       }
     }
     Section("Saved and live conversations") {
@@ -240,6 +242,7 @@ struct JobDetailView: View {
       }
     }
     .navigationTitle(status?.job.title ?? "Scheduled job")
+    .onscreenEntity(status == nil ? nil : .job(ScopedEntityID(profile: lane, item: jobID)))
     .toolbar {
       ToolbarItem(placement: .primaryAction) {
         Button("Refresh", systemImage: "arrow.clockwise") { refresh = UUID() }
