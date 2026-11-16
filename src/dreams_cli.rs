@@ -1,5 +1,6 @@
 use std::{
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -30,12 +31,14 @@ pub enum DreamsAction {
     },
 }
 
+/// What `list` and `show` print for a proposal. It is derived from an
+/// `Inspection` on every read and never stored.
 #[derive(Debug, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum ProposalStatus {
     Pending {
-        #[serde(skip)]
-        half_applied: Vec<TouchedPath>,
+        /// An interrupted apply left proposed content that the next apply finishes.
+        interrupted: bool,
     },
     Applied {
         commit: String,
@@ -53,10 +56,10 @@ enum ProposalStatus {
 impl ProposalStatus {
     fn explain(&self) -> String {
         match self {
-            Self::Pending { half_applied } if half_applied.is_empty() => {
+            Self::Pending { interrupted: false } => {
                 "pending (target HEAD is the base and the touched paths are clean)".into()
             }
-            Self::Pending { .. } => {
+            Self::Pending { interrupted: true } => {
                 "pending (target HEAD is the base; an interrupted apply left proposed content that apply will finish)".into()
             }
             Self::Applied { commit } => format!("applied as commit {commit}"),
@@ -68,6 +71,48 @@ impl ProposalStatus {
             Self::PolicyChanged => {
                 "policy_changed (the private policy no longer matches this proposal)".into()
             }
+        }
+    }
+}
+
+/// How a proposal stands against its patch bytes, the policy and the target's
+/// Git state. Apply acts on this, so the status a reviewer sees is exactly
+/// what apply will do.
+enum Inspection {
+    PatchChanged {
+        actual: ContentDigest,
+    },
+    PolicyChanged,
+    Applied {
+        commit: String,
+    },
+    Stale {
+        head: String,
+    },
+    TargetDirty,
+    /// HEAD is the base and no touched path holds anything but its base or its
+    /// proposed content. `half_applied` lists the paths that an interrupted
+    /// apply already moved to the proposed content.
+    Ready {
+        half_applied: Vec<TouchedPath>,
+    },
+}
+
+impl Inspection {
+    fn status(&self) -> ProposalStatus {
+        match self {
+            Self::PatchChanged { actual } => ProposalStatus::PatchChanged {
+                actual: actual.clone(),
+            },
+            Self::PolicyChanged => ProposalStatus::PolicyChanged,
+            Self::Applied { commit } => ProposalStatus::Applied {
+                commit: commit.clone(),
+            },
+            Self::Stale { head } => ProposalStatus::Stale { head: head.clone() },
+            Self::TargetDirty => ProposalStatus::TargetDirty,
+            Self::Ready { half_applied } => ProposalStatus::Pending {
+                interrupted: !half_applied.is_empty(),
+            },
         }
     }
 }
@@ -125,25 +170,129 @@ fn read_patch(store: &DreamsStore, proposal: &Proposal) -> Result<Vec<u8>> {
         .context("The Dreams patch file is missing")
 }
 
-async fn classify(
-    policy: Option<&DreamsPolicy>,
-    proposal: &Proposal,
-    patch: &[u8],
-) -> Result<ProposalStatus> {
+/// Where one touched path stands in the index and the work tree.
+enum PathState {
+    AtBase,
+    /// The index or the work tree already holds the proposed content.
+    HalfApplied,
+    /// Anything else: other content, another mode or file type, a deletion, or
+    /// a parent that is no longer a plain directory.
+    LocallyChanged,
+}
+
+/// Index entries Git lists for `path`, as `(mode, blob, stage, path)`.
+async fn index_entries(git: &Git, path: &str) -> Result<Vec<(String, String, String, String)>> {
+    let listed = git.text(&["ls-files", "-s", "-z", "--", path]).await?;
+    let mut entries = Vec::new();
+    for entry in listed.split('\0').filter(|entry| !entry.is_empty()) {
+        let (fields, name) = entry
+            .split_once('\t')
+            .context("Git listed an unreadable index entry")?;
+        let fields: Vec<&str> = fields.split(' ').collect();
+        let [mode, blob, stage] = fields.as_slice() else {
+            bail!("Git listed an unreadable index entry");
+        };
+        entries.push((
+            (*mode).to_owned(),
+            (*blob).to_owned(),
+            (*stage).to_owned(),
+            name.to_owned(),
+        ));
+    }
+    Ok(entries)
+}
+
+/// Every local change that a fast-forward would trip over or write through is
+/// found here, before apply writes anything to the target.
+async fn path_state(git: &Git, repository: &Path, file: &TouchedPath) -> Result<PathState> {
+    const PLAIN_FILE: &str = "100644";
+    let mut parent = PathBuf::new();
+    let mut parts: Vec<&str> = file.path.split('/').collect();
+    parts.pop();
+    for part in parts {
+        parent.push(part);
+        // A symlink here would carry the write out of the repository.
+        match fs::symlink_metadata(repository.join(&parent)) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Ok(PathState::LocallyChanged),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Could not read a touched path's parent"),
+        }
+        let name = parent.to_str().context("A touched path is not UTF-8")?;
+        if index_entries(git, name)
+            .await?
+            .iter()
+            .any(|(_, _, _, listed)| listed == name)
+        {
+            return Ok(PathState::LocallyChanged);
+        }
+    }
+
+    let entries: Vec<_> = index_entries(git, &file.path)
+        .await?
+        .into_iter()
+        .filter(|(_, _, _, listed)| listed == &file.path)
+        .collect();
+    let staged = match entries.as_slice() {
+        [] => None,
+        [(mode, blob, stage, _)] if mode == PLAIN_FILE && stage == "0" => Some(blob.clone()),
+        _ => return Ok(PathState::LocallyChanged),
+    };
+    let on_disk = match fs::symlink_metadata(repository.join(&file.path)) {
+        Ok(metadata) if metadata.is_file() => {
+            let plain = if staged.is_some() {
+                // Git compares the mode as its own configuration says to.
+                let changed = git
+                    .text(&["diff-files", "--raw", "-z", "--no-abbrev", "--", &file.path])
+                    .await?;
+                changed
+                    .split('\0')
+                    .next()
+                    .and_then(|change| change.split(' ').nth(1))
+                    .is_none_or(|mode| mode == PLAIN_FILE)
+            } else {
+                metadata.permissions().mode() & 0o111 == 0
+            };
+            if !plain {
+                return Ok(PathState::LocallyChanged);
+            }
+            Some(
+                git.text(&["hash-object", "--", &file.path])
+                    .await?
+                    .trim()
+                    .to_owned(),
+            )
+        }
+        Ok(_) => return Ok(PathState::LocallyChanged),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("Could not read a touched path"),
+    };
+    let proposed = Some(&file.proposed_blob);
+    let is_base = |blob: &Option<String>| blob == &file.base_blob;
+    let known = |blob: &Option<String>| is_base(blob) || blob.as_ref() == proposed;
+    Ok(if !known(&staged) || !known(&on_disk) {
+        PathState::LocallyChanged
+    } else if is_base(&staged) && is_base(&on_disk) {
+        PathState::AtBase
+    } else {
+        PathState::HalfApplied
+    })
+}
+
+/// Reads the target and writes nothing to it.
+async fn inspect(policy: &DreamsPolicy, proposal: &Proposal, patch: &[u8]) -> Result<Inspection> {
     let actual = ContentDigest::of(patch);
     if actual != proposal.patch_sha256 {
-        return Ok(ProposalStatus::PatchChanged { actual });
+        return Ok(Inspection::PatchChanged { actual });
     }
-    let admitted = policy.is_some_and(|policy| {
-        policy.digest() == proposal.policy_digest
-            && policy.repository() == proposal.repository
-            && proposal
-                .files
-                .iter()
-                .all(|path| policy.editable(path).is_ok())
-    });
+    let admitted = policy.digest() == proposal.policy_digest
+        && policy.repository() == proposal.repository
+        && proposal
+            .files
+            .iter()
+            .all(|path| policy.editable(path).is_ok());
     if !admitted {
-        return Ok(ProposalStatus::PolicyChanged);
+        return Ok(Inspection::PolicyChanged);
     }
     let touched =
         touched_paths(std::str::from_utf8(patch).context("The Dreams patch is not text")?)?;
@@ -156,64 +305,42 @@ async fn classify(
     let base = proposal.base.as_str();
     let head = git.text(&["rev-parse", "--verify", "HEAD"]).await?;
     let head = head.trim();
+    let base_commit = format!("{base}^{{commit}}");
+    if git.run(&["cat-file", "-e", &base_commit]).await?.exit_code != 0 {
+        return Ok(Inspection::Stale { head: head.into() });
+    }
     let range = format!("{base}..HEAD");
     let history = git
-        .run(&[
+        .text(&[
             "log",
             "--format=%H%x09%(trailers:key=Dreams-Run,valueonly,separator=%x2C)%x09%(trailers:key=Dreams-Patch-Sha256,valueonly,separator=%x2C)",
             &range,
         ])
         .await?;
-    if history.exit_code != 0 {
-        return Ok(ProposalStatus::Stale { head: head.into() });
-    }
-    for line in history.stdout.lines() {
+    for line in history.lines() {
         let fields: Vec<&str> = line.split('\t').collect();
         if let [commit, run, patch] = fields.as_slice()
             && *run == proposal.run.as_str()
             && *patch == proposal.patch_sha256.hex()
         {
-            return Ok(ProposalStatus::Applied {
+            return Ok(Inspection::Applied {
                 commit: (*commit).to_owned(),
             });
         }
     }
     if head != base {
-        return Ok(ProposalStatus::Stale { head: head.into() });
+        return Ok(Inspection::Stale { head: head.into() });
     }
 
     let mut half_applied = Vec::new();
     for file in touched {
-        let staged = git
-            .text(&["ls-files", "-s", "-z", "--", &file.path])
-            .await?;
-        let staged = staged
-            .split('\0')
-            .next()
-            .and_then(|entry| entry.split(' ').nth(1))
-            .map(str::to_owned);
-        let on_disk = match fs::symlink_metadata(proposal.repository.join(&file.path)) {
-            Ok(metadata) if metadata.is_file() => Some(
-                git.text(&["hash-object", "--", &file.path])
-                    .await?
-                    .trim()
-                    .to_owned(),
-            ),
-            Ok(_) => return Ok(ProposalStatus::TargetDirty),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error).context("Could not read a touched path"),
-        };
-        let proposed = Some(&file.proposed_blob);
-        let is_base = |blob: &Option<String>| blob == &file.base_blob;
-        let known = |blob: &Option<String>| is_base(blob) || blob.as_ref() == proposed;
-        if !known(&staged) || !known(&on_disk) {
-            return Ok(ProposalStatus::TargetDirty);
-        }
-        if !is_base(&staged) || !is_base(&on_disk) {
-            half_applied.push(file);
+        match path_state(&git, &proposal.repository, &file).await? {
+            PathState::AtBase => {}
+            PathState::HalfApplied => half_applied.push(file),
+            PathState::LocallyChanged => return Ok(Inspection::TargetDirty),
         }
     }
-    Ok(ProposalStatus::Pending { half_applied })
+    Ok(Inspection::Ready { half_applied })
 }
 
 /// Characters that change how a terminal lays text out without showing as
@@ -291,19 +418,22 @@ struct RunSummary {
     status: Option<ProposalStatus>,
 }
 
-/// The status of a proposal with the patch bytes it was derived from.
+/// The status of a proposal with the patch bytes it was derived from. Without
+/// a policy nothing admits the proposal, and Git is never run.
 async fn status_of(
     store: &DreamsStore,
     policy: Option<&DreamsPolicy>,
     view: &RunView,
 ) -> Result<Option<(ProposalStatus, Vec<u8>)>> {
-    match &view.outcome {
-        Some(Outcome::Proposed(proposal)) => {
-            let patch = read_patch(store, proposal)?;
-            Ok(Some((classify(policy, proposal, &patch).await?, patch)))
-        }
-        _ => Ok(None),
-    }
+    let Some(Outcome::Proposed(proposal)) = &view.outcome else {
+        return Ok(None);
+    };
+    let patch = read_patch(store, proposal)?;
+    let status = match policy {
+        Some(policy) => inspect(policy, proposal, &patch).await?.status(),
+        None => ProposalStatus::PolicyChanged,
+    };
+    Ok(Some((status, patch)))
 }
 
 fn coverage_word(review: &Review) -> &'static str {
@@ -428,12 +558,13 @@ impl Drop for ScratchIndex {
     }
 }
 
-async fn fast_forward(
+/// Builds the commit for the approved patch on its base, in a scratch index.
+/// It adds objects to the target and changes no ref, index or file.
+async fn build_commit(
     store: &DreamsStore,
     policy: &DreamsPolicy,
     proposal: &Proposal,
     patch: &[u8],
-    half_applied: &[TouchedPath],
 ) -> Result<String> {
     let base = proposal.base.as_str();
     let scratch = ScratchIndex(
@@ -507,12 +638,21 @@ async fn fast_forward(
         ])
         .await
         .context("Could not create the Dreams commit")?;
-    let commit = commit.trim();
+    Ok(commit.trim().to_owned())
+}
 
+/// Returns each path that an interrupted apply left at its proposed content
+/// to the base, then fast-forwards the checked-out branch to `commit`.
+async fn fast_forward(
+    proposal: &Proposal,
+    commit: &str,
+    half_applied: &[TouchedPath],
+) -> Result<()> {
+    let git = Git::writing(&proposal.repository);
     for file in half_applied {
         match &file.base_blob {
             Some(_) => {
-                let source = format!("--source={base}");
+                let source = format!("--source={}", proposal.base);
                 git.text(&[
                     "restore",
                     &source,
@@ -544,8 +684,10 @@ async fn fast_forward(
     git.text(&["merge", "--ff-only", "--quiet", commit])
         .await
         .context("The target could not fast-forward to the Dreams commit")?;
-    Ok(commit.to_owned())
+    Ok(())
 }
+
+const POLICY_CHANGED: &str = "Dreams policy changed since this proposal";
 
 fn short(commit: &str) -> &str {
     commit.get(..12).unwrap_or(commit)
@@ -553,7 +695,7 @@ fn short(commit: &str) -> &str {
 
 async fn apply(
     store: &DreamsStore,
-    policy: Option<&DreamsPolicy>,
+    policy: &DreamsPolicy,
     run: &RunId,
     approval: &ContentDigest,
 ) -> Result<String> {
@@ -568,21 +710,21 @@ async fn apply(
         bail!("Dreams run did not propose a change");
     };
     let patch = read_patch(store, proposal)?;
-    match classify(policy, proposal, &patch).await? {
-        ProposalStatus::PatchChanged { .. } => bail!("Dreams patch changed since it was proposed"),
-        ProposalStatus::PolicyChanged => bail!("Dreams policy changed since this proposal"),
-        ProposalStatus::Stale { head } => bail!(
+    match inspect(policy, proposal, &patch).await? {
+        Inspection::PatchChanged { .. } => bail!("Dreams patch changed since it was proposed"),
+        Inspection::PolicyChanged => bail!("{POLICY_CHANGED}"),
+        Inspection::Stale { head } => bail!(
             "Dreams base is stale: target HEAD is {head}, proposal base is {}",
             proposal.base
         ),
-        ProposalStatus::TargetDirty => bail!("Dreams target has local changes in touched paths"),
-        ProposalStatus::Applied { commit } => Ok(format!(
+        Inspection::TargetDirty => bail!("Dreams target has local changes in touched paths"),
+        Inspection::Applied { commit } => Ok(format!(
             "Dreams run {run} is already applied as commit {}; nothing changed.",
             short(&commit)
         )),
-        ProposalStatus::Pending { half_applied } => {
-            let policy = policy.context("Dreams policy changed since this proposal")?;
-            let commit = fast_forward(store, policy, proposal, &patch, &half_applied).await?;
+        Inspection::Ready { half_applied } => {
+            let commit = build_commit(store, policy, proposal, &patch).await?;
+            fast_forward(proposal, &commit, &half_applied).await?;
             Ok(format!(
                 "Applied Dreams run {run} as commit {} to {}.",
                 short(&commit),
@@ -668,7 +810,7 @@ pub async fn run(
         DreamsAction::Apply { run, approve } => {
             let message = apply(
                 &store,
-                policy.as_ref(),
+                policy.as_ref().context(POLICY_CHANGED)?,
                 &RunId::parse(&run)?,
                 &ContentDigest::parse(&approve)?,
             )
@@ -697,8 +839,8 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::dreams_cli::{
-        ProposalStatus, RunReport, apply, apply_command, classify, escape_terminal_controls,
-        read_patch, render, touched_paths,
+        ProposalStatus, RunReport, apply, apply_command, escape_terminal_controls, inspect,
+        read_patch, render, status_of, touched_paths,
     };
 
     fn git(repository: &Path, arguments: &[&str]) -> String {
@@ -793,24 +935,20 @@ mod tests {
             panic!("The run must hold a proposal");
         };
         let approval = view.review_sha256.clone().unwrap();
+        let patch = read_patch(&store, proposal).unwrap();
         assert!(matches!(
-            classify(Some(&policy), proposal, &read_patch(&store, proposal).unwrap()).await.unwrap(),
-            ProposalStatus::Pending { half_applied } if half_applied.is_empty()
+            inspect(&policy, proposal, &patch).await.unwrap().status(),
+            ProposalStatus::Pending { interrupted: false }
         ));
 
         fs::create_dir(repository.join("playbooks")).unwrap();
         fs::write(repository.join("playbooks/build.md"), playbook).unwrap();
         git(&repository, &["add", "playbooks/build.md"]);
-        let status = classify(
-            Some(&policy),
-            proposal,
-            &read_patch(&store, proposal).unwrap(),
-        )
-        .await
-        .unwrap();
-        assert!(
-            matches!(&status, ProposalStatus::Pending { half_applied } if half_applied.len() == 1)
-        );
+        let status = inspect(&policy, proposal, &patch).await.unwrap().status();
+        assert!(matches!(
+            &status,
+            ProposalStatus::Pending { interrupted: true }
+        ));
         let evidence = store.evidence(&run).unwrap();
         let shown = render(&RunReport {
             run: &view.id,
@@ -835,7 +973,7 @@ mod tests {
             "{shown}"
         );
 
-        let message = apply(&store, Some(&policy), &run, &approval).await.unwrap();
+        let message = apply(&store, &policy, &run, &approval).await.unwrap();
         assert!(message.starts_with("Applied Dreams run"), "{message}");
         assert_eq!(git(&repository, &["status", "--porcelain"]), "");
         assert_eq!(
@@ -843,16 +981,14 @@ mod tests {
             playbook
         );
         assert_eq!(git(&repository, &["rev-parse", "HEAD~1"]), head);
-        let again = apply(&store, Some(&policy), &run, &approval).await.unwrap();
+        let again = apply(&store, &policy, &run, &approval).await.unwrap();
         assert!(again.contains("already applied"), "{again}");
         assert_eq!(git(&repository, &["rev-parse", "HEAD~1"]), head);
 
         assert!(
             matches!(
-                classify(None, proposal, &read_patch(&store, proposal).unwrap())
-                    .await
-                    .unwrap(),
-                ProposalStatus::PolicyChanged
+                status_of(&store, None, &view).await.unwrap(),
+                Some((ProposalStatus::PolicyChanged, _))
             ),
             "Without the private policy, nothing is admitted"
         );
