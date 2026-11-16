@@ -1,7 +1,11 @@
 use std::{
     collections::BTreeSet,
     fs,
-    os::unix::fs::{PermissionsExt, symlink},
+    os::unix::{
+        fs::{OpenOptionsExt, PermissionsExt, symlink},
+        net::UnixStream,
+        process::CommandExt,
+    },
     path::PathBuf,
     process::{Command, Output, Stdio},
     thread,
@@ -323,6 +327,81 @@ fn list_and_show_report_each_gap_of_an_abstained_night_and_apply_refuses_it() {
         stderr.contains("Dreams run did not propose a change"),
         "{stderr}"
     );
+}
+
+#[test]
+fn a_coordinator_admits_no_command_until_its_log_records_its_start() {
+    let fixture = Fixture::new();
+    fixture.seed_witnessed_night();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(fixture.state.join("diagnostics/writer.lock"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    let stderr = fixture.directory.path().join("blocked.stderr");
+    let mut blocked = fixture
+        .command(&["serve", "--local-only", "--no-sources"], true)
+        .process_group(0)
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&stderr).unwrap())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut admitted = 0;
+    while Instant::now() < deadline && blocked.try_wait().unwrap().is_none() {
+        // A command sent before the socket exists could start a second coordinator.
+        if UnixStream::connect(fixture.state.join("agent.sock")).is_ok() {
+            admitted = (0..20)
+                .filter(|_| fixture.cli(&["tasks", "list"], true).status.success())
+                .count();
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let exited = blocked.try_wait().unwrap();
+    if exited.is_none() {
+        let group = libc::pid_t::try_from(blocked.id()).unwrap();
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    }
+    blocked.wait().unwrap();
+    drop(lock);
+
+    let mut server = fixture.start();
+    fixture.script(
+        DREAMS_KEY,
+        vec![
+            tool("dreams_review", json!({ "page": 1 })),
+            tool(
+                "dreams_abstain",
+                json!({ "reason": "quiet", "note": "Looked quiet." }),
+            ),
+            tool(
+                "dreams_abstain",
+                json!({ "reason": "insufficient_coverage", "note": "Receipts are missing." }),
+            ),
+            text("Dreams abstained."),
+        ],
+    );
+    fixture.run_job("dreams");
+    server.stop();
+    let sealed_quiet = fixture
+        .output_of(DREAMS_KEY, "dreams_abstain", 0)
+        .contains("sealed: abstained: quiet");
+    assert!(
+        admitted == 0 || !sealed_quiet,
+        "A quiet night sealed over {admitted} commands a coordinator admitted before its log recorded its start"
+    );
+    let stderr = fs::read_to_string(&stderr).unwrap();
+    assert!(
+        exited.is_some_and(|status| !status.success()),
+        "A coordinator whose log could not record its start kept serving: {stderr}"
+    );
+    assert!(stderr.contains("writer.lock"), "{stderr}");
+    assert_eq!(admitted, 0);
 }
 
 #[test]
