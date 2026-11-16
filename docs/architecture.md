@@ -841,10 +841,10 @@ These are the only differences from the expected store that pass:
   triage. It is dismissed, or linked to the task that produced it. After the
   lookalike, every such outcome keeps the seeded waiting state. A task that
   resolves may also save unresolved progress any number of times.
-- The booking and lookalike cases may publish any number of notices. Triage
-  publishes a notice under Northwind or under no task, and the Northwind
-  worker publishes under Northwind. A notice cites only Northwind's outcomes
-  and the case's own mail.
+- The booking and lookalike cases may publish one notice from triage and one
+  from the Northwind worker. Triage publishes under Northwind or under no
+  task, and the worker publishes under Northwind. A notice cites only
+  Northwind's outcomes and the case's own mail.
 - Ledger log lines that do not start with `book` or `void` may appear in any
   number. The fixture ledger changes nothing for them.
 - The transcript is not compared. It is Pi's message and tool-result entries
@@ -868,7 +868,8 @@ case also counts model requests during the outage.
 A table of wrong agents tests the checks themselves. Each row is a scripted
 agent that breaks a rule, such as a readback that never runs, a readback from
 a stale copy of the ledger, a booking made before the worker resumes, an
-outcome linked to the decoy, a notice published under the decoy, a resolution
+outcome linked to the decoy, a notice published under the decoy or published
+twice, a resolution
 that adds the decoy's supplier thread to the task, a follow-up that carries an
 unrelated attachment, or a file left beside the ledger.
 `oracles_reject_wrong_agents` requires the named check to reject every row.
