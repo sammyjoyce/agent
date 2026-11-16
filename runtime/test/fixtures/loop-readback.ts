@@ -31,16 +31,16 @@ try {
   };
   const receipts: unknown[] = [], conversations: unknown[] = [];
   for (const { id } of await app.database.all<{ id: number }>("SELECT id FROM conversations ORDER BY id")) {
-    const calls = new Map<string, unknown>(), listed: unknown[] = [];
+    const calls = new Map<string, { args: unknown; at: number }>(), listed: unknown[] = [];
     for (const entry of await entries(String(id))) {
       listed.push({ id: entry.id, kind: entry.kind, user: entry.model?.some((message) => message.role === "user") ?? false,
         data: entry.kind === "agent.notice_context" ? cited(entry) : entry.kind.startsWith("agent.") ? entry.data ?? null : null });
       for (const message of entry.model ?? []) {
-        if (message.role === "assistant") for (const part of message.content) if (part.type === "toolCall") calls.set(part.id, part.arguments);
+        if (message.role === "assistant") for (const part of message.content) if (part.type === "toolCall") calls.set(part.id, { args: part.arguments, at: message.timestamp });
         if (message.role !== "toolResult") continue;
-        const details: unknown = message.details;
+        const details: unknown = message.details, call = calls.get(message.toolCallId);
         receipts.push({ conversation_id: String(id), entry_id: entry.id, tool: message.toolName, error: message.isError,
-          args: calls.get(message.toolCallId) ?? null,
+          args: call?.args ?? null, called_at: call?.at ?? null, finished_at: message.timestamp,
           nested: typeof details === "object" && details !== null && "calls" in details && Array.isArray(details.calls) ? details.calls : [] });
       }
     }
