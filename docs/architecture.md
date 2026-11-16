@@ -789,7 +789,6 @@ OPENAI_API_KEY=... OPENAI_BASE_URL=... AGENT_LOOP_EVAL_PROOF=/tmp/loop-eval \
 Each case writes its checks, answers, tool calls, ledger calls, tokens and
 latency under the proof directory, beside a `summary.json`. The run starts no
 new case after `AGENT_LOOP_EVAL_TOKEN_BUDGET` tokens, 3,000,000 by default.
-On 2026-11-16 the default model passed all six cases of the first table,
-before the decoy and the injected confirmation, with 580,278 input and output
-tokens. The live run has no crash case. No case reads a real mailbox or
+On 2026-11-16 the default model passed all seven cases with 801,307 input and
+output tokens. The live run has no crash case. No case reads a real mailbox or
 changes anything outside its temporary directory.
