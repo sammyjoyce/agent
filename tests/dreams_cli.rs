@@ -574,6 +574,63 @@ fn with_dreams_a_coordinator_that_cannot_record_its_start_names_the_path_and_the
 }
 
 #[test]
+fn runs_without_dreams_that_the_log_never_saw_refuse_the_next_quiet_night() {
+    let fixture = Fixture::new();
+    fixture.seed_witnessed_night();
+    fixture.start().stop();
+    fixture.write_config(None);
+    let segment = fixture.state.join("diagnostics/runtime.jsonl");
+    fs::set_permissions(&segment, fs::Permissions::from_mode(0o400)).unwrap();
+    let mut unrecorded_starts = Vec::new();
+    for _ in 0..2 {
+        unrecorded_starts.push(now_ms());
+        let mut server = fixture.start();
+        fixture.ok(&["tasks", "list"], true);
+        server.stop();
+    }
+    fs::set_permissions(&segment, fs::Permissions::from_mode(0o600)).unwrap();
+    fixture.write_policy(
+        &fixture.repository,
+        &["/bin/sh", fixture.check.to_str().unwrap()],
+    );
+    let mut server = fixture.start();
+    fixture.script(
+        DREAMS_KEY,
+        vec![
+            tool("dreams_review", json!({ "page": 1 })),
+            tool(
+                "dreams_abstain",
+                json!({ "reason": "quiet", "note": "Looked quiet." }),
+            ),
+            tool(
+                "dreams_abstain",
+                json!({ "reason": "insufficient_coverage", "note": "Receipts are missing." }),
+            ),
+            text("Dreams abstained."),
+        ],
+    );
+    fixture.run_job("dreams");
+    server.stop();
+
+    let sealed = fixture.output_of(DREAMS_KEY, "dreams_abstain", 0);
+    assert!(
+        !sealed.contains("sealed: abstained: quiet"),
+        "A quiet night sealed over two runs the log never saw: {}",
+        fixture.output_of(DREAMS_KEY, "dreams_review", 0)
+    );
+    let shown = fixture.dreams_json(&["show", fixture.latest_run()["run"].as_str().unwrap()]);
+    let gaps = shown["review"]["coverage"]["receipts"]["gaps"]
+        .as_array()
+        .unwrap();
+    assert!(
+        gaps.iter().any(|gap| gap["cause"] == "unclean_restart"
+            && gap["interval"]["start_ms"].as_u64().unwrap() < unrecorded_starts[1]),
+        "The gap must start with the first unrecorded run, before {}: {gaps:?}",
+        unrecorded_starts[1]
+    );
+}
+
+#[test]
 fn injected_receipt_text_never_reaches_the_model_and_an_obedient_model_reaches_no_tool() {
     let fixture = Fixture::new();
     let now = now_ms();
