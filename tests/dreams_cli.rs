@@ -776,8 +776,6 @@ fn the_shipped_example_jobs_load_and_name_the_reserved_dreams_job() {
     assert!(jobs.contains("dreams"), "{jobs:?}");
 }
 
-/// A proposal sealed through the library with no coordinator, for tests of the
-/// commands a human runs afterwards.
 struct Sealed {
     run: String,
     shown: Value,
@@ -858,8 +856,6 @@ async fn apply_gives_git_the_bytes_it_verified_even_when_the_patch_file_changes_
     );
     assert_ne!(altered, approved);
 
-    // The wrapper changes no Git argument or result. It holds `git apply` until
-    // the test has replaced the patch file that apply already verified.
     let ready = fixture.directory.path().join("git-apply-ready");
     let release = fixture.directory.path().join("git-apply-release");
     let real_git = Command::new("/bin/sh")

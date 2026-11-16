@@ -53,9 +53,6 @@ fn redact(value: &mut serde_json::Value) {
     }
 }
 
-/// Evidence for one receipt. Parsing dropped its unknown fields, and every
-/// string that is not an identifier is redacted here, so no free text from a
-/// log line reaches the model.
 pub(crate) fn redacted_receipt(record: &Record) -> EvidenceItem {
     let mut value = serde_json::to_value(record).unwrap_or(serde_json::Value::Null);
     redact(&mut value);
@@ -224,8 +221,6 @@ pub(crate) fn summaries(
             omitted = omitted.saturating_add(1);
             continue;
         }
-        // The runtime keeps only the end of a task's answer, counted in UTF-16
-        // units. A summary at that limit may have lost its beginning.
         let (body, cut) = clean(&summary.summary, TASK_SUMMARY_MAX_UTF16_UNITS);
         if cut || summary.summary.encode_utf16().count() >= TASK_SUMMARY_MAX_UTF16_UNITS {
             truncated = truncated.saturating_add(1);
@@ -353,9 +348,6 @@ pub(crate) fn coverage(
     }
 }
 
-/// Characters that change how text is laid out without showing as text:
-/// bidirectional overrides and isolates, zero-width characters, line and
-/// paragraph separators, and the tag block.
 fn is_format_control(character: char) -> bool {
     matches!(
         character,
@@ -372,8 +364,6 @@ fn is_format_control(character: char) -> bool {
 }
 
 /// Shows control and format characters as escapes. Newlines and tabs stay.
-/// The model and a human reviewer read untrusted text through this one
-/// function, so neither sees text that differs from its bytes.
 pub fn escape_controls(text: &str) -> String {
     text.chars()
         .flat_map(|character| match character {
@@ -400,7 +390,6 @@ pub fn quote(lines: &mut Vec<String>, text: &str) {
     }
 }
 
-/// One check result with its quoted output. `phase` is `Before` or `After`.
 pub fn check_lines(lines: &mut Vec<String>, phase: &str, check: &CheckResult) {
     lines.push(format!(
         "{phase} check {}: {} ({:.1}s)",
@@ -415,9 +404,6 @@ pub fn check_lines(lines: &mut Vec<String>, phase: &str, check: &CheckResult) {
     }
 }
 
-/// What a review saw, in the words that both the model's review page and
-/// `dreams show` print: the window, the coverage and its gaps, the summary
-/// snapshot, the base, the before checks and the findings.
 pub fn review_summary(review: &Review) -> Vec<String> {
     let coverage = &review.coverage;
     let mut lines = vec![format!(

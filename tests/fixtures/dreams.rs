@@ -224,7 +224,6 @@ impl Fixture {
         fs::write(&self.config, toml::to_string(&config).unwrap()).unwrap();
     }
 
-    /// Puts a program ahead of the real one on the PATH of every CLI this fixture starts.
     pub fn shadow_program(&self, name: &str, script: &str) {
         write_executable(&self.bin.join(name), script);
     }
@@ -535,8 +534,6 @@ impl Fixture {
     }
 }
 
-/// A hosted provider tool has no `name`, so it is counted by its `type`, and
-/// anything with neither is counted as its whole JSON. Nothing offered is dropped.
 pub fn offered_tools(body: &Value) -> BTreeSet<String> {
     let later = body["input"]
         .as_array()
@@ -559,8 +556,6 @@ pub fn offered_tools(body: &Value) -> BTreeSet<String> {
         .collect()
 }
 
-/// Every file below `root` with its mode and bytes, and every symlink with its
-/// target. Nothing is followed, so `.git` and a symlinked directory are compared as they are.
 pub fn tree_snapshot(root: &Path) -> BTreeMap<PathBuf, (u32, Vec<u8>)> {
     let mut snapshot = BTreeMap::new();
     let mut pending = vec![root.to_owned()];

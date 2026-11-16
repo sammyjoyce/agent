@@ -62,7 +62,6 @@ export type ActorExecution = {
   call(command: HostCommand, host: WorkerHost, signal: AbortSignal): Promise<HostResult>;
   prepare?(model: ModelSelection): Promise<void>;
 };
-/** Whether a scheduled job owns this task: any job, or the one named. */
 export function isJobTask(task: Pick<TaskRecord, "sources">, jobId?: string): boolean {
   return task.sources.some((source) => source.provider === "scheduled_jobs" && source.account === "local" &&
     (jobId === undefined || source.thread_id === jobId));
@@ -787,7 +786,6 @@ export class TaskStore {
     const tokens = (key(query).match(/[\p{L}\p{N}]+/gu) ?? []).filter((token) => token.length > 1 && !stop.includes(token));
     const scored: { task: TaskRecord; score: number }[] = [];
     for (const task of await this.list()) {
-      // A confined task's text is untrusted. It reaches another actor only by an explicit read of that task.
       if (this.isConfined(task)) continue;
       const sourceMatch = sources.some((source) =>
         (source.provider === "task_outcomes" && source.account === "local" && source.thread_id === task.id) ||
@@ -1697,7 +1695,6 @@ export class TaskStore {
       if (confined !== undefined && (active.mode !== "job" || input.agent_id !== undefined)) throw new TaskError(CONFINED_ACTOR_ONLY);
       const extensions = () => confined ?? execution.extensions(input.agent_id);
       const conversation = await this.conversation(actor.conversation_id);
-      // Before any configure call, so no request of a confined conversation is ever built with a hosted provider tool.
       if (confined !== undefined) await this.inference.withholdHostedTools(conversation);
       if (active.mode === "job") active.conversation = conversation;
       if (isAbortedJob(active)) throw new TaskError("Background execution stopped; its native input is retained");

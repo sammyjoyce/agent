@@ -16,7 +16,6 @@ use crate::dreams::{
 
 const STALE_STAGING: Duration = Duration::from_secs(60 * 60);
 
-// The run directory layout. Only this module spells these names.
 const RUNS_DIRECTORY: &str = "runs";
 const REVIEW_DIRECTORY: &str = "review";
 const REVIEW_STAGING_PREFIX: &str = ".review-";
@@ -33,7 +32,6 @@ const VERDICT_FILE: &str = "verdict.json";
 const OUTCOME_FILE: &str = "outcome.json";
 const APPLIED_FILE: &str = "applied.json";
 
-/// Whether this call sealed the run's review or found one already sealed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReviewSeal {
     Sealed,
@@ -44,8 +42,6 @@ pub struct DreamsStore {
     root: PathBuf,
 }
 
-/// Written by `dreams apply` after its fast-forward. Git history alone forgets
-/// an apply once HEAD moves back to the base.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppliedRecord {
     pub commit: Revision,
@@ -55,7 +51,6 @@ pub struct RunView {
     pub id: RunId,
     pub review: Review,
     pub outcome: Option<Outcome>,
-    /// sha256 of the exact `outcome.json` bytes. This is what `apply --approve` takes.
     pub outcome_sha256: Option<ContentDigest>,
     pub attempts_used: u8,
 }
@@ -231,13 +226,10 @@ impl DreamsStore {
         Ok(staged)
     }
 
-    /// Where a staged review keeps the clone its before checks run in.
     pub(crate) fn base_clone(staged: &Path) -> PathBuf {
         staged.join(BASE_CLONE)
     }
 
-    /// Where a staged review clones the base to read the editable files. The
-    /// clone is removed again before the review is sealed.
     pub(crate) fn files_clone(staged: &Path) -> PathBuf {
         staged.join(FILES_CLONE)
     }
@@ -273,7 +265,6 @@ impl DreamsStore {
         Ok(seal)
     }
 
-    /// Where an attempt keeps the clone its edits and after checks run in.
     pub(crate) fn candidate_clone(attempt: &Path) -> PathBuf {
         attempt.join(CANDIDATE_CLONE)
     }
@@ -286,7 +277,6 @@ impl DreamsStore {
         write_json(&attempt.join(AFTER_FILE), &after)
     }
 
-    /// `rejected` is the reason an attempt was not sealed, or None when it was.
     pub(crate) fn write_verdict(attempt: &Path, rejected: Option<&str>) -> Result<()> {
         write_json(
             &attempt.join(VERDICT_FILE),
@@ -315,7 +305,6 @@ impl DreamsStore {
             .context("Could not seal the Dreams outcome")
     }
 
-    /// The commit that `dreams apply` moved the target to, if it has.
     pub fn applied(&self, run: &RunId) -> Result<Option<AppliedRecord>> {
         read_json(&self.run_directory(run).join(APPLIED_FILE))
     }
@@ -332,8 +321,6 @@ impl DreamsStore {
         .context("Could not record the Dreams apply")
     }
 
-    /// Writes `name` in the run directory unless it exists, and returns what
-    /// the file holds: this value, or the one that was linked first.
     fn seal_once<T: Serialize + DeserializeOwned>(
         &self,
         run: &RunId,

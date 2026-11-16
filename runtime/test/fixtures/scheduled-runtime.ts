@@ -30,7 +30,6 @@ export const binding: WorkerRef = { host_id: node.host_id, session_id: "session:
   window_id: "window:33333333-3333-4333-8333-333333333333", block_id: "block:44444444-4444-4444-8444-444444444444" };
 
 type Provider = Parameters<ReturnType<typeof createModels>["setProvider"]>[0];
-/** `providers` replace the faux model with real provider adapters, for tests that read the request a provider sends. */
 export async function openScheduled(directory: string, guidanceVersion = "original", clock?: FakeClock, providers: readonly Provider[] = []) {
   const database = await openNodeSqliteDatabase(join(directory, "session.sqlite"));
   await database.exec("PRAGMA synchronous = FULL");

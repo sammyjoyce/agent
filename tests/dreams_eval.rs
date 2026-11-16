@@ -85,8 +85,6 @@ fn seed(fixture: &Fixture, scenario: &Scenario) {
     fs::write(fixture.jobs.join("dreams.toml"), job).unwrap();
 }
 
-/// Whole clones of the target inside a run directory. The patch and the check
-/// results already record what they held.
 const CLONE_DIRECTORIES: [&str; 2] = ["candidate", "base"];
 
 fn copy_artifacts(from: &Path, to: &Path) {
@@ -113,9 +111,7 @@ fn copy_artifacts(from: &Path, to: &Path) {
 }
 
 struct Trial {
-    /// The graded JSONL line. A pass here measures the model.
     record: Value,
-    /// Whether the closed toolset and the unchanged target held, whatever the model chose.
     boundary_held: bool,
 }
 

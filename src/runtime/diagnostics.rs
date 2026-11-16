@@ -30,12 +30,9 @@ mod window;
 pub(crate) use window::{ReceiptWindow, read_window};
 
 const MAX_BYTES: u64 = 1024 * 1024;
-/// The most receipt bytes the writer retains, watermark included.
 pub(crate) const RETENTION_CAP_BYTES: u64 = 128 * MAX_BYTES;
 const CAPACITY: usize = 256;
 pub(crate) const HEARTBEAT: Duration = Duration::from_secs(5 * 60);
-/// A live writer leaves a receipt at least every heartbeat, so silence longer
-/// than two heartbeats means that nothing witnessed that time.
 pub(crate) const UNWITNESSED_AFTER: Duration = Duration::from_secs(2 * HEARTBEAT.as_secs());
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -66,7 +63,6 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, millis)
 }
-/// The only strings a receipt may carry: short identifiers, never free text.
 pub(crate) fn is_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -625,16 +621,12 @@ fn host_kind(bytes: &[u8]) -> Option<String> {
         .leaf()
 }
 
-/// Live writers in this process, by diagnostics directory. A reader in the same
-/// process uses it to count drops that no written receipt reports yet.
 static LIVE_DROP_COUNTS: Mutex<Vec<(PathBuf, Weak<AtomicU64>)>> = Mutex::new(Vec::new());
 
 fn registry_key(directory: &Path) -> PathBuf {
     std::path::absolute(directory).unwrap_or_else(|_| directory.to_owned())
 }
 
-/// Receipts that writers of `directory` in this process dropped on a full
-/// channel and have not reported in a written receipt.
 fn undelivered_drops(directory: &Path) -> u64 {
     let key = registry_key(directory);
     LIVE_DROP_COUNTS
@@ -661,11 +653,7 @@ fn heartbeat(dropped_before: u64) -> Record {
     }
 }
 
-/// Sends without waiting. A receipt that gets through carries the count of
-/// those that did not, whichever sender dropped them. Returns whether the
-/// channel was full.
 fn deliver(sender: &mpsc::Sender<Record>, dropped: &AtomicU64, mut record: Record) -> bool {
-    // Taken before the send, so two senders never report the same drops.
     let pending = dropped.swap(0, Ordering::Relaxed);
     record.dropped_before = pending;
     let Err(refused) = sender.try_send(record) else {
@@ -677,8 +665,6 @@ fn deliver(sender: &mpsc::Sender<Record>, dropped: &AtomicU64, mut record: Recor
 
 pub(crate) struct Diagnostics {
     sender: mpsc::Sender<Record>,
-    /// Shared by every fork and the heartbeat, so a drop is reported even when
-    /// the sender that dropped never records again.
     dropped: Arc<AtomicU64>,
 }
 impl Diagnostics {
@@ -714,7 +700,6 @@ impl Diagnostics {
                 let Some(sender) = witness.upgrade() else {
                     return;
                 };
-                // A heartbeat that does not fit is no lost receipt, so it is not counted.
                 deliver(&sender, &pending, heartbeat(0));
             }
         });
@@ -725,7 +710,6 @@ impl Diagnostics {
                 while let Some(record) = records.blocking_recv() {
                     writer.append(&record)?;
                 }
-                // The last sender is gone, so nothing else can report these.
                 let unreported = pending.swap(0, Ordering::Relaxed);
                 if unreported > 0 {
                     writer.append(&heartbeat(unreported))?;
@@ -1819,7 +1803,6 @@ mod tests {
         .expect("The heartbeat must not keep the writer alive after its last producer");
     }
 
-    /// Starts a writer that waits on writer.lock while `records` overflow its channel.
     fn overflowed(
         state: &std::path::Path,
         heartbeat: std::time::Duration,

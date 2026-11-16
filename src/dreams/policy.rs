@@ -99,8 +99,6 @@ fn components<'a>(path: &'a str, extra: &[u8]) -> Result<Vec<&'a str>, String> {
     Ok(parts)
 }
 
-/// A path may not exist yet. Its nearest existing ancestor is resolved through
-/// the file system, so a symlinked parent cannot hide where the path lands.
 fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
     for ancestor in path.ancestors() {
         if let Ok(canonical) = ancestor.canonicalize() {
@@ -137,7 +135,6 @@ impl Glob {
                 .zip(parts)
                 .all(|(pattern, part)| wildcard(pattern.as_bytes(), part.as_bytes()))
     }
-    /// `lowered` is already lowercase.
     fn matches_ignoring_case(&self, lowered: &[String]) -> bool {
         self.0.len() == lowered.len()
             && self
@@ -157,7 +154,6 @@ fn editable_in(globs: &[Glob], path: &str) -> Result<EditablePath, String> {
     }
 }
 
-/// `.` and empty components dropped, and `..` resolved by name alone.
 fn normalize(path: &Path) -> PathBuf {
     let mut normal = PathBuf::new();
     for component in path.components() {
@@ -172,17 +168,10 @@ fn normalize(path: &Path) -> PathBuf {
     normal
 }
 
-/// An approved edit must not be able to rewrite the program that judges the
-/// next proposal, so no argument of a check may name an editable path.
-///
-/// A check runs in a clone of the repository, so a relative argument is
-/// resolved against the repository root. Each argument is followed both by
-/// name and through the file system, which resolves symlinks and, on a volume
-/// that folds case, the stored spelling. Names are compared without case, so a
-/// file that does not exist yet is covered on such a volume too.
-///
-/// This catches a path written as an argument. It cannot see a file that the
-/// check program opens by itself.
+/// Each argument is followed both by name and through the file system, which
+/// resolves symlinks and, on a volume that folds case, the stored spelling.
+/// Names are compared without case, so a file that does not exist yet is
+/// covered on such a volume too.
 fn refuse_editable_argv(
     repository: &Path,
     editable: &[Glob],
@@ -214,8 +203,6 @@ fn refuse_editable_argv(
                 check.name
             );
         }
-        // A symlink followed by `..` lands somewhere its spelling does not say,
-        // and a relative `..` can leave the clone for the private run directory.
         let climbs = written
             .components()
             .any(|part| part == Component::ParentDir);

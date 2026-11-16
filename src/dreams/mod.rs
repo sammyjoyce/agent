@@ -32,7 +32,6 @@ use crate::{protocol::HostResult, runtime::diagnostics};
 pub const DREAMS_JOB_ID: &str = "dreams";
 pub const MAX_WINDOW_HOURS: u8 = 48;
 pub const MAX_SUMMARIES: usize = 200;
-/// One review request carries the summaries as JSON, which can expand them.
 pub const MAX_SUMMARY_BYTES: usize = crate::runtime::MAX_FRAME_BYTES / 4;
 pub const MAX_EDITS: usize = 4;
 pub const MAX_EDIT_BYTES: usize = 64 * 1024;
@@ -50,10 +49,8 @@ const MAX_SHOWN_FILES: usize = 32;
 const MAX_RECEIPT_BYTES: u64 = diagnostics::RETENTION_CAP_BYTES + 32 * 1024 * 1024;
 const MAX_RECEIPTS: usize = 400_000;
 
-/// Why an attempt was not sealed, in words the model can act on.
 pub(crate) struct Rejection {
     reason: String,
-    /// Quoted check output, when a check is the reason.
     output: Vec<String>,
 }
 impl Rejection {
@@ -65,10 +62,6 @@ impl Rejection {
     }
 }
 
-/// How an attempt ends without a proposal. A rejection is the model's to fix:
-/// it is told why and the attempt is spent. A failure is the host's: the call
-/// fails. Returning the wrong one would hide a host fault from the operator or
-/// a fixable mistake from the model, so every step of an attempt uses this type.
 pub(crate) enum AttemptError {
     Rejected(Rejection),
     Failed(anyhow::Error),
@@ -236,8 +229,6 @@ impl Dreams {
         let built = async {
             let repository = self.policy.repository();
             let base = workspace::resolve_base(repository).await?;
-            // The model reads the editable files from a clone that no check ever
-            // runs in, so what it is shown cannot depend on what a check wrote.
             let reading = DreamsStore::files_clone(&staged);
             workspace::clone_detached(repository, &base, &reading).await?;
             let files = self.editable_files(&reading).await?;
@@ -266,7 +257,6 @@ impl Dreams {
         if built.is_err() {
             let _ = std::fs::remove_dir_all(&staged);
         }
-        // Whichever review was sealed first is the run's review. The caller reads it back.
         built.map(|_: ReviewSeal| ())
     }
 
@@ -450,7 +440,6 @@ impl Dreams {
         let patch = workspace::write_candidate(&candidate, &review.base, &edits).await?;
         let after = workspace::run_checks(&candidate, self.policy.checks(), cancelled).await?;
         DreamsStore::write_after(directory, &after)?;
-        // Written from memory after the checks, which ran beside this directory.
         DreamsStore::write_patch(directory, &patch.bytes)?;
         if let Some(failed) = after.iter().find(|check| !check.passed()) {
             let mut output = Vec::new();
@@ -602,8 +591,6 @@ mod tests {
             }
         }
 
-        /// A heartbeat every five minutes over the last two hours, then `tail`,
-        /// with a watermark that reports no loss.
         fn seed_receipts(&self, tail: &str) {
             let directory = self.dreams.state.join("diagnostics");
             fs::create_dir(&directory).unwrap();
@@ -867,8 +854,6 @@ mod tests {
         }
     }
 
-    /// Holds writer.lock so that the new writer waits and the bounded channel
-    /// overflows, as it does while a retired runtime still drains its queue.
     async fn overflow(night: &Night, sender: &mut diagnostics::Diagnostics, records: u32) -> usize {
         let directory = night.dreams.state.join("diagnostics");
         let lock = fs::OpenOptions::new()

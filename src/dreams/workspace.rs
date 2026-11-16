@@ -87,7 +87,6 @@ impl Git {
         self.spawn(arguments, None).await
     }
 
-    /// Runs Git with exactly `input` on its standard input.
     pub async fn run_with_input(&self, arguments: &[&str], input: &[u8]) -> Result<GitOutput> {
         self.spawn(arguments, Some(input)).await
     }
@@ -153,8 +152,6 @@ pub(crate) async fn resolve_base(repository: &Path) -> Result<Revision> {
     Revision::parse(head.trim())
 }
 
-/// A private clone of `repository` that shares its objects, detached at `base`.
-/// The repository itself is only read.
 pub(crate) async fn clone_detached(
     repository: &Path,
     base: &Revision,
@@ -261,8 +258,6 @@ pub(crate) async fn run_checks(
     Ok(results)
 }
 
-/// What Git derived from a candidate's edits. The bytes stay in memory until
-/// the checks have run, so no check can touch the patch a reviewer will approve.
 pub(crate) struct Patch {
     pub bytes: Vec<u8>,
     pub digest: ContentDigest,
@@ -333,7 +328,6 @@ fn write_edit(candidate: &Path, path: &EditablePath, content: &str) -> Result<()
     Ok(())
 }
 
-/// Writes the edits into the candidate clone and has Git derive the patch.
 pub(crate) async fn write_candidate(
     candidate: &Path,
     base: &Revision,

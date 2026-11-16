@@ -139,13 +139,11 @@ test("the Dreams toolset refuses to start with any tool beyond the three Dreams 
 });
 
 function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
-/** Each tool a provider request offers, in `tools` or in a later `additional_tools` item: its name, or its type for a hosted tool that has none. */
 function requestTools(body: Record<string, unknown> | undefined): string[] {
   assert.ok(body !== undefined && Array.isArray(body.tools) && Array.isArray(body.input), "The provider request lists its tools");
   const later = body.input.flatMap((item: unknown) => object(item) && item.type === "additional_tools" && Array.isArray(item.tools) ? item.tools : []);
   return [...body.tools, ...later].map((tool: unknown) => object(tool) && typeof tool.name === "string" ? tool.name : object(tool) ? String(tool.type) : "invalid").sort();
 }
-/** A local Responses endpoint that records each request body and answers with one plain message. */
 async function recordingProvider() {
   const requests: Record<string, unknown>[] = [];
   const server = createServer((request, response) => { void (async () => {

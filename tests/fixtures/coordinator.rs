@@ -1,5 +1,3 @@
-//! A real `serve --local-only --no-sources` coordinator on private fixture
-//! paths, shared by the integration tests that drive it through the CLI.
 #![allow(dead_code)]
 
 use std::{
@@ -15,7 +13,6 @@ use std::{
 // bounded without treating a brief scheduling delay as coordinator failure.
 pub const COORDINATOR_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The private paths one fixture coordinator and its CLI commands use.
 pub struct Coordinator<'a> {
     pub directory: &'a Path,
     pub config: &'a Path,
@@ -55,8 +52,6 @@ impl Coordinator<'_> {
         command
     }
 
-    /// Starts the coordinator, waits until its socket accepts connections, and
-    /// then until `ready` holds. `still_waiting` names what `ready` waits for.
     pub fn start(&self, mut ready: impl FnMut() -> bool, still_waiting: &str) -> Server {
         let stderr = self.directory.join("server.stderr");
         let child = self

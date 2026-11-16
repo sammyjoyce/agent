@@ -1,5 +1,3 @@
-//! The Dreams wire types, which TypeScript also reads, and the domain types
-//! that the executor, the store and the CLI share.
 use std::{fmt, path::PathBuf};
 
 use anyhow::{Result, ensure};
@@ -70,7 +68,6 @@ impl DreamsAbstainReason {
         Self::NoSupportedChange,
     ];
 
-    /// The name this reason has on the wire and in every label.
     pub fn wire_name(self) -> &'static str {
         match self {
             Self::Quiet => "quiet",
@@ -80,8 +77,6 @@ impl DreamsAbstainReason {
     }
 }
 
-/// Rendered by Rust. The sections that `dreams show` also prints come from the
-/// same function, `review_summary`.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct DreamsReply {
     pub run: String,
@@ -255,7 +250,6 @@ pub enum GapCause {
 }
 
 impl GapCause {
-    /// The name this cause has on the wire and in every label.
     pub fn wire_name(&self) -> &'static str {
         match self {
             Self::RetentionUnknown => "retention_unknown",
@@ -411,7 +405,6 @@ impl PolicyDigest {
     pub(crate) fn of(policy: &[u8]) -> Self {
         Self(hex::encode(Sha256::digest(policy)))
     }
-    /// Enough of the digest to tell two policies apart on one line.
     pub fn short(&self) -> &str {
         self.0.get(..12).unwrap_or(&self.0)
     }
@@ -519,8 +512,6 @@ pub enum Abstention {
     },
 }
 
-/// One file of a proposal's patch: a changed plain file, or a new one when
-/// `base_blob` is None. The blobs are Git object ids.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposedFile {
     pub path: String,
@@ -537,10 +528,7 @@ pub struct Proposal {
     pub repository: PathBuf,
     pub base: Revision,
     pub patch_sha256: ContentDigest,
-    /// The paths of `changes`, in the same order.
     pub files: Vec<String>,
-    /// What the patch does to each file, as Git recorded it when the patch was
-    /// derived. Apply compares the target and its own result against these.
     pub changes: Vec<ProposedFile>,
     pub evidence: Vec<EvidenceId>,
     pub rationale: UntrustedText,

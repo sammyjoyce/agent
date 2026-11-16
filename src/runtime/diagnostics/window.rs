@@ -1,5 +1,3 @@
-//! Reads the retained receipts of a time window. It never takes writer.lock,
-//! so diagnostics never wait on a reader.
 use std::{
     cmp::Reverse,
     fs::{self, File, OpenOptions},
@@ -10,34 +8,22 @@ use std::{
 
 use super::{Record, RetentionWatermark, Segment, WATERMARK_BYTES, undelivered_drops};
 
-/// The segment the writer appends to. Its last line may be half written.
 const LIVE_SEGMENT: u32 = 0;
 
 #[derive(Debug)]
 pub(crate) struct ReceiptWindow {
     pub records: Vec<Record>,
-    /// None when retention.json is missing or unreadable, so loss is unknown.
     pub retention: Option<RetentionWatermark>,
     pub oldest_retained_ms: Option<u64>,
-    /// Lines that are not receipts and that nothing places before the window.
     pub unplaced_lines: u32,
     pub truncated_at_ms: Option<u64>,
     pub rotated_during_read: bool,
-    /// Receipts a live writer in this process dropped on a full channel and no
-    /// written receipt reports yet.
     pub undelivered_drops: u64,
 }
 
-/// Decides which lines that are not receipts may hide a receipt inside the
-/// window. Segments are append ordered, so a bad line followed by a receipt
-/// older than the window was written before the window too. That proof needs
-/// honest timestamps. One that goes back, anywhere in a segment, shows that
-/// the clock moved, so no receipt in that segment places a bad line.
 #[derive(Default)]
 struct Placement {
-    /// Bad lines that no later receipt has placed yet.
     awaiting: u32,
-    /// Bad lines that this segment's receipts placed before the window.
     placed_in_segment: u32,
     clock_went_back_in_segment: bool,
     previous_ms: Option<u64>,
@@ -70,18 +56,14 @@ impl Placement {
         self.placed_in_segment = 0;
         self.clock_went_back_in_segment = false;
     }
-    /// Call after the last segment ended. A bad line with no receipt after it stays unplaced.
     fn unplaced(self) -> u32 {
         self.unplaced.saturating_add(self.awaiting)
     }
 }
 
-/// One pass over the segments, and what may have changed underneath it.
 struct Pass {
     window: ReceiptWindow,
     segments_moved: bool,
-    /// The live segment ended in a line with no newline that is not a receipt.
-    /// The writer may be mid-append, or a crashed writer may have lost a receipt.
     unfinished_last_line: bool,
 }
 
@@ -116,7 +98,6 @@ fn segment_files(directory: &Path) -> io::Result<Vec<(u32, File)>> {
                     "Diagnostics segment is not a regular file",
                 ));
             }
-            // The writer renames and prunes without waiting for readers.
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
@@ -221,10 +202,6 @@ fn read_once(
     })
 }
 
-/// Reads retention.json, then every retained segment oldest first, keeping
-/// receipts inside `window`. Reads once more when segments moved underneath it
-/// or the writer may have been mid-append. An unfinished last line that is
-/// still there on the second pass counts as a line nothing places.
 pub(crate) fn read_window(
     state: &Path,
     window: (u64, u64),
@@ -232,8 +209,6 @@ pub(crate) fn read_window(
     max_bytes: u64,
 ) -> io::Result<ReceiptWindow> {
     let directory = state.join("diagnostics");
-    // A sender takes the count just before it sends the receipt that reports
-    // it. Reading on both sides of the pass keeps that moment from hiding it.
     let dropped_before_pass = undelivered_drops(&directory);
     let first = read_once(&directory, window, max_records, max_bytes)?;
     let mut read = if first.segments_moved || first.unfinished_last_line {

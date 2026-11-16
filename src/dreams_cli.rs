@@ -33,19 +33,14 @@ pub enum DreamsAction {
     },
 }
 
-/// What `list` and `show` print for a proposal. It is derived from an
-/// `Inspection` on every read and never stored.
 #[derive(Debug, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum ProposalStatus {
     Pending {
-        /// An interrupted apply left proposed content that the next apply finishes.
         interrupted: bool,
     },
     Applied {
         commit: String,
-        /// Whether HEAD still contains the commit. Unknown when the policy no
-        /// longer names the repository, because Git only runs in the policy's.
         reachable: Option<bool>,
     },
     Stale {
@@ -59,7 +54,6 @@ enum ProposalStatus {
 }
 
 impl ProposalStatus {
-    /// The name this status has in JSON and in the `list` table.
     fn wire_name(&self) -> &'static str {
         match self {
             Self::Pending { .. } => "pending",
@@ -105,9 +99,6 @@ impl ProposalStatus {
     }
 }
 
-/// How a proposal stands against its patch bytes, the policy and the target's
-/// Git state. Apply acts on this, so the status a reviewer sees is exactly
-/// what apply will do.
 enum Inspection {
     PatchChanged {
         actual: ContentDigest,
@@ -116,17 +107,12 @@ enum Inspection {
     Applied {
         commit: String,
         reachable: Option<bool>,
-        /// False when only the commit trailer shows the apply, which is the
-        /// state a crash between the fast-forward and the record leaves.
         recorded: bool,
     },
     Stale {
         head: String,
     },
     TargetDirty,
-    /// HEAD is the base and no touched path holds anything but its base or its
-    /// proposed content. `half_applied` lists the paths that an interrupted
-    /// apply already moved to the proposed content.
     Ready {
         half_applied: Vec<ProposedFile>,
     },
@@ -154,24 +140,17 @@ impl Inspection {
     }
 }
 
-/// The patch file is read once. The digest check and Git both use those bytes,
-/// so the file cannot change between the two.
 fn read_patch(store: &DreamsStore, proposal: &Proposal) -> Result<Vec<u8>> {
     fs::read(store.patch_path(&proposal.run, proposal.attempt))
         .context("The Dreams patch file is missing")
 }
 
-/// Where one touched path stands in the index and the work tree.
 enum PathState {
     AtBase,
-    /// The index or the work tree already holds the proposed content.
     HalfApplied,
-    /// Anything else: other content, another mode or file type, a deletion, or
-    /// a parent that is no longer a plain directory.
     LocallyChanged,
 }
 
-/// Index entries Git lists for `path`, as `(mode, blob, stage, path)`.
 async fn index_entries(git: &Git, path: &str) -> Result<Vec<(String, String, String, String)>> {
     let listed = git.text(&["ls-files", "-s", "-z", "--", path]).await?;
     let mut entries = Vec::new();
@@ -193,8 +172,6 @@ async fn index_entries(git: &Git, path: &str) -> Result<Vec<(String, String, Str
     Ok(entries)
 }
 
-/// Every local change that a fast-forward would trip over or write through is
-/// found here, before apply writes anything to the target.
 async fn path_state(git: &Git, repository: &Path, file: &ProposedFile) -> Result<PathState> {
     const PLAIN_FILE: &str = "100644";
     let mut parent = PathBuf::new();
@@ -202,7 +179,6 @@ async fn path_state(git: &Git, repository: &Path, file: &ProposedFile) -> Result
     parts.pop();
     for part in parts {
         parent.push(part);
-        // A symlink here would carry the write out of the repository.
         match fs::symlink_metadata(repository.join(&parent)) {
             Ok(metadata) if metadata.is_dir() => {}
             Ok(_) => return Ok(PathState::LocallyChanged),
@@ -270,8 +246,6 @@ async fn path_state(git: &Git, repository: &Path, file: &ProposedFile) -> Result
     })
 }
 
-/// A recorded apply stays applied whatever else changed since. HEAD is
-/// consulted only when the policy still names the repository.
 async fn recorded_apply(
     store: &DreamsStore,
     policy: Option<&DreamsPolicy>,
@@ -296,7 +270,6 @@ async fn recorded_apply(
     }))
 }
 
-/// Reads the target and writes nothing to it.
 async fn inspect(
     store: &DreamsStore,
     policy: &DreamsPolicy,
@@ -394,8 +367,6 @@ struct RunSummary {
     status: Option<ProposalStatus>,
 }
 
-/// The status of a proposal with the patch bytes it was derived from. Without
-/// a policy nothing admits the proposal, and Git is never run.
 async fn status_of(
     store: &DreamsStore,
     policy: Option<&DreamsPolicy>,
@@ -508,8 +479,6 @@ impl Drop for ScratchIndex {
     }
 }
 
-/// Builds the commit for the approved patch on its base, in a scratch index.
-/// It adds objects to the target and changes no ref, index or file.
 async fn build_commit(
     store: &DreamsStore,
     policy: &DreamsPolicy,
@@ -585,8 +554,6 @@ async fn build_commit(
     Ok(commit.trim().to_owned())
 }
 
-/// Returns each path that an interrupted apply left at its proposed content
-/// to the base, then fast-forwards the checked-out branch to `commit`.
 async fn fast_forward(
     proposal: &Proposal,
     commit: &str,
@@ -676,8 +643,6 @@ async fn apply(
         Inspection::Ready { half_applied } => {
             let commit = build_commit(store, policy, proposal, &patch).await?;
             fast_forward(proposal, &commit, &half_applied).await?;
-            // After the fast-forward. A crash in between leaves the trailer,
-            // which the next apply finds and records.
             store.record_applied(run, &Revision::parse(&commit)?)?;
             Ok(format!(
                 "Applied Dreams run {run} as commit {} to {}.",

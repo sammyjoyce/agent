@@ -793,7 +793,6 @@
       ]
     },
     "DreamsReply": {
-      "description": "Rendered by Rust. The sections that `dreams show` also prints come from the\nsame function, `review_summary`.",
       "type": "object",
       "properties": {
         "decided": {

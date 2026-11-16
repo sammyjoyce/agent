@@ -100,9 +100,7 @@ class Citations {
   }
 }
 
-/** Whether the conversation behind a provider session may be offered hosted provider tools. */
 export type HostedToolsOffered = (sessionId: string | undefined) => Promise<boolean>;
-/** The application declares only these tool types. Every other type runs at the provider. */
 function applicationTool(tool: unknown): boolean {
   return object(tool) && (tool.type === "function" || tool.type === "custom");
 }
@@ -120,7 +118,6 @@ export function withWebSearch(native: ProviderStreams["streamSimple"], offered: 
           throw new Error("The provider returned an invalid web search request payload.");
         }
         const tools: unknown[] = selected.tools ?? [];
-        // This wrapper sees the payload last, so a withheld session also loses a hosted tool that an earlier callback added.
         if (!await offered(options?.sessionId)) return { ...selected, tools: tools.filter(applicationTool) };
         if (tools.some((tool) => object(tool) && (tool.type === "web_search" || tool.type === "web_search_2025_08_26"))) return selected;
         return { ...selected, tools: [...tools, { type: "web_search", external_web_access: true }] };

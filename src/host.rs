@@ -43,8 +43,6 @@ pub(crate) struct ProcessOutput {
     pub truncated: bool,
 }
 
-/// How a process stopped. `ProcessOutput::exit_code` reports 124 for a timeout
-/// and 143 for a cancellation, which a program can also exit with by itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProcessEnding {
     Exited,
@@ -52,7 +50,6 @@ pub(crate) enum ProcessEnding {
     Cancelled,
 }
 
-/// Resolves once the flag is set. A dropped sender never cancels.
 pub(crate) async fn until_cancelled(mut cancelled: tokio::sync::watch::Receiver<bool>) {
     loop {
         if *cancelled.borrow_and_update() {

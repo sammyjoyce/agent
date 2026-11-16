@@ -74,7 +74,6 @@ const Policies = defineDoc<{ sessions: Record<string, ModelSelection> }>({
   kind: "agent.models", scope: "session", version: 1, initial: () => ({ sessions: {} }), checkpointWhen: () => true,
 });
 
-/** Provider sessions whose requests never carry a hosted provider tool. Entries are added and never removed. */
 const HostedTools = defineDoc<{ withheld: Record<string, true> }>({
   kind: "agent.hosted_tools", scope: "session", version: 1, initial: () => ({ withheld: {} }), checkpointWhen: () => true,
 });
@@ -125,10 +124,6 @@ export class ConversationModels {
     }
   }
   bind(session: Harness): void { this.bindSession?.(session); this.bindSession = undefined; }
-  /**
-   * From this commit on, no request of this conversation offers a hosted provider tool such as web search.
-   * The record is durable and nothing clears it, so a turn resumed after a restart is covered before any actor runs.
-   */
   async withholdHostedTools(conversation: Conversation): Promise<void> {
     const session = await this.session;
     await session.commit(async (tx) => {
