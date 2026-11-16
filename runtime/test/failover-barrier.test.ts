@@ -14,8 +14,7 @@ import { until } from "./fixtures/until.js";
 
 const context = BACKGROUND_CONTEXT;
 
-/** Deterministic invented bytes that do not compress, standing in for a prepared image. */
-function inventedImage(seed: number, bytes: number): string {
+function incompressibleImageBase64(seed: number, bytes: number): string {
   const data = Buffer.alloc(bytes);
   let state = seed;
   for (let index = 0; index < bytes; index += 1) {
@@ -52,9 +51,9 @@ for (const [name, connect] of Object.entries(authorities)) {
     const crash = new AbortController();
     const crashed = await openOwner(directory, link, { epoch, signal: crash.signal });
     await crashed.root.submit(note("first", "request-1"), context);
-    link.after = (command) => {
+    link.afterApplied = (command) => {
       if (command.op !== "append") return;
-      link.after = () => {};
+      link.afterApplied = () => {};
       crash.abort();
       throw new AuthorityUnreachable("The process stopped before it read the reply");
     };
@@ -77,7 +76,7 @@ for (const [name, connect] of Object.entries(authorities)) {
     const owner = await openOwner(directory, link, { epoch });
     t.after(() => owner.harness.close(context));
     let appends = 0;
-    link.after = (command) => {
+    link.afterApplied = (command) => {
       if (command.op !== "append") return;
       appends += 1;
       if (appends === 1) throw new AuthorityUnreachable("The reply was lost");
@@ -96,9 +95,9 @@ for (const [name, connect] of Object.entries(authorities)) {
     t.after(() => owner.harness.close(context).catch(() => {}));
     await owner.root.submit(note("first", "request-1"), context);
     const before = tables(directory);
-    link.after = async (command) => {
+    link.afterApplied = async (command) => {
       if (command.op !== "append") return;
-      link.after = () => {};
+      link.afterApplied = () => {};
       await link.command({ op: "promote", candidate: STANDBY, expected_epoch: epoch, attestation: null });
       throw new AuthorityUnreachable("The reply was lost");
     };
@@ -128,7 +127,7 @@ for (const [name, connect] of Object.entries(authorities)) {
     let refusedExchanges = 0, reachable = false;
     t.after(() => { reachable = true; return owner.harness.close(context); });
     await owner.root.submit(note("first", "request-1"), context);
-    link.before = () => {
+    link.beforeCommand = () => {
       if (reachable) return;
       refusedExchanges += 1;
       throw new AuthorityUnreachable("The authority is unreachable");
@@ -153,12 +152,12 @@ for (const [name, connect] of Object.entries(authorities)) {
     t.after(() => owner.harness.close(context).catch(() => {}));
     const before = tables(directory);
     let refusedExchanges = 0;
-    link.before = () => { refusedExchanges += 1; throw new AuthorityUnreachable("The authority is unreachable"); };
+    link.beforeCommand = () => { refusedExchanges += 1; throw new AuthorityUnreachable("The authority is unreachable"); };
     const waiting = owner.root.submit(note("never sent", "request-1"), context);
     await until(() => refusedExchanges >= 2, "the commit keeps retrying");
     stop.abort();
     await assert.rejects(waiting, /authority/);
-    link.before = () => {};
+    link.beforeCommand = () => {};
     assert.deepEqual(tables(directory), before);
     assert.deepEqual(await loggedNotes(link), []);
   });
@@ -169,9 +168,9 @@ for (const [name, connect] of Object.entries(authorities)) {
     t.after(() => owner.harness.close(context).catch(() => {}));
     const before = tables(directory);
     let exchanges = 0;
-    link.before = () => { exchanges += 1; throw new AuthorityDenied(403, "Invented: this credential was revoked"); };
+    link.beforeCommand = () => { exchanges += 1; throw new AuthorityDenied(403, "Invented: this credential was revoked"); };
     await assert.rejects(owner.root.submit(note("denied", "request-1"), context), AuthorityDenied);
-    link.before = () => {};
+    link.beforeCommand = () => {};
     assert.equal(exchanges, 1, "a denied exchange is not repeated");
     assert.deepEqual(tables(directory), before);
     assert.deepEqual(await loggedNotes(link), []);
@@ -203,7 +202,7 @@ for (const [name, connect] of Object.entries(authorities)) {
     const owner = await openOwner(directory, link, { epoch });
     owner.faux.setResponses([fauxAssistantMessage("Invented reply about three images.")]);
     const content = [{ type: "text" as const, text: "Compare these three invented screenshots." },
-      ...[1, 2, 3].map((seed) => ({ type: "image" as const, data: inventedImage(seed, 3_000_000), mimeType: "image/png" }))];
+      ...[1, 2, 3].map((seed) => ({ type: "image" as const, data: incompressibleImageBase64(seed, 3_000_000), mimeType: "image/png" }))];
     const submission = await owner.root.submit({ type: "input", content, requestId: "request-images" }, context);
     assert.equal((await submission.wait(context)).status, "done");
     const head = owner.log.head;

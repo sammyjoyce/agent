@@ -44,7 +44,6 @@ function gardenRegistry(held: { started: () => void }) {
   return registry;
 }
 
-/** A view of the log as it stood when its head was `head`. */
 function logThrough(link: AuthorityLink, head: number): AuthorityLink {
   return { command: (command) => link.command(command), putBlob: (sha256, bytes) => link.putBlob(sha256, bytes), getBlob: (sha256) => link.getBlob(sha256),
     async record() { const record = await link.record(); return record && { ...record, state: { ...record.state, head } }; },
@@ -59,13 +58,11 @@ async function position(directory: string): Promise<number> {
   try { return await database.position(); } finally { await database.close(); }
 }
 
-/** Appends an entry as the owner would, with the versions a test names. */
 async function appendStamped(link: AuthorityLink, epoch: number, at: number, stamped: Partial<LogEntry["versions"]>): Promise<void> {
   const body = { at, epoch, versions: { ...await versions(), ...stamped }, pi_seq: null, files: [], batch: null };
   assert.equal((await link.command({ op: "append", holder: OWNER, entry: { ...body, digest: logEntryDigest(body) } })).result, "accepted");
 }
 
-/** Imports a thread whose one item keeps its full text in a cold original, replays it to a standby, moves the owner away and promotes the standby. */
 async function promotedHistory(t: TestContext, link: AuthorityLink) {
   const epoch = await enroll(link), root = await stateDirectory(t), standby = await stateDirectory(t);
   const directory = join(root, "owner");
@@ -164,7 +161,6 @@ for (const [name, connect] of Object.entries(authorities)) {
     assert.equal((await (await owner.root.submit({ type: "input", content: "Plan the garden.", requestId: "request-garden" }, context)).wait(context)).status, "done");
     await owner.harness.close(context);
 
-    // An entry of upserts alone commits again without complaint, so nothing but the position check stops its second application.
     const entries = await logEntries(link), batches = await logBatches(link);
     const upsertsOnly = (batch: StorageWrite[]) => batch.every((write) => write.type === "task" || write.type === "submission" || write.type === "document.change");
     const index = batches.findLastIndex((batch, at) => upsertsOnly(batch) && (batches[at + 1]?.some((write) => write.type === "entry") ?? false));
@@ -227,9 +223,9 @@ for (const [name, connect] of Object.entries(authorities)) {
     const bytes = Buffer.from("invented feedback bundle");
     const crash = new AbortController();
     const crashed = await openOwner(directory, link, { epoch, signal: crash.signal });
-    link.after = (command) => {
+    link.afterApplied = (command) => {
       if (command.op !== "append") return;
-      link.after = () => {};
+      link.afterApplied = () => {};
       crash.abort();
       throw new AuthorityUnreachable("The process stopped before it read the reply");
     };

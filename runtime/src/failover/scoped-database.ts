@@ -2,10 +2,9 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { SqliteDatabase, SqliteExecutor, SqliteValue } from "@earendil-works/chord/sqlite";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 
-/** How one transaction may change the session database. A transaction with no mode can only read. */
 type TransactionMode =
-  /** Pi's schema work and the creation of the position table. */
-  | { readonly kind: "open" }
+  | { readonly kind: "read" }
+  | { readonly kind: "schema" }
   | { readonly kind: "dry-run" }
   | { readonly kind: "apply"; readonly at: number; readonly piSeq: number | null };
 
@@ -58,7 +57,7 @@ export class ScopedDatabase implements SqliteDatabase {
    * mode for the first time is taken to hold the checkpoint, at `through`.
    */
   async openStorage(through: number): Promise<SqliteStorage> {
-    return this.#mode.run({ kind: "open" }, async () => {
+    return this.#mode.run({ kind: "schema" }, async () => {
       const storage = await SqliteStorage.open(this);
       await this.transaction(async (transaction) => {
         await transaction.exec("CREATE TABLE IF NOT EXISTS beep_boop_failover (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), position INTEGER NOT NULL)");
@@ -93,7 +92,7 @@ export class ScopedDatabase implements SqliteDatabase {
   }
 
   transaction<T>(callback: (transaction: SqliteExecutor) => Promise<T>): Promise<T> {
-    const mode = this.#mode.getStore();
+    const mode: TransactionMode = this.#mode.getStore() ?? { kind: "read" };
     // Chord runs operations in call order, so nothing runs between these three
     // and no other operation sees the connection with writes allowed.
     const allowed = this.#inner.exec(ALLOW_WRITES);
@@ -101,7 +100,7 @@ export class ScopedDatabase implements SqliteDatabase {
     const refused = this.#inner.exec(REFUSE_WRITES);
     return Promise.all([allowed, outcome, refused]).then(([, value]) => value, (error: unknown) => {
       if (error instanceof DryRunValue) return error.value as T;
-      if (mode !== undefined) throw error;
+      if (mode.kind !== "read") throw error;
       return refuseUnlogged(error);
     });
   }
@@ -113,15 +112,14 @@ export class ScopedDatabase implements SqliteDatabase {
   close(): Promise<void> { return this.#inner.close(); }
 }
 
-async function runInMode<T>(mode: TransactionMode | undefined, transaction: SqliteExecutor, callback: (transaction: SqliteExecutor) => Promise<T>): Promise<T> {
-  if (mode === undefined) {
-    // Chord begins every transaction as a write, which SQLite refuses while
-    // writes are refused. So the refusal starts here, inside the transaction.
-    await transaction.exec(REFUSE_WRITES);
-    return callback(transaction);
-  }
+async function runInMode<T>(mode: TransactionMode, transaction: SqliteExecutor, callback: (transaction: SqliteExecutor) => Promise<T>): Promise<T> {
   switch (mode.kind) {
-    case "open": return callback(transaction);
+    case "read":
+      // Chord begins every transaction as a write, which SQLite refuses while
+      // writes are refused. So the refusal starts here, inside the transaction.
+      await transaction.exec(REFUSE_WRITES);
+      return callback(transaction);
+    case "schema": return callback(transaction);
     case "dry-run": throw new DryRunValue(await callback(transaction));
     case "apply": {
       const position = await readPosition(transaction);

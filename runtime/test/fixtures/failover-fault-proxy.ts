@@ -2,25 +2,17 @@ import { createServer, request as forward, type IncomingMessage, type Server, ty
 import type { AddressInfo } from "node:net";
 import type { TestContext } from "node:test";
 
-/** What the proxy does to one request on its way to the authority. */
 export type Fault =
   | { readonly kind: "pass" }
-  /** Forwards after the pause. */
   | { readonly kind: "delay"; readonly ms: number }
-  /** Accepts the request and never answers. The authority never sees it. */
   | { readonly kind: "blackhole" }
-  /** The authority applies the request, and the caller's connection is cut before the reply. */
   | { readonly kind: "drop-after-apply" }
-  /** The authority applies the request, and the reply waits until `release` resolves. */
   | { readonly kind: "reply-late"; readonly release: Promise<void> }
-  /** Answers 503 without reaching the authority. */
   | { readonly kind: "unavailable" };
 
 export interface FaultRule {
   readonly fault: Fault;
-  /** Matches every request when absent. `body` is the request body as text. */
   readonly match?: (request: { readonly method: string; readonly path: string; readonly body: string }) => boolean;
-  /** How many matching requests the rule applies to. Unlimited when absent. */
   times?: number;
 }
 
@@ -28,11 +20,6 @@ export const commands = (op?: string): NonNullable<FaultRule["match"]> => ({ met
   method === "POST" && path.endsWith("/commands") && (op === undefined || body.includes(`"op":"${op}"`));
 export const blobs: NonNullable<FaultRule["match"]> = ({ path }) => path.includes("/blobs/");
 
-/**
- * An HTTP proxy in front of the authority that loses, delays or refuses
- * chosen requests. `seen` lists every request in arrival order with whether
- * the authority received it.
- */
 export async function startFaultProxy(t: TestContext, upstream: string) {
   const rules: FaultRule[] = [];
   const seen: { method: string; path: string; body: string; forwarded: boolean }[] = [];
@@ -100,9 +87,7 @@ export async function startFaultProxy(t: TestContext, upstream: string) {
   return {
     url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
     seen,
-    /** Adds a rule ahead of the existing ones. */
     inject(rule: FaultRule) { rules.unshift(rule); return rule; },
-    /** Removes every rule and cuts every held connection, so the authority is reachable again. */
     heal() { rules.length = 0; for (const response of held) response.destroy(); held.clear(); },
     stop,
   };

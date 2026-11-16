@@ -2,14 +2,13 @@ import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { StorageWrite } from "@earendil-works/pi-durable";
 import type { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { BatchBody } from "../generated/BatchBody.js";
 import type { FileRecord } from "../generated/FileRecord.js";
 import type { LogEntry } from "../generated/LogEntry.js";
 import type { Versions } from "../generated/Versions.js";
 import type { AuthorityLink } from "./authority-link.js";
-import { logEntryDigest, sha256Hex, versions } from "./log-entry.js";
+import { logEntryDigest, parseBatch, sha256Hex, versions } from "./log-entry.js";
 import type { ScopedDatabase } from "./scoped-database.js";
 
 const LOG_PAGE_ENTRIES = 32;
@@ -45,8 +44,7 @@ export async function applyLog(follower: LogFollower): Promise<number> {
 
 /**
  * Applies every log entry after the directory's position, in order, through
- * `storage`. The owner's catch-up on open and a standby's follow are this one
- * function, so both apply an entry the same way.
+ * `storage`.
  */
 export async function followLog(follower: LogFollower, storage: SqliteStorage): Promise<number> {
   const { database, link, signal } = follower;
@@ -80,9 +78,8 @@ async function applyEntry({ database, link, stateDirectory }: LogFollower, stora
     return database.applyWithoutBatch(entry.at);
   }
   if (body.pi_seq === null) throw new Error(`Log entry ${entry.at} carries a batch and names no Pi sequence`);
-  const writes: unknown = JSON.parse(await batchJson(link, entry.at, body.batch));
-  if (!Array.isArray(writes)) throw new Error(`The batch of log entry ${entry.at} is not a list of writes`);
-  await database.apply(entry.at, body.pi_seq, () => storage.commit(writes as StorageWrite[], BACKGROUND_CONTEXT));
+  const writes = parseBatch(await batchJson(link, entry.at, body.batch), entry.at);
+  await database.apply(entry.at, body.pi_seq, () => storage.commit(writes, BACKGROUND_CONTEXT));
 }
 
 async function batchJson(link: AuthorityLink, at: number, batch: BatchBody): Promise<string> {
@@ -104,7 +101,6 @@ export function replicatedFilePath(stateDirectory: string, file: FileRecord): st
   return path;
 }
 
-/** Gives a file its final name from the blob store, unless the directory already holds its bytes. */
 async function materializeFile(link: AuthorityLink, stateDirectory: string, file: FileRecord): Promise<void> {
   const path = replicatedFilePath(stateDirectory, file);
   const present = await readFile(path).catch((error: NodeJS.ErrnoException) => {

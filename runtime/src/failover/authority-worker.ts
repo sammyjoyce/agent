@@ -1,5 +1,5 @@
 import { decide, type AuthorityWrite } from "./authority-core.js";
-import { commandHolder, isLowercaseUuid, isSha256Hex, parseAuthorityCommand, parseAuthorityCredentials, type AuthorityCredential } from "./authority-wire.js";
+import { COMMAND_BODY_LIMIT_BYTES, commandHolder, isLowercaseUuid, isSha256Hex, parseAuthorityCommand, parseAuthorityCredentials, type AuthorityCredential } from "./authority-wire.js";
 import type { AuthorityCommand } from "../generated/AuthorityCommand.js";
 import type { AuthorityRecord } from "../generated/AuthorityRecord.js";
 import type { AuthorityReply } from "../generated/AuthorityReply.js";
@@ -9,7 +9,6 @@ type SqlValue = string | number | null;
 interface SqlCursor extends Iterable<Record<string, SqlValue>> {
   toArray(): Record<string, SqlValue>[];
 }
-/** The parts of a SQLite Durable Object's state the authority uses. */
 interface DurableObjectState {
   readonly storage: {
     readonly sql: { exec(query: string, ...bindings: SqlValue[]): SqlCursor };
@@ -26,7 +25,7 @@ interface DurableObjectNamespace {
 interface R2Object {
   readonly size: number;
 }
-interface R2Bucket {
+interface AppendOnlyBucket {
   head(key: string): Promise<R2Object | null>;
   get(key: string): Promise<(R2Object & { readonly body: ReadableStream }) | null>;
   put(key: string, value: ArrayBuffer, options: { readonly sha256: string }): Promise<R2Object | null>;
@@ -34,12 +33,11 @@ interface R2Bucket {
 
 export interface AuthorityEnv {
   readonly AUTHORITY: DurableObjectNamespace;
-  readonly BLOBS: R2Bucket;
+  readonly BLOBS: AppendOnlyBucket;
   /** A JSON array that `parseAuthorityCredentials` accepts. */
   readonly AUTHORITY_CREDENTIALS: string;
 }
 
-const COMMAND_BODY_LIMIT = 1024 * 1024;
 const PAGE_ENTRIES = 64;
 const PAGE_ENTRY_JSON = 4 * 1024 * 1024;
 
@@ -49,8 +47,7 @@ type Endpoint =
   | { readonly name: "log"; readonly after: number; readonly limit: number }
   | { readonly name: "put_blob" | "get_blob" | "head_blob"; readonly sha256: string };
 
-/** What the Worker asks its coordinator's object, after it has authorized the request. */
-type ObjectRequest =
+type AuthorizedObjectRequest =
   | Extract<Endpoint, { readonly name: "record" | "log" }>
   | { readonly name: "command"; readonly coordinator: string; readonly command: AuthorityCommand };
 
@@ -61,7 +58,6 @@ class Refusal extends Error {
 const failure = (status: number, sentence: string) => Response.json({ error: sentence }, { status });
 const jsonResponse = (json: string) => new Response(json, { headers: { "content-type": "application/json" } });
 const notEnrolled = () => failure(404, "This coordinator is not enrolled.");
-/** Blobs are content addressed within one coordinator, so no coordinator reads another's. */
 const blobKey = (coordinator: string, sha256: string) => `${coordinator}/${sha256}`;
 
 function parseEndpoint(request: Request): { readonly coordinator: string; readonly endpoint: Endpoint } {
@@ -130,10 +126,10 @@ async function authenticate(request: Request, env: AuthorityEnv, coordinator: st
 }
 
 async function readCommand(request: Request): Promise<AuthorityCommand> {
-  const tooLarge = new Refusal(413, `A command body may hold at most ${COMMAND_BODY_LIMIT} bytes. Store a large batch as a blob.`);
-  if (Number(request.headers.get("content-length") ?? 0) > COMMAND_BODY_LIMIT) throw tooLarge;
+  const tooLarge = new Refusal(413, `A command body may hold at most ${COMMAND_BODY_LIMIT_BYTES} bytes. Store a large batch as a blob.`);
+  if (Number(request.headers.get("content-length") ?? 0) > COMMAND_BODY_LIMIT_BYTES) throw tooLarge;
   const bytes = await request.arrayBuffer();
-  if (bytes.byteLength > COMMAND_BODY_LIMIT) throw tooLarge;
+  if (bytes.byteLength > COMMAND_BODY_LIMIT_BYTES) throw tooLarge;
   let value: unknown;
   try {
     value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
@@ -147,7 +143,7 @@ async function readCommand(request: Request): Promise<AuthorityCommand> {
   }
 }
 
-function ask(env: AuthorityEnv, coordinator: string, message: ObjectRequest): Promise<Response> {
+function ask(env: AuthorityEnv, coordinator: string, message: AuthorizedObjectRequest): Promise<Response> {
   const authority = env.AUTHORITY.get(env.AUTHORITY.idFromName(coordinator));
   return authority.fetch(new Request("https://authority.internal/", { method: "POST", body: JSON.stringify(message) }));
 }
@@ -183,11 +179,6 @@ async function serve(request: Request, env: AuthorityEnv): Promise<Response> {
   }
 }
 
-/**
- * The authority Worker. It authenticates and authorizes each request, parses
- * commands strictly, serves blobs from R2, and hands everything else to the
- * coordinator's Durable Object.
- */
 export default {
   async fetch(request: Request, env: AuthorityEnv): Promise<Response> {
     try {
@@ -200,14 +191,9 @@ export default {
   },
 };
 
-/**
- * One coordinator's authority: the record and the replication log in the
- * object's SQLite database. Each command runs `decide` inside one synchronous
- * transaction, so the compare-and-swap it describes is atomic.
- */
 export class CoordinatorAuthority {
   private readonly storage: DurableObjectState["storage"];
-  private readonly blobs: R2Bucket;
+  private readonly blobs: AppendOnlyBucket;
 
   constructor(ctx: DurableObjectState, env: AuthorityEnv) {
     this.storage = ctx.storage;
@@ -217,7 +203,7 @@ export class CoordinatorAuthority {
   }
 
   async fetch(request: Request): Promise<Response> {
-    const message = await request.json() as ObjectRequest;
+    const message = await request.json() as AuthorizedObjectRequest;
     switch (message.name) {
       case "command":
         return Response.json(await this.command(message.coordinator, message.command));
@@ -241,10 +227,6 @@ export class CoordinatorAuthority {
     return typeof row?.json === "string" ? row.json : undefined;
   }
 
-  /**
-   * Blobs are checked before the transaction because they are never deleted:
-   * a blob found here is still there when the entry commits.
-   */
   private async command(coordinator: string, command: AuthorityCommand): Promise<AuthorityReply> {
     if (command.op === "append" && await this.namesMissingBlob(coordinator, command.entry)) {
       const record = this.recordJson();
