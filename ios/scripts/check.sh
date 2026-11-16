@@ -100,6 +100,7 @@ SWIFT
   (cd "$native_dir/Speech" && xcodebuild -quiet -scheme Speech -destination 'generic/platform=iOS' \
     -derivedDataPath "$run_dir/speech" -onlyUsePackageVersionsFromResolvedFile \
     CODE_SIGNING_ALLOWED=NO build)
+  python3 "$native_dir/PhoneAcceptance/test_phone_acceptance.py"
   xcodebuild -quiet -project "$native_dir/PhoneAcceptance/PhoneAcceptance.xcodeproj" \
     -scheme PhoneAcceptance -destination 'generic/platform=iOS' \
     -derivedDataPath "$run_dir/phone-acceptance" CODE_SIGNING_ALLOWED=NO build-for-testing
