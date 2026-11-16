@@ -350,7 +350,9 @@ case "$1" in
   google.mail.search)
     [ -d "$here/rounds" ] || {{ printf '%s' '{EMPTY_MAILBOX}'; exit 0; }}
     served=$(( $(cat "$here/served" 2>/dev/null || echo 0) + 1 ))
-    printf '%s\n' "$served" > "$here/served"
+    # The test polls this counter; a rename never shows it empty.
+    printf '%s\n' "$served" > "$here/served.next"
+    mv "$here/served.next" "$here/served"
     round="$here/rounds/$served"
     [ -e "$round.json" ] || [ -e "$round.fail" ] || round="$here/rounds/last"
     [ -e "$round.fail" ] && exit 1
