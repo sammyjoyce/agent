@@ -7,9 +7,9 @@ use std::{
 use agent_cli::{
     config::ClientConfig,
     dreams::{
-        Abstention, CheckResult, ContentDigest, DreamsPolicy, DreamsStore, EvidenceItem,
-        MAX_ATTEMPTS, Outcome, Proposal, ProposedFile, Review, Revision, RunId, RunView, count,
-        format_utc,
+        Abstention, ContentDigest, DreamsPolicy, DreamsStore, EvidenceItem, MAX_ATTEMPTS, Outcome,
+        Proposal, ProposedFile, Review, Revision, RunId, RunView, check_lines, escape_controls,
+        format_utc, quote, review_summary,
         workspace::{Git, plain_changes},
     },
 };
@@ -372,59 +372,6 @@ async fn inspect(
     Ok(Inspection::Ready { half_applied })
 }
 
-/// Characters that change how a terminal lays text out without showing as
-/// text: bidirectional overrides and isolates, zero-width characters, line and
-/// paragraph separators, and the tag block. A reviewer approves what they
-/// read, so these must not make the display differ from the bytes.
-fn is_format_control(character: char) -> bool {
-    matches!(
-        character,
-        '\u{00ad}'
-            | '\u{061c}'
-            | '\u{180e}'
-            | '\u{200b}'..='\u{200f}'
-            | '\u{2028}'..='\u{202e}'
-            | '\u{2060}'..='\u{206f}'
-            | '\u{feff}'
-            | '\u{fff9}'..='\u{fffb}'
-            | '\u{e0000}'..='\u{e007f}'
-    )
-}
-
-/// Shows control and format characters as escapes. Newlines and tabs stay.
-fn escape_terminal_controls(text: &str) -> String {
-    text.chars()
-        .flat_map(|character| match character {
-            '\n' | '\t' => vec![character],
-            other if other.is_control() || is_format_control(other) => {
-                other.escape_unicode().collect()
-            }
-            other => vec![other],
-        })
-        .collect()
-}
-
-fn quoted(text: &str) -> String {
-    escape_terminal_controls(text)
-        .lines()
-        .map(|line| format!("  > {line}\n"))
-        .collect()
-}
-
-fn check_line(label: &str, check: &CheckResult) -> String {
-    let output: String = [&check.stdout, &check.stderr]
-        .into_iter()
-        .filter(|output| !output.trim().is_empty())
-        .map(|output| quoted(output.trim_end()))
-        .collect();
-    format!(
-        "{label:<11} {}  {}  {:.1}s\n{output}",
-        check.name,
-        check.verdict(),
-        check.duration_ms as f64 / 1000.0
-    )
-}
-
 #[derive(Serialize)]
 struct RunReport<'a> {
     run: &'a RunId,
@@ -487,93 +434,68 @@ fn apply_command(view: &RunView) -> Option<String> {
 
 fn render(report: &RunReport) -> String {
     let review = report.review;
-    let coverage = &review.coverage;
-    let hours = (coverage.window.end_ms - coverage.window.start_ms) / (60 * 60 * 1000);
-    let mut text = format!(
-        "Run         {} (request {})\nWindow      {} to {} ({hours}h)\nReceipts    {}, {}\n",
+    let mut lines = vec![format!(
+        "Dreams run {} (request {})",
         report.run,
-        escape_terminal_controls(&review.request_id),
-        format_utc(coverage.window.start_ms),
-        format_utc(coverage.window.end_ms),
-        coverage_word(review),
-        count(coverage.receipts.items as usize, "receipt"),
-    );
-    for gap in coverage.gaps() {
-        text += &format!("  gap {gap}\n");
-    }
-    text += &format!(
-        "Summaries   {} included (snapshot captured at {}; current retained text, not interval-complete history)\n",
-        coverage.summaries.items,
-        format_utc(coverage.summaries.captured_at_ms)
-    );
-    text += &format!(
-        "Target      {} at base {} (policy {})\n",
+        escape_controls(&review.request_id)
+    )];
+    lines.extend(review_summary(review));
+    lines.push(format!(
+        "Repository: {} (policy {})",
         review.repository.display(),
-        review.base,
         review.policy_digest.short()
-    );
-    for check in &review.before {
-        text += &check_line("Before", check);
-    }
-    for finding in &review.findings {
-        text += &format!(
-            "Finding     {} x{} {}\n",
-            finding.kind,
-            finding.count,
-            escape_terminal_controls(&finding.detail)
-        );
-    }
+    ));
     match report.outcome {
-        None => {
-            text += &format!(
-                "Outcome     undecided ({} of {MAX_ATTEMPTS} attempts used)\n",
-                report.attempts_used
-            );
-        }
-        Some(Outcome::Abstained(abstention)) => {
-            text += &format!(
-                "Outcome     {}\n",
-                report.outcome.map(Outcome::label).unwrap_or_default()
-            );
+        None => lines.push(format!(
+            "Outcome: undecided ({} of {MAX_ATTEMPTS} attempts used)",
+            report.attempts_used
+        )),
+        Some(outcome @ Outcome::Abstained(abstention)) => {
+            lines.push(format!("Outcome: {}", outcome.label()));
             if let Abstention::Chosen { note, .. } = abstention
                 && !note.as_str().is_empty()
             {
-                text += "Note (model-written, untrusted):\n";
-                text += &quoted(note.as_str());
+                lines.push("Note (model-written, untrusted):".into());
+                quote(&mut lines, note.as_str());
             }
         }
         Some(Outcome::Proposed(proposal)) => {
-            text += &format!(
-                "Outcome     proposed, attempt {} of {MAX_ATTEMPTS}\n",
+            lines.push(format!(
+                "Outcome: proposed, attempt {} of {MAX_ATTEMPTS}",
                 proposal.attempt
-            );
+            ));
             for check in &proposal.after {
-                text += &check_line("After", check);
+                check_lines(&mut lines, "After", check);
             }
-            text += &format!(
-                "Patch       {}  {}\n",
+            lines.push(format!(
+                "Patch: {}  {}",
                 proposal.patch_sha256,
                 proposal.files.join(", ")
-            );
+            ));
             let evidence: Vec<&str> = proposal.evidence.iter().map(|id| id.as_str()).collect();
-            text += &format!("Evidence    {}\n", evidence.join("  "));
+            lines.push(format!("Evidence: {}", evidence.join("  ")));
             if let Some(status) = report.status {
-                text += &format!("Status      {}\n", status.explain());
+                lines.push(format!("Status: {}", status.explain()));
             }
             if let Some(digest) = report.review_sha256 {
-                text += &format!("Review      {digest}\n");
+                lines.push(format!("Review: {digest}"));
             }
-            text += "Rationale (model-written, untrusted):\n";
-            text += &quoted(proposal.rationale.as_str());
-            text += "--- patch ---\n";
-            text += &escape_terminal_controls(report.patch.unwrap_or_default());
-            text += "--- end of patch ---\n";
+            lines.push("Rationale (model-written, untrusted):".into());
+            quote(&mut lines, proposal.rationale.as_str());
+            lines.push("--- patch ---".into());
+            lines.push(
+                escape_controls(report.patch.unwrap_or_default())
+                    .trim_end_matches('\n')
+                    .to_owned(),
+            );
+            lines.push("--- end of patch ---".into());
             if let Some(command) = &report.apply {
-                text += &format!("Approve this exact review and apply it once:\n  {command}\n");
+                lines.push("Approve this exact review and apply it once:".into());
+                lines.push(format!("  {command}"));
             }
         }
     }
-    text
+    lines.join("\n") + "\n"
 }
 
 struct ScratchIndex(PathBuf);
@@ -870,8 +792,7 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::dreams_cli::{
-        ProposalStatus, RunReport, apply, apply_command, escape_terminal_controls, inspect,
-        read_patch, render, status_of,
+        ProposalStatus, RunReport, apply, apply_command, inspect, read_patch, render, status_of,
     };
 
     fn git(repository: &Path, arguments: &[&str]) -> String {
@@ -1006,7 +927,7 @@ mod tests {
             "beep-boop dreams apply {run} --approve {approval}"
         )));
         assert!(
-            shown.contains("  > Add\\u{1b}[2K the missing playbook."),
+            shown.contains("\n> Add\\u{1b}[2K the missing playbook.\n"),
             "{shown}"
         );
 
@@ -1067,16 +988,5 @@ mod tests {
             );
             assert!(status.explain().starts_with(status.wire_name()));
         }
-    }
-
-    #[test]
-    fn terminal_control_sequences_in_reviewed_text_are_shown_not_obeyed() {
-        let shown = escape_terminal_controls("+safe\u{1b}[2K\r+hidden\n\tkept");
-        assert!(!shown.contains('\u{1b}') && !shown.contains('\r'));
-        assert!(shown.contains("\\u{1b}[2K\\u{d}+hidden\n\tkept"));
-        assert_eq!(
-            escape_terminal_controls("a\u{202e}b\u{200b}c\u{2066}d\u{feff}e\u{2029}f\u{e0041}g"),
-            "a\\u{202e}b\\u{200b}c\\u{2066}d\\u{feff}e\\u{2029}f\\u{e0041}g"
-        );
     }
 }

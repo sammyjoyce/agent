@@ -74,7 +74,8 @@ impl DreamsAbstainReason {
     }
 }
 
-/// Rendered by Rust so the model and `dreams show` read the same words.
+/// Rendered by Rust. The sections that `dreams show` also prints come from the
+/// same function, `review_summary`.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct DreamsReply {
     pub run: String,

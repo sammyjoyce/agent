@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tokio::sync::watch;
 
-pub use evidence::{EvidenceItem, EvidenceKind, Finding};
+pub use evidence::{
+    EvidenceItem, EvidenceKind, Finding, check_lines, escape_controls, quote, review_summary,
+};
 pub use policy::{
     CheckSpec, DreamsCheckFile, DreamsPolicy, DreamsPolicyFile, EditablePath, ProtectedPaths,
 };
