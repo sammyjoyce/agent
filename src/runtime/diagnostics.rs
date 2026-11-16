@@ -748,8 +748,15 @@ impl Diagnostics {
             drops: self.drops.clone(),
         }
     }
-    pub fn start(state: &Path) -> (Self, WriterStart) {
-        Self::start_with_heartbeat(state, HEARTBEAT)
+    pub fn start(state: &Path) -> Self {
+        Self::start_with_heartbeat(state, HEARTBEAT, None)
+    }
+    pub fn start_recorded(state: &Path) -> (Self, WriterStart) {
+        let (started, start) = std::sync::mpsc::sync_channel(1);
+        (
+            Self::start_with_heartbeat(state, HEARTBEAT, Some(started)),
+            WriterStart(start),
+        )
     }
     fn open_channel(directory: &Path, capacity: usize) -> (Self, mpsc::Receiver<Record>) {
         let (sender, records) = mpsc::channel(capacity);
@@ -761,7 +768,11 @@ impl Diagnostics {
         live.push((registry_key(directory), Arc::downgrade(&drops)));
         (Self { sender, drops }, records)
     }
-    fn start_with_heartbeat(state: &Path, interval: Duration) -> (Self, WriterStart) {
+    fn start_with_heartbeat(
+        state: &Path,
+        interval: Duration,
+        started: Option<std::sync::mpsc::SyncSender<io::Result<()>>>,
+    ) -> Self {
         let directory = state.join("diagnostics");
         let (diagnostics, mut records) = Self::open_channel(&directory, CAPACITY);
         // A weak sender lets the writer end when its last real producer does.
@@ -785,7 +796,6 @@ impl Diagnostics {
             }
         });
         let drops = diagnostics.drops.clone();
-        let (started, start) = std::sync::mpsc::sync_channel(1);
         tokio::task::spawn_blocking(move || {
             let opened = Writer::open(directory, MAX_BYTES).and_then(|mut writer| {
                 writer
@@ -795,11 +805,18 @@ impl Diagnostics {
             let mut writer = match opened {
                 Ok(writer) => writer,
                 Err(error) => {
-                    let _ = started.send(Err(error));
+                    match started {
+                        Some(started) => {
+                            let _ = started.send(Err(error));
+                        }
+                        None => eprintln!("Runtime diagnostics unavailable; chat continues."),
+                    }
                     return;
                 }
             };
-            let _ = started.send(Ok(()));
+            if let Some(started) = started {
+                let _ = started.send(Ok(()));
+            }
             let result = (|| -> io::Result<()> {
                 while let Some(record) = records.blocking_recv() {
                     append_reported(&mut writer, &drops, &record)?;
@@ -814,7 +831,7 @@ impl Diagnostics {
                 eprintln!("Runtime diagnostics unavailable; chat continues.");
             }
         });
-        (diagnostics, WriterStart(start))
+        diagnostics
     }
     pub fn record(&mut self, request_id: u32, trace: &Trace, event: Event) {
         let record = Record {
@@ -1876,8 +1893,11 @@ mod tests {
     #[tokio::test]
     async fn heartbeats_witness_an_idle_writer_without_keeping_it_alive() {
         let state = tempfile::tempdir().unwrap();
-        let (diagnostics, _) =
-            Diagnostics::start_with_heartbeat(state.path(), std::time::Duration::from_millis(20));
+        let diagnostics = Diagnostics::start_with_heartbeat(
+            state.path(),
+            std::time::Duration::from_millis(20),
+            None,
+        );
         let directory = state.path().join("diagnostics");
         let heartbeats = || {
             receipts(&directory)
@@ -1922,7 +1942,7 @@ mod tests {
             .open(directory.join("writer.lock"))
             .unwrap();
         fs2::FileExt::lock_exclusive(&lock).unwrap();
-        let (mut log, _) = Diagnostics::start_with_heartbeat(state, heartbeat);
+        let mut log = Diagnostics::start_with_heartbeat(state, heartbeat, None);
         let trace = Trace::new(&RuntimeCommand::Status);
         for id in 1..=records {
             log.record(id, &trace, Event::RequestReceived);

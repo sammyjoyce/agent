@@ -36,6 +36,13 @@ pub(crate) enum ShutdownSignal {
     Sigterm,
 }
 
+/// Dreams reviews the diagnostics log, so a configured coordinator must not
+/// serve a run that log cannot see. Chat alone does not depend on the log.
+pub(crate) enum StartRecord {
+    Required,
+    BestEffort,
+}
+
 pub struct RuntimeCall {
     pub request_id: u32,
     pub events: mpsc::Receiver<RuntimeEventKind>,
@@ -114,13 +121,14 @@ struct Pending {
 
 impl Runtime {
     pub fn start(script: &Path, state: &Path) -> Result<Self> {
-        Self::start_with_notifications(script, state, None)
+        Self::start_with_notifications(script, state, None, StartRecord::BestEffort)
     }
 
-    pub fn start_with_notifications(
+    pub(crate) fn start_with_notifications(
         script: &Path,
         state: &Path,
         apns: Option<&crate::notifications::ApnsConfig>,
+        start_record: StartRecord,
     ) -> Result<Self> {
         ensure!(
             script.is_file(),
@@ -129,10 +137,22 @@ impl Runtime {
         let guard = WriterLock::acquire(state)?;
         let restore_held = crate::backup::restore_held(&guard, state);
         let coordinator_id = CoordinatorId::load_or_mint(state)?;
-        let (diagnostics, started) = Diagnostics::start(state);
-        started
-            .wait()
-            .context("Runtime diagnostics could not record this coordinator's start")?;
+        let diagnostics = match start_record {
+            StartRecord::BestEffort => Diagnostics::start(state),
+            StartRecord::Required => {
+                let (diagnostics, started) = Diagnostics::start_recorded(state);
+                started.wait().with_context(|| {
+                    format!(
+                        "Runtime diagnostics could not record this coordinator's start in {}. \
+                         Dreams needs that record to tell a quiet night from a missed one. Fix \
+                         that path, or remove [dreams] from the config to run chat without \
+                         nightly review",
+                        state.join("diagnostics").display()
+                    )
+                })?;
+                diagnostics
+            }
+        };
         let lock_fd = guard.0.as_raw_fd();
         let mut command = Command::new("node");
         command
@@ -1482,6 +1502,34 @@ createInterface({input:process.stdin}).on('line',line=>{
             .unwrap();
         }
         runtime.close().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(state.path().join("diagnostics")).unwrap(),
+            "Preserve existing unrelated file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_requires_its_start_record_refuses_to_start_and_names_the_remedy() {
+        use crate::runtime::{Runtime, StartRecord};
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(
+            state.path().join("diagnostics"),
+            "Preserve existing unrelated file",
+        )
+        .unwrap();
+        let script = state.path().join("fixture.mjs");
+        std::fs::write(&script, "process.stdin.resume();\n").unwrap();
+        let Err(error) =
+            Runtime::start_with_notifications(&script, state.path(), None, StartRecord::Required)
+        else {
+            panic!("A runtime whose log cannot record its start must not serve");
+        };
+        let error = format!("{error:#}");
+        assert!(
+            error.contains(&state.path().join("diagnostics").display().to_string()),
+            "{error}"
+        );
+        assert!(error.contains("remove [dreams]"), "{error}");
         assert_eq!(
             std::fs::read_to_string(state.path().join("diagnostics")).unwrap(),
             "Preserve existing unrelated file"

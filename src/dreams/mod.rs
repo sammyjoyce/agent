@@ -1054,7 +1054,7 @@ mod tests {
             night.seed_receipts("");
             let directory = night.dreams.state.join("diagnostics");
             let lock = held_writer_lock(&night);
-            let (mut actor, _) = diagnostics::Diagnostics::start(&night.dreams.state);
+            let mut actor = diagnostics::Diagnostics::start(&night.dreams.state);
             let trace = diagnostics::Trace::unowned();
             for id in 1..=300 {
                 actor.record(id, &trace, diagnostics::Event::RequestReceived);
@@ -1113,7 +1113,7 @@ mod tests {
             let night = Night::new();
             night.seed_receipts("");
             let lock = held_writer_lock(&night);
-            let (mut actor, _) = diagnostics::Diagnostics::start(&night.dreams.state);
+            let mut actor = diagnostics::Diagnostics::start(&night.dreams.state);
             let mut service = actor.fork();
             let sent = 400;
             let written = overflow(
@@ -1149,7 +1149,7 @@ mod tests {
     }
 
     fn start_writer(night: &Night) -> diagnostics::Diagnostics {
-        let (writer, started) = diagnostics::Diagnostics::start(&night.dreams.state);
+        let (writer, started) = diagnostics::Diagnostics::start_recorded(&night.dreams.state);
         started.wait().expect("The writer records its start");
         writer
     }
