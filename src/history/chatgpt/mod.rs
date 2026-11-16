@@ -1165,6 +1165,166 @@ mod tests {
         );
     }
 
+    struct Served {
+        text: String,
+        cold_evidence: usize,
+    }
+
+    /// Every list and read response an import requests, and the bytes of every asset its
+    /// items reference.
+    async fn serve_everything(history: &ChatGptHistory) -> Served {
+        let mut served = Served {
+            text: String::new(),
+            cold_evidence: 0,
+        };
+        for archived in [false, true] {
+            let (threads, _) = list(history, archived, None).await.unwrap();
+            served.text += &serde_json::to_string(&threads).unwrap();
+            for thread in threads {
+                let mut cursor = None;
+                loop {
+                    let response = history
+                        .request(HistoryRequest::Read {
+                            thread_id: thread.id.clone(),
+                            cursor,
+                        })
+                        .await
+                        .unwrap();
+                    served.text += &serde_json::to_string(&response).unwrap();
+                    let HistoryResponse::Read {
+                        items, next_cursor, ..
+                    } = response
+                    else {
+                        panic!("expected a read");
+                    };
+                    for asset in items.iter().flat_map(|item| &item.assets) {
+                        if matches!(asset.kind, HistoryAssetKind::ColdEvidence) {
+                            served.cold_evidence += 1;
+                        }
+                        let (bytes, _, _) = fetch(history, &thread.id, &asset.path).await.unwrap();
+                        served.text += &String::from_utf8_lossy(&bytes);
+                    }
+                    match next_cursor {
+                        Some(next) => cursor = Some(next),
+                        None => break,
+                    }
+                }
+            }
+        }
+        served
+    }
+
+    fn assert_no_canary(served: &Served) {
+        let leaked: Vec<String> = served
+            .text
+            .match_indices("PRIVATE_")
+            .map(|(index, _)| served.text[index..].chars().take(32).collect())
+            .collect();
+        assert!(leaked.is_empty(), "{leaked:?}");
+    }
+
+    fn private_answer(node: &str, text: &str) -> Value {
+        let mut hidden = fixture::text_message("assistant", "PRIVATE_HIDDEN_CANARY");
+        hidden["metadata"] = json!({"is_visually_hidden_from_conversation": true});
+        let mut answer = fixture::text_message("assistant", text);
+        answer["id"] = json!(node);
+        answer["metadata"] = json!({
+            "aggregate_result": {"messages": [
+                fixture::text_message("system", "PRIVATE_SYSTEM_CANARY"),
+                hidden,
+            ]},
+            "citations": [{"metadata": {"user_context_message_data": "PRIVATE_CUSTOM_CANARY"}}],
+            "user_context_message_data": "PRIVATE_DIRECT_CANARY",
+        });
+        answer
+    }
+
+    fn privacy_probe(answer: &str) -> Conversation {
+        Conversation::new(1, "Invented audit")
+            .say("u", "root", "user", "Public user text")
+            .node("a", Some("u"), private_answer("a", answer))
+    }
+
+    #[tokio::test]
+    async fn privacy_probe_serves_no_canary() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = open(
+            &Export::new()
+                .conversations(&[privacy_probe("Public answer").build()])
+                .zip(&directory.path().join("privacy.zip")),
+        );
+        let served = serve_everything(&history).await;
+        assert!(served.text.contains("Public answer"));
+        assert_no_canary(&served);
+    }
+
+    #[tokio::test]
+    async fn alternate_probe_serves_no_canary() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut alternate = fixture::text_message("assistant", "Alternate answer");
+        alternate["metadata"] = json!({"aggregate_result": {"messages": [
+            fixture::text_message("developer", "PRIVATE_ALTERNATE_CANARY"),
+        ]}});
+        let history = open(
+            &Export::new()
+                .conversations(&[privacy_probe("Public answer")
+                    .node("alt", Some("u"), alternate)
+                    .current("a")
+                    .build()])
+                .zip(&directory.path().join("alternate.zip")),
+        );
+        let served = serve_everything(&history).await;
+        assert!(served.text.contains("Alternate answer"));
+        assert_no_canary(&served);
+    }
+
+    #[tokio::test]
+    async fn privacy_cold_probe_serves_no_canary() {
+        let directory = tempfile::tempdir().unwrap();
+        let answer = "Visible invented long answer. ".repeat(6000);
+        let history = open(
+            &Export::new()
+                .conversations(&[privacy_probe(&answer).build()])
+                .zip(&directory.path().join("privacy-cold.zip")),
+        );
+        let served = serve_everything(&history).await;
+        assert_eq!(served.cold_evidence, 1);
+        assert_no_canary(&served);
+    }
+
+    #[tokio::test]
+    async fn hidden_library_probe_serves_no_canary() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut hidden = fixture::text_message("system", "PRIVATE_EXCLUDED_CANARY");
+        hidden["id"] = json!("hidden-message-id-not-mapping-key");
+        hidden["metadata"] = json!({"attachments": [{"id": "file-SECRET", "name": "secret.txt"}]});
+        let library = json!([{
+            "origination_thread_id": fixture::id(1),
+            "origination_message_id": "hidden-message-id-not-mapping-key",
+            "file_id": "file-SECRET", "file_name": "secret.txt", "mime_type": "text/plain",
+            "metadata": {"user_context_message_data": "PRIVATE_LIBRARY_CANARY"},
+        }]);
+        let history = open(
+            &Export::new()
+                .conversations(&[Conversation::new(1, "Invented audit")
+                    .node("hidden", Some("root"), hidden)
+                    .build()])
+                .json("library_files.json", &library)
+                .stored("file-SECRET-secret.txt", b"PRIVATE_ATTACHMENT_CANARY")
+                .folder(directory.path()),
+        );
+        assert_eq!(history.summary().attachments, 0);
+        let (items, _) = read_all(&history, &fixture::id(1)).await;
+        let ids: Vec<&str> = items.iter().map(|item| item.id.as_str()).collect();
+        assert!(ids.is_empty(), "{ids:?}");
+        assert!(
+            fetch(&history, &fixture::id(1), "file-SECRET")
+                .await
+                .is_err()
+        );
+        assert_no_canary(&serve_everything(&history).await);
+    }
+
     #[tokio::test]
     async fn asset_chunks_cover_the_file_and_repeat_the_whole_file_digest() {
         let directory = tempfile::tempdir().unwrap();
