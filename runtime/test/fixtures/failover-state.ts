@@ -70,9 +70,23 @@ export const authorities: Record<string, () => TestAuthority | Promise<TestAutho
   "Worker on local workerd": freshWorkerCoordinator,
 };
 
-export async function stateDirectory(t: TestContext): Promise<string> {
+/** A new state directory that holds no replication position. */
+export async function unstampedDirectory(t: TestContext): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "agent-failover-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
+  return directory;
+}
+
+/** Stamps a state directory at a log position, as `failover enroll` and `failover join` do. */
+export async function stamp(directory: string, position = 0): Promise<void> {
+  const database = await openScoped(directory);
+  try { await database.stampPosition(position); } finally { await database.close(); }
+}
+
+/** A new state directory at position 0: the owner's after `failover enroll`, or a standby's after `failover join` of that checkpoint. */
+export async function stateDirectory(t: TestContext): Promise<string> {
+  const directory = await unstampedDirectory(t);
+  await stamp(directory);
   return directory;
 }
 

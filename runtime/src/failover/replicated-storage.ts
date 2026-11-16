@@ -67,7 +67,7 @@ export async function openReplicatedStorage(options: ReplicatedStorageOptions): 
     if (record === undefined) throw new Error("This coordinator is not enrolled with the authority");
     const { state } = record;
     if (state.kind !== "active" || state.holder !== holder || state.epoch !== epoch) throw new OwnerFenced(state.kind === "active" ? "fenced" : "sealed", state);
-    inner = await database.openStorage(record.checkpoint.through);
+    inner = await database.openStorage();
   } catch (error) {
     await database.close().catch(() => {});
     throw error;

@@ -31,9 +31,8 @@ export async function applyLog(follower: LogFollower): Promise<number> {
   const { database, link } = follower;
   let storage: SqliteStorage;
   try {
-    const record = await link.record();
-    if (record === undefined) throw new Error("This coordinator is not enrolled with the authority");
-    storage = await database.openStorage(record.checkpoint.through);
+    if (await link.record() === undefined) throw new Error("This coordinator is not enrolled with the authority");
+    storage = await database.openStorage();
   } catch (error) {
     await database.close().catch(() => {});
     throw error;
@@ -53,7 +52,10 @@ export async function followLog(follower: LogFollower, storage: SqliteStorage): 
   for (;;) {
     signal?.throwIfAborted();
     const { record: { state, checkpoint }, entries } = await link.log(position, LOG_PAGE_ENTRIES);
-    if (position > state.head || position < checkpoint.through) {
+    if (position < checkpoint.through) {
+      throw new Error(`This state directory is at position ${position}, behind the checkpoint at ${checkpoint.through}, and the log no longer holds the entries between them. Rebuild it with \`beep-boop failover join --replace\``);
+    }
+    if (position > state.head) {
       throw new Error(`This state directory does not belong to this log: it is at position ${position}, and the log runs from ${checkpoint.through} to ${state.head}`);
     }
     if (position === state.head) return position;
