@@ -93,6 +93,10 @@ final class ChatModel {
     case pending(text: String, submission: ComposerSubmission?)
     case saved
   }
+  private struct ReturnedText {
+    let sendOrder: Int
+    let text: String
+  }
   /// Runs a Send's delivery to its recipients' outboxes and answers whether any took it. Tests
   /// wrap the delivery to hold a Send in flight, or answer without it to refuse one.
   typealias Admit = @MainActor (_ deliver: @MainActor () async -> Bool) async -> Bool
@@ -169,6 +173,7 @@ final class ChatModel {
   /// included, so all of it is committed.
   var draft = "" {
     didSet {
+      if draft.isEmpty { textsReturnedSinceEmpty = [] }
       if oldValue.isEmpty, attachments.isEmpty, !draft.isEmpty { stampBegun() }
       committed = draft
       forgetClearedSource()
@@ -318,6 +323,8 @@ final class ChatModel {
   @ObservationIgnored private var restoringDraft = false
   private var admission: Admission?
   var admitting: Bool { admission != nil }
+  @ObservationIgnored private var sendsStarted = 0
+  @ObservationIgnored private var textsReturnedSinceEmpty: [ReturnedText] = []
   @ObservationIgnored private var draftStore: AttachmentStore?
   @ObservationIgnored private var retiredDraftFiles: [LocalAttachment] = []
   @ObservationIgnored private let admit: Admit
@@ -393,6 +400,9 @@ final class ChatModel {
       addressing: DraftAddressing(
         destination: destination, restoredFrom: restoredFrom, source: source))
     if case .pending(let text, let submission) = admission {
+      let (returnedText, rest) = splitAfterReturns()
+      value.returnedText = String(returnedText)
+      value.text = String(rest)
       if let submission {
         let submittedIDs = Set(submission.attachments.map(\.id))
         value.submission = submission
@@ -1110,6 +1120,8 @@ final class ChatModel {
     let files = attachments
     let submission = submission(
       ComposerInputIdentity(composerID: composerID), text: text, files: files, at: targets)
+    sendsStarted += 1
+    let sendOrder = sendsStarted
     // Clear the actual bound value before any await. The pending admission
     // retains the recovery copy until the durable outboxes take ownership.
     admission = .pending(text: text, submission: submission)
@@ -1123,7 +1135,7 @@ final class ChatModel {
       var departing: [ControlDeparture] = []
       defer {
         admission = nil
-        if !admitted { putBack(text) }
+        if !admitted { putBack(text, of: sendOrder) }
         // A composer emptied during the Send kept whom its draft was for until now.
         forgetClearedSource()
       }
@@ -1142,7 +1154,9 @@ final class ChatModel {
       admission = .saved
       logComposer(.outboxSaved)
       if !departing.isEmpty {
-        Task { await putBack(text, addressedTo: addressedTo, unlessAnyWrote: departing) }
+        Task {
+          await putBack(text, of: sendOrder, addressedTo: addressedTo, unlessAnyWrote: departing)
+        }
       }
       // Who the draft is for goes with the Send only while nothing changed since its tap.
       if draftRevision == clearedRevision {
@@ -1159,12 +1173,46 @@ final class ChatModel {
     }
   }
 
-  private func putBack(_ text: String, addressedTo addressing: DraftAddressing? = nil) {
+  private var leadingReturns: [(returned: ReturnedText, paragraphEnd: String.Index)] {
+    var leading: [(returned: ReturnedText, paragraphEnd: String.Index)] = []
+    var rest = draft[...]
+    for entry in textsReturnedSinceEmpty {
+      guard rest.starts(with: entry.text) else { break }
+      let paragraph = rest.dropFirst(entry.text.count)
+      let paragraphEnd = paragraph.firstRange(of: "\n\n")?.lowerBound ?? paragraph.endIndex
+      leading.append((entry, paragraphEnd))
+      rest = draft[paragraphEnd...].dropFirst(2)
+    }
+    return leading
+  }
+
+  private func splitAfterReturns(olderThan sendOrder: Int = .max) -> (
+    returned: Substring, rest: Substring
+  ) {
+    guard let last = leadingReturns.last(where: { $0.returned.sendOrder < sendOrder }) else {
+      return ("", draft[...])
+    }
+    return (draft[..<last.paragraphEnd], draft[last.paragraphEnd...].dropFirst(2))
+  }
+
+  private func insertedAfterReturns(_ text: String, olderThan sendOrder: Int = .max) -> String {
+    let (returned, rest) = splitAfterReturns(olderThan: sendOrder)
+    return [returned, text[...], rest].filter { !$0.isEmpty }.joined(separator: "\n\n")
+  }
+
+  private func putBack(
+    _ text: String, of sendOrder: Int, addressedTo addressing: DraftAddressing? = nil
+  ) {
     guard !text.isEmpty else { return }
     let empty = draft.isEmpty && attachments.isEmpty
+    let leading = leadingReturns.map(\.returned)
     // It returns as the draft it was, so the scope shown now does not begin it again.
     changingDraft = true
-    draft = text + (draft.isEmpty ? "" : "\n\n" + draft)
+    draft = insertedAfterReturns(text, olderThan: sendOrder)
+    textsReturnedSinceEmpty =
+      leading.filter { $0.sendOrder < sendOrder }
+      + [ReturnedText(sendOrder: sendOrder, text: text)]
+      + leading.filter { $0.sendOrder > sendOrder }
     if empty, let addressing {
       restoredFrom = addressing.restoredFrom
       destination = addressing.destination
@@ -1175,13 +1223,13 @@ final class ChatModel {
   }
 
   private func putBack(
-    _ text: String, addressedTo addressing: DraftAddressing,
+    _ text: String, of sendOrder: Int, addressedTo addressing: DraftAddressing,
     unlessAnyWrote departing: [ControlDeparture]
   ) async {
     for departure in departing {
       if await departure.wrote { return }
     }
-    putBack(text, addressedTo: addressing)
+    putBack(text, of: sendOrder, addressedTo: addressing)
   }
 
   /// Saves the message in every target's outbox, then starts each. A refusal withdraws every
@@ -1392,7 +1440,7 @@ final class ChatModel {
       for file in restored.attachments { try? await store.remove(file) }
       return
     }
-    draft = restored.text + (draft.isEmpty ? "" : "\n\n" + draft)
+    draft = insertedAfterReturns(restored.text)
     attachments.insert(contentsOf: restored.attachments, at: 0)
     mode = restored.mode
     restoredFrom = lane
