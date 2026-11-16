@@ -242,9 +242,13 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Nightly operational log review through scheduled jobs, with coordinator
   collection, retained task summaries and explicit coverage gaps. Repeat a
   review through the [scheduled-job run command](setup.md#scheduled-jobs).
-- [ ] Dreams and Dreams evals: inspect private logs nightly and propose useful
+- [x] Dreams and Dreams evals: inspect private logs nightly and propose useful
   improvements as reviewable diffs with before/after evidence. Learned changes
   take effect only after approval of that diff.
+  [Dreams](setup.md#dreams) proposes at most one patch to a private guidance
+  repository, with checks run before and after, and `beep-boop dreams apply`
+  applies it only for the approved outcome digest. An opt-in live eval
+  measures proposals, quiet abstentions and injected text.
 - [x] Connect Pi's native telemetry to the same diagnostics. Show token use,
   cache hits and estimated cost for every chat, separately from subscription
   quota; keep estimates distinct from billed amounts. Native tests, review and
