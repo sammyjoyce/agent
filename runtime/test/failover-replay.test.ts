@@ -1,10 +1,8 @@
 import assert from "node:assert/strict";
 import { readdir, readFile, rename } from "node:fs/promises";
 import { join } from "node:path";
-import { performance } from "node:perf_hooks";
 import { test, type TestContext } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { SqliteDatabase } from "@earendil-works/chord/sqlite";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import { createRegistry, defineDoc, defineExtension, defineTool, ROOT_CONVERSATION_ID, type StorageWrite } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
@@ -45,31 +43,6 @@ function gardenRegistry(held: { started: () => void }) {
   ] }));
   return registry;
 }
-
-/** Times each transaction on the raw database, told apart by whether it rolled back or moved the position. */
-function timed(costs: { dryRunMs: number[]; commitMs: number[] }) {
-  return (database: SqliteDatabase): SqliteDatabase => ({
-    exec: (sql) => database.exec(sql), run: (sql, ...params) => database.run(sql, ...params), get: (sql, ...params) => database.get(sql, ...params),
-    all: (sql, ...params) => database.all(sql, ...params), close: () => database.close(),
-    transaction: async (callback) => {
-      const started = performance.now();
-      let applied = false;
-      try {
-        const value = await database.transaction((transaction) => callback({
-          exec: (sql) => transaction.exec(sql), get: (sql, ...params) => transaction.get(sql, ...params), all: (sql, ...params) => transaction.all(sql, ...params),
-          run: (sql, ...params) => { applied ||= sql.startsWith("UPDATE beep_boop_failover"); return transaction.run(sql, ...params); },
-        }));
-        if (applied) costs.commitMs.push(performance.now() - started);
-        return value;
-      } catch (error) {
-        costs.dryRunMs.push(performance.now() - started);
-        throw error;
-      }
-    },
-  });
-}
-
-const median = (values: number[]) => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)] ?? Number.NaN;
 
 /** A view of the log as it stood when its head was `head`. */
 function logThrough(link: AuthorityLink, head: number): AuthorityLink {
@@ -130,8 +103,7 @@ function resolvable() {
 for (const [name, connect] of Object.entries(authorities)) {
   test(`${name}: a streaming turn with a tool call replays to identical tables, and a second follow applies nothing`, async (t) => {
     const link = await connect(), epoch = await enroll(link), directory = await stateDirectory(t), standby = await stateDirectory(t);
-    const costs = { dryRunMs: [] as number[], commitMs: [] as number[] };
-    const owner = await openOwner(directory, link, { epoch, registry: gardenRegistry({ started() {} }), tokensPerSecond: 600, observe: timed(costs) });
+    const owner = await openOwner(directory, link, { epoch, registry: gardenRegistry({ started() {} }), tokensPerSecond: 600 });
     owner.faux.setResponses([
       fauxAssistantMessage([fauxText("I will write that down first."), fauxToolCall("note", { text: "invented note", lines: 12 })], { stopReason: "toolUse" }),
       fauxAssistantMessage(Array.from({ length: 40 }, (_, index) => `Sentence ${index} of an invented answer about a garden plan.`).join(" ")),
@@ -142,8 +114,6 @@ for (const [name, connect] of Object.entries(authorities)) {
     const turnCommits = owner.log.head - before;
     await owner.harness.close(context);
     assert.ok(turnCommits > 10, "the streamed turn commits its deltas");
-    console.log(`failover costs: commits in the streaming turn ${turnCommits} | dry run ms median ${median(costs.dryRunMs).toFixed(2)} max ${Math.max(...costs.dryRunMs).toFixed(2)}`
-      + ` | local commit ms median ${median(costs.commitMs).toFixed(2)} max ${Math.max(...costs.commitMs).toFixed(2)} | samples ${costs.commitMs.length}`);
 
     const head = (await link.record())?.state.head;
     assert.equal(await follow(standby, link), head);
@@ -340,7 +310,6 @@ for (const [name, connect] of Object.entries(authorities)) {
     { todo: "history.ts entry() returns the stored asset path, which is the old owner's absolute path after a promotion" }, async (t) => {
       const { entry, standby, root, path } = await promotedHistory(t, await connect());
       const handed = entry.data.item.assets[0]?.path;
-      console.log(`failover history: entry() on the promoted standby hands clients ${handed?.replace(standby, "<standby>").replace(root, "<old owner's root>")}`);
       assert.equal(handed, join(standby, path));
     });
 }

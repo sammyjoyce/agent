@@ -121,13 +121,11 @@ export interface OwnerOptions {
   readonly signal?: AbortSignal;
   readonly registry?: Registry;
   readonly tokensPerSecond?: number;
-  /** Wraps the raw database before it is scoped, for a test that observes it. */
-  readonly observe?: (database: SqliteDatabase) => SqliteDatabase;
 }
 
 /** An owner's replicated storage with a real Harness over it. */
 export async function openOwner(directory: string, link: AuthorityLink, options: OwnerOptions) {
-  const database = await openScoped(directory, options.observe);
+  const database = await openScoped(directory);
   const { storage, log } = await openReplicatedStorage({ database, link, holder: options.holder ?? OWNER, epoch: options.epoch,
     stateDirectory: directory, ...(options.signal === undefined ? {} : { signal: options.signal }) });
   try { return { database, storage, log, ...await openPi(storage, options) }; }
