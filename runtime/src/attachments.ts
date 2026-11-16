@@ -163,8 +163,6 @@ export class AttachmentStore {
     });
     this.serial = operation.then(() => {}, () => {}); return operation;
   }
-  /** Saves bytes the coordinator already holds as a new attachment, retained
-   * before the caller can put its reference into history. */
   async retainBytes(name: string, mediaType: string, bytes: Buffer): Promise<AttachmentRef> {
     const id = randomUUID();
     const operation = this.serial.catch(() => {}).then(async () => {

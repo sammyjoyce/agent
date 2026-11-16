@@ -113,7 +113,6 @@ function output(binding: BrowserBinding): ToolExecutionResult {
 
 const PNG_SIGNATURE = Buffer.from("\x89PNG\r\n\x1a\n", "latin1");
 
-/** The host's capture is untrusted until it decodes exactly to the PNG its digest names. */
 function verifiedCapture(capture: BrowserCapture): { bytes: Buffer } | { refusal: string } {
   const bytes = Buffer.from(capture.data_base64, "base64");
   if (bytes.toString("base64") !== capture.data_base64) return { refusal: "The browser host sent screenshot data that is not canonical base64." };
