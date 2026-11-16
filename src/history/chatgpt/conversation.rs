@@ -6,7 +6,7 @@ use std::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{ChatGptAttachment, ChatGptEnvelope, archive, json};
+use super::{ChatGptAttachment, ChatGptAuthor, ChatGptEnvelope, ChatGptMessage, archive, json};
 use crate::{
     history::{
         HistoryAssetKind, HistoryAssetRef, HistoryBranch, HistoryBranchState, HistoryGap,
@@ -183,7 +183,6 @@ pub(super) struct LibraryFile {
     pub mime_type: Option<String>,
     pub origination_message: Option<String>,
     pub created_at: Option<f64>,
-    pub raw: Value,
 }
 
 pub(super) fn references(message: &Value, library: &[&LibraryFile]) -> Vec<FileRef> {
@@ -235,17 +234,20 @@ pub(super) fn references(message: &Value, library: &[&LibraryFile]) -> Vec<FileR
             );
         }
     }
-    let node = message.get("id").and_then(Value::as_str);
     for entry in library {
-        if node.is_some() && entry.origination_message.as_deref() == node {
-            add(
-                Some(entry.file.clone()),
-                entry.name.as_deref(),
-                entry.mime_type.as_deref(),
-            );
-        }
+        add(
+            Some(entry.file.clone()),
+            entry.name.as_deref(),
+            entry.mime_type.as_deref(),
+        );
     }
     found
+}
+
+/// The id a library entry's `origination_message_id` names: `message.id`, else the node's
+/// mapping key.
+fn message_id<'a>(node: &'a str, message: &'a Value) -> &'a str {
+    message.get("id").and_then(Value::as_str).unwrap_or(node)
 }
 
 fn asset_pointers(value: &Value, depth: usize, found: &mut Vec<String>) {
@@ -265,22 +267,39 @@ fn asset_pointers(value: &Value, depth: usize, found: &mut Vec<String>) {
 pub(super) struct Survey {
     pub excluded: u32,
     pub files: BTreeSet<FileId>,
+    excluded_ids: BTreeSet<String>,
+}
+
+impl Survey {
+    /// A library file that names an excluded message is left out with it: no item, no asset
+    /// and no count.
+    pub fn keeps(&self, file: &LibraryFile) -> bool {
+        file.origination_message
+            .as_deref()
+            .is_none_or(|origin| !self.excluded_ids.contains(origin))
+    }
 }
 
 pub(super) fn survey(raw: &Value) -> Survey {
     let mut survey = Survey {
         excluded: 0,
         files: BTreeSet::new(),
+        excluded_ids: BTreeSet::new(),
     };
     let Some(mapping) = raw.get("mapping").and_then(Value::as_object) else {
         return survey;
     };
-    for node in mapping.values() {
-        let Some(message) = node.get("message").filter(|message| message.is_object()) else {
+    for (node, entry) in mapping {
+        let Some(message) = entry.get("message").filter(|message| message.is_object()) else {
             continue;
         };
         match classify(message) {
-            Disposition::Excluded => survey.excluded += 1,
+            Disposition::Excluded => {
+                survey.excluded += 1;
+                survey
+                    .excluded_ids
+                    .insert(message_id(node, message).to_owned());
+            }
             Disposition::Skipped => {}
             Disposition::Emit { .. } => survey.files.extend(
                 references(message, &[])
@@ -371,13 +390,6 @@ pub(super) struct Normalized {
 pub(super) const ITEM_FORMAT: u32 = 1;
 const INLINE_EVIDENCE_BYTES: usize = 128 * 1024;
 const TEXT_EXCERPT_BYTES: usize = 16 * 1024;
-const INSTRUCTION_METADATA: [&str; 5] = [
-    "user_context_message_data",
-    "about_user_message",
-    "about_model_message",
-    "user_editable_context",
-    "model_editable_context",
-];
 
 /// The mapping as a tree, built from `parent` links. A legacy `children` list only fills in
 /// a node whose `parent` is missing.
@@ -595,6 +607,8 @@ impl<'a> Turns<'a> {
     }
 }
 
+/// `library` holds the conversation's files that `Survey::keeps`. A file follows the emitted
+/// message it names, else it becomes its own `library:file` item.
 pub(super) fn normalize(
     id: &str,
     raw: &Value,
@@ -609,7 +623,25 @@ pub(super) fn normalize(
     let tree = Tree::build(mapping);
     let placement = Placement::place(&tree, raw.get("current_node").and_then(Value::as_str));
     let turns = Turns::find(&tree);
-    let library: Vec<&LibraryFile> = library.iter().collect();
+    let mut emitted: HashMap<&str, &str> = HashMap::new();
+    for (node, entry) in &tree.nodes {
+        if let (Some(message), Disposition::Emit { .. }) = (entry.message, &entry.disposition) {
+            emitted.entry(message_id(node, message)).or_insert(node);
+        }
+    }
+    let mut attached: HashMap<&str, Vec<&LibraryFile>> = HashMap::new();
+    let mut standalone = Vec::new();
+    for file in library {
+        match file
+            .origination_message
+            .as_deref()
+            .and_then(|origin| emitted.get(origin))
+        {
+            Some(node) => attached.entry(node).or_default().push(file),
+            None => standalone.push(file),
+        }
+    }
+    let attached_to = |node: &str| attached.get(node).map_or(&[][..], Vec::as_slice);
     let mut output = Normalized {
         items: Vec::new(),
         gaps: Vec::new(),
@@ -637,8 +669,7 @@ pub(super) fn normalize(
             role: role.clone(),
             turn: turns.of(node),
             branch,
-            references: references(message, &library),
-            library: library_entries(&library, node),
+            references: references(message, attached_to(node)),
             text: visible_text(message),
             files,
         });
@@ -650,11 +681,7 @@ pub(super) fn normalize(
         .rev()
         .find(|node| tree.emitted(node))
         .map(|node| turns.of(node));
-    for file in library.iter().filter(|file| {
-        file.origination_message
-            .as_deref()
-            .is_none_or(|origin| !mapping.contains_key(origin))
-    }) {
+    for file in standalone {
         let node = format!("library:{}", file.file.as_str());
         let branch = HistoryBranch {
             state: HistoryBranchState::Current,
@@ -675,7 +702,6 @@ pub(super) fn normalize(
                 name: file.name.clone(),
                 mime_type: file.mime_type.clone(),
             }],
-            library: vec![file.raw.clone()],
             text: file
                 .name
                 .clone()
@@ -714,8 +740,7 @@ pub(super) fn normalize(
                 alternates: 0,
                 follows: None,
             },
-            references: references(message, &library),
-            library: library_entries(&library, node),
+            references: references(message, attached_to(node)),
             text: visible_text(message),
             files,
         });
@@ -732,14 +757,6 @@ pub(super) fn normalize(
     output
 }
 
-fn library_entries(library: &[&LibraryFile], node: &str) -> Vec<Value> {
-    library
-        .iter()
-        .filter(|file| file.origination_message.as_deref() == Some(node))
-        .map(|file| file.raw.clone())
-        .collect()
-}
-
 struct Draft<'a> {
     conversation: &'a str,
     node: &'a str,
@@ -750,19 +767,12 @@ struct Draft<'a> {
     turn: &'a str,
     branch: HistoryBranch,
     references: Vec<FileRef>,
-    library: Vec<Value>,
     text: String,
     files: &'a dyn FileLookup,
 }
 
 impl Normalized {
     fn push(&mut self, draft: Draft<'_>) -> String {
-        let mut message = draft.message.cloned().unwrap_or(Value::Null);
-        if let Some(metadata) = message.get_mut("metadata").and_then(Value::as_object_mut) {
-            for key in INSTRUCTION_METADATA {
-                metadata.remove(key);
-            }
-        }
         let text = without_citations(&draft.text);
         let omitted = draft.references.len().saturating_sub(MAXIMUM_REFERENCES);
         let considered: Vec<_> = draft
@@ -778,6 +788,8 @@ impl Normalized {
             .iter()
             .map(|(reference, found)| ChatGptAttachment {
                 file_id: reference.file.as_str().to_owned(),
+                name: reference.name.clone(),
+                mime_type: reference.mime_type.clone(),
                 sha256: found.map(|(_, checked)| checked.sha256.clone()),
             })
             .collect();
@@ -786,8 +798,7 @@ impl Normalized {
             node_id: draft.node.to_owned(),
             parent_id: draft.parent.map(str::to_owned),
             text: text.clone(),
-            message,
-            library_files: draft.library,
+            message: draft.message.map(retained),
             attachments,
         })
         .unwrap_or(Value::Null);
@@ -911,6 +922,26 @@ fn media_type(name: &str) -> Option<String> {
         _ => return None,
     };
     Some(known.to_owned())
+}
+
+fn retained(message: &Value) -> ChatGptMessage {
+    let text = |pointer: &str| {
+        message
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    ChatGptMessage {
+        id: text("/id"),
+        author: ChatGptAuthor {
+            role: text("/author/role"),
+            name: text("/author/name"),
+        },
+        recipient: text("/recipient"),
+        channel: text("/channel"),
+        status: text("/status"),
+        content_type: text("/content/content_type"),
+    }
 }
 
 /// Drops citation markers (`U+E200 … U+E201`, payload included) and the highlight markers
@@ -1214,15 +1245,21 @@ mod tests {
     }
 
     #[test]
-    fn instruction_metadata_is_stripped_from_retained_messages() {
-        let message = json!({"author": {"role": "user"}, "content": {"content_type": "text", "parts": ["Hello"]},
-            "metadata": {"user_context_message_data": {"about_user_message": MARKER}, "kept": "yes"}});
+    fn retained_message_holds_only_the_header_readers_use() {
+        let message = json!({"author": {"role": "tool", "name": "python", "metadata": {"note": MARKER}},
+            "recipient": "all", "status": "finished_successfully", "channel": 7, "weight": 1.0,
+            "content": {"content_type": "text", "parts": ["Hello"], "extra": MARKER},
+            "metadata": {"user_context_message_data": {"about_user_message": MARKER}, "kept": MARKER}});
         let normalized = run(&Conversation::new(1, "Metadata")
-            .node("u1", Some("root"), message)
+            .node("t1", Some("root"), message)
             .build());
-        let data = serde_json::to_string(&normalized.items[0].data).unwrap();
-        assert!(!data.contains(MARKER));
-        assert!(data.contains("kept"));
+        let data = &normalized.items[0].data;
+        assert_eq!(
+            data["message"],
+            json!({"id": "t1", "author": {"role": "tool", "name": "python"}, "recipient": "all",
+                "status": "finished_successfully", "content_type": "text"})
+        );
+        assert!(!serde_json::to_string(data).unwrap().contains(MARKER));
     }
 
     #[test]
@@ -1312,7 +1349,8 @@ mod tests {
         let widget = item(&normalized, "w");
         assert_eq!(widget.kind, "assistant:future_widget");
         assert_eq!(widget.text, "Widget caption");
-        assert_eq!(widget.data["message"]["content"]["shape"], json!([1, 2]));
+        assert_eq!(widget.data["message"]["content_type"], "future_widget");
+        assert_eq!(widget.data["text"], "Widget caption");
     }
 
     #[test]
@@ -1334,7 +1372,6 @@ mod tests {
         let answer = item(&normalized, "a1");
         assert_eq!(answer.text, "Parks open at nine. Bring water.");
         assert_eq!(answer.data["text"], "Parks open at nine. Bring water.");
-        assert_eq!(answer.data["message"]["content"]["parts"][0], text);
     }
 
     #[test]
@@ -1438,15 +1475,12 @@ mod tests {
     }
 
     fn library(file: &str, origin: Option<&str>) -> LibraryFile {
-        let raw = json!({"file_id": file, "file_name": "plan.pdf", "mime_type": "application/pdf",
-            "origination_message_id": origin, "created_at": 1_767_300_000.0});
         LibraryFile {
             file: FileId::find(file).unwrap(),
             name: Some("plan.pdf".into()),
             mime_type: Some("application/pdf".into()),
             origination_message: origin.map(str::to_owned),
             created_at: Some(1_767_300_000.0),
-            raw,
         }
     }
 
@@ -1462,8 +1496,45 @@ mod tests {
         let answer = item(&normalized, "a1");
         assert_eq!(paths(answer), ["file_00ee"]);
         assert_eq!(answer.assets[0].media_type, "application/pdf");
-        assert_eq!(answer.data["library_files"][0]["file_id"], "file_00ee");
+        assert_eq!(
+            answer.data["attachments"][0],
+            json!({"file_id": "file_00ee", "name": "plan.pdf", "mime_type": "application/pdf",
+                "sha256": checked("file_00ee-plan.dat").sha256})
+        );
         assert_eq!(normalized.items.len(), 1);
+    }
+
+    #[test]
+    fn library_file_follows_the_message_id_before_the_mapping_key() {
+        let mut answer = text_message("assistant", "Here is the plan");
+        answer["id"] = json!("message-a1");
+        let normalized = run_with(
+            &Conversation::new(1, "Report")
+                .say("u1", "root", "user", "Make a plan")
+                .node("a1", Some("u1"), answer)
+                .say("empty", "a1", "assistant", "")
+                .build(),
+            &[
+                library("file_00e1", Some("message-a1")),
+                library("file_00e2", Some("u1")),
+                library("file_00e3", Some("a1")),
+                library("file_00e4", Some("empty")),
+            ],
+            &Files::new(&[
+                "file_00e1-plan.dat",
+                "file_00e2-plan.dat",
+                "file_00e3-plan.dat",
+                "file_00e4-plan.dat",
+            ]),
+        );
+        assert_eq!(paths(item(&normalized, "a1")), ["file_00e1"]);
+        assert_eq!(paths(item(&normalized, "u1")), ["file_00e2"]);
+        let ids: Vec<&str> = normalized
+            .items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect();
+        assert_eq!(ids, ["u1", "a1", "library:file_00e3", "library:file_00e4"]);
     }
 
     #[test]
@@ -1528,7 +1599,7 @@ mod tests {
         let envelope: crate::history::chatgpt::ChatGptEnvelope =
             serde_json::from_slice(bytes).unwrap();
         assert_eq!(envelope.node_id, "a1");
-        assert_eq!(envelope.message["content"]["parts"][0], canvas);
+        assert_eq!(envelope.text, canvas);
         assert_eq!(answer.assets[0].size, Some(bytes.len() as u64));
     }
 
@@ -1588,17 +1659,17 @@ mod tests {
 
     #[test]
     fn a_reversioned_current_item_reappends_every_later_current_item() {
-        let base = |metadata: Value| {
+        let base = |status: &str| {
             let mut middle = text_message("assistant", "b");
-            middle["metadata"] = metadata;
+            middle["status"] = json!(status);
             Conversation::new(1, "Chain")
                 .say("A", "root", "user", "a")
                 .node("B", Some("A"), middle)
                 .say("C", "B", "user", "c")
                 .build()
         };
-        let before = run(&base(json!({})));
-        let after = run(&base(json!({"model_slug": "invented-model"})));
+        let before = run(&base("in_progress"));
+        let after = run(&base("finished_successfully"));
         let (old, new) = (versions(&before), versions(&after));
         assert_eq!(old["A"], new["A"]);
         assert_ne!(old["B"], new["B"]);

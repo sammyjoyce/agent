@@ -672,7 +672,6 @@ fn library_file(entry: Value) -> Option<(String, LibraryFile)> {
             mime_type: text("mime_type"),
             origination_message: text("origination_message_id"),
             created_at: entry.get("created_at").and_then(conversation::seconds),
-            raw: entry,
         },
     ))
 }
@@ -849,11 +848,18 @@ impl Scan {
         members: Vec<Member>,
         shards: Vec<Region>,
         files: HashMap<FileId, IndexedFile>,
-        library: HashMap<String, Vec<LibraryFile>>,
+        mut library: HashMap<String, Vec<LibraryFile>>,
         original_names: HashMap<String, String>,
         parts: Vec<String>,
         shard_count: u32,
     ) -> Package {
+        library.retain(|conversation, entries| {
+            let Some(surveyed) = self.surveys.get(conversation) else {
+                return false;
+            };
+            entries.retain(|file| surveyed.survey.keeps(file));
+            !entries.is_empty()
+        });
         let mut referenced = BTreeSet::new();
         let (mut excluded, mut repaired) = (0, 0);
         for Surveyed { survey, repairs } in self.surveys.values() {
@@ -875,7 +881,18 @@ impl Scan {
                     (file.as_str(), sha256)
                 })
                 .collect();
-            let entries: Vec<&Value> = library_files.iter().map(|file| &file.raw).collect();
+            let entries: Vec<Value> = library_files
+                .iter()
+                .map(|file| {
+                    serde_json::json!([
+                        file.file.as_str(),
+                        file.name,
+                        file.mime_type,
+                        file.origination_message,
+                        file.created_at,
+                    ])
+                })
+                .collect();
             entry.thread.version = digest(&serde_json::json!([
                 THREAD_FORMAT,
                 conversation::ITEM_FORMAT,

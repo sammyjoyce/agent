@@ -46,8 +46,8 @@ pub struct ChatGptPackageSummary {
     pub problems: Vec<String>,
 }
 
-/// The inert evidence stored as `HistoryItem.data` for one ChatGPT message node.
-/// Instruction-bearing metadata is removed before it is built.
+/// The inert evidence stored as `HistoryItem.data` for one ChatGPT item. It is built from
+/// the fields readers use, so nothing else in the export's message reaches storage.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ChatGptEnvelope {
     pub conversation_id: String,
@@ -55,21 +55,56 @@ pub struct ChatGptEnvelope {
     pub parent_id: Option<String>,
     /// The whole normalized message text, citations removed. `HistoryItem.text` is its excerpt.
     pub text: String,
-    #[ts(type = "unknown")]
-    pub message: serde_json::Value,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[ts(optional, type = "unknown[]")]
-    pub library_files: Vec<serde_json::Value>,
+    /// Null for a `library:file` item, which has no message.
+    pub message: Option<ChatGptMessage>,
     /// The files the item references, up to its attachment limit. The checked digest is part of
     /// the evidence, so other bytes under the same file id are a new item version, never a
     /// refresh of the old one.
     pub attachments: Vec<ChatGptAttachment>,
 }
 
+/// The retained header of an export message. Each field is copied when the export has it as a
+/// string.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ChatGptMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub id: Option<String>,
+    pub author: ChatGptAuthor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub recipient: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub content_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ChatGptAuthor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub name: Option<String>,
+}
+
 /// A file one ChatGPT item references.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ChatGptAttachment {
     pub file_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mime_type: Option<String>,
     /// The SHA-256 of the checked bytes. Absent when the export does not hold the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -762,7 +797,7 @@ mod tests {
             [
                 "b54f3a3b38e2dedfcb4de7e71773a36a40b160bc32547b3cd687c49efcacf35d",
                 "4d51a21777f8a0cb006d2402f64359ca9820472e7cf1a8c3f01906b116537c3b",
-                "3d0789f8a1906fda4cd5aeea867e651c3e63e63a47aa53e3d8e2eb0a61a0bc2f",
+                "cb963972bacf0447cdabc0dde65ffe3c900bc3478122ccb4b655517aca11933a",
             ],
             "A pinned version changed. If the change is meant, bump PACKAGE_FORMAT, THREAD_FORMAT or ITEM_FORMAT and update these values."
         );
@@ -1390,7 +1425,7 @@ mod tests {
             .unwrap();
         assert_eq!(Some(digest.as_str()), reference.sha256.as_deref());
         let envelope: ChatGptEnvelope = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(envelope.message["content"]["parts"][0], canvas);
+        assert_eq!(envelope.text, canvas);
     }
 
     fn spools() -> Vec<std::ffi::OsString> {

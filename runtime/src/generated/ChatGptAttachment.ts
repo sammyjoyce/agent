@@ -3,7 +3,7 @@
 /**
  * A file one ChatGPT item references.
  */
-export type ChatGptAttachment = { file_id: string,
+export type ChatGptAttachment = { file_id: string, name?: string, mime_type?: string,
 /**
  * The SHA-256 of the checked bytes. Absent when the export does not hold the file.
  */
