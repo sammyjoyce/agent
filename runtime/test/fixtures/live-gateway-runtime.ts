@@ -19,15 +19,14 @@ globalThis.fetch = async (input, options) => {
   const responses = process.env.AGENT_TEST_RESPONSES;
   if (responses === undefined || response.body === null) return response;
   const [model, copy] = response.body.tee();
-  void record(copy, responses, { request, status: response.status, started });
+  void appendResponseWhenStreamEnds(copy, responses, { request, status: response.status, started });
   const headers = new Headers(response.headers);
   headers.delete("content-encoding"); headers.delete("content-length");
   return new Response(model, { status: response.status, statusText: response.statusText, headers });
 };
 
 function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
-/** One line per request, written when its stream ends, so a reader can tell when none is in flight. */
-async function record(stream: ReadableStream<Uint8Array>, file: string, meta: { request: number; status: number; started: number }): Promise<void> {
+async function appendResponseWhenStreamEnds(stream: ReadableStream<Uint8Array>, file: string, meta: { request: number; status: number; started: number }): Promise<void> {
   const decoder = new TextDecoder();
   let body = "", error: string | null = null;
   try { for await (const chunk of stream) body += decoder.decode(chunk, { stream: true }); }

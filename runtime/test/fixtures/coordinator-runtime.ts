@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import type { JsonObject } from "@earendil-works/pi-ai";
 
 export type ModelStep = { text: string } | { tool: string; args: JsonObject; commentary?: string } |
-  { code: string; commentary?: string } | { hold: string };
+  { code: string; commentary?: string } | { hold_and_write_pid: string };
 export type ModelQueue = Record<string, ModelStep[]>;
 type ResponseItem = { id: string; type: "message"; role: "assistant"; status: "completed"; phase?: "commentary";
   content: [{ type: "output_text"; text: string; annotations: [] }] } |
@@ -35,9 +35,8 @@ globalThis.fetch = async (input, options) => {
   const step: unknown = steps.shift(); assert.ok(object(step));
   writeFileSync(path, JSON.stringify(queue));
   appendFileSync(path + ".requests", JSON.stringify({ key, body }) + "\n");
-  if (typeof step.hold === "string") {
-    // A test stops the process here, between an admitted turn and its next effect.
-    writeFileSync(step.hold, String(process.pid));
+  if (typeof step.hold_and_write_pid === "string") {
+    writeFileSync(step.hold_and_write_pid, String(process.pid));
     const signal = options?.signal;
     return new Promise<Response>((_resolve, reject) => signal?.addEventListener("abort", () => reject(signal.reason), { once: true }));
   }
