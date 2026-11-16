@@ -119,7 +119,7 @@
     devShells = eachSystem (system: let
       pkgs = import nixpkgs {inherit system;};
       tools = {
-        packages = with pkgs; [cargo rustc rustfmt clippy nodejs_26 pkg-config git lsof actionlint unzip];
+        packages = with pkgs; [cargo rustc rustfmt clippy nodejs_26 pkg-config git lsof actionlint unzip wrangler];
         AGENT_SQLITE_VEC = "${pkgs.sqlite-vec}/lib/vec0${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
       };
     in {
@@ -130,7 +130,7 @@
         });
       ci = pkgs.mkShell (tools
         // {
-          packages = tools.packages ++ [pkgs.codex pkgs.wrangler];
+          packages = tools.packages ++ [pkgs.codex];
         });
     });
   };
