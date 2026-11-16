@@ -1032,19 +1032,23 @@
           ]
         },
         {
+          "description": "A goal retains the request IDs it accepted, so a replayed pause or resume\nchanges nothing even after later controls.",
           "type": "object",
           "properties": {
+            "request_id": {
+              "type": "string"
+            },
             "type": {
               "type": "string",
               "const": "pause"
             }
           },
           "required": [
-            "type"
+            "type",
+            "request_id"
           ]
         },
         {
-          "description": "Replaying the request that started the current activation changes nothing.",
           "type": "object",
           "properties": {
             "request_id": {

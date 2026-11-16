@@ -1101,8 +1101,11 @@ pub enum GoalAction {
         request_id: String,
         objective: String,
     },
-    Pause,
-    /// Replaying the request that started the current activation changes nothing.
+    /// A goal retains the request IDs it accepted, so a replayed pause or resume
+    /// changes nothing even after later controls.
+    Pause {
+        request_id: String,
+    },
     Resume {
         request_id: String,
     },
