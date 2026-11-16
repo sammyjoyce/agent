@@ -41,7 +41,7 @@ enum ProposalStatus {
     },
     Applied {
         commit: String,
-        reachable: Option<bool>,
+        reachable: Reachability,
     },
     Stale {
         head: String,
@@ -79,15 +79,15 @@ impl ProposalStatus {
             }
             Self::Applied {
                 commit,
-                reachable: Some(true),
+                reachable: Reachability::Reachable,
             } => format!("applied as commit {commit}"),
             Self::Applied {
                 commit,
-                reachable: Some(false),
+                reachable: Reachability::Unreachable,
             } => format!("applied as commit {commit}, which is no longer reachable from HEAD"),
             Self::Applied {
                 commit,
-                reachable: None,
+                reachable: Reachability::NotChecked,
             } => format!(
                 "applied as commit {commit} (HEAD was not checked: the policy no longer names this repository)"
             ),
@@ -107,6 +107,57 @@ impl ProposalStatus {
     }
 }
 
+/// Whether HEAD still contains an applied commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reachability {
+    Reachable,
+    Unreachable,
+    /// The policy no longer names the repository, and Git runs only in the policy's.
+    NotChecked,
+}
+
+impl Serialize for Reachability {
+    /// `true`, `false`, or `null` when HEAD was not checked.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Reachable => serializer.serialize_bool(true),
+            Self::Unreachable => serializer.serialize_bool(false),
+            Self::NotChecked => serializer.serialize_none(),
+        }
+    }
+}
+
+/// What shows that a run was applied.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApplyEvidence {
+    /// The record that apply writes after its fast-forward.
+    Recorded,
+    /// Only the commit trailer in `base..HEAD`, which is what a crash between
+    /// the fast-forward and the record leaves.
+    TrailerOnly,
+}
+
+/// Patch bytes whose digest is the one the sealed proposal names. Only
+/// `read_patch` makes one, so apply can give Git nothing else.
+struct VerifiedPatch(Vec<u8>);
+
+/// The patch file, read once.
+enum PatchFile {
+    Verified(VerifiedPatch),
+    Changed {
+        actual: ContentDigest,
+        bytes: Vec<u8>,
+    },
+}
+
+impl PatchFile {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Verified(VerifiedPatch(bytes)) | Self::Changed { bytes, .. } => bytes,
+        }
+    }
+}
+
 enum Inspection {
     PatchChanged {
         actual: ContentDigest,
@@ -114,8 +165,8 @@ enum Inspection {
     PolicyChanged,
     Applied {
         commit: String,
-        reachable: Option<bool>,
-        recorded: bool,
+        reachable: Reachability,
+        evidence: ApplyEvidence,
     },
     Stale {
         head: String,
@@ -126,6 +177,7 @@ enum Inspection {
         lock: PathBuf,
     },
     Ready {
+        patch: VerifiedPatch,
         half_applied: Vec<ProposedFile>,
     },
 }
@@ -146,16 +198,22 @@ impl Inspection {
             Self::Stale { head } => ProposalStatus::Stale { head: head.clone() },
             Self::TargetDirty => ProposalStatus::TargetDirty,
             Self::IndexLocked { lock } => ProposalStatus::TargetLocked { lock: lock.clone() },
-            Self::Ready { half_applied } => ProposalStatus::Pending {
+            Self::Ready { half_applied, .. } => ProposalStatus::Pending {
                 interrupted: !half_applied.is_empty(),
             },
         }
     }
 }
 
-fn read_patch(store: &DreamsStore, proposal: &Proposal) -> Result<Vec<u8>> {
-    fs::read(store.patch_path(&proposal.run, proposal.attempt))
-        .context("The Dreams patch file is missing")
+fn read_patch(store: &DreamsStore, proposal: &Proposal) -> Result<PatchFile> {
+    let bytes = fs::read(store.patch_path(&proposal.run, proposal.attempt))
+        .context("The Dreams patch file is missing")?;
+    let actual = ContentDigest::of(&bytes);
+    Ok(if actual == proposal.patch_sha256 {
+        PatchFile::Verified(VerifiedPatch(bytes))
+    } else {
+        PatchFile::Changed { actual, bytes }
+    })
 }
 
 enum PathState {
@@ -164,7 +222,15 @@ enum PathState {
     LocallyChanged,
 }
 
-async fn index_entries(git: &Git, path: &str) -> Result<Vec<(String, String, String, String)>> {
+/// One line of `git ls-files -s`.
+struct IndexEntry {
+    mode: String,
+    blob: String,
+    stage: String,
+    path: String,
+}
+
+async fn index_entries(git: &Git, path: &str) -> Result<Vec<IndexEntry>> {
     let listed = git.text(&["ls-files", "-s", "-z", "--", path]).await?;
     let mut entries = Vec::new();
     for entry in listed.split('\0').filter(|entry| !entry.is_empty()) {
@@ -175,12 +241,12 @@ async fn index_entries(git: &Git, path: &str) -> Result<Vec<(String, String, Str
         let [mode, blob, stage] = fields.as_slice() else {
             bail!("Git listed an unreadable index entry");
         };
-        entries.push((
-            (*mode).to_owned(),
-            (*blob).to_owned(),
-            (*stage).to_owned(),
-            name.to_owned(),
-        ));
+        entries.push(IndexEntry {
+            mode: (*mode).to_owned(),
+            blob: (*blob).to_owned(),
+            stage: (*stage).to_owned(),
+            path: name.to_owned(),
+        });
     }
     Ok(entries)
 }
@@ -202,7 +268,7 @@ async fn path_state(git: &Git, repository: &Path, file: &ProposedFile) -> Result
         if index_entries(git, name)
             .await?
             .iter()
-            .any(|(_, _, _, listed)| listed == name)
+            .any(|entry| entry.path == name)
         {
             return Ok(PathState::LocallyChanged);
         }
@@ -211,11 +277,11 @@ async fn path_state(git: &Git, repository: &Path, file: &ProposedFile) -> Result
     let entries: Vec<_> = index_entries(git, &file.path)
         .await?
         .into_iter()
-        .filter(|(_, _, _, listed)| listed == &file.path)
+        .filter(|entry| entry.path == file.path)
         .collect();
     let staged = match entries.as_slice() {
         [] => None,
-        [(mode, blob, stage, _)] if mode == PLAIN_FILE && stage == "0" => Some(blob.clone()),
+        [entry] if entry.mode == PLAIN_FILE && entry.stage == "0" => Some(entry.blob.clone()),
         _ => return Ok(PathState::LocallyChanged),
     };
     let on_disk = match fs::symlink_metadata(repository.join(&file.path)) {
@@ -261,14 +327,18 @@ async fn recorded_apply(
         let contained = Git::reading(&proposal.repository)
             .run(&["merge-base", "--is-ancestor", commit, "HEAD"])
             .await?;
-        Some(contained.exit_code == 0)
+        if contained.exit_code == 0 {
+            Reachability::Reachable
+        } else {
+            Reachability::Unreachable
+        }
     } else {
-        None
+        Reachability::NotChecked
     };
     Ok(Some(Inspection::Applied {
         commit: commit.to_owned(),
         reachable,
-        recorded: true,
+        evidence: ApplyEvidence::Recorded,
     }))
 }
 
@@ -276,15 +346,15 @@ async fn inspect(
     store: &DreamsStore,
     policy: &DreamsPolicy,
     proposal: &Proposal,
-    patch: &[u8],
+    patch: PatchFile,
 ) -> Result<Inspection> {
     if let Some(applied) = recorded_apply(store, Some(policy), proposal).await? {
         return Ok(applied);
     }
-    let actual = ContentDigest::of(patch);
-    if actual != proposal.patch_sha256 {
-        return Ok(Inspection::PatchChanged { actual });
-    }
+    let patch = match patch {
+        PatchFile::Verified(patch) => patch,
+        PatchFile::Changed { actual, .. } => return Ok(Inspection::PatchChanged { actual }),
+    };
     let admitted = policy.digest() == &proposal.policy_digest
         && policy.repository() == proposal.repository
         && proposal
@@ -327,8 +397,8 @@ async fn inspect(
         {
             return Ok(Inspection::Applied {
                 commit: (*commit).to_owned(),
-                reachable: Some(true),
-                recorded: false,
+                reachable: Reachability::Reachable,
+                evidence: ApplyEvidence::TrailerOnly,
             });
         }
     }
@@ -349,7 +419,10 @@ async fn inspect(
             PathState::LocallyChanged => return Ok(Inspection::TargetDirty),
         }
     }
-    Ok(Inspection::Ready { half_applied })
+    Ok(Inspection::Ready {
+        patch,
+        half_applied,
+    })
 }
 
 #[derive(Serialize)]
@@ -383,13 +456,14 @@ async fn status_of(
         return Ok(None);
     };
     let patch = read_patch(store, proposal)?;
+    let shown = patch.bytes().to_vec();
     let status = match policy {
-        Some(policy) => inspect(store, policy, proposal, &patch).await?.status(),
+        Some(policy) => inspect(store, policy, proposal, patch).await?.status(),
         None => recorded_apply(store, None, proposal)
             .await?
             .map_or(ProposalStatus::PolicyChanged, |applied| applied.status()),
     };
-    Ok(Some((status, patch)))
+    Ok(Some((status, shown)))
 }
 
 fn coverage_word(review: &Review) -> &'static str {
@@ -490,7 +564,7 @@ async fn build_commit(
     store: &DreamsStore,
     policy: &DreamsPolicy,
     proposal: &Proposal,
-    patch: &[u8],
+    patch: &VerifiedPatch,
 ) -> Result<String> {
     let base = proposal.base.as_str();
     let scratch = ScratchIndex(
@@ -504,7 +578,7 @@ async fn build_commit(
     );
     staging.text(&["read-tree", base]).await?;
     let applied = staging
-        .run_with_input(&["apply", "--cached", "--whitespace=nowarn"], patch)
+        .run_with_input(&["apply", "--cached", "--whitespace=nowarn"], &patch.0)
         .await?;
     ensure!(
         applied.exit_code == 0,
@@ -561,11 +635,9 @@ async fn build_commit(
     Ok(commit.trim().to_owned())
 }
 
-async fn fast_forward(
-    proposal: &Proposal,
-    commit: &str,
-    half_applied: &[ProposedFile],
-) -> Result<()> {
+/// Returns each path that an interrupted apply left at its proposed content
+/// to the base, so the fast-forward finds a clean target.
+async fn restore_half_applied(proposal: &Proposal, half_applied: &[ProposedFile]) -> Result<()> {
     let git = Git::writing(&proposal.repository);
     for file in half_applied {
         match &file.base_blob {
@@ -599,7 +671,12 @@ async fn fast_forward(
             }
         }
     }
-    git.text(&["merge", "--ff-only", "--quiet", commit])
+    Ok(())
+}
+
+async fn fast_forward(proposal: &Proposal, commit: &str) -> Result<()> {
+    Git::writing(&proposal.repository)
+        .text(&["merge", "--ff-only", "--quiet", commit])
         .await
         .context("The target could not fast-forward to the Dreams commit")?;
     Ok(())
@@ -627,8 +704,7 @@ async fn apply(
     let Some(Outcome::Proposed(proposal)) = &view.outcome else {
         bail!("Dreams run did not propose a change");
     };
-    let patch = read_patch(store, proposal)?;
-    match inspect(store, policy, proposal, &patch).await? {
+    match inspect(store, policy, proposal, read_patch(store, proposal)?).await? {
         Inspection::PatchChanged { .. } => bail!("Dreams patch changed since it was proposed"),
         Inspection::PolicyChanged => bail!("{POLICY_CHANGED}"),
         Inspection::Stale { head } => bail!(
@@ -641,9 +717,9 @@ async fn apply(
             lock.display()
         ),
         Inspection::Applied {
-            commit, recorded, ..
+            commit, evidence, ..
         } => {
-            if !recorded {
+            if evidence == ApplyEvidence::TrailerOnly {
                 store.record_applied(run, &Revision::parse(&commit)?)?;
             }
             Ok(format!(
@@ -651,9 +727,13 @@ async fn apply(
                 short(&commit)
             ))
         }
-        Inspection::Ready { half_applied } => {
+        Inspection::Ready {
+            patch,
+            half_applied,
+        } => {
             let commit = build_commit(store, policy, proposal, &patch).await?;
-            fast_forward(proposal, &commit, &half_applied).await?;
+            restore_half_applied(proposal, &half_applied).await?;
+            fast_forward(proposal, &commit).await?;
             store.record_applied(run, &Revision::parse(&commit)?)?;
             Ok(format!(
                 "Applied Dreams run {run} as commit {} to {}.",
@@ -768,7 +848,8 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::dreams_cli::{
-        ProposalStatus, RunReport, apply, apply_command, inspect, read_patch, render, status_of,
+        ProposalStatus, Reachability, RunReport, apply, apply_command, inspect, read_patch, render,
+        status_of,
     };
 
     fn git(repository: &Path, arguments: &[&str]) -> String {
@@ -863,9 +944,9 @@ mod tests {
             panic!("The run must hold a proposal");
         };
         let approval = view.outcome_sha256.clone().unwrap();
-        let patch = read_patch(&store, proposal).unwrap();
+        let patch = || read_patch(&store, proposal).unwrap();
         assert!(matches!(
-            inspect(&store, &policy, proposal, &patch)
+            inspect(&store, &policy, proposal, patch())
                 .await
                 .unwrap()
                 .status(),
@@ -875,7 +956,7 @@ mod tests {
         fs::create_dir(repository.join("playbooks")).unwrap();
         fs::write(repository.join("playbooks/build.md"), playbook).unwrap();
         git(&repository, &["add", "playbooks/build.md"]);
-        let status = inspect(&store, &policy, proposal, &patch)
+        let status = inspect(&store, &policy, proposal, patch())
             .await
             .unwrap()
             .status();
@@ -932,7 +1013,7 @@ mod tests {
                 status_of(&store, None, &view).await.unwrap(),
                 Some((
                     ProposalStatus::Applied {
-                        reachable: None,
+                        reachable: Reachability::NotChecked,
                         ..
                     },
                     _
@@ -949,7 +1030,7 @@ mod tests {
             ProposalStatus::Pending { interrupted: false },
             ProposalStatus::Applied {
                 commit: "a".repeat(40),
-                reachable: Some(true),
+                reachable: Reachability::Reachable,
             },
             ProposalStatus::Stale {
                 head: "b".repeat(40),
