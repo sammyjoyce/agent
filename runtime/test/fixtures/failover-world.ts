@@ -268,6 +268,11 @@ export async function failoverWorld(t: TestContext, options: WorldOptions = {}) 
       const text = await readFile(base.queue + ".requests", "utf8").catch(() => "");
       return text.split("\n").filter(Boolean).filter((line) => (JSON.parse(line) as { key: string }).key === key).length;
     },
+    /** The newest request the scripted model got for the input that contains `key`, as the JSON it was sent. */
+    async lastAsked(key: string): Promise<string> {
+      const text = await readFile(base.queue + ".requests", "utf8").catch(() => "");
+      return text.split("\n").filter(Boolean).filter((line) => (JSON.parse(line) as { key: string }).key === key).at(-1) ?? "";
+    },
     /** The methods the fixture source helper was asked, in order. */
     async sourceCalls(): Promise<string[]> {
       const text = await readFile(join(source, "calls"), "utf8").catch(() => "");
