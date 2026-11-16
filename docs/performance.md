@@ -270,7 +270,8 @@ Two runs on one build show the gates' range:
    with status 1. Leave out `scroll_history`. Its keys never reach the
    runtime, and with the slow runtime the replay outlasts the 20-second
    deadline, so the sample fails before its first key. No fixture slows the
-   CLI itself, so no run yet shows that the scroll gates can fail.
+   CLI itself. Showing that the scroll gates can fail needs a candidate CLI
+   patched to delay its Ctrl+Home and PageUp handling.
 
 ## Limits
 
