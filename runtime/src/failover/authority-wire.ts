@@ -16,7 +16,6 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
 /** `REPLICATED_FILE_ROOTS` in `src/failover.rs`. */
 const REPLICATED_FILE_ROOTS = ["attachments", "history/assets", "feedback"];
 
-/** Holder and coordinator ids travel in the lowercase hyphenated form Rust writes, so one id has one spelling. */
 export const isLowercaseUuid = (value: string) => LOWERCASE_UUID.test(value);
 export const isSha256Hex = (value: string) => SHA256_HEX.test(value);
 
@@ -124,9 +123,11 @@ export function parseAuthorityCredentials(value: unknown): AuthorityCredential[]
 }
 
 /**
- * Parses a command from untrusted JSON. It accepts exactly what `src/failover.rs`
- * accepts, except that every field the generated type names must be present,
- * and throws an Error whose message names the first bad field.
+ * Parses a command from untrusted JSON, or throws an Error whose message names
+ * the first bad field. It accepts what `src/failover.rs` accepts, narrowed in
+ * three ways: every field the generated type names must be present, a UUID must
+ * be in the lowercase hyphenated form Rust writes because the rules compare
+ * holders as strings, and an attestation may not be blank.
  */
 export function parseAuthorityCommand(value: unknown): AuthorityCommand {
   return authorityCommand(value, "");

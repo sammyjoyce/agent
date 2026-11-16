@@ -44,15 +44,15 @@ const PAGE_ENTRIES = 64;
 const PAGE_ENTRY_JSON = 4 * 1024 * 1024;
 
 type Endpoint =
-  | { readonly name: "command" | "record" }
+  | { readonly name: "command" }
+  | { readonly name: "record" }
   | { readonly name: "log"; readonly after: number; readonly limit: number }
   | { readonly name: "put_blob" | "get_blob" | "head_blob"; readonly sha256: string };
 
 /** What the Worker asks its coordinator's object, after it has authorized the request. */
 type ObjectRequest =
-  | { readonly type: "command"; readonly coordinator: string; readonly command: AuthorityCommand }
-  | { readonly type: "record" }
-  | { readonly type: "log"; readonly after: number; readonly limit: number };
+  | Extract<Endpoint, { readonly name: "record" | "log" }>
+  | { readonly name: "command"; readonly coordinator: string; readonly command: AuthorityCommand };
 
 class Refusal extends Error {
   constructor(readonly status: number, message: string) { super(message); }
@@ -61,6 +61,8 @@ class Refusal extends Error {
 const failure = (status: number, sentence: string) => Response.json({ error: sentence }, { status });
 const jsonResponse = (json: string) => new Response(json, { headers: { "content-type": "application/json" } });
 const notEnrolled = () => failure(404, "This coordinator is not enrolled.");
+/** Blobs are content addressed within one coordinator, so no coordinator reads another's. */
+const blobKey = (coordinator: string, sha256: string) => `${coordinator}/${sha256}`;
 
 function parseEndpoint(request: Request): { readonly coordinator: string; readonly endpoint: Endpoint } {
   const url = new URL(request.url);
@@ -156,27 +158,26 @@ async function serve(request: Request, env: AuthorityEnv): Promise<Response> {
   if (credential.holder === null && endpoint.name !== "record") throw new Refusal(403, "A read-only credential may only read the record.");
   switch (endpoint.name) {
     case "record":
-      return ask(env, coordinator, { type: "record" });
     case "log":
-      return ask(env, coordinator, { type: "log", after: endpoint.after, limit: endpoint.limit });
+      return ask(env, coordinator, endpoint);
     case "command": {
       const command = await readCommand(request);
       if (commandHolder(command) !== credential.holder) throw new Refusal(403, "A credential may only run commands for its own holder.");
-      return ask(env, coordinator, { type: "command", coordinator, command });
+      return ask(env, coordinator, { name: "command", coordinator, command });
     }
     case "put_blob": {
       const bytes = await request.arrayBuffer();
       if (await sha256Hex(bytes) !== endpoint.sha256) throw new Refusal(422, "The bytes do not match the SHA-256 in the path.");
-      await env.BLOBS.put(`${coordinator}/${endpoint.sha256}`, bytes, { sha256: endpoint.sha256 });
+      await env.BLOBS.put(blobKey(coordinator, endpoint.sha256), bytes, { sha256: endpoint.sha256 });
       return new Response(null, { status: 204 });
     }
     case "get_blob": {
-      const blob = await env.BLOBS.get(`${coordinator}/${endpoint.sha256}`);
+      const blob = await env.BLOBS.get(blobKey(coordinator, endpoint.sha256));
       if (blob === null) throw new Refusal(404, "The blob store holds no such blob for this coordinator.");
       return new Response(blob.body, { headers: { "content-type": "application/octet-stream" } });
     }
     case "head_blob":
-      return new Response(null, { status: await env.BLOBS.head(`${coordinator}/${endpoint.sha256}`) === null ? 404 : 200 });
+      return new Response(null, { status: await env.BLOBS.head(blobKey(coordinator, endpoint.sha256)) === null ? 404 : 200 });
     default:
       return endpoint satisfies never;
   }
@@ -217,7 +218,7 @@ export class CoordinatorAuthority {
 
   async fetch(request: Request): Promise<Response> {
     const message = await request.json() as ObjectRequest;
-    switch (message.type) {
+    switch (message.name) {
       case "command":
         return Response.json(await this.command(message.coordinator, message.command));
       case "record": {
@@ -266,7 +267,7 @@ export class CoordinatorAuthority {
 
   private async namesMissingBlob(coordinator: string, entry: LogEntry): Promise<boolean> {
     const named = new Set([...entry.files.map((file) => file.sha256), ...(entry.batch?.kind === "blob" ? [entry.batch.sha256] : [])]);
-    const found = await Promise.all([...named].map((sha256) => this.blobs.head(`${coordinator}/${sha256}`)));
+    const found = await Promise.all([...named].map((sha256) => this.blobs.head(blobKey(coordinator, sha256))));
     return found.includes(null);
   }
 
