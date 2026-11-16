@@ -230,7 +230,6 @@ export class HistoryStore {
       if (cold === undefined) throw new OriginalUnavailable("Full historical original is unavailable; only its bounded saved excerpt is retained");
       if (cold.size === null || cold.size > 64 * 1024 * 1024) throw new HistoryError("Historical text exceeds the bounded index reader; source evidence is retained");
       if (cold.sha256 === null) throw new HistoryError("Retained history evidence changed");
-      // The recorded path is where the asset was first written. A restored store finds the same digest under its own root.
       const bytes = await readFile(this.assetRoot === undefined ? cold.path : join(this.assetRoot, cold.sha256));
       if (createHash("sha256").update(bytes).digest("hex") !== cold.sha256) throw new HistoryError("Retained history evidence changed");
       const decoded: unknown = JSON.parse(bytes.toString("utf8"));

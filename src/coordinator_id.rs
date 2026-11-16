@@ -27,8 +27,6 @@ impl CoordinatorId {
         }
     }
 
-    /// Reads an existing ID without ever minting one; `None` when the file is
-    /// absent.
     pub fn read(state: &Path) -> Result<Option<Self>> {
         let path = state.join(COORDINATOR_ID_FILE);
         match OpenOptions::new()

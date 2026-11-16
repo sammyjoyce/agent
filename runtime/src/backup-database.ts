@@ -12,7 +12,6 @@ function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-/** Answers one request from src/backup.rs with facts; Rust decides every refusal. */
 export async function answerDatabaseRequest(request: DatabaseRequest): Promise<DatabaseReport> {
   switch (request.type) {
     case "snapshot": {
@@ -69,7 +68,6 @@ async function main(): Promise<void> {
 }
 
 if (process.argv[1] !== undefined && pathToFileURL(process.argv[1]).href === import.meta.url) {
-  // Rust puts this message in its refusal, so it must say what SQLite said.
   void main().catch((error: unknown) => {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;

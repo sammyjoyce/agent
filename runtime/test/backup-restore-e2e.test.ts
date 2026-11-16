@@ -34,7 +34,6 @@ const HELD_JOB = "invented-held-review";
 function sha256(bytes: Buffer): string { return createHash("sha256").update(bytes).digest("hex"); }
 async function exists(path: string): Promise<boolean> { return stat(path).then(() => true, () => false); }
 
-/** Every regular file below a store, by relative path and SHA-256. */
 async function fingerprint(root: string): Promise<Map<string, string>> {
   const files = new Map<string, string>();
   for (const entry of await readdir(root, { recursive: true, withFileTypes: true })) {
@@ -81,7 +80,6 @@ async function seed(state: string): Promise<Seeded> {
       thread: { id: "invented-thread", title: "Invented imported thread", cwd: "/workspace/example", created_at: 1, updated_at: 2,
         forked_from_id: null, parent_thread_id: null, version: "thread-v1", version_reliable: true, archived: false },
       items: [item], next_cursor: null, complete: true, gaps: [] });
-    // A large unreferenced asset widens the window in which a killed backup is still publishing.
     const large = randomBytes(16 * 1024 * 1024); await writeFile(join(assets, sha256(large)), large, { mode: 0o600 });
 
     const feedback = new FeedbackStore(state, app.tasks);
@@ -166,7 +164,6 @@ test("an offline backup restores into a new directory that the production coordi
     }
     return Buffer.concat(chunks);
   }
-  /** Everything a client reads back through the production coordinator's own consumers. */
   async function readBack(state: string, seeded: Seeded) {
     const tasks = [];
     for (const taskId of [seeded.taskId, seeded.scheduledTaskId]) {
@@ -194,7 +191,6 @@ test("an offline backup restores into a new directory that the production coordi
     await writeFile(join(original, "auth.json"), JSON.stringify({ invented: { type: "api_key", key: "invented-not-a-credential" } }), { mode: 0o600 });
     await writeFile(join(original, "invented-unknown.txt"), "An unknown file is reported, never copied.\n", { mode: 0o600 });
 
-    // Baseline readback from the original store through the production coordinator.
     let server = await start(original, plainConfig); await ready(server, original);
     const baseline = await readBack(original, seeded);
     assert.equal(baseline.attachment, seeded.attachment.sha256);
@@ -203,12 +199,10 @@ test("an offline backup restores into a new directory that the production coordi
     assert.ok(importedText.includes("zirconium connector") && !importedText.includes("Bounded excerpt only."), "the original store renders its retained cold original");
     const coordinatorId = await readFile(join(original, "coordinator-id"), "utf8");
 
-    // A live coordinator owns the writer lock, so an offline backup refuses.
     refused(await cli(["--state-dir", original, "backup", "create", archive]), /Another agent process owns this state directory/, "backup of a live coordinator");
     assert.equal(await exists(archive), false, "a refused backup publishes nothing");
     await stop(server);
 
-    // A surviving Pi child keeps the lock after its Rust supervisor dies.
     const linger = join(directory, "linger.mjs");
     await writeFile(linger, `import { createInterface } from "node:readline";
       setInterval(() => {}, 1000);
@@ -228,7 +222,7 @@ test("an offline backup restores into a new directory that the production coordi
     process.kill(-supervisor.child.pid!, "SIGKILL");
     await rm(join(original, "agent.sock"), { force: true });
 
-    // A real offline backup.
+    const beforeBackup = await fingerprint(original);
     let created: Run | undefined;
     for (const deadline = Date.now() + 10_000; ;) {
       created = await cli(["--state-dir", original, "--json", "backup", "create", archive]);
@@ -239,7 +233,15 @@ test("an offline backup restores into a new directory that the production coordi
     const receipt = JSON.parse(created.stdout) as { coordinator_id: string; archive: string; files: number; bytes: number; not_included: string[] };
     assert.equal(receipt.coordinator_id, coordinatorId);
     assert.ok(receipt.files >= 6 && receipt.bytes > 16 * 1024 * 1024, created.stdout);
-    assert.ok(receipt.not_included.includes("invented-unknown.txt"), "unknown state is reported, not copied");
+    assert.deepEqual(receipt.not_included, ["invented-unknown.txt"], "every name the production coordinator wrote is classified; unknown state is reported, not copied");
+    const afterBackup = await fingerprint(original);
+    for (const [path, digest] of beforeBackup) assert.equal(afterBackup.get(path), digest, `a backup leaves ${path} byte-identical`);
+    for (const [path, digest] of afterBackup) {
+      if (!beforeBackup.has(path)) {
+        assert.ok(path === "session.sqlite-shm" || (path === "session.sqlite-wal" && digest === sha256(Buffer.alloc(0))),
+          `a backup adds only SQLite's read-only bookkeeping to the original store, not ${path}`);
+      }
+    }
     const manifest = JSON.parse(await readFile(join(archive, "manifest.json"), "utf8")) as { format: number; coordinator_id: string;
       database_integrity: string; sqlite_schema_version: number; files: { path: string; kind: string; size: number; sha256: string }[] };
     assert.equal(manifest.format, 1); assert.equal(manifest.coordinator_id, coordinatorId); assert.equal(manifest.database_integrity, "ok");
@@ -255,7 +257,6 @@ test("an offline backup restores into a new directory that the production coordi
     }
     refused(await cli(["--state-dir", original, "backup", "create", archive]), /already exists/, "backup over an existing archive");
 
-    // A killed backup never publishes a partial archive, and a rerun still succeeds.
     const killedArchive = join(directory, "killed");
     const killed = spawn(binary, ["--runtime", runtime, "--state-dir", original, "backup", "create", killedArchive],
       { cwd: directory, env, stdio: "ignore" });
@@ -283,7 +284,6 @@ test("an offline backup restores into a new directory that the production coordi
       assert.equal(rerun.code, 0, rerun.stderr);
     }
 
-    // The original disappears, so every restored read comes from the restored store alone.
     const originalFiles = await fingerprint(original);
     await rename(original, moved);
 
@@ -326,7 +326,6 @@ test("an offline backup restores into a new directory that the production coordi
     assert.deepEqual(await readdir(occupied), ["keep.txt"]);
     assert.equal(await readFile(join(occupied, "keep.txt"), "utf8"), "Existing invented state.\n");
 
-    // Restore into an existing empty directory is allowed.
     await mkdir(restored, { mode: 0o700 });
     const restore = await cli(["backup", "restore", archive, restored]);
     assert.equal(restore.code, 0, restore.stderr);
@@ -339,7 +338,6 @@ test("an offline backup restores into a new directory that the production coordi
     assert.ok(await exists(join(restored, "restore-hold.json")), "a restored store starts held");
     assert.deepEqual(await fingerprint(moved), originalFiles, "restore never touches the old store");
 
-    // Held: reads work, background work stays off, so the configured job is never synced.
     server = await start(restored, jobConfig); await ready(server, restored);
     const restoredRead = await readBack(restored, seeded);
     assert.deepEqual(restoredRead, baseline, "the restored store reads identical history, receipts, assets, attachments and feedback");

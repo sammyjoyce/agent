@@ -1,15 +1,3 @@
-//! Offline coordinator backups.
-//!
-//! An archive is `manifest.json` plus `data/<path relative to the state
-//! directory>`. Both commands write into a private sibling staging directory
-//! that becomes the destination by one rename that cannot replace a store, so
-//! a killed run leaves only a dot-named directory.
-//!
-//! `StateFile` is the one grammar of carried paths. `create` uses it to decide
-//! what to copy and `restore` to parse manifest paths, and every path is
-//! derived from a parsed value, so a manifest cannot name a location outside
-//! the grammar.
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{CString, OsString},
@@ -84,7 +72,6 @@ pub fn create(state: &Path, destination: &Path, runtime: &Path) -> Result<Create
         )?;
         records.push(FileRecord::new(file.clone(), written));
     }
-    // Last, so a refused file never lets SQLite touch the source's WAL bookkeeping.
     let snapshot = data.join(StateFile::Database.relative_path());
     let database = helper
         .run(&DatabaseRequest::Snapshot {
@@ -394,7 +381,6 @@ impl DatabaseHelper {
     }
 }
 
-/// One durable file a backup carries. Serialized as its relative path.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 enum StateFile {
@@ -448,7 +434,6 @@ impl StateFile {
         }
     }
 
-    /// The directories `create` descends into on the way to a carried file.
     fn is_carried_directory(relative: &str) -> bool {
         let components: Vec<&str> = relative.split('/').collect();
         match components.as_slice() {
@@ -506,9 +491,6 @@ impl From<StateFile> for String {
     }
 }
 
-/// A hyphenated UUID spelled exactly as the runtime named the file. The
-/// runtime accepts either case and derives paths from the text, so the text is
-/// kept verbatim.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct UuidName(String);
 
@@ -532,7 +514,6 @@ impl UuidName {
 struct Sha256Digest([u8; 32]);
 
 impl Sha256Digest {
-    /// Lowercase only, like the importer's asset names.
     fn parse(text: &str) -> Option<Self> {
         if !text
             .bytes()
@@ -578,7 +559,6 @@ struct Manifest {
     files: Vec<FileRecord>,
 }
 
-/// A damaged snapshot is never published, so `ok` is the only claim.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum DatabaseIntegrity {
@@ -594,8 +574,6 @@ struct FileRecord {
     sha256: Sha256Digest,
 }
 
-/// Read before the strict parse, so a newer archive reads as unsupported
-/// rather than malformed.
 #[derive(Deserialize)]
 struct FormatProbe {
     format: u32,
@@ -727,8 +705,6 @@ impl FileRecord {
     }
 }
 
-/// Every top-level name a coordinator writes. A name missing here is reported
-/// as not included and never read.
 const STATE_ENTRIES: &[(EntryName, Disposition)] = &[
     (EntryName::Exact("session.sqlite"), Disposition::Carried),
     (EntryName::Exact("coordinator-id"), Disposition::Carried),
@@ -766,10 +742,8 @@ enum EntryName {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Disposition {
     Carried,
-    /// SQLite's own WAL bookkeeping, already inside the snapshot.
     DatabaseLog,
     Credential,
-    /// Rebuilt by background work, or meaningful only to the process that wrote it.
     Local,
 }
 
@@ -788,7 +762,6 @@ struct Inventory {
     not_included: Vec<String>,
 }
 
-/// What the store already guarantees about a file's bytes, checked while copying.
 #[derive(Clone, Copy, Debug)]
 struct Promise {
     sha256: Sha256Digest,
@@ -813,8 +786,6 @@ impl fmt::Display for PromisedBy {
     }
 }
 
-/// The fields of `attachments/<id>/metadata.json` a backup relies on. The
-/// runtime owns the file, so other fields are ignored.
 #[derive(Deserialize)]
 struct AttachmentMetadata {
     attachment: AttachmentRef,
@@ -882,8 +853,6 @@ impl Inventory {
         Ok(())
     }
 
-    /// Incomplete uploads are transient staging and stay behind. A complete
-    /// attachment travels whole, its content promised by its metadata.
     fn admit_attachments(&mut self, state: &Path) -> Result<()> {
         let ids: BTreeSet<UuidName> = self
             .files
@@ -950,7 +919,6 @@ fn sorted_names(directory: &Path) -> Result<Vec<OsString>> {
     Ok(names)
 }
 
-/// The runtime's writers stage `.<uuid>` and `*.tmp` files before a rename.
 fn is_writer_temporary(relative: &str) -> bool {
     let name = relative.rsplit('/').next().unwrap_or(relative);
     name.starts_with('.') || name.ends_with(".tmp")
@@ -1073,7 +1041,6 @@ enum Existing {
     EmptyDirectory,
 }
 
-/// A private sibling of the destination, removed on drop unless published.
 struct Staging {
     root: PathBuf,
     directories: BTreeSet<PathBuf>,
@@ -1148,8 +1115,6 @@ fn private_directory(path: &Path) -> Result<()> {
         .with_context(|| format!("Could not create {}", path.display()))
 }
 
-/// Every ancestor directory of `files`, relative, excluding the root. Sorted,
-/// so a parent precedes its children.
 fn directories(files: impl Iterator<Item = PathBuf>) -> BTreeSet<PathBuf> {
     files
         .flat_map(|file| {
@@ -1203,7 +1168,6 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Unlike `state::directory`, never creates the directory.
 fn existing_private_directory(state: &Path) -> Result<()> {
     let metadata = match fs::metadata(state) {
         Ok(metadata) => metadata,
@@ -1289,7 +1253,6 @@ fn now_ms() -> Result<u64> {
     )?)
 }
 
-/// Written for the operator; `restore_held` reads only its existence.
 #[derive(Serialize)]
 struct RestoreHold {
     coordinator_id: CoordinatorId,
@@ -1572,7 +1535,6 @@ mod tests {
         assert!(!abandoned.exists());
     }
 
-    /// A stopped store with a runtime whose SQLite helper fails if it ever runs.
     fn stopped_store() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let root = tempfile::tempdir().unwrap();
         let state = root.path().join("state");
@@ -1632,6 +1594,36 @@ mod tests {
             fs::write(folder.join("content"), "tampered invented bytes").unwrap();
             folder.join("content")
         });
+    }
+
+    #[test]
+    fn incomplete_uploads_and_content_without_metadata_stay_behind() {
+        let (_root, state, _) = stopped_store();
+        let pending = state.join("attachments").join(ID);
+        fs::create_dir_all(&pending).unwrap();
+        let metadata = serde_json::json!({
+            "attachment": {"id": ID, "name": "draft.txt", "media_type": "text/plain",
+                "size_bytes": 7, "sha256": "ab".repeat(32)},
+            "retained": true, "complete": false, "created": 1,
+        });
+        fs::write(pending.join("metadata.json"), metadata.to_string()).unwrap();
+        fs::write(pending.join("content"), "partial").unwrap();
+        let orphan = state
+            .join("attachments")
+            .join("1f5a3c2e-7b1d-4e8f-9a6b-1c2d3e4f5a6b");
+        fs::create_dir_all(&orphan).unwrap();
+        fs::write(orphan.join("content"), "orphaned").unwrap();
+
+        let inventory = Inventory::scan(&state).unwrap();
+        assert_eq!(
+            inventory.files.keys().cloned().collect::<Vec<_>>(),
+            vec![StateFile::Database, StateFile::CoordinatorId]
+        );
+        assert!(
+            inventory.not_included.is_empty(),
+            "{:?}",
+            inventory.not_included
+        );
     }
 
     #[test]

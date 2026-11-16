@@ -47,14 +47,9 @@ pub struct RuntimeNotice {
     pub event: RuntimeEventKind,
 }
 
-/// Exclusive ownership of one state directory. The coordinator, the Pi child
-/// it hands the lock to, and the offline backup commands all take it here, so
-/// they refuse each other with the same message.
 pub struct WriterLock(File);
 
 impl WriterLock {
-    /// Non-blocking. Fails while anyone holds the lock, a Pi child that
-    /// outlived its supervisor included.
     pub fn acquire(state: &Path) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
