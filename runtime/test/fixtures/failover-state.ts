@@ -3,13 +3,15 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { TestContext } from "node:test";
+import { after, type TestContext } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { SqliteDatabase } from "@earendil-works/chord/sqlite";
 import { createModels, fauxProvider } from "@earendil-works/pi-ai";
 import { createRegistry, Harness, type Registry, type Storage, type StorageWrite } from "@earendil-works/pi-durable";
 import { openConversationDatabase } from "../../src/conversation-database.js";
+import { AuthorityClient } from "../../src/failover/authority-client.js";
 import type { AuthorityLink } from "../../src/failover/authority-link.js";
+import { commandHolder } from "../../src/failover/authority-wire.js";
 import { sha256Hex } from "../../src/failover/log-entry.js";
 import { openReplicatedStorage, type StagedFile } from "../../src/failover/replicated-storage.js";
 import { ScopedDatabase } from "../../src/failover/scoped-database.js";
@@ -19,6 +21,7 @@ import type { AuthorityState } from "../../src/generated/AuthorityState.js";
 import type { LogEntry } from "../../src/generated/LogEntry.js";
 import { fixtureModel } from "../model.js";
 import { MemoryAuthority } from "./failover-memory-authority.js";
+import { startAuthority, type LocalAuthority } from "./failover-workerd.js";
 
 export const OWNER = "11111111-1111-4111-8111-111111111111";
 export const STANDBY = "22222222-2222-4222-8222-222222222222";
@@ -27,11 +30,51 @@ export const STANDBY = "22222222-2222-4222-8222-222222222222";
 export type TestAuthority = AuthorityLink & Pick<MemoryAuthority, "before" | "after">;
 
 /**
- * Every failover case runs once per entry. Add the Worker on local workerd
- * here to run the same cases against the deployed rules.
+ * The Worker over HTTP with the same two stops: before a command leaves, and
+ * after the Worker applied it. Each command goes out under its own holder's
+ * credential, as it does from that holder's host.
  */
+class HookedLink implements TestAuthority {
+  before: TestAuthority["before"] = () => {};
+  after: TestAuthority["after"] = () => {};
+  constructor(private readonly reader: AuthorityLink, private readonly as: (holder: string) => AuthorityLink) {}
+  async command(command: AuthorityCommand) {
+    await this.before(command);
+    const reply = await this.as(commandHolder(command)).command(command);
+    await this.after(command);
+    return reply;
+  }
+  record() { return this.reader.record(); }
+  log(after: number, limit: number) { return this.reader.log(after, limit); }
+  putBlob(sha256: string, bytes: Uint8Array) { return this.reader.putBlob(sha256, bytes); }
+  getBlob(sha256: string) { return this.reader.getBlob(sha256); }
+}
+
+const workerCoordinators = Array.from({ length: 48 }, (_, index) => `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`);
+let worker: Promise<LocalAuthority> | undefined;
+let workerLinks = 0;
+// Registered while the test file loads, so the Worker outlives the test that first asks for it.
+after(async () => { await (await worker)?.stop(); });
+
+/** A coordinator nobody has enrolled, on one Worker under local workerd that the test file shares. */
+async function workerAuthority(): Promise<TestAuthority> {
+  worker ??= startAuthority({ context: { after: () => {} },
+    grants: workerCoordinators.flatMap((coordinator) => [OWNER, STANDBY].map((holder) => ({ coordinator, holder }))) });
+  const { url, credentials } = await worker;
+  const coordinatorId = workerCoordinators[workerLinks++];
+  if (coordinatorId === undefined) throw new Error("The test file ran out of Worker coordinators");
+  const as = (holder: string) => {
+    const credential = credentials.find((candidate) => candidate.coordinator === coordinatorId && candidate.holder === holder);
+    if (credential === undefined) throw new Error(`The fixture holds no credential for holder ${holder}`);
+    return new AuthorityClient({ url, coordinatorId, token: credential.token });
+  };
+  return new HookedLink(as(OWNER), as);
+}
+
+/** Every failover case runs once per entry: against the rules in process, and against the Worker that deploys them. */
 export const authorities: Record<string, () => TestAuthority | Promise<TestAuthority>> = {
   "memory authority": () => new MemoryAuthority(),
+  "Worker on local workerd": workerAuthority,
 };
 
 export async function stateDirectory(t: TestContext): Promise<string> {
