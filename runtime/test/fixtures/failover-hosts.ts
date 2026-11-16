@@ -117,6 +117,13 @@ export class Host {
 
   failover(...command: string[]): Promise<Run> { return this.start(...command).done; }
 
+  /** Runs a command that must succeed without `--json` and returns what it prints for a person. */
+  async plain(...command: string[]): Promise<string> {
+    const run = await this.world.spawn([...this.arguments(true), "failover", ...command], this.home).done;
+    assert.equal(run.code, 0, `failover ${command.join(" ")} failed: ${run.stderr}`);
+    return run.stdout;
+  }
+
   /** Runs a command that must succeed and returns its receipt. */
   async receipt<T>(...command: string[]): Promise<T> {
     const run = await this.failover(...command);

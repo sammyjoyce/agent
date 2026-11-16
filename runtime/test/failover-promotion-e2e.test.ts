@@ -15,6 +15,7 @@ import { fixtureModel } from "./model.js";
 
 const [OWNER, STANDBY] = HOLDERS;
 const STATEMENT = "Invented: the old host lost power at 09:14, and \"nobody\" can reach it";
+const FEEDBACK = "feedback/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.json";
 const held = (state: string) => exists(join(state, "restore-hold.json"));
 
 /** The owner claims a start, begins a tool call that never returns, and claims a phone notification it never finishes. */
@@ -119,6 +120,34 @@ test("promotion moves ownership to a standby only on stop evidence", { timeout: 
       unreadable: [] });
     assert.deepEqual((await standby.receipt<StatusReceipt>("status")).record?.state, { kind: "active", epoch: epoch + 1, holder: STANDBY, head });
     assert.deepEqual(tables(standby.state), tables(owner.state));
+  });
+
+  await t.test("a standby whose replicated file is damaged is not activated", async () => {
+    const { owner, standby, epoch, head } = await replicatedPair(world);
+    await standby.receipt("follow", "--once");
+    await writeFile(join(standby.state, FEEDBACK), "Invented damage");
+    const refused = await standby.failover("promote", "--replace-epoch", String(epoch), "--old-owner-stopped", STATEMENT);
+    assert.notEqual(refused.code, 0);
+    assert.match(refused.stderr, new RegExp(`${FEEDBACK.replaceAll(".", "\\.")} in .* does not match the record the log holds for it`));
+    assert.deepEqual(await owner.authorityState(),
+      { kind: "vacant", epoch, candidate: STANDBY, evidence: { kind: "operator_attested", statement: STATEMENT }, head }, "nobody was activated");
+    assert.equal(await held(standby.state), true);
+
+    const back = await owner.receipt<PromotedReceipt>("promote", "--replace-epoch", String(epoch));
+    assert.equal(back.holder, OWNER, "the old owner can still take ownership back");
+    assert.deepEqual(await owner.authorityState(), { kind: "active", epoch: epoch + 1, holder: OWNER, head });
+  });
+
+  await t.test("the report a person reads carries the statement word for word and what to do next", async () => {
+    const { coordinator, standby, epoch, head } = await replicatedPair(world);
+    const report = await standby.plain("promote", "--replace-epoch", String(epoch), "--old-owner-stopped", STATEMENT);
+    assert.ok(report.includes(`Holder ${STANDBY} owns coordinator ${coordinator} at epoch ${epoch + 1}. The sealed log head is ${head}.`), report);
+    assert.ok(report.includes(`Stop evidence: the operator stated: ${STATEMENT}`), report);
+    assert.ok(report.includes("This host lacks credentials that do not replicate: auth.json, [apns]."), report);
+    assert.ok(report.includes("Start the coordinator with `beep-boop serve`."), report);
+    const status = await standby.plain("status");
+    assert.ok(status.includes(`Coordinator ${coordinator} is active at epoch ${epoch + 1}, owned by holder ${STANDBY}. The log head is ${head}`), status);
+    assert.ok(status.includes(`holds the log through position ${head}.`), status);
   });
 
   await t.test("a sealed holder that restarts releases by itself and exits 75", async () => {
