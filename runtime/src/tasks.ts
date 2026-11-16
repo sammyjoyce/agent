@@ -88,6 +88,7 @@ type TaskActor = { readonly ref: ActorRef; readonly mode: ActorMode; readonly ex
   readonly bound: Promise<void>; started(): void; readonly exit: Promise<ActorAnswer>; wake?: () => void; drained?: () => void };
 type ActorPlacement = { type: "placed"; host: WorkerHost } | { type: "host_at_start" } | { type: "unplaced" | "host_offline"; reason: string };
 function isAbortedJob(actor: TaskActor): boolean { return actor.mode === "job" && actor.turn.controller.signal.aborted; }
+const STOPPED_INPUT_WITHDRAWN = "The stopped turn withdrew this input; submit it again to continue.";
 function recordedHostId(worker: Exclude<WorkerState, { state: "unassigned" }>): string | null {
   return worker.host.host_id ?? ("binding" in worker ? worker.binding.host_id : null);
 }
@@ -330,31 +331,37 @@ export class TaskStore {
     }
     return actor.turn.finished;
   }
-  /** A job actor ends and withdraws its unplaced inputs. An interactive actor loses its current turn only. */
+  /** Withdraws the inputs that have not reached Pi, and returns their ids. An input already in Pi is left to Pi's abort. */
+  private withdrawUnplaced(ref: ActorRef, conversation: Conversation, inputs: readonly { id: string }[]): Promise<string[]> {
+    return this.session.commit(async (tx) => {
+      const withdrawn: string[] = [];
+      for (const input of inputs) {
+        if (await tx.submissionByRequest(conversation.id, input.id) === undefined) withdrawn.push(input.id);
+      }
+      // App admission can precede native placement during preflight. Keep the
+      // same native unplaced-abort receipt as an ordinarily queued Pi input.
+      for (const requestId of withdrawn) {
+        await tx.createSubmission({ type: "input", conversationId: conversation.id, requestId, status: "unanswered", reason: "aborted" });
+      }
+      if (withdrawn.length > 0) await this.updateIn(tx, ref.task_id, (current) => {
+        const saved = this.actor(current, ref.agent_id);
+        saved.pending = saved.pending.filter((input) => !withdrawn.includes(input.id));
+      });
+      return withdrawn;
+    }, BACKGROUND_CONTEXT);
+  }
+  /**
+   * A job actor ends and withdraws its unplaced inputs. An interactive actor loses its current turn only,
+   * and with it the input of that turn when the input has not reached Pi.
+   */
   async stop(ref: ActorRef): Promise<boolean> {
     const actor = this.running.get(this.actorKey(ref.task_id, ref.agent_id));
     if (actor === undefined) return false;
     switch (actor.mode) {
       case "job": {
-        const task = await this.get(ref.task_id);
-        const { pending, conversation_id } = this.actor(task, ref.agent_id);
+        const { pending, conversation_id } = this.actor(await this.get(ref.task_id), ref.agent_id);
         void this.interrupt(actor).catch(() => {});
-        const conversation = await this.conversation(conversation_id);
-        await this.session.commit(async (tx) => {
-          const withdrawn: string[] = [];
-          for (const input of pending) {
-            if (await tx.submissionByRequest(conversation.id, input.id) === undefined) withdrawn.push(input.id);
-          }
-          // App admission can precede native placement during preflight. Keep the
-          // same native unplaced-abort receipt as an ordinarily queued Pi input.
-          for (const requestId of withdrawn) {
-            await tx.createSubmission({ type: "input", conversationId: conversation.id, requestId, status: "unanswered", reason: "aborted" });
-          }
-          if (withdrawn.length > 0) await this.updateIn(tx, task.id, (current) => {
-            const saved = this.actor(current, ref.agent_id);
-            saved.pending = saved.pending.filter((input) => !withdrawn.includes(input.id));
-          });
-        }, BACKGROUND_CONTEXT);
+        await this.withdrawUnplaced(ref, await this.conversation(conversation_id), pending);
         await actor.exit.catch(() => {});
         return true;
       }
@@ -1525,6 +1532,9 @@ export class TaskStore {
     let recoverPrevious = true;
     const published = new Set<string>();
     const scope = () => active.turn.controller.signal;
+    // The turn that was current when the work in hand began. reopenTurn replaces a stopped turn,
+    // so only this still shows a Stop that landed before the selected input reached Pi.
+    let turnInHand: AbortController | undefined = active.turn.controller;
     try {
       let task = await this.get(input.task_id);
       let actor = this.actor(task, input.agent_id);
@@ -1574,6 +1584,8 @@ export class TaskStore {
       active.started();
       this.session.resume();
       while (true) {
+        await this.reopenTurn(active);
+        turnInHand ??= active.turn.controller;
         await this.turnBoundary(active);
         if (active.fenced || isAbortedJob(active)) break;
         active.busy = true;
@@ -1622,7 +1634,7 @@ export class TaskStore {
             childResultPending = false;
           }
           if (active.revision !== revision) continue;
-          active.busy = false;
+          active.busy = false; turnInHand = undefined;
           if (!this.hasInteractiveObserver(active)) break;
           this.publish(active, (session) => session.idle());
           while (active.revision === revision && this.hasInteractiveObserver(active) && !active.fenced) {
@@ -1668,6 +1680,12 @@ export class TaskStore {
         const prepared = await this.prepareInput(conversation, next.content, next.attachments, active.call, next.origin, next.sender);
         await this.reopenTurn(active);
         if (active.fenced || isAbortedJob(active)) break;
+        const stopped = turnInHand.signal.aborted; turnInHand = undefined;
+        if (stopped && (await this.withdrawUnplaced(input, conversation, [next])).length > 0) {
+          if (next.mode !== undefined) this.publish(active, (session) => session.rejected?.(next.id, STOPPED_INPUT_WITHDRAWN));
+          childResultPending = false;
+          continue;
+        }
         const submission = await conversation.submit({ type: "input", ...prepared, requestId: next.id,
           whenBusy: next.mode === "steer" ? "steer" : "followUp" }, BACKGROUND_CONTEXT);
         active.nativeActive = true;
@@ -1683,7 +1701,7 @@ export class TaskStore {
         if (settled.type === "input" && settled.status === "unanswered" && settled.reason === "aborted" &&
             (active.mode === "interactive" || settled.entry === undefined)) {
           if (settled.entry === undefined && next.mode !== undefined) {
-            this.publish(active, (session) => session.rejected?.(next.id, "The stopped turn withdrew this input; submit it again to continue."));
+            this.publish(active, (session) => session.rejected?.(next.id, STOPPED_INPUT_WITHDRAWN));
           }
           await conversation.waitForIdle(BACKGROUND_CONTEXT);
           childResultPending = false;
