@@ -21,7 +21,7 @@ import { ConversationViews } from "./conversation-views.js";
 import { Observation } from "./observation.js";
 import { Retrieval } from "./retrieval.js";
 import { FeedbackStore } from "./feedback.js";
-import { LocalFiles } from "./failover/retained-files.js";
+import { LocalFiles, ReplicatedFiles, type RetainedFiles } from "./failover/retained-files.js";
 import { FeedbackDispatcher } from "./feedback-dispatch.js";
 import { createGuidance } from "./guidance.js";
 import { createDreamsTools, createDreamsToolset, isDreamsTask } from "./dreams.js";
@@ -80,6 +80,13 @@ function openStorage(): Promise<Storage> {
   switch (ownership.kind) {
     case "local": return startup.run("storage_open", async () => SqliteStorage.open(await openConversationDatabase(join(state, "session.sqlite"))));
     case "replicated": return Promise.resolve(ownership.storage);
+    default: return ownership satisfies never;
+  }
+}
+function retainedFiles(): RetainedFiles {
+  switch (ownership.kind) {
+    case "local": return new LocalFiles(state);
+    case "replicated": return new ReplicatedFiles(ownership.log, { link: ownership.link, stateDirectory: state, signal: closed.signal });
     default: return ownership satisfies never;
   }
 }
@@ -167,7 +174,7 @@ async function openApplication(): Promise<Application> {
   const notifications = new Notifications(harness, registry, notificationConfig(), undefined, effectGate(ownership));
   const tasks = new TaskStore(harness, inference);
   await startup.run("task_migration", () => tasks.prepare());
-  const files = new LocalFiles(state);
+  const files = retainedFiles();
   const attachments = new AttachmentStore(files); tasks.useAttachments(attachments);
   const environment = new CoordinatorEnvironment(harness); environment.useLiveGuidance(); tasks.useEnvironment(environment);
   const assets = join(state, "history", "assets");

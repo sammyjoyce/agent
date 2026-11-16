@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -19,7 +19,9 @@ import { ScopedDatabase } from "../../src/failover/scoped-database.js";
 import { applyLog } from "../../src/failover/standby.js";
 import type { AuthorityCommand } from "../../src/generated/AuthorityCommand.js";
 import type { AuthorityState } from "../../src/generated/AuthorityState.js";
+import type { FileRecord } from "../../src/generated/FileRecord.js";
 import type { LogEntry } from "../../src/generated/LogEntry.js";
+import { REPLICATED_FILE_ROOTS } from "../../src/generated/replicated-file-roots.js";
 import { fixtureModel } from "../model.js";
 import { manifest, manifestBytes } from "./failover-authority-cells.js";
 import { MemoryAuthority } from "./failover-memory-authority.js";
@@ -85,6 +87,12 @@ export async function filesUnder(directory: string): Promise<string[]> {
     throw error;
   });
   return entries.filter((entry) => entry.isFile()).map((entry) => relative(directory, join(entry.parentPath, entry.name))).sort();
+}
+
+/** Every file under the replicated file trees, by path and SHA-256. */
+export async function retainedFiles(directory: string): Promise<Record<string, string>> {
+  const paths = (await filesUnder(directory)).filter((path) => REPLICATED_FILE_ROOTS.some((root) => path.startsWith(`${root}/`)));
+  return Object.fromEntries(await Promise.all(paths.map(async (path) => [path, sha256Hex(await readFile(join(directory, path)))] as const)));
 }
 
 export async function enroll(link: AuthorityLink, holder = OWNER): Promise<number> {
@@ -170,6 +178,11 @@ export async function logEntries(link: AuthorityLink): Promise<LogEntry[]> {
     if (page.entries.length === 0) return entries;
     entries.push(...page.entries);
   }
+}
+
+/** The newest record of each path the log names. */
+export async function loggedFiles(link: AuthorityLink): Promise<Map<string, FileRecord>> {
+  return new Map((await logEntries(link)).flatMap((entry) => entry.files.map((file) => [file.path, file] as const)));
 }
 
 export async function logBatches(link: AuthorityLink): Promise<StorageWrite[][]> {

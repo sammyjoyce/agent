@@ -16,16 +16,14 @@ import { FeedbackStore } from "../src/feedback.js";
 import type { AgentNode } from "../src/generated/AgentNode.js";
 import type { AttachmentRef } from "../src/generated/AttachmentRef.js";
 import type { FeedbackContext } from "../src/generated/FeedbackContext.js";
-import type { FileRecord } from "../src/generated/FileRecord.js";
 import type { HistoryItem } from "../src/generated/HistoryItem.js";
 import type { HistoryResponse } from "../src/generated/HistoryResponse.js";
 import type { HistoryThread } from "../src/generated/HistoryThread.js";
-import { REPLICATED_FILE_ROOTS } from "../src/generated/replicated-file-roots.js";
 import { HistoryStore } from "../src/history.js";
 import { CodexImporter } from "../src/importer.js";
 import { ConversationModels } from "../src/models.js";
 import { TaskStore, type HostCall } from "../src/tasks.js";
-import { authorities, enroll, filesUnder, follow, logEntries, openOwner, replaceOwner, STANDBY, stateDirectory, type TestAuthority } from "./fixtures/failover-state.js";
+import { authorities, enroll, filesUnder, follow, logEntries, loggedFiles, openOwner, replaceOwner, retainedFiles, STANDBY, stateDirectory, type TestAuthority } from "./fixtures/failover-state.js";
 import { fixtureModel } from "./model.js";
 
 const context = BACKGROUND_CONTEXT;
@@ -75,18 +73,7 @@ function nativeHistory(bytes: Buffer, advertised = sha256Hex(bytes)): HostCall {
 
 const importHistory = (importer: CodexImporter, call: HostCall) => importer.run([historyHost], [historyHost.host_id], [], call, () => {}, async () => {});
 
-/** The newest record of each path the log names. */
-async function loggedFiles(link: TestAuthority): Promise<Map<string, FileRecord>> {
-  return new Map((await logEntries(link)).flatMap((entry) => entry.files.map((file) => [file.path, file] as const)));
-}
-
 const temporaryName = (path: string) => path.split("/").some((name) => name.startsWith(".") || name.endsWith(".tmp"));
-
-/** Every file under the retained trees, by path and SHA-256. */
-async function retainedFiles(directory: string): Promise<Record<string, string>> {
-  const paths = (await filesUnder(directory)).filter((path) => REPLICATED_FILE_ROOTS.some((root) => path.startsWith(`${root}/`)));
-  return Object.fromEntries(await Promise.all(paths.map(async (path) => [path, sha256Hex(await readFile(join(directory, path)))] as const)));
-}
 
 /** The files under the retained trees that a reader takes as real: no temporary name, and an attachment only once its metadata says it is complete. */
 async function finalNamed(directory: string): Promise<string[]> {

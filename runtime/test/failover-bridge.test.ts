@@ -4,9 +4,10 @@ import { test } from "node:test";
 import type { AuthorityLink } from "../src/failover/authority-link.js";
 import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
 import { OWNER_FENCED_EXIT } from "../src/generated/owner-fenced-exit.js";
+import { DEFAULT_MODEL } from "../src/models.js";
 import { chat, failoverCoordinator, startBridge } from "./fixtures/failover-bridge.js";
 import { commands } from "./fixtures/failover-fault-proxy.js";
-import { enroll, follow, logBatches, OWNER, STANDBY, stateDirectory, tables } from "./fixtures/failover-state.js";
+import { enroll, follow, logBatches, loggedFiles, OWNER, retainedFiles, STANDBY, stateDirectory, tables } from "./fixtures/failover-state.js";
 import { until } from "./fixtures/until.js";
 
 /** How many submissions the log holds for the input with this id. Each one is an admission of it. */
@@ -48,6 +49,26 @@ test("the Pi bridge as a replicated owner, against the Worker on local workerd",
     assert.equal(await follow(standby, coordinator.standby), head);
     assert.deepEqual(tables(standby), tables(directory));
     assert.equal(localInputs(standby, "replicated-input"), 1);
+  });
+
+  await t.test("an upload and a feedback capture are in the log before their receipts, and a standby that follows the log holds the owner's retained files", async (t) => {
+    const coordinator = await failoverCoordinator(t), directory = await stateDirectory(t), standby = await stateDirectory(t);
+    const bridge = await startBridge(t, { directory, session: await coordinator.session(OWNER, await enroll(coordinator.owner)) });
+    const bytes = Buffer.from("Invented attachment bytes"), attachment = randomUUID(), feedback = randomUUID();
+    bridge.send(1, { type: "attachment", request: { type: "upload", id: attachment, name: "evidence.txt", media_type: "text/plain", size_bytes: bytes.length,
+      offset: 0, data_base64: bytes.toString("base64"), complete: true } });
+    await bridge.wait(1, (event) => event.type === "attachment" && event.response.type === "uploaded" && event.response.attachment !== null);
+    const uploaded = [`attachments/${attachment}/content`, `attachments/${attachment}/metadata.json`];
+    assert.deepEqual([...(await loggedFiles(coordinator.standby)).keys()].sort(), uploaded, bridge.errors());
+
+    bridge.send(2, { type: "feedback", description: "Invented report about a garden", input_id: feedback, context: { origin_host_id: "33333333-3333-4333-8333-333333333333",
+      cwd: "/example/project", conversation_id: null, task_id: null, agent_id: null, model: DEFAULT_MODEL, binding: null, draft: "", queued_inputs: [], client_errors: [] } });
+    await bridge.wait(2, (event) => event.type === "input_accepted" && event.input_id === feedback);
+    assert.deepEqual([...(await loggedFiles(coordinator.standby)).keys()].sort(), [...uploaded, `feedback/${feedback}.json`, "feedback/latest"], bridge.errors());
+
+    assert.equal(await follow(standby, coordinator.standby), (await coordinator.reader.record())?.state.head);
+    assert.deepEqual(await retainedFiles(standby), await retainedFiles(directory));
+    assert.deepEqual(Object.keys(await retainedFiles(standby)).sort(), [...uploaded, `feedback/${feedback}.json`, "feedback/latest"]);
   });
 
   await t.test("without a session the bridge asks the authority nothing and keeps no replication position", async (t) => {
