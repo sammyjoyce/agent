@@ -214,10 +214,11 @@ export async function failoverWorld(t: TestContext, options: WorldOptions = {}) 
     },
     /** Starts `serve` on a host that is expected to be refused, and returns the process. */
     starting(host: CoordinatorHost): OwnedProcess { return host.serving = launch(host, SERVE); },
-    /** Stops a coordinator as an operator does and returns its exit status. */
+    /** Asks a coordinator's supervisor to stop, as a service manager does, and returns its exit status. */
     async stop(host: CoordinatorHost): Promise<number | null> {
-      signalGroup(host, "SIGINT");
-      return host.serving!.exited;
+      assert.ok(host.serving, `the ${host.name} has no coordinator to stop`);
+      host.serving.child.kill("SIGINT");
+      return host.serving.exited;
     },
     /** Kills the supervisor, its Pi child and their helpers at once, as a host that loses power does. */
     async crash(host: CoordinatorHost): Promise<void> {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { readFile, rename } from "node:fs/promises";
+import { readdir, readFile, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { isDeepStrictEqual } from "node:util";
@@ -139,4 +139,32 @@ test("a planned handover with inputs, a tool call on a worker, an attachment, fe
   assert.ok(bundle.some((event) => event.type === "feedback" && event.bundle.id === feedback && event.bundle.description === "Invented report about a garden"), JSON.stringify(bundle));
   assert.equal(await read(standby), original, "the new owner reads the cold original from its own directory, with the old owner's home moved away");
   assert.equal(world.pushes().length, 2, "the new owner sends no push the old owner already sent");
+});
+
+test("backup create knows every entry in a replicated owner's stopped state directory and in a standby's", { timeout: 120_000 }, async (t) => {
+  const world = await failoverWorld(t), { owner, standby, worker, until } = world;
+  await world.enroll();
+  const serving = await world.serve(owner);
+  world.work();
+  await world.online(owner, [worker.nodeId]);
+  const bytes = Buffer.from("Invented attachment bytes for the backup"), attachment = randomUUID();
+  const uploaded = await world.request(owner, { type: "attachment", request: { type: "upload", id: attachment, name: "evidence.txt", media_type: "text/plain",
+    size_bytes: bytes.length, offset: 0, data_base64: bytes.toString("base64"), complete: true } });
+  const receipt = uploaded.flatMap((event) => event.type === "attachment" && event.response.type === "uploaded" && event.response.attachment !== null ? [event.response.attachment] : [])[0];
+  assert.ok(receipt, JSON.stringify(uploaded));
+  await world.script("fixture-backup", [{ tool: "exec", args: { program: process.execPath, args: effect } }, { text: "Ran before the backup." }]);
+  assert.deepEqual(answers(await world.send(owner, "fixture-backup", { attachments: [receipt] })), ["Ran before the backup."]);
+  await world.request(owner, { type: "feedback", description: "Invented report about a garden", input_id: randomUUID(), context: {
+    origin_host_id: "33333333-3333-4333-8333-333333333333", cwd: owner.home, conversation_id: null, task_id: null, agent_id: null, model: DEFAULT_MODEL,
+    binding: null, draft: "", queued_inputs: [], client_errors: [] } });
+  await world.join();
+  await until(async () => (await world.follow()).applied === (await world.record())?.state.head, "The standby must reach the owner's head");
+  assert.equal(await world.stop(owner), 0, serving.errors().slice(-1500));
+
+  for (const host of [owner, standby]) {
+    const created = world.launch(host, ["backup", "create", join(world.directory, `backup-of-${host.name}`)], "");
+    assert.equal(await created.exited, 0, created.errors());
+    const { not_included: unknown } = JSON.parse(created.output()) as { not_included: string[] };
+    assert.deepEqual(unknown, [], `backup create must know every entry in the ${host.name}'s state directory: ${(await readdir(host.state)).join(", ")}`);
+  }
 });
