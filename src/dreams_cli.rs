@@ -7,11 +7,12 @@ use std::{
 use agent_cli::{
     config::ClientConfig,
     dreams::{
-        Abstention, CheckPhase, ContentDigest, DreamsPolicy, DreamsStore, EvidenceItem, FileChange,
-        MAX_ATTEMPTS, Outcome, Proposal, ProposedFile, Review, Revision, RunId, RunView,
-        check_lines, escape_controls, format_utc, quote, review_summary,
+        Abstention, CheckPhase, ContentDigest, DreamsPolicy, DreamsStore, EvidenceId, EvidenceItem,
+        FileChange, MAX_ATTEMPTS, Outcome, Proposal, ProposedFile, Review, Revision, RunId,
+        RunView, check_lines, escape_controls, format_utc, quote, review_summary,
         workspace::{Git, plain_changes},
     },
+    protocol::TASK_SUMMARY_MAX_UTF16_UNITS,
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::Subcommand;
@@ -483,6 +484,36 @@ fn apply_command(view: &RunView) -> Option<String> {
     }
 }
 
+/// A whole ASCII task summary prints uncut.
+const SHOWN_EVIDENCE_BYTES: usize = TASK_SUMMARY_MAX_UTF16_UNITS;
+/// Four whole summaries, so twenty citations still leave the patch a short scroll away.
+const SHOWN_EVIDENCE_TOTAL_BYTES: usize = 4 * SHOWN_EVIDENCE_BYTES;
+
+fn cited_evidence(lines: &mut Vec<String>, cited: &[EvidenceId], reviewed: &[EvidenceItem]) {
+    lines.push("Cited evidence (untrusted, quoted):".into());
+    let mut budget = SHOWN_EVIDENCE_TOTAL_BYTES;
+    for id in cited {
+        lines.push(format!("evidence {}", escape_controls(id.as_str())));
+        let Some(item) = reviewed.iter().find(|item| &item.id == id) else {
+            lines.push("[not in the sealed review]".into());
+            continue;
+        };
+        let shown = item
+            .body
+            .floor_char_boundary(SHOWN_EVIDENCE_BYTES.min(budget));
+        budget -= shown;
+        if shown > 0 {
+            quote(lines, &item.body[..shown]);
+        }
+        if shown < item.body.len() {
+            lines.push(format!(
+                "[... {} more bytes; dreams show --json has the exact record]",
+                item.body.len() - shown
+            ));
+        }
+    }
+}
+
 fn render(report: &RunReport) -> String {
     let review = report.review;
     let mut lines = vec![format!(
@@ -523,8 +554,6 @@ fn render(report: &RunReport) -> String {
                 proposal.patch_sha256,
                 proposal.files.join(", ")
             ));
-            let evidence: Vec<&str> = proposal.evidence.iter().map(|id| id.as_str()).collect();
-            lines.push(format!("Evidence: {}", evidence.join("  ")));
             if let Some(status) = report.status {
                 lines.push(format!("Status: {}", status.explain()));
             }
@@ -533,6 +562,7 @@ fn render(report: &RunReport) -> String {
             }
             lines.push("Rationale (model-written, untrusted):".into());
             quote(&mut lines, proposal.rationale.as_str());
+            cited_evidence(&mut lines, &proposal.evidence, report.evidence);
             lines.push("--- patch ---".into());
             lines.push(
                 escape_controls(report.patch.unwrap_or_default())

@@ -521,9 +521,11 @@ beep-boop dreams apply RUN --approve sha256:OUTCOME_DIGEST
 
 `dreams list` shows each run's window, coverage, outcome and status.
 `dreams show RUN` prints the coverage gaps, the before and after check results,
-the cited evidence, the rationale, the patch, and the exact `apply` command.
-Text that a model wrote is labeled and quoted. Control characters and Unicode
-format characters, such as bidirectional overrides and zero-width characters,
+the rationale, the body of each cited piece of evidence, the patch, and the
+exact `apply` command. It prints at most 4,000 bytes of each evidence body and
+16,000 bytes of evidence in all, and says how many bytes it left out. Evidence
+and text that a model wrote are labeled and quoted. Control characters and
+Unicode format characters, such as bidirectional overrides and zero-width characters,
 are shown as escapes in that text and in the patch, so the patch you read is
 the patch that `apply` commits. Add `--json` for the typed record, which keeps
 the exact bytes. These commands read the
