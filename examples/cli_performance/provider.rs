@@ -312,7 +312,7 @@ async fn respond(
     })
 }
 
-const TOOL_SCRIPT: &str = "require('node:fs').writeFileSync(process.argv[1], String(process.pid)); const parent = process.ppid; setInterval(() => { if (process.ppid !== parent) process.exit(1); }, 200);";
+const TOOL_SCRIPT: &str = "const [pidFile, owner] = process.argv.slice(1); const owned = () => process.ppid === Number(owner); if (!owned()) process.exit(1); require('node:fs').writeFileSync(pidFile, String(process.pid)); setInterval(() => { if (!owned()) process.exit(1); }, 200);";
 
 fn with(base: &Value, extra: Value) -> Value {
     let mut merged = base.clone();
