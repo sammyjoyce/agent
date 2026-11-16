@@ -171,8 +171,9 @@ A sample fails, and the run with it, when any of these happen:
   responses that completed inside the measured window.
 - A launch or scroll scenario contacts the provider.
 - A background search fails or misses the long conversation, none finishes
-  before Enter, or at some moment between Enter and visible activity no
-  search is outstanding.
+  before Enter, or between Enter and visible activity no search is
+  outstanding for more than 1 ms. A shorter gap is a loop sending its next
+  search after the runtime answered every loop at once.
 - The import fails, commits no item before Enter, or commits no new item after
   activity is visible. The error then asks for a larger corpus.
 

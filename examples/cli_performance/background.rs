@@ -1,9 +1,11 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::gate::{Mark, Marks};
+
+const LONGEST_SEARCH_LOOP_TURNAROUND: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,8 +84,8 @@ fn searched(requests: &[SearchRequest], (enter, end): (Instant, Instant)) -> Res
             continue;
         }
         ensure!(
-            sent <= covered,
-            "No search was outstanding for {:.1} ms inside the foreground window",
+            sent <= covered + LONGEST_SEARCH_LOOP_TURNAROUND,
+            "No search was outstanding for {:.3} ms inside the foreground window",
             (sent.min(end) - covered).as_secs_f64() * 1000.0
         );
         covered = done;
@@ -188,6 +190,27 @@ mod tests {
     fn a_moment_with_no_outstanding_search_inside_the_window_fails() {
         assert!(search_verdict(&[WARM, (900, 1_100), (1_110, 1_350)]).is_err());
         assert!(search_verdict(&[WARM, (1_010, 1_350)]).is_err());
+    }
+
+    #[test]
+    fn a_loop_turnaround_passes_and_a_longer_pause_fails() {
+        let origin = Instant::now();
+        let verdict = |pause: Duration| {
+            let Evidence::Search(mut requests) =
+                searches(origin, &[WARM, (900, 1_100), (1_100, 1_350)])
+            else {
+                unreachable!()
+            };
+            requests[2].sent = at(origin, 1_100) + pause;
+            verify_overlap(
+                Background::Search,
+                &Evidence::Search(requests),
+                &marks(origin),
+            )
+        };
+        assert!(verdict(Duration::from_nanos(583)).is_ok());
+        assert!(verdict(LONGEST_SEARCH_LOOP_TURNAROUND).is_ok());
+        assert!(verdict(LONGEST_SEARCH_LOOP_TURNAROUND + Duration::from_micros(1)).is_err());
     }
 
     #[test]
