@@ -191,3 +191,25 @@ pub enum HistoryResponse {
 pub trait HistorySource: Send + Sync {
     async fn request(&self, request: HistoryRequest) -> Result<HistoryResponse>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{HistoryBranchState, HistoryItem};
+
+    #[test]
+    fn history_item_without_branch_still_decodes() {
+        let saved = r#"{"id":"item","turn_id":"turn","kind":"userMessage","role":"user","text":"Hello","version":"v1","order":0,"timestamp_ms":null,"data":null,"assets":[]}"#;
+        let item: HistoryItem = serde_json::from_str(saved).unwrap();
+        assert!(item.branch.is_none());
+        assert_eq!(serde_json::to_string(&item).unwrap(), saved);
+        let placed: HistoryItem = serde_json::from_str(&saved.replace(
+            r#""assets":[]"#,
+            r#""assets":[],"branch":{"state":"alternate","alternates":0}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            placed.branch.map(|branch| (branch.state, branch.follows)),
+            Some((HistoryBranchState::Alternate, None))
+        );
+    }
+}

@@ -159,3 +159,60 @@ impl RequestLifecycle {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::RequestLifecycle;
+    use crate::{embeddings::EmbeddingPurpose, history::HistoryRequest, protocol::HostCommand};
+
+    #[test]
+    fn only_an_export_import_reads_history_from_its_client() {
+        let history = HostCommand::History {
+            request: HistoryRequest::List {
+                archived: false,
+                cursor: None,
+            },
+        };
+        let exec = HostCommand::Exec {
+            program: "true".into(),
+            args: Vec::new(),
+            cwd: "/".into(),
+            timeout_seconds: 1,
+            sender_conversation_id: None,
+        };
+        let others = [
+            exec.clone(),
+            HostCommand::ReadFile {
+                path: "/invented".into(),
+                offset: 0,
+                limit: 1,
+                image: None,
+            },
+            HostCommand::WriteFile {
+                path: "/invented".into(),
+                content: String::new(),
+            },
+            HostCommand::OnNode {
+                host_id: "invented-host".into(),
+                command: Box::new(history.clone()),
+            },
+            HostCommand::Embed {
+                texts: vec!["Invented".into()],
+                purpose: EmbeddingPurpose::Document,
+            },
+        ];
+        let client = RequestLifecycle::ClientHistory;
+        assert!(client.serves_client_history(&history) && client.owns_host_effects());
+        for command in &others {
+            assert!(!client.serves_client_history(command), "{command:?}");
+        }
+        for lifecycle in [
+            RequestLifecycle::Once,
+            RequestLifecycle::Worker { interactive: false },
+            RequestLifecycle::Worker { interactive: true },
+            RequestLifecycle::Background,
+        ] {
+            assert!(!lifecycle.serves_client_history(&history), "{lifecycle:?}");
+        }
+    }
+}

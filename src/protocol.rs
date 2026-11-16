@@ -2177,6 +2177,30 @@ mod tests {
     };
 
     #[test]
+    fn import_chatgpt_command_round_trips_on_the_wire() {
+        let wire = r#"{"type":"import_chatgpt","package":{"digest":"3f2a9c1b","parts":["export.zip"],"conversations":2,"archived":1,"shards":1,"attachments":3,"missing_attachments":1,"excluded_messages":4,"notes":["1 broken characters are replaced with U+FFFD"],"problems":[]}}"#;
+        let command: RuntimeCommand = serde_json::from_str(wire).unwrap();
+        let RuntimeCommand::ImportChatGpt { package } = &command else {
+            panic!("expected import_chatgpt, got {command:?}");
+        };
+        assert_eq!((package.conversations, package.missing_attachments), (2, 1));
+        assert_eq!(serde_json::to_string(&command).unwrap(), wire);
+    }
+
+    #[test]
+    fn history_provider_serializes_as_codex_and_chatgpt() {
+        assert_eq!(
+            serde_json::to_string(&[HistoryProvider::Codex, HistoryProvider::ChatGpt]).unwrap(),
+            r#"["codex","chatgpt"]"#
+        );
+        let progress: crate::protocol::ImportProgress = serde_json::from_str(
+            r#"{"phase":"complete","host_id":null,"threads_seen":0,"threads_imported":0,"threads_unchanged":0,"items_added":0,"items_unchanged":0,"assets_saved":0,"gap_count":0,"gaps":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(progress.source, HistoryProvider::Codex);
+    }
+
+    #[test]
     fn import_coverage_summary_preserves_legacy_fields_and_accepts_absent_counts() {
         let record = ImportedConversation {
             source: HistoryProvider::Codex,

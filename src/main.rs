@@ -24,15 +24,16 @@ use agent_cli::{
     context::ContextStore,
     discovery,
     feedback::FeedbackContext,
+    history::{HistorySource, chatgpt::ChatGptHistory},
     host,
     host::effects::{Admission, Capacity, HostEffects},
     instructions, jobs,
     models::{ModelProvider, ModelSelection, Reasoning},
     protocol::{
         AuthStatus, ConversationChange, ConversationSettings, CoordinatorBootstrap,
-        CoordinatorSettings, ImportPhase, InputMode, MainInputContext, RuntimeCommand,
-        RuntimeEventKind, SavedConversation, SearchMode, TaskId, TranscriptAnnotation,
-        TranscriptClassification, WorkerLaunch, WorkerRef,
+        CoordinatorSettings, ImportPhase, ImportProgress, InputMode, MainInputContext,
+        RuntimeCommand, RuntimeEventKind, SavedConversation, SearchMode, TaskId,
+        TranscriptAnnotation, TranscriptClassification, WorkerLaunch, WorkerRef,
     },
     rex::{BlockId, RexClient, SessionId},
     runtime::{FrameReader, Wire, decode_coordinator_event, lifecycle::RequestLifecycle},
@@ -297,6 +298,19 @@ enum ImportAction {
         #[arg(long, value_name = "NAME_OR_ID", value_parser = clap::builder::NonEmptyStringValueParser::new())]
         embedding_host: Option<String>,
     },
+    /// Import a downloaded ChatGPT data export. The export is checked before anything is
+    /// saved; nothing in it runs, and system or custom instructions are never imported.
+    #[command(name = "chatgpt")]
+    ChatGpt {
+        /// The export: its ZIP, the first part of a split download, an extracted folder,
+        /// or a conversations JSON file.
+        #[arg(required = true, num_args = 1.., value_name = "EXPORT")]
+        paths: Vec<PathBuf>,
+        /// Check the export and report what would be imported, without contacting the
+        /// coordinator.
+        #[arg(long)]
+        check: bool,
+    },
     Status,
     /// Resume existing history indexing parked by the restart limit.
     RetryIndex,
@@ -487,6 +501,7 @@ async fn main() -> Result<()> {
         prompt: None,
         selection: ModelArgs::default(),
     });
+    let mut chatgpt = None;
     match action {
         Action::MessagesRead { argv } => {
             let output = agent_cli::sources::messages_read::capture(&argv).await?;
@@ -528,6 +543,15 @@ async fn main() -> Result<()> {
                 );
             }
             return Ok(());
+        }
+        Action::Import {
+            command: ImportAction::ChatGpt { ref paths, check },
+        } => {
+            let source = check_chatgpt_export(paths.clone(), arguments.json, check).await?;
+            if check {
+                return Ok(());
+            }
+            chatgpt = Some(source);
         }
         Action::Init => {
             let path = arguments
@@ -790,6 +814,19 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if let Some(source) = chatgpt {
+        let package = source.summary().clone();
+        return request_presented(
+            &arguments,
+            client,
+            RuntimeCommand::ImportChatGpt { package },
+            None,
+            PlainNoticeRoute::Direct,
+            Some(Arc::new(source)),
+        )
+        .await
+        .map(|_| ());
+    }
     let command = match action {
         Action::Login => RuntimeCommand::Login,
         Action::Status => RuntimeCommand::Status,
@@ -875,6 +912,9 @@ async fn main() -> Result<()> {
                 hosts,
                 embedding_host,
             },
+            ImportAction::ChatGpt { .. } => {
+                bail!("ChatGPT exports are checked locally before import")
+            }
             ImportAction::Status => RuntimeCommand::ImportStatus,
             ImportAction::RetryIndex => RuntimeCommand::RetryHistoryIndex,
         },
@@ -1146,6 +1186,7 @@ async fn main() -> Result<()> {
                             command,
                             None,
                             PlainNoticeRoute::Watch,
+                            None,
                         )
                         .await?;
                     }
@@ -3418,7 +3459,15 @@ async fn request(
     client: ClientContext<'_>,
     command: RuntimeCommand,
 ) -> Result<Option<String>> {
-    request_presented(arguments, client, command, None, PlainNoticeRoute::Direct).await
+    request_presented(
+        arguments,
+        client,
+        command,
+        None,
+        PlainNoticeRoute::Direct,
+        None,
+    )
+    .await
 }
 
 async fn request_with_ui(
@@ -3437,6 +3486,7 @@ async fn request_with_ui(
             session: Some(ui),
         }),
         PlainNoticeRoute::Direct,
+        None,
     )
     .await
 }
@@ -3447,6 +3497,7 @@ async fn request_presented(
     command: RuntimeCommand,
     mut presentation: Option<Presentation<'_>>,
     notices: PlainNoticeRoute,
+    history: Option<Arc<dyn HistorySource>>,
 ) -> Result<Option<String>> {
     let ClientContext {
         config,
@@ -3459,7 +3510,10 @@ async fn request_presented(
     let lifecycle = RequestLifecycle::for_command(&command)
         .context("Transport controls require an active request")?;
     let mut active_turn = lifecycle.allows(&RuntimeCommand::Interrupt);
-    let importing = matches!(command, RuntimeCommand::ImportCodex { .. });
+    let importing = matches!(
+        command,
+        RuntimeCommand::ImportCodex { .. } | RuntimeCommand::ImportChatGpt { .. }
+    );
     let mut ui_controls = presentation
         .as_ref()
         .is_some_and(|view| view.session.is_some());
@@ -3479,6 +3533,7 @@ async fn request_presented(
     let mut history_cursor = None;
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let mut feedback = tokio::task::JoinSet::new();
+    let mut reads = tokio::task::JoinSet::new();
     let mut thinking = false;
     let mut wire = connection(client, lifecycle == RequestLifecycle::Login).await?;
     let relay_needed = match (
@@ -3506,6 +3561,11 @@ async fn request_presented(
     loop {
         let frame = tokio::select! {
             frame = reader.next_frame() => frame?.context("Coordinator disconnected; saved work is retained")?,
+            read = reads.join_next(), if !reads.is_empty() => {
+                let (call_id, result) = read.context("Export reads stopped")??;
+                write_command(&mut *wire.writer, &RuntimeCommand::HostReply { call_id, result }).await?;
+                continue;
+            }
             target = async {
                 match callback.as_mut() {
                     Some(callback) => callback.next().await,
@@ -3580,7 +3640,7 @@ async fn request_presented(
                             let (task_id, agent_id) = history_target.clone().map_or((None, None), |(task, agent)| (Some(task), agent));
                             let next = Box::pin(request_presented(arguments, client,
                                 RuntimeCommand::ReadHistory { task_id, agent_id, cursor: Some(cursor) },
-                                Some(Presentation { handle: view.handle.clone(), session: None }), PlainNoticeRoute::Direct)).await?;
+                                Some(Presentation { handle: view.handle.clone(), session: None }), PlainNoticeRoute::Direct, None)).await?;
                             if lifecycle.is_worker() { history_cursor = next; } else if let Some(ui) = view.session.as_mut() { ui.history_cursor = next; }
                         } else { view.handle.event(RuntimeEventKind::Notice { task_id: None, text: "No older history.".into() })?; }
                     }
@@ -3735,7 +3795,18 @@ async fn request_presented(
             view.handle.event(event.clone())?;
         }
         match event {
-            RuntimeEventKind::HostCall { call_id, .. } => {
+            RuntimeEventKind::HostCall { call_id, command } => {
+                if let (Some(source), agent_cli::protocol::HostCommand::History { request }) = (&history, *command) {
+                    let source = source.clone();
+                    reads.spawn(async move {
+                        let result = match source.request(request).await {
+                            Ok(response) => agent_cli::protocol::HostResult::History { response },
+                            Err(error) => agent_cli::protocol::HostResult::Failed { message: error.to_string(), delivery: None },
+                        };
+                        (call_id, result)
+                    });
+                    continue;
+                }
                 write_command(&mut *wire.writer, &RuntimeCommand::HostReply { call_id, result: outdated_coordinator_effect() }).await?;
                 let notice = "Update the coordinator so this task's host runs its commands.";
                 match &presentation {
@@ -3944,16 +4015,7 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
         }
         RuntimeEventKind::Interrupted => println!("Interrupted."),
         RuntimeEventKind::ImportProgress { progress } => {
-            println!(
-                "{}: {} imported, {} unchanged, {} seen; {} items added, {} assets, {} gaps",
-                import_phase_name(&progress.phase),
-                progress.threads_imported,
-                progress.threads_unchanged,
-                progress.threads_seen,
-                progress.items_added,
-                progress.assets_saved,
-                progress.gap_count
-            );
+            println!("{}", import_progress_line(progress));
             if matches!(progress.phase, ImportPhase::Complete | ImportPhase::Partial) {
                 for gap in progress.gaps.iter().take(3) {
                     eprintln!("  {gap}");
@@ -4101,12 +4163,71 @@ fn import_phase(phase: &ImportPhase) -> u8 {
 }
 fn import_phase_name(phase: &ImportPhase) -> &'static str {
     match phase {
-        ImportPhase::Discovering => "Discovering",
-        ImportPhase::Importing => "Importing",
-        ImportPhase::Indexing => "Indexing",
-        ImportPhase::Complete => "Complete",
-        ImportPhase::Partial => "Partial",
+        ImportPhase::Discovering => "discovering",
+        ImportPhase::Importing => "importing",
+        ImportPhase::Indexing => "indexing",
+        ImportPhase::Complete => "complete",
+        ImportPhase::Partial => "partial",
     }
+}
+
+/// One line per source, so `import status` can report Codex and ChatGPT side by side.
+fn import_progress_line(progress: &ImportProgress) -> String {
+    format!(
+        "{} {}: {} imported, {} unchanged, {} seen; {} items added, {} assets, {} gaps",
+        progress.source.label(),
+        import_phase_name(&progress.phase),
+        progress.threads_imported,
+        progress.threads_unchanged,
+        progress.threads_seen,
+        progress.items_added,
+        progress.assets_saved,
+        progress.gap_count
+    )
+}
+
+/// The check is the admission gate: an export refused here never reaches a coordinator.
+/// Humans read the report on stderr; `--check --json` prints the summary on stdout.
+async fn check_chatgpt_export(
+    paths: Vec<PathBuf>,
+    json: bool,
+    check: bool,
+) -> Result<ChatGptHistory> {
+    let source = tokio::task::spawn_blocking(move || {
+        ChatGptHistory::open(&paths, &mut |step| {
+            if !json {
+                eprintln!("{step}");
+            }
+        })
+    })
+    .await??;
+    let summary = source.summary();
+    if json && check {
+        println!("{}", serde_json::to_string(summary)?);
+        return Ok(source);
+    }
+    eprintln!(
+        "ChatGPT export {}: {} conversations ({} archived) in {} shards",
+        summary.digest.get(..8).unwrap_or(&summary.digest),
+        summary.conversations,
+        summary.archived,
+        summary.shards
+    );
+    eprintln!(
+        "  {} attachments, {} not in this export",
+        summary.attachments, summary.missing_attachments
+    );
+    eprintln!(
+        "  {} system and custom-instruction messages are left out",
+        summary.excluded_messages
+    );
+    for note in &summary.notes {
+        eprintln!("  {note}");
+    }
+    for problem in &summary.problems {
+        eprintln!("  Not imported: {problem}");
+    }
+    Ok(source)
 }
 
 #[cfg(test)]
@@ -4125,10 +4246,10 @@ mod tests {
         local_service_command,
     };
     use agent_cli::models::{ModelProvider, ModelSelection, Reasoning};
-    use agent_cli::protocol::SearchMode;
+    use agent_cli::protocol::{ImportPhase, ImportProgress, SearchMode};
     use agent_cli::rex::RexClient;
     use clap::Parser;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     fn personal_rex() -> RexClient {
         RexClient::for_process(None).unwrap()
@@ -4738,6 +4859,50 @@ esac
         assert!(admission.sending().unwrap());
         assert_eq!(admission.input().unwrap(), input);
         assert_eq!(admission.id, id);
+    }
+
+    #[test]
+    fn import_chatgpt_parses_paths_and_check() {
+        let parsed =
+            Arguments::try_parse_from(["agent", "import", "chatgpt", "a.zip", "b.zip", "--check"])
+                .unwrap();
+        assert!(matches!(parsed.command, Some(Action::Import {
+            command: crate::ImportAction::ChatGpt { paths, check: true }
+        }) if paths == [PathBuf::from("a.zip"), PathBuf::from("b.zip")]));
+        let parsed = Arguments::try_parse_from(["agent", "import", "chatgpt", "export/"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Action::Import {
+                command: crate::ImportAction::ChatGpt { check: false, .. }
+            })
+        ));
+        assert!(Arguments::try_parse_from(["agent", "import", "chatgpt"]).is_err());
+        assert!(Arguments::try_parse_from(["agent", "import", "chatgpt", "--check"]).is_err());
+    }
+
+    #[test]
+    fn progress_lines_name_their_source() {
+        let progress = |source| ImportProgress {
+            source,
+            phase: ImportPhase::Complete,
+            host_id: None,
+            threads_seen: 3,
+            threads_imported: 2,
+            threads_unchanged: 1,
+            items_added: 9,
+            items_unchanged: 0,
+            assets_saved: 1,
+            gap_count: 0,
+            gaps: Vec::new(),
+        };
+        assert_eq!(
+            crate::import_progress_line(&progress(agent_cli::protocol::HistoryProvider::ChatGpt)),
+            "ChatGPT complete: 2 imported, 1 unchanged, 3 seen; 9 items added, 1 assets, 0 gaps"
+        );
+        assert_eq!(
+            crate::import_progress_line(&progress(agent_cli::protocol::HistoryProvider::Codex)),
+            "Codex complete: 2 imported, 1 unchanged, 3 seen; 9 items added, 1 assets, 0 gaps"
+        );
     }
 
     #[test]
