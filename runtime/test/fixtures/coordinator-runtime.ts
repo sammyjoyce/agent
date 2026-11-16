@@ -3,15 +3,15 @@ import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { JsonObject } from "@earendil-works/pi-ai";
 
-export type ModelStep = { text: string } | { tool: string; args: JsonObject; commentary?: string };
+export type ModelStep = { text: string } | { tool: string; args: JsonObject; commentary?: string } |
+  { code: string; commentary?: string } | { hold: string };
 export type ModelQueue = Record<string, ModelStep[]>;
 type ResponseItem = { id: string; type: "message"; role: "assistant"; status: "completed"; phase?: "commentary";
   content: [{ type: "output_text"; text: string; annotations: [] }] } |
   { id: string; type: "function_call"; call_id: string; name: string; arguments: string; status: "completed" } |
   { id: string; type: "custom_tool_call"; call_id: string; name: string; input: string; status: "completed" };
 function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
-function oneCallScript(id: string, tool: string, args: object, codemode: unknown): ResponseItem {
-  const code = `return await tools.${tool}(${JSON.stringify(args)});`;
+function codemodeCall(id: string, code: string, codemode: unknown): ResponseItem {
   return codemode === "custom" ? { id, type: "custom_tool_call", call_id: id, name: "codemode", input: code, status: "completed" }
     : { id, type: "function_call", call_id: id, name: "codemode", arguments: JSON.stringify({ code }), status: "completed" };
 }
@@ -35,16 +35,25 @@ globalThis.fetch = async (input, options) => {
   const step: unknown = steps.shift(); assert.ok(object(step));
   writeFileSync(path, JSON.stringify(queue));
   appendFileSync(path + ".requests", JSON.stringify({ key, body }) + "\n");
+  if (typeof step.hold === "string") {
+    // A test stops the process here, between an admitted turn and its next effect.
+    writeFileSync(step.hold, String(process.pid));
+    const signal = options?.signal;
+    return new Promise<Response>((_resolve, reject) => signal?.addEventListener("abort", () => reject(signal.reason), { once: true }));
+  }
   const id = randomUUID();
   let item: ResponseItem;
+  const updates = body.input.flatMap((item: unknown) => object(item) && item.type === "additional_tools" && Array.isArray(item.tools) ? item.tools : []);
+  const declared = new Map([...(Array.isArray(body.tools) ? body.tools : []), ...updates].flatMap((tool: unknown) =>
+    object(tool) && typeof tool.name === "string" ? [[tool.name, tool.type] as const] : []));
+  const codemode = declared.get("codemode");
   if (typeof step.text === "string") item = { id, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: step.text, annotations: [] }] };
-  else {
+  else if (typeof step.code === "string") {
+    assert.ok(codemode !== undefined, "A scripted program needs the codemode tool");
+    item = codemodeCall(id, step.code, codemode);
+  } else {
     assert.ok(typeof step.tool === "string" && object(step.args));
-    const updates = body.input.flatMap((item: unknown) => object(item) && item.type === "additional_tools" && Array.isArray(item.tools) ? item.tools : []);
-    const declared = new Map([...(Array.isArray(body.tools) ? body.tools : []), ...updates].flatMap((tool: unknown) =>
-      object(tool) && typeof tool.name === "string" ? [[tool.name, tool.type] as const] : []));
-    const codemode = declared.get("codemode");
-    item = !declared.has(step.tool) && codemode !== undefined ? oneCallScript(id, step.tool, step.args, codemode)
+    item = !declared.has(step.tool) && codemode !== undefined ? codemodeCall(id, `return await tools.${step.tool}(${JSON.stringify(step.args)});`, codemode)
       : { id, type: "function_call", call_id: id, name: step.tool, arguments: JSON.stringify(step.args), status: "completed" };
   }
   const items: ResponseItem[] = typeof step.commentary === "string" && item.type !== "message" ? [
