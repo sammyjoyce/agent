@@ -934,6 +934,12 @@ func anOlderControlComesBackOnceWhileANewerSendIsAdmitting(newerRefused: Bool) a
     #expect(cold.draft.text == model.draft, "Recovery offers what the composer shows")
     let queued = try queuedRequests(coordinator.session.outboxURL).map(\.text)
     #expect(queued == (newerRefused ? [] : ["An invented newer note"]))
+    if !newerRefused {
+      for await input in coordinator.fixture.observedInputs {
+        #expect(input.text == "An invented newer note", "/status never went")
+        break
+      }
+    }
     #expect(await coordinator.fixture.count() == (newerRefused ? 0 : 1), "/status never went")
     await model.setActive(false)
   }
