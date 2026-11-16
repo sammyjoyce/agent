@@ -185,19 +185,21 @@ mode roles, to the tools that stay direct beside `codemode`:
 
 | Role | Surface |
 | --- | --- |
-| main | Direct tools and `tool_search`. The browser, context repository, worktree and source tools are deferred. |
-| triage, worker, agent | `codemode`, with `read_file`, `read_attachment` and, outside agent, `record_task` direct. Scripts reach every other tool. The browser, context repository, worktree and, outside triage, source tools stay out of the script section until a script searches for them. |
+| main | Direct tools and `tool_search`. The browser tools other than `browser_screenshot`, and the context repository, worktree and source tools, are deferred. |
+| triage, worker, agent | `codemode`, with `read_file`, `read_attachment`, `browser_screenshot` and, outside agent, `record_task` direct. Scripts reach every other tool. The browser, context repository, worktree and, outside triage, source tools stay out of the script section until a script searches for them. |
 
 The [results](#hillclimb-results) below explain the choice.
 `runtime/test/fixtures/tool-discovery.ts` holds the alternatives in one table,
 `DISCOVERY_ARMS`. `direct` offers every tool directly, as before, and
 `production` is `TOOL_SURFACES`.
 
-Every surface keeps `finish_without_reply`, `read_attachment` and `read_file`
-directly offered. `finish_without_reply` must be the main turn's own final
-call. A script receives only the text of a nested result from a tool without
-a structured output schema, and `read_attachment` and `read_file` can return
-images. Triage and worker also keep `record_task` direct. A recovery turn reconciles its input
+Every surface keeps `finish_without_reply`, `read_attachment`, `read_file` and
+`browser_screenshot` directly offered. `finish_without_reply` must be the main
+turn's own final call. A script receives only the text of a nested result from
+a tool without a structured output schema, and `read_attachment`, `read_file`
+and `browser_screenshot` can return images. Scripts cannot call
+`browser_screenshot` at all, because its image and attachment would be lost.
+Triage and worker also keep `record_task` direct. A recovery turn reconciles its input
 through the turn's own `record_task` call, and a call from a script fails that
 check.
 

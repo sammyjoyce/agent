@@ -138,8 +138,12 @@ test("a screenshot reaches the next model request as an image and history as a r
     const text = result.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n");
     assert.equal(text.includes(png.toString("base64").slice(0, 64)), false, "Image bytes never travel as model text");
 
-    const [row, ...others] = await screenshotRows(app);
+    const rows = await screenshotRows(app);
+    assert.equal(new Set(rows.map((message) => message.tool?.call_id)).size, 1, "History holds one screenshot call");
+    const [row, ...others] = rows.filter((message) => message.tool?.status === "finished");
     assert.ok(row !== undefined && others.length === 0);
+    assert.deepEqual(rows.filter((message) => message !== row).flatMap((message) => message.attachments ?? []), [],
+      "Only the result row carries the attachment");
     const [attachment, ...extra] = row.attachments ?? [];
     assert.ok(attachment !== undefined && extra.length === 0, "The shared transcript lists the screenshot attachment");
     assert.equal(attachment.media_type, "image/png");
@@ -152,8 +156,8 @@ test("a screenshot reaches the next model request as an image and history as a r
       "The browser connection record keeps no image bytes");
 
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
-    const [reopened] = await screenshotRows(app);
-    assert.deepEqual(reopened?.attachments, [attachment], "Reopened history keeps the same attachment");
+    assert.deepEqual((await screenshotRows(app)).flatMap((message) => message.attachments ?? []), [attachment],
+      "Reopened history keeps the same attachment");
     assert.ok((await download(app.attachments, attachment.id)).equals(png));
     await assert.rejects(app.attachments.request({ type: "discard", id: attachment.id }), /retained/,
       "History owns the screenshot, so staging expiry cannot remove it");

@@ -5,6 +5,7 @@ import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai/u
 import { createRegistry, Harness, type CompactionSettings, type Conversation, type Registry } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { join } from "node:path";
+import { AttachmentStore } from "../../src/attachments.js";
 import { BackgroundScheduler } from "../../src/background.js";
 import { BrowserStore, createBrowserTools } from "../../src/browser.js";
 import { CoordinatorEnvironment } from "../../src/environment.js";
@@ -100,7 +101,7 @@ export async function openDiscoveryApp(directory: string, { models, model, arm, 
   });
   const jobTools = createJobTools(scheduler, executions);
   const production = withActorPolicies(createToolsets({ guidance: createGuidance(executions), tools, sourceTools,
-    resourceTools: createResourceTools(resources, tasks, executions), browserTools: createBrowserTools(new BrowserStore(session), executions), jobTools,
+    resourceTools: createResourceTools(resources, tasks, executions), browserTools: createBrowserTools(new BrowserStore(session), executions, new AttachmentStore(directory)), jobTools,
   }), { responsePolicy: createMainResponsePolicy(session), inputOrigins: createInputOrigins(session) });
   const discovery = createToolDiscovery();
   const { toolsets, installed } = applyToolSurfaces(production, arm, discovery);

@@ -172,7 +172,7 @@ async function openApplication(): Promise<Application> {
   const resources = new ResourceStore(harness, tasks);
   tasks.guardResources(resources);
   const resourceTools = createResourceTools(resources, tasks, executions);
-  const browserTools = createBrowserTools(new BrowserStore(harness), executions);
+  const browserTools = createBrowserTools(new BrowserStore(harness), executions, attachments);
   registry.install(tools.host);
   registry.install(tools.main);
   registry.install(tools.legacy);

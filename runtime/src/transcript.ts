@@ -99,7 +99,8 @@ function messageRows(entry: EntryRecord, message: MessageContent): HistoryMessag
     offset += text.length;
     const row: HistoryMessage = { entry_id: entry.id.toString(), role: message.role, text, continuation, final_chunk: offset === value.length,
       ...(message.tool === undefined ? {} : { tool: message.tool }),
-      ...(message.presentation === undefined || continuation ? {} : { presentation: message.presentation }) };
+      ...(message.presentation === undefined || continuation ? {} : { presentation: message.presentation }),
+      ...(message.attachments === undefined || continuation ? {} : { attachments: message.attachments }) };
     continuation = true; return row;
   });
 }
