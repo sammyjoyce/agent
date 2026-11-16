@@ -56,6 +56,8 @@ export async function failoverCoordinator(t: TestContext) {
   const direct = (holder: string | null) => new AuthorityClient({ url: authority.url, coordinatorId: id, token: token(holder) });
   return {
     id, proxy, owner: direct(OWNER), standby: direct(STANDBY), reader: direct(null),
+    /** The Worker's own address, for a second fault proxy. */
+    url: authority.url,
     /** The `AGENT_FAILOVER` value of a process that speaks as `holder`, or with the read-only credential when it is null. */
     async session(holder: string | null, epoch?: number, url = proxy.url): Promise<string> {
       const token_file = join(tokens, `${id}-${holder ?? "reader"}`);
@@ -86,8 +88,6 @@ export interface BridgeOptions {
   readonly session?: string;
   readonly queue?: ModelQueue;
   readonly env?: Record<string, string>;
-  /** Modules the child loads before the bridge. */
-  readonly imports?: readonly string[];
   /** Answers a host call that is not a guidance read, given its operation. A call it leaves unanswered stays pending. */
   readonly host?: (operation: HostCommand) => HostResult | undefined;
 }
@@ -101,7 +101,7 @@ export async function startBridge(t: TestContext, options: BridgeOptions) {
   await chmod(options.directory, 0o700);
   await writeFile(queue, JSON.stringify(options.queue ?? {}));
   const { AGENT_FAILOVER: _inherited, ...inherited } = process.env;
-  const child = spawn(process.execPath, ["--no-warnings", ...(options.imports ?? []).flatMap((module) => ["--import", module]),
+  const child = spawn(process.execPath, ["--no-warnings",
     fileURLToPath(new URL("./coordinator-runtime.js", import.meta.url)), options.directory],
   { stdio: ["pipe", "pipe", "pipe"], env: { ...inherited, OPENAI_API_KEY: "sk-synthetic-fixture", AGENT_TEST_MODEL_QUEUE: queue,
     ...(options.session === undefined ? {} : { AGENT_FAILOVER: options.session }), ...options.env } });

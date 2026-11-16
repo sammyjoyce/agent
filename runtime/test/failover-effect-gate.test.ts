@@ -1,13 +1,9 @@
 import assert from "node:assert/strict";
-import { generateKeyPairSync } from "node:crypto";
-import { writeFile } from "node:fs/promises";
-import { createServer, type ServerHttp2Session, type ServerHttp2Stream } from "node:http2";
-import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
-import type { ApnsConfig } from "../src/generated/ApnsConfig.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 import { OWNER_FENCED_EXIT } from "../src/generated/owner-fenced-exit.js";
+import { apnsConfig, startApnsOrigin } from "./fixtures/apns-origin.js";
 import { chat, connectHost, failoverCoordinator, startBridge } from "./fixtures/failover-bridge.js";
 import { commands, type FaultRule } from "./fixtures/failover-fault-proxy.js";
 import { enroll, OWNER, replaceOwner, STANDBY, stateDirectory } from "./fixtures/failover-state.js";
@@ -68,34 +64,13 @@ function confirmsAfterTheAttempt(): NonNullable<FaultRule["match"]> {
 async function push(t: TestContext) {
   const coordinator = await failoverCoordinator(t), directory = await stateDirectory(t), { proxy } = coordinator;
   const epoch = await enroll(coordinator.owner);
-  const key = join(directory, "AuthKey.p8"), preload = join(directory, "local-apns.mjs");
-  await writeFile(key, generateKeyPairSync("ec", { namedCurve: "prime256v1" }).privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600 });
-  await writeFile(preload, `import http2 from "node:http2";
-import { syncBuiltinESMExports } from "node:module";
-const original = http2.connect;
-http2.connect = (authority, ...options) => {
-  if (String(authority) !== "https://api.sandbox.push.apple.com") throw new Error("Unexpected APNs authority");
-  return original(process.env.AGENT_TEST_APNS_ORIGIN, ...options);
-};
-syncBuiltinESMExports();
-`, { mode: 0o600 });
-  const server = createServer(), sessions = new Set<ServerHttp2Session>();
+  const origin = await startApnsOrigin(t);
   /** How many requests the proxy had seen when each push reached the origin. */
   const pushes: number[] = [];
-  server.on("session", (session) => { sessions.add(session); session.on("error", () => {}); session.once("close", () => sessions.delete(session)); });
-  server.on("stream", (stream: ServerHttp2Stream) => {
-    stream.on("error", () => {});
-    stream.resume();
-    stream.once("end", () => { pushes.push(proxy.seen.length); stream.respond({ ":status": 200 }); stream.end(); });
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  t.after(async () => {
-    for (const session of sessions) session.destroy();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-  });
-  const config: ApnsConfig = { team_id: "TEAM000001", key_id: "KEY0000001", topic: "dev.example.Agent", key_file: key, environment: "sandbox" };
-  const bridge = await startBridge(t, { directory, session: await coordinator.session(OWNER, epoch), imports: [preload],
-    env: { AGENT_APNS_CONFIG: JSON.stringify(config), AGENT_TEST_APNS_ORIGIN: `http://127.0.0.1:${(server.address() as AddressInfo).port}` },
+  origin.onPush = () => { pushes.push(proxy.seen.length); };
+  const config = await apnsConfig(join(directory, "AuthKey.p8"));
+  const bridge = await startBridge(t, { directory, session: await coordinator.session(OWNER, epoch),
+    env: { AGENT_APNS_CONFIG: JSON.stringify(config), ...origin.environment },
     queue: { "fixture-push": [{ text: "A reply worth a push." }] } });
   bridge.send(1, { type: "notifications", request: { type: "register", installation_id: INSTALLATION, token: "01ab".repeat(24) } });
   await bridge.wait(1, (event) => event.type === "done");

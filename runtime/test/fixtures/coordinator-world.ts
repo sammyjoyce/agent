@@ -85,7 +85,8 @@ export async function coordinatorWorld(t: TestContext, prepare: (homes: readonly
       "--runtime", runtime, "--instructions", join(home, "AGENTS.md"), ...args];
     const command = terminal ? [clientBinary, ...arguments_]
       : ["--json", "--no-tui", ...arguments_];
-    const child = spawn(terminal ? terminalFixture : clientBinary, command, { cwd: home, detached: true, stdio: ["pipe", "pipe", "pipe"], env: {
+    // A process given another HOME belongs to a host this fixture did not make, and runs there.
+    const child = spawn(terminal ? terminalFixture : clientBinary, command, { cwd: extra.HOME ?? home, detached: true, stdio: ["pipe", "pipe", "pipe"], env: {
       PATH: bin + delimiter + process.env.PATH, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local"),
       TMPDIR: directory, TERM: "xterm-256color", AGENT_SQLITE_VEC: process.env.AGENT_SQLITE_VEC, OPENAI_API_KEY: "sk-synthetic-fixture",
       AGENT_TEST_NODE_ID: host === 0 ? coordinator : laptop, AGENT_TEST_REX_STATE: join(home, "rex.json"),
