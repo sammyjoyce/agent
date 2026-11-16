@@ -81,17 +81,17 @@ pub struct DreamsPolicy {
     digest: String,
 }
 
-/// Printable ASCII keeps a path free of separators, controls and the
-/// ignorable code points some file systems fold into `.git`.
-fn components(path: &str) -> Result<Vec<&str>, String> {
+/// A small ASCII alphabet keeps a path free of controls, of the ignorable code
+/// points some file systems fold into `.git`, and of anything Git would quote
+/// in a patch header. `extra` admits the wildcard in a policy glob.
+fn components<'a>(path: &'a str, extra: &[u8]) -> Result<Vec<&'a str>, String> {
     if path.is_empty() || path.len() > MAX_PATH_BYTES {
         return Err(format!("needs 1 to {MAX_PATH_BYTES} bytes"));
     }
-    if !path
-        .bytes()
-        .all(|byte| (0x20..=0x7e).contains(&byte) && byte != b'\\')
-    {
-        return Err("must be printable ASCII without backslashes".into());
+    if !path.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || b"._-/ +@,".contains(&byte) || extra.contains(&byte)
+    }) {
+        return Err("may use only ASCII letters, digits, spaces and . _ - / + @ ,".into());
     }
     let parts: Vec<&str> = path.split('/').collect();
     for part in &parts {
@@ -131,7 +131,7 @@ fn wildcard(pattern: &[u8], text: &[u8]) -> bool {
 
 impl Glob {
     fn parse(text: &str) -> Result<Self> {
-        let parts = components(text)
+        let parts = components(text, b"*")
             .map_err(|reason| anyhow::anyhow!("Dreams editable glob {text:?} {reason}"))?;
         Ok(Self(parts.into_iter().map(str::to_owned).collect()))
     }
@@ -272,12 +272,21 @@ impl DreamsPolicy {
 
     /// The one place a path from a model or a patch becomes an editable path.
     pub fn editable(&self, path: &str) -> Result<EditablePath, String> {
-        let parts = components(path).map_err(|reason| format!("path {path:?} {reason}"))?;
+        let parts = components(path, b"").map_err(|reason| format!("path {path:?} {reason}"))?;
         if self.editable.iter().any(|glob| glob.matches(&parts)) {
             Ok(EditablePath(path.to_owned()))
         } else {
             Err(format!("path {path} is not editable"))
         }
+    }
+
+    /// A state directory inside the target would let a proposal edit its own evidence.
+    pub fn refuse_state_inside(&self, state: &Path) -> Result<()> {
+        ensure!(
+            !resolved(state).starts_with(&self.repository),
+            "Dreams repository must not contain the state directory"
+        );
+        Ok(())
     }
 
     pub fn repository(&self) -> &Path {
@@ -359,6 +368,8 @@ mod tests {
             "AGENTS.md\n",
             "caf\u{e9}.md",
             "a\\b",
+            "say\"hi\".md",
+            "all*.md",
             "",
         ] {
             assert!(policy.editable(path).is_err(), "{path:?} must be refused");

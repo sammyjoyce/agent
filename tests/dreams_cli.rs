@@ -301,6 +301,8 @@ impl Fixture {
             .arg(&self.instructions)
             .args(args)
             .env("PATH", std::env::join_paths(paths).unwrap())
+            // The developer's Git identity and settings must not decide a test.
+            .env("HOME", self.directory.path())
             .env(
                 "AGENT_TEST_EXTERNAL_CALLS",
                 self.directory.path().join("external-calls"),

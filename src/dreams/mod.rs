@@ -585,14 +585,8 @@ impl Dreams {
     /// Refuses a state directory inside the policy repository, where a
     /// proposal could otherwise edit its own evidence.
     pub fn open(state: &Path, policy: DreamsPolicy) -> Result<Self> {
+        policy.refuse_state_inside(state)?;
         let store = DreamsStore::open(state)?;
-        ensure!(
-            !state
-                .canonicalize()
-                .context("The state directory is unavailable")?
-                .starts_with(policy.repository()),
-            "Dreams repository must not contain the state directory"
-        );
         Ok(Self {
             state: state.to_owned(),
             store,
