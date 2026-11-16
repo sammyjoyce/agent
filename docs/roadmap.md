@@ -59,7 +59,7 @@ recovery; [history](history.md) describes import and retrieval.
   Delivery and processing have separate states; completed work is normal,
   blocked work is visible, and explicit continuation can recover a parked
   main generation without duplicating its saved inputs.
-- [ ] Clear the iOS composer immediately on Send while retaining its backup
+- [x] Clear the iOS composer immediately on Send while retaining its backup
   until outbox admission. Preserve newer typing and restore local rejections;
   connection changes cannot resurrect saved text. Native tests keep the
   keyboard active through consecutive sends and use production persistence.
@@ -74,8 +74,10 @@ recovery; [history](history.md) describes import and retrieval.
   an installed build showed the placeholder and the keyboard in the first
   composer capture after every Send. It covered consecutive sends, an active
   response across Home and an app switch, a long multiline draft, identical
-  newer typing and a relaunch with a newer draft. Restoring a started control
-  that never left the phone remains open
+  newer typing and a relaunch with a newer draft. A started control that never
+  left the phone comes back to the live composer ahead of newer typing, and
+  `ChatModel` tests drive a failed dial, a disconnect and an address edit
+  before any recipient writes it
   ([#34](https://github.com/sammyjoyce/agent/issues/34)).
 - [x] Return a control's text, such as `/status`, to the live iOS composer when
   no recipient of its Send wrote it, as crash recovery already does, and keep
