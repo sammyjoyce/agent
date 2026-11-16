@@ -10,7 +10,9 @@ import os
 from pathlib import Path
 import plistlib
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("phone_acceptance", HERE / "phone-acceptance.py")
@@ -206,6 +208,59 @@ class ReportTests(unittest.TestCase):
              "messages": ["The simulator has no APNs"]},
             {"test": "NotificationDeliveryTests/testBackgroundReply()", "result": "Passed", "messages": []},
         ])
+
+
+class MissingEvidenceTests(unittest.TestCase):
+    """A Send whose composer crop did not reach the host fails its record and the run."""
+
+    test = "ComposerRecurrenceTests/testTwoConsecutiveSendsKeepTheKeyboardUp()"
+
+    def run_with(self, attachments_listed, files_written):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            attachments = out / "attachments"
+            attachments.mkdir()
+            record = {"kind": "send", "test": self.test, "problems": [], "record": {
+                "label": "first", "sentAt": 1794790000123, "placeholderShown": True,
+                "sentGlyphsAbsent": True, "keyboardShown": True, "recipientLine": "To Work",
+                "cropAttachment": "first-composer", "screenAttachment": "first-screen"}}
+            (attachments / "record.json").write_text(json.dumps(record))
+            for name in files_written:
+                (attachments / name).write_bytes(b"invented image")
+            listed = [{"exportedFileName": "record.json",
+                       "suggestedHumanReadableName": "send-first_0_record.json"}]
+            listed += [{"exportedFileName": file, "suggestedHumanReadableName": f"{name}_0_{file}"}
+                       for name, file in attachments_listed]
+            (attachments / "manifest.json").write_text(
+                json.dumps([{"testIdentifier": self.test, "attachments": listed}]))
+            records = phone.load_records(attachments)
+            arguments = SimpleNamespace(out=out, run="r15-0412", app="dev.example.Agent", coordinator="Work")
+            tests = [{"test": self.test, "result": "Passed", "messages": []}]
+            with patch.object(phone, "export_evidence", return_value=(records, tests)):
+                passed = phone.write_evidence(arguments, "simulator", {"checks": [], "problems": []}, 0)
+            return passed, (out / "report.md").read_text()
+
+    def test_every_capture_present_passes(self):
+        passed, report = self.run_with(
+            [("first-composer", "crop.png"), ("first-screen", "screen.png")], ["crop.png", "screen.png"])
+        self.assertTrue(passed)
+        self.assertIn("| [crop.png](attachments/crop.png) | [screen.png](attachments/screen.png) | ok |", report)
+        self.assertIn("Overall: PASS.", report)
+
+    def test_a_crop_the_export_never_listed_fails_the_run(self):
+        passed, report = self.run_with([("first-screen", "screen.png")], ["screen.png"])
+        self.assertFalse(passed)
+        self.assertIn("| missing | [screen.png](attachments/screen.png) | FAIL: ", report)
+        self.assertIn("cropAttachment", report)
+        self.assertIn("Overall: FAIL.", report)
+
+    def test_a_listed_crop_whose_file_is_gone_fails_the_run(self):
+        passed, report = self.run_with(
+            [("first-composer", "crop.png"), ("first-screen", "screen.png")], ["screen.png"])
+        self.assertFalse(passed)
+        self.assertIn("| missing | [screen.png](attachments/screen.png) | FAIL: ", report)
+        self.assertIn("cropAttachment", report)
+        self.assertIn("Overall: FAIL.", report)
 
 
 @unittest.skipUnless(EVIDENCE, "set PHONE_ACCEPTANCE_EVIDENCE to a simulator run's --out directory")
