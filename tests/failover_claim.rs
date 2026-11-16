@@ -587,3 +587,23 @@ fn a_second_coordinator_on_the_same_state_is_refused_by_the_lock_before_the_help
     assert_eq!(world.helper_runs().len(), 1);
     drop(first);
 }
+
+#[test]
+fn a_coordinator_without_failover_starts_while_a_process_of_an_earlier_run_holds_the_effects_lock()
+{
+    let world = World::new(Failover::Absent);
+    let orphan = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(world.state.join("effects.lock"))
+        .unwrap();
+    // An effect process that outlived its coordinator holds a share, as this file does.
+    fs2::FileExt::try_lock_shared(&orphan).unwrap();
+    let supervisor = world.serve_with(&[]);
+    assert_eq!(world.bridge().unwrap(), json!({ "failover": null }));
+    assert!(world.helper_runs().is_empty());
+    drop(supervisor);
+    drop(orphan);
+}

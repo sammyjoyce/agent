@@ -31,6 +31,7 @@ use crate::{
         HistoryResponse, HistorySource, HistoryThread,
     },
     protocol::HistoryRole,
+    runtime::effects::EffectProcess,
 };
 
 const PAGE_BYTES: usize = 500 * 1024;
@@ -1632,6 +1633,7 @@ struct TurnsParams<'a> {
 }
 
 struct Connection {
+    _effect: EffectProcess,
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
@@ -1707,9 +1709,11 @@ impl Connection {
         if let Some(home) = home {
             command.env("CODEX_HOME", home);
         }
+        let mut effect = EffectProcess::of(&mut command);
         let mut child = command
             .spawn()
             .context("Could not start the installed Codex history reader")?;
+        effect.leads(child.id());
         let input = child
             .stdin
             .take()
@@ -1721,6 +1725,7 @@ impl Connection {
                 .context("Codex history output is unavailable")?,
         );
         let mut connection = Self {
+            _effect: effect,
             child,
             input,
             output,

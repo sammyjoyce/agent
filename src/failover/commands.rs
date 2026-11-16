@@ -19,7 +19,11 @@ use super::{
     HolderId, LogPosition, OperatorReport, OperatorRequest, OwnerEpoch, REPLICATED_FILE_ROOTS,
     ReleaseEvidence, StopEvidence, UnfinishedDelivery, UnfinishedToolCall,
 };
-use crate::{backup, coordinator_id::CoordinatorId, runtime::WriterLock};
+use crate::{
+    backup,
+    coordinator_id::CoordinatorId,
+    runtime::{WriterLock, effects},
+};
 
 const EVIDENCE_POLL: Duration = Duration::from_millis(500);
 
@@ -769,11 +773,47 @@ pub struct Released {
     pub candidate: HolderId,
 }
 
-/// On the old owner's host: proves by taking the writer lock that no
-/// supervisor or Pi child of this state directory is alive, and says so.
+/// The one place that posts `lock_held`, for `failover release` and for a
+/// sealed holder that restarts. The writer lock proves that no supervisor and
+/// no Pi child of the state directory is alive. The exclusive `effects.lock`
+/// proves the same of every local effect process, after the recorded process
+/// groups that were still alive were stopped. A survivor is an error, and
+/// nothing is posted.
+pub(crate) fn release_by_lock(
+    lock: &WriterLock,
+    state: &Path,
+    operator: &FailoverOperator,
+    session: &FailoverSession,
+    holder: HolderId,
+    epoch: OwnerEpoch,
+) -> Result<()> {
+    let _stopped = effects::stop_survivors(lock, state)?;
+    let command = AuthorityCommand::Release {
+        holder,
+        epoch,
+        evidence: ReleaseEvidence::LockHeld,
+    };
+    match operator.run(session, &OperatorRequest::Authority { command })? {
+        OperatorReport::Reply {
+            reply: AuthorityReply::Accepted { .. },
+        } => Ok(()),
+        OperatorReport::Reply {
+            reply: AuthorityReply::Refused { reason, state },
+        } => Err(Refused {
+            action: "this release",
+            reason,
+            state,
+        }
+        .into()),
+        other => Err(unexpected("authority", &other)),
+    }
+}
+
+/// On the old owner's host: proves that no supervisor, Pi child or local
+/// effect process of this state directory is alive, and says so.
 pub fn release(state: &Path, script: &Path, config: &FailoverConfig) -> Result<Released> {
     let holder = holder(config)?;
-    let (_lock, coordinator_id) = lock_state(state)?;
+    let (lock, coordinator_id) = lock_state(state)?;
     let authority = Authority::open(script, config, coordinator_id)?;
     let record = authority.enrolled()?;
     let AuthorityState::Sealed {
@@ -798,19 +838,18 @@ pub fn release(state: &Path, script: &Path, config: &FailoverConfig) -> Result<R
         }
         .into());
     }
-    let evidence = ReleaseEvidence::LockHeld;
-    authority.command(
-        "this release",
-        AuthorityCommand::Release {
-            holder,
-            epoch,
-            evidence,
-        },
+    release_by_lock(
+        &lock,
+        state,
+        &authority.operator,
+        &authority.session,
+        holder,
+        epoch,
     )?;
     Ok(Released {
         coordinator_id,
         epoch,
-        evidence,
+        evidence: ReleaseEvidence::LockHeld,
         candidate,
     })
 }

@@ -15,6 +15,8 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use uuid::Uuid;
 
+use crate::runtime::effects::EffectProcess;
+
 const CALL_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
 const MAX_ERROR_BYTES: u64 = 16 * 1024;
@@ -653,6 +655,7 @@ impl RexClient {
 
     async fn run(&self, args: Vec<String>) -> Result<Vec<u8>, CallFailure> {
         let mut command = self.command(&args);
+        let _effect = EffectProcess::of(&mut command);
         let mut child = command.spawn().map_err(|_| CallFailure::Unavailable)?;
         let result = tokio::time::timeout(CALL_TIMEOUT, async {
             let stdout = child.stdout.take().ok_or(CallFailure::Failed)?;

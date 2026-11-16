@@ -817,6 +817,8 @@ const STATE_ENTRIES: &[(EntryName, Disposition)] = &[
     (EntryName::Exact("coordinator.log"), Disposition::Local),
     (EntryName::Exact("agent.sock"), Disposition::Local),
     (EntryName::Exact("writer.lock"), Disposition::Local),
+    (EntryName::Exact("effects.lock"), Disposition::Local),
+    (EntryName::Exact("effects"), Disposition::Local),
     (EntryName::Exact("embeddings"), Disposition::Local),
     (EntryName::Exact("attachment-cache"), Disposition::Local),
     (EntryName::Exact("feedback-outbox"), Disposition::Local),
@@ -1719,6 +1721,21 @@ mod tests {
             "{:?}",
             inventory.not_included
         );
+    }
+
+    #[test]
+    fn the_effects_lock_and_its_records_are_local_and_not_reported_as_unknown() {
+        let (_root, state, _) = stopped_store();
+        fs::write(state.join("effects.lock"), "").unwrap();
+        fs::create_dir(state.join("effects")).unwrap();
+        fs::write(state.join("effects").join("4242"), "1794872808").unwrap();
+
+        let inventory = Inventory::scan(&state).unwrap();
+        assert_eq!(
+            inventory.files.keys().cloned().collect::<Vec<_>>(),
+            vec![StateFile::Database, StateFile::CoordinatorId]
+        );
+        assert_eq!(inventory.not_included, Vec::<String>::new());
     }
 
     #[test]

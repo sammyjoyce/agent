@@ -23,6 +23,7 @@ use tokio::{
 };
 
 pub(crate) mod diagnostics;
+pub(crate) mod effects;
 pub mod lifecycle;
 mod owner;
 use crate::runtime::diagnostics::{Diagnostics, Event as DiagnosticEvent, HostTiming, Trace};

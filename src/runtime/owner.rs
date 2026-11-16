@@ -10,11 +10,13 @@ use anyhow::{Context, Result, bail};
 use crate::{
     coordinator_id::CoordinatorId,
     failover::{
-        AuthorityCommand, AuthorityRefusal, AuthorityReply, AuthorityState, FailoverConfig,
-        FailoverHelper, FailoverOperator, FailoverReport, FailoverRequest, FailoverSession,
-        HolderId, OperatorReport, OperatorRequest, OwnerEpoch, ReleaseEvidence,
+        AuthorityRefusal, AuthorityState, FailoverConfig, FailoverHelper, FailoverOperator,
+        FailoverReport, FailoverRequest, FailoverSession, HolderId, OwnerEpoch,
     },
-    runtime::WriterLock,
+    runtime::{
+        WriterLock,
+        effects::{EffectsLock, SurvivingEffects},
+    },
 };
 
 /// Proof that this process may run a coordinator. `Runtime::start` requires
@@ -22,6 +24,9 @@ use crate::{
 pub struct OwnerClaim {
     state: PathBuf,
     lock: WriterLock,
+    /// Declared after `lock`, so the writer lock is freed first and a release
+    /// that takes it finds this share still held until this process is done.
+    _effects: Option<EffectsLock>,
     coordinator_id: CoordinatorId,
     authority: Authority,
 }
@@ -44,10 +49,16 @@ impl OwnerClaim {
     pub fn acquire(state: &Path, script: &Path, failover: Option<&FailoverConfig>) -> Result<Self> {
         let Some(failover) = failover else {
             let lock = WriterLock::acquire(state)?;
+            // Only a replicated owner's release reads this lock, so a start
+            // without failover never fails on it.
+            let effects = EffectsLock::share(state)
+                .inspect_err(|error| eprintln!("Local effect processes are not tracked: {error:#}"))
+                .ok();
             return Ok(Self {
                 state: state.to_owned(),
                 coordinator_id: CoordinatorId::load_or_mint(state)?,
                 lock,
+                _effects: effects,
                 authority: Authority::Local,
             });
         };
@@ -74,21 +85,29 @@ impl OwnerClaim {
         match FailoverHelper::locate(script)?.run(&session, &claim)? {
             FailoverReport::Claimed { epoch, .. } => Ok(Self {
                 state: state.to_owned(),
+                _effects: Some(EffectsLock::share(state)?),
                 lock,
                 coordinator_id,
                 authority: Authority::Replicated { epoch, session },
             }),
-            FailoverReport::Refused { reason, state } => {
+            FailoverReport::Refused {
+                reason,
+                state: record,
+            } => {
                 if let Some(AuthorityState::Sealed {
                     epoch,
                     holder: sealed,
                     ..
-                }) = state
+                }) = record
                     && sealed == holder
                 {
-                    release_by_lock(&lock, script, &session, holder, epoch);
+                    release_by_lock(&lock, state, script, &session, holder, epoch);
                 }
-                Err(OwnerFenced::Refused { reason, state }.into())
+                Err(OwnerFenced::Refused {
+                    reason,
+                    state: record,
+                }
+                .into())
             }
             FailoverReport::Unstamped => bail!(
                 "{} holds no replication position, so this coordinator cannot start as the replicated owner and claimed nothing. Run `beep-boop failover enroll` to enroll this state directory as a replicated coordinator, or `beep-boop failover join` to make it a standby of an enrolled one",
@@ -132,33 +151,29 @@ impl OwnerClaim {
     }
 }
 
-/// A sealed holder that holds its writer lock has no supervisor and no Pi
-/// child alive, so it says so, and the promotion that sealed it need not wait
-/// for an operator. A failed post changes nothing: the start is still refused,
-/// and `failover release` posts the same evidence.
+/// A sealed holder that restarts says by itself that it is stopped, so the
+/// promotion that sealed it need not wait for an operator. A failed post
+/// changes nothing: the start is still refused, and `failover release` posts
+/// the same evidence.
 fn release_by_lock(
-    _lock: &WriterLock,
+    lock: &WriterLock,
+    state: &Path,
     script: &Path,
     session: &FailoverSession,
     holder: HolderId,
     epoch: OwnerEpoch,
 ) {
-    let command = AuthorityCommand::Release {
-        holder,
-        epoch,
-        evidence: ReleaseEvidence::LockHeld,
-    };
-    let posted = FailoverOperator::locate(script)
-        .and_then(|operator| operator.run(session, &OperatorRequest::Authority { command }));
+    let posted = FailoverOperator::locate(script).and_then(|operator| {
+        crate::failover::commands::release_by_lock(lock, state, &operator, session, holder, epoch)
+    });
     match posted {
-        Ok(OperatorReport::Reply {
-            reply: AuthorityReply::Accepted { .. },
-        }) => eprintln!(
+        Ok(()) => eprintln!(
             "Told the failover authority that no process of this coordinator is alive at epoch {}",
             epoch.get()
         ),
-        Ok(report) => eprintln!(
-            "The failover authority did not take this coordinator's release: {report:?}. Run `beep-boop failover release` on this host"
+        // A survivor's own sentence already says what an operator can do.
+        Err(error) if error.is::<SurvivingEffects>() => eprintln!(
+            "Did not tell the failover authority that this coordinator is stopped. {error:#}"
         ),
         Err(error) => eprintln!(
             "Could not tell the failover authority that this coordinator is stopped: {error:#}. Run `beep-boop failover release` on this host"
