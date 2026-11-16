@@ -634,6 +634,68 @@ its destination, description and attachments, or `refused` or `incomplete`.
 Before the watcher's first start, every capture present shows `backlog`.
 Add `--state-dir` when the service uses one.
 
+## Backups and restore
+
+Back up a coordinator while it is stopped. Stop the service first; the command
+never stops one. It takes the state directory's writer lock and refuses while a
+coordinator or its Pi child still owns the directory.
+
+```sh
+beep-boop backup create /Volumes/Backup/beep-boop-2026-11-16
+```
+
+Add `--state-dir` when the service uses one. The destination must not exist.
+The backup is a directory with `manifest.json` and a `data` folder that mirrors
+the state directory. It contains:
+
+- A copy of `session.sqlite` made with SQLite's backup API and checked with
+  `PRAGMA integrity_check`.
+- `coordinator-id`, so paired phones recognize the restored coordinator.
+- Uploaded attachments, imported history assets and private feedback.
+
+The manifest records the backup format, the application and Pi versions, the
+database schema version, the coordinator ID, the integrity result and the size
+and SHA-256 of each file. The command writes the backup in a hidden
+`.<name>.partial-<id>` directory beside the destination and renames it only
+after every file is written and synced. An interrupted backup leaves that hidden
+directory, never a partial destination. Delete it when no backup is running.
+
+The backup leaves out credentials (`auth.json`), the search index, diagnostics,
+logs, sockets, locks and this machine's client state: worker caches, the Scrawl
+ledger, the feedback outbox and saved TUI drafts. The private TOML configuration
+is outside the state directory, so keep a separate copy of it. The command
+lists any other name in the state directory as not included. A backup contains
+private conversations, attachments and feedback; keep it as private as the
+state directory.
+
+Restore into a new directory or an empty one:
+
+```sh
+beep-boop backup restore /Volumes/Backup/beep-boop-2026-11-16 ~/agent-restored
+```
+
+Before anything appears at the target, restore checks every path, size and
+SHA-256, the database integrity and schema version, and the coordinator ID. It
+refuses a target that is not empty, and it never reads or changes the existing
+state directory. To check a backup without using it, restore it into a scratch
+directory and then delete that directory.
+
+A restored store starts held. Its coordinator serves history, attachments and
+chats, but its background owner stays off: scheduled jobs, source polling,
+worktree collection and history indexing do not run. The restored coordinator
+has the same coordinator ID, so do not run it while the original still runs.
+Check the hosts first, for example that work a restored job would start has not
+already happened elsewhere. Then stop the coordinator and release the hold:
+
+```sh
+beep-boop --state-dir ~/agent-restored backup release
+```
+
+Start the service with `--state-dir` set to the restored directory, or move the
+directory to the default location while no coordinator runs. Run
+`beep-boop login` again, because credentials are not in the backup. After the
+release, the coordinator rebuilds the search index in the background.
+
 ## nix-darwin service
 
 The flake exports `darwinModules.default`. Import it and reference a private

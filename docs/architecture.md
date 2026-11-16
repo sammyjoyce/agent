@@ -174,7 +174,10 @@ conversation messages.
 
 The MVP does not replicate the store or recover onto another host. If the
 coordinator is down, the client reports that it is unavailable. Copying a live
-SQLite database or starting two coordinators is not a recovery mechanism.
+SQLite database or starting two coordinators is not a recovery mechanism. An
+[offline backup](setup.md#backups-and-restore) of a stopped coordinator
+restores into a new directory with background work held until the operator
+releases it.
 
 ## Tasks and execution
 
@@ -184,7 +187,8 @@ migrates legacy records in resumable batches before accepting work, retaining
 the original documents. Source decisions, task links and cursor advances keep
 their existing atomic commit boundary. Subsequent writes use the keyed records;
 rolling back only the binary would expose stale legacy state. A rollback needs
-the verified pre-upgrade database backup, restored with the coordinator stopped.
+the verified pre-upgrade [backup](setup.md#backups-and-restore), restored with
+the coordinator stopped.
 See [performance](performance.md) for migration and steady-state measurements.
 
 A task has a stable ID, title, intended outcome, source links, summary, pending
