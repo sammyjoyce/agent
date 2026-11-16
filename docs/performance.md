@@ -44,8 +44,9 @@ first, and Enter is pressed only once the composer shows the prompt, so Enter
 is a keystroke of its own. `/exit` ends every sample.
 
 `scroll_history` resumes the long conversation and prepares outside timing.
-It waits until the `• Loading history` status clears with the last sentence
-visible, then until the CLI has written nothing for 500 ms. Once replay ends,
+It waits until the last sentence and the composer are visible with neither
+`• Connecting` nor `• Loading history` showing, then until the CLI has
+written nothing for 500 ms. Once replay ends,
 the CLI writes every replayed message into the terminal's native scrollback
 in batches over several frames, and no visible cell marks the end of that
 write. Ctrl+Home then opens the history view at the oldest message. An
@@ -135,7 +136,8 @@ after the prime turn settles, and the measured window opens only once the
 load is under way.
 
 For search, the seed builds `search/search.sqlite` with the runtime's own
-retrieval code from a copy of the session and fixed 8-dimension vectors, so
+retrieval code from a copy of the session and 8-dimension vectors hashed
+from each text, so
 the index's checkpoints match the stored history. The session that the other
 scenarios read stays unchanged. Each search coordinator gets a copy of the
 index and the shell's sqlite-vec through `AGENT_SQLITE_VEC`. Four loops each
@@ -148,8 +150,9 @@ For import, the seed writes 200 invented legacy Codex rollouts. Each holds one
 user message and 50 answers as `agent_message` events, the lines that Codex
 reads from a legacy rollout. Each import coordinator gets its own copy as
 `~/.codex` and a `codex` on its private `PATH` that records its pid and runs
-the shell's `codex`. The import names no host, so it reads every registered
-node, and the Rex stand-in registers only the coordinator's own. The load is
+the shell's `codex`. The import names no host, so it reads every node the
+coordinator knows. The Rex stand-in lists no other host, so that is the
+coordinator's own node. The load is
 under way once the import commits its first item. The sample does not wait for
 the import to finish, and closing the coordinator stops it.
 
@@ -172,10 +175,11 @@ A sample fails, and the run with it, when any of these happen:
 - A launch or scroll scenario contacts the provider.
 - A background search fails or misses the long conversation, none finishes
   before Enter, or between Enter and visible activity no search is
-  outstanding for more than 1 ms. A shorter gap is a loop sending its next
+  outstanding for more than 5 ms. A shorter gap is a loop sending its next
   search after the runtime answered every loop at once.
 - The import fails, commits no item before Enter, or commits no new item after
   activity is visible. The error then asks for a larger corpus.
+- The `codex` process still runs 2 s after its coordinator exits.
 
 The error includes the visible screen, the marks and the provider log.
 
@@ -291,6 +295,9 @@ Two runs on one build show the gates' range:
   the window, and its indexing runs after it.
 - `scroll_history` measures scrolling after the replay and its scrollback
   write end, not during them.
+- On Linux the scroll gates' medians are about 1 ms for Ctrl+Home and 0.3 ms
+  for PageUp. The 20 ms absolute allowance is far above both, so a scroll
+  key that slows by less than about 20 ms passes.
 - After the scrollback write, the first PageUp from the live bottom redraws an
   identical screen, and only the second scrolls. The gates start from
   Ctrl+Home and from inside the history view, so that first PageUp is not
