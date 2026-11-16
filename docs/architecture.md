@@ -800,12 +800,13 @@ task, but nothing books. One case kills the runtime after routing and before
 the action, reopens the same state and replays the message.
 
 The checks read source decisions, tasks, task inputs, tool receipts and
-notices from the closed store, plus the ledger file and its call log. They do
-not read model wording or program text, so they do not judge the summary or
-evidence of a resolved task, or the lookalike case's summary. They trust the
-fixture ledger program, its log and the closed store. An agent that rewrites
-those files could forge what the checks read. The source-failure case also
-counts model requests during the outage.
+notices from the closed store, plus the ledger file and its call log. They
+compare task records with their seeded values, but they do not judge model
+wording or program text. So they accept any summary or evidence on a resolved
+task, and any summary in the lookalike case. They trust the fixture ledger
+program, its log and the closed store. An agent that rewrites those files
+could forge what the checks read. The source-failure case also counts model
+requests during the outage.
 
 A table of wrong agents tests the checks themselves. Each row is a scripted
 agent that breaks a rule, such as a readback that never runs, a readback from
