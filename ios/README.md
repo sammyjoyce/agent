@@ -536,6 +536,18 @@ the built app keeps the retry behind authentication and gives it no phrase. No
 test shows the authentication itself. On a fresh simulator the retry ran with
 the lock screen showing.
 
+App Intents Testing also confirms a confirmation by itself, so the
+out-of-process tests of Send Message check what follows it: the intent's
+value, what each fixture coordinator received, and the draft. A package test
+checks each sentence and each confirmation. `testShortcutsAsksBeforeItSends`
+runs the App Shortcut from the Shortcuts app, which shows the confirmation,
+and checks that Cancel sends nothing. `testSendMessageToAPrivateCoordinator`
+runs against the real service with a synthetic model, served by
+`runtime/test/fixtures/siri-world.ts`, and checks that a retry after a lost
+reply starts one generation. It runs only when the test runner's
+`TEST_RUNNER_AGENT_SIRI_WORLD` names that world's relay port, control port
+and coordinator ID, and is skipped otherwise.
+
 ## Validation
 
 ```sh
