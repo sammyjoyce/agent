@@ -1445,8 +1445,10 @@ export class TaskStore {
         return call(command, actor.host, actor.turn.controller.signal);
       } }) };
     // Input admitted while the last turn wound down still needs an owner. Native-only work was already drained.
+    // A job that Stop ended is not ensured again: its exit can precede the commit that withdraws its unplaced inputs.
     actor.exit.then(async () => {
-      if (!actor.fenced && this.actor(await this.get(ref.task_id), ref.agent_id).pending.length > 0) await this.ensureActor(ref);
+      if (actor.fenced || (actor.mode === "job" && actor.turn.phase === "stopping")) return;
+      if (this.actor(await this.get(ref.task_id), ref.agent_id).pending.length > 0) await this.ensureActor(ref);
     }).catch(() => {});
     this.running.set(this.actorKey(ref.task_id, ref.agent_id), actor);
     return actor;
