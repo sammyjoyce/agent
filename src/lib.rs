@@ -7,6 +7,7 @@ pub mod coordinator_id;
 pub mod discovery;
 pub mod dreams;
 pub mod embeddings;
+pub mod failover;
 pub mod feedback;
 pub mod goal_view;
 pub mod history;

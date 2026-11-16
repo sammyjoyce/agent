@@ -48,6 +48,9 @@ fn main() -> Result<()> {
     agent_cli::browser::BrowserBinding::export_all(&config)?;
     agent_cli::backup::DatabaseRequest::export_all(&config)?;
     agent_cli::backup::DatabaseReport::export_all(&config)?;
+    agent_cli::failover::AuthorityCommand::export_all(&config)?;
+    agent_cli::failover::AuthorityReply::export_all(&config)?;
+    agent_cli::failover::LogPage::export_all(&config)?;
     fs::write(
         output.join("browser.schema.json"),
         serde_json::to_string_pretty(&schema_for!(agent_cli::browser::BrowserHelperInput))?,

@@ -130,7 +130,7 @@
         });
       ci = pkgs.mkShell (tools
         // {
-          packages = tools.packages ++ [pkgs.codex];
+          packages = tools.packages ++ [pkgs.codex pkgs.wrangler];
         });
     });
   };
