@@ -831,6 +831,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn versions_change_only_when_their_format_constants_do() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = open(
+            &Export::new()
+                .conversations(&[picnic(1)])
+                .zip(&directory.path().join("export.zip")),
+        );
+        let (threads, _) = list(&history, false, None).await.unwrap();
+        let page = read(&history, &fixture::id(1), None).await;
+        assert_eq!(
+            [
+                history.summary().digest.as_str(),
+                threads[0].version.as_str(),
+                page.items[1].version.as_str(),
+            ],
+            [
+                "6d9add3c44295b197c450a40e3165106e69ca05acb48f1decbf721872aadf5f8",
+                "22bf46faad64cc152e1159ac4ba66f6ba7a8a970a26e0205cb1423f10480c493",
+                "6b273e3331333be4d762a3bc73367b4f6b077ddefc2c49bacd8c40ad04b29b78",
+            ],
+            "A pinned version changed. If the change is meant, bump PACKAGE_FORMAT, THREAD_FORMAT or ITEM_FORMAT and update these values."
+        );
+    }
+
+    #[tokio::test]
     async fn edited_branch_reads_back_with_the_selected_prompt_shown() {
         let directory = tempfile::tempdir().unwrap();
         let path = Export::new()

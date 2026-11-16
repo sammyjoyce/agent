@@ -669,11 +669,16 @@ fn file_index(members: &[Member]) -> HashMap<FileId, MemberId> {
     files
 }
 
+struct Surveyed {
+    survey: conversation::Survey,
+    repairs: u32,
+}
+
 #[derive(Default)]
 struct Scan {
     conversations: Vec<ConversationEntry>,
     by_id: HashMap<String, usize>,
-    surveys: HashMap<String, (u32, BTreeSet<FileId>, u32)>,
+    surveys: HashMap<String, Surveyed>,
     skipped: u32,
     problems: Vec<String>,
     problem_count: usize,
@@ -746,8 +751,10 @@ impl Scan {
             },
             content,
         };
-        let survey = conversation::survey(&value);
-        let survey = (survey.excluded, survey.files, repairs);
+        let survey = Surveyed {
+            survey: conversation::survey(&value),
+            repairs,
+        };
         if let Some(existing) = self.by_id.get(id).copied() {
             let previous = &self.conversations[existing];
             if previous.content == content {
@@ -785,10 +792,10 @@ impl Scan {
     ) -> Package {
         let mut referenced = BTreeSet::new();
         let (mut excluded, mut repaired) = (0, 0);
-        for (count, files, repairs) in self.surveys.into_values() {
-            excluded += count;
+        for Surveyed { survey, repairs } in self.surveys.into_values() {
+            excluded += survey.excluded;
             repaired += repairs;
-            referenced.extend(files);
+            referenced.extend(survey.files);
         }
         for entry in &mut self.conversations {
             let entries: Vec<&Value> = library

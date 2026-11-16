@@ -26,7 +26,8 @@ type Owned = { child: ChildProcess; closed: Promise<Run> };
 
 const CODEX_NOTE = "Codex note about deployment";
 const EXPORT_ONE_ITEMS = 10;
-const EXPORT_TWO_ADDED_ITEMS = 4 + 2;
+const PICNIC_EDIT_ADDED_ITEMS = 4;
+const KAYAK_REGENERATION_ADDED_ITEMS = 2;
 const NOTICE = "1 other version of this message is retained as evidence and not shown.";
 
 function events(stdout: string): RuntimeEventKind[] {
@@ -260,7 +261,7 @@ test("a ChatGPT export imports resumably and idempotently through an isolated co
     const later = await importExport(exportTwo);
     assert.equal(later.run.code, 0, later.run.stderr);
     assert.equal(later.final.threads_unchanged, 2);
-    assert.equal(later.final.items_added, EXPORT_TWO_ADDED_ITEMS);
+    assert.equal(later.final.items_added, PICNIC_EDIT_ADDED_ITEMS + KAYAK_REGENERATION_ADDED_ITEMS);
     const edited = await read(ids.picnic);
     assert.deepEqual(shown(edited.messages), [["notice", NOTICE], ["user", PICNIC.eight], ["assistant", PICNIC.eightReply]]);
     assert.deepEqual(shown((await read(ids.kayak)).messages), [["user", KAYAK.prompt], ["notice", NOTICE], ["assistant", KAYAK.regenerated]]);
