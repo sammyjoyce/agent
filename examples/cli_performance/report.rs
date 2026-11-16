@@ -1,6 +1,3 @@
-//! The results file: raw samples with their timelines, per-gate comparisons,
-//! and resource and token medians.
-
 use std::{
     collections::BTreeMap,
     time::{Instant, UNIX_EPOCH},
@@ -39,8 +36,6 @@ pub struct Sample {
     received_bytes: usize,
 }
 
-/// Milliseconds from the sample's start. Receipts carry the coordinator's
-/// epoch-millisecond resolution.
 #[derive(Serialize)]
 struct Moment {
     at_ms: f64,
@@ -186,11 +181,11 @@ impl Sample {
                 });
             }
         }
-        let (epoch, instant) = outcome.opened;
-        let opened_ms = epoch.duration_since(UNIX_EPOCH)?.as_secs_f64() * 1000.0;
+        let opened = outcome.opened;
+        let opened_ms = opened.wall.duration_since(UNIX_EPOCH)?.as_secs_f64() * 1000.0;
         for receipt in receipts.kept {
             timeline.push(Moment {
-                at_ms: receipt.epoch_ms as f64 - opened_ms + at(instant),
+                at_ms: receipt.epoch_ms as f64 - opened_ms + at(opened.monotonic),
                 event: Event::Receipt {
                     event: receipt.event,
                     input_id: receipt.input_id,
@@ -250,7 +245,6 @@ fn median(mut values: Vec<f64>) -> f64 {
     values.get(values.len() / 2).copied().unwrap_or(f64::NAN)
 }
 
-/// Reported, never gated. Warmup pairs are excluded as in the gate.
 fn medians(samples: &[Sample]) -> (Vec<ResourceMedian>, Vec<TokenMedian>) {
     let mut processes: BTreeMap<_, Vec<&Process>> = BTreeMap::new();
     let mut tokens: BTreeMap<_, Vec<Tokens>> = BTreeMap::new();

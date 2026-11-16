@@ -152,16 +152,16 @@ Build both revisions' runtime and CLI, then compare:
 
 ```sh
 nix develop --command cargo build --release --bin beep-boop \
-	--example terminal-fixture --example cli-performance
+  --example terminal-fixture --example cli-performance
 nix develop --command npm --prefix runtime run build
 nix develop --command target/release/examples/cli-performance \
-	--baseline /path/to/base/target/release/beep-boop \
-	--baseline-runtime /path/to/base/runtime/dist/src/bridge.js \
-	--candidate target/release/beep-boop \
-	--candidate-runtime runtime/dist/src/bridge.js \
-	--terminal target/release/examples/terminal-fixture \
-	--seed runtime/dist/test/fixtures/performance.js \
-	--output performance/results.json
+  --baseline /path/to/base/target/release/beep-boop \
+  --baseline-runtime /path/to/base/runtime/dist/src/bridge.js \
+  --candidate target/release/beep-boop \
+  --candidate-runtime runtime/dist/src/bridge.js \
+  --terminal target/release/examples/terminal-fixture \
+  --seed runtime/dist/test/fixtures/performance.js \
+  --output performance/results.json
 ```
 
 Add `--scenario submit`, repeated as needed, to run a subset. `--samples`

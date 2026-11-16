@@ -1,6 +1,3 @@
-//! How one sample's CLI session runs: a measured launch, or an interactive
-//! session prepared outside timing around a scenario's measured steps.
-
 use std::{
     path::Path,
     time::{Duration, Instant, SystemTime},
@@ -28,10 +25,24 @@ pub struct Context<'a> {
     pub seed: &'a Seed,
 }
 
+#[derive(Clone, Copy)]
+pub struct Anchor {
+    pub wall: SystemTime,
+    pub monotonic: Instant,
+}
+
+impl Anchor {
+    fn now() -> Self {
+        Self {
+            wall: SystemTime::now(),
+            monotonic: Instant::now(),
+        }
+    }
+}
+
 pub struct Outcome {
     pub origin: Instant,
-    /// The resource window's open, on both clocks, for mapping epoch receipts.
-    pub opened: (SystemTime, Instant),
+    pub opened: Anchor,
     pub marks: Marks,
     pub processes: Vec<Process>,
     pub tokens: Option<Tokens>,
@@ -72,7 +83,7 @@ pub async fn launch(
         (Role::Runtime, context.coordinator.runtime_pid()?),
     ];
     let window = Window::open(&services)?;
-    let opened = (SystemTime::now(), Instant::now());
+    let opened = Anchor::now();
     let (spawned, terminal, mut seen) = Terminal::spawn(command, vec![Sight::Shows(sentence)])?;
     let mut marks = Marks::default();
     marks.record(Mark::Spawn, spawned)?;
@@ -96,8 +107,6 @@ pub async fn launch(
     }
 }
 
-/// Outside timing, the chief becomes visible and a first turn settles, so the
-/// measured steps start from a warm, idle conversation.
 pub async fn interactive(
     context: &Context<'_>,
     steps: impl AsyncFnOnce(&Terminal, &mut Marks) -> Result<()>,
@@ -116,7 +125,7 @@ pub async fn interactive(
         terminal
             .press(ENTER, vec![Sight::Settled(PRIME_ANSWER)])
             .await?
-            .1
+            .sightings
             .next()
             .await?;
         let before = coordinator.ledger(&context.seed.chief).await?;
@@ -128,7 +137,7 @@ pub async fn interactive(
             ])
         };
         let window = Window::open(&roles()?)?;
-        let opened = (SystemTime::now(), Instant::now());
+        let opened = Anchor::now();
         steps(&terminal, &mut marks).await?;
         let processes = window.close(&roles()?)?;
         if let Ok(esc) = marks.get(Mark::Esc) {

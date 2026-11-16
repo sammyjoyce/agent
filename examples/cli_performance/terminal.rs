@@ -1,5 +1,3 @@
-//! The CLI in a PTY, observed through visible `vt100` cells.
-
 use std::{
     collections::VecDeque,
     num::NonZeroU16,
@@ -27,8 +25,6 @@ const BUSY: &str = "esc to interrupt";
 #[derive(Clone, Copy, Debug)]
 pub enum Sight {
     Shows(&'static str),
-    /// The composer is empty and the prompt is a placed transcript cell, not
-    /// a pending one that is still being sent.
     Admitted(&'static str),
     Settled(&'static str),
     Stopped,
@@ -115,7 +111,6 @@ impl Screen {
         ))
     }
 
-    /// Sights resolve in order; a later one may resolve in the same chunk.
     fn observe(&mut self, bytes: &[u8], at: Instant) -> Vec<u8> {
         self.parser.process(bytes);
         self.received += bytes.len();
@@ -132,8 +127,12 @@ impl Screen {
     }
 }
 
-/// The instants at which armed sights became true, in arming order.
 pub struct Sightings(VecDeque<(Sight, oneshot::Receiver<Instant>)>);
+
+pub struct Keystroke {
+    pub before_write: Instant,
+    pub sightings: Sightings,
+}
 
 impl Sightings {
     pub async fn next(&mut self) -> Result<Instant> {
@@ -153,7 +152,6 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    /// Arms `sights` before the CLI exists, so the first frame is observed.
     pub fn spawn(mut command: Command, sights: Vec<Sight>) -> Result<(Instant, Self, Sightings)> {
         command
             .stdin(Stdio::piped())
@@ -185,21 +183,21 @@ impl Terminal {
         ))
     }
 
-    /// Arms `sights`, then writes `key`. Returns the instant before the write.
-    pub async fn press(&self, key: &[u8], sights: Vec<Sight>) -> Result<(Instant, Sightings)> {
+    pub async fn press(&self, key: &[u8], sights: Vec<Sight>) -> Result<Keystroke> {
         let sightings = locked(&self.screen)?.arm(sights)?;
         let mut input = self.input.lock().await;
-        let pressed = Instant::now();
+        let before_write = Instant::now();
         input.write_all(key).await?;
-        Ok((pressed, sightings))
+        Ok(Keystroke {
+            before_write,
+            sightings,
+        })
     }
 
-    /// Types `text` and waits until the composer shows it, so a measured Enter
-    /// is a keystroke of its own.
     pub async fn compose(&self, text: &'static str) -> Result<()> {
         self.press(text.as_bytes(), vec![Sight::Shows(text)])
             .await?
-            .1
+            .sightings
             .next()
             .await
             .map(drop)
@@ -212,7 +210,6 @@ impl Terminal {
         )
     }
 
-    /// Detaches with `/exit` while output keeps draining. Returns received bytes.
     pub async fn exit(self) -> Result<usize> {
         self.input.lock().await.write_all(b"/exit\r").await?;
         let Self {

@@ -1,6 +1,3 @@
-//! Every scenario's definition and its driver. This is the one place a scenario
-//! names its coordinator lifetime, provider turns, gates and steps.
-
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail, ensure};
@@ -11,10 +8,10 @@ use tokio::time::sleep;
 use crate::{
     DEADLINE,
     coordinator::read_pid,
-    gate::{Discount, Gate, GateDefinition, Mark},
+    gate::{Gate, GateDefinition, HoldDiscount, Mark},
     provider::{End, Request},
     session::{self, Context, Outcome},
-    terminal::Sight,
+    terminal::{Keystroke, Sight},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, ValueEnum)]
@@ -45,7 +42,6 @@ pub struct Turn {
     pub ending: Ending,
 }
 
-/// What the provider sends after the tail hold.
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Ending {
@@ -126,7 +122,7 @@ const STOP_TOOL: Turn = Turn {
     ending: Ending::Exec { tail_ms: 300 },
 };
 
-const fn gate(gate: Gate, from: Mark, to: Mark, discount: Discount) -> GateDefinition {
+const fn gate(gate: Gate, from: Mark, to: Mark, discount: HoldDiscount) -> GateDefinition {
     GateDefinition {
         gate,
         from,
@@ -139,13 +135,13 @@ static LAUNCH_GATES: [GateDefinition; 1] = [gate(
     Gate::ConversationVisible,
     Mark::Spawn,
     Mark::StoredTextVisible,
-    Discount::None,
+    HoldDiscount::None,
 )];
 static STOP_GATES: [GateDefinition; 1] = [gate(
     Gate::Stop,
     Mark::Esc,
     Mark::InterruptedVisible,
-    Discount::None,
+    HoldDiscount::None,
 )];
 
 static CHIEF_COLD_DEFINITION: Definition = Definition {
@@ -162,12 +158,17 @@ static SUBMIT_DEFINITION: Definition = Definition {
     coordinator: Lifetime::PerSample,
     turns: &[PRIME, SUBMIT],
     gates: &[
-        gate(Gate::Admission, Mark::Enter, Mark::Admitted, Discount::None),
+        gate(
+            Gate::Admission,
+            Mark::Enter,
+            Mark::Admitted,
+            HoldDiscount::None,
+        ),
         gate(
             Gate::FirstActivity,
             Mark::Enter,
             Mark::ActivityVisible,
-            Discount::FirstChunkHolds,
+            HoldDiscount::FirstChunkHolds,
         ),
     ],
 };
@@ -179,13 +180,13 @@ static STEER_DEFINITION: Definition = Definition {
             Gate::SteerAdmission,
             Mark::SteerEnter,
             Mark::SteerQueuedVisible,
-            Discount::None,
+            HoldDiscount::None,
         ),
         gate(
             Gate::SteerReply,
             Mark::SteerEnter,
             Mark::SteerReplyVisible,
-            Discount::AllHoldsAfter(Mark::SteerQueuedVisible),
+            HoldDiscount::AllHoldsAfter(Mark::SteerQueuedVisible),
         ),
     ],
 };
@@ -229,7 +230,10 @@ pub async fn drive(scenario: Scenario, context: &Context<'_>) -> Result<Outcome>
         Scenario::Submit => {
             session::interactive(context, async |terminal, marks| {
                 terminal.compose(SUBMIT.prompt).await?;
-                let (enter, mut seen) = terminal
+                let Keystroke {
+                    before_write: enter,
+                    sightings: mut seen,
+                } = terminal
                     .press(
                         ENTER,
                         vec![
@@ -249,13 +253,19 @@ pub async fn drive(scenario: Scenario, context: &Context<'_>) -> Result<Outcome>
         Scenario::Steer => {
             session::interactive(context, async |terminal, marks| {
                 terminal.compose(STEER_BASE.prompt).await?;
-                let (enter, mut seen) = terminal
+                let Keystroke {
+                    before_write: enter,
+                    sightings: mut seen,
+                } = terminal
                     .press(ENTER, vec![Sight::Shows(STEER_BASE.reasoning)])
                     .await?;
                 marks.record(Mark::Enter, enter)?;
                 marks.record(Mark::BaseActivityVisible, seen.next().await?)?;
                 terminal.compose(STEER.prompt).await?;
-                let (enter, mut seen) = terminal
+                let Keystroke {
+                    before_write: enter,
+                    sightings: mut seen,
+                } = terminal
                     .press(
                         ENTER,
                         vec![
@@ -275,12 +285,18 @@ pub async fn drive(scenario: Scenario, context: &Context<'_>) -> Result<Outcome>
         Scenario::StopStream => {
             session::interactive(context, async |terminal, marks| {
                 terminal.compose(STOP_STREAM.prompt).await?;
-                let (enter, mut seen) = terminal
+                let Keystroke {
+                    before_write: enter,
+                    sightings: mut seen,
+                } = terminal
                     .press(ENTER, vec![Sight::Shows(STOP_STREAM.reasoning)])
                     .await?;
                 marks.record(Mark::Enter, enter)?;
                 marks.record(Mark::ActivityVisible, seen.next().await?)?;
-                let (esc, mut seen) = terminal.press(ESC, vec![Sight::Stopped]).await?;
+                let Keystroke {
+                    before_write: esc,
+                    sightings: mut seen,
+                } = terminal.press(ESC, vec![Sight::Stopped]).await?;
                 marks.record(Mark::Esc, esc)?;
                 marks.record(Mark::InterruptedVisible, seen.next().await?)
             })
@@ -290,7 +306,10 @@ pub async fn drive(scenario: Scenario, context: &Context<'_>) -> Result<Outcome>
             let pid_file = context.coordinator.tool_pid_file();
             session::interactive(context, async |terminal, marks| {
                 terminal.compose(STOP_TOOL.prompt).await?;
-                let (enter, mut seen) = terminal
+                let Keystroke {
+                    before_write: enter,
+                    sightings: mut seen,
+                } = terminal
                     .press(ENTER, vec![Sight::Shows(STOP_TOOL.reasoning)])
                     .await?;
                 marks.record(Mark::Enter, enter)?;
@@ -308,7 +327,10 @@ pub async fn drive(scenario: Scenario, context: &Context<'_>) -> Result<Outcome>
                 .await
                 .context("The exec tool did not start")?;
                 marks.record(Mark::ToolRunning, Instant::now())?;
-                let (esc, mut seen) = terminal.press(ESC, vec![Sight::Stopped]).await?;
+                let Keystroke {
+                    before_write: esc,
+                    sightings: mut seen,
+                } = terminal.press(ESC, vec![Sight::Stopped]).await?;
                 marks.record(Mark::Esc, esc)?;
                 marks.record(Mark::InterruptedVisible, seen.next().await?)?;
                 let alive = unsafe { libc::kill(tool, 0) };
@@ -324,9 +346,6 @@ pub async fn drive(scenario: Scenario, context: &Context<'_>) -> Result<Outcome>
     }
 }
 
-/// Correctness that fails the sample: the provider saw exactly the scripted
-/// turns, stops stopped, steering waited for its boundary, and Pi's ledger
-/// counted exactly the requests that completed inside the window.
 pub fn verify(scenario: Scenario, outcome: &Outcome, requests: &[Request]) -> Result<()> {
     let turns = scenario.definition().turns;
     ensure!(
@@ -373,7 +392,7 @@ pub fn verify(scenario: Scenario, outcome: &Outcome, requests: &[Request]) -> Re
         let completed: u64 = requests
             .iter()
             .filter_map(|request| match request.end {
-                Some(End::Completed { at, total_tokens }) if at > outcome.opened.1 => {
+                Some(End::Completed { at, total_tokens }) if at > outcome.opened.monotonic => {
                     Some(total_tokens)
                 }
                 _ => None,

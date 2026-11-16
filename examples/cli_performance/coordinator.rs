@@ -1,5 +1,3 @@
-//! One isolated coordinator with its own provider, Rex stand-in and receipts.
-
 use std::{
     collections::BTreeMap,
     fs,
@@ -150,6 +148,12 @@ pub struct Receipt {
     pub command: Option<String>,
 }
 
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum ReceiptKey {
+    EarliestPerInput { event: String, input_id: String },
+    OnePerMillisecond { event: String, epoch_ms: u64 },
+}
+
 #[derive(Deserialize)]
 struct ReceiptRecord {
     timestamp_ms: u64,
@@ -221,7 +225,6 @@ impl Coordinator {
             },
         )
         .await?;
-        // isolated clears inherited credentials; these are the only additions.
         command
             .env("AGENT_PERFORMANCE_RUNTIME", runtime)
             .env("AGENT_PERFORMANCE_PROVIDER", &provider.base_url)
@@ -286,7 +289,6 @@ impl Coordinator {
         self.provider.requests()
     }
 
-    /// Pi's token ledger for one conversation, summed over its models.
     pub async fn ledger(&self, conversation: &str) -> Result<Tokens> {
         let stream = agent_cli::service::connect(self.directory()).await?;
         let (reader, mut writer) = stream.into_split();
@@ -348,15 +350,12 @@ pub fn read_pid(path: &Path) -> Result<i32> {
         .parse()?)
 }
 
-/// Diagnostics explain a sample; they never gate it. Control and view
-/// requests both log an event, so each input keeps its earliest receipt of a
-/// kind, and an event without an input keeps one receipt per millisecond.
 fn receipts(directory: &Path) -> Result<Receipts> {
     let mut receipts = Receipts::default();
     let Ok(entries) = fs::read_dir(directory) else {
         return Ok(receipts);
     };
-    let mut earliest: BTreeMap<(String, Option<String>, Option<u64>), Receipt> = BTreeMap::new();
+    let mut earliest: BTreeMap<ReceiptKey, Receipt> = BTreeMap::new();
     for entry in entries {
         let path = entry?.path();
         if !path
@@ -377,7 +376,16 @@ fn receipts(directory: &Path) -> Result<Receipts> {
             {
                 continue;
             }
-            let occurrence = record.input_id.is_none().then_some(record.timestamp_ms);
+            let key = match &record.input_id {
+                Some(input_id) => ReceiptKey::EarliestPerInput {
+                    event: record.event.clone(),
+                    input_id: input_id.clone(),
+                },
+                None => ReceiptKey::OnePerMillisecond {
+                    event: record.event.clone(),
+                    epoch_ms: record.timestamp_ms,
+                },
+            };
             let receipt = Receipt {
                 epoch_ms: record.timestamp_ms,
                 event: record.event,
@@ -385,7 +393,7 @@ fn receipts(directory: &Path) -> Result<Receipts> {
                 command: record.command,
             };
             earliest
-                .entry((receipt.event.clone(), receipt.input_id.clone(), occurrence))
+                .entry(key)
                 .and_modify(|kept| {
                     if receipt.epoch_ms < kept.epoch_ms {
                         *kept = receipt.clone();

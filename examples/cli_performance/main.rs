@@ -1,7 +1,3 @@
-//! Paired benchmarks of the real CLI and Pi: conversation launch, input
-//! admission, first visible activity, steering and stop, each gated on
-//! application delay with a loopback model provider's holds removed.
-
 mod coordinator;
 mod gate;
 mod provider;

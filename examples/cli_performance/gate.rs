@@ -41,10 +41,9 @@ pub enum Gate {
     Stop,
 }
 
-/// Which provider holds a gate may subtract from its wall-clock span.
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Discount {
+pub enum HoldDiscount {
     None,
     FirstChunkHolds,
     AllHoldsAfter(Mark),
@@ -55,7 +54,7 @@ pub struct GateDefinition {
     pub gate: Gate,
     pub from: Mark,
     pub to: Mark,
-    pub discount: Discount,
+    pub discount: HoldDiscount,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -122,9 +121,9 @@ pub fn span(definition: &GateDefinition, marks: &Marks, holds: &[Hold]) -> Resul
         );
     }
     let (start, eligible): (Instant, fn(&Hold) -> bool) = match definition.discount {
-        Discount::None => (to, |_| false),
-        Discount::FirstChunkHolds => (from, |hold| hold.kind == HoldKind::FirstChunk),
-        Discount::AllHoldsAfter(mark) => (from.max(marks.get(mark)?), |_| true),
+        HoldDiscount::None => (to, |_| false),
+        HoldDiscount::FirstChunkHolds => (from, |hold| hold.kind == HoldKind::FirstChunk),
+        HoldDiscount::AllHoldsAfter(mark) => (from.max(marks.get(mark)?), |_| true),
     };
     let mut clipped = holds
         .iter()
@@ -307,19 +306,19 @@ mod tests {
         gate: Gate::FirstActivity,
         from: Mark::Enter,
         to: Mark::ActivityVisible,
-        discount: Discount::FirstChunkHolds,
+        discount: HoldDiscount::FirstChunkHolds,
     };
     const STEER_REPLY: GateDefinition = GateDefinition {
         gate: Gate::SteerReply,
         from: Mark::SteerEnter,
         to: Mark::SteerReplyVisible,
-        discount: Discount::AllHoldsAfter(Mark::SteerQueuedVisible),
+        discount: HoldDiscount::AllHoldsAfter(Mark::SteerQueuedVisible),
     };
     const ADMISSION: GateDefinition = GateDefinition {
         gate: Gate::Admission,
         from: Mark::Enter,
         to: Mark::Admitted,
-        discount: Discount::None,
+        discount: HoldDiscount::None,
     };
 
     fn first_activity(first_chunk: (u64, u64), tail: (u64, u64), visible: u64) -> Span {
@@ -453,12 +452,10 @@ mod tests {
         assert!(marks.get(Mark::Esc).is_err());
     }
 
-    /// A realistic timeline for any gate. The candidate's closing mark arrives
-    /// `delay` later while every provider hold stays identical.
     fn timeline(definition: &GateDefinition, delay: u64) -> Span {
         let origin = Instant::now();
         let mut entries = vec![(definition.from, 1_000), (definition.to, 1_600 + delay)];
-        if let Discount::AllHoldsAfter(mark) = definition.discount
+        if let HoldDiscount::AllHoldsAfter(mark) = definition.discount
             && mark != definition.from
             && mark != definition.to
         {

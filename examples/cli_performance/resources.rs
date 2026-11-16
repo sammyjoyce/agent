@@ -1,5 +1,3 @@
-//! Per-process CPU time and resident memory, read only at window boundaries.
-
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -22,7 +20,6 @@ pub enum PeakKind {
     VmHwm,
 }
 
-/// Where a process's CPU time starts counting.
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Since {
@@ -59,7 +56,6 @@ impl Window {
             .map(Self)
     }
 
-    /// A role absent at open was born inside the window, so its CPU is lifetime.
     pub fn close(self, processes: &[(Role, i32)]) -> Result<Vec<Process>> {
         processes
             .iter()

@@ -1,5 +1,3 @@
-//! A loopback OpenAI Responses server whose holds run on the benchmark's clock.
-
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
@@ -22,9 +20,8 @@ use crate::{
 
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 
-/// The `exec` turn's program. Node writes its pid to `pid_file` and idles
-/// until the stop kills it. A tool the stop missed exits once its parent
-/// does, so the benchmark never signals a pid that may have been reused.
+/// A tool the stop missed exits once its parent does, so the benchmark never
+/// signals a pid the OS may have reused.
 #[derive(Clone)]
 pub struct ToolFixture {
     pub node: PathBuf,
@@ -183,8 +180,6 @@ async fn read_request(stream: &mut TcpStream) -> Result<(Instant, Vec<u8>)> {
     }
 }
 
-/// The same rule as `runtime/test/fixtures/coordinator-runtime.ts`: the turn
-/// whose prompt appears in the latest user input.
 fn matched(body: &[u8], turns: &'static [Turn]) -> Result<&'static Turn> {
     let body: Value = serde_json::from_slice(body)?;
     let user = body["input"]
@@ -337,8 +332,6 @@ enum Released {
     Closed(Instant),
 }
 
-/// Wait for the scripted deadline, or forever without one, while watching
-/// for the client to abort its request by closing the connection.
 async fn hold(stream: &mut TcpStream, until: Option<Instant>) -> Released {
     let mut buffer = [0; 1024];
     let deadline = async {

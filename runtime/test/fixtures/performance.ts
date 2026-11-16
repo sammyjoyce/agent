@@ -1,5 +1,3 @@
-// Native retained history. Seeding never calls a provider; the runtime reaches
-// only the benchmark's loopback provider.
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -20,8 +18,6 @@ if (runtime !== undefined) {
   if (provider === undefined || pidFile === undefined) throw new Error("The benchmark provider and runtime PID file are required");
   process.env.OPENAI_API_KEY = "sk-synthetic-performance";
   await writeFile(pidFile, String(process.pid));
-  // Only the model provider moves to the benchmark's loopback server, which
-  // owns its delays and clock. Pi's request, headers and abort signal are unchanged.
   globalThis.fetch = async (input, init) => {
     const url = input instanceof Request ? input.url : input.toString();
     if (url !== "https://api.openai.com/v1/responses") throw new Error(`Performance scenarios must not contact ${url}`);

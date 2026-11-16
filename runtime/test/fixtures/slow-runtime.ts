@@ -1,5 +1,3 @@
-// The deliberately slow candidate for the CLI benchmark's proof that every
-// interactive gate can fail. Each runtime event reaches the coordinator late.
 const SLOW_RUNTIME_DELAY_MS = 500;
 
 const write = process.stdout.write.bind(process.stdout);
