@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +11,8 @@ import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import { defineExtension, defineTool, type CompactionSettings } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
 import type { AgentNode } from "../src/generated/AgentNode.js";
+import { ATTACHMENT_CHUNK_BYTES } from "../src/generated/attachment-limits.js";
+import type { BrowserResponse } from "../src/generated/BrowserResponse.js";
 import type { HostCommand } from "../src/generated/HostCommand.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 import type { TaskRecord } from "../src/generated/TaskRecord.js";
@@ -17,6 +20,7 @@ import { ALWAYS_DIRECT, applyToolSurfaces, BROWSER_TOOLS, createToolDiscovery, T
 import { history, toolDetails, UserNoticeEntry } from "../src/transcript.js";
 import { declarationSize, DISCOVERY_ARMS, openDiscoveryApp, type DeclarationSize, type DiscoveryApp, type DiscoveryArm,
   type DiscoveryArmName } from "./fixtures/tool-discovery.js";
+import { capturePng, pngSize } from "./fixtures/png.js";
 import { fixtureModel } from "./model.js";
 import { runAdmitted } from "./fixtures/run-admitted.js";
 
@@ -25,7 +29,7 @@ const node: AgentNode = { host_id: "11111111-1111-4111-8111-111111111111", name:
 const jobSource = { provider: "scheduled_jobs", account: "local", thread_id: "example-job" };
 type ToolArguments = Parameters<typeof fauxToolCall>[1];
 
-async function lab(prefix: string) {
+async function lab(prefix: string, answer?: (command: HostCommand) => HostResult | undefined) {
   const directory = await mkdtemp(join(tmpdir(), prefix));
   const models = createModels(), faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }], tokensPerSecond: 1_000_000 });
   models.setProvider(faux.provider);
@@ -34,6 +38,8 @@ async function lab(prefix: string) {
     let command = request;
     while (command.type === "on_node") command = command.command;
     commands.push(command);
+    const answered = answer?.(command);
+    if (answered !== undefined) return answered;
     if (command.type === "reload_guidance") return { type: "shared_guidance", global: { text: "", sources: [] }, workflow_policy: "", context_repositories: [], context_sources: [] };
     if (command.type === "project_guidance") return { type: "project_guidance", snapshot: { text: "", sources: [] } };
     if (command.type === "exec") return { type: "process", exit_code: 0, stdout: "EXAMPLE_EXEC_OUTPUT", stderr: "", truncated: false };
@@ -232,6 +238,72 @@ for (const guard of scriptGuards) {
     } finally { await app.close(); await env.remove(); }
   });
 }
+
+test("code mode: a worker opens a tab in a script, and its direct screenshot reaches the next request and history", async () => {
+  const capture = capturePng(96, 48), digest = createHash("sha256").update(capture).digest("hex");
+  const tabs = [{ id: 7, title: "Invented color blocks", url: "https://example.com/blocks" }];
+  const browser = (command: HostCommand): HostResult | undefined => {
+    if (command.type !== "browser") return undefined;
+    const { action, session_id } = command.request;
+    const response: BrowserResponse = action.type === "screenshot"
+      ? { type: "screenshot", session_id, tabs, capture: { data_base64: capture.toString("base64"), sha256: digest } }
+      : action.type === "release" ? { type: "closed", session_id, tabs: [], output: "Released" }
+      : { type: "ready", session_id, tabs, output: "Invented page ready", is_error: false };
+    return { type: "browser", response };
+  };
+  const env = await lab("agent-tool-discovery-screenshot-", browser), app = await env.open(DISCOVERY_ARMS.production);
+  try {
+    const turn = await startRole.worker(app, "Show me the invented page.");
+    let opened: unknown, receipt = "", image: [number, number] | undefined;
+    env.faux.setResponses([
+      (input) => {
+        const offered = offeredNames(input);
+        assert.ok(offered.includes("codemode") && offered.includes("browser_screenshot") && !offered.includes("browser_open"), offered.join(", "));
+        return script(`const found = (await searchTools("browser open")).map((tool) => tool.name);
+const opened = JSON.parse(await tools.browser_open({ url: "https://example.com/blocks" }));
+return { found, tabs: opened.response.tabs.map((tab) => tab.id) };`);
+      },
+      (input) => {
+        const result = toolResult(input, "codemode"); assert.equal(result.isError, false, result.text);
+        opened = scriptValue(result.text);
+        return fauxAssistantMessage(fauxToolCall("browser_screenshot", { tab_id: 7 }), { stopReason: "toolUse" });
+      },
+      (input) => {
+        const result = input.messages.findLast((message) => message.role === "toolResult");
+        assert.ok(result?.role === "toolResult" && result.toolName === "browser_screenshot" && result.isError !== true, JSON.stringify(result));
+        const part = result.content.find((item) => item.type === "image");
+        assert.ok(part?.type === "image" && part.mimeType === "image/png", "The next request carries the screenshot as native image content");
+        image = pngSize(Buffer.from(part.data, "base64"));
+        receipt = result.content.flatMap((item) => item.type === "text" ? [item.text] : []).join("\n");
+        return fauxAssistantMessage("The invented page has three color blocks.");
+      },
+    ]);
+    await turn.run();
+    assert.ok(typeof opened === "object" && opened !== null && "found" in opened && "tabs" in opened && Array.isArray(opened.found));
+    assert.ok(opened.found.includes("browser_open"), `The script found the deferred browser tools: ${JSON.stringify(opened.found)}`);
+    assert.deepEqual(opened.tabs, [7], "The script opened the owned tab");
+    assert.deepEqual(image, [96, 48]);
+    assert.equal(receipt.includes(capture.toString("base64").slice(0, 64)), false, "Image bytes never travel as model text");
+    assert.deepEqual(env.commands.flatMap((command) => command.type === "browser" ? [command.request.action.type] : []), ["open", "screenshot", "release"]);
+
+    const conversation = await app.tasks.conversation((await ownTask(app)).conversation_id);
+    const rows = (await history(conversation, null, app.session)).flatMap((page) => page.messages)
+      .filter((message) => message.tool?.name === "browser_screenshot");
+    const [row, ...others] = rows.filter((message) => message.tool?.status === "finished");
+    assert.ok(row !== undefined && others.length === 0, "History holds one finished screenshot row");
+    assert.deepEqual(rows.filter((message) => message !== row).flatMap((message) => message.attachments ?? []), [], "Only the result row carries the attachment");
+    const [attachment, ...extra] = row.attachments ?? [];
+    assert.ok(attachment !== undefined && extra.length === 0, "The screenshot's result row lists its attachment");
+    assert.equal(attachment.media_type, "image/png");
+    assert.equal(attachment.size_bytes, capture.length);
+    assert.equal(attachment.sha256, digest);
+    assert.ok(receipt.includes(attachment.id), "The model can name the attachment for read_attachment and delegation");
+    const download = await app.attachments.request({ type: "download", id: attachment.id, offset: 0, limit: ATTACHMENT_CHUNK_BYTES });
+    assert.ok(download.type === "download" && download.next_offset === null);
+    assert.ok(Buffer.from(download.data_base64, "base64").equals(capture), "The retained bytes are the captured bytes");
+    await assert.rejects(app.attachments.request({ type: "discard", id: attachment.id }), /retained/, "History owns the screenshot");
+  } finally { await app.close(); await env.remove(); }
+});
 
 type Publication = { conversation_id: string; entry_id: string | null; text: string; call_id?: string | null };
 type CallerIdentity = { role: Exclude<ToolRole, "triage">; tool: string; texts: string[]; args(text: string): ToolArguments;

@@ -6,7 +6,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { crc32, deflateSync } from "node:zlib";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type Message, type TranscriptContext } from "@earendil-works/pi-ai";
@@ -28,26 +27,11 @@ import { DEFAULT_MODEL } from "../src/models.js";
 import { protocolLines, validEvent } from "../src/protocol.js";
 import { Executions } from "../src/tools.js";
 import { history } from "../src/transcript.js";
+import { capturePng, pngSize } from "./fixtures/png.js";
 
 const hostId = "11111111-1111-4111-8111-111111111111";
 const host = { host_id: hostId, name: "fixture", rex_server: null, coordinator: null, cwd: "/example/project", agent_program: "/example/agent" };
-const stripes: [number, number, number][] = [[0xd0, 0x30, 0x30], [0x30, 0xa0, 0x40], [0x30, 0x50, 0xd0]];
-
-function capturePng(width: number, height: number): Buffer {
-  const row = Buffer.alloc(1 + width * 3);
-  for (let x = 0; x < width; x++) row.set(stripes[Math.floor(x * stripes.length / width)] ?? [0, 0, 0], 1 + x * 3);
-  const chunk = (kind: string, data: Buffer) => {
-    const body = Buffer.concat([Buffer.from(kind, "ascii"), data]);
-    const length = Buffer.alloc(4); length.writeUInt32BE(data.length);
-    const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(body));
-    return Buffer.concat([length, body, crc]);
-  };
-  const header = Buffer.alloc(13); header.writeUInt32BE(width, 0); header.writeUInt32BE(height, 4); header.set([8, 2, 0, 0, 0], 8);
-  return Buffer.concat([Buffer.from("\x89PNG\r\n\x1a\n", "latin1"), chunk("IHDR", header),
-    chunk("IDAT", deflateSync(Buffer.concat(Array.from({ length: height }, () => row)), { level: 0 })), chunk("IEND", Buffer.alloc(0))]);
-}
 function sha256(bytes: Buffer): string { return createHash("sha256").update(bytes).digest("hex"); }
-function size(png: Buffer): [number, number] { return [png.readUInt32BE(16), png.readUInt32BE(20)]; }
 
 async function open(directory: string) {
   const database = await openNodeSqliteDatabase(join(directory, "session.sqlite"));
@@ -132,7 +116,7 @@ test("a screenshot reaches the next model request as an image and history as a r
     assert.ok(result !== undefined && result.isError !== true, JSON.stringify(result?.content));
     const image = result.content.find((part) => part.type === "image");
     assert.ok(image?.type === "image" && image.mimeType === "image/png", "The model receives the capture as native image content");
-    assert.deepEqual(size(Buffer.from(image.data, "base64")), [96, 48]);
+    assert.deepEqual(pngSize(Buffer.from(image.data, "base64")), [96, 48]);
     const text = result.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n");
     assert.equal(text.includes(png.toString("base64").slice(0, 64)), false, "Image bytes never travel as model text");
 
@@ -305,7 +289,7 @@ test("the production bridge sends a screenshot to the Responses provider as an i
     const [first] = images;
     assert.ok(first !== undefined, "A later Responses request carries the screenshot as an input image");
     assert.match(first, /^data:image\/png;base64,/);
-    assert.deepEqual(size(Buffer.from(first.slice("data:image/png;base64,".length), "base64")), [120, 60]);
+    assert.deepEqual(pngSize(Buffer.from(first.slice("data:image/png;base64,".length), "base64")), [120, 60]);
 
     const [attachment, ...extra] = await bridge.screenshots(5);
     assert.ok(attachment !== undefined && extra.length === 0, "read_history lists the screenshot attachment on its tool row");

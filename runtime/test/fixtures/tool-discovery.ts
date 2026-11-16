@@ -100,8 +100,9 @@ export async function openDiscoveryApp(directory: string, { models, model, arm, 
     jobActor: (job) => openJobActor(job, tasks), runJob: (occurrence, signal, id) => runScheduled(occurrence, signal, { session, tasks, sources }, id),
   });
   const jobTools = createJobTools(scheduler, executions);
+  const attachments = new AttachmentStore(directory);
   const production = withActorPolicies(createToolsets({ guidance: createGuidance(executions), tools, sourceTools,
-    resourceTools: createResourceTools(resources, tasks, executions), browserTools: createBrowserTools(new BrowserStore(session), executions, new AttachmentStore(directory)), jobTools,
+    resourceTools: createResourceTools(resources, tasks, executions), browserTools: createBrowserTools(new BrowserStore(session), executions, attachments), jobTools,
   }), { responsePolicy: createMainResponsePolicy(session), inputOrigins: createInputOrigins(session) });
   const discovery = createToolDiscovery();
   const { toolsets, installed } = applyToolSurfaces(production, arm, discovery);
@@ -116,6 +117,6 @@ export async function openDiscoveryApp(directory: string, { models, model, arm, 
     const detached = tasks.detachActors();
     await session.close(BACKGROUND_CONTEXT); await detached; await discovery.close();
   }
-  return { session, registry, inference, tasks, environment, sources, resources, scheduler, executions, tools, toolsets, worker, bind, close };
+  return { session, registry, inference, tasks, environment, sources, resources, scheduler, executions, attachments, tools, toolsets, worker, bind, close };
 }
 export type DiscoveryApp = Awaited<ReturnType<typeof openDiscoveryApp>>;
