@@ -8,8 +8,6 @@ mod json;
 mod package;
 
 use std::{
-    collections::HashMap,
-    io::Read,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -75,15 +73,7 @@ pub struct ChatGptHistory {
 #[derive(Default)]
 struct ReadState {
     current: Option<(String, Arc<conversation::Normalized>)>,
-    digests: HashMap<package::MemberId, Result<MemberDigest, String>>,
     transfer: Option<(package::MemberId, archive::Region)>,
-}
-
-#[derive(Clone)]
-struct MemberDigest {
-    sha256: String,
-    size: u64,
-    sniffed: Option<&'static str>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -253,7 +243,7 @@ impl ChatGptHistory {
                 .filter(|gap| gap.item_id.as_deref() == Some(item.id.as_str()))
                 .cloned()
                 .collect();
-            self.fill_digests(state, &mut item, &mut item_gaps);
+            self.fill_digests(&mut item, &mut item_gaps);
             let length = serde_json::to_vec(&item)?.len() + serde_json::to_vec(&item_gaps)?.len();
             if bytes + length > PAGE_BYTES && !items.is_empty() {
                 break;
@@ -309,77 +299,34 @@ impl ChatGptHistory {
         Some(normalized)
     }
 
-    fn fill_digests(
-        &self,
-        state: &mut ReadState,
-        item: &mut HistoryItem,
-        gaps: &mut Vec<HistoryGap>,
-    ) {
+    fn fill_digests(&self, item: &mut HistoryItem, gaps: &mut Vec<HistoryGap>) {
         let mut kept = Vec::new();
         for mut asset in std::mem::take(&mut item.assets) {
             if !matches!(asset.kind, HistoryAssetKind::LocalMedia) {
                 kept.push(asset);
                 continue;
             }
-            match self.digest(state, &asset.path) {
-                Ok(digest) => {
+            match conversation::FileId::find(&asset.path).and_then(|file| self.package.file(&file))
+            {
+                Some(indexed) => {
+                    let digest = &indexed.digest;
                     if asset.media_type == conversation::UNKNOWN_MEDIA
                         && let Some(sniffed) = digest.sniffed
                     {
                         asset.media_type = sniffed.to_owned();
                     }
-                    asset.sha256 = Some(digest.sha256);
+                    asset.sha256 = Some(digest.sha256.clone());
                     asset.size = Some(digest.size);
                     kept.push(asset);
                 }
-                Err(reason) => gaps.push(HistoryGap {
-                    code: HistoryGapCode::Changed,
+                None => gaps.push(HistoryGap {
+                    code: HistoryGapCode::Missing,
                     item_id: Some(item.id.clone()),
-                    message: format!("Attachment {} {reason}; it was not imported", asset.path),
+                    message: format!("Attachment {} is not in this export", asset.path),
                 }),
             }
         }
         item.assets = kept;
-    }
-
-    fn digest(&self, state: &mut ReadState, file: &str) -> Result<MemberDigest, String> {
-        let (member, _) = conversation::FileId::find(file)
-            .and_then(|file| self.package.file(&file))
-            .ok_or_else(|| "is not in this export".to_owned())?;
-        if let Some(known) = state.digests.get(&member) {
-            return known.clone();
-        }
-        let computed = self.compute_digest(member);
-        state.digests.insert(member, computed.clone());
-        computed
-    }
-
-    fn compute_digest(&self, member: package::MemberId) -> Result<MemberDigest, String> {
-        let describe = |error: std::io::Error| match archive::corruption(&error) {
-            Some(reason) => reason.describe().to_owned(),
-            None => format!("could not be read ({error})"),
-        };
-        let mut reader = self.package.member(member).open().map_err(describe)?;
-        let mut hash = Sha256::new();
-        let mut head = Vec::new();
-        let mut buffer = vec![0; 64 * 1024];
-        let mut size = 0u64;
-        loop {
-            let count = reader.read(&mut buffer).map_err(describe)?;
-            if count == 0 {
-                break;
-            }
-            if head.len() < 16 {
-                head.extend_from_slice(&buffer[..count.min(16 - head.len())]);
-            }
-            hash.update(&buffer[..count]);
-            size += count as u64;
-        }
-        Ok(MemberDigest {
-            sha256: hex::encode(hash.finalize()),
-            size,
-            sniffed: sniff(&head),
-        })
     }
 
     fn asset(
@@ -407,18 +354,16 @@ impl ChatGptHistory {
                 )
             }
             Some(conversation::AssetSource::File(file)) => {
-                let digest = self
-                    .digest(state, file.as_str())
-                    .map_err(|reason| anyhow!("Attachment {path} {reason}"))?;
+                let indexed = self
+                    .package
+                    .file(file)
+                    .context("Attachment is not in this export")?;
+                let digest = &indexed.digest;
                 ensure!(
                     offset <= digest.size,
                     "History asset offset exceeds its size"
                 );
-                let (member, _) = self
-                    .package
-                    .file(file)
-                    .context("Attachment is not in this export")?;
-                let region = self.transfer_region(state, member)?;
+                let region = self.transfer_region(state, indexed.member)?;
                 ensure!(
                     region.len() == digest.size,
                     "Attachment changed after it was checked"
@@ -426,7 +371,7 @@ impl ChatGptHistory {
                 let length = (digest.size - offset).min(ASSET_CHUNK_BYTES as u64) as usize;
                 let mut chunk = vec![0; length];
                 region.read_exact_at(&mut chunk, offset)?;
-                (chunk, digest.size, digest.sha256)
+                (chunk, digest.size, digest.sha256.clone())
             }
             None => bail!("Asset is not referenced by this ChatGPT conversation"),
         };
@@ -481,24 +426,6 @@ fn changed(thread_id: &str, version: String, message: &str) -> HistoryResponse {
     }
 }
 
-fn sniff(head: &[u8]) -> Option<&'static str> {
-    let riff = |kind: &[u8]| head.starts_with(b"RIFF") && head.get(8..12) == Some(kind);
-    Some(match head {
-        _ if head.starts_with(b"\x89PNG") => "image/png",
-        _ if head.starts_with(&[0xFF, 0xD8, 0xFF]) => "image/jpeg",
-        _ if head.starts_with(b"GIF8") => "image/gif",
-        _ if riff(b"WEBP") => "image/webp",
-        _ if riff(b"WAVE") => "audio/wav",
-        _ if head.starts_with(b"%PDF-") => "application/pdf",
-        _ if head.starts_with(b"ID3") || head.starts_with(&[0xFF, 0xFB]) => "audio/mpeg",
-        _ if head.get(4..8) == Some(b"ftyp") => "video/mp4",
-        _ if head.starts_with(b"OggS") => "audio/ogg",
-        _ if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) => "video/webm",
-        _ if head.starts_with(b"PK\x03\x04") => "application/zip",
-        _ => return None,
-    })
-}
-
 #[async_trait]
 impl HistorySource for ChatGptHistory {
     /// Err only for protocol misuse: an unknown thread, a foreign cursor or an unreferenced
@@ -518,8 +445,9 @@ pub enum PackageProgress {
         index: u32,
         count: u32,
     },
-    Attachments {
-        referenced: u32,
+    Files {
+        count: u32,
+        bytes: u64,
     },
 }
 
@@ -530,8 +458,11 @@ impl std::fmt::Display for PackageProgress {
             Self::Shard { name, index, count } => {
                 write!(formatter, "Checking {name} ({index}/{count})")
             }
-            Self::Attachments { referenced } => {
-                write!(formatter, "Checking {referenced} referenced attachments")
+            Self::Files { count, bytes } => {
+                write!(
+                    formatter,
+                    "Checking the bytes of {count} files ({bytes} bytes)"
+                )
             }
         }
     }
@@ -1090,8 +1021,8 @@ mod tests {
         assert_eq!((bytes.as_slice(), digest), (fixture::PDF, pdf));
     }
 
-    #[tokio::test]
-    async fn forged_attachment_size_is_a_changed_gap_not_an_error() {
+    #[test]
+    fn forged_attachment_size_refuses_the_export() {
         let directory = tempfile::tempdir().unwrap();
         let conversation = Conversation::new(1, "Forged")
             .node("u1", Some("root"), upload(&[("file_0c01", "honest")]))
@@ -1106,17 +1037,38 @@ mod tests {
         )
         .size("file_0c02-forged.dat", 100)
         .write(&directory.path().join("export.zip"));
-        let history = open(&path);
+        let error = refusal(&path);
+        assert!(
+            matches!(&error, PackageError::Corrupt { member, reason: Corruption::LongerThanDeclared }
+                if member == "file_0c02-forged.dat"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_changed_after_the_check_is_served_with_its_checked_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = Export::new()
+            .conversations(&[Conversation::new(1, "Notes")
+                .node("u1", Some("root"), upload(&[("file_0c03", "notes.txt")]))
+                .build()])
+            .stored("file_0c03-notes.txt", b"First attachment")
+            .folder(directory.path());
+        let history = open(&root);
+        std::fs::write(root.join("file_0c03-notes.txt"), b"Other attachment").unwrap();
+        let checked = sha(b"First attachment");
         let page = read(&history, &fixture::id(1), None).await;
-        let honest = page.items.iter().find(|item| item.id == "u1").unwrap();
-        let forged = page.items.iter().find(|item| item.id == "u2").unwrap();
-        assert_eq!(honest.assets.len(), 1);
-        assert!(forged.assets.is_empty());
-        assert_eq!(forged.text, "Files attached");
-        assert_eq!(page.gaps.len(), 1);
-        assert!(matches!(page.gaps[0].code, HistoryGapCode::Changed));
-        assert_eq!(page.gaps[0].item_id.as_deref(), Some("u2"));
-        assert!(!page.complete);
+        assert_eq!(
+            page.items[0].assets[0].sha256.as_deref(),
+            Some(checked.as_str())
+        );
+        let (bytes, served, _) = fetch(&history, &fixture::id(1), "file_0c03").await.unwrap();
+        assert_eq!(served, checked);
+        assert_ne!(
+            sha(&bytes),
+            served,
+            "the coordinator refuses bytes that miss the digest"
+        );
     }
 
     fn refusal(path: &Path) -> PackageError {

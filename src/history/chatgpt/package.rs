@@ -1,6 +1,6 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    io::{self, Read},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -20,9 +20,23 @@ const THREAD_FORMAT: u32 = 1;
 const MAXIMUM_PROBLEMS: usize = 100;
 const MAXIMUM_ID_BYTES: usize = 256;
 const MANIFEST: &str = "export_manifest.json";
+const SNIFF_BYTES: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) struct MemberId(usize);
+
+/// The checked bytes of a file-index member, measured while the package is opened.
+#[derive(Clone, Debug)]
+pub(super) struct MemberDigest {
+    pub sha256: String,
+    pub size: u64,
+    pub sniffed: Option<&'static str>,
+}
+
+pub(super) struct IndexedFile {
+    pub member: MemberId,
+    pub digest: MemberDigest,
+}
 
 pub(super) struct Member {
     pub path: MemberPath,
@@ -81,7 +95,7 @@ pub(super) struct Package {
     shards: Vec<Region>,
     conversations: Vec<ConversationEntry>,
     by_id: HashMap<String, usize>,
-    files: HashMap<FileId, MemberId>,
+    files: HashMap<FileId, IndexedFile>,
     original_names: HashMap<String, String>,
     library: HashMap<String, Vec<LibraryFile>>,
     pub summary: ChatGptPackageSummary,
@@ -106,6 +120,7 @@ impl Package {
             parts: Vec::new(),
             zip_parts: Vec::new(),
             spool_remaining: limits.spool_bytes,
+            read_whole: HashSet::new(),
         };
         for path in resolve(paths)? {
             let name = path
@@ -132,9 +147,14 @@ impl Package {
             let bytes = builder.read_shard(member, shards.len(), &mut scan)?;
             shards.push(bytes);
         }
-        let Builder { members, parts, .. } = builder;
+        let Builder {
+            members,
+            parts,
+            read_whole,
+            ..
+        } = builder;
+        let files = verify(&members, file_index(&members), &read_whole, progress)?;
         let (library, original_names) = sidecars(&members, &limits, &mut scan);
-        let files = file_index(&members);
         Ok(scan.finish(
             members,
             shards,
@@ -143,7 +163,6 @@ impl Package {
             original_names,
             parts,
             count,
-            progress,
         ))
     }
 
@@ -168,9 +187,8 @@ impl Package {
         serde_json::from_slice(&repaired).map_err(|_| SpanChanged)
     }
 
-    pub fn file(&self, id: &FileId) -> Option<(MemberId, &Member)> {
-        let member = *self.files.get(id)?;
-        Some((member, &self.members[member.0]))
+    pub fn file(&self, id: &FileId) -> Option<&IndexedFile> {
+        self.files.get(id)
     }
 
     pub fn member(&self, id: MemberId) -> &Member {
@@ -184,7 +202,8 @@ impl Package {
 
 impl FileLookup for Package {
     fn stored_name(&self, file: &FileId) -> Option<&str> {
-        self.file(file).map(|(_, member)| member.path.file_name())
+        self.file(file)
+            .map(|indexed| self.member(indexed.member).path.file_name())
     }
 
     fn original_name(&self, stored: &str) -> Option<&str> {
@@ -238,6 +257,7 @@ struct Builder {
     parts: Vec<String>,
     zip_parts: Vec<usize>,
     spool_remaining: u64,
+    read_whole: HashSet<MemberId>,
 }
 
 impl Builder {
@@ -338,6 +358,7 @@ impl Builder {
                     spool.into_region()
                 }
             };
+            self.read_whole.insert(MemberId(index));
             self.add_zip(part, &name, region)?;
         }
         Ok(())
@@ -466,18 +487,24 @@ impl Builder {
         let source = &self.members[member.0];
         let mut reader = source.open().map_err(damaged)?;
         let mut handle = |element: Element<'_>| scan.element(&name, shard, element);
-        if let Some(region) = source.region().map_err(damaged)? {
-            split(&name, &mut reader, maximum, &mut handle)?;
-            return Ok(region);
-        }
-        let mut spool = Spool::create(self.spool_remaining).map_err(damaged)?;
-        let mut tee = Tee {
-            inner: reader,
-            spool: &mut spool,
+        let region = match source.region().map_err(damaged)? {
+            Some(region) => {
+                split(&name, &mut reader, maximum, &mut handle)?;
+                region
+            }
+            None => {
+                let mut spool = Spool::create(self.spool_remaining).map_err(damaged)?;
+                let mut tee = Tee {
+                    inner: reader,
+                    spool: &mut spool,
+                };
+                split(&name, &mut tee, maximum, &mut handle)?;
+                self.spool_remaining -= spool.len();
+                spool.into_region()
+            }
         };
-        split(&name, &mut tee, maximum, &mut handle)?;
-        self.spool_remaining -= spool.len();
-        Ok(spool.into_region())
+        self.read_whole.insert(member);
+        Ok(region)
     }
 }
 
@@ -652,6 +679,89 @@ fn library_file(entry: Value) -> Option<(String, LibraryFile)> {
     ))
 }
 
+/// Reads every member to its end, so a damaged byte anywhere in the export refuses it before
+/// anything is imported. Shards and nested archives were already read whole while opening.
+fn verify(
+    members: &[Member],
+    index: HashMap<FileId, MemberId>,
+    read_whole: &HashSet<MemberId>,
+    progress: &mut dyn FnMut(PackageProgress),
+) -> Result<HashMap<FileId, IndexedFile>, PackageError> {
+    let mut indexed: HashMap<MemberId, FileId> = index
+        .into_iter()
+        .map(|(file, member)| (member, file))
+        .collect();
+    let pending: Vec<MemberId> = (0..members.len())
+        .map(MemberId)
+        .filter(|member| indexed.contains_key(member) || !read_whole.contains(member))
+        .collect();
+    progress(PackageProgress::Files {
+        count: pending.len() as u32,
+        bytes: pending.iter().map(|member| members[member.0].size).sum(),
+    });
+    let mut files = HashMap::with_capacity(indexed.len());
+    for member in pending {
+        let source = &members[member.0];
+        let damaged = |error: io::Error| member_error(source.path.as_str(), error);
+        let mut reader = source.open().map_err(damaged)?;
+        match indexed.remove(&member) {
+            Some(file) => {
+                let mut hashing = Hashing::default();
+                io::copy(&mut reader, &mut hashing).map_err(damaged)?;
+                let digest = MemberDigest {
+                    sha256: hex::encode(hashing.sha256.finalize()),
+                    size: source.size,
+                    sniffed: sniff(&hashing.head),
+                };
+                files.insert(file, IndexedFile { member, digest });
+            }
+            None => {
+                io::copy(&mut reader, &mut io::sink()).map_err(damaged)?;
+            }
+        }
+    }
+    Ok(files)
+}
+
+#[derive(Default)]
+struct Hashing {
+    sha256: Sha256,
+    head: Vec<u8>,
+}
+
+impl Write for Hashing {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let wanted = SNIFF_BYTES
+            .saturating_sub(self.head.len())
+            .min(buffer.len());
+        self.head.extend_from_slice(&buffer[..wanted]);
+        self.sha256.update(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn sniff(head: &[u8]) -> Option<&'static str> {
+    let riff = |kind: &[u8]| head.starts_with(b"RIFF") && head.get(8..12) == Some(kind);
+    Some(match head {
+        _ if head.starts_with(b"\x89PNG") => "image/png",
+        _ if head.starts_with(&[0xFF, 0xD8, 0xFF]) => "image/jpeg",
+        _ if head.starts_with(b"GIF8") => "image/gif",
+        _ if riff(b"WEBP") => "image/webp",
+        _ if riff(b"WAVE") => "audio/wav",
+        _ if head.starts_with(b"%PDF-") => "application/pdf",
+        _ if head.starts_with(b"ID3") || head.starts_with(&[0xFF, 0xFB]) => "audio/mpeg",
+        _ if head.get(4..8) == Some(b"ftyp") => "video/mp4",
+        _ if head.starts_with(b"OggS") => "audio/ogg",
+        _ if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) => "video/webm",
+        _ if head.starts_with(b"PK\x03\x04") => "application/zip",
+        _ => return None,
+    })
+}
+
 fn file_index(members: &[Member]) -> HashMap<FileId, MemberId> {
     let mut files: HashMap<FileId, MemberId> = HashMap::new();
     for (index, member) in members.iter().enumerate() {
@@ -783,12 +893,11 @@ impl Scan {
         mut self,
         members: Vec<Member>,
         shards: Vec<Region>,
-        files: HashMap<FileId, MemberId>,
+        files: HashMap<FileId, IndexedFile>,
         library: HashMap<String, Vec<LibraryFile>>,
         original_names: HashMap<String, String>,
         parts: Vec<String>,
         shard_count: u32,
-        progress: &mut dyn FnMut(PackageProgress),
     ) -> Package {
         let mut referenced = BTreeSet::new();
         let (mut excluded, mut repaired) = (0, 0);
@@ -828,9 +937,6 @@ impl Scan {
             .enumerate()
             .map(|(index, entry)| (entry.thread.id.clone(), index))
             .collect();
-        progress(PackageProgress::Attachments {
-            referenced: referenced.len() as u32,
-        });
         let missing = referenced
             .iter()
             .filter(|file| !files.contains_key(*file))
@@ -860,7 +966,7 @@ impl Scan {
         pairs.sort();
         let mut sizes: Vec<(&str, u64)> = files
             .iter()
-            .map(|(file, member)| (file.as_str(), members[member.0].size))
+            .map(|(file, indexed)| (file.as_str(), indexed.digest.size))
             .collect();
         sizes.sort();
         let summary = ChatGptPackageSummary {
@@ -943,9 +1049,14 @@ mod tests {
     }
 
     fn member_bytes(package: &Package, file: &str) -> Vec<u8> {
-        let (_, member) = package.file(&FileId::find(file).unwrap()).unwrap();
+        let indexed = package.file(&FileId::find(file).unwrap()).unwrap();
         let mut bytes = Vec::new();
-        member.open().unwrap().read_to_end(&mut bytes).unwrap();
+        package
+            .member(indexed.member)
+            .open()
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
         bytes
     }
 
