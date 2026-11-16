@@ -130,16 +130,22 @@ public struct JobQuery: EnumerableEntityQuery {
     throw failure
   }
 
+  /// Each job in `identifiers`, read from its saved coordinator. A coordinator's failure is thrown
+  /// first, then `JobUnavailable` for the first job that could not be returned.
   @MainActor static func jobs(
     identifiedBy identifiers: [ScopedEntityID], in coordinators: Coordinators,
     within limit: Duration = ConnectionLease.connectionWait
   ) async throws -> [JobEntity] {
     let owners = Set(identifiers.map(\.profile))
-    let reads = await coordinators.jobs(
-      of: coordinators.profiles.filter { owners.contains($0.id) }, within: limit)
+    let saved = coordinators.profiles.filter { owners.contains($0.id) }
+    let reads = await coordinators.jobs(of: saved, within: limit)
     try Task.checkCancellation()
     if let failure = failure(in: reads) { throw failure }
-    return reads.flatMap { (try? $0.get()) ?? [] }.filter { identifiers.contains($0.id) }
+    let found = reads.flatMap { (try? $0.get()) ?? [] }.filter { identifiers.contains($0.id) }
+    if let missing = identifiers.first(where: { id in !found.contains { $0.id == id } }) {
+      throw JobUnavailable(missing, saved: saved)
+    }
+    return found
   }
 
   /// The failure to report for `reads`: any other failure before a coordinator's silence.
@@ -152,6 +158,31 @@ public struct JobQuery: EnumerableEntityQuery {
 }
 
 typealias JobRead = Result<[JobEntity], any Error>
+
+/// A job that Siri or Shortcuts named and this phone cannot show. The job query throws it, so the
+/// words are ours for every intent that takes a job.
+public enum JobUnavailable: Error, Equatable, CustomLocalizedStringResourceConvertible {
+  /// The job's profile is not saved on this phone, so its name may be unknown.
+  case coordinatorNotSaved
+  /// The coordinator answered, and its list has no job with this ID.
+  case notOnCoordinator(job: String, coordinator: String)
+
+  init(_ id: ScopedEntityID, saved: [CoordinatorProfile]) {
+    guard let profile = saved.first(where: { $0.id == id.profile }) else {
+      self = .coordinatorNotSaved
+      return
+    }
+    self = .notOnCoordinator(job: id.item, coordinator: "\(profile.name)")
+  }
+
+  public var localizedStringResource: LocalizedStringResource {
+    switch self {
+    case .coordinatorNotSaved: "This job's coordinator is no longer saved in Beep Boop."
+    case .notOnCoordinator(let job, let coordinator):
+      "The scheduled job \(job) is no longer on \(coordinator)."
+    }
+  }
+}
 
 /// A coordinator that never connected for the intent, or whose connection closed or timed out
 /// under its request.
