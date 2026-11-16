@@ -532,15 +532,23 @@ coordinator's state directory, so run them on the coordinator's machine.
 Read the patch before you approve it. The outcome digest, which `dreams show`
 prints as `Outcome sha256`, is the SHA-256 of the exact bytes of the sealed
 `outcome.json`. That record holds the patch hash, the base commit, the changed
-files with their blob ids, the cited evidence ids and the check results. `apply` recomputes the digest and the patch
-hash and refuses with one of these messages, without changing the repository:
+files with their blob ids, the cited evidence ids and the check results.
+`apply` recomputes the digest and the patch hash and refuses with one of these
+messages, without changing the repository:
 
 - `Dreams approval does not match the review`
 - `Dreams patch changed since it was proposed`
 - `Dreams policy changed since this proposal`
 - `Dreams base is stale: target HEAD is <commit>, proposal base is <commit>`
 - `Dreams target has local changes in touched paths`
+- `Dreams target has a held Git index lock: <path>`
 - `Dreams run did not propose a change`
+
+A local change is any difference in a touched path or its parent directories:
+content, file type, a deletion, or an executable bit. Apply reads the
+executable bit from the file itself, so it refuses even when `core.fileMode` is
+off. A held index lock means that another Git command is running or that one
+crashed. Remove a stale `index.lock` and apply again.
 
 A successful apply adds one commit with `Dreams-Run`, `Dreams-Base` and
 `Dreams-Patch-Sha256` trailers and fast-forwards the checked-out branch. The

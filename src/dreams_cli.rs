@@ -47,6 +47,9 @@ enum ProposalStatus {
         head: String,
     },
     TargetDirty,
+    TargetLocked {
+        lock: PathBuf,
+    },
     PatchChanged {
         actual: ContentDigest,
     },
@@ -60,6 +63,7 @@ impl ProposalStatus {
             Self::Applied { .. } => "applied",
             Self::Stale { .. } => "stale",
             Self::TargetDirty => "target_dirty",
+            Self::TargetLocked { .. } => "target_locked",
             Self::PatchChanged { .. } => "patch_changed",
             Self::PolicyChanged => "policy_changed",
         }
@@ -89,6 +93,10 @@ impl ProposalStatus {
             ),
             Self::Stale { head } => format!("stale (target HEAD is {head})"),
             Self::TargetDirty => "target_dirty (local changes in touched paths)".into(),
+            Self::TargetLocked { lock } => format!(
+                "target_locked (a Git index lock is held at {}; another Git command is running, or one crashed)",
+                lock.display()
+            ),
             Self::PatchChanged { actual } => {
                 format!("patch_changed (the patch file now hashes to {actual})")
             }
@@ -113,6 +121,10 @@ enum Inspection {
         head: String,
     },
     TargetDirty,
+    /// Git would refuse the fast-forward, but only after apply had written to the target.
+    IndexLocked {
+        lock: PathBuf,
+    },
     Ready {
         half_applied: Vec<ProposedFile>,
     },
@@ -133,6 +145,7 @@ impl Inspection {
             },
             Self::Stale { head } => ProposalStatus::Stale { head: head.clone() },
             Self::TargetDirty => ProposalStatus::TargetDirty,
+            Self::IndexLocked { lock } => ProposalStatus::TargetLocked { lock: lock.clone() },
             Self::Ready { half_applied } => ProposalStatus::Pending {
                 interrupted: !half_applied.is_empty(),
             },
@@ -207,20 +220,9 @@ async fn path_state(git: &Git, repository: &Path, file: &ProposedFile) -> Result
     };
     let on_disk = match fs::symlink_metadata(repository.join(&file.path)) {
         Ok(metadata) if metadata.is_file() => {
-            let plain = if staged.is_some() {
-                // Git compares the mode as its own configuration says to.
-                let changed = git
-                    .text(&["diff-files", "--raw", "-z", "--no-abbrev", "--", &file.path])
-                    .await?;
-                changed
-                    .split('\0')
-                    .next()
-                    .and_then(|change| change.split(' ').nth(1))
-                    .is_none_or(|mode| mode == PLAIN_FILE)
-            } else {
-                metadata.permissions().mode() & 0o111 == 0
-            };
-            if !plain {
+            // Read from the file, not asked of Git. With core.fileMode off Git
+            // reports no mode change, and the fast-forward would then reset it.
+            if metadata.permissions().mode() & 0o111 != 0 {
                 return Ok(PathState::LocallyChanged);
             }
             Some(
@@ -332,6 +334,11 @@ async fn inspect(
     }
     if head != base {
         return Ok(Inspection::Stale { head: head.into() });
+    }
+    let lock = git.text(&["rev-parse", "--git-path", "index.lock"]).await?;
+    let lock = proposal.repository.join(lock.trim_end_matches('\n'));
+    if fs::symlink_metadata(&lock).is_ok() {
+        return Ok(Inspection::IndexLocked { lock });
     }
 
     let mut half_applied = Vec::new();
@@ -629,6 +636,10 @@ async fn apply(
             proposal.base
         ),
         Inspection::TargetDirty => bail!("Dreams target has local changes in touched paths"),
+        Inspection::IndexLocked { lock } => bail!(
+            "Dreams target has a held Git index lock: {}. Wait for the other Git command, or remove the lock if none is running",
+            lock.display()
+        ),
         Inspection::Applied {
             commit, recorded, ..
         } => {
@@ -944,6 +955,9 @@ mod tests {
                 head: "b".repeat(40),
             },
             ProposalStatus::TargetDirty,
+            ProposalStatus::TargetLocked {
+                lock: "/example/guidance/.git/index.lock".into(),
+            },
             ProposalStatus::PatchChanged { actual: digest },
             ProposalStatus::PolicyChanged,
         ] {

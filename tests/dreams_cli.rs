@@ -1066,3 +1066,131 @@ async fn show_escapes_unicode_format_controls_in_the_patch_and_the_rationale() {
         "The typed record keeps the exact bytes"
     );
 }
+
+fn changed_paths(
+    before: &std::collections::BTreeMap<PathBuf, (u32, Vec<u8>)>,
+    after: &std::collections::BTreeMap<PathBuf, (u32, Vec<u8>)>,
+) -> Vec<PathBuf> {
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| before.get(*path) != after.get(*path))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+#[tokio::test]
+async fn a_local_executable_bit_refuses_apply_even_when_git_ignores_file_modes() {
+    let fixture = Fixture::new();
+    fixture.seed_witnessed_night();
+    let sealed = Sealed::new(&fixture, "AGENTS.md", FIXED_AGENTS, "Name the real target.").await;
+    git(&fixture.repository, &["config", "core.filemode", "false"]);
+    fs::set_permissions(
+        fixture.repository.join("AGENTS.md"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let before = tree_snapshot(&fixture.repository);
+    let output = fixture.cli(&sealed.apply_arguments(), false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success()
+            && stderr.contains("Dreams target has local changes in touched paths"),
+        "apply must refuse a local executable bit: exit {:?} {stderr}",
+        output.status.code()
+    );
+    let changed = changed_paths(&before, &tree_snapshot(&fixture.repository));
+    assert!(
+        changed.is_empty(),
+        "A refused apply wrote to the target: {changed:?}"
+    );
+    assert_eq!(
+        fixture.dreams_json(&["show", &sealed.run])["status"]["state"],
+        "target_dirty"
+    );
+}
+
+#[tokio::test]
+async fn a_held_git_index_lock_refuses_apply_before_it_writes_and_apply_works_once_it_is_gone() {
+    let fixture = Fixture::new();
+    fixture.seed_witnessed_night();
+    let sealed = Sealed::new(&fixture, "AGENTS.md", FIXED_AGENTS, "Name the real target.").await;
+    let lock = fixture.repository.join(".git/index.lock");
+    fs::write(&lock, "").unwrap();
+    let before = tree_snapshot(&fixture.repository);
+    let output = fixture.cli(&sealed.apply_arguments(), false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let changed = changed_paths(&before, &tree_snapshot(&fixture.repository));
+    assert!(
+        changed.is_empty(),
+        "An apply that cannot finish wrote to the target: {changed:?}\n{stderr}"
+    );
+    assert!(
+        !output.status.success() && stderr.contains("Dreams target has a held Git index lock"),
+        "exit {:?} {stderr}",
+        output.status.code()
+    );
+    assert_eq!(
+        fixture.dreams_json(&["show", &sealed.run])["status"]["state"],
+        "target_locked"
+    );
+
+    fs::remove_file(&lock).unwrap();
+    let applied = fixture.ok(&sealed.apply_arguments(), false);
+    assert!(applied.contains("Applied Dreams run"), "{applied}");
+}
+
+#[tokio::test]
+async fn every_kind_of_local_change_to_a_touched_path_refuses_apply_and_writes_nothing() {
+    for case in [
+        "deleted",
+        "replaced by a symlink",
+        "replaced by a directory",
+        "staged as executable",
+        "staged for deletion",
+        "staged with other content",
+    ] {
+        let fixture = Fixture::new();
+        fixture.seed_witnessed_night();
+        let sealed =
+            Sealed::new(&fixture, "AGENTS.md", FIXED_AGENTS, "Name the real target.").await;
+        let file = fixture.repository.join("AGENTS.md");
+        match case {
+            "deleted" => fs::remove_file(&file).unwrap(),
+            "replaced by a symlink" => {
+                fs::remove_file(&file).unwrap();
+                symlink(&fixture.instructions, &file).unwrap();
+            }
+            "replaced by a directory" => {
+                fs::remove_file(&file).unwrap();
+                fs::create_dir(&file).unwrap();
+            }
+            "staged as executable" => {
+                git(
+                    &fixture.repository,
+                    &["update-index", "--chmod=+x", "AGENTS.md"],
+                );
+            }
+            "staged for deletion" => {
+                git(&fixture.repository, &["rm", "--quiet", "AGENTS.md"]);
+            }
+            _ => {
+                fs::write(&file, "Unapproved example content.\n").unwrap();
+                git(&fixture.repository, &["add", "AGENTS.md"]);
+            }
+        }
+        let before = tree_snapshot(&fixture.repository);
+        let output = fixture.cli(&sealed.apply_arguments(), false);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success()
+                && stderr.contains("Dreams target has local changes in touched paths"),
+            "{case}: exit {:?} {stderr}",
+            output.status.code()
+        );
+        let changed = changed_paths(&before, &tree_snapshot(&fixture.repository));
+        assert!(changed.is_empty(), "{case}: apply wrote {changed:?}");
+    }
+}
