@@ -141,13 +141,13 @@ test("the real bridge retains attached-worker origins without labeling its task 
     agent_program: "/fixture/agent", coordinator: null, rex_server: null, launch: { model: null, state_dir: null, runtime: null, config: null, instructions: null } },
     settings: { model: DEFAULT_MODEL, instructions: "", context_repositories: [], sources: [] } } });
   await request(2, { type: "set_connected_nodes", host_ids: [hostId] });
-  const service = 9;
-  send(service, { type: "run_background", settings: { poll_interval_seconds: 3600, sources: false, jobs: null } });
+  const serviceRequestId = 9;
+  send(serviceRequestId, { type: "run_background", settings: { poll_interval_seconds: 3600, sources: false, jobs: null } });
   const stopped = until((frame) => frame.id === 3 && frame.event.type === "done"); void stopped.catch(() => {});
   send(3, { type: "run_task", task_id: task.id, binding, allocation_id: task.worker.allocation_id, cwd: host.cwd,
     instructions: "", model: DEFAULT_MODEL, interactive: true });
   const exec = await until((frame) => {
-    if (frame.id !== service || frame.event.type !== "host_call") return false;
+    if (frame.id !== serviceRequestId || frame.event.type !== "host_call") return false;
     let command = frame.event.command; while (command.type === "on_node") command = command.command;
     return command.type === "exec";
   }); assert.ok(exec.event.type === "host_call");
@@ -156,7 +156,7 @@ test("the real bridge retains attached-worker origins without labeling its task 
   await request(4, { type: "read_task", task_id: task.id });
   const pending = frames.find((frame) => frame.id === 4 && frame.event.type === "task"); assert.ok(pending?.event.type === "task");
   assert.equal(pending.event.task.pending.find((input) => input.id === "worker-ios")?.origin, "ios");
-  send(service, { type: "host_reply", call_id: exec.event.call_id, result: { type: "process", exit_code: 0, stdout: "complete", stderr: "", truncated: false } });
+  send(serviceRequestId, { type: "host_reply", call_id: exec.event.call_id, result: { type: "process", exit_code: 0, stdout: "complete", stderr: "", truncated: false } });
   await until((frame) => frame.id === 3 && frame.event.type === "worker_idle");
   send(3, { type: "detach_worker" }); await stopped;
   const captures = (await readFile(queue + ".requests", "utf8")).trim().split("\n").map((line): unknown => JSON.parse(line));

@@ -15,7 +15,7 @@ export async function runAdmitted(tasks: TaskStore, id: string, agentId?: string
         if (pending.length === 0 || signal?.aborted) return;
         break;
       }
-      case "idle": return;
+      case "no_work": return;
       case "unplaced": case "host_offline": case "unavailable": throw new TaskError(start.reason);
       default: { const unknown: never = start; throw new TaskError(`Unknown actor start ${JSON.stringify(unknown)}`); }
     }

@@ -62,7 +62,7 @@ export async function runScheduled(occurrence: ScheduledOccurrence, signal: Abor
       case "started": case "running":
         void start.exit.then(() => {}, (error: unknown) => { failure = error; }).finally(() => { revision += 1; wake?.(); });
         break;
-      case "idle": break;
+      case "no_work": break;
       case "unplaced": case "host_offline": case "unavailable": throw new TaskError(start.reason);
       default: { const unknown: never = start; throw new TaskError(`Unknown actor start ${JSON.stringify(unknown)}`); }
     }

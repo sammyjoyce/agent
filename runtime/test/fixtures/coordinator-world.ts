@@ -46,7 +46,7 @@ export async function coordinatorWorld(t: TestContext) {
         try { process.kill(-owned.child.pid, "SIGKILL"); } catch { /* This owned group already exited. */ }
       }
       try {
-        for (const pid of await processes(directory)) {
+        for (const pid of await pidsMatching(directory)) {
           try { process.kill(pid, "SIGKILL"); } catch {}
         }
       } catch (error) { context.diagnostic("Could not sweep processes that left their owner's group: " + String(error)); }
@@ -152,7 +152,7 @@ export async function coordinatorWorld(t: TestContext) {
     events, start, cli, exchange, until, online, tasks, script };
 }
 
-export async function processes(text: string): Promise<number[]> {
+export async function pidsMatching(text: string): Promise<number[]> {
   // procps leaves piped width undefined; -w twice is unlimited on procps and macOS.
   const { stdout } = await promisify(execFile)("/bin/ps", ["-A", "-ww", "-o", "pid=,args="], { maxBuffer: 64 * 1024 * 1024 });
   return stdout.split("\n").flatMap((line) => {
