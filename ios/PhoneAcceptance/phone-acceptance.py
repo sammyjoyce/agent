@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import plistlib
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -190,6 +191,26 @@ def attachment_name(exported):
     return (parts[0] if len(parts) == 3 else stem), extension
 
 
+def capture_problem(path):
+    """Why the file at `path` is not a whole PNG image, or None when it is one."""
+    if not path.exists():
+        return "is missing"
+    data = path.read_bytes()
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "is not a PNG"
+    chunks, position = [], 8
+    while position + 12 <= len(data):
+        length, kind = struct.unpack_from(">I4s", data, position)
+        chunks.append((kind, data[position + 8:position + 8 + length]))
+        position += 12 + length
+    if position != len(data) or not chunks or chunks[-1][0] != b"IEND":
+        return "does not end with an IEND chunk"
+    kind, header = chunks[0]
+    if kind != b"IHDR" or len(header) != 13 or 0 in struct.unpack(">II", header[:8]):
+        return "has no IHDR chunk with a non-zero width and height"
+    return None
+
+
 def load_records(attachments):
     """The JSON records the runner attached, each with the files its attachment names point to."""
     manifest_path = attachments / "manifest.json"
@@ -198,8 +219,7 @@ def load_records(attachments):
     records = []
     for test in read_json(manifest_path):
         named = [(attachment_name(item), item["exportedFileName"]) for item in test["attachments"]]
-        images = {name: f"attachments/{file}" for (name, extension), file in named
-                  if extension != "json" and (attachments / file).exists()}
+        images = {name: file for (name, extension), file in named if extension != "json"}
         for (name, extension), file in named:
             if extension != "json":
                 continue
@@ -208,10 +228,15 @@ def load_records(attachments):
                 records.append({"kind": name, "test": test["testIdentifier"], "record": body,
                                 "problems": [], "files": {}})
                 continue
-            body["files"] = {key: images.get(value) for key, value in body["record"].items()
-                             if key == "attachment" or key.endswith("Attachment")}
-            body["problems"] += [f"the {key} image {body['record'][key]!r} is missing"
-                                 for key, path in body["files"].items() if path is None]
+            body["files"] = {}
+            for key, value in body["record"].items():
+                if key != "attachment" and not key.endswith("Attachment"):
+                    continue
+                file = images.get(value)
+                problem = capture_problem(attachments / file) if file else "is missing"
+                body["files"][key] = None if problem else f"attachments/{file}"
+                if problem:
+                    body["problems"].append(f"the {key} image {value!r} {problem}")
             body["test"] = test["testIdentifier"]
             records.append(body)
     return records
