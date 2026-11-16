@@ -18,7 +18,6 @@ enum FeedScope: Hashable, Sendable {
     }
   }
 
-  /// The one coordinator a feed in this scope shows: the one it names, or the only one saved.
   func shownCoordinator(among profiles: [CoordinatorProfile]) -> ProfileID? {
     coordinator ?? (profiles.count == 1 ? profiles[0].id : nil)
   }

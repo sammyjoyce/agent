@@ -7,8 +7,6 @@ import UniformTypeIdentifiers
   import QuickLook
 #endif
 
-/// A job an open request pushed over the feed. The request's ID makes asking again a new path, so
-/// the job's screen is pushed afresh.
 private struct OpenedJob: Hashable {
   let job: ScopedEntityID
   let request: UUID

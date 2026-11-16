@@ -130,8 +130,6 @@ public struct JobQuery: EnumerableEntityQuery {
     throw failure
   }
 
-  /// Each job in `identifiers`, read from its saved coordinator. A coordinator's failure is thrown
-  /// first, then `JobUnavailable` for the first job that could not be returned.
   @MainActor static func jobs(
     identifiedBy identifiers: [ScopedEntityID], in coordinators: Coordinators,
     within limit: Duration = ConnectionLease.connectionWait

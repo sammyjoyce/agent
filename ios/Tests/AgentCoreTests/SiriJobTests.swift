@@ -307,7 +307,6 @@ struct SiriJobTests {
     }
   }
 
-  /// A saved shortcut can name a job of a coordinator that was removed, or never saved here.
   @MainActor @Test(.timeLimit(.minutes(1)))
   func aJobWhoseCoordinatorIsNoLongerSavedSaysSo() async throws {
     try await withJobPeers { coordinators, work, _, workPeer, _ in
@@ -339,7 +338,6 @@ struct SiriJobTests {
     }
   }
 
-  /// A rename keeps the profile's ID and the job's, so a saved shortcut still finds the job.
   @MainActor @Test(.timeLimit(.minutes(1)))
   func aRenamedCoordinatorAndARenamedJobStillResolve() async throws {
     try await withJobPeers { coordinators, work, _, workPeer, _ in
@@ -365,7 +363,6 @@ struct SiriJobTests {
         conversations: [], pageSize: 10)
       await personalPeer.leaveObserveUnanswered(.silent)
       let ids = [work, personal].map { ScopedEntityID(profile: $0, item: "nightly:deps") }
-      // Work has to connect inside the wait that Personal runs out, on a busy machine too.
       let refused = await #expect(throws: CoordinatorDidNotAnswer.self) {
         try await JobQuery.jobs(identifiedBy: ids, in: coordinators, within: .seconds(3))
       }

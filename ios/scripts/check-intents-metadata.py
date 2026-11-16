@@ -27,7 +27,6 @@ QUERIES = {"CoordinatorQuery", "JobQuery"}
 PHRASED = {"OpenCoordinatorIntent": {"${target}", "${applicationName}"}}
 # `authenticationPolicy` 1 is `.requiresAuthentication`.
 AUTHENTICATED = {"RetryInterruptedRunIntent": 1}
-# Each action that opens the app on an entity, and that entity.
 OPENS = {"OpenCoordinatorIntent": "CoordinatorEntity", "OpenJobIntent": "JobEntity"}
 OPEN_ENTITY = "com.apple.link.systemProtocol.OpenEntity"
 

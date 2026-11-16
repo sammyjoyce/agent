@@ -90,8 +90,6 @@
       XCTAssertEqual(retried, [])
     }
 
-    /// The test terminates the app before the query and again before the intent, so the system
-    /// starts it for each. Weekly report is on Personal, so the open must not move the feed there.
     func testOpenJobStartsTheTerminatedAppOnTheJob() async throws {
       guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
       let (app, _, _) = try await launchWithJobs()
@@ -138,7 +136,6 @@
         becomes(field, "value == %@", "Keep this Work draft"), String(describing: field.value))
     }
 
-    /// A saved shortcut still names Nightly deps after Work stopped serving it.
     func testOpenJobSaysWhenTheJobIsNoLongerOnItsCoordinator() async throws {
       guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
       let (app, work, _) = try await launchWithJobs()
@@ -254,8 +251,6 @@
       return app
     }
 
-    /// Launches the app on two fixture peers. Work serves Nightly deps, parked at the restart
-    /// limit, and Personal serves Weekly report, whose last run completed.
     private func launchWithJobs() async throws -> (
       app: XCUIApplication, work: InteractionPeer, personal: InteractionPeer
     ) {
@@ -291,7 +286,6 @@
         schedules: [])
     }
 
-    /// `launchWithJobs`, then the app is sent to the background and terminated.
     private func launchWithJobsThenTerminate() async throws -> (
       app: XCUIApplication, work: InteractionPeer, personal: InteractionPeer
     ) {
@@ -350,7 +344,6 @@
       return try XCTUnwrap(titles.firstIndex(of: title).map { jobs[$0] }, "\(titles)")
     }
 
-    /// Shows Work's feed, then types `draft` into the composer when there is one.
     private func chooseWorkAndType(_ draft: String?, in app: XCUIApplication) throws {
       let menu = app.buttons["scopeMenu"]
       XCTAssertTrue(menu.waitForExistence(timeout: 10))
@@ -367,7 +360,6 @@
       field.typeText(draft)
     }
 
-    /// Back from the job's screen shows `jobsAndWork`, then Connection, and Done shows the feed.
     private func assertBackStepsToTheFeed(
       _ app: XCUIApplication, from job: String, through jobsAndWork: String
     ) {
@@ -381,7 +373,6 @@
       XCTAssertTrue(app.buttons["scopeMenu"].waitForExistence(timeout: 5), app.debugDescription)
     }
 
-    /// Waits until the system's view annotations of `entity` name exactly `identifiers`.
     @available(iOS 27, *)
     private func assertAnnotations(
       of entity: AppEntityDefinition, become identifiers: Set<String>, _ screen: String
@@ -396,7 +387,6 @@
       XCTFail("\(screen): annotations \(shown), expected \(identifiers)")
     }
 
-    /// Back from a job that Open Job showed returns to the feed in one step.
     private func assertBackShowsTheFeed(_ app: XCUIApplication, from job: String) {
       app.navigationBars[job].buttons.element(boundBy: 0).tap()
       XCTAssertTrue(app.buttons["scopeMenu"].waitForExistence(timeout: 5), app.debugDescription)

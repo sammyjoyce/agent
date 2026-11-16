@@ -14,12 +14,8 @@ enum AlertOrigin: Equatable {
   case malformed
 }
 
-/// Where an open request leaves the app.
 enum OpenDestination: Hashable {
-  /// The feed, in whatever scope `Coordinators.show(opening:)` left it, with a notice when the
-  /// alert named no saved coordinator.
   case feed(notice: String?)
-  /// One job's screen over the feed. The scope, the draft and the feed stay as they were.
   case job(ScopedEntityID)
 }
 
@@ -86,8 +82,6 @@ public final class AppNotifications: NSObject {
     openRequest = OpenRequest(destination: .feed(notice: coordinators.show(opening: origin)))
   }
 
-  /// Shows `job`'s screen and asks `Coordinators` nothing, since the query that produced `job`
-  /// just read it from its coordinator.
   func open(_ job: JobEntity) {
     openRequest = OpenRequest(destination: .job(job.id))
   }
