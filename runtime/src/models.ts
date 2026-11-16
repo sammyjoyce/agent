@@ -74,6 +74,11 @@ const Policies = defineDoc<{ sessions: Record<string, ModelSelection> }>({
   kind: "agent.models", scope: "session", version: 1, initial: () => ({ sessions: {} }), checkpointWhen: () => true,
 });
 
+/** Provider sessions whose requests never carry a hosted provider tool. Entries are added and never removed. */
+const HostedTools = defineDoc<{ withheld: Record<string, true> }>({
+  kind: "agent.hosted_tools", scope: "session", version: 1, initial: () => ({ withheld: {} }), checkpointWhen: () => true,
+});
+
 /** Pi owns model catalogs, auth and inference. This adapter owns saved application choices. */
 export class ConversationModels {
   private readonly catalogRefreshes = new Map<ModelProvider, Promise<void>>();
@@ -82,7 +87,7 @@ export class ConversationModels {
   constructor(readonly models: MutableModels = builtinModels(), auth?: ChatGptAuth) {
     for (const id of ["openai", "openai-codex"]) {
       const provider = models.getProvider(id);
-      if (provider !== undefined) models.setProvider({ ...provider, streamSimple: withDetailedReasoning(withWebSearch(provider.streamSimple)) });
+      if (provider !== undefined) models.setProvider({ ...provider, streamSimple: withDetailedReasoning(withWebSearch(provider.streamSimple, (sessionId) => this.hostedToolsOffered(sessionId))) });
     }
     const openai = models.getProvider("openai");
     if (openai !== undefined) {
@@ -120,6 +125,23 @@ export class ConversationModels {
     }
   }
   bind(session: Harness): void { this.bindSession?.(session); this.bindSession = undefined; }
+  /**
+   * From this commit on, no request of this conversation offers a hosted provider tool such as web search.
+   * The record is durable and nothing clears it, so a turn resumed after a restart is covered before any actor runs.
+   */
+  async withholdHostedTools(conversation: Conversation): Promise<void> {
+    const session = await this.session;
+    await session.commit(async (tx) => {
+      const native = await tx.doc(ProviderDoc, conversation.id);
+      (await tx.doc(HostedTools)).withheld[native.sessionId] = true;
+    }, BACKGROUND_CONTEXT);
+  }
+  private async hostedToolsOffered(sessionId: string | undefined): Promise<boolean> {
+    // Pi sends the session of every conversation request. A request without one belongs to no conversation.
+    if (sessionId === undefined) return true;
+    const session = await this.session;
+    return (await session.snapshot(HostedTools, BACKGROUND_CONTEXT))?.withheld[sessionId] !== true;
+  }
   validate(selection: ModelSelection): void {
     const model = this.models.getModel(selection.provider, selection.model_id);
     if (model === undefined) throw new ModelError(`Unknown model ${selection.provider}/${selection.model_id}.`);

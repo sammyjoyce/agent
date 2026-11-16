@@ -700,6 +700,10 @@ channel to an actor that holds one. Tests cover each link.
 - `TaskStore.runActor` gives the task of the job `dreams` exactly
   `dreams_review`, `dreams_propose` and `dreams_abstain` on every path, and it
   refuses an attached worker or a child agent on that task.
+- The same confinement withholds hosted provider tools, web search included,
+  from every request of that conversation on the `openai` and `openai-codex`
+  providers. The record is durable and is never removed, so a turn that resumes
+  after a restart is covered before any actor reconfigures it.
 - The scheduler source that marks the task cannot be added or removed by a
   tool, and the task's outcomes are recorded already dismissed, so triage never
   reads them.

@@ -492,9 +492,12 @@ coordinator after you change the policy.
 Copy the [example job](../examples/scheduled_jobs/dreams.toml) into a job
 directory, then check and sync as for any job. The job id `dreams` is reserved.
 A job with that id can call `dreams_review`, `dreams_propose` and
-`dreams_abstain`, and it has no shell, file, browser or delegation tool. A
-`dreams` job without a `[dreams]` policy still runs with only those tools, and
-each tool answers `Dreams is not configured`.
+`dreams_abstain`, and it has no shell, file, browser or delegation tool. Its
+model requests also carry no hosted provider tool, so the model that reads your
+private evidence has no web search. The coordinator records that rule for the
+job's conversation and never lifts it. A `dreams` job without a `[dreams]`
+policy still runs with only those tools, and each tool answers
+`Dreams is not configured`.
 
 ```sh
 beep-boop jobs check && beep-boop jobs sync

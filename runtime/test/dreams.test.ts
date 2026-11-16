@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { zstdDecompressSync } from "node:zlib";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { fauxAssistantMessage, fauxToolCall, type FauxResponseFactory } from "@earendil-works/pi-ai";
 import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
-import { defineExtension, defineTool } from "@earendil-works/pi-durable";
+import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
+import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
+import { defineExtension, defineTool, ProviderDoc } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
 import { createDreamsTools, createDreamsToolset, DREAMS_TOOL_NAMES, isDreamsTask } from "../src/dreams.js";
 import { createInputOrigins } from "../src/input_origin.js";
@@ -22,8 +27,8 @@ import { fixtureModel } from "./model.js";
 const dreamsOccurrence: ScheduledOccurrence = { ...scheduledOccurrence, id: "dreams-occurrence",
   job: { ...exampleJob("one", "Review the night and propose or abstain."), id: "dreams", title: "Dreams" } };
 
-async function openDreams(directory: string) {
-  const app = await openScheduled(directory);
+async function openDreams(directory: string, providers: Parameters<typeof openScheduled>[3] = []) {
+  const app = await openScheduled(directory, undefined, undefined, providers);
   const guidance = app.registry.snapshot().extension("workspace_guidance");
   assert.ok(guidance, "The fixture installs workspace guidance");
   const inputOrigins = createInputOrigins(app.session); app.registry.install(inputOrigins);
@@ -131,4 +136,91 @@ test("the Dreams toolset refuses to start with any tool beyond the three Dreams 
     assert.throws(() => createDreamsToolset({ guidance: app.guidance, inputOrigins: app.inputOrigins,
       dreams: defineExtension({ name: "dreams-tools", tools: (app.dreams.tools ?? []).slice(0, 2) }) }), offers);
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
+/** Each tool a provider request offers, in `tools` or in a later `additional_tools` item: its name, or its type for a hosted tool that has none. */
+function requestTools(body: Record<string, unknown> | undefined): string[] {
+  assert.ok(body !== undefined && Array.isArray(body.tools) && Array.isArray(body.input), "The provider request lists its tools");
+  const later = body.input.flatMap((item: unknown) => object(item) && item.type === "additional_tools" && Array.isArray(item.tools) ? item.tools : []);
+  return [...body.tools, ...later].map((tool: unknown) => object(tool) && typeof tool.name === "string" ? tool.name : object(tool) ? String(tool.type) : "invalid").sort();
+}
+/** A local Responses endpoint that records each request body and answers with one plain message. */
+async function recordingProvider() {
+  const requests: Record<string, unknown>[] = [];
+  const server = createServer((request, response) => { void (async () => {
+    const data: Buffer[] = []; for await (const chunk of request) data.push(Buffer.from(chunk));
+    const bytes = Buffer.concat(data);
+    const body: unknown = JSON.parse((request.headers["content-encoding"] === "zstd" ? zstdDecompressSync(bytes) : bytes).toString("utf8"));
+    assert.ok(object(body)); requests.push(body);
+    const id = `message_${requests.length}`, text = `Example answer ${requests.length}.`;
+    const message = { type: "message", id, role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] };
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    for (const event of [
+      { type: "response.created", response: { id: `response_${requests.length}`, object: "response", status: "in_progress", output: [] } },
+      { type: "response.output_item.added", output_index: 0, item: { ...message, status: "in_progress", content: [] } },
+      { type: "response.content_part.added", item_id: id, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } },
+      { type: "response.output_text.delta", item_id: id, output_index: 0, content_index: 0, delta: text },
+      { type: "response.output_item.done", output_index: 0, item: message },
+      { type: "response.completed", response: { id: `response_${requests.length}`, object: "response", status: "completed", output: [message],
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } } } },
+    ]) response.write("data: " + JSON.stringify(event) + "\n\n");
+    response.end();
+  })().catch(() => { response.writeHead(500).end(); }); });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address(); assert.ok(address !== null && typeof address !== "string");
+  const url = `http://127.0.0.1:${address.port}/v1`;
+  const openai = openaiProvider(), codex = openaiCodexProvider();
+  const responses = openai.getModels().find((model) => model.api === "openai-responses"), codexModel = codex.getModels()[0];
+  assert.ok(responses !== undefined && codexModel !== undefined);
+  const codexToken = "fixture." + Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "synthetic-account" } })).toString("base64") + ".fixture";
+  return { requests, codexModelId: codexModel.id,
+    providers: [
+      { ...openai, getModels: () => [{ ...responses, id: fixtureModel.model_id, baseUrl: url }],
+        auth: { apiKey: { name: "Synthetic authentication", resolve: async () => ({ auth: { apiKey: "sk-synthetic-fixture" } }) } } },
+      { ...codex, getModels: () => [{ ...codexModel, baseUrl: url }],
+        auth: { apiKey: { name: "Synthetic authentication", resolve: async () => ({ auth: { apiKey: codexToken } }) } } },
+    ],
+    async close() { server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); } };
+}
+
+test("a Dreams conversation is never offered hosted web search, on either provider, after a restart or under another toolset", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-dreams-")), wire = await recordingProvider();
+  let app = await openDreams(directory, wire.providers);
+  try {
+    await runScheduled(scheduledOccurrence, new AbortController().signal, app); await app.settled();
+    const ordinary = requestTools(wire.requests.at(-1));
+    assert.ok(ordinary.includes("web_search") && ordinary.includes("exec"), "An ordinary job keeps hosted web search");
+
+    await runScheduled(dreamsOccurrence, new AbortController().signal, app); await app.settled();
+    assert.equal(wire.requests.length, 2);
+    assert.deepEqual(requestTools(wire.requests.at(-1)), [...DREAMS_TOOL_NAMES].sort());
+    const task = (await app.tasks.list()).find(isDreamsTask); assert.ok(task);
+
+    await app.close(); app = await openDreams(directory, wire.providers);
+    const conversation = await app.tasks.conversation(task.conversation_id);
+    const resumed = await conversation.submit({ type: "input", content: "Continue from the saved configuration." }, BACKGROUND_CONTEXT);
+    assert.equal((await resumed.wait(BACKGROUND_CONTEXT)).status, "done");
+    assert.deepEqual(requestTools(wire.requests.at(-1)), [...DREAMS_TOOL_NAMES].sort(),
+      "A request sent from the saved configuration, before any actor reconfigures it, stays withheld");
+
+    const host = app.registry.snapshot().extension("host-tools"); assert.ok(host);
+    await app.tasks.inference.configure(conversation, fixtureModel, { extensions: [host] });
+    const widened = await conversation.submit({ type: "input", content: "Continue with another toolset." }, BACKGROUND_CONTEXT);
+    assert.equal((await widened.wait(BACKGROUND_CONTEXT)).status, "done");
+    const reconfigured = requestTools(wire.requests.at(-1));
+    assert.ok(reconfigured.includes("exec") && !reconfigured.includes("web_search"), "Nothing gives a withheld conversation hosted tools again");
+
+    const codex = app.tasks.inference.models.getModel("openai-codex", wire.codexModelId); assert.ok(codex);
+    const sessionId = (await app.session.snapshot(ProviderDoc, conversation.id, BACKGROUND_CONTEXT))?.sessionId; assert.ok(sessionId);
+    const ask = async (session: string) => {
+      const answer = await app.tasks.inference.models.streamSimple(codex, { messages: [{ role: "user", content: "Example question.", timestamp: Date.now() }],
+        tools: [{ name: "example_tool", description: "An example application tool.", parameters: Type.Object({}) }] },
+        { sessionId: session, transport: "sse", maxRetries: 0 }).result();
+      assert.equal(answer.stopReason, "stop", answer.errorMessage ?? "The Codex request did not finish");
+      return requestTools(wire.requests.at(-1));
+    };
+    assert.deepEqual(await ask(sessionId), ["example_tool"], "The Codex provider withholds hosted tools from the same conversation");
+    assert.deepEqual(await ask(randomUUID()), ["example_tool", "web_search"], "Any other Codex conversation keeps hosted web search");
+  } finally { await app.close(); await wire.close(); await rm(directory, { recursive: true, force: true }); }
 });

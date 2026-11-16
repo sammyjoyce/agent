@@ -1689,6 +1689,8 @@ export class TaskStore {
       if (confined !== undefined && (active.mode !== "job" || input.agent_id !== undefined)) throw new TaskError(CONFINED_ACTOR_ONLY);
       const extensions = () => confined ?? execution.extensions(input.agent_id);
       const conversation = await this.conversation(actor.conversation_id);
+      // Before any configure call, so no request of a confined conversation is ever built with a hosted provider tool.
+      if (confined !== undefined) await this.inference.withholdHostedTools(conversation);
       if (active.mode === "job") active.conversation = conversation;
       if (isAbortedJob(active)) throw new TaskError("Background execution stopped; its native input is retained");
       let executionHost = active.host ?? await this.backgroundHost(task, input.agent_id);
