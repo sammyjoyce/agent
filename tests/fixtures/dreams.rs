@@ -565,6 +565,8 @@ impl Fixture {
     }
 }
 
+/// A hosted provider tool has no `name`, so it is counted by its `type`, and
+/// anything with neither is counted as its whole JSON. Nothing offered is dropped.
 pub fn offered_tools(body: &Value) -> BTreeSet<String> {
     let later = body["input"]
         .as_array()
@@ -578,7 +580,12 @@ pub fn offered_tools(body: &Value) -> BTreeSet<String> {
         .unwrap_or_default()
         .into_iter()
         .chain(later)
-        .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+        .map(|tool| {
+            tool["name"]
+                .as_str()
+                .or_else(|| tool["type"].as_str())
+                .map_or_else(|| tool.to_string(), str::to_owned)
+        })
         .collect()
 }
 
