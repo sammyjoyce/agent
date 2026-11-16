@@ -239,8 +239,6 @@ class ReportTests(unittest.TestCase):
 
 
 class MissingEvidenceTests(unittest.TestCase):
-    """A Send whose composer crop did not reach the host fails its record and the run."""
-
     test = "ComposerRecurrenceTests/testTwoConsecutiveSendsKeepTheKeyboardUp()"
 
     def run_with(self, attachments_listed, files_written):
