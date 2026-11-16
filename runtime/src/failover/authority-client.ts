@@ -1,11 +1,8 @@
-import type { AuthorityLink } from "./authority-link.js";
+import { AuthorityUnreachable, type AuthorityLink } from "./authority-link.js";
 import type { AuthorityCommand } from "../generated/AuthorityCommand.js";
 import type { AuthorityRecord } from "../generated/AuthorityRecord.js";
 import type { AuthorityReply } from "../generated/AuthorityReply.js";
 import type { LogPage } from "../generated/LogPage.js";
-
-/** The authority did not answer: a transport failure, a timeout or a server error. */
-export class AuthorityUnreachable extends Error {}
 
 /** The authority refused the credential: 401 for an unknown token, 403 for one that may not do this. */
 export class AuthorityDenied extends Error {
