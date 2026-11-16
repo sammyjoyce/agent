@@ -7,6 +7,8 @@ find related history; import does not create work or revive old instructions.
 beep-boop import codex                  # all registered online hosts
 beep-boop import codex --host desktop   # one announced host name
 beep-boop import codex --embedding-host workstation  # indexing compute only
+beep-boop import chatgpt --check ~/Downloads/chatgpt-export.zip  # check only
+beep-boop import chatgpt ~/Downloads/chatgpt-export.zip
 beep-boop import status
 beep-boop history search "fabrication files"
 beep-boop history search "ERR_SURFACE_413" --mode keyword
@@ -112,10 +114,10 @@ paging mode while validating their page and cursor; a later inventory discovers
 changed source versions.
 
 Rust owns a small `HistorySource` trait for enumeration, transcript reads and
-asset reads. Codex is its first implementation. Rust also owns import records
-and provenance types, generating TypeScript bindings for the Pi adapter.
-Cloud-only or Dot history needs a separately verified export path; local Codex
-access does not establish access to those conversations.
+asset reads. Codex and checked ChatGPT exports implement it. Rust also owns
+import records and provenance types, generating TypeScript bindings for the Pi
+adapter. Other cloud-only or Dot history needs its own verified export path;
+local Codex access does not establish access to those conversations.
 Persistent attached-thread sessions require separate enumeration; the ordinary
 native list excludes them.
 
@@ -139,6 +141,53 @@ same host, not page arrival order. Equal timestamps across hosts or unverified
 observations keep conflicting versions visibly ambiguous. Page receipts
 advance only the items actually observed. Background indexing migrates older
 ledgers using cached vectors; opening history never waits for that scan.
+
+## ChatGPT exports
+
+`beep-boop import chatgpt` reads a ChatGPT data export from the machine that
+runs the command. Pass the downloaded ZIP, every part of a split download, an
+extracted folder or a conversations JSON file. Numbered sibling parts beside
+the first part are found automatically.
+
+The command checks the whole export before anything is saved. It refuses an
+export with missing or unlisted conversation shards, a gap in its part
+numbering, member names that leave the export, symlinks or special files,
+encrypted members, sizes or CRCs that do not match the bytes, or more expansion
+than its limits allow. A privacy-portal ZIP of ZIPs opens one level deep. A
+refused export exits 1 and saves nothing. A single conversation that cannot be
+read, such as invalid JSON or one over the size limit, is reported and becomes
+a gap, so the import ends partial. `--check` prints the counts and any such
+problems without contacting a coordinator; `--check --json` prints the summary
+as one JSON object.
+
+Once checked, the coordinator imports the export through the same checkpointed
+importer as Codex. The client that ran the command serves every read, so the
+export never needs to be on the coordinator's disk. Keep the command running
+until it finishes. If it stops, the
+import ends partial; run the same command again. Finished conversations are
+skipped, an interrupted one resumes from its committed page, and retained
+attachments are reused by digest. `import status` reports Codex and ChatGPT on
+separate lines.
+
+The path to the message ChatGPT last showed is the transcript. Edited prompts
+and regenerated replies on other branches are retained as evidence and are not
+shown, searched or used as continuation context; the transcript states how many
+other versions a message has. A later export that moves the selected branch or
+edits a message adds new versions and keeps the earlier ones. A message that a
+later export no longer contains keeps its last imported version and placement,
+so it stays in the transcript if it was shown. An older export imported after a
+newer one does not replace the newer view.
+
+Attachments referenced by `sediment://` or `file-service://` pointers,
+`metadata.attachments` and the export's file library are copied from the export
+with a verified size and SHA-256. A referenced file that is not in the export
+is an explicit `missing` gap; nothing is downloaded.
+
+System, developer, custom-instruction and hidden messages are never imported.
+Historical tool calls and their output are inert text. ChatGPT and Codex keys
+are separate, so a ChatGPT conversation never merges with a Codex thread that
+has the same ID. Imported text is indexed with the same local embedding model
+as Codex history; no chat model, tool or Rex session runs.
 
 ## Native Pi storage, inert history
 
