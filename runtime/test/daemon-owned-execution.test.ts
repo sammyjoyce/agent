@@ -7,6 +7,7 @@ import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
 import type { HistoryMessage } from "../src/generated/HistoryMessage.js";
 import { sessions, type NativeSession } from "./fixtures/coordinator-native.js";
+import type { ModelStep } from "./fixtures/coordinator-runtime.js";
 import { coordinatorWorld, delegate, effect, held, processes } from "./fixtures/coordinator-world.js";
 
 type World = Awaited<ReturnType<typeof coordinatorWorld>>;
@@ -15,7 +16,9 @@ const heldReceipt = { type: "process", exit_code: 0, stdout: "Completed the held
 
 function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
 
-async function laptopTask(world: World, dispatch: string, title: string) {
+/** The actor starts when the task is delegated, so the worker's script must exist first. */
+async function laptopTask(world: World, dispatch: string, title: string, steps: ModelStep[]) {
+  await world.script(title, steps);
   await world.script(dispatch, [delegate(title, world.laptop), { text: `Delegated ${title}.` }]);
   await world.cli(0, ["chat", dispatch]);
   const task = (await world.tasks()).find((task) => task.title === title);
@@ -74,6 +77,23 @@ const starts = async (path: string) => (await lines(path + ".started")).map((lin
   const [pid, host] = line.split(" "); return { pid: Number(pid), host };
 });
 const exists = (path: string) => stat(path).then(() => true, () => false);
+/** How many model requests were served for the input that contains `key`. */
+const modelRequests = async (world: World, key: string) => (await lines(world.queue + ".requests")).filter((line) => {
+  const request: unknown = JSON.parse(line); return object(request) && request.key === key;
+}).length;
+const attached = (world: World, client: ReturnType<World["start"]>) => world.until(async () =>
+  world.events(client.output()).some((event) => event.type === "task_ready"), "The worker terminal must attach to its task", () => client.errors().slice(-2000));
+const noTerminal = async (world: World, taskId: string, message: string) =>
+  assert.deepEqual(await processes("run-task " + taskId), [], message);
+/** One main-agent turn that makes a single tool call. */
+async function mainCalls(world: World, key: string, step: ModelStep) {
+  await world.script(key, [step, { text: `Finished ${key}.` }]);
+  await world.cli(0, ["chat", key]);
+}
+/** Its finish line is written 500 ms before its output, so a test can act between the effect and its receipt. */
+const lingering = (path: string, output: string): ModelStep => ({ tool: "exec", args: { program: process.execPath, timeout_seconds: 60, args: ["-e",
+  'const fs=require("node:fs"),path=process.argv[1];fs.appendFileSync(path+".started",process.pid+" "+process.env.AGENT_TEST_NODE_ID+"\\n");' +
+  'fs.appendFileSync(path+".finished","once\\n");setTimeout(()=>process.stdout.write(process.argv[2]),500);', path, output] } });
 
 function alive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
@@ -114,12 +134,12 @@ async function available(reader: FileHandle): Promise<string> {
 test("closing the worker terminal mid-effect leaves the laptop daemon to finish the turn and its queued follow-up", { timeout: 90_000 }, async (t) => {
   const world = await coordinatorWorld(t);
   const { directory, laptop, cli, until, tasks, script } = world;
-  const { task, worker, launch } = await laptopTask(world, "fixture-close-dispatch", "fixture-close-worker");
   const action = join(directory, "close-action"), pipe = join(directory, "close-pipe");
   const content = "Written once by the owning daemon.\n";
   const answer = "The closed terminal's turn finished.", followAnswer = "The queued follow-up ran without a terminal.";
   await mkfifo(pipe);
-  await script("fixture-close-worker", [held(action), { tool: "write_file", args: { path: pipe, content } }, { text: answer }]);
+  const { task, worker, launch } = await laptopTask(world, "fixture-close-dispatch", "fixture-close-worker",
+    [held(action), { tool: "write_file", args: { path: pipe, content } }, { text: answer }]);
   const terminal = runTask(world, launch, true);
   await until(async () => (await starts(action)).length === 1, "The worker's held exec did not start", () => terminal.output().slice(-2000));
 
@@ -161,15 +181,16 @@ test("closing the worker terminal mid-effect leaves the laptop daemon to finish 
 test("killing the worker client mid-write keeps its actor running, and reopening the task attaches without a replay", { timeout: 90_000 }, async (t) => {
   const world = await coordinatorWorld(t);
   const { directory, laptop, homes, events, until, script } = world;
-  const { task, launch } = await laptopTask(world, "fixture-kill-dispatch", "fixture-kill-worker");
   const pipe = join(directory, "kill-pipe"), action = join(directory, "kill-action"), rex = join(homes[1], "rex.json");
   const content = "Written once after the client was killed.\n";
   const answer = "The killed client's turn finished.", laterAnswer = "The reopened terminal continues the same conversation.";
   await mkfifo(pipe);
-  await script("fixture-kill-worker", [{ tool: "write_file", args: { path: pipe, content } }, held(action), { text: answer }]);
+  const { task, launch } = await laptopTask(world, "fixture-kill-dispatch", "fixture-kill-worker",
+    [{ tool: "write_file", args: { path: pipe, content } }, held(action), { text: answer }]);
   const client = runTask(world, launch, false);
-  await until(async () => events(client.output()).some((event) => event.type === "activity" &&
-    event.activity.type === "tool_started" && event.activity.name === "write_file"), "The worker did not start its FIFO write");
+  // The FIFO has no reader yet, so the write cannot finish before the client is killed.
+  await attached(world, client);
+  await until(async () => await modelRequests(world, "fixture-kill-worker") === 1, "The model did not ask for the FIFO write");
   const launches = sessions(rex), before = await history(world, task.id);
 
   client.child.kill("SIGKILL"); await client.exited;
@@ -214,16 +235,16 @@ test("killing the worker client mid-write keeps its actor running, and reopening
 test("an explicit Stop interrupts only its own actor's held effect, and the stopped actor still accepts input", { timeout: 90_000 }, async (t) => {
   const world = await coordinatorWorld(t);
   const { directory, events, until, script } = world;
-  const first = await laptopTask(world, "fixture-stop-dispatch-a", "fixture-stop-held-a");
-  const second = await laptopTask(world, "fixture-stop-dispatch-b", "fixture-stop-held-b");
   const stopped = join(directory, "stop-a"), running = join(directory, "stop-b");
   const runningAnswer = "The other actor finished its held exec.", resumedAnswer = "The stopped actor accepts new input.";
-  await script("fixture-stop-held-a", [held(stopped), { text: "A stopped action must not finish." }]);
-  await script("fixture-stop-held-b", [held(running), { text: runningAnswer }]);
+  const first = await laptopTask(world, "fixture-stop-dispatch-a", "fixture-stop-held-a", [held(stopped), { text: "A stopped action must not finish." }]);
+  const second = await laptopTask(world, "fixture-stop-dispatch-b", "fixture-stop-held-b", [held(running), { text: runningAnswer }]);
   const stoppedTerminal = runTask(world, first.launch, true), runningClient = runTask(world, second.launch, false);
   await until(async () => (await starts(stopped)).length === 1 && (await starts(running)).length === 1, "Both held execs must start");
   const [stoppedStart] = await starts(stopped), [runningStart] = await starts(running);
   assert.ok(stoppedStart !== undefined && runningStart !== undefined);
+  // The exec started when the task was delegated. Esc reaches the actor once the terminal shows that turn as working.
+  await until(async () => stoppedTerminal.output().includes("Working"), "The attached terminal must show the running turn", () => stoppedTerminal.output().slice(-2000));
 
   stoppedTerminal.child.stdin.write("\u001b");
   await until(async () => !alive(stoppedStart.pid), "Esc must stop the actor's held process", () => stoppedTerminal.output().slice(-2000));
@@ -248,8 +269,7 @@ test("an explicit Stop interrupts only its own actor's held effect, and the stop
 test("an offline owning host never runs the worker's command in its terminal or on the coordinator", { timeout: 90_000 }, async (t) => {
   const world = await coordinatorWorld(t);
   const { coordinator, laptop, homes, events, start, until, online, script } = world;
-  const { launch } = await laptopTask(world, "fixture-offline-dispatch", "fixture-offline-worker");
-  await script("fixture-offline-worker", [{ text: "Ready for input." }]);
+  const { launch } = await laptopTask(world, "fixture-offline-dispatch", "fixture-offline-worker", [{ text: "Ready for input." }]);
   const client = runTask(world, launch, false);
   await until(async () => events(client.output()).some((event) => event.type === "worker_idle"), "The worker terminal must become idle");
 
@@ -278,4 +298,199 @@ test("an offline owning host never runs the worker's command in its terminal or 
     "The reconnected owning daemon must run the command once on the laptop");
   assert.deepEqual(await lines(join(homes[0], "effects")), [], "The coordinator must never run the worker's command");
   client.child.stdin.end("/exit\n"); assert.equal(await client.exited, 0, client.errors());
+});
+
+test("a delegated task runs on its host with no pane attached", { timeout: 90_000 }, async (t) => {
+  const world = await coordinatorWorld(t);
+  const { directory, laptop, until } = world;
+  const action = join(directory, "nopane-action"), answer = "The task finished with no pane.";
+  const { task } = await laptopTask(world, "fixture-nopane-dispatch", "fixture-nopane-worker", [held(action), { text: answer }]);
+  await until(async () => (await starts(action)).length === 1, "The delegated exec must start with no terminal attached");
+  await writeFile(action + ".release", "Finish with no pane.");
+  await until(async () => (await history(world, task.id)).some((message) => message.text === answer), "The turn must finish with no terminal attached");
+  assert.equal((await history(world, task.id)).filter((message) => message.text === answer).length, 1, "The answer must be saved once");
+  assert.deepEqual((await starts(action)).map((start) => start.host), [laptop], "The exec must start exactly once, on the laptop");
+  assert.deepEqual(await lines(action + ".finished"), ["once"]);
+  const execReceipt = await receipt(world, action); assert.ok(execReceipt !== undefined);
+  assert.deepEqual(hostResult(execReceipt), heldReceipt, "The model must receive the exec's real output\n" + execReceipt);
+  await noTerminal(world, task.id, "No terminal client may be needed to run delegated work");
+});
+
+test("input to an idle task whose terminal was killed runs on its host with no terminal", { timeout: 90_000 }, async (t) => {
+  const world = await coordinatorWorld(t);
+  const { laptop, homes, events, until, script } = world;
+  const followAnswer = "The follow-up ran after the terminal was killed.";
+  const { task, launch } = await laptopTask(world, "fixture-idle-dispatch", "fixture-idle-worker", [{ text: "Ready for input." }]);
+  const client = runTask(world, launch, false);
+  await until(async () => events(client.output()).some((event) => event.type === "worker_idle"), "The worker terminal must become idle");
+  client.child.kill("SIGKILL"); await client.exited;
+  await until(async () => (await processes("run-task " + task.id)).length === 0, "The killed client must be gone");
+
+  await script("fixture-idle-followup", [{ tool: "exec", args: { program: process.execPath, args: effect } }, { text: followAnswer }]);
+  await mainCalls(world, "fixture-idle-send", { tool: "delegate_task", args: { task_id: task.id, input: "fixture-idle-followup" } });
+  await until(async () => (await history(world, task.id)).some((message) => message.text === followAnswer),
+    "The follow-up must be answered with no terminal attached");
+  assert.equal((await history(world, task.id)).filter((message) => message.text === followAnswer).length, 1, "The follow-up must be answered once");
+  assert.deepEqual((await lines(join(homes[1], "effects"))).map((line) => JSON.parse(line)), [{ host: laptop, cwd: homes[1] }],
+    "The follow-up's command must run once on the laptop");
+  assert.deepEqual(await lines(join(homes[0], "effects")), [], "The coordinator must never run the worker's command");
+  assert.equal((await world.tasks()).find((candidate) => candidate.id === task.id)?.conversation_id, task.conversation_id);
+  await noTerminal(world, task.id, "The follow-up must not need a terminal");
+});
+
+test("killing the client between an effect and its receipt still delivers the real output", { timeout: 90_000 }, async (t) => {
+  const world = await coordinatorWorld(t);
+  const { directory, laptop, events, until, script } = world;
+  const action = join(directory, "gap-action"), output = "Completed after its client died.", answer = "The turn finished after its client died.";
+  const { task, launch } = await laptopTask(world, "fixture-gap-dispatch", "fixture-gap-worker", [{ text: "Ready for input." }]);
+  const client = runTask(world, launch, false);
+  await until(async () => events(client.output()).some((event) => event.type === "worker_idle"), "The worker terminal must become idle");
+  await script("fixture-gap-work", [lingering(action, output), { text: answer }]);
+  client.child.stdin.write("fixture-gap-work\n");
+  await until(async () => (await lines(action + ".finished")).length === 1, "The effect did not reach its finish line");
+  client.child.kill("SIGKILL"); await client.exited;
+
+  const execReceipt = await delivered(world, action, "The model never received the effect's receipt");
+  assert.deepEqual(hostResult(execReceipt), { type: "process", exit_code: 0, stdout: output, stderr: "", truncated: false },
+    "The model must receive the output of the effect that finished after its client died\n" + execReceipt);
+  await until(async () => (await history(world, task.id)).some((message) => message.text === answer), "The turn must finish with no terminal attached");
+  assert.equal((await history(world, task.id)).filter((message) => message.text === answer).length, 1, "The answer must be saved once");
+  assert.deepEqual((await starts(action)).map((start) => start.host), [laptop], "The effect must start exactly once, on the laptop");
+  assert.deepEqual(await lines(action + ".finished"), ["once"]);
+});
+
+test("two terminals on one task observe one actor", { timeout: 90_000 }, async (t) => {
+  const world = await coordinatorWorld(t);
+  const { directory, laptop, events, until } = world;
+  const action = join(directory, "pair-action"), answer = "Both terminals saw this answer.";
+  const { task, launch } = await laptopTask(world, "fixture-pair-dispatch", "fixture-pair-worker", [held(action), { text: answer }]);
+  const first = runTask(world, launch, false), second = runTask(world, launch, false);
+  await attached(world, first); await attached(world, second);
+  await until(async () => (await starts(action)).length === 1, "The held exec did not start");
+  await writeFile(action + ".release", "Finish while two terminals observe.");
+  for (const client of [first, second]) {
+    await until(async () => events(client.output()).some((event) => event.type === "answer" && event.text === answer),
+      "Each attached terminal must print the final answer", () => client.errors().slice(-2000));
+    assert.equal(events(client.output()).filter((event) => event.type === "answer" && event.text === answer).length, 1);
+  }
+  assert.equal(await modelRequests(world, "fixture-pair-worker"), 2, "One actor asks the model once per scripted step");
+  assert.deepEqual((await starts(action)).map((start) => start.host), [laptop], "The exec must start exactly once, on the laptop");
+  assert.deepEqual(await lines(action + ".finished"), ["once"]);
+  assert.equal((await history(world, task.id)).filter((message) => message.text === answer).length, 1, "The answer must be saved once");
+  for (const client of [first, second]) { client.child.stdin.end("/exit\n"); assert.equal(await client.exited, 0, client.errors()); }
+});
+
+test("a child agent's effect finishes on the laptop after its terminal is killed, and its result reaches the parent once", { timeout: 90_000 }, async (t) => {
+  const world = await coordinatorWorld(t);
+  const { directory, laptop, homes, until, script } = world;
+  const action = join(directory, "child-action"), childAnswer = "The child finished its held exec.", parentAnswer = "The parent received the child's result.";
+  await script("fixture-child-work", [held(action), { text: childAnswer }]);
+  await script("Agent result (evidence", [{ text: parentAnswer }]);
+  const { task } = await laptopTask(world, "fixture-family-dispatch", "fixture-family-worker", [
+    { tool: "spawn_agent", args: { title: "Bounded review", outcome: "Run the held command", input: "fixture-child-work" } },
+    { text: "The child is working." }]);
+  await until(async () => (await starts(action)).length === 1, "The child's held exec did not start");
+  const agent = async () => (await world.tasks()).find((candidate) => candidate.id === task.id)?.agents[0];
+  await until(async () => (await agent())?.worker.state === "bound", "The child must get its own pane in the parent's session");
+  const child = await agent(); assert.ok(child?.worker.state === "bound");
+  const binding = child.worker.binding;
+  const launch = sessions(join(homes[1], "rex.json")).find((session) => session.block_id === binding.block_id);
+  assert.ok(launch, "The laptop's Rex must record the child's launch command");
+  const terminal = runTask(world, launch, false);
+  await attached(world, terminal);
+  terminal.child.kill("SIGKILL"); await terminal.exited;
+
+  await writeFile(action + ".release", "Finish after the child's terminal was killed.");
+  await until(async () => (await history(world, task.id)).some((message) => message.text === parentAnswer),
+    "The parent must answer the child's result with no terminal attached");
+  assert.deepEqual((await starts(action)).map((start) => start.host), [laptop], "The child's exec must start exactly once, on the laptop");
+  assert.deepEqual(await lines(action + ".finished"), ["once"]);
+  const execReceipt = await receipt(world, action); assert.ok(execReceipt !== undefined);
+  assert.deepEqual(hostResult(execReceipt), heldReceipt, "The child must receive its exec's real output\n" + execReceipt);
+  assert.equal(await modelRequests(world, "Agent result (evidence"), 1, "The parent must be given the child's result once");
+  assert.equal((await history(world, task.id)).filter((message) => message.text === parentAnswer).length, 1);
+  const finished = (await world.tasks()).find((candidate) => candidate.id === task.id)?.agents[0];
+  assert.equal(finished?.state.state, "done"); assert.equal(finished?.summary, childAnswer);
+});
+
+test("input for an offline host with no actor is kept, reported to its sender, and runs once when the host reconnects", { timeout: 90_000 }, async (t) => {
+  const world = await coordinatorWorld(t);
+  const { coordinator, laptop, homes, start, until, online, script } = world;
+  const followAnswer = "The kept input ran after the laptop reconnected.";
+  const { task } = await laptopTask(world, "fixture-dark-dispatch", "fixture-dark-worker", [{ text: "Ready for input." }]);
+  await until(async () => (await history(world, task.id)).some((message) => message.text === "Ready for input."), "The first turn must finish");
+
+  world.worker.child.kill("SIGINT"); assert.equal(await world.worker.exited, 0, world.worker.errors()); await online([coordinator]);
+  await script("fixture-dark-followup", [{ tool: "exec", args: { program: process.execPath, args: effect } }, { text: followAnswer }]);
+  const sent = await world.exchange({ type: "task_input", task_id: task.id, input_id: "fixture-dark-input", input: "fixture-dark-followup", mode: "follow_up" });
+  assert.ok(sent.some((event) => event.type === "input_accepted" && event.input_id === "fixture-dark-input"), "The input must be saved");
+  assert.ok(sent.some((event) => event.type === "failure" && /is offline/.test(event.message)),
+    "The sender must be told the owning host is offline\n" + JSON.stringify(sent));
+  for (const home of homes) assert.deepEqual(await lines(join(home, "effects")), [], `No command may run in ${home} while the owning daemon is offline`);
+  assert.equal(await modelRequests(world, "fixture-dark-followup"), 0, "The kept input must not start a turn while its host is offline");
+
+  start(1, ["maintain"]); await online([coordinator, laptop]);
+  await until(async () => (await history(world, task.id)).some((message) => message.text === followAnswer),
+    "The kept input must run when its host reconnects, with no new input");
+  assert.equal((await history(world, task.id)).filter((message) => message.text === followAnswer).length, 1, "The kept input must be answered once");
+  assert.deepEqual((await lines(join(homes[1], "effects"))).map((line) => JSON.parse(line)), [{ host: laptop, cwd: homes[1] }],
+    "The kept input's command must run once on the laptop");
+  assert.deepEqual(await lines(join(homes[0], "effects")), [], "The coordinator must never run the worker's command");
+  await noTerminal(world, task.id, "The kept input must not need a terminal");
+});
+
+test("a coordinator restart never reruns a held effect and still answers the queued follow-up", { timeout: 120_000 }, async (t) => {
+  const world = await coordinatorWorld(t);
+  const { directory, coordinator, laptop, socket, start, until, online, script } = world;
+  const action = join(directory, "restart-action"), followAnswer = "The queued follow-up ran after the restart.";
+  const { task } = await laptopTask(world, "fixture-restart-dispatch", "fixture-restart-worker",
+    [held(action), { text: "The interrupted turn was reported." }]);
+  await until(async () => (await starts(action)).length === 1, "The held exec did not start");
+  await script("fixture-restart-followup", [{ text: followAnswer }]);
+  await mainCalls(world, "fixture-restart-queue", { tool: "delegate_task", args: { task_id: task.id, input: "fixture-restart-followup", mode: "follow_up" } });
+
+  world.server.child.kill("SIGINT"); await world.server.exited;
+  start(0, ["serve", "--local-only", "--no-sources"]);
+  await until(async () => { try { return (await stat(socket)).isSocket(); } catch { return false; } }, "The restarted coordinator must bind its socket");
+  await online([coordinator, laptop]);
+
+  await until(async () => (await history(world, task.id)).some((message) => message.text === followAnswer),
+    "The queued follow-up must be answered after the restart with no terminal attached");
+  assert.equal((await history(world, task.id)).filter((message) => message.text === followAnswer).length, 1, "The follow-up must be answered once");
+  assert.deepEqual((await starts(action)).map((start) => start.host), [laptop], "The held exec must not start a second time");
+  const interrupted = await receipt(world, action);
+  assert.ok(interrupted === undefined || !interrupted.includes("Completed the held action."),
+    "The model must not be given a success result for the effect the restart interrupted\n" + interrupted);
+  assert.equal(await exists(action + ".finished"), false, "The interrupted effect must not finish");
+  await noTerminal(world, task.id, "The queued follow-up must not need a terminal");
+});
+
+test("Esc from a reattached terminal stops its actor's held effect and no other actor's", { timeout: 90_000 }, async (t) => {
+  const world = await coordinatorWorld(t);
+  const { directory, until } = world;
+  const stopped = join(directory, "restop-a"), running = join(directory, "restop-b"), runningAnswer = "The other actor finished its held exec.";
+  const first = await laptopTask(world, "fixture-restop-dispatch-a", "fixture-restop-held-a", [held(stopped), { text: "A stopped action must not finish." }]);
+  const second = await laptopTask(world, "fixture-restop-dispatch-b", "fixture-restop-held-b", [held(running), { text: runningAnswer }]);
+  const original = runTask(world, first.launch, false);
+  await attached(world, original);
+  await until(async () => (await starts(stopped)).length === 1 && (await starts(running)).length === 1, "Both held execs must start");
+  const [stoppedStart] = await starts(stopped), [runningStart] = await starts(running);
+  assert.ok(stoppedStart !== undefined && runningStart !== undefined);
+  original.child.kill("SIGKILL"); await original.exited;
+  await until(async () => (await processes("run-task " + first.task.id)).length === 0, "The killed client must be gone");
+  assert.ok(alive(stoppedStart.pid), "Killing the terminal must not stop its actor's held process");
+
+  const reattached = runTask(world, first.launch, true);
+  await until(async () => reattached.output().includes("Working"), "The reattached terminal must show the running turn", () => reattached.output().slice(-2000));
+  reattached.child.stdin.write("\u001b");
+  await until(async () => !alive(stoppedStart.pid), "Esc from the reattached terminal must stop the actor's held process", () => reattached.output().slice(-2000));
+  await writeFile(stopped + ".release", "A stopped action must remain stopped.");
+  assert.equal(await exists(stopped + ".finished"), false, "A stopped effect must never finish");
+  assert.ok(alive(runningStart.pid), "Stopping one actor must not touch another actor's held process");
+
+  await writeFile(running + ".release", "Finish the other actor.");
+  await until(async () => (await history(world, second.task.id)).some((message) => message.text === runningAnswer), "The other actor's turn must complete");
+  assert.deepEqual(await lines(running + ".finished"), ["once"]);
+  const runningReceipt = await receipt(world, running); assert.ok(runningReceipt !== undefined);
+  assert.deepEqual(hostResult(runningReceipt), heldReceipt, "The other actor must receive its real receipt\n" + runningReceipt);
 });
