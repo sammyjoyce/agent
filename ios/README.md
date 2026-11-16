@@ -202,10 +202,14 @@ the phone by cable. To allow that, list the app's bundle ID under `usbApps` in
   wrote it, its text also comes back to the live composer ahead of newer typing,
   under its chip if the composer is still empty.
   Texts that come back, after a local rejection or a stopped control, keep the
-  order they were sent in, ahead of anything typed or restored since. Typing onto a returned text's last
-  paragraph stays with it, and an edit inside one counts as new typing. While a
-  newer Send is still being admitted, the composer record keeps the returned
-  text ahead of it, so recovery after a crash offers the same order.
+  order they were sent in, ahead of anything typed or restored since. Typing
+  onto a returned text's last paragraph stays with it, and an edit inside one
+  counts as new typing. The composer tells returned texts apart by their words
+  alone. If you delete one returned text and another begins with the deleted
+  text's words, a text that comes back later can land out of Send order.
+  Nothing is lost or duplicated. While a newer Send is still being admitted,
+  the composer record keeps the returned text ahead of it, so recovery after a
+  crash offers the same order.
   Ownership paths are relative to the composer record, allowing storage to move.
   Local rejection restores the unadmitted copy, preserving newer typing.
   Restoring an outbox input saves the complete replacement draft and keeps the
