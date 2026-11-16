@@ -194,6 +194,8 @@
       try await assertAnnotations(of: coordinators, become: [], "the opened job over the feed")
     }
 
+    /// App Intents Testing confirms a confirmation by itself, so these tests check what follows
+    /// it. `testShortcutsAsksBeforeItSends` answers the confirmation the system shows.
     /// The app is terminated before the intent, so the system starts it in the background.
     func testSendMessageDeliversFromTheBackgroundAndKeepsTheDraft() async throws {
       guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
@@ -203,7 +205,7 @@
       let workEntity = try await coordinator(named: "Work")
       terminate(app)
 
-      let sent = try await send("Check the build", to: workEntity, answering: "Send")
+      let sent = try await send("Check the build", to: workEntity)
 
       XCTAssertEqual(sent.value, "delivered")
       let submits = await work.submitRequests()
@@ -227,10 +229,10 @@
       let workEntity = try await coordinator(named: "Work")
       await work.holdSubmits()
 
-      let first = try await send("Rotate the Work logs", to: workEntity, answering: "Send")
+      let first = try await send("Rotate the Work logs", to: workEntity)
       XCTAssertEqual(first.value, "saved")
       await work.releaseSubmits()
-      let again = try await send("Rotate the Work logs", to: workEntity, answering: "Send")
+      let again = try await send("Rotate the Work logs", to: workEntity)
 
       XCTAssertTrue(["delivered", "alreadyDelivered"].contains(again.value), again.value)
       let submits = await work.submitRequests()
@@ -239,6 +241,7 @@
       XCTAssertEqual(Set(submits.map(\.text)), ["Rotate the Work logs"])
     }
 
+    /// A saved copy waits out the 8 second deadline. A failure answers before it.
     func testSendMessageSaysWhenTheCoordinatorFailsTheSend() async throws {
       guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
       let (app, work, _) = try await launchWithAWorkDraft(origins: ["siri"])
@@ -247,10 +250,10 @@
       let workEntity = try await coordinator(named: "Work")
       await work.failSubmits("The coordinator execution host is offline")
 
-      let sent = try await send("Check the build", to: workEntity, answering: "Send")
+      let sent = try await send("Check the build", to: workEntity)
 
       XCTAssertEqual(sent.value, "refused")
-      XCTAssertLessThan(sent.afterAnswer, .seconds(6), "The failure waited for the deadline")
+      XCTAssertLessThan(sent.took, .seconds(7), "The failure waited for the deadline")
       let submits = await work.submitRequests()
       XCTAssertEqual(submits.map(\.text), ["Check the build"])
     }
@@ -262,7 +265,7 @@
       let workEntity = try await coordinator(named: "Work")
 
       for command in ["/status", " /goal clear", "?"] {
-        let sent = try await send(command, to: workEntity, answering: nil)
+        let sent = try await send(command, to: workEntity)
         XCTAssertEqual(sent.value, "refusal.command", command)
       }
 
@@ -279,27 +282,45 @@
       terminate(app)
       let workEntity = try await coordinator(named: "Work")
 
-      let sent = try await send("Check the build", to: workEntity, answering: "Send")
+      let sent = try await send("Check the build", to: workEntity)
 
       XCTAssertEqual(sent.value, "notSent.notAdvertised")
       let submits = await work.submitRequests()
       XCTAssertEqual(submits.map(\.text), [])
     }
 
-    func testCancellingSendMessageSendsNothing() async throws {
-      guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
-      let (app, work, _) = try await launchWithAWorkDraft(origins: ["siri"])
+    /// Runs the App Shortcut from the Shortcuts app, which shows the confirmation and the
+    /// outcome. Cancel sends nothing, and Send sends one copy.
+    func testShortcutsAsksBeforeItSends() async throws {
+      let (app, work, personal) = try await launchWithAWorkDraft(origins: ["siri"])
       goHome()
-      terminate(app)
-      let workEntity = try await coordinator(named: "Work")
+      let shortcuts = XCUIApplication(bundleIdentifier: "com.apple.shortcuts")
+      shortcuts.launch()
+      var log: [String] = []
+      defer { attach(log, named: "shortcuts-steps") }
 
-      let sent = try await send("Check the build", to: workEntity, answering: "Cancel")
-
-      XCTAssertTrue(sent.value.hasPrefix("threw"), sent.value)
+      let asked = try await runSendMessageShortcut(
+        "Check the build", to: "Work", answering: "Cancel", in: shortcuts, log: &log)
+      capture("shortcuts-send-confirmation", shortcuts)
+      XCTAssertTrue(
+        asked.contains { $0.contains("Work") && $0.contains("Check the build") }, "\(asked)")
       try await Task.sleep(for: .seconds(3))
-      let submits = await work.submitRequests()
-      XCTAssertEqual(submits.map(\.text), [])
-      app.launch()
+      var submits = await work.submitRequests() + personal.submitRequests()
+      XCTAssertEqual(submits.map(\.text), [], "Cancel sent a message")
+
+      _ = try await runSendMessageShortcut(
+        "Check the build", to: "Work", answering: "Send", in: shortcuts, log: &log)
+      let outcome = shortcuts.staticTexts.matching(
+        NSPredicate(format: "label CONTAINS %@", "Sent to Work.")
+      ).firstMatch
+      XCTAssertTrue(outcome.waitForExistence(timeout: 20), shortcuts.debugDescription)
+      capture("shortcuts-send-outcome", shortcuts)
+      submits = await work.submitRequests()
+      XCTAssertEqual(submits.map(\.text), ["Check the build"])
+      XCTAssertEqual(submits.map(\.origin), [.siri])
+      let elsewhere = await personal.submitRequests()
+      XCTAssertEqual(elsewhere.map(\.text), [])
+      app.activate()
       assertTheWorkDraftIsKept(app)
     }
 
@@ -312,100 +333,151 @@
         throw XCTSkip("Needs a private coordinator from runtime/test/fixtures/siri-world.ts")
       }
       let app = try launch(ports: [world.relay], coordinators: [world.coordinator])
-      try chooseWorkAndType("Keep this Work draft", in: app)
+      let field = app.textViews["Message the coordinator"]
+      XCTAssertTrue(field.wait(for: \.isEnabled, toEqual: true, timeout: 15))
+      field.tap()
+      field.typeText("Keep this Work draft")
       goHome()
       terminate(app)
       let work = try await coordinator(named: "Work", among: ["Work"])
       terminate(app)
 
-      let delivered = try await send("Check the build", to: work, answering: "Send")
+      let delivered = try await send("Check the build", to: work)
       XCTAssertEqual(delivered.value, "delivered")
       var state = try await world.state()
       XCTAssertEqual(state.generations["Check the build"], 1)
       XCTAssertEqual(state.submits.map(\.origin), ["siri"])
 
       try await world.loseNextSubmitReply()
-      let saved = try await send("Rotate the Work logs", to: work, answering: "Send")
+      let saved = try await send("Rotate the Work logs", to: work)
       XCTAssertEqual(saved.value, "saved")
-      let again = try await send("Rotate the Work logs", to: work, answering: "Send")
+      let again = try await send("Rotate the Work logs", to: work)
       XCTAssertTrue(["delivered", "alreadyDelivered"].contains(again.value), again.value)
       state = try await world.state()
       let rotations = state.submits.filter { $0.text == "Rotate the Work logs" }
       XCTAssertEqual(Set(rotations.map(\.inputId)).count, 1, "\(rotations)")
       XCTAssertEqual(rotations.map(\.replyLost).filter { $0 }.count, 1, "\(rotations)")
       XCTAssertEqual(state.generations["Rotate the Work logs"], 1)
-
-      let cancelled = try await send("Check the build", to: work, answering: "Cancel")
-      XCTAssertTrue(cancelled.value.hasPrefix("threw"), cancelled.value)
-      try await Task.sleep(for: .seconds(3))
-      state = try await world.state()
-      XCTAssertEqual(state.submits.filter { $0.text == "Check the build" }.count, 1)
       XCTAssertEqual(state.generations["Check the build"], 1)
 
       app.launch()
-      assertTheWorkDraftIsKept(app)
+      XCTAssertTrue(
+        becomes(field, "value == %@", "Keep this Work draft"), String(describing: field.value))
       capture("siri-send-private-coordinator-draft-kept", app)
     }
 
     private struct Sent {
       /// The intent's value, or `threw: <error>`.
       let value: String
-      let afterAnswer: Duration
+      let took: Duration
     }
 
-    /// Runs Send Message and taps `answer` on its confirmation. With `answer` nil, the intent
-    /// must finish without asking.
     @available(iOS 27, *)
-    private func send(_ text: String, to coordinator: AnyAppEntity, answering answer: String?)
-      async throws -> Sent
-    {
+    private func send(_ text: String, to coordinator: AnyAppEntity) async throws -> Sent {
       let intent = definitions.intents["SendMessageIntent"].makeIntent(
         message: text, coordinator: coordinator)
-      let finished = Finished()
-      let run = Task { @MainActor () -> String in
-        defer { finished.value = true }
-        do {
-          let value: String = try await intent.run().value
-          return value
-        } catch { return "threw: \(error)" }
-      }
-      let limit = Task {
-        try await Task.sleep(for: .seconds(45))
-        run.cancel()
-      }
-      defer { limit.cancel() }
-      var answered = ContinuousClock.now
-      if let answer {
-        guard let button = try await confirmationButton(answer, until: finished) else {
-          run.cancel()
-          let value = await run.value
-          XCTFail("Send Message showed no \(answer) button and returned \(value)")
-          return Sent(value: value, afterAnswer: .zero)
-        }
-        capture("siri-send-confirmation-\(answer.lowercased())", XCUIApplication())
-        button.tap()
-        answered = .now
-      }
-      let value = await run.value
-      return Sent(value: value, afterAnswer: .now - answered)
+      let started = ContinuousClock.now
+      do {
+        let value: String = try await intent.run().value
+        return Sent(value: value, took: .now - started)
+      } catch { return Sent(value: "threw: \(error)", took: .now - started) }
     }
 
-    @MainActor private final class Finished { var value = false }
-
-    /// The confirmation's button, or nil when the intent finished or 20 seconds passed first.
-    private func confirmationButton(_ label: String, until finished: Finished) async throws
-      -> XCUIElement?
-    {
+    /// Runs the Send Message App Shortcut in the Shortcuts app, answers its prompts, taps
+    /// `answer` on the confirmation, and returns the confirmation's texts.
+    private func runSendMessageShortcut(
+      _ message: String, to coordinator: String, answering answer: String,
+      in shortcuts: XCUIApplication, log: inout [String]
+    ) async throws -> [String] {
       let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-      let deadline = ContinuousClock.now + .seconds(20)
-      repeat {
-        for button in [springboard.buttons[label], XCUIApplication().buttons[label]]
-        where button.exists {
-          return button
+      let any = { (app: XCUIApplication, label: String) in
+        app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", label))
+          .firstMatch
+      }
+      var typed = false
+      var chose = false
+      var started = false
+      let deadline = ContinuousClock.now + .seconds(90)
+      while ContinuousClock.now < deadline {
+        let texts =
+          (shortcuts.staticTexts.allElementsBoundByIndex
+          + springboard.staticTexts.allElementsBoundByIndex).map(\.label)
+        let buttons =
+          (shortcuts.buttons.allElementsBoundByIndex
+          + springboard.buttons.allElementsBoundByIndex).map(\.label)
+        log.append("texts \(texts)\nbuttons \(buttons)")
+        let confirm = [shortcuts.buttons[answer], springboard.buttons[answer]]
+          .first { $0.exists && $0.isHittable }
+        if typed || chose, let confirm, texts.contains(where: { $0.contains(message) }) {
+          capture("shortcuts-confirmation-\(answer.lowercased())", shortcuts)
+          log.append("tapped \(answer)")
+          confirm.tap()
+          return texts
         }
-        try await Task.sleep(for: .milliseconds(250))
-      } while ContinuousClock.now < deadline && !finished.value
-      return nil
+        if let field = [
+          shortcuts.textFields.firstMatch, springboard.textFields.firstMatch,
+          shortcuts.textViews.firstMatch, springboard.textViews.firstMatch,
+        ]
+        .first(where: { $0.exists && $0.isHittable }), !typed {
+          field.tap()
+          field.typeText(message)
+          typed = true
+          log.append("typed the message")
+          for done in ["Done", "Continue", "Next"] {
+            let button = [shortcuts.buttons[done], springboard.buttons[done]]
+              .first { $0.exists && $0.isHittable }
+            if let button {
+              button.tap()
+              log.append("tapped \(done)")
+              break
+            }
+          }
+          continue
+        }
+        if !chose, started,
+          let option = [any(shortcuts, coordinator), any(springboard, coordinator)]
+            .first(where: { $0.exists && $0.isHittable })
+        {
+          option.tap()
+          chose = true
+          log.append("chose \(coordinator)")
+          continue
+        }
+        if !started {
+          for label in ["Continue", "Not Now", "OK", "Get Started"] {
+            let button = shortcuts.buttons[label]
+            if button.exists && button.isHittable {
+              button.tap()
+              log.append("dismissed \(label)")
+            }
+          }
+          let tile = any(shortcuts, "Send Message")
+          if tile.exists && tile.isHittable {
+            tile.tap()
+            started = true
+            log.append("tapped the Send Message tile")
+          } else {
+            let folder = any(shortcuts, "Beep Boop")
+            if folder.exists && folder.isHittable {
+              folder.tap()
+              log.append("opened Beep Boop")
+            }
+          }
+        }
+        try await Task.sleep(for: .seconds(1))
+      }
+      attach(log, named: "shortcuts-steps-timeout")
+      add(XCTAttachment(string: shortcuts.debugDescription))
+      add(XCTAttachment(string: springboard.debugDescription))
+      XCTFail("The Shortcuts app showed no \(answer) confirmation for \(message)")
+      return []
+    }
+
+    private func attach(_ lines: [String], named name: String) {
+      let attachment = XCTAttachment(string: lines.joined(separator: "\n"))
+      attachment.name = name
+      attachment.lifetime = .keepAlways
+      add(attachment)
     }
 
     private func goHome() {
