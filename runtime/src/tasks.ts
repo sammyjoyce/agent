@@ -69,6 +69,8 @@ export type WorkerSession = {
   configured?(conversation: Conversation, title: string): Promise<void>;
   answer(conversationId: string, text: string, entryId?: string): void;
   idle(): void;
+  /** The actor was already mid-turn when this terminal attached, so no live event will say so. */
+  working?(): void;
   interrupted?(): void;
   beforeTurn?(): Promise<void>;
   rejected?(inputId: string, message: string): void;
@@ -1515,9 +1517,10 @@ export class TaskStore {
             await actor.bound;
             if (actor.phase !== "bound" || actor.conversation === undefined) { actor.observers.delete(attached); continue; }
             await attached.session.ready(actor.conversation, this.actor(await this.get(ref.task_id), ref.agent_id).title);
-            const idle = !actor.busy && attached.held?.length === 0;
+            const busy = actor.busy, quiet = attached.held?.length === 0;
+            if (busy) attached.session.working?.();
             this.release(attached);
-            if (idle) attached.session.idle();
+            if (!busy && quiet) attached.session.idle();
           } catch (error) { if (actor.observers.delete(attached)) actor.wake?.(); throw error; }
         }
       }

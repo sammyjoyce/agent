@@ -710,6 +710,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
           configured,
           answer(conversation_id, text, entry_id) { emit(id, { type: "answer", conversation_id, text, ...(entry_id === undefined ? {} : { entry_id }) }); },
           idle() { emit(id, { type: "worker_idle" }); },
+          working() { emit(id, { type: "conversation_state", working: true }); },
           interrupted() { emit(id, { type: "interrupted" }); },
         });
         if (command.interactive !== true) emit(id, { type: "answer", ...answer });
