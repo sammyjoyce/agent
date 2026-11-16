@@ -67,36 +67,33 @@ export async function followLog(follower: LogFollower, storage: SqliteStorage): 
 }
 
 async function applyEntry({ database, link, stateDirectory }: LogFollower, storage: SqliteStorage, installed: Versions, entry: LogEntry): Promise<void> {
-  const { digest, ...body } = entry;
-  if (body.versions.pi_durable !== installed.pi_durable || body.versions.chord !== installed.chord) {
-    throw new Error(`Log entry ${entry.at} was written by Pi Durable ${body.versions.pi_durable} and Chord ${body.versions.chord}, and this host runs Pi Durable ${installed.pi_durable} and Chord ${installed.chord}`);
+  const { digest, ...digested } = entry;
+  const { at, versions: written, files, batch } = entry;
+  if (written.pi_durable !== installed.pi_durable || written.chord !== installed.chord) {
+    throw new Error(`Log entry ${at} was written by Pi Durable ${written.pi_durable} and Chord ${written.chord}, and this host runs Pi Durable ${installed.pi_durable} and Chord ${installed.chord}`);
   }
-  if (logEntryDigest(body) !== digest) throw new Error(`Log entry ${entry.at} does not match its digest`);
-  const pending = await downloadFiles(link, stateDirectory, body.files);
+  if (logEntryDigest(digested) !== digest) throw new Error(`Log entry ${at} does not match its digest`);
+  const pending = await downloadFiles(link, stateDirectory, files);
   const publish = () => publishFiles(pending);
   try {
-    if (body.batch === null) {
-      if (body.pi_seq !== null) throw new Error(`Log entry ${entry.at} names Pi sequence ${body.pi_seq} and carries no batch`);
-      return await database.applyWithoutBatch(entry.at, publish);
-    }
-    if (body.pi_seq === null) throw new Error(`Log entry ${entry.at} carries a batch and names no Pi sequence`);
-    const writes = parseBatch(await batchJson(link, entry.at, body.batch), entry.at);
-    await database.apply(entry.at, body.pi_seq, { publish, commit: () => storage.commit(writes, BACKGROUND_CONTEXT) });
+    if (batch === null) return await database.applyWithoutBatch(at, publish);
+    const writes = parseBatch(await batchJson(link, at, batch.body), at);
+    await database.apply(at, batch.pi_seq, { publish, commit: () => storage.commit(writes, BACKGROUND_CONTEXT) });
   } catch (error) {
     await removeFiles(pending);
     throw error;
   }
 }
 
-async function batchJson(link: AuthorityLink, at: number, batch: BatchBody): Promise<string> {
-  switch (batch.kind) {
-    case "inline": return batch.json;
+async function batchJson(link: AuthorityLink, at: number, body: BatchBody): Promise<string> {
+  switch (body.kind) {
+    case "inline": return body.json;
     case "blob": {
-      const bytes = await link.getBlob(batch.sha256);
-      if (bytes.byteLength !== batch.size || sha256Hex(bytes) !== batch.sha256) throw new Error(`The blob that holds the batch of log entry ${at} does not match its record`);
+      const bytes = await link.getBlob(body.sha256);
+      if (bytes.byteLength !== body.size || sha256Hex(bytes) !== body.sha256) throw new Error(`The blob that holds the batch of log entry ${at} does not match its record`);
       return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("utf8");
     }
-    default: return batch satisfies never;
+    default: return body satisfies never;
   }
 }
 

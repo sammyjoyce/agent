@@ -3,6 +3,7 @@ import type { BatchBody } from "../generated/BatchBody.js";
 import type { CheckpointRecord } from "../generated/CheckpointRecord.js";
 import type { FileRecord } from "../generated/FileRecord.js";
 import type { LogEntry } from "../generated/LogEntry.js";
+import type { LoggedBatch } from "../generated/LoggedBatch.js";
 import type { Versions } from "../generated/Versions.js";
 import { REPLICATED_FILE_ROOTS } from "../generated/replicated-file-roots.js";
 
@@ -88,14 +89,15 @@ const batchBody = tagged<BatchBody, "kind">("kind", {
   blob: { sha256, size: counter },
 });
 
+const loggedBatch = object<LoggedBatch>({ pi_seq: counter, body: batchBody });
+
 const logEntry = object<LogEntry>({
   at: counter,
   epoch: counter,
   digest: sha256,
   versions,
-  pi_seq: nullable(counter),
   files: list(fileRecord),
-  batch: nullable(batchBody),
+  batch: nullable(loggedBatch),
 });
 
 const authorityCommand = tagged<AuthorityCommand, "op">("op", {
@@ -154,7 +156,7 @@ export function commandBlobs(command: AuthorityCommand): string[] {
       return [command.record.manifest];
     case "append": {
       const { files, batch } = command.entry;
-      return [...files.map((file) => file.sha256), ...(batch?.kind === "blob" ? [batch.sha256] : [])];
+      return [...files.map((file) => file.sha256), ...(batch?.body.kind === "blob" ? [batch.body.sha256] : [])];
     }
     case "claim": case "confirm": case "promote": case "release": case "activate":
       return [];

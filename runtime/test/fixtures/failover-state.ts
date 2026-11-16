@@ -164,7 +164,8 @@ export async function logBatches(link: AuthorityLink): Promise<StorageWrite[][]>
   const batches: StorageWrite[][] = [];
   for (const { batch } of await logEntries(link)) {
     if (batch === null) continue;
-    const json = batch.kind === "inline" ? batch.json : Buffer.from(await link.getBlob(batch.sha256)).toString("utf8");
+    const { body } = batch;
+    const json = body.kind === "inline" ? body.json : Buffer.from(await link.getBlob(body.sha256)).toString("utf8");
     batches.push(JSON.parse(json) as StorageWrite[]);
   }
   return batches;

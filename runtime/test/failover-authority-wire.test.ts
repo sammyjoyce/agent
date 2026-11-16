@@ -9,8 +9,8 @@ const wellFormed: readonly AuthorityCommand[] = [
   { op: "enroll", holder: tarantula, checkpoint: { through: 0, manifest } },
   { op: "claim", holder: tarantula },
   { op: "append", holder: tarantula, entry: entry(1, 1, digests[0]) },
-  { op: "append", holder: tarantula, entry: { ...entry(1, 2, digests[0]), pi_seq: null, batch: null, files: [file, { ...file, path: "history/assets/ab/cd.png" }, { ...file, path: "feedback/latest" }] } },
-  { op: "append", holder: tarantula, entry: { ...entry(1, 3, digests[0]), files: [file], batch: { kind: "blob", sha256: digests[1], size: 9_007_199_254_740_991 } } },
+  { op: "append", holder: tarantula, entry: { ...entry(1, 2, digests[0]), batch: null, files: [file, { ...file, path: "history/assets/ab/cd.png" }, { ...file, path: "feedback/latest" }] } },
+  { op: "append", holder: tarantula, entry: { ...entry(1, 3, digests[0]), files: [file], batch: { pi_seq: 9_007_199_254_740_991, body: { kind: "blob", sha256: digests[1], size: 9_007_199_254_740_991 } } } },
   { op: "confirm", holder: tarantula, epoch: 9_007_199_254_740_991 },
   { op: "promote", candidate: orion, expected_epoch: 1, attestation: null },
   { op: "promote", candidate: orion, expected_epoch: 1, attestation: "the old host is powered off" },
@@ -32,6 +32,7 @@ const claim = { op: "claim", holder: tarantula };
 const append = { op: "append", holder: tarantula, entry: entry(1, 1, digests[0]) };
 const withEntry = (change: Record<string, unknown>) => ({ ...append, entry: { ...append.entry, ...change } });
 const withFile = (change: Record<string, unknown>) => withEntry({ files: [{ ...file, ...change }] });
+const withBatch = (change: Record<string, unknown>) => withEntry({ batch: { ...append.entry.batch, ...change } });
 const promote = { op: "promote", candidate: orion, expected_epoch: 1, attestation: null };
 const without = <T extends object>(value: T, field: keyof T) => Object.fromEntries(Object.entries(value).filter(([key]) => key !== field));
 
@@ -72,8 +73,6 @@ const malformed: readonly (readonly [field: string, value: unknown])[] = [
   ["entry.digest", withEntry({ digest: "g".repeat(64) })],
   ["entry.versions.chord", withEntry({ versions: { application: "0.1.0", pi_durable: "1.4.0", chord: 1 } })],
   ["entry.versions.pi", withEntry({ versions: { application: "0.1.0", pi_durable: "1.4.0", chord: "1.4.0", pi: "1" } })],
-  ["entry.pi_seq", withEntry({ pi_seq: -1 })],
-  ["entry.pi_seq", { ...append, entry: without(append.entry, "pi_seq") }],
   ["entry.files", withEntry({ files: {} })],
   ["entry.files[0]", withEntry({ files: ["attachments/a"] })],
   ...["/attachments/a", "attachments", "attachments/", "attachments/../auth.json", "attachments//a", "attachments/./a",
@@ -83,11 +82,16 @@ const malformed: readonly (readonly [field: string, value: unknown])[] = [
   ["entry.files[0].size", withFile({ size: 2 ** 53 })],
   ["entry.files[0].mode", withFile({ mode: 0o600 })],
   ["entry.batch", { ...append, entry: without(append.entry, "batch") }],
-  ["entry.batch.kind", withEntry({ batch: { kind: "zip", json: "[]" } })],
-  ["entry.batch.json", withEntry({ batch: { kind: "inline" } })],
-  ["entry.batch.json", withEntry({ batch: { kind: "inline", json: [] } })],
-  ["entry.batch.sha256", withEntry({ batch: { kind: "blob", sha256: "x", size: 1 } })],
-  ["entry.batch.json", withEntry({ batch: { kind: "blob", sha256: digests[0], size: 1, json: "[]" } })],
+  ["entry.pi_seq", withEntry({ pi_seq: 4, batch: null })],
+  ["entry.batch.pi_seq", withEntry({ batch: { body: { kind: "inline", json: "[]" } } })],
+  ["entry.batch.pi_seq", withBatch({ pi_seq: -1 })],
+  ["entry.batch.body", withBatch({ body: null })],
+  ["entry.batch.kind", withEntry({ batch: { kind: "inline", json: "[]" } })],
+  ["entry.batch.body.kind", withBatch({ body: { kind: "zip", json: "[]" } })],
+  ["entry.batch.body.json", withBatch({ body: { kind: "inline" } })],
+  ["entry.batch.body.json", withBatch({ body: { kind: "inline", json: [] } })],
+  ["entry.batch.body.sha256", withBatch({ body: { kind: "blob", sha256: "x", size: 1 } })],
+  ["entry.batch.body.json", withBatch({ body: { kind: "blob", sha256: digests[0], size: 1, json: "[]" } })],
 ];
 
 test("a malformed command is refused with a message that names the bad field", () => {
