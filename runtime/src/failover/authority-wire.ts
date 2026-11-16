@@ -1,9 +1,15 @@
 import type { AuthorityCommand } from "../generated/AuthorityCommand.js";
+import type { AuthorityRecord } from "../generated/AuthorityRecord.js";
+import type { AuthorityRefusal } from "../generated/AuthorityRefusal.js";
+import type { AuthorityReply } from "../generated/AuthorityReply.js";
+import type { AuthorityState } from "../generated/AuthorityState.js";
 import type { BatchBody } from "../generated/BatchBody.js";
 import type { CheckpointRecord } from "../generated/CheckpointRecord.js";
 import type { FileRecord } from "../generated/FileRecord.js";
 import type { LogEntry } from "../generated/LogEntry.js";
 import type { LoggedBatch } from "../generated/LoggedBatch.js";
+import type { LogPage } from "../generated/LogPage.js";
+import type { StopEvidence } from "../generated/StopEvidence.js";
 import type { Versions } from "../generated/Versions.js";
 import { REPLICATED_FILE_ROOTS } from "../generated/replicated-file-roots.js";
 
@@ -22,7 +28,7 @@ export const isLowercaseUuid = (value: string) => LOWERCASE_UUID.test(value);
 export const isSha256Hex = (value: string) => SHA256_HEX.test(value);
 
 function invalid(path: string, problem: string): never {
-  throw new Error(`${path === "" ? "The command" : `The field ${path}`} ${problem}.`);
+  throw new Error(`The field ${path} ${problem}.`);
 }
 
 const join = (path: string, key: string) => path === "" ? key : `${path}.${key}`;
@@ -100,6 +106,31 @@ const logEntry = object<LogEntry>({
   batch: nullable(loggedBatch),
 });
 
+const stopEvidence = tagged<StopEvidence, "kind">("kind", {
+  released: {},
+  lock_held: {},
+  operator_attested: { statement: text },
+});
+
+const authorityState = tagged<AuthorityState, "kind">("kind", {
+  active: { epoch: counter, holder: uuid, head: counter },
+  sealed: { epoch: counter, holder: uuid, candidate: uuid, head: counter },
+  vacant: { epoch: counter, candidate: uuid, evidence: stopEvidence, head: counter },
+});
+
+const refusals = { not_enrolled: null, enrolled: null, sealed: null, fenced: null, gap: null, conflict: null, missing_blob: null, epoch_moved: null,
+  already_owner: null, self_attestation: null, not_sealed: null, not_sealed_holder: null, not_candidate: null, not_caught_up: null,
+  checkpoint_out_of_range: null } satisfies Record<AuthorityRefusal, null>;
+
+const authorityReply = tagged<AuthorityReply, "result">("result", {
+  accepted: { state: authorityState },
+  refused: { reason: oneOf(...Object.keys(refusals) as AuthorityRefusal[]), state: nullable(authorityState) },
+});
+
+const authorityRecord = object<AuthorityRecord>({ state: authorityState, checkpoint: checkpointRecord });
+
+const logPage = object<LogPage>({ record: authorityRecord, entries: list(logEntry) });
+
 const authorityCommand = tagged<AuthorityCommand, "op">("op", {
   enroll: { holder: uuid, checkpoint: checkpointRecord },
   claim: { holder: uuid },
@@ -124,6 +155,12 @@ export function parseAuthorityCredentials(value: unknown): AuthorityCredential[]
   return authorityCredentials(value, "AUTHORITY_CREDENTIALS");
 }
 
+/** Parses one whole JSON object, which a refusal's message calls `subject`. */
+const whole = <T>(subject: string, field: Field<T>) => (value: unknown): T => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`The ${subject} is not an object.`);
+  return field(value, "");
+};
+
 /**
  * Parses a command from untrusted JSON, or throws an Error whose message names
  * the first bad field. It accepts what `src/failover.rs` accepts, narrowed in
@@ -131,9 +168,15 @@ export function parseAuthorityCredentials(value: unknown): AuthorityCredential[]
  * be in the lowercase hyphenated form Rust writes because the rules compare
  * holders as strings, and an attestation may not be blank.
  */
-export function parseAuthorityCommand(value: unknown): AuthorityCommand {
-  return authorityCommand(value, "");
-}
+export const parseAuthorityCommand = whole("command", authorityCommand);
+
+/**
+ * Parse the Worker's answers as `parseAuthorityCommand` parses a command,
+ * narrowed in its first two ways.
+ */
+export const parseAuthorityReply = whole("reply", authorityReply);
+export const parseAuthorityRecord = whole("record", authorityRecord);
+export const parseLogPage = whole("log page", logPage);
 
 /** The holder a command speaks for, which its credential must name. */
 export function commandHolder(command: AuthorityCommand): string {

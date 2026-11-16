@@ -4,7 +4,7 @@ import { once } from "node:events";
 import { createServer as createHttpServer } from "node:http";
 import { createServer, type Server, type Socket } from "node:net";
 import test, { type TestContext } from "node:test";
-import { AuthorityClient, AuthorityDenied, AuthorityRejected } from "../src/failover/authority-client.js";
+import { AuthorityClient, AuthorityDenied, AuthorityProtocolError, AuthorityRejected } from "../src/failover/authority-client.js";
 import { AuthorityUnreachable } from "../src/failover/authority-link.js";
 import { commandHolder } from "../src/failover/authority-wire.js";
 import type { AuthorityCommand } from "../src/generated/AuthorityCommand.js";
@@ -296,15 +296,15 @@ async function listening(server: Server | ReturnType<typeof createHttpServer>, t
   return address.port;
 }
 
-const unreachable = (port: number, timeoutMs?: number) => new AuthorityClient({
+const clientAt = (port: number, timeoutMs?: number) => new AuthorityClient({
   url: `http://127.0.0.1:${port}`, coordinatorId: coordinatorIds[1]!, token: "invented-token", ...(timeoutMs === undefined ? {} : { timeoutMs }) });
 
 test("the client reports a closed port as unreachable", async (t) => {
   const server = createServer();
   const port = await listening(server, t);
   await new Promise((resolve) => server.close(resolve));
-  await assert.rejects(unreachable(port).record(), AuthorityUnreachable);
-  await assert.rejects(unreachable(port).command(enroll), AuthorityUnreachable);
+  await assert.rejects(clientAt(port).record(), AuthorityUnreachable);
+  await assert.rejects(clientAt(port).command(enroll), AuthorityUnreachable);
 });
 
 test("the client gives up on a port that accepts and never answers after its timeout", async (t) => {
@@ -312,7 +312,7 @@ test("the client gives up on a port that accepts and never answers after its tim
   const server = createServer(() => { connections += 1; });
   const port = await listening(server, t);
   const started = Date.now();
-  await assert.rejects(unreachable(port, 300).command(enroll), AuthorityUnreachable);
+  await assert.rejects(clientAt(port, 300).command(enroll), AuthorityUnreachable);
   const waited = Date.now() - started;
   assert.ok(waited >= 290 && waited < 5_000, `the client waited ${waited} ms`);
   assert.ok(connections >= 1, "the client never connected");
@@ -325,7 +325,20 @@ test("the client reports a server error as unreachable and never retries", async
     response.writeHead(503, { "content-type": "application/json" }).end(JSON.stringify({ error: "The invented authority is overloaded." }));
   });
   const port = await listening(server, t);
-  await assert.rejects(unreachable(port).command(enroll), (error: unknown) =>
+  await assert.rejects(clientAt(port).command(enroll), (error: unknown) =>
     error instanceof AuthorityUnreachable && error.message.includes("The invented authority is overloaded."));
   assert.equal(requests, 1);
+});
+
+test("the client refuses a 2xx body that is not the answer it asked for, and does not repeat the request", async (t) => {
+  let requests = 0;
+  const server = createHttpServer((request, response) => {
+    requests += 1;
+    const body = request.url?.endsWith("/record") ? "<html>Invented captive portal</html>" : JSON.stringify({ result: "accepted" });
+    response.writeHead(200, { "content-type": "application/json" }).end(body);
+  });
+  const port = await listening(server, t);
+  await assert.rejects(clientAt(port).command(enroll), (error: unknown) => error instanceof AuthorityProtocolError && error.message.includes("state"));
+  await assert.rejects(clientAt(port).record(), (error: unknown) => error instanceof AuthorityProtocolError && error.message.includes("not JSON"));
+  assert.equal(requests, 2);
 });

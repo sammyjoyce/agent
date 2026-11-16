@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseAuthorityCommand } from "../src/failover/authority-wire.js";
+import { parseAuthorityCommand, parseAuthorityRecord, parseAuthorityReply, parseLogPage } from "../src/failover/authority-wire.js";
 import type { AuthorityCommand } from "../src/generated/AuthorityCommand.js";
+import type { AuthorityRecord } from "../src/generated/AuthorityRecord.js";
+import type { AuthorityRefusal } from "../src/generated/AuthorityRefusal.js";
+import type { AuthorityReply } from "../src/generated/AuthorityReply.js";
+import type { AuthorityState } from "../src/generated/AuthorityState.js";
+import type { LogPage } from "../src/generated/LogPage.js";
 import { digests, entry, manifest, orion, tarantula } from "./fixtures/failover-authority-cells.js";
 
 const file = { path: "attachments/a1/content", sha256: digests[1], size: 12 };
@@ -36,7 +41,19 @@ const withBatch = (change: Record<string, unknown>) => withEntry({ batch: { ...a
 const promote = { op: "promote", candidate: orion, expected_epoch: 1, attestation: null };
 const without = <T extends object>(value: T, field: keyof T) => Object.fromEntries(Object.entries(value).filter(([key]) => key !== field));
 
-const malformed: readonly (readonly [field: string, value: unknown])[] = [
+type Malformed = readonly (readonly [field: string, value: unknown])[];
+
+function assertRefusedNamingField(parse: (value: unknown) => unknown, table: Malformed): void {
+  for (const [field, value] of table) {
+    assert.throws(() => parse(value), (error: unknown) => {
+      assert.ok(error instanceof Error, `${JSON.stringify(value)} threw something other than an Error`);
+      assert.ok(error.message.includes(field), `the message "${error.message}" does not name ${field}`);
+      return true;
+    }, `${field} in ${JSON.stringify(value)} was accepted`);
+  }
+}
+
+const malformed: Malformed = [
   ["command", null],
   ["command", [claim]],
   ["command", "claim"],
@@ -95,11 +112,91 @@ const malformed: readonly (readonly [field: string, value: unknown])[] = [
 ];
 
 test("a malformed command is refused with a message that names the bad field", () => {
-  for (const [field, value] of malformed) {
-    assert.throws(() => parseAuthorityCommand(value), (error: unknown) => {
-      assert.ok(error instanceof Error, `${JSON.stringify(value)} threw something other than an Error`);
-      assert.ok(error.message.includes(field), `the message "${error.message}" does not name ${field}`);
-      return true;
-    }, `${field} in ${JSON.stringify(value)} was accepted`);
-  }
+  assertRefusedNamingField(parseAuthorityCommand, malformed);
+});
+
+const active: AuthorityState = { kind: "active", epoch: 3, holder: tarantula, head: 2 };
+const sealed: AuthorityState = { kind: "sealed", epoch: 3, holder: tarantula, candidate: orion, head: 2 };
+const vacant: AuthorityState = { kind: "vacant", epoch: 3, candidate: orion, evidence: { kind: "operator_attested", statement: "the old host is powered off" }, head: 2 };
+const states: readonly AuthorityState[] = [active, sealed, vacant,
+  { ...vacant, evidence: { kind: "released" } }, { ...vacant, evidence: { kind: "lock_held" } }];
+const refusals = Object.keys({ not_enrolled: 0, enrolled: 0, sealed: 0, fenced: 0, gap: 0, conflict: 0, missing_blob: 0, epoch_moved: 0, already_owner: 0,
+  self_attestation: 0, not_sealed: 0, not_sealed_holder: 0, not_candidate: 0, not_caught_up: 0, checkpoint_out_of_range: 0 } satisfies Record<AuthorityRefusal, 0>) as AuthorityRefusal[];
+const record: AuthorityRecord = { state: active, checkpoint: { through: 1, manifest } };
+
+const wellFormedReplies: readonly AuthorityReply[] = [
+  ...states.map((state) => ({ result: "accepted", state }) as const),
+  ...refusals.map((reason) => ({ result: "refused", reason, state: sealed }) as const),
+  { result: "refused", reason: "not_enrolled", state: null },
+];
+const wellFormedRecords: readonly AuthorityRecord[] = states.map((state) => ({ state, checkpoint: { through: 1, manifest } }));
+const wellFormedPages: readonly LogPage[] = [
+  { record, entries: [] },
+  { record, entries: wellFormed.flatMap((command) => command.op === "append" ? [command.entry] : []) },
+];
+
+test("every well-formed reply, record and log page is accepted unchanged", () => {
+  const roundTrip = (value: unknown): unknown => JSON.parse(JSON.stringify(value));
+  for (const reply of wellFormedReplies) assert.deepEqual(parseAuthorityReply(roundTrip(reply)), reply);
+  for (const each of wellFormedRecords) assert.deepEqual(parseAuthorityRecord(roundTrip(each)), each);
+  for (const page of wellFormedPages) assert.deepEqual(parseLogPage(roundTrip(page)), page);
+  assert.equal(wellFormedPages[1]?.entries.length, 3, "the page holds the table's three appends");
+});
+
+const accepted = (state: unknown) => ({ result: "accepted", state });
+
+const malformedReplies: Malformed = [
+  ["reply", null],
+  ["reply", "accepted"],
+  ["reply", [accepted(active)]],
+  ["result", { state: active }],
+  ["result", { result: "maybe", state: active }],
+  ["state", { result: "accepted" }],
+  ["state", accepted(null)],
+  ["extra", { ...accepted(active), extra: 1 }],
+  ["state.kind", accepted({ ...active, kind: "paused" })],
+  ["state.epoch", accepted({ ...active, epoch: -1 })],
+  ["state.epoch", accepted({ ...active, epoch: "3" })],
+  ["state.holder", accepted({ ...active, holder: "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE" })],
+  ["state.head", accepted(without(active, "head"))],
+  ["state.candidate", accepted({ ...active, candidate: orion })],
+  ["state.candidate", accepted(without(sealed, "candidate"))],
+  ["state.evidence", accepted(without(vacant, "evidence"))],
+  ["state.evidence.kind", accepted({ ...vacant, evidence: { kind: "timed_out" } })],
+  ["state.evidence.statement", accepted({ ...vacant, evidence: { kind: "operator_attested" } })],
+  ["state.evidence.statement", accepted({ ...vacant, evidence: { kind: "released", statement: "invented" } })],
+  ["reason", { result: "refused", state: null }],
+  ["reason", { result: "refused", reason: "busy", state: null }],
+  ["state", { result: "refused", reason: "fenced" }],
+  ["state.head", { result: "refused", reason: "fenced", state: { ...active, head: 2 ** 53 } }],
+];
+
+const malformedRecords: Malformed = [
+  ["record", null],
+  ["record", [record]],
+  ["state", { checkpoint: record.checkpoint }],
+  ["checkpoint", { state: active }],
+  ["state.kind", { ...record, state: { ...active, kind: undefined } }],
+  ["checkpoint.through", { ...record, checkpoint: { through: 1.5, manifest } }],
+  ["checkpoint.manifest", { ...record, checkpoint: { through: 1, manifest: manifest.toUpperCase() } }],
+  ["head", { ...record, head: 2 }],
+];
+
+const malformedPages: Malformed = [
+  ["log page", null],
+  ["log page", "[]"],
+  ["record", { entries: [] }],
+  ["entries", { record }],
+  ["entries", { record, entries: {} }],
+  ["record.state.holder", { record: { ...record, state: { ...active, holder: "tarantula" } }, entries: [] }],
+  ["entries[0].digest", { record, entries: [{ ...entry(1, 1, digests[0]), digest: "a".repeat(63) }] }],
+  ["entries[1].batch.pi_seq", { record, entries: [entry(1, 1, digests[0]), { ...entry(1, 2, digests[1]), batch: { body: { kind: "inline", json: "[]" } } }] }],
+  ["entries[0].files[0].size", { record, entries: [{ ...entry(1, 1, digests[0]), files: [{ ...file, size: 2 ** 53 }] }] }],
+  ["cursor", { record, entries: [], cursor: 3 }],
+];
+
+test("a malformed reply, record or log page is refused with a message that names the bad field", () => {
+  assertRefusedNamingField(parseAuthorityReply, malformedReplies);
+  assertRefusedNamingField(parseAuthorityRecord, malformedRecords);
+  assertRefusedNamingField(parseLogPage, malformedPages);
 });
