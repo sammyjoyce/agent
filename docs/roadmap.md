@@ -213,18 +213,18 @@ recovery; [history](history.md) describes import and retrieval.
   and the design's other open questions are the owner's decisions. See the
   [design](https://github.com/sammyjoyce/agent/issues/31).
 - [ ] Computer use for desktop apps on the selected host, based on or using
-  [agent-desktop](https://github.com/vercel-labs/agent-desktop). agent-desktop
-  reads an app's accessibility tree as JSON with a ref for each element, acts
-  on a ref, then reads the tree again to check the result. It needs no
-  screenshots or pixel matching and has no model inside, so the loop stays in
-  Pi. It ships under Apache-2.0 as a CLI, an MCP server and a C library for
-  macOS, Windows and Linux. Ref actions do not move the pointer or take focus
-  unless `--headed` is set, and macOS needs the Accessibility grant. Whether
-  to run agent-desktop or build on its design is open. Snapshots, screenshots
-  and clipboard reads can hold private desktop content. The
-  [architecture](architecture.md#integrations-and-scheduling) puts desktop
-  Computer Use outside the design and names Chrome tools as the final UI
-  fallback, so this item changes that decision.
+  [agent-desktop](https://github.com/vercel-labs/agent-desktop). Computer use
+  is the final fallback, after supported APIs, configured CLIs and Chrome
+  tools, as the [architecture](architecture.md#integrations-and-scheduling)
+  orders them. agent-desktop reads an app's accessibility tree as JSON with a
+  ref for each element, acts on a ref, then reads the tree again to check the
+  result. It needs no screenshots or pixel matching and has no model inside,
+  so the loop stays in Pi. It ships under Apache-2.0 as a CLI, an MCP server
+  and a C library for macOS, Windows and Linux. Ref actions do not move the
+  pointer or take focus unless `--headed` is set, and macOS needs the
+  Accessibility grant. Whether to run agent-desktop or build on its design is
+  open. Snapshots, screenshots and clipboard reads can hold private desktop
+  content.
 
 ## Retrieval, learning and proof
 
