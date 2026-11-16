@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use agent_cli::{
@@ -29,7 +29,7 @@ use agent_cli::{
     sources::{SourceConfig, SourceCoverage},
 };
 use executable_fixture::write_executable;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
 
@@ -640,6 +640,10 @@ where
 
 enum Backend {
     Scripted,
+    /// Forwards every model request to OPENAI_BASE_URL and records requests and responses in `proof`.
+    Live {
+        proof: PathBuf,
+    },
 }
 
 struct Coordinator {
@@ -656,6 +660,14 @@ impl Coordinator {
                 format!(
                     "process.env.OPENAI_API_KEY='sk-synthetic-fixture';\nprocess.env.AGENT_TEST_MODEL_QUEUE={};\n",
                     serde_json::to_string(&world.queue).unwrap()
+                ),
+            ),
+            Backend::Live { proof } => (
+                "live-gateway-runtime.js",
+                format!(
+                    "process.env.AGENT_TEST_REQUESTS={};\nprocess.env.AGENT_TEST_RESPONSES={};\n",
+                    serde_json::to_string(&proof.join("requests.jsonl")).unwrap(),
+                    serde_json::to_string(&proof.join("responses.jsonl")).unwrap()
                 ),
             ),
         };
@@ -957,7 +969,7 @@ async fn while_failing(
     ]
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct Stored {
     id: String,
     decision: Option<Value>,
@@ -1022,6 +1034,20 @@ fn trace(requests: &[Value]) -> Vec<(Value, Option<Value>)> {
     calls
 }
 
+/// Whether a call records the task as resolved, directly or from a codemode program.
+fn resolves(call: &Value) -> bool {
+    let arguments = call["arguments"]
+        .as_str()
+        .or(call["input"].as_str())
+        .unwrap_or_default();
+    if call["name"] == "record_task" {
+        return serde_json::from_str::<Value>(arguments)
+            .is_ok_and(|arguments| arguments["state"]["state"] == "resolved");
+    }
+    let program = arguments.replace('\\', "");
+    program.contains("record_task") && program.contains("resolved")
+}
+
 /// Whether a tool output shows `needle`, at any depth of JSON string escaping.
 fn mentions(output: &Value, needle: &str) -> bool {
     output.to_string().replace('\\', "").contains(needle)
@@ -1062,9 +1088,9 @@ fn oracles(
     scenario: &Scenario,
     world: &World,
     seeded: &TaskRecord,
+    saved: &Readback,
     requests: &[Value],
 ) -> Vec<Oracle> {
-    let saved = readback(world);
     let expect = &scenario.expect;
     let messages = scenario.messages();
     let mut checks = Vec::new();
@@ -1185,19 +1211,17 @@ fn oracles(
             .enumerate()
             .any(|(index, call)| call == "show" && last_mutation.is_none_or(|last| index > last));
         let calls = trace(requests);
-        let readback = calls.iter().position(|(_, output)| {
-            output
-                .as_ref()
-                .is_some_and(|output| mentions(output, BOOKED_LINE))
+        let readback = calls.iter().position(|(call, output)| {
+            call["name"] != "record_task"
+                && output
+                    .as_ref()
+                    .is_some_and(|output| mentions(output, BOOKED_LINE))
         });
-        let resolution = calls.iter().position(|(call, _)| {
-            call["name"] == "record_task"
-                && serde_json::from_str::<Value>(call["arguments"].as_str().unwrap_or_default())
-                    .is_ok_and(|arguments| arguments["state"]["state"] == "resolved")
-        });
+        let resolution = calls.iter().position(|(call, _)| resolves(call));
+        // One codemode program may read back and then resolve; it counts as ordered.
         checks.push(oracle(
             "resolved_after_readback",
-            read_back && readback.zip(resolution).is_some_and(|(readback, resolution)| readback < resolution),
+            read_back && readback.zip(resolution).is_some_and(|(readback, resolution)| readback <= resolution),
             json!({ "ledger_calls": world.ledger_calls(), "readback_call": readback, "resolution_call": resolution }),
         ));
     }
@@ -1257,7 +1281,13 @@ async fn scripted(name: &str) {
     }
     settle(&world, scenario.rounds.len()).await;
     coordinator.close().await;
-    checks.extend(oracles(scenario, &world, &task, &scripted_requests(&world)));
+    checks.extend(oracles(
+        scenario,
+        &world,
+        &task,
+        &readback(&world),
+        &scripted_requests(&world),
+    ));
     checks.push(oracle(
         "scripted_steps_consumed",
         world.drained(),
@@ -1294,4 +1324,216 @@ async fn duplicate_events() {
 #[tokio::test]
 async fn source_failure_then_recovery() {
     scripted("source_failure_then_recovery").await;
+}
+
+/// Complete lines only, since the fixture may be mid-append.
+fn written(path: &Path) -> usize {
+    fs::read(path)
+        .unwrap_or_default()
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+}
+
+fn lines(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// Settles once no model request is in flight, the task has no queued input
+/// and five polls pass without a new request. Returns whether it settled and
+/// the time from the reply's first poll to the last model response.
+async fn settle_live(
+    scenario: &Scenario,
+    world: &World,
+    coordinator: &Coordinator,
+    task: &TaskId,
+    proof: &Path,
+) -> (bool, Duration) {
+    let first_mail = 1 + scenario
+        .rounds
+        .iter()
+        .position(|round| matches!(round, Feed::Mail(_)))
+        .unwrap();
+    eventually(Duration::from_secs(60), "the reply is served", || async {
+        (world.served() >= first_mail).then_some(())
+    })
+    .await;
+    let available = Instant::now();
+    let mut last = available;
+    let mut seen = (0, 0);
+    let mut quiet_from = world.served();
+    let settled = timeout(Duration::from_secs(900), async {
+        loop {
+            let recorded = (
+                written(&proof.join("requests.jsonl")),
+                written(&proof.join("responses.jsonl")),
+            );
+            if recorded != seen {
+                (seen, last, quiet_from) = (recorded, Instant::now(), world.served());
+            }
+            let served = world.served();
+            if recorded.0 == recorded.1
+                && served >= quiet_from + 5
+                && served > scenario.rounds.len()
+                && coordinator.task(task).await.pending.is_empty()
+            {
+                return;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .is_ok();
+    (settled, last.saturating_duration_since(available))
+}
+
+fn tokens(responses: &[Value]) -> Value {
+    let sum = |pointer: &str| -> u64 {
+        responses
+            .iter()
+            .filter_map(|response| response["usage"].pointer(pointer)?.as_u64())
+            .sum()
+    };
+    json!({
+        "input": sum("/input_tokens"),
+        "cached_input": sum("/input_tokens_details/cached_tokens"),
+        "output": sum("/output_tokens"),
+        "reasoning": sum("/output_tokens_details/reasoning_tokens"),
+    })
+}
+
+fn answers(responses: &[Value]) -> Vec<Value> {
+    responses
+        .iter()
+        .flat_map(|response| {
+            response["output"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|item| item["type"] == "message")
+                .map(|item| {
+                    let text: Vec<&str> = item["content"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|part| part["text"].as_str())
+                        .collect();
+                    json!({ "request": response["request"], "text": text.join("\n") })
+                })
+        })
+        .collect()
+}
+
+/// Seeds with scripted inference, then reopens the same state so every turn
+/// that handles the reply runs on the live model. Records instead of asserting.
+async fn live(scenario: &Scenario, proof: &Path) -> Value {
+    fs::create_dir_all(proof).unwrap();
+    for name in ["requests.jsonl", "responses.jsonl", "record.json"] {
+        let _ = fs::remove_file(proof.join(name));
+    }
+    let world = World::new(scenario.ledger);
+    let Seeded { coordinator, task } = seed(&world).await;
+    coordinator.close().await;
+    let backend = Backend::Live {
+        proof: proof.to_owned(),
+    };
+    let coordinator = Coordinator::open(&world, &backend).await;
+    world.release(scenario.rounds);
+    let requests = proof.join("requests.jsonl");
+    let mut checks = while_failing(scenario, &world, &coordinator, &task.id, &requests).await;
+    let (settled, latency) = settle_live(scenario, &world, &coordinator, &task.id, proof).await;
+    coordinator.close().await;
+    let (requests, responses) = (lines(&requests), lines(&proof.join("responses.jsonl")));
+    let saved = readback(&world);
+    checks.push(oracle("settled", settled, json!(latency.as_millis())));
+    checks.extend(oracles(scenario, &world, &task, &saved, &requests));
+    let finished = saved.tasks.iter().find(|saved| saved.id == task.id);
+    let record = json!({
+        "scenario": scenario.name,
+        "passed": checks.iter().all(|check| check.pass),
+        "oracles": checks.iter().map(|check| json!({
+            "name": check.name, "pass": check.pass, "observed": check.observed,
+        })).collect::<Vec<_>>(),
+        "decisions": saved.mail,
+        "mutations": mutations(&world.ledger_calls()),
+        "ledger_calls": world.ledger_calls(),
+        "ledger": world.ledger_bytes(),
+        "task": finished.map(|task| json!({ "state": task.state, "summary": task.summary })),
+        "answers": answers(&responses),
+        "trace": trace(&requests).into_iter().map(|(call, output)| json!({ "call": call, "output": output })).collect::<Vec<_>>(),
+        "tokens": tokens(&responses),
+        "model_requests": requests.len(),
+        "latency_ms": latency.as_millis(),
+    });
+    fs::write(
+        proof.join("record.json"),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+    record
+}
+
+#[tokio::test]
+#[ignore = "live model through OPENAI_BASE_URL; AGENT_LOOP_EVAL_PROOF names a directory that keeps the evidence"]
+async fn live_model_closes_the_loop() {
+    assert!(
+        std::env::var_os("OPENAI_API_KEY").is_some()
+            && std::env::var_os("OPENAI_BASE_URL").is_some(),
+        "Set OPENAI_API_KEY and OPENAI_BASE_URL"
+    );
+    let proof = PathBuf::from(
+        std::env::var_os("AGENT_LOOP_EVAL_PROOF")
+            .expect("Set AGENT_LOOP_EVAL_PROOF to a directory that keeps the evidence"),
+    );
+    let budget: u64 = std::env::var("AGENT_LOOP_EVAL_TOKEN_BUDGET").map_or(3_000_000, |value| {
+        value
+            .parse()
+            .expect("AGENT_LOOP_EVAL_TOKEN_BUDGET is a token count")
+    });
+    let _turn = SWITCHBOARD.lock().await;
+    let (mut spent, mut rows) = (0, Vec::new());
+    for scenario in SCENARIOS {
+        if spent >= budget {
+            rows.push(json!({ "scenario": scenario.name, "skipped": "token budget reached" }));
+            continue;
+        }
+        let record = live(scenario, &proof.join(scenario.name)).await;
+        let used = &record["tokens"];
+        spent += used["input"].as_u64().unwrap() + used["output"].as_u64().unwrap();
+        rows.push(json!({
+            "scenario": scenario.name,
+            "passed": record["passed"],
+            "failed_oracles": record["oracles"].as_array().unwrap().iter()
+                .filter(|check| check["pass"] == false).map(|check| &check["name"]).collect::<Vec<_>>(),
+            "decisions": record["decisions"],
+            "mutations": record["mutations"],
+            "task": record["task"],
+            "tokens": record["tokens"],
+            "latency_ms": record["latency_ms"],
+        }));
+    }
+    let failed: Vec<&Value> = rows
+        .iter()
+        .filter(|row| row["passed"] != true)
+        .map(|row| &row["scenario"])
+        .collect();
+    fs::write(
+        proof.join("summary.json"),
+        serde_json::to_vec_pretty(&json!({
+            "gateway": "OPENAI_BASE_URL",
+            "token_budget": budget,
+            "tokens_spent": spent,
+            "scenarios": rows,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        failed.is_empty(),
+        "Scenarios failed their oracles or were skipped: {failed:?}; see summary.json"
+    );
 }
