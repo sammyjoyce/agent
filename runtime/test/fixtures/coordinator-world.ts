@@ -25,12 +25,15 @@ export const held = (path: string): ModelStep => ({ tool: "exec", args: { progra
   'async function run(){while(!fs.existsSync(path+".release"))await new Promise(resolve=>setTimeout(resolve,20));' +
   'fs.appendFileSync(path+".finished","once\\n");process.stdout.write("Completed the held action.");}void run();', path] } });
 
-/** `prepare` runs after each home has its default files and before either service starts. */
-export async function coordinatorWorld(t: TestContext, prepare: (homes: readonly [string, string]) => Promise<void> = async () => {}) {
+/**
+ * `prepare` runs after each home has its default files and before either
+ * service starts. `runtime` is the script both services run as their Pi child.
+ */
+export async function coordinatorWorld(t: TestContext, prepare: (homes: readonly [string, string]) => Promise<void> = async () => {},
+  runtime = fileURLToPath(new URL("./coordinator-runtime.js", import.meta.url))) {
   const directory = await realpath(await mkdtemp("/tmp/agent-e2e-"));
   const binary = process.env.AGENT_TEST_BINARY ?? fileURLToPath(new URL("../../../../target/debug/beep-boop", import.meta.url));
   const terminalFixture = fileURLToPath(new URL("../../../../target/debug/examples/terminal-fixture", import.meta.url));
-  const runtime = fileURLToPath(new URL("./coordinator-runtime.js", import.meta.url));
   const coordinator = "11111111-1111-4111-8111-111111111111", laptop = "22222222-2222-4222-8222-222222222222";
   const bin = join(directory, "bin"), queue = join(directory, "responses.json"), feedbackGate = join(directory, "feedback-gate");
   const homes = [join(directory, "desktop"), join(directory, "laptop")] as const;
