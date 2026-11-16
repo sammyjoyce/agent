@@ -25,7 +25,6 @@ import type { BackgroundScheduler } from "./background.js";
 import { hostOutput, output } from "./host-output.js";
 import { imageInput, readImageFile, type ReadFileCommand } from "./images.js";
 
-/** A goal check reads the same window as read_file. */
 export const MAX_FILE_READ_BYTES = 262_144;
 export type Execution = { model?: ModelSelection; cwd: string; hosts: WorkerHost[]; default_host?: WorkerHost | null; call: HostCall; role?: "worker" | "triage";
   origin_host_id?: string | null; connectedHosts?: () => Promise<WorkerHost[]>;

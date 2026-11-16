@@ -183,7 +183,7 @@ function text(entry: EntryRecord, toolLimit?: number): string {
     return message.role === "toolResult" && toolLimit !== undefined ? content.slice(0, toolLimit) : content;
   }).join("\n") ?? "";
 }
-/** The queued input with this input's ID. Throws when that ID already carries a different input. */
+/** Throws when this input's ID already carries a different input. */
 function queuedInput(actor: TaskRecord | TaskAgentRecord, input: TaskInput): TaskInput | undefined {
   const previous = actor.pending.find((saved) => saved.id === input.id);
   if (previous === undefined) return undefined;

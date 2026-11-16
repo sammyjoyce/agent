@@ -51,7 +51,6 @@ export type StopTurn = (taskId: string, run: NativeTaskId) => Promise<void>;
 class Proof {
   readonly #brand = true;
   constructor(readonly goal_id: string, readonly activation: number, readonly check: GoalCheck, readonly observed: ObservedFile) {}
-  /** Only this module constructs a Proof, so a copied object with the same fields is refused. */
   static minted(value: unknown): value is Proof { return typeof value === "object" && value !== null && #brand in value; }
 }
 export type GoalProof = Proof;
@@ -189,7 +188,6 @@ export class GoalStore implements GoalPolicy {
     return this.status(selected);
   }
 
-  /** A replay changes nothing. The goal it named still gets its worker while active, so a crash before dispatch converges. */
   private async replayed(selected: Selected, goalId: string, call: HostCall): Promise<GoalStatus> {
     const status = await this.status(selected);
     const goal = status.goal?.goal;
@@ -198,7 +196,6 @@ export class GoalStore implements GoalPolicy {
     return this.status(selected);
   }
 
-  /** A replayed pause on the goal it paused repeats only the stop, so a crash between the commit and the stop converges. */
   private async pause(selected: Selected, request: string): Promise<GoalStatus> {
     const control: GoalControl = { action: "pause", objective: null };
     const paused = await this.session.commit(async (tx) => {
@@ -392,7 +389,6 @@ function taskRequestId(value: string): string {
   if (!UUID.test(value) || /^[0-]+$/.test(value)) throw new TaskError("A main goal request ID must be a non-nil UUID");
   return value;
 }
-/** A request ID names one control on one target. Its replay returns the receipt, and any other use is refused. */
 function replayOf(saved: Readonly<GoalRequest> | null | undefined, selected: Selected, control: GoalControl): GoalRequest | undefined {
   if (saved === null || saved === undefined) return undefined;
   const sameTarget = selected.kind === "main" ? saved.main : !saved.main && saved.task_id === selected.task.id;
@@ -403,7 +399,6 @@ function replayOf(saved: Readonly<GoalRequest> | null | undefined, selected: Sel
 function inputPrefix(goal: Goal): string { return `goal:${goal.id}:`; }
 function activationPrefix(goal: Goal): string { return `${inputPrefix(goal)}${goal.activation.number}:`; }
 function inputId(goal: Goal, sequence: number): string { return `${activationPrefix(goal)}${sequence}`; }
-/** A resume can land before the actor sees its stopped input, so that input belongs to an earlier activation. */
 function fromEarlierActivation(goal: Goal, id: string): boolean { return id.startsWith(inputPrefix(goal)) && !id.startsWith(activationPrefix(goal)); }
 function pauseIn(goal: Goal, reason: GoalPause): undefined {
   goal.state = { state: "paused", reason }; goal.updated_at = Date.now(); return undefined;
