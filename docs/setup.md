@@ -146,8 +146,9 @@ turn is running. Otherwise an action already under way, such as a command or a
 file write, can finish after the pause. `/goal resume` starts a new activation
 in the same task. A goal completes only when the runtime itself finds the
 required text in the named file on the task's host. The task's history keeps
-the result of each check that returns while its activation is still running.
-A check that returns after a pause, Esc or a new activation is discarded. While
+the result of each check that returns while its turn and activation are still
+running. A check, passed or failed, that returns after a pause, Esc or a new
+activation is discarded. While
 a goal is open, the task cannot mark itself resolved. The phone accepts the
 same commands for main.
 

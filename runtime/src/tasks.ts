@@ -553,9 +553,9 @@ export class TaskStore {
         reconciliation = { original: { request_id: input.reconciles_input, submission_id: original.id.toString() }, recovery_inputs: recoveryInputs };
       }
       if (input.state.state === "resolved" && !this.canResolve(task)) throw new TaskError("Wait for unfinished task agents before resolving the task");
-      if (proof !== undefined && (task.conversation_id !== provenance.conversation_id ||
-          !await this.uncancelledIn(tx, conversation.id, provenance.native_task_id))) {
-        throw new TaskError("The turn that ran this goal check was stopped. Check the goal again in the current turn.");
+      if (proof !== undefined) {
+        if (task.conversation_id !== provenance.conversation_id) throw new TaskError("A goal check records only in its own task");
+        await this.assertCheckUncancelledIn(tx, conversation.id, provenance.native_task_id);
       }
       let state = input.state;
       if (state.state === "resolved" && this.goals !== undefined) {
@@ -576,6 +576,11 @@ export class TaskStore {
     }, BACKGROUND_CONTEXT);
     if (refused !== undefined) throw new TaskError(refused);
     return this.get(id);
+  }
+  async assertCheckUncancelledIn(tx: Tx, conversationId: ConversationId, invocation: NativeTaskId | undefined): Promise<void> {
+    if (!await this.uncancelledIn(tx, conversationId, invocation)) {
+      throw new TaskError("The turn that ran this goal check was stopped. Check the goal again in the current turn.");
+    }
   }
   /** Whether a tool call still runs in the conversation's live run with no abort mark on it or on any call or run that
    * owns it. A conversation abort marks the whole tree, and an exact-run abort marks only the run. */

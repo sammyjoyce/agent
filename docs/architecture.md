@@ -325,9 +325,10 @@ places it. The actor reads that state from Pi on every wait, so the repair
 survives a restart between the abort and the placement. The bridge cancels host
 calls only for a connected worker, so without one a running host call finishes
 after the pause. The worker tool `complete_goal` reads the file on the execution
-host. A result that still belongs to the live activation is retained as an
-`agent.goal_verification` entry. A result that returns after a pause, Esc or a
-new activation is discarded without one. A pass completes the goal and resolves
+host. A result whose turn still runs in the live activation is retained as an
+`agent.goal_verification` entry. A passed or failed result that returns after a
+pause, Esc or a new activation is discarded without one, through the same
+stopped-turn check. A pass completes the goal and resolves
 the task in that same commit. A failed check pins its predicate for the rest of the
 activation. `record_task` cannot resolve a goal-bound task, and the refusal is
 recorded on the goal. Controls keep their request IDs, so a replayed native

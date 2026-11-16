@@ -339,10 +339,11 @@ export class GoalStore implements GoalPolicy {
   }
 
   private async recordFailure(task: TaskRecord, checked: Goal, check: GoalCheck, failure: GoalCheckFailure,
-    origin: { conversation_id: string; call_id: string }): Promise<GoalCheckReply> {
+    origin: { conversation_id: string; call_id: string; native_task_id: NativeTaskId }): Promise<GoalCheckReply> {
     const conversation = await this.tasks.conversation(task.conversation_id);
     const originEntry = await this.tasks.origin(conversation, origin.call_id);
     return this.session.commit(async (tx) => {
+      await this.tasks.assertCheckUncancelledIn(tx, conversation.id, origin.native_task_id);
       const goal = (await tx.doc(GoalDoc, task.id, null)).goal;
       if (goal === null || goal.id !== checked.id || goal.state.state !== "active" || goal.activation.number !== checked.activation.number) {
         throw new TaskError(CHANGED);
