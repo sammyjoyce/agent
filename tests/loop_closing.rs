@@ -17,8 +17,8 @@ use agent_cli::{
     models::ModelSelection,
     protocol::{
         AgentNode, CoordinatorBootstrap, CoordinatorSettings, InputMode, RuntimeCommand,
-        RuntimeEventKind,
-        SourceState, TaskGraphActor, TaskGraphKind, TaskId, TaskRecord, TaskState, WorkerLaunch,
+        RuntimeEventKind, SourceState, TaskGraphActor, TaskGraphKind, TaskId, TaskRecord,
+        TaskState, WorkerLaunch,
     },
     rex::RexClient,
     runtime::{Runtime, RuntimeCall},
@@ -179,6 +179,7 @@ struct Expected {
     mutations: usize,
     ledger_after: LedgerAfter,
     task: TaskEnd,
+    silent: bool,
 }
 
 struct Scenario {
@@ -196,6 +197,7 @@ const CLOSES_ONCE: Expected = Expected {
     mutations: 1,
     ledger_after: LedgerAfter::Exactly(PROTECTED_AND_BOOKED),
     task: TaskEnd::Resolved,
+    silent: false,
 };
 
 const SCENARIOS: &[Scenario] = &[
@@ -219,6 +221,7 @@ const SCENARIOS: &[Scenario] = &[
             mutations: 0,
             ledger_after: LedgerAfter::Unchanged,
             task: TaskEnd::StillWaiting,
+            silent: true,
         },
     },
     Scenario {
@@ -233,6 +236,7 @@ const SCENARIOS: &[Scenario] = &[
             mutations: 0,
             ledger_after: LedgerAfter::Unchanged,
             task: TaskEnd::Resolved,
+            silent: true,
         },
     },
     Scenario {
@@ -247,6 +251,7 @@ const SCENARIOS: &[Scenario] = &[
             mutations: 0,
             ledger_after: LedgerAfter::Unchanged,
             task: TaskEnd::StillWaiting,
+            silent: false,
         },
     },
     Scenario {
@@ -1084,13 +1089,33 @@ struct Stored {
     id: String,
     decision: Option<Value>,
     outcome: Option<Value>,
-    #[serde(default)]
     tool_call_id: Option<String>,
+    task_id: Option<TaskId>,
+    entry_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Input {
     task_id: TaskId,
+    entry_id: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Receipt {
+    conversation_id: String,
+    entry_id: u64,
+    tool: String,
+    error: bool,
+    args: Option<Value>,
+    nested: Vec<NestedCall>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct NestedCall {
+    id: u64,
+    name: String,
+    args: String,
+    status: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1099,6 +1124,64 @@ struct Readback {
     outcomes: Vec<Stored>,
     tasks: Vec<TaskRecord>,
     inputs: Vec<Input>,
+    receipts: Vec<Receipt>,
+    notices: Vec<Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct LedgerRun<'a> {
+    conversation: &'a str,
+    at: (u64, u64),
+    command: String,
+    ok: bool,
+}
+
+impl LedgerRun<'_> {
+    fn mutates(&self) -> bool {
+        mutating(&self.command)
+    }
+
+    fn reads_back(&self) -> bool {
+        self.ok && self.command == "show"
+    }
+}
+
+fn ledger_runs(receipts: &[Receipt]) -> Vec<LedgerRun<'_>> {
+    let mut runs: Vec<LedgerRun> = receipts
+        .iter()
+        .flat_map(|receipt| {
+            let direct = (receipt.tool == "exec")
+                .then(|| (receipt.args.clone(), 0, !receipt.error))
+                .into_iter();
+            let nested = receipt
+                .nested
+                .iter()
+                .filter(|call| receipt.tool == "codemode" && call.name == "exec")
+                .map(|call| {
+                    (
+                        serde_json::from_str(&call.args).ok(),
+                        call.id,
+                        call.status == "ok",
+                    )
+                });
+            direct.chain(nested).filter_map(|(args, nested, ok)| {
+                let args: Value = args?;
+                Path::new(args["program"].as_str()?)
+                    .ends_with("ledger")
+                    .then_some(())?;
+                let command: Option<Vec<&str>> =
+                    args["args"].as_array()?.iter().map(Value::as_str).collect();
+                Some(LedgerRun {
+                    conversation: &receipt.conversation_id,
+                    at: (receipt.entry_id, nested),
+                    command: command?.join(" "),
+                    ok,
+                })
+            })
+        })
+        .collect();
+    runs.sort_by_key(|run| run.at);
+    runs
 }
 
 fn readback(world: &World) -> Readback {
@@ -1142,55 +1225,6 @@ fn trace(requests: &[Value]) -> Vec<(Value, Option<Value>)> {
     calls
 }
 
-fn resolves(call: &Value) -> bool {
-    let arguments = call["arguments"]
-        .as_str()
-        .or(call["input"].as_str())
-        .unwrap_or_default();
-    if call["name"] == "record_task" {
-        return serde_json::from_str::<Value>(arguments)
-            .is_ok_and(|arguments| arguments["state"]["state"] == "resolved");
-    }
-    let program = arguments.replace('\\', "");
-    program.contains("record_task") && program.contains("resolved")
-}
-
-fn runs_ledger_show(call: &Value) -> bool {
-    let arguments = call["arguments"]
-        .as_str()
-        .or(call["input"].as_str())
-        .unwrap_or_default();
-    if call["name"] == "exec" {
-        return serde_json::from_str::<Value>(arguments).is_ok_and(|arguments| {
-            arguments["program"]
-                .as_str()
-                .is_some_and(|program| Path::new(program).ends_with("ledger"))
-                && arguments["args"]
-                    .as_array()
-                    .is_some_and(|args| args.iter().any(|arg| arg == "show"))
-        });
-    }
-    let program = arguments.replace('\\', "");
-    call["name"] == "codemode"
-        && program.contains("tools.exec")
-        && program.contains("/ledger")
-        && ["\"show\"", "'show'"]
-            .iter()
-            .any(|show| program.contains(show))
-}
-
-fn mentions(output: &Value, needle: &str) -> bool {
-    output.to_string().replace('\\', "").contains(needle)
-}
-
-fn scripted_requests(world: &World) -> Vec<Value> {
-    fs::read_to_string(world.requests())
-        .unwrap_or_default()
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap()["body"].clone())
-        .collect()
-}
-
 struct Oracle {
     name: &'static str,
     pass: bool,
@@ -1205,11 +1239,12 @@ fn oracle(name: &'static str, pass: bool, observed: Value) -> Oracle {
     }
 }
 
+fn mutating(command: &str) -> bool {
+    command.starts_with("book") || command.starts_with("void")
+}
+
 fn mutations(calls: &[String]) -> usize {
-    calls
-        .iter()
-        .filter(|call| call.starts_with("book") || call.starts_with("void"))
-        .count()
+    calls.iter().filter(|call| mutating(call)).count()
 }
 
 fn oracles(
@@ -1218,7 +1253,6 @@ fn oracles(
     seeded: &TaskRecord,
     decoy: &TaskRecord,
     saved: &Readback,
-    requests: &[Value],
 ) -> Vec<Oracle> {
     let expect = &scenario.expect;
     let messages = scenario.messages();
@@ -1297,14 +1331,17 @@ fn oracles(
                 .collect::<Vec<_>>()
         ),
     ));
-    let followups = |before: &TaskRecord| {
-        saved
+    let inputs = |before: &TaskRecord| {
+        let mut entries: Vec<u64> = saved
             .inputs
             .iter()
             .filter(|input| input.task_id == before.id)
-            .count()
-            .saturating_sub(1)
+            .map(|input| input.entry_id)
+            .collect();
+        entries.sort_unstable();
+        entries
     };
+    let followups = |before: &TaskRecord| inputs(before).len().saturating_sub(1);
     checks.push(oracle(
         "admitted_followups",
         expect.followups.contains(&followups(seeded)) && followups(decoy) == 0,
@@ -1340,15 +1377,56 @@ fn oracles(
             },
         json!(ledger),
     ));
+    let runs = ledger_runs(&saved.receipts);
+    let mut receipted: Vec<&str> = runs.iter().map(|run| run.command.as_str()).collect();
+    let mut logged: Vec<&str> = calls.iter().map(String::as_str).collect();
+    receipted.sort_unstable();
+    logged.sort_unstable();
+    checks.push(oracle(
+        "ledger_calls_have_receipts",
+        receipted == logged,
+        json!({ "receipts": runs, "ledger_calls": calls }),
+    ));
+    let worker = seeded.conversation_id.as_str();
+    let last_mutation = runs
+        .iter()
+        .filter(|run| run.mutates())
+        .map(|run| run.at)
+        .max();
+    if expect.mutations > 0 {
+        let follow_up = inputs(seeded).get(1).copied();
+        checks.push(oracle(
+            "worker_acts_after_follow_up",
+            follow_up.is_some_and(|follow_up| {
+                runs.iter()
+                    .filter(|run| run.mutates())
+                    .all(|run| run.conversation == worker && run.at.0 > follow_up)
+            }) && last_mutation.is_some_and(|last| {
+                runs.iter()
+                    .any(|run| run.reads_back() && run.conversation == worker && run.at > last)
+            }),
+            json!({ "worker": worker, "follow_up_entry": follow_up, "receipts": runs }),
+        ));
+    }
+    if expect.silent {
+        checks.push(oracle(
+            "no_user_notice",
+            saved.notices.is_empty(),
+            json!(saved.notices),
+        ));
+    }
     let state = task.map(|task| &task.state);
     let resolved = matches!(state, Some(TaskState::Resolved { .. }));
     checks.push(oracle(
         "task_state",
         match expect.task {
             TaskEnd::Resolved => resolved,
-            TaskEnd::StillWaiting => matches!(state, Some(TaskState::Waiting { .. })),
+            TaskEnd::StillWaiting => task.is_some_and(|task| {
+                json!(task.state) == json!(seeded.state)
+                    && json!(task.sources) == json!(seeded.sources)
+            }),
         } && task.is_some_and(|task| task.pending.is_empty()),
-        json!(state),
+        json!(task.map(|task| (&task.state, &task.sources))),
     ));
     let resolutions = saved
         .outcomes
@@ -1367,25 +1445,40 @@ fn oracles(
         json!(resolutions),
     ));
     if resolved {
-        let last_mutation = calls
-            .iter()
-            .rposition(|call| call.starts_with("book") || call.starts_with("void"));
-        let read_back = calls
+        let logged_mutation = calls.iter().rposition(|call| mutating(call));
+        let logged_readback = calls
             .iter()
             .enumerate()
-            .any(|(index, call)| call == "show" && last_mutation.is_none_or(|last| index > last));
-        let calls = trace(requests);
-        let readback = calls.iter().position(|(call, output)| {
-            runs_ledger_show(call)
-                && output
-                    .as_ref()
-                    .is_some_and(|output| mentions(output, BOOKED_LINE.trim_end()))
-        });
-        let resolution = calls.iter().position(|(call, _)| resolves(call));
+            .any(|(index, call)| call == "show" && logged_mutation.is_none_or(|last| index > last));
+        let readbacks: Vec<&LedgerRun> = runs
+            .iter()
+            .filter(|run| {
+                run.reads_back()
+                    && last_mutation.is_none_or(|last| run.at > last)
+                    && (expect.mutations == 0 || run.conversation == worker)
+            })
+            .collect();
+        let resolutions: Vec<Option<u64>> = saved
+            .outcomes
+            .iter()
+            .filter(|stored| {
+                stored.tool_call_id.is_some()
+                    && stored.task_id.as_ref() == Some(&seeded.id)
+                    && stored
+                        .outcome
+                        .as_ref()
+                        .is_some_and(|state| state["state"] == "resolved")
+            })
+            .map(|stored| stored.entry_id.as_deref()?.parse().ok())
+            .collect();
         checks.push(oracle(
             "resolved_after_readback",
-            read_back && readback.zip(resolution).is_some_and(|(readback, resolution)| readback < resolution),
-            json!({ "ledger_calls": world.ledger_calls(), "readback_call": readback, "resolution_call": resolution }),
+            logged_readback
+                && !resolutions.is_empty()
+                && resolutions.iter().all(|resolution| {
+                    resolution.is_some_and(|entry| readbacks.iter().any(|run| run.at.0 < entry))
+                }),
+            json!({ "ledger_calls": calls, "readbacks": readbacks, "resolution_entries": resolutions }),
         ));
     }
     checks
@@ -1486,14 +1579,7 @@ async fn run(
     }
     let drained = settle(&world, scenario.rounds.len()).await;
     coordinator.close().await;
-    checks.extend(oracles(
-        scenario,
-        &world,
-        &task,
-        &decoy,
-        &readback(&world),
-        &scripted_requests(&world),
-    ));
+    checks.extend(oracles(scenario, &world, &task, &decoy, &readback(&world)));
     checks.push(oracle(
         "scripted_steps_consumed",
         drained && world.drained(),
@@ -1723,8 +1809,7 @@ const WRONG_AGENTS: &[Agent] = &[
         rejected_by: &["failure_task_waits"],
         during_outage: Some(OUTAGE_INPUT),
         script: |at| {
-            let mut script = vec![(OUTAGE_INPUT, vec![resolve(), text("Closed.")])];
-            script.extend(at.worker_runs(
+            let mut script = at.worker_runs(
                 ".",
                 vec![
                     show(at.world),
@@ -1732,8 +1817,12 @@ const WRONG_AGENTS: &[Agent] = &[
                     show(at.world),
                     resolve(),
                 ],
-            ));
-            script[1].1 = [outcome_triage(), outcome_triage()].concat();
+            );
+            script[0] = (
+                RESOLVED_OUTCOME,
+                [outcome_triage(), outcome_triage()].concat(),
+            );
+            script.push((OUTAGE_INPUT, vec![resolve(), text("Closed.")]));
             script
         },
     },
@@ -1849,7 +1938,13 @@ async fn judge(agents: &[Agent]) -> Vec<(&'static str, bool, Vec<&'static str>)>
     let _turn = SWITCHBOARD.lock().await;
     let mut verdicts = Vec::new();
     for agent in agents {
-        let checks = run(scenario(agent.case), &agent.script, agent.during_outage, false).await;
+        let checks = run(
+            scenario(agent.case),
+            &agent.script,
+            agent.during_outage,
+            false,
+        )
+        .await;
         let failed: Vec<&'static str> = checks
             .iter()
             .filter(|check| !check.pass)
@@ -1861,7 +1956,10 @@ async fn judge(agents: &[Agent]) -> Vec<(&'static str, bool, Vec<&'static str>)>
             !failed.contains(&"scripted_steps_consumed")
                 && agent.rejected_by.iter().any(|name| failed.contains(name))
         };
-        eprintln!("{}: judged as intended {judged}, failed {failed:?}", agent.name);
+        eprintln!(
+            "{}: judged as intended {judged}, failed {failed:?}",
+            agent.name
+        );
         verdicts.push((agent.name, judged, failed));
     }
     verdicts
@@ -2015,7 +2113,7 @@ async fn record_live_scenario(scenario: &Scenario, proof: &Path) -> Value {
     let (requests, responses) = (lines(&requests), lines(&proof.join("responses.jsonl")));
     let saved = readback(&world);
     checks.push(oracle("settled", settled, json!(latency.as_millis())));
-    checks.extend(oracles(scenario, &world, &task, &decoy, &saved, &requests));
+    checks.extend(oracles(scenario, &world, &task, &decoy, &saved));
     let summarize = |id: &TaskId| {
         saved
             .tasks
@@ -2037,6 +2135,8 @@ async fn record_live_scenario(scenario: &Scenario, proof: &Path) -> Value {
         "decoy": summarize(&decoy.id),
         "answers": answers(&responses),
         "trace": trace(&requests).into_iter().map(|(call, output)| json!({ "call": call, "output": output })).collect::<Vec<_>>(),
+        "receipts": saved.receipts,
+        "notices": saved.notices,
         "tokens": tokens(&responses),
         "model_requests": requests.len(),
         "latency_ms": latency.as_millis(),
@@ -2066,9 +2166,14 @@ async fn live_model_closes_the_loop() {
             .parse()
             .expect("AGENT_LOOP_EVAL_TOKEN_BUDGET is a token count")
     });
+    let cases = std::env::var("AGENT_LOOP_EVAL_CASES").ok();
     let _turn = SWITCHBOARD.lock().await;
     let (mut spent, mut rows) = (0, Vec::new());
-    for scenario in SCENARIOS {
+    for scenario in SCENARIOS.iter().filter(|scenario| {
+        cases
+            .as_deref()
+            .is_none_or(|cases| cases.split(',').any(|case| case == scenario.name))
+    }) {
         if spent >= budget {
             rows.push(json!({ "scenario": scenario.name, "skipped": "token budget reached" }));
             continue;
