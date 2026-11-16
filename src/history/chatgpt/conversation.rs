@@ -1438,7 +1438,6 @@ mod tests {
             "content": {"content_type": "execution_output", "text": "first line\nsecond line"},
             "metadata": {"aggregate_result": {"messages": [
                 {"message_type": "stream", "text": "first line\n"},
-                {"message_type": "stream"},
                 {"message_type": "stream", "text": "UNSEEN-STREAM-TEXT"}]}}});
         let raw = Conversation::new(1, "Streams")
             .node("out", Some("root"), output)
@@ -1468,6 +1467,146 @@ mod tests {
         let newest = survey(&raw, &[]).newest_message;
         let thread = thread(raw["id"].as_str().unwrap(), &raw, newest, String::new());
         assert_eq!(thread.updated_at, 1_800_000_050);
+    }
+
+    #[test]
+    fn a_stream_is_compared_with_the_text_history_stores() {
+        let widget = |raw: &str, fallback: &str, stream: &str| {
+            json!({"author": {"role": "assistant"},
+                "content": {"content_type": "execution_output", "text": raw},
+                "metadata": {"model_dil_v2": {"fallbackMarkdown": fallback},
+                    "aggregate_result": {"messages": [
+                        {"id": "stream-output", "message_type": "stream", "text": stream}]}}})
+        };
+        let raw = Conversation::new(1, "Fallback stream")
+            .node(
+                "replaced",
+                Some("root"),
+                widget(
+                    "markup RAW-STREAM-TEXT suffix",
+                    "Rendered widget",
+                    "RAW-STREAM-TEXT",
+                ),
+            )
+            .node(
+                "kept",
+                Some("replaced"),
+                widget("markup 42 suffix", "The total is 42", "42"),
+            )
+            .build();
+        let normalized = run(&raw);
+        assert_eq!(item(&normalized, "replaced").text, "Rendered widget");
+        assert_eq!(item(&normalized, "kept").text, "The total is 42");
+        let unread = unread(&normalized);
+        assert_eq!(unread.len(), 1, "{unread:?}");
+        assert!(unread[0].contains("replaced"), "{unread:?}");
+        assert_eq!(
+            labels(&raw),
+            [("output stream (text not in the message)".to_owned(), 1)]
+        );
+    }
+
+    #[test]
+    fn a_stream_without_its_text_is_reported() {
+        let message = json!({"author": {"role": "assistant"},
+            "content": {"content_type": "text", "parts": ["Shown answer"]},
+            "metadata": {"aggregate_result": {"messages": [
+                {"message_type": "stream", "data": "STREAM-DATA"}]}}});
+        let raw = Conversation::new(1, "Stream")
+            .node("answer", Some("root"), message)
+            .build();
+        let normalized = run(&raw);
+        assert_eq!(item(&normalized, "answer").text, "Shown answer");
+        let unread = unread(&normalized);
+        assert_eq!(unread.len(), 1, "{unread:?}");
+        assert!(unread[0].contains("answer"), "{unread:?}");
+        assert_eq!(labels(&raw), [("output stream (unreadable)".to_owned(), 1)]);
+    }
+
+    #[test]
+    fn metadata_with_a_null_message_key_is_message_shaped() {
+        let carrying = |key: &str, file: &str| {
+            json!({"author": {"role": "assistant"},
+                "content": {"content_type": "text", "parts": [format!("Answer beside {key}")]},
+                "metadata": {key: null, "attachments": [{"id": file}]}})
+        };
+        let raw = Conversation::new(1, "Null keys")
+            .node(
+                "author",
+                Some("root"),
+                carrying("author", "file-NullAuthor"),
+            )
+            .node(
+                "content",
+                Some("author"),
+                carrying("content", "file-NullContent"),
+            )
+            .node(
+                "metadata",
+                Some("content"),
+                carrying("metadata", "file-NullMetadata"),
+            )
+            .build();
+        let normalized = run_with(
+            &raw,
+            &[],
+            &Files::new(&[
+                "file-NullAuthor-a.dat",
+                "file-NullContent-b.dat",
+                "file-NullMetadata-c.dat",
+            ]),
+        );
+        for id in ["author", "content", "metadata"] {
+            let kept = item(&normalized, id);
+            assert_eq!(kept.text, format!("Answer beside {id}"));
+            assert!(paths(kept).is_empty(), "{id}: {:?}", paths(kept));
+        }
+        assert_eq!(unread(&normalized).len(), 3);
+        assert_eq!(labels(&raw), [("metadata (message-shaped)".to_owned(), 3)]);
+    }
+
+    #[test]
+    fn a_pointer_outside_the_two_export_schemes_is_reported() {
+        let captioned = |pointer: &str| {
+            json!({"author": {"role": "assistant"},
+                "content": {"content_type": "multimodal_text", "parts": ["Neighbor",
+                    {"content_type": "image_asset_pointer", "asset_pointer": pointer,
+                        "text": "SCHEME-CAPTION"}]}})
+        };
+        let chart = json!({"author": {"role": "tool", "name": "python"},
+            "content": {"content_type": "execution_output", "text": "<Figure>"},
+            "metadata": {"aggregate_result": {"messages": [
+                {"message_type": "image", "image_url": "https://file-Scheme3"}]}}});
+        let raw = Conversation::new(1, "Schemes")
+            .node("web", Some("root"), captioned("https://file-Scheme0"))
+            .node("vendor", Some("web"), captioned("vendor://file-Scheme1"))
+            .node("bare", Some("vendor"), captioned("file-Scheme2"))
+            .node("chart", Some("bare"), chart)
+            .build();
+        let normalized = run_with(
+            &raw,
+            &[],
+            &Files::new(&[
+                "file-Scheme0-a.dat",
+                "file-Scheme1-b.dat",
+                "file-Scheme2-c.dat",
+                "file-Scheme3-d.dat",
+            ]),
+        );
+        for id in ["web", "vendor", "bare"] {
+            let kept = item(&normalized, id);
+            assert_eq!(kept.text, "Neighbor", "{id}");
+            assert!(paths(kept).is_empty(), "{id}: {:?}", paths(kept));
+        }
+        assert!(paths(item(&normalized, "chart")).is_empty());
+        assert_eq!(unread(&normalized).len(), 4);
+        assert_eq!(
+            labels(&raw),
+            [
+                ("output image".to_owned(), 1),
+                ("part image_asset_pointer".to_owned(), 3)
+            ]
+        );
     }
 
     #[test]
