@@ -311,10 +311,14 @@
 
       _ = try await runSendMessageShortcut(
         "Check the build", to: "Work", answering: "Send", in: shortcuts, log: &log)
-      let outcome = shortcuts.staticTexts.matching(
-        NSPredicate(format: "label CONTAINS %@", "Sent to Work.")
-      ).firstMatch
-      XCTAssertTrue(outcome.waitForExistence(timeout: 20), shortcuts.debugDescription)
+      let sentence = NSPredicate(format: "label CONTAINS %@", "Sent to Work.")
+      let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+      let outcome = [shortcuts, springboard].map { $0.staticTexts.matching(sentence).firstMatch }
+      let deadline = ContinuousClock.now + .seconds(20)
+      while !outcome.contains(where: \.exists) && ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(250))
+      }
+      XCTAssertTrue(outcome.contains(where: \.exists), shortcuts.debugDescription)
       capture("shortcuts-send-outcome", shortcuts)
       submits = await work.submitRequests()
       XCTAssertEqual(submits.map(\.text), ["Check the build"])
@@ -760,13 +764,13 @@
     let control: UInt16
     let coordinator: String
 
-    struct Submit: Decodable {
+    struct Submit: Decodable, Sendable {
       let inputId: String
       let text: String
       let origin: String?
       let replyLost: Bool
     }
-    struct State: Decodable {
+    struct State: Decodable, Sendable {
       let submits: [Submit]
       /// Model requests per scripted text. More than one for a text is a second generation.
       let generations: [String: Int]
@@ -782,7 +786,7 @@
 
     /// The world's state once `ready` holds, or after 15 seconds. A generation starts after the
     /// coordinator accepts its input, so the phone can hear `delivered` before it is counted.
-    func state(once ready: (State) -> Bool = { _ in true }) async throws -> State {
+    func state(once ready: @Sendable (State) -> Bool = { _ in true }) async throws -> State {
       let decoder = JSONDecoder()
       decoder.keyDecodingStrategy = .convertFromSnakeCase
       let deadline = ContinuousClock.now + .seconds(15)
