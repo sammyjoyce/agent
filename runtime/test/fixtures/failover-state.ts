@@ -9,7 +9,11 @@ import { createModels, fauxProvider } from "@earendil-works/pi-ai";
 import { createRegistry, Harness, type Registry, type Storage, type StorageWrite } from "@earendil-works/pi-durable";
 import { openConversationDatabase } from "../../src/conversation-database.js";
 import type { AuthorityLink } from "../../src/failover/authority-link.js";
+import { openReplicatedStorage } from "../../src/failover/replicated-storage.js";
 import { ScopedDatabase } from "../../src/failover/scoped-database.js";
+import { applyLog } from "../../src/failover/standby.js";
+import type { AuthorityCommand } from "../../src/generated/AuthorityCommand.js";
+import type { AuthorityState } from "../../src/generated/AuthorityState.js";
 import type { LogEntry } from "../../src/generated/LogEntry.js";
 import { MemoryAuthority } from "./failover-memory-authority.js";
 
@@ -37,9 +41,7 @@ export const sessionPath = (directory: string) => join(directory, "session.sqlit
 
 /** Enrolls `holder` as the first owner and returns its epoch. */
 export async function enroll(link: AuthorityLink, holder = OWNER): Promise<number> {
-  const reply = await link.command({ op: "enroll", holder, checkpoint: { through: 0, manifest: "0".repeat(64) } });
-  if (reply.result !== "accepted") throw new Error(`The fixture could not enroll: ${reply.reason}`);
-  return reply.state.epoch;
+  return (await accepted(link, { op: "enroll", holder, checkpoint: { through: 0, manifest: "0".repeat(64) } })).epoch;
 }
 
 /** Every table's rows in rowid order, read through a separate connection. */
@@ -64,6 +66,49 @@ export async function openPi(storage: Storage, options: { registry?: Registry; t
 /** The session database of a state directory, opened as the application opens it and then scoped. */
 export async function openScoped(directory: string, observe: (database: SqliteDatabase) => SqliteDatabase = (database) => database): Promise<ScopedDatabase> {
   return ScopedDatabase.over(observe(await openConversationDatabase(sessionPath(directory))));
+}
+
+export interface OwnerOptions {
+  readonly holder?: string;
+  readonly epoch: number;
+  readonly signal?: AbortSignal;
+  readonly registry?: Registry;
+  readonly tokensPerSecond?: number;
+  /** Wraps the raw database before it is scoped, for a test that observes it. */
+  readonly observe?: (database: SqliteDatabase) => SqliteDatabase;
+}
+
+/** An owner's replicated storage with a real Harness over it. */
+export async function openOwner(directory: string, link: AuthorityLink, options: OwnerOptions) {
+  const database = await openScoped(directory, options.observe);
+  const { storage, log } = await openReplicatedStorage({ database, link, holder: options.holder ?? OWNER, epoch: options.epoch,
+    stateDirectory: directory, ...(options.signal === undefined ? {} : { signal: options.signal }) });
+  try { return { database, storage, log, ...await openPi(storage, options) }; }
+  catch (error) { await storage.close(BACKGROUND_CONTEXT).catch(() => {}); throw error; }
+}
+
+/** A standby's follow of the log into its own state directory. Returns the position it reached. */
+export async function follow(directory: string, link: AuthorityLink): Promise<number> {
+  return applyLog({ database: await openScoped(directory), link, stateDirectory: directory });
+}
+
+/** The sealed holder takes ownership back, as `promote` on itself does. Returns the new epoch. */
+export async function takeBack(link: AuthorityLink, holder: string, epoch: number): Promise<number> {
+  await accepted(link, { op: "promote", candidate: holder, expected_epoch: epoch, attestation: null });
+  const { head } = await accepted(link, { op: "release", holder, epoch, evidence: "released" });
+  return (await accepted(link, { op: "activate", candidate: holder, applied: head })).epoch;
+}
+
+/** Another holder replaces the owner on an invented attestation. Returns the new epoch. */
+export async function replaceOwner(link: AuthorityLink, candidate: string, epoch: number): Promise<number> {
+  const { head } = await accepted(link, { op: "promote", candidate, expected_epoch: epoch, attestation: "Invented: the old host is powered off" });
+  return (await accepted(link, { op: "activate", candidate, applied: head })).epoch;
+}
+
+async function accepted(link: AuthorityLink, command: AuthorityCommand): Promise<AuthorityState> {
+  const reply = await link.command(command);
+  if (reply.result !== "accepted") throw new Error(`The fixture's ${command.op} was refused: ${reply.reason}`);
+  return reply.state;
 }
 
 export async function logEntries(link: AuthorityLink): Promise<LogEntry[]> {
