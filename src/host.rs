@@ -992,10 +992,310 @@ mod tests {
     use tokio::{net::TcpStream, sync::oneshot, time::timeout};
 
     use crate::{
+        executable_fixture::write_executable,
         host::{Executor, ProcessOutput, ProcessRequest, run_process, run_process_until},
-        protocol::{HostCommand, HostResult},
+        protocol::{HostCommand, HostDelivery, HostResult, WorkerPresence, WorkerRef, WorkerState},
         rex::{RexClient, fake_rex},
     };
+
+    const FIXTURE_INSTANCE: &str = "66666666-6666-4666-8666-666666666666";
+    const RESTARTED_INSTANCE: &str = "88888888-8888-4888-8888-888888888888";
+    const ADDED_BLOCK: &str = "block:eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+
+    /// The coordinator stores and forwards the stamp as an opaque wire field.
+    fn stamped(binding: WorkerRef, stamp: Option<&str>) -> WorkerRef {
+        let mut wire = serde_json::to_value(binding).unwrap();
+        wire["rex_instance_id"] = stamp.into();
+        serde_json::from_value(wire).unwrap()
+    }
+
+    fn stamp_of(binding: &WorkerRef) -> Option<String> {
+        serde_json::to_value(binding).unwrap()["rex_instance_id"]
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    /// The shared fixture shows every pane exited under one Rex instance. This
+    /// wrapper shows the block named by `AGENT_TEST_FAKE_REX_RUNNING` with a
+    /// live process, and answers `whoami` as a restarted server once the method
+    /// named by `AGENT_TEST_FAKE_REX_RESTART_AFTER` has run.
+    const PANE_REX: &str = r#"#!/bin/sh
+set -eu
+root=${AGENT_TEST_FAKE_REX:?}
+reply=$("$root/rex" "$@")
+for argument do
+  case $argument in
+    whoami)
+      if [ -e "$root/restarted" ]; then
+        reply=$(printf '%s' "$reply" | sed 's/66666666-6666-4666-8666-666666666666/88888888-8888-4888-8888-888888888888/')
+      fi ;;
+    com.superlogical.terminal.process)
+      case "$*" in
+        *"${AGENT_TEST_FAKE_REX_RUNNING:-<none>}"*) reply='{"child":{"pid":4242},"foreground":null,"last_exit":null}' ;;
+      esac ;;
+  esac
+  if [ "$argument" = "${AGENT_TEST_FAKE_REX_RESTART_AFTER:-<none>}" ]; then
+    : > "$root/restarted"
+  fi
+done
+printf '%s\n' "$reply"
+"#;
+
+    fn run_with_panes(test: &str, case: &str, envs: &[(&str, &str)]) {
+        let wrapper = tempfile::tempdir().unwrap();
+        write_executable(&wrapper.path().join("rex"), PANE_REX);
+        let path = std::env::join_paths(std::iter::once(wrapper.path().to_owned()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
+        .unwrap();
+        // `fake_rex::run` applies these last, so this PATH finds the wrapper
+        // before the fixture it wraps.
+        fake_rex::run(
+            test,
+            case,
+            &[envs, &[("PATH", path.to_str().unwrap())]].concat(),
+        );
+    }
+
+    #[test]
+    fn a_worker_binding_without_a_rex_instance_still_parses_and_a_stamp_round_trips() {
+        let unstamped = serde_json::json!({
+            "state": "bound",
+            "allocation_id": "allocation-root",
+            "host": serde_json::to_value(fixture_host()).unwrap(),
+            "binding": serde_json::to_value(fixture_origin()).unwrap(),
+        });
+        assert!(unstamped["binding"].get("rex_instance_id").is_none());
+        let record: WorkerState = serde_json::from_value(unstamped.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&record).unwrap(),
+            unstamped,
+            "An unstamped record is the frame it was before stamps"
+        );
+        let mut stamped_record = unstamped;
+        stamped_record["binding"]["rex_instance_id"] = FIXTURE_INSTANCE.into();
+        let record: WorkerState = serde_json::from_value(stamped_record.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&record).unwrap(), stamped_record);
+    }
+
+    #[tokio::test]
+    async fn a_pane_process_is_the_worker_only_under_the_rex_instance_that_started_it() {
+        const TEST: &str =
+            "host::tests::a_pane_process_is_the_worker_only_under_the_rex_instance_that_started_it";
+        let Some(case) = fake_rex::case() else {
+            let running = ("AGENT_TEST_FAKE_REX_RUNNING", fake_rex::ORIGIN_BLOCK);
+            for (case, envs) in [
+                ("restored", &[running][..]),
+                ("unstamped", &[running][..]),
+                ("live", &[running][..]),
+                ("exited", &[][..]),
+            ] {
+                run_with_panes(TEST, case, envs);
+            }
+            return;
+        };
+        let stamp = match case.as_str() {
+            "restored" => Some(RESTARTED_INSTANCE),
+            "unstamped" => None,
+            _ => Some(FIXTURE_INSTANCE),
+        };
+        let binding = stamped(fixture_origin(), stamp);
+        let directory = tempfile::tempdir().unwrap();
+        let executor = personal_executor(directory.path());
+        let presence = executor
+            .execute(HostCommand::InspectWorker {
+                binding: binding.clone(),
+            })
+            .await;
+        let resumed = executor
+            .execute(HostCommand::ResumeWorker {
+                host: fixture_host(),
+                binding,
+                task_id: fixture_task(),
+                allocation_id: "allocation-root".into(),
+            })
+            .await;
+        let methods = fake_rex::methods();
+        let count = |method: &str| methods.iter().filter(|called| *called == method).count();
+        let live = case == "live";
+        assert!(
+            matches!(presence, HostResult::WorkerPresence { presence: WorkerPresence::Present { running } } if running == live),
+            "{presence:?}"
+        );
+        if live {
+            assert!(matches!(resumed, HostResult::Written), "{resumed:?}");
+            assert_eq!(count("session.new_window"), 0);
+        } else {
+            let HostResult::Spawned { binding } = resumed else {
+                panic!("Expected a replacement pane, got {resumed:?}");
+            };
+            assert_eq!(
+                (binding.session_id.as_str(), binding.block_id.as_str()),
+                (fake_rex::ORIGIN_SESSION, ADDED_BLOCK)
+            );
+            assert_eq!(stamp_of(&binding).as_deref(), Some(FIXTURE_INSTANCE));
+            assert_eq!(count("session.new_window"), 1);
+        }
+        assert_eq!(
+            count("block.close"),
+            usize::from(case == "exited"),
+            "Only a pane Rex reports exited is closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restart_after_the_process_read_never_proves_the_worker() {
+        const TEST: &str = "host::tests::a_restart_after_the_process_read_never_proves_the_worker";
+        if fake_rex::case().is_none() {
+            run_with_panes(
+                TEST,
+                "restart-after-process-read",
+                &[
+                    ("AGENT_TEST_FAKE_REX_RUNNING", fake_rex::ORIGIN_BLOCK),
+                    (
+                        "AGENT_TEST_FAKE_REX_RESTART_AFTER",
+                        "com.superlogical.terminal.process",
+                    ),
+                ],
+            );
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let presence = personal_executor(directory.path())
+            .execute(HostCommand::InspectWorker {
+                binding: stamped(fixture_origin(), Some(FIXTURE_INSTANCE)),
+            })
+            .await;
+        assert!(
+            matches!(
+                presence,
+                HostResult::WorkerPresence {
+                    presence: WorkerPresence::Present { running: false }
+                }
+            ),
+            "The shell Rex restored after the first whoami is not the worker: {presence:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_that_fails_before_its_create_keeps_the_binding_as_not_started() {
+        const TEST: &str =
+            "host::tests::a_resume_that_fails_before_its_create_keeps_the_binding_as_not_started";
+        let Some(case) = fake_rex::case() else {
+            for (case, envs) in [
+                ("down", &[("AGENT_TEST_FAKE_REX_DOWN_AT", "whoami")][..]),
+                (
+                    "missing-session",
+                    &[("AGENT_TEST_FAKE_REX_MISSING", fake_rex::ORIGIN_SESSION)][..],
+                ),
+                (
+                    "unreadable-pane",
+                    &[(
+                        "AGENT_TEST_FAKE_REX_FAIL_AT",
+                        "com.superlogical.terminal.process",
+                    )][..],
+                ),
+                ("foreign-host", &[][..]),
+            ] {
+                fake_rex::run(TEST, case, envs);
+            }
+            return;
+        };
+        let mut binding = fixture_origin();
+        if case == "foreign-host" {
+            binding.host_id = "55555555-5555-4555-8555-555555555555".into();
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let result = personal_executor(directory.path())
+            .execute(HostCommand::ResumeWorker {
+                host: fixture_host(),
+                binding,
+                task_id: fixture_task(),
+                allocation_id: "allocation-root".into(),
+            })
+            .await;
+        assert!(
+            matches!(
+                &result,
+                HostResult::Failed {
+                    delivery: Some(HostDelivery::NotStarted),
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+        assert!(
+            !fake_rex::methods()
+                .iter()
+                .any(|method| method == "session.new_window"),
+            "A failed resume must not create a pane"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_created_pane_carries_the_rex_instance_read_before_its_create() {
+        const TEST: &str =
+            "host::tests::every_created_pane_carries_the_rex_instance_read_before_its_create";
+        let Some(case) = fake_rex::case() else {
+            for path in [
+                "root",
+                "origin-window",
+                "subagent",
+                "missing-terminal",
+                "exited-pane",
+            ] {
+                let create = if path == "root" {
+                    "session.create"
+                } else {
+                    "session.new_window"
+                };
+                run_with_panes(TEST, &format!("{path}-steady"), &[]);
+                run_with_panes(
+                    TEST,
+                    &format!("{path}-restarted"),
+                    &[("AGENT_TEST_FAKE_REX_RESTART_AFTER", create)],
+                );
+            }
+            return;
+        };
+        let (path, outcome) = case.rsplit_once('-').unwrap();
+        let resume = |binding| HostCommand::ResumeWorker {
+            host: fixture_host(),
+            binding,
+            task_id: fixture_task(),
+            allocation_id: "allocation-root".into(),
+        };
+        let command = match path {
+            "root" => spawn_root(None),
+            "origin-window" => spawn_root(Some(fixture_origin())),
+            "subagent" => spawn_child(fixture_origin()),
+            "missing-terminal" => {
+                let mut missing = fixture_origin();
+                missing.block_id = "block:ffffffff-ffff-4fff-8fff-ffffffffffff".into();
+                resume(missing)
+            }
+            _ => resume(fixture_origin()),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let result = personal_executor(directory.path()).execute(command).await;
+        let session = if path == "root" {
+            fake_rex::CREATED_SESSION
+        } else {
+            fake_rex::ORIGIN_SESSION
+        };
+        if outcome == "restarted" {
+            assert!(
+                matches!(&result, HostResult::CreationUncertain { session_id: Some(id) } if id == session),
+                "A restart around the create must leave it uncertain, got {result:?}"
+            );
+        } else {
+            let HostResult::Spawned { binding } = result else {
+                panic!("Expected a confirmed pane, got {result:?}");
+            };
+            assert_eq!(binding.session_id, session);
+            assert_eq!(stamp_of(&binding).as_deref(), Some(FIXTURE_INSTANCE));
+        }
+    }
 
     #[test]
     fn execution_bindings_validate_each_native_identity_once_before_execution() {
@@ -1017,6 +1317,19 @@ mod tests {
             ExecutionBinding::try_from(&wrong_kind),
             Err(crate::rex::RexError::InvalidId)
         ));
+        let malformed = stamped(valid.clone(), Some("not-a-rex-instance"));
+        assert!(matches!(
+            ExecutionBinding::try_from(&malformed),
+            Err(crate::rex::RexError::InvalidId)
+        ));
+        let started = stamped(valid.clone(), Some(FIXTURE_INSTANCE));
+        assert_eq!(
+            stamp_of(&WorkerRef::from(
+                ExecutionBinding::try_from(&started).unwrap()
+            ))
+            .as_deref(),
+            Some(FIXTURE_INSTANCE)
+        );
         let mut nil_host = valid;
         nil_host.host_id = "00000000-0000-0000-0000-000000000000".into();
         assert!(matches!(
