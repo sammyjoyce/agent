@@ -167,15 +167,15 @@ impl Terminal {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let spawned = Instant::now();
         let mut screen = Screen {
             parser: parser()?,
             armed: VecDeque::new(),
             received: 0,
-            last_output: spawned,
+            last_output: Instant::now(),
         };
         let sightings = screen.arm(sights)?;
         let screen = Arc::new(Mutex::new(screen));
+        let spawned = Instant::now();
         let mut child = command.spawn()?;
         let input = Arc::new(tokio::sync::Mutex::new(
             child.stdin.take().context("Missing terminal input")?,
