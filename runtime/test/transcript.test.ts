@@ -194,7 +194,7 @@ test("native phases and old inert Codex metadata project consistently before and
     const store = new HistoryStore(session);
     await store.import({ host_id: "fixture", thread: { id: "thread", title: "Saved work", cwd: "/workspace", created_at: 1, updated_at: 2, forked_from_id: null,
       parent_thread_id: null, version: "v1", version_reliable: true, archived: false }, items, complete: true, next_cursor: null, gaps: [] });
-    const imported = await store.get("thread"); assert.ok(imported);
+    const imported = await store.get({ source: "codex", thread_id: "thread" }); assert.ok(imported);
     const conversation = await store.conversation(imported.conversation_id); assert.ok(conversation);
     const original = (await conversation.entries({ order: "ascending" }, 20, undefined, BACKGROUND_CONTEXT)).items;
     const importedFrames = await history(conversation, null, session);

@@ -1,8 +1,9 @@
 import { defineDocFamily, defineEntry, type EntryId } from "@earendil-works/pi-durable";
+import type { HistoryProvider } from "./generated/HistoryProvider.js";
 
 export type RevisionStatus = "superseded" | "ambiguous";
 export type SourceSnapshot = { host_id: string; version: string; sequence: number };
-export type SourceCapture = { thread_id: string; attempt: number; snapshot: SourceSnapshot; phase: "advertised" | "read" };
+export type SourceCapture = { source: HistoryProvider; thread_id: string; attempt: number; snapshot: SourceSnapshot; phase: "advertised" | "read" };
 export type CaptureState = Pick<SourceCapture, "attempt" | "phase">;
 export const REVISION_FORMAT = 2;
 export type RevisionView = { watermark: EntryId | null; ready: boolean; entries: Readonly<Record<string, RevisionStatus>> };

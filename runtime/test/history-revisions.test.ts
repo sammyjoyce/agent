@@ -187,13 +187,13 @@ test("same-host same-second captures replace revisions through the native import
   };
   const run = () => new CodexImporter(app.session, app.store, join(directory, "assets")).run([node], [node.host_id], [node.host_id], call, () => {}, () => app.retrieval.sync(app.embed, true));
   try {
-    await run(); const record = await app.store.get(thread.id); assert.ok(record); const id = record.conversation_id;
+    await run(); const record = await app.store.get({ source: "codex", thread_id: thread.id }); assert.ok(record); const id = record.conversation_id;
     await app.close(); app = await open(directory);
     metadata = { ...metadata, version: "later-same-second-snapshot" }; values = [current]; changedDuringRead = true;
     await run(); assert.equal(reads, 2);
     assert.deepEqual((await rows(app, id)).filter((row) => row.role === "user").map((row) => row.text), [current.text]);
     assert.equal((await lexical(directory, "Obsidianoldonly")).candidates.length, 0);
-    assert.equal((await app.store.checkpoint(thread.id, node.host_id))?.version, "native-page-snapshot");
+    assert.equal((await app.store.checkpoint({ source: "codex", thread_id: thread.id }, node.host_id))?.version, "native-page-snapshot");
     const before = await nativeEntries(app, id);
     await app.close(); app = await open(directory);
     metadata = { ...metadata, version: "native-page-snapshot" }; changedDuringRead = false;
@@ -218,13 +218,13 @@ test("a provisional advertised snapshot yields to its own already-known native r
   try {
     await run(); advertised = "provisional-inventory"; await run();
     assert.equal(reads, 2);
-    assert.equal((await app.store.checkpoint(thread.id, node.host_id))?.version, "known-native");
-    assert.equal((await app.store.checkpoint(thread.id, node.host_id))?.complete, true);
-    const record = await app.store.get(thread.id); assert.ok(record); assert.equal(record.thread.version, "known-native");
+    assert.equal((await app.store.checkpoint({ source: "codex", thread_id: thread.id }, node.host_id))?.version, "known-native");
+    assert.equal((await app.store.checkpoint({ source: "codex", thread_id: thread.id }, node.host_id))?.complete, true);
+    const record = await app.store.get({ source: "codex", thread_id: thread.id }); assert.ok(record); assert.equal(record.thread.version, "known-native");
     await app.close(); app = await open(directory); advertised = "known-native";
     await run(); assert.equal(reads, 2, "The confirmed known snapshot must skip another source read");
     assert.equal((await originals(app, record.conversation_id)).length, 1);
-    const conflicting = await app.store.capture(node.host_id, { ...thread, version: "provisional-inventory" }, true); assert.ok(conflicting);
+    const conflicting = await app.store.capture(node.host_id, "codex", { ...thread, version: "provisional-inventory" }, true); assert.ok(conflicting);
     const confirmed = await app.store.rebindCapture(conflicting, { ...thread, version: "known-native" }); assert.ok(confirmed);
     const wrong = await app.store.rebindCapture(conflicting, { ...thread, version: "provisional-inventory" }); assert.equal(wrong, null,
       "A late reply cannot turn the same capture into two confirmed snapshots");
@@ -264,16 +264,16 @@ test("empty targeted retry pages retain their confirmed capture and new cursor a
   };
   const run = () => new CodexImporter(app.session, app.store, join(directory, "assets")).run([node], [node.host_id], [node.host_id], call, () => {}, async () => {});
   try {
-    await run(); const record = await app.store.get(thread.id); assert.ok(record);
+    await run(); const record = await app.store.get({ source: "codex", thread_id: thread.id }); assert.ok(record);
     await app.close(); app = await open(directory); stage = 1; reads.length = 0;
     await run(); assert.deepEqual(reads, [null, "second-page", "moved-page"]);
-    const checkpoint = await app.store.checkpoint(thread.id, node.host_id); assert.ok(checkpoint);
+    const checkpoint = await app.store.checkpoint({ source: "codex", thread_id: thread.id }, node.host_id); assert.ok(checkpoint);
     assert.deepEqual(checkpoint.retry_pages?.map((page) => page.cursor), [null, "moved-page"]);
     assert.ok(checkpoint.gaps.some((gap) => gap.item_id === null && gap.code === "unavailable"));
     await app.close(); app = await open(directory); stage = 2; reads.length = 0;
     await run(); assert.deepEqual(reads, [null, "moved-page"]);
     assert.equal((await originals(app, record.conversation_id)).length, 2);
-    assert.deepEqual((await app.store.checkpoint(thread.id, node.host_id))?.retry_pages?.map((page) => page.cursor), [null]);
+    assert.deepEqual((await app.store.checkpoint({ source: "codex", thread_id: thread.id }, node.host_id))?.retry_pages?.map((page) => page.cursor), [null]);
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -281,25 +281,25 @@ test("delayed pages retain their original host epoch across partial snapshots, r
   const directory = await mkdtemp(join(tmpdir(), "agent-revision-delayed-page-")); let app = await open(directory);
   try {
     const older = { ...thread, version: "capture-old" }, newer = { ...thread, version: "capture-new" };
-    const oldCapture = await app.store.capture("source-host", older, true); assert.ok(oldCapture);
+    const oldCapture = await app.store.capture("source-host", "codex", older, true); assert.ok(oldCapture);
     const other = item("Original second page", "other-old", "another-item");
     const batch = (source: HistoryThread, items: HistoryItem[], cursor: string | null = null) => ({ host_id: "source-host", thread: source,
       items, next_cursor: cursor, gaps: [], complete: cursor === null });
     const seeded = await app.store.import(batch(older, [old, other]), oldCapture), id = seeded.conversation.conversation_id;
-    const newCapture = await app.store.capture("source-host", newer, true); assert.ok(newCapture);
+    const newCapture = await app.store.capture("source-host", "codex", newer, true); assert.ok(newCapture);
     await app.store.import(batch(newer, [current], "second-page"), newCapture);
     await app.store.import(batch(older, [old, other]), oldCapture);
-    assert.equal((await app.store.checkpoint(thread.id, "source-host"))?.version, newer.version);
-    assert.equal((await app.store.checkpoint(thread.id, "source-host"))?.next_cursor, "second-page");
+    assert.equal((await app.store.checkpoint({ source: "codex", thread_id: thread.id }, "source-host"))?.version, newer.version);
+    assert.equal((await app.store.checkpoint({ source: "codex", thread_id: thread.id }, "source-host"))?.next_cursor, "second-page");
     await app.close(); app = await open(directory);
-    const resumed = await app.store.capture("source-host", newer, true); assert.ok(resumed);
+    const resumed = await app.store.capture("source-host", "codex", newer, true); assert.ok(resumed);
     assert.equal(resumed.snapshot.sequence, newCapture.snapshot.sequence);
     const otherNew = item("Current second page", "other-new", "another-item");
     await app.store.import(batch(newer, [otherNew]), resumed);
     await app.store.import(batch(older, [old, other]), oldCapture);
     assert.deepEqual((await rows(app, id)).filter((row) => row.role === "user").map((row) => row.text), [current.text, otherNew.text]);
-    assert.equal((await app.store.get(thread.id))?.thread.version, newer.version);
-    assert.equal((await app.store.checkpoint(thread.id, "source-host"))?.complete, true);
+    assert.equal((await app.store.get({ source: "codex", thread_id: thread.id }))?.thread.version, newer.version);
+    assert.equal((await app.store.checkpoint({ source: "codex", thread_id: thread.id }, "source-host"))?.complete, true);
     const before = await nativeEntries(app, id);
     await app.store.import(batch(newer, [current, otherNew]), resumed);
     assert.deepEqual(await nativeEntries(app, id), before);
@@ -309,14 +309,14 @@ test("delayed pages retain their original host epoch across partial snapshots, r
 test("an overlapping unadvertised page fingerprint remains ambiguous instead of gaining arrival-time authority", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-revision-overlap-")); const app = await open(directory);
   try {
-    const before = await app.store.capture("source-host", { ...thread, version: "first-inventory" }, true); assert.ok(before);
-    const newer = { ...thread, version: "newer-inventory" }, later = await app.store.capture("source-host", newer, true); assert.ok(later);
+    const before = await app.store.capture("source-host", "codex", { ...thread, version: "first-inventory" }, true); assert.ok(before);
+    const newer = { ...thread, version: "newer-inventory" }, later = await app.store.capture("source-host", "codex", newer, true); assert.ok(later);
     const seeded = await app.store.import({ host_id: "source-host", thread: newer, items: [current], next_cursor: null, gaps: [], complete: true }, later);
     const unadvertised = { ...thread, version: "unadvertised-page" };
     const unknown = await app.store.rebindCapture(before, unadvertised); assert.equal(unknown, null);
     await app.store.import({ host_id: "source-host", thread: unadvertised, items: [old], next_cursor: null, gaps: [], complete: true }, unknown);
     assert.equal((await rows(app, seeded.conversation.conversation_id)).filter((row) => row.role === "notice").length, 2);
-    assert.equal((await app.store.checkpoint(thread.id, "source-host"))?.version, newer.version);
+    assert.equal((await app.store.checkpoint({ source: "codex", thread_id: thread.id }, "source-host"))?.version, newer.version);
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -327,14 +327,14 @@ test("page observations advance only seen items and survive restart before a lat
     const saved = await save(app, [old, other]), id = saved.conversation.conversation_id;
     await save(app, [old], 30, "partial-source", { cursor: "remaining-page" });
     assert.deepEqual((await rows(app, id)).filter((row) => row.role === "user").map((row) => row.text), [old.text, other.text]);
-    assert.equal((await app.store.checkpoint(thread.id, "source-host"))?.next_cursor, "remaining-page");
+    assert.equal((await app.store.checkpoint({ source: "codex", thread_id: thread.id }, "source-host"))?.next_cursor, "remaining-page");
     await app.close(); app = await open(directory);
     await save(app, [current], 20, "stale-missing-page", { host: "stale-host" });
     assert.deepEqual((await rows(app, id)).filter((row) => row.role === "user").map((row) => row.text), [old.text, other.text]);
     const otherNew = item("Newly read second page evidence", "other-two", "another-item");
     await save(app, [otherNew], 30, "partial-source");
     assert.deepEqual((await rows(app, id)).filter((row) => row.role === "user").map((row) => row.text), [old.text, otherNew.text]);
-    assert.equal((await app.store.checkpoint(thread.id, "source-host"))?.complete, true);
+    assert.equal((await app.store.checkpoint({ source: "codex", thread_id: thread.id }, "source-host"))?.complete, true);
     assert.equal((await originals(app, id)).length, 4);
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
 });

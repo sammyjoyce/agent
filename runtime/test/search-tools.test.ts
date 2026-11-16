@@ -109,15 +109,15 @@ test("search and task reads bound imported coverage while Pi retains every canon
     assert.deepEqual(await tasks.saved(chosen.conversation_id), receipt.conversation);
     const adopted = await tasks.adopt(chosen.conversation_id, { id: "11111111-1111-4111-8111-111111111111",
       outcome: "Continue the retained decision", evidence: "The original connector decision is retained", model: DEFAULT_MODEL });
-    assert.deepEqual((await history.get(source.thread.id))?.gaps, source.gaps);
+    assert.deepEqual((await history.get({ source: "codex", thread_id: source.thread.id }))?.gaps, source.gaps);
     await retrieval.close(); await session.close(BACKGROUND_CONTEXT); closed = true;
     const reopened = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
       { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
     try {
-      const retained = new HistoryStore(reopened), canonical = await retained.get(source.thread.id);
+      const retained = new HistoryStore(reopened), canonical = await retained.get({ source: "codex", thread_id: source.thread.id });
       assert.deepEqual(canonical?.gaps, source.gaps);
       assert.equal(canonical?.adopted_task_id, adopted.id);
-      assert.deepEqual((await retained.checkpoint(source.thread.id, source.host_id))?.gaps, source.gaps);
+      assert.deepEqual((await retained.checkpoint({ source: "codex", thread_id: source.thread.id }, source.host_id))?.gaps, source.gaps);
     } finally { await reopened.close(BACKGROUND_CONTEXT); }
   } finally {
     if (!closed) { await retrieval.close(); await session.close(BACKGROUND_CONTEXT); }
@@ -188,8 +188,8 @@ test("main and worker tools find older substantive context beside a newer shallo
     }
     assert.deepEqual(inspected, ["main", "worker"]);
     assert.equal((await tasks.list()).length, 1);
-    assert.equal((await history.get("older-substantive"))?.adopted_task_id, null);
-    assert.equal((await history.get("newer-shallow"))?.adopted_task_id, null);
+    assert.equal((await history.get({ source: "codex", thread_id: "older-substantive" }))?.adopted_task_id, null);
+    assert.equal((await history.get({ source: "codex", thread_id: "newer-shallow" }))?.adopted_task_id, null);
   } finally { await retrieval.close(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 

@@ -142,9 +142,9 @@ export class CodexImporter {
   }
   private async thread(host: string, thread: HistoryThread, progress: ImportProgress, call: HostCall,
     checkpoint: () => Promise<void>): Promise<void> {
-    const saved = await this.history.checkpoint(thread.id, host);
+    const saved = await this.history.checkpoint({ source: "codex", thread_id: thread.id }, host);
     if (thread.version_reliable && saved?.version === thread.version) {
-      await this.history.reconcileLineage(thread);
+      await this.history.reconcileLineage("codex", thread);
       if (saved.complete) { progress.threads_unchanged += 1; return; }
     }
     let gaps: HistoryGap[] | undefined;
@@ -184,7 +184,7 @@ export class CodexImporter {
     const failed = retries.filter((page) => page.cursor === cursor && page.gaps.some((gap) => !assetGap(gap)));
     gaps = without(gaps, failed.flatMap((page) => page.gaps)); retries = retries.filter((page) => !failed.includes(page));
     const cursors = new Set<string>(); let resets = 0;
-    let capture = await this.history.capture(host, thread, true) ?? null;
+    let capture = await this.history.capture(host, "codex", thread, true) ?? null;
     // Record the current observation before an RPC can fail, so a changed or
     // unreliable locator cannot keep advertising yesterday's complete coverage.
     await this.history.import({ host_id: host, thread, items: [], next_cursor: cursor,
@@ -194,7 +194,7 @@ export class CodexImporter {
       if (page.type !== "read" || page.thread_id !== thread.id) throw new Error("History host returned another conversation");
       if (page.gaps.some((gap) => gap.code === "changed" && gap.item_id === null) && resets++ === 0) {
         cursor = null; resumeCursor = null; gaps = []; retries = []; cursors.clear(); thread = { ...thread, version: page.version || thread.version };
-        capture = await this.history.capture(host, thread, true) ?? null; continue;
+        capture = await this.history.capture(host, "codex", thread, true) ?? null; continue;
       }
       if (page.version.length > 0) thread = { ...thread, version: page.version };
       capture = await this.history.rebindCapture(capture, thread);
@@ -218,7 +218,7 @@ export class CodexImporter {
   }
   private async retry(host: string, thread: HistoryThread, saved: HistoryRetryPage[],
     progress: ImportProgress, call: HostCall, checkpoint: () => Promise<void>, resumeCursor: string | null | undefined): Promise<HistoryGap[] | undefined> {
-    let capture = await this.history.capture(host, thread, true) ?? null;
+    let capture = await this.history.capture(host, "codex", thread, true) ?? null;
     const retries = structuredClone(saved), cursors = new Set<string>();
     for (let index = 0; index < retries.length;) {
       const pending = retries[index]; if (pending === undefined) break;
