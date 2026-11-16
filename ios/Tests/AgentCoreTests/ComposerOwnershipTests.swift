@@ -548,6 +548,7 @@ private func held(_ gate: DialGate) async throws {
 /// A fixture coordinator and a session that dials it through `gate`, which can hold a Send's dial
 /// so that its exchange waits before it writes anything, and can then fail that dial.
 private struct GatedCoordinator {
+  let profile: CoordinatorProfile
   let fixture: FixtureCoordinator
   let endpoint: NWEndpoint
   let directory: ProfileDirectory
@@ -567,14 +568,17 @@ private struct GatedCoordinator {
     try? FileManager.default.removeItem(at: root)
   }
   var coordinators: [GatedCoordinator] = []
-  for _ in 0..<count {
+  for index in 0..<count {
     let fixture = FixtureCoordinator()
     let (listener, endpoint) = try await listen(fixture)
     listeners.append(listener)
     let gate = DialGate()
-    let directory = ProfileDirectory(ProfileID(), applicationSupport: root, caches: root)
+    let address = try CoordinatorAddress(host: "100.64.1.2")
+    var profile = CoordinatorProfile(name: try TagName("Coordinator\(index + 1)"), address: address)
+    profile.pin = fixture.id
+    let directory = ProfileDirectory(profile.id, applicationSupport: root, caches: root)
     let session = CoordinatorSession(
-      directory: directory, address: try CoordinatorAddress(host: "100.64.1.2"), pin: fixture.id,
+      directory: directory, address: address, pin: fixture.id,
       stamps: StampSource(),
       transport: CoordinatorTransport { _ in
         try await gate.pass()
@@ -582,7 +586,8 @@ private struct GatedCoordinator {
       })
     coordinators.append(
       GatedCoordinator(
-        fixture: fixture, endpoint: endpoint, directory: directory, gate: gate, session: session))
+        profile: profile, fixture: fixture, endpoint: endpoint, directory: directory, gate: gate,
+        session: session))
   }
   func stop() async {
     for coordinator in coordinators {
@@ -758,7 +763,8 @@ func aSendStoppedEverywhereBeforeItLeftThePhoneIsOfferedAgainAfterACrash(
   }
 }
 
-/// A model that saves its draft under `root`, as the app does, connected to every coordinator.
+/// A model that saves its draft under `root`, as the app does, with every coordinator saved and
+/// connected.
 @MainActor private func connectedModel(
   to coordinators: [GatedCoordinator], under root: URL
 ) async throws -> ChatModel {
@@ -766,6 +772,7 @@ func aSendStoppedEverywhereBeforeItLeftThePhoneIsOfferedAgainAfterACrash(
   let model = ChatModel(
     draftStore: AttachmentStore(directory: directory.appending(path: "Files")),
     persistence: ComposerDraftStore(url: directory.appending(path: "draft.json")))
+  model.profiles = coordinators.map(\.profile)
   await model.restoreDraft()
   for coordinator in coordinators { model.attach(lane(coordinator.session)) }
   await model.setActive(true)
@@ -831,6 +838,62 @@ func aControlOneRecipientWroteDoesNotComeBack() async throws {
     }
     #expect(model.draft == "An invented newer note", "/status does not come back")
     #expect(await second.fixture.count() == 0, "The second coordinator got nothing")
+    await model.setActive(false)
+  }
+}
+
+/// A `/status` for one of two coordinators, under its chip, never leaves the phone. It comes back
+/// to the empty composer under the same chip, so the next Send goes where this one was meant to.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aControlThatComesBackToAnEmptyComposerKeepsItsChip() async throws {
+  try await withGatedCoordinators(2) { coordinators, root in
+    let (first, second) = (coordinators[0], coordinators[1])
+    let model = try await connectedModel(to: coordinators, under: root)
+    await first.gate.arm()
+    model.setChip(first.profile.id)
+    model.draft = "/status"
+    await model.send()
+    try await held(first.gate)
+    #expect(model.draft.isEmpty && model.destination == .open, "The chip went with the Send")
+    await first.gate.fail()
+    let deadline = ContinuousClock.now + .seconds(5)
+    while model.draft.isEmpty, ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(model.draft == "/status")
+    #expect(model.destination == .chip(first.profile.id), "/status comes back under its chip")
+    #expect(await first.fixture.count() == 0, "The first coordinator got nothing")
+    #expect(await second.fixture.count() == 0, "The second coordinator got nothing")
+    await model.setActive(false)
+  }
+}
+
+/// The user sends `/help` while an older `/status` is still dialing, and the coordinator gets
+/// `/help` at once. The dial for `/status` then fails, so `/status` comes back and `/help` does
+/// not.
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aNewerSendDoesNotWaitForAnOlderControlThatComesBack() async throws {
+  try await withGatedCoordinators(1) { coordinators, root in
+    let coordinator = coordinators[0]
+    let model = try await connectedModel(to: coordinators, under: root)
+    await coordinator.gate.arm()
+    model.draft = "/status"
+    await model.send()
+    try await held(coordinator.gate)
+    model.draft = "/help"
+    await model.send()
+    #expect(model.draft.isEmpty, "Send took /help while /status was dialing")
+    for await input in coordinator.fixture.observedInputs {
+      #expect(input.text == "/help")
+      break
+    }
+    await coordinator.gate.fail()
+    let deadline = ContinuousClock.now + .seconds(5)
+    while model.draft.isEmpty, ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(model.draft == "/status", "/status comes back and /help stays sent")
+    #expect(await coordinator.fixture.count() == 1, "Only /help reached the coordinator")
     await model.setActive(false)
   }
 }
