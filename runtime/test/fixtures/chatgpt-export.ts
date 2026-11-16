@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, open, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { crc32, deflateRawSync, deflateSync } from "node:zlib";
 
@@ -26,6 +26,8 @@ export const KAYAK = { prompt: "Suggest a kayak route along the coast", reply: "
   regenerated: "Paddle around the headland at slack tide." } as const;
 const BLOB_FILE = { id: "file_00e2", member: "file_00e2-blob.dat" } as const;
 const PNG_FILE = { id: "file_00e3", member: "file_00e3-lighthouse.dat" } as const;
+const NOTES_FILE = { id: "file_00e4", member: "file_00e4-notes.txt" } as const;
+const SURVEY_REPLY = "The lighthouse survey data looks complete. ".repeat(3_200);
 
 function message(id: string, role: Author["role"], created: number, content: Record<string, unknown>,
   extra: { metadata?: Record<string, unknown>; recipient?: string; name?: string } = {}): Message {
@@ -66,14 +68,20 @@ function picnic(edited: boolean): Conversation {
 
 function lighthouse(png: Uint8Array, blob: Uint8Array): Conversation {
   const id = CHATGPT_CONVERSATIONS.lighthouse, at = 1_767_398_400;
-  return conversation(id, "Lighthouse survey", at, at + 3_600, `${id}-reply`, [
+  const briefing: MappingNode = { id: `${id}-briefing-node`, parent: `${id}-root`,
+    message: message(`${id}-briefing`, "system", at + 5, text(`${INSTRUCTION_MARKER}: a system briefing with private notes.`)) };
+  const hidden = message(`${id}-nested-hidden`, "assistant", at + 16, text(`${INSTRUCTION_MARKER}: a nested hidden message.`),
+    { metadata: { is_visually_hidden_from_conversation: true } });
+  return conversation(id, "Lighthouse survey", at, at + 3_600, `${id}-reply`, [briefing,
     node(`${id}-root`, message(`${id}-upload`, "user", at + 10, { content_type: "multimodal_text", parts: [
       { content_type: "image_asset_pointer", asset_pointer: `sediment://${PNG_FILE.id}`, size_bytes: png.byteLength, width: 1, height: 1 },
       "Here are the lighthouse photo and the survey data."] },
     { metadata: { attachments: [
       { id: PNG_FILE.id, name: "lighthouse.png", size: png.byteLength, mime_type: "image/png", width: 1, height: 1 },
       { id: BLOB_FILE.id, name: "survey.dat", size: blob.byteLength, mime_type: "application/octet-stream" }] } })),
-    node(`${id}-upload`, message(`${id}-reply`, "assistant", at + 20, text("The lighthouse survey data looks complete."))),
+    node(`${id}-upload`, message(`${id}-reply`, "assistant", at + 20, text(SURVEY_REPLY), { metadata: {
+      aggregate_result: { messages: [message(`${id}-nested-system`, "system", at + 15, text(`${INSTRUCTION_MARKER}: a nested system message.`)), hidden] },
+      citations: [{ metadata: { user_context_message_data: { about_user_message: `${INSTRUCTION_MARKER}: a nested custom instruction.` } } }] } })),
   ]);
 }
 
@@ -111,15 +119,38 @@ export function onePixelPng(): Buffer {
 
 export function chatGptExports(blob: Uint8Array): { first: ExportMember[]; second: ExportMember[] } {
   const png = onePixelPng();
+  const library = [{ origination_thread_id: CHATGPT_CONVERSATIONS.lighthouse, origination_message_id: `${CHATGPT_CONVERSATIONS.lighthouse}-briefing`,
+    file_id: NOTES_FILE.id, file_name: "notes.txt", mime_type: "text/plain", metadata: { user_context_message_data: `${INSTRUCTION_MARKER}: library metadata.` } }];
   const members = (conversations: Conversation[]): ExportMember[] => [
     { name: "conversations.json", bytes: Buffer.from(JSON.stringify(conversations)), method: "deflated" },
+    { name: "library_files.json", bytes: Buffer.from(JSON.stringify(library)), method: "deflated" },
     { name: PNG_FILE.member, bytes: png, method: "deflated" },
     { name: BLOB_FILE.member, bytes: blob, method: "stored" },
+    { name: NOTES_FILE.member, bytes: Buffer.from(`${INSTRUCTION_MARKER}: notes attached to a system briefing.`), method: "deflated" },
   ];
   return {
     first: members([picnic(false), lighthouse(png, blob), kayak(false), tent()]),
     second: members([picnic(true), lighthouse(png, blob), kayak(true), tent()]),
   };
+}
+
+/** The same export with the photo's bytes changed and its length kept. */
+export function withChangedPhoto(members: readonly ExportMember[]): { members: ExportMember[]; digest: string } {
+  const photo = Buffer.from(onePixelPng());
+  photo.writeUInt8(photo.readUInt8(photo.length - 1) ^ 0xff, photo.length - 1);
+  return { members: members.map((member) => member.name === PNG_FILE.member ? { ...member, bytes: photo } : member), digest: sha256(photo) };
+}
+
+/** A ZIP whose stored photo has one flipped byte while both of its CRC fields still describe the original. */
+export async function writeDamagedExportZip(path: string, members: readonly ExportMember[]): Promise<void> {
+  const photo = members.find((member) => member.name === PNG_FILE.member);
+  if (photo === undefined) throw new Error("The export has no photo to damage");
+  await writeExportZip(path, members.map((member) => member === photo ? { ...member, method: "stored" } : member));
+  const archive = await readFile(path), at = archive.indexOf(photo.bytes);
+  if (at < 0) throw new Error("The stored photo is not in the archive");
+  const last = at + photo.bytes.byteLength - 1;
+  archive.writeUInt8(archive.readUInt8(last) ^ 0xff, last);
+  await writeFile(path, archive);
 }
 
 export function sha256(bytes: Uint8Array): string { return createHash("sha256").update(bytes).digest("hex"); }

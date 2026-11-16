@@ -19,7 +19,7 @@ import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
 import type { SavedMatch } from "../src/generated/SavedMatch.js";
 import { HistoryStore } from "../src/history.js";
 import { CHATGPT_CONVERSATIONS, chatGptExports, INSTRUCTION_MARKER, KAYAK, MALICIOUS_TOOL_TEXT, onePixelPng, PICNIC,
-  sha256, writeExportFolder, writeExportZip } from "./fixtures/chatgpt-export.js";
+  sha256, withChangedPhoto, writeDamagedExportZip, writeExportFolder, writeExportZip } from "./fixtures/chatgpt-export.js";
 
 type Run = { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string };
 type Owned = { child: ChildProcess; closed: Promise<Run> };
@@ -155,7 +155,9 @@ test("a ChatGPT export imports resumably and idempotently through an isolated co
     const blob = randomBytes(64 * 1024 * 1024), blobDigest = sha256(blob), pngDigest = sha256(onePixelPng());
     const { first, second } = chatGptExports(blob);
     const exportOne = join(exports, "export-1.zip"), exportTwo = join(exports, "export-2.zip"), extracted = join(exports, "export-1");
+    const damaged = join(exports, "export-damaged.zip"), exportThree = join(exports, "export-3.zip"), changedPhoto = withChangedPhoto(second);
     await writeExportZip(exportOne, first); await writeExportZip(exportTwo, second); await writeExportFolder(extracted, first);
+    await writeDamagedExportZip(damaged, first); await writeExportZip(exportThree, changedPhoto.members);
 
     const harness = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(state, "session.sqlite"))),
       { models: createModels(), registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
@@ -173,6 +175,16 @@ test("a ChatGPT export imports resumably and idempotently through an isolated co
     let server = await serve();
     const main = ROOT_CONVERSATION_ID.toString();
     const codexBaseline = (await read(codexConversation)).raw, mainBaseline = (await read(main)).raw;
+
+    for (const check of [["--check"], []]) {
+      const refused = await launch(["import", "chatgpt", ...check, damaged]).closed;
+      assert.equal(refused.code, 1, `A damaged export is refused${check.length > 0 ? " by --check" : ""}:\n${refused.stderr}`);
+      assert.match(refused.stderr, /fails its checksum\. Nothing was imported\./);
+    }
+    assert.equal(await status(), undefined, "A refused export records no import");
+    assert.equal(await stat(assets).then(() => true, () => false), false, "A refused export retains no attachment");
+    assert.deepEqual((await search("lighthouse", "--mode", "keyword")).matches.filter((match) => match.imported?.source === "chatgpt"), [],
+      "A refused export indexes nothing");
 
     const interrupted = launch(["--json", "--no-tui", "import", "chatgpt", exportOne]);
     const stdout = interrupted.child.stdout;
@@ -214,7 +226,6 @@ test("a ChatGPT export imports resumably and idempotently through an isolated co
     assert.equal(resumed.run.code, 0, resumed.run.stderr);
     assert.equal(resumed.final.phase, "complete");
     assert.ok(resumed.final.threads_unchanged >= 1, "A conversation committed before the interruption is not reread");
-    assert.equal(resumed.final.items_added, EXPORT_ONE_ITEMS - partial.items_added);
 
     const ids = {
       picnic: await conversationOf(CHATGPT_CONVERSATIONS.picnic, "picnic"),
@@ -241,10 +252,18 @@ test("a ChatGPT export imports resumably and idempotently through an isolated co
     const written = [...Object.values(afterFirst).map((value) => value.raw), ...injected.map((value) => value.raw), instructions.raw];
     for (const name of await readdir(state, { recursive: true })) {
       const path = join(state, name);
-      if (path.startsWith(assets) || !(await stat(path)).isFile()) continue;
+      if (!(await stat(path)).isFile()) continue;
       written.push((await readFile(path)).toString("latin1"));
     }
-    assert.ok(written.every((value) => !value.includes(INSTRUCTION_MARKER)), "Instructions are never stored, rendered or indexed");
+    const leaked = written.flatMap((value) => {
+      const at = value.indexOf(INSTRUCTION_MARKER);
+      return at < 0 ? [] : [value.slice(Math.max(0, at - 200), at + 200)];
+    });
+    assert.deepEqual(leaked, [], "Instructions, hidden messages and their files are never stored, retained, rendered or indexed");
+    assert.equal(resumed.final.items_added, EXPORT_ONE_ITEMS - partial.items_added);
+    const firstAssets = (await readdir(assets)).sort();
+    assert.ok(firstAssets.includes(blobDigest) && firstAssets.includes(pngDigest), firstAssets.join("\n"));
+    assert.equal(firstAssets.length, 3, "The two attachments and the long survey reply's cold evidence are retained");
     assert.deepEqual(events((await cli("--json", "tasks", "list")).stdout), [{ type: "tasks", tasks: [] }]);
     assert.equal((await read(main)).raw, mainBaseline, "Importing adds no notice, input or answer to the main conversation");
 
@@ -265,12 +284,20 @@ test("a ChatGPT export imports resumably and idempotently through an isolated co
     const edited = await read(ids.picnic);
     assert.deepEqual(shown(edited.messages), [["notice", NOTICE], ["user", PICNIC.eight], ["assistant", PICNIC.eightReply]]);
     assert.deepEqual(shown((await read(ids.kayak)).messages), [["user", KAYAK.prompt], ["notice", NOTICE], ["assistant", KAYAK.regenerated]]);
-    assert.deepEqual((await readdir(assets)).sort(), [blobDigest, pngDigest].sort(), "Retained attachments are stored once");
+    assert.deepEqual((await readdir(assets)).sort(), firstAssets, "Retained attachments are stored once");
 
     const older = await importExport(exportOne);
     assert.equal(older.run.code, 0, older.run.stderr);
     assert.equal(older.final.items_added, 0);
     assert.deepEqual((await read(ids.picnic)).messages, edited.messages, "An older export never replaces the newer view");
+
+    const photo = await importExport(exportThree);
+    assert.equal(photo.run.code, 0, photo.run.stderr);
+    assert.equal(photo.final.threads_unchanged, 3, "Only the conversation that references the changed photo is reread");
+    assert.ok(photo.final.items_added >= 1, "The photo's new bytes make a new version of the message that carries it");
+    const photoAssets = await readdir(assets);
+    assert.ok(photoAssets.includes(changedPhoto.digest), "A same-size photo with different bytes is retained");
+    assert.ok(photoAssets.includes(pngDigest), "The earlier photo stays as evidence");
 
     server.child.kill("SIGINT");
     const stopped = await server.closed;
