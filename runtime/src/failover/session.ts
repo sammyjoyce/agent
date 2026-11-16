@@ -1,0 +1,62 @@
+import { readFile } from "node:fs/promises";
+import type { FailoverSession } from "../generated/FailoverSession.js";
+import { AuthorityClient } from "./authority-client.js";
+import { counter, object, text, uuid, type Field } from "./authority-wire.js";
+
+/** The environment variable in which Rust passes a `FailoverSession` as private JSON. */
+const VARIABLE = "AGENT_FAILOVER";
+
+type Reach = Pick<FailoverSession, "url" | "token_file" | "coordinator_id">;
+const reach = { url: text, token_file: text, coordinator_id: uuid };
+const watcherSession = object<Reach>(reach);
+const holderSession = object<Reach & { holder: string }>({ ...reach, holder: uuid });
+const epochSession = object<Reach & { holder: string; epoch: number }>({ ...reach, holder: uuid, epoch: counter });
+
+/** How the Pi child of a replicated coordinator reaches the authority, and the epoch its start was granted. */
+export interface OwnerSession {
+  readonly link: AuthorityClient;
+  readonly holder: string;
+  readonly epoch: number;
+}
+
+/** How the one-shot helper reaches the authority. A session without a holder can only read the record. */
+export interface HelperSession {
+  readonly link: AuthorityClient;
+  readonly holder: string | undefined;
+}
+
+export interface SessionOptions {
+  /** Bounds each request to the authority. */
+  readonly timeoutMs?: number;
+  /** An abort cuts every request in flight. */
+  readonly signal?: AbortSignal;
+}
+
+/** Parses the Pi child's session, which must name a holder and an epoch. */
+export async function ownerSession(value: string, options: SessionOptions = {}): Promise<OwnerSession> {
+  const session = parse(value, epochSession);
+  return { link: await client(session, options), holder: session.holder, epoch: session.epoch };
+}
+
+/** Parses the helper's session, which never names an epoch and names a holder unless its host only watches the record. */
+export async function helperSession(value: string | undefined, options: SessionOptions = {}): Promise<HelperSession> {
+  if (value === undefined) throw new Error(`${VARIABLE} is not set`);
+  const session = parse(value, (given, path): Reach & { holder?: string } =>
+    typeof given === "object" && given !== null && "holder" in given ? holderSession(given, path) : watcherSession(given, path));
+  return { link: await client(session, options), holder: session.holder };
+}
+
+function parse<T>(value: string, field: Field<T>): T {
+  let given: unknown;
+  try { given = JSON.parse(value); }
+  catch { throw new Error(`${VARIABLE} is not JSON`); }
+  return field(given, VARIABLE);
+}
+
+async function client({ url, token_file, coordinator_id }: Reach, options: SessionOptions): Promise<AuthorityClient> {
+  let token: string;
+  try { token = (await readFile(token_file, "utf8")).trim(); }
+  catch (error) { throw new Error(`The failover token file ${token_file} could not be read`, { cause: error }); }
+  if (token === "") throw new Error(`The failover token file ${token_file} is empty`);
+  return new AuthorityClient({ url, coordinatorId: coordinator_id, token, ...options });
+}
