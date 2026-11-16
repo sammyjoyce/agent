@@ -25,6 +25,7 @@ export async function conversationSettings(tasks: TaskStore, environment: Coordi
   if (actor !== undefined && command.conversation_id !== undefined && actor.conversation_id !== command.conversation_id) {
     throw new ModelError("The saved conversation does not belong to this task agent.");
   }
+  if (task !== undefined && command.change !== null) tasks.refuseConfinedWrite(task);
   const conversation = actor !== undefined ? await tasks.conversation(actor.conversation_id) : command.conversation_id !== undefined
     ? await tasks.conversation(command.conversation_id) : await tasks.session.root(BACKGROUND_CONTEXT);
   const fallback = actor?.model ?? task?.model ?? await environment.model(null);
