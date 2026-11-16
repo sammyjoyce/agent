@@ -99,9 +99,8 @@ fn searched(requests: &[SearchRequest], (enter, end): (Instant, Instant)) -> Res
 }
 
 fn imported(progress: &[ImportProgress], (enter, end): (Instant, Instant)) -> Result<()> {
-    let committed = |event: &&ImportProgress| {
-        event.phase == ImportPhase::Importing && event.items_added > 0
-    };
+    let committed =
+        |event: &&ImportProgress| event.phase == ImportPhase::Importing && event.items_added > 0;
     progress
         .iter()
         .filter(committed)
@@ -239,7 +238,11 @@ mod tests {
 
     fn import_verdict(events: &[(u64, ImportPhase, u32)]) -> Result<()> {
         let origin = Instant::now();
-        verify(Background::Import, &progress(origin, events), &marks(origin))
+        verify(
+            Background::Import,
+            &progress(origin, events),
+            &marks(origin),
+        )
     }
 
     use ImportPhase::{Complete, Discovering, Importing, Indexing, Partial};

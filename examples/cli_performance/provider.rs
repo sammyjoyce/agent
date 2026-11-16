@@ -374,7 +374,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::coordinator::node;
+    use crate::coordinator::installed;
 
     const EXIT_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -407,7 +407,7 @@ exec sleep 60 >/dev/null"#;
                 .spawn()
                 .unwrap();
             let call = ToolFixture {
-                node: node().unwrap(),
+                node: installed("node").unwrap(),
                 pid_file: pid_file.clone(),
                 owner: owner.id(),
             }

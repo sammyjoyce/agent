@@ -18,9 +18,15 @@ use tokio::{
 
 use crate::{
     DEADLINE,
+    background::Background,
     provider::{Provider, Request, ToolFixture},
     scenario::Turn,
 };
+
+/// Snapshot subdirectories that the seed fills. Only coordinators whose
+/// background needs them receive a copy.
+pub const SEARCH_INDEX: &str = "search";
+pub const CODEX_CORPUS: &str = "codex";
 
 /// Answers the coordinator's local-node discovery and the CLI's per-input
 /// identity check without starting Node inside a timed interval.
@@ -45,20 +51,63 @@ const RECEIPTS: &[&str] = &[
     "interrupted",
 ];
 
-pub fn node() -> Result<PathBuf> {
+pub fn installed(program: &str) -> Result<PathBuf> {
     let paths = std::env::var_os("PATH").context("PATH is required")?;
-    let node = std::env::split_paths(&paths)
-        .map(|path| path.join("node"))
+    let found = std::env::split_paths(&paths)
+        .map(|path| path.join(program))
         .find(|path| path.is_file())
-        .context("Node is required")?;
-    Ok(fs::canonicalize(node)?)
+        .with_context(|| format!("{program} is required on PATH"))?;
+    Ok(fs::canonicalize(found)?)
+}
+
+fn copy_files(from: &Path, to: &Path) -> Result<()> {
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            fs::copy(entry.path(), to.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+fn quoted(path: &Path) -> Result<String> {
+    let text = path.to_str().context("A fixture path is not UTF-8")?;
+    ensure!(
+        !text.contains('\''),
+        "A fixture path contains a quote: {text}"
+    );
+    Ok(format!("'{text}'"))
+}
+
+/// Records the pid of the Codex history reader the coordinator starts, which
+/// then replaces the wrapper under the same pid.
+fn codex_wrapper(pid_file: &Path) -> Result<String> {
+    Ok(format!(
+        "#!/bin/sh\nprintf '%s' \"$$\" > {}\nexec {} \"$@\"\n",
+        quoted(pid_file)?,
+        quoted(&installed("codex")?)?
+    ))
 }
 
 pub fn isolated(command: &mut Command, directory: &Path) -> Result<()> {
     let bin = directory.join("bin");
     if !bin.exists() {
         fs::create_dir(&bin)?;
-        std::os::unix::fs::symlink(node()?, bin.join("node"))?;
+        std::os::unix::fs::symlink(installed("node")?, bin.join("node"))?;
         fs::write(bin.join("rex"), REX)?;
         fs::set_permissions(bin.join("rex"), fs::Permissions::from_mode(0o700))?;
     }
@@ -181,6 +230,7 @@ pub struct Closed {
 }
 
 pub struct Coordinator {
+    background: Background,
     child: Child,
     directory: tempfile::TempDir,
     provider: Provider,
@@ -193,16 +243,12 @@ impl Coordinator {
         runtime: &Path,
         snapshot: &Path,
         turns: &'static [Turn],
+        background: Background,
     ) -> Result<Self> {
         let directory = tempfile::tempdir()?;
         let path = directory.path();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-        for entry in fs::read_dir(snapshot)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                fs::copy(entry.path(), path.join(entry.file_name()))?;
-            }
-        }
+        copy_files(snapshot, path)?;
         fs::write(path.join("config.toml"), "")?;
         fs::write(path.join("AGENTS.md"), "")?;
         let mut command = Command::new(binary);
@@ -230,6 +276,19 @@ impl Coordinator {
                 format!("http://{}", listener.local_addr()?),
             )
             .env("AGENT_PERFORMANCE_RUNTIME_PID", path.join("runtime.pid"));
+        match background {
+            Background::None => {}
+            Background::Search => {
+                command.env("AGENT_SQLITE_VEC", sqlite_vec()?);
+                copy_files(&snapshot.join(SEARCH_INDEX), path)?;
+            }
+            Background::Import => {
+                copy_tree(&snapshot.join(CODEX_CORPUS), &path.join(".codex"))?;
+                let codex = path.join("bin/codex");
+                fs::write(&codex, codex_wrapper(&path.join("codex.pid"))?)?;
+                fs::set_permissions(codex, fs::Permissions::from_mode(0o700))?;
+            }
+        }
         let child = command.spawn()?;
         let provider = Provider::start(
             listener,
@@ -241,6 +300,7 @@ impl Coordinator {
             },
         );
         let mut coordinator = Self {
+            background,
             child,
             directory,
             provider,
@@ -273,6 +333,10 @@ impl Coordinator {
         Ok(coordinator)
     }
 
+    pub fn background(&self) -> Background {
+        self.background
+    }
+
     pub fn directory(&self) -> &Path {
         self.directory.path()
     }
@@ -293,6 +357,10 @@ impl Coordinator {
 
     pub fn tool_pid_file(&self) -> PathBuf {
         self.directory().join("tool.pid")
+    }
+
+    pub fn codex_pid_file(&self) -> PathBuf {
+        self.directory().join("codex.pid")
     }
 
     pub fn requests(&self) -> Result<Vec<Request>> {
@@ -351,6 +419,12 @@ impl Coordinator {
             receipts: receipts(&directory.path().join("diagnostics"))?,
         })
     }
+}
+
+pub fn sqlite_vec() -> Result<std::ffi::OsString> {
+    std::env::var_os("AGENT_SQLITE_VEC").context(
+        "Search contention needs sqlite-vec; set AGENT_SQLITE_VEC, as the Nix development shells do",
+    )
 }
 
 pub fn read_pid(path: &Path) -> Result<i32> {

@@ -1,6 +1,7 @@
 mod background;
 mod coordinator;
 mod gate;
+mod load;
 mod provider;
 mod report;
 mod resources;
@@ -18,9 +19,10 @@ use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use tokio::{process::Command, time::timeout};
 
-use coordinator::{Coordinator, Receipts, isolated};
+use background::Background;
+use coordinator::{Coordinator, Receipts, isolated, sqlite_vec};
 use gate::Version;
-use report::Sample;
+use report::{ImportCorpus, Sample, SearchCorpus};
 use scenario::{Lifetime, Scenario};
 use session::Context;
 
@@ -59,6 +61,8 @@ struct Arguments {
 struct Seed {
     chief: String,
     long_history: String,
+    search_corpus: Option<SearchCorpus>,
+    import_corpus: ImportCorpus,
 }
 
 struct Versions {
@@ -116,10 +120,16 @@ async fn run(mut options: Arguments) -> Result<()> {
     };
     let snapshot = tempfile::tempdir()?;
     fs::set_permissions(snapshot.path(), fs::Permissions::from_mode(0o700))?;
+    let searches = scenarios
+        .iter()
+        .any(|scenario| scenario.definition().background == Background::Search);
     let mut command = Command::new("node");
     command.arg(&options.seed).arg(snapshot.path());
     isolated(&mut command, snapshot.path())?;
-    let seeded = timeout(Duration::from_secs(60), command.output())
+    if searches {
+        command.env("AGENT_SQLITE_VEC", sqlite_vec()?);
+    }
+    let seeded = timeout(Duration::from_secs(180), command.output())
         .await
         .context("Synthetic history seeding did not finish")??;
     ensure!(
@@ -132,9 +142,21 @@ async fn run(mut options: Arguments) -> Result<()> {
         !seed.chief.is_empty(),
         "The native chief conversation is missing"
     );
+    ensure!(
+        !searches || seed.search_corpus.is_some(),
+        "The seed built no search index"
+    );
     let start = async |version| {
         let (binary, runtime) = versions.of(version);
-        Coordinator::start(binary, &options.runtime_shim, runtime, snapshot.path(), &[]).await
+        Coordinator::start(
+            binary,
+            &options.runtime_shim,
+            runtime,
+            snapshot.path(),
+            &[],
+            Background::None,
+        )
+        .await
     };
     let mut shared = BTreeMap::new();
     if scenarios
@@ -177,6 +199,7 @@ async fn run(mut options: Arguments) -> Result<()> {
                                 runtime,
                                 snapshot.path(),
                                 definition.turns,
+                                definition.background,
                             )
                             .await?,
                         ),
@@ -208,8 +231,9 @@ async fn run(mut options: Arguments) -> Result<()> {
                     closed?;
                     scenario::verify(*scenario, &outcome, &requests).map_err(|error| {
                         anyhow!(
-                            "{scenario:?} {version:?} pair {pair}: {error:#}\nmarks: {:?}\nprovider requests: {requests:?}\nvisible screen:\n{}",
+                            "{scenario:?} {version:?} pair {pair}: {error:#}\nmarks: {:?}\nprovider requests: {requests:?}\nbackground: {:?}\nvisible screen:\n{}",
                             outcome.marks,
+                            outcome.background,
                             outcome.screen
                         )
                     })?;
@@ -237,7 +261,7 @@ async fn run(mut options: Arguments) -> Result<()> {
     }
     let samples = measured?;
     closed.into_iter().collect::<Result<Vec<_>>>()?;
-    let report = report::build(&scenarios, samples)?;
+    let report = report::build(&scenarios, samples, &seed)?;
     fs::write(&options.output, serde_json::to_vec_pretty(&report)?)?;
     report::print(&report);
     ensure!(
