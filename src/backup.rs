@@ -213,7 +213,7 @@ pub fn restore_held(_owner: &WriterLock, state: &Path) -> bool {
 
 pub fn hold_notice(state: &Path) -> String {
     format!(
-        "Background work, task workers, automatic worktree collection and phone notifications are held after a restore until `beep-boop --state-dir {} backup release`.",
+        "Background work, task turns, automatic worktree collection and phone notifications are held after a restore until `beep-boop --state-dir {} backup release`.",
         state.display()
     )
 }

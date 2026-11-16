@@ -269,8 +269,8 @@ recovery; [history](history.md) describes import and retrieval.
   `beep-boop backup create` copies a stopped coordinator's database,
   coordinator ID, attachments, history assets and feedback with a checksummed
   manifest. `backup restore` checks the archive and rebuilds the store in a new
-  directory. Background work, task workers and automatic worktree collection
-  stay held until `backup release`. See
+  directory. Background work, task turns and automatic worktree collection stay
+  held until `backup release`. See
   [backups and restore](setup.md#backups-and-restore).
 - [ ] Replicated coordinator state and failover, retaining one active owner so
   additional coordinators do not duplicate work or external effects.

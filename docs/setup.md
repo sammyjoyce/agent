@@ -686,18 +686,18 @@ run this work:
 - Scheduled jobs, source polling, automatic triage and automatic history
   indexing.
 - Phone notifications.
-- Task workers, so no backed-up task turn resumes.
+- Task turns. The coordinator starts no task actor and refuses the worker that
+  a task's terminal starts, so no backed-up task turn resumes.
 - Worktree collection, both the collection that each registered worker requests
   on its own and `beep-boop resources collect`.
 
 A held store is not a read-only copy. It serves history and attachments, and it
 runs chats and the other commands you send. A chat's tool calls run on hosts
 and in the browser, and its own tool can still collect worktrees. A chat can
-create tasks and open their terminals, but the coordinator refuses their task
-workers until the release. `/feedback` saves its report and opens a repair
-terminal on the reporting machine, and the coordinator refuses the task worker
-in that terminal too. `beep-boop import codex` imports history and indexes
-what it imports.
+create tasks, send them input and open their terminals, but no task turn runs
+until the release. `/feedback` saves its report and opens a repair terminal on
+the reporting machine, and the repair turn waits too. `beep-boop import codex`
+imports history and indexes what it imports.
 
 The restored coordinator has the same coordinator ID, so do not run it while
 the original still runs. Check the hosts first, for example that work a
