@@ -120,6 +120,32 @@ class PlanTests(unittest.TestCase):
             self.assertIn("names no test target", phone.xctestrun_problems(empty)[0])
 
 
+class RunnerLaunchTests(unittest.TestCase):
+    """The runner refuses a coordinator its menu lacks, so the name must reach it unchanged."""
+
+    def launched_with(self, argv):
+        with tempfile.TemporaryDirectory() as directory:
+            arguments = phone.parse_arguments([*argv, "--out", str(Path(directory) / "run")])
+            arguments.app = "dev.example.Agent"
+            with patch.object(phone.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as launch:
+                phone.run_runner(Path("plan.xctestrun"), "platform=iOS Simulator,id=SIM", arguments,
+                                 rehearsal=argv[0] == "simulator")
+        return launch.call_args.kwargs["env"]
+
+    def test_an_unknown_rehearsal_coordinator_reaches_the_runner_unchanged(self):
+        environment = self.launched_with(["simulator", "--simulator", "SIM", "--coordinator", "Nobody"])
+        self.assertEqual(environment["TEST_RUNNER_PHONE_ACCEPTANCE_COORDINATOR"], "Nobody")
+        self.assertEqual(environment["TEST_RUNNER_PHONE_ACCEPTANCE_REHEARSAL"], "1")
+
+    def test_the_device_coordinator_reaches_the_runner_unchanged(self):
+        environment = self.launched_with([
+            "device", "--device", "00000000-0000000000000000", "--app", "dev.example.Agent",
+            "--team", "EXAMPLE123", "--runner-bundle", "dev.example.PhoneAcceptanceTests",
+            "--coordinator", "Studio"])
+        self.assertEqual(environment["TEST_RUNNER_PHONE_ACCEPTANCE_COORDINATOR"], "Studio")
+        self.assertNotIn("TEST_RUNNER_PHONE_ACCEPTANCE_REHEARSAL", environment)
+
+
 def send_record(label, problems=()):
     return {
         "kind": "send", "test": "ComposerRecurrenceTests/testTwoConsecutiveSendsKeepTheKeyboardUp()",
