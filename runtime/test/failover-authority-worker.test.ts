@@ -10,7 +10,7 @@ import { commandHolder } from "../src/failover/authority-wire.js";
 import type { AuthorityCommand } from "../src/generated/AuthorityCommand.js";
 import type { AuthorityReply } from "../src/generated/AuthorityReply.js";
 import type { LogEntry } from "../src/generated/LogEntry.js";
-import { cellCheckpoint, cellCommand, cellLog, cells, cellStates, digests, entry, holders, manifest, orion, scriptedSequences, tarantula,
+import { cellCheckpoint, cellCommand, cellLog, cells, cellStates, digests, entry, holders, manifest, manifestBytes, orion, scriptedSequences, tarantula,
   type Outcome, type Script } from "./fixtures/failover-authority-cells.js";
 import { startAuthority } from "./fixtures/failover-workerd.js";
 
@@ -30,11 +30,16 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
     { coordinator: readOnlyCoordinator, holder: null },
   ] });
   let used = 1;
-  const fresh = () => coordinatorIds[used++] ?? assert.fail("the test ran out of coordinator ids");
   const token = (coordinator: string, holder: string | null) =>
     authority.credentials.find((credential) => credential.coordinator === coordinator && credential.holder === holder)!.token;
   const link = (coordinator: string, holder: string | null = tarantula) =>
     new AuthorityClient({ url: authority.url, coordinatorId: coordinator, token: token(coordinator, holder) });
+  const bare = () => coordinatorIds[used++] ?? assert.fail("the test ran out of coordinator ids");
+  const fresh = async () => {
+    const coordinator = bare();
+    await link(coordinator).putBlob(manifest, manifestBytes);
+    return coordinator;
+  };
   const play = async (coordinator: string, script: Script) => {
     for (const [command, expected] of script) {
       assert.equal(outcome(await link(coordinator, commandHolder(command)).command(command)), expected, JSON.stringify(command));
@@ -65,7 +70,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
     const vacant: Script = [...sealed, [{ op: "release", holder: tarantula, epoch: 3, evidence: "released" }, "accepted"]];
     const setups = [active, sealed, vacant];
     const answer = async (setup: Script | undefined, name: string, caller: string) => {
-      const coordinator = fresh();
+      const coordinator = await fresh();
       if (setup !== undefined) {
         await play(coordinator, setup);
         assert.deepEqual(await link(coordinator).record(), { state: cellStates[setups.indexOf(setup)], checkpoint: cellCheckpoint });
@@ -82,7 +87,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
 
   await t.test("the rules' scripted sequences end in the same record and log", async () => {
     for (const [name, sequence] of Object.entries(scriptedSequences)) {
-      const coordinator = fresh();
+      const coordinator = await fresh();
       await play(coordinator, sequence.steps);
       assert.deepEqual(await link(coordinator).record(), sequence.record, name);
       if (sequence.record === undefined) await assert.rejects(link(coordinator).log(0, 64), status(404, AuthorityRejected), name);
@@ -91,7 +96,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
   });
 
   await t.test("of appends for one position sent at the same time, one is accepted and the rest are conflicts", async () => {
-    const coordinator = fresh();
+    const coordinator = await fresh();
     const bytes = Buffer.from("invented bytes that make each append wait on the blob store");
     await link(coordinator).putBlob(sha256(bytes), bytes);
     await play(coordinator, [[enroll, "accepted"]]);
@@ -108,14 +113,14 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
   });
 
   await t.test("one hundred sequential appends leave the head at 100 with no gap", async () => {
-    const coordinator = fresh();
+    const coordinator = await fresh();
     await play(coordinator, [[enroll, "accepted"], ...Array.from({ length: 100 }, (_, index) => [append(index + 1), "accepted"] as const)]);
     assert.equal(await head(coordinator), 100);
     assert.deepEqual((await pages(coordinator)).flat().map((logged) => logged.at), Array.from({ length: 100 }, (_, index) => index + 1));
   });
 
   await t.test("a repeat of an append whose reply was lost is accepted and writes nothing", async () => {
-    const coordinator = fresh();
+    const coordinator = await fresh();
     await play(coordinator, [[enroll, "accepted"], [append(1), "accepted"]]);
     const before = await link(coordinator).log(0, 64);
     const repeat = await link(coordinator).command(append(1));
@@ -125,7 +130,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
   });
 
   await t.test("an append naming a missing blob is refused until the blob is stored", async () => {
-    const coordinator = fresh();
+    const coordinator = await fresh();
     const attachment = Buffer.from("invented attachment bytes");
     const batch = Buffer.from(JSON.stringify([{ invented: "batch" }]));
     const withFile = append(1, { files: [{ path: "attachments/a1/content", sha256: sha256(attachment), size: attachment.length }] });
@@ -140,8 +145,25 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
     assert.equal(await head(coordinator), 2);
   });
 
+  await t.test("an enrollment or a checkpoint naming a manifest the blob store lacks is refused until the manifest is stored", async () => {
+    const coordinator = bare();
+    await play(coordinator, [[enroll, "missing_blob"]]);
+    assert.equal(await link(coordinator).record(), undefined);
+    await link(coordinator).putBlob(manifest, manifestBytes);
+    await play(coordinator, [[enroll, "accepted"], [append(1), "accepted"], [append(2), "accepted"]]);
+
+    const later = Buffer.from("invented backup manifest through entry 2");
+    const checkpoint: AuthorityCommand = { op: "checkpoint", holder: tarantula, epoch: 1, record: { through: 2, manifest: sha256(later) } };
+    const before = await link(coordinator).log(0, 64);
+    await play(coordinator, [[checkpoint, "missing_blob"]]);
+    assert.deepEqual(await link(coordinator).log(0, 64), before, "the record, the head and the log entries are unchanged");
+    await link(coordinator).putBlob(sha256(later), later);
+    await play(coordinator, [[checkpoint, "accepted"]]);
+    assert.deepEqual(await link(coordinator).log(0, 64), { record: { ...before.record, checkpoint: { through: 2, manifest: sha256(later) } }, entries: [] });
+  });
+
   await t.test("a 12 MiB blob round-trips and bytes that do not match their hash are refused", async () => {
-    const coordinator = fresh();
+    const coordinator = await fresh();
     const large = randomBytes(12 * 1024 * 1024);
     await link(coordinator).putBlob(sha256(large), large);
     const back = await link(coordinator).getBlob(sha256(large));
@@ -158,7 +180,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
   });
 
   await t.test("a command body over 1 MiB is refused and an inline batch of 256 KiB is accepted", async () => {
-    const coordinator = fresh();
+    const coordinator = await fresh();
     await play(coordinator, [[enroll, "accepted"]]);
     const oversized = append(1, { batch: { kind: "inline", json: "x".repeat(1024 * 1024) } });
     await assert.rejects(link(coordinator).command(oversized), status(413, AuthorityRejected));
@@ -170,7 +192,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
   });
 
   await t.test("two coordinator ids are two objects with separate credentials and blobs", async () => {
-    const first = fresh(), second = fresh();
+    const first = await fresh(), second = await fresh();
     const bytes = Buffer.from("invented bytes of the first coordinator");
     await play(first, [[enroll, "accepted"], [append(1), "accepted"]]);
     await link(first).putBlob(sha256(bytes), bytes);
@@ -191,6 +213,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
     const wrong = new AuthorityClient({ url: authority.url, coordinatorId: coordinator, token: "invented-wrong-token" });
     await assert.rejects(wrong.record(), status(401, AuthorityDenied));
 
+    await link(coordinator).putBlob(manifest, manifestBytes);
     await play(coordinator, [[enroll, "accepted"]]);
     await assert.rejects(link(coordinator, tarantula).command({ op: "claim", holder: orion }), status(403, AuthorityDenied));
     await assert.rejects(link(coordinator, tarantula).command({ op: "activate", candidate: orion, applied: 0 }), status(403, AuthorityDenied));
@@ -205,14 +228,14 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
   });
 
   await t.test("following the log page by page returns every entry once, in order, in bounded pages", async () => {
-    const coordinator = fresh();
+    const coordinator = await fresh();
     await play(coordinator, [[enroll, "accepted"], ...Array.from({ length: 150 }, (_, index) => [append(index + 1), "accepted"] as const)]);
     const capped = await pages(coordinator, 1_000);
     assert.deepEqual(capped.map((page) => page.length), [64, 64, 22]);
     assert.deepEqual(capped.flat().map((logged) => logged.at), Array.from({ length: 150 }, (_, index) => index + 1));
     assert.deepEqual((await pages(coordinator, 7)).flat(), capped.flat());
 
-    const heavy = fresh();
+    const heavy = await fresh();
     const large = (at: number) => append(at, { batch: { kind: "inline", json: "y".repeat(900 * 1024) } });
     await play(heavy, [[enroll, "accepted"], ...[1, 2, 3, 4, 5].map((at) => [large(at), "accepted"] as const)]);
     const sized = await pages(heavy);
@@ -222,7 +245,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
   });
 
   await t.test("malformed requests are refused with 400 and a sentence", async () => {
-    const coordinator = fresh();
+    const coordinator = await fresh();
     const authorization = { authorization: `Bearer ${token(coordinator, tarantula)}` };
     const refusal = async (path: string, init: RequestInit = {}) => {
       const response = await fetch(`${authority.url}${path}`, { ...init, headers: { ...authorization, ...init.headers } });
@@ -244,7 +267,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
   });
 
   await t.test("the record, the log and a blob survive a restart of workerd", async () => {
-    const coordinator = fresh();
+    const coordinator = await fresh();
     const bytes = Buffer.from("invented bytes that must outlive a restart");
     await link(coordinator).putBlob(sha256(bytes), bytes);
     await play(coordinator, [[enroll, "accepted"],

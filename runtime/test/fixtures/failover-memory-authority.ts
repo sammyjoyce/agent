@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { decide } from "../../src/failover/authority-core.js";
 import type { AuthorityLink } from "../../src/failover/authority-link.js";
+import { commandBlobs } from "../../src/failover/authority-wire.js";
 import type { AuthorityCommand } from "../../src/generated/AuthorityCommand.js";
 import type { AuthorityRecord } from "../../src/generated/AuthorityRecord.js";
 import type { LogEntry } from "../../src/generated/LogEntry.js";
@@ -14,11 +15,7 @@ export class MemoryAuthority implements AuthorityLink {
 
   async command(command: AuthorityCommand) {
     await this.beforeCommand(command);
-    if (command.op === "append") {
-      const { batch, files } = command.entry;
-      const named = [...files.map((file) => file.sha256), ...(batch?.kind === "blob" ? [batch.sha256] : [])];
-      if (named.some((sha256) => !this.blobs.has(sha256))) return { result: "refused", reason: "missing_blob", state: this.current?.state ?? null } as const;
-    }
+    if (commandBlobs(command).some((sha256) => !this.blobs.has(sha256))) return { result: "refused", reason: "missing_blob", state: this.current?.state ?? null } as const;
     const decision = decide(this.current, structuredClone(command), (at) => this.entries.get(at)?.digest);
     this.current = decision.record;
     if (decision.write?.type === "append") this.entries.set(decision.write.entry.at, decision.write.entry);

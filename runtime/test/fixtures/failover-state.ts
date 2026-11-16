@@ -20,6 +20,7 @@ import type { AuthorityCommand } from "../../src/generated/AuthorityCommand.js";
 import type { AuthorityState } from "../../src/generated/AuthorityState.js";
 import type { LogEntry } from "../../src/generated/LogEntry.js";
 import { fixtureModel } from "../model.js";
+import { manifest, manifestBytes } from "./failover-authority-cells.js";
 import { MemoryAuthority } from "./failover-memory-authority.js";
 import { startAuthority, type LocalAuthority } from "./failover-workerd.js";
 
@@ -78,7 +79,8 @@ export async function stateDirectory(t: TestContext): Promise<string> {
 export const sessionPath = (directory: string) => join(directory, "session.sqlite");
 
 export async function enroll(link: AuthorityLink, holder = OWNER): Promise<number> {
-  return (await accepted(link, { op: "enroll", holder, checkpoint: { through: 0, manifest: "0".repeat(64) } })).epoch;
+  await link.putBlob(manifest, manifestBytes);
+  return (await accepted(link, { op: "enroll", holder, checkpoint: { through: 0, manifest } })).epoch;
 }
 
 export function tables(directory: string): Record<string, string[]> {
