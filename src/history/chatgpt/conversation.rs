@@ -741,10 +741,12 @@ impl Normalized {
                 metadata.remove(key);
             }
         }
+        let text = without_citations(&draft.text);
         let envelope = serde_json::to_value(ChatGptEnvelope {
             conversation_id: draft.conversation.to_owned(),
             node_id: draft.node.to_owned(),
             parent_id: draft.parent.map(str::to_owned),
+            text: text.clone(),
             message,
             library_files: draft.library,
         })
@@ -835,7 +837,7 @@ impl Normalized {
             turn_id: draft.turn.to_owned(),
             kind: draft.kind,
             role: draft.role,
-            text: excerpt(&without_citations(&draft.text), TEXT_EXCERPT_BYTES),
+            text: excerpt(&text, TEXT_EXCERPT_BYTES),
             version: version.clone(),
             order: self.items.len() as u64,
             timestamp_ms,
@@ -1277,7 +1279,19 @@ mod tests {
             .build());
         let answer = item(&normalized, "a1");
         assert_eq!(answer.text, "Parks open at nine. Bring water.");
+        assert_eq!(answer.data["text"], "Parks open at nine. Bring water.");
         assert_eq!(answer.data["message"]["content"]["parts"][0], text);
+    }
+
+    #[test]
+    fn long_answer_envelope_carries_the_whole_text_beside_its_excerpt() {
+        let answer = "Bring sixteen sandwiches. ".repeat(1600);
+        let normalized = run(&Conversation::new(1, "Long")
+            .say("a1", "root", "assistant", &answer)
+            .build());
+        let item = item(&normalized, "a1");
+        assert_eq!(item.data["text"], answer);
+        assert_eq!(item.text, answer[..TEXT_EXCERPT_BYTES]);
     }
 
     #[test]

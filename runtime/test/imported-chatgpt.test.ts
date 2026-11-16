@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -15,7 +15,7 @@ import { historyToolId } from "../src/message-presentation.js";
 import { ConversationModels } from "../src/models.js";
 import { TaskStore } from "../src/tasks.js";
 import { history, toolDetails } from "../src/transcript.js";
-import { chatGptBatch, type ChatGptNode } from "./fixtures/chatgpt-history.js";
+import { chatGptBatch, sha256, type ChatGptNode } from "./fixtures/chatgpt-history.js";
 
 const CONVERSATION = "00000000-0000-4000-8000-0000000000c1";
 const NOTICE = "1 other version of this message is retained as evidence and not shown.";
@@ -30,9 +30,9 @@ async function open(directory: string) {
   return { session, store, tasks };
 }
 type App = Awaited<ReturnType<typeof open>>;
-async function withApp(name: string, body: (app: App) => Promise<void>): Promise<void> {
+async function withApp(name: string, body: (app: App, directory: string) => Promise<void>): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), `agent-chatgpt-${name}-`)), app = await open(directory);
-  try { await body(app); } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  try { await body(app, directory); } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 }
 async function transcript(app: App, conversationId: string): Promise<HistoryMessage[]> {
   const conversation = await app.store.conversation(conversationId); assert.ok(conversation);
@@ -139,14 +139,61 @@ test("chatgpt kinds render with the right roles and presentations", () => withAp
   ]);
 }));
 
-test("tool details for a chatgpt code call show code and output", () => withApp("tool-details", async (app) => {
-  const conversationId = await importAll(app, chatGptBatch(CONVERSATION, 10, kinds));
+async function details(app: App, conversationId: string, node: string) {
   const conversation = await app.store.conversation(conversationId); assert.ok(conversation);
   const entries = (await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items.filter(ImportedItemEntry.is);
-  const call = entries.find((entry) => entry.data.item.id === "call"); assert.ok(call);
-  const details = await toolDetails(conversation, call.id.toString(), historyToolId(call.id.toString()), app.session);
-  assert.deepEqual(details, { type: "available", call_id: historyToolId(call.id.toString()), name: "python", status: "finished",
+  const entry = entries.find((candidate) => candidate.data.item.id === node); assert.ok(entry);
+  return { call_id: historyToolId(entry.id.toString()), details: await toolDetails(conversation, entry.id.toString(), historyToolId(entry.id.toString()), app.session) };
+}
+
+test("tool details for a chatgpt code call show code and output", () => withApp("tool-details", async (app) => {
+  const { call_id, details: shown } = await details(app, await importAll(app, chatGptBatch(CONVERSATION, 10, kinds)), "call");
+  assert.deepEqual(shown, { type: "available", call_id, name: "python", status: "finished",
     input: { type: "text", text: "print(8 * 2)", truncated: false }, output: { type: "text", text: MALICIOUS, truncated: false } });
+}));
+
+test("a parts-shaped tool output is inspected in full up to the detail limit", () => withApp("tool-output", async (app) => {
+  const complete = "Sandwich count: 16\n".repeat(1_100), long = "Blanket count: 2\n".repeat(2_500);
+  const python = { author: { role: "tool", name: "python", metadata: {} } };
+  const conversation = await importAll(app, chatGptBatch(CONVERSATION, 10, [kinds[0]!, kinds[3]!,
+    { id: "complete", parent: "call", turn: "prompt", kind: "tool:execution_output", role: "tool", text: complete, message: python },
+    { id: "long", parent: "complete", turn: "prompt", kind: "tool:execution_output", role: "tool", text: long, message: python }]));
+  const output = async (node: string) => {
+    const { details: shown } = await details(app, conversation, node);
+    assert.equal(shown.type, "available"); return shown.type === "available" ? shown.output : undefined;
+  };
+  assert.deepEqual(await output("complete"), { type: "text", text: complete, truncated: false });
+  const cut = await output("long");
+  assert.ok(cut?.type === "text" && cut.truncated && long.startsWith(cut.text) && cut.text.length >= 32_000, "A long output is cut at the detail limit and says so");
+}));
+
+test("a long answer renders in full, not as its excerpt", () => withApp("long", async (app) => {
+  const answer = "Bring sixteen sandwiches. ".repeat(1_600);
+  const conversation = await importAll(app, chatGptBatch(CONVERSATION, 10,
+    [{ id: "answer", parent: null, turn: "answer", kind: "assistant:text", role: "assistant", text: answer }]));
+  assert.equal((await transcript(app, conversation)).map((row) => row.text).join(""), answer);
+}));
+
+test("a cold-evidence answer renders in full from its retained original", () => withApp("cold", async (app, directory) => {
+  const answer = "Pack the lanterns before dusk. ".repeat(5_000);
+  const batch = chatGptBatch(CONVERSATION, 10, [{ id: "answer", parent: null, turn: "answer", kind: "assistant:text", role: "assistant", text: answer }]);
+  const item = batch.items[0]!, bytes = Buffer.from(JSON.stringify(item.data)), digest = sha256(bytes), path = join(directory, "assets", digest);
+  await mkdir(join(directory, "assets")); await writeFile(path, bytes, { mode: 0o600 });
+  item.data = null;
+  item.assets = [{ path, item_id: item.id, version: item.version, kind: "cold_evidence", media_type: "application/json", sha256: digest, size: bytes.length }];
+  assert.ok(bytes.length > 128 * 1024);
+  assert.equal((await transcript(app, await importAll(app, batch))).map((row) => row.text).join(""), answer);
+}));
+
+test("search indexes the whole message and marks an excerpt whose original is gone", () => withApp("search-full", async (app) => {
+  const long = "Picnic blankets and baskets. ".repeat(1_000) + "The zeppelin leaves at noon.";
+  const batch = chatGptBatch(CONVERSATION, 10, [
+    { id: "long", parent: null, turn: "long", kind: "assistant:text", role: "assistant", text: long },
+    { id: "lost", parent: "long", turn: "lost", kind: "user:text", role: "user", text: "Where do the lanterns go?" }]);
+  batch.items[1]!.data = null;
+  const conversation = await importAll(app, batch), texts: string[] = [];
+  for await (const record of app.tasks.records(conversation)) texts.push(record.text);
+  assert.deepEqual(texts, ["Picnic planning", long, "Bounded historical excerpt (full original unavailable):\nWhere do the lanterns go?"]);
 }));
 
 const searchable: ChatGptNode[] = [

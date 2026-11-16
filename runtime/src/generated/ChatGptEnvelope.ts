@@ -4,4 +4,8 @@
  * The inert evidence stored as `HistoryItem.data` for one ChatGPT message node.
  * Instruction-bearing metadata is removed before it is built.
  */
-export type ChatGptEnvelope = { conversation_id: string, node_id: string, parent_id: string | null, message: unknown, library_files?: unknown[], };
+export type ChatGptEnvelope = { conversation_id: string, node_id: string, parent_id: string | null,
+/**
+ * The whole normalized message text, citations removed. `HistoryItem.text` is its excerpt.
+ */
+text: string, message: unknown, library_files?: unknown[], };

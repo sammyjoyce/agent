@@ -19,6 +19,7 @@ import type { ImportedConversation } from "./generated/ImportedConversation.js";
 import type { ImportedConversationSummary } from "./generated/ImportedConversationSummary.js";
 import type { SourceRef } from "./generated/SourceRef.js";
 import { HistoryObservation, HistoryRevisions, REVISION_FORMAT, RevisionTracker, type CaptureState, type RevisionView, type SourceCapture, type SourceSnapshot } from "./history-revisions.js";
+import { field, string } from "./message-presentation.js";
 
 export type SourceThread = { readonly source: HistoryProvider; readonly thread_id: string };
 const HISTORY_SOURCES = {
@@ -245,14 +246,17 @@ export class HistoryStore {
     const { source, item } = entry.data;
     switch (source) {
       case "codex": return this.codexIndexText(entry, item);
-      case "chatgpt": return CHATGPT_SEARCHABLE_ROLES.has(item.role) ? item.text : "";
+      case "chatgpt": return CHATGPT_SEARCHABLE_ROLES.has(item.role) ? this.originalText(entry, item, (original) => string(field(original, "text")) ?? "") : "";
       default: { const unhandled: never = source; throw new HistoryError(`Unknown history source ${String(unhandled)}`); }
     }
   }
   private async codexIndexText(entry: EntryRecord, item: InertItem): Promise<string> {
     if (item.kind === "imageGeneration") return "";
     if (item.role !== "user" && item.role !== "assistant") return item.text.slice(0, 32_000);
-    try { return body(await this.original(entry)) || item.text; }
+    return this.originalText(entry, item, body);
+  }
+  private async originalText(entry: EntryRecord, item: InertItem, text: (original: JsonValue) => string): Promise<string> {
+    try { return text(await this.original(entry)) || item.text; }
     catch (error) {
       if (error instanceof OriginalUnavailable) return "Bounded historical excerpt (full original unavailable):\n" + item.text;
       throw error;

@@ -56,6 +56,8 @@ pub struct ChatGptEnvelope {
     pub conversation_id: String,
     pub node_id: String,
     pub parent_id: Option<String>,
+    /// The whole normalized message text, citations removed. `HistoryItem.text` is its excerpt.
+    pub text: String,
     #[ts(type = "unknown")]
     pub message: serde_json::Value,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -957,7 +959,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut conversation = Conversation::new(1, "Long");
         let mut parent = "root".to_owned();
-        for index in 0..12 {
+        for index in 0..40 {
             let node = format!("n{index:02}");
             conversation = conversation.say(&node, &parent, "user", &"words ".repeat(20 * 1024));
             parent = node;
