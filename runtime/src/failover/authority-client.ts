@@ -1,4 +1,5 @@
 import { AuthorityUnreachable, type AuthorityLink } from "./authority-link.js";
+import { parseAuthorityRecord, parseAuthorityReply, parseLogPage } from "./authority-wire.js";
 import type { AuthorityCommand } from "../generated/AuthorityCommand.js";
 import type { AuthorityRecord } from "../generated/AuthorityRecord.js";
 import type { AuthorityReply } from "../generated/AuthorityReply.js";
@@ -13,6 +14,13 @@ export class AuthorityDenied extends Error {
 export class AuthorityRejected extends Error {
   constructor(readonly status: number, message: string) { super(message); }
 }
+
+/**
+ * The authority answered with a body that is not the answer the request
+ * expects, so something else answered at its address or it runs another
+ * version. Repeating the request does not help.
+ */
+export class AuthorityProtocolError extends Error {}
 
 export interface AuthorityClientOptions {
   readonly url: string;
@@ -37,21 +45,21 @@ export class AuthorityClient implements AuthorityLink {
     this.timeoutMs = timeoutMs;
   }
 
-  async command(command: AuthorityCommand): Promise<AuthorityReply> {
-    return json(await this.exchange("POST", "commands", JSON.stringify(command)));
+  command(command: AuthorityCommand): Promise<AuthorityReply> {
+    return this.answer("POST", "commands", parseAuthorityReply, JSON.stringify(command));
   }
 
   async record(): Promise<AuthorityRecord | undefined> {
     try {
-      return json(await this.exchange("GET", "record"));
+      return await this.answer("GET", "record", parseAuthorityRecord);
     } catch (error) {
       if (error instanceof AuthorityRejected && error.status === 404) return undefined;
       throw error;
     }
   }
 
-  async log(after: number, limit: number): Promise<LogPage> {
-    return json(await this.exchange("GET", `log?after=${after}&limit=${limit}`));
+  log(after: number, limit: number): Promise<LogPage> {
+    return this.answer("GET", `log?after=${after}&limit=${limit}`, parseLogPage);
   }
 
   async putBlob(sha256: string, bytes: Uint8Array): Promise<void> {
@@ -62,8 +70,23 @@ export class AuthorityClient implements AuthorityLink {
     return this.exchange("GET", `blobs/${sha256}`);
   }
 
+  private async answer<T>(method: string, path: string, parse: (value: unknown) => T, body: string | null = null): Promise<T> {
+    const bytes = await this.exchange(method, path, body);
+    let value: unknown;
+    try {
+      value = JSON.parse(new TextDecoder().decode(bytes));
+    } catch (error) {
+      throw new AuthorityProtocolError(`The authority answered ${requestName(method, path)} with a body that is not JSON, so something else answered at its address.`, { cause: error });
+    }
+    try {
+      return parse(value);
+    } catch (error) {
+      throw new AuthorityProtocolError(`The authority answered ${requestName(method, path)} with a body this client does not understand. ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+    }
+  }
+
   private async exchange(method: string, path: string, body: string | Uint8Array | null = null): Promise<Uint8Array> {
-    const request = `${method} ${path.split("?")[0]}`;
+    const request = requestName(method, path);
     let status: number, bytes: Uint8Array;
     try {
       const response = await fetch(`${this.base}/${path}`, {
@@ -83,13 +106,7 @@ export class AuthorityClient implements AuthorityLink {
   }
 }
 
-function json<T>(bytes: Uint8Array): T {
-  try {
-    return JSON.parse(new TextDecoder().decode(bytes)) as T;
-  } catch (error) {
-    throw new AuthorityUnreachable("The authority answered with a body that is not JSON, so something else answered at its address.", { cause: error });
-  }
-}
+const requestName = (method: string, path: string) => `${method} ${path.split("?")[0]}`;
 
 function errorSentence(bytes: Uint8Array): string | undefined {
   try {
