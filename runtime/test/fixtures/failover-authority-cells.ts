@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { AuthorityCommand } from "../../src/generated/AuthorityCommand.js";
 import type { AuthorityRecord } from "../../src/generated/AuthorityRecord.js";
 import type { AuthorityRefusal } from "../../src/generated/AuthorityRefusal.js";
@@ -9,7 +10,9 @@ export const orion = "22222222-2222-4222-8222-222222222222";
 export const spare = "33333333-3333-4333-8333-333333333333";
 export const holders = [tarantula, orion, spare] as const;
 export const digests = ["a".repeat(64), "b".repeat(64)] as const;
-export const manifest = "c".repeat(64);
+/** An invented backup manifest. A test stores it as a blob before it enrolls or checkpoints through an authority with a blob store. */
+export const manifestBytes = Buffer.from(JSON.stringify({ invented: "backup manifest", files: [] }));
+export const manifest = createHash("sha256").update(manifestBytes).digest("hex");
 export const versions = { application: "0.1.0", pi_durable: "1.4.0", chord: "1.4.0" };
 
 export const entry = (epoch: number, at: number, digest: string): LogEntry =>

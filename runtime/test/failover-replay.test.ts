@@ -326,7 +326,11 @@ for (const [name, connect] of Object.entries(authorities)) {
     await again.root.submit(note("second", "request-2"), context);
     await again.harness.close(context);
     const head = (await link.record())?.state.head ?? 0;
-    assert.equal((await link.command({ op: "checkpoint", holder: OWNER, epoch, record: { through: head, manifest: "1".repeat(64) } })).result, "accepted");
+    const snapshot = Buffer.from("invented backup manifest at the head");
+    const checkpoint = { op: "checkpoint" as const, holder: OWNER, epoch, record: { through: head, manifest: sha256Hex(snapshot) } };
+    assert.deepEqual(await link.command(checkpoint), { result: "refused", reason: "missing_blob", state: (await link.record())?.state }, "a manifest the blob store lacks is refused");
+    await link.putBlob(sha256Hex(snapshot), snapshot);
+    assert.equal((await link.command(checkpoint)).result, "accepted");
     const stale = tables(behind);
     const behindCheckpoint = new RegExp(`does not belong to this log: it is at position ${early}, and the log runs from ${head} to ${head}`);
     await assert.rejects(follow(behind, link), behindCheckpoint);

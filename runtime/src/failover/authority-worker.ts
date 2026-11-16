@@ -1,9 +1,8 @@
 import { decide, type AuthorityWrite } from "./authority-core.js";
-import { COMMAND_BODY_LIMIT_BYTES, commandHolder, isLowercaseUuid, isSha256Hex, parseAuthorityCommand, parseAuthorityCredentials, type AuthorityCredential } from "./authority-wire.js";
+import { COMMAND_BODY_LIMIT_BYTES, commandBlobs, commandHolder, isLowercaseUuid, isSha256Hex, parseAuthorityCommand, parseAuthorityCredentials, type AuthorityCredential } from "./authority-wire.js";
 import type { AuthorityCommand } from "../generated/AuthorityCommand.js";
 import type { AuthorityRecord } from "../generated/AuthorityRecord.js";
 import type { AuthorityReply } from "../generated/AuthorityReply.js";
-import type { LogEntry } from "../generated/LogEntry.js";
 
 type SqlValue = string | number | null;
 interface SqlCursor extends Iterable<Record<string, SqlValue>> {
@@ -228,7 +227,7 @@ export class CoordinatorAuthority {
   }
 
   private async command(coordinator: string, command: AuthorityCommand): Promise<AuthorityReply> {
-    if (command.op === "append" && await this.namesMissingBlob(coordinator, command.entry)) {
+    if (await this.lacksBlob(coordinator, commandBlobs(command))) {
       const record = this.recordJson();
       return { result: "refused", reason: "missing_blob", state: record === undefined ? null : (JSON.parse(record) as AuthorityRecord).state };
     }
@@ -247,9 +246,8 @@ export class CoordinatorAuthority {
     });
   }
 
-  private async namesMissingBlob(coordinator: string, entry: LogEntry): Promise<boolean> {
-    const named = new Set([...entry.files.map((file) => file.sha256), ...(entry.batch?.kind === "blob" ? [entry.batch.sha256] : [])]);
-    const found = await Promise.all([...named].map((sha256) => this.blobs.head(blobKey(coordinator, sha256))));
+  private async lacksBlob(coordinator: string, named: readonly string[]): Promise<boolean> {
+    const found = await Promise.all([...new Set(named)].map((sha256) => this.blobs.head(blobKey(coordinator, sha256))));
     return found.includes(null);
   }
 

@@ -310,7 +310,8 @@ pub enum AuthorityRefusal {
     Gap,
     /// The log holds a different entry at that position.
     Conflict,
-    /// The entry names a blob the blob store does not hold.
+    /// The command names a blob the blob store does not hold: a file or the
+    /// batch of an entry, or the manifest of a checkpoint.
     MissingBlob,
     /// The epoch the operator named is not the current one.
     EpochMoved,

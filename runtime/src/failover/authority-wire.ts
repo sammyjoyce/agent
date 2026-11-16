@@ -144,3 +144,21 @@ export function commandHolder(command: AuthorityCommand): string {
       return command satisfies never;
   }
 }
+
+/** The blobs a command names, which the blob store must hold before the authority decides the command. */
+export function commandBlobs(command: AuthorityCommand): string[] {
+  switch (command.op) {
+    case "enroll":
+      return [command.checkpoint.manifest];
+    case "checkpoint":
+      return [command.record.manifest];
+    case "append": {
+      const { files, batch } = command.entry;
+      return [...files.map((file) => file.sha256), ...(batch?.kind === "blob" ? [batch.sha256] : [])];
+    }
+    case "claim": case "confirm": case "promote": case "release": case "activate":
+      return [];
+    default:
+      return command satisfies never;
+  }
+}
