@@ -32,7 +32,7 @@ import type { WorkerHost } from "./generated/WorkerHost.js";
 import type { WorkerRef } from "./generated/WorkerRef.js";
 import type { WorkerPresence } from "./generated/WorkerPresence.js";
 import { noticeMetadata, UserNoticeEntry, type UserNoticeData } from "./transcript.js";
-import { HistoryStore, ImportedItemEntry, importedSummary, importedText } from "./history.js";
+import { entryThread, historyKey, HistoryStore, ImportedItemEntry, importedSourceRef, importedSummary, importedText, importedThread } from "./history.js";
 import { REVISION_AMBIGUOUS, REVISION_PENDING, revisionStatus, type RevisionView } from "./history-revisions.js";
 import type { SavedMatch } from "./generated/SavedMatch.js";
 import type { ImportedConversation } from "./generated/ImportedConversation.js";
@@ -843,7 +843,7 @@ export class TaskStore {
       // Published chunks can lag a corrected task link. Current routing owns
       // exact-source priority; retained Codex identity remains original evidence.
       const currentRefs = task === undefined ? null : new Set(task.sources.map(sourceReference));
-      if (imported !== null) currentRefs?.add(sourceReference({ provider: "codex", account: "local", thread_id: imported.thread.id }));
+      if (imported !== null) currentRefs?.add(sourceReference(importedSourceRef(imported)));
       if (candidate.matches.some((match) => match.source_refs.some((ref) => refs.has(ref) && (currentRefs === null || currentRefs.has(ref))))) {
         exact.add(candidate.conversation_id);
       }
@@ -863,11 +863,11 @@ export class TaskStore {
     const imported = await this.histories?.byConversation(conversationId);
     if (imported === undefined || this.histories === undefined) throw new TaskError("Only an imported historical conversation can be adopted");
     if (input.outcome.trim().length === 0) throw new TaskError("A task outcome is required");
-    const id = await this.histories.adopt(imported.thread.id, input.id, input.evidence, async (tx, native, record) => {
+    const id = await this.histories.adopt(importedThread(imported), input.id, input.evidence, async (tx, native, record) => {
       if (await this.taskIn(tx, input.id) !== undefined) throw new TaskError("This task ID already belongs to another conversation");
       const { value: task } = await this.recordsStore.insertIn(tx, input.id, { id: input.id, model: input.model, conversation_id: native.toString(), title: input.title?.trim() || record.thread.title.trim() || "Imported conversation",
         outcome: input.outcome.trim(), summary: "", state: { state: "open" }, worker: { state: "unassigned" },
-        sources: [{ provider: "codex", account: "local", thread_id: record.thread.id }, ...input.sources ?? []], pending: [], agents: [], updated_at: Date.now() });
+        sources: [importedSourceRef(record), ...input.sources ?? []], pending: [], agents: [], updated_at: Date.now() });
       await this.indexTaskIn(tx, task);
     });
     return this.get(id);
@@ -878,7 +878,7 @@ export class TaskStore {
     if (conversationId !== ROOT_CONVERSATION_ID.toString() && task === undefined && imported === undefined) return;
     const conversation = await this.conversation(conversationId);
     const refs = (task?.sources ?? []).map(sourceReference);
-    if (imported !== undefined) refs.push(sourceReference({ provider: "codex", account: "local", thread_id: imported.thread.id }));
+    if (imported !== undefined) refs.push(sourceReference(importedSourceRef(imported)));
     const revisions = new Map<string, RevisionView>();
     for await (const entries of this.historyPages(conversation, { order: "ascending" })) {
       for (const entry of entries) {
@@ -894,13 +894,14 @@ export class TaskStore {
   }
   private async revision(entry: EntryRecord, views: Map<string, RevisionView>, prepare = false, maximum?: EntryId): Promise<ReturnType<typeof revisionStatus>> {
     if (!ImportedItemEntry.is(entry)) return "current";
-    let view = views.get(entry.data.thread_id);
+    const key = historyKey(entry.data.source, entry.data.thread_id);
+    let view = views.get(key);
     if (view === undefined) {
       const histories = this.histories ?? new HistoryStore(this.session);
       if (prepare) await histories.prepareRevisions(entry.conversationId.toString());
-      view = await histories.revisionView(entry.data.thread_id);
+      view = await histories.revisionView(entryThread(entry));
       if (maximum !== undefined && view.watermark !== null && view.watermark > maximum) view = { ...view, ready: false };
-      views.set(entry.data.thread_id, view);
+      views.set(key, view);
     }
     return revisionStatus(entry.id, view);
   }

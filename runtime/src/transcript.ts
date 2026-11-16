@@ -13,7 +13,7 @@ import type { ModelActivity } from "./generated/ModelActivity.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import type { ToolDetails } from "./generated/ToolDetails.js";
 import type { ToolDetailContent } from "./generated/ToolDetailContent.js";
-import { HistoryError, HistoryStore, ImportedItemEntry, ImportedThreadEntry, isHistoryEntry } from "./history.js";
+import { entryThread, HistoryError, HistoryStore, ImportedItemEntry, ImportedThreadEntry, isHistoryEntry, shownInConversation } from "./history.js";
 import { codexDisplayMessage, codexMessage, codexToolOutput, historyToolId } from "./imported-history.js";
 import { field, piToolPresentation, piToolResult, string, type MessageContent } from "./message-presentation.js";
 import { observeTranscriptVisibility, readTranscriptVisibility, transcriptVisible, type TranscriptVisibilityState } from "./transcript_visibility.js";
@@ -78,6 +78,7 @@ export async function projectTranscript(entry: EntryRecord, originals: Pick<Hist
     const response = await reader.snapshot(MainResponses, entry.conversationId, entry.id.toString(), BACKGROUND_CONTEXT);
     return response === undefined ? rows : [...rows.filter((row) => !["assistant", "commentary", "final"].includes(row.role) || row.text.trim()), ...messageRows(entry, { role: "final", text: response.text })];
   }
+  if (!shownInConversation(entry.data.item)) return [];
   const status = revisions === undefined ? "current" : revisionStatus(entry.id, revisions);
   if (status === "superseded" || status === "outside_snapshot") return [];
   let message: MessageContent;
@@ -184,7 +185,7 @@ export async function history(conversation: Conversation, value: string | null,
       if (ImportedItemEntry.is(entry)) {
         view = revisions.get(entry.data.thread_id);
         if (view === undefined) {
-          view = await originals.revisionView(entry.data.thread_id);
+          view = await originals.revisionView(entryThread(entry));
           if (maximum !== undefined && view.watermark !== null && view.watermark > maximum) view = { ...view, ready: false };
           revisions.set(entry.data.thread_id, view);
         }

@@ -64,7 +64,7 @@ async function open(directory: string) {
     run: (producer: Producer, nodes = [coordinator]) => importer.run(nodes, nodes.map((node) => node.host_id), [], native(producer), () => {}, async () => { indexes += 1; }) };
 }
 async function originals(app: Awaited<ReturnType<typeof open>>, id: string) {
-  const record = await app.histories.get(id); assert.ok(record);
+  const record = await app.histories.get({ source: "codex", thread_id: id }); assert.ok(record);
   const conversation = await app.histories.conversation(record.conversation_id); assert.ok(conversation);
   const entries = await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT);
   return { conversation, entries: entries.items.filter(ImportedItemEntry.is), all: entries.items };
@@ -125,7 +125,7 @@ test("large thread progress publishes committed page counters before that thread
     }), () => {}, async () => {});
     await reading;
     assert.equal((await app.importer.status()).items_added, 1);
-    assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.next_cursor, "second-page");
+    assert.equal((await app.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id))?.next_cursor, "second-page");
     assert.equal((await originals(app, source.id)).entries.length, 1);
     release(); assert.equal((await pending).phase, "complete");
   } finally { release(); await pending?.catch(() => {}); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
@@ -149,7 +149,7 @@ test("asset-only recovery preserves the durable EOF position for the next change
   try {
     assert.equal((await app.run(producer)).phase, "partial"); recovered = true;
     assert.equal((await app.run(producer)).phase, "complete");
-    assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.resume_cursor, "durable-tail");
+    assert.equal((await app.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id))?.resume_cursor, "durable-tail");
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
     source = { ...source, version: "native-v2", updated_at: 3 };
     const result = await app.run(producer);
@@ -176,7 +176,7 @@ test("a changed source restarts the full walk even when native page cursors are 
     });
     assert.equal(result.phase, "complete"); assert.equal(result.items_added, 2);
     assert.deepEqual(requests, [null, "page-two", null, "page-two"]);
-    assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.complete, true);
+    assert.equal((await app.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id))?.complete, true);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -193,12 +193,12 @@ test("same-version imports repair native lineage before completed skips and affe
           ? { ...source, parent_thread_id: "native-parent", forked_from_id: "native-fork" } : listing], next_cursor: null };
         assert.equal(request.type, "read"); if (request.type !== "read") throw new Error("No asset transfer is needed");
         reads += 1; assert.equal(request.cursor, null);
-        if (corrected) assert.equal((await app.histories.get(source.id))?.thread.parent_thread_id, "native-parent",
+        if (corrected) assert.equal((await app.histories.get({ source: "codex", thread_id: source.id }))?.thread.parent_thread_id, "native-parent",
           "Lineage must be repaired before retrying the affected page");
         return { ...page(source, [entry]), complete, gaps };
       };
       await app.run(producer);
-      const seeded = await app.histories.get(source.id); assert.ok(seeded);
+      const seeded = await app.histories.get({ source: "codex", thread_id: source.id }); assert.ok(seeded);
       assert.equal(seeded.thread.version, source.version); assert.equal(seeded.thread.parent_thread_id, null);
       await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
       const tasks = new TaskStore(app.session, new ConversationModels(app.models)); tasks.useHistory(app.histories);
@@ -212,7 +212,7 @@ test("same-version imports repair native lineage before completed skips and affe
           dimensions: 3, pooling: "last", normalization: "l2", instruction_version: 1 }, vectors: command.texts.map(() => [1, 0, 0]) } };
       };
       await index.sync(embedding, true); assert.ok(embeddings > 0);
-      const before = await app.histories.get(source.id), checkpoint = await app.histories.checkpoint(source.id, coordinator.host_id);
+      const before = await app.histories.get({ source: "codex", thread_id: source.id }), checkpoint = await app.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id);
       assert.ok(before);
       const retained = await originals(app, source.id), indexed = embeddings;
       const search = new SearchIndex(join(directory, "search.sqlite"));
@@ -220,7 +220,7 @@ test("same-version imports repair native lineage before completed skips and affe
       corrected = true; reads = 0;
       const result = await app.importer.run([coordinator], [coordinator.host_id], [], native(producer), () => {}, () => index.sync(embedding, true));
       assert.equal(result.items_added, 0); assert.equal(reads, complete ? 0 : 1);
-      assert.deepEqual(await app.histories.get(source.id), { ...before, thread: { ...before.thread,
+      assert.deepEqual(await app.histories.get({ source: "codex", thread_id: source.id }), { ...before, thread: { ...before.thread,
         parent_thread_id: "native-parent", forked_from_id: "native-fork" } });
       assert.deepEqual((await originals(app, source.id)).entries, retained.entries);
       assert.deepEqual((await originals(app, source.id)).all, retained.all);
@@ -229,12 +229,12 @@ test("same-version imports repair native lineage before completed skips and affe
       try { assert.deepEqual(afterSearch.checkpoint(seeded.conversation_id), published); } finally { await afterSearch.close(); }
       assert.equal((await tasks.get(adopted.id)).conversation_id, seeded.conversation_id);
       assert.equal(await app.histories.evidence(seeded.conversation_id), "Synthetic existing context");
-      if (complete) assert.deepEqual(await app.histories.checkpoint(source.id, coordinator.host_id), checkpoint);
+      if (complete) assert.deepEqual(await app.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id), checkpoint);
 
       await retrieval.close(); retrieval = undefined;
       await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
-      assert.equal((await app.histories.get(source.id))?.thread.parent_thread_id, "native-parent");
-      assert.equal((await app.histories.get(source.id))?.adopted_task_id, adopted.id);
+      assert.equal((await app.histories.get({ source: "codex", thread_id: source.id }))?.thread.parent_thread_id, "native-parent");
+      assert.equal((await app.histories.get({ source: "codex", thread_id: source.id }))?.adopted_task_id, adopted.id);
     } finally { await retrieval?.close(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
   });
 });
@@ -272,7 +272,7 @@ test("unchanged partial imports retry only affected source pages across reopen a
     const repeated = await app.run(producer);
     assert.deepEqual(reads, ["opaque-media"], "Unchanged text outside the failed asset page must not be read again");
     assert.equal(repeated.phase, "partial"); assert.equal(repeated.items_added, 0); assert.equal(repeated.gap_count, 2);
-    assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.source_exhausted, true);
+    assert.equal((await app.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id))?.source_exhausted, true);
     available = true; reads.length = 0;
     const recovered = await app.run(producer);
     assert.deepEqual(reads, ["opaque-media", "opaque-media-split"], "Only enough native pages to find the affected item IDs may be retried");
@@ -280,8 +280,8 @@ test("unchanged partial imports retry only affected source pages across reopen a
     assert.equal(recovered.gap_count, 0); assert.equal(recovered.assets_saved, 2);
     assert.equal((await originals(app, source.id)).conversation.id, before.conversation.id);
     assert.deepEqual((await originals(app, source.id)).entries, before.entries);
-    const saved = await app.histories.get(source.id); assert.equal(saved?.complete, true); assert.deepEqual(saved.gaps, []);
-    const checkpoint = await app.histories.checkpoint(source.id, coordinator.host_id);
+    const saved = await app.histories.get({ source: "codex", thread_id: source.id }); assert.equal(saved?.complete, true); assert.deepEqual(saved.gaps, []);
+    const checkpoint = await app.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id);
     assert.equal(checkpoint?.complete, true); assert.deepEqual(checkpoint.retry_pages, []);
     reads.length = 0; assert.equal((await app.run(producer)).threads_unchanged, 1); assert.deepEqual(reads, []);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
@@ -324,11 +324,11 @@ test("a failed native read keeps its unread cursor and clears that read gap afte
       return page(source, [item("after-failure")]);
     };
     assert.equal((await app.run(producer)).phase, "partial");
-    assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.next_cursor, "unread-native-page");
+    assert.equal((await app.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id))?.next_cursor, "unread-native-page");
     fail = false; reads.length = 0;
     const recovered = await app.run(producer); assert.equal(recovered.phase, "complete"); assert.equal(recovered.items_added, 1);
     assert.deepEqual(reads, ["unread-native-page"]); assert.equal(recovered.gap_count, 0);
-    assert.deepEqual((await app.histories.get(source.id))?.gaps, []); assert.equal((await originals(app, source.id)).entries.length, 2);
+    assert.deepEqual((await app.histories.get({ source: "codex", thread_id: source.id }))?.gaps, []); assert.equal((await originals(app, source.id)).entries.length, 2);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -351,7 +351,7 @@ test("changed and unreliable source versions scan safely instead of reusing a pr
       fail = false; reads.length = 0;
       const recovered = await app.run(producer); assert.equal(recovered.phase, "complete"); assert.equal(recovered.items_added, 0);
       assert.deepEqual(reads, [null, "media-page"]);
-      assert.equal((await app.histories.get(source.id))?.thread.title, source.title);
+      assert.equal((await app.histories.get({ source: "codex", thread_id: source.id }))?.thread.title, source.title);
       assert.equal((await originals(app, source.id)).entries.length, 2);
     } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
   });
@@ -427,7 +427,7 @@ test("source text and cursors commit while native embedding is held, and joined 
     await began;
     assert.equal(sourceStartedBeforeEmbedding, true, "Source discovery must start without waiting for the existing corpus embeddings");
     await atTail;
-    assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.next_cursor, "last-text");
+    assert.equal((await app.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id))?.next_cursor, "last-text");
     assert.ok((await originals(app, source.id)).entries.some((entry) => entry.data.item.id === "new-sapphire"));
     assert.equal((await retrieval.snapshot("zirconia", [], 8)).candidates[0]?.conversation_id, saved.conversation.conversation_id);
     assert.equal(app.importer.isRunning(), true);
@@ -495,7 +495,7 @@ test("failure drains the owned initial host call before request cleanup and rest
     await began;
     assert.ok(sourceCalls > 0, "The owned initial index call must not gate source discovery");
     await atTail;
-    assert.equal((await previous.histories.checkpoint(source.id, coordinator.host_id))?.next_cursor, "tail-page");
+    assert.equal((await previous.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id))?.next_cursor, "tail-page");
     assert.notEqual((await previous.importer.status()).phase, "indexing", "Only postwalk indexing can skip source discovery on resume");
     await previous.session.close(BACKGROUND_CONTEXT); closed = true; releaseSource();
     await sourceFailed; await new Promise<void>((resolve) => setImmediate(resolve));
@@ -556,7 +556,7 @@ test("the orchestrator imports active and archived history from both hosts witho
     assert.equal(first.phase, "complete"); assert.equal(first.threads_seen, 4);
     assert.equal(first.items_added, 3); assert.equal(first.items_unchanged, 1);
     assert.deepEqual([...listings].sort(), ["coordinator:false", "coordinator:true", "laptop:false", "laptop:true"]);
-    assert.equal((await app.histories.get(fork.id))?.thread.forked_from_id, shared.id);
+    assert.equal((await app.histories.get({ source: "codex", thread_id: fork.id }))?.thread.forked_from_id, shared.id);
     const repeated = await app.run(producer, [coordinator, laptop]);
     assert.equal(repeated.phase, "complete"); assert.equal(repeated.threads_unchanged, 4); assert.equal(repeated.items_added, 0); assert.equal(reads, 4);
     assert.equal(app.indexCount(), 4);
@@ -583,13 +583,13 @@ test("an interrupted native page resumes its durable cursor after reopening Pi",
       return page(source, [item("second")]);
     };
     assert.equal((await app.run(producer)).phase, "partial");
-    assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.next_cursor, "page-two");
+    assert.equal((await app.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id))?.next_cursor, "page-two");
     assert.equal((await originals(app, source.id)).entries.length, 1);
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory); interrupt = false; cursors.length = 0;
     const resumed = await app.run(producer);
     assert.equal(resumed.phase, "complete"); assert.equal(resumed.items_added, 1); assert.deepEqual(cursors, ["page-two"]);
     assert.equal((await originals(app, source.id)).entries.length, 2);
-    assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.complete, true);
+    assert.equal((await app.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id))?.complete, true);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -613,8 +613,8 @@ test("inventory failures remain visible after the media gap summary fills", asyn
     assert.equal(result.phase, "partial"); assert.equal(result.items_added, 58);
     assert.equal(result.gap_count, 59); assert.equal(result.gaps.length, 50);
     assert.equal(result.gaps[0], "coordinator: active inventory: Synthetic inventory failure");
-    assert.equal((await app.histories.checkpoint(active.id, coordinator.host_id))?.gaps.length, 55);
-    assert.equal((await app.histories.checkpoint(archived.id, coordinator.host_id))?.gaps.length, 3);
+    assert.equal((await app.histories.checkpoint({ source: "codex", thread_id: active.id }, coordinator.host_id))?.gaps.length, 55);
+    assert.equal((await app.histories.checkpoint({ source: "codex", thread_id: archived.id }, coordinator.host_id))?.gaps.length, 3);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -663,7 +663,7 @@ test("status reports a stopped import after reopening Pi and preserves its resum
     const status = await app.importer.status(); assert.equal(status.phase, "partial");
     assert.equal(status.gaps[0], "Previous import was interrupted; run beep-boop import codex to resume.");
     assert.deepEqual(await app.importer.status(), status);
-    assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.next_cursor, "second-page");
+    assert.equal((await app.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id))?.next_cursor, "second-page");
     const resumed = await app.run((_host, request) => {
       if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
       if (request.type !== "read") throw new Error("No media is present");
@@ -812,7 +812,7 @@ test("deleted advertised media preserves mixed user text and same-version recove
     let afterWatermark: string | undefined;
     for await (const record of app.histories.inventory()) if (record.conversation_id === conversationId) afterWatermark = record.watermark;
     assert.ok(beforeWatermark && afterWatermark); assert.notEqual(afterWatermark, beforeWatermark, "Recovered assets must invalidate the existing search watermark");
-    assert.equal((await app.histories.checkpoint(source.id, laptop.host_id))?.complete, true);
+    assert.equal((await app.histories.checkpoint({ source: "codex", thread_id: source.id }, laptop.host_id))?.complete, true);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -928,7 +928,7 @@ test("a failed chunked asset transfer leaves a gap and retries the same item ver
     await assert.rejects(app.histories.original(initial), /Full historical original is unavailable/);
     assert.ok((await app.histories.indexText(initial))?.startsWith("Bounded historical excerpt (full original unavailable):\n"));
     assert.deepEqual(await readdir(app.assets), []);
-    assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.complete, false);
+    assert.equal((await app.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id))?.complete, false);
     fail = false; const recovered = await app.run(producer);
     assert.equal(recovered.phase, "complete"); assert.equal(recovered.items_added, 0); assert.equal(recovered.items_unchanged, 1); assert.equal(recovered.assets_saved, 1);
     const saved = await originals(app, source.id); assert.equal(saved.entries.length, 1);
@@ -973,10 +973,10 @@ test("operational asset transfer failures outrank missing media and recover with
     const failed = await app.run(producer);
     assert.equal(failed.phase, "partial"); assert.equal(failed.gap_count, 59); assert.equal(failed.gaps.length, 50);
     assert.equal(failed.gaps[0], `${source.id}: ${failure}`, "Operational failure must survive a full missing-media summary and later missing gaps");
-    const checkpoint = await app.histories.checkpoint(source.id, coordinator.host_id); assert.ok(checkpoint);
+    const checkpoint = await app.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id); assert.ok(checkpoint);
     assert.equal(checkpoint.complete, false); assert.equal(checkpoint.next_cursor, null);
     assert.deepEqual(checkpoint.gaps, [{ code: "unavailable", item_id: evidence.id, message: failure }]);
-    assert.ok((await app.histories.checkpoint(before.id, coordinator.host_id))?.gaps.every((gap) => gap.code === "missing"));
+    assert.ok((await app.histories.checkpoint({ source: "codex", thread_id: before.id }, coordinator.host_id))?.gaps.every((gap) => gap.code === "missing"));
     assert.deepEqual((await originals(app, source.id)).entries.map((entry) => entry.data.item.id), [retained.id, evidence.id]);
     assert.deepEqual(await readdir(app.assets), []);
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory); fail = false;
@@ -984,8 +984,8 @@ test("operational asset transfer failures outrank missing media and recover with
     assert.equal(recovered.phase, "partial", "Native missing references remain coverage gaps");
     assert.equal(recovered.gap_count, 58); assert.equal(recovered.items_added, 0); assert.equal(recovered.items_unchanged, 59,
       "The intact sibling of the failed asset item does not need another read/import");
-    assert.equal((await app.histories.checkpoint(source.id, coordinator.host_id))?.complete, true);
-    assert.deepEqual((await app.histories.checkpoint(source.id, coordinator.host_id))?.gaps, []);
+    assert.equal((await app.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id))?.complete, true);
+    assert.deepEqual((await app.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id))?.gaps, []);
     const entries = (await originals(app, source.id)).entries;
     assert.deepEqual(entries.map((entry) => entry.data.item.id), [retained.id, evidence.id]);
     const saved = entries.find((entry) => entry.data.item.id === evidence.id); assert.ok(saved);
@@ -1010,9 +1010,9 @@ test("changed or unreliable first-read failures replace stale completeness befor
     for (const current of [{ ...advertised, version: "native-v2" }, { ...advertised, version: "native-v2", version_reliable: false }]) {
       advertised = current; fail = true;
       const failed = await app.run(producer); assert.equal(failed.phase, "partial");
-      const checkpoint = await app.histories.checkpoint(current.id, coordinator.host_id);
+      const checkpoint = await app.histories.checkpoint({ source: "codex", thread_id: current.id }, coordinator.host_id);
       assert.ok(checkpoint); assert.equal(checkpoint.version, current.version); assert.equal(checkpoint.complete, false); assert.equal(checkpoint.next_cursor, null);
-      assert.equal((await app.histories.get(current.id))?.complete, false);
+      assert.equal((await app.histories.get({ source: "codex", thread_id: current.id }))?.complete, false);
       assert.equal((await originals(app, current.id)).entries.length, 1, "Previously retained source evidence remains available");
       fail = false; const recovered = await app.run(producer);
       assert.equal(recovered.phase, "complete"); assert.equal(recovered.items_added, 0); assert.equal(recovered.items_unchanged, 1);
