@@ -206,8 +206,8 @@ reads nothing else in a message, for text or for files.
 | Content of type `reasoning_recap` | `content` |
 | `id`, `create_time`, `author.role`, `author.name`, `recipient`, `channel`, `status` | The message's header. |
 | `metadata.is_thinking_preamble_message` | Whether the message is shown as thinking. |
-| `metadata.attachments` | The `id`, `name` and `mime_type` of each entry. |
-| `metadata.aggregate_result.messages` | Code-interpreter output. An `image` entry contributes the file its `image_url` names. A `stream` entry adds nothing when the message's own text already holds its text. Each entry is kept or left out by its own author, content type and flags, by the same rule as a message. |
+| `metadata.attachments` | The `id`, `name` and `mime_type` of each entry. The `id` is a file ID that starts with `file-` or `file_`, bare or after the last `://`. |
+| `metadata.aggregate_result.messages` | Code-interpreter output. An `image` entry contributes the file that its `image_url` names with a `sediment://` or `file-service://` pointer. A `stream` entry adds nothing when the text that History stores for the message already holds the stream's `text`. That stored text is the fallback Markdown when the import uses it. Each entry is kept or left out by its own author, content type and flags, by the same rule as a message. |
 | `metadata.model_dil_v2.fallbackMarkdown` | The message's text in place of widget markup, when every part is plain text and no part was left out. |
 
 A part is read when it is one of these shapes:
@@ -220,44 +220,61 @@ A part is read when it is one of these shapes:
   `audio_asset_pointer`, or is absent, and `asset_pointer` names a file with a
   `sediment://` or `file-service://` pointer. The part contributes that file
   and, when it has one, its `text` caption. The import reads no other key of a
-  file object.
+  file object. A pointer with another scheme, or a bare file ID, names no file.
 
 A part contributes its text and its file together, or neither. A part or an
 attachment entry whose own metadata sets `is_visually_hidden_from_conversation`
 contributes neither.
 
-Content outside these lists is never imported and never dropped silently. The
-import does not read any of the following. It reports each one as an
-`unsupported` gap with the message ID and the type name, so the import ends
-partial, and History shows nothing of that content. `--check` prints the count
-of each kind.
+The import reads nothing outside these lists. It reports each of the following
+as an `unsupported` gap with the message ID and the type name, so the import
+ends partial and History shows nothing of that content. `--check` prints the
+count of each kind.
 
-- A message with another content type, or with a listed field of the wrong JSON
-  type.
+- A message with another content type, or whose content lacks the field its
+  type needs or holds it as the wrong JSON type.
+- A `metadata.attachments`, `metadata.aggregate_result.messages` or
+  `fallbackMarkdown` value of the wrong JSON type.
 - A message that is not a JSON object, or whose own author, content type or
   flags cannot be read. Such a message is never kept.
 - A part of another shape, or a file object whose pointer names no file.
 - A hidden part, a hidden attachment entry, or an attachment entry that names no
   file.
-- A code-interpreter entry of another type, or a `stream` entry whose text the
-  message does not show.
+- A code-interpreter entry of another type, an `image` entry whose `image_url`
+  names no file, or a `stream` entry that has no `text` or whose `text` is not
+  in the text that History stores for the message.
 - Fallback Markdown beside a part that holds a file or was left out. The import
   reads the parts instead.
-- Message metadata that itself carries an `author`, `content` or `metadata` key.
-  Such metadata is shaped like a message. The import keeps the message's own
-  content and reads nothing from that metadata.
+- Message metadata that itself carries an `author`, `content` or `metadata` key,
+  whatever the key's value, null included. Such metadata is shaped like a
+  message. The import keeps the message's own content and reads nothing from
+  that metadata.
+
+The import reports only what it detects, and two limits remain:
+
+- Text or a file pointer in a field outside these lists is never read. If the
+  export holds that file and no imported message names it, `--check` counts it
+  among the files that no imported message names. If the export lacks the
+  file, nothing records the pointer.
+- An optional field in these lists that holds the wrong JSON type is ignored
+  without a gap. These fields are the message's `id`, `create_time`,
+  `author.name`, `recipient`, `channel` and `status`, the
+  `is_thinking_preamble_message` flag, an attachment entry's `name` and
+  `mime_type`, and a code-interpreter entry's `id`.
 
 A file reaches History only through a kept message: a part's pointer, an
 attachment entry, an image entry of code-interpreter output, or a file-library
 entry whose `origination_message_id` names a kept message or a kept
-code-interpreter entry. The import drops a library entry that has no origin, an
-origin that is not in the conversation, or an origin that was left out, and
-`--check` counts the dropped entries. `--check` also counts the files in the
-export that no imported message names. Each copied file has a verified size and
-SHA-256. Those bytes are part of the message's version, so a later export whose
-file has different bytes, or has a file that the earlier export lacked, adds a
-new version of the message and keeps the earlier one. A named file that is not
-in the export is an explicit `missing` gap. Nothing is downloaded.
+code-interpreter entry. A library entry's `file_id` names its file the same way
+as an attachment entry's `id`. The import drops a library entry that has no
+origin, an origin that is not in the conversation, or an origin that was left
+out, and `--check` counts the dropped entries. `--check` also counts the files
+in the export that no imported message names. Each copied file has a verified
+size and SHA-256. Those bytes are part of the message's version, so a later
+export whose file has different bytes, or has a file that the earlier export
+lacked, adds a new version of the message and keeps the earlier one. A named
+file that is not in the export is an explicit `missing` gap. Nothing is
+downloaded.
 
 Each imported message stores its text, author, recipient, channel, status,
 content type and IDs, and the ID, name, type and SHA-256 of each attachment.
