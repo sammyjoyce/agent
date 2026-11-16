@@ -14,7 +14,7 @@ import json
 import sys
 from pathlib import Path
 
-ACTIONS = {"OpenCoordinatorIntent", "RetryInterruptedRunIntent"}
+ACTIONS = {"OpenCoordinatorIntent", "OpenJobIntent", "RetryInterruptedRunIntent"}
 ENTITIES = {
     "CoordinatorEntity": {"name"},
     "JobEntity": {"title", "coordinator", "schedule", "state", "lastRun", "nextRun"},
