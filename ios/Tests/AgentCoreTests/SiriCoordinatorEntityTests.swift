@@ -190,7 +190,7 @@ struct SiriCoordinatorEntityTests {
     tapped.notifications.coordinators.chat.show(.one(tapped.profiles[0].id))
     tapped.notifications.open(.named(tapped.profiles[1].id))
     let tapScope = tapped.notifications.coordinators.chat.scope
-    let tapNotice = try #require(tapped.notifications.openRequest).notice
+    let tapDestination = try #require(tapped.notifications.openRequest).destination
 
     let fixture = try SavedFixture()
     defer { fixture.clean() }
@@ -201,7 +201,7 @@ struct SiriCoordinatorEntityTests {
     fixture.notifications.open(fixture.entity(1))
     #expect(chat.scope == .one(fixture.profiles[1].id))
     #expect(tapScope == .one(tapped.profiles[1].id))
-    #expect(try #require(fixture.notifications.openRequest).notice == tapNotice)
+    #expect(try #require(fixture.notifications.openRequest).destination == tapDestination)
     #expect(chat.draft == "An invented Work draft")
     #expect(chat.destination == destination)
   }
