@@ -808,7 +808,6 @@ enum TerminalState {
     Exited,
     Pending,
 }
-/// What a recorded pane holds, judged against its binding's Rex instance.
 enum PaneHolds {
     Worker,
     OtherProcess,

@@ -301,8 +301,8 @@ pane is the task's terminal only while that server instance still runs. The
 host reads the instance after it reads the pane's process. A binding with no
 recorded instance proves nothing. An exited pane, and a pane whose process is
 not the task's terminal, get a replacement terminal in the same session. The
-host closes the old pane only when Rex reports that its process exited. It
-never closes a restored shell, because you may have used it.
+host closes the old pane only after Rex reports that its process exited. It
+leaves a restored shell open, because you may have used it.
 
 A terminal's own attachment is the receipt for a lost reply. A `run-task`
 terminal presents its allocation ID, which only its launch command carries. If

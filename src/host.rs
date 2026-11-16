@@ -554,7 +554,7 @@ async fn resume_bound_worker(
     .await;
     let (identity, presence) = match checked {
         Ok(checked) => checked,
-        Err(error) => return Ok(resume_not_started(error)),
+        Err(error) => return Ok(resume_created_nothing(error)),
     };
     if matches!(presence, crate::protocol::WorkerPresence::MissingTerminal) {
         return match client
@@ -584,7 +584,7 @@ async fn resume_bound_worker(
             Err(RexError::CreationUncertain { session_id }) => Ok(HostResult::CreationUncertain {
                 session_id: session_id.map(|id| id.to_string()),
             }),
-            Err(error) => Ok(resume_not_started(error.into())),
+            Err(error) => Ok(resume_created_nothing(error.into())),
         };
     }
     // A running client drains new pending inputs itself. An exited pane
@@ -601,8 +601,7 @@ async fn resume_bound_worker(
     .await
 }
 
-/// Rex created nothing, so the coordinator keeps the binding it sent.
-fn resume_not_started(error: anyhow::Error) -> HostResult {
+fn resume_created_nothing(error: anyhow::Error) -> HostResult {
     HostResult::Failed {
         message: error.to_string(),
         delivery: Some(HostDelivery::NotStarted),
@@ -844,7 +843,7 @@ async fn resume_worker(
         Err(RexError::CreationUncertain { session_id }) => Ok(HostResult::CreationUncertain {
             session_id: session_id.map(|id| id.to_string()),
         }),
-        Err(error) => Ok(resume_not_started(error.into())),
+        Err(error) => Ok(resume_created_nothing(error.into())),
     }
 }
 
@@ -1023,7 +1022,6 @@ mod tests {
     use tokio::{net::TcpStream, sync::oneshot, time::timeout};
 
     use crate::{
-        executable_fixture::write_executable,
         host::{Executor, ProcessOutput, ProcessRequest, run_process, run_process_until},
         protocol::{HostCommand, HostDelivery, HostResult, WorkerPresence, WorkerRef, WorkerState},
         rex::{RexClient, fake_rex},
@@ -1038,48 +1036,6 @@ mod tests {
             rex_instance_id: stamp.map(str::to_owned),
             ..binding
         }
-    }
-
-    /// The shared fixture shows every pane exited under one Rex instance. This
-    /// wrapper shows the block named by `AGENT_TEST_FAKE_REX_RUNNING` with a
-    /// live process, and answers `whoami` as a restarted server once the method
-    /// named by `AGENT_TEST_FAKE_REX_RESTART_AFTER` has run.
-    const PANE_REX: &str = r#"#!/bin/sh
-set -eu
-root=${AGENT_TEST_FAKE_REX:?}
-reply=$("$root/rex" "$@")
-for argument do
-  case $argument in
-    whoami)
-      if [ -e "$root/restarted" ]; then
-        reply=$(printf '%s' "$reply" | sed 's/66666666-6666-4666-8666-666666666666/88888888-8888-4888-8888-888888888888/')
-      fi ;;
-    com.superlogical.terminal.process)
-      case "$*" in
-        *"${AGENT_TEST_FAKE_REX_RUNNING:-<none>}"*) reply='{"child":{"pid":4242},"foreground":null,"last_exit":null}' ;;
-      esac ;;
-  esac
-  if [ "$argument" = "${AGENT_TEST_FAKE_REX_RESTART_AFTER:-<none>}" ]; then
-    : > "$root/restarted"
-  fi
-done
-printf '%s\n' "$reply"
-"#;
-
-    fn run_with_panes(test: &str, case: &str, envs: &[(&str, &str)]) {
-        let wrapper = tempfile::tempdir().unwrap();
-        write_executable(&wrapper.path().join("rex"), PANE_REX);
-        let path = std::env::join_paths(std::iter::once(wrapper.path().to_owned()).chain(
-            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
-        ))
-        .unwrap();
-        // `fake_rex::run` applies these last, so this PATH finds the wrapper
-        // before the fixture it wraps.
-        fake_rex::run(
-            test,
-            case,
-            &[envs, &[("PATH", path.to_str().unwrap())]].concat(),
-        );
     }
 
     #[test]
@@ -1115,7 +1071,7 @@ printf '%s\n' "$reply"
                 ("live", &[running][..]),
                 ("exited", &[][..]),
             ] {
-                run_with_panes(TEST, case, envs);
+                fake_rex::run(TEST, case, envs);
             }
             return;
         };
@@ -1172,7 +1128,7 @@ printf '%s\n' "$reply"
     async fn a_restart_after_the_process_read_never_proves_the_worker() {
         const TEST: &str = "host::tests::a_restart_after_the_process_read_never_proves_the_worker";
         if fake_rex::case().is_none() {
-            run_with_panes(
+            fake_rex::run(
                 TEST,
                 "restart-after-process-read",
                 &[
@@ -1274,8 +1230,8 @@ printf '%s\n' "$reply"
                 } else {
                     "session.new_window"
                 };
-                run_with_panes(TEST, &format!("{path}-steady"), &[]);
-                run_with_panes(
+                fake_rex::run(TEST, &format!("{path}-steady"), &[]);
+                fake_rex::run(
                     TEST,
                     &format!("{path}-restarted"),
                     &[("AGENT_TEST_FAKE_REX_RESTART_AFTER", create)],

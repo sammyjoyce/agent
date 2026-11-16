@@ -1543,9 +1543,7 @@ export class TaskStore {
         const replacement = await this.inspect(input.binding, inspect);
         if (replacement?.state === "present" && replacement.running) {
           // A lost creation reply must not strand the worker that actually
-          // started. Prove the old pane no longer runs the worker (a restored
-          // shell is never closed, so the pane may stay) and this exact
-          // replacement is running before moving the retained allocation.
+          // started.
           task = await this.allocation(input.task_id, "reconcile", (saved) => {
             const current = this.actor(saved, input.agent_id);
             this.requireResume(current.worker, uncertain);
