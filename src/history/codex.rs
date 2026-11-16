@@ -3355,7 +3355,7 @@ import {createRegistry,Harness} from '@earendil-works/pi-durable';
 import {SqliteStorage} from '@earendil-works/pi-durable/storage/sqlite';
 const runtime=pathToFileURL(process.argv[1]);
 const {HistoryStore,ImportedItemEntry}=await import(new URL('./history.js',runtime));
-const {CodexImporter}=await import(new URL('./importer.js',runtime));
+const {HistoryImports}=await import(new URL('./importer.js',runtime));
 const {TaskStore}=await import(new URL('./tasks.js',runtime));
 const {ConversationModels}=await import(new URL('./models.js',runtime));
 const {Retrieval}=await import(new URL('./retrieval.js',runtime));
@@ -3374,7 +3374,7 @@ async function open(){
   {models,registry:createRegistry(),identity:{attribution:null}},BACKGROUND_CONTEXT);
  const store=new HistoryStore(session),tasks=new TaskStore(session,new ConversationModels(models));tasks.useHistory(store);
  const retrieval=new Retrieval(session,store,tasks,join(evidence.directory,'search.sqlite'));
- return {session,store,retrieval,importer:new CodexImporter(session,store,join(evidence.directory,'assets'))};
+ return {session,store,retrieval,importer:new HistoryImports(session,store,join(evidence.directory,'assets'))};
 }
 let app=await open(),reads=0;
 const call=async command=>{
@@ -3385,7 +3385,7 @@ const call=async command=>{
  return {type:'history',response:{type:'read',thread_id:evidence.current.id,version:evidence.current.version,items:evidence.items,
   next_cursor:null,gaps:evidence.gaps,complete:false,source_exhausted:true}};
 };
-const run=()=>app.importer.run([host],[host.host_id],[],call,()=>{},()=>app.retrieval.sync(embed,true));
+const run=()=>app.importer.codex([host],[host.host_id],[],call,()=>{},()=>app.retrieval.sync(embed,true));
 try{
  const seeded=await app.store.import({host_id:host.host_id,thread:evidence.previous,items:evidence.items,next_cursor:null,gaps:[],complete:true,source_exhausted:true,retry_pages:[]});
  await app.retrieval.sync(embed,true);
@@ -3396,7 +3396,7 @@ try{
  const retained=(await conversation.entries({order:'ascending'},100,undefined,BACKGROUND_CONTEXT)).items.filter(ImportedItemEntry.is);
  assert.equal(retained.length,5);for(const entry of original)assert.deepEqual(retained.find(value=>value.id===entry.id),entry);
  for(const text of initialEmbedded)assert.equal(embedded.filter(value=>value===text).length,1,'Existing vectors must be reused');
- const checkpoint=await app.store.checkpoint(evidence.current.id,host.host_id);
+ const checkpoint=await app.store.checkpoint({source:'codex',thread_id:evidence.current.id},host.host_id);
  assert.equal(checkpoint.version,evidence.current.version);assert.notEqual(checkpoint.version,evidence.previous.version);
  assert.equal(checkpoint.complete,false);assert.deepEqual(checkpoint.gaps,evidence.gaps);
  assert.deepEqual((await conversation.context(BACKGROUND_CONTEXT)).messages,[]);

@@ -10,6 +10,7 @@ import { createModels } from "@earendil-works/pi-ai";
 import { createRegistry, defineDoc, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { AgentNode } from "../src/generated/AgentNode.js";
+import type { ChatGptPackageSummary } from "../src/generated/ChatGptPackageSummary.js";
 import type { HistoryItem } from "../src/generated/HistoryItem.js";
 import type { HistoryGap } from "../src/generated/HistoryGap.js";
 import type { HistoryRequest } from "../src/generated/HistoryRequest.js";
@@ -18,7 +19,7 @@ import type { HistoryThread } from "../src/generated/HistoryThread.js";
 import type { ImportProgress } from "../src/generated/ImportProgress.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 import { HistoryStore, ImportedItemEntry } from "../src/history.js";
-import { CodexImporter } from "../src/importer.js";
+import { CHATGPT_ORIGIN, HistoryImports } from "../src/importer.js";
 import { ConversationModels, DEFAULT_MODEL } from "../src/models.js";
 import { Retrieval } from "../src/retrieval.js";
 import { SearchIndex } from "../src/search.js";
@@ -58,10 +59,10 @@ async function open(directory: string) {
   const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
     { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
   const assets = join(directory, "assets"), histories = new HistoryStore(session, assets);
-  const importer = new CodexImporter(session, histories, assets);
+  const importer = new HistoryImports(session, histories, assets);
   let indexes = 0;
   return { session, histories, importer, assets, models, indexCount: () => indexes,
-    run: (producer: Producer, nodes = [coordinator]) => importer.run(nodes, nodes.map((node) => node.host_id), [], native(producer), () => {}, async () => { indexes += 1; }) };
+    run: (producer: Producer, nodes = [coordinator]) => importer.codex(nodes, nodes.map((node) => node.host_id), [], native(producer), () => {}, async () => { indexes += 1; }) };
 }
 async function originals(app: Awaited<ReturnType<typeof open>>, id: string) {
   const record = await app.histories.get({ source: "codex", thread_id: id }); assert.ok(record);
@@ -78,7 +79,7 @@ test("host progress advances before waiting for the next host's paged inventory"
   const waiting = new Promise<void>((resolve) => { entered = resolve; });
   let pending: Promise<ImportProgress> | undefined;
   try {
-    pending = app.importer.run([coordinator, laptop], [coordinator.host_id, laptop.host_id], [], native(async (host, request) => {
+    pending = app.importer.codex([coordinator, laptop], [coordinator.host_id, laptop.host_id], [], native(async (host, request) => {
       if (request.type === "list") {
         if (request.archived) return { type: "list", threads: [], next_cursor: null };
         if (host === coordinator.host_id) return { type: "list", threads: [first], next_cursor: null };
@@ -93,7 +94,7 @@ test("host progress advances before waiting for the next host's paged inventory"
       return page(host === coordinator.host_id ? first : second, [item(request.thread_id)]);
     }), (progress) => updates.push(progress), async () => {});
     await waiting;
-    assert.equal((await app.importer.status()).host_id, laptop.host_id);
+    assert.equal((await app.importer.status("codex")).host_id, laptop.host_id);
     assert.equal(updates.at(-1)?.host_id, laptop.host_id);
     assert.equal(updates.at(-1)?.threads_imported, 1, "Earlier committed work stays visible while discovery waits");
     release();
@@ -113,7 +114,7 @@ test("large thread progress publishes committed page counters before that thread
   const reading = new Promise<void>((resolve) => { entered = resolve; });
   let pending: Promise<ImportProgress> | undefined;
   try {
-    pending = app.importer.run([coordinator], [coordinator.host_id], [], native(async (_host, request) => {
+    pending = app.importer.codex([coordinator], [coordinator.host_id], [], native(async (_host, request) => {
       if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
       if (request.type !== "read") throw new Error("No media in this fixture");
       if (request.cursor === null) {
@@ -124,7 +125,7 @@ test("large thread progress publishes committed page counters before that thread
       return page(source, [item("second-page")]);
     }), () => {}, async () => {});
     await reading;
-    assert.equal((await app.importer.status()).items_added, 1);
+    assert.equal((await app.importer.status("codex")).items_added, 1);
     assert.equal((await app.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id))?.next_cursor, "second-page");
     assert.equal((await originals(app, source.id)).entries.length, 1);
     release(); assert.equal((await pending).phase, "complete");
@@ -218,7 +219,7 @@ test("same-version imports repair native lineage before completed skips and affe
       const search = new SearchIndex(join(directory, "search.sqlite"));
       const published = search.checkpoint(seeded.conversation_id); await search.close();
       corrected = true; reads = 0;
-      const result = await app.importer.run([coordinator], [coordinator.host_id], [], native(producer), () => {}, () => index.sync(embedding, true));
+      const result = await app.importer.codex([coordinator], [coordinator.host_id], [], native(producer), () => {}, () => index.sync(embedding, true));
       assert.equal(result.items_added, 0); assert.equal(reads, complete ? 0 : 1);
       assert.deepEqual(await app.histories.get({ source: "codex", thread_id: source.id }), { ...before, thread: { ...before.thread,
         parent_thread_id: "native-parent", forked_from_id: "native-fork" } });
@@ -361,13 +362,13 @@ async function stoppedDuringIndexing(directory: string, producer: Producer) {
   let release = () => {}, entered = () => {}, indexes = 0;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   const began = new Promise<void>((resolve) => { entered = resolve; });
-  const pending = previous.importer.run([coordinator], [coordinator.host_id], [], native(producer), () => {}, async () => {
+  const pending = previous.importer.codex([coordinator], [coordinator.host_id], [], native(producer), () => {}, async () => {
     if (++indexes === 1) return;
     entered(); await gate; throw new Error("Previous indexing owner stopped");
   });
   void pending.catch(() => {});
   await began;
-  const progress = await previous.importer.status(); assert.equal(progress.phase, "indexing");
+  const progress = await previous.importer.status("codex"); assert.equal(progress.phase, "indexing");
 
   const legacy = defineDoc<{ progress: ImportProgress | null; indexing?: ImportProgress | null }>({
     kind: "agent.import-progress", scope: "session", version: 1, initial: () => ({ progress: null }), checkpointWhen: () => true,
@@ -423,7 +424,7 @@ test("source text and cursors commit while native embedding is held, and joined 
       return page(source, [added], "last-text");
     });
     const index = async () => { indexes += 1; await retrieval.sync(embedding, true); };
-    pending = app.importer.run([coordinator], [coordinator.host_id], [], producer, (progress) => { updates.push(progress); if (progress.phase === "indexing") checkpointed(); }, index);
+    pending = app.importer.codex([coordinator], [coordinator.host_id], [], producer, (progress) => { updates.push(progress); if (progress.phase === "indexing") checkpointed(); }, index);
     await began;
     assert.equal(sourceStartedBeforeEmbedding, true, "Source discovery must start without waiting for the existing corpus embeddings");
     await atTail;
@@ -431,10 +432,10 @@ test("source text and cursors commit while native embedding is held, and joined 
     assert.ok((await originals(app, source.id)).entries.some((entry) => entry.data.item.id === "new-sapphire"));
     assert.equal((await retrieval.snapshot("zirconia", [], 8)).candidates[0]?.conversation_id, saved.conversation.conversation_id);
     assert.equal(app.importer.isRunning(), true);
-    joined = app.importer.run([coordinator], [coordinator.host_id], [], producer, () => {}, index);
+    joined = app.importer.codex([coordinator], [coordinator.host_id], [], producer, () => {}, index);
     releaseSource(); await walked; await postwalk;
     assert.equal(indexes, 1); assert.equal(inventories, 2, "A joined import cannot start another native walk");
-    assert.equal((await app.importer.status()).phase, "indexing", "Only the completed source walk can create a postwalk checkpoint");
+    assert.equal((await app.importer.status("codex")).phase, "indexing", "Only the completed source walk can create a postwalk checkpoint");
     release();
     const result = await pending; assert.equal(result.phase, "complete"); assert.deepEqual(await joined, result); assert.equal(indexes, 2);
     assert.equal((await retrieval.snapshot("sapphire", [], 8)).candidates[0]?.conversation_id, saved.conversation.conversation_id);
@@ -487,7 +488,7 @@ test("failure drains the owned initial host call before request cleanup and rest
   try {
     await previous.histories.import({ host_id: coordinator.host_id, thread: source, items: [item("before-stop")],
       next_cursor: "unread-page", gaps: [], complete: false });
-    pending = previous.importer.run([coordinator], [coordinator.host_id], [], (command) => requests.call(71, command), () => {}, async () => {
+    pending = previous.importer.codex([coordinator], [coordinator.host_id], [], (command) => requests.call(71, command), () => {}, async () => {
       const result = await requests.call(71, { type: "embed", texts: ["Retained corpus"], purpose: "document" });
       if (result.type === "failed") throw new Error(result.message);
     }).finally(() => { requests.finish(71); ownerFinished = true; });
@@ -496,13 +497,13 @@ test("failure drains the owned initial host call before request cleanup and rest
     assert.ok(sourceCalls > 0, "The owned initial index call must not gate source discovery");
     await atTail;
     assert.equal((await previous.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id))?.next_cursor, "tail-page");
-    assert.notEqual((await previous.importer.status()).phase, "indexing", "Only postwalk indexing can skip source discovery on resume");
+    assert.notEqual((await previous.importer.status("codex")).phase, "indexing", "Only postwalk indexing can skip source discovery on resume");
     await previous.session.close(BACKGROUND_CONTEXT); closed = true; releaseSource();
     await sourceFailed; await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(ownerFinished, false, "Request cleanup must retain its host-call owner until the initial index drains");
     release(); await assert.rejects(pending); assert.equal(ownerFinished, true); assert.equal(callsAfterFinish, 0); assert.ok(owners.every((id) => id === 71));
     app = await open(directory);
-    assert.equal((await app.importer.status()).phase, "partial");
+    assert.equal((await app.importer.status("codex")).phase, "partial");
     let reads = 0;
     const resumed = await app.run((_host, request) => {
       if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
@@ -523,7 +524,7 @@ test("prewalk indexing failure stays visible during source reads and final succe
   const directory = await mkdtemp(join(tmpdir(), "agent-importer-prewalk-failure-")); const app = await open(directory);
   const source = thread("missing-media"); let indexes = 0, reads = 0; const updates: ImportProgress[] = [];
   try {
-    const result = await app.importer.run([coordinator], [coordinator.host_id], [], native(async (_host, request) => {
+    const result = await app.importer.codex([coordinator], [coordinator.host_id], [], native(async (_host, request) => {
       if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
       if (request.type !== "read") throw new Error("No transferable media is present");
       reads += 1;
@@ -658,11 +659,11 @@ test("status reports a stopped import after reopening Pi and preserves its resum
   void abandoned.catch(() => {});
   try {
     await waiting;
-    const active = await app.importer.status(); assert.notEqual(active.phase, "partial");
+    const active = await app.importer.status("codex"); assert.notEqual(active.phase, "partial");
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
-    const status = await app.importer.status(); assert.equal(status.phase, "partial");
+    const status = await app.importer.status("codex"); assert.equal(status.phase, "partial");
     assert.equal(status.gaps[0], "Previous import was interrupted; run beep-boop import codex to resume.");
-    assert.deepEqual(await app.importer.status(), status);
+    assert.deepEqual(await app.importer.status("codex"), status);
     assert.equal((await app.histories.checkpoint({ source: "codex", thread_id: source.id }, coordinator.host_id))?.next_cursor, "second-page");
     const resumed = await app.run((_host, request) => {
       if (request.type === "list") return { type: "list", threads: request.archived ? [] : [source], next_cursor: null };
@@ -697,15 +698,15 @@ test("interrupted indexing resumes retained counts and gaps without rereading so
     const forbidden: HostCall = async () => { sourceCalls += 1; throw new Error("Resuming indexing must not read native sources"); };
     const index = async () => { indexCalls += 1; entered(); await gate; };
     try {
-      const status = await app.importer.status(); assert.equal(status.phase, "partial");
+      const status = await app.importer.status("codex"); assert.equal(status.phase, "partial");
       assert.equal(status.gap_count, progress.gap_count + 1);
-      const first = app.importer.run(available.nodes, available.online, [], forbidden, () => {}, index);
-      const second = app.importer.run(available.nodes, available.online, [], forbidden, () => {}, index);
+      const first = app.importer.codex(available.nodes, available.online, [], forbidden, () => {}, index);
+      const second = app.importer.codex(available.nodes, available.online, [], forbidden, () => {}, index);
       void first.catch(() => {}); void second.catch(() => {});
       try {
         await Promise.race([began, first.then(() => { throw new Error("Index recovery did not reach its callback"); })]);
         assert.equal(sourceCalls, 0, "The resumed phase must not walk native inventory again"); assert.equal(indexCalls, 1);
-        assert.deepEqual(await app.importer.status(), progress);
+        assert.deepEqual(await app.importer.status("codex"), progress);
         release();
         const results = await Promise.all([first, second]);
         assert.deepEqual(results, [{ ...progress, phase: "partial" }, { ...progress, phase: "partial" }]);
@@ -731,9 +732,9 @@ test("explicit host selection starts a new native walk instead of claiming an in
   const hosts: string[] = []; let indexes = 0;
   const call = native((host, request) => { hosts.push(host); return producer(host, request); });
   try {
-    await assert.rejects(app.importer.run([coordinator, laptop], [coordinator.host_id, laptop.host_id], ["unknown"], call, () => {}, async () => { indexes += 1; }), /registered history host/);
+    await assert.rejects(app.importer.codex([coordinator, laptop], [coordinator.host_id, laptop.host_id], ["unknown"], call, () => {}, async () => { indexes += 1; }), /registered history host/);
     assert.equal(indexes, 0); assert.deepEqual(hosts, []);
-    const result = await app.importer.run([coordinator, laptop], [coordinator.host_id, laptop.host_id], [laptop.name], call, () => {}, async () => { indexes += 1; });
+    const result = await app.importer.codex([coordinator, laptop], [coordinator.host_id, laptop.host_id], [laptop.name], call, () => {}, async () => { indexes += 1; });
     assert.equal(result.phase, "complete"); assert.equal(result.items_added, 0); assert.equal(result.items_unchanged, 1);
     assert.deepEqual(hosts, [laptop.host_id, laptop.host_id, laptop.host_id]); assert.equal(indexes, 2);
   } finally { await stopped.settle(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
@@ -753,20 +754,20 @@ test("a failed index keeps source progress across reopen and clears resolved ind
   let sourceCalls = 0, indexes = 0;
   const forbidden: HostCall = async () => { sourceCalls += 1; throw new Error("Index recovery must not call a source host"); };
   try {
-    const failed = await app.importer.run([coordinator], [coordinator.host_id], [], native(producer), () => {}, async () => {
+    const failed = await app.importer.codex([coordinator], [coordinator.host_id], [], native(producer), () => {}, async () => {
       indexes += 1; throw new Error("The execution request ended before the host operation completed");
     });
     assert.equal(failed.phase, "partial"); assert.equal(failed.items_added, 1); assert.equal(failed.gap_count, 3);
     assert.equal(failed.gaps[0], "Search indexing: The execution request ended before the host operation completed");
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
-    assert.deepEqual(await app.importer.status(), failed);
-    const repeated = await app.importer.run([coordinator], [coordinator.host_id], [], forbidden, () => {}, async () => {
+    assert.deepEqual(await app.importer.status("codex"), failed);
+    const repeated = await app.importer.codex([coordinator], [coordinator.host_id], [], forbidden, () => {}, async () => {
       indexes += 1; throw new Error("Synthetic second index failure");
     });
     assert.equal(sourceCalls, 0, "Public partial status must not discard the pending index checkpoint");
     assert.equal(repeated.gap_count, 3); assert.equal(repeated.gaps[0], "Search indexing: Synthetic second index failure");
     assert.deepEqual(repeated.gaps.slice(1), failed.gaps.slice(1));
-    const recovered = await app.importer.run([], [], [], forbidden, () => {}, async () => { indexes += 1; });
+    const recovered = await app.importer.codex([], [], [], forbidden, () => {}, async () => { indexes += 1; });
     assert.deepEqual(recovered, { ...failed, gap_count: 2, gaps: failed.gaps.slice(1) });
     assert.equal(sourceCalls, 0); assert.equal(indexes, 4);
     assert.deepEqual((await originals(app, source.id)).entries.map((entry) => entry.data.item.id), ["retained"]);
@@ -1017,5 +1018,162 @@ test("changed or unreliable first-read failures replace stale completeness befor
       fail = false; const recovered = await app.run(producer);
       assert.equal(recovered.phase, "complete"); assert.equal(recovered.items_added, 0); assert.equal(recovered.items_unchanged, 1);
     }
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+const DISCONNECTED: HostResult = { type: "failed", delivery: "outcome_uncertain", message: "The execution client disconnected; no command ran on a fallback host." };
+function exported(digest: string, problems: string[] = []): ChatGptPackageSummary {
+  return { digest, parts: ["export.zip"], conversations: 3, archived: 0, shards: 1, attachments: 0, missing_attachments: 0,
+    excluded_messages: 0, notes: [], problems };
+}
+type ClientReader = (request: HistoryRequest) => HostResult | Promise<HostResult>;
+function client(reader: ClientReader, seen: string[] = []): HostCall {
+  return async (command) => {
+    seen.push(command.type);
+    if (command.type !== "history") throw new Error("A ChatGPT import attempted an operation other than a client history read");
+    return reader(command.request);
+  };
+}
+function served(threads: HistoryThread[], read: (request: Extract<HistoryRequest, { type: "read" }>) => HistoryResponse): ClientReader {
+  return (request) => {
+    if (request.type === "list") return { type: "history", response: { type: "list", threads: request.archived ? [] : threads, next_cursor: null } };
+    if (request.type !== "read") throw new Error("No attachments in this fixture");
+    return { type: "history", response: read(request) };
+  };
+}
+const conversations = ["00000000-0000-4000-8000-0000000000c1", "00000000-0000-4000-8000-0000000000c2", "00000000-0000-4000-8000-0000000000c3"]
+  .map((id) => thread(id));
+const chatGptThread = (id: string) => ({ source: "chatgpt", thread_id: id }) as const;
+
+test("chatgpt reads are plain history calls, never on_node", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-chatgpt-reads-")), app = await open(directory);
+  try {
+    const seen: string[] = [], updates: ImportProgress[] = [];
+    const result = await app.importer.chatgpt(exported("3f2a9c1b"), client(served(conversations, (request) =>
+      page(conversations.find((value) => value.id === request.thread_id)!, [item(request.thread_id)])), seen),
+    (progress) => updates.push(progress), async () => {});
+    assert.equal(result.phase, "complete"); assert.equal(result.threads_imported, 3);
+    assert.deepEqual(new Set(seen), new Set(["history"]));
+    assert.ok(updates.length > 0 && updates.every((progress) => progress.source === "chatgpt" && progress.host_id === null));
+    assert.equal((await app.histories.get(chatGptThread(conversations[0]!.id)))?.source, "chatgpt");
+    assert.equal(await app.histories.get({ source: "codex", thread_id: conversations[0]!.id }), undefined);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a lost client ends the feed after the thread in flight, and a rerun resumes without rereading finished threads", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-chatgpt-lost-client-")), app = await open(directory);
+  const [first, second, third] = conversations; assert.ok(first && second && third);
+  const read = (request: Extract<HistoryRequest, { type: "read" }>) => {
+    if (request.thread_id === first.id) return page(first, [item("first")]);
+    if (request.thread_id === second.id) return request.cursor === null ? page(second, [item("second-a")], "page-two") : page(second, [item("second-b")]);
+    return page(third, [item("third")]);
+  };
+  try {
+    let reads = 0;
+    const lost = await app.importer.chatgpt(exported("3f2a9c1b"), client(async (request) =>
+      ++reads > 3 ? DISCONNECTED : served(conversations, read)(request)), () => {}, async () => {});
+    assert.equal(lost.phase, "partial");
+    assert.equal(lost.gaps.filter((gap) => gap.includes("disconnected")).length, 1, lost.gaps.join("\n"));
+    assert.equal(lost.gap_count, 1, "Unread conversations are not each reported as failed");
+    assert.equal(lost.threads_imported, 1);
+    assert.equal((await app.histories.checkpoint(chatGptThread(first.id), CHATGPT_ORIGIN))?.complete, true);
+    assert.equal((await app.histories.checkpoint(chatGptThread(second.id), CHATGPT_ORIGIN))?.next_cursor, "page-two");
+    assert.equal(await app.histories.get(chatGptThread(third.id)), undefined, "A conversation that was never read has no empty conversation");
+
+    const cursors: [string, string | null][] = [];
+    const resumed = await app.importer.chatgpt(exported("3f2a9c1b"), client(served(conversations, (request) => {
+      cursors.push([request.thread_id, request.cursor]); return read(request);
+    })), () => {}, async () => {});
+    assert.equal(resumed.phase, "complete");
+    assert.equal(resumed.threads_unchanged, 1);
+    assert.deepEqual(cursors, [[second.id, "page-two"], [third.id, null]]);
+    assert.equal(resumed.items_added, 2);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a client reader error is one conversation's gap, not a lost client", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-chatgpt-reader-error-")), app = await open(directory);
+  const [first, second, third] = conversations; assert.ok(first && second && third);
+  const refused: HostResult = { type: "failed", message: "History cursor belongs to another export" };
+  try {
+    const result = await app.importer.chatgpt(exported("3f2a9c1b"), client((request) => request.type === "read" && request.thread_id === second.id
+      ? refused : served(conversations, (read) => page(conversations.find((value) => value.id === read.thread_id)!, [item(read.thread_id)]))(request)),
+    () => {}, async () => {});
+    assert.equal(result.phase, "partial"); assert.equal(result.threads_imported, 2); assert.equal(result.gap_count, 1);
+    assert.match(result.gaps[0] ?? "", /another export/);
+    assert.equal((await app.histories.checkpoint(chatGptThread(third.id), CHATGPT_ORIGIN))?.complete, true);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a different export is refused while one runs and the same export attaches", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-chatgpt-single-flight-")), app = await open(directory);
+  let release = () => {}, entered = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; }), listing = new Promise<void>((resolve) => { entered = resolve; });
+  const call = client(async (request) => {
+    if (request.type === "list" && !request.archived) { entered(); await gate; }
+    return served(conversations, (read) => page(conversations.find((value) => value.id === read.thread_id)!, [item(read.thread_id)]))(request);
+  });
+  let first: Promise<ImportProgress> | undefined;
+  try {
+    first = app.importer.chatgpt(exported("3f2a9c1b"), call, () => {}, async () => {});
+    await listing;
+    await assert.rejects(app.importer.chatgpt(exported("77aa0d4e"), call, () => {}, async () => {}), /already/);
+    const attached = app.importer.chatgpt(exported("3f2a9c1b"), call, () => {}, async () => {});
+    release();
+    assert.equal(await attached, await first);
+    assert.equal((await first).threads_imported, 3);
+  } finally { release(); await first?.catch(() => {}); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("codex and chatgpt imports run concurrently with separate progress", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-chatgpt-concurrent-")), app = await open(directory);
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let both = 0, entered = () => {};
+  const listing = new Promise<void>((resolve) => { entered = resolve; });
+  const arrive = async () => { if (++both === 2) entered(); await gate; };
+  const codexSource = thread("codex-only");
+  try {
+    const codex = app.importer.codex([coordinator], [coordinator.host_id], [], native(async (_host, request) => {
+      if (request.type === "list") { if (!request.archived) await arrive(); return { type: "list", threads: request.archived ? [] : [codexSource], next_cursor: null }; }
+      if (request.type !== "read") throw new Error("No media in this fixture");
+      return page(codexSource, [item("codex-item")]);
+    }), () => {}, async () => {});
+    const chatgpt = app.importer.chatgpt(exported("3f2a9c1b"), client(async (request) => {
+      if (request.type === "list" && !request.archived) await arrive();
+      return served(conversations, (read) => page(conversations.find((value) => value.id === read.thread_id)!, [item(read.thread_id)]))(request);
+    }), () => {}, async () => {});
+    await listing;
+    assert.equal(app.importer.isRunning(), true);
+    release();
+    const [left, right] = await Promise.all([codex, chatgpt]);
+    assert.deepEqual([left.phase, left.threads_imported, right.phase, right.threads_imported], ["complete", 1, "complete", 3]);
+    assert.deepEqual((await app.importer.statuses()).map((row) => [row.source, row.threads_imported]), [["codex", 1], ["chatgpt", 3]]);
+  } finally { release(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("package problems make the import partial", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-chatgpt-problems-")), app = await open(directory);
+  try {
+    const problem = "Conversation 00000000-0000-4000-8000-0000000000c9 has no message tree; it was not imported.";
+    const result = await app.importer.chatgpt(exported("3f2a9c1b", [problem]), client(served(conversations, (request) =>
+      page(conversations.find((value) => value.id === request.thread_id)!, [item(request.thread_id)]))), () => {}, async () => {});
+    assert.equal(result.phase, "partial"); assert.ok(result.gaps.includes(problem));
+    assert.equal(result.threads_imported, 3);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("import status omits ChatGPT until it has run, then names its own resume command when interrupted", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-chatgpt-status-")), app = await open(directory);
+  try {
+    assert.deepEqual((await app.importer.statuses()).map((row) => row.source), ["codex"]);
+    const saved = defineDoc<{ progress: ImportProgress | null; indexing?: ImportProgress | null }>({
+      kind: "agent.import-progress.chatgpt", scope: "session", version: 1, initial: () => ({ progress: null }), checkpointWhen: () => true });
+    const interrupted: ImportProgress = { ...await app.importer.status("chatgpt"), phase: "importing", threads_imported: 2 };
+    await app.session.commit(async (tx) => { (await tx.doc(saved)).progress = interrupted; }, BACKGROUND_CONTEXT);
+    const [codex, chatgpt] = await app.importer.statuses();
+    assert.equal(codex?.source, "codex"); assert.equal(codex.phase, "discovering");
+    assert.equal(chatgpt?.source, "chatgpt"); assert.equal(chatgpt.phase, "partial"); assert.equal(chatgpt.threads_imported, 2);
+    assert.equal(chatgpt.gaps[0], "Previous import was interrupted; run beep-boop import chatgpt with the same export to resume.");
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

@@ -98,7 +98,7 @@ export class Retrieval {
     const gaps: string[] = [];
     // The durable background lane owns indexing and its host effects. A lookup
     // must not inherit arbitrary document inference or a catch-up queue.
-    if (importing) gaps.push("Codex history import and indexing are in progress");
+    if (importing) gaps.push("History import and indexing are in progress");
     else if (this.pendingSyncs > 0) gaps.push("History indexing is in progress; results use the published index");
     else if (this.dirty.size > 0) gaps.push("History changes await indexing; results use the published index");
     else if (!this.ready) gaps.push("History index freshness is unverified; results use the published index");
