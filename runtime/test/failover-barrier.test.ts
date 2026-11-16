@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
+import { ROOT_CONVERSATION_ID, type StorageWrite } from "@earendil-works/pi-durable";
 import { AuthorityDenied } from "../src/failover/authority-client.js";
 import { AuthorityUnreachable } from "../src/failover/authority-link.js";
 import { INLINE_BATCH_LIMIT_BYTES, sha256Hex } from "../src/failover/log-entry.js";
@@ -225,6 +225,21 @@ for (const [name, connect] of Object.entries(authorities)) {
     const head = owner.log.head, before = tables(directory);
     await assert.rejects(owner.storage.commit([reused], context), /already belongs to entry/);
     assert.equal((await link.record())?.state.head, head);
+    assert.equal(owner.log.head, head);
+    assert.deepEqual(tables(directory), before);
+  });
+
+  test(`${name}: a batch that Pi accepts and whose JSON Pi refuses never reaches the log`, async (t) => {
+    const link = await connect(), epoch = await enroll(link), directory = await stateDirectory(t);
+    const owner = await openOwner(directory, link, { epoch });
+    t.after(() => owner.harness.close(context).catch(() => {}));
+    await owner.root.submit(note("first", "request-1"), context);
+    const reused = (await logBatches(link)).flat().findLast((write) => write.type === "entry");
+    assert.ok(reused?.type === "entry");
+    const fresh: StorageWrite = { type: "entry", value: { ...reused.value, id: await owner.storage.mintId() } };
+    const head = owner.log.head, before = tables(directory);
+    await assert.rejects(owner.storage.commit(Object.assign([fresh], { toJSON: () => [reused] }), context), /already belongs to entry/);
+    assert.equal((await link.record())?.state.head, head, "the log did not move");
     assert.equal(owner.log.head, head);
     assert.deepEqual(tables(directory), before);
   });
