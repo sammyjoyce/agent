@@ -151,13 +151,13 @@ recovery; [history](history.md) describes import and retrieval.
   planned WhatsApp/iMessage client use case. System appearance is the default,
   with saved Light/Dark overrides and native keyboard dismissal.
 - [x] Enable iPhone alerts for completed main-chat replies and explicit
-  `notify_user` notices, including mid-job requests. A development-signed
-  build enrolled automatically on a real phone. A
-  [phone acceptance](../ios/README.md#phone-acceptance) run showed a completed
-  reply as an alert with the app in the background and after it was
-  terminated, and a mid-job notice while its job still ran. Each alert matched
-  an accepted durable delivery. TestFlight builds need the production APNs
-  environment. See [notification setup](notifications.md).
+  `notify_user` notices, including mid-job requests. On a real phone, a
+  development-signed build had alerts on and was registered with the
+  coordinator. A [phone acceptance](../ios/README.md#phone-acceptance) run
+  showed a completed reply as an alert with the app in the background and
+  after it was terminated, and a mid-job notice while its job still ran. Each
+  alert matched an accepted durable delivery. TestFlight builds need the
+  production APNs environment. See [notification setup](notifications.md).
 - [x] Direct coordination between task sessions through their durable inboxes:
   sender identity, admission receipts, steering or queueing, and shared history.
 - [x] Voice input through a transcription provider interface. The iPhone
