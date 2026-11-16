@@ -1478,6 +1478,408 @@ mod tests {
         assert_eq!(observed, expected);
     }
 
+    struct Imported {
+        history: ChatGptHistory,
+        thread: String,
+        served: Served,
+        items: Vec<HistoryItem>,
+        gaps: Vec<HistoryGap>,
+    }
+
+    async fn imported(directory: &Path, export: Export, conversation: Value) -> Imported {
+        let thread = conversation["id"].as_str().unwrap().to_owned();
+        let history = open(&export.conversations(&[conversation]).folder(directory));
+        let served = serve_everything(&history).await;
+        let (items, gaps) = read_all(&history, &thread).await;
+        Imported {
+            history,
+            thread,
+            served,
+            items,
+            gaps,
+        }
+    }
+
+    impl Imported {
+        fn shows(&self, text: &str) -> bool {
+            self.served.text.contains(text)
+        }
+
+        async fn serves(&self, file: &str) -> Option<Vec<u8>> {
+            fetch(&self.history, &self.thread, file)
+                .await
+                .ok()
+                .map(|(bytes, _, _)| bytes)
+        }
+
+        /// The reports of content this import does not read: thread gaps, never item gaps.
+        fn unread(&self) -> Vec<&str> {
+            self.gaps
+                .iter()
+                .map(|gap| {
+                    assert!(
+                        matches!(gap.code, HistoryGapCode::Unsupported) && gap.item_id.is_none(),
+                        "{gap:?}"
+                    );
+                    gap.message.as_str()
+                })
+                .collect()
+        }
+    }
+
+    fn upper(case: &str) -> String {
+        case.to_uppercase().replace('-', "_")
+    }
+
+    fn metadata_container(case: &str, marker: (&str, Value)) -> Value {
+        let case_name = upper(case);
+        let mut metadata = json!({"attachments": [{"id": "file-Private", "name": "private.txt"}]});
+        metadata[marker.0] = marker.1;
+        json!({
+            "id": format!("r3-{case}"),
+            "title": format!("Invented {case}"),
+            "create_time": 1_800_000_000,
+            "update_time": 1_800_000_100,
+            "current_node": "a",
+            "mapping": {
+                "u": {"parent": null, "message": {"id": "u", "author": {"role": "user"},
+                    "content": {"content_type": "text",
+                        "parts": [format!("VISIBLE_USER_PROMPT_CASE_{case_name}_CANARY")]},
+                    "metadata": {}, "create_time": 1_800_000_000}},
+                "a": {"parent": "u", "message": {"id": "a", "author": {"role": "assistant"},
+                    "content": {"content_type": "text",
+                        "parts": [format!("VISIBLE_ASSISTANT_ANSWER_CASE_{case_name}_CANARY")]},
+                    "metadata": metadata, "create_time": 1_800_000_000}},
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn metadata_shaped_like_a_message_is_not_read() {
+        let cases = [
+            (
+                "excluded-metadata-container-system",
+                ("author", json!({"role": "system"})),
+            ),
+            (
+                "excluded-metadata-container-hidden",
+                (
+                    "metadata",
+                    json!({"is_visually_hidden_from_conversation": true}),
+                ),
+            ),
+            (
+                "excluded-metadata-container-instruction",
+                ("content", json!({"content_type": "user_editable_context"})),
+            ),
+        ];
+        let (mut observed, mut expected) = (Vec::new(), Vec::new());
+        for (case, marker) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let case_name = upper(case);
+            let file = format!("EXCLUDED_CONTAINER_FILE_CASE_{case_name}_CANARY");
+            let import = imported(
+                directory.path(),
+                Export::new().stored("file-Private.txt", file.as_bytes()),
+                metadata_container(case, marker),
+            )
+            .await;
+            let unread = import.unread();
+            observed.push(format!(
+                "{case}: prompt {}, answer {}, file named {}, bytes served {}, file served {}, unread {}, says metadata {}",
+                import.shows(&format!("VISIBLE_USER_PROMPT_CASE_{case_name}_CANARY")),
+                import.shows(&format!("VISIBLE_ASSISTANT_ANSWER_CASE_{case_name}_CANARY")),
+                import.shows("file-Private"),
+                import.shows(&file),
+                import.serves("file-Private").await.is_some(),
+                unread.len(),
+                unread.iter().all(|gap| gap.contains("metadata")),
+            ));
+            expected.push(format!(
+                "{case}: prompt true, answer true, file named false, bytes served false, file served false, unread 1, says metadata true"
+            ));
+        }
+        assert_eq!(observed, expected);
+    }
+
+    fn focused(case: &str, role: &str, parts: Value) -> Value {
+        json!({
+            "id": format!("focused-{case}"),
+            "title": format!("Invented {case}"),
+            "create_time": 1_800_000_000,
+            "update_time": 1_800_000_100,
+            "current_node": "m",
+            "mapping": {"m": {"parent": null, "message": {"id": "m", "author": {"role": role},
+                "content": {"content_type": "multimodal_text", "parts": parts}, "metadata": {}}}},
+        })
+    }
+
+    async fn focused_import(directory: &Path, case: &str, role: &str, parts: Value) -> Imported {
+        let canvas = format!("VISIBLE_CANVAS_BYTES_{}_CANARY", upper(case));
+        imported(
+            directory,
+            Export::new().stored("file-Canvas.png", canvas.as_bytes()),
+            focused(case, role, parts),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_hidden_part_contributes_no_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let import = focused_import(
+            directory.path(),
+            "nested-hidden-part",
+            "assistant",
+            json!(["VISIBLE_OUTER_ANSWER_CANARY", {"content_type": "text",
+                "text": "EXCLUDED_HIDDEN_PART_TEXT_CANARY",
+                "metadata": {"is_visually_hidden_from_conversation": true}}]),
+        )
+        .await;
+        assert_eq!(import.items.len(), 1);
+        assert_eq!(import.items[0].text, "VISIBLE_OUTER_ANSWER_CANARY");
+        assert!(!import.shows("EXCLUDED_HIDDEN_PART_TEXT_CANARY"));
+        let unread = import.unread();
+        assert_eq!(unread.len(), 1, "{unread:?}");
+        assert!(unread[0].contains("hidden"), "{unread:?}");
+    }
+
+    #[tokio::test]
+    async fn a_text_part_with_other_keys_is_reported_and_not_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let import = focused_import(
+            directory.path(),
+            "nested-developer-part",
+            "assistant",
+            json!(["VISIBLE_OUTER_ANSWER_CANARY", {"content_type": "text",
+                "text": "EXCLUDED_DEVELOPER_PART_TEXT_CANARY",
+                "author": {"role": "developer"},
+                "content": {"content_type": "text", "parts": ["EXCLUDED_OTHER_TEXT_CANARY"]}}]),
+        )
+        .await;
+        assert_eq!(import.items.len(), 1);
+        assert_eq!(import.items[0].text, "VISIBLE_OUTER_ANSWER_CANARY");
+        assert!(!import.shows("EXCLUDED_DEVELOPER_PART_TEXT_CANARY"));
+        assert!(!import.shows("EXCLUDED_OTHER_TEXT_CANARY"));
+        let unread = import.unread();
+        assert_eq!(unread.len(), 1, "{unread:?}");
+        assert!(unread[0].contains("type text"), "{unread:?}");
+    }
+
+    #[tokio::test]
+    async fn a_canvas_image_part_keeps_its_caption_and_its_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let import = focused_import(
+            directory.path(),
+            "canvas-assistant",
+            "assistant",
+            json!(["VISIBLE_ASSISTANT_CANVAS_ANSWER_CANARY", {"content_type": "image_asset_pointer",
+                "asset_pointer": "sediment://file-Canvas",
+                "author": {"role": "system", "name": "canvas-renderer"},
+                "text": "VISIBLE_ASSISTANT_CANVAS_CAPTION_CANARY"}]),
+        )
+        .await;
+        assert_eq!(import.items.len(), 1);
+        assert_eq!(
+            import.items[0].text,
+            "VISIBLE_ASSISTANT_CANVAS_ANSWER_CANARY\n\nVISIBLE_ASSISTANT_CANVAS_CAPTION_CANARY"
+        );
+        assert_eq!(
+            import.serves("file-Canvas").await.as_deref(),
+            Some(b"VISIBLE_CANVAS_BYTES_CANVAS_ASSISTANT_CANARY".as_slice())
+        );
+        assert!(!import.shows("canvas-renderer"));
+        assert!(import.gaps.is_empty(), "{:?}", import.gaps);
+    }
+
+    #[tokio::test]
+    async fn a_hidden_canvas_part_keeps_neither_caption_nor_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let import = focused_import(
+            directory.path(),
+            "canvas-user",
+            "user",
+            json!(["VISIBLE_USER_CANVAS_PROMPT_CANARY", {"content_type": "image_asset_pointer",
+                "asset_pointer": "sediment://file-Canvas",
+                "metadata": {"is_visually_hidden_from_conversation": true, "source": "canvas-preview-cache"},
+                "text": "VISIBLE_USER_CANVAS_CAPTION_CANARY"}]),
+        )
+        .await;
+        assert_eq!(import.items.len(), 1);
+        assert_eq!(import.items[0].text, "VISIBLE_USER_CANVAS_PROMPT_CANARY");
+        assert!(!import.shows("VISIBLE_USER_CANVAS_CAPTION_CANARY"));
+        assert!(!import.shows("VISIBLE_CANVAS_BYTES_CANVAS_USER_CANARY"));
+        assert!(!import.shows("file-Canvas"));
+        assert!(import.serves("file-Canvas").await.is_none());
+        let unread = import.unread();
+        assert_eq!(unread.len(), 1, "{unread:?}");
+        assert!(unread[0].contains("hidden"), "{unread:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_message_type_is_reported_instead_of_imported() {
+        let directory = tempfile::tempdir().unwrap();
+        let import = imported(
+            directory.path(),
+            Export::new(),
+            Conversation::new(1, "Widget")
+                .say("u1", "root", "user", "Show me the widget")
+                .node(
+                    "w",
+                    Some("u1"),
+                    json!({"author": {"role": "assistant"},
+                        "content": {"content_type": "future_widget", "text": "FUTURE_WIDGET_TEXT"}}),
+                )
+                .build(),
+        )
+        .await;
+        let ids: Vec<&str> = import.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["u1"]);
+        assert!(!import.shows("FUTURE_WIDGET_TEXT"));
+        let unread = import.unread();
+        assert_eq!(unread.len(), 1, "{unread:?}");
+        assert!(
+            unread[0].contains("future_widget") && unread[0].contains("Message w "),
+            "{unread:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_part_is_reported_and_the_other_parts_are_kept() {
+        let directory = tempfile::tempdir().unwrap();
+        let import = imported(
+            directory.path(),
+            Export::new().stored("file-FuturePart-data.txt", b"FUTURE_PART_BYTES"),
+            Conversation::new(1, "Parts")
+                .node(
+                    "u1",
+                    Some("root"),
+                    json!({"author": {"role": "user"}, "content": {"content_type": "multimodal_text",
+                        "parts": ["Before", {"content_type": "future_part", "text": "FUTURE_PART_TEXT",
+                            "asset_pointer": "sediment://file-FuturePart"}, "After"]}}),
+                )
+                .build(),
+        )
+        .await;
+        assert_eq!(import.items.len(), 1);
+        assert_eq!(import.items[0].text, "Before\n\nAfter");
+        assert!(import.items[0].assets.is_empty());
+        assert!(!import.shows("FUTURE_PART_TEXT"));
+        assert!(!import.shows("FUTURE_PART_BYTES"));
+        let unread = import.unread();
+        assert_eq!(unread.len(), 1, "{unread:?}");
+        assert!(unread[0].contains("future_part"), "{unread:?}");
+    }
+
+    #[tokio::test]
+    async fn a_hidden_attachment_entry_is_reported_and_not_served() {
+        let directory = tempfile::tempdir().unwrap();
+        let import = imported(
+            directory.path(),
+            Export::new()
+                .stored("file_0a11-shown.txt", b"SHOWN_ATTACHMENT_BYTES")
+                .stored("file_0a12-hidden.txt", b"HIDDEN_ATTACHMENT_BYTES"),
+            Conversation::new(1, "Attachments")
+                .node(
+                    "u1",
+                    Some("root"),
+                    json!({"author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": ["Files attached"]},
+                    "metadata": {"attachments": [
+                        {"id": "file_0a11", "name": "shown.txt"},
+                        {"id": "file_0a12", "name": "hidden.txt",
+                            "metadata": {"is_visually_hidden_from_conversation": true}},
+                    ]}}),
+                )
+                .build(),
+        )
+        .await;
+        let paths: Vec<&str> = import.items[0]
+            .assets
+            .iter()
+            .map(|asset| asset.path.as_str())
+            .collect();
+        assert_eq!(paths, ["file_0a11"]);
+        assert!(import.shows("SHOWN_ATTACHMENT_BYTES"));
+        for hidden in ["HIDDEN_ATTACHMENT_BYTES", "file_0a12", "hidden.txt"] {
+            assert!(!import.shows(hidden), "{hidden}");
+        }
+        assert!(import.serves("file_0a12").await.is_none());
+        let unread = import.unread();
+        assert_eq!(unread.len(), 1, "{unread:?}");
+        assert!(
+            unread[0].contains("attachment") && unread[0].contains("hidden"),
+            "{unread:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_library_file_without_a_kept_origin_is_dropped() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut briefing = fixture::text_message("system", "Invented briefing");
+        briefing["id"] = json!("briefing-message");
+        let entry = |file: &str, origin: Option<&str>| {
+            json!({"origination_thread_id": fixture::id(1), "origination_message_id": origin,
+                "file_id": file, "file_name": "plan.txt", "mime_type": "text/plain"})
+        };
+        let import = imported(
+            directory.path(),
+            Export::new()
+                .json(
+                    "library_files.json",
+                    &json!([
+                        entry("file_0a21", None),
+                        entry("file_0a22", Some("nowhere")),
+                        entry("file_0a23", Some("briefing-message")),
+                    ]),
+                )
+                .stored("file_0a21-plan.txt", b"LIBRARY_NO_ORIGIN_BYTES")
+                .stored("file_0a22-plan.txt", b"LIBRARY_UNKNOWN_ORIGIN_BYTES")
+                .stored("file_0a23-plan.txt", b"LIBRARY_EXCLUDED_ORIGIN_BYTES"),
+            Conversation::new(1, "Library")
+                .node("briefing", Some("root"), briefing)
+                .say("u1", "briefing", "user", "Make a plan")
+                .say("a1", "u1", "assistant", "Here is the plan")
+                .build(),
+        )
+        .await;
+        let ids: Vec<&str> = import.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["u1", "a1"]);
+        for file in ["file_0a21", "file_0a22", "file_0a23"] {
+            assert!(!import.shows(file), "{file}");
+            assert!(import.serves(file).await.is_none(), "{file}");
+        }
+        assert!(!import.shows("LIBRARY_"));
+    }
+
+    #[tokio::test]
+    async fn unread_entries_list_at_most_32_gaps_per_conversation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut parts = vec![json!("Visible")];
+        parts.extend(
+            (0..40).map(
+                |index| json!({"content_type": "future_part", "text": format!("Part {index}")}),
+            ),
+        );
+        let import = imported(
+            directory.path(),
+            Export::new(),
+            Conversation::new(1, "Parts")
+                .node(
+                    "u1",
+                    Some("root"),
+                    json!({"author": {"role": "user"},
+                        "content": {"content_type": "multimodal_text", "parts": parts}}),
+                )
+                .build(),
+        )
+        .await;
+        assert_eq!(import.items[0].text, "Visible");
+        let unread = import.unread();
+        assert_eq!(unread.len(), 33);
+        assert!(unread[32].starts_with("8 more "), "{}", unread[32]);
+    }
+
     #[tokio::test]
     async fn asset_chunks_cover_the_file_and_repeat_the_whole_file_digest() {
         let directory = tempfile::tempdir().unwrap();

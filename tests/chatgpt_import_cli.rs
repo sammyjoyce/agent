@@ -30,20 +30,16 @@ fn picnic(attachment: Option<&str>) -> Value {
     conversation
 }
 
-fn zip(
-    path: &Path,
-    conversation: Value,
-    extra: Option<(&str, &[u8], CompressionMethod)>,
-) -> PathBuf {
+fn zip(path: &Path, conversation: Value, extra: &[(&str, &[u8], CompressionMethod)]) -> PathBuf {
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     writer.start_file("conversations.json", options).unwrap();
     writer
         .write_all(&serde_json::to_vec(&[conversation]).unwrap())
         .unwrap();
-    if let Some((name, bytes, method)) = extra {
+    for (name, bytes, method) in extra {
         writer
-            .start_file(name, options.compression_method(method))
+            .start_file(*name, options.compression_method(*method))
             .unwrap();
         writer.write_all(bytes).unwrap();
     }
@@ -52,11 +48,11 @@ fn zip(
 }
 
 fn export(path: &Path, extra: Option<(&str, &[u8])>) -> PathBuf {
-    zip(
-        path,
-        picnic(None),
-        extra.map(|(name, bytes)| (name, bytes, CompressionMethod::Deflated)),
-    )
+    let extra: Vec<_> = extra
+        .into_iter()
+        .map(|(name, bytes)| (name, bytes, CompressionMethod::Deflated))
+        .collect();
+    zip(path, picnic(None), &extra)
 }
 
 fn damaged_export(path: &Path) -> PathBuf {
@@ -64,7 +60,7 @@ fn damaged_export(path: &Path) -> PathBuf {
     zip(
         path,
         picnic(Some("file_0g01")),
-        Some(("file_0g01-notes.txt", attachment, CompressionMethod::Stored)),
+        &[("file_0g01-notes.txt", attachment, CompressionMethod::Stored)],
     );
     let mut bytes = std::fs::read(path).unwrap();
     let payload = bytes
@@ -110,7 +106,64 @@ fn check_reports_and_never_contacts_a_coordinator() {
         stderr.contains("1 conversations (0 archived) in 1 shards"),
         "{stderr}"
     );
+    for absent in ["does not read", "library files", "not named by any"] {
+        assert!(!stderr.contains(absent), "{absent}: {stderr}");
+    }
     assert!(output.stdout.is_empty());
+    untouched(&state);
+}
+
+#[test]
+fn check_reports_what_the_import_leaves_out() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("state");
+    let mut conversation = picnic(None);
+    conversation["mapping"]["w1"] = json!({"id": "w1", "parent": "a1", "message": {"id": "w1",
+        "author": {"role": "assistant"}, "content": {"content_type": "future_widget", "text": "Widget"}}});
+    conversation["mapping"]["s1"] = json!({"id": "s1", "parent": "root", "message": {"id": "s1",
+        "author": {"role": "system"}, "content": {"content_type": "text", "parts": ["Invented briefing"]}}});
+    let library = json!([{"origination_thread_id": conversation["id"], "file_id": "file_0h01",
+        "file_name": "plan.txt"}]);
+    let library = serde_json::to_vec(&library).unwrap();
+    let path = zip(
+        &directory.path().join("export.zip"),
+        conversation,
+        &[
+            (
+                "library_files.json",
+                library.as_slice(),
+                CompressionMethod::Deflated,
+            ),
+            (
+                "file_0h01-plan.txt",
+                b"Invented plan".as_slice(),
+                CompressionMethod::Stored,
+            ),
+            (
+                "file_0h02-stray.txt",
+                b"Invented stray file".as_slice(),
+                CompressionMethod::Stored,
+            ),
+        ],
+    );
+    let output = run(
+        directory.path(),
+        &state,
+        &["import", "chatgpt", "--check", path.to_str().unwrap()],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    for line in [
+        "  1 system, custom-instruction and hidden messages are left out",
+        "  1 messages or parts are of a kind this import does not read: 1 × message future_widget",
+        "  1 library files have no kept message in this export and are left out",
+        "  2 files in this export are not named by any imported message and are left out",
+    ] {
+        assert!(
+            stderr.lines().any(|printed| printed == line),
+            "{line}: {stderr}"
+        );
+    }
     untouched(&state);
 }
 
