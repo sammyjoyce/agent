@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { JsonObject } from "@earendil-works/pi-ai";
+import type { FailoverSession } from "../../src/generated/FailoverSession.js";
 
 export type ModelStep = { text: string } | { tool: string; args: JsonObject; commentary?: string };
 export type ModelQueue = Record<string, ModelStep[]>;
@@ -16,10 +17,16 @@ function oneCallScript(id: string, tool: string, args: object, codemode: unknown
     : { id, type: "function_call", call_id: id, name: "codemode", arguments: JSON.stringify({ code }), status: "completed" };
 }
 
+// A replicated coordinator also reaches its authority, which a test runs on loopback.
+const authority = process.env.AGENT_FAILOVER === undefined ? undefined : new URL((JSON.parse(process.env.AGENT_FAILOVER) as FailoverSession).url);
+assert.ok(authority === undefined || authority.hostname === "127.0.0.1", "The fixture's authority must be on loopback");
+const network = globalThis.fetch;
+
 // Only the external provider is synthetic. Pi, application tools and the bridge
 // are imported unchanged and consume actual Responses API event frames.
 globalThis.fetch = async (input, options) => {
   const url = input instanceof Request ? input.url : input.toString();
+  if (authority !== undefined && new URL(url).origin === authority.origin) return network(input, options);
   assert.equal(url, "https://api.openai.com/v1/responses", "The fixture must never contact an external service");
   assert.equal(typeof options?.body, "string");
   const body: unknown = JSON.parse(String(options?.body));

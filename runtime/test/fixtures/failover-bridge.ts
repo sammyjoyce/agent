@@ -118,8 +118,15 @@ export async function startBridge(t: TestContext, options: BridgeOptions) {
   t.after(async () => { lines.close(); child.kill("SIGKILL"); await exit; });
   const describe = () => `${JSON.stringify(frames.map((frame) => ({ id: frame.id, event: frame.event })))}\n${errors}`;
   return {
-    child, frames, exit, send,
+    child, frames, send,
     errors: () => errors,
+    /** How the bridge ended. Rejects when it is still running after `timeoutMs`. */
+    exited(timeoutMs = 15_000): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`The bridge was still running after ${timeoutMs} ms: ${describe()}`)), timeoutMs);
+        void exit.then((ended) => { clearTimeout(timer); resolve(ended); });
+      });
+    },
     /** The first frame of request `id` that matches. Rejects when the bridge exits or the wait runs out first. */
     wait(id: number, predicate: (event: RuntimeEventKind) => boolean, timeoutMs = 20_000): Promise<RuntimeEventKind> {
       return new Promise((resolve, reject) => {
