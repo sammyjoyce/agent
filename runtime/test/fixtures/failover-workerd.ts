@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -28,6 +28,15 @@ export interface LocalAuthority {
 
 const runtimeRoot = fileURLToPath(new URL("../../../", import.meta.url));
 const MISSING_WRANGLER = "wrangler is not on PATH. Run the failover tests inside the flake's ci shell: nix develop .#ci";
+/**
+ * Runs wrangler as the leader of its own process group, beside a watcher that
+ * kills the group when this test process's end of stdin closes. A runner that
+ * kills the test process with a signal then leaves no workerd behind.
+ */
+const GROUP_WITH_WATCHER = `command -v wrangler >/dev/null || exit 127
+exec 3<&0
+{ read -r _ <&3; kill -KILL -- -$$; } &
+exec wrangler "$@" </dev/null 3<&-`;
 
 async function freePort(): Promise<number> {
   const server = createServer();
@@ -40,10 +49,30 @@ async function freePort(): Promise<number> {
   return address.port;
 }
 
-function killGroup(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (child.pid === undefined) return;
-  try { process.kill(-child.pid, signal); } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+/**
+ * Signals a process group and says whether any member was still there. macOS
+ * answers EPERM while the only members left are exiting, so that counts as present.
+ */
+function signalGroup(group: number, signal: NodeJS.Signals | 0): boolean {
+  try {
+    process.kill(-group, signal);
+    return true;
+  } catch (error) {
+    const { code } = error as NodeJS.ErrnoException;
+    if (code === "ESRCH") return false;
+    if (code === "EPERM") return true;
+    throw error;
+  }
+}
+
+/** Stops a process group and waits until no member is left, so the port and the persisted state are free. */
+async function stopGroup(group: number): Promise<void> {
+  signalGroup(group, "SIGTERM");
+  const force = Date.now() + 5_000, deadline = force + 10_000;
+  while (signalGroup(group, 0)) {
+    if (Date.now() > deadline) throw new Error(`Process group ${group} of wrangler dev outlived SIGKILL`);
+    if (Date.now() > force) signalGroup(group, "SIGKILL");
+    await new Promise((resolve) => setTimeout(resolve, 25));
   }
 }
 
@@ -51,8 +80,11 @@ function killGroup(child: ChildProcess, signal: NodeJS.Signals): void {
  * Runs the real authority Worker under `wrangler dev --local` on a free
  * loopback port, with a temporary persistence directory and no Cloudflare
  * account: every `CLOUDFLARE_*` and `CF_*` variable is removed and HOME points
- * at the temporary directory, so wrangler can find no login. Each grant gets a
- * fresh random token. The test's `after` hook stops workerd even when the test fails.
+ * at the temporary directory, so wrangler can find no login. It also skips the
+ * banner's npm update check and the download of request.cf data from
+ * Cloudflare, so a run makes no network request at all. Each grant gets a
+ * fresh random token. The test's `after` hook stops workerd even when the test
+ * fails, and it never skips: without wrangler on PATH it throws.
  */
 export async function startAuthority(options: {
   readonly context: { after(hook: () => Promise<void>): void };
@@ -70,25 +102,25 @@ export async function startAuthority(options: {
   const port = await freePort();
   const url = `http://127.0.0.1:${port}`;
   const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("CLOUDFLARE_") && !name.startsWith("CF_")));
-  Object.assign(env, { WRANGLER_SEND_METRICS: "false", HOME: home, XDG_CONFIG_HOME: join(home, ".config") });
+  Object.assign(env, { HOME: home, XDG_CONFIG_HOME: join(home, ".config"), WRANGLER_SEND_METRICS: "false",
+    WRANGLER_HIDE_BANNER: "true", CLOUDFLARE_CF_FETCH_ENABLED: "false" });
 
-  let child: ChildProcess | undefined;
-  const killOnExit = () => { if (child !== undefined) killGroup(child, "SIGKILL"); };
-  process.once("exit", killOnExit);
+  let group: number | undefined;
 
-  async function launch(): Promise<ChildProcess> {
-    const started = spawn("wrangler", ["dev", "--local", "--config", join(directory, "wrangler.json"),
+  async function launch(): Promise<void> {
+    const started = spawn("bash", ["-c", GROUP_WITH_WATCHER, "wrangler", "dev", "--local", "--config", join(directory, "wrangler.json"),
       "--ip", "127.0.0.1", "--port", String(port), "--inspector-port", String(await freePort()),
       "--persist-to", join(directory, "state"), "--show-interactive-dev-session=false", "--log-level", "warn",
-      "--var", `AUTHORITY_CREDENTIALS:${secret}`], { cwd: directory, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
-    child = started;
+      "--var", `AUTHORITY_CREDENTIALS:${secret}`], { cwd: directory, env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
+    group = started.pid;
     let output = "";
     const collect = (chunk: Buffer) => { output = (output + chunk.toString("utf8")).slice(-20_000); };
     started.stdout?.on("data", collect);
     started.stderr?.on("data", collect);
     const failed = new Promise<Error>((resolve) => {
-      started.once("error", (error: NodeJS.ErrnoException) => resolve(error.code === "ENOENT" ? new Error(MISSING_WRANGLER) : error));
-      started.once("exit", (code, signal) => resolve(new Error(`wrangler dev exited (${code ?? signal}) before it answered:\n${output}`)));
+      started.once("error", resolve);
+      started.once("exit", (code, signal) =>
+        resolve(new Error(code === 127 ? MISSING_WRANGLER : `wrangler dev exited (${code ?? signal}) before it answered:\n${output}`)));
     });
     const settled = new AbortController();
     const answered = (async (): Promise<Error | undefined> => {
@@ -103,21 +135,13 @@ export async function startAuthority(options: {
     const failure = await Promise.race([answered, failed]);
     settled.abort();
     if (failure !== undefined) {
-      await halt(started);
+      await halt();
       throw failure;
     }
-    return started;
   }
 
-  async function halt(running: ChildProcess): Promise<void> {
-    if (running.exitCode === null && running.signalCode === null) {
-      const exited = once(running, "exit");
-      killGroup(running, "SIGTERM");
-      const force = setTimeout(() => killGroup(running, "SIGKILL"), 5_000);
-      await exited;
-      clearTimeout(force);
-    }
-    killGroup(running, "SIGKILL");
+  async function halt(): Promise<void> {
+    if (group !== undefined) await stopGroup(group);
   }
 
   let stopped = false;
@@ -127,12 +151,11 @@ export async function startAuthority(options: {
     async stop() {
       if (stopped) return;
       stopped = true;
-      if (child !== undefined) await halt(child);
-      process.removeListener("exit", killOnExit);
+      await halt();
       await rm(directory, { recursive: true, force: true });
     },
     async restart() {
-      if (child !== undefined) await halt(child);
+      await halt();
       await launch();
     },
   };
