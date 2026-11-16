@@ -895,6 +895,8 @@ first table breaks a rule. Its rows include:
 - a stale readback beside a real `show` whose output goes to `/dev/null`;
 - a `show` cut down to its receipt line, and a receipt replayed from before
   the booking;
+- a `show` taken while the agent hides the booking in the ledger file, and a
+  `show` of a booking line that the agent wrote by hand before it booked;
 - a booking made before the worker resumes, and a booking made by triage
   whose saved output the worker prints;
 - an outcome linked to the decoy;
