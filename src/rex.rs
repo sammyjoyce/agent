@@ -308,18 +308,14 @@ impl RexClient {
         })
     }
 
-    /// A create is confirmed when Rex shows its pane on this host under the
-    /// instance read before the create. A restart after the create can lose
-    /// the pane or restore it with a shell instead of the worker.
-    pub async fn confirm_creation(&self, binding: &WorkerBinding, before: &RexIdentity) -> bool {
-        let confirmed = async {
-            self.inspect_session(&binding.session_id)
-                .await?
-                .verify_binding(binding, &before.host_id)?;
-            Ok::<_, RexError>(self.whoami().await?.instance_id == before.instance_id)
-        }
-        .await;
-        matches!(confirmed, Ok(true))
+    /// A create is confirmed when Rex shows its pane in the session on this
+    /// host. Its binding carries the instance read before the create, so if
+    /// Rex restarted around it, the next presentation replaces the shell Rex
+    /// restored in the pane.
+    pub async fn confirm_creation(&self, binding: &WorkerBinding, host: &HostId) -> bool {
+        self.inspect_session(&binding.session_id)
+            .await
+            .is_ok_and(|view| view.verify_binding(binding, host).is_ok())
     }
 
     pub fn for_process(server: Option<&str>) -> anyhow::Result<Self> {
@@ -579,7 +575,7 @@ impl RexClient {
         };
         // Once creation succeeded, every later failure must retain uncertainty
         // about this same session rather than authorize another allocation.
-        if !self.confirm_creation(&replacement, identity).await {
+        if !self.confirm_creation(&replacement, &identity.host_id).await {
             return Err(RexError::CreationUncertain {
                 session_id: Some(binding.session_id.clone()),
             });

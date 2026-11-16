@@ -567,7 +567,7 @@ async fn resume_bound_worker(
             )
             .await
         {
-            Ok(restored) if client.confirm_creation(&restored, &identity).await => {
+            Ok(restored) if client.confirm_creation(&restored, &identity.host_id).await => {
                 promote(client, &restored.session_id).await;
                 Ok(HostResult::Spawned {
                     binding: ExecutionBinding {
@@ -778,7 +778,7 @@ async fn created_worker(
 ) -> Result<HostResult> {
     match created {
         Ok(binding) => {
-            if !client.confirm_creation(&binding, identity).await {
+            if !client.confirm_creation(&binding, &identity.host_id).await {
                 return Ok(HostResult::CreationUncertain {
                     session_id: Some(binding.session_id.to_string()),
                 });
