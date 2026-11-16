@@ -542,7 +542,8 @@
       try await assertSpotlight(
         coordinators: ["Office", "Personal"],
         jobs: ["Nightly deps": "Office", "Weekly report": "Personal"], "after the rename")
-      XCTAssertEqual(try await spotlightAnswer("Work"), [], "Spotlight still finds the old name")
+      let foundWork = try await spotlightAnswer("Work")
+      XCTAssertEqual(foundWork, [], "Spotlight still finds the old name")
 
       try editCoordinator("Personal", in: app) { _ in
         app.buttons["Remove coordinator"].tap()
@@ -552,8 +553,10 @@
       }
       try await assertSpotlight(
         coordinators: ["Office"], jobs: ["Nightly deps": "Office"], "after the removal")
-      XCTAssertEqual(try await spotlightAnswer("Personal"), [], "Spotlight still finds Personal")
-      XCTAssertEqual(try await spotlightAnswer("Weekly"), [], "Spotlight still finds its job")
+      let foundPersonal = try await spotlightAnswer("Personal")
+      XCTAssertEqual(foundPersonal, [], "Spotlight still finds Personal")
+      let foundWeekly = try await spotlightAnswer("Weekly")
+      XCTAssertEqual(foundWeekly, [], "Spotlight still finds its job")
     }
 
     func testSpotlightDropsAJobItsCoordinatorNoLongerHasAfterARelaunch() async throws {
@@ -571,7 +574,8 @@
       try await assertSpotlight(
         coordinators: ["Work", "Personal"],
         jobs: ["Docs sweep": "Work", "Weekly report": "Personal"], "after the relaunch")
-      XCTAssertEqual(try await spotlightAnswer("Nightly"), [], "Spotlight still finds the old job")
+      let foundNightly = try await spotlightAnswer("Nightly")
+      XCTAssertEqual(foundNightly, [], "Spotlight still finds the old job")
     }
 
     func testASpotlightResultOpensThroughTheOpenIntentsAndKeepsTheDraft() async throws {
