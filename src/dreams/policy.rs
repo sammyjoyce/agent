@@ -7,11 +7,10 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::dreams::{HOST_TIMEOUT_MS, MAX_WINDOW_HOURS, PolicyDigest};
+use crate::dreams::{HOST_TIMEOUT_MS, MAX_PATH_BYTES, MAX_WINDOW_HOURS, PolicyDigest};
 
 const DEFAULT_WINDOW_HOURS: u8 = 24;
 const MAX_CHECK_SECONDS: u16 = 600;
-const MAX_PATH_BYTES: usize = 512;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

@@ -8,14 +8,13 @@ use crate::{
         CheckResult, Coverage, DreamsTaskSummary, EvidenceId, Gap, GapCause, Interval,
         ReceiptCoverage, Review, SummarySnapshot, count, format_utc,
     },
-    protocol::ErrorCode,
+    protocol::{ErrorCode, TASK_SUMMARY_MAX_UTF16_UNITS},
     runtime::diagnostics::{Event, ReceiptWindow, Record, UNWITNESSED_AFTER, is_token},
 };
 
 const SAMPLES: usize = 5;
 const SLOW_HOST_CALL_MS: u64 = 30_000;
 const MAX_TITLE_CHARS: usize = 200;
-const SUMMARY_RETENTION_CHARS: usize = 4000;
 const PAGE_BYTES: usize = 12_000;
 const QUOTED_LINE_CHARS: usize = 1_000;
 
@@ -226,8 +225,10 @@ pub(crate) fn summaries(
             omitted = omitted.saturating_add(1);
             continue;
         }
-        let (body, cut) = clean(&summary.summary, SUMMARY_RETENTION_CHARS);
-        if cut || summary.summary.chars().count() >= SUMMARY_RETENTION_CHARS {
+        // The runtime keeps only the end of a task's answer, counted in UTF-16
+        // units. A summary at that limit may have lost its beginning.
+        let (body, cut) = clean(&summary.summary, TASK_SUMMARY_MAX_UTF16_UNITS);
+        if cut || summary.summary.encode_utf16().count() >= TASK_SUMMARY_MAX_UTF16_UNITS {
             truncated = truncated.saturating_add(1);
         }
         items.push(EvidenceItem {

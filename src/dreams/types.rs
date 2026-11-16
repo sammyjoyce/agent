@@ -64,6 +64,12 @@ pub enum DreamsAbstainReason {
 }
 
 impl DreamsAbstainReason {
+    pub const ALL: [Self; 3] = [
+        Self::Quiet,
+        Self::InsufficientCoverage,
+        Self::NoSupportedChange,
+    ];
+
     /// The name this reason has on the wire and in every label.
     pub fn wire_name(self) -> &'static str {
         match self {
@@ -587,11 +593,7 @@ mod tests {
                 cause.wire_name()
             );
         }
-        for reason in [
-            DreamsAbstainReason::Quiet,
-            DreamsAbstainReason::InsufficientCoverage,
-            DreamsAbstainReason::NoSupportedChange,
-        ] {
+        for reason in DreamsAbstainReason::ALL {
             assert_eq!(json!(reason), reason.wire_name());
         }
     }

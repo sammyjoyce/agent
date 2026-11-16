@@ -20,6 +20,7 @@ import type { TaskInputReceipt } from "./generated/TaskInputReceipt.js";
 import type { TaskState } from "./generated/TaskState.js";
 import type { TaskRecord } from "./generated/TaskRecord.js";
 import type { JobRunReceipt } from "./generated/JobRunReceipt.js";
+import { TASK_SUMMARY_MAX_UTF16_UNITS } from "./generated/task-limits.js";
 import { NoticeLineage, readNoticeOrigin } from "./notice_origin.js";
 import type { InputOrigin } from "./generated/InputOrigin.js";
 import type { TaskMessageSender } from "./generated/TaskMessageSender.js";
@@ -593,7 +594,7 @@ export class TaskStore {
       if (input.remove_sources !== undefined && input.remove_sources.length > 0) {
         await this.outcomes?.assertSourceRemovalIn(tx, id, input.remove_sources);
       }
-      task.summary = input.summary.slice(-4000); task.state = state; task.updated_at = Date.now();
+      task.summary = input.summary.slice(-TASK_SUMMARY_MAX_UTF16_UNITS); task.state = state; task.updated_at = Date.now();
       await this.relinkSourcesIn(tx, id, input.sources ?? [], input.remove_sources ?? []);
       const outcome = this.outcome(task, provenance.conversation_id, origin.id.toString(), provenance.call_id);
       if (reconciliation !== undefined) outcome.reconciliation = reconciliation;
@@ -1258,7 +1259,7 @@ export class TaskStore {
   private async reportAgentIn(tx: Tx, task: TaskRecord, agent: TaskAgentRecord, summary: string, failure?: string,
     origin?: { entry_id: string; call_id: string | null }): Promise<void> {
     this.assertSource(agent.conversation_id);
-    agent.summary = summary.slice(-4000);
+    agent.summary = summary.slice(-TASK_SUMMARY_MAX_UTF16_UNITS);
     agent.state = failure === undefined ? { state: "done" } : { state: "failed", reason: failure };
     agent.updated_at = Date.now(); task.updated_at = Date.now();
     const outcome: TaskOutcome = { ...this.outcome(task, agent.conversation_id, origin?.entry_id ?? null,
@@ -1439,7 +1440,7 @@ export class TaskStore {
       await this.updateIn(tx, id, (task) => {
         this.assertSource(conversationId);
         // A silent final answer must not erase recorded progress or a handoff.
-        if (answer.trim().length > 0) task.summary = answer.slice(-4000);
+        if (answer.trim().length > 0) task.summary = answer.slice(-TASK_SUMMARY_MAX_UTF16_UNITS);
         outcome = this.outcome(task, conversationId, entryId, null);
       });
       if (outcome !== undefined) await this.outcomes?.recordIn(tx, outcome, false);
@@ -1779,9 +1780,9 @@ export class TaskStore {
                 break;
               }
             }
-            if (answer.trim().length > 0 && actor.summary !== answer.slice(-4000)) {
+            if (answer.trim().length > 0 && actor.summary !== answer.slice(-TASK_SUMMARY_MAX_UTF16_UNITS)) {
               task = await this.update(task.id, (current) => {
-                this.assertSource(conversation.id.toString()); this.actor(current, input.agent_id).summary = answer.slice(-4000);
+                this.assertSource(conversation.id.toString()); this.actor(current, input.agent_id).summary = answer.slice(-TASK_SUMMARY_MAX_UTF16_UNITS);
               });
             }
           }
@@ -1890,7 +1891,7 @@ export class TaskStore {
         task = await this.update(task.id, (current) => {
           this.assertSource(conversation.id.toString());
           const currentActor = this.actor(current, input.agent_id);
-          if (answer.trim().length > 0 && (input.agent_id === undefined || currentActor.state.state === "open")) currentActor.summary = answer.slice(-4000);
+          if (answer.trim().length > 0 && (input.agent_id === undefined || currentActor.state.state === "open")) currentActor.summary = answer.slice(-TASK_SUMMARY_MAX_UTF16_UNITS);
         });
         active.answer = { conversation_id: conversation.id.toString(), text: answer, ...(entry === undefined ? {} : { entry_id: entry.id.toString() }) };
         this.publish(active, (session) => session.answer(conversation.id.toString(), answer, entry?.id.toString()));

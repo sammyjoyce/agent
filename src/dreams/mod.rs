@@ -37,11 +37,16 @@ pub const MAX_SUMMARY_BYTES: usize = crate::runtime::MAX_FRAME_BYTES / 4;
 const _: () = assert!(MAX_SUMMARY_BYTES * 4 <= crate::runtime::MAX_FRAME_BYTES);
 pub const MAX_EDITS: usize = 4;
 pub const MAX_EDIT_BYTES: usize = 64 * 1024;
+pub const MAX_PATH_BYTES: usize = 512;
+pub const MAX_RATIONALE_CHARS: usize = 4_000;
+pub const MAX_NOTE_CHARS: usize = 2_000;
+pub const MAX_EVIDENCE_CITATIONS: usize = 20;
+pub const MAX_EVIDENCE_ID_CHARS: usize = 96;
+pub const MAX_REVIEW_PAGE: u32 = 10_000;
 pub const MAX_ATTEMPTS: u8 = 3;
 pub const HOST_TIMEOUT_MS: u64 = 21 * 60 * 1000;
 pub const NOT_CONFIGURED: &str = "Dreams is not configured";
 
-const MAX_EVIDENCE_CITATIONS: usize = 20;
 const MAX_SHOWN_FILES: usize = 32;
 const MAX_RECEIPT_BYTES: u64 = diagnostics::RETENTION_CAP_BYTES + 32 * 1024 * 1024;
 const _: () = assert!(MAX_RECEIPT_BYTES > diagnostics::RETENTION_CAP_BYTES);
@@ -324,7 +329,7 @@ impl Dreams {
             &run,
             &Outcome::Abstained(Abstention::Chosen {
                 reason,
-                note: UntrustedText::bounded(note, 2_000),
+                note: UntrustedText::bounded(note, MAX_NOTE_CHARS),
             }),
         )?;
         Ok(Self::decided(&run, &outcome))
@@ -429,7 +434,7 @@ impl Dreams {
         let mut evidence = Vec::new();
         for cited in draft.evidence {
             let Some(item) = reviewed.iter().find(|item| item.id.as_str() == cited) else {
-                let shown: String = cited.chars().take(96).collect();
+                let shown: String = cited.chars().take(MAX_EVIDENCE_ID_CHARS).collect();
                 return Err(reject(format!(
                     "evidence id {shown:?} is not in this review"
                 )));
@@ -466,7 +471,7 @@ impl Dreams {
                 .collect(),
             changes: patch.changes,
             evidence,
-            rationale: UntrustedText::bounded(draft.rationale, 4_000),
+            rationale: UntrustedText::bounded(draft.rationale, MAX_RATIONALE_CHARS),
             before: review.before.clone(),
             after,
             policy_digest: review.policy_digest.clone(),
