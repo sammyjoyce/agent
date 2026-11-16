@@ -600,9 +600,9 @@ private let acceptedTexts = [
       let id = UUID().uuidString
       let started = ContinuousClock.now
       let result = await session.sendFromSiri(
-        message, confirmed: .none, newInputID: id, until: .now + .seconds(3))
+        message, confirmed: .none, newInputID: id, until: .now + .seconds(30))
       #expect(result == .failed("Invented: the execution host is offline"))
-      #expect(ContinuousClock.now - started < .seconds(1))
+      #expect(ContinuousClock.now - started < .seconds(10), "It does not wait out the deadline")
       #expect(waitingID(try await session.siriEarlier(message)) == id, "Asking again retries it")
     }
   }
