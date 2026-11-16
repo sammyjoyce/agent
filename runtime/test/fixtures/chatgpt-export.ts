@@ -141,6 +141,69 @@ export function chatGptExports(blob: Uint8Array): { first: ExportMember[]; secon
   };
 }
 
+export const LEFT_OUT_MARKER = "INVENTED-LEFT-OUT-MARKER";
+export const CONTENT_SHAPES = {
+  tide: "00000000-0000-4000-8000-0000000000d1", orchard: "00000000-0000-4000-8000-0000000000d2",
+  compost: "00000000-0000-4000-8000-0000000000d3", glacier: "00000000-0000-4000-8000-0000000000d4",
+  windmill: "00000000-0000-4000-8000-0000000000d5", canyon: "00000000-0000-4000-8000-0000000000d6",
+  meadow: "00000000-0000-4000-8000-0000000000d7", quarry: "00000000-0000-4000-8000-0000000000d8",
+} as const;
+export const CONTENT_SHAPE_TEXT = {
+  tide: ["When is high tide at the harbor?", "High tide at the harbor is at noon."],
+  orchard: ["When should the orchard be pruned?", "Prune the orchard in late winter."],
+  compost: ["What compost ratio works?", "Mix two parts brown compost to one part green."],
+  glacier: "Pack crampons for the glacier.", windmill: "Oil the windmill gears.", canyon: "Here is my canyon sketch.",
+  meadow: "Here is the meadow chart.", meadowCaption: "Wildflower counts by month.", quarry: "Plan a quarry visit.",
+} as const;
+const MEADOW_CHART = Buffer.from("An invented meadow chart the assistant showed.");
+
+/** One conversation per message shape the importer must refuse to read past, or must read whole. */
+export function contentShapeExport(): { members: ExportMember[]; meadowDigest: string } {
+  const leftOut = (what: string) => `${LEFT_OUT_MARKER}: ${what}`, at = 1_768_176_000;
+  const hidden = { is_visually_hidden_from_conversation: true };
+  const parts = (...values: unknown[]) => ({ content_type: "multimodal_text", parts: values });
+  const asked = (name: "tide" | "orchard" | "compost", file: string, shape: Record<string, unknown>): Conversation => {
+    const id = CONTENT_SHAPES[name], [question, answer] = CONTENT_SHAPE_TEXT[name];
+    return conversation(id, `Invented ${name}`, at, at + 60, `${id}-answer`, [
+      node(`${id}-root`, message(`${id}-question`, "user", at + 10, text(question))),
+      node(`${id}-question`, message(`${id}-answer`, "assistant", at + 20, text(answer),
+        { metadata: { attachments: [{ id: file, name: "private.txt" }], ...shape } }))]);
+  };
+  const single = (name: "glacier" | "windmill" | "canyon" | "meadow", role: "user" | "assistant", content: Record<string, unknown>): Conversation => {
+    const id = CONTENT_SHAPES[name];
+    return conversation(id, `Invented ${name}`, at, at + 60, `${id}-message`, [node(`${id}-root`, message(`${id}-message`, role, at + 10, content))]);
+  };
+  const quarry = CONTENT_SHAPES.quarry;
+  const conversations = [
+    asked("tide", "file_00f1", { author: { role: "system" } }),
+    asked("orchard", "file_00f2", { metadata: hidden }),
+    asked("compost", "file_00f3", { content: { content_type: "user_editable_context" } }),
+    single("glacier", "assistant", parts(CONTENT_SHAPE_TEXT.glacier, { content_type: "text", text: leftOut("a hidden part"), metadata: hidden })),
+    single("windmill", "assistant", parts(CONTENT_SHAPE_TEXT.windmill, { content_type: "text", text: leftOut("a developer part"),
+      author: { role: "developer" }, content: text(leftOut("text inside a developer part")) })),
+    single("canyon", "user", parts(CONTENT_SHAPE_TEXT.canyon, { content_type: "image_asset_pointer", asset_pointer: "sediment://file_00f4",
+      metadata: { ...hidden, source: "canvas-preview-cache" }, text: leftOut("the caption of a hidden image part") })),
+    single("meadow", "assistant", parts(CONTENT_SHAPE_TEXT.meadow, { content_type: "image_asset_pointer", asset_pointer: "sediment://file_00f5",
+      author: { role: "system", name: "canvas-renderer" }, text: CONTENT_SHAPE_TEXT.meadowCaption })),
+    conversation(quarry, "Invented quarry", at, at + 60, `${quarry}-widget`, [
+      node(`${quarry}-root`, message(`${quarry}-question`, "user", at + 10, text(CONTENT_SHAPE_TEXT.quarry),
+        { metadata: { attachments: [{ id: "file_00f6", name: "private.txt", metadata: hidden }] } })),
+      node(`${quarry}-question`, message(`${quarry}-widget`, "assistant", at + 20, { content_type: "future_widget", text: leftOut("an unknown content type") }))]),
+  ];
+  const library = [
+    { origination_thread_id: quarry, origination_message_id: `${quarry}-absent`, file_id: "file_00f7", file_name: "unknown-origin.txt", mime_type: "text/plain" },
+    { origination_thread_id: quarry, file_id: "file_00f8", file_name: "no-origin.txt", mime_type: "text/plain" }];
+  const file = (id: string, what: string): ExportMember => ({ name: `${id}-private.txt`, bytes: Buffer.from(leftOut(what)), method: "deflated" });
+  return { meadowDigest: sha256(MEADOW_CHART), members: [
+    { name: "conversations.json", bytes: Buffer.from(JSON.stringify(conversations)), method: "deflated" },
+    { name: "library_files.json", bytes: Buffer.from(JSON.stringify(library)), method: "deflated" },
+    file("file_00f1", "a file of metadata with a system author"), file("file_00f2", "a file of hidden metadata"),
+    file("file_00f3", "a file of metadata with instruction content"), file("file_00f4", "a hidden image part's bytes"),
+    { name: "file_00f5-chart.dat", bytes: MEADOW_CHART, method: "deflated" },
+    file("file_00f6", "a hidden attachment entry's bytes"), file("file_00f7", "a library file with an unknown origin"),
+    file("file_00f8", "a library file with no origin")] };
+}
+
 export function withChangedPhoto(members: readonly ExportMember[]): { members: ExportMember[]; digest: string } {
   const photo = Buffer.from(onePixelPng());
   photo.writeUInt8(photo.readUInt8(photo.length - 1) ^ 0xff, photo.length - 1);

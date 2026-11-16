@@ -18,8 +18,9 @@ import type { ImportProgress } from "../src/generated/ImportProgress.js";
 import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
 import type { SavedMatch } from "../src/generated/SavedMatch.js";
 import { HistoryStore } from "../src/history.js";
-import { CHATGPT_CONVERSATIONS, chatGptExports, INSTRUCTION_MARKER, KAYAK, MALICIOUS_TOOL_TEXT, onePixelPng, PICNIC,
-  sha256, withChangedPhoto, writeDamagedExportZip, writeExportFolder, writeExportZip } from "./fixtures/chatgpt-export.js";
+import { CHATGPT_CONVERSATIONS, chatGptExports, CONTENT_SHAPE_TEXT, CONTENT_SHAPES, contentShapeExport, INSTRUCTION_MARKER, KAYAK,
+  LEFT_OUT_MARKER, MALICIOUS_TOOL_TEXT, onePixelPng, PICNIC, sha256, withChangedPhoto, writeDamagedExportZip, writeExportFolder,
+  writeExportZip } from "./fixtures/chatgpt-export.js";
 
 type Run = { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string };
 type Owned = { child: ChildProcess; closed: Promise<Run> };
@@ -143,6 +144,17 @@ test("a ChatGPT export imports resumably and idempotently through an isolated co
     assert.ok(found, `Keyword search for "${query}" must find ChatGPT conversation ${threadId}`);
     return found.conversation_id;
   }
+  async function leaks(marker: string, rendered: readonly string[]): Promise<string[]> {
+    const written = [...rendered];
+    for (const name of await readdir(state, { recursive: true })) {
+      const path = join(state, name);
+      if ((await stat(path)).isFile()) written.push((await readFile(path)).toString("latin1"));
+    }
+    return written.flatMap((value) => {
+      const at = value.indexOf(marker);
+      return at < 0 ? [] : [value.slice(Math.max(0, at - 200), at + 200)];
+    });
+  }
   function shown(messages: readonly HistoryMessage[]): [string, string][] {
     return messages.filter((message) => !message.continuation).map((message) => [message.role, message.text]);
   }
@@ -249,17 +261,8 @@ test("a ChatGPT export imports resumably and idempotently through an isolated co
     const injected = [await search("previous instructions", "--mode", "keyword"), await search("previous instructions")];
     for (const result of injected) assert.ok(result.matches.every((match) => !match.excerpt.includes("Ignore previous instructions")));
     const instructions = await search(INSTRUCTION_MARKER, "--mode", "keyword");
-    const written = [...Object.values(afterFirst).map((value) => value.raw), ...injected.map((value) => value.raw), instructions.raw];
-    for (const name of await readdir(state, { recursive: true })) {
-      const path = join(state, name);
-      if (!(await stat(path)).isFile()) continue;
-      written.push((await readFile(path)).toString("latin1"));
-    }
-    const leaked = written.flatMap((value) => {
-      const at = value.indexOf(INSTRUCTION_MARKER);
-      return at < 0 ? [] : [value.slice(Math.max(0, at - 200), at + 200)];
-    });
-    assert.deepEqual(leaked, [], "Instructions, hidden messages and their files are never stored, retained, rendered or indexed");
+    assert.deepEqual(await leaks(INSTRUCTION_MARKER, [...Object.values(afterFirst).map((value) => value.raw), ...injected.map((value) => value.raw), instructions.raw]),
+      [], "Instructions, hidden messages and their files are never stored, retained, rendered or indexed");
     assert.equal(resumed.final.items_added, EXPORT_ONE_ITEMS - partial.items_added);
     const firstAssets = (await readdir(assets)).sort();
     assert.ok(firstAssets.includes(blobDigest) && firstAssets.includes(pngDigest), firstAssets.join("\n"));
@@ -298,6 +301,49 @@ test("a ChatGPT export imports resumably and idempotently through an isolated co
     const photoAssets = await readdir(assets);
     assert.ok(photoAssets.includes(changedPhoto.digest), "A same-size photo with different bytes is retained");
     assert.ok(photoAssets.includes(pngDigest), "The earlier photo stays as evidence");
+
+    const shapes = contentShapeExport(), exportShapes = join(exports, "export-shapes.zip");
+    await writeExportZip(exportShapes, shapes.members);
+    const assetsBeforeShapes = await readdir(assets);
+    const shaped = await importExport(exportShapes);
+    assert.equal(shaped.final.phase, "partial", "Content the import does not read ends the import partial");
+    assert.equal(shaped.run.code, 1, shaped.run.stderr);
+    assert.match(shaped.run.stderr, /History import is partial \(8 gaps\)/);
+    assert.match(shaped.run.stderr, /2 library files have no kept message in this export and are left out/);
+    assert.match(shaped.run.stderr, /7 files in this export are not named by any imported message and are left out/);
+    const reported: [string, RegExp][] = [
+      [`${CONTENT_SHAPES.tide}-answer`, /metadata/], [`${CONTENT_SHAPES.orchard}-answer`, /metadata/], [`${CONTENT_SHAPES.compost}-answer`, /metadata/],
+      [`${CONTENT_SHAPES.glacier}-message`, /hidden/], [`${CONTENT_SHAPES.windmill}-message`, /\btext\b/],
+      [`${CONTENT_SHAPES.canyon}-message`, /hidden/], [`${CONTENT_SHAPES.quarry}-question`, /attachment.*hidden|hidden.*attachment/],
+      [`${CONTENT_SHAPES.quarry}-widget`, /future_widget/]];
+    for (const [id, what] of reported) {
+      assert.ok(shaped.final.gaps.some((gap) => gap.includes(id) && what.test(gap)), `A gap names ${id} (${what}):\n${shaped.final.gaps.join("\n")}`);
+    }
+    assert.equal(shaped.final.gap_count, reported.length, shaped.final.gaps.join("\n"));
+    const shapeReads: string[] = [];
+    const shownIn = async (thread: string, query: string) => {
+      const result = await read(await conversationOf(thread, query)); shapeReads.push(result.raw);
+      return shown(result.messages);
+    };
+    for (const name of ["tide", "orchard", "compost"] as const) {
+      const [question, answer] = CONTENT_SHAPE_TEXT[name];
+      assert.deepEqual(await shownIn(CONTENT_SHAPES[name], name), [["user", question], ["assistant", answer]]);
+    }
+    assert.deepEqual(await shownIn(CONTENT_SHAPES.glacier, "glacier"), [["assistant", CONTENT_SHAPE_TEXT.glacier]]);
+    assert.deepEqual(await shownIn(CONTENT_SHAPES.windmill, "windmill"), [["assistant", CONTENT_SHAPE_TEXT.windmill]]);
+    assert.deepEqual(await shownIn(CONTENT_SHAPES.canyon, "canyon"), [["user", CONTENT_SHAPE_TEXT.canyon]],
+      "A part marked hidden contributes neither its caption nor its image");
+    assert.deepEqual(await shownIn(CONTENT_SHAPES.quarry, "quarry"), [["user", CONTENT_SHAPE_TEXT.quarry]]);
+    const meadow = await shownIn(CONTENT_SHAPES.meadow, "meadow");
+    assert.ok(meadow.some(([role, value]) => role === "assistant" && value.includes(CONTENT_SHAPE_TEXT.meadow) && value.includes(CONTENT_SHAPE_TEXT.meadowCaption)),
+      "An image part contributes its caption with its image");
+    assert.deepEqual((await readdir(assets)).filter((name) => !assetsBeforeShapes.includes(name)), [shapes.meadowDigest],
+      "Only the image of the kept image part is retained");
+    assert.deepEqual(await leaks(LEFT_OUT_MARKER, [...shapeReads, (await search(LEFT_OUT_MARKER, "--mode", "keyword")).raw, (await search("hidden part")).raw]),
+      [], "Content the import does not read is never stored, retained, rendered or indexed");
+    const reshaped = await importExport(exportShapes);
+    assert.equal(reshaped.final.items_added, 0, "Repeating an import with reported content adds nothing");
+    assert.equal(reshaped.final.gap_count, reported.length);
 
     server.child.kill("SIGINT");
     const stopped = await server.closed;
