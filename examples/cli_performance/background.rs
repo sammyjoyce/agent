@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::gate::{Mark, Marks};
 
-const LONGEST_SEARCH_LOOP_TURNAROUND: Duration = Duration::from_millis(1);
+const LONGEST_SEARCH_LOOP_TURNAROUND: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
