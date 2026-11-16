@@ -206,6 +206,31 @@ private let acceptedTexts = [
     }
   }
 
+  /// The person confirmed the waiting copy. The connection for the send then learns that the
+  /// coordinator placed it, so it is the same copy, already delivered, and is not written again.
+  @Test(.timeLimit(.minutes(1)))
+  func aWaitingCopyPlacedBeforeItsRetryIsAlreadyDelivered() async throws {
+    try await withSiriPeer { session, fixture, directory, _ in
+      await fixture.holdNextSubmitReply()
+      let message = try SiriMessage(parsing: build)
+      let id = UUID().uuidString
+      let first = await session.sendFromSiri(
+        message, copy: .new(inputID: id), earlier: .none, until: .now + .milliseconds(500))
+      #expect(first == .saved)
+      let waiting = try await session.siriEarlier(message)
+      #expect(waitingID(waiting) == id)
+      await session.disconnect()
+      try await connected(session)
+      try await eventually("the observe reported it placed") {
+        try queuedItems(directory.outbox).isEmpty
+      }
+      let again = await session.sendFromSiri(
+        message, copy: .earlier(inputID: id), earlier: waiting, until: .now + .seconds(5))
+      #expect(isAlreadyDelivered(again), "\(again)")
+      #expect(await submits(fixture).map(\.inputId) == [id], "Nothing was written again")
+    }
+  }
+
   @Test(.timeLimit(.minutes(1)))
   func aDeliveredCopyLeavesAReceiptThatTheNextSessionReads() async throws {
     try await withSiriPeer { session, fixture, directory, reopen in

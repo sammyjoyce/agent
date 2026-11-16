@@ -577,21 +577,26 @@ public actor CoordinatorSession {
   }
 
   /// Writes `copy` of `message` and waits until `deadline` for the coordinator's first word on
-  /// it. `earlier` is what the person confirmed against. When the outbox now says otherwise,
-  /// nothing is saved. Once saved, the copy stays in the outbox until the coordinator places it,
-  /// and a cancelled wait reads `saved`.
+  /// it. `earlier` is what the person confirmed against. For a new copy, when the outbox now says
+  /// otherwise, nothing is saved. An earlier copy the coordinator accepted or placed is not
+  /// written again. Once saved, a copy stays in the outbox until the coordinator places it, and a
+  /// cancelled wait reads `saved`.
   public func sendFromSiri(
     _ message: SiriMessage, copy: SiriCopy, earlier: SiriEarlier,
     until deadline: ContinuousClock.Instant
   ) async -> SiriSendResult {
     guard !retired, inspectedConversation == nil else { return .notSent(.unanswered) }
-    do {
-      guard try siriEarlier(message) == earlier else { return .notSent(.changed) }
-    } catch { return .notSent(error) }
     let inputID: String
     switch copy {
-    case .new(let id): inputID = id
+    case .new(let id):
+      do {
+        guard try siriEarlier(message) == earlier else { return .notSent(.changed) }
+      } catch { return .notSent(error) }
+      inputID = id
     case .earlier(let id):
+      // Two asks that confirmed this copy write one ID, which the coordinator dedupes, so only
+      // what became of the copy itself decides.
+      guard loadOutbox() else { return .notSent(.outboxUnreadable) }
       guard
         let item = pending.first(where: { $0.request.inputId == id }),
         item.request.origin == .siri, item.request.text == message.text
