@@ -18,7 +18,6 @@ import type { ImportProgress } from "./generated/ImportProgress.js";
 import type { HostCall } from "./tasks.js";
 import type { HistoryStore, ImportCheckpoint } from "./history.js";
 
-/** Checkpoint and capture origin of every ChatGPT export, so a later export of the same account outranks an earlier one. */
 export const CHATGPT_ORIGIN = "chatgpt-export";
 
 // Keep source progress separate from index errors so retries need no native walk.
@@ -36,24 +35,18 @@ const IMPORT_SOURCES = {
   },
 } satisfies Record<HistoryProvider, { progress: unknown; resume: string }>;
 
-/** A history origin one import walks. Checkpoints and capture clocks are scoped to its source and origin. */
 type HistoryFeed = {
   readonly origin: string;
-  /** Reported as ImportProgress.host_id; an export has none. */
   readonly host_id: string | null;
   readonly name: string;
   readonly online: boolean;
   read(request: HistoryRequest): Promise<HistoryResponse>;
 };
 type ImportPlan = {
-  /** A walk that finished may complete its parked index pass without rereading sources. */
   readonly resumeIndex: boolean;
-  /** Package problems found by the client's check. Each is a gap, so the run ends partial. */
   readonly problems: readonly string[];
-  /** Resolved inside the claimed job, after a parked index pass is ruled out. */
   feeds(): readonly HistoryFeed[];
 };
-/** The client serving a feed stopped answering, so its remaining threads wait for a rerun instead of each failing. */
 class HistoryFeedLost extends Error {}
 
 function initial(source: HistoryProvider): ImportProgress { return { source, phase: "discovering", host_id: null, threads_seen: 0, threads_imported: 0,
@@ -73,7 +66,6 @@ function addGap(progress: ImportProgress, gap: string, priority = true): void {
   if (progress.gaps.length > 50) progress.gaps.pop();
 }
 
-/** One import per source; a caller with the same key attaches to its progress instead of starting another walk. */
 class HistoryImporter {
   private active: { key: string; run: Promise<ImportProgress> } | undefined;
   private readonly listeners = new Set<(progress: ImportProgress) => void>();
@@ -345,7 +337,6 @@ class HistoryImporter {
   }
 }
 
-/** One importer per source, so a Codex walk and a ChatGPT walk never share progress or single flight. */
 export class HistoryImports {
   private readonly runs: Record<HistoryProvider, HistoryImporter>;
   constructor(session: Harness, history: HistoryStore, assetRoot: string) {
@@ -353,7 +344,6 @@ export class HistoryImports {
   }
   isRunning(): boolean { return Object.values(this.runs).some((run) => run.isRunning()); }
   status(source: HistoryProvider): Promise<ImportProgress> { return this.runs[source].status(); }
-  /** Codex always, as before ChatGPT existed; ChatGPT once it has run. */
   async statuses(): Promise<ImportProgress[]> {
     return [await this.status("codex"), ...await this.runs.chatgpt.hasRun() ? [await this.status("chatgpt")] : []];
   }
@@ -375,14 +365,12 @@ export class HistoryImports {
         } }));
     } }, notify, index);
   }
-  /** The requesting client serves every read from the export it checked, so reads go out as plain history calls. */
   chatgpt(summary: ChatGptPackageSummary, call: HostCall,
     notify: (progress: ImportProgress) => void, index: () => Promise<void>): Promise<ImportProgress> {
     return this.runs.chatgpt.run(summary.digest, { resumeIndex: false, problems: summary.problems, feeds: () => [{
       origin: CHATGPT_ORIGIN, host_id: null, name: `ChatGPT export ${summary.digest.slice(0, 8)}`, online: true,
       read: async (request) => {
         const result = await call({ type: "history", request });
-        // A reader error fails one request; only a lost transport leaves the outcome uncertain.
         if (result.type === "failed") throw result.delivery === "outcome_uncertain" ? new HistoryFeedLost(result.message) : new Error(result.message);
         if (result.type !== "history") throw new Error("History client returned another response type");
         return result.response;

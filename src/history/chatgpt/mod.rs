@@ -27,7 +27,6 @@ use crate::history::{
     HistorySource, PAGE_BYTES,
 };
 
-/// One asset chunk, leaving room for base64 expansion inside one history page.
 const ASSET_CHUNK_BYTES: usize = 320 * 1024;
 
 /// What the client checked, sent to the coordinator as the import's identity. Bounded and
@@ -71,15 +70,10 @@ pub struct ChatGptHistory {
     state: Arc<Mutex<ReadState>>,
 }
 
-/// What the reader caches between requests. Everything here can be rebuilt from the
-/// package, so losing it costs only time.
 #[derive(Default)]
 struct ReadState {
-    /// The last thread read, normalized once for all of its pages and assets.
     current: Option<(String, Arc<conversation::Normalized>)>,
-    /// Whole-member digests, computed once per member.
     digests: HashMap<package::MemberId, Result<MemberDigest, String>>,
-    /// The deflated member being transferred, inflated once into a private spool.
     transfer: Option<(package::MemberId, archive::Region)>,
 }
 
@@ -87,11 +81,9 @@ struct ReadState {
 struct MemberDigest {
     sha256: String,
     size: u64,
-    /// From the first bytes, for files whose names carry no type.
     sniffed: Option<&'static str>,
 }
 
-/// Bound to one package so a cursor from another export is refused.
 #[derive(Serialize, Deserialize)]
 struct InventoryCursor {
     package: String,
@@ -99,19 +91,16 @@ struct InventoryCursor {
     offset: usize,
 }
 
-/// Bound to the thread version, so a cursor saved against older content restarts the thread.
 #[derive(Serialize, Deserialize)]
 struct ReadCursor {
     thread: String,
     version: String,
     order: u64,
-    /// An earlier page reported a gap.
     #[serde(default)]
     incomplete: bool,
 }
 
 const LIST_PAGE: usize = 100;
-/// Room for the response envelope, gaps and cursor around a page's items.
 const PAGE_SLACK: usize = 16 * 1024;
 
 impl ChatGptHistory {
@@ -161,7 +150,6 @@ impl ChatGptHistory {
         Ok(response)
     }
 
-    /// Newest-updated first, so recent conversations become searchable first.
     fn list(&self, archived: bool, cursor: Option<&str>) -> Result<HistoryResponse> {
         let package = &self.summary().digest[..16];
         let offset = match cursor {
@@ -297,8 +285,6 @@ impl ChatGptHistory {
         })
     }
 
-    /// The thread's items, normalized once and reused for its later pages and assets.
-    /// None when its bytes no longer match the check.
     fn normalized(
         &self,
         state: &mut ReadState,
@@ -321,9 +307,6 @@ impl ChatGptHistory {
         Some(normalized)
     }
 
-    /// Gives each file reference its member's real digest and size, so an importer that
-    /// already holds the bytes need not transfer them again. A member whose bytes break its
-    /// declared size or checksum loses its reference and leaves a `changed` gap.
     fn fill_digests(
         &self,
         state: &mut ReadState,
@@ -397,8 +380,6 @@ impl ChatGptHistory {
         })
     }
 
-    /// Serves only paths the thread's own items reference. Every chunk repeats the
-    /// whole-file digest so the importer can verify the reassembled bytes.
     fn asset(
         &self,
         state: &mut ReadState,
@@ -458,8 +439,6 @@ impl ChatGptHistory {
         })
     }
 
-    /// A positioned view of a member's bytes: in place when stored, otherwise inflated once
-    /// into a private spool that later chunks read.
     fn transfer_region(
         &self,
         state: &mut ReadState,
@@ -500,7 +479,6 @@ fn changed(thread_id: &str, version: String, message: &str) -> HistoryResponse {
     }
 }
 
-/// Media types recognizable from a file's first bytes.
 fn sniff(head: &[u8]) -> Option<&'static str> {
     let riff = |kind: &[u8]| head.starts_with(b"RIFF") && head.get(8..12) == Some(kind);
     Some(match head {
@@ -529,7 +507,6 @@ impl HistorySource for ChatGptHistory {
     }
 }
 
-/// One step of the check, for people watching stderr.
 pub enum PackageProgress {
     Part {
         name: String,
@@ -789,7 +766,6 @@ mod tests {
         }
     }
 
-    /// Every chunk of one asset, checked for contiguity and a repeated whole-file digest.
     async fn fetch(
         history: &ChatGptHistory,
         thread: &str,

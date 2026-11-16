@@ -3,7 +3,6 @@ import { mkdir, open, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { crc32, deflateRawSync, deflateSync } from "node:zlib";
 
-/** One file of an export package, stored or deflated when written as a ZIP. */
 export type ExportMember = { name: string; bytes: Uint8Array; method: "stored" | "deflated" };
 
 type Author = { role: "system" | "user" | "assistant" | "tool"; name: string | null; metadata: Record<string, unknown> };
@@ -43,7 +42,6 @@ function conversation(id: string, title: string, created: number, updated: numbe
     default_model_slug: "invented-model" };
 }
 
-/** Prompt scaffolding a real export carries before the first visible message. Never imported. */
 function scaffolding(id: string, created: number): MappingNode[] {
   return [
     node(`${id}-root`, message(`${id}-system`, "system", created, text(`${INSTRUCTION_MARKER}: you are a helpful assistant.`),
@@ -99,7 +97,6 @@ function tent(): Conversation {
   ]);
 }
 
-/** A valid 1x1 RGB PNG. */
 export function onePixelPng(): Buffer {
   const chunk = (type: string, data: Buffer) => {
     const body = Buffer.concat([Buffer.from(type, "ascii"), data]), length = Buffer.alloc(4), checksum = Buffer.alloc(4);
@@ -112,10 +109,6 @@ export function onePixelPng(): Buffer {
     chunk("IDAT", deflateSync(Buffer.from([0, 0x2a, 0x7f, 0xd4]))), chunk("IEND", Buffer.alloc(0))]);
 }
 
-/**
- * The same invented account exported twice. The second export edits the picnic prompt and
- * regenerates the kayak reply; the lighthouse and tent conversations are byte-identical.
- */
 export function chatGptExports(blob: Uint8Array): { first: ExportMember[]; second: ExportMember[] } {
   const png = onePixelPng();
   const members = (conversations: Conversation[]): ExportMember[] => [
@@ -131,7 +124,6 @@ export function chatGptExports(blob: Uint8Array): { first: ExportMember[]; secon
 
 export function sha256(bytes: Uint8Array): string { return createHash("sha256").update(bytes).digest("hex"); }
 
-/** Writes a single-part ZIP with UTF-8 names and regular-file modes. */
 export async function writeExportZip(path: string, members: readonly ExportMember[]): Promise<void> {
   const file = await open(path, "wx", 0o600), central: Buffer[] = [];
   const time = (3 << 11) | (4 << 5) | 3, date = ((2026 - 1980) << 9) | (1 << 5) | 2;
@@ -160,7 +152,6 @@ export async function writeExportZip(path: string, members: readonly ExportMembe
   } finally { await file.close(); }
 }
 
-/** Writes the same members as an extracted export folder. */
 export async function writeExportFolder(path: string, members: readonly ExportMember[]): Promise<void> {
   await mkdir(path, { mode: 0o700 });
   for (const member of members) await writeFile(join(path, member.name), member.bytes, { mode: 0o600, flag: "wx" });

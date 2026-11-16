@@ -14,11 +14,7 @@ pub enum RequestLifecycle {
     Once,
     Login,
     Chat,
-    Worker {
-        interactive: bool,
-    },
-    /// A one-shot request whose history reads belong to the requesting client, because the
-    /// export it checked is on the client's disk. Only `HostCommand::History` is delegated.
+    Worker { interactive: bool },
     ClientHistory,
     View(View),
     Background,

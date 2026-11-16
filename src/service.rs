@@ -602,8 +602,6 @@ async fn identify<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     Ok(Some(next))
 }
 
-/// Fails every read still waiting on the client serving an import, so the import ends
-/// partial at once instead of at each read's timeout.
 async fn release_client_reads(
     runtime: &Runtime,
     request_id: u32,
@@ -1425,7 +1423,6 @@ mod tests {
         }
     }
 
-    /// Reads the two delegated history calls the fixture sends for an import.
     async fn delegated_history_calls<R: AsyncRead + Unpin>(reader: &mut FrameReader<BufReader<R>>) {
         for expected in ["history-1", "history-2"] {
             let event: RuntimeEventKind =
@@ -1437,8 +1434,6 @@ mod tests {
         }
     }
 
-    /// The fixture records each history reply it receives. A dropped client's calls must
-    /// fail well inside a second, not at the history call timeout.
     async fn disconnected_reply(directory: &std::path::Path, call: &str) {
         let path = directory.join(format!("{call}.json"));
         let deadline = Instant::now() + Duration::from_secs(1);

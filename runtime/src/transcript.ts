@@ -225,7 +225,6 @@ export async function history(conversation: Conversation, value: string | null,
 
 const TOOL_DETAIL_BYTES = 32_768;
 const TOOL_DETAIL_ENTRIES = 128;
-/** A source reader emits a call's output right after it; the bound steps over the import's thread, asset and observation records. */
 const IMPORTED_PAIR_ENTRIES = 8;
 function entryId(value: unknown): value is EntryId { return typeof value === "number" && Number.isSafeInteger(value) && value > 0; }
 function detailText(text: string): ToolDetailContent {

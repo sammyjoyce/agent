@@ -26,8 +26,6 @@ type Owned = { child: ChildProcess; closed: Promise<Run> };
 
 const CODEX_NOTE = "Codex note about deployment";
 const EXPORT_ONE_ITEMS = 10;
-// The picnic edit adds two prompts and replies and flips the old pair to alternate; the kayak
-// regeneration adds one reply and flips the old one.
 const EXPORT_TWO_ADDED_ITEMS = 4 + 2;
 const NOTICE = "1 other version of this message is retained as evidence and not shown.";
 

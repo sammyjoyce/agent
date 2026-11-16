@@ -4171,7 +4171,6 @@ fn import_phase_name(phase: &ImportPhase) -> &'static str {
     }
 }
 
-/// One line per source, so `import status` can report Codex and ChatGPT side by side.
 fn import_progress_line(progress: &ImportProgress) -> String {
     format!(
         "{} {}: {} imported, {} unchanged, {} seen; {} items added, {} assets, {} gaps",
@@ -4186,8 +4185,6 @@ fn import_progress_line(progress: &ImportProgress) -> String {
     )
 }
 
-/// The check is the admission gate: an export refused here never reaches a coordinator.
-/// Humans read the report on stderr; `--check --json` prints the summary on stdout.
 async fn check_chatgpt_export(
     paths: Vec<PathBuf>,
     json: bool,

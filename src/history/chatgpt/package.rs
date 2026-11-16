@@ -1,5 +1,3 @@
-//! The validated package index, built once before admission and immutable afterwards.
-
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     io::{self, Read},
@@ -17,10 +15,7 @@ use super::{
 };
 use crate::history::HistoryThread;
 
-/// Bump when the package digest's inputs change.
 const PACKAGE_FORMAT: u32 = 1;
-/// Bump when anything that feeds normalization changes meaning; every thread then reads
-/// as changed once.
 const THREAD_FORMAT: u32 = 1;
 const MAXIMUM_PROBLEMS: usize = 100;
 const MANIFEST: &str = "export_manifest.json";
@@ -28,10 +23,8 @@ const MANIFEST: &str = "export_manifest.json";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) struct MemberId(usize);
 
-/// Every regular file of every part, with where its bytes live.
 pub(super) struct Member {
     pub path: MemberPath,
-    /// Declared uncompressed size. Every read is held to it.
     pub size: u64,
     part: usize,
     location: Location,
@@ -43,7 +36,6 @@ enum Location {
 }
 
 impl Member {
-    /// The member's bytes, held to their declared size (and CRC inside a ZIP).
     pub fn open(&self) -> io::Result<Box<dyn Read + Send>> {
         match &self.location {
             Location::File(path) => Ok(Box::new(archive::Exact::new(
@@ -55,8 +47,6 @@ impl Member {
         }
     }
 
-    /// The member's bytes as a positioned region, when they are stored as-is. Deflated
-    /// members have none and must be inflated.
     pub fn region(&self) -> io::Result<Option<Region>> {
         match &self.location {
             Location::File(path) => Region::whole(archive::open_regular(path)?).map(Some),
@@ -70,8 +60,6 @@ impl Member {
     }
 }
 
-/// One conversation's bytes inside its shard, with the digest that proves a later read saw
-/// the bytes the check saw.
 pub(super) struct Span {
     shard: usize,
     start: u64,
@@ -79,35 +67,25 @@ pub(super) struct Span {
     sha256: [u8; 32],
 }
 
-/// One conversation, located but not held in memory.
 pub(super) struct ConversationEntry {
-    /// Complete as List returns it; `version` covers the content and its library entries.
     pub thread: HistoryThread,
     pub span: Span,
     content: [u8; 32],
 }
 
-/// The bytes moved since the check; the reader reports the thread as changed.
 pub(super) struct SpanChanged;
 
 pub(super) struct Package {
     members: Vec<Member>,
-    /// Each shard's decompressed bytes: in place when stored, otherwise a private spool.
     shards: Vec<Region>,
-    /// Inventory order: newest update first, then id.
     conversations: Vec<ConversationEntry>,
     by_id: HashMap<String, usize>,
-    /// Attachment resolution. Root-level members win over folder copies, then the
-    /// smallest member path, then the earliest part.
     files: HashMap<FileId, MemberId>,
-    /// `conversation_asset_file_names.json`: stored name to original name.
     original_names: HashMap<String, String>,
-    /// Live library entries by the conversation they belong to.
     library: HashMap<String, Vec<LibraryFile>>,
     pub summary: ChatGptPackageSummary,
 }
 
-/// One input or discovered part, before its members are admitted.
 enum Input {
     Folder(PathBuf),
     Json(PathBuf),
@@ -115,8 +93,6 @@ enum Input {
 }
 
 impl Package {
-    /// Checks the whole package before returning: parts, member safety and bounds, the
-    /// shard set, every conversation (streamed once) and the sidecars. Reads no attachment.
     pub fn open(
         paths: &[PathBuf],
         limits: Limits,
@@ -174,7 +150,6 @@ impl Package {
         self.by_id.get(id).map(|index| &self.conversations[*index])
     }
 
-    /// Rereads one conversation's span and proves it is the content that was checked.
     pub fn read_conversation(&self, entry: &ConversationEntry) -> Result<Value, SpanChanged> {
         let span = &entry.span;
         let mut bytes = vec![0; usize::try_from(span.len).map_err(|_| SpanChanged)?];
@@ -212,8 +187,6 @@ impl FileLookup for Package {
     }
 }
 
-/// Canonicalizes each argument once (a symlinked argument is the user's own choice),
-/// classifies it, and adds sibling parts of a split download.
 fn resolve(paths: &[PathBuf], limits: &Limits) -> Result<Vec<(String, Input)>, PackageError> {
     let unreadable = |path: &Path, error: io::Error| PackageError::Unreadable {
         path: archive::shown(&path.to_string_lossy()),
@@ -263,7 +236,6 @@ struct Builder {
     limits: Limits,
     members: Vec<Member>,
     parts: Vec<String>,
-    /// Top-level ZIP parts, the only places a nested archive may open from.
     zip_parts: Vec<usize>,
     declared: u64,
     spool_remaining: u64,
@@ -365,8 +337,6 @@ impl Builder {
         Ok(())
     }
 
-    /// The conversation shards to read, in order. The manifest, when present, must list
-    /// exactly the shards present; without one the shards must be numbered without a gap.
     fn shard_members(&self) -> Result<Vec<MemberId>, PackageError> {
         let mut present: BTreeMap<String, MemberId> = BTreeMap::new();
         let mut manifests: Vec<Value> = Vec::new();
@@ -425,7 +395,6 @@ impl Builder {
         Ok(order.iter().map(|name| present[name]).collect())
     }
 
-    /// The shard names a manifest lists, or None when it describes no conversation shards.
     fn manifest_shards(&self, manifest: &Value) -> Result<Option<Vec<String>>, PackageError> {
         if let Some(logical) = manifest.pointer("/logical_files/conversations.json") {
             let files: Vec<String> = logical
@@ -479,9 +448,6 @@ impl Builder {
         Ok((!listed.is_empty()).then_some(listed))
     }
 
-    /// Streams one shard once: splits it, checks every element, and records where each
-    /// conversation's bytes can be read again. Deflated shards inflate into a private spool
-    /// so a later read never re-inflates from the start.
     fn read_shard(
         &mut self,
         member: MemberId,
@@ -569,7 +535,6 @@ fn read_small(member: &Member, maximum: usize) -> Result<Vec<u8>, PackageError> 
     Ok(bytes)
 }
 
-/// `conversations.json` is shard 0 of 1; `conversations-NNN.json` is shard NNN.
 fn shard_number(name: &str) -> Option<u32> {
     if name == "conversations.json" {
         return Some(0);
@@ -603,9 +568,6 @@ fn numbered_shards(present: &BTreeMap<String, MemberId>) -> Result<Vec<String>, 
     Ok(numbered.into_iter().map(|(_, name)| name.clone()).collect())
 }
 
-/// Library and asset-name sidecars, matched ignoring case and `-`/`_`. A sidecar that does
-/// not parse is a problem, never a refusal. Personal sidecars such as `user.json` are never
-/// opened.
 fn sidecars(
     members: &[Member],
     limits: &Limits,
@@ -684,7 +646,6 @@ fn library_file(entry: Value) -> Option<(String, LibraryFile)> {
     ))
 }
 
-/// Every member whose file name carries a file id, resolved once.
 fn file_index(members: &[Member]) -> HashMap<FileId, MemberId> {
     let mut files: HashMap<FileId, MemberId> = HashMap::new();
     for (index, member) in members.iter().enumerate() {
@@ -702,12 +663,10 @@ fn file_index(members: &[Member]) -> HashMap<FileId, MemberId> {
     files
 }
 
-/// What the shard pass learned, before the package is assembled.
 #[derive(Default)]
 struct Scan {
     conversations: Vec<ConversationEntry>,
     by_id: HashMap<String, usize>,
-    /// Per kept conversation: excluded messages, referenced files and repaired characters.
     surveys: HashMap<String, (u32, BTreeSet<FileId>, u32)>,
     skipped: u32,
     problems: Vec<String>,

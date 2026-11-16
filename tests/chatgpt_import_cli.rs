@@ -1,4 +1,3 @@
-//! `import chatgpt` checks an export on the client before anything reaches a coordinator.
 use std::{
     io::{Cursor, Write},
     path::{Path, PathBuf},

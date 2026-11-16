@@ -4,11 +4,9 @@ import type { ToolStatus } from "./generated/ToolStatus.js";
 import type { ImportedAdapter } from "./imported-history.js";
 import { field, historyToolId, string, type MessageContent } from "./message-presentation.js";
 
-/** Content the reader already turned into message text. Anything else keeps its text under an unknown presentation. */
 const MESSAGE_CONTENT = new Set(["text", "multimodal_text", "thoughts", "reasoning_recap"]);
 const MEDIA_KINDS: Readonly<Record<string, MediaOperation>> = { "tool:multimodal_text": "generate", "library:file": "attachment" };
 
-/** `kind` is "<author role>:<content type>". */
 function author(item: HistoryItem): string { return item.kind.slice(0, item.kind.indexOf(":")); }
 function contentType(item: HistoryItem): string { return item.kind.slice(item.kind.indexOf(":") + 1); }
 function nativeMessage(data: unknown): unknown { return field(data, "message"); }
@@ -19,7 +17,6 @@ function status(data: unknown): ToolStatus {
     default: return "unknown";
   }
 }
-/** Code and execution output keep their whole text in the envelope; `item.text` is a bounded excerpt. */
 function fullText(item: HistoryItem, data: unknown): string {
   return string(field(field(nativeMessage(data), "content"), "text")) ?? item.text;
 }
@@ -38,7 +35,6 @@ function chatGptMessage(item: HistoryItem, data: unknown, entryId: string): Mess
   return { role: item.role, text: item.text };
 }
 
-/** Reads only the reader's placement-free fields; the Rust reader owns the export's content shapes. */
 export const chatGptAdapter: ImportedAdapter = {
   message: chatGptMessage,
   display: chatGptMessage,

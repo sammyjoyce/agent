@@ -11,10 +11,8 @@ use ts_rs::TS;
 
 use crate::protocol::HistoryRole;
 
-/// The transport budget of one serialized history response, for every source.
 pub(crate) const PAGE_BYTES: usize = 500 * 1024;
 
-/// The longest UTF-8-safe prefix of `text` within `maximum` bytes.
 pub(crate) fn excerpt(text: &str, maximum: usize) -> String {
     let end = text
         .char_indices()

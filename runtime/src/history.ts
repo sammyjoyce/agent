@@ -20,13 +20,11 @@ import type { ImportedConversationSummary } from "./generated/ImportedConversati
 import type { SourceRef } from "./generated/SourceRef.js";
 import { HistoryObservation, HistoryRevisions, REVISION_FORMAT, RevisionTracker, type CaptureState, type RevisionView, type SourceCapture, type SourceSnapshot } from "./history-revisions.js";
 
-/** Native thread IDs are unique only inside their source, so every durable key and lookup names both. */
 export type SourceThread = { readonly source: HistoryProvider; readonly thread_id: string };
 const HISTORY_SOURCES = {
   codex: { account: "local" },
   chatgpt: { account: "export" },
 } as const satisfies Record<HistoryProvider, { account: string }>;
-/** Codex preimages are byte-identical to the keys saved before other sources existed. */
 export function historyKey(source: HistoryProvider, ...values: string[]): string {
   return createHash("sha256").update(JSON.stringify([source, ...values])).digest("hex");
 }
@@ -39,9 +37,7 @@ export function entryThread(entry: { data: { source: HistoryProvider; thread_id:
 export function importedSourceRef(record: Pick<ImportedConversation, "source" | "thread">): SourceRef {
   return { provider: record.source, account: HISTORY_SOURCES[record.source].account, thread_id: record.thread.id };
 }
-/** ChatGPT tool output can carry anything a tool fetched, so it stays inspectable evidence and never becomes a search match. */
 const CHATGPT_SEARCHABLE_ROLES: ReadonlySet<HistoryRole> = new Set(["user", "assistant", "commentary", "final"]);
-/** Branches a source kept but did not show never render, index or feed continuation evidence. */
 export function shownInConversation(item: { branch?: HistoryBranch }): boolean {
   return item.branch === undefined || item.branch.state === "current";
 }
@@ -56,7 +52,6 @@ export type ImportCheckpoint = { version: string; next_cursor: string | null; co
 const Threads = defineDocFamily<ThreadState, null>({ kind: "agent.history.threads", scope: "session", family: true, version: 1,
   initial: () => ({ native_id: null, record: null, watermark: null, evidence: null }), checkpointWhen: () => true });
 type ReverseLink = { thread_id: string | null; source?: Exclude<HistoryProvider, "codex"> };
-/** An absent source means Codex, so Codex links stay byte-identical to those saved before other sources. */
 const Reverse = defineDocFamily<ReverseLink, null>({ kind: "agent.history.conversations", scope: "session", family: true, version: 1,
   initial: () => ({ thread_id: null }), checkpointWhen: () => true });
 function reverseThread(link: Readonly<ReverseLink> | undefined): SourceThread | undefined {
@@ -145,7 +140,6 @@ export class HistoryStore {
     const thread = await this.linked(id);
     return thread === undefined ? undefined : this.get(thread);
   }
-  /** `origin` is the Codex host ID, or the constant origin of every ChatGPT export. */
   async checkpoint(thread: SourceThread, origin: string): Promise<ImportCheckpoint | undefined> {
     const state = await this.session.snapshot(Checkpoints, historyKey(thread.source, thread.thread_id, origin), BACKGROUND_CONTEXT);
     return state?.checkpoint === null || state?.checkpoint === undefined ? undefined : structuredClone(state.checkpoint);

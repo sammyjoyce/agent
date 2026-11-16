@@ -6,16 +6,11 @@ import type { HistoryItem } from "../../src/generated/HistoryItem.js";
 import type { HistoryRole } from "../../src/generated/HistoryRole.js";
 import { CHATGPT_ORIGIN } from "../../src/importer.js";
 
-/** One message node as the ChatGPT reader places and classifies it. Invented data only. */
 export type ChatGptNode = { id: string; parent: string | null; turn: string; kind: string; role: HistoryRole; text: string;
   state?: HistoryBranchState; alternates?: number; message?: Record<string, unknown> };
 
 function sha256(value: string): string { return createHash("sha256").update(value).digest("hex"); }
 
-/**
- * A complete page of one exported conversation, in the reader's emission order. Item versions
- * hash their content and placement, and each current item follows the previous current one.
- */
 export function chatGptBatch(conversation: string, updated_at: number, nodes: readonly ChatGptNode[], title = "Picnic planning"): HistoryImportBatch {
   let follows: string | undefined;
   const items = nodes.map((node, order): HistoryItem => {

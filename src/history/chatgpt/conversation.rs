@@ -1,5 +1,3 @@
-//! Pure: one native ChatGPT conversation becomes a placed tree of inert history items.
-
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
@@ -43,16 +41,10 @@ impl FileId {
     }
 }
 
-/// What one native message becomes.
 pub(super) enum Disposition {
-    /// Never stored, rendered or indexed. Counted in the summary.
     Excluded,
-    /// Structural or empty: no item, but the node keeps its place in the tree.
     Skipped,
-    Emit {
-        kind: String,
-        role: HistoryRole,
-    },
+    Emit { kind: String, role: HistoryRole },
 }
 
 const INSTRUCTION_CONTENT: [&str; 4] = [
@@ -62,8 +54,6 @@ const INSTRUCTION_CONTENT: [&str; 4] = [
     "about_model_message",
 ];
 
-/// Exclusions come first, so instruction content never reaches an item even when it also
-/// looks like an ordinary user message. A message without a recipient is addressed to `all`.
 pub(super) fn classify(message: &Value) -> Disposition {
     let author = message
         .pointer("/author/role")
@@ -129,7 +119,6 @@ fn content_type(message: &Value) -> &str {
         .unwrap_or("text")
 }
 
-/// The text a person saw for this message, before excerpting.
 pub(super) fn visible_text(message: &Value) -> String {
     if let Some(markdown) = message
         .pointer("/metadata/model_dil_v2/fallbackMarkdown")
@@ -173,7 +162,6 @@ pub(super) fn visible_text(message: &Value) -> String {
         .join("\n\n")
 }
 
-/// A file one message points at.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct FileRef {
     pub file: FileId,
@@ -181,7 +169,6 @@ pub(super) struct FileRef {
     pub mime_type: Option<String>,
 }
 
-/// One live entry of the export's file library.
 #[derive(Clone, Debug)]
 pub(super) struct LibraryFile {
     pub file: FileId,
@@ -189,13 +176,9 @@ pub(super) struct LibraryFile {
     pub mime_type: Option<String>,
     pub origination_message: Option<String>,
     pub created_at: Option<f64>,
-    /// The entry as exported, kept as evidence on the item that shows it.
     pub raw: Value,
 }
 
-/// Every file a message references: attachment metadata, asset pointers (including voice
-/// wrappers), code-interpreter chart images, and library entries that name this message as
-/// their origin. One ref per file id, in that order.
 pub(super) fn references(message: &Value, library: &[&LibraryFile]) -> Vec<FileRef> {
     let mut found: Vec<FileRef> = Vec::new();
     let mut add = |file: Option<FileId>, name: Option<&str>, mime_type: Option<&str>| {
@@ -272,7 +255,6 @@ fn asset_pointers(value: &Value, depth: usize, found: &mut Vec<String>) {
     }
 }
 
-/// What the package check counts for one conversation.
 pub(super) struct Survey {
     pub excluded: u32,
     pub files: BTreeSet<FileId>,
@@ -303,7 +285,6 @@ pub(super) fn survey(raw: &Value) -> Survey {
     survey
 }
 
-/// Seconds since the epoch from float seconds, integer milliseconds or an ISO string.
 pub(super) fn seconds(value: &Value) -> Option<f64> {
     match value {
         Value::Number(number) => {
@@ -318,8 +299,6 @@ pub(super) fn seconds(value: &Value) -> Option<f64> {
     .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
 }
 
-/// The thread List returns. `updated_at` falls back to the newest message, then creation.
-/// `version` is filled by the package once the conversation's library entries are known.
 pub(super) fn thread(id: &str, raw: &Value, version: String) -> HistoryThread {
     let created = raw.get("create_time").and_then(seconds);
     let newest_message = raw
@@ -365,30 +344,22 @@ pub(super) fn thread(id: &str, raw: &Value, version: String) -> HistoryThread {
     }
 }
 
-/// What normalization needs from the package index, so this module stays free of I/O.
 pub(super) trait FileLookup {
-    /// The stored member name of a file the package holds.
     fn stored_name(&self, file: &FileId) -> Option<&str>;
-    /// The original name `conversation_asset_file_names.json` records for a stored name.
     fn original_name(&self, stored: &str) -> Option<&str>;
 }
 
-/// Where an authorized asset path's bytes live.
 pub(super) enum AssetSource {
     File(FileId),
     Evidence(Arc<Vec<u8>>),
 }
 
-/// One conversation, ready to page. Items are in emission order and `order == index`.
 pub(super) struct Normalized {
     pub items: Vec<HistoryItem>,
-    /// Item gaps carry their item id; thread gaps carry none.
     pub gaps: Vec<HistoryGap>,
-    /// Every asset path this thread may serve.
     pub assets: HashMap<String, AssetSource>,
 }
 
-/// Bump when item mapping or version inputs change; every item then reads as new once.
 const ITEM_FORMAT: u32 = 1;
 const INLINE_EVIDENCE_BYTES: usize = 128 * 1024;
 const TEXT_EXCERPT_BYTES: usize = 16 * 1024;
@@ -404,9 +375,7 @@ const INSTRUCTION_METADATA: [&str; 5] = [
 /// a node whose `parent` is missing.
 struct Tree<'a> {
     nodes: BTreeMap<&'a str, Node<'a>>,
-    /// Sorted by (create time, node id).
     children: HashMap<&'a str, Vec<&'a str>>,
-    /// Nodes with no parent, or a parent the mapping does not hold.
     roots: Vec<&'a str>,
 }
 
@@ -486,15 +455,10 @@ impl<'a> Tree<'a> {
     }
 }
 
-/// Where each node lands, computed once. Every later step reads only this.
 struct Placement<'a> {
-    /// Root to the selected leaf.
     current: Vec<&'a str>,
-    /// Reachable and off the current path, parents before children.
     alternate: Vec<&'a str>,
-    /// Unreachable from every root (parent cycles), by (create time, id).
     detached: Vec<&'a str>,
-    /// For current nodes: sibling subtrees holding at least one emitted node.
     alternates: HashMap<&'a str, u32>,
 }
 
@@ -582,7 +546,6 @@ impl<'a> Placement<'a> {
     }
 }
 
-/// The nearest emitted user message at or above `id`, or `id` itself when there is none.
 fn turn<'a>(tree: &Tree<'a>, id: &'a str) -> &'a str {
     let mut cursor = Some(id);
     let mut seen = BTreeSet::new();
@@ -604,8 +567,6 @@ fn turn<'a>(tree: &Tree<'a>, id: &'a str) -> &'a str {
     id
 }
 
-/// Builds every item of one conversation in emission order: the current path, files only
-/// the library shows, alternates, then detached nodes.
 pub(super) fn normalize(
     id: &str,
     raw: &Value,
@@ -750,7 +711,6 @@ fn library_entries(library: &[&LibraryFile], node: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Everything one item needs before its version exists.
 struct Draft<'a> {
     conversation: &'a str,
     node: &'a str,
@@ -767,7 +727,6 @@ struct Draft<'a> {
 }
 
 impl Normalized {
-    /// Appends one item and returns its version.
     fn push(&mut self, draft: Draft<'_>) -> String {
         let mut message = draft.message.cloned().unwrap_or(Value::Null);
         if let Some(metadata) = message.get_mut("metadata").and_then(Value::as_object_mut) {
@@ -872,7 +831,6 @@ impl Normalized {
 
 pub(super) const UNKNOWN_MEDIA: &str = "application/octet-stream";
 
-/// A media type from a meaningful file extension. Stored `.dat` names carry none.
 fn media_type(name: &str) -> Option<String> {
     let extension = name.rsplit_once('.')?.1.to_ascii_lowercase();
     let known = match extension.as_str() {

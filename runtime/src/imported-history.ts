@@ -32,12 +32,9 @@ function webAction(value: unknown): WebSearchAction | null {
 }
 
 export type ImportedToolDetail = { input: string | null; output: string | null; truncated: boolean };
-/** A source's reading of its own native item data. Branch visibility is generic and belongs to the store. */
 export type ImportedAdapter = {
-  /** Canonical message for inspection and tool details. */
   message(item: HistoryItem, data: unknown, entryId: string): MessageContent;
   display(item: HistoryItem, data: unknown, entryId: string): MessageContent;
-  /** `next` reads the item stored after this one, for sources that record a call and its output separately. */
   toolDetail(item: HistoryItem, data: unknown, next: () => Promise<{ item: HistoryItem; data: unknown } | undefined>): Promise<ImportedToolDetail>;
 };
 

@@ -1,6 +1,3 @@
-//! Invented ChatGPT exports for tests: folders, single JSON files, ZIPs, sibling parts and
-//! nested ZIPs, plus raw-byte forgery of sizes, checksums, modes and names.
-
 use std::{
     io::{Cursor, Write},
     path::{Path, PathBuf},
@@ -19,7 +16,6 @@ pub(super) const PNG: &[u8] = &[
 
 pub(super) const PDF: &[u8] = b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n";
 
-/// 0.1 s of 8 kHz, 8-bit mono silence.
 pub(super) fn wav() -> Vec<u8> {
     let samples = 800u32;
     let mut bytes = Vec::new();
@@ -39,7 +35,6 @@ pub(super) fn wav() -> Vec<u8> {
     bytes
 }
 
-/// Invented conversation ids: `00000000-0000-4000-8000-0000000000NN`.
 pub(super) fn id(number: u8) -> String {
     format!("00000000-0000-4000-8000-{number:012x}")
 }
@@ -52,7 +47,6 @@ pub(super) fn text_message(role: &str, text: &str) -> Value {
     })
 }
 
-/// A conversation in the 2026 shape: nodes name only their `parent`.
 #[derive(Clone)]
 pub(super) struct Conversation {
     value: Value,
@@ -78,7 +72,6 @@ impl Conversation {
         }
     }
 
-    /// Adds a node and moves `current_node` to it. Fills the message's id and time.
     pub fn node(mut self, node: &str, parent: Option<&str>, message: Value) -> Self {
         self.clock += 1.0;
         let mut message = message;
@@ -119,7 +112,6 @@ struct Entry {
     deflated: bool,
 }
 
-/// An invented export, written as a ZIP or as an extracted folder.
 #[derive(Clone, Default)]
 pub(super) struct Export {
     entries: Vec<Entry>,
@@ -192,7 +184,6 @@ impl Export {
     }
 }
 
-/// Raw edits to a written ZIP, for headers no honest writer produces.
 pub(super) struct Forge {
     pub bytes: Vec<u8>,
 }

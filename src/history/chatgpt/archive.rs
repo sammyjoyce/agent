@@ -1,5 +1,3 @@
-//! Bounded access to the bytes of an export: ZIP members, folder files and private spools.
-
 use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
@@ -10,16 +8,12 @@ use std::{
 
 use super::{Corruption, Incompleteness, PackageError, UnsafeReason};
 
-/// Every bound the package check enforces. Tests shrink these to build small bombs.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Limits {
     pub parts: usize,
     pub members_per_archive: usize,
-    /// Declared uncompressed bytes of one member.
     pub member_bytes: u64,
-    /// Declared uncompressed bytes across every archive and folder.
     pub package_bytes: u64,
-    /// Expansion allowed for members that declare more than `RATIO_FLOOR` bytes.
     pub ratio: u64,
     pub conversation_bytes: usize,
     pub spool_bytes: u64,
@@ -45,8 +39,6 @@ impl Default for Limits {
     }
 }
 
-/// A member name proven relative, normalized and UTF-8: no `..`, NUL, drive letter or
-/// backslash. The only way package code names a member.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) struct MemberPath(String);
 
@@ -101,7 +93,6 @@ impl MemberPath {
     }
 }
 
-/// Bounded for error messages, which may reach a terminal.
 pub(super) fn shown(text: &str) -> String {
     text.chars()
         .map(|character| {
@@ -115,7 +106,6 @@ pub(super) fn shown(text: &str) -> String {
         .collect()
 }
 
-/// A window of one open file, read with positioned reads so clones never share a cursor.
 #[derive(Clone)]
 pub(super) struct Region {
     file: Arc<File>,
@@ -209,7 +199,6 @@ impl Seek for RegionReader {
     }
 }
 
-/// A private temporary file, unlinked as soon as it exists so a crash leaves nothing behind.
 pub(super) struct Spool {
     file: File,
     len: u64,
@@ -281,7 +270,6 @@ impl std::fmt::Display for SpoolFull {
 
 impl std::error::Error for SpoolFull {}
 
-/// Copies every byte read into a spool.
 pub(super) struct Tee<'a, R> {
     pub inner: R,
     pub spool: &'a mut Spool,
@@ -295,7 +283,6 @@ impl<R: Read> Read for Tee<'_, R> {
     }
 }
 
-/// Carries a `Corruption` through `io::Error` so callers can tell a forged member from I/O.
 #[derive(Debug)]
 pub(super) struct CorruptRead(pub Corruption);
 
@@ -318,8 +305,6 @@ fn corrupt(reason: Corruption) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, CorruptRead(reason))
 }
 
-/// Yields exactly `declared` bytes or fails, so a forged size can neither truncate nor expand
-/// a member silently. Checks the CRC-32 at the end when one is known.
 pub(super) struct Exact<R> {
     inner: R,
     declared: u64,
@@ -388,7 +373,6 @@ pub(super) enum Method {
     Deflated,
 }
 
-/// One admitted ZIP member: where its compressed bytes start inside the archive region.
 pub(super) struct ZipMember {
     pub path: MemberPath,
     pub size: u64,
@@ -399,7 +383,6 @@ pub(super) struct ZipMember {
 }
 
 impl ZipMember {
-    /// The member's bytes, held to their declared size and CRC.
     pub fn open(&self, archive: &Region) -> io::Result<Box<dyn Read + Send>> {
         let raw = archive.slice(self.data_start, self.compressed)?.reader();
         Ok(match self.method {
@@ -418,8 +401,6 @@ const SYMLINK: u32 = 0o120_000;
 const DIRECTORY: u32 = 0o040_000;
 const REGULAR: u32 = 0o100_000;
 
-/// Reads one archive's central directory and admits every regular member, or refuses the
-/// package. Bounds are checked from declared sizes before any member is inflated.
 pub(super) fn zip_members(
     name: &str,
     archive: &Region,
@@ -516,15 +497,12 @@ fn count_bytes(total: &mut u64, size: u64, limits: &Limits) -> Result<(), Packag
     Ok(())
 }
 
-/// One regular file inside an extracted export folder.
 pub(super) struct FolderMember {
     pub path: MemberPath,
     pub size: u64,
     pub file: PathBuf,
 }
 
-/// Walks an extracted folder without following links. Any symlink or special file refuses
-/// the package before a single file is opened.
 pub(super) fn walk_folder(
     root: &Path,
     limits: &Limits,

@@ -1,6 +1,3 @@
-//! Pure JSON helpers: a streaming splitter for conversation shards, string repair and the
-//! canonical form every version hashes.
-
 use std::{
     borrow::Cow,
     io::{self, BufRead, BufReader, Read},
@@ -8,17 +5,9 @@ use std::{
 
 use serde_json::Value;
 
-/// One top-level element of a conversation shard.
 pub(super) enum Element<'a> {
-    Value {
-        offset: u64,
-        bytes: &'a [u8],
-    },
-    /// Larger than the element bound; skipped without buffering.
-    Oversized {
-        offset: u64,
-        len: u64,
-    },
+    Value { offset: u64, bytes: &'a [u8] },
+    Oversized { offset: u64, len: u64 },
 }
 
 #[derive(Debug)]
@@ -33,10 +22,6 @@ impl From<io::Error> for SplitError {
     }
 }
 
-/// Calls `element` with each top-level conversation's raw bytes and its offset in the stream.
-/// Accepts a JSON array, an object whose first key is `conversations` holding an array, or
-/// one bare conversation object. Tracks only strings, escapes and depth, buffers at most one
-/// element, and reads the stream to its end so a size or checksum fault always surfaces.
 pub(super) fn split_conversations<E>(
     stream: &mut dyn Read,
     maximum_element: usize,
@@ -107,7 +92,6 @@ impl<E> From<io::Error> for Split<E> {
     }
 }
 
-/// String, escape and bracket state of the bytes seen so far.
 struct Lexer {
     depth: usize,
     string: bool,
@@ -140,7 +124,6 @@ impl Lexer {
     }
 }
 
-/// Buffers an element until it passes `maximum`, then drops it and only keeps scanning.
 fn keep(bytes: &mut Vec<u8>, byte: u8, maximum: usize, oversized: &mut bool) {
     if *oversized {
         return;
@@ -240,7 +223,6 @@ impl<R: Read> Scanner<R> {
         }
     }
 
-    /// Reads the whitespace and first key of an object whose `{` was consumed, copying them.
     fn first_key(
         &mut self,
         lexer: &mut Lexer,
@@ -268,8 +250,6 @@ impl<R: Read> Scanner<R> {
         Ok(String::from_utf8(key).ok())
     }
 
-    /// Consumes bytes until the object `lexer` is inside closes. True when `bytes` passed
-    /// `maximum` and was dropped.
     fn finish(
         &mut self,
         lexer: &mut Lexer,
@@ -286,8 +266,6 @@ impl<R: Read> Scanner<R> {
     }
 }
 
-/// Replaces invalid UTF-8 and unpaired UTF-16 surrogate escapes with U+FFFD, counting each.
-/// Borrowed when nothing needed repair.
 pub(super) fn repair(bytes: &[u8]) -> (Cow<'_, [u8]>, u32) {
     let mut repairs = 0;
     let text: Cow<'_, [u8]> = if std::str::from_utf8(bytes).is_ok() {
@@ -372,8 +350,6 @@ fn escape_unit(bytes: &[u8]) -> Option<u16> {
     u16::from_str_radix(digits, 16).ok()
 }
 
-/// JSON with object keys sorted at every depth, so equal content hashes equally whatever
-/// key order the export used.
 pub(super) fn canonical(value: &Value) -> Vec<u8> {
     let mut output = Vec::new();
     write_canonical(value, &mut output);
