@@ -743,7 +743,6 @@ func aSendStoppedEverywhereBeforeItLeftThePhoneIsOfferedAgainAfterACrash(
   }
 }
 
-/// Stops each coordinator's copy of a Send while its dial is held, the way `stop` names.
 @MainActor private func stopEveryCopy(
   _ stop: UnwrittenStop, of coordinators: [GatedCoordinator], in model: ChatModel
 ) async throws {
@@ -763,8 +762,6 @@ func aSendStoppedEverywhereBeforeItLeftThePhoneIsOfferedAgainAfterACrash(
   }
 }
 
-/// A model that saves its draft under `root`, as the app does, with every coordinator saved and
-/// connected.
 @MainActor private func connectedModel(
   to coordinators: [GatedCoordinator], under root: URL
 ) async throws -> ChatModel {
@@ -782,9 +779,6 @@ func aSendStoppedEverywhereBeforeItLeftThePhoneIsOfferedAgainAfterACrash(
   return model
 }
 
-/// A Send of `/status` starts toward every recipient and leaves the composer, and the user types
-/// a newer note. Each copy then stops while its socket is still connecting, so no coordinator gets
-/// it. The live composer gets `/status` back ahead of the newer note, as recovery would offer it.
 @MainActor @Test(.timeLimit(.minutes(1)), arguments: UnwrittenStop.allCases, [1, 2])
 func aControlNoRecipientWroteComesBackToTheLiveComposer(
   stop: UnwrittenStop, recipients: Int
@@ -811,9 +805,6 @@ func aControlNoRecipientWroteComesBackToTheLiveComposer(
   }
 }
 
-/// A Send of `/status` goes to two coordinators. The dial to the second fails, and the first then
-/// gets `/status` and may run it. The composer keeps only the newer note, since sending `/status`
-/// again would run it twice.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func aControlOneRecipientWroteDoesNotComeBack() async throws {
   try await withGatedCoordinators(2) { coordinators, root in
@@ -842,8 +833,6 @@ func aControlOneRecipientWroteDoesNotComeBack() async throws {
   }
 }
 
-/// A `/status` for one of two coordinators, under its chip, never leaves the phone. It comes back
-/// to the empty composer under the same chip, so the next Send goes where this one was meant to.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func aControlThatComesBackToAnEmptyComposerKeepsItsChip() async throws {
   try await withGatedCoordinators(2) { coordinators, root in
@@ -868,9 +857,6 @@ func aControlThatComesBackToAnEmptyComposerKeepsItsChip() async throws {
   }
 }
 
-/// The user sends `/help` while an older `/status` is still dialing, and the coordinator gets
-/// `/help` at once. The dial for `/status` then fails, so `/status` comes back and `/help` does
-/// not.
 @MainActor @Test(.timeLimit(.minutes(1)))
 func aNewerSendDoesNotWaitForAnOlderControlThatComesBack() async throws {
   try await withGatedCoordinators(1) { coordinators, root in

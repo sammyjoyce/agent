@@ -1123,7 +1123,6 @@ final class ChatModel {
       var departing: [ControlDeparture] = []
       defer {
         admission = nil
-        // Nothing went, so no outbox holds the message.
         if !admitted { putBack(text) }
         // A composer emptied during the Send kept whom its draft was for until now.
         forgetClearedSource()
@@ -1142,7 +1141,6 @@ final class ChatModel {
       // The outboxes own this message even if their connections have since stopped.
       admission = .saved
       logComposer(.outboxSaved)
-      // Started only now, so the text never returns while the pending record still holds it.
       if !departing.isEmpty {
         Task { await putBack(text, addressedTo: addressedTo, unlessAnyWrote: departing) }
       }
@@ -1161,11 +1159,10 @@ final class ChatModel {
     }
   }
 
-  /// Puts a Send's `text` back ahead of anything typed since. It returns as the draft it was, so
-  /// the scope shown now does not begin it again, and an empty composer gets back `addressing`.
   private func putBack(_ text: String, addressedTo addressing: DraftAddressing? = nil) {
     guard !text.isEmpty else { return }
     let empty = draft.isEmpty && attachments.isEmpty
+    // It returns as the draft it was, so the scope shown now does not begin it again.
     changingDraft = true
     draft = text + (draft.isEmpty ? "" : "\n\n" + draft)
     if empty, let addressing {
@@ -1177,8 +1174,6 @@ final class ChatModel {
     logComposer(.localDraftRestored)
   }
 
-  /// Puts a control's `text` back once every copy that started stopped before it left the phone.
-  /// A copy that was written may have run, so the text stays sent.
   private func putBack(
     _ text: String, addressedTo addressing: DraftAddressing,
     unlessAnyWrote departing: [ControlDeparture]
@@ -1192,8 +1187,7 @@ final class ChatModel {
   /// Saves the message in every target's outbox, then starts each. A refusal withdraws every
   /// staged copy, so nothing is queued anywhere. Every copy carries the composer's receipt, and a
   /// copy that does not go releases only its own, so recovery offers the text again only when no
-  /// recipient took it. Admitted once any recipient has the message or still will. `departing`
-  /// holds each started control's departure, since a control can still stop before it leaves.
+  /// recipient took it. Admitted once any recipient has the message or still will.
   private func deliver(
     _ body: String, mode: InputMode, files: [LocalAttachment], to targets: [Target],
     receipt: ComposerInputIdentity

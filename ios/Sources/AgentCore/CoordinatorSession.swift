@@ -138,18 +138,18 @@ public struct StagedInput: Sendable, Equatable {
 }
 
 /// Whether a staged control was written to its coordinator. The session that holds the control
-/// answers once: when its exchange starts to write it, or when it stops before it leaves the phone.
+/// answers when its exchange starts to write it, or when it stops before it leaves the phone.
+/// The first answer stands.
 public final class ControlDeparture: Sendable, Equatable {
   private let answers: AsyncStream<Bool>
   private let continuation: AsyncStream<Bool>.Continuation
   init() { (answers, continuation) = AsyncStream.makeStream() }
-  /// The first answer stands.
   func settle(wrote: Bool) {
     continuation.yield(wrote)
     continuation.finish()
   }
-  /// Waits for the answer. One that never comes counts as written, so the control is never sent
-  /// twice.
+  /// Waits for the answer, which only the first read gets. A cancelled or later read gets true, so
+  /// the control is never sent twice.
   public var wrote: Bool {
     get async {
       for await wrote in answers { return wrote }
@@ -384,7 +384,7 @@ public actor CoordinatorSession {
     guard !retired else { return [] }
     let waiting = pending.filter { unsent[$0.request.inputId] == .waiting }.map { staged($0) }
     let cancelled = waiting + unwritten.compactMap(\.started)
-    abandon(Array(stagedControls.values) + cancelled)
+    markNeverLeft(Array(stagedControls.values) + cancelled)
     retired = true
     let satellites = liveInspectors
     inspectors = []
@@ -405,7 +405,7 @@ public actor CoordinatorSession {
     flush = nil
     for action in actions.values { action.cancel() }
     actions = [:]
-    abandon(unwritten.compactMap(\.started))
+    markNeverLeft(unwritten.compactMap(\.started))
     unwritten = []
     historyAction = nil
     let ownedConnections = Array(actionConnections.values) + [connection].compactMap { $0 }
@@ -553,7 +553,7 @@ public actor CoordinatorSession {
     }
     guard actions.count < 32, snapshot.connection == .connected else {
       guard staged.control == nil else {
-        abandon([staged])
+        markNeverLeft([staged])
         return .notSent
       }
       transcript.delivery(staged.inputID, .uncertain)
@@ -581,7 +581,7 @@ public actor CoordinatorSession {
     guard staged.control == nil else {
       stagedControls[staged.inputID] = nil
       // The receipt is in the outbox, which a session that has not connected has yet to read.
-      if loadOutbox() { abandon([staged]) }
+      if loadOutbox() { markNeverLeft([staged]) }
       return true
     }
     switch unsent[staged.inputID] {
@@ -608,10 +608,7 @@ public actor CoordinatorSession {
     await removal.value
     return true
   }
-  /// The controls among `inputs` never left the phone. Each one's departure says so, and this
-  /// outbox releases, in one save, each one's composer receipt that it still holds. A durable
-  /// input's receipt stays with its outbox item.
-  private func abandon(_ inputs: [StagedInput]) {
+  private func markNeverLeft(_ inputs: [StagedInput]) {
     for input in inputs { input.departure?.settle(wrote: false) }
     let keys = inputs.filter { $0.control != nil }.compactMap(receiptKey)
     guard !keys.isEmpty else { return }
@@ -1001,7 +998,7 @@ public actor CoordinatorSession {
     var failed = false
     defer {
       if historyAction?.id != id { actions.removeValue(forKey: id) }
-      abandon(unwritten.filter { $0.action == id }.compactMap(\.started))
+      markNeverLeft(unwritten.filter { $0.action == id }.compactMap(\.started))
       unwritten.removeAll { $0.action == id }
       transcript.abandonHistory(id)
     }
