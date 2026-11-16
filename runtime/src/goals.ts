@@ -43,7 +43,10 @@ type Origin = { conversation_id: string; entry_id: string; tool_call_id: string 
 export type StopTurn = (taskId: string, run: NativeTaskId) => Promise<void>;
 
 class Proof {
+  readonly #brand = true;
   constructor(readonly goal_id: string, readonly activation: number, readonly check: GoalCheck, readonly observed: ObservedFile) {}
+  /** Only this module constructs a Proof, so a copied object with the same fields is refused. */
+  static minted(value: unknown): value is Proof { return typeof value === "object" && value !== null && #brand in value; }
 }
 export type GoalProof = Proof;
 export type ResolutionAttempt = { origin?: Origin; proof?: GoalProof };
@@ -265,6 +268,7 @@ export class GoalStore implements GoalPolicy {
       }
       return { type: "rejected", message: PREMATURE };
     }
+    if (!Proof.minted(proof)) return { type: "rejected", message: "A goal completes only through complete_goal" };
     if (attempt.origin === undefined) throw new TaskError("A goal verification needs its tool call provenance");
     if (goal.state.state !== "active" || proof.goal_id !== goal.id || proof.activation !== goal.activation.number) {
       return { type: "rejected", message: CHANGED };
