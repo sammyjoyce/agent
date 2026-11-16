@@ -1,4 +1,3 @@
-import { setTimeout as sleep } from "node:timers/promises";
 import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import type { Seq, Storage, StorageWrite } from "@earendil-works/pi-durable";
 import type { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
@@ -6,13 +5,10 @@ import type { AuthorityState } from "../generated/AuthorityState.js";
 import type { BatchBody } from "../generated/BatchBody.js";
 import type { FileRecord } from "../generated/FileRecord.js";
 import type { LogEntry } from "../generated/LogEntry.js";
-import { AuthorityUnreachable, type AuthorityLink } from "./authority-link.js";
+import { untilReachable, type AuthorityLink } from "./authority-link.js";
 import { INLINE_BATCH_LIMIT_BYTES, logEntryDigest, parseBatch, sha256Hex, versions } from "./log-entry.js";
 import type { ScopedDatabase } from "./scoped-database.js";
 import { followLog, publishFiles, replicatedFilePath, type LogFollower } from "./standby.js";
-
-const FIRST_RETRY_MS = 50;
-const RETRY_CAP_MS = 5_000;
 
 /**
  * The authority no longer takes this holder for the owner. The process must
@@ -50,6 +46,18 @@ export interface LogWriter {
 export interface ReplicatedStorageOptions extends LogFollower {
   readonly holder: string;
   readonly epoch: number;
+  /**
+   * Called where a refusal is read from the authority's answer, before the
+   * `OwnerFenced` is thrown. Pi turns a rejected commit into a failed Session
+   * and keeps the process alive, so the throw alone can be swallowed.
+   */
+  readonly onFenced: (error: OwnerFenced) => void;
+}
+
+function fenced(options: Pick<ReplicatedStorageOptions, "onFenced">, reason: OwnerFenced["reason"], state: AuthorityState | null): OwnerFenced {
+  const error = new OwnerFenced(reason, state);
+  options.onFenced(error);
+  return error;
 }
 
 /**
@@ -66,7 +74,7 @@ export async function openReplicatedStorage(options: ReplicatedStorageOptions): 
     const record = await link.record();
     if (record === undefined) throw new Error("This coordinator is not enrolled with the authority");
     const { state } = record;
-    if (state.kind !== "active" || state.holder !== holder || state.epoch !== epoch) throw new OwnerFenced(state.kind === "active" ? "fenced" : "sealed", state);
+    if (state.kind !== "active" || state.holder !== holder || state.epoch !== epoch) throw fenced(options, state.kind === "active" ? "fenced" : "sealed", state);
     inner = await database.openStorage(record.checkpoint.through);
   } catch (error) {
     await database.close().catch(() => {});
@@ -132,13 +140,15 @@ class OwnerLog implements LogWriter {
   }
 
   async #append(files: readonly StagedFile[], batch: { readonly piSeq: number; readonly json: string } | null): Promise<number> {
-    const { link, holder, epoch } = this.#options;
+    const { link, holder, epoch, signal } = this.#options;
     const body = { at: this.#head + 1, epoch, versions: await versions(), files: files.map(({ record }) => record),
       batch: batch === null ? null : { pi_seq: batch.piSeq, body: await this.#batchBody(batch.json) } };
     const entry: LogEntry = { ...body, digest: logEntryDigest(body) };
-    const reply = await this.#repeatUntilAnswered(() => link.command({ op: "append", holder, entry }));
+    // The authority takes a repeated append from the current owner as the same
+    // append, so a repeat after a lost exchange is safe.
+    const reply = await untilReachable(() => link.command({ op: "append", holder, entry }), signal);
     if (reply.result === "accepted") return entry.at;
-    if (reply.reason === "sealed" || reply.reason === "fenced") throw new OwnerFenced(reply.reason, reply.state);
+    if (reply.reason === "sealed" || reply.reason === "fenced") throw fenced(this.#options, reply.reason, reply.state);
     throw new Error(`The authority refused log entry ${entry.at} as ${reply.reason}: this owner's head is ${this.#head}, and the authority's is ${reply.state?.head ?? "unknown"}`);
   }
 
@@ -146,26 +156,11 @@ class OwnerLog implements LogWriter {
     const bytes = Buffer.from(json, "utf8");
     if (bytes.byteLength <= INLINE_BATCH_LIMIT_BYTES) return { kind: "inline", json };
     const sha256 = sha256Hex(bytes);
-    await this.#repeatUntilAnswered(() => this.#options.link.putBlob(sha256, bytes));
+    await untilReachable(() => this.#options.link.putBlob(sha256, bytes), this.#options.signal);
     return { kind: "blob", sha256, size: bytes.byteLength };
   }
 
   #publish(files: readonly StagedFile[]): Promise<void> {
     return publishFiles(files.map(({ record, staged }) => ({ synced: staged, path: replicatedFilePath(this.#options.stateDirectory, record) })));
-  }
-
-  async #repeatUntilAnswered<T>(exchange: () => Promise<T>): Promise<T> {
-    const { signal } = this.#options;
-    for (let wait = FIRST_RETRY_MS; ; wait = Math.min(wait * 2, RETRY_CAP_MS)) {
-      try {
-        return await exchange();
-      } catch (error) {
-        if (!(error instanceof AuthorityUnreachable)) throw error;
-        if (signal?.aborted) throw new Error("Stopped waiting for the authority, which was unreachable", { cause: error });
-      }
-      await sleep(wait, undefined, signal === undefined ? {} : { signal }).catch((error: unknown) => {
-        throw new Error("Stopped waiting for the authority, which was unreachable", { cause: error });
-      });
-    }
   }
 }
