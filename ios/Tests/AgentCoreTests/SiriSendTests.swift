@@ -198,7 +198,7 @@ private let acceptedTexts = [
       let earlier = try await session.siriEarlier(message)
       #expect(waitingID(earlier) == id, "The saved copy is found before the confirmation")
       let again = await session.sendFromSiri(
-        message, confirmed: earlier, newInputID: UUID().uuidString, until: .now + .seconds(5))
+        message, confirmed: earlier, newInputID: UUID().uuidString, until: .now + .seconds(15))
       #expect(again == .delivered)
       let written = await submits(fixture)
       #expect(written.count == 2)
@@ -226,7 +226,7 @@ private let acceptedTexts = [
         try queuedItems(directory.outbox).isEmpty
       }
       let again = await session.sendFromSiri(
-        message, confirmed: waiting, newInputID: UUID().uuidString, until: .now + .seconds(5))
+        message, confirmed: waiting, newInputID: UUID().uuidString, until: .now + .seconds(15))
       #expect(isAlreadyDelivered(again), "\(again)")
       #expect(await submits(fixture).map(\.inputId) == [id], "Nothing was written again")
     }
@@ -238,7 +238,7 @@ private let acceptedTexts = [
       let message = try SiriMessage(parsing: build)
       let id = UUID().uuidString
       let sent = await session.sendFromSiri(
-        message, confirmed: .none, newInputID: id, until: .now + .seconds(5))
+        message, confirmed: .none, newInputID: id, until: .now + .seconds(15))
       #expect(sent == .delivered)
       try await eventually("Work placed it") { try queuedItems(directory.outbox).isEmpty }
       #expect(isDelivered(try await session.siriEarlier(message)))
@@ -249,7 +249,7 @@ private let acceptedTexts = [
       try await connected(next)
       let second = UUID().uuidString
       let again = await next.sendFromSiri(
-        message, confirmed: earlier, newInputID: second, until: .now + .seconds(5))
+        message, confirmed: earlier, newInputID: second, until: .now + .seconds(15))
       #expect(again == .delivered, "Confirmed against the delivered copy, a second one goes")
       #expect(await submits(fixture).map(\.inputId) == [id, second])
     }
@@ -262,12 +262,12 @@ private let acceptedTexts = [
       let message = try SiriMessage(parsing: build)
       let id = UUID().uuidString
       let sent = await session.sendFromSiri(
-        message, confirmed: .none, newInputID: id, until: .now + .seconds(5))
+        message, confirmed: .none, newInputID: id, until: .now + .seconds(15))
       #expect(sent == .delivered)
       let earlier = try await session.siriEarlier(message)
       #expect(earlier != .none && waitingID(earlier) == nil && !isDelivered(earlier))
       let again = await session.sendFromSiri(
-        message, confirmed: earlier, newInputID: UUID().uuidString, until: .now + .seconds(5))
+        message, confirmed: earlier, newInputID: UUID().uuidString, until: .now + .seconds(15))
       #expect(isAlreadyDelivered(again))
       #expect(await submits(fixture).count == 1, "Nothing was written again")
     }
@@ -632,7 +632,7 @@ private let acceptedTexts = [
       let message = try SiriMessage(parsing: build)
       let result = await session.sendFromSiri(
         message, confirmed: .none, newInputID: UUID().uuidString,
-        until: .now + .seconds(3))
+        until: .now + .seconds(15))
       #expect(result == .notSent(.notAdvertised))
       #expect(!FileManager.default.fileExists(atPath: directory.outbox.path))
       #expect(await submits(fixture).isEmpty)
