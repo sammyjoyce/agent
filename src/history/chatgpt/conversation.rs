@@ -553,25 +553,45 @@ impl<'a> Placement<'a> {
     }
 }
 
-fn turn<'a>(tree: &Tree<'a>, id: &'a str) -> &'a str {
-    let mut cursor = Some(id);
-    let mut seen = BTreeSet::new();
-    while let Some(node) = cursor {
-        if !seen.insert(node) {
-            break;
-        }
-        if matches!(
-            tree.nodes[node].disposition,
-            Disposition::Emit {
-                role: HistoryRole::User,
-                ..
+struct Turns<'a>(HashMap<&'a str, Option<&'a str>>);
+
+impl<'a> Turns<'a> {
+    fn find(tree: &Tree<'a>) -> Self {
+        let mut turns: HashMap<&'a str, Option<&'a str>> = HashMap::with_capacity(tree.nodes.len());
+        for &start in tree.nodes.keys() {
+            let mut path = Vec::new();
+            let mut on_path = BTreeSet::new();
+            let mut cursor = Some(start);
+            let found = loop {
+                let Some(node) = cursor else { break None };
+                if let Some(known) = turns.get(node) {
+                    break *known;
+                }
+                if !on_path.insert(node) {
+                    break None;
+                }
+                path.push(node);
+                if matches!(
+                    tree.nodes[node].disposition,
+                    Disposition::Emit {
+                        role: HistoryRole::User,
+                        ..
+                    }
+                ) {
+                    break Some(node);
+                }
+                cursor = tree.nodes[node].parent;
+            };
+            for node in path {
+                turns.insert(node, found);
             }
-        ) {
-            return node;
         }
-        cursor = tree.nodes[node].parent;
+        Self(turns)
     }
-    id
+
+    fn of(&self, id: &'a str) -> &'a str {
+        self.0.get(id).copied().flatten().unwrap_or(id)
+    }
 }
 
 pub(super) fn normalize(
@@ -587,6 +607,7 @@ pub(super) fn normalize(
         .unwrap_or(&empty);
     let tree = Tree::build(mapping);
     let placement = Placement::place(&tree, raw.get("current_node").and_then(Value::as_str));
+    let turns = Turns::find(&tree);
     let library: Vec<&LibraryFile> = library.iter().collect();
     let mut output = Normalized {
         items: Vec::new(),
@@ -613,7 +634,7 @@ pub(super) fn normalize(
             message: Some(message),
             kind: kind.clone(),
             role: role.clone(),
-            turn: turn(&tree, node),
+            turn: turns.of(node),
             branch,
             references: references(message, &library),
             library: library_entries(&library, node),
@@ -627,7 +648,7 @@ pub(super) fn normalize(
         .iter()
         .rev()
         .find(|node| tree.emitted(node))
-        .map(|node| turn(&tree, node));
+        .map(|node| turns.of(node));
     for file in library.iter().filter(|file| {
         file.origination_message
             .as_deref()
@@ -686,7 +707,7 @@ pub(super) fn normalize(
             message: Some(message),
             kind: kind.clone(),
             role: role.clone(),
-            turn: turn(&tree, node),
+            turn: turns.of(node),
             branch: HistoryBranch {
                 state,
                 alternates: 0,
@@ -1546,6 +1567,25 @@ mod tests {
         assert_eq!(follows(&after, "C"), Some(new["B"].clone()));
         assert_ne!(follows(&before, "C"), follows(&after, "C"));
         assert_eq!(follows(&after, "A"), None);
+    }
+
+    #[test]
+    fn a_long_chain_under_one_user_takes_its_turn_in_linear_time() {
+        let mut conversation = Conversation::new(1, "Chain").say("u1", "root", "user", "Start");
+        let mut parent = "u1".to_owned();
+        for index in 0..50_000 {
+            let node = format!("n{index:05}");
+            let role = if index % 2 == 0 { "assistant" } else { "tool" };
+            conversation = conversation.say(&node, &parent, role, "Step");
+            parent = node;
+        }
+        let raw = conversation.build();
+        let started = std::time::Instant::now();
+        let normalized = run(&raw);
+        let elapsed = started.elapsed();
+        assert_eq!(normalized.items.len(), 50_001);
+        assert!(normalized.items.iter().all(|item| item.turn_id == "u1"));
+        assert!(elapsed < std::time::Duration::from_secs(20), "{elapsed:?}");
     }
 
     #[test]
