@@ -5,8 +5,9 @@ import Foundation
 public struct SendMessageIntent: AppIntent {
   public static let title: LocalizedStringResource = "Send Message"
   public static let description = IntentDescription(
-    "Sends one line to a saved coordinator after asking you to confirm it. It never runs commands.")
-  public static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
+    "Sends one line to a saved coordinator after you confirm it. It never runs commands.")
+  public static let authenticationPolicy: IntentAuthenticationPolicy =
+    .requiresLocalDeviceAuthentication
   public static let openAppWhenRun = false
 
   @Parameter(title: "Message", requestValueDialog: "What's the message?")
@@ -31,6 +32,9 @@ public struct SendMessageIntent: AppIntent {
   }
 
   /// Sends `text` to `coordinator` in `coordinators` once `confirm` returns, and says how it went.
+  /// A throw from `confirm`, as when the person cancels, saves and sends nothing.
+  /// `protectedDataAvailable` is read before anything else, and again when the outbox could not
+  /// be read or saved, so a phone that locked meanwhile is named.
   @MainActor static func send(
     _ text: String, to coordinator: CoordinatorEntity, in coordinators: Coordinators,
     protectedDataAvailable: () -> Bool,
@@ -39,23 +43,51 @@ public struct SendMessageIntent: AppIntent {
     let message: SiriMessage
     do { message = try SiriMessage(parsing: text) } catch { return SiriSendOutcome(error) }
     let name = coordinator.name
-    guard let id = ProfileID(wire: coordinator.id) else {
-      return SiriSendOutcome(.notSent(.removed), to: name)
+    guard protectedDataAvailable() else { return SiriSendOutcome(.notSent(.locked), to: name) }
+    var result: SiriSendResult
+    do {
+      guard let id = ProfileID(wire: coordinator.id) else { throw SiriNotSent.removed }
+      let earlier = try await coordinators.siriEarlier(message, to: id)
+      let copy: SiriCopy
+      switch earlier {
+      case .accepted(let savedAt): return SiriSendOutcome(.alreadyDelivered(savedAt), to: name)
+      case .waiting(let inputID, _): copy = .earlier(inputID: inputID)
+      case .none, .delivered: copy = .new(inputID: UUID().uuidString)
+      }
+      if let dialog = confirmation(earlier, to: name, reading: message) {
+        try await confirm(dialog)
+      }
+      result = try await coordinators.sendFromSiri(message, copy: copy, earlier: earlier, to: id)
+    } catch let reason as SiriNotSent { result = .notSent(reason) }
+    if case .notSent(.outboxUnreadable) = result, !protectedDataAvailable() {
+      result = .notSent(.locked)
+    } else if case .notSent(.outboxNotSaved) = result, !protectedDataAvailable() {
+      result = .notSent(.locked)
     }
-    let earlier = SiriEarlier.none
-    if let dialog = confirmation(earlier, to: name, reading: message) { try await confirm(dialog) }
-    let result = try await coordinators.sendFromSiri(
-      message, copy: .new(inputID: UUID().uuidString), earlier: earlier, to: id)
     return SiriSendOutcome(result, to: name)
   }
 
-  /// What the person confirms before a send.
+  /// What the person confirms before a send, or nil when the coordinator already accepted this
+  /// copy. The coordinator's name comes first and the message last, after a fixed lead-in, so the
+  /// message cannot change which coordinator the sentence names.
   static func confirmation(_ earlier: SiriEarlier, to name: String, reading message: SiriMessage)
     -> LocalizedStringResource?
   {
-    "Send \"\(message.text)\" to \(name)?"
+    let text = message.text
+    switch earlier {
+    case .none: return "Send to \(name)? The message reads: \(text)"
+    case .waiting(_, let savedAt):
+      return
+        "An earlier copy of this message to \(name), saved at \(time(savedAt)), is not confirmed. Send that copy again? The message reads: \(text)"
+    case .delivered(let sentAt):
+      return
+        "\(name) already has this message, sent at \(time(sentAt)). Send it again? The message reads: \(text)"
+    case .accepted: return nil
+    }
   }
 }
+
+private func time(_ date: Date) -> String { date.formatted(date: .omitted, time: .shortened) }
 
 /// What Send Message says, and the code it returns.
 public struct SiriSendOutcome: Sendable {
@@ -65,50 +97,105 @@ public struct SiriSendOutcome: Sendable {
 }
 
 extension SiriSendOutcome {
+  /// No sentence for a send that saved nothing blames the coordinator, and each says so.
   init(_ result: SiriSendResult, to name: String) {
+    let retries = "It stays on this iPhone, and asking again retries this copy."
     switch result {
     case .delivered: self.init(code: "delivered", dialog: "Sent to \(name).")
-    case .alreadyDelivered: self.init(code: "alreadyDelivered", dialog: "Sent to \(name).")
-    case .saved: self.init(code: "saved", dialog: "Saved. \(name) has not confirmed it yet.")
-    case .rejected: self.init(code: "refused", dialog: "\(name) did not take the message.")
+    case .alreadyDelivered(let at):
+      self.init(
+        code: "alreadyDelivered",
+        dialog: "\(name) already has this message, from \(time(at)). Nothing new was sent.")
+    case .saved:
+      self.init(
+        code: "saved",
+        dialog:
+          "Saved on this iPhone, but \(name) has not confirmed it. Ask again to retry this copy.")
+    case .rejected:
+      self.init(code: "refused", dialog: "\(name) did not accept the message. \(retries)")
     case .failed(let reason):
-      self.init(code: "refused", dialog: "\(name) did not take the message. \(reason)")
+      let sentence = reason.hasSuffix(".") ? reason : reason + "."
+      self.init(code: "refused", dialog: "\(name) reported a problem: \(sentence) \(retries)")
     case .notSent(let reason):
-      self.init(code: "notSent.\(reason)", dialog: "\(name) did not take the message.")
+      self.init(code: "notSent.\(reason)", dialog: Self.notSent(reason, to: name))
+    }
+  }
+
+  private static func notSent(_ reason: SiriNotSent, to name: String) -> LocalizedStringResource {
+    switch reason {
+    case .locked: "Unlock your iPhone to send messages to \(name). Nothing was sent."
+    case .unanswered: "\(name) did not answer. Nothing was sent."
+    case .outboxUnreadable:
+      "The messages saved for \(name) on this iPhone could not be read. Nothing was sent."
+    case .outboxNotSaved: "This iPhone could not save the message. Nothing was sent."
+    case .notAdvertised:
+      "\(name) needs an update before it takes messages from Siri. Nothing was sent."
+    case .outboxFull:
+      "Too many messages are waiting for \(name) on this iPhone. Open Beep Boop to resolve them. Nothing was sent."
+    case .busy: "Beep Boop is busy with \(name). Try again in a moment. Nothing was sent."
+    case .removed: "\(name) is no longer saved in Beep Boop. Nothing was sent."
+    case .notPaired: "\(name) is not paired yet. Nothing was sent."
+    case .copyGone: "The earlier copy is no longer on this iPhone. Nothing was sent."
+    case .changed:
+      "Another copy of this message reached \(name) while you were confirming. Nothing was sent."
     }
   }
 
   init(_ refusal: SiriMessage.Refusal) {
-    switch refusal {
-    case .blank: self.init(code: "refusal.blank", dialog: "There is no message to send.")
-    case .tooLong: self.init(code: "refusal.tooLong", dialog: "Messages must be at most 64 KiB.")
-    case .command, .hidden, .lineBreak:
-      self.init(
-        code: "refusal.\(refusal)",
-        dialog: "Beep Boop does not run commands from Siri. Open Beep Boop to send it.")
+    let dialog: LocalizedStringResource =
+      switch refusal {
+      case .blank: "There is no message to send."
+      case .tooLong:
+        "Siri sends messages of at most 1,000 characters. Open Beep Boop to send a longer one."
+      case .command: "Beep Boop does not run commands from Siri. Open Beep Boop to send it."
+      case .hidden:
+        "The message has characters that the confirmation cannot show. Open Beep Boop to send it."
+      case .lineBreak: "Siri sends one line at a time. Open Beep Boop to send several lines."
+      }
+    self.init(code: "refusal.\(refusal)", dialog: dialog)
+  }
+}
+
+extension SiriNotSent {
+  init(_ error: LaneError) {
+    switch error {
+    case .gone: self = .removed
+    case .notPaired: self = .notPaired
+    case .outboxUnreadable: self = .outboxUnreadable
+    case .unanswered, .interrupted: self = .unanswered
     }
   }
 }
 
 extension Coordinators {
-  /// Sends `message` to coordinator `id` over a lease.
+  /// What coordinator `id`'s outbox holds of earlier Siri copies of `message`. It reads the
+  /// outbox, and dials nothing.
+  func siriEarlier(_ message: SiriMessage, to id: ProfileID) async throws(SiriNotSent)
+    -> SiriEarlier
+  {
+    let session: CoordinatorSession
+    do { session = try chat.session(on: id) } catch let error as LaneError {
+      throw SiriNotSent(error)
+    } catch { throw .removed }
+    return try await session.siriEarlier(message)
+  }
+
+  /// Sends `copy` of `message` to coordinator `id` over a lease. One limit covers the connection
+  /// and the coordinator's answer. The session that connected answers, even if an address edit
+  /// replaces it meanwhile, so what it saved is reported. It throws `SiriNotSent` when nothing was
+  /// sent, and `CancellationError` for a task cancelled before the send.
   func sendFromSiri(
     _ message: SiriMessage, copy: SiriCopy, earlier: SiriEarlier, to id: ProfileID
   ) async throws -> SiriSendResult {
-    let deadline = ContinuousClock.now + ConnectionLease.connectionWait
+    let limit = ConnectionLease.connectionWait
+    let deadline = ContinuousClock.now + limit
     do {
-      return try await withConnection(to: id) {
+      return try await withConnection(to: id, within: limit) {
         try await chat.session(on: id).sendFromSiri(
           message, copy: copy, earlier: earlier, until: deadline)
       }
     } catch let error as LaneError {
-      switch error {
-      case .gone: return .notSent(.removed)
-      case .notPaired: return .notSent(.notPaired)
-      case .outboxUnreadable: return .notSent(.outboxUnreadable)
-      case .unanswered: return .notSent(.unanswered)
-      case .interrupted: throw error
-      }
+      throw SiriNotSent(error)
     }
   }
 }

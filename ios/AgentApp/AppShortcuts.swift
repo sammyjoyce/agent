@@ -11,5 +11,11 @@ struct AgentShortcuts: AppShortcutsProvider {
       shortTitle: "Open Coordinator",
       systemImageName: "bubble.left.and.bubble.right"
     )
+    AppShortcut(
+      intent: SendMessageIntent(),
+      phrases: ["Send a message to \(\.$coordinator) in \(.applicationName)"],
+      shortTitle: "Send Message",
+      systemImageName: "paperplane"
+    )
   }
 }
