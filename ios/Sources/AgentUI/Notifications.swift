@@ -112,13 +112,24 @@ public final class AppNotifications: NSObject {
       caches: .cachesDirectory, transport: .tailnet,
       persistence: ComposerDraftStore(
         url: URL.applicationSupportDirectory.appending(path: "Agent/Composer/draft.json")),
-      sharedInbox: try? SharedDraftInbox.configured())
+      sharedInbox: try? SharedDraftInbox.configured(), spotlight: Self.appSpotlight)
     AppDependencyManager.shared.add(dependency: self)
+  }
+
+  /// The app's own index on a phone. A Mac test host has none, so no test writes the Mac's own
+  /// Spotlight.
+  private static var appSpotlight: (any SpotlightStore)? {
+    #if os(iOS)
+      CoreSpotlightStore()
+    #else
+      nil
+    #endif
   }
 
   init(
     defaults: UserDefaults, applicationSupport: URL, caches: URL, transport: CoordinatorTransport,
     persistence: ComposerDraftStore? = nil, sharedInbox: SharedDraftInbox? = nil,
+    spotlight: (any SpotlightStore)? = nil,
     permission: @escaping @MainActor () async throws -> Bool = AppNotifications.alertPermission
   ) {
     let registration = NotificationRegistration(
@@ -134,7 +145,8 @@ public final class AppNotifications: NSObject {
     self.registration = registration
     coordinators = Coordinators(
       registration: registration, defaults: defaults, applicationSupport: applicationSupport,
-      caches: caches, transport: transport, persistence: persistence, sharedInbox: sharedInbox)
+      caches: caches, transport: transport, persistence: persistence, sharedInbox: sharedInbox,
+      spotlight: spotlight)
     super.init()
   }
 
