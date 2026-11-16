@@ -355,18 +355,21 @@ for (const [name, connect] of Object.entries(authorities)) {
     const existing = await upload(attachments, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", Buffer.from("Invented existing upload"));
     const bundle = await feedback.capture("Invented report", feedbackContext(), FEEDBACK_ID);
     const putBlob = link.putBlob.bind(link);
+    const reachable = () => { link.putBlob = putBlob; link.beforeCommand = () => {}; };
     link.putBlob = async () => { throw new AuthorityUnreachable("The authority is unreachable"); };
     link.beforeCommand = () => { throw new AuthorityUnreachable("The authority is unreachable"); };
     let settled = false;
     const waiting = upload(attachments, "ffffffff-ffff-4fff-8fff-ffffffffffff", Buffer.from("Invented upload while unreachable")).finally(() => { settled = true; });
-    const download = await attachments.request({ type: "download", id: existing.id, offset: 0, limit: 64 });
-    assert.deepEqual(download, { type: "download", data_base64: Buffer.from("Invented existing upload").toString("base64"), next_offset: null });
-    assert.deepEqual(await feedback.read(bundle.id), bundle);
-    assert.deepEqual(await attachments.references([existing.id]), [existing]);
-    await sleep(300);
-    assert.equal(settled, false, "the write waits for the authority");
-    link.putBlob = putBlob;
-    link.beforeCommand = () => {};
+    try {
+      const read = <T>(label: string, reading: Promise<T>) => Promise.race([reading,
+        sleep(2_000).then(() => { throw new Error(`${label} waited behind the write for the unreachable authority`); })]);
+      assert.deepEqual(await read("a download", attachments.request({ type: "download", id: existing.id, offset: 0, limit: 64 })),
+        { type: "download", data_base64: Buffer.from("Invented existing upload").toString("base64"), next_offset: null });
+      assert.deepEqual(await read("a feedback read", feedback.read(bundle.id)), bundle);
+      assert.deepEqual(await read("a reference lookup", attachments.references([existing.id])), [existing]);
+      await sleep(300);
+      assert.equal(settled, false, "the write waits for the authority");
+    } finally { reachable(); }
     const landed = await waiting;
     const entries = (await logEntries(link)).filter((entry) => entry.files.some((file) => file.path === `attachments/${landed.id}/content`));
     assert.equal(entries.length, 1, "the write lands once");
