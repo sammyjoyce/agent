@@ -13,7 +13,7 @@ use crate::{
         RELATIVE_ALLOWANCE, Span, Version,
     },
     provider::{End, Request},
-    resources::{Process, Role},
+    resources::{PEAK_KIND, PeakKind, Process, Role},
     scenario::{Definition, Scenario},
     session::Outcome,
     terminal,
@@ -124,6 +124,7 @@ pub struct Report {
     absolute_allowance_ms: f64,
     synthetic: bool,
     usage_formula: &'static str,
+    peak_kind: PeakKind,
     scenarios: Vec<ScenarioHeader>,
     samples: Vec<Sample>,
     comparisons: Vec<Comparison>,
@@ -314,12 +315,13 @@ pub fn print(report: &Report) {
     }
     for resource in &report.resources {
         println!(
-            "{:?} {:?} {:?}: cpu {:.1} ms, resident {:.1} MiB, peak {:.1} MiB",
+            "{:?} {:?} {:?}: cpu {:.1} ms, resident {:.1} MiB, {} {:.1} MiB",
             resource.scenario,
             resource.version,
             resource.role,
             resource.cpu_ms,
             resource.resident_bytes / 1_048_576.0,
+            report.peak_kind.label(),
             resource.peak_bytes / 1_048_576.0
         );
     }
@@ -362,6 +364,7 @@ pub fn build(scenarios: &[Scenario], samples: Vec<Sample>) -> Result<Report> {
         absolute_allowance_ms: ABSOLUTE_ALLOWANCE_MS,
         synthetic: true,
         usage_formula: USAGE_FORMULA,
+        peak_kind: PEAK_KIND,
         scenarios: scenarios
             .iter()
             .map(|scenario| ScenarioHeader {

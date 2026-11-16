@@ -90,9 +90,20 @@ impl Window {
 }
 
 #[cfg(target_os = "macos")]
-const PEAK_KIND: PeakKind = PeakKind::LifetimeMaxPhysFootprint;
+pub const PEAK_KIND: PeakKind = PeakKind::LifetimeMaxPhysFootprint;
 #[cfg(target_os = "linux")]
-const PEAK_KIND: PeakKind = PeakKind::VmHwm;
+pub const PEAK_KIND: PeakKind = PeakKind::VmHwm;
+
+impl PeakKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::LifetimeMaxPhysFootprint => "peak footprint",
+            #[cfg(target_os = "linux")]
+            Self::VmHwm => "peak resident",
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 fn read(pid: i32) -> Result<Reading> {

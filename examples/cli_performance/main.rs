@@ -41,6 +41,10 @@ struct Arguments {
     /// Compiled runtime/test/fixtures/performance.js.
     #[arg(long)]
     seed: PathBuf,
+    /// Compiled runtime/test/fixtures/performance-runtime.js. It starts each
+    /// version's runtime against the loopback model provider.
+    #[arg(long)]
+    runtime_shim: PathBuf,
     #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u8).range(3..=31))]
     samples: u8,
     /// Run only these scenarios; repeat the flag for several. Defaults to all.
@@ -93,6 +97,7 @@ async fn run(mut options: Arguments) -> Result<()> {
         &mut options.candidate_runtime,
         &mut options.terminal,
         &mut options.seed,
+        &mut options.runtime_shim,
     ] {
         *path = fs::canonicalize(&*path)
             .with_context(|| format!("Could not locate {}", path.display()))?;
@@ -128,7 +133,7 @@ async fn run(mut options: Arguments) -> Result<()> {
     );
     let start = async |version| {
         let (binary, runtime) = versions.of(version);
-        Coordinator::start(binary, &options.seed, runtime, snapshot.path(), &[]).await
+        Coordinator::start(binary, &options.runtime_shim, runtime, snapshot.path(), &[]).await
     };
     let mut shared = BTreeMap::new();
     if scenarios
@@ -167,7 +172,7 @@ async fn run(mut options: Arguments) -> Result<()> {
                         Lifetime::PerSample => Some(
                             Coordinator::start(
                                 binary,
-                                &options.seed,
+                                &options.runtime_shim,
                                 runtime,
                                 snapshot.path(),
                                 definition.turns,

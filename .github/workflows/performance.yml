@@ -63,7 +63,7 @@ jobs:
             done
             cargo build --locked --release --example terminal-fixture --example cli-performance
           BUILD
-      - name: Compare process-to-visible-conversation latency
+      - name: Compare CLI application delay
         working-directory: candidate
         run: |
           baseline=../baseline/target/release/beep-boop
@@ -76,6 +76,7 @@ jobs:
             --candidate-runtime runtime/dist/src/bridge.js \
             --terminal target/release/examples/terminal-fixture \
             --seed runtime/dist/test/fixtures/performance.js \
+            --runtime-shim runtime/dist/test/fixtures/performance-runtime.js \
             --output performance/results.json
       - name: Compare native search and cached indexing
         working-directory: candidate

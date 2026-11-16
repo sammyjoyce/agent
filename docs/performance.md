@@ -64,8 +64,9 @@ samples.
 
 ## Loopback model provider
 
-`runtime/test/fixtures/performance.ts` starts the real runtime with an
-invented `OPENAI_API_KEY`. It rewrites only
+`runtime/test/fixtures/performance-runtime.ts` starts each version's real
+runtime with an invented `OPENAI_API_KEY`. It imports only Node built-ins, so
+each version loads only its own runtime's packages. It rewrites only
 `https://api.openai.com/v1/responses` to the benchmark's loopback server,
 through the original `fetch` with Pi's method, headers, body and abort signal.
 Every other URL throws. The server in `examples/cli_performance/provider.rs`
@@ -123,6 +124,9 @@ text is visible, so the CLI's CPU time covers its whole life.
 | macOS | `proc_pid_rusage` user and system time | `ri_resident_size` | `ri_lifetime_max_phys_footprint`, the lifetime physical footprint |
 | Linux | `clock_getcpuclockid` | `VmRSS` | `VmHWM` |
 
+On macOS the footprint leaves out shared and file-backed pages that the
+resident size counts, so the peak can be lower than the resident size.
+
 A runtime that respawns inside the window fails the sample. Token use is the
 change in Pi's `conversation_usage` ledger for the chief across the window.
 The provider reports synthetic usage, so the token counts are synthetic too:
@@ -136,7 +140,7 @@ usage for the stopped stream, so `stop_stream` reports a change of zero.
 
 `performance/results.json` uses schema 3. Its header names the terminal size,
 the corpus sizes, the allowances, each scenario's turns and gates, the usage
-formula, and `synthetic: true`. Each sample keeps its gate spans and a
+formula, the kind of peak memory, and `synthetic: true`. Each sample keeps its gate spans and a
 timeline in milliseconds from the sample's start. The timeline holds the
 marks, the provider's request, first chunk, completion and client close, and
 coordinator diagnostics receipts at their 1 ms resolution. Receipts only
@@ -161,6 +165,7 @@ nix develop --command target/release/examples/cli-performance \
   --candidate-runtime runtime/dist/src/bridge.js \
   --terminal target/release/examples/terminal-fixture \
   --seed runtime/dist/test/fixtures/performance.js \
+  --runtime-shim runtime/dist/test/fixtures/performance-runtime.js \
   --output performance/results.json
 ```
 

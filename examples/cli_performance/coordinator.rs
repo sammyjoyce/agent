@@ -184,7 +184,7 @@ pub struct Coordinator {
 impl Coordinator {
     pub async fn start(
         binary: &Path,
-        seed: &Path,
+        shim: &Path,
         runtime: &Path,
         snapshot: &Path,
         turns: &'static [Turn],
@@ -209,7 +209,7 @@ impl Coordinator {
             .arg("--instructions")
             .arg(path.join("AGENTS.md"))
             .arg("--runtime")
-            .arg(seed)
+            .arg(shim)
             .arg("serve")
             .arg("--local-only")
             .arg("--no-sources")
