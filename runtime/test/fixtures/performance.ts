@@ -88,7 +88,7 @@ async function searchIndex(): Promise<{ conversations: number; chunks: number }>
   } finally { index.close(); }
 }
 
-/** Invented legacy rollouts that the real Codex app-server lists and reads. */
+/** Invented legacy rollouts. Codex reads each as a user message turn and an agent turn of agent_message items. */
 async function codexCorpus(): Promise<{ rollouts: number; items_per_rollout: number }> {
   const home = join(directory!, CODEX_CORPUS), folder = join(home, "sessions", "2026", "01", "02");
   await mkdir(folder, { recursive: true, mode: 0o700 });
@@ -101,10 +101,9 @@ async function codexCorpus(): Promise<{ rollouts: number; items_per_rollout: num
         cli_version: "0.0.0", source: "cli", model_provider: "openai", history_mode: "legacy" }),
       line("event_msg", { type: "user_message", message: `Summarize invented ledger ${rollout}.`, images: [], local_images: [], text_elements: [] }),
       line("event_msg", { type: "task_started", turn_id: "turn-a", root_turn_id: "turn-a", started_at: 1767355200, model_context_window: null }),
-      ...Array.from({ length: ITEMS_PER_ROLLOUT }, (_, item) => line("event_msg", { type: "item_completed", thread_id: id, turn_id: "turn-a",
-        item: { type: "AgentMessage", id: `item-${rollout}-${item}`, phase: "final_answer",
-          content: [{ type: "Text", text: `Invented ledger ${rollout} entry ${item} balances a synthetic account.` }] },
-        completed_at_ms: 1767355200000 })),
+      ...Array.from({ length: ITEMS_PER_ROLLOUT }, (_, item) => line("event_msg", { type: "agent_message", phase: "final_answer",
+        message: `Invented ledger ${rollout} entry ${item} balances a synthetic account.` })),
+      line("event_msg", { type: "task_complete", turn_id: "turn-a", last_agent_message: null }),
     ];
     await writeFile(join(folder, `rollout-2026-01-02T12-00-00-${id}.jsonl`), lines.join(""));
   }

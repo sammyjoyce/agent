@@ -116,12 +116,12 @@ test("the performance seed indexes a copy of the session so search finds the lon
   } finally { await index.close(); await session.close(BACKGROUND_CONTEXT); }
 }));
 
-test("the performance seed writes invented legacy Codex rollouts with unique thread and item ids", () => inTemporaryDirectory(async directory => {
+test("the performance seed writes invented legacy Codex rollouts with unique threads and messages", () => inTemporaryDirectory(async directory => {
   const { import_corpus: { rollouts: count, items_per_rollout: perRollout } } = await seed(directory);
   assert.ok(count > 0 && perRollout > 0);
   const home = join(directory, "codex"), folder = join(home, "sessions", "2026", "01", "02");
   assert.equal(await readFile(join(home, "config.toml"), "utf8"), "model_provider = \"openai\"\n");
-  const rollouts = await readdir(folder), threads = new Set<string>(), items = new Set<string>();
+  const rollouts = await readdir(folder), threads = new Set<string>(), messages = new Set<string>();
   assert.equal(rollouts.length, count);
   for (const name of rollouts) {
     const records = (await readFile(join(folder, name), "utf8")).trimEnd().split("\n")
@@ -132,15 +132,12 @@ test("the performance seed writes invented legacy Codex rollouts with unique thr
     const thread = String(meta?.payload.id);
     assert.ok(name.endsWith(`-${thread}.jsonl`), name);
     threads.add(thread);
-    const completed = events.filter(event => event.payload.type === "item_completed");
-    assert.equal(completed.length, perRollout);
-    for (const event of completed) {
-      assert.equal(event.payload.thread_id, thread);
-      items.add(String((event.payload.item as { id: string }).id));
-    }
+    const answers = events.filter(event => event.payload.type === "agent_message");
+    assert.equal(answers.length, perRollout);
+    for (const answer of answers) messages.add(String(answer.payload.message));
   }
   assert.equal(threads.size, count);
-  assert.equal(items.size, count * perRollout);
+  assert.equal(messages.size, count * perRollout);
 }));
 
 test("the runtime shim starts the requested runtime with that runtime's own packages", () => inTemporaryDirectory(async directory => {
