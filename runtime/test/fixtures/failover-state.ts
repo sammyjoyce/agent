@@ -14,6 +14,7 @@ import type { AuthorityLink } from "../../src/failover/authority-link.js";
 import { commandHolder } from "../../src/failover/authority-wire.js";
 import { sha256Hex } from "../../src/failover/log-entry.js";
 import { openReplicatedStorage, type OwnerFenced, type StagedFile } from "../../src/failover/replicated-storage.js";
+import { ReplicatedFiles } from "../../src/failover/retained-files.js";
 import { ScopedDatabase } from "../../src/failover/scoped-database.js";
 import { applyLog } from "../../src/failover/standby.js";
 import type { AuthorityCommand } from "../../src/generated/AuthorityCommand.js";
@@ -121,13 +122,15 @@ export interface OwnerOptions {
   readonly onFenced?: (error: OwnerFenced) => void;
   readonly registry?: Registry;
   readonly tokensPerSecond?: number;
+  readonly observe?: (database: SqliteDatabase) => SqliteDatabase;
 }
 
 export async function openOwner(directory: string, link: AuthorityLink, options: OwnerOptions) {
-  const database = await openScoped(directory);
-  const { storage, log } = await openReplicatedStorage({ database, link, holder: options.holder ?? OWNER, epoch: options.epoch,
-    stateDirectory: directory, onFenced: options.onFenced ?? (() => {}), ...(options.signal === undefined ? {} : { signal: options.signal }) });
-  try { return { database, storage, log, ...await openPi(storage, options) }; }
+  const database = await openScoped(directory, options.observe);
+  const opened = { database, link, holder: options.holder ?? OWNER, epoch: options.epoch, stateDirectory: directory,
+    onFenced: options.onFenced ?? (() => {}), ...(options.signal === undefined ? {} : { signal: options.signal }) };
+  const { storage, log } = await openReplicatedStorage(opened);
+  try { return { database, storage, log, files: new ReplicatedFiles(log, opened), ...await openPi(storage, options) }; }
   catch (error) { await storage.close(BACKGROUND_CONTEXT).catch(() => {}); throw error; }
 }
 

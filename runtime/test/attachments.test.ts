@@ -21,6 +21,7 @@ import { HistoryStore } from "../src/history.js";
 import { fixtureModel } from "./model.js";
 import { CoordinatorEnvironment } from "../src/environment.js";
 import { until } from "./fixtures/until.js";
+import { LocalFiles } from "../src/failover/retained-files.js";
 
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==", "base64");
 async function upload(store: AttachmentStore, bytes: Buffer, name = "evidence.txt", media_type = "text/plain"): Promise<AttachmentRef> {
@@ -36,12 +37,12 @@ async function upload(store: AttachmentStore, bytes: Buffer, name = "evidence.tx
 }
 
 test("attachments survive partial retries and restart, enforce immutable receipts, and retain only admitted originals", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "agent-attachment-")); let store = new AttachmentStore(directory);
+  const directory = await mkdtemp(join(tmpdir(), "agent-attachment-")); let store = new AttachmentStore(new LocalFiles(directory));
   try {
     const bytes = Buffer.alloc(ATTACHMENT_CHUNK_BYTES + 7, 42), id = randomUUID();
     const request = { type: "upload", id, name: "report.txt", media_type: "text/plain", size_bytes: bytes.length, offset: 0,
       data_base64: bytes.subarray(0, 7).toString("base64"), complete: false } satisfies Parameters<AttachmentStore["request"]>[0];
-    await store.request(request); store = new AttachmentStore(directory);
+    await store.request(request); store = new AttachmentStore(new LocalFiles(directory));
     await store.request({ ...request, data_base64: bytes.subarray(0, ATTACHMENT_CHUNK_BYTES).toString("base64") });
     const last = { ...request, offset: ATTACHMENT_CHUNK_BYTES, data_base64: bytes.subarray(ATTACHMENT_CHUNK_BYTES).toString("base64"), complete: true };
     const completed = await store.request(last); assert.equal(completed.type, "uploaded");
@@ -64,7 +65,7 @@ test("attachments survive partial retries and restart, enforce immutable receipt
     const fresh = await upload(store, Buffer.alloc(0));
     assert.equal((await readdir(join(directory, "attachments"))).includes(orphan.id), false);
     assert.equal((await readdir(join(directory, "attachments"))).includes(uncommitted), false);
-    assert.deepEqual(await new AttachmentStore(directory).references([id]), [completed.attachment]);
+    assert.deepEqual(await new AttachmentStore(new LocalFiles(directory)).references([id]), [completed.attachment]);
     await store.request({ type: "discard", id: fresh.id });
     await assert.rejects(store.references([fresh.id]), /ENOENT/);
     assert.throws(() => validateInput(""), /text or an attachment/); validateInput("", [completed.attachment]);
@@ -99,7 +100,7 @@ test("attachments survive partial retries and restart, enforce immutable receipt
 });
 
 test("upload quota reserves unfinished declared sizes before bytes arrive", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "agent-attachment-quota-")); const store = new AttachmentStore(directory);
+  const directory = await mkdtemp(join(tmpdir(), "agent-attachment-quota-")); const store = new AttachmentStore(new LocalFiles(directory));
   try {
     for (let i = 0; i < 31; i += 1) await store.request({ type: "upload", id: randomUUID(), name: "pending.bin", media_type: "application/octet-stream",
       size_bytes: MAX_ATTACHMENT_BYTES, offset: 0, data_base64: "", complete: false });
@@ -117,7 +118,7 @@ for (const child of [false, true]) test(`${child ? "child" : "task"} attachment 
   const directory = await mkdtemp(join(tmpdir(), "agent-attachment-commit-")), models = createModels();
   const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
     { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
-  const tasks = new TaskStore(session, new ConversationModels(models)), store = new AttachmentStore(directory); tasks.useAttachments(store);
+  const tasks = new TaskStore(session, new ConversationModels(models)), store = new AttachmentStore(new LocalFiles(directory)); tasks.useAttachments(store);
   let release = () => {}, admission: Promise<unknown> | undefined, unrelated: Promise<unknown> | undefined, timer: NodeJS.Timeout | undefined;
   try {
     const task = await tasks.create({ title: "Retain exact evidence", outcome: "Keep the input", model: fixtureModel });
@@ -151,16 +152,18 @@ test("retention failure cannot leave a Pi input referring to an unretained attac
   const directory = await mkdtemp(join(tmpdir(), "agent-attachment-retention-failure-")), models = createModels();
   const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
     { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
-  const store = new AttachmentStore(directory);
+  const files = new LocalFiles(directory); let failing = false;
+  const store = new AttachmentStore({ stateDirectory: directory, remove: (path) => files.remove(path),
+    write: (writes) => failing ? Promise.reject(new Error("Invented disk failure while retaining")) : files.write(writes) });
   try {
     const file = await upload(store, Buffer.from("An original that must not disappear after admission")), root = await session.root(BACKGROUND_CONTEXT);
-    const temporary = join(directory, "attachments", file.id, "metadata.json.tmp"); await mkdir(temporary);
+    failing = true;
     await assert.rejects(store.admit([file], () => root.submit({ type: "write", requestId: "must-not-admit",
-      entry: { kind: "fixture.attachment-admission", data: { attachment_id: file.id } } }, BACKGROUND_CONTEXT)));
+      entry: { kind: "fixture.attachment-admission", data: { attachment_id: file.id } } }, BACKGROUND_CONTEXT)), /Invented disk failure/);
     await session.commit(async () => {}, BACKGROUND_CONTEXT);
     assert.equal((await root.entries({}, 20, undefined, BACKGROUND_CONTEXT)).items.some(entry => entry.kind === "fixture.attachment-admission"), false,
       "Pi must never durably reference a file whose retention failed");
-    await rm(temporary, { recursive: true });
+    failing = false;
     assert.deepEqual(await store.request({ type: "discard", id: file.id }), { type: "discarded" });
   } finally { await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -171,7 +174,7 @@ test("Pi receives native images and delegation keeps immutable files on each act
   const registry = createRegistry();
   const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
     { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
-  const tasks = new TaskStore(session, new ConversationModels(models)), store = new AttachmentStore(directory), executions = new Executions(); tasks.useAttachments(store);
+  const tasks = new TaskStore(session, new ConversationModels(models)), store = new AttachmentStore(new LocalFiles(directory)), executions = new Executions(); tasks.useAttachments(store);
   const tools = createAppTools(tasks, executions); registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker); registry.install(tools.agent);
   const writes: string[] = [];
   const call = (machine: string): HostCall => async (command) => {

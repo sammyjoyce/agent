@@ -14,6 +14,7 @@ import { ConversationModels } from "../src/models.js";
 import { TaskStore } from "../src/tasks.js";
 import type { FeedbackContext } from "../src/generated/FeedbackContext.js";
 import { fixtureModel } from "./model.js";
+import { LocalFiles } from "../src/failover/retained-files.js";
 
 async function open(directory: string) {
   const database = await openNodeSqliteDatabase(join(directory, "session.sqlite"));
@@ -21,7 +22,7 @@ async function open(directory: string) {
   const faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }] }); models.setProvider(faux.provider);
   const session = await Harness.open(storage, { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
   const tasks = new TaskStore(session, new ConversationModels(models));
-  return { session, tasks, faux, feedback: new FeedbackStore(directory, tasks) };
+  return { session, tasks, faux, feedback: new FeedbackStore(new LocalFiles(directory), tasks) };
 }
 function context(): FeedbackContext {
   return { origin_host_id: "11111111-1111-4111-8111-111111111111", cwd: "/example/project", conversation_id: null,

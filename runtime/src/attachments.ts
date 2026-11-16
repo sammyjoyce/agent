@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { open, readFile, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { InputEntry, UserInput } from "@earendil-works/pi-durable";
 import { DEFAULT_IMAGE_LIMITS } from "@earendil-works/pi-durable/tools";
@@ -7,6 +7,8 @@ import type { InputOrigin } from "./generated/InputOrigin.js";
 import type { AttachmentRef } from "./generated/AttachmentRef.js";
 import type { AttachmentRequest } from "./generated/AttachmentRequest.js";
 import type { AttachmentResponse } from "./generated/AttachmentResponse.js";
+import { beginUpload, writeChunk } from "./attachment-upload.js";
+import type { RetainedFiles, RetainedWrite } from "./failover/retained-files.js";
 import type { HostCall } from "./tasks.js";
 import { prepareImage } from "./images.js";
 
@@ -43,7 +45,7 @@ function same(left: AttachmentRef, right: AttachmentRef): boolean {
 export class AttachmentStore {
   private readonly directory: string;
   private serial: Promise<void> = Promise.resolve();
-  constructor(state: string) { this.directory = join(state, "attachments"); }
+  constructor(private readonly files: RetainedFiles) { this.directory = join(files.stateDirectory, "attachments"); }
   private folder(id: string): string { requireId(id); return join(this.directory, id); }
   private async metadata(id: string): Promise<Metadata> {
     const value: unknown = JSON.parse(await readFile(join(this.folder(id), "metadata.json"), "utf8"));
@@ -51,20 +53,33 @@ export class AttachmentStore {
     if (metadata.attachment.id !== id) throw new AttachmentError("Attachment metadata identity does not match its directory");
     return metadata;
   }
-  private async save(metadata: Metadata): Promise<void> {
-    const folder = this.folder(metadata.attachment.id), path = join(folder, "metadata.json"), temporary = path + ".tmp";
-    const file = await open(temporary, "w", 0o600);
-    try { await file.writeFile(JSON.stringify(metadata)); await file.sync(); } finally { await file.close(); }
-    await rename(temporary, path);
+  /** Metadata for `write`. A rewrite happens only once the upload is complete, so every logged metadata file says it is. */
+  private metadataFile(metadata: Metadata): RetainedWrite {
+    return { path: `attachments/${metadata.attachment.id}/metadata.json`, bytes: Buffer.from(JSON.stringify(metadata)) };
   }
+  private remove(id: string): Promise<void> { requireId(id); return this.files.remove(`attachments/${id}`); }
   async request(request: AttachmentRequest): Promise<AttachmentResponse> {
+    // A download reads a complete upload, so it does not wait behind a write that waits for the authority.
+    if (request.type === "download") return this.download(request);
     const operation = this.serial.catch(() => {}).then(() => this.transfer(request));
     this.serial = operation.then(() => {}, () => {});
     return operation;
   }
-  private async transfer(request: AttachmentRequest): Promise<AttachmentResponse> {
+  private async download(request: Extract<AttachmentRequest, { type: "download" }>): Promise<AttachmentResponse> {
+    if (request.limit <= 0 || request.limit > ATTACHMENT_CHUNK_BYTES) throw new AttachmentError("Invalid attachment read limit");
+    const metadata = await this.metadata(request.id);
+    if (!metadata.complete || request.offset > metadata.attachment.size_bytes) throw new AttachmentError("Attachment is not available at this offset");
+    const file = await open(join(this.folder(request.id), "content"), "r");
+    try {
+      const bytes = Buffer.alloc(Math.min(request.limit, metadata.attachment.size_bytes - request.offset));
+      const read = await file.read(bytes, 0, bytes.length, request.offset);
+      const next = request.offset + read.bytesRead;
+      return { type: "download", data_base64: bytes.subarray(0, read.bytesRead).toString("base64"),
+        next_offset: next < metadata.attachment.size_bytes ? next : null };
+    } finally { await file.close(); }
+  }
+  private async transfer(request: Exclude<AttachmentRequest, { type: "download" }>): Promise<AttachmentResponse> {
     requireId(request.id);
-    await mkdir(this.directory, { recursive: true, mode: 0o700 }); await chmod(this.directory, 0o700);
     const folder = this.folder(request.id);
     if (request.type === "discard") {
       let metadata: Metadata;
@@ -72,20 +87,7 @@ export class AttachmentStore {
         if (object(error) && error.code === "ENOENT") return { type: "discarded" }; throw error;
       }
       if (metadata.retained) throw new AttachmentError("An admitted attachment is retained with its conversation");
-      await rm(folder, { recursive: true, force: true }); return { type: "discarded" };
-    }
-    if (request.type === "download") {
-      if (request.limit <= 0 || request.limit > ATTACHMENT_CHUNK_BYTES) throw new AttachmentError("Invalid attachment read limit");
-      const metadata = await this.metadata(request.id);
-      if (!metadata.complete || request.offset > metadata.attachment.size_bytes) throw new AttachmentError("Attachment is not available at this offset");
-      const file = await open(join(folder, "content"), "r");
-      try {
-        const bytes = Buffer.alloc(Math.min(request.limit, metadata.attachment.size_bytes - request.offset));
-        const read = await file.read(bytes, 0, bytes.length, request.offset);
-        const next = request.offset + read.bytesRead;
-        return { type: "download", data_base64: bytes.subarray(0, read.bytesRead).toString("base64"),
-          next_offset: next < metadata.attachment.size_bytes ? next : null };
-      } finally { await file.close(); }
+      await this.remove(request.id); return { type: "discarded" };
     }
     if (request.name.length === 0 || Buffer.byteLength(request.name) > MAX_ATTACHMENT_NAME_BYTES || /[\/\\\x00-\x1f\x7f]/.test(request.name) ||
       request.name === "." || request.name === ".." || !/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(request.media_type) ||
@@ -100,50 +102,51 @@ export class AttachmentStore {
       if (!object(error) || error.code !== "ENOENT") throw error;
       if (request.offset !== 0) throw new AttachmentError("Attachment upload must start at offset zero");
       let reserved = 0;
-      for (const entry of await readdir(this.directory, { withFileTypes: true })) {
+      const uploads = await readdir(this.directory, { withFileTypes: true }).catch((error: unknown) => {
+        if (object(error) && error.code === "ENOENT") return []; throw error;
+      });
+      for (const entry of uploads) {
         if (!entry.isDirectory() || !UUID.test(entry.name)) continue;
         let saved: Metadata;
         try { saved = await this.metadata(entry.name); } catch (error) {
           // A crash before the first metadata rename never returned a receipt.
-          if (object(error) && error.code === "ENOENT") { await rm(this.folder(entry.name), { recursive: true, force: true }); continue; }
+          if (object(error) && error.code === "ENOENT") { await this.remove(entry.name); continue; }
           throw error;
         }
-        if (!saved.retained && Date.now() - saved.created > ATTACHMENT_STAGING_MILLIS) await rm(this.folder(entry.name), { recursive: true });
+        if (!saved.retained && Date.now() - saved.created > ATTACHMENT_STAGING_MILLIS) await this.remove(entry.name);
         else reserved += saved.attachment.size_bytes + 4096;
       }
       if (reserved + request.size_bytes + 4096 > QUOTA) throw new AttachmentError("Attachment storage is full; no input was admitted");
-      await mkdir(folder, { mode: 0o700 });
-      metadata = { attachment: { id: request.id, name: request.name, media_type: request.media_type, size_bytes: request.size_bytes, sha256: "" },
-        retained: false, complete: false, created: Date.now() };
-      await writeFile(join(folder, "content"), Buffer.alloc(0), { flag: "wx", mode: 0o600 }); await this.save(metadata);
+      const started = { attachment: { id: request.id, name: request.name, media_type: request.media_type, size_bytes: request.size_bytes, sha256: "" },
+        retained: false, complete: false as const, created: Date.now() };
+      await beginUpload(folder, started);
+      metadata = started;
     }
     const reference = metadata.attachment;
     if (reference.name !== request.name || reference.media_type !== request.media_type || reference.size_bytes !== request.size_bytes) {
       throw new AttachmentError("Attachment identity was reused with different content");
     }
-    const file = await open(join(folder, "content"), "r+");
-    try {
-      const current = (await file.stat()).size;
-      if (request.offset > current) throw new AttachmentError("Attachment chunk is out of order");
-      const existing = Math.min(current - request.offset, bytes.length);
-      if (existing > 0) {
+    const content = join(folder, "content"), current = (await stat(content)).size;
+    if (request.offset > current) throw new AttachmentError("Attachment chunk is out of order");
+    const existing = Math.min(current - request.offset, bytes.length);
+    if (existing > 0) {
+      const file = await open(content, "r");
+      try {
         const previous = Buffer.alloc(existing); const read = await file.read(previous, 0, existing, request.offset);
         if (read.bytesRead !== existing || !previous.equals(bytes.subarray(0, existing))) throw new AttachmentError("Attachment retry changed its bytes");
-      }
-      let written = existing;
-      while (written < bytes.length) {
-        const result = await file.write(bytes, written, bytes.length - written, request.offset + written);
-        if (result.bytesWritten === 0) throw new AttachmentError("Attachment write stopped before the chunk completed");
-        written += result.bytesWritten;
-      }
-      await file.sync();
-    } finally { await file.close(); }
+      } finally { await file.close(); }
+    }
+    if (!await writeChunk(content, request.offset + existing, bytes.subarray(existing))) throw new AttachmentError("Attachment write stopped before the chunk completed");
     if (request.complete) {
-      const content = await readFile(join(folder, "content"));
-      if (content.length !== reference.size_bytes) throw new AttachmentError("Attachment size does not match its declared size");
-      const sha256 = createHash("sha256").update(content).digest("hex");
+      const uploaded = await readFile(content);
+      if (uploaded.length !== reference.size_bytes) throw new AttachmentError("Attachment size does not match its declared size");
+      const sha256 = createHash("sha256").update(uploaded).digest("hex");
       if (metadata.complete && reference.sha256 !== sha256) throw new AttachmentError("Attachment checksum mismatch");
-      metadata.attachment.sha256 = sha256; metadata.complete = true; await this.save(metadata);
+      if (!metadata.complete) {
+        metadata.attachment.sha256 = sha256; metadata.complete = true;
+        // The upload becomes real when its metadata says complete, so the content takes its logged name with it.
+        await this.files.write([{ path: `attachments/${request.id}/content`, staged: content }, this.metadataFile(metadata)]);
+      }
     }
     return { type: "uploaded", next_offset: end, attachment: request.complete ? { ...metadata.attachment } : null };
   }
@@ -181,7 +184,8 @@ export class AttachmentStore {
     return operation;
   }
   private async keep(refs: readonly AttachmentRef[]): Promise<void> {
-    for (const ref of refs) { const saved = await this.metadata(ref.id); saved.retained = true; await this.save(saved); }
+    const released = (await Promise.all(refs.map((ref) => this.metadata(ref.id)))).filter((saved) => !saved.retained);
+    await this.files.write(released.map((saved) => this.metadataFile({ ...saved, retained: true })));
   }
   /** Retain bytes before Pi can own their references. The callback checks its
    * live owner after filesystem work; undefined releases provisional retention.
@@ -190,7 +194,7 @@ export class AttachmentStore {
     const operation = this.serial.catch(() => {}).then(async () => {
       const canonical = await this.resolve(refs);
       const previous = await Promise.all(canonical.map(ref => this.metadata(ref.id)));
-      const restore = async () => { for (const saved of previous) if (!saved.retained) await this.save(saved); };
+      const restore = () => this.files.write(previous.filter((saved) => !saved.retained).map((saved) => this.metadataFile(saved)));
       try { await this.keep(canonical); }
       catch (error) { await restore(); throw error; }
       const pending = submit();

@@ -1,6 +1,6 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { mkdir, open, rename, rm } from "node:fs/promises";
+import { open } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { defineDoc, type Harness } from "@earendil-works/pi-durable";
@@ -14,7 +14,10 @@ import type { HistoryRetryPage } from "./generated/HistoryRetryPage.js";
 import type { HistoryThread } from "./generated/HistoryThread.js";
 import type { ImportProgress } from "./generated/ImportProgress.js";
 import type { HostCall } from "./tasks.js";
+import { StagingFile, type RetainedFiles } from "./failover/retained-files.js";
 import type { HistoryStore, ImportCheckpoint } from "./history.js";
+
+const ASSETS = "history/assets";
 
 // Keep source progress separate from index errors so retries need no native walk.
 const Progress = defineDoc<{ progress: ImportProgress | null; indexing?: ImportProgress | null }>({ kind: "agent.import-progress", scope: "session", version: 1,
@@ -40,7 +43,10 @@ function addGap(progress: ImportProgress, gap: string, priority = true): void {
 export class CodexImporter {
   private active: Promise<ImportProgress> | undefined;
   private readonly listeners = new Set<(progress: ImportProgress) => void>();
-  constructor(private readonly session: Harness, private readonly history: HistoryStore, private readonly assetRoot: string) {}
+  private readonly assetRoot: string;
+  constructor(private readonly session: Harness, private readonly history: HistoryStore, private readonly files: RetainedFiles) {
+    this.assetRoot = join(files.stateDirectory, ASSETS);
+  }
   isRunning(): boolean { return this.active !== undefined; }
   async status(): Promise<ImportProgress> {
     const progress = (await this.session.snapshot(Progress, BACKGROUND_CONTEXT))?.progress;
@@ -278,11 +284,9 @@ export class CodexImporter {
     return;
   }
   private async asset(host: string, thread: string, source: HistoryAssetRef, call: HostCall): Promise<HistoryAssetRef> {
-    await mkdir(this.assetRoot, { recursive: true, mode: 0o700 });
     const retained = await this.retainedAsset(source);
     if (retained !== undefined) return retained;
-    const temporary = join(this.assetRoot, "." + randomUUID());
-    const file = await open(temporary, "wx", 0o600);
+    const staging = await StagingFile.create(this.assetRoot);
     let offset = 0; let digest: string | undefined; let total: number | undefined; const hash = createHash("sha256");
     try {
       do {
@@ -292,15 +296,14 @@ export class CodexImporter {
         if (digest !== page.sha256 || total !== page.total_bytes) throw new Error("History asset changed during transfer");
         const bytes = Buffer.from(page.data_base64, "base64");
         if (offset + bytes.length > total || (page.next_offset !== null && page.next_offset !== offset + bytes.length)) throw new Error("History asset has an invalid byte range");
-        hash.update(bytes); await file.writeFile(bytes); offset += bytes.length;
+        hash.update(bytes); await staging.append(bytes); offset += bytes.length;
         if (page.next_offset === null) break;
         if (bytes.length === 0) throw new Error("History asset made no progress");
       } while (true);
       if (digest === undefined || total === undefined || offset !== total || hash.digest("hex") !== digest || (source.sha256 !== null && source.sha256 !== digest)) throw new Error("History asset digest did not verify");
-      await file.sync(); await file.close();
-      const destination = join(this.assetRoot, digest);
-      await rename(temporary, destination);
-      return { ...source, path: destination, sha256: digest, size: offset };
-    } finally { await file.close().catch(() => {}); await rm(temporary, { force: true }); }
+      await staging.sync();
+      await this.files.write([{ path: `${ASSETS}/${digest}`, staged: staging.path }]);
+      return { ...source, path: join(this.assetRoot, digest), sha256: digest, size: offset };
+    } finally { await staging.discard(); }
   }
 }

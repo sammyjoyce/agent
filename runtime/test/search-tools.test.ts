@@ -21,6 +21,7 @@ import { Retrieval } from "../src/retrieval.js";
 import { TaskStore, type HostCall } from "../src/tasks.js";
 import { createAppTools, Executions } from "../src/tools.js";
 import { validEvent } from "../src/protocol.js";
+import { LocalFiles } from "../src/failover/retained-files.js";
 
 const space: EmbeddingSpace = { id: "synthetic-tool-search", model_revision: "fixture", model_digest: "fixture",
   dimensions: 3, pooling: "last", normalization: "l2", instruction_version: 1 };
@@ -202,7 +203,7 @@ test("main and worker search retain fresh matching tasks while an import fills t
   const history = new HistoryStore(session); const tasks = new TaskStore(session, new ConversationModels(models)); tasks.useHistory(history);
   const executions = new Executions(), tools = createAppTools(tasks, executions); registry.install(tools.main); registry.install(tools.worker);
   const retrieval = new Retrieval(session, history, tasks, join(directory, "search.sqlite"));
-  const importer = new CodexImporter(session, history, join(directory, "assets"));
+  const importer = new CodexImporter(session, history, new LocalFiles(directory));
   const node: AgentNode = { host_id: "fixture-source", name: "Desktop", rex_server: "https://desktop.example.test", coordinator: null,
     agent_program: "agent", home_directory: "/example/home", launch: { state_dir: null, runtime: null, config: null, instructions: null, model: null } };
   const query = "connector decisions";
