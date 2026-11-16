@@ -792,6 +792,25 @@
         "sources"
       ]
     },
+    "DreamsReply": {
+      "type": "object",
+      "properties": {
+        "decided": {
+          "type": "boolean"
+        },
+        "run": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run",
+        "decided",
+        "text"
+      ]
+    },
     "EmbeddingBatch": {
       "type": "object",
       "properties": {
@@ -1554,6 +1573,22 @@
           "required": [
             "type",
             "response"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reply": {
+              "$ref": "#/$defs/DreamsReply"
+            },
+            "type": {
+              "type": "string",
+              "const": "dreams"
+            }
+          },
+          "required": [
+            "type",
+            "reply"
           ]
         },
         {

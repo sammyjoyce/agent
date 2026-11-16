@@ -1298,6 +1298,10 @@ pub enum HostCommand {
     Background {
         request: crate::background::BackgroundRequest,
     },
+    /// Coordinator-local Dreams review. Its request type has no apply variant.
+    Dreams {
+        request: crate::dreams::DreamsRequest,
+    },
     MachineSnapshot,
     ReadUsage {
         expected_email: String,
@@ -1407,6 +1411,9 @@ pub enum HostCommand {
     },
 }
 
+/// The runtime keeps this much of the end of a task's or an agent's answer as
+/// its summary, counted in UTF-16 code units.
+pub const TASK_SUMMARY_MAX_UTF16_UNITS: usize = 4000;
 pub const IMAGE_CHUNK_BYTES: u32 = 1024 * 1024;
 pub const MAX_IMAGE_READ_BYTES: u32 = crate::attachments::MAX_ATTACHMENT_BYTES;
 
@@ -1447,6 +1454,9 @@ pub enum HostResult {
     },
     Background {
         response: crate::background::BackgroundResponse,
+    },
+    Dreams {
+        reply: crate::dreams::DreamsReply,
     },
     MachineSnapshot {
         snapshot: MachineSnapshot,

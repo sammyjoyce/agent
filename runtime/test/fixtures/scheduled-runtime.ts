@@ -29,15 +29,17 @@ export const node: AgentNode = { host_id: "11111111-1111-4111-8111-111111111111"
 export const binding: WorkerRef = { host_id: node.host_id, session_id: "session:22222222-2222-4222-8222-222222222222",
   window_id: "window:33333333-3333-4333-8333-333333333333", block_id: "block:44444444-4444-4444-8444-444444444444" };
 
-export async function openScheduled(directory: string, guidanceVersion = "original", clock?: FakeClock) {
+type Provider = Parameters<ReturnType<typeof createModels>["setProvider"]>[0];
+export async function openScheduled(directory: string, guidanceVersion = "original", clock?: FakeClock, providers: readonly Provider[] = []) {
   const database = await openNodeSqliteDatabase(join(directory, "session.sqlite"));
   await database.exec("PRAGMA synchronous = FULL");
   const models = createModels(), faux = fauxProvider({ provider: "openai", models: [{ id: "fixture" }, { id: "fixture-updated" }], tokensPerSecond: 1_000_000 });
   models.setProvider(faux.provider);
+  for (const provider of providers) models.setProvider(provider);
   const registry = createRegistry();
   const session = await Harness.open(await SqliteStorage.open(database), { models, registry,
     ...(clock === undefined ? {} : { now: clock.now, setTimer: clock.setTimer }),
-    identity: { attribution: null }, settings: { retry: { enabled: false } } }, BACKGROUND_CONTEXT);
+    identity: { attribution: null }, settings: { retry: { enabled: false }, ...(providers.length === 0 ? {} : { stream: { transport: "sse", maxRetries: 0 } }) } }, BACKGROUND_CONTEXT);
   const inference = new ConversationModels(models), tasks = new TaskStore(session, inference);
   const histories = new HistoryStore(session); tasks.useHistory(histories);
   const environment = new CoordinatorEnvironment(session); environment.useLiveGuidance(); tasks.useEnvironment(environment);

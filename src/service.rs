@@ -22,7 +22,7 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::runtime::{FrameReader, Runtime, ShutdownSignal};
+use crate::runtime::{FrameReader, Runtime, ShutdownSignal, StartRecord};
 
 const SOCKET_NAME: &str = "agent.sock";
 
@@ -127,14 +127,18 @@ async fn serve_with_transport(
     let background = bootstrap
         .as_ref()
         .and_then(|value| value.background.clone());
-    let apns = bootstrap
+    let config = bootstrap
         .as_ref()
         .and_then(|value| value.node.as_ref())
         .and_then(|node| node.launch.config.as_deref())
         .map(|path| crate::config::load(Some(Path::new(path))))
-        .transpose()?
-        .and_then(|config| config.apns);
-    let owner = Runtime::start_with_notifications(script, state, apns.as_ref())?;
+        .transpose()?;
+    let owner = Runtime::start_with_notifications(
+        script,
+        state,
+        config.as_ref().and_then(|config| config.apns.as_ref()),
+        StartRecord::for_config(config.as_ref()),
+    )?;
     let background = if owner.restore_held() {
         eprintln!("{}", crate::backup::hold_notice(state));
         None

@@ -7,7 +7,8 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex, PoisonError, Weak},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -22,8 +23,22 @@ use crate::{
     },
 };
 
+mod window;
+#[cfg(test)]
+pub(crate) use window::ClockMoves;
+pub(crate) use window::{ReceiptWindow, read_window};
+
 const MAX_BYTES: u64 = 1024 * 1024;
+pub(crate) const RETENTION_CAP_BYTES: u64 = 128 * MAX_BYTES;
 const CAPACITY: usize = 256;
+pub(crate) const HEARTBEAT: Duration = Duration::from_secs(5 * 60);
+const LOCK_WAIT: Duration = Duration::from_secs(10);
+/// A sender stamps a receipt and then enqueues it without waiting, so two
+/// senders can land a few milliseconds out of order, and a replacement writer
+/// starts with receipts stamped while the retired one drained its queue. Both
+/// are far below a minute. A timestamp that goes back by more is a moved clock.
+pub(crate) const STAMP_REORDER_TOLERANCE: Duration = Duration::from_secs(60);
+pub(crate) const UNWITNESSED_AFTER: Duration = Duration::from_secs(2 * HEARTBEAT.as_secs());
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Record {
@@ -48,13 +63,20 @@ fn is_zero(value: &u64) -> bool {
 fn millis(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
-fn token(value: &str) -> Option<String> {
-    (!value.is_empty()
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, millis)
+}
+pub(crate) fn is_token(value: &str) -> bool {
+    !value.is_empty()
         && value.len() <= 128
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_-.:|".contains(&byte)))
-    .then(|| value.to_owned())
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-.:|".contains(&byte))
+}
+fn token(value: &str) -> Option<String> {
+    is_token(value).then(|| value.to_owned())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -137,6 +159,10 @@ pub(crate) enum Event {
     RuntimeStopped {
         code: ErrorCode,
     },
+    Heartbeat,
+    UnrecordedStart,
+    WriterStarted,
+    WriterStopped,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -603,60 +629,262 @@ fn host_kind(bytes: &[u8]) -> Option<String> {
         .leaf()
 }
 
+/// Receipts lost on a full channel, from the drop until a written receipt
+/// reports them. A reader in this process counts both fields, so a loss is
+/// never invisible while its report waits in the channel or in the writer.
+#[derive(Default)]
+struct DropLedger {
+    /// Dropped, and not yet carried by any receipt.
+    unreported: u64,
+    /// Carried by a receipt that was sent and is not on disk yet.
+    reported_unwritten: u64,
+}
+type SharedDrops = Arc<Mutex<DropLedger>>;
+
+/// The ledgers of live writers in this process, by diagnostics directory. The
+/// reader finds them here because the runtime that owns a writer and the
+/// broker that owns a review are built apart, and a retiring writer and its
+/// replacement can both be live for one directory.
+static LIVE_DROP_LEDGERS: Mutex<Vec<(PathBuf, Weak<Mutex<DropLedger>>)>> = Mutex::new(Vec::new());
+
+fn registry_key(directory: &Path) -> PathBuf {
+    std::path::absolute(directory).unwrap_or_else(|_| directory.to_owned())
+}
+
+fn undelivered_drops(directory: &Path) -> u64 {
+    let key = registry_key(directory);
+    LIVE_DROP_LEDGERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .filter(|(live, _)| *live == key)
+        .filter_map(|(_, ledger)| ledger.upgrade())
+        .fold(0, |total, ledger| {
+            let ledger = ledger.lock().unwrap_or_else(PoisonError::into_inner);
+            total
+                .saturating_add(ledger.unreported)
+                .saturating_add(ledger.reported_unwritten)
+        })
+}
+
+fn writer_receipt(event: Event, dropped_before: u64) -> Record {
+    Record {
+        timestamp_ms: now_ms(),
+        request_id: 0,
+        elapsed_ms: None,
+        conversation_id: None,
+        task_id: None,
+        agent_id: None,
+        dropped_before,
+        event,
+    }
+}
+
+/// What a record that finds the channel full means for the ledger.
+#[derive(Clone, Copy)]
+enum WhenFull {
+    /// The record is a receipt, and losing it is a loss to report.
+    CountAsLost,
+    /// The record is a heartbeat, which witnesses time and reports nothing.
+    Forget,
+}
+
+/// Sends without waiting. A record that gets through carries the count of the
+/// receipts that did not, whichever sender dropped them.
+fn deliver(
+    sender: &mpsc::Sender<Record>,
+    drops: &Mutex<DropLedger>,
+    mut record: Record,
+    when_full: WhenFull,
+) {
+    let mut ledger = drops.lock().unwrap_or_else(PoisonError::into_inner);
+    record.dropped_before = ledger.unreported;
+    match sender.try_send(record) {
+        Ok(()) => {
+            ledger.reported_unwritten = ledger.reported_unwritten.saturating_add(ledger.unreported);
+            ledger.unreported = 0;
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            if let WhenFull::CountAsLost = when_full {
+                ledger.unreported = ledger.unreported.saturating_add(1);
+            }
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
+    }
+}
+
+/// Appends a record, and only then stops counting the drops it reports.
+fn append_reported(
+    writer: &mut Writer,
+    drops: &Mutex<DropLedger>,
+    record: &Record,
+) -> io::Result<()> {
+    writer.append(record)?;
+    if record.dropped_before > 0 {
+        let mut ledger = drops.lock().unwrap_or_else(PoisonError::into_inner);
+        ledger.reported_unwritten = ledger
+            .reported_unwritten
+            .saturating_sub(record.dropped_before);
+    }
+    Ok(())
+}
+
 pub(crate) struct Diagnostics {
     sender: mpsc::Sender<Record>,
-    dropped: u64,
+    drops: SharedDrops,
 }
+
+const UNRECORDED_START_STAMP: &str = "unrecorded-start";
+
+fn read_unrecorded_start(stamp: &Path) -> Option<u64> {
+    fs::read_to_string(stamp)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+}
+
+fn stamp_unrecorded_start(stamp: &Path) {
+    let _ = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(stamp)
+        .and_then(|mut file| file.write_all(now_ms().to_string().as_bytes()));
+}
+
+#[must_use]
+pub(crate) struct WriterStart(std::sync::mpsc::Receiver<io::Result<()>>);
+impl WriterStart {
+    pub fn wait(self) -> io::Result<()> {
+        self.0.recv().map_err(io::Error::other)?
+    }
+}
+
 impl Diagnostics {
     pub fn fork(&self) -> Self {
         Self {
             sender: self.sender.clone(),
-            dropped: 0,
+            drops: self.drops.clone(),
         }
     }
     pub fn start(state: &Path) -> Self {
-        let (sender, mut records) = mpsc::channel(CAPACITY);
+        let stamp = state.join(UNRECORDED_START_STAMP);
+        let unrecorded_since = read_unrecorded_start(&stamp);
+        if unrecorded_since.is_none() {
+            stamp_unrecorded_start(&stamp);
+        }
+        Self::start_with_heartbeat(state, HEARTBEAT, unrecorded_since, None)
+    }
+    pub fn start_recorded(state: &Path) -> (Self, WriterStart) {
+        let unrecorded_since = read_unrecorded_start(&state.join(UNRECORDED_START_STAMP));
+        let (started, start) = std::sync::mpsc::sync_channel(1);
+        (
+            Self::start_with_heartbeat(state, HEARTBEAT, unrecorded_since, Some(started)),
+            WriterStart(start),
+        )
+    }
+    fn open_channel(directory: &Path, capacity: usize) -> (Self, mpsc::Receiver<Record>) {
+        let (sender, records) = mpsc::channel(capacity);
+        let drops = SharedDrops::default();
+        let mut live = LIVE_DROP_LEDGERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        live.retain(|(_, ledger)| ledger.strong_count() > 0);
+        live.push((registry_key(directory), Arc::downgrade(&drops)));
+        (Self { sender, drops }, records)
+    }
+    fn start_with_heartbeat(
+        state: &Path,
+        interval: Duration,
+        unrecorded_since: Option<u64>,
+        started: Option<std::sync::mpsc::SyncSender<io::Result<()>>>,
+    ) -> Self {
         let directory = state.join("diagnostics");
+        let stamp = state.join(UNRECORDED_START_STAMP);
+        let (diagnostics, mut records) = Self::open_channel(&directory, CAPACITY);
+        // A weak sender lets the writer end when its last real producer does.
+        let witness = diagnostics.sender.downgrade();
+        let drops = diagnostics.drops.clone();
+        tokio::spawn(async move {
+            let mut ticks =
+                tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticks.tick().await;
+                let Some(sender) = witness.upgrade() else {
+                    return;
+                };
+                deliver(
+                    &sender,
+                    &drops,
+                    writer_receipt(Event::Heartbeat, 0),
+                    WhenFull::Forget,
+                );
+            }
+        });
+        let drops = diagnostics.drops.clone();
         tokio::task::spawn_blocking(move || {
-            let result = (|| -> io::Result<()> {
-                let mut writer = Writer::open(directory, MAX_BYTES)?;
-                while let Some(record) = records.blocking_recv() {
-                    writer.append(&record)?;
+            let opened = Writer::open(directory, MAX_BYTES).and_then(|mut writer| {
+                if let Some(since) = unrecorded_since {
+                    writer.append(&Record {
+                        timestamp_ms: since,
+                        ..writer_receipt(Event::UnrecordedStart, 0)
+                    })?;
                 }
+                writer.append(&writer_receipt(Event::WriterStarted, 0))?;
+                let _ = fs::remove_file(&stamp);
+                Ok(writer)
+            });
+            let mut writer = match opened {
+                Ok(writer) => writer,
+                Err(error) => {
+                    match started {
+                        Some(started) => {
+                            let _ = started.send(Err(error));
+                        }
+                        None => eprintln!("Runtime diagnostics unavailable; chat continues."),
+                    }
+                    return;
+                }
+            };
+            if let Some(started) = started {
+                let _ = started.send(Ok(()));
+            }
+            let result = (|| -> io::Result<()> {
+                while let Some(record) = records.blocking_recv() {
+                    append_reported(&mut writer, &drops, &record)?;
+                }
+                // The last sender is gone, so nothing else can report these.
+                let mut ledger = drops.lock().unwrap_or_else(PoisonError::into_inner);
+                writer.append(&writer_receipt(Event::WriterStopped, ledger.unreported))?;
+                ledger.unreported = 0;
                 Ok(())
             })();
             if result.is_err() {
                 eprintln!("Runtime diagnostics unavailable; chat continues.");
             }
         });
-        Self { sender, dropped: 0 }
+        diagnostics
     }
     pub fn record(&mut self, request_id: u32, trace: &Trace, event: Event) {
         let record = Record {
-            timestamp_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, millis),
+            timestamp_ms: now_ms(),
             request_id,
             elapsed_ms: trace.started.map(|started| millis(started.elapsed())),
             conversation_id: trace.conversation_id.clone(),
             task_id: trace.task_id.clone(),
             agent_id: trace.agent_id.clone(),
-            dropped_before: self.dropped,
+            dropped_before: 0,
             event,
         };
-        match self.sender.try_send(record) {
-            Ok(()) => self.dropped = 0,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.dropped = self.dropped.saturating_add(1)
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
-        }
+        deliver(&self.sender, &self.drops, record, WhenFull::CountAsLost);
     }
 }
 
 /// The total cap includes room for the watermark and its atomic replacement.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-struct RetentionPolicy {
+pub(crate) struct RetentionPolicy {
     segment_bytes: u64,
     horizon_ms: u64,
     max_total_bytes: u64,
@@ -666,7 +894,7 @@ impl Default for RetentionPolicy {
         Self {
             segment_bytes: MAX_BYTES,
             horizon_ms: 48 * 60 * 60 * 1000,
-            max_total_bytes: 128 * MAX_BYTES,
+            max_total_bytes: RETENTION_CAP_BYTES,
         }
     }
 }
@@ -736,12 +964,12 @@ impl Segment {
 /// Bounds summarize capacity loss; they do not claim every timestamp between
 /// them was lost. An interrupted prune can conservatively report possible loss.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-struct CapacityLoss {
-    first_timestamp_ms: Option<u64>,
-    last_timestamp_ms: Option<u64>,
-    unknown_timestamps: bool,
-    segments: u64,
-    bytes: u64,
+pub(crate) struct CapacityLoss {
+    pub(crate) first_timestamp_ms: Option<u64>,
+    pub(crate) last_timestamp_ms: Option<u64>,
+    pub(crate) unknown_timestamps: bool,
+    pub(crate) segments: u64,
+    pub(crate) bytes: u64,
 }
 impl CapacityLoss {
     fn include(&mut self, segment: &Segment) {
@@ -759,12 +987,12 @@ impl CapacityLoss {
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct RetentionWatermark {
-    version: u32,
-    policy: RetentionPolicy,
-    prior_history_unknown: bool,
-    expired_through_ms: Option<u64>,
-    capacity_loss: Option<CapacityLoss>,
+pub(crate) struct RetentionWatermark {
+    pub(crate) version: u32,
+    pub(crate) policy: RetentionPolicy,
+    pub(crate) prior_history_unknown: bool,
+    pub(crate) expired_through_ms: Option<u64>,
+    pub(crate) capacity_loss: Option<CapacityLoss>,
 }
 
 struct Writer {
@@ -810,8 +1038,7 @@ impl Writer {
             return Err(io::Error::other("Diagnostics directory is unavailable"));
         }
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-        // A retired runtime may still be draining its bounded queue. Only the
-        // background writer waits here; chat admission never waits on this lock.
+        let path = directory.join("writer.lock");
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -819,9 +1046,22 @@ impl Writer {
             .truncate(false)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(directory.join("writer.lock"))?;
+            .open(&path)?;
         lock.set_permissions(fs::Permissions::from_mode(0o600))?;
-        fs2::FileExt::lock_exclusive(&lock)?;
+        let deadline = Instant::now() + LOCK_WAIT;
+        while let Err(error) = fs2::FileExt::try_lock_exclusive(&lock) {
+            if error.kind() != io::ErrorKind::WouldBlock {
+                return Err(error);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::other(format!(
+                    "Another process has held {} for {} seconds",
+                    path.display(),
+                    LOCK_WAIT.as_secs()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let file = Self::file(&directory)?;
         let current = Segment::read(&file, 0)?;
         let mut archives = Vec::new();
@@ -1074,7 +1314,7 @@ mod tests {
     use crate::protocol::{InputMode, MainInputContext, RuntimeCommand, RuntimeRequest};
     use crate::runtime::diagnostics::{
         Diagnostics, Event, Record, RetentionPolicy, RetentionWatermark, Trace, WATERMARK_BYTES,
-        Writer, command_kind,
+        Writer, command_kind, read_window,
     };
     use std::{
         fs,
@@ -1466,7 +1706,10 @@ mod tests {
     #[tokio::test]
     async fn a_full_nonblocking_channel_reports_its_dropped_count_after_recovery() {
         let (sender, mut records) = mpsc::channel(1);
-        let mut log = Diagnostics { sender, dropped: 0 };
+        let mut log = Diagnostics {
+            sender,
+            drops: Default::default(),
+        };
         let trace = Trace::new(&RuntimeCommand::Status);
         log.record(1, &trace, Event::RequestReceived);
         log.record(2, &trace, Event::RequestReceived);
@@ -1547,7 +1790,10 @@ mod tests {
         let directory = state.path().join("diagnostics");
         let mut writer = Writer::open(directory.clone(), 8192).unwrap();
         let (sender, mut received) = mpsc::channel(16);
-        let mut diagnostics = Diagnostics { sender, dropped: 0 };
+        let mut diagnostics = Diagnostics {
+            sender,
+            drops: Default::default(),
+        };
         let commands = [
             RuntimeCommand::MainInput {
                 origin: None,
@@ -1668,5 +1914,443 @@ mod tests {
                 serde_json::to_string(&expected).unwrap()
             );
         }
+    }
+
+    fn at(timestamp_ms: u64, event: Event) -> Record {
+        Record {
+            timestamp_ms,
+            event,
+            ..record(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeats_witness_an_idle_writer_without_keeping_it_alive() {
+        let state = tempfile::tempdir().unwrap();
+        let diagnostics = Diagnostics::start_with_heartbeat(
+            state.path(),
+            std::time::Duration::from_millis(20),
+            None,
+            None,
+        );
+        let directory = state.path().join("diagnostics");
+        let heartbeats = || {
+            receipts(&directory)
+                .iter()
+                .filter(|record| matches!(record.event, Event::Heartbeat))
+                .count()
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !directory.join("runtime.jsonl").exists() || heartbeats() < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("An idle writer must still record heartbeats");
+        drop(diagnostics);
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.join("writer.lock"))
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("The heartbeat must not keep the writer alive after its last producer");
+    }
+
+    fn overflowed(
+        state: &std::path::Path,
+        heartbeat: std::time::Duration,
+        records: u32,
+    ) -> Diagnostics {
+        let directory = state.join("diagnostics");
+        fs::create_dir(&directory).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join("writer.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        let mut log = Diagnostics::start_with_heartbeat(state, heartbeat, None, None);
+        let trace = Trace::new(&RuntimeCommand::Status);
+        for id in 1..=records {
+            log.record(id, &trace, Event::RequestReceived);
+        }
+        fs2::FileExt::unlock(&lock).unwrap();
+        log
+    }
+
+    async fn reported_drops(directory: &std::path::Path) -> u64 {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let reported: u64 = receipts(directory)
+                    .iter()
+                    .map(|record| record.dropped_before)
+                    .sum();
+                if reported > 0 {
+                    return reported;
+                }
+            }
+        })
+        .await
+        .expect("Dropped receipts must be reported without another record() call")
+    }
+
+    #[tokio::test]
+    async fn a_dropped_receipt_stays_visible_to_a_reader_until_its_report_is_on_disk() {
+        let state = tempfile::tempdir().unwrap();
+        let directory = state.path().join("diagnostics");
+        let mut writer = Writer::open(directory.clone(), super::MAX_BYTES).unwrap();
+        let (mut log, mut records) = Diagnostics::open_channel(&directory, 1);
+        let trace = Trace::new(&RuntimeCommand::Status);
+        let seen = || {
+            let read = read_window(state.path(), (0, u64::MAX), 100, u64::MAX).unwrap();
+            let written: u64 = read
+                .records
+                .iter()
+                .map(|record| record.dropped_before)
+                .sum();
+            (read.undelivered_drops, written)
+        };
+        for id in 1..=3 {
+            log.record(id, &trace, Event::RequestReceived);
+        }
+        assert_eq!(seen(), (2, 0), "Dropped and not yet carried by a receipt");
+        super::append_reported(&mut writer, &log.drops, &records.recv().await.unwrap()).unwrap();
+        log.record(4, &trace, Event::Done);
+        assert_eq!(
+            seen(),
+            (2, 0),
+            "Carried by a receipt that waits in the channel"
+        );
+        let report = records.recv().await.unwrap();
+        assert_eq!(report.dropped_before, 2);
+        assert_eq!(
+            seen(),
+            (2, 0),
+            "Received by the writer and not yet appended"
+        );
+        super::append_reported(&mut writer, &log.drops, &report).unwrap();
+        assert_eq!(seen(), (0, 2), "On disk, and no longer counted as pending");
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_reports_receipts_that_a_silent_sender_dropped() {
+        let state = tempfile::tempdir().unwrap();
+        let log = overflowed(state.path(), std::time::Duration::from_millis(50), 300);
+        let directory = state.path().join("diagnostics");
+        let reported = reported_drops(&directory).await;
+        let written = receipts(&directory)
+            .iter()
+            .filter(|record| matches!(record.event, Event::RequestReceived))
+            .count() as u64;
+        assert_eq!(
+            reported + written,
+            300,
+            "Every receipt is written or counted"
+        );
+        assert_eq!(
+            read_window(state.path(), (0, u64::MAX), 1_000, u64::MAX)
+                .unwrap()
+                .undelivered_drops,
+            0,
+            "A reported drop is no longer pending"
+        );
+        drop(log);
+    }
+
+    #[tokio::test]
+    async fn a_reader_sees_drops_that_no_record_has_reported_yet_and_the_last_sender_leaves_them_on_disk()
+     {
+        let state = tempfile::tempdir().unwrap();
+        let log = overflowed(state.path(), std::time::Duration::from_secs(3_600), 300);
+        let directory = state.path().join("diagnostics");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while receipts(&directory).len() < 256 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            read_window(state.path(), (0, u64::MAX), 1_000, u64::MAX)
+                .unwrap()
+                .undelivered_drops,
+            44
+        );
+        drop(log);
+        assert_eq!(reported_drops(&directory).await, 44);
+    }
+
+    #[test]
+    fn a_window_read_spans_segments_and_reports_loss_without_the_writer_lock() {
+        let state = tempfile::tempdir().unwrap();
+        let directory = state.path().join("diagnostics");
+        let mut writer = Writer::open_at(directory.clone(), policy(1_000_000), 10_000).unwrap();
+        for timestamp in (1_000..=9_000).step_by(100) {
+            writer.append(&at(timestamp, Event::Heartbeat)).unwrap();
+        }
+        assert!(writer.archives.len() > 3, "The fixture must span segments");
+        let all = read_window(state.path(), (0, 20_000), 1_000, u64::MAX).unwrap();
+        assert_eq!(all.records.len(), 81);
+        assert_eq!(all.oldest_retained_ms, Some(1_000));
+        assert_eq!(all.unplaced_lines, 0);
+        assert!(!all.rotated_during_read);
+        assert_eq!(all.truncated_at_ms, None);
+        let facts = all.retention.unwrap();
+        assert!(!facts.prior_history_unknown);
+        assert_eq!(facts.expired_through_ms, None);
+        assert_eq!(facts.capacity_loss, None);
+
+        let middle = read_window(state.path(), (3_000, 5_000), 1_000, u64::MAX).unwrap();
+        let timestamps: Vec<u64> = middle
+            .records
+            .iter()
+            .map(|record| record.timestamp_ms)
+            .collect();
+        assert_eq!(timestamps, (3_000..5_000).step_by(100).collect::<Vec<_>>());
+        assert_eq!(middle.oldest_retained_ms, Some(1_000));
+
+        let cut = read_window(state.path(), (3_000, 5_000), 5, u64::MAX).unwrap();
+        assert_eq!(cut.records.len(), 5);
+        assert_eq!(cut.truncated_at_ms, Some(3_500));
+    }
+
+    #[test]
+    fn a_bad_line_is_placed_before_the_window_only_while_receipt_timestamps_never_go_back() {
+        let line = |timestamp| serde_json::to_string(&at(timestamp, Event::Heartbeat)).unwrap();
+        let unplaced = |segments: &[(&str, String)]| {
+            let state = tempfile::tempdir().unwrap();
+            let directory = state.path().join("diagnostics");
+            fs::create_dir(&directory).unwrap();
+            for (name, content) in segments {
+                fs::write(directory.join(name), content).unwrap();
+            }
+            read_window(state.path(), (500, 2_000), 100, u64::MAX)
+                .unwrap()
+                .unplaced_lines
+        };
+        let ordered = format!("{}\nbad\n{}\n{}\n", line(100), line(200), line(1_000));
+        assert_eq!(unplaced(&[("runtime.jsonl", ordered)]), 0);
+
+        let rolled_back = format!("{}\nbad\n{}\n{}\n", line(1_000), line(100), line(1_100));
+        assert_eq!(
+            unplaced(&[("runtime.jsonl", rolled_back)]),
+            1,
+            "A receipt whose clock went back proves nothing about the line before it"
+        );
+        let rolled_back_elsewhere = format!(
+            "{}\n{}\n{}\nbad\n{}\n{}\n",
+            line(400),
+            line(100),
+            line(150),
+            line(200),
+            line(1_000)
+        );
+        assert_eq!(
+            unplaced(&[("runtime.jsonl", rolled_back_elsewhere)]),
+            1,
+            "Any timestamp that goes back in a segment removes the proof for that segment"
+        );
+        assert_eq!(
+            unplaced(&[
+                ("runtime.jsonl.1", format!("{}\nbad\n", line(100))),
+                ("runtime.jsonl", format!("{}\n{}\n", line(200), line(1_000))),
+            ]),
+            0,
+            "The next segment's older receipt places a segment's last line"
+        );
+        assert_eq!(
+            unplaced(&[
+                ("runtime.jsonl.1", format!("{}\nbad\n", line(300))),
+                ("runtime.jsonl", format!("{}\n{}\n", line(200), line(1_000))),
+            ]),
+            1,
+            "A timestamp that goes back across segments removes the proof too"
+        );
+        let unfinished = format!(
+            "{}\n{}\n{{\"timestamp_ms\":1200,\"event\":",
+            line(100),
+            line(1_000)
+        );
+        assert_eq!(
+            unplaced(&[("runtime.jsonl", unfinished)]),
+            1,
+            "An unfinished last line may be a receipt that a crashed writer lost"
+        );
+    }
+
+    #[test]
+    fn a_rollback_stays_with_a_segments_last_bad_line_until_a_later_segment_places_it() {
+        let line = |timestamp| serde_json::to_string(&at(timestamp, Event::Heartbeat)).unwrap();
+        let unplaced = |segments: &[(&str, String)]| {
+            let state = tempfile::tempdir().unwrap();
+            let directory = state.path().join("diagnostics");
+            fs::create_dir(&directory).unwrap();
+            for (name, content) in segments {
+                fs::write(directory.join(name), content).unwrap();
+            }
+            read_window(state.path(), (500, 2_000), 100, u64::MAX)
+                .unwrap()
+                .unplaced_lines
+        };
+        assert_eq!(
+            unplaced(&[
+                (
+                    "runtime.jsonl.1",
+                    format!("{}\n{}\nbad\n", line(200), line(100))
+                ),
+                ("runtime.jsonl", format!("{}\n{}\n", line(150), line(1_000))),
+            ]),
+            1,
+            "The clock went back in the segment that holds the bad line"
+        );
+        assert_eq!(
+            unplaced(&[
+                (
+                    "runtime.jsonl.2",
+                    format!("{}\n{}\nbad\n", line(200), line(100))
+                ),
+                ("runtime.jsonl.1", "also bad\n".to_owned()),
+                ("runtime.jsonl", format!("{}\n{}\n", line(150), line(1_000))),
+            ]),
+            1,
+            "Only the line from the segment whose clock went back loses its proof"
+        );
+        assert_eq!(
+            unplaced(&[
+                ("runtime.jsonl.1", format!("{}\nbad\n", line(100))),
+                (
+                    "runtime.jsonl",
+                    format!("{}\n{}\n{}\n", line(150), line(120), line(1_000))
+                ),
+            ]),
+            1,
+            "The clock went back in the segment whose receipt would place the line"
+        );
+    }
+
+    #[test]
+    fn a_timestamp_that_goes_back_past_the_reorder_tolerance_around_the_window_is_a_clock_move() {
+        const HOUR: u64 = 3_600_000;
+        let line = |timestamp| serde_json::to_string(&at(timestamp, Event::Heartbeat)).unwrap();
+        let now = super::now_ms();
+        let window = (now - 2 * HOUR, now);
+        let moves = |stamps: &[u64]| {
+            let state = tempfile::tempdir().unwrap();
+            let directory = state.path().join("diagnostics");
+            fs::create_dir(&directory).unwrap();
+            let log: String = stamps.iter().map(|stamp| line(*stamp) + "\n").collect();
+            fs::write(directory.join("runtime.jsonl"), log).unwrap();
+            read_window(state.path(), window, 100, u64::MAX)
+                .unwrap()
+                .clock_moves
+        };
+        assert_eq!(moves(&[now - HOUR, now - HOUR + 5, now - HOUR + 1]), None);
+        assert_eq!(
+            moves(&[now - HOUR, now - HOUR - 59_000, now - 1_000]),
+            None,
+            "Senders and a replacement writer reorder stamps by less than a minute"
+        );
+        assert_eq!(
+            moves(&[now - 5 * HOUR, now - 6 * HOUR, now - HOUR]),
+            None,
+            "A move wholly before the window hides nothing in it"
+        );
+        let back = moves(&[now - HOUR, now - 4 * HOUR, now - 1_000]).unwrap();
+        assert_eq!((back.times, back.largest_back_ms), (1, 3 * HOUR));
+        assert_eq!(back.span_ms, (now - 4 * HOUR, now - HOUR));
+        let ahead = moves(&[now - HOUR, now + 2 * HOUR, now - 1_000]).unwrap();
+        assert_eq!(ahead.times, 1);
+        assert_eq!(ahead.span_ms, (now - 1_000, now + 2 * HOUR));
+        let trailing = moves(&[now - HOUR, now + 2 * HOUR]).unwrap();
+        assert_eq!(
+            trailing.times, 1,
+            "A last receipt stamped ahead of the present"
+        );
+        let twice = moves(&[now - HOUR, now - 3 * HOUR, now - HOUR, now - 2 * HOUR - 1]).unwrap();
+        assert_eq!((twice.times, twice.largest_back_ms), (2, 2 * HOUR));
+    }
+
+    #[test]
+    fn a_window_read_counts_only_bad_lines_that_may_hide_a_receipt_in_the_window() {
+        let state = tempfile::tempdir().unwrap();
+        let directory = state.path().join("diagnostics");
+        fs::create_dir(&directory).unwrap();
+        let line = |timestamp| serde_json::to_string(&at(timestamp, Event::Heartbeat)).unwrap();
+        fs::write(
+            directory.join("runtime.jsonl.1"),
+            format!(
+                "{}\nnot a receipt, provably old\n{}\nmaybe in the window\n{}\n",
+                line(100),
+                line(200),
+                line(1_000)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("runtime.jsonl"),
+            format!(
+                "{}\n{{\"timestamp_ms\":1200,\"event\":\"from_a_newer_writer\"}}\n{}\n{{\"timestamp_ms\":",
+                line(1_100),
+                line(1_300)
+            ),
+        )
+        .unwrap();
+        let read = read_window(state.path(), (500, 2_000), 100, u64::MAX).unwrap();
+        assert_eq!(read.records.len(), 3);
+        assert_eq!(
+            read.unplaced_lines, 3,
+            "Only the bad line that ordered receipts place before the window is no gap"
+        );
+        assert!(
+            read.retention.is_none(),
+            "A missing watermark means loss is unknown"
+        );
+
+        fs::write(
+            directory.join("retention.json"),
+            serde_json::to_vec(&RetentionWatermark {
+                version: 1,
+                policy: RetentionPolicy::default(),
+                prior_history_unknown: true,
+                expired_through_ms: Some(90),
+                capacity_loss: Some(super::CapacityLoss {
+                    first_timestamp_ms: Some(10),
+                    last_timestamp_ms: Some(20),
+                    unknown_timestamps: false,
+                    segments: 2,
+                    bytes: 1_200,
+                }),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let facts = read_window(state.path(), (500, 2_000), 100, u64::MAX)
+            .unwrap()
+            .retention
+            .unwrap();
+        assert!(facts.prior_history_unknown);
+        assert_eq!(facts.expired_through_ms, Some(90));
+        let loss = facts.capacity_loss.unwrap();
+        assert_eq!(
+            (
+                loss.first_timestamp_ms,
+                loss.last_timestamp_ms,
+                loss.segments,
+                loss.bytes
+            ),
+            (Some(10), Some(20), 2, 1_200)
+        );
+        let empty = tempfile::tempdir().unwrap();
+        let none = read_window(empty.path(), (0, 10), 10, u64::MAX).unwrap();
+        assert!(none.records.is_empty() && none.retention.is_none());
     }
 }

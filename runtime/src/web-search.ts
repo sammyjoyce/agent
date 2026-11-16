@@ -100,8 +100,13 @@ class Citations {
   }
 }
 
+export type HostedToolsOffered = (sessionId: string | undefined) => Promise<boolean>;
+function isClientExecutedTool(tool: unknown): boolean {
+  return object(tool) && (tool.type === "function" || tool.type === "custom");
+}
+
 /** Pi still owns transport, auth, retry, reasoning, replay signatures and usage. */
-export function withWebSearch(native: ProviderStreams["streamSimple"]): ProviderStreams["streamSimple"] {
+export function withWebSearch(native: ProviderStreams["streamSimple"], offered: HostedToolsOffered): ProviderStreams["streamSimple"] {
   return (model, context, options) => {
     if (!supportsWebSearch(model)) return native(model, context, options);
     const citations = new Citations();
@@ -113,6 +118,7 @@ export function withWebSearch(native: ProviderStreams["streamSimple"]): Provider
           throw new Error("The provider returned an invalid web search request payload.");
         }
         const tools: unknown[] = selected.tools ?? [];
+        if (!await offered(options?.sessionId)) return { ...selected, tools: tools.filter(isClientExecutedTool) };
         if (tools.some((tool) => object(tool) && (tool.type === "web_search" || tool.type === "web_search_2025_08_26"))) return selected;
         return { ...selected, tools: [...tools, { type: "web_search", external_web_access: true }] };
       },

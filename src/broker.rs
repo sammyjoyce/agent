@@ -40,6 +40,7 @@ pub struct Broker {
     local: Option<AgentNode>,
     contexts: ContextStore,
     executor: host::Executor,
+    dreams: Option<crate::dreams::Dreams>,
     instructions: std::path::PathBuf,
     peers: Mutex<HashMap<String, Peer>>,
 }
@@ -75,19 +76,27 @@ impl Broker {
             None => ContextStore::default(),
         };
         let mut executor = host::Executor::with_tailscale(state, daemon, rex);
-        if let Some(launch) = local.as_ref().map(|node| &node.launch)
-            && let Some(runtime) = &launch.runtime
-        {
-            let browser = match &launch.config {
-                Some(path) => crate::config::load(Some(Path::new(path)))?.browser,
-                None => None,
-            };
+        let launch = local.as_ref().map(|node| &node.launch);
+        let config = launch
+            .and_then(|launch| launch.config.as_ref())
+            .map(|path| crate::config::load(Some(Path::new(path))))
+            .transpose()?;
+        if let Some(runtime) = launch.and_then(|launch| launch.runtime.as_ref()) {
+            let browser = config.as_ref().and_then(|config| config.browser.clone());
             executor = executor.with_browser(Path::new(runtime), browser);
         }
+        let dreams = config
+            .as_ref()
+            .map(crate::config::ClientConfig::dreams_policy)
+            .transpose()?
+            .flatten()
+            .map(|policy| crate::dreams::Dreams::open(state, policy))
+            .transpose()?;
         Ok(Self {
             local,
             contexts,
             executor,
+            dreams,
             instructions: bootstrap
                 .and_then(|value| value.node.as_ref())
                 .and_then(|node| node.launch.instructions.as_ref())
@@ -284,6 +293,15 @@ impl Broker {
                 HostCommand::Background { request } => crate::background::execute(request)
                     .await
                     .map(|response| HostResult::Background { response }),
+                HostCommand::Dreams { request } => {
+                    return match &self.dreams {
+                        Some(dreams) => dreams.execute(request, cancelled).await,
+                        None => HostResult::Failed {
+                            delivery: Some(HostDelivery::NotStarted),
+                            message: crate::dreams::NOT_CONFIGURED.into(),
+                        },
+                    };
+                }
                 HostCommand::ReadUsage { expected_email } => {
                     return HostResult::Usage {
                         usage: crate::usage::account(&expected_email).await,
@@ -334,6 +352,7 @@ impl Broker {
                         *command,
                         HostCommand::OnNode { .. }
                             | HostCommand::Background { .. }
+                            | HostCommand::Dreams { .. }
                             | HostCommand::ReloadGuidance
                             | HostCommand::ReadContext { .. }
                             | HostCommand::SearchContext { .. }

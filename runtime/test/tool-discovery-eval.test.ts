@@ -160,7 +160,7 @@ async function askMain({ app, workspace, model }: World, content: string): Promi
 }
 
 async function runJobTask({ app, model, signal }: World, title: string, outcome: string, input: string): Promise<TaskRecord> {
-  const task = await app.tasks.create({ title, outcome, model, sources: [{ provider: "scheduled_jobs", account: "local", thread_id: "eval-maintenance" }] });
+  const task = await app.tasks.create({ title, outcome, model, job_id: "eval-maintenance" });
   await app.tasks.enqueue(task.id, input);
   await runAdmitted(app.tasks, task.id, undefined, signal);
   for (let saved = await app.tasks.get(task.id); ; saved = await app.tasks.get(task.id)) {

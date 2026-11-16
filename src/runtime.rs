@@ -22,7 +22,7 @@ use tokio::{
     time::timeout,
 };
 
-mod diagnostics;
+pub(crate) mod diagnostics;
 pub mod lifecycle;
 use crate::runtime::diagnostics::{Diagnostics, Event as DiagnosticEvent, HostTiming, Trace};
 use crate::runtime::lifecycle::RequestLifecycle;
@@ -34,6 +34,21 @@ pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) enum ShutdownSignal {
     Sigint,
     Sigterm,
+}
+
+pub(crate) enum StartRecord {
+    RequiredByDreams,
+    BestEffort,
+}
+
+impl StartRecord {
+    pub(crate) fn for_config(config: Option<&crate::config::ClientConfig>) -> Self {
+        if config.is_some_and(|config| config.dreams.is_some()) {
+            Self::RequiredByDreams
+        } else {
+            Self::BestEffort
+        }
+    }
 }
 
 pub struct RuntimeCall {
@@ -114,13 +129,14 @@ struct Pending {
 
 impl Runtime {
     pub fn start(script: &Path, state: &Path) -> Result<Self> {
-        Self::start_with_notifications(script, state, None)
+        Self::start_with_notifications(script, state, None, StartRecord::BestEffort)
     }
 
-    pub fn start_with_notifications(
+    pub(crate) fn start_with_notifications(
         script: &Path,
         state: &Path,
         apns: Option<&crate::notifications::ApnsConfig>,
+        start_record: StartRecord,
     ) -> Result<Self> {
         ensure!(
             script.is_file(),
@@ -129,6 +145,22 @@ impl Runtime {
         let guard = WriterLock::acquire(state)?;
         let restore_held = crate::backup::restore_held(&guard, state);
         let coordinator_id = CoordinatorId::load_or_mint(state)?;
+        let diagnostics = match start_record {
+            StartRecord::BestEffort => Diagnostics::start(state),
+            StartRecord::RequiredByDreams => {
+                let (diagnostics, started) = Diagnostics::start_recorded(state);
+                started.wait().with_context(|| {
+                    format!(
+                        "Runtime diagnostics could not record this coordinator's start in {}. \
+                         Dreams needs that record to tell a quiet night from a missed one. Fix \
+                         that path, or remove [dreams] from the config to run chat without \
+                         nightly review",
+                        state.join("diagnostics").display()
+                    )
+                })?;
+                diagnostics
+            }
+        };
         let lock_fd = guard.0.as_raw_fd();
         let mut command = Command::new("node");
         command
@@ -170,7 +202,6 @@ impl Runtime {
         let (shutdown, stopping) = watch::channel(false);
         let (notices, _) = broadcast::channel(64);
         let notifications = notices.clone();
-        let diagnostics = Diagnostics::start(state);
         let service_diagnostics = Mutex::new(diagnostics.fork());
         let (quiescing, _) = watch::channel(false);
         let actor = tokio::spawn(async move {
@@ -759,6 +790,7 @@ setInterval(()=>{},1000);
                 &script,
                 state.path(),
                 Some(&apns),
+                crate::runtime::StartRecord::BestEffort,
             )
             .unwrap();
             let reported = state.path().join("apns");
@@ -1479,6 +1511,37 @@ createInterface({input:process.stdin}).on('line',line=>{
             .unwrap();
         }
         runtime.close().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(state.path().join("diagnostics")).unwrap(),
+            "Preserve existing unrelated file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_requires_its_start_record_refuses_to_start_and_names_the_remedy() {
+        use crate::runtime::{Runtime, StartRecord};
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(
+            state.path().join("diagnostics"),
+            "Preserve existing unrelated file",
+        )
+        .unwrap();
+        let script = state.path().join("fixture.mjs");
+        std::fs::write(&script, "process.stdin.resume();\n").unwrap();
+        let Err(error) = Runtime::start_with_notifications(
+            &script,
+            state.path(),
+            None,
+            StartRecord::RequiredByDreams,
+        ) else {
+            panic!("A runtime whose log cannot record its start must not serve");
+        };
+        let error = format!("{error:#}");
+        assert!(
+            error.contains(&state.path().join("diagnostics").display().to_string()),
+            "{error}"
+        );
+        assert!(error.contains("remove [dreams]"), "{error}");
         assert_eq!(
             std::fs::read_to_string(state.path().join("diagnostics")).unwrap(),
             "Preserve existing unrelated file"

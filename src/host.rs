@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use tokio::{
     fs,
-    io::{AsyncRead, AsyncReadExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
     time::{sleep, timeout},
 };
@@ -43,6 +43,24 @@ pub(crate) struct ProcessOutput {
     pub truncated: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProcessEnding {
+    Exited,
+    TimedOut,
+    Cancelled,
+}
+
+pub(crate) async fn until_cancelled(mut cancelled: tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *cancelled.borrow_and_update() {
+            return;
+        }
+        if cancelled.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 impl From<ProcessOutput> for HostResult {
     fn from(output: ProcessOutput) -> Self {
         Self::Process {
@@ -61,6 +79,8 @@ pub(crate) struct ProcessRequest<'a> {
     deadline: Duration,
     output_limit: usize,
     sender_conversation_id: Option<&'a str>,
+    environment: Option<&'a [(String, String)]>,
+    stdin: Option<&'a [u8]>,
 }
 
 impl<'a> ProcessRequest<'a> {
@@ -83,7 +103,20 @@ impl<'a> ProcessRequest<'a> {
             deadline,
             output_limit,
             sender_conversation_id: None,
+            environment: None,
+            stdin: None,
         })
+    }
+
+    /// The child reads exactly these bytes and then end of input.
+    pub fn with_stdin(mut self, bytes: &'a [u8]) -> Self {
+        self.stdin = Some(bytes);
+        self
+    }
+
+    pub fn with_only_environment(mut self, environment: &'a [(String, String)]) -> Self {
+        self.environment = Some(environment);
+        self
     }
 
     pub fn with_sender_conversation(mut self, sender_conversation_id: Option<&'a str>) -> Self {
@@ -290,18 +323,9 @@ impl Executor {
                 )?
                 .with_sender_conversation(sender_conversation_id.as_deref());
                 Ok::<_, anyhow::Error>(
-                    run_process_until(request, async move {
-                        loop {
-                            if *cancelled.borrow_and_update() {
-                                break;
-                            }
-                            if cancelled.changed().await.is_err() {
-                                std::future::pending::<()>().await;
-                            }
-                        }
-                    })
-                    .await?
-                    .into(),
+                    run_process_until(request, until_cancelled(cancelled))
+                        .await?
+                        .into(),
                 )
             }
             .await;
@@ -350,6 +374,7 @@ async fn execute_inner(rex: &RexClient, command: HostCommand) -> Result<HostResu
         }
         HostCommand::OnNode { .. }
         | HostCommand::Background { .. }
+        | HostCommand::Dreams { .. }
         | HostCommand::ReadContext { .. }
         | HostCommand::SearchContext { .. } => {
             anyhow::bail!("This operation requires the coordinator's registered host broker")
@@ -919,6 +944,15 @@ pub(crate) async fn run_process_until(
     request: ProcessRequest<'_>,
     cancelled: impl Future<Output = ()>,
 ) -> std::result::Result<ProcessOutput, ProcessFailure> {
+    run_process_ending(request, cancelled)
+        .await
+        .map(|(output, _)| output)
+}
+
+pub(crate) async fn run_process_ending(
+    request: ProcessRequest<'_>,
+    cancelled: impl Future<Output = ()>,
+) -> std::result::Result<(ProcessOutput, ProcessEnding), ProcessFailure> {
     let ProcessRequest {
         program,
         args,
@@ -926,8 +960,13 @@ pub(crate) async fn run_process_until(
         deadline,
         output_limit,
         sender_conversation_id,
+        environment,
+        stdin,
     } = request;
     let mut command = Command::new(program);
+    if let Some(environment) = environment {
+        command.env_clear().envs(environment.iter().cloned());
+    }
     // Actor identity belongs to this effect, never to the long-lived host's
     // inherited environment or an earlier task.
     if let Some(sender) = sender_conversation_id {
@@ -938,7 +977,11 @@ pub(crate) async fn run_process_until(
     let mut child = command
         .args(args)
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
@@ -967,6 +1010,18 @@ pub(crate) async fn run_process_until(
             .context("Command error pipe is unavailable")?;
         let mut output = tokio::spawn(captured(stdout, output_limit));
         let mut errors = tokio::spawn(captured(stderr, output_limit));
+        if let Some(input) = stdin {
+            let mut pipe = child
+                .stdin
+                .take()
+                .context("Command input pipe is unavailable")?;
+            let input = input.to_vec();
+            // Written beside the output readers, so a child that prints before
+            // it reads cannot stall. Dropping the pipe ends its input.
+            tokio::spawn(async move {
+                let _ = pipe.write_all(&input).await;
+            });
+        }
         let finished = tokio::select! {
             result = timeout(deadline, exited_unreaped(group.0)) => Some(result),
             _ = cancelled => None,
@@ -988,26 +1043,29 @@ pub(crate) async fn run_process_until(
             }
         };
         let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
-        let exit_code = match finished {
+        let (exit_code, ending) = match finished {
             Some(Ok(result)) => {
                 result?;
-                status.code().unwrap_or(128)
+                (status.code().unwrap_or(128), ProcessEnding::Exited)
             }
             Some(Err(_)) => {
                 stderr.push_str("\nCommand timed out and its process group was stopped.");
-                124
+                (124, ProcessEnding::TimedOut)
             }
             None => {
                 stderr.push_str("\nCommand cancelled and its process group was stopped.");
-                143
+                (143, ProcessEnding::Cancelled)
             }
         };
-        Ok(ProcessOutput {
-            exit_code,
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr,
-            truncated: out_cut || err_cut,
-        })
+        Ok((
+            ProcessOutput {
+                exit_code,
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr,
+                truncated: out_cut || err_cut,
+            },
+            ending,
+        ))
     }
     .await;
     result.map_err(ProcessFailure::OutcomeUncertain)

@@ -1,6 +1,7 @@
 mod chat_admission;
 mod chat_history;
 mod chat_view;
+mod dreams_cli;
 mod mail;
 mod state;
 
@@ -105,6 +106,11 @@ enum Action {
     Jobs {
         #[command(subcommand)]
         command: JobsAction,
+    },
+    /// Review nightly Dreams proposals and apply an approved one. Local to the coordinator.
+    Dreams {
+        #[command(subcommand)]
+        command: dreams_cli::DreamsAction,
     },
     /// Show shared settings and registered machines.
     Nodes,
@@ -577,6 +583,16 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string(&preview)?);
             }
             return Ok(());
+        }
+        Action::Dreams { command } => {
+            let config = config::load(arguments.config.as_deref())?;
+            return dreams_cli::run(
+                &state::directory(arguments.state_dir.clone())?,
+                &config,
+                arguments.json,
+                command,
+            )
+            .await;
         }
         Action::Mail { command } => {
             match command {

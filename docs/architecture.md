@@ -693,6 +693,56 @@ authority.
 An unrestricted same-user shell can bypass a CLI allowlist, so prove that
 separation before enabling activation. Learning cannot grant new permissions.
 
+Dreams implements this for one target repository. The separation it proves is
+narrow: the actor that reads untrusted nightly evidence holds no shell and no
+channel to an actor that holds one. Tests cover each link.
+
+- `TaskStore.runActor` gives the task of the job `dreams` exactly
+  `dreams_review`, `dreams_propose` and `dreams_abstain` on every path.
+- Only the scheduler delivers that task's input. `TaskStore` refuses every
+  other route before it saves the input and before any model call: a steer or
+  follow-up from `delegate_task`, `message_task`, a native client's input,
+  worker input, a terminal that attaches and a child agent. The text the
+  scheduler delivers is the job file's prompt. Any connected client can change
+  that definition with `jobs sync`, as any same-user process can edit the file.
+- The actor consumes only scheduler input, and only in a conversation that was
+  created confined. It withdraws any other saved input unrun. A task that
+  carried the job id `dreams` before an upgrade never runs: its queued input
+  is withdrawn, its history stays readable by id, and the scheduler runs Dreams
+  in a new task, so no earlier turn or tool schema reaches a Dreams request.
+- Only the scheduler writes to that task. `record_task`, a new source link
+  from `link_source_events` and a model or reasoning change are refused. The
+  model comes from the job file.
+- The same confinement withholds hosted provider tools, web search included,
+  from every request of that conversation on the `openai` and `openai-codex`
+  providers. The record is durable and is never removed, so a turn that resumes
+  after a restart is covered before any actor reconfigures it.
+- Only the scheduler creates a task that a scheduled job owns. `TaskStore`
+  refuses a `scheduled_jobs` source from any other caller, whether it creates,
+  adopts or relinks a task, and no caller can remove one. The task's outcomes
+  are recorded already dismissed, so triage never reads them.
+- Related-task retrieval, task search and history index matches skip a confined
+  task, so its model-written text enters no actor's context unasked. An explicit
+  read by id still returns it: `read_task`, `read_job`, `beep-boop tasks read`,
+  `beep-boop jobs get` and `beep-boop dreams show`.
+- The only host command those tools send has no apply, command, target or
+  policy variant. The broker runs it on the coordinator and nodes refuse it.
+- The executor reads the target repository and writes only under
+  `<state_dir>/dreams/runs/`. Its checks are the operator's programs from
+  private configuration.
+- `dreams apply` is in the `beep-boop` binary, which the coordinator library
+  cannot link. It applies only the patch whose outcome digest a human passed,
+  onto the unchanged base.
+
+Dreams does not claim more than that. The main, triage and worker actors still
+hold same-user shells, so each of them can run `beep-boop dreams apply` or edit
+the repository directly. A shell-bearing actor that reads a Dreams record reads
+untrusted text, as it does with any email or web page. A check that executes an
+editable file runs proposed content before approval, so checks must treat
+candidate files as data. Approval is a digest typed by whoever runs the
+command. The policy, the editable set and the tool list are code and private
+configuration, which no Dreams path writes.
+
 Evaluate actual retrieval and task execution against a simple baseline with the
 same model, tools and budget, including unrelated tasks and withdrawn advice.
 Measure verified outcomes, regressions, later corrections and cost; a better

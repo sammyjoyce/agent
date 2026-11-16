@@ -29,3 +29,15 @@ enabled = true
 [[sources]]
 provider = "messages"
 enabled = false
+
+# Dreams proposes reviewed edits to one private guidance repository. Keep the
+# check program outside that repository. See docs/setup.md#dreams.
+# [dreams]
+# repository = "/Users/example/context"
+# editable = ["AGENTS.md", "playbooks/*.md"]
+# window_hours = 24
+#
+# [[dreams.checks]]
+# name = "commands-exist"
+# argv = ["/bin/sh", "/Users/example/dreams-checks/commands-exist.sh"]
+# timeout_seconds = 60

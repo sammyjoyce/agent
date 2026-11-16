@@ -20,6 +20,7 @@ import type { TaskInputReceipt } from "./generated/TaskInputReceipt.js";
 import type { TaskState } from "./generated/TaskState.js";
 import type { TaskRecord } from "./generated/TaskRecord.js";
 import type { JobRunReceipt } from "./generated/JobRunReceipt.js";
+import { TASK_SUMMARY_MAX_UTF16_UNITS } from "./generated/task-limits.js";
 import { NoticeLineage, readNoticeOrigin } from "./notice_origin.js";
 import type { InputOrigin } from "./generated/InputOrigin.js";
 import type { TaskMessageSender } from "./generated/TaskMessageSender.js";
@@ -49,7 +50,7 @@ export type HostCall = (command: HostCommand) => Promise<HostResult>;
 export type SearchQuery = (query: string, sourceRefs: string[], limit: number, mode?: SearchMode) => Promise<SearchResult>;
 export function sourceReference(source: SourceRef): string { return JSON.stringify([source.provider, source.account, source.thread_id]); }
 type TaskIndex = { tasks: TaskRecord[] };
-type TaskCreate = { id?: string; title: string; outcome: string; sources?: SourceRef[]; model?: ModelSelection; scheduled_run?: JobRunReceipt };
+type TaskCreate = { id?: string; title: string; outcome: string; sources?: SourceRef[]; job_id?: string; model?: ModelSelection; scheduled_run?: JobRunReceipt };
 type WorkerInput = Extract<RuntimeCommand, { type: "run_task" }>;
 type ActorRef = { task_id: string; agent_id?: string };
 export type ActorMode = "job" | "interactive";
@@ -61,6 +62,11 @@ export type ActorExecution = {
   call(command: HostCommand, host: WorkerHost, signal: AbortSignal): Promise<HostResult>;
   prepare?(model: ModelSelection): Promise<void>;
 };
+export function isJobTask(task: Pick<TaskRecord, "sources">, jobId?: string): boolean {
+  return task.sources.some((source) => source.provider === "scheduled_jobs" && source.account === "local" &&
+    (jobId === undefined || source.thread_id === jobId));
+}
+export type ActorConfinement = (task: Pick<TaskRecord, "sources">) => readonly Extension[] | undefined;
 /** A terminal's view of its actor. Its signal ends the observation only, never the actor's work. */
 export type WorkerSession = {
   signal: AbortSignal;
@@ -94,6 +100,12 @@ type TaskActor = { readonly ref: ActorRef; readonly mode: ActorMode; readonly ex
   readonly bound: Promise<void>; started(): void; readonly exit: Promise<ActorAnswer>; wake?: () => void; drained?: () => void };
 type ActorPlacement = { type: "placed"; host: WorkerHost } | { type: "host_at_start" } | { type: "unplaced" | "host_offline"; reason: string };
 function isAbortedJob(actor: TaskActor): boolean { return actor.mode === "job" && actor.turn.controller.signal.aborted; }
+const CONFINED_ACTOR_ONLY = "A confined task runs only its scheduler's input, as coordinator background work without agents or terminals";
+const PREDATES_CONFINEMENT = "This task held work before Dreams reserved its job id; it does not run, and a new task runs Dreams";
+const CONFINED_SCHEDULER_WRITES = "Only the scheduler writes to a confined task";
+function refuseScheduledJobSources(sources: readonly SourceRef[]): void {
+  if (sources.some((source) => source.provider === "scheduled_jobs")) throw new TaskError("Scheduled job ownership is assigned only by the scheduler");
+}
 const STOPPED_INPUT_WITHDRAWN = "The stopped turn withdrew this input; submit it again to continue.";
 function recordedHostId(worker: Exclude<WorkerState, { state: "unassigned" }>): string | null {
   return worker.host.host_id ?? ("binding" in worker ? worker.binding.host_id : null);
@@ -107,6 +119,8 @@ const SourceOwners = defineDocFamily<{ ids: string[] }, null>({ kind: "agent.tas
   initial: () => ({ ids: [] }), checkpointWhen: () => false });
 const ConversationOwner = defineDocFamily<{ task_id: string | null; agent_id: string | null }, null>({ kind: "agent.task.owners", scope: "session", family: true, version: 1,
   initial: () => ({ task_id: null, agent_id: null }), checkpointWhen: () => true });
+const ConfinedConversation = defineDocFamily<{ confined: boolean }, null>({ kind: "agent.task.confined", scope: "session", family: true, version: 1,
+  initial: () => ({ confined: false }), checkpointWhen: () => true });
 function conversationIdentity(value: unknown): value is ConversationId {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
@@ -222,6 +236,7 @@ export class TaskStore {
   private attachments: AttachmentStore | undefined;
   private execution: ActorExecution | undefined;
   private goals: GoalPolicy | undefined;
+  private confinement: ActorConfinement = () => undefined;
   constructor(readonly session: Harness, readonly inference = new ConversationModels()) { inference.bind(session); }
   async prepare(): Promise<void> {
     await this.recordsStore.prepare(this.session, async () => (await this.session.snapshot(Tasks, BACKGROUND_CONTEXT))?.tasks ?? [], task => task.id,
@@ -260,9 +275,19 @@ export class TaskStore {
   useHistory(history: HistoryStore): void { this.histories = history; }
   useAttachments(attachments: AttachmentStore): void { this.attachments = attachments; }
   useActorExecution(execution: ActorExecution): void { this.execution = execution; }
-  isBackgroundTask(task: TaskRecord): boolean {
-    return task.sources.some((source) => source.provider === "scheduled_jobs" && source.account === "local");
+  useConfinement(rule: ActorConfinement): void { this.confinement = rule; }
+  isConfined(task: Pick<TaskRecord, "sources">): boolean { return this.confinement(task) !== undefined; }
+  async predatesConfinementIn(tx: Tx, id: string): Promise<boolean> {
+    const task = await this.taskIn(tx, id);
+    return task !== undefined && this.isConfined(task) && !(await tx.doc(ConfinedConversation, task.conversation_id, null)).confined;
   }
+  refuseConfinedWrite(task: Pick<TaskRecord, "sources">): void {
+    if (this.isConfined(task)) throw new TaskError(CONFINED_SCHEDULER_WRITES);
+  }
+  private requireSchedulerAdmission(task: Pick<TaskRecord, "sources">, scheduled?: ScheduledOccurrence): void {
+    if (this.isConfined(task) && scheduled === undefined) throw new TaskError(CONFINED_ACTOR_ONLY);
+  }
+  isBackgroundTask(task: TaskRecord): boolean { return isJobTask(task); }
   private async backgroundHost(task: TaskRecord, agentId?: string): Promise<WorkerHost> {
     if (this.environment === undefined) throw new TaskError("The coordinator execution environment is unavailable");
     const actor = this.actor(task, agentId);
@@ -553,6 +578,7 @@ export class TaskStore {
       const task = await this.taskIn(tx, id);
       this.assertSource(provenance.conversation_id);
       if (task === undefined) throw new TaskError("Unknown task");
+      this.refuseConfinedWrite(task);
       task.agents ??= [];
       let reconciliation: TaskInputReconciliation | undefined;
       if (input.reconciles_input !== undefined) {
@@ -585,7 +611,7 @@ export class TaskStore {
       if (input.remove_sources !== undefined && input.remove_sources.length > 0) {
         await this.outcomes?.assertSourceRemovalIn(tx, id, input.remove_sources);
       }
-      task.summary = input.summary.slice(-4000); task.state = state; task.updated_at = Date.now();
+      task.summary = input.summary.slice(-TASK_SUMMARY_MAX_UTF16_UNITS); task.state = state; task.updated_at = Date.now();
       await this.relinkSourcesIn(tx, id, input.sources ?? [], input.remove_sources ?? []);
       const outcome = this.outcome(task, provenance.conversation_id, origin.id.toString(), provenance.call_id);
       if (reconciliation !== undefined) outcome.reconciliation = reconciliation;
@@ -778,6 +804,7 @@ export class TaskStore {
     const tokens = (key(query).match(/[\p{L}\p{N}]+/gu) ?? []).filter((token) => token.length > 1 && !stop.includes(token));
     const scored: { task: TaskRecord; score: number }[] = [];
     for (const task of await this.list()) {
+      if (this.isConfined(task)) continue;
       const sourceMatch = sources.some((source) =>
         (source.provider === "task_outcomes" && source.account === "local" && source.thread_id === task.id) ||
         task.sources.some((saved) => related(saved, source)));
@@ -807,6 +834,7 @@ export class TaskStore {
     };
     for (const [rank, candidate] of indexed.candidates.entries()) {
       const task = tasks.find((task) => task.conversation_id === candidate.conversation_id || task.agents.some((agent) => agent.conversation_id === candidate.conversation_id));
+      if (task !== undefined && this.isConfined(task)) continue;
       const imported = await this.histories?.byConversation(candidate.conversation_id) ?? null;
       add({ conversation_id: candidate.conversation_id, title: task?.title ?? imported?.thread.title ?? "Main conversation",
         excerpt: candidate.matches.map((match) => match.text).join("\n").slice(0, 24_000), score: candidate.score,
@@ -830,6 +858,7 @@ export class TaskStore {
       .slice(0, Math.min(20, Math.max(1, limit))), gaps: indexed.gaps };
   }
   async adopt(conversationId: string, input: { id: string; title?: string; outcome: string; evidence: string; model: ModelSelection; sources?: SourceRef[] }): Promise<TaskRecord> {
+    refuseScheduledJobSources(input.sources ?? []);
     await this.prepare();
     const imported = await this.histories?.byConversation(conversationId);
     if (imported === undefined || this.histories === undefined) throw new TaskError("Only an imported historical conversation can be adopted");
@@ -890,13 +919,16 @@ export class TaskStore {
   async createIn(tx: Tx, input: TaskCreate): Promise<{ id: TaskRecord["id"]; native?: ConversationId }> {
     const id = input.id ?? randomUUID();
     if (input.title.trim().length === 0 || input.outcome.trim().length === 0) throw new TaskError("Task title and outcome are required");
+    refuseScheduledJobSources(input.sources ?? []);
+    const sources = [...input.sources ?? [], ...input.job_id === undefined ? [] : [{ provider: "scheduled_jobs", account: "local", thread_id: input.job_id }]];
     const previous = await this.taskIn(tx, id);
     if (previous !== undefined) return { id: previous.id };
     const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
     const task: TaskRecord = { id, model: input.model ?? null, conversation_id: conversation.id.toString(), title: input.title.trim(), outcome: input.outcome.trim(),
-      summary: "", state: { state: "open" }, worker: { state: "unassigned" }, sources: input.sources ?? [], pending: [], agents: [], updated_at: Date.now(),
+      summary: "", state: { state: "open" }, worker: { state: "unassigned" }, sources, pending: [], agents: [], updated_at: Date.now(),
       ...(input.scheduled_run === undefined ? {} : { scheduled_run: input.scheduled_run }) };
     const { value: saved } = await this.recordsStore.insertIn(tx, id, task); await this.indexTaskIn(tx, saved);
+    if (this.isConfined(task)) (await tx.doc(ConfinedConversation, task.conversation_id, null)).confined = true;
     return { id, native: conversation.id };
   }
   async create(input: TaskCreate): Promise<TaskRecord> {
@@ -931,6 +963,8 @@ export class TaskStore {
     const removed = task.sources.filter((source) => remove.some((other) => related(other, source)))
       .map((source) => ({ ...source }));
     if (added.length === 0 && removed.length === 0) return;
+    refuseScheduledJobSources([...added, ...removed]);
+    if (added.length > 0) this.refuseConfinedWrite(task);
     const sources = task.sources.filter((source) => !removed.some((other) => related(other, source))).map((source) => ({ ...source }));
     task.sources = [...sources, ...added]; task.updated_at = Date.now();
     await this.indexTaskIn(tx, task, [...sources, ...removed]);
@@ -988,6 +1022,8 @@ export class TaskStore {
   }
   private async enqueueActor(id: string, content: string, inputId: string, agentId?: string, delivered?: TaskOutcome, mode?: InputMode, attachments?: AttachmentRef[], scheduled?: ScheduledOccurrence, origin?: InputOrigin, sender?: TaskMessageSender): Promise<TaskRecord> {
     validateInput(content, attachments);
+    const owner = await this.get(id);
+    this.requireSchedulerAdmission(owner, scheduled);
     const store = this.attachments;
     if (attachments !== undefined && attachments.length > 0) {
       if (store === undefined) throw new TaskError("Attachment storage is unavailable");
@@ -997,7 +1033,7 @@ export class TaskStore {
       ...(attachments === undefined ? {} : { attachments }),
       ...(scheduled === undefined ? {} : { scheduled }), ...(origin === undefined ? {} : { origin }),
       ...(sender === undefined ? {} : { sender }) };
-    queuedInput(this.actor(await this.get(id), agentId), input);
+    queuedInput(this.actor(owner, agentId), input);
     const active = this.running.get(this.actorKey(id, agentId));
     if (active !== undefined) active.admissions += 1;
     try {
@@ -1051,7 +1087,9 @@ export class TaskStore {
     // The outbox is committed first. A crash between these commits retries
     // the same native request ID instead of injecting the input twice.
     try {
-      const queued = this.actor(await this.get(active.ref.task_id), active.ref.agent_id).pending;
+      const task = await this.get(active.ref.task_id);
+      if (this.isConfined(task)) return;
+      const queued = this.actor(task, active.ref.agent_id).pending;
       let scheduled = false;
       for (const input of queued) {
         // Scheduled turns and later follow-ups wait for their captured
@@ -1066,6 +1104,7 @@ export class TaskStore {
     } catch { /* The durable outbox still owns admission through this actor. */ }
   }
   async createAgent(taskId: string, input: { id: string; title: string; outcome: string; input: string; inputId: string; model?: ModelSelection; attachments?: AttachmentRef[] }): Promise<TaskAgentRecord> {
+    this.requireSchedulerAdmission(await this.get(taskId));
     if (input.title.trim().length === 0 || input.title.length > 80 || input.outcome.trim().length === 0 ||
         input.outcome.length > 4000) {
       throw new TaskError("An agent needs a title, bounded outcome, and instruction");
@@ -1246,7 +1285,7 @@ export class TaskStore {
   private async reportAgentIn(tx: Tx, task: TaskRecord, agent: TaskAgentRecord, summary: string, failure?: string,
     origin?: { entry_id: string; call_id: string | null }): Promise<void> {
     this.assertSource(agent.conversation_id);
-    agent.summary = summary.slice(-4000);
+    agent.summary = summary.slice(-TASK_SUMMARY_MAX_UTF16_UNITS);
     agent.state = failure === undefined ? { state: "done" } : { state: "failed", reason: failure };
     agent.updated_at = Date.now(); task.updated_at = Date.now();
     const outcome: TaskOutcome = { ...this.outcome(task, agent.conversation_id, origin?.entry_id ?? null,
@@ -1427,7 +1466,7 @@ export class TaskStore {
       await this.updateIn(tx, id, (task) => {
         this.assertSource(conversationId);
         // A silent final answer must not erase recorded progress or a handoff.
-        if (answer.trim().length > 0) task.summary = answer.slice(-4000);
+        if (answer.trim().length > 0) task.summary = answer.slice(-TASK_SUMMARY_MAX_UTF16_UNITS);
         outcome = this.outcome(task, conversationId, entryId, null);
       });
       if (outcome !== undefined) await this.outcomes?.recordIn(tx, outcome, false);
@@ -1621,6 +1660,7 @@ export class TaskStore {
     const ref: ActorRef = { task_id: input.task_id, ...(input.agent_id === undefined ? {} : { agent_id: input.agent_id }) };
     const key = this.actorKey(ref.task_id, ref.agent_id);
     if (observer === undefined && (this.running.get(key)?.phase ?? "closing") !== "closing") throw new TaskError("This task already has an attached worker");
+    this.requireSchedulerAdmission(await this.get(input.task_id));
     const { task, worker } = await this.confirmBinding(input, call);
     const record = this.actor(task, ref.agent_id);
     const attached: ActorObserver | undefined = observer === undefined ? undefined
@@ -1679,7 +1719,16 @@ export class TaskStore {
     try {
       let task = await this.get(input.task_id);
       let actor = this.actor(task, input.agent_id);
+      const confined = this.confinement(task);
+      if (confined !== undefined && (active.mode !== "job" || input.agent_id !== undefined)) throw new TaskError(CONFINED_ACTOR_ONLY);
+      const extensions = () => confined ?? execution.extensions(input.agent_id);
       const conversation = await this.conversation(actor.conversation_id);
+      if (confined !== undefined && await this.session.commit((tx) => this.predatesConfinementIn(tx, input.task_id), BACKGROUND_CONTEXT)) {
+        await conversation.abort(BACKGROUND_CONTEXT);
+        await this.session.commit((tx) => this.withdrawIn(tx, input.task_id, input.agent_id, () => true), BACKGROUND_CONTEXT);
+        throw new TaskError(PREDATES_CONFINEMENT);
+      }
+      if (confined !== undefined) await this.inference.withholdHostedTools(conversation);
       if (active.mode === "job") active.conversation = conversation;
       if (isAbortedJob(active)) throw new TaskError("Background execution stopped; its native input is retained");
       let executionHost = active.host ?? await this.backgroundHost(task, input.agent_id);
@@ -1708,7 +1757,7 @@ export class TaskStore {
             : "\nComplete this bounded assignment and return the final evidence. Use report_result for an explicit failure or a structured report. The parent owns the overall task.");
       const initial = {
         instructions: await instructions(bootstrap?.job.prompt ?? actor.outcome),
-        cwd: executionHost.cwd, extensions: execution.extensions(input.agent_id),
+        cwd: executionHost.cwd, extensions: extensions(),
       };
       if (bootstrap === undefined) selected = await this.inference.configureCurrent(conversation, selected, initial);
       else await this.inference.configure(conversation, selected, initial);
@@ -1761,9 +1810,9 @@ export class TaskStore {
                 break;
               }
             }
-            if (answer.trim().length > 0 && actor.summary !== answer.slice(-4000)) {
+            if (answer.trim().length > 0 && actor.summary !== answer.slice(-TASK_SUMMARY_MAX_UTF16_UNITS)) {
               task = await this.update(task.id, (current) => {
-                this.assertSource(conversation.id.toString()); this.actor(current, input.agent_id).summary = answer.slice(-4000);
+                this.assertSource(conversation.id.toString()); this.actor(current, input.agent_id).summary = answer.slice(-TASK_SUMMARY_MAX_UTF16_UNITS);
               });
             }
           }
@@ -1785,6 +1834,11 @@ export class TaskStore {
           delete active.wake;
           continue;
         }
+        if (confined !== undefined && next.scheduled === undefined && (await this.session.commit((tx) =>
+          this.withdrawIn(tx, input.task_id, input.agent_id, (queued) => queued.id === next.id), BACKGROUND_CONTEXT)).length > 0) {
+          this.publish(active, (session) => session.rejected?.(next.id, CONFINED_ACTOR_ONLY));
+          continue;
+        }
         const previousAnswer = answer, previousEntry = answerEntry;
         answer = ""; answerEntry = undefined;
         recoverPrevious = false;
@@ -1800,7 +1854,7 @@ export class TaskStore {
           await conversation.waitForIdle(BACKGROUND_CONTEXT);
           await execution.prepare?.(job.model);
           if (isAbortedJob(active)) break;
-          await this.inference.configure(conversation, job.model, { instructions: await instructions(job.prompt), cwd: job.cwd, extensions: execution.extensions(input.agent_id) });
+          await this.inference.configure(conversation, job.model, { instructions: await instructions(job.prompt), cwd: job.cwd, extensions: extensions() });
           await this.session.commit(async (tx) => {
             (await tx.doc(NoticeLineage, conversation.id)).origin = readNoticeOrigin({ job_id: job.id, title: job.title }) ?? null;
             await this.updateIn(tx, task.id, (current) => {
@@ -1872,7 +1926,7 @@ export class TaskStore {
         task = await this.update(task.id, (current) => {
           this.assertSource(conversation.id.toString());
           const currentActor = this.actor(current, input.agent_id);
-          if (answer.trim().length > 0 && (input.agent_id === undefined || currentActor.state.state === "open")) currentActor.summary = answer.slice(-4000);
+          if (answer.trim().length > 0 && (input.agent_id === undefined || currentActor.state.state === "open")) currentActor.summary = answer.slice(-TASK_SUMMARY_MAX_UTF16_UNITS);
         });
         active.answer = { conversation_id: conversation.id.toString(), text: answer, ...(entry === undefined ? {} : { entry_id: entry.id.toString() }) };
         this.publish(active, (session) => session.answer(conversation.id.toString(), answer, entry?.id.toString()));

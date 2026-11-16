@@ -44,7 +44,7 @@ export async function runScheduled(occurrence: ScheduledOccurrence, signal: Abor
   const { session, tasks, sources } = services;
   const task = await tasks.create({ id, title: occurrence.job.title,
     outcome: occurrence.job.prompt, model: occurrence.job.model,
-    sources: [{ provider: "scheduled_jobs", account: "local", thread_id: occurrence.job.id }] });
+    job_id: occurrence.job.id });
   const conversation = await tasks.conversation(task.conversation_id);
   let submission = await session.commit((tx) => tx.submissionByRequest(conversation.id, occurrence.id), BACKGROUND_CONTEXT);
   if (submission?.status === "done") return;

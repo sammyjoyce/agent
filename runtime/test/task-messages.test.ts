@@ -85,7 +85,7 @@ test("peer messages retain their sender through native steering and reopening wi
   const noHost: HostCall = async command => assert.fail(`Coordination must not launch host effects: ${command.type}`);
   try {
     const owner = await app.tasks.create({ title: "Delivery job", outcome: "Save and verify the existing delivery records.",
-      model: DEFAULT_MODEL, sources: [{ provider: "scheduled_jobs", account: "local", thread_id: "delivery-review" }] });
+      model: DEFAULT_MODEL, job_id: "delivery-review" });
     const sender = await app.tasks.create({ title: "Morning review", outcome: "Review useful changes.", model: DEFAULT_MODEL });
     const host: WorkerHost = { host_id: binding.host_id, name: "fixture", rex_server: null, coordinator: null,
       agent_program: process.execPath, cwd: directory };

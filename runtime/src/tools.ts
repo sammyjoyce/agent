@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { MAX_ATTACHMENTS } from "./generated/attachment-limits.js";
+import { DREAMS_HOST_TIMEOUT_MS } from "./generated/dreams-limits.js";
 import { awaitWithContext, BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import { Type } from "typebox";
 import { Check } from "typebox/value";
@@ -122,6 +123,7 @@ export class HostRequests {
         : operation.type === "browser" ? 170_000
         : operation.type === "background" && operation.request.type === "poll_sources" ? 930_000
         : operation.type === "history" ? 930_000 : operation.type === "embed" ? 330_000
+        : operation.type === "dreams" ? DREAMS_HOST_TIMEOUT_MS
         : operation.type.startsWith("resource_") ? 310_000 : 30_000;
       const timer = setTimeout(() => {
         this.pending.delete(call); dispose();
