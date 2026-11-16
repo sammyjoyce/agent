@@ -613,6 +613,15 @@ mod tests {
     }
 
     #[test]
+    fn an_even_pair_count_gates_the_upper_middle_fraction() {
+        let observations = paired(&[100.0; 4], &[100.0, 100.0, 150.0, 150.0]);
+        for result in comparisons(Scenario::value_variants(), &observations).unwrap() {
+            assert_eq!(result.paired_budget_median, 150.0 / 125.0);
+            assert!(!result.passed, "{:?} {:?}", result.scenario, result.gate);
+        }
+    }
+
+    #[test]
     fn paired_gate_preserves_relative_and_absolute_budget_boundaries() {
         for (baseline, candidate, passed) in [
             (100.0, 125.0, true),

@@ -333,17 +333,21 @@ pub async fn drive(scenario: Scenario, context: &Context<'_>) -> Result<Outcome>
                 } = terminal.press(ESC, vec![Sight::Stopped]).await?;
                 marks.record(Mark::Esc, esc)?;
                 marks.record(Mark::InterruptedVisible, seen.next().await?)?;
-                let alive = unsafe { libc::kill(tool, 0) };
-                let error = std::io::Error::last_os_error();
-                ensure!(
-                    alive != 0 && error.raw_os_error() == Some(libc::ESRCH),
-                    "Tool process {tool} was not reaped when Interrupted became visible ({error})"
-                );
-                Ok(())
+                ensure_reaped(tool)
             })
             .await
         }
     }
+}
+
+fn ensure_reaped(tool: i32) -> Result<()> {
+    let alive = unsafe { libc::kill(tool, 0) };
+    let error = std::io::Error::last_os_error();
+    ensure!(
+        alive != 0 && error.raw_os_error() == Some(libc::ESRCH),
+        "Tool process {tool} was not reaped when Interrupted became visible ({error})"
+    );
+    Ok(())
 }
 
 pub fn verify(scenario: Scenario, outcome: &Outcome, requests: &[Request]) -> Result<()> {
@@ -409,7 +413,171 @@ pub fn verify(scenario: Scenario, outcome: &Outcome, requests: &[Request]) -> Re
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use super::*;
+    use crate::{
+        coordinator::Tokens,
+        gate::{Hold, HoldKind, Marks, span},
+        session::Anchor,
+    };
+
+    const FIRST_TURN_ARRIVES_MS: u64 = 10;
+    const WINDOW_OPENS_MS: u64 = 100;
+    const LATER_TURNS_ARRIVE_MS: u64 = 150;
+    const ANSWER_TOKENS: u64 = 17;
+
+    fn ms(milliseconds: u64) -> Duration {
+        Duration::from_millis(milliseconds)
+    }
+
+    fn outcome(origin: Instant, marks: Marks, recorded_tokens: u64) -> Outcome {
+        Outcome {
+            origin,
+            opened: Anchor {
+                wall: SystemTime::now(),
+                monotonic: origin + ms(WINDOW_OPENS_MS),
+            },
+            marks,
+            processes: Vec::new(),
+            tokens: Some(Tokens {
+                total: recorded_tokens,
+                ..Tokens::default()
+            }),
+            screen: String::new(),
+            received_bytes: 1,
+        }
+    }
+
+    fn requests(scenario: Scenario, origin: Instant) -> Vec<Request> {
+        scenario
+            .definition()
+            .turns
+            .iter()
+            .enumerate()
+            .map(|(index, turn)| {
+                let received = origin
+                    + ms(if index == 0 {
+                        FIRST_TURN_ARRIVES_MS
+                    } else {
+                        LATER_TURNS_ARRIVE_MS
+                    });
+                Request {
+                    turn: Some(turn),
+                    body_bytes: 1,
+                    received,
+                    first_chunk: None,
+                    holds: Vec::new(),
+                    end: Some(match turn.ending {
+                        Ending::Hang => End::ClosedByClient {
+                            at: received + ms(70),
+                        },
+                        Ending::Answer { .. } | Ending::Exec { .. } => End::Completed {
+                            at: received + ms(5),
+                            total_tokens: ANSWER_TOKENS,
+                        },
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_provider_request_after_esc_fails_verification() {
+        let origin = Instant::now();
+        let requests = requests(Scenario::StopStream, origin);
+        let esc_at = |milliseconds| {
+            let mut marks = Marks::default();
+            marks.record(Mark::Esc, origin + ms(milliseconds)).unwrap();
+            outcome(origin, marks, 0)
+        };
+        assert!(
+            verify(
+                Scenario::StopStream,
+                &esc_at(LATER_TURNS_ARRIVE_MS + 10),
+                &requests
+            )
+            .is_ok()
+        );
+        assert!(
+            verify(
+                Scenario::StopStream,
+                &esc_at(LATER_TURNS_ARRIVE_MS - 10),
+                &requests
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn the_token_ledger_must_match_responses_completed_after_the_window_opens() {
+        let origin = Instant::now();
+        let requests = requests(Scenario::Submit, origin);
+        let verified = |recorded| {
+            verify(
+                Scenario::Submit,
+                &outcome(origin, Marks::default(), recorded),
+                &requests,
+            )
+        };
+        assert!(verified(ANSWER_TOKENS).is_ok());
+        for recorded in [0, ANSWER_TOKENS - 1, ANSWER_TOKENS + 1, 2 * ANSWER_TOKENS] {
+            assert!(verified(recorded).is_err(), "{recorded} tokens");
+        }
+    }
+
+    #[test]
+    fn production_gates_that_must_not_wait_on_the_model_subtract_no_hold() {
+        let origin = Instant::now();
+        let holds = [
+            Hold {
+                kind: HoldKind::FirstChunk,
+                from: origin + ms(10),
+                to: origin + ms(60),
+            },
+            Hold {
+                kind: HoldKind::Tail,
+                from: origin + ms(60),
+                to: origin + ms(90),
+            },
+        ];
+        let mut checked = 0;
+        for scenario in Scenario::value_variants() {
+            for definition in scenario.gates() {
+                match definition.gate {
+                    Gate::ConversationVisible
+                    | Gate::Admission
+                    | Gate::SteerAdmission
+                    | Gate::Stop => {}
+                    Gate::FirstActivity | Gate::SteerReply => continue,
+                }
+                let mut marks = Marks::default();
+                marks.record(definition.from, origin).unwrap();
+                marks.record(definition.to, origin + ms(100)).unwrap();
+                let measured = span(definition, &marks, &holds).unwrap();
+                assert_eq!(
+                    measured.application_ms, 100.0,
+                    "{scenario:?} {:?}",
+                    definition.gate
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
+    }
+
+    #[test]
+    fn a_tool_still_alive_when_interrupted_is_visible_fails_the_sample() {
+        let mut tool = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(tool.id()).unwrap();
+        assert!(ensure_reaped(pid).is_err());
+        tool.kill().unwrap();
+        tool.wait().unwrap();
+        assert!(ensure_reaped(pid).is_ok());
+    }
 
     #[test]
     fn every_scenario_has_unique_gates_prompts_and_unambiguous_text() {
