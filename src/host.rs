@@ -43,6 +43,27 @@ pub(crate) struct ProcessOutput {
     pub truncated: bool,
 }
 
+/// How a process stopped. `ProcessOutput::exit_code` reports 124 for a timeout
+/// and 143 for a cancellation, which a program can also exit with by itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProcessEnding {
+    Exited,
+    TimedOut,
+    Cancelled,
+}
+
+/// Resolves once the flag is set. A dropped sender never cancels.
+pub(crate) async fn until_cancelled(mut cancelled: tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *cancelled.borrow_and_update() {
+            return;
+        }
+        if cancelled.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 impl From<ProcessOutput> for HostResult {
     fn from(output: ProcessOutput) -> Self {
         Self::Process {
@@ -297,18 +318,9 @@ impl Executor {
                 )?
                 .with_sender_conversation(sender_conversation_id.as_deref());
                 Ok::<_, anyhow::Error>(
-                    run_process_until(request, async move {
-                        loop {
-                            if *cancelled.borrow_and_update() {
-                                break;
-                            }
-                            if cancelled.changed().await.is_err() {
-                                std::future::pending::<()>().await;
-                            }
-                        }
-                    })
-                    .await?
-                    .into(),
+                    run_process_until(request, until_cancelled(cancelled))
+                        .await?
+                        .into(),
                 )
             }
             .await;
@@ -927,6 +939,15 @@ pub(crate) async fn run_process_until(
     request: ProcessRequest<'_>,
     cancelled: impl Future<Output = ()>,
 ) -> std::result::Result<ProcessOutput, ProcessFailure> {
+    run_process_ending(request, cancelled)
+        .await
+        .map(|(output, _)| output)
+}
+
+pub(crate) async fn run_process_ending(
+    request: ProcessRequest<'_>,
+    cancelled: impl Future<Output = ()>,
+) -> std::result::Result<(ProcessOutput, ProcessEnding), ProcessFailure> {
     let ProcessRequest {
         program,
         args,
@@ -1000,26 +1021,29 @@ pub(crate) async fn run_process_until(
             }
         };
         let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
-        let exit_code = match finished {
+        let (exit_code, ending) = match finished {
             Some(Ok(result)) => {
                 result?;
-                status.code().unwrap_or(128)
+                (status.code().unwrap_or(128), ProcessEnding::Exited)
             }
             Some(Err(_)) => {
                 stderr.push_str("\nCommand timed out and its process group was stopped.");
-                124
+                (124, ProcessEnding::TimedOut)
             }
             None => {
                 stderr.push_str("\nCommand cancelled and its process group was stopped.");
-                143
+                (143, ProcessEnding::Cancelled)
             }
         };
-        Ok(ProcessOutput {
-            exit_code,
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr,
-            truncated: out_cut || err_cut,
-        })
+        Ok((
+            ProcessOutput {
+                exit_code,
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr,
+                truncated: out_cut || err_cut,
+            },
+            ending,
+        ))
     }
     .await;
     result.map_err(ProcessFailure::OutcomeUncertain)

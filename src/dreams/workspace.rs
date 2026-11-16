@@ -16,7 +16,10 @@ use crate::{
         CheckResult, ContentDigest, Revision,
         policy::{CheckSpec, EditablePath},
     },
-    host::{ProcessFailure, ProcessOutput, ProcessRequest, run_process_until},
+    host::{
+        ProcessEnding, ProcessFailure, ProcessOutput, ProcessRequest, run_process_ending,
+        run_process_until, until_cancelled,
+    },
 };
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -188,7 +191,6 @@ pub(crate) async fn run_checks(
             .argv
             .split_first()
             .context("A Dreams check has no program")?;
-        let mut stop = cancelled.clone();
         let started = Instant::now();
         let finished = match ProcessRequest::new(
             program,
@@ -198,16 +200,10 @@ pub(crate) async fn run_checks(
             CHECK_OUTPUT_BYTES,
         ) {
             Ok(request) => {
-                run_process_until(request.with_only_environment(&environment), async move {
-                    loop {
-                        if *stop.borrow_and_update() {
-                            break;
-                        }
-                        if stop.changed().await.is_err() {
-                            std::future::pending::<()>().await;
-                        }
-                    }
-                })
+                run_process_ending(
+                    request.with_only_environment(&environment),
+                    until_cancelled(cancelled.clone()),
+                )
                 .await
             }
             Err(error) => Err(error),
@@ -224,11 +220,11 @@ pub(crate) async fn run_checks(
             truncated,
         };
         results.push(match finished {
-            Ok(output) => {
-                if *cancelled.borrow() {
-                    bail!("Dreams stopped while check {} was running", check.name);
-                }
-                let timed_out = output.exit_code == 124 && started.elapsed() >= check.timeout;
+            Ok((_, ProcessEnding::Cancelled)) => {
+                bail!("Dreams stopped while check {} was running", check.name)
+            }
+            Ok((output, ending)) => {
+                let timed_out = ending == ProcessEnding::TimedOut;
                 result(
                     (!timed_out).then_some(output.exit_code),
                     timed_out,
