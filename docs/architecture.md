@@ -313,6 +313,20 @@ and `tasks read` remain the record of what exists. A snapshot holds at most
 larger than 1 MiB fails that request. `--json` prints the typed event. A live
 watch, the TUI and the phone do not show the graph yet.
 
+A goal binds one objective to one task. It lives in the Pi document family
+`agent.goal`, keyed by task, and main keeps a pointer to its goal. Every goal
+transition happens inside a TaskStore commit. At the actor's idle point, a
+continuation enters the task's outbox in the same commit that counts it. Pause
+commits first, withdraws the goal's queued inputs, then aborts only the task's
+live generation through Pi, so other queued inputs stay. The worker tool
+`complete_goal` reads the file on the execution host and retains an
+`agent.goal_verification` entry. A pass completes the goal and resolves the task
+in that same commit. A failed check pins its predicate for the rest of the
+activation. `record_task` cannot resolve a goal-bound task, and the refusal is
+recorded on the goal. Controls keep their request IDs, so a replayed native
+submit changes nothing. The model picks the predicate, so a goal proves that an
+artifact exists, not that it is right.
+
 Delegate and child-agent conversations stay ownerless in Pi. Two prototypes ran
 against `runtime/test/delegate-lifetime.test.ts`, which drives the real
 `delegate_task` and `spawn_agent` tools on SQLite storage. Ownership by the

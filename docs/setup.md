@@ -132,6 +132,17 @@ Changes persist when the conversation reopens and apply to the next model
 generation. TOML supplies defaults for new work. `/help` has the accepted
 arguments; Pi validates model capabilities.
 
+`/goal <objective>` gives the current conversation one persistent objective.
+In main it starts a task on the default host. In a task view it uses that task.
+When a turn ends without a verified result, the task continues on its own, up
+to five times per activation. `/goal` shows the objective, its state and
+continuations, the task's latest summary and the last refused attempt.
+`/goal pause` stops the task's current turn and queues nothing more.
+`/goal resume` starts a new activation in the same task. A goal completes only
+when the runtime itself finds the required text in the named file on the task's
+host. Each check stays in the task's history. While a goal is open, the task
+cannot mark itself resolved. The phone accepts the same commands for main.
+
 OpenAI Responses models have hosted web search enabled, including page opening
 and find-in-page when the model supports them. The same tools apply to the main
 agent, tasks and child agents. Citations remain copyable links in saved history.
