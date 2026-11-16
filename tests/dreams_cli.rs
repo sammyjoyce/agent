@@ -70,7 +70,7 @@ impl Proposed {
         server.stop();
         let run = fixture.latest_run()["run"].as_str().unwrap().to_owned();
         let shown = fixture.dreams_json(&["show", &run]);
-        let approval = shown["review_sha256"].as_str().unwrap().to_owned();
+        let approval = shown["outcome_sha256"].as_str().unwrap().to_owned();
         Self {
             fixture,
             run,
@@ -316,7 +316,7 @@ fn list_and_show_report_each_gap_of_an_abstained_night_and_apply_refuses_it() {
         "apply",
         run,
         "--approve",
-        shown["review_sha256"].as_str().unwrap(),
+        shown["outcome_sha256"].as_str().unwrap(),
     ]);
     assert!(
         stderr.contains("Dreams run did not propose a change"),
@@ -828,7 +828,7 @@ impl Sealed {
         }
         let shown = fixture.dreams_json(&["show", &run]);
         assert_eq!(shown["outcome"]["outcome"], "proposed");
-        let approval = shown["review_sha256"].as_str().unwrap().to_owned();
+        let approval = shown["outcome_sha256"].as_str().unwrap().to_owned();
         Self {
             run,
             shown,

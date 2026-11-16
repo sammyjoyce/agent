@@ -457,7 +457,7 @@ first instant. Source polling uses elapsed intervals through the same Pi timer.
 Dreams is one scheduled job that reads the coordinator's private runtime
 receipts and task summaries each night. It proposes at most one diff to a
 private Git repository, or it abstains. A proposal changes nothing until you
-approve that exact review with `beep-boop dreams apply`.
+approve that exact outcome with `beep-boop dreams apply`.
 
 Point Dreams at a repository of guidance that your agents read, such as one of
 your `context_repositories`. Add the policy to the coordinator's private
@@ -508,19 +508,23 @@ beep-boop jobs check && beep-boop jobs sync
 beep-boop jobs run dreams
 beep-boop dreams list
 beep-boop dreams show RUN
-beep-boop dreams apply RUN --approve sha256:REVIEW_DIGEST
+beep-boop dreams apply RUN --approve sha256:OUTCOME_DIGEST
 ```
 
 `dreams list` shows each run's window, coverage, outcome and status.
 `dreams show RUN` prints the coverage gaps, the before and after check results,
 the cited evidence, the rationale, the patch, and the exact `apply` command.
-Text that a model wrote is labeled and quoted, and control characters are shown
-as escapes. Add `--json` for the typed record. These commands read the
+Text that a model wrote is labeled and quoted. Control characters and Unicode
+format characters, such as bidirectional overrides and zero-width characters,
+are shown as escapes in that text and in the patch, so the patch you read is
+the patch that `apply` commits. Add `--json` for the typed record, which keeps
+the exact bytes. These commands read the
 coordinator's state directory, so run them on the coordinator's machine.
 
-Read the patch before you approve it. The review digest is the SHA-256 of the
-sealed outcome record, which holds the patch hash, the base commit, the cited
-evidence ids and the check results. `apply` recomputes the digest and the patch
+Read the patch before you approve it. The outcome digest, which `dreams show`
+prints as `Outcome sha256`, is the SHA-256 of the exact bytes of the sealed
+`outcome.json`. That record holds the patch hash, the base commit, the changed
+files with their blob ids, the cited evidence ids and the check results. `apply` recomputes the digest and the patch
 hash and refuses with one of these messages, without changing the repository:
 
 - `Dreams approval does not match the review`

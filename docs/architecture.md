@@ -717,7 +717,7 @@ channel to an actor that holds one. Tests cover each link.
   `<state_dir>/dreams/runs/`. Its checks are the operator's programs from
   private configuration.
 - `dreams apply` is in the `beep-boop` binary, which the coordinator library
-  cannot link. It applies only the patch whose review digest a human passed,
+  cannot link. It applies only the patch whose outcome digest a human passed,
   onto the unchanged base.
 
 Dreams does not claim more than that. The main, triage and worker actors still

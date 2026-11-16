@@ -24,11 +24,11 @@ pub enum DreamsAction {
     List,
     /// Show one run: window, coverage gaps, checks, evidence, patch and how to apply it.
     Show { run: String },
-    /// Approve the exact review by its digest and apply its patch to the policy repository once.
+    /// Approve the exact sealed outcome by its digest and apply its patch to the policy repository once.
     Apply {
         run: String,
-        /// The review digest printed by `dreams show`.
-        #[arg(long, value_name = "sha256:REVIEW_DIGEST")]
+        /// The outcome digest printed by `dreams show`.
+        #[arg(long, value_name = "sha256:OUTCOME_DIGEST")]
         approve: String,
     },
 }
@@ -378,7 +378,7 @@ struct RunReport<'a> {
     review: &'a Review,
     evidence: &'a [EvidenceItem],
     outcome: Option<&'a Outcome>,
-    review_sha256: Option<&'a ContentDigest>,
+    outcome_sha256: Option<&'a ContentDigest>,
     status: Option<&'a ProposalStatus>,
     patch: Option<&'a str>,
     apply: Option<String>,
@@ -423,7 +423,7 @@ fn coverage_word(review: &Review) -> &'static str {
 }
 
 fn apply_command(view: &RunView) -> Option<String> {
-    match (&view.outcome, &view.review_sha256) {
+    match (&view.outcome, &view.outcome_sha256) {
         (Some(Outcome::Proposed(_)), Some(digest)) => Some(format!(
             "beep-boop dreams apply {} --approve {digest}",
             view.id
@@ -477,8 +477,8 @@ fn render(report: &RunReport) -> String {
             if let Some(status) = report.status {
                 lines.push(format!("Status: {}", status.explain()));
             }
-            if let Some(digest) = report.review_sha256 {
-                lines.push(format!("Review: {digest}"));
+            if let Some(digest) = report.outcome_sha256 {
+                lines.push(format!("Outcome sha256: {digest}"));
             }
             lines.push("Rationale (model-written, untrusted):".into());
             quote(&mut lines, proposal.rationale.as_str());
@@ -490,7 +490,7 @@ fn render(report: &RunReport) -> String {
             );
             lines.push("--- end of patch ---".into());
             if let Some(command) = &report.apply {
-                lines.push("Approve this exact review and apply it once:".into());
+                lines.push("Approve this exact outcome and apply it once:".into());
                 lines.push(format!("  {command}"));
             }
         }
@@ -647,7 +647,7 @@ async fn apply(
         .read(run)?
         .with_context(|| format!("Unknown Dreams run {run}"))?;
     ensure!(
-        view.review_sha256.as_ref() == Some(approval),
+        view.outcome_sha256.as_ref() == Some(approval),
         "Dreams approval does not match the review"
     );
     let Some(Outcome::Proposed(proposal)) = &view.outcome else {
@@ -748,7 +748,7 @@ pub async fn run(
                 review: &view.review,
                 evidence: &evidence,
                 outcome: view.outcome.as_ref(),
-                review_sha256: view.review_sha256.as_ref(),
+                outcome_sha256: view.outcome_sha256.as_ref(),
                 status: status.as_ref(),
                 patch: patch.as_deref(),
                 apply: apply_command(&view),
@@ -886,7 +886,7 @@ mod tests {
         let Some(agent_cli::dreams::Outcome::Proposed(proposal)) = &view.outcome else {
             panic!("The run must hold a proposal");
         };
-        let approval = view.review_sha256.clone().unwrap();
+        let approval = view.outcome_sha256.clone().unwrap();
         let patch = read_patch(&store, proposal).unwrap();
         assert!(matches!(
             inspect(&store, &policy, proposal, &patch)
@@ -913,7 +913,7 @@ mod tests {
             review: &view.review,
             evidence: &evidence,
             outcome: view.outcome.as_ref(),
-            review_sha256: view.review_sha256.as_ref(),
+            outcome_sha256: view.outcome_sha256.as_ref(),
             status: Some(&status),
             patch: Some("+new\n"),
             apply: apply_command(&view),

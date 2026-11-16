@@ -55,7 +55,8 @@ pub struct RunView {
     pub id: RunId,
     pub review: Review,
     pub outcome: Option<Outcome>,
-    pub review_sha256: Option<ContentDigest>,
+    /// sha256 of the exact `outcome.json` bytes. This is what `apply --approve` takes.
+    pub outcome_sha256: Option<ContentDigest>,
     pub attempts_used: u8,
 }
 
@@ -185,7 +186,7 @@ impl DreamsStore {
             id: run.clone(),
             review,
             outcome,
-            review_sha256: sealed.as_deref().map(ContentDigest::of),
+            outcome_sha256: sealed.as_deref().map(ContentDigest::of),
             attempts_used,
         }))
     }
@@ -429,7 +430,7 @@ mod tests {
         assert!(!second.exists(), "The losing staging directory is removed");
         let view = store.read(&run).unwrap().unwrap();
         assert_eq!(view.review.coverage.window.end_ms, 10);
-        assert!(view.outcome.is_none() && view.review_sha256.is_none());
+        assert!(view.outcome.is_none() && view.outcome_sha256.is_none());
 
         let won = store
             .seal_outcome(&run, &abstained(DreamsAbstainReason::Quiet))
@@ -443,7 +444,7 @@ mod tests {
         assert_eq!(view.outcome, Some(won));
         let bytes = fs::read(store.outcome_path(&run)).unwrap();
         assert_eq!(
-            view.review_sha256,
+            view.outcome_sha256,
             Some(crate::dreams::ContentDigest::of(&bytes))
         );
         let leftovers: Vec<_> = fs::read_dir(store.run_directory(&run))
