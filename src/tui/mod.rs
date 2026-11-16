@@ -5296,24 +5296,32 @@ mod tests {
             attachments: Some(vec![attachment.clone()]),
             ..call.clone()
         };
+        let next = HistoryMessage {
+            entry_id: "release-entry".into(),
+            tool: Some(ToolHistory {
+                call_id: "release-call".into(),
+                name: "browser_release".into(),
+                status: ToolStatus::Running,
+            }),
+            ..call.clone()
+        };
         for historical in [false, true] {
             let mut view = state();
             if historical {
                 view.event(RuntimeEventKind::History {
                     conversation_id: "saved".into(),
-                    messages: vec![call.clone(), result.clone()],
+                    messages: vec![call.clone(), result.clone(), next.clone()],
                     next_cursor: None,
                     page_complete: true,
                 });
             } else {
-                view.event(RuntimeEventKind::Message {
-                    message: call.clone(),
-                });
-                view.event(RuntimeEventKind::Message {
-                    message: result.clone(),
-                });
+                for message in [&call, &result, &next] {
+                    view.event(RuntimeEventKind::Message {
+                        message: message.clone(),
+                    });
+                }
             }
-            assert_eq!(view.messages.len(), 1, "historical={historical}");
+            assert_eq!(view.messages.len(), 2, "historical={historical}");
             assert_eq!(
                 view.messages[0]
                     .attachments
@@ -5324,9 +5332,32 @@ mod tests {
                 "historical={historical}"
             );
             let screen = rendered(&mut view, 120, 28);
-            assert!(
-                screen.contains("Attachment: browser-screenshot-invented.png · 4242 bytes"),
+            let label = "Attachment: browser-screenshot-invented.png · 4242 bytes";
+            assert_eq!(
+                screen.matches(label).count(),
+                1,
                 "historical={historical}: {screen}"
+            );
+            let rows = screen
+                .chars()
+                .collect::<Vec<_>>()
+                .chunks(120)
+                .map(|row| row.iter().collect::<String>().trim_end().to_owned())
+                .collect::<Vec<_>>();
+            let at = rows.iter().position(|row| row.contains(label)).unwrap();
+            assert_eq!(
+                rows[at - 1].trim(),
+                "└ Saved the screenshot of tab 7.",
+                "historical={historical}: the label belongs to the tool block: {rows:#?}"
+            );
+            assert_eq!(
+                rows[at + 1],
+                "",
+                "historical={historical}: the block's separator follows the label: {rows:#?}"
+            );
+            assert!(
+                rows[at + 2].contains("browser_release"),
+                "historical={historical}: {rows:#?}"
             );
         }
     }
