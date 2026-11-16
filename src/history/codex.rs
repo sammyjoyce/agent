@@ -830,6 +830,7 @@ impl CodexHistory {
                 timestamp_ms: entry.completed_at_ms.or(entry.started_at_ms),
                 data,
                 assets,
+                branch: None,
             }),
             gaps,
         ))

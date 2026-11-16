@@ -1,6 +1,6 @@
 //! Request ownership and connection controls, independent of wire transport.
 
-use crate::protocol::RuntimeCommand;
+use crate::protocol::{HostCommand, RuntimeCommand};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
@@ -14,7 +14,12 @@ pub enum RequestLifecycle {
     Once,
     Login,
     Chat,
-    Worker { interactive: bool },
+    Worker {
+        interactive: bool,
+    },
+    /// A one-shot request whose history reads belong to the requesting client, because the
+    /// export it checked is on the client's disk. Only `HostCommand::History` is delegated.
+    ClientHistory,
     View(View),
     Background,
     Coordinator,
@@ -33,6 +38,7 @@ impl RequestLifecycle {
             RuntimeCommand::ObserveMain { .. } => Self::View(View::MainObserver),
             RuntimeCommand::AttachConversation { .. } => Self::View(View::Conversation),
             RuntimeCommand::RunBackground { .. } => Self::Background,
+            RuntimeCommand::ImportChatGpt { .. } => Self::ClientHistory,
             RuntimeCommand::ConfigureCoordinator { .. }
             | RuntimeCommand::RegisterNode { .. }
             | RuntimeCommand::SetConnectedNodes { .. } => Self::Coordinator,
@@ -133,6 +139,10 @@ impl RequestLifecycle {
 
     pub fn owns_host_effects(self) -> bool {
         !self.is_worker()
+    }
+
+    pub fn serves_client_history(self, command: &HostCommand) -> bool {
+        self == Self::ClientHistory && matches!(command, HostCommand::History { .. })
     }
 
     /// Release a connection's attachment once, without revoking admitted work.

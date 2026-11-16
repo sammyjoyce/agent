@@ -542,6 +542,79 @@
         "title"
       ]
     },
+    "ChatGptPackageSummary": {
+      "description": "What the client checked, sent to the coordinator as the import's identity. Bounded and\npath-free: part names are file names only.",
+      "type": "object",
+      "properties": {
+        "archived": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "attachments": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "conversations": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "digest": {
+          "description": "Equal for a ZIP and its extracted folder. The coordinator's single-flight key.",
+          "type": "string"
+        },
+        "excluded_messages": {
+          "description": "System, developer and custom-instruction messages left out on purpose.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "missing_attachments": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "notes": {
+          "description": "Repairs and skips that lose no conversation data. Printed, never gaps.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "parts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "problems": {
+          "description": "Export data that will not be imported. Each becomes an import gap.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "shards": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "digest",
+        "parts",
+        "conversations",
+        "archived",
+        "shards",
+        "attachments",
+        "missing_attachments",
+        "excluded_messages",
+        "notes",
+        "problems"
+      ]
+    },
     "CleanupPlan": {
       "type": "object",
       "properties": {
@@ -1223,6 +1296,50 @@
         "media_type"
       ]
     },
+    "HistoryBranch": {
+      "type": "object",
+      "properties": {
+        "alternates": {
+          "description": "Sibling subtrees the source kept but did not select at this point. Nonzero only on\ncurrent items.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "follows": {
+          "description": "Version of the previous current item. A re-versioned current item therefore\nre-versions every later one, and they re-append in path order instead of\naliasing to entries that sit before it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/HistoryBranchState"
+        }
+      },
+      "required": [
+        "state",
+        "alternates"
+      ]
+    },
+    "HistoryBranchState": {
+      "oneOf": [
+        {
+          "description": "On the path from the root to the leaf the source last displayed.",
+          "type": "string",
+          "const": "current"
+        },
+        {
+          "description": "Reachable from a root, on a branch the source did not select.",
+          "type": "string",
+          "const": "alternate"
+        },
+        {
+          "description": "Unreachable from every root, as in a parent cycle.",
+          "type": "string",
+          "const": "detached"
+        }
+      ]
+    },
     "HistoryGap": {
       "type": "object",
       "properties": {
@@ -1263,6 +1380,17 @@
           "items": {
             "$ref": "#/$defs/HistoryAssetRef"
           }
+        },
+        "branch": {
+          "description": "Placement in a source's branch tree. Absent for sources without branches and for\nitems saved before branches existed; readers treat absence as shown.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HistoryBranch"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "data": true,
         "id": {
@@ -3959,6 +4087,23 @@
           "required": [
             "type",
             "hosts"
+          ]
+        },
+        {
+          "description": "Import one checked ChatGPT export. The requesting client serves every history read\nfor this request from the package it checked; the coordinator never sees a path.",
+          "type": "object",
+          "properties": {
+            "package": {
+              "$ref": "#/$defs/ChatGptPackageSummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "import_chatgpt"
+            }
+          },
+          "required": [
+            "type",
+            "package"
           ]
         },
         {
