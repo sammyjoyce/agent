@@ -805,7 +805,7 @@ Each case states an expected store, and the `store.*` checks compare the whole
 closed store with it. After the coordinator closes, a reader returns every
 task record, every source event with its decision and outcome, every
 application entry in every conversation, the set of conversations, the
-document kinds, the resources and the source streams. The checks add the
+document kinds, the goals, the resources and the source streams. The checks add the
 ledger file, its call log, the names in its directory and the bytes of its
 program. A record or a field that the expected store does not state is a
 difference, and each check lists its differences by path.
@@ -819,7 +819,7 @@ difference, and each check lists its differences by path.
 | `store.notices` | None after the newsletter or the already-handled reply. In the other cases, only notices that the tolerances below allow. |
 | `store.entries` | Two job runs in the main chat, one seeded source link per task, and one delegation that reuses Northwind per follow-up. No other application entry anywhere, no other entry in the main chat, and no entry in the decoy's conversation after seeding. |
 | `store.ledger` | The case's ledger bytes, the case's `book` and `void` calls in order, the three fixture files in the ledger's directory, and the ledger program as written. |
-| `store.inventory` | Four conversations: the main chat, triage and one per task. Only known document kinds. No resources. The outcome stream and the mailbox, both with complete coverage. |
+| `store.inventory` | Four conversations: the main chat, triage and one per task. Only known document kinds. No goal and no resources. The outcome stream and the mailbox, both with complete coverage. |
 
 These are the only differences from the expected store that pass:
 
@@ -849,6 +849,8 @@ These are the only differences from the expected store that pass:
   Northwind's outcomes and the case's own mail.
 - Ledger log lines that do not start with `book` or `void` may appear in any
   number. The fixture ledger changes nothing for them.
+- Either task may have a goal slot that holds no goal. The runtime creates
+  the slot when it checks a task for a goal.
 - The transcript is not compared. It is Pi's message and tool-result entries
   in the triage and Northwind conversations, its task rows, its submissions
   and its `pi.*` documents. The receipt checks read tool receipts from it.

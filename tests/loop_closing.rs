@@ -1218,6 +1218,7 @@ struct Readback {
     root: String,
     conversations: Vec<Conversation>,
     receipts: Vec<Receipt>,
+    goals: Vec<Value>,
     documents: Vec<String>,
 }
 
@@ -1411,10 +1412,11 @@ const DECOY_ROLE: &str = "decoy";
 const TRIAGE_ROLE: &str = "triage";
 const MAIN_ROLE: &str = "main";
 const ANY_NUMBER: RangeInclusive<usize> = 0..=usize::MAX;
-const KNOWN_DOCUMENTS: [&str; 9] = [
+const KNOWN_DOCUMENTS: [&str; 10] = [
     "agent.background",
     "agent.delegation.receipts",
     "agent.environment",
+    "agent.goal",
     "agent.models",
     "agent.notice_lineage",
     "agent.notifications",
@@ -2115,6 +2117,17 @@ impl Closed<'_> {
             .map(|state| json!({ "source": state["source"], "coverage": state["coverage"] }))
             .collect();
         streams.sort_by_key(|stream| stream["source"]["provider"].as_str().map(str::to_owned));
+        let mut goals = json!(self.saved.goals);
+        self.by_role(&mut goals);
+        let goals: Vec<&Value> = goals
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|slot| {
+                !slot["goal"].is_null()
+                    || ![json!(NORTHWIND_ROLE), json!(DECOY_ROLE)].contains(&slot["task_id"])
+            })
+            .collect();
         let complete = json!({ "status": "complete" });
         let mut out = Vec::new();
         differences(
@@ -2122,6 +2135,7 @@ impl Closed<'_> {
             &json!({
                 "conversations": [DECOY_ROLE, MAIN_ROLE, NORTHWIND_ROLE, TRIAGE_ROLE],
                 "unknown_documents": [],
+                "goals": [],
                 "resources": [],
                 "streams": [
                     { "source": { "provider": "google", "account": ACCOUNT }, "coverage": complete },
@@ -2131,6 +2145,7 @@ impl Closed<'_> {
             &json!({
                 "conversations": conversations,
                 "unknown_documents": unknown_documents,
+                "goals": goals,
                 "resources": self.saved.resources,
                 "streams": streams,
             }),
