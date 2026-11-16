@@ -1851,7 +1851,7 @@ mod tests {
     }
 
     #[test]
-    fn personal_sidecars_are_never_opened() {
+    fn personal_sidecars_are_checked_but_never_parsed() {
         let directory = tempfile::tempdir().unwrap();
         let path = Export::new()
             .conversations(&[picnic(1)])
