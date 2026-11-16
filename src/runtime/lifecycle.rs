@@ -130,8 +130,6 @@ impl RequestLifecycle {
         matches!(self, Self::Background | Self::Coordinator)
     }
 
-    /// A task terminal observes its actor and sends input. Its connection can end at any
-    /// moment, so the coordinator's service request owns every effect the actor issues.
     pub fn owns_host_effects(self) -> bool {
         !self.is_worker()
     }

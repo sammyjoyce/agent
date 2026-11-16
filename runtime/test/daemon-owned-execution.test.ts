@@ -16,7 +16,6 @@ const heldReceipt = { type: "process", exit_code: 0, stdout: "Completed the held
 
 function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
 
-/** The actor starts when the task is delegated, so the worker's script must exist first. */
 async function laptopTask(world: World, dispatch: string, title: string, steps: ModelStep[]) {
   await world.script(title, steps);
   await world.script(dispatch, [delegate(title, world.laptop), { text: `Delegated ${title}.` }]);
@@ -38,7 +37,6 @@ async function history(world: World, taskId: string): Promise<HistoryMessage[]> 
   return frames.flatMap((frame) => frame.type === "history" ? frame.messages : []);
 }
 
-/** The tool output the model received for the first call whose arguments contain `marker`. */
 async function receipt(world: World, marker: string): Promise<string | undefined> {
   const log = await readFile(world.queue + ".requests", "utf8").catch(() => "");
   for (const line of log.split("\n").filter(Boolean)) {
@@ -63,11 +61,11 @@ async function delivered(world: World, marker: string, message: string): Promise
   return output;
 }
 
-/** Code mode wraps a host result as text after its status lines; the JSON value is the receipt. */
+/** Code mode wraps a host result as text between its status lines and any trailing prose. */
 function hostResult(output: string): unknown {
   const start = output.indexOf("{");
   for (let end = output.lastIndexOf("}"); start >= 0 && end > start; end = output.lastIndexOf("}", end - 1)) {
-    try { return JSON.parse(output.slice(start, end + 1)); } catch { /* Trailing prose can follow the JSON value. */ }
+    try { return JSON.parse(output.slice(start, end + 1)); } catch {}
   }
   return undefined;
 }
@@ -77,7 +75,6 @@ const starts = async (path: string) => (await lines(path + ".started")).map((lin
   const [pid, host] = line.split(" "); return { pid: Number(pid), host };
 });
 const exists = (path: string) => stat(path).then(() => true, () => false);
-/** How many model requests were served for the input that contains `key`. */
 const modelRequests = async (world: World, key: string) => (await lines(world.queue + ".requests")).filter((line) => {
   const request: unknown = JSON.parse(line); return object(request) && request.key === key;
 }).length;
@@ -85,12 +82,10 @@ const attached = (world: World, client: ReturnType<World["start"]>) => world.unt
   world.events(client.output()).some((event) => event.type === "task_ready"), "The worker terminal must attach to its task", () => client.errors().slice(-2000));
 const noTerminal = async (world: World, taskId: string, message: string) =>
   assert.deepEqual(await processes("run-task " + taskId), [], message);
-/** One main-agent turn that makes a single tool call. */
 async function mainCalls(world: World, key: string, step: ModelStep) {
   await world.script(key, [step, { text: `Finished ${key}.` }]);
   await world.cli(0, ["chat", key]);
 }
-/** Its finish line is written 500 ms before its output, so a test can act between the effect and its receipt. */
 const lingering = (path: string, output: string): ModelStep => ({ tool: "exec", args: { program: process.execPath, timeout_seconds: 60, args: ["-e",
   'const fs=require("node:fs"),path=process.argv[1];fs.appendFileSync(path+".started",process.pid+" "+process.env.AGENT_TEST_NODE_ID+"\\n");' +
   'fs.appendFileSync(path+".finished","once\\n");setTimeout(()=>process.stdout.write(process.argv[2]),500);', path, output] } });
@@ -102,8 +97,7 @@ function alive(pid: number): boolean {
 async function mkfifo(path: string): Promise<void> { await promisify(execFile)("mkfifo", [path]); }
 
 /**
- * Opening the read end releases a writer blocked in open(2). Reads until the FIFO holds `length` bytes or the model
- * already has the write's receipt. The handle stays open, so `written` would also return a replayed write.
+ * Opening the read end releases a writer blocked in open(2).
  */
 async function drainWrite(t: TestContext, world: World, pipe: string, length: number) {
   const reader = await open(pipe, constants.O_RDONLY | constants.O_NONBLOCK);
@@ -243,7 +237,6 @@ test("an explicit Stop interrupts only its own actor's held effect, and the stop
   await until(async () => (await starts(stopped)).length === 1 && (await starts(running)).length === 1, "Both held execs must start");
   const [stoppedStart] = await starts(stopped), [runningStart] = await starts(running);
   assert.ok(stoppedStart !== undefined && runningStart !== undefined);
-  // The exec started when the task was delegated. Esc reaches the actor once the terminal shows that turn as working.
   await until(async () => stoppedTerminal.output().includes("Working"), "The attached terminal must show the running turn", () => stoppedTerminal.output().slice(-2000));
 
   stoppedTerminal.child.stdin.write("\u001b");
@@ -284,7 +277,6 @@ test("an offline owning host never runs the worker's command in its terminal or 
   }
   const offline = await receipt(world, "offline-attempt"); assert.ok(offline !== undefined);
   const result = hostResult(offline);
-  // The task's host serves its project guidance, so an offline host blocks the tool before the command is issued.
   assert.ok((object(result) && (result.type === "not_started" || result.delivery === "not_started")) || offline.includes("Workspace guidance is unavailable"),
     "The model must be told the command was not started\n" + offline);
 

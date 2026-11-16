@@ -141,7 +141,6 @@ test("the real bridge retains attached-worker origins without labeling its task 
     agent_program: "/fixture/agent", coordinator: null, rex_server: null, launch: { model: null, state_dir: null, runtime: null, config: null, instructions: null } },
     settings: { model: DEFAULT_MODEL, instructions: "", context_repositories: [], sources: [] } } });
   await request(2, { type: "set_connected_nodes", host_ids: [hostId] });
-  // The service-owned request carries every worker effect. A terminal's request carries none.
   const service = 9;
   send(service, { type: "run_background", settings: { poll_interval_seconds: 3600, sources: false, jobs: null } });
   const stopped = until((frame) => frame.id === 3 && frame.event.type === "done"); void stopped.catch(() => {});

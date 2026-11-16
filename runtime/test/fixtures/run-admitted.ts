@@ -1,9 +1,5 @@
 import { TaskError, type TaskStore } from "../../src/tasks.js";
 
-/**
- * Start the actor for a task's admitted work with no terminal, and wait until the outbox is drained.
- * Rejects when an actor fails or when nothing can start one. Aborting `signal` stops the actor.
- */
 export async function runAdmitted(tasks: TaskStore, id: string, agentId?: string, signal?: AbortSignal): Promise<void> {
   const ref = { task_id: id, ...(agentId === undefined ? {} : { agent_id: agentId }) };
   for (;;) {

@@ -3504,7 +3504,6 @@ async fn request_presented(
                             ui.exiting = true;
                         }
                         if lifecycle == RequestLifecycle::Chat || lifecycle.is_view() { return Ok(history_cursor); }
-                        // Leaving the pane stops watching. The task keeps working, and Esc is the Stop.
                         if lifecycle.is_worker() { write_command(&mut *wire.writer, &RuntimeCommand::DetachWorker).await?; }
                         ui_controls = false;
                     }
@@ -3651,7 +3650,6 @@ async fn request_presented(
         }
         match event {
             RuntimeEventKind::HostCall { call_id, .. } => {
-                // Only a coordinator older than daemon-owned execution still sends a terminal its task's effects.
                 write_command(&mut *wire.writer, &RuntimeCommand::HostReply { call_id, result: outdated_coordinator_effect() }).await?;
                 let notice = "Update the coordinator so this task's host runs its commands.";
                 match &presentation {

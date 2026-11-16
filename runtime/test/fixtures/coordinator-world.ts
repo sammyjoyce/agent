@@ -20,16 +20,11 @@ export const exec: ModelStep = { tool: "exec", args: { program: process.execPath
 export const delegate = (title: string, host?: string): ModelStep => ({ tool: "delegate_task", args: { title, outcome: title, input: title, new_task: true,
   new_task_reason: `${title} is a separate synthetic audit.`,
   ...(host === undefined ? {} : { host }) } });
-/** One `.started` line (pid and node) per start and one `.finished` line per finish, so a replay is visible as a second line. */
 export const held = (path: string): ModelStep => ({ tool: "exec", args: { program: process.execPath, timeout_seconds: 60, args: ["-e",
   'const fs=require("node:fs"),path=process.argv[1];fs.appendFileSync(path+".started",process.pid+" "+process.env.AGENT_TEST_NODE_ID+"\\n");' +
   'async function run(){while(!fs.existsSync(path+".release"))await new Promise(resolve=>setTimeout(resolve,20));' +
   'fs.appendFileSync(path+".finished","once\\n");process.stdout.write("Completed the held action.");}void run();', path] } });
 
-/**
- * A desktop coordinator (`serve --local-only`) and a registered laptop daemon (`maintain`) in private homes,
- * with synthetic `rex` and `ssh` shims and a scripted model queue. The test context owns teardown.
- */
 export async function coordinatorWorld(t: TestContext) {
   const directory = await realpath(await mkdtemp("/tmp/agent-e2e-"));
   const binary = process.env.AGENT_TEST_BINARY ?? fileURLToPath(new URL("../../../../target/debug/beep-boop", import.meta.url));
@@ -50,11 +45,9 @@ export async function coordinatorWorld(t: TestContext) {
       for (const owned of children) if (owned.child.pid !== undefined && owned.child.exitCode === null && owned.child.signalCode === null) {
         try { process.kill(-owned.child.pid, "SIGKILL"); } catch { /* This owned group already exited. */ }
       }
-      // Effects and clients that outlive their parent leave its process group.
-      // Every process this world started names its private directory.
       try {
         for (const pid of await processes(directory)) {
-          try { process.kill(pid, "SIGKILL"); } catch { /* It exited after the listing. */ }
+          try { process.kill(pid, "SIGKILL"); } catch {}
         }
       } catch (error) { context.diagnostic("Could not sweep processes that left their owner's group: " + String(error)); }
       await Promise.allSettled(children.map((owned) => owned.exited));
@@ -159,7 +152,6 @@ export async function coordinatorWorld(t: TestContext) {
     events, start, cli, exchange, until, online, tasks, script };
 }
 
-/** Process ids whose command line contains `text`, excluding this test process. */
 export async function processes(text: string): Promise<number[]> {
   // procps leaves piped width undefined; -w twice is unlimited on procps and macOS.
   const { stdout } = await promisify(execFile)("/bin/ps", ["-A", "-ww", "-o", "pid=,args="], { maxBuffer: 64 * 1024 * 1024 });

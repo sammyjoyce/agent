@@ -281,7 +281,6 @@ const conversationViews = new ConversationViews(async () => ({ ...await app(), i
 const activeCommands = new Set<number>();
 const interrupted = new Set<number>();
 const interrupts = new Map<number, Promise<void>>();
-/** A terminal attached to its task's actor. Aborting the controller ends the observation, never the actor's work. */
 const workers = new Map<number, { command: Extract<RuntimeCommand, { type: "run_task" }>; controller: AbortController }>();
 type MainTurn = { conversation?: Conversation; accepting: boolean; admissions: number; wake?: () => void;
   info?: Extract<RuntimeEventKind, { type: "main_ready" }>;
@@ -478,7 +477,6 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const { environment, tasks } = await app();
         const arrived = new Set(command.host_ids.filter((hostId) => !environment.isConnected(hostId)));
         environment.setConnected(command.host_ids); emit(id, { type: "configured" });
-        // Work kept for an offline host runs when that host connects. This request does not wait for it.
         if (arrived.size > 0) void tasks.resumeActors(arrived).catch(() => {});
         break;
       }

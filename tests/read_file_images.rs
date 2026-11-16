@@ -704,7 +704,6 @@ async fn a_registered_worker_serves_image_reads_from_its_own_host() {
         bin.join("rex"),
     )
     .unwrap();
-    // The daemon reaches its coordinator through ssh. This stand-in joins it to the listener above.
     let ssh = bin.join("ssh");
     fs::write(
         &ssh,

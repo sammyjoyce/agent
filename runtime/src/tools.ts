@@ -30,7 +30,6 @@ export type Execution = { model?: ModelSelection; cwd: string; hosts: WorkerHost
   search?: SearchQuery;
   project?: () => Promise<HostResult>;
   notify?: (task: string | null, text: string) => void };
-/** A conversation can execute only through its currently attached CLI client. */
 export class Executions {
   private readonly attached = new Map<string, Execution>();
   private readonly recovering = new Map<string, { ready: Promise<void>; attached(): void }>();

@@ -148,7 +148,6 @@ for (const mode of ["queued", "legacy", "stopped"]) test(`job inspection and ret
     { signal: controller.signal, async ready() {}, answer() { assert.fail("The retained retry deadline has not elapsed"); }, idle() {} });
     await pump(() => app.tasks.isRunning(actor.id));
     if (mode === "stopped") {
-      // Shutdown fences the actor. A terminal that only detaches leaves it the execution owner.
       void app.tasks.detachActors();
       await assert.rejects(app.scheduler.retryJob(job.id), /existing worker must attach/);
       assert.deepEqual(await app.session.getTask(current.generation, BACKGROUND_CONTEXT), originalBefore,

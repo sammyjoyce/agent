@@ -452,7 +452,6 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                 event = call.events.recv() => {
                     let event = event.context("Coordinator closed before completing the request")?;
                     if let RuntimeEventKind::HostCall { call_id, command } = &event {
-                        // A terminal can vanish at any moment, so no effect is admitted on its request.
                         if !lifecycle.owns_host_effects() {
                             runtime.reply(call.request_id, call_id.clone(), terminal_effect_refused()).await?;
                             continue;

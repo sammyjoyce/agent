@@ -23,7 +23,6 @@ import { binding, host, open, within } from "./delegation.js";
 import type { ModelQueue } from "./fixtures/coordinator-runtime.js";
 
 type HostCall = { id: number; call_id: string; command: HostCommand };
-/** A worker's effect names its owning node. The command inside is what the test answers. */
 function effect(command: HostCommand): HostCommand { return command.type === "on_node" ? effect(command.command) : command; }
 
 test("the task graph request joins live generations and tool calls with main, task and agent identity", { timeout: 30_000 }, async (t) => {
@@ -86,7 +85,6 @@ test("the task graph request joins live generations and tool calls with main, ta
   const attach = (id: number, taskId: string, allocationId: string, worker: WorkerRef, agentId?: string) => send(id, { type: "run_task", task_id: taskId,
     ...(agentId === undefined ? {} : { agent_id: agentId }), allocation_id: allocationId, binding: worker, instructions: "", model: DEFAULT_MODEL,
     cwd: host.cwd, interactive: true });
-  // The service-owned request carries every worker effect. A terminal's request carries none.
   const service = 9;
   try {
     send(service, { type: "run_background", settings: { poll_interval_seconds: 3600, sources: false, jobs: null } });
@@ -107,7 +105,6 @@ test("the task graph request joins live generations and tool calls with main, ta
     assert.ok(response.type === "task_graph", "The runtime must answer a task graph request: " + JSON.stringify(response));
     const { conversations, omitted } = response.graph;
     assert.equal(omitted, 0);
-    // The service request that carries worker effects also runs the scheduler, whose sleeping timers are not this test's subject.
     const nodes = response.graph.nodes.filter((node) => !(node.kind.type === "other" && node.kind.name === "agent.background"));
     const work = (type: TaskGraphActor["type"]): TaskGraphNode[] => nodes.filter((node) =>
       conversations.find((conversation) => conversation.conversation_id === node.conversation_id)?.actor.type === type);
