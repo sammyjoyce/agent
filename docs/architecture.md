@@ -318,10 +318,17 @@ A goal binds one objective to one task. It lives in the Pi document family
 transition happens inside a TaskStore commit. At the actor's idle point, a
 continuation enters the task's outbox in the same commit that counts it. Pause
 commits first, withdraws the goal's queued inputs, then aborts only the task's
-live generation through Pi, so other queued inputs stay. The worker tool
-`complete_goal` reads the file on the execution host and retains an
-`agent.goal_verification` entry. A pass completes the goal and resolves the task
-in that same commit. A failed check pins its predicate for the rest of the
+live generation through Pi, so other queued inputs stay. Pi ends an aborted run
+without placing the inputs queued behind it. While the actor waits on an input
+that is still queued with no live run, it writes an empty boundary entry so Pi
+places it. The actor reads that state from Pi on every wait, so the repair
+survives a restart between the abort and the placement. The bridge cancels host
+calls only for a connected worker, so without one a running host call finishes
+after the pause. The worker tool `complete_goal` reads the file on the execution
+host. A result that still belongs to the live activation is retained as an
+`agent.goal_verification` entry. A result that returns after a pause, Esc or a
+new activation is discarded without one. A pass completes the goal and resolves
+the task in that same commit. A failed check pins its predicate for the rest of the
 activation. `record_task` cannot resolve a goal-bound task, and the refusal is
 recorded on the goal. Controls keep their request IDs, so a replayed native
 submit changes nothing. The model picks the predicate, so a goal proves that an
