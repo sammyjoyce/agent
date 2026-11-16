@@ -6,7 +6,7 @@ import type { AttachmentRef } from "./generated/AttachmentRef.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AgentDoc, AssistantEntry, defineDoc, defineDocFamily, defineEntry, GenerationTask, InboxDoc, LiveDoc, ROOT_CONVERSATION_ID, ToolTask, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness, type SettledSubmissionRecord, type Submission, type TaskId as NativeTaskId, type Tx } from "@earendil-works/pi-durable";
 import { EnvironmentError, type CoordinatorEnvironment } from "./environment.js";
-import { ConversationModels, DEFAULT_MODEL, ModelError, modelFailureMessage, savedHost, savedModel } from "./models.js";
+import { ConversationModels, DEFAULT_MODEL, ModelError, ModelTurnError, modelFailureMessage, savedHost, savedModel } from "./models.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
 import type { WorkerState } from "./generated/WorkerState.js";
 import type { HostCommand } from "./generated/HostCommand.js";
@@ -1910,7 +1910,7 @@ export class TaskStore {
           continue;
         }
         if (settled.type !== "input" || settled.status !== "done") {
-          throw new TaskError(await modelFailureMessage(conversation, "The worker turn did not complete; its conversation is retained"));
+          throw new ModelTurnError(await modelFailureMessage(conversation, "The worker turn did not complete; its conversation is retained", this.session, settled));
         }
         const entry = await conversation.commit((tx) => tx.entry(settled.answer), BACKGROUND_CONTEXT);
         if (active.fenced) break;

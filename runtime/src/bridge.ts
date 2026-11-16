@@ -9,7 +9,7 @@ import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import type { ErrorCode } from "./generated/ErrorCode.js";
 import { CoordinatorEnvironment, EnvironmentError } from "./environment.js";
-import { ConversationModels, ModelError, modelFailureMessage } from "./models.js";
+import { ConversationModels, ModelError, ModelTurnError, modelFailureMessage } from "./models.js";
 import { ChatGptAuth } from "./auth.js";
 import { validRequest, validEvent, validApnsConfig, errorEvent, invalidHostReply, protocolLines } from "./protocol.js";
 import { TaskError, TaskStore, type ActorExecution, type HostCall } from "./tasks.js";
@@ -890,7 +890,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
                 // receipt to this owner and every connected observer.
                 continue;
               }
-              if (settled.type !== "input" || settled.status !== "done") throw new TaskError(await modelFailureMessage(root, "The model turn did not complete; its state is retained"));
+              if (settled.type !== "input" || settled.status !== "done") throw new ModelTurnError(await modelFailureMessage(root, "The model turn did not complete; its state is retained", harness, settled));
               const response = await mainResponse(harness, root, settled.entry, settled.answer);
               if (!response.text.trim() || answers.has(response.entry_id)) continue;
               answers.add(response.entry_id);
