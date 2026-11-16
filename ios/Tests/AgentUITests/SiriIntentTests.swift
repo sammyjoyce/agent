@@ -344,7 +344,7 @@
 
       let delivered = try await send("Check the build", to: work)
       XCTAssertEqual(delivered.value, "delivered")
-      var state = try await world.state()
+      var state = try await world.state(once: { $0.generations["Check the build"] != nil })
       XCTAssertEqual(state.generations["Check the build"], 1)
       XCTAssertEqual(state.submits.map(\.origin), ["siri"])
 
@@ -353,7 +353,7 @@
       XCTAssertEqual(saved.value, "saved")
       let again = try await send("Rotate the Work logs", to: work)
       XCTAssertTrue(["delivered", "alreadyDelivered"].contains(again.value), again.value)
-      state = try await world.state()
+      state = try await world.state(once: { $0.generations["Rotate the Work logs"] != nil })
       let rotations = state.submits.filter { $0.text == "Rotate the Work logs" }
       XCTAssertEqual(Set(rotations.map(\.inputId)).count, 1, "\(rotations)")
       XCTAssertEqual(rotations.map(\.replyLost).filter { $0 }.count, 1, "\(rotations)")
@@ -397,6 +397,7 @@
       var typed = false
       var chose = false
       var started = false
+      var scrolls = 0
       let deadline = ContinuousClock.now + .seconds(90)
       while ContinuousClock.now < deadline {
         let texts =
@@ -452,16 +453,22 @@
             }
           }
           let tile = any(shortcuts, "Send Message")
+          let folder = any(shortcuts, "Beep Boop")
+          let library = shortcuts.buttons["Library"]
           if tile.exists && tile.isHittable {
             tile.tap()
             started = true
             log.append("tapped the Send Message tile")
-          } else {
-            let folder = any(shortcuts, "Beep Boop")
-            if folder.exists && folder.isHittable {
-              folder.tap()
-              log.append("opened Beep Boop")
-            }
+          } else if folder.exists && folder.isHittable {
+            folder.tap()
+            log.append("opened Beep Boop")
+          } else if library.exists && library.isHittable {
+            library.tap()
+            log.append("opened Library")
+          } else if scrolls < 4 {
+            shortcuts.swipeUp()
+            scrolls += 1
+            log.append("scrolled")
           }
         }
         try await Task.sleep(for: .seconds(1))
@@ -773,10 +780,17 @@
       (self.relay, self.control, coordinator) = (relay, control, String(parts[2]))
     }
 
-    func state() async throws -> State {
+    /// The world's state once `ready` holds, or after 15 seconds. A generation starts after the
+    /// coordinator accepts its input, so the phone can hear `delivered` before it is counted.
+    func state(once ready: (State) -> Bool = { _ in true }) async throws -> State {
       let decoder = JSONDecoder()
       decoder.keyDecodingStrategy = .convertFromSnakeCase
-      return try decoder.decode(State.self, from: try await request("GET", "/state"))
+      let deadline = ContinuousClock.now + .seconds(15)
+      while true {
+        let state = try decoder.decode(State.self, from: try await request("GET", "/state"))
+        if ready(state) || ContinuousClock.now > deadline { return state }
+        try await Task.sleep(for: .milliseconds(250))
+      }
     }
 
     func loseNextSubmitReply() async throws {
