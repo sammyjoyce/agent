@@ -695,7 +695,8 @@ A held store is not a read-only copy. It serves history and attachments, and it
 runs chats and the other commands you send. A chat's tool calls run on hosts
 and in the browser, and its own tool can still collect worktrees. A chat can
 create tasks, send them input and open their terminals, but no task turn runs
-until the release. `/feedback` saves its report and opens a repair terminal on
+until the release. `/goal` saves, pauses and resumes a goal, and the goal's
+task turns and automatic continuations wait for the release. `/feedback` saves its report and opens a repair terminal on
 the reporting machine, and the repair turn waits too. `beep-boop import codex`
 imports history and indexes what it imports.
 

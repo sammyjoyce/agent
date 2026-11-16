@@ -267,6 +267,7 @@ pub fn held_after_restore(command: &RuntimeCommand) -> Option<&'static str> {
         | RuntimeCommand::MainInterrupt
         | RuntimeCommand::MainFeedback { .. }
         | RuntimeCommand::ConversationSettings { .. }
+        | RuntimeCommand::Goal { .. }
         | RuntimeCommand::Logout
         | RuntimeCommand::SearchTasks { .. }
         | RuntimeCommand::ListTasks
