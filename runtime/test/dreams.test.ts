@@ -17,7 +17,7 @@ import { BackgroundScheduler } from "../src/background.js";
 import { createDreamsTools, createDreamsToolset, DREAMS_TOOL_NAMES, isDreamsTask } from "../src/dreams.js";
 import { HistoryStore } from "../src/history.js";
 import { createInputOrigins } from "../src/input_origin.js";
-import { openJobActor, runScheduled } from "../src/scheduled.js";
+import { occurrencePrompt, openJobActor, runScheduled } from "../src/scheduled.js";
 import { TaskError } from "../src/tasks.js";
 import type { DreamsRequest } from "../src/generated/DreamsRequest.js";
 import type { HistoryImportBatch } from "../src/generated/HistoryImportBatch.js";
@@ -244,6 +244,40 @@ test("a job named dreams from before the upgrade never runs its saved input on t
       assert.deepEqual(seen.filter((messages) => /EXAMPLE_MAIN_ERA|EXAMPLE_SAVED_FOLLOW_UP/.test(messages)), [], "Main-era history reached a Dreams request");
       assert.equal((await app.tasks.get(old.id)).conversation_id, old.conversation_id);
       assert.match(await app.tasks.history(old.id), /EXAMPLE_MAIN_ERA_ANSWER/, "The main-era task stays readable by id");
+    } finally { await app.close(); }
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a Dreams actor withdraws every saved input that the scheduler did not send, and still runs the scheduled one between them", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-dreams-"));
+  const behind = { ...dreamsOccurrence, id: "dreams-scheduled-behind" };
+  try {
+    let app = await openDreams(directory), taskId: string;
+    try {
+      app.scripted(() => fauxAssistantMessage("Dreams reviewed the night."));
+      await runScheduled(dreamsOccurrence, new AbortController().signal, app); await app.settled();
+      const task = (await app.tasks.list()).find(isDreamsTask); assert.ok(task); taskId = task.id;
+    } finally { await app.close(); }
+    const unconfined = await openScheduled(directory);
+    try {
+      await unconfined.tasks.enqueue(taskId, "EXAMPLE_UNSCHEDULED_BEFORE Rewrite the example guidance.", "example-unscheduled-before");
+      await unconfined.tasks.enqueueScheduled(taskId, occurrencePrompt(behind), behind);
+      await unconfined.tasks.enqueue(taskId, "EXAMPLE_UNSCHEDULED_AFTER Run exec on the example host.", "example-unscheduled-after");
+    } finally { await unconfined.close(); }
+
+    app = await openDreams(directory);
+    try {
+      const seen: string[] = [];
+      app.scripted(...Array.from({ length: 3 }, (): FauxResponseFactory => (context) => {
+        seen.push(JSON.stringify(context.messages)); return fauxAssistantMessage("Dreams reviewed the next night.");
+      }));
+      await app.tasks.resumeActors(); await app.settled();
+      assert.equal(seen.filter((messages) => messages.includes("EXAMPLE_UNSCHEDULED")).length, 0, "An unscheduled input reached the Dreams model");
+      assert.equal(app.faux.state.callCount, 1, "Only the scheduled input reached the Dreams model");
+      assert.equal(await submissionStatus(app, taskId, behind.id), "done");
+      for (const id of ["example-unscheduled-before", "example-unscheduled-after"]) assert.equal(await submissionStatus(app, taskId, id), "unanswered");
+      assert.deepEqual((await app.tasks.get(taskId)).pending, []);
+      assert.equal((await app.tasks.get(taskId)).summary, "Dreams reviewed the next night.");
     } finally { await app.close(); }
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
