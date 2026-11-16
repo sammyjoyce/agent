@@ -20,6 +20,7 @@ const ROLLOUTS = 200, ITEMS_PER_ROLLOUT = 50;
 
 const directory = process.argv[2];
 if (directory === undefined) throw new Error("A synthetic state directory is required");
+const state: string = directory;
 await mkdir(directory, { recursive: true, mode: 0o700 });
 const open = async (path: string) => Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(path)),
   { models: createModels(), registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
@@ -63,10 +64,10 @@ function vector(text: string): number[] {
 }
 
 async function searchIndex(): Promise<{ conversations: number; chunks: number }> {
-  const target = join(directory!, SEARCH_INDEX);
+  const target = join(state, SEARCH_INDEX);
   await mkdir(target, { mode: 0o700 });
-  const copies = (await readdir(directory!)).filter((name) => name.startsWith("session.sqlite"));
-  for (const name of copies) await cp(join(directory!, name), join(target, name));
+  const copies = (await readdir(state)).filter((name) => name.startsWith("session.sqlite"));
+  for (const name of copies) await cp(join(state, name), join(target, name));
   const copy = await open(join(target, "session.sqlite"));
   try {
     const histories = new HistoryStore(copy), tasks = new TaskStore(copy);
@@ -87,7 +88,7 @@ async function searchIndex(): Promise<{ conversations: number; chunks: number }>
 }
 
 async function codexCorpus(): Promise<{ rollouts: number; items_per_rollout: number }> {
-  const home = join(directory!, CODEX_CORPUS), folder = join(home, "sessions", "2026", "01", "02");
+  const home = join(state, CODEX_CORPUS), folder = join(home, "sessions", "2026", "01", "02");
   await mkdir(folder, { recursive: true, mode: 0o700 });
   await writeFile(join(home, "config.toml"), "model_provider = \"openai\"\n");
   const line = (type: string, payload: object) => JSON.stringify({ timestamp: "2026-01-02T12:00:00Z", type, payload }) + "\n";
