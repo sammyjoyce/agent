@@ -689,6 +689,9 @@
             (try $0.title.as(String.self), try $0.coordinator.as(String.self))
           }, uniquingKeysWith: { first, _ in first })
         if shown.coordinators == coordinators, shown.jobs == jobs, foundJobs.count == jobs.count {
+          attach(
+            "spotlight \(moment)", "coordinators \(shown.coordinators.sorted())\njobs \(shown.jobs)"
+          )
           return
         }
         try await Task.sleep(for: .milliseconds(500))
