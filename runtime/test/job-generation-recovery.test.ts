@@ -73,9 +73,9 @@ for (const mode of ["queued", "legacy", "stopped"]) test(`job inspection and ret
   try {
     await app.scheduler.syncJobs([job, otherJob]);
     const actor = await app.tasks.create({ id: scheduledTaskId("job:" + job.id), title: job.title, outcome: job.prompt,
-      model: job.model, sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.id }] });
+      model: job.model, job_id: job.id });
     const otherActor = await app.tasks.create({ id: scheduledTaskId("job:" + otherJob.id), title: otherJob.title, outcome: otherJob.prompt,
-      model: otherJob.model, sources: [{ provider: "scheduled_jobs", account: "local", thread_id: otherJob.id }] });
+      model: otherJob.model, job_id: otherJob.id });
     const conversation = await app.tasks.conversation(actor.conversation_id), other = await app.tasks.conversation(otherActor.conversation_id);
     actorConversation = actor.conversation_id;
     const binding = { host_id: "11111111-1111-4111-8111-111111111111", session_id: "session:22222222-2222-4222-8222-222222222222",

@@ -50,7 +50,8 @@ export type HostCall = (command: HostCommand) => Promise<HostResult>;
 export type SearchQuery = (query: string, sourceRefs: string[], limit: number, mode?: SearchMode) => Promise<SearchResult>;
 export function sourceReference(source: SourceRef): string { return JSON.stringify([source.provider, source.account, source.thread_id]); }
 type TaskIndex = { tasks: TaskRecord[] };
-type TaskCreate = { id?: string; title: string; outcome: string; sources?: SourceRef[]; model?: ModelSelection; scheduled_run?: JobRunReceipt };
+/** `job_id` names the scheduled job that owns the task. Only the scheduler sets it; `sources` only link. */
+type TaskCreate = { id?: string; title: string; outcome: string; sources?: SourceRef[]; job_id?: string; model?: ModelSelection; scheduled_run?: JobRunReceipt };
 type WorkerInput = Extract<RuntimeCommand, { type: "run_task" }>;
 type ActorRef = { task_id: string; agent_id?: string };
 export type ActorMode = "job" | "interactive";
@@ -100,7 +101,10 @@ type TaskActor = { readonly ref: ActorRef; readonly mode: ActorMode; readonly ex
   readonly bound: Promise<void>; started(): void; readonly exit: Promise<ActorAnswer>; wake?: () => void; drained?: () => void };
 type ActorPlacement = { type: "placed"; host: WorkerHost } | { type: "host_at_start" } | { type: "unplaced" | "host_offline"; reason: string };
 function isAbortedJob(actor: TaskActor): boolean { return actor.mode === "job" && actor.turn.controller.signal.aborted; }
-const CONFINED_ACTOR_ONLY = "A confined task runs only as coordinator background work, without agents";
+const CONFINED_ACTOR_ONLY = "A confined task runs only its scheduler's input, as coordinator background work without agents or terminals";
+function requireLinksOnly(sources: readonly SourceRef[]): void {
+  if (sources.some((source) => source.provider === "scheduled_jobs")) throw new TaskError("Scheduled job ownership is assigned only by the scheduler");
+}
 const STOPPED_INPUT_WITHDRAWN = "The stopped turn withdrew this input; submit it again to continue.";
 function recordedHostId(worker: Exclude<WorkerState, { state: "unassigned" }>): string | null {
   return worker.host.host_id ?? ("binding" in worker ? worker.binding.host_id : null);
@@ -270,6 +274,10 @@ export class TaskStore {
   useActorExecution(execution: ActorExecution): void { this.execution = execution; }
   useConfinement(rule: ActorConfinement): void { this.confinement = rule; }
   isConfined(task: Pick<TaskRecord, "sources">): boolean { return this.confinement(task) !== undefined; }
+  /** A confined task admits only a scheduled occurrence: no other input, child agent or terminal. */
+  private requireSchedulerAdmission(task: Pick<TaskRecord, "sources">, scheduled: ScheduledOccurrence | undefined): void {
+    if (this.isConfined(task) && scheduled === undefined) throw new TaskError(CONFINED_ACTOR_ONLY);
+  }
   isBackgroundTask(task: TaskRecord): boolean { return isJobTask(task); }
   private async backgroundHost(task: TaskRecord, agentId?: string): Promise<WorkerHost> {
     if (this.environment === undefined) throw new TaskError("The coordinator execution environment is unavailable");
@@ -840,6 +848,7 @@ export class TaskStore {
       .slice(0, Math.min(20, Math.max(1, limit))), gaps: indexed.gaps };
   }
   async adopt(conversationId: string, input: { id: string; title?: string; outcome: string; evidence: string; model: ModelSelection; sources?: SourceRef[] }): Promise<TaskRecord> {
+    requireLinksOnly(input.sources ?? []);
     await this.prepare();
     const imported = await this.histories?.byConversation(conversationId);
     if (imported === undefined || this.histories === undefined) throw new TaskError("Only an imported historical conversation can be adopted");
@@ -900,11 +909,13 @@ export class TaskStore {
   async createIn(tx: Tx, input: TaskCreate): Promise<{ id: TaskRecord["id"]; native?: ConversationId }> {
     const id = input.id ?? randomUUID();
     if (input.title.trim().length === 0 || input.outcome.trim().length === 0) throw new TaskError("Task title and outcome are required");
+    requireLinksOnly(input.sources ?? []);
+    const sources = [...input.sources ?? [], ...input.job_id === undefined ? [] : [{ provider: "scheduled_jobs", account: "local", thread_id: input.job_id }]];
     const previous = await this.taskIn(tx, id);
     if (previous !== undefined) return { id: previous.id };
     const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
     const task: TaskRecord = { id, model: input.model ?? null, conversation_id: conversation.id.toString(), title: input.title.trim(), outcome: input.outcome.trim(),
-      summary: "", state: { state: "open" }, worker: { state: "unassigned" }, sources: input.sources ?? [], pending: [], agents: [], updated_at: Date.now(),
+      summary: "", state: { state: "open" }, worker: { state: "unassigned" }, sources, pending: [], agents: [], updated_at: Date.now(),
       ...(input.scheduled_run === undefined ? {} : { scheduled_run: input.scheduled_run }) };
     const { value: saved } = await this.recordsStore.insertIn(tx, id, task); await this.indexTaskIn(tx, saved);
     return { id, native: conversation.id };
@@ -941,7 +952,7 @@ export class TaskStore {
     const removed = task.sources.filter((source) => remove.some((other) => related(other, source)))
       .map((source) => ({ ...source }));
     if (added.length === 0 && removed.length === 0) return;
-    if ([...added, ...removed].some((source) => source.provider === "scheduled_jobs")) throw new TaskError("Scheduled job ownership is assigned only by the scheduler");
+    requireLinksOnly([...added, ...removed]);
     const sources = task.sources.filter((source) => !removed.some((other) => related(other, source))).map((source) => ({ ...source }));
     task.sources = [...sources, ...added]; task.updated_at = Date.now();
     await this.indexTaskIn(tx, task, [...sources, ...removed]);
@@ -999,6 +1010,8 @@ export class TaskStore {
   }
   private async enqueueActor(id: string, content: string, inputId: string, agentId?: string, delivered?: TaskOutcome, mode?: InputMode, attachments?: AttachmentRef[], scheduled?: ScheduledOccurrence, origin?: InputOrigin, sender?: TaskMessageSender): Promise<TaskRecord> {
     validateInput(content, attachments);
+    const owner = await this.get(id);
+    this.requireSchedulerAdmission(owner, scheduled);
     const store = this.attachments;
     if (attachments !== undefined && attachments.length > 0) {
       if (store === undefined) throw new TaskError("Attachment storage is unavailable");
@@ -1008,7 +1021,7 @@ export class TaskStore {
       ...(attachments === undefined ? {} : { attachments }),
       ...(scheduled === undefined ? {} : { scheduled }), ...(origin === undefined ? {} : { origin }),
       ...(sender === undefined ? {} : { sender }) };
-    queuedInput(this.actor(await this.get(id), agentId), input);
+    queuedInput(this.actor(owner, agentId), input);
     const active = this.running.get(this.actorKey(id, agentId));
     if (active !== undefined) active.admissions += 1;
     try {
@@ -1077,6 +1090,7 @@ export class TaskStore {
     } catch { /* The durable outbox still owns admission through this actor. */ }
   }
   async createAgent(taskId: string, input: { id: string; title: string; outcome: string; input: string; inputId: string; model?: ModelSelection; attachments?: AttachmentRef[] }): Promise<TaskAgentRecord> {
+    this.requireSchedulerAdmission(await this.get(taskId), undefined);
     if (input.title.trim().length === 0 || input.title.length > 80 || input.outcome.trim().length === 0 ||
         input.outcome.length > 4000) {
       throw new TaskError("An agent needs a title, bounded outcome, and instruction");
@@ -1632,7 +1646,7 @@ export class TaskStore {
     const ref: ActorRef = { task_id: input.task_id, ...(input.agent_id === undefined ? {} : { agent_id: input.agent_id }) };
     const key = this.actorKey(ref.task_id, ref.agent_id);
     if (observer === undefined && (this.running.get(key)?.phase ?? "closing") !== "closing") throw new TaskError("This task already has an attached worker");
-    if (this.isConfined(await this.get(input.task_id))) throw new TaskError(CONFINED_ACTOR_ONLY);
+    this.requireSchedulerAdmission(await this.get(input.task_id), undefined);
     const { task, worker } = await this.confirmBinding(input, call);
     const record = this.actor(task, ref.agent_id);
     const attached: ActorObserver | undefined = observer === undefined ? undefined

@@ -698,15 +698,19 @@ narrow: the actor that reads untrusted nightly evidence holds no shell and no
 channel to an actor that holds one. Tests cover each link.
 
 - `TaskStore.runActor` gives the task of the job `dreams` exactly
-  `dreams_review`, `dreams_propose` and `dreams_abstain` on every path. The
-  task refuses a terminal that attaches to it, and it refuses a child agent.
+  `dreams_review`, `dreams_propose` and `dreams_abstain` on every path.
+- Only the scheduler sends that task input. `TaskStore` refuses every other
+  route before it saves the input and before any model call: a steer or
+  follow-up from `delegate_task`, `message_task`, a native client's input,
+  worker input, a terminal that attaches and a child agent.
 - The same confinement withholds hosted provider tools, web search included,
   from every request of that conversation on the `openai` and `openai-codex`
   providers. The record is durable and is never removed, so a turn that resumes
   after a restart is covered before any actor reconfigures it.
-- The scheduler source that marks the task cannot be added or removed by a
-  tool, and the task's outcomes are recorded already dismissed, so triage never
-  reads them.
+- Only the scheduler creates a task that a scheduled job owns. `TaskStore`
+  refuses a `scheduled_jobs` source from any other caller, whether it creates,
+  adopts or relinks a task, and no caller can remove one. The task's outcomes
+  are recorded already dismissed, so triage never reads them.
 - Related-task retrieval, task search and history index matches skip a confined
   task, so its model-written text enters no actor's context unasked. An explicit
   read by id still returns it: `read_task`, `read_job`, `beep-boop tasks read`,

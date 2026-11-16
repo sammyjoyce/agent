@@ -88,7 +88,7 @@ test("an existing interactive job actor drains a scheduled occurrence without wa
   const controller = new AbortController(); let running: Promise<unknown> | undefined, release = () => {};
   try {
     const task = await app.tasks.create({ title: "Existing job actor", outcome: "Keep the original job conversation", model: fixtureModel,
-      sources: [{ provider: "scheduled_jobs", account: "local", thread_id: scheduledOccurrence.job.id }] });
+      job_id: scheduledOccurrence.job.id });
     const host = await app.tasks.workerHost(task.id);
     const allocation = "existing-allocation";
     await app.tasks.update(task.id, (saved) => { saved.worker = { state: "bound", allocation_id: allocation, host, binding }; });
@@ -153,7 +153,7 @@ test("stop during asynchronous preflight fences the admitted input before infere
         cwd: host.cwd, hosts: [host], model, role: "worker", call: app.call,
       }) });
     const task = await app.tasks.create({ title: "Preparing job", outcome: "Stop before inference", model: scheduledOccurrence.job.model,
-      sources: [{ provider: "scheduled_jobs", account: "local", thread_id: scheduledOccurrence.job.id }] });
+      job_id: scheduledOccurrence.job.id });
     await app.tasks.enqueue(task.id, "Stop this queued turn", "preparing-input");
     app.faux.setResponses([fauxAssistantMessage("Must never execute after the interrupted receipt.")]);
     running = runAdmitted(app.tasks, task.id);

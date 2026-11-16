@@ -51,7 +51,7 @@ test("native job and saved-work inspection uses the production coordinator witho
   let parentID: string, childID: string;
   try {
     const task = await seeded.tasks.create({ id: scheduledTaskId("job:" + jobID), title: "Native work inspection", outcome: "Retain the original work", model: DEFAULT_MODEL,
-      sources: [{ provider: "scheduled_jobs", account: "local", thread_id: jobID }] });
+      job_id: jobID });
     const child = await seeded.tasks.createAgent(task.id, { id: "review", title: "Bounded review", outcome: "Read the existing evidence",
       input: "Retain the pending child assignment", inputId: "pending-child-assignment", model: DEFAULT_MODEL });
     parentID = task.conversation_id; childID = child.conversation_id;

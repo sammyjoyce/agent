@@ -131,7 +131,7 @@ test("a scheduled child inherits its trusted lineage through deletion and its ow
 test("main, generic and legacy notices never guess a job from titles, source links or body text", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-notice-generic-")), app = await openScheduled(directory);
   try {
-    const task = await app.tasks.create({ title: "Morning brief", outcome: "An ordinary task", sources: [{ provider: "scheduled_jobs", account: "local", thread_id: "morning-brief" }] });
+    const task = await app.tasks.create({ title: "Morning brief", outcome: "An ordinary task", job_id: "morning-brief" });
     const host = await app.environment.defaultHost(await app.environment.hosts("/workspace/example", null, [])); assert.ok(host);
     await app.tasks.enqueue(task.id, "Package tracking: a claimed job name is not transport metadata.", "generic"); await app.tasks.dispatch(task.id, host, app.call);
     app.faux.setResponses([notice("Morning brief: actionable generic work."), fauxAssistantMessage("")]); await runAdmitted(app.tasks, task.id);

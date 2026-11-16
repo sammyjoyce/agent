@@ -94,7 +94,7 @@ test("live source triage applies standing workflows to pitches while preserving 
     cwd: directory, timezone: "Etc/UTC", revision: "evaluation-v1", schedules: [{ id: "daily",
       recurrence: "DTSTART:20300101T090000Z\nRRULE:FREQ=DAILY", focus: null, prompt: null }] };
   const owner = await tasks.create({ title: job.title, outcome: job.prompt, model: job.model,
-    sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.id }] });
+    job_id: job.id });
   const pitch = original("mail-101", "your new constraint solver release",
     "From: Morgan <morgan@pipelinevendor.example>\nTo: alex@designfirm.example\n" +
     "Body: Saw your solver release. We sell outsourced lead generation and can book 30 sales calls a month. " +

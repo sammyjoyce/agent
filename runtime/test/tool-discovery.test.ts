@@ -27,7 +27,6 @@ import { runAdmitted } from "./fixtures/run-admitted.js";
 
 const node: AgentNode = { host_id: "11111111-1111-4111-8111-111111111111", name: "example", rex_server: null, agent_program: "/example/agent",
   home_directory: "/workspace/example", coordinator: null, launch: { state_dir: null, runtime: null, config: null, instructions: null, model: fixtureModel } };
-const jobSource = { provider: "scheduled_jobs", account: "local", thread_id: "example-job" };
 type ToolArguments = Parameters<typeof fauxToolCall>[1];
 
 async function lab(prefix: string, answer?: (command: HostCommand) => HostResult | undefined) {
@@ -74,7 +73,7 @@ const done: FauxResponseFactory = () => fauxAssistantMessage("Done.");
 
 type RoleTurn = { responsesFromFirstRequest: [FauxResponseFactory, ...FauxResponseFactory[]]; run(): Promise<void> };
 async function backgroundTask(app: DiscoveryApp) {
-  return app.tasks.create({ title: "Example job", outcome: "Finish the example job", model: fixtureModel, sources: [jobSource] });
+  return app.tasks.create({ title: "Example job", outcome: "Finish the example job", model: fixtureModel, job_id: "example-job" });
 }
 const startRole: Record<ToolRole, (app: DiscoveryApp, input: string) => Promise<RoleTurn>> = {
   async main(app, input) {

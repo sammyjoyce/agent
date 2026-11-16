@@ -254,7 +254,7 @@ test("job migration preserves only a job-owned conversation independently of its
     await app.tasks.dispatch(unrelated.id, host, app.call);
     assert.equal(await openJobActor(job, app.tasks), undefined);
     const owned = await app.tasks.create({ title: job.title, outcome: job.prompt,
-      sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.id }] });
+      job_id: job.id });
     await app.tasks.update(owned.id, (saved) => { saved.worker = { state: "bound", allocation_id: "old-allocation", host, binding }; });
     assert.equal(await openJobActor(job, app.tasks), owned.id);
     assert.equal(app.commands.filter((command) => command.type === "spawn_worker").length, 1);

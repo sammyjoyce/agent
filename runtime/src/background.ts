@@ -242,7 +242,7 @@ export class BackgroundScheduler {
         source.account === "local" && source.thread_id === job.id)) throw new TaskError("This task is not owned by the scheduled job");
     if (previous === undefined && id !== scheduledTaskId("job:" + job.id)) throw new TaskError("The scheduled job's owned actor is unavailable; reconcile its existing task");
     const created = await this.tasks.createIn(tx, { id, title: job.title, outcome: job.prompt, model: job.model,
-      sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.id }] });
+      job_id: job.id });
     lane.actor_task_id ??= created.id;
     return created;
   }

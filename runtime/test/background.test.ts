@@ -187,7 +187,7 @@ test("timer and manual runs reuse one owned job actor across reopen while equal 
   } });
   try {
     const owned = await app.tasks.create({ id: actorId, title: job.title, outcome: job.prompt, model: job.model,
-      sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.id }] });
+      job_id: job.id });
     await app.scheduler.start({ poll_interval_seconds: 60, sources: false, jobs: [job, other] });
     await pump(async () => (await app.scheduler.getJob(job.id)).schedules[0]?.next_at === START + DAY);
     const first = await app.scheduler.runJob({ type: "run_job", job_id: job.id, schedule_id: null, request_id: "first" });
