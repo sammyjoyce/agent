@@ -1029,6 +1029,7 @@ mod tests {
 
     const FIXTURE_INSTANCE: &str = "66666666-6666-4666-8666-666666666666";
     const RESTARTED_INSTANCE: &str = "88888888-8888-4888-8888-888888888888";
+    const CREATED_BLOCK: &str = "block:cccccccc-cccc-4ccc-8ccc-cccccccccccc";
     const ADDED_BLOCK: &str = "block:eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 
     fn stamped(binding: WorkerRef, stamp: Option<&str>) -> WorkerRef {
@@ -1225,16 +1226,19 @@ mod tests {
                 "missing-terminal",
                 "exited-pane",
             ] {
-                let create = if path == "root" {
-                    "session.create"
+                let (create, block) = if path == "root" {
+                    ("session.create", CREATED_BLOCK)
                 } else {
-                    "session.new_window"
+                    ("session.new_window", ADDED_BLOCK)
                 };
                 fake_rex::run(TEST, &format!("{path}-steady"), &[]);
                 fake_rex::run(
                     TEST,
                     &format!("{path}-restarted"),
-                    &[("AGENT_TEST_FAKE_REX_RESTART_AFTER", create)],
+                    &[
+                        ("AGENT_TEST_FAKE_REX_RESTART_AFTER", create),
+                        ("AGENT_TEST_FAKE_REX_RUNNING", block),
+                    ],
                 );
             }
             return;
@@ -1258,23 +1262,32 @@ mod tests {
             _ => resume(fixture_origin()),
         };
         let directory = tempfile::tempdir().unwrap();
-        let result = personal_executor(directory.path()).execute(command).await;
-        let session = if path == "root" {
-            fake_rex::CREATED_SESSION
+        let executor = personal_executor(directory.path());
+        let result = executor.execute(command).await;
+        let (session, block) = if path == "root" {
+            (fake_rex::CREATED_SESSION, CREATED_BLOCK)
         } else {
-            fake_rex::ORIGIN_SESSION
+            (fake_rex::ORIGIN_SESSION, ADDED_BLOCK)
         };
+        let HostResult::Spawned { binding } = result else {
+            panic!("Expected a confirmed pane, got {result:?}");
+        };
+        assert_eq!(binding.session_id, session);
+        assert_eq!(binding.rex_instance_id.as_deref(), Some(FIXTURE_INSTANCE));
         if outcome == "restarted" {
+            assert_eq!(binding.block_id, block);
+            let presence = executor
+                .execute(HostCommand::InspectWorker { binding })
+                .await;
             assert!(
-                matches!(&result, HostResult::CreationUncertain { session_id: Some(id) } if id == session),
-                "A restart around the create must leave it uncertain, got {result:?}"
+                matches!(
+                    presence,
+                    HostResult::WorkerPresence {
+                        presence: WorkerPresence::Present { running: false }
+                    }
+                ),
+                "The shell in a pane Rex restarted around is not the worker, so the next presentation replaces it: {presence:?}"
             );
-        } else {
-            let HostResult::Spawned { binding } = result else {
-                panic!("Expected a confirmed pane, got {result:?}");
-            };
-            assert_eq!(binding.session_id, session);
-            assert_eq!(binding.rex_instance_id.as_deref(), Some(FIXTURE_INSTANCE));
         }
     }
 
