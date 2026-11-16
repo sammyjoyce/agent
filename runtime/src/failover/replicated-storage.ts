@@ -115,11 +115,11 @@ class OwnerLog implements LogWriter {
 
   readonly commit = (writes: readonly StorageWrite[], context: Context): Promise<Seq> => this.#serialized(async () => {
     const { database } = this.#options;
-    const piSeq = await database.dryRun(() => this.#storage.commit(writes, context));
-    const files = this.#carried.splice(0);
     const json = JSON.stringify(writes);
+    const logged = parseBatch(json, this.#head + 1);
+    const piSeq = await database.dryRun(() => this.#storage.commit(logged, context));
+    const files = this.#carried.splice(0);
     const at = await this.#append(piSeq, files, json);
-    const logged = parseBatch(json, at);
     const committed = await database.apply(at, piSeq, { publish: () => this.#publish(files), commit: () => this.#storage.commit(logged, context) });
     this.#head = at;
     return committed;
