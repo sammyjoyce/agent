@@ -111,10 +111,17 @@ extension JobEntity: IndexedEntity {
   private let store: any SpotlightStore
   private var saved: [ProfileID: Saved] = [:]
   private var mirror = Mirror.dormant
+  private let retryDelay: Duration
+  private var active = false
+  private var refusals = 0
   private var writing: Task<Void, Never>?
+  private var retrying: Task<Void, Never>?
   private var reading: Task<Void, Never>?
 
-  init(store: any SpotlightStore) { self.store = store }
+  init(store: any SpotlightStore, retryDelay: Duration = .seconds(2)) {
+    self.store = store
+    self.retryDelay = retryDelay
+  }
 
   func save(_ coordinators: [CoordinatorProfile]) {
     saved = Dictionary(
@@ -132,6 +139,7 @@ extension JobEntity: IndexedEntity {
 
   func activate(listing coordinators: Coordinators) {
     if case .dormant = mirror { mirror = .resetFirst }
+    active = true
     write()
     reading?.cancel()
     let paired = coordinators.profiles.filter { $0.pin != nil }
@@ -141,13 +149,16 @@ extension JobEntity: IndexedEntity {
   }
 
   func deactivate() {
+    active = false
+    retrying?.cancel()
+    retrying = nil
     reading?.cancel()
     reading = nil
   }
 
   func settled() async {
     await reading?.value
-    while let writing { await writing.value }
+    while let task = writing ?? retrying { await task.value }
   }
 
   private var wanted: [SpotlightEntry.Key: SpotlightEntry] {
@@ -173,6 +184,8 @@ extension JobEntity: IndexedEntity {
 
   private func write() {
     guard writing == nil, step(toward: wanted) != nil else { return }
+    retrying?.cancel()
+    retrying = nil
     writing = Task {
       while true {
         let target = wanted
@@ -180,12 +193,25 @@ extension JobEntity: IndexedEntity {
         do {
           try await step.run(on: store)
           mirror = .known(target)
+          refusals = 0
         } catch {
           mirror = .resetFirst
+          refusals += 1
           break
         }
       }
       writing = nil
+      if refusals > 0, active { retry() }
+    }
+  }
+
+  /// A write refused while the app is active is taken as the system not being ready yet.
+  private func retry() {
+    let delay = min(retryDelay * (1 << min(refusals - 1, 6)), .seconds(64))
+    retrying = Task {
+      guard (try? await Task.sleep(for: delay)) != nil, !Task.isCancelled else { return }
+      retrying = nil
+      write()
     }
   }
 }
