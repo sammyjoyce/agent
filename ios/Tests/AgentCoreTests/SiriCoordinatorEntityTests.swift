@@ -15,24 +15,36 @@ struct SiriCoordinatorEntityTests {
     let defaults: UserDefaults
     let profiles: [CoordinatorProfile]
     let notifications: AppNotifications
+    private let transport: CoordinatorTransport
+    private let spotlight: SpotlightFake?
 
     init(
       names: [String] = ["Work", "Personal", "Home"], transport: CoordinatorTransport = .tailnet,
+      paired: Bool = true, spotlight: SpotlightFake? = nil,
       permission: @escaping @MainActor () async throws -> Bool = AppNotifications.alertPermission
     ) throws {
       defaults = try #require(UserDefaults(suiteName: suite))
       profiles = try names.enumerated().map { index, name in
         var profile = CoordinatorProfile(
           name: try TagName(name), address: try CoordinatorAddress(host: "100.64.1.\(index + 2)"))
-        profile.pin = CoordinatorID(UUID())
+        if paired { profile.pin = CoordinatorID(UUID()) }
         return profile
       }
       try writePrivately(
         JSONEncoder().encode(Coordinators.SavedProfiles(profiles: profiles)),
         to: root.appending(path: "Agent/profiles.json"))
+      self.transport = transport
+      self.spotlight = spotlight
       notifications = AppNotifications(
         defaults: defaults, applicationSupport: root, caches: root, transport: transport,
-        permission: permission)
+        spotlight: spotlight, permission: permission)
+    }
+
+    /// The app started again over the same folder and Spotlight index.
+    func relaunch() -> AppNotifications {
+      AppNotifications(
+        defaults: defaults, applicationSupport: root, caches: root, transport: transport,
+        spotlight: spotlight)
     }
 
     func saved() -> [CoordinatorEntity] { CoordinatorEntity.saved(in: notifications.coordinators) }
@@ -52,6 +64,164 @@ struct SiriCoordinatorEntityTests {
   }
 
   private func named(_ entities: [CoordinatorEntity]) -> [String] { entities.map(\.name) }
+
+  /// Work, Personal and Home, indexed into `spotlight`. They are unpaired and every dial fails at
+  /// once, so an activation reads no jobs and reaches no network.
+  private func indexing(
+    _ spotlight: SpotlightFake, names: [String] = ["Work", "Personal", "Home"]
+  ) throws -> SavedFixture {
+    try SavedFixture(
+      names: names, transport: CoordinatorTransport { _ in throw ConnectionError.timedOut },
+      paired: false, spotlight: spotlight)
+  }
+
+  /// Returns once every Spotlight write `notifications` started has finished.
+  private func settle(_ notifications: AppNotifications) async {
+    await notifications.coordinators.chat.spotlight?.settled()
+  }
+
+  private func activate(_ notifications: AppNotifications) async {
+    await notifications.coordinators.setActive(true)
+    await settle(notifications)
+  }
+
+  private func names(_ fixture: SavedFixture, _ names: [Int: String]) -> [ProfileID: String] {
+    Dictionary(uniqueKeysWithValues: names.map { (fixture.profiles[$0.key].id, $0.value) })
+  }
+
+  @Test func spotlightHoldsEachSavedCoordinatorByNameOnceActivated() async throws {
+    let spotlight = SpotlightFake()
+    let fixture = try indexing(spotlight)
+    defer { fixture.clean() }
+    await settle(fixture.notifications)
+    #expect(await spotlight.entries.isEmpty, "Nothing is indexed before a scene is active")
+    await activate(fixture.notifications)
+    #expect(await spotlight.coordinators == names(fixture, [0: "Work", 1: "Personal", 2: "Home"]))
+    #expect(await spotlight.entries.count == 3, "No job and no All")
+  }
+
+  /// Under the interaction fixture the app delegate's coordinators live on, never activated.
+  @Test func coordinatorsNoSceneActivatedNeverWriteTheIndex() async throws {
+    let spotlight = SpotlightFake()
+    let delegate = try indexing(spotlight, names: ["Home"])
+    let fixture = try indexing(spotlight, names: ["Work", "Personal"])
+    defer {
+      delegate.clean()
+      fixture.clean()
+    }
+    await activate(fixture.notifications)
+    let home = delegate.profiles[0]
+    try await delegate.notifications.coordinators.update(
+      home.id, name: TagName("Cabin"), address: home.address)
+    await settle(delegate.notifications)
+    await settle(fixture.notifications)
+    #expect(await spotlight.coordinators == names(fixture, [0: "Work", 1: "Personal"]))
+    #expect(await spotlight.entries.count == 2)
+  }
+
+  @Test func aRenameReplacesTheCoordinatorsEntry() async throws {
+    let spotlight = SpotlightFake()
+    let fixture = try indexing(spotlight)
+    defer { fixture.clean() }
+    await activate(fixture.notifications)
+    let personal = fixture.profiles[1]
+    try await fixture.notifications.coordinators.update(
+      personal.id, name: TagName("Family"), address: personal.address)
+    await settle(fixture.notifications)
+    #expect(await spotlight.coordinators == names(fixture, [0: "Work", 1: "Family", 2: "Home"]))
+    #expect(await spotlight.entries.count == 3)
+  }
+
+  @Test func aRemovedCoordinatorLeavesTheIndex() async throws {
+    let spotlight = SpotlightFake()
+    let fixture = try indexing(spotlight)
+    defer { fixture.clean() }
+    await activate(fixture.notifications)
+    let coordinators = fixture.notifications.coordinators
+    try await coordinators.remove(coordinators.removal(fixture.profiles[2].id))
+    await settle(fixture.notifications)
+    #expect(await spotlight.coordinators == names(fixture, [0: "Work", 1: "Personal"]))
+    #expect(await spotlight.entries.count == 2)
+  }
+
+  @Test func aRelaunchConvergesAfterARemoveThatStoppedBeforeSpotlightHeard() async throws {
+    let spotlight = SpotlightFake()
+    let fixture = try indexing(spotlight)
+    defer { fixture.clean() }
+    await activate(fixture.notifications)
+    let coordinators = fixture.notifications.coordinators
+    let home = fixture.profiles[2].id
+    await spotlight.holdNextWrite()
+    try await coordinators.remove(coordinators.removal(home))
+    await spotlight.abandonHeldWrite()
+    #expect(await spotlight.coordinators[home] == "Home", "The stop left Home in the index")
+    let relaunched = fixture.relaunch()
+    #expect(relaunched.coordinators.savedNames == ["Work", "Personal"])
+    await activate(relaunched)
+    #expect(await spotlight.coordinators == names(fixture, [0: "Work", 1: "Personal"]))
+    #expect(await spotlight.entries.count == 2)
+  }
+
+  @Test func aRelaunchConvergesAfterARenameThatStoppedBeforeSpotlightHeard() async throws {
+    let spotlight = SpotlightFake()
+    let fixture = try indexing(spotlight)
+    defer { fixture.clean() }
+    await activate(fixture.notifications)
+    let personal = fixture.profiles[1]
+    await spotlight.holdNextWrite()
+    try await fixture.notifications.coordinators.update(
+      personal.id, name: TagName("Family"), address: personal.address)
+    await spotlight.abandonHeldWrite()
+    #expect(
+      await spotlight.coordinators[personal.id] == "Personal", "The stop left the old name")
+    let relaunched = fixture.relaunch()
+    #expect(relaunched.coordinators.savedNames == ["Work", "Family", "Home"])
+    await activate(relaunched)
+    #expect(await spotlight.coordinators == names(fixture, [0: "Work", 1: "Family", 2: "Home"]))
+    #expect(await spotlight.entries.count == 3)
+  }
+
+  @Test func aWriteTheLockedPhoneRefusedIsRedoneAtTheNextActivation() async throws {
+    let spotlight = SpotlightFake()
+    let fixture = try indexing(spotlight)
+    defer { fixture.clean() }
+    await activate(fixture.notifications)
+    let coordinators = fixture.notifications.coordinators
+    let personal = fixture.profiles[1]
+    await spotlight.refuseNextWrite()
+    try await coordinators.update(personal.id, name: TagName("Family"), address: personal.address)
+    await settle(fixture.notifications)
+    #expect(await spotlight.coordinators[personal.id] == "Personal", "The rename was refused")
+    await coordinators.setActive(false)
+    await activate(fixture.notifications)
+    #expect(await spotlight.coordinators == names(fixture, [0: "Work", 1: "Family", 2: "Home"]))
+    #expect(await spotlight.entries.count == 3)
+  }
+
+  @Test func aSpotlightCoordinatorOpensLikeOpenCoordinatorAndKeepsTheDraft() async throws {
+    let spotlight = SpotlightFake()
+    let fixture = try indexing(spotlight)
+    defer { fixture.clean() }
+    await activate(fixture.notifications)
+    let work = fixture.profiles[0].id
+    let personal = fixture.profiles[1].id
+    let indexed = try #require(await spotlight.entries[.coordinator(personal)]?.coordinatorEntity)
+    let found = CoordinatorEntity.saved(
+      in: fixture.notifications.coordinators, matching: [indexed.id])
+    let result = try #require(found.first)
+    #expect(found.map(\.name) == ["Personal"])
+    let chat = fixture.notifications.coordinators.chat
+    chat.show(.one(work))
+    chat.draft = "An invented Work draft"
+    let destination = chat.destination
+    fixture.notifications.open(result)
+    #expect(chat.scope == .one(personal))
+    #expect(
+      try #require(fixture.notifications.openRequest).destination == .feed(notice: nil),
+      "An alert tap on Personal opens its feed with no notice")
+    #expect(chat.draft == "An invented Work draft")
+    #expect(chat.destination == destination)
+  }
 
   @Test func theQueryReturnsEachSavedCoordinatorOnceInSavedOrder() async throws {
     let fixture = try SavedFixture()

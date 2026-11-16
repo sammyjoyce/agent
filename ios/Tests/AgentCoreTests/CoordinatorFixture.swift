@@ -73,6 +73,15 @@ actor FixtureCoordinator {
   }
   /// The job ID of every retry received, in arrival order.
   func retryRequests() -> [String] { retried }
+  private var holdsJobsReply = false
+  private var jobsReplyRelease: CheckedContinuation<Void, Never>?
+  /// Holds the answer to the next jobs read until `releaseJobsReply`.
+  func holdNextJobsReply() { holdsJobsReply = true }
+  func releaseJobsReply() {
+    holdsJobsReply = false
+    jobsReplyRelease?.resume()
+    jobsReplyRelease = nil
+  }
   private var notificationRequests: [NotificationRequest] = []
   /// Each installation this coordinator holds a registration for, with its device token.
   private var registrations: [String: String] = [:]
@@ -250,6 +259,7 @@ actor FixtureCoordinator {
     releaseIdentity()
     releaseSubmitReply()
     releaseRetryReply()
+    releaseJobsReply()
     for socket in sockets { socket.cancel() }
     sockets = []
   }
@@ -399,6 +409,10 @@ actor FixtureCoordinator {
         closedContinuation.yield(())
         return
       case .jobs(let request):
+        if holdsJobsReply {
+          holdsJobsReply = false
+          await withCheckedContinuation { jobsReplyRelease = $0 }
+        }
         try await emit(jobReply(request.jobId), on: socket)
         try await emit(.done, on: socket)
         return

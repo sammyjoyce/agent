@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import Testing
 
 @testable import AgentCore
@@ -61,22 +62,77 @@ private func jobReads(_ fixture: FixtureCoordinator) async -> Int {
 private let updateTheCoordinator =
   "Update the coordinator to inspect scheduled jobs and saved work."
 
+/// Work serves an interrupted Nightly deps and Personal a healthy one.
+private func serveNightlyDeps(work: FixtureCoordinator, personal: FixtureCoordinator) async {
+  for (peer, title, state) in [
+    (work, "Work nightly deps", parked), (personal, "Personal nightly deps", .completed),
+  ] {
+    await peer.advertiseWorkInspection(true)
+    await peer.serveWork(
+      jobs: [nightlyDeps(title: title, lastRun: state)], conversations: [], pageSize: 10)
+  }
+}
+
 /// Work serves an interrupted Nightly deps and Personal a healthy one, both paired and connected.
 @MainActor private func withJobPeers(
+  registration: NotificationRegistration? = nil, holdingWork gate: DialGate? = nil,
+  spotlight: SpotlightFake? = nil,
   _ body: (Coordinators, ProfileID, ProfileID, FixtureCoordinator, FixtureCoordinator) async throws
     -> Void
 ) async throws {
-  try await withTwoFixtures { coordinators, workPeer, personalPeer, _ in
-    for (peer, title, state) in [
-      (workPeer, "Work nightly deps", parked), (personalPeer, "Personal nightly deps", .completed),
-    ] {
-      await peer.advertiseWorkInspection(true)
-      await peer.serveWork(
-        jobs: [nightlyDeps(title: title, lastRun: state)], conversations: [], pageSize: 10)
-    }
+  try await withTwoFixtures(registration: registration, holdingWork: gate, spotlight: spotlight) {
+    coordinators, workPeer, personalPeer, _ in
+    await serveNightlyDeps(work: workPeer, personal: personalPeer)
     let (work, personal) = try await addWorkAndPersonal(coordinators)
     try await body(coordinators, work, personal, workPeer, personalPeer)
   }
+}
+
+/// Work and Personal served as `withJobPeers` serves them. Each `launch` starts the app again over
+/// one folder and `spotlight`, with nothing saved at first and no scene active. The body
+/// deactivates what it launched.
+@MainActor private func withRelaunches(
+  spotlight: SpotlightFake,
+  _ body: (
+    _ launch: @MainActor () -> Coordinators, FixtureCoordinator, FixtureCoordinator
+  ) async throws -> Void
+) async throws {
+  let workPeer = FixtureCoordinator()
+  let personalPeer = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(workPeer)
+  defer { workListener.cancel() }
+  let (personalListener, personalPort) = try await listen(personalPeer)
+  defer { personalListener.cancel() }
+  await serveNightlyDeps(work: workPeer, personal: personalPeer)
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let suite = "relaunch-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defer { defaults.removePersistentDomain(forName: suite) }
+  let launch: @MainActor () -> Coordinators = {
+    Coordinators(
+      registration: nil, defaults: defaults, applicationSupport: root, caches: root,
+      transport: CoordinatorTransport { address in
+        LineConnection(
+          connection: NWConnection(
+            to: address.port == 4002 ? personalPort : workPort, using: .tcp))
+      }, spotlight: spotlight)
+  }
+  let outcome: Result<Void, any Error>
+  do {
+    try await body(launch, workPeer, personalPeer)
+    outcome = .success(())
+  } catch { outcome = .failure(error) }
+  await workPeer.stop()
+  await personalPeer.stop()
+  try outcome.get()
+}
+
+/// Activates the scene and returns once the job read it starts, and every Spotlight write since,
+/// have finished.
+@MainActor private func activate(_ coordinators: Coordinators) async {
+  await coordinators.setActive(true)
+  await coordinators.chat.spotlight?.settled()
 }
 
 struct SiriJobTests {
@@ -430,6 +486,216 @@ struct SiriJobTests {
 
   /// Work is saved first and is still connecting when the query starts. Personal is read
   /// meanwhile, and the jobs come back in saved order.
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func anActivationIndexesEveryPairedCoordinatorsJobs() async throws {
+    let spotlight = SpotlightFake()
+    try await withJobPeers(spotlight: spotlight) { coordinators, work, personal, _, _ in
+      try await background(coordinators)
+      await activate(coordinators)
+      let workJob = ScopedEntityID(profile: work, item: "nightly:deps")
+      let personalJob = ScopedEntityID(profile: personal, item: "nightly:deps")
+      #expect(
+        await spotlight.jobs == [
+          workJob: .init(title: "Work nightly deps", coordinator: "Work", state: .interrupted),
+          personalJob: .init(
+            title: "Personal nightly deps", coordinator: "Personal", state: .completed),
+        ])
+      #expect(await spotlight.coordinators == [work: "Work", personal: "Personal"])
+      let indexed = try #require(await spotlight.entries[.job(workJob)]?.jobEntity)
+      let opened = try await JobQuery.jobs(identifiedBy: [indexed.id], in: coordinators)
+      #expect(opened.map(\.title) == ["Work nightly deps"], "Open Job resolves the result")
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func theIndexedJobHoldsOnlyItsTitleCoordinatorAndState() async throws {
+    let spotlight = SpotlightFake()
+    try await withJobPeers(spotlight: spotlight) { coordinators, work, _, _, _ in
+      await activate(coordinators)
+      let id = ScopedEntityID(profile: work, item: "nightly:deps")
+      let job = try #require(await spotlight.entries[.job(id)]?.jobEntity)
+      #expect(job.id == id)
+      #expect(job.title == "Work nightly deps")
+      #expect(job.coordinator == "Work")
+      #expect(job.state == .interrupted)
+      #expect(job.schedule.isEmpty)
+      #expect(job.lastRun == nil, "Work's last run has a time, and the index leaves it out")
+      #expect(job.nextRun == nil)
+      #expect(job.summary == "Work nightly deps, Work, Interrupted")
+      let attributes = job.attributeSet
+      #expect(attributes.title == "Work nightly deps")
+      #expect(attributes.displayName == "Work nightly deps")
+      #expect(attributes.contentDescription == "Work, Interrupted")
+      #expect(attributes.keywords == nil)
+      #expect(attributes.textContent == nil)
+      #expect(attributes.alternateNames == nil)
+      #expect(attributes.subject == nil)
+      #expect(attributes.comment == nil)
+      let coordinator = try #require(await spotlight.entries[.coordinator(work)]?.coordinatorEntity)
+      #expect(coordinator.id == "\(work)")
+      #expect(coordinator.attributeSet.title == "Work")
+      #expect(coordinator.attributeSet.displayName == "Work")
+      #expect(coordinator.attributeSet.contentDescription == nil)
+      #expect(coordinator.attributeSet.keywords == nil)
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func aRenameRewritesTheCoordinatorsJobsWithoutReadingThem() async throws {
+    let spotlight = SpotlightFake()
+    try await withJobPeers(spotlight: spotlight) { coordinators, work, personal, workPeer, _ in
+      await activate(coordinators)
+      let reads = await jobReads(workPeer)
+      let address = try #require(coordinators.profiles.first { $0.id == work }).address
+      try await coordinators.update(work, name: TagName("Office"), address: address)
+      await coordinators.chat.spotlight?.settled()
+      #expect(await spotlight.coordinators == [work: "Office", personal: "Personal"])
+      let workJob = ScopedEntityID(profile: work, item: "nightly:deps")
+      #expect(
+        await spotlight.jobs[workJob]
+          == .init(title: "Work nightly deps", coordinator: "Office", state: .interrupted))
+      #expect(await jobReads(workPeer) == reads, "The rename read no jobs")
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func aJobItsCoordinatorNoLongerListsLeavesTheIndexWhenResolved() async throws {
+    let spotlight = SpotlightFake()
+    try await withJobPeers(spotlight: spotlight) { coordinators, work, _, workPeer, _ in
+      await activate(coordinators)
+      let gone = ScopedEntityID(profile: work, item: "nightly:deps")
+      try #require(await spotlight.jobs[gone] != nil)
+      await workPeer.serveWork(
+        jobs: [nightlyDeps(title: "Docs sweep", lastRun: .completed, id: "docs:sweep")],
+        conversations: [], pageSize: 10)
+      let refused = await #expect(throws: JobUnavailable.self) {
+        try await JobQuery.jobs(identifiedBy: [gone], in: coordinators)
+      }
+      #expect(refused == .notOnCoordinator(job: "nightly:deps", coordinator: "Work"))
+      await coordinators.chat.spotlight?.settled()
+      let jobs = await spotlight.jobs
+      #expect(jobs[gone] == nil)
+      #expect(
+        jobs[ScopedEntityID(profile: work, item: "docs:sweep")]
+          == .init(title: "Docs sweep", coordinator: "Work", state: .completed))
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func removingACoordinatorRemovesItsJobs() async throws {
+    let spotlight = SpotlightFake()
+    try await withJobPeers(spotlight: spotlight) { coordinators, work, personal, _, _ in
+      await activate(coordinators)
+      try #require(await spotlight.jobs.count == 2)
+      try await coordinators.remove(coordinators.removal(work))
+      await coordinators.chat.spotlight?.settled()
+      #expect(await spotlight.keys(of: work).isEmpty)
+      #expect(await spotlight.coordinators == [personal: "Personal"])
+      #expect(
+        await spotlight.jobs == [
+          ScopedEntityID(profile: personal, item: "nightly:deps"): .init(
+            title: "Personal nightly deps", coordinator: "Personal", state: .completed)
+        ])
+    }
+  }
+
+  /// Remove marks Work removed, saves, then waits on Work for its alert withdrawal before it
+  /// detaches Work's lane. A job list Work answers in that wait still reaches the caller.
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func aJobListThatArrivesAfterRemoveBeganPutsNothingBack() async throws {
+    let spotlight = SpotlightFake()
+    let registration = NotificationRegistration(
+      enabled: false, permission: { true }, register: {}, save: { _ in })
+    let gate = DialGate()
+    try await withJobPeers(registration: registration, holdingWork: gate, spotlight: spotlight) {
+      coordinators, work, personal, workPeer, _ in
+      let chat = coordinators.chat
+      try await until("Work's alert channel linked") { registration.status(work).configured }
+      await activate(coordinators)
+      try #require(await spotlight.jobs.count == 2)
+      await workPeer.holdNextJobsReply()
+      let reads = await jobReads(workPeer)
+      let reading = Task { @MainActor in try await chat.jobs(lane: work) }
+      try await until("Work received the read") { await jobReads(workPeer) == reads + 1 }
+      await gate.arm()
+      let removal = Task { @MainActor in
+        try await coordinators.remove(coordinators.removal(work))
+      }
+      try await until("Remove waiting on Work's alert withdrawal") { await gate.waiting }
+      await chat.spotlight?.settled()
+      #expect(await spotlight.keys(of: work).isEmpty, "Work left the index once Remove began")
+      await workPeer.releaseJobsReply()
+      let read = try await reading.value
+      guard case .list(let listing) = read else {
+        Issue.record("Work answered \(read)")
+        return
+      }
+      #expect(listing.jobs.map(\.job.title) == ["Work nightly deps"], "The list landed")
+      await chat.spotlight?.settled()
+      #expect(await spotlight.keys(of: work).isEmpty, "The late list put nothing back")
+      await gate.open()
+      try await removal.value
+      await chat.spotlight?.settled()
+      #expect(await spotlight.coordinators == [personal: "Personal"])
+      #expect(
+        Array(await spotlight.jobs.keys) == [
+          ScopedEntityID(profile: personal, item: "nightly:deps")
+        ])
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func aRelaunchIndexesJobsAgainUnderTheCurrentName() async throws {
+    let spotlight = SpotlightFake()
+    try await withRelaunches(spotlight: spotlight) { launch, _, _ in
+      let first = launch()
+      await first.setActive(true)
+      let (work, personal) = try await addWorkAndPersonal(first)
+      await activate(first)
+      try #require(await spotlight.jobs.count == 2)
+      let address = try #require(first.profiles.first { $0.id == work }).address
+      await spotlight.holdNextWrite()
+      try await first.update(work, name: TagName("Office"), address: address)
+      await spotlight.abandonHeldWrite()
+      await first.setActive(false)
+      #expect(await spotlight.coordinators[work] == "Work", "The stop left the old name")
+      let second = launch()
+      await activate(second)
+      await second.setActive(false)
+      #expect(await spotlight.coordinators == [work: "Office", personal: "Personal"])
+      #expect(
+        await spotlight.jobs == [
+          ScopedEntityID(profile: work, item: "nightly:deps"): .init(
+            title: "Work nightly deps", coordinator: "Office", state: .interrupted),
+          ScopedEntityID(profile: personal, item: "nightly:deps"): .init(
+            title: "Personal nightly deps", coordinator: "Personal", state: .completed),
+        ])
+    }
+  }
+
+  /// The Jobs and work screen's inspection holds one coordinator as its saved list.
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func anInspectionModelNeverIndexes() async throws {
+    let spotlight = SpotlightFake()
+    try await withJobPeers(spotlight: spotlight) { coordinators, _, personal, _, personalPeer in
+      await personalPeer.replyToHistory(
+        initial: .init(messages: [], pageComplete: true), pages: [:])
+      await activate(coordinators)
+      let indexed = await spotlight.entries
+      try #require(indexed.count == 4)
+      let inspection = ChatModel(
+        inspecting: SavedConversation(
+          conversationId: "example-conversation", taskId: "example-task",
+          title: "Example review"))
+      await inspection.connectInspection(using: coordinators.chat, lane: personal)
+      #expect(inspection.failure == nil)
+      #expect(inspection.profiles.map(\.id) == [personal])
+      await coordinators.chat.spotlight?.settled()
+      #expect(await spotlight.entries == indexed)
+      await inspection.detach(personal)
+    }
+  }
+
   @MainActor @Test(.timeLimit(.minutes(1)))
   func aCoordinatorStillConnectingDoesNotDelayTheNextOnesRead() async throws {
     try await withJobPeers { coordinators, _, _, workPeer, personalPeer in
