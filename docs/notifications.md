@@ -72,3 +72,23 @@ Apple and the operating system do not provide an exactly-once display guarantee.
 See Apple's [registration guide](https://developer.apple.com/documentation/usernotifications/registering-your-app-with-apns)
 and [provider authentication](https://developer.apple.com/documentation/usernotifications/establishing-a-token-based-connection-to-apns)
 for the account and signing steps.
+
+## Verify on a phone
+
+APNs acceptance does not show that the phone displayed an alert. The
+[phone acceptance runner](../ios/README.md#phone-acceptance) drives the
+installed app, puts it in the background or terminates it, and records each
+alert that the phone shows. To match those alerts with the coordinator's
+delivery records, run `runtime/scripts/notification-deliveries.mjs` on the
+coordinator host. It opens the session database read-only and prints the
+delivery state, HTTP status and attempts for each entry whose text contains a
+given string. It never prints a device token or the entry text.
+
+```sh
+node --input-type=module - --database <state directory>/session.sqlite \
+  --text <codeword> < runtime/scripts/notification-deliveries.mjs
+```
+
+Add `--tasks-since-entry <entry ID>` to list the tasks that were running when
+a notice was committed. If the phone showed the notice before the job's last
+task ended, the notice arrived while the job still ran.

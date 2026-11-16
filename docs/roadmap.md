@@ -70,7 +70,13 @@ recovery; [history](history.md) describes import and retrieval.
   The native text view copies and clears its buffer in the Send event, before
   asynchronous admission work. Native checks cover marked text, consecutive
   sends, foreground recovery and active responses. The replacement is available
-  in TestFlight; physical-phone verification of the recurrence remains open.
+  in TestFlight. A [phone acceptance](../ios/README.md#phone-acceptance) run on
+  an installed build showed the placeholder and the keyboard in the first
+  composer capture after every Send. It covered consecutive sends, an active
+  response across Home and an app switch, a long multiline draft, identical
+  newer typing and a relaunch with a newer draft. Restoring a started control
+  that never left the phone remains open
+  ([#34](https://github.com/sammyjoyce/agent/issues/34)).
 - [ ] Return a control's text, such as `/status`, to the live iOS composer when
   no recipient of its Send wrote it, as crash recovery already does, and keep
   newer typing. A control that any recipient wrote does not come back. A
@@ -144,11 +150,14 @@ recovery; [history](history.md) describes import and retrieval.
   steering and queueing path as the CLI. The native iPhone app fulfills the
   planned WhatsApp/iMessage client use case. System appearance is the default,
   with saved Light/Dark overrides and native keyboard dismissal.
-- [ ] Enable iPhone alerts for completed main-chat replies and explicit
-  `notify_user` notices, including mid-job requests. The durable delivery path
-  and automatic enrollment are implemented; signed-build enrollment and
-  real-phone delivery remain to verify.
-  See [notification setup](notifications.md).
+- [x] Enable iPhone alerts for completed main-chat replies and explicit
+  `notify_user` notices, including mid-job requests. A development-signed
+  build enrolled automatically on a real phone. A
+  [phone acceptance](../ios/README.md#phone-acceptance) run showed a completed
+  reply as an alert with the app in the background and after it was
+  terminated, and a mid-job notice while its job still ran. Each alert matched
+  an accepted durable delivery. TestFlight builds need the production APNs
+  environment. See [notification setup](notifications.md).
 - [x] Direct coordination between task sessions through their durable inboxes:
   sender identity, admission receipts, steering or queueing, and shared history.
 - [x] Voice input through a transcription provider interface. The iPhone
