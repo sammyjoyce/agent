@@ -752,6 +752,9 @@ mod tests {
           emit(id,{type:'host_call',call_id:'11111111-1111-4111-8111-111111111111',command:{
             type:'exec',program:'node',args:['--eval','process.stdout.write("synthetic\\n")'],cwd:'/',timeout_seconds:60}});
         } else if(command.type==='import_chatgpt') {
+          if(command.package.parts[0]==='mixed.zip') for (const [call,delay] of [[1,0],[2,10000]])
+            emit(id,{type:'host_call',call_id:'exec-'+call,command:{type:'exec',program:'node',cwd:'/',timeout_seconds:60,
+              args:['--eval','setTimeout(()=>process.stdout.write("synthetic\\n"),'+delay+')']}});
           for (const call of [1,2]) emit(id,{type:'host_call',call_id:'history-'+call,
             command:{type:'history',request:{type:'list',archived:false,cursor:null}}});
         } else if(command.type==='host_reply'&&command.call_id.startsWith('history-')) {
@@ -759,6 +762,8 @@ mod tests {
           histories.set(id,(histories.get(id)??0)+1);
           if(histories.get(id)===1) emit(id,{type:'notice',task_id:null,text:'Invented history progress'});
           else { emit(id,{type:'done'}); }
+        } else if(command.type==='host_reply'&&command.call_id.startsWith('exec-')) {
+          publish(command.call_id+'.json',JSON.stringify(command.result));
         } else if(command.type==='host_reply') {
           publish('reply.json',JSON.stringify(command.result)); finish(id);
         } else if(command.type==='attachment'&&command.request.type==='upload') {
@@ -1406,11 +1411,11 @@ mod tests {
         service.stop().await;
     }
 
-    fn chatgpt_import() -> RuntimeCommand {
+    fn chatgpt_import(part: &str) -> RuntimeCommand {
         RuntimeCommand::ImportChatGpt {
             package: crate::history::chatgpt::ChatGptPackageSummary {
                 digest: "0".repeat(64),
-                parts: vec!["export.zip".into()],
+                parts: vec![part.into()],
                 conversations: 1,
                 archived: 0,
                 shards: 1,
@@ -1449,7 +1454,9 @@ mod tests {
     async fn history_client_eof_fails_outstanding_reads_promptly() {
         let service = Running::start().await;
         let mut client = service.client().await;
-        write_frame(&mut client, &chatgpt_import()).await.unwrap();
+        write_frame(&mut client, &chatgpt_import("export.zip"))
+            .await
+            .unwrap();
         let (reader, mut writer) = client.into_split();
         let mut reader = FrameReader::new(BufReader::new(reader));
         delegated_history_calls(&mut reader).await;
@@ -1465,7 +1472,9 @@ mod tests {
     async fn history_client_read_error_fails_outstanding_reads_promptly() {
         let service = Running::start().await;
         let mut client = service.client().await;
-        write_frame(&mut client, &chatgpt_import()).await.unwrap();
+        write_frame(&mut client, &chatgpt_import("export.zip"))
+            .await
+            .unwrap();
         let (reader, mut writer) = client.into_split();
         let mut reader = FrameReader::new(BufReader::new(reader));
         delegated_history_calls(&mut reader).await;
@@ -1548,7 +1557,9 @@ mod tests {
             broker,
         ));
         let (reader, mut writer) = tokio::io::split(client);
-        write_frame(&mut writer, &chatgpt_import()).await.unwrap();
+        write_frame(&mut writer, &chatgpt_import("export.zip"))
+            .await
+            .unwrap();
         let mut reader = FrameReader::new(BufReader::new(reader));
         delegated_history_calls(&mut reader).await;
         failed.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1577,6 +1588,43 @@ mod tests {
             .close()
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_client_is_sent_only_reads_and_cannot_answer_the_services_calls() {
+        let service = Running::start().await;
+        let mut client = service.client().await;
+        write_frame(&mut client, &chatgpt_import("mixed.zip"))
+            .await
+            .unwrap();
+        let (reader, mut writer) = client.into_split();
+        let mut reader = FrameReader::new(BufReader::new(reader));
+        delegated_history_calls(&mut reader).await;
+        let executed = service.wait_for("exec-1.json").await;
+        let result: HostResult = serde_json::from_slice(&fs::read(&executed).unwrap()).unwrap();
+        assert!(
+            matches!(&result, HostResult::Process { exit_code: 0, stdout, .. } if stdout == "synthetic\n"),
+            "{result:?}"
+        );
+        write_frame(
+            &mut writer,
+            &RuntimeCommand::HostReply {
+                call_id: "exec-2".into(),
+                result: HostResult::Failed {
+                    delivery: None,
+                    message: "Invented forged reply".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let running = fs::read_to_string(service.wait_for("exec-2.json").await).unwrap();
+        assert!(!running.contains("Invented forged reply"), "{running}");
+        for call in ["history-1", "history-2"] {
+            disconnected_reply(service.directory.path(), call).await;
+        }
+        drop((reader, writer));
+        service.stop().await;
     }
 
     #[tokio::test]
