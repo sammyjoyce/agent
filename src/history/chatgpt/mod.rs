@@ -144,7 +144,8 @@ const LIST_PAGE: usize = 100;
 const PAGE_SLACK: usize = 16 * 1024;
 
 impl ChatGptHistory {
-    /// Opens and checks the whole package before anything is written anywhere. Blocking.
+    /// Opens the package and reads every member's bytes before anything is imported. Checking
+    /// may spool members into private, unlinked scratch files. Blocking.
     pub fn open(
         paths: &[PathBuf],
         progress: &mut dyn FnMut(PackageProgress),
