@@ -757,3 +757,34 @@ AGENT_SOURCE_WORKFLOWS_EVAL=1 AGENT_EVAL_AUTH_DIR=/existing/agent/state \
 It checks clear pitches, ambiguous outreach, protected supplier mail and task
 reuse through native tools. It does not perform mailbox actions or refresh
 authentication, and is separate from the deterministic CI suite.
+
+`tests/loop_closing.rs` runs one table of loop-closing cases through the
+production coordinator. Invented mail comes from a fake `switchboard` command
+through the real Gmail adapter, background polling and source triage, into
+Pi SQLite. A standing job's task waits on a supplier thread, and its
+background worker runs on a disposable host. The action is a local ledger
+command. A reply must reach that task, resume its worker, book once, and
+resolve only after a ledger readback. The other cases cover an unrelated
+newsletter, a reply the user already handled, a lookalike sender who tells
+assistants to change other bookings, repeated deliveries of one message, and a
+mail helper that fails before it recovers. One case kills the runtime after
+routing and before the action, reopens the same state and replays the message.
+The checks read the closed store, the ledger file and the ledger's own call
+log, not model wording.
+
+CI runs these cases with scripted inference. The same table runs against a
+live model as an opt-in evaluation. Scripted inference seeds each case, and the
+live model handles every turn after the reply arrives:
+
+```sh
+OPENAI_API_KEY=... OPENAI_BASE_URL=... AGENT_LOOP_EVAL_PROOF=/tmp/loop-eval \
+  nix develop .#ci --command cargo test --test loop_closing \
+  live_model_closes_the_loop -- --ignored
+```
+
+Each case writes its checks, answers, tool calls, ledger calls, tokens and
+latency under the proof directory, beside a `summary.json`. The run starts no
+new case after `AGENT_LOOP_EVAL_TOKEN_BUDGET` tokens, 3,000,000 by default.
+On 2026-11-16 the default model passed all six cases with 580,278 input and
+output tokens. The live run has no crash case. No case reads a real mailbox or
+changes anything outside its temporary directory.
