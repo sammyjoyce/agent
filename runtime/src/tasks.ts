@@ -102,7 +102,7 @@ type TaskActor = { readonly ref: ActorRef; readonly mode: ActorMode; readonly ex
 type ActorPlacement = { type: "placed"; host: WorkerHost } | { type: "host_at_start" } | { type: "unplaced" | "host_offline"; reason: string };
 function isAbortedJob(actor: TaskActor): boolean { return actor.mode === "job" && actor.turn.controller.signal.aborted; }
 const CONFINED_ACTOR_ONLY = "A confined task runs only its scheduler's input, as coordinator background work without agents or terminals";
-function requireLinksOnly(sources: readonly SourceRef[]): void {
+function refuseScheduledJobSources(sources: readonly SourceRef[]): void {
   if (sources.some((source) => source.provider === "scheduled_jobs")) throw new TaskError("Scheduled job ownership is assigned only by the scheduler");
 }
 const STOPPED_INPUT_WITHDRAWN = "The stopped turn withdrew this input; submit it again to continue.";
@@ -848,7 +848,7 @@ export class TaskStore {
       .slice(0, Math.min(20, Math.max(1, limit))), gaps: indexed.gaps };
   }
   async adopt(conversationId: string, input: { id: string; title?: string; outcome: string; evidence: string; model: ModelSelection; sources?: SourceRef[] }): Promise<TaskRecord> {
-    requireLinksOnly(input.sources ?? []);
+    refuseScheduledJobSources(input.sources ?? []);
     await this.prepare();
     const imported = await this.histories?.byConversation(conversationId);
     if (imported === undefined || this.histories === undefined) throw new TaskError("Only an imported historical conversation can be adopted");
@@ -909,7 +909,7 @@ export class TaskStore {
   async createIn(tx: Tx, input: TaskCreate): Promise<{ id: TaskRecord["id"]; native?: ConversationId }> {
     const id = input.id ?? randomUUID();
     if (input.title.trim().length === 0 || input.outcome.trim().length === 0) throw new TaskError("Task title and outcome are required");
-    requireLinksOnly(input.sources ?? []);
+    refuseScheduledJobSources(input.sources ?? []);
     const sources = [...input.sources ?? [], ...input.job_id === undefined ? [] : [{ provider: "scheduled_jobs", account: "local", thread_id: input.job_id }]];
     const previous = await this.taskIn(tx, id);
     if (previous !== undefined) return { id: previous.id };
@@ -952,7 +952,7 @@ export class TaskStore {
     const removed = task.sources.filter((source) => remove.some((other) => related(other, source)))
       .map((source) => ({ ...source }));
     if (added.length === 0 && removed.length === 0) return;
-    requireLinksOnly([...added, ...removed]);
+    refuseScheduledJobSources([...added, ...removed]);
     const sources = task.sources.filter((source) => !removed.some((other) => related(other, source))).map((source) => ({ ...source }));
     task.sources = [...sources, ...added]; task.updated_at = Date.now();
     await this.indexTaskIn(tx, task, [...sources, ...removed]);
