@@ -38,8 +38,12 @@ PHRASED = {
 # `authenticationPolicy` 1 is `.requiresAuthentication`, 2 `.requiresLocalDeviceAuthentication`.
 AUTHENTICATED = {"RetryInterruptedRunIntent": 1, "SendMessageIntent": 2}
 POLICIES = {1: "require authentication", 2: "require an unlock of the device that runs it"}
-# Actions that run in the background, by each parameter and the entity it takes, or None.
-BACKGROUND = {"SendMessageIntent": {"message": None, "coordinator": "CoordinatorEntity"}}
+# `typeIdentifier` 0 is a String.
+STRING = "primitive 0"
+# Each action's parameters, by name and the type it takes: an entity's name or STRING.
+PARAMETERS = {"SendMessageIntent": {"message": STRING, "coordinator": "CoordinatorEntity"}}
+# Actions that run without opening the app.
+IN_BACKGROUND = {"SendMessageIntent"}
 OPENS = {"OpenCoordinatorIntent": "CoordinatorEntity", "OpenJobIntent": "JobEntity"}
 OPEN_ENTITY = "com.apple.link.systemProtocol.OpenEntity"
 
@@ -49,6 +53,14 @@ def metadata_path(argument: str) -> Path:
     if path.is_dir():
         return path / "Metadata.appintents" / "extract.actionsdata"
     return path
+
+
+def value_type(value: dict) -> str | None:
+    if "entity" in value:
+        return (value["entity"].get("wrapper") or {}).get("typeName")
+    if "primitive" in value:
+        return f"primitive {(value['primitive'].get('wrapper') or {}).get('typeIdentifier')}"
+    return None
 
 
 def problems(metadata: dict) -> list[str]:
@@ -94,19 +106,16 @@ def problems(metadata: dict) -> list[str]:
     for action, policy in AUTHENTICATED.items():
         if action in actions and actions[action].get("authenticationPolicy") != policy:
             found.append(f"{action} does not {POLICIES[policy]}")
-    for action, expected in BACKGROUND.items():
-        if action not in actions:
-            continue
-        definition = actions[action]
-        parameters = {
-            p.get("name"): ((p.get("valueType") or {}).get("entity") or {})
-            .get("wrapper", {})
-            .get("typeName")
-            for p in definition.get("parameters") or []
-        }
-        if parameters != expected:
-            found.append(f"{action} takes {parameters}, not {expected}")
-        if definition.get("openAppWhenRun") is not False:
+    for action, expected in PARAMETERS.items():
+        if action in actions:
+            taken = {
+                p.get("name"): value_type(p.get("valueType") or {})
+                for p in actions[action].get("parameters") or []
+            }
+            if taken != expected:
+                found.append(f"{action} takes {taken}, not {expected}")
+    for action in IN_BACKGROUND:
+        if action in actions and actions[action].get("openAppWhenRun") is not False:
             found.append(f"{action} opens the app")
     for action, entity in OPENS.items():
         if action not in actions:
