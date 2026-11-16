@@ -16,6 +16,14 @@ pub const ABSOLUTE_ALLOWANCE_MS: f64 = 20.0;
 pub enum Mark {
     Spawn,
     StoredTextVisible,
+    ReplayFinished,
+    OutputSettled,
+    CtrlHome,
+    OldestVisible,
+    PageDown,
+    NewerPageVisible,
+    PageUp,
+    OlderPageVisible,
     Enter,
     Admitted,
     ActivityVisible,
@@ -34,6 +42,8 @@ pub enum Mark {
 #[serde(rename_all = "snake_case")]
 pub enum Gate {
     ConversationVisible,
+    ScrollToOldest,
+    PageUp,
     Admission,
     FirstActivity,
     SteerAdmission,

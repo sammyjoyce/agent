@@ -1,3 +1,4 @@
+mod background;
 mod coordinator;
 mod gate;
 mod provider;

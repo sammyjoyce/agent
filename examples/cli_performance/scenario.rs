@@ -7,6 +7,7 @@ use tokio::time::sleep;
 
 use crate::{
     DEADLINE,
+    background::Background,
     coordinator::read_pid,
     gate::{Gate, GateDefinition, HoldDiscount, Mark},
     provider::{End, Request},
@@ -20,7 +21,10 @@ pub enum Scenario {
     ChiefCold,
     Chief,
     LongHistory,
+    ScrollHistory,
     Submit,
+    SubmitDuringSearch,
+    SubmitDuringImport,
     Steer,
     StopStream,
     StopTool,
@@ -53,12 +57,16 @@ pub enum Ending {
 #[derive(Debug, Serialize)]
 pub struct Definition {
     pub coordinator: Lifetime,
+    pub background: Background,
     pub turns: &'static [Turn],
     pub gates: &'static [GateDefinition],
 }
 
 pub const CHIEF_SENTENCE: &str = "Stored chief conversation is ready.";
 const LONG_SENTENCE: &str = "Stored long conversation is ready.";
+const OLDEST_MESSAGE: &str = "Synthetic retained conversation message 0.";
+const OLDER_PAGE_MESSAGE: &str = "Synthetic retained conversation message 3.";
+const NEWER_PAGE_MESSAGE: &str = "Synthetic retained conversation message 12.";
 pub const ENTER: &[u8] = b"\r";
 const ESC: &[u8] = b"\x1b";
 
@@ -146,16 +154,19 @@ static STOP_GATES: [GateDefinition; 1] = [gate(
 
 static CHIEF_COLD_DEFINITION: Definition = Definition {
     coordinator: Lifetime::PerSample,
+    background: Background::None,
     turns: &[],
     gates: &LAUNCH_GATES,
 };
 static RETAINED_DEFINITION: Definition = Definition {
     coordinator: Lifetime::SharedPerVersion,
+    background: Background::None,
     turns: &[],
     gates: &LAUNCH_GATES,
 };
 static SUBMIT_DEFINITION: Definition = Definition {
     coordinator: Lifetime::PerSample,
+    background: Background::None,
     turns: &[PRIME, SUBMIT],
     gates: &[
         gate(
@@ -174,6 +185,7 @@ static SUBMIT_DEFINITION: Definition = Definition {
 };
 static STEER_DEFINITION: Definition = Definition {
     coordinator: Lifetime::PerSample,
+    background: Background::None,
     turns: &[PRIME, STEER_BASE, STEER],
     gates: &[
         gate(
@@ -192,11 +204,13 @@ static STEER_DEFINITION: Definition = Definition {
 };
 static STOP_STREAM_DEFINITION: Definition = Definition {
     coordinator: Lifetime::PerSample,
+    background: Background::None,
     turns: &[PRIME, STOP_STREAM],
     gates: &STOP_GATES,
 };
 static STOP_TOOL_DEFINITION: Definition = Definition {
     coordinator: Lifetime::PerSample,
+    background: Background::None,
     turns: &[PRIME, STOP_TOOL],
     gates: &STOP_GATES,
 };
@@ -206,6 +220,9 @@ impl Scenario {
         match self {
             Self::ChiefCold => &CHIEF_COLD_DEFINITION,
             Self::Chief | Self::LongHistory => &RETAINED_DEFINITION,
+            Self::ScrollHistory | Self::SubmitDuringSearch | Self::SubmitDuringImport => {
+                todo!("definition of {self:?}")
+            }
             Self::Submit => &SUBMIT_DEFINITION,
             Self::Steer => &STEER_DEFINITION,
             Self::StopStream => &STOP_STREAM_DEFINITION,
@@ -226,6 +243,9 @@ pub async fn drive(scenario: Scenario, context: &Context<'_>) -> Result<Outcome>
         Scenario::LongHistory => {
             let resume = format!("/resume {}", context.seed.long_history);
             session::launch(context, Some(resume), LONG_SENTENCE).await
+        }
+        Scenario::ScrollHistory | Scenario::SubmitDuringSearch | Scenario::SubmitDuringImport => {
+            bail!("not implemented")
         }
         Scenario::Submit => {
             session::interactive(context, async |terminal, marks| {
@@ -541,11 +561,13 @@ mod tests {
                 to: origin + ms(90),
             },
         ];
-        let mut checked = 0;
+        let mut checked = Vec::new();
         for scenario in Scenario::value_variants() {
             for definition in scenario.gates() {
                 match definition.gate {
                     Gate::ConversationVisible
+                    | Gate::ScrollToOldest
+                    | Gate::PageUp
                     | Gate::Admission
                     | Gate::SteerAdmission
                     | Gate::Stop => {}
@@ -560,10 +582,18 @@ mod tests {
                     "{scenario:?} {:?}",
                     definition.gate
                 );
-                checked += 1;
+                checked.push((*scenario, definition.gate));
             }
         }
-        assert!(checked > 0);
+        for required in [
+            (Scenario::Submit, Gate::Admission),
+            (Scenario::ScrollHistory, Gate::ScrollToOldest),
+            (Scenario::ScrollHistory, Gate::PageUp),
+            (Scenario::SubmitDuringSearch, Gate::Admission),
+            (Scenario::SubmitDuringImport, Gate::Admission),
+        ] {
+            assert!(checked.contains(&required), "{required:?} was not checked");
+        }
     }
 
     #[test]
@@ -604,6 +634,9 @@ mod tests {
         let mut texts = vec![
             CHIEF_SENTENCE,
             LONG_SENTENCE,
+            OLDEST_MESSAGE,
+            OLDER_PAGE_MESSAGE,
+            NEWER_PAGE_MESSAGE,
             "Synthetic chief conversation message 38.",
             "Synthetic retained conversation message 4998.",
             "Unrelated saved discussion 2999",
