@@ -1,7 +1,10 @@
+import CoreGraphics
 import CryptoKit
 import Foundation
+import ImageIO
 import Network
 import Testing
+import UniformTypeIdentifiers
 
 @testable import AgentCore
 
@@ -434,6 +437,25 @@ func realNetworkTransportClosesAfterAnInvalidEvent() async throws {
   }
 }
 
+/// An invented 96 by 48 page capture: one vertical stripe each of red, green and blue.
+private func screenshotPNG() throws -> Data {
+  let context = try #require(
+    CGContext(
+      data: nil, width: 96, height: 48, bitsPerComponent: 8, bytesPerRow: 96 * 4,
+      space: CGColorSpaceCreateDeviceRGB(),
+      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+  for (index, color) in [(0.82, 0.19, 0.19), (0.19, 0.63, 0.25), (0.19, 0.31, 0.82)].enumerated() {
+    context.setFillColor(CGColor(red: color.0, green: color.1, blue: color.2, alpha: 1))
+    context.fill(CGRect(x: index * 32, y: 0, width: 32, height: 48))
+  }
+  let data = NSMutableData()
+  let image = try #require(
+    CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil))
+  CGImageDestinationAddImage(image, try #require(context.makeImage()), nil)
+  try #require(CGImageDestinationFinalize(image))
+  return data as Data
+}
+
 private func screenshotReference(_ bytes: Data) -> AttachmentRef {
   AttachmentRef(
     id: "33333333-3333-4333-8333-333333333333", mediaType: "image/png",
@@ -454,8 +476,8 @@ private func screenshotMessages(_ reference: AttachmentRef) -> [HistoryMessage] 
   ]
 }
 
-@Test func aToolResultAttachmentStaysOnItsToolRowLiveAndInHistory() {
-  let reference = screenshotReference(Data("Invented screenshot bytes".utf8))
+@Test func aToolResultAttachmentStaysOnItsToolRowLiveAndInHistory() throws {
+  let reference = screenshotReference(try screenshotPNG())
   let messages = screenshotMessages(reference)
   var live = Transcript()
   live.activity(.toolStarted(.init(callId: "screenshot-call", name: "browser_screenshot")))
@@ -474,13 +496,15 @@ private func screenshotMessages(_ reference: AttachmentRef) -> [HistoryMessage] 
   async throws
 {
   try await withCoordinator { session, fixture, _ in
-    let bytes = Data("Invented screenshot bytes".utf8)
+    let bytes = try screenshotPNG()
     let reference = screenshotReference(bytes)
     let changed = AttachmentRef(
       id: "44444444-4444-4444-8444-444444444444", mediaType: reference.mediaType,
       name: reference.name, sha256: reference.sha256, sizeBytes: bytes.count)
+    var altered = bytes
+    altered[altered.count / 2] ^= 0xff
     await fixture.retain(bytes, id: reference.id)
-    await fixture.retain(Data("Invented screenshot BYTES".utf8), id: changed.id)
+    await fixture.retain(altered, id: changed.id)
     await fixture.replyToHistory(
       initial: .init(
         messages: screenshotMessages(reference), nextCursor: nil, pageComplete: true),
@@ -493,6 +517,11 @@ private func screenshotMessages(_ reference: AttachmentRef) -> [HistoryMessage] 
     #expect(row.attachments == [reference])
     let preview = try await session.preview(reference)
     #expect(try Data(contentsOf: preview) == bytes)
+    let image = try #require(
+      CGImageSourceCreateWithURL(preview as CFURL, nil).flatMap {
+        CGImageSourceCreateImageAtIndex($0, 0, nil)
+      })
+    #expect(image.width == 96 && image.height == 48)
     do {
       _ = try await session.preview(changed)
       Issue.record("Bytes that do not match the screenshot's digest previewed")
