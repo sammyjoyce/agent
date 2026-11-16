@@ -82,7 +82,9 @@ alert that the phone shows. To match those alerts with the coordinator's
 delivery records, run `runtime/scripts/notification-deliveries.mjs` on the
 coordinator host. It opens the session database read-only and prints the
 delivery state, HTTP status and attempts for each entry whose text contains a
-given string. It never prints a device token or the entry text.
+given string. It never prints a device token or the entry text. Read-only
+mode does not change the database file, but SQLite can still create its
+`-wal` and `-shm` files next to it when they are missing.
 
 ```sh
 node --input-type=module - --database <state directory>/session.sqlite \
