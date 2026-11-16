@@ -188,7 +188,9 @@ Two runs on one build show the gates' range:
 - The benchmark makes no claim about native iOS frame pacing.
 - The TUI draws a runtime update after waiting up to 40 ms for input, and Pi
   commits a streamed partial on a trailing 100 ms timer. Both count as
-  application delay.
+  application delay. Visible marks land on steps of about 41 ms, so a sample
+  near a step boundary can move by a whole step. `chief_cold` moves most
+  often, and its gate can fail with no change.
 - Rex is a shell stand-in, and the model provider is a local script.
 - Token counts are synthetic.
 - Scrolling to older text in a long history, and foreground work during search
