@@ -114,8 +114,11 @@ export async function enroll(link: AuthorityLink, holder = OWNER): Promise<numbe
   return (await accepted(link, { op: "enroll", holder, checkpoint: { through: 0, manifest } })).epoch;
 }
 
+/** A read-only connection that waits for a lock, because a test reads a database that another process may be opening or closing. */
+const reader = (directory: string) => new DatabaseSync(sessionPath(directory), { readOnly: true, timeout: 5_000 });
+
 export function tables(directory: string): Record<string, string[]> {
-  const database = new DatabaseSync(sessionPath(directory), { readOnly: true });
+  const database = reader(directory);
   try {
     const names = database.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all();
     return Object.fromEntries(names.map(({ name }) =>
@@ -219,7 +222,7 @@ export async function loggedNotes(link: AuthorityLink): Promise<string[]> {
 }
 
 export function localNotes(directory: string): string[] {
-  const database = new DatabaseSync(sessionPath(directory), { readOnly: true });
+  const database = reader(directory);
   try { return noteData(database.prepare("SELECT record FROM entries ORDER BY rowid").all().map((row) => JSON.parse(String(row.record)))); }
   finally { database.close(); }
 }

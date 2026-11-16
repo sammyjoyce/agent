@@ -17,11 +17,18 @@ const LOG_PAGE_ENTRIES = 64;
 
 export const sessionDatabasePath = (state: string) => join(state, "session.sqlite");
 
+/**
+ * How long a read waits for a lock. SQLite locks the file for an instant when
+ * another process opens or closes it, and a read with no wait is then refused
+ * as locked: `failover status` beside a running `failover follow`, or the reverse.
+ */
+const BUSY_TIMEOUT_MS = 5_000;
+
 /** Opens a state directory's session database without the right to change it. */
 function readOnly(state: string): DatabaseSync {
   const path = sessionDatabasePath(state);
   if (!existsSync(path)) throw new Error(`${state} has no session.sqlite, so it is not a coordinator's state directory`);
-  return new DatabaseSync(path, { readOnly: true });
+  return new DatabaseSync(path, { readOnly: true, timeout: BUSY_TIMEOUT_MS });
 }
 
 const hasTable = (database: DatabaseSync, name: string) =>

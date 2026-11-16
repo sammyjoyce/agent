@@ -96,10 +96,12 @@ test("the failover commands enroll an owner and keep a standby of it", { timeout
     assert.deepEqual(tables(standby.state), settled, "a second follow applies nothing");
 
     const polling = standby.start("follow", "--interval", "1");
-    await until(async () => (await standby.failover("follow", "--once")).stderr.includes("Another agent process owns this state directory"),
-      "a second follow is refused while the first holds the lock");
     await ownerActivity(owner, ["third"]);
-    await until(() => JSON.stringify(tables(standby.state)) === JSON.stringify(tables(owner.state)), "the polling follow applies what the owner logs next");
+    await until(() => { polling.assertRunning(); return JSON.stringify(tables(standby.state)) === JSON.stringify(tables(owner.state)); },
+      "the polling follow applies what the owner logs next");
+    const second = await standby.failover("follow", "--once");
+    assert.notEqual(second.code, 0, "a second follow is refused while the first holds the lock");
+    assert.match(second.stderr, /Another agent process owns this state directory/);
     await crash(polling);
   });
 
@@ -125,6 +127,21 @@ test("the failover commands enroll an owner and keep a standby of it", { timeout
     assert.ok(entries.length > 0);
     assert.equal(JSON.stringify(entries).includes("SENTINEL-INVENTED"), false);
     assert.equal(JSON.stringify(proxy.seen.filter((request) => request.method === "POST")).includes("SENTINEL-INVENTED"), false);
+  });
+
+  await t.test("an authority that does not answer is a failure that names the request, never a refusal", async (t) => {
+    const coordinator = world.coordinator(), proxy = await startFaultProxy(t, world.authorityUrl), owner = await world.host(coordinator, OWNER, proxy.url);
+    await owner.create();
+    proxy.inject({ fault: { kind: "unavailable" } });
+    for (const command of [["status"], ["enroll"], ["release"], ["promote", "--replace-epoch", "1"]]) {
+      const run = await owner.failover(...command), label = command.join(" ");
+      assert.equal(run.code, 1, `${label}: ${run.stderr}`);
+      assert.match(run.stderr, /The fault proxy refused this request/, label);
+      assert.equal(run.stdout, "", `${label} prints no receipt`);
+    }
+    proxy.heal();
+    assert.equal(await owner.record(), undefined, "nothing reached the authority");
+    assert.equal(tables(owner.state).beep_boop_failover, undefined, "an enrollment that reached nobody stamps nothing");
   });
 
   await t.test("status needs the coordinator named when the state directory names none", async () => {

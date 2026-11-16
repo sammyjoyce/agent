@@ -378,6 +378,151 @@ fn a_pi_child_that_exits_75_ends_the_supervisor_with_75_and_removes_its_socket()
     }
 }
 
+const OPERATOR: &str = r#"
+const { appendFileSync } = require("node:fs");
+const { join } = require("node:path");
+appendFileSync(join(__dirname, "operator-runs.ndjson"), process.argv[2] + "\n");
+const request = JSON.parse(process.argv[2]);
+const sealed = { kind: "sealed", epoch: 8, holder: "22222222-2222-4222-8222-222222222222",
+  candidate: "33333333-3333-4333-8333-333333333333", head: 3 };
+const report = request.op === "status"
+  ? { result: "status", record: { state: sealed, checkpoint: { through: 0, manifest: "ab".repeat(32) } }, applied: null }
+  : { result: "reply", reply: { result: "accepted", state: { kind: "vacant", epoch: 8, candidate: sealed.candidate,
+      evidence: { kind: request.command.evidence }, head: 3 } } };
+process.stdout.write(JSON.stringify(report) + "\n");
+"#;
+
+impl World {
+    fn with_operator(self) -> Self {
+        fs::write(self.runtime.join("failover/operator.js"), OPERATOR).unwrap();
+        self
+    }
+
+    fn operator_runs(&self) -> Vec<Value> {
+        fs::read_to_string(self.runtime.join("failover/operator-runs.ndjson"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+}
+
+fn sealed(holder: &str) -> Value {
+    json!({
+        "result": "refused",
+        "reason": "sealed",
+        "state": { "kind": "sealed", "epoch": 8, "holder": holder, "candidate": OTHER_HOLDER, "head": 3 },
+    })
+}
+
+#[test]
+fn a_start_refused_as_the_sealed_holder_posts_lock_held_and_exits_75_whether_or_not_the_post_lands()
+{
+    let world = World::new(Failover::Holder)
+        .with_coordinator_id()
+        .with_operator();
+    world.answer(sealed(HOLDER), "", 0);
+    let output = world.run();
+    assert_eq!(
+        output.status.code(),
+        Some(OWNER_FENCED),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        world.operator_runs(),
+        [json!({
+            "op": "authority",
+            "command": { "op": "release", "holder": HOLDER, "epoch": 8, "evidence": "lock_held" },
+        })]
+    );
+    assert!(!world.socket().exists());
+    assert_eq!(world.bridge(), None);
+
+    let unbuilt = World::new(Failover::Holder).with_coordinator_id();
+    unbuilt.answer(sealed(HOLDER), "", 0);
+    let output = unbuilt.run();
+    let message = stderr(&output);
+    assert_eq!(output.status.code(), Some(OWNER_FENCED), "{message}");
+    assert!(
+        message.contains("beep-boop failover release"),
+        "a failed post names the command that posts the same evidence: {message}"
+    );
+}
+
+#[test]
+fn a_start_refused_while_another_holder_is_sealed_posts_nothing() {
+    let world = World::new(Failover::Holder)
+        .with_coordinator_id()
+        .with_operator();
+    world.answer(sealed(OTHER_HOLDER), "", 0);
+    let output = world.run();
+    assert_eq!(
+        output.status.code(),
+        Some(OWNER_FENCED),
+        "{}",
+        stderr(&output)
+    );
+    assert!(world.operator_runs().is_empty());
+}
+
+#[test]
+fn a_fenced_pi_child_posts_released_only_under_a_replicated_claim_and_a_failed_post_still_exits_75()
+{
+    let posted = World::new(Failover::Holder)
+        .with_coordinator_id()
+        .with_operator();
+    posted.answer(json!({ "result": "claimed", "epoch": 8, "head": 3 }), "", 0);
+    let running = posted.serve();
+    fs::write(posted.runtime.join("exit"), OWNER_FENCED.to_string()).unwrap();
+    let output = running.finish();
+    assert_eq!(
+        output.status.code(),
+        Some(OWNER_FENCED),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        posted.operator_runs(),
+        [
+            json!({ "op": "status", "state": null }),
+            json!({
+                "op": "authority",
+                "command": { "op": "release", "holder": HOLDER, "epoch": 8, "evidence": "released" },
+            }),
+        ]
+    );
+    assert!(!posted.socket().exists());
+
+    let unbuilt = World::new(Failover::Holder).with_coordinator_id();
+    unbuilt.answer(json!({ "result": "claimed", "epoch": 8, "head": 3 }), "", 0);
+    let running = unbuilt.serve();
+    fs::write(unbuilt.runtime.join("exit"), OWNER_FENCED.to_string()).unwrap();
+    let output = running.finish();
+    let message = stderr(&output);
+    assert_eq!(output.status.code(), Some(OWNER_FENCED), "{message}");
+    assert!(message.contains("beep-boop failover release"), "{message}");
+
+    let another_epoch = World::new(Failover::Holder)
+        .with_coordinator_id()
+        .with_operator();
+    another_epoch.answer(json!({ "result": "claimed", "epoch": 9, "head": 3 }), "", 0);
+    let running = another_epoch.serve();
+    fs::write(another_epoch.runtime.join("exit"), OWNER_FENCED.to_string()).unwrap();
+    let output = running.finish();
+    assert_eq!(
+        output.status.code(),
+        Some(OWNER_FENCED),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        another_epoch.operator_runs(),
+        [json!({ "op": "status", "state": null })],
+        "a log sealed at another epoch is not this claim's to release"
+    );
+}
+
 #[test]
 fn an_unreachable_authority_is_an_ordinary_failure_with_the_helper_error() {
     for (stdout, stderr_text, status) in [

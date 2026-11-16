@@ -25,7 +25,12 @@ export const HOLDERS = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4
 const COORDINATORS = Array.from({ length: 24 }, (_, index) => `aaaaaaaa-aaaa-4aaa-8aaa-${index.toString(16).padStart(12, "0")}`);
 
 export interface Run { readonly code: number | null; readonly stdout: string; readonly stderr: string }
-export interface Running { readonly child: ChildProcess; readonly done: Promise<Run> }
+export interface Running {
+  readonly child: ChildProcess;
+  readonly done: Promise<Run>;
+  /** Fails with the command's output when it has ended, for a wait that needs it running. */
+  assertRunning(): void;
+}
 
 export interface StatusReceipt { coordinator_id: string; record: AuthorityRecord | null; state_dir: string; applied: number | null }
 export interface EnrolledReceipt { coordinator_id: string; holder: string; epoch: number; checkpoint: CheckpointRecord;
@@ -185,11 +190,12 @@ export class World {
     let stdout = "", stderr = "";
     child.stdout.setEncoding("utf8").on("data", (value: string) => { stdout += value; });
     child.stderr.setEncoding("utf8").on("data", (value: string) => { stderr += value; });
+    let ended: Run | undefined;
     const done = new Promise<Run>((resolve, reject) => {
       child.once("error", reject);
-      child.once("close", (code) => { this.children.delete(child); resolve({ code, stdout, stderr }); });
+      child.once("close", (code) => { this.children.delete(child); ended = { code, stdout, stderr }; resolve(ended); });
     });
-    return { child, done };
+    return { child, done, assertRunning: () => assert.equal(ended, undefined, `${args.join(" ")} ended: ${JSON.stringify(ended)}`) };
   }
 }
 
@@ -244,8 +250,19 @@ export async function replicatedFiles(state: string): Promise<Map<string, string
   return files;
 }
 
-/** Kills a command and everything it started, as a crash of its host does. */
+/** Whether any process of a group is left. macOS answers EPERM while the only members left are exiting. */
+function groupAlive(group: number): boolean {
+  try { process.kill(-group, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+}
+
+/**
+ * Kills a command and everything it started, as a crash of its host does. It
+ * returns once the whole group is gone: the operator script a command started
+ * holds the state directory's writer lock until it has died too.
+ */
 export async function crash(running: Running): Promise<void> {
-  if (running.child.pid !== undefined) try { process.kill(-running.child.pid, "SIGKILL"); } catch { /* It already ended. */ }
+  const group = running.child.pid;
+  if (group !== undefined) try { process.kill(-group, "SIGKILL"); } catch { /* It already ended. */ }
   await running.done;
+  if (group !== undefined) await until(() => !groupAlive(group), "every process the command started has ended");
 }

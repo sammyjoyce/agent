@@ -999,6 +999,44 @@ mod tests {
     }
 
     #[test]
+    fn a_checkpoint_manifest_names_only_paths_inside_its_archive() {
+        let manifest = |path: &str| {
+            serde_json::json!({
+                "format": CHECKPOINT_FORMAT,
+                "through": 3,
+                "coordinator_id": Uuid::nil(),
+                "files": [{ "path": path, "size": 0, "sha256": "ab".repeat(32), "parts": [] }],
+            })
+        };
+        for accepted in [
+            "manifest.json",
+            "data/session.sqlite",
+            "data/history/assets/ab",
+        ] {
+            assert!(
+                serde_json::from_value::<CheckpointManifest>(manifest(accepted)).is_ok(),
+                "{accepted}"
+            );
+        }
+        for refused in [
+            "",
+            "/etc/passwd",
+            "data/../../auth.json",
+            "data//a",
+            "./a",
+            "data\\a",
+        ] {
+            assert!(
+                serde_json::from_value::<CheckpointManifest>(manifest(refused)).is_err(),
+                "{refused}"
+            );
+        }
+        let mut unknown = manifest("manifest.json");
+        unknown["note"] = "invented".into();
+        assert!(serde_json::from_value::<CheckpointManifest>(unknown).is_err());
+    }
+
+    #[test]
     fn a_release_cannot_carry_an_attestation() {
         let command = serde_json::json!({
             "op": "release",

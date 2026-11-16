@@ -610,6 +610,35 @@ pub fn join(
         fs::File::open(&parent)?.sync_all()?;
         set_aside = Some((lock, renamed));
     }
+    let replaced = set_aside.as_ref().map(|(_, renamed)| renamed.clone());
+    let (checkpoint, files, bytes, restored) =
+        restore_checkpoint(&authority, target, coordinator_id, script).with_context(|| {
+            match &replaced {
+                Some(renamed) => format!(
+                    "No standby was built in {}. The directory that was there is now {}",
+                    target.display(),
+                    renamed.display()
+                ),
+                None => format!("No standby was built in {}", target.display()),
+            }
+        })?;
+    Ok(Joined {
+        coordinator_id,
+        state_dir: restored,
+        through: checkpoint.through,
+        files,
+        bytes,
+        replaced,
+    })
+}
+
+/// Downloads the current checkpoint beside `target`, then restores it there.
+fn restore_checkpoint(
+    authority: &Authority,
+    target: &Path,
+    coordinator_id: CoordinatorId,
+    script: &Path,
+) -> Result<(CheckpointRecord, u64, u64, PathBuf)> {
     let scratch = Scratch::beside(target, "join")?;
     let (checkpoint, files, bytes) = match authority.run(&OperatorRequest::FetchCheckpoint {
         archive: scratch.0.clone(),
@@ -627,14 +656,7 @@ pub fn join(
         "The checkpoint restored coordinator {}, not {coordinator_id}",
         restored.coordinator_id
     );
-    Ok(Joined {
-        coordinator_id,
-        state_dir: restored.state_dir,
-        through: checkpoint.through,
-        files,
-        bytes,
-        replaced: set_aside.map(|(_, renamed)| renamed),
-    })
+    Ok((checkpoint, files, bytes, restored.state_dir))
 }
 
 impl fmt::Display for Joined {

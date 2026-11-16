@@ -79,7 +79,8 @@ test("a promotion that others contend for leaves one owner", { timeout: 120_000 
   await t.test("a promotion is refused while follow applies to the same directory, and then catches up", async () => {
     const { owner, standby, epoch, head } = await replicatedPair(world);
     const following = standby.start("follow", "--interval", "1");
-    await until(() => JSON.stringify(tables(standby.state)) === JSON.stringify(tables(owner.state)), "follow holds the lock and has applied the log");
+    await until(() => { following.assertRunning(); return JSON.stringify(tables(standby.state)) === JSON.stringify(tables(owner.state)); },
+      "follow holds the lock and has applied the log");
     const record = await owner.record();
     const refused = await standby.failover("promote", "--replace-epoch", String(epoch), "--old-owner-stopped", STATEMENT);
     assert.notEqual(refused.code, 0);
