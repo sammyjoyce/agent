@@ -29,6 +29,7 @@ import type { ScheduledOccurrence } from "./generated/ScheduledOccurrence.js";
 import type { TaskAgentRecord } from "./generated/TaskAgentRecord.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
 import type { WorkerRef } from "./generated/WorkerRef.js";
+import type { WorkerPresence } from "./generated/WorkerPresence.js";
 import { noticeMetadata, UserNoticeEntry, type UserNoticeData } from "./transcript.js";
 import { HistoryStore, ImportedItemEntry, importedSummary, importedText } from "./history.js";
 import { REVISION_AMBIGUOUS, REVISION_PENDING, revisionStatus, type RevisionView } from "./history-revisions.js";
@@ -201,6 +202,9 @@ function queuedInput(actor: TaskRecord | TaskAgentRecord, input: TaskInput): Tas
 function sameBinding(left: WorkerRef, right: WorkerRef): boolean {
   return left.host_id === right.host_id && left.session_id === right.session_id &&
     left.window_id === right.window_id && left.block_id === right.block_id;
+}
+function paneWithoutWorker(presence: WorkerPresence | undefined): boolean {
+  return presence?.state === "missing_terminal" || (presence?.state === "present" && !presence.running);
 }
 
 /** Application metadata lives on Pi's commit line, beside its conversations. */
@@ -1132,7 +1136,7 @@ export class TaskStore {
       if (this.resuming.has(key)) throw new TaskError("An agent resume is already in progress; its pending input is retained");
       this.resuming.add(key);
       try {
-        const previous = { ...existing.worker, host: await this.workerHost(taskId, agentId) };
+        let previous = { ...existing.worker, host: await this.workerHost(taskId, agentId) };
         let presence = await this.inspect(previous.binding, call), reopened = false;
         if (presence?.state === "missing_session") {
           // A child read cannot own its parent's folder transition. Claim the
@@ -1156,15 +1160,21 @@ export class TaskStore {
           } finally { this.resuming.delete(taskId); }
         }
         if (!reopened && previous.state !== "bound") {
+          const stopped = paneWithoutWorker(presence);
+          const fresh = randomUUID();
           task = await this.allocation(taskId, "reconcile", (saved) => {
             const actor = this.actor(saved, agentId); this.requireResume(actor.worker, previous);
-            actor.worker = { ...previous, state: presence?.state === "pending" || (presence?.state === "present" && presence.running) ? "bound" : "resume_uncertain" };
+            actor.worker = stopped ? { ...previous, state: "bound", allocation_id: fresh }
+              : { ...previous, state: presence?.state === "pending" || (presence?.state === "present" && presence.running) ? "bound" : "resume_uncertain" };
             return { result: presence === undefined ? { type: "failed", message: "Agent inspection was unavailable" } : { type: "presence", presence },
-              reason: "Reconciled the retained agent terminal without repeating an uncertain write" };
+              reason: stopped ? "The recorded agent terminal is not running; a fresh allocation fences the unconfirmed attempt"
+                : "Reconciled the retained agent terminal without repeating an uncertain write" };
           }, agentId);
           if (this.actor(task, agentId).worker.state !== "bound") throw new TaskError("Agent resume is still unconfirmed; its binding and input are retained");
-          return task;
-        } else if (!reopened && (presence?.state === "pending" || (presence?.state === "present" && presence.running))) return task;
+          if (!stopped) return task;
+          previous = { ...previous, state: "bound", allocation_id: fresh };
+        }
+        if (!reopened && (presence?.state === "pending" || (presence?.state === "present" && presence.running))) return task;
         else if (!reopened) {
           if (presence === undefined) throw new TaskError("Agent inspection is unavailable; its binding and input are retained");
           await this.allocation(taskId, "resume", (saved) => {
@@ -1282,7 +1292,7 @@ export class TaskStore {
     return this.ownThenPresent({ task_id: id }, () => this.presentPane(id, host, call));
   }
   private async presentPane(id: string, host: WorkerHost, call: HostCall): Promise<TaskRecord> {
-    const current = await this.get(id);
+    let current = await this.get(id);
     if (current.worker.state === "allocating" || current.worker.state === "uncertain") {
       throw new TaskError("Worker allocation needs reconciliation; no duplicate session was created");
     }
@@ -1293,17 +1303,22 @@ export class TaskStore {
       try {
         const presence = await this.inspect(previous.binding, call);
         if (presence?.state === "missing_session") return await this.reopen(id, previous, call);
+        const stopped = paneWithoutWorker(presence);
+        const fresh = randomUUID();
         const recovered = await this.allocation(id, "reconcile", (task) => {
           this.requireResume(task.worker, previous);
           if (presence?.state === "pending" || (presence?.state === "present" && presence.running)) {
             task.worker = { ...previous, state: "bound" };
-          } else task.worker = { ...previous, state: "resume_uncertain" };
+          } else if (stopped) task.worker = { ...previous, state: "bound", allocation_id: fresh };
+          else task.worker = { ...previous, state: "resume_uncertain" };
           return { result: presence === undefined ? { type: "failed", message: "Worker inspection was unavailable" } : { type: "presence", presence },
-            reason: task.worker.state === "bound" ? "Recovered the original running terminal in its existing session"
+            reason: stopped ? "The recorded terminal is not running; a fresh allocation fences the unconfirmed attempt"
+              : task.worker.state === "bound" ? "Recovered the original running terminal in its existing session"
               : "Retained the known session because its replacement terminal is still unconfirmed" };
         });
         if (recovered.worker.state !== "bound") throw new TaskError("Worker resume needs reconciliation; its known session and pending input are retained");
-        return recovered;
+        if (!stopped) return recovered;
+        current = recovered;
       } finally { this.resuming.delete(id); }
     }
     if (current.worker.state === "bound") {
@@ -1499,18 +1514,38 @@ export class TaskStore {
       task = await this.get(input.task_id);
       actor = this.actor(task, input.agent_id);
     }
+    const created = actor.worker.state === "uncertain" ? actor.worker : undefined;
+    const createdHostId = created === undefined ? null : recordedHostId(created);
+    if (created !== undefined && call !== undefined && created.allocation_id === input.allocation_id &&
+        (createdHostId === null || createdHostId === input.binding.host_id) &&
+        (created.session_id === null || created.session_id === input.binding.session_id)) {
+      const signal = new AbortController().signal;
+      const presence = await this.inspect(input.binding, (command) => call(command, created.host, signal));
+      if (presence?.state === "present" && presence.running) {
+        task = await this.allocation(input.task_id, "reconcile", (saved) => {
+          const current = this.actor(saved, input.agent_id);
+          if (current.worker.state !== "uncertain" || current.worker.allocation_id !== created.allocation_id ||
+              current.worker.session_id !== created.session_id) throw new TaskError("Worker allocation changed; its late claim was ignored");
+          current.worker = { state: "bound", allocation_id: created.allocation_id, host: created.host, binding: { ...input.binding } };
+          return { result: { type: "presence", presence },
+            reason: "The terminal that started confirmed its own allocation after the create reply was lost" };
+        }, input.agent_id);
+        actor = this.actor(task, input.agent_id);
+      }
+    }
     const uncertain = actor.worker.state === "resume_uncertain" ? actor.worker : undefined;
     if (uncertain !== undefined && call !== undefined && uncertain.allocation_id === input.allocation_id &&
         uncertain.binding.host_id === input.binding.host_id && uncertain.binding.session_id === input.binding.session_id &&
         !sameBinding(uncertain.binding, input.binding)) {
       const signal = new AbortController().signal;
       const inspect: HostCall = (command) => call(command, uncertain.host, signal);
-      if ((await this.inspect(uncertain.binding, inspect))?.state === "missing_terminal") {
+      if (paneWithoutWorker(await this.inspect(uncertain.binding, inspect))) {
         const replacement = await this.inspect(input.binding, inspect);
         if (replacement?.state === "present" && replacement.running) {
           // A lost creation reply must not strand the worker that actually
-          // started. Prove the old pane is gone and this exact replacement is
-          // running before moving the retained allocation to its new binding.
+          // started. Prove the old pane no longer runs the worker (a restored
+          // shell is never closed, so the pane may stay) and this exact
+          // replacement is running before moving the retained allocation.
           task = await this.allocation(input.task_id, "reconcile", (saved) => {
             const current = this.actor(saved, input.agent_id);
             this.requireResume(current.worker, uncertain);
