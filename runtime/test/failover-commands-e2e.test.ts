@@ -5,9 +5,9 @@ import { test } from "node:test";
 import type { CheckpointManifest } from "../src/generated/CheckpointManifest.js";
 import { OWNER_FENCED_EXIT } from "../src/generated/owner-fenced-exit.js";
 import { blobs, startFaultProxy } from "./fixtures/failover-fault-proxy.js";
-import { crash, exists, fingerprint, HOLDERS, ownerActivity, replicatedFiles, until, World, type EnrolledReceipt, type FollowedReceipt,
+import { crash, exists, fingerprint, HOLDERS, ownerActivity, until, World, type EnrolledReceipt, type FollowedReceipt,
   type JoinedReceipt, type StatusReceipt } from "./fixtures/failover-hosts.js";
-import { logEntries, tables } from "./fixtures/failover-state.js";
+import { logEntries, retainedFiles, tables } from "./fixtures/failover-state.js";
 
 const [OWNER, STANDBY, THIRD] = HOLDERS;
 
@@ -89,8 +89,8 @@ test("the failover commands enroll an owner and keep a standby of it", { timeout
     assert.ok(head >= 4, "the owner logged its notes and its files");
     assert.deepEqual(followed, { coordinator_id: coordinator, from: 0, applied: head });
     assert.deepEqual(tables(standby.state), tables(owner.state));
-    assert.deepEqual(await replicatedFiles(standby.state), await replicatedFiles(owner.state));
-    assert.equal((await replicatedFiles(standby.state)).size, 2);
+    assert.deepEqual(await retainedFiles(standby.state), await retainedFiles(owner.state));
+    assert.equal(Object.keys(await retainedFiles(standby.state)).length, 2);
 
     const settled = tables(standby.state);
     assert.deepEqual(await standby.receipt<FollowedReceipt>("follow", "--once"), { coordinator_id: coordinator, from: head, applied: head });

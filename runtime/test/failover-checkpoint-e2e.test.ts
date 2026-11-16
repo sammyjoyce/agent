@@ -5,9 +5,9 @@ import { test } from "node:test";
 import { beginUpload, writeChunk } from "../src/attachment-upload.js";
 import type { CheckpointManifest } from "../src/generated/CheckpointManifest.js";
 import { startFaultProxy } from "./fixtures/failover-fault-proxy.js";
-import { exists, fingerprint, HOLDERS, ownerActivity, replicatedFiles, sha256, World, type CheckpointedReceipt, type EnrolledReceipt, type FollowedReceipt,
+import { exists, fingerprint, HOLDERS, ownerActivity, sha256, World, type CheckpointedReceipt, type EnrolledReceipt, type FollowedReceipt,
   type JoinedReceipt, type StatusReceipt } from "./fixtures/failover-hosts.js";
-import { logEntries, tables } from "./fixtures/failover-state.js";
+import { logEntries, retainedFiles, tables } from "./fixtures/failover-state.js";
 
 const [OWNER, STANDBY, THIRD] = HOLDERS;
 const FEEDBACK = "feedback/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.json";
@@ -85,8 +85,8 @@ test("a checkpoint is stored in parts and replaces the log entries it covers", {
     const joined = await fresh.receipt<JoinedReceipt>("join", coordinator);
     assert.equal(joined.through, head);
     assert.deepEqual(tables(fresh.state), tables(owner.state));
-    assert.deepEqual(await replicatedFiles(fresh.state), await replicatedFiles(owner.state));
-    assert.equal((await replicatedFiles(fresh.state)).size, 2, "the checkpoint carries the replicated files");
+    assert.deepEqual(await retainedFiles(fresh.state), await retainedFiles(owner.state));
+    assert.equal(Object.keys(await retainedFiles(fresh.state)).length, 2, "the checkpoint carries the replicated files");
     assert.equal((await fresh.receipt<StatusReceipt>("status")).applied, head);
 
     await ownerActivity(owner, ["third"], { "feedback/invented-unknown-name.json": "A name no backup carries" });
@@ -127,7 +127,7 @@ test("a checkpoint is stored in parts and replaces the log entries it covers", {
     await place(owner.state, "dreams/invented-night.json", Buffer.from("Invented review of a quiet night"));
     const named = async (record: { manifest: string }) => (await manifestOf(owner.link, record.manifest)).files
       .map((file) => file.path).filter((path) => /^data\/(attachments|history|feedback)\//.test(path)).map((path) => path.slice("data/".length)).sort();
-    const retained = async (state: string) => [...(await replicatedFiles(state)).keys()].sort();
+    const retained = async (state: string) => Object.keys(await retainedFiles(state)).sort();
 
     const enrolled = await owner.receipt<EnrolledReceipt>("enroll");
     assert.deepEqual(enrolled.uploaded?.not_included, ["dreams"], "the receipt names what the checkpoint does not carry");
@@ -147,9 +147,9 @@ test("a checkpoint is stored in parts and replaces the log entries it covers", {
     assert.deepEqual(await named(stored.checkpoint), after);
     await late.receipt<JoinedReceipt>("join", coordinator);
     assert.deepEqual(await retained(late.state), after);
-    assert.deepEqual(await replicatedFiles(late.state), await replicatedFiles(early.state), "a standby that joined later holds the bytes one that followed holds");
-    const owned = await replicatedFiles(owner.state);
-    for (const [path, digest] of await replicatedFiles(late.state)) assert.equal(digest, owned.get(path), path);
+    assert.deepEqual(await retainedFiles(late.state), await retainedFiles(early.state), "a standby that joined later holds the bytes one that followed holds");
+    const owned = await retainedFiles(owner.state);
+    for (const [path, digest] of Object.entries(await retainedFiles(late.state))) assert.equal(digest, owned[path], path);
     assert.deepEqual(tables(late.state), tables(owner.state));
   });
 });

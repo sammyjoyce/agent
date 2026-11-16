@@ -9,7 +9,6 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AuthorityClient } from "../../src/failover/authority-client.js";
-import { REPLICATED_FILE_ROOTS } from "../../src/generated/replicated-file-roots.js";
 import type { AuthorityRecord } from "../../src/generated/AuthorityRecord.js";
 import type { AuthorityState } from "../../src/generated/AuthorityState.js";
 import type { CheckpointRecord } from "../../src/generated/CheckpointRecord.js";
@@ -242,16 +241,6 @@ export async function replicatedPair(world: World, urls: { standby?: string } = 
 export async function sealedFor(host: Host, candidate: string): Promise<boolean> {
   const state = await host.authorityState();
   return state.kind === "sealed" && state.candidate === candidate;
-}
-
-/** The bytes of every replicated file of a state directory, by path. */
-export async function replicatedFiles(state: string): Promise<Map<string, string>> {
-  const files = new Map<string, string>();
-  for (const root of REPLICATED_FILE_ROOTS) {
-    if (!await exists(join(state, root))) continue;
-    for (const [path, digest] of await fingerprint(join(state, root))) files.set(`${root}/${path}`, digest);
-  }
-  return files;
 }
 
 /** Whether any process of a group is left. macOS answers EPERM while the only members left are exiting. */
