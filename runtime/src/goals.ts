@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { resolve } from "node:path";
 import { Type } from "typebox";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { defineDoc, defineDocFamily, defineEntry, defineExtension, defineTool, GenerationTask, LiveDoc, ROOT_CONVERSATION_ID,
@@ -20,11 +19,10 @@ import type { TaskRecord } from "./generated/TaskRecord.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
 import { output } from "./host-output.js";
 import { nativeConversationId, TaskError, type HostCall, type TaskStore } from "./tasks.js";
-import type { Execution, Executions } from "./tools.js";
+import { MAX_FILE_READ_BYTES, resolveHostPath, type Execution, type Executions } from "./tools.js";
 
 /** Automatic continuations one activation may admit before the goal pauses itself. */
 export const GOAL_CONTINUATION_BUDGET = 5;
-const CHECK_READ_BYTES = 262_144;
 const OBJECTIVE_LIMIT = 4000;
 const TITLE_LIMIT = 80;
 const RETAINED_REQUESTS = 32;
@@ -422,13 +420,13 @@ function sameCheck(left: GoalCheck, right: GoalCheck): boolean {
   return left.type === right.type && left.path === right.path && left.text === right.text;
 }
 function pinnable(check: GoalCheck, execution: Execution): GoalCheck {
-  return { ...check, path: resolve(execution.default_host?.cwd ?? execution.cwd, check.path) };
+  return { ...check, path: resolveHostPath(execution, check.path) };
 }
 
 async function runCheck(check: GoalCheck, call: HostCall): Promise<GoalCheckResult> {
   switch (check.type) {
     case "file_contains": {
-      const result = await call({ type: "read_file", path: check.path, offset: 0, limit: CHECK_READ_BYTES });
+      const result = await call({ type: "read_file", path: check.path, offset: 0, limit: MAX_FILE_READ_BYTES });
       if (result.type !== "file") {
         return { type: "failed", failure: { type: "unreadable", message: result.type === "failed" ? result.message : "The host returned no file text" } };
       }
