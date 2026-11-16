@@ -1,12 +1,14 @@
 import { writeSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Storage } from "@earendil-works/pi-durable";
 import { openConversationDatabase } from "../conversation-database.js";
 import { OWNER_FENCED_EXIT } from "../generated/owner-fenced-exit.js";
 import type { AuthorityLink } from "./authority-link.js";
 import { ConfirmGate, type OwnerGate } from "./owner-gate.js";
 import { openReplicatedStorage, OwnerFenced, type LogWriter } from "./replicated-storage.js";
+import { cleanRetainedFiles } from "./retained-files.js";
 import { ScopedDatabase } from "./scoped-database.js";
 import { ownerSession } from "./session.js";
 
@@ -42,13 +44,18 @@ export interface ReplicatedOwnershipOptions {
 
 /**
  * Opens the owner's side of a replicated coordinator: the session database
- * caught up with the log, and a check with the authority every 5 s. Without
- * that check an idle owner would never learn that a promotion sealed the log.
+ * and the retained files caught up with the log, the leftovers of a crash
+ * removed, and a check with the authority every 5 s. Without that check an
+ * idle owner would never learn that a promotion sealed the log.
  */
 export async function openReplicatedOwnership({ session, stateDirectory, onFenced, signal }: ReplicatedOwnershipOptions): Promise<ReplicatedOwnership> {
   const { link, holder, epoch } = await ownerSession(session, { signal });
   const database = await ScopedDatabase.over(await openConversationDatabase(join(stateDirectory, "session.sqlite")));
   const { storage, log } = await openReplicatedStorage({ database, link, holder, epoch, stateDirectory, onFenced, signal });
+  // The catch-up has named every file the log names, so what is left under a
+  // temporary name or in an unfinished upload is what a crash left behind.
+  try { await cleanRetainedFiles(stateDirectory); }
+  catch (error) { await storage.close(BACKGROUND_CONTEXT).catch(() => {}); throw error; }
   const gate = new ConfirmGate({ link, holder, epoch, onFenced });
   void watchOwner(gate, signal);
   return { kind: "replicated", link, holder, epoch, storage, log, gate };

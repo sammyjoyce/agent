@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { test } from "node:test";
 import type { AuthorityLink } from "../src/failover/authority-link.js";
 import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
@@ -7,7 +9,7 @@ import { OWNER_FENCED_EXIT } from "../src/generated/owner-fenced-exit.js";
 import { DEFAULT_MODEL } from "../src/models.js";
 import { chat, failoverCoordinator, startBridge } from "./fixtures/failover-bridge.js";
 import { commands } from "./fixtures/failover-fault-proxy.js";
-import { enroll, follow, logBatches, loggedFiles, OWNER, retainedFiles, STANDBY, stateDirectory, tables } from "./fixtures/failover-state.js";
+import { enroll, filesUnder, follow, logBatches, loggedFiles, OWNER, retainedFiles, STANDBY, stateDirectory, tables } from "./fixtures/failover-state.js";
 import { until } from "./fixtures/until.js";
 
 /** How many submissions the log holds for the input with this id. Each one is an admission of it. */
@@ -69,6 +71,21 @@ test("the Pi bridge as a replicated owner, against the Worker on local workerd",
     assert.equal(await follow(standby, coordinator.standby), (await coordinator.reader.record())?.state.head);
     assert.deepEqual(await retainedFiles(standby), await retainedFiles(directory));
     assert.deepEqual(Object.keys(await retainedFiles(standby)).sort(), [...uploaded, `feedback/${feedback}.json`, "feedback/latest"]);
+  });
+
+  await t.test("a replicated owner removes what a crash left under the retained trees before it answers a frame", async (t) => {
+    const coordinator = await failoverCoordinator(t), directory = await stateDirectory(t);
+    const unfinished = randomUUID();
+    const left = { "feedback/.44444444-4444-4444-8444-444444444444.tmp": "Invented half-written bundle",
+      [`attachments/${unfinished}/content`]: "Invented half", [`attachments/${unfinished}/metadata.json`]: JSON.stringify({ complete: false }) };
+    for (const [path, text] of Object.entries(left)) {
+      await mkdir(join(directory, path, ".."), { recursive: true });
+      await writeFile(join(directory, path), text);
+    }
+    const bridge = await startBridge(t, { directory, session: await coordinator.session(OWNER, await enroll(coordinator.owner)) });
+    bridge.send(1, { type: "status" });
+    await bridge.wait(1, (event) => event.type === "done");
+    assert.deepEqual((await filesUnder(directory)).filter((path) => path in left), [], bridge.errors());
   });
 
   await t.test("without a session the bridge asks the authority nothing and keeps no replication position", async (t) => {
