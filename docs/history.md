@@ -207,8 +207,8 @@ reads nothing else in a message, for text or for files.
 | `id`, `create_time`, `author.role`, `author.name`, `recipient`, `channel`, `status` | The message's header. |
 | `metadata.is_thinking_preamble_message` | Whether the message is shown as thinking. |
 | `metadata.attachments` | The `id`, `name` and `mime_type` of each entry. |
-| `metadata.aggregate_result.messages` | Code-interpreter output. An `image` entry contributes the file its `image_url` names. A `stream` entry adds nothing, because its text is already the message's text. Each entry is kept or left out by its own author, content type and flags, by the same rule as a message. |
-| `metadata.model_dil_v2.fallbackMarkdown` | When present, the message's text, in place of widget markup. |
+| `metadata.aggregate_result.messages` | Code-interpreter output. An `image` entry contributes the file its `image_url` names. A `stream` entry adds nothing when the message's own text already holds its text. Each entry is kept or left out by its own author, content type and flags, by the same rule as a message. |
+| `metadata.model_dil_v2.fallbackMarkdown` | The message's text in place of widget markup, when every part is plain text and no part was left out. |
 
 A part is read when it is one of these shapes:
 
@@ -227,16 +227,25 @@ attachment entry whose own metadata sets `is_visually_hidden_from_conversation`
 contributes neither.
 
 Content outside these lists is never imported and never dropped silently. The
-import does not read a message with another content type, a part of another
-shape, a hidden part or attachment entry, an attachment entry or pointer that
-names no file, a listed field of the wrong JSON type, or a code-interpreter
-entry of another type. It reports each one as an `unsupported` gap with the
-message ID and the type name, so the import ends partial, and History shows
-nothing of that content. A message whose own author, content type or flags
-cannot be read is reported the same way and is never kept. Message metadata
-that itself carries an `author`, `content` or `metadata` key is shaped like a
-message. The import keeps the message's own content, reads nothing from that
-metadata, and reports it the same way. `--check` prints the count of each kind.
+import does not read any of the following. It reports each one as an
+`unsupported` gap with the message ID and the type name, so the import ends
+partial, and History shows nothing of that content. `--check` prints the count
+of each kind.
+
+- A message with another content type, or with a listed field of the wrong JSON
+  type.
+- A message that is not a JSON object, or whose own author, content type or
+  flags cannot be read. Such a message is never kept.
+- A part of another shape, or a file object whose pointer names no file.
+- A hidden part, a hidden attachment entry, or an attachment entry that names no
+  file.
+- A code-interpreter entry of another type, or a `stream` entry whose text the
+  message does not show.
+- Fallback Markdown beside a part that holds a file or was left out. The import
+  reads the parts instead.
+- Message metadata that itself carries an `author`, `content` or `metadata` key.
+  Such metadata is shaped like a message. The import keeps the message's own
+  content and reads nothing from that metadata.
 
 A file reaches History only through a kept message: a part's pointer, an
 attachment entry, an image entry of code-interpreter output, or a file-library

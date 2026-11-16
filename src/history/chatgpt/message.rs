@@ -75,6 +75,7 @@ pub(super) enum LeftOut {
     UnreadableAttachments,
     UnreadableOutputs,
     UnreadableFallback,
+    UnusedFallback,
     MessageShapedMetadata,
 }
 
@@ -90,6 +91,7 @@ impl LeftOut {
             Self::UnreadableAttachments => "attachments (unreadable)".into(),
             Self::UnreadableOutputs => "metadata aggregate_result (unreadable)".into(),
             Self::UnreadableFallback => "metadata model_dil_v2 (unreadable)".into(),
+            Self::UnusedFallback => "metadata model_dil_v2 (not used)".into(),
             Self::MessageShapedMetadata => "metadata (message-shaped)".into(),
         }
     }
@@ -126,6 +128,9 @@ impl LeftOut {
             Self::UnreadableFallback => {
                 format!("The fallback text of message {message} cannot be read and was left out")
             }
+            Self::UnusedFallback => format!(
+                "The fallback text of message {message} was not used, because the message holds a file or a part that was left out"
+            ),
             Self::MessageShapedMetadata => format!(
                 "The metadata of message {message} is shaped like a message and was not read"
             ),
@@ -173,12 +178,7 @@ impl Kept {
         if let Some(markdown) = &self.fallback {
             return markdown.replace("<escape>", "").replace("</escape>", "");
         }
-        self.contributions
-            .iter()
-            .filter_map(|contribution| contribution.text.as_deref())
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n")
+        shown_text(&self.contributions)
     }
 
     pub fn files(&self) -> Vec<FileRef> {
@@ -207,6 +207,15 @@ impl Kept {
     pub fn is_empty(&self) -> bool {
         self.text().trim().is_empty() && self.files().is_empty()
     }
+}
+
+fn shown_text(contributions: &[Contribution]) -> String {
+    contributions
+        .iter()
+        .filter_map(|contribution| contribution.text.as_deref())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 pub(super) fn read(node: &str, message: &Value) -> Reading {
@@ -262,7 +271,7 @@ pub(super) fn read(node: &str, message: &Value) -> Reading {
             .push(LeftOut::Message(unreadable(Some(&content_type))));
         return reading;
     }
-    let contributions = match supported_body(&content_type, message) {
+    let contributions: Vec<Contribution> = match supported_body(&content_type, message) {
         None => {
             reading
                 .left_out
@@ -291,10 +300,19 @@ pub(super) fn read(node: &str, message: &Value) -> Reading {
             })
             .collect(),
     };
-    let extras = match flags {
-        Field::Read(_) => MetadataExtras::read(message, &mut reading.left_out),
+    let text_stands_alone = reading.left_out.is_empty()
+        && contributions
+            .iter()
+            .all(|contribution| contribution.file.is_none());
+    let shown = shown_text(&contributions);
+    let mut extras = match flags {
+        Field::Read(_) => MetadataExtras::read(message, &shown, &mut reading.left_out),
         Field::Absent | Field::Unreadable => MetadataExtras::default(),
     };
+    if extras.fallback.is_some() && !text_stands_alone {
+        extras.fallback = None;
+        reading.left_out.push(LeftOut::UnusedFallback);
+    }
     let recipient = recipient.value();
     let channel = channel.value();
     let part = |text: &str| text.chars().take(KIND_PART_CHARACTERS).collect::<String>();
@@ -666,6 +684,7 @@ struct AggregateOutputEntry {
     metadata: Field<Record<ExclusionFlags>>,
     message_type: Field<String>,
     image_url: Field<String>,
+    text: Field<String>,
 }
 
 #[derive(Deserialize)]
@@ -680,7 +699,7 @@ struct Widget {
 }
 
 impl MetadataExtras {
-    fn read(message: &Value, left_out: &mut Vec<LeftOut>) -> Self {
+    fn read(message: &Value, shown: &str, left_out: &mut Vec<LeftOut>) -> Self {
         let Ok(Record(MetadataOf {
             metadata: Field::Read(Record(metadata)),
         })) = Record::<MetadataOf>::deserialize(message)
@@ -725,7 +744,7 @@ impl MetadataExtras {
             Field::Unreadable => left_out.push(LeftOut::UnreadableOutputs),
             Field::Read(entries) => {
                 for Record(entry) in entries {
-                    match read_aggregate_output(entry) {
+                    match read_aggregate_output(entry, shown) {
                         Ok(output) => extras.outputs.push(output),
                         Err(entry) => left_out.push(entry),
                     }
@@ -744,7 +763,10 @@ impl MetadataExtras {
     }
 }
 
-fn read_aggregate_output(entry: AggregateOutputEntry) -> Result<AggregateOutput, LeftOut> {
+fn read_aggregate_output(
+    entry: AggregateOutputEntry,
+    shown: &str,
+) -> Result<AggregateOutput, LeftOut> {
     let id = entry.id.value();
     let role = entry.author.then(|Record(author)| author.role);
     let content_type = entry.content.then(|Record(content)| content.content_type);
@@ -768,7 +790,13 @@ fn read_aggregate_output(entry: AggregateOutputEntry) -> Result<AggregateOutput,
                 file: Some(file),
             })
             .ok_or(LeftOut::Output(name)),
-        Some("stream") => Ok(AggregateOutput::Kept { id, file: None }),
+        Some("stream") => match entry.text {
+            Field::Unreadable => Err(LeftOut::Output(format!("{name} (unreadable)"))),
+            Field::Read(text) if !shown.contains(text.trim()) => {
+                Err(LeftOut::Output(format!("{name} (text not in the message)")))
+            }
+            Field::Read(_) | Field::Absent => Ok(AggregateOutput::Kept { id, file: None }),
+        },
         _ => Err(LeftOut::Output(name)),
     }
 }

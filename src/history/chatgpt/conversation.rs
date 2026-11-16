@@ -115,7 +115,7 @@ fn mapping(raw: &Value) -> Option<&serde_json::Map<String, Value>> {
 }
 
 fn message_of(node: &Value) -> Option<&Value> {
-    node.get("message").filter(|message| message.is_object())
+    node.get("message").filter(|message| !message.is_null())
 }
 
 pub(super) struct Survey {
@@ -123,6 +123,7 @@ pub(super) struct Survey {
     pub kept_message_files: BTreeSet<FileId>,
     pub attached_library_files: Vec<LibraryFile>,
     pub dropped_library_files: u32,
+    pub newest_message: Option<f64>,
     pub unsupported: BTreeMap<String, u32>,
 }
 
@@ -141,6 +142,10 @@ pub(super) fn survey(raw: &Value, library: &[LibraryFile]) -> Survey {
         kept_message_files: BTreeSet::new(),
         attached_library_files: attached.into_iter().cloned().collect(),
         dropped_library_files: dropped.len() as u32,
+        newest_message: readings
+            .iter()
+            .filter_map(|(_, reading)| reading.created)
+            .reduce(f64::max),
         unsupported: BTreeMap::new(),
     };
     for (_, reading) in &readings {
@@ -182,17 +187,13 @@ pub(super) fn seconds(value: &Value) -> Option<f64> {
     Time::deserialize(value).ok()?.seconds()
 }
 
-pub(super) fn thread(id: &str, raw: &Value, version: String) -> HistoryThread {
+pub(super) fn thread(
+    id: &str,
+    raw: &Value,
+    newest_message: Option<f64>,
+    version: String,
+) -> HistoryThread {
     let created = raw.get("create_time").and_then(seconds);
-    let newest_message = raw
-        .get("mapping")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flat_map(|mapping| mapping.values())
-        .filter_map(|node| node.pointer("/message/create_time").and_then(seconds))
-        .fold(None, |newest: Option<f64>, time| {
-            Some(newest.map_or(time, |newest| newest.max(time)))
-        });
     let updated = raw
         .get("update_time")
         .and_then(seconds)
@@ -1454,6 +1455,22 @@ mod tests {
     }
 
     #[test]
+    fn a_conversation_without_an_update_time_takes_its_newest_message_time() {
+        let mut raw = Conversation::new(1, "Undated")
+            .say("u1", "root", "user", "Hello")
+            .say("a1", "u1", "assistant", "Hi there")
+            .build();
+        raw.as_object_mut().unwrap().remove("update_time");
+        raw["mapping"]["u1"]["message"]["create_time"] = json!(1_800_000_050.0);
+        raw["mapping"]["a1"]["message"]["create_time"] = json!("2027-01-15T08:00:00Z");
+        raw["mapping"]["odd"] =
+            json!({"parent": "a1", "message": {"create_time": [1_900_000_000]}});
+        let newest = survey(&raw, &[]).newest_message;
+        let thread = thread(raw["id"].as_str().unwrap(), &raw, newest, String::new());
+        assert_eq!(thread.updated_at, 1_800_000_050);
+    }
+
+    #[test]
     fn a_message_that_is_not_an_object_is_reported() {
         let raw = Conversation::new(1, "Odd")
             .say("u1", "root", "user", "Hello")
@@ -1721,7 +1738,7 @@ mod tests {
             (
                 "inside a kept nested message",
                 answer_carrying(with(
-                    json!({"message_type": "stream", "text": "stdout"}),
+                    json!({"message_type": "stream", "text": "Public response"}),
                     "metadata",
                     json!({"aggregate_result": {"messages": [system]}}),
                 )),
@@ -1795,7 +1812,7 @@ mod tests {
     #[test]
     fn library_file_whose_origin_is_excluded_at_any_depth_is_dropped() {
         let tool_output = |inner: Value| {
-            json!({"message_type": "stream", "text": "stdout",
+            json!({"message_type": "stream", "text": "Public response",
                 "metadata": {"aggregate_result": {"messages": [inner]}}})
         };
         let briefing = with(

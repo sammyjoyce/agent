@@ -811,8 +811,13 @@ impl Scan {
             return Ok(());
         }
         let content: [u8; 32] = Sha256::digest(json::canonical(&value)).into();
+        let library = self
+            .library_by_conversation
+            .get(id)
+            .map_or(&[][..], Vec::as_slice);
+        let survey = conversation::survey(&value, library);
         let entry = ConversationEntry {
-            thread: conversation::thread(id, &value, String::new()),
+            thread: conversation::thread(id, &value, survey.newest_message, String::new()),
             span: Span {
                 shard,
                 start: offset,
@@ -821,14 +826,7 @@ impl Scan {
             },
             content,
         };
-        let library = self
-            .library_by_conversation
-            .get(id)
-            .map_or(&[][..], Vec::as_slice);
-        let survey = Surveyed {
-            survey: conversation::survey(&value, library),
-            repairs,
-        };
+        let survey = Surveyed { survey, repairs };
         if let Some(existing) = self.by_id.get(id).copied() {
             let previous = &self.conversations[existing];
             if previous.content == content {

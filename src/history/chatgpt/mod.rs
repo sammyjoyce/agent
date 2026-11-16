@@ -1899,7 +1899,7 @@ mod tests {
                 {"id": "file_0b32", "metadata": {"is_visually_hidden_from_conversation": true}}],
             "aggregate_result": {"messages": [
                 fixture::text_message("system", "Excluded output"),
-                {"message_type": "stream", "text": "stdout"},
+                {"message_type": "stream", "text": "Answer"},
                 {"message_type": "table"},
             ]},
         }});
