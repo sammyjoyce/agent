@@ -36,6 +36,10 @@ final class Capture: Sendable {
   private let heard: AsyncThrowingStream<[Float], any Error>.Continuation
   private let reporting: AsyncStream<Take.Event>.Continuation
   private let state: OSAllocatedUnfairLock<State>
+  /// A converter error halts capture on this queue, since `removeTap` inside the tap's block can
+  /// run that block again before it returns. The queued halt holds the capture strongly. A weak
+  /// reference could leave the last release, and the running engine with it, to the tap's block.
+  private let teardown = DispatchQueue(label: "ParakeetSpeech.Capture.teardown")
 
   private struct State {
     var engine: AVAudioEngine?
@@ -102,8 +106,11 @@ final class Capture: Sendable {
 
   var isRunning: Bool { state.withLockUnchecked { $0.engine != nil } }
 
+  /// Halts, then waits for any halt a converter error queued, so that halt cannot deactivate the
+  /// shared audio session after the next take activates it.
   func stop() {
     halt(interrupted: false)
+    teardown.sync {}
   }
 
   private func halt(interrupted: Bool) {
@@ -128,25 +135,22 @@ final class Capture: Sendable {
   }
 
   private func hear(_ buffer: AVAudioPCMBuffer) {
-    do {
-      let level = try state.withLockUnchecked { state -> Float? in
-        guard state.engine != nil else { return nil }
-        let samples: [Float]
-        do {
-          samples = try Self.convert(buffer, with: state.converter)
-        } catch {
-          // Under the lock, so a stop racing this buffer cannot end the audio cleanly first.
-          heard.finish(throwing: error)
-          throw error
-        }
-        guard !samples.isEmpty else { return nil }
-        heard.yield(samples)
-        return state.level(samples)
+    let level = state.withLockUnchecked { state -> Float? in
+      guard state.engine != nil else { return nil }
+      let samples: [Float]
+      do {
+        samples = try Self.convert(buffer, with: state.converter)
+      } catch {
+        // Under the lock, so a stop racing this buffer cannot end the audio cleanly first.
+        heard.finish(throwing: error)
+        teardown.async { self.halt(interrupted: false) }
+        return nil
       }
-      if let level { reporting.yield(.level(level)) }
-    } catch {
-      stop()
+      guard !samples.isEmpty else { return nil }
+      heard.yield(samples)
+      return state.level(samples)
     }
+    if let level { reporting.yield(.level(level)) }
   }
 
   private static func convert(_ buffer: AVAudioPCMBuffer?, with converter: AVAudioConverter)
