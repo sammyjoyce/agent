@@ -10,8 +10,9 @@ use anyhow::{Context, Result, bail};
 use crate::{
     coordinator_id::CoordinatorId,
     failover::{
-        AuthorityRefusal, AuthorityState, FailoverConfig, FailoverHelper, FailoverReport,
-        FailoverRequest, FailoverSession, OwnerEpoch,
+        AuthorityCommand, AuthorityRefusal, AuthorityReply, AuthorityState, FailoverConfig,
+        FailoverHelper, FailoverOperator, FailoverReport, FailoverRequest, FailoverSession,
+        HolderId, OperatorReport, OperatorRequest, OwnerEpoch, ReleaseEvidence,
     },
     runtime::WriterLock,
 };
@@ -66,7 +67,7 @@ impl OwnerClaim {
             holder: Some(holder),
             epoch: None,
         };
-        match FailoverHelper::locate(script)?.run(&session, FailoverRequest::Claim)? {
+        match FailoverHelper::locate(script)?.run(&session, &FailoverRequest::Claim)? {
             FailoverReport::Claimed { epoch, .. } => Ok(Self {
                 state: state.to_owned(),
                 lock,
@@ -74,6 +75,15 @@ impl OwnerClaim {
                 authority: Authority::Replicated { epoch, session },
             }),
             FailoverReport::Refused { reason, state } => {
+                if let Some(AuthorityState::Sealed {
+                    epoch,
+                    holder: sealed,
+                    ..
+                }) = state
+                    && sealed == holder
+                {
+                    release_by_lock(&lock, script, &session, holder, epoch);
+                }
                 Err(OwnerFenced::Refused { reason, state }.into())
             }
             FailoverReport::Record { .. } => {
@@ -114,6 +124,40 @@ impl OwnerClaim {
     }
 }
 
+/// A sealed holder that holds its writer lock has no supervisor and no Pi
+/// child alive, so it says so, and the promotion that sealed it need not wait
+/// for an operator. A failed post changes nothing: the start is still refused,
+/// and `failover release` posts the same evidence.
+fn release_by_lock(
+    _lock: &WriterLock,
+    script: &Path,
+    session: &FailoverSession,
+    holder: HolderId,
+    epoch: OwnerEpoch,
+) {
+    let command = AuthorityCommand::Release {
+        holder,
+        epoch,
+        evidence: ReleaseEvidence::LockHeld,
+    };
+    let posted = FailoverOperator::locate(script)
+        .and_then(|operator| operator.run(session, &OperatorRequest::Authority { command }));
+    match posted {
+        Ok(OperatorReport::Reply {
+            reply: AuthorityReply::Accepted { .. },
+        }) => eprintln!(
+            "Told the failover authority that no process of this coordinator is alive at epoch {}",
+            epoch.get()
+        ),
+        Ok(report) => eprintln!(
+            "The failover authority did not take this coordinator's release: {report:?}. Run `beep-boop failover release` on this host"
+        ),
+        Err(error) => eprintln!(
+            "Could not tell the failover authority that this coordinator is stopped: {error:#}. Run `beep-boop failover release` on this host"
+        ),
+    }
+}
+
 /// This host does not own the coordinator. `main` ends the process with
 /// `OWNER_FENCED_EXIT` for this error and for no other.
 #[derive(Debug)]
@@ -142,32 +186,7 @@ impl fmt::Display for OwnerFenced {
             "The failover authority refused this coordinator start ({reason:?}): "
         )?;
         match state {
-            Some(AuthorityState::Active { epoch, holder, .. }) => write!(
-                f,
-                "holder {} owns it at epoch {}",
-                holder.get(),
-                epoch.get()
-            ),
-            Some(AuthorityState::Sealed {
-                epoch,
-                holder,
-                candidate,
-                ..
-            }) => write!(
-                f,
-                "the log is sealed at epoch {} while holder {} replaces holder {}",
-                epoch.get(),
-                candidate.get(),
-                holder.get()
-            ),
-            Some(AuthorityState::Vacant {
-                epoch, candidate, ..
-            }) => write!(
-                f,
-                "holder {} is taking ownership after epoch {}",
-                candidate.get(),
-                epoch.get()
-            ),
+            Some(state) => state.fmt(f),
             None => f.write_str("the authority has no record of this coordinator"),
         }
     }

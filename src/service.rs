@@ -5,6 +5,7 @@ use std::{
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use crate::{
@@ -22,9 +23,11 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::runtime::{FrameReader, OwnerClaim, Runtime, ShutdownSignal, StartRecord};
+use crate::runtime::{FrameReader, OwnerClaim, OwnerFenced, Runtime, ShutdownSignal, StartRecord};
 
 const SOCKET_NAME: &str = "agent.sock";
+/// How long a fenced owner waits for the authority to take its stop evidence.
+const RELEASE_LIMIT: Duration = Duration::from_secs(30);
 
 pub async fn connect(state: &Path) -> io::Result<UnixStream> {
     UnixStream::connect(state.join(SOCKET_NAME)).await
@@ -111,8 +114,48 @@ async fn serve_until(
     .await
 }
 
+/// Runs the coordinator, then posts a fenced owner's stop evidence. When
+/// `serve_owner` returns, its listeners are closed, every connection has
+/// cancelled and drained the effects it owned, the worker links have ended
+/// and Pi is reaped. That is what `released` states, so it is posted here,
+/// before the process exits. A failed post changes nothing else.
 #[allow(clippy::too_many_arguments)]
 async fn serve_with_transport(
+    script: &Path,
+    claim: OwnerClaim,
+    port: Option<u16>,
+    policy: crate::tailnet::PeerPolicy,
+    daemon: crate::tailnet::Daemon,
+    rex: crate::rex::RexClient,
+    bootstrap: Option<CoordinatorBootstrap>,
+    shutdown: impl Future<Output = Result<ShutdownReason>>,
+) -> Result<()> {
+    let session = claim.pi_session();
+    let served = serve_owner(
+        script, claim, port, policy, daemon, rex, bootstrap, shutdown,
+    )
+    .await;
+    if let (Err(error), Some(session)) = (&served, session)
+        && let Some(OwnerFenced::Runtime) = error.downcast_ref()
+        && let Some(epoch) = session.epoch
+    {
+        match crate::failover::commands::post_released(script, &session, epoch, RELEASE_LIMIT).await
+        {
+            Ok(true) => eprintln!(
+                "Told the failover authority that this coordinator stopped its effects at epoch {}",
+                epoch.get()
+            ),
+            Ok(false) => {}
+            Err(error) => eprintln!(
+                "Could not tell the failover authority that this coordinator stopped: {error:#}. Run `beep-boop failover release` on this host"
+            ),
+        }
+    }
+    served
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_owner(
     script: &Path,
     claim: OwnerClaim,
     port: Option<u16>,

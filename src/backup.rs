@@ -32,6 +32,18 @@ const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 
 pub fn create(state: &Path, destination: &Path, runtime: &Path) -> Result<Created> {
     existing_private_directory(state)?;
+    let lock = WriterLock::acquire(state)?;
+    create_locked(&lock, state, destination, runtime)
+}
+
+/// `create` for a caller that already holds the state directory's writer lock.
+pub(crate) fn create_locked(
+    _lock: &WriterLock,
+    state: &Path,
+    destination: &Path,
+    runtime: &Path,
+) -> Result<Created> {
+    existing_private_directory(state)?;
     ensure!(
         absent(destination)?,
         "{} already exists",
@@ -43,7 +55,6 @@ pub fn create(state: &Path, destination: &Path, runtime: &Path) -> Result<Create
         "The backup destination must be outside the state directory"
     );
     let helper = DatabaseHelper::locate(runtime)?;
-    let _lock = WriterLock::acquire(state)?;
     let coordinator_id = CoordinatorId::read(state)?.context(
         "The state directory has no coordinator-id; back up a store that a coordinator created",
     )?;
@@ -183,7 +194,12 @@ pub fn restore(archive: &Path, target: &Path, runtime: &Path) -> Result<Restored
 /// without a hold succeeds.
 pub fn release(state: &Path) -> Result<Released> {
     existing_private_directory(state)?;
-    let _lock = WriterLock::acquire(state)?;
+    let lock = WriterLock::acquire(state)?;
+    release_locked(&lock, state)
+}
+
+/// `release` for a caller that already holds the state directory's writer lock.
+pub(crate) fn release_locked(_lock: &WriterLock, state: &Path) -> Result<Released> {
     let state_dir = std::path::absolute(state)?;
     match fs::remove_file(state.join(RESTORE_HOLD_FILE)) {
         Ok(()) => {

@@ -23,7 +23,7 @@ use agent_cli::{
     config::{self, ClientConfig},
     context::ContextStore,
     discovery,
-    failover::OWNER_FENCED_EXIT,
+    failover::{OWNER_FENCED_EXIT, OwnerEpoch, commands},
     feedback::FeedbackContext,
     host,
     host::effects::{Admission, Capacity, HostEffects},
@@ -154,6 +154,12 @@ enum Action {
     Backup {
         #[command(subcommand)]
         command: BackupAction,
+    },
+    /// Replicate a coordinator: enroll its owner, keep a standby, and promote
+    /// the standby. Every command needs a [failover] section in the private config.
+    Failover {
+        #[command(subcommand)]
+        command: FailoverAction,
     },
     /// Run this machine's coordinator or registered worker service.
     Serve {
@@ -355,6 +361,56 @@ enum BackupAction {
     /// Rebuild a state directory at TARGET, which must be absent or empty, from ARCHIVE.
     Restore { archive: PathBuf, target: PathBuf },
     /// Let a restored coordinator run background work again.
+    Release,
+}
+
+#[derive(Subcommand)]
+enum FailoverAction {
+    /// Print the authority's record and the log position this state directory holds.
+    Status {
+        /// The coordinator to ask about, when the state directory names none.
+        #[arg(long)]
+        coordinator_id: Option<agent_cli::coordinator_id::CoordinatorId>,
+    },
+    /// Make the stopped coordinator the first owner of its replicated state.
+    Enroll {
+        #[arg(long, hide = true)]
+        part_bytes: Option<u64>,
+    },
+    /// Store a new checkpoint from the stopped owner, which drops the log entries it covers.
+    Checkpoint {
+        #[arg(long, hide = true)]
+        part_bytes: Option<u64>,
+    },
+    /// Build a standby of COORDINATOR_ID in the state directory, which must be absent or empty.
+    Join {
+        coordinator_id: agent_cli::coordinator_id::CoordinatorId,
+        /// First rename the state directory that is there to <name>.replaced-<time>.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Apply new log entries and their files to a standby until interrupted.
+    Follow {
+        /// Return when the standby holds the whole log.
+        #[arg(long)]
+        once: bool,
+        /// Seconds between two reads of the log.
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
+        interval: u64,
+    },
+    /// Make this standby the owner in place of the owner at EPOCH.
+    Promote {
+        /// The owner epoch that `failover status` shows now.
+        #[arg(long, value_name = "EPOCH")]
+        replace_epoch: u64,
+        /// Your statement that the old owner is stopped, for a host that cannot be reached.
+        #[arg(long, value_name = "STATEMENT")]
+        old_owner_stopped: Option<String>,
+        /// Seconds to wait for the old owner's stop evidence.
+        #[arg(long, default_value_t = 60)]
+        wait: u64,
+    },
+    /// On the old owner's host: prove that no process of this state directory is alive.
     Release,
 }
 
@@ -655,6 +711,73 @@ async fn run() -> Result<()> {
                     arguments.json,
                     &agent_cli::backup::release(&state::path(arguments.state_dir.clone())?)?,
                 )?,
+            }
+            return Ok(());
+        }
+        Action::Failover { command } => {
+            let script = runtime_script(arguments.runtime.clone());
+            let state = state::path(arguments.state_dir.clone())?;
+            let config = config::load(arguments.config.as_deref())?;
+            let failover = config.failover.as_ref().context(
+                "The failover commands need a [failover] section in the private config file",
+            )?;
+            let json = arguments.json;
+            match command {
+                FailoverAction::Status { coordinator_id } => print_receipt(
+                    json,
+                    &commands::status(&state, coordinator_id, &script, failover)?,
+                )?,
+                FailoverAction::Enroll { part_bytes } => print_receipt(
+                    json,
+                    &commands::enroll(&state, &script, failover, part_bytes)?,
+                )?,
+                FailoverAction::Checkpoint { part_bytes } => print_receipt(
+                    json,
+                    &commands::checkpoint(&state, &script, failover, part_bytes)?,
+                )?,
+                FailoverAction::Join {
+                    coordinator_id,
+                    replace,
+                } => print_receipt(
+                    json,
+                    &commands::join(&state, coordinator_id, replace, &script, failover)?,
+                )?,
+                FailoverAction::Follow { once, interval } => commands::follow(
+                    &state,
+                    &script,
+                    failover,
+                    (!once).then(|| Duration::from_secs(interval)),
+                    |followed| print_receipt(json, followed),
+                )?,
+                FailoverAction::Promote {
+                    replace_epoch,
+                    old_owner_stopped,
+                    wait,
+                } => {
+                    ensure!(
+                        old_owner_stopped
+                            .as_deref()
+                            .is_none_or(|statement| !statement.trim().is_empty()),
+                        "--old-owner-stopped needs your statement of why the old owner is stopped"
+                    );
+                    print_receipt(
+                        json,
+                        &commands::promote(
+                            &state,
+                            &script,
+                            failover,
+                            commands::Promotion {
+                                replace_epoch: OwnerEpoch::new(replace_epoch)?,
+                                old_owner_stopped,
+                                wait: Duration::from_secs(wait),
+                                apns_configured: config.apns.is_some(),
+                            },
+                        )?,
+                    )?
+                }
+                FailoverAction::Release => {
+                    print_receipt(json, &commands::release(&state, &script, failover)?)?
+                }
             }
             return Ok(());
         }

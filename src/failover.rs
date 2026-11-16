@@ -3,7 +3,8 @@
 //! The authority's rules are `decide` in `runtime/src/failover/authority-core.ts`.
 
 use std::{
-    fs,
+    fmt, fs,
+    marker::PhantomData,
     net::{Ipv4Addr, Ipv6Addr},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
@@ -12,11 +13,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use ts_rs::TS;
 use uuid::Uuid;
 
-use crate::coordinator_id::CoordinatorId;
+use crate::{coordinator_id::CoordinatorId, runtime::WriterLock};
+
+pub mod commands;
 
 /// JavaScript carries these counters as numbers, so they stay exact only below 2^53.
 const MAX_EXACT: u64 = 9_007_199_254_740_991;
@@ -24,6 +27,17 @@ const MAX_EXACT: u64 = 9_007_199_254_740_991;
 /// The exit status of a coordinator the authority fenced, from the supervisor
 /// and from its Pi child alike, so a service manager can leave it stopped.
 pub const OWNER_FENCED_EXIT: u8 = 75;
+
+/// The exit status of `failover/operator.js` when the authority did not
+/// answer, so a caller can tell a request that is safe to repeat from a failure.
+pub const AUTHORITY_UNREACHABLE_EXIT: u8 = 69;
+
+/// The largest part of a checkpoint file. One Worker request body holds at
+/// most 100 MB and a Worker has 128 MB of memory.
+pub const CHECKPOINT_PART_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The `format` of every checkpoint manifest this build writes and reads.
+pub const CHECKPOINT_FORMAT: u32 = 1;
 
 /// Granted only by the authority. Rises at every coordinator start and at every promotion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
@@ -274,6 +288,60 @@ pub struct CheckpointRecord {
     pub through: LogPosition,
     /// The backup manifest of the snapshot, stored in the blob store with every file it names.
     pub manifest: Sha256Hex,
+}
+
+/// A file path inside a checkpoint archive, relative to the archive.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(try_from = "String", into = "String")]
+pub struct ArchivePath(String);
+
+impl ArchivePath {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ArchivePath {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        ensure!(
+            value.split('/').all(|segment| {
+                !matches!(segment, "" | "." | "..") && !segment.contains(['\\', '\0'])
+            }),
+            "A checkpoint file path is relative and has no empty, `.` or `..` segment"
+        );
+        Ok(Self(value))
+    }
+}
+
+impl From<ArchivePath> for String {
+    fn from(value: ArchivePath) -> String {
+        value.0
+    }
+}
+
+/// One file of a checkpoint. Each part is a blob of at most
+/// `CHECKPOINT_PART_BYTES`, and the parts in order are the file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointFile {
+    pub path: ArchivePath,
+    #[ts(type = "number")]
+    pub size: u64,
+    pub sha256: Sha256Hex,
+    pub parts: Vec<Sha256Hex>,
+}
+
+/// The blob that `CheckpointRecord.manifest` names: a backup archive of the
+/// state directory at log position `through`, its `manifest.json` included.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointManifest {
+    pub format: u32,
+    pub through: LogPosition,
+    pub coordinator_id: CoordinatorId,
+    pub files: Vec<CheckpointFile>,
 }
 
 /// A change to the authority. Each one is a single transaction in the object.
@@ -553,72 +621,282 @@ pub enum FailoverReport {
     Record { record: Option<AuthorityRecord> },
 }
 
-/// `failover/helper.js` beside the runtime script, run once per request.
-pub struct FailoverHelper(PathBuf);
+/// One request to `failover/operator.js`, which does what a `beep-boop
+/// failover` command needs from the authority and the blob store. The
+/// operator reports facts and Rust decides.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OperatorRequest {
+    /// Read the owner record and, when `state` holds a session database, the
+    /// log position it holds. Writes nothing.
+    Status {
+        #[ts(type = "string | null")]
+        state: Option<PathBuf>,
+    },
+    /// Record that the state directory holds the log through `position`.
+    Stamp {
+        #[ts(type = "string")]
+        state: PathBuf,
+        position: LogPosition,
+    },
+    /// Store the backup archive at `archive` as a checkpoint at the position
+    /// its database holds. `part_bytes` is for tests only.
+    StoreCheckpoint {
+        #[ts(type = "string")]
+        archive: PathBuf,
+        #[ts(type = "number | null")]
+        part_bytes: Option<u64>,
+    },
+    /// Download the current checkpoint into the new directory `archive`.
+    FetchCheckpoint {
+        #[ts(type = "string")]
+        archive: PathBuf,
+    },
+    /// Run one command and report the authority's reply.
+    Authority { command: AuthorityCommand },
+    /// Apply the log entries the state directory lacks, with their files.
+    Follow {
+        #[ts(type = "string")]
+        state: PathBuf,
+    },
+    /// Check a state directory that must hold the whole log: the database's
+    /// integrity, the coordinator id, and every replicated file's hash.
+    Verify {
+        #[ts(type = "string")]
+        state: PathBuf,
+    },
+    /// List the effects the session database records as started and unfinished.
+    Unfinished {
+        #[ts(type = "string")]
+        state: PathBuf,
+    },
+}
+
+/// The operator's one line of output. An authority it could not reach is an
+/// exit with `AUTHORITY_UNREACHABLE_EXIT`, never a report.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OperatorReport {
+    Status {
+        /// Null before enrollment.
+        record: Option<AuthorityRecord>,
+        /// Null when the state directory holds no log position.
+        applied: Option<LogPosition>,
+    },
+    Stamped,
+    Stored {
+        checkpoint: CheckpointRecord,
+        #[ts(type = "number")]
+        files: u64,
+        #[ts(type = "number")]
+        bytes: u64,
+    },
+    Fetched {
+        checkpoint: CheckpointRecord,
+        #[ts(type = "number")]
+        files: u64,
+        #[ts(type = "number")]
+        bytes: u64,
+    },
+    Reply {
+        reply: AuthorityReply,
+    },
+    Followed {
+        from: LogPosition,
+        applied: LogPosition,
+    },
+    Verified {
+        applied: LogPosition,
+        /// How many replicated files matched their records.
+        #[ts(type = "number")]
+        files: u64,
+    },
+    Unfinished {
+        tools: Vec<UnfinishedToolCall>,
+        deliveries: Vec<UnfinishedDelivery>,
+        /// One sentence for each stored record the operator could not read.
+        unreadable: Vec<String>,
+    },
+}
+
+/// A tool call whose intent Pi committed and whose result it did not. A
+/// restarted owner reruns it only when it is replay-safe, and otherwise
+/// reports it to the model as interrupted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct UnfinishedToolCall {
+    pub conversation_id: String,
+    pub tool: String,
+    pub call_id: String,
+    pub replay_safe: bool,
+}
+
+/// A phone notification claimed for sending whose outcome was not stored. A
+/// restarted owner marks it uncertain and does not send it again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct UnfinishedDelivery {
+    pub conversation_id: String,
+    pub entry_id: String,
+    pub installation_id: String,
+    pub apns_id: String,
+}
+
+/// The authority did not answer the operator. The same request is safe to repeat.
+#[derive(Debug)]
+pub struct AuthorityUnreachable(String);
+
+impl fmt::Display for AuthorityUnreachable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AuthorityUnreachable {}
+
+/// A script under `failover/` beside the runtime script, run once per request
+/// with the session in `AGENT_FAILOVER`. It prints one report.
+pub struct FailoverScript<Request, Report> {
+    path: PathBuf,
+    name: &'static str,
+    exchange: PhantomData<fn(&Request) -> Report>,
+}
+
+/// `failover/helper.js`, which a coordinator start and an owner watch use.
+pub type FailoverHelper = FailoverScript<FailoverRequest, FailoverReport>;
+
+/// `failover/operator.js`, which the `beep-boop failover` commands use.
+pub type FailoverOperator = FailoverScript<OperatorRequest, OperatorReport>;
 
 impl FailoverHelper {
     pub fn locate(script: &Path) -> Result<Self> {
-        let helper = script.with_file_name("failover").join("helper.js");
+        Self::beside(script, "helper.js", "failover helper")
+    }
+}
+
+impl FailoverOperator {
+    pub fn locate(script: &Path) -> Result<Self> {
+        Self::beside(script, "operator.js", "failover operator")
+    }
+}
+
+impl<Request: Serialize, Report: DeserializeOwned> FailoverScript<Request, Report> {
+    fn beside(script: &Path, file: &str, name: &'static str) -> Result<Self> {
+        let path = script.with_file_name("failover").join(file);
         ensure!(
-            helper.is_file(),
+            path.is_file(),
             "Pi runtime is not built; build the runtime first"
         );
-        Ok(Self(helper))
+        Ok(Self {
+            path,
+            name,
+            exchange: PhantomData,
+        })
     }
 
-    pub fn run(
+    pub fn run(&self, session: &FailoverSession, request: &Request) -> Result<Report> {
+        self.finish(self.command(session, request)?)
+    }
+
+    /// Runs the script as a holder of `lock`, so the state directory stays
+    /// locked while the script still writes to it, also when this process dies.
+    pub(crate) fn run_holding(
         &self,
+        lock: &WriterLock,
         session: &FailoverSession,
-        request: FailoverRequest,
-    ) -> Result<FailoverReport> {
-        let output = self
-            .command(session, request)?
-            .output()
-            .context("Could not start the failover helper")?;
-        Self::report(output)
+        request: &Request,
+    ) -> Result<Report> {
+        let mut command = self.command(session, request)?;
+        lock.inherit(&mut command);
+        self.finish(command)
     }
 
-    /// Runs the helper without blocking a runtime thread, and kills it after `limit`.
+    /// Runs the script without blocking a runtime thread, and kills it after `limit`.
     pub async fn run_within(
         &self,
         session: &FailoverSession,
-        request: FailoverRequest,
+        request: &Request,
         limit: Duration,
-    ) -> Result<FailoverReport> {
+    ) -> Result<Report> {
         let mut command = tokio::process::Command::from(self.command(session, request)?);
         command.kill_on_drop(true);
         let output = tokio::time::timeout(limit, command.output())
             .await
-            .context("The failover helper did not answer in time")?
-            .context("Could not start the failover helper")?;
-        Self::report(output)
+            .with_context(|| format!("The {} did not answer in time", self.name))?
+            .with_context(|| format!("Could not start the {}", self.name))?;
+        self.report(output)
     }
 
-    fn command(&self, session: &FailoverSession, request: FailoverRequest) -> Result<Command> {
+    fn finish(&self, mut command: Command) -> Result<Report> {
+        let output = command
+            .output()
+            .with_context(|| format!("Could not start the {}", self.name))?;
+        self.report(output)
+    }
+
+    fn command(&self, session: &FailoverSession, request: &Request) -> Result<Command> {
         let mut command = Command::new("node");
         command
             .arg("--no-warnings")
-            .arg(&self.0)
-            .arg(serde_json::to_string(&request)?)
+            .arg(&self.path)
+            .arg(serde_json::to_string(request)?)
             .env("AGENT_FAILOVER", serde_json::to_string(session)?)
             .stdin(Stdio::null());
         Ok(command)
     }
 
-    fn report(output: Output) -> Result<FailoverReport> {
+    fn report(&self, output: Output) -> Result<Report> {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.code() == Some(i32::from(AUTHORITY_UNREACHABLE_EXIT)) {
+            return Err(AuthorityUnreachable(stderr.trim().to_owned()).into());
+        }
         ensure!(
             output.status.success(),
-            "The failover helper failed ({}): {}",
+            "The {} failed ({}): {}",
+            self.name,
             output.status,
             stderr.trim()
         );
         serde_json::from_slice(&output.stdout).with_context(|| {
             format!(
-                "The failover helper returned an invalid report: {}",
+                "The {} returned an invalid report: {}",
+                self.name,
                 stderr.trim()
             )
         })
+    }
+}
+
+impl fmt::Display for AuthorityState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Active { epoch, holder, .. } => write!(
+                f,
+                "holder {} owns it at epoch {}",
+                holder.get(),
+                epoch.get()
+            ),
+            Self::Sealed {
+                epoch,
+                holder,
+                candidate,
+                ..
+            } => write!(
+                f,
+                "the log is sealed at epoch {} while holder {} replaces holder {}",
+                epoch.get(),
+                candidate.get(),
+                holder.get()
+            ),
+            Self::Vacant {
+                epoch, candidate, ..
+            } => write!(
+                f,
+                "holder {} is taking ownership after epoch {}",
+                candidate.get(),
+                epoch.get()
+            ),
+        }
     }
 }
 

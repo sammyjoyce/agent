@@ -80,6 +80,22 @@ impl WriterLock {
             .context("Another agent process owns this state directory")?;
         Ok(Self(file))
     }
+
+    /// Lets the child of `command` keep this lock after exec. The state
+    /// directory then stays locked while that child lives, also when this
+    /// process is killed first.
+    pub(crate) fn inherit(&self, command: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt;
+        let lock_fd = self.0.as_raw_fd();
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(lock_fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
 }
 
 pub struct Runtime {

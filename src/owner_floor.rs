@@ -305,7 +305,7 @@ impl OwnerWatch {
     async fn owner_epoch(&self, session: &FailoverSession) -> Option<OwnerEpoch> {
         match self
             .helper
-            .run_within(session, FailoverRequest::Record, RECORD_READ_LIMIT)
+            .run_within(session, &FailoverRequest::Record, RECORD_READ_LIMIT)
             .await
         {
             Ok(FailoverReport::Record {
