@@ -705,10 +705,11 @@ fn late_real_show(world: &World) -> Value {
 }
 
 fn point_link(link: &Path, target: &Path) -> Value {
-    run_program(
-        "/bin/ln",
-        &["-sfn", &target.to_string_lossy(), &link.to_string_lossy()],
-    )
+    shell(&format!(
+        "ln -sfn '{}' '{}'",
+        target.display(),
+        link.display()
+    ))
 }
 
 fn stale_program(world: &World, also: &str) -> PathBuf {
@@ -2866,7 +2867,7 @@ const WRONG_AGENTS: &[Agent] = &[
                     follow_up(at.task, FOLLOW_UP_KEY, "."),
                 ],
                 vec![
-                    run_program("/bin/cat", &[&saved.to_string_lossy()]),
+                    shell(&format!("cat '{}'", saved.display())),
                     show(at.world),
                     resolve(),
                 ],
@@ -3413,10 +3414,7 @@ const LEGAL_ALTERNATIVES: &[Agent] = &[
                 ".",
                 vec![
                     book(at.world, NORTHWIND.po),
-                    run_program(
-                        "/usr/bin/env",
-                        &[&at.world.ledger().to_string_lossy(), "show"],
-                    ),
+                    run_program("env", &[&at.world.ledger().to_string_lossy(), "show"]),
                     resolve(),
                 ],
             )
