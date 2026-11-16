@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Fails unless a built Agent.app ships every App Intents action, entity with its properties,
 enum and query, at least one shortcut, each for Open Coordinator, the retry behind
-authentication, and each open action as the system's open intent for its entity. Every shortcut must hold a phrase that is not empty, and one of Open Coordinator's
-phrases must name ${target} and ${applicationName}.
+authentication, and each open action as the system's open intent for its entity. Every shortcut
+must hold a phrase that is not empty, and one of Open Coordinator's phrases must name ${target}
+and ${applicationName}. No other action has a phrase. Open Job has none, because a phrase on its
+job would make each refresh of the app's phrases read every coordinator's jobs.
 
 A shortcuts provider in the wrong target still builds, and only the extracted metadata shows that
 the app ships no phrase.

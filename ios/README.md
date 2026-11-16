@@ -436,14 +436,30 @@ output. A job that the action would retry reads Interrupted. The action reads
 the job again before it retries, and says that the job has no interrupted run
 when the run has recovered. It has no phrase. Add it in the Shortcuts app.
 
-An intent holds a coordinator connected with a lease, so the job action works
-with the app in the background. A leased coordinator stays connected whatever
-the scene does. When its last lease ends, it disconnects unless the app is
-open. The Job picker reads every paired coordinator at the same time and gives
-each 8 seconds to connect. It leaves out a coordinator that does not connect
-in that time. With no job to show, it reports a coordinator's refusal, such as
-a request to update the coordinator, and it reports silence only when no
-coordinator answered.
+**Open Job** brings Beep Boop forward on a scheduled job's screen, the one
+Jobs and work opens, from the same Job picker. It starts the app when the app
+is not running. The job opens over the feed, and Back returns to the feed in
+one step, with its scope and the composer draft as they were. A renamed
+coordinator or job still opens. When the job's coordinator is no longer saved,
+the action fails with "This job's coordinator is no longer saved in Beep
+Boop." When the coordinator no longer has the job, it fails with "The
+scheduled job nightly:deps is no longer on Work." Retry Interrupted Run fails
+with the same sentences. Open Job has no phrase, because a phrase would make
+each refresh of the app's phrases read every coordinator's jobs. Add it in the
+Shortcuts app.
+
+The feed of one coordinator, Jobs and work, and a job's screen tell the system
+which coordinator or jobs they show, by identifier alone, so no message text
+is part of it.
+
+An intent holds a coordinator connected with a lease, so the Job picker and
+Retry Interrupted Run work with the app in the background. A leased
+coordinator stays connected whatever the scene does. When its last lease ends,
+it disconnects unless the app is open. The Job picker reads every paired
+coordinator at the same time and gives each 8 seconds to connect. It leaves
+out a coordinator that does not connect in that time. With no job to show, it
+reports a coordinator's refusal, such as a request to update the coordinator,
+and it reports silence only when no coordinator answered.
 
 A session loads its saved outbox before it first dials. While that file
 exists and cannot be read or decoded, the session dials nothing and reports
