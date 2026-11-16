@@ -786,6 +786,8 @@ export class TaskStore {
     const tokens = (key(query).match(/[\p{L}\p{N}]+/gu) ?? []).filter((token) => token.length > 1 && !stop.includes(token));
     const scored: { task: TaskRecord; score: number }[] = [];
     for (const task of await this.list()) {
+      // A confined task's text is untrusted. It reaches another actor only by an explicit read of that task.
+      if (this.isConfined(task)) continue;
       const sourceMatch = sources.some((source) =>
         (source.provider === "task_outcomes" && source.account === "local" && source.thread_id === task.id) ||
         task.sources.some((saved) => related(saved, source)));
@@ -815,6 +817,7 @@ export class TaskStore {
     };
     for (const [rank, candidate] of indexed.candidates.entries()) {
       const task = tasks.find((task) => task.conversation_id === candidate.conversation_id || task.agents.some((agent) => agent.conversation_id === candidate.conversation_id));
+      if (task !== undefined && this.isConfined(task)) continue;
       const imported = await this.histories?.byConversation(candidate.conversation_id) ?? null;
       add({ conversation_id: candidate.conversation_id, title: task?.title ?? imported?.thread.title ?? "Main conversation",
         excerpt: candidate.matches.map((match) => match.text).join("\n").slice(0, 24_000), score: candidate.score,

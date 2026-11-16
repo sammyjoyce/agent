@@ -423,7 +423,7 @@ export class SourceJournal {
   }
   private async due(): Promise<DueTask[]> {
     return (await this.tasks.list()).flatMap((task) => task.state.state === "waiting" && task.state.next_check !== null &&
-      task.pending.length === 0 && !this.tasks.isRunning(task.id) &&
+      task.pending.length === 0 && !this.tasks.isRunning(task.id) && !this.tasks.isConfined(task) &&
       Number.isFinite(Date.parse(task.state.next_check)) && Date.parse(task.state.next_check) <= Date.now()
       ? [{ id: task.id, next_check: task.state.next_check }] : []);
   }

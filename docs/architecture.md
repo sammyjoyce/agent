@@ -707,6 +707,10 @@ channel to an actor that holds one. Tests cover each link.
 - The scheduler source that marks the task cannot be added or removed by a
   tool, and the task's outcomes are recorded already dismissed, so triage never
   reads them.
+- Related-task retrieval, task search and history index matches skip a confined
+  task, so its model-written text enters no actor's context unasked. An explicit
+  read by id still returns it: `read_task`, `read_job`, `beep-boop tasks read`,
+  `beep-boop jobs get` and `beep-boop dreams show`.
 - The only host command those tools send has no apply, command, target or
   policy variant. The broker runs it on the coordinator and nodes refuse it.
 - The executor reads the target repository and writes only under
