@@ -49,9 +49,14 @@ added_block=block:eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee
 block() {
   printf '{"window_id":"%s","layers":[{"blocks":[{"block_id":"%s","host_id":"%s","flavor":"com.superlogical.terminal.shell"}]}]}' "$1" "$2" "$host"
 }
+instance=66666666-6666-4666-8666-666666666666
+if [ -e "$root/restarted" ]; then instance=88888888-8888-4888-8888-888888888888; fi
+if [ "${AGENT_TEST_FAKE_REX_RESTART_AFTER-}" = "$method" ]; then
+  : > "$root/restarted"
+fi
 case "$method" in
   whoami)
-    printf '{"host_id":"%s","instance_id":"66666666-6666-4666-8666-666666666666","rex_version":"fixture","tailscale":{"dns_name":"fixture-node.example.ts.net","https":{"state":"available","url":"https://fixture-node.example.ts.net"}}}\n' "$host" ;;
+    printf '{"host_id":"%s","instance_id":"%s","rex_version":"fixture","tailscale":{"dns_name":"fixture-node.example.ts.net","https":{"state":"available","url":"https://fixture-node.example.ts.net"}}}\n' "$host" "$instance" ;;
   hosts)
     printf '{"hosts":[{"host_id":"%s","label":"fixture-peer","endpoints":["https://peer.example.invalid"]}]}\n' "$host" ;;
   session.create)
@@ -72,7 +77,10 @@ case "$method" in
     printf '{"sessions":[{"session_id":"session:99999999-9999-4999-8999-999999999999","label":"Unrelated"}]}\n' ;;
   session.move) printf '{}\n' ;;
   com.superlogical.terminal.process)
-    printf '{"child":null,"foreground":null,"last_exit":{"exit_code":0}}\n' ;;
+    case "$payload" in
+      *"${AGENT_TEST_FAKE_REX_RUNNING:-<none>}"*) printf '{"child":{"pid":4242},"foreground":null,"last_exit":null}\n' ;;
+      *) printf '{"child":null,"foreground":null,"last_exit":{"exit_code":0}}\n' ;;
+    esac ;;
   block.close) : > "$root/closed"; printf '{}\n' ;;
   *) printf 'Unexpected fixture method %s\n' "$method" >&2; exit 1 ;;
 esac

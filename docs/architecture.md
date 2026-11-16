@@ -293,16 +293,56 @@ models and transcript views distinguish coordination context from user input.
 The recipient retains its owning outcome while using relevant new context.
 Resuming an existing terminal retains its complete binding through failures and
 coordinator restarts. An uncertain resume cannot discard a known folder.
-If the resume reply is lost, the replacement worker can confirm its retained
-allocation only after native inspection proves the old pane is gone and the
-replacement is running on the same host in the same session. Ambiguous
-inspection leaves the input queued.
-Only an exited process needs a replacement terminal in the same session; close
-its old pane after the replacement exists.
-Rex server restart recovery remains an open question below.
-Closing a whole session is different: positive native absence fences its old
-actor before a replacement session is bound to the same task on the same
-online host. Failed inspection and offline machines never prove closure.
+
+A binding records a Rex server instance ID. When the host creates a terminal,
+it records the instance it read just before the create. When a terminal
+confirms a lost reply by attaching, the binding records the instance that the
+terminal read as it attached. After a restart, Rex restores a saved pane under
+the same session, window and block IDs, but with a fresh shell in place of the
+program. So a process in a recorded pane is the task's terminal only while the
+recorded instance still runs. If Rex restarts between the host's read and the
+create, the recorded instance is stale from the start, and the next
+presentation opens the task's terminal in a second window of the same session.
+The host reads the instance after it reads the pane's process. A binding with
+no recorded instance proves nothing. An exited pane, and a pane whose process
+is not the task's terminal, get a replacement terminal in the same session.
+
+The host closes the old pane only after Rex reports that its process exited,
+and it leaves a restored shell open, because you may have used it. That rule
+has two costs. Each Rex restart that a presentation follows leaves one more
+restored shell window in the task's session, each with its own shell process,
+and nothing removes them. Rex also has no call that closes a pane only if its
+process has exited. If Rex restarts between the host's exit check and its
+`block.close`, the close reaches the restored shell and ends any command you
+started there.
+
+A terminal's own attachment is the receipt for a lost reply. A `run-task`
+terminal presents its allocation ID, which only its launch command carries. If
+the create reply was lost, the coordinator binds the allocation to that
+terminal once the host confirms that it runs on the recorded host, and in the
+recorded session when one is known. If a resume reply was lost, the replacement
+terminal confirms the allocation once the host shows that the old pane no
+longer runs the task's terminal and that the replacement runs in the same
+session. A resume that fails before Rex receives the create reports that it did
+not start, and the binding stays ready for the next attempt.
+
+When a resume stays unconfirmed and the recorded pane no longer runs the task's
+terminal, the next presentation resumes once under a fresh allocation ID. That
+ID refuses a late terminal from the unconfirmed attempt, which can leave one
+exited pane in the session. A failed inspection changes nothing and leaves the
+input queued. The create of a new session is never repeated while its outcome
+is unknown.
+
+This reconciliation runs when a task is next presented: when input arrives with
+no terminal attached, or when you open the task. Nothing sweeps tasks after a
+Rex restart. Inputs never wait for a terminal, because the coordinator's actor
+delivers them.
+A session that is gone is different, whether you closed it or Rex restarted
+without restoring it. Only Rex's session-not-found answer proves that it is
+gone. That answer fences the old actor, and the same presentation then binds a
+replacement session to the same task on the same online host. Failed
+inspection, a lost reply and offline machines never prove closure, so the task
+keeps its binding and the next presentation asks again.
 
 `beep-boop tasks graph` prints one snapshot of Pi's live tasks: generations,
 tool calls and background timers, each with its state and the task that owns
@@ -673,10 +713,10 @@ uploads its audio. `/feedback` recordings are separate and can include
 microphone audio sent to Scrawl. Pi's existing inference interfaces remain the
 model boundary.
 
-Rex server restart behavior needs investigation: what persists, how bindings
-become stale, and how to reattach without duplicate workers. Conversation
-recovery and terminal recovery are separate. Automatic restart recovery is not
-part of the MVP.
+After a Rex server restart, a task's pane holds a restored shell until the task
+is next presented. A sweep that replaces restored panes without a presentation
+is not built. A `run-task` terminal does not reconnect when its coordinator
+connection drops. It exits, and the next presentation replaces it.
 
 ## Validation
 

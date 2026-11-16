@@ -3216,6 +3216,7 @@ async fn local_worker_binding(rex: &RexClient, terminal: &RexClient) -> Result<W
         session_id: session.to_string(),
         window_id: window.to_string(),
         block_id: block.to_string(),
+        rex_instance_id: Some(identity.instance_id.to_string()),
     })
 }
 
@@ -4335,6 +4336,7 @@ mod tests {
                 session_id: SESSION.into(),
                 window_id: "window:22222222-2222-4222-8222-222222222222".into(),
                 block_id: BLOCK.into(),
+                rex_instance_id: None,
             };
             let capture =
                 crate::capture_feedback_view(&personal_rex(), directory.path(), &binding).await;

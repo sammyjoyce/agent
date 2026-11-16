@@ -256,8 +256,14 @@ recovery; [history](history.md) describes import and retrieval.
 
 ## Recovery
 
-- [ ] Reconcile Rex server restarts, terminal exits and reconnects without
-  duplicate sessions or lost pending inputs.
+- [x] Reconcile Rex server restarts, terminal exits and reconnects without
+  duplicate sessions or lost pending inputs. A binding records the Rex server
+  instance read just before its terminal was created, or read by the terminal
+  as it attached, so a shell that Rex restores after a restart is never taken
+  for the task's terminal. A terminal's own attachment confirms a create or
+  resume whose reply was lost. The task keeps its session and gets its terminal
+  back the next time it is presented. If Rex answers that the session is gone,
+  that same presentation opens one new session for the task.
 - [x] Transfer interactive worker execution to a daemon before its terminal
   client exits, retaining ownership of pending host effects. The coordinator
   owns each task actor and the execution host's worker service owns every

@@ -748,6 +748,13 @@ pub struct WorkerRef {
     pub session_id: String,
     pub window_id: String,
     pub block_id: String,
+    /// `whoami.instance_id` of the Rex server that started this pane's process.
+    /// Rex restores a saved pane with a fresh shell under a new instance, so a
+    /// process in the pane is the worker terminal only under this instance.
+    /// Absent on a binding saved before this field, or made by an older host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub rex_instance_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]

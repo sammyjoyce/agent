@@ -736,6 +736,7 @@ mod tests {
             session_id: "session:22222222-2222-4222-8222-222222222222".into(),
             window_id: "window:33333333-3333-4333-8333-333333333333".into(),
             block_id: "block:44444444-4444-4444-8444-444444444444".into(),
+            rex_instance_id: None,
         };
         let task_id = crate::protocol::TaskId::new();
         let child = broker

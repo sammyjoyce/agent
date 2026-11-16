@@ -425,12 +425,19 @@ test("a closed child resumes its own conversation in the existing task folder an
         : { type: "creation_uncertain", session_id: binding.session_id }, () => {}), /not confirmed/u);
     const uncertain = (await app.tasks.get(task.id)).agents[0]; assert.ok(uncertain?.worker.state === "resume_uncertain");
     assert.deepEqual(uncertain.worker.binding, replaced); assert.ok(uncertain.pending.some((item) => item.id === "review-uncertain"));
-    let writes = 0;
-    await assert.rejects(app.views.input(input(child.conversation_id, "retry-uncertain", "Retain this too"), async (command) => {
-      if (local(command).type !== "inspect_worker") writes += 1;
-      return { type: "worker_presence", presence: { state: "missing_terminal" } };
-    }, () => {}), /unconfirmed/u);
-    assert.equal(writes, 0, "Uncertain pane creation must only inspect its retained binding");
+    const sent: HostCommand[] = [], resumed = { ...replaced, block_id: "block:77777777-7777-4777-8777-777777777777" };
+    await app.views.input(input(child.conversation_id, "retry-uncertain", "Retain this too"), async (command) => {
+      const operation = local(command); sent.push(operation);
+      return operation.type === "inspect_worker" ? { type: "worker_presence", presence: { state: "missing_terminal" } } : { type: "spawned", binding: resumed };
+    }, () => {});
+    assert.deepEqual(sent.map((operation) => operation.type), ["inspect_worker", "resume_agent_worker"]);
+    const resume = sent[1]; assert.ok(resume?.type === "resume_agent_worker");
+    assert.equal(resume.agent_id, child.id); assert.deepEqual(resume.binding, replaced);
+    assert.notEqual(resume.allocation_id, uncertain.worker.allocation_id);
+    const recovered = (await app.tasks.get(task.id)).agents[0]; assert.ok(recovered?.worker.state === "bound");
+    assert.equal(recovered.worker.allocation_id, resume.allocation_id); assert.equal(recovered.worker.binding.session_id, binding.session_id);
+    assert.equal(recovered.conversation_id, child.conversation_id);
+    assert.deepEqual(recovered.pending.map((item) => item.id), [...uncertain.pending.map((item) => item.id), "retry-uncertain"]);
   } finally { app.views.close(); await view?.running; app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
