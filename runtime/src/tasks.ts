@@ -102,6 +102,7 @@ type ActorPlacement = { type: "placed"; host: WorkerHost } | { type: "host_at_st
 function isAbortedJob(actor: TaskActor): boolean { return actor.mode === "job" && actor.turn.controller.signal.aborted; }
 const CONFINED_ACTOR_ONLY = "A confined task runs only its scheduler's input, as coordinator background work without agents or terminals";
 const PREDATES_CONFINEMENT = "This task held work before Dreams reserved its job id; it does not run, and a new task runs Dreams";
+const CONFINED_SCHEDULER_WRITES = "Only the scheduler writes to a confined task";
 function refuseScheduledJobSources(sources: readonly SourceRef[]): void {
   if (sources.some((source) => source.provider === "scheduled_jobs")) throw new TaskError("Scheduled job ownership is assigned only by the scheduler");
 }
@@ -279,6 +280,9 @@ export class TaskStore {
   /** A confined task whose conversation was not created confined may hold history and input from before its confinement. */
   async predatesConfinementIn(tx: Tx, task: Pick<TaskRecord, "sources" | "conversation_id">): Promise<boolean> {
     return this.isConfined(task) && !(await tx.doc(ConfinedConversation, task.conversation_id, null)).confined;
+  }
+  refuseConfinedWrite(task: Pick<TaskRecord, "sources">): void {
+    if (this.isConfined(task)) throw new TaskError(CONFINED_SCHEDULER_WRITES);
   }
   private requireSchedulerAdmission(task: Pick<TaskRecord, "sources">, scheduled?: ScheduledOccurrence): void {
     if (this.isConfined(task) && scheduled === undefined) throw new TaskError(CONFINED_ACTOR_ONLY);
@@ -574,6 +578,7 @@ export class TaskStore {
       const task = await this.taskIn(tx, id);
       this.assertSource(provenance.conversation_id);
       if (task === undefined) throw new TaskError("Unknown task");
+      this.refuseConfinedWrite(task);
       task.agents ??= [];
       let reconciliation: TaskInputReconciliation | undefined;
       if (input.reconciles_input !== undefined) {
@@ -959,6 +964,7 @@ export class TaskStore {
       .map((source) => ({ ...source }));
     if (added.length === 0 && removed.length === 0) return;
     refuseScheduledJobSources([...added, ...removed]);
+    if (added.length > 0) this.refuseConfinedWrite(task);
     const sources = task.sources.filter((source) => !removed.some((other) => related(other, source))).map((source) => ({ ...source }));
     task.sources = [...sources, ...added]; task.updated_at = Date.now();
     await this.indexTaskIn(tx, task, [...sources, ...removed]);

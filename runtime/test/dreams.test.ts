@@ -291,8 +291,7 @@ test("only the scheduler writes to a Dreams task: main's record_task and triage'
     const refused = /Only the scheduler writes to a confined task/, allowed: string[] = [];
 
     const recorded = await fromMain(app, "task-main", { name: "record_task", arguments: { task_id: task.id,
-      summary: "EXAMPLE_MAIN_WROTE_DREAMS_SUMMARY", state: { state: "resolved", evidence: "Example evidence." },
-      sources: [{ provider: "agent_feedback", account: "local", thread_id: "example-feedback" }] } });
+      summary: "EXAMPLE_MAIN_WROTE_DREAMS_SUMMARY", state: { state: "resolved", evidence: "Example evidence." } } });
     if (!refused.test(JSON.stringify(recorded.result))) allowed.push("record_task");
 
     await app.sources.admit({ source: { provider: "mail", account: "example" }, checkpoint: { value: "one" }, coverage: { status: "complete" },
