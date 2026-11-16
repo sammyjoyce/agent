@@ -629,6 +629,41 @@ async function queuedInputRunsAfterPauseAndRestart(settledBeforeRestart: boolean
 test("an input queued behind a paused goal turn runs after a restart without another message", () => queuedInputRunsAfterPauseAndRestart(true));
 test("an input queued behind a goal turn still stopping at a restart runs after it", () => queuedInputRunsAfterPauseAndRestart(false));
 
+test("an input admitted while a recovered goal run is live still runs after a pause", async () => {
+  await scenario(undefined, async (fixture) => {
+    const first = fixture.app;
+    const task = await first.task("Recovered goal run");
+    const target = inTask(task.id);
+    await first.goal(target, { type: "set", request_id: "set-recovered", objective: "Build the fixture report" });
+    first.script([call("exec", { program: "make", args: ["report"] }, "recovered-exec-1")]);
+    const before = fixture.host.hold("exec");
+    const prior = first.run(await first.command(task.id));
+    prior.catch(() => {});
+    await before.entered;
+    const reopening = fixture.reopen();
+    before.release();
+    const app = await reopening;
+
+    app.script([call("exec", { program: "make", args: ["report"] }, "recovered-exec-2"), fauxAssistantMessage("Answered the unrelated question."),
+      fauxAssistantMessage("A goal turn must not run.")]);
+    const recovered = fixture.host.hold("exec");
+    const watcher = client();
+    const running = app.run(await app.command(task.id, true), watcher.observer);
+    running.catch(() => {});
+    await recovered.entered;
+    await app.tasks.enqueue(task.id, "Answer the unrelated question.", "recovered-unrelated", undefined, "follow_up");
+    assert.equal(await app.submission(task.id, "recovered-unrelated"), undefined, "The input waits in the outbox behind the recovered run");
+    await app.goal(target, { type: "pause", request_id: "pause-recovered" });
+    recovered.release();
+    await until(async () => (await app.submission(task.id, "recovered-unrelated"))?.status !== undefined &&
+      (await app.submission(task.id, "recovered-unrelated"))?.status !== "queued" && (await app.submission(task.id, "recovered-unrelated"))?.status !== "placed");
+    assert.equal((await app.submission(task.id, "recovered-unrelated"))?.status, "done", "Pause must not withdraw an unrelated input");
+    assert.deepEqual(watcher.rejected, []);
+    await watcher.idle; watcher.stop(); await running;
+    assert.deepEqual(goalOf(await app.goal(target, show)).state, { state: "paused", reason: "requested" });
+  });
+});
+
 test("continuations stop at the budget and exhaustion pauses the goal", async () => {
   await scenario(undefined, async ({ app }) => {
     const task = await app.task("Budget task");
