@@ -81,7 +81,10 @@ export type ActorStart =
   /** `host_offline`: the recorded host is not connected, and no other host is chosen. */
   | { state: "unplaced" | "host_offline" | "unavailable"; reason: string };
 type ActorObserver = { session: WorkerSession; interactive: boolean; held?: ((session: WorkerSession) => void)[] };
-type ActorTurn = { phase: "open"; controller: AbortController } | { phase: "stopping"; controller: AbortController; finished: Promise<void> };
+/** `run_stopped`: /goal pause aborted one native run. Its host calls stay cancelled until the conversation is idle, and
+ * inputs still reach Pi so a later Stop can withdraw them. */
+type ActorTurn = { phase: "open" | "run_stopped"; controller: AbortController }
+  | { phase: "stopping"; controller: AbortController; finished: Promise<void> };
 type TaskActor = { readonly ref: ActorRef; readonly mode: ActorMode; readonly execution: ActorExecution;
   readonly terminalLaunch?: { model: ModelSelection; instructions: string };
   readonly observers: Set<ActorObserver>; turn: ActorTurn; phase: "starting" | "bound" | "closing";
@@ -204,6 +207,8 @@ function sameBinding(left: WorkerRef, right: WorkerRef): boolean {
 export class TaskStore {
   private readonly recordsStore = new PartitionedRecords<TaskRecord>("agent.task");
   private readonly running = new Map<string, TaskActor>();
+  /** Turns a Stop ended, as opposed to a pause, which aborts the same signal but keeps the actor's inputs. */
+  private readonly stoppedTurns = new WeakSet<AbortController>();
   private readonly resuming = new Set<string>();
   private readonly nativeIds = new Map<string, ConversationId>();
   private resources: { attach(taskId: string): Promise<void> } | undefined;
@@ -341,8 +346,9 @@ export class TaskStore {
     }
   }
   private interrupt(actor: TaskActor): Promise<void> {
-    if (actor.turn.phase === "open") {
+    if (actor.turn.phase !== "stopping") {
       const { controller } = actor.turn;
+      this.stoppedTurns.add(controller);
       const finished = Promise.resolve().then(async () => {
         await (actor.conversation ?? await this.conversation(actor.answer.conversation_id)).abort(BACKGROUND_CONTEXT);
       });
@@ -352,14 +358,13 @@ export class TaskStore {
     }
     return actor.turn.finished;
   }
-  /** Stops one native run of the task's primary actor and cancels its host calls until that run is idle. The turn
-   * stays open, so inputs admitted behind the run still reach Pi and a later Esc still withdraws them. */
+  /** Stops one native run of the task's primary actor, and with it the run's host calls. */
   async stopRun(taskId: string, run: NativeTaskId): Promise<void> {
     const actor = this.running.get(this.actorKey(taskId));
-    const open = actor?.turn.phase === "open" && !actor.turn.controller.signal.aborted ? actor : undefined;
-    open?.turn.controller.abort();
+    const turn = actor?.mode === "interactive" && actor.turn.phase === "open" ? actor.turn : undefined;
+    if (actor !== undefined && turn !== undefined) { actor.turn = { phase: "run_stopped", controller: turn.controller }; turn.controller.abort(); }
     await this.session.abortTask(run, BACKGROUND_CONTEXT);
-    if (open !== undefined) this.publish(open, (session) => session.interrupted?.());
+    if (actor !== undefined && turn !== undefined) this.publish(actor, (session) => session.interrupted?.());
   }
   /**
    * A job actor ends and withdraws its unplaced inputs. An interactive actor loses its current turn only,
@@ -376,7 +381,7 @@ export class TaskStore {
         return true;
       }
       case "interactive": {
-        const first = actor.turn.phase === "open";
+        const first = actor.turn.phase !== "stopping";
         await this.interrupt(actor);
         if (first) this.publish(actor, (session) => session.interrupted?.());
         return true;
@@ -1037,7 +1042,7 @@ export class TaskStore {
   }
   private async admitActiveInputs(active: TaskActor): Promise<void> {
     const conversation = active.conversation;
-    const admitting = () => active.nativeActive && active.phase === "bound" && !active.fenced && active.turn.phase === "open";
+    const admitting = () => active.nativeActive && active.phase === "bound" && !active.fenced && active.turn.phase !== "stopping";
     if (!admitting() || conversation === undefined) return;
     // The outbox is committed first. A crash between these commits retries
     // the same native request ID instead of injecting the input twice.
@@ -1562,7 +1567,7 @@ export class TaskStore {
     return false;
   }
   private async reopenTurn(actor: TaskActor): Promise<void> {
-    while ((actor.turn.phase === "stopping" || actor.turn.controller.signal.aborted) && actor.mode === "interactive" && !actor.fenced) {
+    while (actor.turn.phase !== "open" && actor.mode === "interactive" && !actor.fenced) {
       const stopping = actor.turn;
       if (stopping.phase === "stopping") await stopping.finished.catch(() => {});
       await actor.conversation?.waitForIdle(BACKGROUND_CONTEXT);
@@ -1784,7 +1789,7 @@ export class TaskStore {
         const prepared = await this.prepareInput(conversation, next.content, next.attachments, active.call, next.origin, next.sender);
         await this.reopenTurn(active);
         if (active.fenced || isAbortedJob(active)) break;
-        const stopped = turnInHand.signal.aborted; turnInHand = undefined;
+        const stopped = this.stoppedTurns.has(turnInHand); turnInHand = undefined;
         if (stopped && (await this.session.commit((tx) => this.withdrawIn(tx, task.id, input.agent_id, (queued) => queued.id === next.id),
           BACKGROUND_CONTEXT)).length > 0) {
           if (next.mode !== undefined) this.publish(active, (session) => session.rejected?.(next.id, STOPPED_INPUT_WITHDRAWN));
