@@ -932,8 +932,6 @@ func anOlderControlComesBackOnceWhileANewerSendIsAdmitting(newerRefused: Bool) a
     #expect(await model.saveDraft())
     let cold = try await ComposerDraftStore(url: url).load(from: files)
     #expect(cold.draft.text == model.draft, "Recovery offers what the composer shows")
-    let queued = try queuedRequests(coordinator.session.outboxURL).map(\.text)
-    #expect(queued == (newerRefused ? [] : ["An invented newer note"]))
     if !newerRefused {
       for await input in coordinator.fixture.observedInputs {
         #expect(input.text == "An invented newer note", "/status never went")
@@ -941,6 +939,12 @@ func anOlderControlComesBackOnceWhileANewerSendIsAdmitting(newerRefused: Bool) a
       }
     }
     #expect(await coordinator.fixture.count() == (newerRefused ? 0 : 1), "/status never went")
+    let outbox = coordinator.session.outboxURL
+    let drainDeadline = ContinuousClock.now + .seconds(10)
+    while try !queuedRequests(outbox).isEmpty, ContinuousClock.now < drainDeadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(try queuedRequests(outbox).isEmpty, "Nothing stays queued")
     await model.setActive(false)
   }
 }

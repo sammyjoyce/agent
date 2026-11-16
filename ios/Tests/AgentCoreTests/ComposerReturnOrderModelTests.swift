@@ -488,14 +488,18 @@ private func kind(_ control: Bool?) -> String {
   return current
 }
 
-let deletedReturnEndedRunSeeds: [UInt64] = [
-  119, 133, 309, 335, 398, 686, 709, 872, 873, 1016, 1121, 1216, 1280, 1403, 1421, 1496, 1581,
-  1601, 1725, 2123, 2172, 2208, 2283, 2363, 2370, 2385, 2551, 2664, 2706, 2722, 2779, 2833, 2838,
-  2917, 2973,
+/// Every seed whose history has ever failed: the 36 a deleted return broke before the walk skipped
+/// it, and 66, which a walk that stops at the first mismatch also fails. The default suite plays
+/// only these, one at a time, because each history drives four loopback coordinators in the same
+/// process as the rest of the host suite. To play every seed from 1 through N in eight parallel
+/// lanes, run `COMPOSER_RETURN_SEEDS=N swift test --filter returnOrderExploration` in `ios/`.
+let returnOrderCounterexampleSeeds: [UInt64] = [
+  33, 66, 119, 133, 309, 335, 398, 686, 709, 872, 873, 1016, 1121, 1216, 1280, 1403, 1421, 1496,
+  1581, 1601, 1725, 2123, 2172, 2208, 2283, 2363, 2370, 2385, 2551, 2664, 2706, 2722, 2779, 2833,
+  2838, 2917, 2973,
 ]
-let returnOrderSeeds = Array(UInt64(1)...100) + deletedReturnEndedRunSeeds
 
-@MainActor @Test(.timeLimit(.minutes(1)), arguments: returnOrderSeeds)
+@MainActor @Test(.serialized, .timeLimit(.minutes(1)), arguments: returnOrderCounterexampleSeeds)
 func returnedTextsKeepTheOrderTheyWereSentInAnyHistory(seed: UInt64) async throws {
   let history = ReturnOrderHistory(seed: seed)
   let violation = try await firstReturnOrderViolation(history)
