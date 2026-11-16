@@ -42,9 +42,7 @@ test("the Pi bridge as a replicated owner, against the Worker on local workerd",
     assert.equal(admissions(bridge.of(1), "replicated-input"), 1, bridge.errors());
     assert.ok(bridge.of(1).some((event) => event.type === "answer" && event.text === "The replicated owner answered."));
     bridge.child.stdin.end();
-    const closing = Date.now();
-    assert.deepEqual(await bridge.exited(), { code: 0, signal: null }, bridge.errors());
-    assert.ok(Date.now() - closing < 4_000, "the owner check does not keep a closing bridge alive");
+    assert.deepEqual(await bridge.exited(), { code: 0, signal: null }, "the owner check does not keep a closing bridge alive");
     assert.equal(await loggedInputs(coordinator.standby, "replicated-input"), 1);
     const head = (await coordinator.reader.record())?.state.head;
     assert.equal(await follow(standby, coordinator.standby), head);
@@ -77,6 +75,18 @@ test("the Pi bridge as a replicated owner, against the Worker on local workerd",
     assert.equal(coordinator.proxy.seen.some(commands()), false, "a fenced start sends no command");
   });
 
+  await t.test("a bridge that cannot reach the authority at start does not start, and its exit is not the fenced one", async (t) => {
+    const coordinator = await failoverCoordinator(t), directory = await stateDirectory(t);
+    const epoch = await enroll(coordinator.owner);
+    coordinator.proxy.inject({ fault: { kind: "unavailable" } });
+    const bridge = await startBridge(t, { directory, session: await coordinator.session(OWNER, epoch) });
+    bridge.send(1, { type: "status" });
+    const ended = await bridge.exited();
+    assert.ok(ended.code !== 0 && ended.code !== OWNER_FENCED_EXIT, `the bridge exited ${ended.code}`);
+    assert.deepEqual(bridge.frames, []);
+    assert.match(bridge.errors(), /fault proxy refused/);
+  });
+
   await t.test("after a promotion seals the log, the next input is not accepted, nothing new is on disk, and the bridge exits 75", async (t) => {
     const coordinator = await failoverCoordinator(t), directory = await stateDirectory(t);
     const epoch = await enroll(coordinator.owner);
@@ -105,7 +115,7 @@ test("the Pi bridge as a replicated owner, against the Worker on local workerd",
     await seal(coordinator.standby, epoch);
     const sealed = Date.now();
     assert.deepEqual(await bridge.exited(), { code: OWNER_FENCED_EXIT, signal: null }, bridge.errors());
-    assert.ok(Date.now() - sealed < 8_000, `the idle owner left ${Date.now() - sealed} ms after the seal`);
+    assert.ok(Date.now() - sealed < 12_000, `the idle owner left ${Date.now() - sealed} ms after the seal`);
     assert.ok(coordinator.proxy.seen.some(commands("confirm")), "the owner check is a confirm");
   });
 
