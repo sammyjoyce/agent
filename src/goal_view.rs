@@ -55,7 +55,11 @@ pub fn format(status: &GoalStatus) -> String {
         ));
     }
     if let Some(rejection) = &goal.last_rejection {
-        lines.push(format!("Last rejection: {}", rejection_text(rejection)));
+        let heading = match goal.state {
+            GoalState::Complete { .. } => "Earlier rejection",
+            GoalState::Active | GoalState::Paused { .. } => "Last rejection",
+        };
+        lines.push(format!("{heading}: {}", rejection_text(rejection)));
     }
     if let GoalState::Paused { .. } = goal.state {
         lines.push("Continue with /goal resume.".into());
@@ -266,7 +270,7 @@ mod tests {
                 "Summary: The notes contain GOAL-DONE.",
                 &format!("Check: {CHECK}"),
                 "Verified: activation 2 · entry 58 · sha256 3f2a9c01b4d5 · 10 bytes",
-                "Last rejection: resolution without a passing check · conversation 17 · entry 41 · call call-4",
+                "Earlier rejection: resolution without a passing check · conversation 17 · entry 41 · call call-4",
             ]
         );
     }
