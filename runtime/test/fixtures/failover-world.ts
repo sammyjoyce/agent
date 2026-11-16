@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TestContext } from "node:test";
@@ -63,6 +64,12 @@ export interface Sent {
 }
 
 const isSocket = (path: string) => stat(path).then((entry) => entry.isSocket(), () => false);
+
+/** Whether a process accepts connections on the socket. A coordinator that was killed leaves its socket file behind. */
+const accepts = (path: string) => new Promise<boolean>((resolve) => {
+  const channel = createConnection(path);
+  channel.once("connect", () => { channel.destroy(); resolve(true); }).once("error", () => resolve(false));
+});
 
 function groupAlive(group: number): boolean {
   try { process.kill(-group, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
@@ -187,14 +194,14 @@ export async function failoverWorld(t: TestContext, options: WorldOptions = {}) 
     release: () => receipt<ReleasedReceipt>(owner, "release"),
     status: (host: CoordinatorHost) => receipt<StatusReceipt>(host, "status"),
 
-    /** Starts `serve` on a host and returns once it has bound its socket. */
+    /** Starts `serve` on a host and returns once it accepts clients on its socket. */
     async serve(host: CoordinatorHost): Promise<OwnedProcess> {
       const serving = launch(host, SERVE);
       host.serving = serving;
       await until(async () => {
         assert.equal(serving.child.exitCode, null, `serve on the ${host.name} exited ${serving.child.exitCode}: ${serving.errors()}`);
-        return isSocket(host.socket);
-      }, `The ${host.name} must bind its socket`, () => serving.errors().slice(-2000));
+        return accepts(host.socket);
+      }, `The ${host.name} must accept clients on its socket`, () => serving.errors().slice(-2000));
       return serving;
     },
     /** Starts `serve` on a host that is expected to be refused, and returns the process. */
@@ -256,6 +263,11 @@ export async function failoverWorld(t: TestContext, options: WorldOptions = {}) 
     /** How many submissions a host's session database holds for the input with this id. */
     saved: (host: CoordinatorHost, inputId: string) => (tables(host.state).submissions ?? []).filter((row) => row.includes(inputId)).length,
     pushes: (): readonly Push[] => apns?.received ?? [],
+    /** How many requests the scripted model got for the input that contains `key`. */
+    async asked(key: string): Promise<number> {
+      const text = await readFile(base.queue + ".requests", "utf8").catch(() => "");
+      return text.split("\n").filter(Boolean).filter((line) => (JSON.parse(line) as { key: string }).key === key).length;
+    },
     /** The methods the fixture source helper was asked, in order. */
     async sourceCalls(): Promise<string[]> {
       const text = await readFile(join(source, "calls"), "utf8").catch(() => "");
