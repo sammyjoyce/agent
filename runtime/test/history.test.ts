@@ -540,3 +540,24 @@ test("native source-triage and unknown conversations stay out of search while hu
     }
   } finally { await index.close(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
+
+test("a store that was moved to another directory, as a restored backup is, hands out asset paths under its own asset root", async () => {
+  const origin = await mkdtemp(join(tmpdir(), "agent-history-moved-")), moved = `${origin}-restored`;
+  let app = await open(origin);
+  try {
+    const assets = join(origin, "assets"); await mkdir(assets);
+    const cold = Buffer.from(JSON.stringify({ type: "userMessage", text: "The full original, kept cold." })), media = Buffer.from("synthetic media");
+    const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+    for (const bytes of [cold, media]) await writeFile(join(assets, digest(bytes)), bytes);
+    const ref = (bytes: Buffer, kind: HistoryAssetRef["kind"], media_type: string): HistoryAssetRef =>
+      ({ path: join(assets, digest(bytes)), item_id: "item1", version: "v1", kind, media_type, sha256: digest(bytes), size: bytes.length });
+    const saved = await app.imported.import(batch([{ ...item("item1", "Bounded excerpt"), data: null,
+      assets: [ref(cold, "cold_evidence", "application/json"), ref(media, "local_media", "image/png")] }]));
+    await app.session.close(BACKGROUND_CONTEXT);
+    await rename(origin, moved);
+    app = await open(moved);
+    const handed = (await app.tasks.originals(saved.conversation.conversation_id, saved.entry_ids)).flatMap((original) => original.assets);
+    assert.deepEqual(handed.map((asset) => asset.path).sort(), [cold, media].map((bytes) => join(moved, "assets", digest(bytes))).sort());
+    for (const asset of handed) assert.equal(digest(await readFile(asset.path)), asset.sha256, "each handed path names the retained bytes");
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(origin, { recursive: true, force: true }); await rm(moved, { recursive: true, force: true }); }
+});

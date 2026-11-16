@@ -344,10 +344,9 @@ for (const [name, connect] of Object.entries(authorities)) {
     assert.equal(await histories.indexText(entry), original.text);
   });
 
-  test(`${name}: a promoted standby hands clients an asset path under its own directory`,
-    { todo: "history.ts entry() returns the stored asset path, which is the old owner's absolute path after a promotion" }, async (t) => {
-      const { entry, standby, root, path } = await promotedHistory(t, await connect());
-      const handed = entry.data.item.assets[0]?.path;
-      assert.equal(handed, join(standby, path));
-    });
+  test(`${name}: a promoted standby hands clients an asset path under its own directory`, async (t) => {
+    const { entry, standby, path } = await promotedHistory(t, await connect());
+    assert.deepEqual(entry.data.item.assets.map((asset) => asset.path), [join(standby, path)]);
+    assert.ok((await readFile(join(standby, path))).byteLength > 0, "the handed path names a file the standby holds");
+  });
 }
