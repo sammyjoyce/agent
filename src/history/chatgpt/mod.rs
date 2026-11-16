@@ -1382,6 +1382,102 @@ mod tests {
         assert_no_canary(&serve_everything(&history).await);
     }
 
+    fn nested_private(id: &str, role: &str, text: &str, metadata: Value) -> Value {
+        json!({"id": id, "author": {"role": role},
+            "content": {"content_type": "text", "parts": [text]},
+            "metadata": metadata, "create_time": 1_767_225_600})
+    }
+
+    fn public_response_carrying(nested: Value) -> Value {
+        Conversation::new(1, "Invented allowlist audit")
+            .node(
+                "a",
+                Some("root"),
+                json!({"id": "a", "author": {"role": "assistant"},
+                    "content": {"content_type": "text", "parts": ["Public response"]},
+                    "metadata": {"aggregate_result": {"messages": [nested]}}}),
+            )
+            .build()
+    }
+
+    #[tokio::test]
+    async fn nested_excluded_messages_retain_none_of_their_files() {
+        let mut cases = Vec::new();
+        for (role, metadata) in [
+            ("system", json!({})),
+            ("developer", json!({})),
+            (
+                "assistant",
+                json!({"is_visually_hidden_from_conversation": true}),
+            ),
+        ] {
+            let mut hidden = nested_private(
+                "nested-private",
+                role,
+                "EXCLUDED_NESTED_MESSAGE_TEXT_CANARY",
+                metadata,
+            );
+            hidden["image_url"] = json!("file-service://file-PrivateNested");
+            cases.push((
+                format!("nested-{role}-attachment"),
+                "file-PrivateNested",
+                Export::new()
+                    .conversations(&[public_response_carrying(hidden)])
+                    .stored(
+                        "file-PrivateNested-data.txt",
+                        b"EXCLUDED_NESTED_ATTACHMENT_BYTES_CANARY",
+                    ),
+            ));
+        }
+        let library_origin = nested_private(
+            "nested-library-private",
+            "system",
+            "EXCLUDED_NESTED_LIBRARY_MESSAGE_CANARY",
+            json!({}),
+        );
+        cases.push((
+            "nested-excluded-library".into(),
+            "file-NestedLibrary",
+            Export::new()
+                .conversations(&[public_response_carrying(library_origin)])
+                .json(
+                    "library_files.json",
+                    &json!([{"origination_thread_id": fixture::id(1),
+                        "origination_message_id": "nested-library-private",
+                        "file_id": "file-NestedLibrary", "file_name": "private.txt",
+                        "mime_type": "text/plain"}]),
+                )
+                .stored(
+                    "file-NestedLibrary-private.txt",
+                    b"EXCLUDED_NESTED_LIBRARY_BYTES_CANARY",
+                ),
+        ));
+        let (mut observed, mut expected) = (Vec::new(), Vec::new());
+        for (case, file, export) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let history = open(&export.folder(directory.path()));
+            let served = serve_everything(&history).await;
+            assert!(served.text.contains("Public response"), "{case}");
+            let leaked: Vec<String> = served
+                .text
+                .match_indices("EXCLUDED_NESTED")
+                .map(|(index, _)| served.text[index..].chars().take(40).collect())
+                .collect();
+            let summary = history.summary();
+            observed.push(format!(
+                "{case}: leaked {leaked:?}, file named {}, file served {}, attachments {}, excluded {}",
+                served.text.contains(file),
+                fetch(&history, &fixture::id(1), file).await.is_ok(),
+                summary.attachments,
+                summary.excluded_messages,
+            ));
+            expected.push(format!(
+                "{case}: leaked [], file named false, file served false, attachments 0, excluded 1"
+            ));
+        }
+        assert_eq!(observed, expected);
+    }
+
     #[tokio::test]
     async fn asset_chunks_cover_the_file_and_repeat_the_whole_file_digest() {
         let directory = tempfile::tempdir().unwrap();

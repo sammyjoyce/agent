@@ -1571,6 +1571,189 @@ mod tests {
         assert!(normalized.assets.is_empty());
     }
 
+    fn answer_carrying(nested: Value) -> Value {
+        let mut answer = text_message("assistant", "Public response");
+        answer["metadata"] = json!({"aggregate_result": {"messages": [nested]}});
+        answer
+    }
+
+    fn nested(id: &str, role: &str, metadata: Value) -> Value {
+        let mut message = text_message(role, MARKER);
+        message["id"] = json!(id);
+        message["metadata"] = metadata;
+        message
+    }
+
+    fn with(mut message: Value, key: &str, value: Value) -> Value {
+        message[key] = value;
+        message
+    }
+
+    fn one_answer(answer: Value) -> Value {
+        Conversation::new(1, "Nested")
+            .node("a", Some("root"), answer)
+            .build()
+    }
+
+    #[test]
+    fn a_file_only_an_excluded_message_names_is_never_retained_at_any_depth() {
+        let image = json!("file-service://file-PrivateNested");
+        let hidden = json!({"is_visually_hidden_from_conversation": true});
+        let system = with(nested("n", "system", json!({})), "image_url", image.clone());
+        let cases = [
+            ("nested system", answer_carrying(system.clone())),
+            (
+                "nested developer",
+                answer_carrying(with(
+                    nested("n", "developer", json!({})),
+                    "image_url",
+                    image.clone(),
+                )),
+            ),
+            (
+                "nested hidden",
+                answer_carrying(with(
+                    nested("n", "assistant", hidden),
+                    "image_url",
+                    image.clone(),
+                )),
+            ),
+            (
+                "inside a kept nested message",
+                answer_carrying(with(
+                    json!({"message_type": "stream", "text": "stdout"}),
+                    "metadata",
+                    json!({"aggregate_result": {"messages": [system]}}),
+                )),
+            ),
+            (
+                "inside a content part",
+                with(
+                    text_message("assistant", "Public response"),
+                    "content",
+                    json!({"content_type": "multimodal_text", "parts": ["Public response",
+                        {"content_type": "future_bundle", "message": with(nested("n", "system", json!({})),
+                            "asset_pointer", json!("sediment://file-PrivateNested"))}]}),
+                ),
+            ),
+        ];
+        let (mut observed, mut expected) = (Vec::new(), Vec::new());
+        for (case, answer) in cases {
+            let raw = one_answer(answer);
+            let normalized = run_with(&raw, &[], &Files::new(&["file-PrivateNested-data.txt"]));
+            assert_eq!(shown(&normalized), ["Public response"], "{case}");
+            let surveyed = survey(&raw);
+            observed.push(format!(
+                "{case}: assets {}, gaps {}, named {}, surveyed files {}, excluded {}",
+                normalized.assets.len(),
+                normalized.gaps.len(),
+                serde_json::to_string(&normalized.items)
+                    .unwrap()
+                    .contains("PrivateNested"),
+                surveyed.files.len(),
+                surveyed.excluded,
+            ));
+            expected.push(format!(
+                "{case}: assets 0, gaps 0, named false, surveyed files 0, excluded 1"
+            ));
+        }
+        assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn a_file_a_kept_message_names_is_kept_when_an_excluded_one_names_it_too() {
+        let excluded = with(
+            nested("n", "system", json!({})),
+            "image_url",
+            json!("file-service://file-Shared"),
+        );
+        let mut answer = answer_carrying(excluded);
+        answer["metadata"]["attachments"] = json!([{"id": "file-Shared", "name": "chart.png"}]);
+        let raw = one_answer(answer);
+        let normalized = run_with(&raw, &[], &Files::new(&["file-Shared-chart.dat"]));
+        assert_eq!(paths(item(&normalized, "a")), ["file-Shared"]);
+        let surveyed = survey(&raw);
+        assert_eq!(
+            surveyed
+                .files
+                .iter()
+                .map(FileId::as_str)
+                .collect::<Vec<_>>(),
+            ["file-Shared"]
+        );
+        assert_eq!(surveyed.excluded, 1);
+    }
+
+    #[test]
+    fn library_file_whose_origin_is_excluded_at_any_depth_is_dropped() {
+        let tool_output = |inner: Value| {
+            json!({"message_type": "stream", "text": "stdout",
+                "metadata": {"aggregate_result": {"messages": [inner]}}})
+        };
+        let briefing = with(
+            text_message("system", MARKER),
+            "metadata",
+            json!({"aggregate_result": {"messages": [{"id": "origin", "message_type": "stream"}]}}),
+        );
+        let cases = [
+            (
+                "nested system",
+                Conversation::new(1, "Nested")
+                    .node(
+                        "a",
+                        Some("root"),
+                        answer_carrying(nested("origin", "system", json!({}))),
+                    )
+                    .build(),
+            ),
+            (
+                "inside a kept nested message",
+                Conversation::new(1, "Nested")
+                    .node(
+                        "a",
+                        Some("root"),
+                        answer_carrying(tool_output(nested("origin", "developer", json!({})))),
+                    )
+                    .build(),
+            ),
+            (
+                "inside an excluded message",
+                Conversation::new(1, "Nested")
+                    .node("briefing", Some("root"), briefing)
+                    .say("a", "briefing", "assistant", "Public response")
+                    .build(),
+            ),
+        ];
+        let (mut observed, mut expected) = (Vec::new(), Vec::new());
+        for (case, raw) in cases {
+            let file = library("file_00e7", Some("origin"));
+            let kept = survey(&raw).keeps(&file);
+            let normalized = run_with(&raw, &[file], &Files::new(&["file_00e7-plan.dat"]));
+            let ids: Vec<&str> = normalized
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect();
+            observed.push(format!(
+                "{case}: kept {kept}, items {ids:?}, assets {}",
+                normalized.assets.len()
+            ));
+            expected.push(format!("{case}: kept false, items [\"a\"], assets 0"));
+        }
+        assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn library_file_whose_origin_is_a_kept_nested_message_attaches_to_its_message() {
+        let chart = json!({"id": "chart-output", "message_type": "image"});
+        let raw = one_answer(answer_carrying(chart));
+        let file = library("file_00e8", Some("chart-output"));
+        assert!(survey(&raw).keeps(&file));
+        let normalized = run_with(&raw, &[file], &Files::new(&["file_00e8-plan.dat"]));
+        assert_eq!(placed(&normalized), [("a", Current)]);
+        assert_eq!(paths(item(&normalized, "a")), ["file_00e8"]);
+    }
+
     #[test]
     fn library_only_generated_file_gets_its_own_item() {
         let normalized = run_with(

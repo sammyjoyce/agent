@@ -27,6 +27,8 @@ export const KAYAK = { prompt: "Suggest a kayak route along the coast", reply: "
 const BLOB_FILE = { id: "file_00e2", member: "file_00e2-blob.dat" } as const;
 const PNG_FILE = { id: "file_00e3", member: "file_00e3-lighthouse.dat" } as const;
 const NOTES_FILE = { id: "file_00e4", member: "file_00e4-notes.txt" } as const;
+const NESTED_IMAGE_FILE = { id: "file_00e5", member: "file_00e5-briefing.dat" } as const;
+const NESTED_LIBRARY_FILE = { id: "file_00e6", member: "file_00e6-hidden.txt" } as const;
 const SURVEY_REPLY = "The lighthouse survey data looks complete. ".repeat(3_200);
 
 function message(id: string, role: Author["role"], created: number, content: Record<string, unknown>,
@@ -80,7 +82,8 @@ function lighthouse(png: Uint8Array, blob: Uint8Array): Conversation {
       { id: PNG_FILE.id, name: "lighthouse.png", size: png.byteLength, mime_type: "image/png", width: 1, height: 1 },
       { id: BLOB_FILE.id, name: "survey.dat", size: blob.byteLength, mime_type: "application/octet-stream" }] } })),
     node(`${id}-upload`, message(`${id}-reply`, "assistant", at + 20, text(SURVEY_REPLY), { metadata: {
-      aggregate_result: { messages: [message(`${id}-nested-system`, "system", at + 15, text(`${INSTRUCTION_MARKER}: a nested system message.`)), hidden] },
+      aggregate_result: { messages: [{ ...message(`${id}-nested-system`, "system", at + 15, text(`${INSTRUCTION_MARKER}: a nested system message.`)),
+        image_url: `sediment://${NESTED_IMAGE_FILE.id}` }, hidden] },
       citations: [{ metadata: { user_context_message_data: { about_user_message: `${INSTRUCTION_MARKER}: a nested custom instruction.` } } }] } })),
   ]);
 }
@@ -120,13 +123,17 @@ export function onePixelPng(): Buffer {
 export function chatGptExports(blob: Uint8Array): { first: ExportMember[]; second: ExportMember[] } {
   const png = onePixelPng();
   const library = [{ origination_thread_id: CHATGPT_CONVERSATIONS.lighthouse, origination_message_id: `${CHATGPT_CONVERSATIONS.lighthouse}-briefing`,
-    file_id: NOTES_FILE.id, file_name: "notes.txt", mime_type: "text/plain", metadata: { user_context_message_data: `${INSTRUCTION_MARKER}: library metadata.` } }];
+    file_id: NOTES_FILE.id, file_name: "notes.txt", mime_type: "text/plain", metadata: { user_context_message_data: `${INSTRUCTION_MARKER}: library metadata.` } },
+  { origination_thread_id: CHATGPT_CONVERSATIONS.lighthouse, origination_message_id: `${CHATGPT_CONVERSATIONS.lighthouse}-nested-hidden`,
+    file_id: NESTED_LIBRARY_FILE.id, file_name: "hidden.txt", mime_type: "text/plain" }];
   const members = (conversations: Conversation[]): ExportMember[] => [
     { name: "conversations.json", bytes: Buffer.from(JSON.stringify(conversations)), method: "deflated" },
     { name: "library_files.json", bytes: Buffer.from(JSON.stringify(library)), method: "deflated" },
     { name: PNG_FILE.member, bytes: png, method: "deflated" },
     { name: BLOB_FILE.member, bytes: blob, method: "stored" },
     { name: NOTES_FILE.member, bytes: Buffer.from(`${INSTRUCTION_MARKER}: notes attached to a system briefing.`), method: "deflated" },
+    { name: NESTED_IMAGE_FILE.member, bytes: Buffer.from(`${INSTRUCTION_MARKER}: an image only a nested system message shows.`), method: "deflated" },
+    { name: NESTED_LIBRARY_FILE.member, bytes: Buffer.from(`${INSTRUCTION_MARKER}: a library file of a nested hidden message.`), method: "deflated" },
   ];
   return {
     first: members([picnic(false), lighthouse(png, blob), kayak(false), tent()]),
