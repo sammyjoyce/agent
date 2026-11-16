@@ -3,4 +3,4 @@
 /**
  * One request to `failover/helper.js`. The helper reports facts and Rust decides.
  */
-export type FailoverRequest = { "op": "claim" } | { "op": "record" };
+export type FailoverRequest = { "op": "claim", state: string, } | { "op": "record" };

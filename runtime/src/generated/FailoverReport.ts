@@ -9,4 +9,4 @@ import type { OwnerEpoch } from "./OwnerEpoch.js";
  * The helper's one line of output. An authority it could not reach is an
  * exit with `AUTHORITY_UNREACHABLE_EXIT`, never a refusal.
  */
-export type FailoverReport = { "result": "claimed", epoch: OwnerEpoch, head: LogPosition, } | { "result": "refused", reason: AuthorityRefusal, state: AuthorityState | null, } | { "result": "record", record: AuthorityRecord | null, };
+export type FailoverReport = { "result": "claimed", epoch: OwnerEpoch, head: LogPosition, } | { "result": "refused", reason: AuthorityRefusal, state: AuthorityState | null, } | { "result": "unstamped" } | { "result": "record", record: AuthorityRecord | null, };

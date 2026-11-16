@@ -2,13 +2,14 @@ import { AUTHORITY_UNREACHABLE_EXIT } from "../generated/authority-unreachable-e
 import type { FailoverReport } from "../generated/FailoverReport.js";
 import type { FailoverRequest } from "../generated/FailoverRequest.js";
 import { AuthorityUnreachable } from "./authority-link.js";
-import { tagged } from "./authority-wire.js";
+import { tagged, text } from "./authority-wire.js";
 import { scriptSession, type ScriptSession } from "./session.js";
+import { appliedPosition } from "./state-directory.js";
 
 /** Rust puts no limit on a claim, so the helper bounds its one request itself. */
 const REQUEST_TIMEOUT_MS = 10_000;
 
-const failoverRequest = tagged<FailoverRequest, "op">("op", { claim: {}, record: {} });
+const failoverRequest = tagged<FailoverRequest, "op">("op", { claim: { state: text }, record: {} });
 
 function parseRequest(argument: string | undefined): FailoverRequest {
   if (argument === undefined) throw new Error("The failover helper needs one request");
@@ -18,11 +19,13 @@ function parseRequest(argument: string | undefined): FailoverRequest {
   return failoverRequest(given, "");
 }
 
-/** One exchange with the authority. An authority that refuses is a report. One that does not answer rejects with `AuthorityUnreachable`. */
+/** At most one exchange with the authority. An authority that refuses is a report. One that does not answer rejects with `AuthorityUnreachable`. */
 async function answer(session: ScriptSession, request: FailoverRequest): Promise<FailoverReport> {
   switch (request.op) {
     case "claim": {
       if (session.holder === undefined) throw new Error("A claim needs a holder, and this host's failover session names none");
+      // A claim raises the epoch, and the Pi child refuses a directory with no position, so the check comes first.
+      if (appliedPosition(request.state) === undefined) return { result: "unstamped" };
       const reply = await session.link.command({ op: "claim", holder: session.holder });
       return reply.result === "accepted" ? { result: "claimed", epoch: reply.state.epoch, head: reply.state.head }
         : { result: "refused", reason: reply.reason, state: reply.state };

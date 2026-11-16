@@ -145,14 +145,18 @@ test("the failover commands enroll an owner and keep a standby of it", { timeout
     assert.equal(tables(owner.state).beep_boop_failover, undefined, "an enrollment that reached nobody stamps nothing");
   });
 
-  await t.test("serve does not start as the replicated owner on a directory that was never stamped, and enroll says how to rebuild it", async () => {
+  await t.test("serve refuses a directory that was never stamped before it claims an epoch, names enroll and join, and enroll says how to rebuild it", async () => {
     const coordinator = world.coordinator(), owner = await world.host(coordinator, OWNER), unstamped = await world.host(coordinator, OWNER);
     await owner.create();
     await owner.receipt<EnrolledReceipt>("enroll");
     await unstamped.create();
-    const before = tables(unstamped.state);
+    const before = tables(unstamped.state), enrolled = await owner.record();
     const served = await unstamped.serve().done;
     assert.ok(served.code !== 0 && served.code !== OWNER_FENCED_EXIT, `serve exited ${served.code}: ${served.stderr}`);
+    assert.match(served.stderr, /holds no replication position/);
+    assert.match(served.stderr, /`beep-boop failover enroll`/);
+    assert.match(served.stderr, /`beep-boop failover join`/);
+    assert.deepEqual(await owner.record(), enrolled, "a start that was refused claims no epoch");
     assert.equal(await exists(join(unstamped.state, "agent.sock")), false, "a start that was refused leaves no socket");
     assert.deepEqual(tables(unstamped.state), before, "a start that was refused changes nothing in the session database");
     const refused = await unstamped.failover("enroll");

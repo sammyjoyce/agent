@@ -596,11 +596,15 @@ pub struct FailoverSession {
 }
 
 /// One request to `failover/helper.js`. The helper reports facts and Rust decides.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FailoverRequest {
-    /// Raise the epoch for a coordinator start by the current owner.
-    Claim,
+    /// Raise the epoch for a coordinator start by the current owner, whose
+    /// state directory `state` must already hold a log position.
+    Claim {
+        #[ts(type = "string")]
+        state: PathBuf,
+    },
     /// Read the owner record. Writes nothing.
     Record,
 }
@@ -618,6 +622,9 @@ pub enum FailoverReport {
         reason: AuthorityRefusal,
         state: Option<AuthorityState>,
     },
+    /// The state directory of a claim holds no log position, so the helper
+    /// asked the authority nothing.
+    Unstamped,
     /// The owner record, or null before enrollment.
     Record { record: Option<AuthorityRecord> },
 }

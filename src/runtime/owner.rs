@@ -39,7 +39,8 @@ enum Authority {
 impl OwnerClaim {
     /// Takes `writer.lock`, then the coordinator identity. With a `[failover]`
     /// section, asks the authority for the next epoch through the runtime's
-    /// helper and never mints an identity.
+    /// helper and never mints an identity. A state directory that holds no
+    /// log position is refused before any epoch is asked for.
     pub fn acquire(state: &Path, script: &Path, failover: Option<&FailoverConfig>) -> Result<Self> {
         let Some(failover) = failover else {
             let lock = WriterLock::acquire(state)?;
@@ -67,7 +68,10 @@ impl OwnerClaim {
             holder: Some(holder),
             epoch: None,
         };
-        match FailoverHelper::locate(script)?.run(&session, &FailoverRequest::Claim)? {
+        let claim = FailoverRequest::Claim {
+            state: state.to_owned(),
+        };
+        match FailoverHelper::locate(script)?.run(&session, &claim)? {
             FailoverReport::Claimed { epoch, .. } => Ok(Self {
                 state: state.to_owned(),
                 lock,
@@ -86,6 +90,10 @@ impl OwnerClaim {
                 }
                 Err(OwnerFenced::Refused { reason, state }.into())
             }
+            FailoverReport::Unstamped => bail!(
+                "{} holds no replication position, so this coordinator cannot start as the replicated owner and claimed nothing. Run `beep-boop failover enroll` to enroll this state directory as a replicated coordinator, or `beep-boop failover join` to make it a standby of an enrolled one",
+                state.display()
+            ),
             FailoverReport::Record { .. } => {
                 bail!("The failover helper answered a claim with the owner record")
             }

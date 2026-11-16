@@ -303,12 +303,32 @@ fn a_refused_claim_exits_75_before_sources_rex_pi_or_a_socket() {
     let runs = world.helper_runs();
     assert_eq!(runs.len(), 1);
     let request: Value = serde_json::from_str(runs[0]["request"].as_str().unwrap()).unwrap();
-    assert_eq!(request, json!({ "op": "claim" }));
+    assert_eq!(request, json!({ "op": "claim", "state": world.state }));
     let session = session(&runs[0]["session"]);
     assert_eq!(session["url"], AUTHORITY);
     assert_eq!(session["coordinator_id"], COORDINATOR);
     assert_eq!(session["holder"], HOLDER);
     assert!(session.get("epoch").is_none_or(Value::is_null), "{session}");
+}
+
+#[test]
+fn a_state_directory_without_a_log_position_names_enroll_and_join_before_sources_rex_pi_or_a_socket()
+ {
+    let world = World::new(Failover::Holder).with_coordinator_id();
+    world.answer(json!({ "result": "unstamped" }), "", 0);
+    let output = world.run();
+    let message = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{message}");
+    assert!(
+        message.contains("holds no replication position")
+            && message.contains("`beep-boop failover enroll`")
+            && message.contains("`beep-boop failover join`"),
+        "{message}"
+    );
+    assert!(!world.socket().exists());
+    assert_eq!(world.bridge(), None);
+    assert_eq!(world.rex_calls(), None);
+    assert_eq!(world.helper_runs().len(), 1);
 }
 
 #[test]
