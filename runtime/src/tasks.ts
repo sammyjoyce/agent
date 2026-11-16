@@ -41,6 +41,7 @@ import type { AllocationOperation } from "./generated/AllocationOperation.js";
 import type { AllocationResult } from "./generated/AllocationResult.js";
 import { AllocationDecisionEntry, allocationResult } from "./allocation.js";
 import { PartitionedRecords } from "./partitioned-records.js";
+import type { TaskInput } from "./generated/TaskInput.js";
 
 export type HostCall = (command: HostCommand) => Promise<HostResult>;
 export type SearchQuery = (query: string, sourceRefs: string[], limit: number, mode?: SearchMode) => Promise<SearchResult>;
@@ -103,6 +104,12 @@ const ConversationOwner = defineDocFamily<{ task_id: string | null; agent_id: st
   initial: () => ({ task_id: null, agent_id: null }), checkpointWhen: () => true });
 function conversationIdentity(value: unknown): value is ConversationId {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+/** A task actor's conversation ID without a Harness read, for use inside a commit. */
+export function nativeConversationId(value: string): ConversationId {
+  const native: unknown = Number(value);
+  if (!conversationIdentity(native) || native.toString() !== value) throw new TaskError("Task conversation is unavailable");
+  return native;
 }
 
 export class TaskError extends Error {}
@@ -174,6 +181,18 @@ function text(entry: EntryRecord, toolLimit?: number): string {
       part.type === "text" && !noticeMetadata(entry, index, message.content.length, part.text) ? [part.text] : []).join("\n");
     return message.role === "toolResult" && toolLimit !== undefined ? content.slice(0, toolLimit) : content;
   }).join("\n") ?? "";
+}
+/** Whether the actor already holds this input. A reused ID must carry the same input. */
+function holds(actor: TaskRecord | TaskAgentRecord, input: TaskInput): boolean {
+  const previous = actor.pending.find((saved) => saved.id === input.id);
+  if (previous === undefined) return false;
+  if (previous.content !== input.content || (previous.mode ?? "follow_up") !== (input.mode ?? "follow_up") ||
+      JSON.stringify(previous.attachments ?? []) !== JSON.stringify(input.attachments ?? []) ||
+      JSON.stringify(previous.scheduled) !== JSON.stringify(input.scheduled) || previous.origin !== input.origin ||
+      !sameSender(previous.sender, input.sender)) {
+    throw new TaskError("A task input ID cannot be reused with different content or mode");
+  }
+  return true;
 }
 function sameBinding(left: WorkerRef, right: WorkerRef): boolean {
   return left.host_id === right.host_id && left.session_id === right.session_id &&
@@ -331,25 +350,6 @@ export class TaskStore {
     }
     return actor.turn.finished;
   }
-  /** Withdraws the inputs that have not reached Pi, and returns their ids. An input already in Pi is left to Pi's abort. */
-  private withdrawUnplaced(ref: ActorRef, conversation: Conversation, inputs: readonly { id: string }[]): Promise<string[]> {
-    return this.session.commit(async (tx) => {
-      const withdrawn: string[] = [];
-      for (const input of inputs) {
-        if (await tx.submissionByRequest(conversation.id, input.id) === undefined) withdrawn.push(input.id);
-      }
-      // App admission can precede native placement during preflight. Keep the
-      // same native unplaced-abort receipt as an ordinarily queued Pi input.
-      for (const requestId of withdrawn) {
-        await tx.createSubmission({ type: "input", conversationId: conversation.id, requestId, status: "unanswered", reason: "aborted" });
-      }
-      if (withdrawn.length > 0) await this.updateIn(tx, ref.task_id, (current) => {
-        const saved = this.actor(current, ref.agent_id);
-        saved.pending = saved.pending.filter((input) => !withdrawn.includes(input.id));
-      });
-      return withdrawn;
-    }, BACKGROUND_CONTEXT);
-  }
   /**
    * A job actor ends and withdraws its unplaced inputs. An interactive actor loses its current turn only,
    * and with it the input of that turn when the input has not reached Pi.
@@ -359,9 +359,8 @@ export class TaskStore {
     if (actor === undefined) return false;
     switch (actor.mode) {
       case "job": {
-        const { pending, conversation_id } = this.actor(await this.get(ref.task_id), ref.agent_id);
         void this.interrupt(actor).catch(() => {});
-        await this.withdrawUnplaced(ref, await this.conversation(conversation_id), pending);
+        await this.session.commit((tx) => this.withdrawIn(tx, ref.task_id, ref.agent_id, () => true), BACKGROUND_CONTEXT);
         await actor.exit.catch(() => {});
         return true;
       }
@@ -373,6 +372,26 @@ export class TaskStore {
       }
       default: { const unknown: never = actor.mode; throw new TaskError(`Unknown actor mode ${String(unknown)}`); }
     }
+  }
+  /** Withdraws the matching outbox inputs that have not reached Pi, and returns their ids. An input already in Pi is left to Pi's abort. */
+  async withdrawIn(tx: Tx, id: string, agentId: string | undefined, matches: (input: TaskInput) => boolean): Promise<string[]> {
+    const task = await this.taskIn(tx, id);
+    if (task === undefined) throw new TaskError("Unknown task");
+    const actor = this.actor(task, agentId), conversationId = nativeConversationId(actor.conversation_id);
+    const withdrawn: string[] = [];
+    for (const input of actor.pending) {
+      if (matches(input) && await tx.submissionByRequest(conversationId, input.id) === undefined) withdrawn.push(input.id);
+    }
+    // App admission can precede native placement during preflight. Keep the
+    // same native unplaced-abort receipt as an ordinarily queued Pi input.
+    for (const requestId of withdrawn) {
+      await tx.createSubmission({ type: "input", conversationId, requestId, status: "unanswered", reason: "aborted" });
+    }
+    if (withdrawn.length > 0) await this.updateIn(tx, id, (current) => {
+      const saved = this.actor(current, agentId);
+      saved.pending = saved.pending.filter((input) => !withdrawn.includes(input.id));
+    });
+    return withdrawn;
   }
   /** Fence app bindings before Harness.close checkpoints native work for its next owner. */
   async detachActors(): Promise<void> {
@@ -860,11 +879,7 @@ export class TaskStore {
     // Child records inherit their parent's source references. Each native tail
     // must change so restart catchup also replaces its published provenance.
     for (const value of [task.conversation_id, ...(task.agents ?? []).map((agent) => agent.conversation_id)]) {
-      const native: unknown = Number(value);
-      if (!conversationIdentity(native) || native.toString() !== value) {
-        throw new TaskError("Task conversation is unavailable");
-      }
-      await tx.appendEntry(SourceLinksEntry, native, { data: { task_id: id, added, removed } });
+      await tx.appendEntry(SourceLinksEntry, nativeConversationId(value), { data: { task_id: id, added, removed } });
     }
   }
   async update(id: string, change: (task: TaskRecord) => void): Promise<TaskRecord> {
@@ -920,17 +935,11 @@ export class TaskStore {
       if (store === undefined) throw new TaskError("Attachment storage is unavailable");
       attachments = await store.resolve(attachments);
     }
-    const validate = (actor: TaskRecord | TaskAgentRecord) => {
-      const previous = actor.pending.find(input => input.id === inputId);
-      if (previous !== undefined && (previous.content !== content || (previous.mode ?? "follow_up") !== (mode ?? "follow_up") ||
-          JSON.stringify(previous.attachments ?? []) !== JSON.stringify(attachments ?? []) ||
-          JSON.stringify(previous.scheduled) !== JSON.stringify(scheduled) || previous.origin !== origin ||
-          !sameSender(previous.sender, sender))) {
-        throw new TaskError("A task input ID cannot be reused with different content or mode");
-      }
-      return previous;
-    };
-    validate(this.actor(await this.get(id), agentId));
+    const input: TaskInput = { id: inputId, content, ...(mode === undefined ? {} : { mode }),
+      ...(attachments === undefined ? {} : { attachments }),
+      ...(scheduled === undefined ? {} : { scheduled }), ...(origin === undefined ? {} : { origin }),
+      ...(sender === undefined ? {} : { sender }) };
+    holds(this.actor(await this.get(id), agentId), input);
     const active = this.running.get(this.actorKey(id, agentId));
     if (active !== undefined) active.admissions += 1;
     try {
@@ -938,14 +947,7 @@ export class TaskStore {
       await this.admit(attachments, () => this.session.commit(async (tx) => {
       await this.updateIn(tx, id, async (task) => {
         if (delivered !== undefined) this.assertSource(delivered.conversation_id);
-        const actor = this.actor(task, agentId);
-        const previous = validate(actor);
-        if (previous === undefined) actor.pending.push({ id: inputId, content, ...(mode === undefined ? {} : { mode }),
-          ...(attachments === undefined ? {} : { attachments }),
-          ...(scheduled === undefined ? {} : { scheduled }), ...(origin === undefined ? {} : { origin }),
-          ...(sender === undefined ? {} : { sender }) });
-        actor.state = { state: "open" };
-        task.state = { state: "open" };
+        this.pushIn(task, this.actor(task, agentId), input);
       });
       if (delivered !== undefined) await this.outcomes?.deliveredIn(tx, delivered);
       }, BACKGROUND_CONTEXT));
@@ -956,6 +958,12 @@ export class TaskStore {
     const task = await this.get(id);
     if (active !== undefined) { active.revision += 1; active.wake?.(); }
     return task;
+  }
+  /** The one way into an actor's outbox. Admission reopens the actor and its task. */
+  private pushIn(task: TaskRecord, actor: TaskRecord | TaskAgentRecord, input: TaskInput): void {
+    if (!holds(actor, input)) actor.pending.push(input);
+    actor.state = { state: "open" };
+    task.state = { state: "open" };
   }
   private async admitActiveInputs(active: TaskActor): Promise<void> {
     const conversation = active.conversation;
@@ -1681,7 +1689,8 @@ export class TaskStore {
         await this.reopenTurn(active);
         if (active.fenced || isAbortedJob(active)) break;
         const stopped = turnInHand.signal.aborted; turnInHand = undefined;
-        if (stopped && (await this.withdrawUnplaced(input, conversation, [next])).length > 0) {
+        if (stopped && (await this.session.commit((tx) => this.withdrawIn(tx, task.id, input.agent_id, (queued) => queued.id === next.id),
+          BACKGROUND_CONTEXT)).length > 0) {
           if (next.mode !== undefined) this.publish(active, (session) => session.rejected?.(next.id, STOPPED_INPUT_WITHDRAWN));
           childResultPending = false;
           continue;
