@@ -20,8 +20,12 @@ use crate::{
     history::{HistorySource, codex::CodexHistory},
     protocol::{HostCommand, HostDelivery, HostResult, TaskId, WorkerHost, WorkerRef},
     resources::{ResourceBackend, git::GitBackend},
-    rex::{BlockId, HostId, RexClient, RexError, SessionId, WindowId, WorkerBinding, WorkerResume},
+    rex::{
+        BlockId, HostId, RexClient, RexError, RexIdentity, SessionId, WindowId, WorkerBinding,
+        WorkerResume,
+    },
 };
+use uuid::Uuid;
 
 pub const DEFAULT_TIMEOUT_SECONDS: u16 = 15 * 60;
 pub const ACTOR_CONVERSATION_ENV: &str = "BEEP_BOOP_ACTOR_CONVERSATION";
@@ -340,7 +344,7 @@ async fn execute_inner(rex: &RexClient, command: HostCommand) -> Result<HostResu
             );
             Ok(HostResult::WorkerPresence {
                 presence: rex
-                    .worker_presence(&binding.native, &identity.host_id)
+                    .worker_presence(&binding.native, binding.rex_instance_id, &identity.host_id)
                     .await?,
             })
         }
@@ -483,7 +487,7 @@ async fn execute_inner(rex: &RexClient, command: HostCommand) -> Result<HostResu
                     Path::new(&host.cwd),
                 )
                 .await;
-            created_worker(rex, created, &identity.host_id).await
+            created_worker(rex, created, &identity).await
         }
         HostCommand::ResumeWorker {
             host,
@@ -532,15 +536,26 @@ async fn resume_bound_worker(
     agent_id: Option<String>,
 ) -> Result<HostResult> {
     let native = &binding.native;
-    let identity = client.whoami().await?;
-    ensure!(
-        identity.host_id == binding.host_id,
-        "Worker host identity changed"
-    );
-    let presence = client.worker_presence(native, &identity.host_id).await?;
-    if matches!(presence, crate::protocol::WorkerPresence::MissingSession) {
-        anyhow::bail!("The task session was closed; reconcile its allocation before reopening");
+    let checked = async {
+        let identity = client.whoami().await?;
+        ensure!(
+            identity.host_id == binding.host_id,
+            "Worker host identity changed"
+        );
+        let presence = client
+            .worker_presence(native, binding.rex_instance_id, &identity.host_id)
+            .await?;
+        ensure!(
+            !matches!(presence, crate::protocol::WorkerPresence::MissingSession),
+            "The task session was closed; reconcile its allocation before reopening"
+        );
+        Ok((identity, presence))
     }
+    .await;
+    let (identity, presence) = match checked {
+        Ok(checked) => checked,
+        Err(error) => return Ok(resume_not_started(error)),
+    };
     if matches!(presence, crate::protocol::WorkerPresence::MissingTerminal) {
         return match client
             .create_worker_window(
@@ -552,12 +567,13 @@ async fn resume_bound_worker(
             )
             .await
         {
-            Ok(restored) if confirmed_binding(client, &restored, &identity.host_id).await => {
+            Ok(restored) if client.confirm_creation(&restored, &identity).await => {
                 promote(client, &restored.session_id).await;
                 Ok(HostResult::Spawned {
                     binding: ExecutionBinding {
                         host_id: binding.host_id,
                         native: restored,
+                        rex_instance_id: Some(identity.instance_id),
                     }
                     .into(),
                 })
@@ -568,7 +584,7 @@ async fn resume_bound_worker(
             Err(RexError::CreationUncertain { session_id }) => Ok(HostResult::CreationUncertain {
                 session_id: session_id.map(|id| id.to_string()),
             }),
-            Err(error) => Err(error.into()),
+            Err(error) => Ok(resume_not_started(error.into())),
         };
     }
     // A running client drains new pending inputs itself. An exited pane
@@ -579,9 +595,18 @@ async fn resume_bound_worker(
         &task_id,
         &allocation_id,
         &binding,
+        &identity,
         agent_id.as_deref(),
     )
     .await
+}
+
+/// Rex created nothing, so the coordinator keeps the binding it sent.
+fn resume_not_started(error: anyhow::Error) -> HostResult {
+    HostResult::Failed {
+        message: error.to_string(),
+        delivery: Some(HostDelivery::NotStarted),
+    }
 }
 
 async fn require_local_host(rex: &RexClient, expected: &str) -> Result<()> {
@@ -597,6 +622,7 @@ async fn require_local_host(rex: &RexClient, expected: &str) -> Result<()> {
 struct ExecutionBinding {
     host_id: HostId,
     native: WorkerBinding,
+    rex_instance_id: Option<Uuid>,
 }
 
 impl TryFrom<&WorkerRef> for ExecutionBinding {
@@ -611,6 +637,12 @@ impl TryFrom<&WorkerRef> for ExecutionBinding {
                 // The protocol records identity, not a live Rex revision.
                 revision: 0,
             },
+            rex_instance_id: binding
+                .rex_instance_id
+                .as_deref()
+                .map(Uuid::parse_str)
+                .transpose()
+                .map_err(|_| RexError::InvalidId)?,
         })
     }
 }
@@ -622,6 +654,7 @@ impl From<ExecutionBinding> for WorkerRef {
             session_id: binding.native.session_id.to_string(),
             window_id: binding.native.window_id.to_string(),
             block_id: binding.native.block_id.to_string(),
+            rex_instance_id: binding.rex_instance_id.map(|id| id.to_string()),
         }
     }
 }
@@ -730,7 +763,7 @@ async fn spawn_worker(
                 .await
         }
     };
-    created_worker(client, created, &identity.host_id).await
+    created_worker(client, created, &identity).await
 }
 
 fn not_started(error: anyhow::Error) -> HostResult {
@@ -742,11 +775,11 @@ fn not_started(error: anyhow::Error) -> HostResult {
 async fn created_worker(
     client: &RexClient,
     created: Result<WorkerBinding, RexError>,
-    host: &HostId,
+    identity: &RexIdentity,
 ) -> Result<HostResult> {
     match created {
         Ok(binding) => {
-            if !confirmed_binding(client, &binding, host).await {
+            if !client.confirm_creation(&binding, identity).await {
                 return Ok(HostResult::CreationUncertain {
                     session_id: Some(binding.session_id.to_string()),
                 });
@@ -754,8 +787,9 @@ async fn created_worker(
             promote(client, &binding.session_id).await;
             Ok(HostResult::Spawned {
                 binding: ExecutionBinding {
-                    host_id: host.clone(),
+                    host_id: identity.host_id.clone(),
                     native: binding,
+                    rex_instance_id: Some(identity.instance_id),
                 }
                 .into(),
             })
@@ -765,13 +799,6 @@ async fn created_worker(
         }),
         Err(error @ RexError::ServerDown { .. }) => Ok(not_started(error.into())),
         Err(error) => Err(error.into()),
-    }
-}
-
-async fn confirmed_binding(client: &RexClient, binding: &WorkerBinding, host: &HostId) -> bool {
-    match client.inspect_session(&binding.session_id).await {
-        Ok(view) => view.verify_binding(binding, host).is_ok(),
-        Err(_) => false,
     }
 }
 
@@ -787,12 +814,15 @@ async fn resume_worker(
     task_id: &TaskId,
     allocation_id: &str,
     binding: &ExecutionBinding,
+    identity: &RexIdentity,
     agent_id: Option<&str>,
 ) -> Result<HostResult> {
     promote(client, &binding.native.session_id).await;
     match client
         .resume_worker(
             &binding.native,
+            binding.rex_instance_id,
+            identity,
             &host.agent_program,
             &worker_args(client, host, task_id, allocation_id, agent_id),
             Path::new(&host.cwd),
@@ -807,13 +837,14 @@ async fn resume_worker(
             binding: ExecutionBinding {
                 host_id: binding.host_id.clone(),
                 native: replacement,
+                rex_instance_id: Some(identity.instance_id),
             }
             .into(),
         }),
         Err(RexError::CreationUncertain { session_id }) => Ok(HostResult::CreationUncertain {
             session_id: session_id.map(|id| id.to_string()),
         }),
-        Err(error) => Err(error.into()),
+        Err(error) => Ok(resume_not_started(error.into())),
     }
 }
 
@@ -1002,17 +1033,11 @@ mod tests {
     const RESTARTED_INSTANCE: &str = "88888888-8888-4888-8888-888888888888";
     const ADDED_BLOCK: &str = "block:eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 
-    /// The coordinator stores and forwards the stamp as an opaque wire field.
     fn stamped(binding: WorkerRef, stamp: Option<&str>) -> WorkerRef {
-        let mut wire = serde_json::to_value(binding).unwrap();
-        wire["rex_instance_id"] = stamp.into();
-        serde_json::from_value(wire).unwrap()
-    }
-
-    fn stamp_of(binding: &WorkerRef) -> Option<String> {
-        serde_json::to_value(binding).unwrap()["rex_instance_id"]
-            .as_str()
-            .map(str::to_owned)
+        WorkerRef {
+            rex_instance_id: stamp.map(str::to_owned),
+            ..binding
+        }
     }
 
     /// The shared fixture shows every pane exited under one Rex instance. This
@@ -1133,7 +1158,7 @@ printf '%s\n' "$reply"
                 (binding.session_id.as_str(), binding.block_id.as_str()),
                 (fake_rex::ORIGIN_SESSION, ADDED_BLOCK)
             );
-            assert_eq!(stamp_of(&binding).as_deref(), Some(FIXTURE_INSTANCE));
+            assert_eq!(binding.rex_instance_id.as_deref(), Some(FIXTURE_INSTANCE));
             assert_eq!(count("session.new_window"), 1);
         }
         assert_eq!(
@@ -1293,7 +1318,7 @@ printf '%s\n' "$reply"
                 panic!("Expected a confirmed pane, got {result:?}");
             };
             assert_eq!(binding.session_id, session);
-            assert_eq!(stamp_of(&binding).as_deref(), Some(FIXTURE_INSTANCE));
+            assert_eq!(binding.rex_instance_id.as_deref(), Some(FIXTURE_INSTANCE));
         }
     }
 
@@ -1305,6 +1330,7 @@ printf '%s\n' "$reply"
             session_id: "session:22222222-2222-4222-8222-222222222222".into(),
             window_id: "window:33333333-3333-4333-8333-333333333333".into(),
             block_id: "block:44444444-4444-4444-8444-444444444444".into(),
+            rex_instance_id: None,
         };
         let binding = ExecutionBinding::try_from(&valid).unwrap();
         assert_eq!(binding.host_id.as_str(), valid.host_id);
@@ -1324,11 +1350,8 @@ printf '%s\n' "$reply"
         ));
         let started = stamped(valid.clone(), Some(FIXTURE_INSTANCE));
         assert_eq!(
-            stamp_of(&WorkerRef::from(
-                ExecutionBinding::try_from(&started).unwrap()
-            ))
-            .as_deref(),
-            Some(FIXTURE_INSTANCE)
+            WorkerRef::from(ExecutionBinding::try_from(&started).unwrap()).rex_instance_id,
+            started.rex_instance_id
         );
         let mut nil_host = valid;
         nil_host.host_id = "00000000-0000-0000-0000-000000000000".into();
@@ -1365,6 +1388,7 @@ printf '%s\n' "$reply"
             session_id: fake_rex::ORIGIN_SESSION.into(),
             window_id: fake_rex::ORIGIN_WINDOW.into(),
             block_id: fake_rex::ORIGIN_BLOCK.into(),
+            rex_instance_id: None,
         }
     }
 

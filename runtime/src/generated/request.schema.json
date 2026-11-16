@@ -5088,6 +5088,13 @@
         "host_id": {
           "type": "string"
         },
+        "rex_instance_id": {
+          "description": "`whoami.instance_id` of the Rex server that started this pane's process.\nRex restores a saved pane with a fresh shell under a new instance, so a\nprocess in the pane is the worker terminal only under this instance.\nAbsent on a binding saved before this field, or made by an older host.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "session_id": {
           "type": "string"
         },

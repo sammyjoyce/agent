@@ -745,6 +745,7 @@ mod tests {
                 session_id: "fixture".into(),
                 window_id: "fixture".into(),
                 block_id: "fixture".into(),
+                rex_instance_id: None,
             },
             instructions: String::new(),
             model: crate::models::ModelSelection::default(),
