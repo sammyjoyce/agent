@@ -2,7 +2,7 @@
 use crate::{
     chat_commands::ChatCommand,
     protocol::{
-        HistoryMessage, InputMode, ModelActivity, RuntimeCommand, RuntimeEventKind,
+        GoalTarget, HistoryMessage, InputMode, ModelActivity, RuntimeCommand, RuntimeEventKind,
         SavedConversation, SourceState,
     },
 };
@@ -357,7 +357,7 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
             mode,
             attachments,
         } => {
-            validate_id(&input_id)?;
+            let request_id = validate_id(&input_id)?;
             ensure!(
                 (!text.trim().is_empty()
                     || attachments.as_ref().is_some_and(|items| !items.is_empty()))
@@ -390,7 +390,11 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
                         args.request_with_id(format!("native-job:{input_id}")),
                     )));
                 }
-                if let Some(command) = control.request().or_else(|| control.settings(None)) {
+                let goal = control.goal(GoalTarget::Main, request_id).transpose()?;
+                if let Some(command) = goal
+                    .or_else(|| control.request())
+                    .or_else(|| control.settings(None))
+                {
                     return Ok(Operation::Runtime(Box::new(command)));
                 }
                 match control {
@@ -416,7 +420,7 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
                     })),
                     ChatCommand::Status | ChatCommand::Model { .. } | ChatCommand::Fast { .. }
                     | ChatCommand::Reasoning { .. } | ChatCommand::Jobs { .. }
-                    | ChatCommand::RunJob(_) | ChatCommand::Worktrees => anyhow::bail!("The shared control handler did not accept this request"),
+                    | ChatCommand::RunJob(_) | ChatCommand::Worktrees | ChatCommand::Goal { .. } => anyhow::bail!("The shared control handler did not accept this request"),
                 }
             } else {
                 RuntimeCommand::MainInput {
@@ -433,12 +437,11 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
     Ok(Operation::Runtime(Box::new(command)))
 }
 
-fn validate_id(id: &str) -> Result<()> {
-    ensure!(
-        uuid::Uuid::parse_str(id).is_ok_and(|id| !id.is_nil()),
-        "Input ID must be a nonnil UUID"
-    );
-    Ok(())
+fn validate_id(id: &str) -> Result<uuid::Uuid> {
+    match uuid::Uuid::parse_str(id) {
+        Ok(id) if !id.is_nil() => Ok(id),
+        _ => anyhow::bail!("Input ID must be a nonnil UUID"),
+    }
 }
 
 fn model_label(model: &crate::models::ModelSelection) -> String {
@@ -606,6 +609,11 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
             settings: None,
             job_status: None,
             text: crate::resources::format_inventory(resources),
+        },
+        RuntimeEventKind::Goal { status } => NativeEvent::Notice {
+            settings: None,
+            job_status: None,
+            text: crate::goal_view::format(status),
         },
         RuntimeEventKind::FeedbackReady {
             receipt,
@@ -1371,6 +1379,144 @@ mod tests {
                 matches!(decoded, NativeEvent::Accepted { work: Some(saved), .. } if saved == work)
             );
         }
+    }
+
+    fn goal_submit(input_id: &str, text: &str) -> Operation {
+        prepare(NativeRequest::Submit {
+            origin: None,
+            attachments: None,
+            input_id: input_id.into(),
+            text: text.into(),
+            mode: InputMode::FollowUp,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn native_goal_reuses_input_id_and_targets_main() {
+        use crate::protocol::{GoalAction, GoalTarget};
+        let input_id = "7a0c2b9e-1d1f-4c3a-9a51-0f6a3d1c2b02";
+        let request_id = || input_id.to_owned();
+        for (text, expected) in [
+            ("/goal", GoalAction::Show),
+            (
+                "/goal pause",
+                GoalAction::Pause {
+                    request_id: request_id(),
+                },
+            ),
+            (
+                "/goal resume",
+                GoalAction::Resume {
+                    request_id: request_id(),
+                },
+            ),
+            (
+                "/goal ship it",
+                GoalAction::Set {
+                    request_id: request_id(),
+                    objective: "ship it".into(),
+                },
+            ),
+        ] {
+            for attempt in 0..2 {
+                let Operation::Runtime(command) = goal_submit(input_id, text) else {
+                    panic!("{text} must reach the runtime as a control");
+                };
+                let RuntimeCommand::Goal { target, action } = *command else {
+                    panic!("{text} must be a goal control, never model input");
+                };
+                assert_eq!(target, GoalTarget::Main, "{text} {attempt}");
+                assert_eq!(action, expected, "{text} {attempt}");
+            }
+        }
+        let replayed = |input_id: &str| match goal_submit(input_id, "/goal resume") {
+            Operation::Runtime(command) => match *command {
+                RuntimeCommand::Goal {
+                    action: GoalAction::Resume { request_id },
+                    ..
+                } => request_id,
+                other => panic!("Unexpected goal request: {other:?}"),
+            },
+            Operation::Local(event) => panic!("Unexpected local reply: {event:?}"),
+        };
+        assert_eq!(
+            replayed("7A0C2B9E-1D1F-4C3A-9A51-0F6A3D1C2B02"),
+            input_id,
+            "A phone's uppercase input ID names the same request on every replay"
+        );
+        assert!(
+            crate::native::commands()
+                .iter()
+                .any(|command| command.usage == "/goal [OBJECTIVE | pause | resume]")
+        );
+    }
+
+    #[test]
+    fn native_goal_refuses_attachments() {
+        let operation = prepare(NativeRequest::Submit {
+            origin: None,
+            attachments: Some(vec![crate::attachments::AttachmentRef {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "notes.png".into(),
+                media_type: "image/png".into(),
+                size_bytes: 0,
+                sha256: "0".repeat(64),
+            }]),
+            input_id: uuid::Uuid::new_v4().to_string(),
+            text: "/goal ship it".into(),
+            mode: InputMode::FollowUp,
+        })
+        .unwrap();
+        assert!(matches!(
+            operation,
+            Operation::Local(NativeEvent::Rejected { .. })
+        ));
+    }
+
+    #[test]
+    fn native_goal_status_projects_to_notice() {
+        let event: RuntimeEventKind = serde_json::from_value(serde_json::json!({
+            "type": "goal",
+            "status": { "conversation_id": "root", "goal": {
+                "goal": { "id": "g1", "task_id": "5b2f7c1e-8d4a-4e6b-9c3f-1a2b3c4d5e6f",
+                    "objective": "Write GOAL-DONE into the notes.",
+                    "activation": { "number": 2, "request_id": "r2", "continuations": 0, "budget": 5, "check": null },
+                    "state": { "state": "active" }, "last_rejection": null, "created_at": 0, "updated_at": 0 },
+                "task": { "id": "5b2f7c1e-8d4a-4e6b-9c3f-1a2b3c4d5e6f", "conversation_id": "17",
+                    "title": "Notes", "outcome": "Notes exist", "summary": "", "model": null,
+                    "state": { "state": "open" }, "worker": { "state": "unassigned" },
+                    "sources": [], "pending": [], "agents": [], "updated_at": 0 } } },
+        }))
+        .unwrap();
+        let RuntimeEventKind::Goal { status } = &event else {
+            panic!("The fixture must decode as a goal event");
+        };
+        let notice = crate::native::project(&event).unwrap();
+        let wire: serde_json::Value = serde_json::to_value(&notice).unwrap();
+        assert_eq!(wire["type"], "notice");
+        let text = wire["text"].as_str().unwrap();
+        assert_eq!(
+            text,
+            crate::goal_view::format(status),
+            "The phone shows the TUI text"
+        );
+        assert!(
+            text.contains("Goal: Write GOAL-DONE into the notes."),
+            "{text}"
+        );
+        assert!(
+            text.contains("State: active · activation 2 · continuations 0 of 5"),
+            "{text}"
+        );
+        assert!(matches!(
+            notice,
+            NativeEvent::Notice {
+                settings: None,
+                job_status: None,
+                ..
+            }
+        ));
     }
 
     #[test]

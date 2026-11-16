@@ -3,7 +3,7 @@ use crate::protocol::{
     TaskGraphNode, TaskGraphOutcome, TaskGraphSnapshot, TaskGraphState,
 };
 
-fn label(text: &str) -> String {
+pub(crate) fn label(text: &str) -> String {
     text.chars()
         .map(|character| {
             if character.is_control() {
