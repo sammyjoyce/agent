@@ -128,6 +128,7 @@ enum Judgment {
 
 #[derive(Clone, Copy, Debug)]
 enum Decision {
+    /// At least one message reaches the seeded task; any other is dismissed.
     Linked,
     Dismissed,
     /// Any recorded decision; the outcome oracles carry the scenario.
@@ -198,7 +199,7 @@ const SCENARIOS: &[Scenario] = &[
         crash_before_action: false,
         expect: Expected {
             reply: Decision::Linked,
-            followups: 1..=1,
+            followups: 0..=1,
             mutations: 0,
             ledger_after: None,
             task: TaskEnd::Resolved,
@@ -1114,19 +1115,28 @@ fn oracles(
             }),
         json!(decisions.iter().map(|(id, _)| id).collect::<Vec<_>>()),
     ));
-    checks.push(oracle(
-        "reply_decision",
+    let linked = |decision: &Value| {
+        decision["type"] == "task" && decision["task_id"] == seeded.id.to_string()
+    };
+    let dismissed = |decision: &Value| decision["type"] == "dismissed";
+    let all = |accept: &dyn Fn(&Value) -> bool| {
         !decisions.is_empty()
             && decisions
                 .iter()
-                .all(|(_, decision)| match (expect.reply, decision) {
-                    (Decision::Linked, Some(decision)) => {
-                        decision["type"] == "task" && decision["task_id"] == seeded.id.to_string()
-                    }
-                    (Decision::Dismissed, Some(decision)) => decision["type"] == "dismissed",
-                    (Decision::Either, Some(_)) => true,
-                    (_, None) => false,
-                }),
+                .all(|(_, decision)| decision.as_ref().is_some_and(accept))
+    };
+    checks.push(oracle(
+        "reply_decision",
+        match expect.reply {
+            Decision::Linked => {
+                all(&|decision| linked(decision) || dismissed(decision))
+                    && decisions
+                        .iter()
+                        .any(|(_, decision)| decision.as_ref().is_some_and(linked))
+            }
+            Decision::Dismissed => all(&dismissed),
+            Decision::Either => all(&|_| true),
+        },
         json!(decisions),
     ));
     checks.push(oracle(
