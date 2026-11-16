@@ -547,7 +547,7 @@ private func held(_ gate: DialGate) async throws {
 
 /// A fixture coordinator and a session that dials it through `gate`, which can hold a Send's dial
 /// so that its exchange waits before it writes anything, and can then fail that dial.
-private struct GatedCoordinator {
+struct GatedCoordinator {
   let profile: CoordinatorProfile
   let fixture: FixtureCoordinator
   let endpoint: NWEndpoint
@@ -558,7 +558,7 @@ private struct GatedCoordinator {
 
 /// Runs `body` with `count` gated coordinators whose profiles share a fresh temporary root, then
 /// opens every gate and stops them.
-@MainActor private func withGatedCoordinators(
+@MainActor func withGatedCoordinators(
   _ count: Int, _ body: ([GatedCoordinator], URL) async throws -> Void
 ) async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
@@ -762,7 +762,7 @@ func aSendStoppedEverywhereBeforeItLeftThePhoneIsOfferedAgainAfterACrash(
   }
 }
 
-@MainActor private func connectedModel(
+@MainActor func connectedModel(
   to coordinators: [GatedCoordinator], under root: URL,
   admit: @escaping ChatModel.Admit = { deliver in await deliver() }
 ) async throws -> ChatModel {
@@ -1085,5 +1085,85 @@ func aRestoreWhileSendsComeBackKeepsTheirOrder(attempt: Int) async throws {
     #expect(await first.fixture.count() == 0, "The first coordinator kept nothing")
     #expect(await second.fixture.count() == 0, "The second coordinator got nothing")
     await model.setActive(false)
+  }
+}
+
+@MainActor private func failDial(of coordinator: GatedCoordinator, in model: ChatModel) async {
+  let before = model.draft
+  await coordinator.gate.fail()
+  let deadline = ContinuousClock.now + .seconds(5)
+  while model.draft == before, ContinuousClock.now < deadline {
+    try? await Task.sleep(for: .milliseconds(5))
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func deletingAnEarlierReturnKeepsTheRestInTheOrderTheyWereSent() async throws {
+  try await withGatedCoordinators(3) { coordinators, root in
+    let model = try await connectedModel(to: coordinators, under: root)
+    for (coordinator, text) in zip(coordinators, ["/status", "/help", "/compact"]) {
+      await coordinator.gate.arm()
+      model.setChip(coordinator.profile.id)
+      model.draft = text
+      await model.send()
+      try await held(coordinator.gate)
+    }
+    for coordinator in coordinators.prefix(2) { await failDial(of: coordinator, in: model) }
+    #expect(model.draft == "/status\n\n/help")
+    model.draft = "/help"
+    await failDial(of: coordinators[2], in: model)
+    let expected = "/help\n\n/compact"
+    #expect(
+      model.draft == expected, "/help, which the user kept, stays ahead of the newer /compact")
+    #expect(await model.saveDraft())
+    #expect(try await recoveredText(under: root) == expected, "Recovery offers the same order")
+    for coordinator in coordinators { #expect(await coordinator.fixture.count() == 0) }
+    await model.setActive(false)
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: 0..<10)
+func deletingAnEarlierReturnKeepsALaterControlAControl(attempt: Int) async throws {
+  try await withGatedCoordinators(2) { coordinators, root in
+    let gate = ComposerOwnershipGate()
+    let next = NextAdmission()
+    let model = try await connectedModel(
+      to: coordinators, under: root,
+      admit: { deliver in
+        if next.refused { _ = await gate.wait(after: false) }
+        return await deliver()
+      })
+    for (coordinator, text) in zip(coordinators, ["/status", "/help"]) {
+      await coordinator.gate.arm()
+      model.setChip(coordinator.profile.id)
+      model.draft = text
+      await model.send()
+      try await held(coordinator.gate)
+    }
+    next.refused = true
+    model.draft = "An invented third Send"
+    let third = try #require(model.startSend())
+    for await _ in gate.entered.stream { break }
+    for coordinator in coordinators { await failDial(of: coordinator, in: model) }
+    #expect(model.draft == "/status\n\n/help")
+    model.draft = "/help"
+    let expected = "/help\n\nAn invented third Send"
+    #expect(await model.saveDraft())
+    #expect(
+      try await recoveredText(under: root) == expected,
+      "Recovery during the third Send keeps /help ahead of it")
+    await model.setActive(false)
+    await gate.finish()
+    await third.value
+    #expect(model.draft == expected, "The refused third Send comes back after /help")
+    try await withCoordinator { session, _, _ in
+      try await connected(session)
+      let retry = try #require(
+        await session.stage(model.draft, sendID: "invented-retry", recipients: [session.profile]))
+      #expect(retry.departure != nil, "A retry of the draft still goes as a control")
+    }
+    #expect(await model.saveDraft())
+    #expect(try await recoveredText(under: root) == expected, "Recovery offers the same order")
+    for coordinator in coordinators { #expect(await coordinator.fixture.count() == 0) }
   }
 }
