@@ -18,6 +18,7 @@ import { createDreamsTools, createDreamsToolset, DREAMS_TOOL_NAMES, isDreamsTask
 import { HistoryStore } from "../src/history.js";
 import { createInputOrigins } from "../src/input_origin.js";
 import { occurrencePrompt, openJobActor, runScheduled } from "../src/scheduled.js";
+import { conversationSettings } from "../src/settings.js";
 import { TaskError } from "../src/tasks.js";
 import type { DreamsRequest } from "../src/generated/DreamsRequest.js";
 import type { HistoryImportBatch } from "../src/generated/HistoryImportBatch.js";
@@ -315,6 +316,24 @@ test("only the scheduler writes to a Dreams task: main's record_task and triage'
     assert.equal(after.summary, "Dreams reviewed the night.");
     assert.deepEqual(after.state, task.state);
     assert.deepEqual(after.sources, task.sources);
+  } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("only the scheduler changes a Dreams conversation's model: a settings change is refused and a read still works", { timeout: 20_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-dreams-")), app = await openDreams(directory);
+  try {
+    app.scripted(() => fauxAssistantMessage("Dreams reviewed the night."));
+    await runScheduled(dreamsOccurrence, new AbortController().signal, app); await app.settled();
+    const task = (await app.tasks.list()).find(isDreamsTask); assert.ok(task);
+    const settings = (change: Parameters<typeof conversationSettings>[2]["change"], target: { task_id: string | null; conversation_id?: string }) =>
+      conversationSettings(app.tasks, app.environment, { type: "conversation_settings", agent_id: null, change, catalog: false, ...target });
+    const read = await settings(null, { task_id: task.id });
+    assert.deepEqual(read.model, fixtureModel);
+    const refused = /Only the scheduler writes to a confined task/;
+    await assert.rejects(settings({ type: "set_model", provider: null, model_id: "fixture-updated" }, { task_id: task.id }), refused);
+    await assert.rejects(settings({ type: "set_reasoning", reasoning: "high" }, { task_id: null, conversation_id: task.conversation_id }), refused);
+    assert.deepEqual((await settings(null, { task_id: null, conversation_id: task.conversation_id })).model, read.model);
+    assert.deepEqual((await app.tasks.get(task.id)).model, task.model);
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
