@@ -553,6 +553,10 @@ export class TaskStore {
         reconciliation = { original: { request_id: input.reconciles_input, submission_id: original.id.toString() }, recovery_inputs: recoveryInputs };
       }
       if (input.state.state === "resolved" && !this.canResolve(task)) throw new TaskError("Wait for unfinished task agents before resolving the task");
+      if (proof !== undefined && (task.conversation_id !== provenance.conversation_id ||
+          !await this.uncancelledIn(tx, conversation.id, provenance.native_task_id))) {
+        throw new TaskError("The turn that ran this goal check was stopped. Check the goal again in the current turn.");
+      }
       let state = input.state;
       if (state.state === "resolved" && this.goals !== undefined) {
         const verdict = await this.goals.resolutionIn(tx, task, { ...(proof === undefined ? {} : { proof }),
@@ -572,6 +576,20 @@ export class TaskStore {
     }, BACKGROUND_CONTEXT);
     if (refused !== undefined) throw new TaskError(refused);
     return this.get(id);
+  }
+  /** Whether a tool call still runs in the conversation's live run with no abort mark on it or on any call or run that
+   * owns it. A conversation abort marks the whole tree, and an exact-run abort marks only the run. */
+  private async uncancelledIn(tx: Tx, conversationId: ConversationId, invocation: NativeTaskId | undefined): Promise<boolean> {
+    const run = (await tx.doc(LiveDoc, conversationId)).run;
+    let id = invocation;
+    for (let depth = 0; run !== undefined && id !== undefined && depth < 8; depth += 1) {
+      const current = await tx.task(id);
+      if (current === undefined || current.conversationId !== conversationId || current.abortRequested || current.state.status === "terminal") return false;
+      if (current.id === run.taskId) return depth > 0;
+      if (current.kind !== ToolTask.definition.name || current.state.status !== "running") return false;
+      id = current.owner;
+    }
+    return false;
   }
   guardResources(resources: { attach(taskId: string): Promise<void> }): void { this.resources = resources; }
   isRunning(id: string): boolean { return [...this.running].some(([actor, run]) => (run.busy || run.admissions > 0) && (actor === id || actor.startsWith(id + ":"))); }

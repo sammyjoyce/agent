@@ -379,6 +379,32 @@ test("a check that passes after a pause and resume does not complete the new act
   });
 });
 
+test("a passing check that returns after Esc does not complete the goal", async () => {
+  await scenario(undefined, async ({ app, host }) => {
+    host.files.set(notes, "GOAL-DONE");
+    const task = await app.task("Cancelled verifier");
+    await app.goal(inTask(task.id), { type: "set", request_id: "set-cancelled", objective: "Write GOAL-DONE into notes.md" });
+    app.script([call("complete_goal", { check: doneCheck, summary: "Done" }, "cancelled-check")]);
+    const read = host.hold("read_file");
+    const watcher = client();
+    const running = app.run(await app.command(task.id, true), watcher.observer);
+    await read.entered;
+    const conversation = await app.conversation(task.id);
+    const aborting = conversation.abort(BACKGROUND_CONTEXT);
+    await until(() => app.abortMarked(conversation));
+    read.release();
+    await aborting;
+    await watcher.idle;
+    watcher.stop();
+    await running;
+    assert.equal(host.count("read_file"), 1, "The check read the passing file after the abort mark");
+    const goal = goalOf(await app.goal(inTask(task.id), show));
+    assert.deepEqual(goal.state, { state: "paused", reason: "interrupted" });
+    assert.equal((await app.tasks.get(task.id)).state.state, "open");
+    assert.deepEqual(await app.verifications(task.id), []);
+  });
+});
+
 test("main sets its goal in one new task, replays by request ID and keeps it across a restart", async () => {
   await scenario(undefined, async (fixture) => {
     let app = fixture.app;
