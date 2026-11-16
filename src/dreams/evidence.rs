@@ -407,9 +407,26 @@ pub fn quote(lines: &mut Vec<String>, text: &str) {
     }
 }
 
-pub fn check_lines(lines: &mut Vec<String>, phase: &str, check: &CheckResult) {
+/// Whether a check ran on the base or on the candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckPhase {
+    Before,
+    After,
+}
+
+impl CheckPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Before => "Before",
+            Self::After => "After",
+        }
+    }
+}
+
+pub fn check_lines(lines: &mut Vec<String>, phase: CheckPhase, check: &CheckResult) {
     lines.push(format!(
-        "{phase} check {}: {} ({:.1}s)",
+        "{} check {}: {} ({:.1}s)",
+        phase.label(),
         check.name,
         check.verdict(),
         check.duration_ms as f64 / 1000.0
@@ -449,7 +466,7 @@ pub fn review_summary(review: &Review) -> Vec<String> {
     ));
     lines.push(format!("Target base: {}", review.base));
     for check in &review.before {
-        check_lines(&mut lines, "Before", check);
+        check_lines(&mut lines, CheckPhase::Before, check);
     }
     if review.findings.is_empty() {
         lines.push("Findings: none".into());

@@ -101,7 +101,7 @@ class Citations {
 }
 
 export type HostedToolsOffered = (sessionId: string | undefined) => Promise<boolean>;
-function applicationTool(tool: unknown): boolean {
+function isClientExecutedTool(tool: unknown): boolean {
   return object(tool) && (tool.type === "function" || tool.type === "custom");
 }
 
@@ -118,7 +118,7 @@ export function withWebSearch(native: ProviderStreams["streamSimple"], offered: 
           throw new Error("The provider returned an invalid web search request payload.");
         }
         const tools: unknown[] = selected.tools ?? [];
-        if (!await offered(options?.sessionId)) return { ...selected, tools: tools.filter(applicationTool) };
+        if (!await offered(options?.sessionId)) return { ...selected, tools: tools.filter(isClientExecutedTool) };
         if (tools.some((tool) => object(tool) && (tool.type === "web_search" || tool.type === "web_search_2025_08_26"))) return selected;
         return { ...selected, tools: [...tools, { type: "web_search", external_web_access: true }] };
       },

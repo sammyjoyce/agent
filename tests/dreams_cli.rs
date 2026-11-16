@@ -839,6 +839,28 @@ impl Sealed {
     }
 }
 
+/// Puts a wrapper ahead of Git that changes no argument or result. It creates
+/// the first returned file when `git apply` starts, and holds that command
+/// until the second file exists.
+fn hold_git_apply_until_released(fixture: &Fixture) -> (PathBuf, PathBuf) {
+    let ready = fixture.directory.path().join("git-apply-ready");
+    let release = fixture.directory.path().join("git-apply-release");
+    let real_git = Command::new("/bin/sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    fixture.shadow_program(
+        "git",
+        &format!(
+            "#!/bin/sh\nfor argument do\n  if [ \"$argument\" = apply ]; then\n    : > '{}'\n    while [ ! -f '{}' ]; do sleep 0.01; done\n  fi\ndone\nexec '{}' \"$@\"\n",
+            ready.display(),
+            release.display(),
+            String::from_utf8(real_git.stdout).unwrap().trim()
+        ),
+    );
+    (ready, release)
+}
+
 #[tokio::test]
 async fn apply_gives_git_the_bytes_it_verified_even_when_the_patch_file_changes_afterwards() {
     let fixture = Fixture::new();
@@ -856,21 +878,7 @@ async fn apply_gives_git_the_bytes_it_verified_even_when_the_patch_file_changes_
     );
     assert_ne!(altered, approved);
 
-    let ready = fixture.directory.path().join("git-apply-ready");
-    let release = fixture.directory.path().join("git-apply-release");
-    let real_git = Command::new("/bin/sh")
-        .args(["-c", "command -v git"])
-        .output()
-        .unwrap();
-    fixture.shadow_program(
-        "git",
-        &format!(
-            "#!/bin/sh\nfor argument do\n  if [ \"$argument\" = apply ]; then\n    : > '{}'\n    while [ ! -f '{}' ]; do sleep 0.01; done\n  fi\ndone\nexec '{}' \"$@\"\n",
-            ready.display(),
-            release.display(),
-            String::from_utf8(real_git.stdout).unwrap().trim()
-        ),
-    );
+    let (ready, release) = hold_git_apply_until_released(&fixture);
     let child = fixture
         .command(&sealed.apply_arguments(), false)
         .stdout(Stdio::piped())

@@ -13,7 +13,7 @@ use tokio::sync::watch;
 
 use crate::{
     dreams::{
-        AttemptError, CheckResult, ContentDigest, ProposedFile, Rejection, Revision,
+        AttemptError, CheckResult, ContentDigest, FileChange, ProposedFile, Rejection, Revision,
         policy::{CheckSpec, EditablePath},
     },
     host::{
@@ -272,16 +272,21 @@ pub fn plain_changes(raw: &str) -> Result<Vec<ProposedFile>> {
     let mut fields = raw.split('\0').filter(|field| !field.is_empty());
     while let (Some(change), Some(path)) = (fields.next(), fields.next()) {
         let parts: Vec<&str> = change.split(' ').collect();
-        let (base_blob, proposed_blob) = match parts.as_slice() {
-            [":100644", "100644", base, proposed, "M"] => (Some((*base).to_owned()), *proposed),
-            [":000000", "100644", _, proposed, "A"] => (None, *proposed),
+        let (change, proposed_blob) = match parts.as_slice() {
+            [":100644", "100644", base, proposed, "M"] => (
+                FileChange::Changed {
+                    base_blob: (*base).to_owned(),
+                },
+                *proposed,
+            ),
+            [":000000", "100644", _, proposed, "A"] => (FileChange::Added, *proposed),
             _ => bail!(
                 "A Dreams patch may only change or add plain files, but it has {change} for {path}"
             ),
         };
         changes.push(ProposedFile {
             path: path.to_owned(),
-            base_blob,
+            change,
             proposed_blob: proposed_blob.to_owned(),
         });
     }
@@ -409,7 +414,7 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::dreams::{
-        ProposedFile,
+        FileChange, ProposedFile,
         policy::CheckSpec,
         workspace::{plain_changes, run_checks},
     };
@@ -425,12 +430,14 @@ mod tests {
             vec![
                 ProposedFile {
                     path: "AGENTS.md".into(),
-                    base_blob: Some(old.clone()),
+                    change: FileChange::Changed {
+                        base_blob: old.clone(),
+                    },
                     proposed_blob: new.clone(),
                 },
                 ProposedFile {
                     path: "playbooks/new file.md".into(),
-                    base_blob: None,
+                    change: FileChange::Added,
                     proposed_blob: new.clone(),
                 },
             ]

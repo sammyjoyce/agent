@@ -7,9 +7,9 @@ use std::{
 use agent_cli::{
     config::ClientConfig,
     dreams::{
-        Abstention, ContentDigest, DreamsPolicy, DreamsStore, EvidenceItem, MAX_ATTEMPTS, Outcome,
-        Proposal, ProposedFile, Review, Revision, RunId, RunView, check_lines, escape_controls,
-        format_utc, quote, review_summary,
+        Abstention, CheckPhase, ContentDigest, DreamsPolicy, DreamsStore, EvidenceItem, FileChange,
+        MAX_ATTEMPTS, Outcome, Proposal, ProposedFile, Review, Revision, RunId, RunView,
+        check_lines, escape_controls, format_utc, quote, review_summary,
         workspace::{Git, plain_changes},
     },
 };
@@ -303,7 +303,7 @@ async fn path_state(git: &Git, repository: &Path, file: &ProposedFile) -> Result
         Err(error) => return Err(error).context("Could not read a touched path"),
     };
     let proposed = Some(&file.proposed_blob);
-    let is_base = |blob: &Option<String>| blob == &file.base_blob;
+    let is_base = |blob: &Option<String>| blob.as_deref() == file.base_blob();
     let known = |blob: &Option<String>| is_base(blob) || blob.as_ref() == proposed;
     Ok(if !known(&staged) || !known(&on_disk) {
         PathState::LocallyChanged
@@ -517,7 +517,7 @@ fn render(report: &RunReport) -> String {
                 proposal.attempt
             ));
             for check in &proposal.after {
-                check_lines(&mut lines, "After", check);
+                check_lines(&mut lines, CheckPhase::After, check);
             }
             lines.push(format!(
                 "Patch: {}  {}",
@@ -640,8 +640,8 @@ async fn build_commit(
 async fn restore_half_applied(proposal: &Proposal, half_applied: &[ProposedFile]) -> Result<()> {
     let git = Git::writing(&proposal.repository);
     for file in half_applied {
-        match &file.base_blob {
-            Some(_) => {
+        match &file.change {
+            FileChange::Changed { .. } => {
                 let source = format!("--source={}", proposal.base);
                 git.text(&[
                     "restore",
@@ -653,7 +653,7 @@ async fn restore_half_applied(proposal: &Proposal, half_applied: &[ProposedFile]
                 ])
                 .await?;
             }
-            None => {
+            FileChange::Added => {
                 git.text(&[
                     "rm",
                     "--cached",

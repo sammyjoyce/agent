@@ -74,7 +74,7 @@ const Policies = defineDoc<{ sessions: Record<string, ModelSelection> }>({
   kind: "agent.models", scope: "session", version: 1, initial: () => ({ sessions: {} }), checkpointWhen: () => true,
 });
 
-const HostedTools = defineDoc<{ withheld: Record<string, true> }>({
+const WithheldHostedToolSessions = defineDoc<{ withheld: Record<string, true> }>({
   kind: "agent.hosted_tools", scope: "session", version: 1, initial: () => ({ withheld: {} }), checkpointWhen: () => true,
 });
 
@@ -128,14 +128,14 @@ export class ConversationModels {
     const session = await this.session;
     await session.commit(async (tx) => {
       const native = await tx.doc(ProviderDoc, conversation.id);
-      (await tx.doc(HostedTools)).withheld[native.sessionId] = true;
+      (await tx.doc(WithheldHostedToolSessions)).withheld[native.sessionId] = true;
     }, BACKGROUND_CONTEXT);
   }
   private async hostedToolsOffered(sessionId: string | undefined): Promise<boolean> {
     // Pi sends the session of every conversation request. A request without one belongs to no conversation.
     if (sessionId === undefined) return true;
     const session = await this.session;
-    return (await session.snapshot(HostedTools, BACKGROUND_CONTEXT))?.withheld[sessionId] !== true;
+    return (await session.snapshot(WithheldHostedToolSessions, BACKGROUND_CONTEXT))?.withheld[sessionId] !== true;
   }
   validate(selection: ModelSelection): void {
     const model = this.models.getModel(selection.provider, selection.model_id);

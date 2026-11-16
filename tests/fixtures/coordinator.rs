@@ -52,7 +52,7 @@ impl Coordinator<'_> {
         command
     }
 
-    pub fn start(&self, mut ready: impl FnMut() -> bool, still_waiting: &str) -> Server {
+    pub fn start(&self, mut ready: impl FnMut() -> bool, ready_description: &str) -> Server {
         let stderr = self.directory.join("server.stderr");
         let child = self
             .command(&["serve", "--local-only", "--no-sources"], true)
@@ -79,7 +79,7 @@ impl Coordinator<'_> {
         while !ready() {
             assert!(
                 Instant::now() < deadline,
-                "{still_waiting}: {}",
+                "{ready_description}: {}",
                 self.startup_diagnostics()
             );
             thread::sleep(Duration::from_millis(10));

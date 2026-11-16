@@ -13,17 +13,18 @@ use anyhow::{Context, Result};
 use tokio::sync::watch;
 
 pub use evidence::{
-    EvidenceItem, EvidenceKind, Finding, check_lines, escape_controls, quote, review_summary,
+    CheckPhase, EvidenceItem, EvidenceKind, Finding, check_lines, escape_controls, quote,
+    review_summary,
 };
 pub use policy::{
     CheckSpec, DreamsCheckFile, DreamsPolicy, DreamsPolicyFile, EditablePath, ProtectedPaths,
 };
-use store::ReviewSeal;
 pub use store::{AppliedRecord, DreamsStore, RunView};
+use store::{ReviewSeal, Verdict};
 pub use types::{
     Abstention, CheckResult, ContentDigest, Coverage, DreamsAbstainReason, DreamsFileEdit,
-    DreamsReply, DreamsRequest, DreamsTaskSummary, EvidenceId, Gap, GapCause, Interval, Outcome,
-    PolicyDigest, Proposal, ProposedFile, ReceiptCoverage, Review, Revision, RunId,
+    DreamsReply, DreamsRequest, DreamsTaskSummary, EvidenceId, FileChange, Gap, GapCause, Interval,
+    Outcome, PolicyDigest, Proposal, ProposedFile, ReceiptCoverage, Review, Revision, RunId,
     SummarySnapshot, UntrustedText, count, format_utc,
 };
 
@@ -32,7 +33,9 @@ use crate::{protocol::HostResult, runtime::diagnostics};
 pub const DREAMS_JOB_ID: &str = "dreams";
 pub const MAX_WINDOW_HOURS: u8 = 48;
 pub const MAX_SUMMARIES: usize = 200;
-pub const MAX_SUMMARY_BYTES: usize = crate::runtime::MAX_FRAME_BYTES / 4;
+/// JSON escaping can grow a summary, and the frame carries more than summaries.
+const SUMMARY_SHARE_OF_A_FRAME: usize = 4;
+pub const MAX_SUMMARY_BYTES: usize = crate::runtime::MAX_FRAME_BYTES / SUMMARY_SHARE_OF_A_FRAME;
 pub const MAX_EDITS: usize = 4;
 pub const MAX_EDIT_BYTES: usize = 64 * 1024;
 pub const MAX_PATH_BYTES: usize = 512;
@@ -51,34 +54,36 @@ const MAX_RECEIPTS: usize = 400_000;
 
 pub(crate) struct Rejection {
     reason: String,
-    output: Vec<String>,
+    check_output: Vec<String>,
 }
 impl Rejection {
     pub(crate) fn because(reason: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
-            output: Vec::new(),
+            check_output: Vec::new(),
         }
     }
 }
 
 pub(crate) enum AttemptError {
-    Rejected(Rejection),
-    Failed(anyhow::Error),
+    /// The model's to fix. It is told why, and the attempt is spent.
+    ModelRejected(Rejection),
+    /// The host's fault. The call fails, and the operator sees why.
+    HostFailed(anyhow::Error),
 }
 impl From<Rejection> for AttemptError {
     fn from(rejection: Rejection) -> Self {
-        Self::Rejected(rejection)
+        Self::ModelRejected(rejection)
     }
 }
 impl From<anyhow::Error> for AttemptError {
     fn from(error: anyhow::Error) -> Self {
-        Self::Failed(error)
+        Self::HostFailed(error)
     }
 }
 impl From<std::io::Error> for AttemptError {
     fn from(error: std::io::Error) -> Self {
-        Self::Failed(error.into())
+        Self::HostFailed(error.into())
     }
 }
 
@@ -229,10 +234,10 @@ impl Dreams {
         let built = async {
             let repository = self.policy.repository();
             let base = workspace::resolve_base(repository).await?;
-            let reading = DreamsStore::files_clone(&staged);
-            workspace::clone_detached(repository, &base, &reading).await?;
-            let files = self.editable_files(&reading).await?;
-            std::fs::remove_dir_all(&reading)?;
+            let check_free = DreamsStore::check_free_clone(&staged);
+            workspace::clone_detached(repository, &base, &check_free).await?;
+            let files = self.editable_files(&check_free).await?;
+            std::fs::remove_dir_all(&check_free)?;
             let checking = DreamsStore::base_clone(&staged);
             workspace::clone_detached(repository, &base, &checking).await?;
             let before = self.run_checks(&checking, cancelled).await?;
@@ -374,22 +379,27 @@ impl Dreams {
             .await
         {
             Ok(proposal) => {
-                DreamsStore::write_verdict(&directory, None)?;
+                DreamsStore::write_verdict(&directory, Verdict::Accepted)?;
                 let outcome = self
                     .store
                     .seal_outcome(&run, &Outcome::Proposed(Box::new(proposal)))?;
                 return Ok(Self::decided(&run, &outcome));
             }
-            Err(AttemptError::Failed(error)) => return Err(error),
-            Err(AttemptError::Rejected(rejection)) => rejection,
+            Err(AttemptError::HostFailed(error)) => return Err(error),
+            Err(AttemptError::ModelRejected(rejection)) => rejection,
         };
-        DreamsStore::write_verdict(&directory, Some(&rejection.reason))?;
+        DreamsStore::write_verdict(
+            &directory,
+            Verdict::Rejected {
+                reason: &rejection.reason,
+            },
+        )?;
         let mut lines = vec![format!(
             "Dreams proposal attempt {attempt} of {MAX_ATTEMPTS} rejected: {}. {} of {MAX_ATTEMPTS} attempts remain.",
             rejection.reason,
             MAX_ATTEMPTS - attempt
         )];
-        lines.extend(rejection.output);
+        lines.extend(rejection.check_output);
         if attempt < MAX_ATTEMPTS {
             return Ok(Self::reply(&run, false, lines.join("\n")));
         }
@@ -454,10 +464,10 @@ impl Dreams {
         DreamsStore::write_patch(directory, &patch.bytes)?;
         if let Some(failed) = after.iter().find(|check| !check.passed()) {
             let mut output = Vec::new();
-            evidence::check_lines(&mut output, "After", failed);
+            evidence::check_lines(&mut output, CheckPhase::After, failed);
             return Err(Rejection {
                 reason: format!("after check {} did not pass", failed.name),
-                output,
+                check_output: output,
             }
             .into());
         }

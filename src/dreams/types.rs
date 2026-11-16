@@ -529,8 +529,27 @@ pub enum Abstention {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposedFile {
     pub path: String,
-    pub base_blob: Option<String>,
+    #[serde(flatten)]
+    pub change: FileChange,
     pub proposed_blob: String,
+}
+
+impl ProposedFile {
+    /// The blob the path holds at the base, or None for a file the patch adds.
+    pub fn base_blob(&self) -> Option<&str> {
+        match &self.change {
+            FileChange::Added => None,
+            FileChange::Changed { base_blob } => Some(base_blob),
+        }
+    }
+}
+
+/// What a patch does to one plain file. A patch can do nothing else.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "change", rename_all = "snake_case")]
+pub enum FileChange {
+    Added,
+    Changed { base_blob: String },
 }
 
 /// A sealed proposal. Every after check passed, the evidence is contained in
@@ -569,7 +588,35 @@ pub fn count(number: usize, noun: &str) -> String {
 mod tests {
     use serde_json::json;
 
-    use crate::dreams::{DreamsAbstainReason, GapCause};
+    use crate::dreams::{DreamsAbstainReason, FileChange, GapCause, ProposedFile};
+
+    #[test]
+    fn a_sealed_file_change_says_whether_the_patch_adds_or_changes_the_file() {
+        let changed = ProposedFile {
+            path: "AGENTS.md".into(),
+            change: FileChange::Changed {
+                base_blob: "1".repeat(40),
+            },
+            proposed_blob: "2".repeat(40),
+        };
+        let added = ProposedFile {
+            path: "playbooks/new.md".into(),
+            change: FileChange::Added,
+            proposed_blob: "2".repeat(40),
+        };
+        assert_eq!(
+            serde_json::to_value(&changed).unwrap(),
+            json!({ "path": "AGENTS.md", "change": "changed", "base_blob": "1".repeat(40), "proposed_blob": "2".repeat(40) })
+        );
+        assert_eq!(
+            serde_json::to_value(&added).unwrap(),
+            json!({ "path": "playbooks/new.md", "change": "added", "proposed_blob": "2".repeat(40) })
+        );
+        for file in [changed, added] {
+            let sealed = serde_json::to_string(&file).unwrap();
+            assert_eq!(serde_json::from_str::<ProposedFile>(&sealed).unwrap(), file);
+        }
+    }
 
     #[test]
     fn every_label_is_the_name_the_wire_uses() {

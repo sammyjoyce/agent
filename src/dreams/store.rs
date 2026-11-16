@@ -23,7 +23,7 @@ const REVIEW_FILE: &str = "review.json";
 const EVIDENCE_FILE: &str = "evidence.jsonl";
 const FILES_FILE: &str = "files.json";
 const BASE_CLONE: &str = "base";
-const FILES_CLONE: &str = "files";
+const CHECK_FREE_CLONE: &str = "files";
 const ATTEMPTS_DIRECTORY: &str = "attempts";
 const CANDIDATE_CLONE: &str = "candidate";
 const PATCH_FILE: &str = "patch.diff";
@@ -31,6 +31,12 @@ const AFTER_FILE: &str = "after.json";
 const VERDICT_FILE: &str = "verdict.json";
 const OUTCOME_FILE: &str = "outcome.json";
 const APPLIED_FILE: &str = "applied.json";
+
+/// How one proposal attempt ended.
+pub(crate) enum Verdict<'a> {
+    Accepted,
+    Rejected { reason: &'a str },
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReviewSeal {
@@ -230,8 +236,8 @@ impl DreamsStore {
         staged.join(BASE_CLONE)
     }
 
-    pub(crate) fn files_clone(staged: &Path) -> PathBuf {
-        staged.join(FILES_CLONE)
+    pub(crate) fn check_free_clone(staged: &Path) -> PathBuf {
+        staged.join(CHECK_FREE_CLONE)
     }
 
     pub(crate) fn write_review(
@@ -277,12 +283,14 @@ impl DreamsStore {
         write_json(&attempt.join(AFTER_FILE), &after)
     }
 
-    pub(crate) fn write_verdict(attempt: &Path, rejected: Option<&str>) -> Result<()> {
+    pub(crate) fn write_verdict(attempt: &Path, verdict: Verdict<'_>) -> Result<()> {
         write_json(
             &attempt.join(VERDICT_FILE),
-            &match rejected {
-                Some(reason) => serde_json::json!({ "accepted": false, "reason": reason }),
-                None => serde_json::json!({ "accepted": true }),
+            &match verdict {
+                Verdict::Rejected { reason } => {
+                    serde_json::json!({ "accepted": false, "reason": reason })
+                }
+                Verdict::Accepted => serde_json::json!({ "accepted": true }),
             },
         )
     }
