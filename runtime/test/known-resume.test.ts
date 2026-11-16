@@ -167,17 +167,33 @@ test("lost resume responses retain the full folder through inconclusive inspecti
     await assert.rejects(app.tasks.dispatch(task.id, host, async () => { throw new Error("Synthetic response loss"); }), /needs reconciliation/);
     const uncertain = { ...original.worker, state: "resume_uncertain" };
     assert.deepEqual((await app.tasks.get(task.id)).worker, uncertain);
+    let checks = 0;
+    await assert.rejects(app.tasks.dispatch(task.id, host, async (command): Promise<HostResult> => {
+      assert.ok(command.type === "on_node" && command.command.type === "inspect_worker"); checks += 1;
+      return { type: "failed", message: "Synthetic inspection unavailable" };
+    }), /needs reconciliation/);
+    assert.equal(checks, 1); assert.deepEqual((await app.tasks.get(task.id)).worker, uncertain);
+    await assert.rejects(app.tasks.revokeAllocation(task.id, original.worker.allocation_id), /known session/);
     for (const result of [
-      { type: "failed", message: "Synthetic inspection unavailable" },
       { type: "worker_presence", presence: { state: "present", running: false } },
       { type: "worker_presence", presence: { state: "missing_terminal" } },
     ] satisfies HostResult[]) {
-      let checks = 0;
-      await assert.rejects(app.tasks.dispatch(task.id, host, async (command) => {
-        assert.ok(command.type === "on_node" && command.command.type === "inspect_worker"); checks += 1; return result;
-      }), /needs reconciliation/);
-      assert.equal(checks, 1); assert.deepEqual((await app.tasks.get(task.id)).worker, uncertain);
-      await assert.rejects(app.tasks.revokeAllocation(task.id, original.worker.allocation_id), /known session/);
+      const before = (await app.tasks.get(task.id)).worker; assert.ok(before.state === "resume_uncertain");
+      const sent: HostCommand[] = [];
+      const resumed = await app.tasks.dispatch(task.id, host, async (command): Promise<HostResult> => {
+        sent.push(command); return command.type === "on_node" ? result : { type: "written" };
+      });
+      assert.deepEqual(sent.map((command) => command.type), ["on_node", "resume_worker"]);
+      const inspection = sent[0]; assert.ok(inspection?.type === "on_node" && inspection.command.type === "inspect_worker");
+      const resume = sent[1]; assert.ok(resume?.type === "resume_worker");
+      assert.notEqual(resume.allocation_id, before.allocation_id); assert.deepEqual(resume.binding, binding);
+      assert.deepEqual(resumed.worker, { ...before, state: "bound", allocation_id: resume.allocation_id });
+      assert.deepEqual((await app.tasks.get(task.id)).worker, resumed.worker);
+      await assert.rejects(app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: before.allocation_id, binding,
+        instructions: "", cwd: host.cwd, model: fixtureModel }, () => { throw new Error("A late claim with the fenced allocation must never attach"); },
+        [], async () => ({ type: "worker_presence", presence: { state: "present", running: true } })), /binding is not confirmed/);
+      assert.equal(app.faux.state.callCount, 0);
+      await assert.rejects(app.tasks.dispatch(task.id, host, async () => { throw new Error("Synthetic response loss"); }), /needs reconciliation/);
     }
     const allocationId = original.worker.allocation_id;
     await app.tasks.update(task.id, (saved) => { saved.worker = { state: "uncertain", allocation_id: allocationId, host, session_id: binding.session_id }; });
