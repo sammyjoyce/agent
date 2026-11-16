@@ -231,8 +231,9 @@ recovery; [history](history.md) describes import and retrieval.
   duplicate events and source failures.
   [Loop-closing tests and the live evaluation](architecture.md#validation) use
   a local ledger command as the action. Real mailbox and provider effects stay
-  outside both. The latest live run passed six of seven cases. In the
-  already-handled case the model sent the user a needless completion notice.
+  outside both. The latest live run, on `gpt-6.1-sol` from the `openai`
+  provider, passed six of seven cases. In the already-handled case the model
+  sent the user a needless completion notice.
 - [x] CLI startup and retained-history first-render benchmarks, with paired
   baseline comparisons and a separate CI regression gate.
 - [ ] Benchmarks for input admission, first visible activity, steering/stop,
