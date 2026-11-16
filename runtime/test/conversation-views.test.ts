@@ -27,6 +27,7 @@ import { conversationSettings } from "../src/settings.js";
 import { TaskStore, type HostCall } from "../src/tasks.js";
 import { history } from "../src/transcript.js";
 import { fixtureModel } from "./model.js";
+import { chatGptBatch } from "./fixtures/chatgpt-history.js";
 
 const binding: WorkerRef = { host_id: "11111111-1111-4111-8111-111111111111", session_id: "session:22222222-2222-4222-8222-222222222222",
   window_id: "window:33333333-3333-4333-8333-333333333333", block_id: "block:44444444-4444-4444-8444-444444444444" };
@@ -653,4 +654,33 @@ test("saved conversation transport origin survives outbox reopen, conflicting re
     app.faux.setResponses([origins([null]), origins([null, "ios"])]); await run(child.id);
     assert.equal(app.faux.state.callCount, 3, "Provenance adds no inference");
   } finally { app.views.close(); app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("continuing a chatgpt conversation uses the default host", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-chatgpt-continue-")), app = await open(directory);
+  const views: ReturnType<typeof observe>[] = [];
+  try {
+    const shared = "00000000-0000-4000-8000-0000000000c1";
+    await app.histories.import({ host_id: binding.host_id, thread: { id: shared, title: "Deployment notes", cwd: "/example/project",
+      created_at: 1, updated_at: 2, version: "codex-v1", version_reliable: true, archived: false, forked_from_id: null, parent_thread_id: null },
+      items: [{ id: "note", turn_id: "one", kind: "userMessage", role: "user", text: "Codex note about deployment", version: "one",
+        timestamp_ms: 1, order: 0, data: { type: "userMessage", text: "Codex note about deployment" }, assets: [] }], next_cursor: null, gaps: [], complete: true });
+    const saved = (await app.histories.import(chatGptBatch(shared, 10, [
+      { id: "prompt", parent: null, turn: "prompt", kind: "user:text", role: "user", text: "Plan a picnic for eight" }]))).conversation;
+    const view = observe(app, 1, saved.conversation_id); views.push(view);
+    await view.until(() => view.frames.some((event) => event.type === "conversation_ready"));
+    const ready = view.frames.find((event) => event.type === "conversation_ready");
+    assert.equal(ready?.type === "conversation_ready" ? ready.cwd : undefined, "/", "An export has no working directory to report");
+    await view.detach();
+    const spawned: [string | null | undefined, string][] = [];
+    const call: HostCall = async (command) => {
+      if (command.type !== "spawn_worker") throw new Error("Unexpected host operation");
+      spawned.push([command.host.host_id, command.host.cwd]); return { type: "spawned", binding };
+    };
+    await app.views.input(input(saved.conversation_id, "continue", "Continue the picnic plan"), call, () => {});
+    assert.deepEqual(spawned, [[binding.host_id, "/example/home"]],
+      "A Codex checkpoint for the same native ID never makes the ChatGPT conversation resume in that thread's directory");
+    assert.equal(app.faux.state.callCount, 0);
+  } finally { app.views.close(); await Promise.allSettled(views.map((view) => view.running)); app.catalog.close();
+    await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

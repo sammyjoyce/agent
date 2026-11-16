@@ -73,7 +73,7 @@ export class ConversationViews {
         { includeFinal: true, working(value) { working = value; publish({ type: "conversation_state", working }); } });
       if (view.closed) return;
       view.snapshot({ type: "conversation_ready", conversation: summary, model,
-        cwd: native?.cwd ?? imported?.thread.cwd ?? "/", working });
+        cwd: native?.cwd ?? (imported?.thread.cwd || "/"), working });
       const receiptWork = inputIds.length === 0 ? undefined : await inspectMainWork(app.harness, conversation);
       for (const input_id of inputIds) {
         if (view.closed) return;

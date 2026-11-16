@@ -30,7 +30,7 @@ import type { TaskAgentRecord } from "./generated/TaskAgentRecord.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
 import type { WorkerRef } from "./generated/WorkerRef.js";
 import { noticeMetadata, UserNoticeEntry, type UserNoticeData } from "./transcript.js";
-import { entryThread, HistoryStore, ImportedItemEntry, importedSourceRef, importedSummary, importedText, importedThread } from "./history.js";
+import { entryThread, HistoryStore, ImportedItemEntry, importedSourceRef, importedSummary, importedText, importedThread, shownInConversation } from "./history.js";
 import { REVISION_AMBIGUOUS, REVISION_PENDING, revisionStatus, type RevisionView } from "./history-revisions.js";
 import type { SavedMatch } from "./generated/SavedMatch.js";
 import type { ImportedConversation } from "./generated/ImportedConversation.js";
@@ -595,6 +595,7 @@ export class TaskStore {
     const warned = new Set<string>();
     for await (const entries of this.historyPages(conversation, { order: "descending", ...(maximum === undefined ? {} : { maxEntryId: maximum }) })) {
       for (const entry of entries) {
+        if (ImportedItemEntry.is(entry) && !shownInConversation(entry.data.item)) continue;
         const status = await this.revision(entry, revisions, false, maximum);
         if (status === "superseded" || status === "outside_snapshot") continue;
         const warning = status === "ambiguous" ? REVISION_AMBIGUOUS : status === "pending" ? REVISION_PENDING : "";
@@ -629,6 +630,7 @@ export class TaskStore {
     const revisions = new Map<string, RevisionView>();
     for await (const entries of this.historyPages(conversation, { order: "descending" })) {
       for (const entry of entries) {
+        if (ImportedItemEntry.is(entry) && !shownInConversation(entry.data.item)) continue;
         const status = await this.revision(entry, revisions);
         if (status === "superseded" || status === "outside_snapshot") continue;
         const content = key(text(entry));
@@ -721,7 +723,7 @@ export class TaskStore {
     const revisions = new Map<string, RevisionView>();
     for await (const entries of this.historyPages(conversation, { order: "ascending" })) {
       for (const entry of entries) {
-        if (ImportedItemEntry.is(entry) && entry.data.item.role === "thinking") continue;
+        if (ImportedItemEntry.is(entry) && (entry.data.item.role === "thinking" || !shownInConversation(entry.data.item))) continue;
         const status = await this.revision(entry, revisions, true);
         if (status === "superseded" || status === "outside_snapshot") continue;
         const content = (await this.histories?.indexText(entry)) ?? text(entry, 32_000);

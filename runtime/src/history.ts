@@ -12,6 +12,7 @@ import type { HistoryImportBatch } from "./generated/HistoryImportBatch.js";
 import type { HistoryImportReceipt } from "./generated/HistoryImportReceipt.js";
 import type { HistoryItem } from "./generated/HistoryItem.js";
 import type { HistoryProvider } from "./generated/HistoryProvider.js";
+import type { HistoryRole } from "./generated/HistoryRole.js";
 import type { HistoryRetryPage } from "./generated/HistoryRetryPage.js";
 import type { HistoryThread } from "./generated/HistoryThread.js";
 import type { ImportedConversation } from "./generated/ImportedConversation.js";
@@ -38,6 +39,8 @@ export function entryThread(entry: { data: { source: HistoryProvider; thread_id:
 export function importedSourceRef(record: Pick<ImportedConversation, "source" | "thread">): SourceRef {
   return { provider: record.source, account: HISTORY_SOURCES[record.source].account, thread_id: record.thread.id };
 }
+/** ChatGPT tool output can carry anything a tool fetched, so it stays inspectable evidence and never becomes a search match. */
+const CHATGPT_SEARCHABLE_ROLES: ReadonlySet<HistoryRole> = new Set(["user", "assistant", "commentary", "final"]);
 /** Branches a source kept but did not show never render, index or feed continuation evidence. */
 export function shownInConversation(item: { branch?: HistoryBranch }): boolean {
   return item.branch === undefined || item.branch.state === "current";
@@ -245,7 +248,14 @@ export class HistoryStore {
   }
   async indexText(entry: EntryRecord): Promise<string | undefined> {
     if (!ImportedItemEntry.is(entry)) return importedText(entry);
-    const item = entry.data.item;
+    const { source, item } = entry.data;
+    switch (source) {
+      case "codex": return this.codexIndexText(entry, item);
+      case "chatgpt": return CHATGPT_SEARCHABLE_ROLES.has(item.role) ? item.text : "";
+      default: { const unhandled: never = source; throw new HistoryError(`Unknown history source ${String(unhandled)}`); }
+    }
+  }
+  private async codexIndexText(entry: EntryRecord, item: InertItem): Promise<string> {
     if (item.kind === "imageGeneration") return "";
     if (item.role !== "user" && item.role !== "assistant") return item.text.slice(0, 32_000);
     try { return body(await this.original(entry)) || item.text; }
