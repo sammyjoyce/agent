@@ -996,6 +996,129 @@
         }
       ]
     },
+    "GoalAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "show"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "`request_id` becomes the goal ID, and in main also the new task's ID, so a\nreplayed set finds the goal it created instead of being refused.",
+          "type": "object",
+          "properties": {
+            "objective": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "set"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "objective"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pause"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "Replaying the request that started the current activation changes nothing.",
+          "type": "object",
+          "properties": {
+            "request_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "resume"
+            }
+          },
+          "required": [
+            "type",
+            "request_id"
+          ]
+        }
+      ]
+    },
+    "GoalTarget": {
+      "description": "The conversation a `/goal` control addresses. The runtime resolves every form\nto main or to exactly one existing task, and refuses an agent conversation.",
+      "oneOf": [
+        {
+          "description": "The root conversation. The phone always sends this.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "main"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "agent_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            },
+            "type": {
+              "type": "string",
+              "const": "task"
+            }
+          },
+          "required": [
+            "type",
+            "task_id"
+          ]
+        },
+        {
+          "description": "A saved conversation selected in the TUI.",
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "conversation"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id"
+          ]
+        }
+      ]
+    },
     "GuidanceSnapshot": {
       "type": "object",
       "properties": {
@@ -3331,6 +3454,27 @@
           },
           "required": [
             "type"
+          ]
+        },
+        {
+          "description": "`/goal` for one selected conversation: show, set, pause or resume its objective.",
+          "type": "object",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/GoalAction"
+            },
+            "target": {
+              "$ref": "#/$defs/GoalTarget"
+            },
+            "type": {
+              "type": "string",
+              "const": "goal"
+            }
+          },
+          "required": [
+            "type",
+            "target",
+            "action"
           ]
         },
         {

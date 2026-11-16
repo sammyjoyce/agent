@@ -88,7 +88,8 @@ impl RequestLifecycle {
             | RuntimeCommand::SearchHistory { .. }
             | RuntimeCommand::ReadConversation { .. }
             | RuntimeCommand::OpenConversation { .. }
-            | RuntimeCommand::RevokeAllocation { .. } => Self::Once,
+            | RuntimeCommand::RevokeAllocation { .. }
+            | RuntimeCommand::Goal { .. } => Self::Once,
         })
     }
 
