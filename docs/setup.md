@@ -516,6 +516,12 @@ job's conversation and never lifts it. A `dreams` job without a `[dreams]`
 policy still runs with only those tools, and each tool answers
 `Dreams is not configured`.
 
+If you ran a job with the id `dreams` before you upgraded, its task stops
+running. The coordinator withdraws that task's unrun input and records why as
+the task's outcome, and its history stays readable with `beep-boop tasks read`.
+The next Dreams run starts a new task, so no earlier turn reaches the Dreams
+model.
+
 ```sh
 beep-boop jobs check && beep-boop jobs sync
 beep-boop jobs run dreams
@@ -538,13 +544,16 @@ coordinator's state directory, so run them on the coordinator's machine.
 
 Read the patch before you approve it. The outcome digest, which `dreams show`
 prints as `Outcome sha256`, is the SHA-256 of the exact bytes of the sealed
-`outcome.json`. That record holds the patch hash, the base commit, the changed
-files with their blob ids, the cited evidence ids, the check results, and one
-hash of the sealed review record and all of its evidence. So the digest you
-approve covers the evidence bodies that `dreams show` printed, not only their
-ids. `dreams show` refuses a run whose review or evidence changed, and
-`dreams list` fails while any run has such a change. `apply` recomputes the outcome digest, the review hash and the patch
-hash, and refuses with one of these messages, without changing the repository:
+`outcome.json`. Every sealed outcome, a proposal or an abstention, holds one
+hash of the sealed review record and all of its evidence. A proposal also holds
+the patch hash, the base commit, the changed files with their blob ids, the
+cited evidence ids and the check results. `dreams show` reads the review and
+the evidence once, checks them against that hash, and prints only the bodies
+it checked. So the digest you approve covers the evidence bodies that
+`dreams show` printed, not only their ids. `dreams show` refuses a run whose
+review or evidence changed, and `dreams list` fails and names that run.
+`apply` recomputes the outcome digest, the review hash and the patch hash, and
+refuses with one of these messages, without changing the repository:
 
 - `Dreams approval does not match the review`
 - `Dreams review changed since it was sealed`
@@ -593,14 +602,23 @@ they enqueue it. A gap never blocks a proposal. It blocks only the claim
 that the night was quiet. Task summaries are the text retained when the review
 was sealed. They are a snapshot, not a history of the window.
 
-The log writer also records when it starts and when it stops cleanly. A writer
-holds queued receipts and its count of dropped receipts in memory, so a crash
-loses them. When a writer starts and the receipt before its start is not a
-clean stop, the review shows an `unclean_restart` gap from that receipt to the
-start, even when the restart came within ten minutes. The first start after
-you upgrade from a version without these records shows this gap once. A crash
-in the first moments of startup, before the new writer has recorded its start,
-leaves no gap for the receipts of that moment.
+The log writer also records when it starts and when it stops cleanly. The
+coordinator starts no work until the writer has written its start record. If
+the writer cannot write it, the coordinator exits with an error instead. One
+cause is another process that holds `<state_dir>/diagnostics/writer.lock` for
+10 seconds, and the error names that file. A writer holds queued receipts and
+its count of dropped receipts in memory, so a crash loses them. When a writer
+starts and the receipt before its start is not a clean stop, the review shows
+an `unclean_restart` gap from that receipt to the start, even when the restart
+came within ten minutes. The writer leaves flushing to the operating system.
+After an operating-system crash or a power loss, the receipts written just
+before it can be gone, a recent start record included, so a review of that
+time can miss the restart.
+
+The first start after an upgrade from a version without these records leaves
+one `unclean_restart` gap. Every review whose window covers that start shows
+it, so with `window_hours = 48` that one upgrade can refuse a quiet abstention
+in every run for two days.
 
 A check runs with only `PATH`, `HOME`, `LANG` and `TMPDIR` in its environment,
 in a private clone under `<state_dir>/dreams/runs/`. Write checks that read

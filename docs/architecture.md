@@ -699,10 +699,20 @@ channel to an actor that holds one. Tests cover each link.
 
 - `TaskStore.runActor` gives the task of the job `dreams` exactly
   `dreams_review`, `dreams_propose` and `dreams_abstain` on every path.
-- Only the scheduler sends that task input. `TaskStore` refuses every other
-  route before it saves the input and before any model call: a steer or
+- Only the scheduler delivers that task's input. `TaskStore` refuses every
+  other route before it saves the input and before any model call: a steer or
   follow-up from `delegate_task`, `message_task`, a native client's input,
-  worker input, a terminal that attaches and a child agent.
+  worker input, a terminal that attaches and a child agent. The text the
+  scheduler delivers is the job file's prompt. Any connected client can change
+  that definition with `jobs sync`, as any same-user process can edit the file.
+- The actor consumes only scheduler input, and only in a conversation that was
+  created confined. It withdraws any other saved input unrun. A task that
+  carried the job id `dreams` before an upgrade never runs: its queued input
+  is withdrawn, its history stays readable by id, and the scheduler runs Dreams
+  in a new task, so no earlier turn or tool schema reaches a Dreams request.
+- Only the scheduler writes to that task. `record_task`, a new source link
+  from `link_source_events` and a model or reasoning change are refused. The
+  model comes from the job file.
 - The same confinement withholds hosted provider tools, web search included,
   from every request of that conversation on the `openai` and `openai-codex`
   providers. The record is durable and is never removed, so a turn that resumes
