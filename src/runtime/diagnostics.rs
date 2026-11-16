@@ -734,26 +734,23 @@ pub(crate) struct Diagnostics {
     drops: SharedDrops,
 }
 
-/// A run that may serve before its log records it leaves its start time here,
-/// outside the log, and the writer that records a start removes it. A time
-/// still here at the next start belongs to runs the log never saw.
-const UNRECORDED_START: &str = "unrecorded-start";
+const UNRECORDED_START_STAMP: &str = "unrecorded-start";
 
-fn unrecorded_since(stamp: &Path, may_serve_unrecorded: bool) -> Option<u64> {
-    let since = fs::read_to_string(stamp)
+fn read_unrecorded_start(stamp: &Path) -> Option<u64> {
+    fs::read_to_string(stamp)
         .ok()
-        .and_then(|text| text.trim().parse().ok());
-    if since.is_none() && may_serve_unrecorded {
-        let _ = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(stamp)
-            .and_then(|mut file| file.write_all(now_ms().to_string().as_bytes()));
-    }
-    since
+        .and_then(|text| text.trim().parse().ok())
+}
+
+fn stamp_unrecorded_start(stamp: &Path) {
+    let _ = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(stamp)
+        .and_then(|mut file| file.write_all(now_ms().to_string().as_bytes()));
 }
 
 #[must_use]
@@ -772,12 +769,18 @@ impl Diagnostics {
         }
     }
     pub fn start(state: &Path) -> Self {
-        Self::start_with_heartbeat(state, HEARTBEAT, None)
+        let stamp = state.join(UNRECORDED_START_STAMP);
+        let unrecorded_since = read_unrecorded_start(&stamp);
+        if unrecorded_since.is_none() {
+            stamp_unrecorded_start(&stamp);
+        }
+        Self::start_with_heartbeat(state, HEARTBEAT, unrecorded_since, None)
     }
     pub fn start_recorded(state: &Path) -> (Self, WriterStart) {
+        let unrecorded_since = read_unrecorded_start(&state.join(UNRECORDED_START_STAMP));
         let (started, start) = std::sync::mpsc::sync_channel(1);
         (
-            Self::start_with_heartbeat(state, HEARTBEAT, Some(started)),
+            Self::start_with_heartbeat(state, HEARTBEAT, unrecorded_since, Some(started)),
             WriterStart(start),
         )
     }
@@ -794,11 +797,11 @@ impl Diagnostics {
     fn start_with_heartbeat(
         state: &Path,
         interval: Duration,
+        unrecorded_since: Option<u64>,
         started: Option<std::sync::mpsc::SyncSender<io::Result<()>>>,
     ) -> Self {
         let directory = state.join("diagnostics");
-        let stamp = state.join(UNRECORDED_START);
-        let unrecorded_since = unrecorded_since(&stamp, started.is_none());
+        let stamp = state.join(UNRECORDED_START_STAMP);
         let (diagnostics, mut records) = Self::open_channel(&directory, CAPACITY);
         // A weak sender lets the writer end when its last real producer does.
         let witness = diagnostics.sender.downgrade();
@@ -1928,6 +1931,7 @@ mod tests {
             state.path(),
             std::time::Duration::from_millis(20),
             None,
+            None,
         );
         let directory = state.path().join("diagnostics");
         let heartbeats = || {
@@ -1973,7 +1977,7 @@ mod tests {
             .open(directory.join("writer.lock"))
             .unwrap();
         fs2::FileExt::lock_exclusive(&lock).unwrap();
-        let mut log = Diagnostics::start_with_heartbeat(state, heartbeat, None);
+        let mut log = Diagnostics::start_with_heartbeat(state, heartbeat, None, None);
         let trace = Trace::new(&RuntimeCommand::Status);
         for id in 1..=records {
             log.record(id, &trace, Event::RequestReceived);

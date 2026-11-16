@@ -610,20 +610,20 @@ with an error that names `<state_dir>/diagnostics`. Causes include a read-only
 `retention.json`, and another process that holds
 `<state_dir>/diagnostics/writer.lock` for 10 seconds, which the error also
 names. Fix that path, or remove `[dreams]` from the config to run chat without
-nightly review. While it waits, startup takes as long as the writer needs to
-read the retained log, which is a few seconds when the log is near its 128 MiB
-cap.
+nightly review. While it waits, startup also takes the time the writer needs
+to read the retained log.
 
 Without `[dreams]`, startup does not wait for the writer. A writer that cannot
 start prints `Runtime diagnostics unavailable; chat continues.` and the
 coordinator serves chat, as it did before Dreams. That run leaves no receipts.
 So a coordinator without `[dreams]` writes its start time to
-`<state_dir>/unrecorded-start` before it serves, and the writer removes the
-file once the log holds the start record. A writer that finds the file left by
-an earlier start records an `unclean_restart` gap from that time to its own
-start, so a review after you add `[dreams]` back does not call that time quiet.
-If the state directory refuses that file, only the ten-minute rule above
-catches the run.
+`<state_dir>/unrecorded-start` before it serves, unless the file is already
+there, and the writer removes the file once the log holds the start record. A
+writer that finds the file left by earlier starts records that time first, and
+the review shows an `unclean_restart` gap from the first unrecorded start to
+the writer's own. A review after you add `[dreams]` back does not call that
+time quiet. If the state directory refuses that file, only the ten-minute rule
+above catches the run.
 
 A writer holds queued receipts and its count of dropped receipts in memory, so
 a crash loses them. When a writer starts and the receipt before its start is

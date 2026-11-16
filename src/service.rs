@@ -133,19 +133,11 @@ async fn serve_with_transport(
         .and_then(|node| node.launch.config.as_deref())
         .map(|path| crate::config::load(Some(Path::new(path))))
         .transpose()?;
-    let start_record = if config
-        .as_ref()
-        .is_some_and(|config| config.dreams.is_some())
-    {
-        StartRecord::Required
-    } else {
-        StartRecord::BestEffort
-    };
     let owner = Runtime::start_with_notifications(
         script,
         state,
         config.as_ref().and_then(|config| config.apns.as_ref()),
-        start_record,
+        StartRecord::for_config(config.as_ref()),
     )?;
     let background = if owner.restore_held() {
         eprintln!("{}", crate::backup::hold_notice(state));

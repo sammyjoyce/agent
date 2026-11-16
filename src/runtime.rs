@@ -36,11 +36,19 @@ pub(crate) enum ShutdownSignal {
     Sigterm,
 }
 
-/// Dreams reviews the diagnostics log, so a configured coordinator must not
-/// serve a run that log cannot see. Chat alone does not depend on the log.
 pub(crate) enum StartRecord {
-    Required,
+    RequiredByDreams,
     BestEffort,
+}
+
+impl StartRecord {
+    pub(crate) fn for_config(config: Option<&crate::config::ClientConfig>) -> Self {
+        if config.is_some_and(|config| config.dreams.is_some()) {
+            Self::RequiredByDreams
+        } else {
+            Self::BestEffort
+        }
+    }
 }
 
 pub struct RuntimeCall {
@@ -139,7 +147,7 @@ impl Runtime {
         let coordinator_id = CoordinatorId::load_or_mint(state)?;
         let diagnostics = match start_record {
             StartRecord::BestEffort => Diagnostics::start(state),
-            StartRecord::Required => {
+            StartRecord::RequiredByDreams => {
                 let (diagnostics, started) = Diagnostics::start_recorded(state);
                 started.wait().with_context(|| {
                     format!(
@@ -1519,9 +1527,12 @@ createInterface({input:process.stdin}).on('line',line=>{
         .unwrap();
         let script = state.path().join("fixture.mjs");
         std::fs::write(&script, "process.stdin.resume();\n").unwrap();
-        let Err(error) =
-            Runtime::start_with_notifications(&script, state.path(), None, StartRecord::Required)
-        else {
+        let Err(error) = Runtime::start_with_notifications(
+            &script,
+            state.path(),
+            None,
+            StartRecord::RequiredByDreams,
+        ) else {
             panic!("A runtime whose log cannot record its start must not serve");
         };
         let error = format!("{error:#}");
