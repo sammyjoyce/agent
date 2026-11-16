@@ -47,7 +47,7 @@ nix develop --command target/release/examples/cli-performance \
   --output performance/results.json
 ```
 
-Add a scenario to the typed `Scenario` enum in `examples/cli_performance.rs` and
+Add a scenario to the typed `Scenario` enum in `examples/cli_performance/main.rs` and
 seed its synthetic retained data in `runtime/test/fixtures/performance.ts`.
 The paired sampling and regression gate apply to every enum variant. Keep
 conversation text synthetic and test the real path the scenario is measuring.
