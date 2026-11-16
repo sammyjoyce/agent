@@ -163,7 +163,7 @@ async function openApplication(): Promise<Application> {
   } catch (error) { await telemetry.close(); throw error; }
   const discovery = createToolDiscovery();
   try { return await startup.run("application_recovery", async () => {
-  const notifications = new Notifications(harness, registry, notificationConfig());
+  const notifications = new Notifications(harness, registry, notificationConfig(), undefined, effectGate(ownership));
   const tasks = new TaskStore(harness, inference);
   await startup.run("task_migration", () => tasks.prepare());
   const attachments = new AttachmentStore(state); tasks.useAttachments(attachments);
