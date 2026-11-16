@@ -627,6 +627,10 @@
         becomes(field, "value == %@", "Keep this Work draft"), String(describing: field.value))
     }
 
+    /// Core Spotlight indexes in the background, and on a simulator that just installed the app
+    /// it took minutes to answer.
+    private static let spotlightWait = Duration.seconds(120)
+
     private static let searchable: [String: [String]] = [
       "Nightly": ["job Nightly deps"],
       "Nightly deps": ["job Nightly deps"],
@@ -654,7 +658,7 @@
     private func spotlightResult(of entity: String, for search: String) async throws
       -> AnyAppEntity
     {
-      let deadline = ContinuousClock.now + .seconds(20)
+      let deadline = ContinuousClock.now + Self.spotlightWait
       repeat {
         if let first = try await definitions.entities[entity].spotlightQuery(search).first {
           return first
@@ -668,7 +672,7 @@
     private func assertSpotlight(
       coordinators: Set<String>, jobs: [String: String], _ moment: String
     ) async throws {
-      let deadline = ContinuousClock.now + .seconds(20)
+      let deadline = ContinuousClock.now + Self.spotlightWait
       var shown: (coordinators: Set<String>, jobs: [String: String]) = ([], [:])
       repeat {
         let foundCoordinators = try await definitions.entities["CoordinatorEntity"]
