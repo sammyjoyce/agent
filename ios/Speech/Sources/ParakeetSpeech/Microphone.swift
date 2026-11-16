@@ -32,8 +32,8 @@ public enum Microphone {
 /// The session is `.record` with mode `.measurement`, which keeps the system's own signal
 /// processing to a minimum, so the model hears audio closest to what it was trained on.
 final class Capture: Sendable {
-  let audio: AsyncStream<[Float]>
-  private let heard: AsyncStream<[Float]>.Continuation
+  let audio: AsyncThrowingStream<[Float], any Error>
+  private let heard: AsyncThrowingStream<[Float], any Error>.Continuation
   private let reporting: AsyncStream<Take.Event>.Continuation
   private let state: OSAllocatedUnfairLock<State>
 
@@ -59,7 +59,7 @@ final class Capture: Sendable {
     engine: AVAudioEngine, converter: AVAudioConverter,
     reporting: AsyncStream<Take.Event>.Continuation
   ) {
-    (audio, heard) = AsyncStream.makeStream(of: [Float].self)
+    (audio, heard) = AsyncThrowingStream.makeStream(of: [Float].self)
     self.reporting = reporting
     state = OSAllocatedUnfairLock(uncheckedState: State(engine: engine, converter: converter))
   }
@@ -109,7 +109,7 @@ final class Capture: Sendable {
   private func halt(interrupted: Bool) {
     let running = state.withLockUnchecked { state -> (AVAudioEngine, [any NSObjectProtocol])? in
       guard let engine = state.engine else { return nil }
-      let rest = Self.convert(nil, with: state.converter)
+      let rest = (try? Self.convert(nil, with: state.converter)) ?? []
       if !rest.isEmpty { heard.yield(rest) }
       heard.finish()
       defer {
@@ -128,18 +128,29 @@ final class Capture: Sendable {
   }
 
   private func hear(_ buffer: AVAudioPCMBuffer) {
-    let level = state.withLockUnchecked { state -> Float? in
-      guard state.engine != nil else { return nil }
-      let samples = Self.convert(buffer, with: state.converter)
-      guard !samples.isEmpty else { return nil }
-      heard.yield(samples)
-      return state.level(samples)
+    do {
+      let level = try state.withLockUnchecked { state -> Float? in
+        guard state.engine != nil else { return nil }
+        let samples: [Float]
+        do {
+          samples = try Self.convert(buffer, with: state.converter)
+        } catch {
+          // Under the lock, so a stop racing this buffer cannot end the audio cleanly first.
+          heard.finish(throwing: error)
+          throw error
+        }
+        guard !samples.isEmpty else { return nil }
+        heard.yield(samples)
+        return state.level(samples)
+      }
+      if let level { reporting.yield(.level(level)) }
+    } catch {
+      stop()
     }
-    if let level { reporting.yield(.level(level)) }
   }
 
   private static func convert(_ buffer: AVAudioPCMBuffer?, with converter: AVAudioConverter)
-    -> [Float]
+    throws -> [Float]
   {
     let ratio = converter.outputFormat.sampleRate / converter.inputFormat.sampleRate
     let capacity = AVAudioFrameCount(Double(buffer?.frameLength ?? 0) * ratio) + 1_024
@@ -156,6 +167,7 @@ final class Capture: Sendable {
         input.pointee = .haveData
         return next
       }
+      if status == .error { throw ParakeetError.audioFormat }
       if let channel = output.floatChannelData {
         heard.append(
           contentsOf: UnsafeBufferPointer(start: channel[0], count: Int(output.frameLength)))
