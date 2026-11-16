@@ -208,21 +208,27 @@ named child terminals handle bounded subwork. A separate outcome can start a
 new top-level task. Private delegation receipts retain the considered
 conversation IDs, retrieval gaps and reason for overriding related work.
 
-Job-owned tasks and their children use the same actor loop, outbox, history and
-outcome journal through the coordinator's background transport. Host effects use
-registered worker connections. Timers, source handoffs and chat continuations
-retain this execution mode without allocating Rex terminals. Native views
-observe the conversation independently of execution. Stopping an actor cancels
-only its host calls; issued effects still return their actual receipts.
-An already attached Rex worker keeps ownership until it detaches; background
-dispatch does not create a competing execution.
+Every task actor runs in the coordinator, whether its task is interactive or
+job-owned, and uses the same actor loop, outbox, history and outcome journal.
+The coordinator's service transport owns each issued host effect and routes it
+to the registered worker service of the task's execution host, or to the
+coordinator's own executor when that host is the coordinator's node.
+Interactive tasks execute on the host recorded with their allocation. Job-owned
+tasks execute on the coordinator's default host; timers, source handoffs and
+chat continuations retain this mode without allocating Rex terminals. Task
+terminals and native views observe the conversation independently of
+execution. Stopping an actor cancels only its host calls; issued effects still
+return their actual receipts. One actor exists per task or child agent. A
+terminal that attaches while that actor runs observes it and never starts a
+second execution.
 Coordinator shutdown detaches execution while preserving admitted Pi work.
 An explicit user Stop withdraws inputs through Pi's interruption path.
 
-Task terminals remain interactive after a turn. A single attached actor
-serializes replies typed in the terminal and inputs queued by the main agent;
-queued work wakes an idle terminal automatically. An idle attachment retains
-its execution lease without counting as busy work. New input reacquires
+Task terminals remain interactive after a turn. A single actor serializes
+replies typed in the terminal and inputs queued by the main agent; admitted
+work runs whether or not a terminal is attached. An idle actor stays resident
+while a terminal observes it, without counting as busy work, and ends when
+none does. The next admitted input starts it again. New input reacquires
 resource guards. Child results return while their tabs remain available for
 replies. Main and task CLIs load older history automatically in the background;
 reading it does not submit it back to the model. Live
@@ -239,16 +245,24 @@ The Rust TUI renders Markdown with model, reasoning and directory status.
 Completed activity groups emit one compact terminal scrollback row. Ctrl+T
 opens the retained reasoning and tool details; progress commentary stays prose.
 Enter steers, Tab queues a separate turn, and Esc stops the current Pi turn and
-drains owned host operations. Tool results remain recorded; stopping cannot
-undo an external effect that already completed.
+drains owned host operations. Leaving or closing a task terminal stops
+observation only; its task keeps working. Tool results remain recorded;
+stopping cannot undo an external effect that already completed.
 Pi submission commits publish terminal input receipts to connected observers,
 including inputs admitted after attachment and recovered runs without a
 transport owner. Live delivery and reconnect use the same receipt projection;
 stopped, unplaced inputs return as unsent drafts instead of waiting forever.
 
-Main and resumed views detach from coordinator-owned execution. Direct
-`RunTask` processes still own their host effects; transferring that execution
-to a daemon before their process exits remains recovery work.
+Main, task and resumed views detach from coordinator-owned execution. A task
+terminal runs no host effect. Closing it, or losing its process, leaves the
+turn, its issued effects and its queued inputs with the coordinator and the
+execution host's worker service, so task commands run in that service's
+environment, not the terminal's. While its execution host is offline, a task's
+tools are blocked or fail as not started, and no other host runs them. Input
+already admitted for that task is retained and runs when the host reconnects;
+the main agent's delegation to an offline host is refused before its input is
+saved. After a coordinator restart, admitted work resumes once its host is
+connected. An effect that was in flight at the restart is not run again.
 
 Recovery binds the main conversation's execution context before native Pi work
 can depend on it. New input uses Pi's steering or follow-up admission while

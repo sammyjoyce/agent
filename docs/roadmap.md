@@ -248,8 +248,11 @@ recovery; [history](history.md) describes import and retrieval.
 
 - [ ] Reconcile Rex server restarts, terminal exits and reconnects without
   duplicate sessions or lost pending inputs.
-- [ ] Transfer interactive worker execution to a daemon before its terminal
-  client exits, retaining ownership of pending host effects.
+- [x] Transfer interactive worker execution to a daemon before its terminal
+  client exits, retaining ownership of pending host effects. The coordinator
+  owns each task actor and the execution host's worker service owns every
+  issued effect before the terminal is ready, so closing or killing the
+  terminal only stops observation.
 - [ ] Tested coordinator backups and restoration, including retained assets.
 - [ ] Replicated coordinator state and failover, retaining one active owner so
   additional coordinators do not duplicate work or external effects.
