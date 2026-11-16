@@ -288,6 +288,14 @@ session list omits it. An exited terminal can reopen in the same folder. Only
 an explicit session-not-found response permits a replacement folder, after
 fencing the old allocation. A transport or permission failure retains ownership.
 
+Nothing sweeps tasks after a Rex server restart. A task's terminal comes back
+the next time the task is presented: when input arrives with no terminal
+attached, or when you open the task. Until then, its pane can hold a shell that
+Rex restored in place of the terminal. Each restart that a presentation follows
+leaves one such shell window in the session.
+[Tasks and execution](architecture.md#tasks-and-execution) describes the rule
+and its costs.
+
 Reopening restores saved messages, pending inputs and task settings. Recent
 history loads first; older pages load automatically while chat stays usable.
 Known identities use direct metadata lookups. Live views observe Pi's typed
