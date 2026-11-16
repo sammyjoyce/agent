@@ -2,13 +2,26 @@
 //! coordinator that grants the owner epoch and holds the replication log.
 //! The authority's rules are `decide` in `runtime/src/failover/authority-core.ts`.
 
-use anyhow::{Result, ensure};
+use std::{
+    fs,
+    net::{Ipv4Addr, Ipv6Addr},
+    os::unix::fs::MetadataExt,
+    path::PathBuf,
+};
+
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 use uuid::Uuid;
 
+use crate::coordinator_id::CoordinatorId;
+
 /// JavaScript carries these counters as numbers, so they stay exact only below 2^53.
 const MAX_EXACT: u64 = 9_007_199_254_740_991;
+
+/// The exit status of a coordinator the authority fenced, from the supervisor
+/// and from its Pi child alike, so a service manager can leave it stopped.
+pub const OWNER_FENCED_EXIT: u8 = 75;
 
 /// Granted only by the authority. Rises at every coordinator start and at every promotion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
@@ -365,6 +378,159 @@ pub struct AuthorityRecord {
 pub struct LogPage {
     pub record: AuthorityRecord,
     pub entries: Vec<LogEntry>,
+}
+
+/// The authority's address: https, or http on a loopback address for tests and
+/// local workerd. It carries no user name, password or escapes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(try_from = "String", into = "String")]
+pub struct AuthorityUrl(String);
+
+impl AuthorityUrl {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for AuthorityUrl {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        ensure!(
+            authority_url_allowed(&value),
+            "The failover url must be https, or http on a loopback address, without a user name, password or escapes"
+        );
+        Ok(Self(value))
+    }
+}
+
+impl From<AuthorityUrl> for String {
+    fn from(value: AuthorityUrl) -> String {
+        value.0
+    }
+}
+
+fn authority_url_allowed(value: &str) -> bool {
+    let (secure, rest) = match (
+        value.strip_prefix("https://"),
+        value.strip_prefix("http://"),
+    ) {
+        (Some(rest), _) => (true, rest),
+        (None, Some(rest)) => (false, rest),
+        (None, None) => return false,
+    };
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'\\' | b'@' | b'%'))
+    {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let (host, port, loopback) = match authority.strip_prefix('[') {
+        Some(bracketed) => {
+            let Some((host, after)) = bracketed.split_once(']') else {
+                return false;
+            };
+            let Ok(address) = host.parse::<Ipv6Addr>() else {
+                return false;
+            };
+            let port = match after {
+                "" => None,
+                after => match after.strip_prefix(':') {
+                    Some(port) => Some(port),
+                    None => return false,
+                },
+            };
+            (host, port, address.is_loopback())
+        }
+        None => {
+            let (host, port) = match authority.split_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (authority, None),
+            };
+            let loopback = host.eq_ignore_ascii_case("localhost")
+                || host.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback());
+            (host, port, loopback)
+        }
+    };
+    let port_valid = port.is_none_or(|port| {
+        !port.is_empty()
+            && port.bytes().all(|byte| byte.is_ascii_digit())
+            && port.parse::<u16>().is_ok_and(|port| port != 0)
+    });
+    !host.is_empty() && port_valid && (secure || loopback)
+}
+
+/// `[failover]` in the private config file. Managed settings cannot set it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailoverConfig {
+    pub url: AuthorityUrl,
+    /// Absent on a host that only watches the owner record.
+    pub holder: Option<HolderId>,
+    /// The holder's credential for the authority.
+    pub token_file: PathBuf,
+}
+
+impl FailoverConfig {
+    /// Checks `token_file` once `~/` is expanded: a private regular file outside the Nix store.
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.token_file.is_absolute() && !self.token_file.starts_with("/nix/store"),
+            "The failover token_file must be an absolute private file outside the Nix store"
+        );
+        let metadata = fs::metadata(&self.token_file).with_context(|| {
+            format!(
+                "Could not read the failover token_file {}",
+                self.token_file.display()
+            )
+        })?;
+        ensure!(
+            metadata.is_file() && metadata.mode() & 0o077 == 0,
+            "The failover token_file {} must be a regular file only its owner can read; run chmod 600 on it",
+            self.token_file.display()
+        );
+        Ok(())
+    }
+}
+
+/// What the Pi child and the failover helper need to reach the authority,
+/// passed as private JSON in `AGENT_FAILOVER`. The helper's session has no
+/// epoch. The child's carries the epoch its coordinator start was granted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct FailoverSession {
+    pub url: AuthorityUrl,
+    #[ts(type = "string")]
+    pub token_file: PathBuf,
+    pub coordinator_id: CoordinatorId,
+    pub holder: HolderId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub epoch: Option<OwnerEpoch>,
+}
+
+/// One request to `failover/helper.js`. The helper reports facts and Rust decides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FailoverRequest {
+    /// Raise the epoch for a coordinator start by the current owner.
+    Claim,
+}
+
+/// The helper's one line of output. An authority it could not reach is a
+/// helper failure, never a refusal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FailoverReport {
+    Claimed {
+        epoch: OwnerEpoch,
+        head: LogPosition,
+    },
+    Refused {
+        reason: AuthorityRefusal,
+        state: Option<AuthorityState>,
+    },
 }
 
 #[cfg(test)]

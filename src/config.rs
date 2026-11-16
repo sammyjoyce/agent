@@ -36,6 +36,8 @@ pub struct ClientConfig {
     pub browser: Option<crate::browser::BrowserConfig>,
     /// APNs credentials are coordinator-local and never announced to workers.
     pub apns: Option<crate::notifications::ApnsConfig>,
+    /// This host's right to own a replicated coordinator. Local, like APNs.
+    pub failover: Option<crate::failover::FailoverConfig>,
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
     #[serde(default = "default_poll_interval")]
@@ -81,6 +83,7 @@ impl Default for ClientConfig {
             node_name: None,
             browser: None,
             apns: None,
+            failover: None,
             sources: Vec::new(),
             poll_interval_seconds: default_poll_interval(),
             scrawl_feedback: false,
@@ -280,6 +283,17 @@ fn validate(config: &mut ClientConfig) -> Result<()> {
         );
         apns.key_file = context_repository_path(&apns.key_file, home.as_deref())?;
         apns.validate()?;
+    }
+    if let Some(failover) = &mut config.failover {
+        ensure!(
+            !config
+                .path
+                .as_ref()
+                .is_some_and(|path| path.starts_with("/nix/store")),
+            "Failover configuration belongs in a private local file, outside the Nix store"
+        );
+        failover.token_file = context_repository_path(&failover.token_file, home.as_deref())?;
+        failover.validate()?;
     }
     if let Some(browser) = &mut config.browser
         && let Some(path) = &mut browser.user_data_dir
@@ -556,6 +570,88 @@ mod tests {
         assert!(toml::from_str::<crate::config::ManagedSettings>(&managed).is_err());
         config.path = Some("/nix/store/example/config.toml".into());
         assert!(crate::config::validate(&mut config).is_err());
+    }
+
+    #[test]
+    fn failover_is_a_private_section_with_a_checked_authority_and_token_file() {
+        use std::{os::unix::fs::PermissionsExt, path::Path};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let private = directory.path().join("private-token");
+        let shared = directory.path().join("shared-token");
+        for (file, mode) in [(&private, 0o600), (&shared, 0o640)] {
+            std::fs::write(file, "invented-token").unwrap();
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let holder = "holder = '22222222-2222-4222-8222-222222222222'\n";
+        let section = |url: &str, holder: &str, token: &Path| {
+            format!(
+                "[failover]\nurl = '{url}'\n{holder}token_file = '{}'\n",
+                token.display()
+            )
+        };
+        let authority = "https://authority.example.invalid/coordinators/one";
+        for (url, holder) in [
+            (authority, holder),
+            ("https://authority.example.invalid:8443", holder),
+            ("http://127.0.0.1:8787", holder),
+            ("http://127.0.0.2:8787/coordinators/one", holder),
+            ("http://localhost:8787", holder),
+            ("http://[::1]:8787", holder),
+            (authority, ""),
+        ] {
+            let config = section(url, holder, &private);
+            std::fs::write(&path, &config).unwrap();
+            let failover = load(Some(&path)).unwrap().failover.unwrap();
+            assert_eq!(failover.url.as_str(), url);
+            assert_eq!(failover.holder.is_some(), !holder.is_empty(), "{config}");
+            assert_eq!(failover.token_file, private);
+        }
+        for config in [
+            section("http://authority.example.invalid", holder, &private),
+            section("http://127.0.0.1.example.invalid:8787", holder, &private),
+            section("http://192.0.2.1:8787", holder, &private),
+            section("http://[2001:db8::1]:8787", holder, &private),
+            section("ftp://authority.example.invalid", holder, &private),
+            section("https://", holder, &private),
+            section(
+                "https://user:secret@authority.example.invalid",
+                holder,
+                &private,
+            ),
+            section(
+                "http://authority.example.invalid\\@127.0.0.1",
+                holder,
+                &private,
+            ),
+            section("http://127.0.0.1%2eexample.invalid", holder, &private),
+            section("https://authority.example.invalid:0", holder, &private),
+            section("https://authority.example.invalid:+443", holder, &private),
+            section("https://authority.example.invalid :443", holder, &private),
+            section(authority, "holder = 'not-a-holder'\n", &private),
+            section(authority, holder, &shared),
+            section(authority, holder, &directory.path().join("missing-token")),
+            section(authority, holder, Path::new("/nix/store/invented-token")),
+            section(authority, holder, Path::new("relative/token")),
+            section(authority, holder, &private) + "holder_id = 'invented'\n",
+        ] {
+            std::fs::write(&path, &config).unwrap();
+            assert!(load(Some(&path)).is_err(), "{config}");
+        }
+        let config = section(authority, holder, &private);
+        std::fs::write(&path, &config).unwrap();
+        let mut loaded = load(Some(&path)).unwrap();
+        loaded.path = Some("/nix/store/example/config.toml".into());
+        assert!(crate::config::validate(&mut loaded).is_err());
+        let settings = directory.path().join("managed.toml");
+        std::fs::write(&settings, "poll_interval_seconds = 120\n").unwrap();
+        assert!(crate::config::apply(&path, &settings).unwrap().changed);
+        let failover = load(Some(&path)).unwrap().failover.unwrap();
+        assert_eq!(failover.url.as_str(), authority);
+        let retained = std::fs::read(&path).unwrap();
+        std::fs::write(&settings, section(authority, holder, &private)).unwrap();
+        assert!(crate::config::apply(&path, &settings).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), retained);
     }
 
     #[test]
