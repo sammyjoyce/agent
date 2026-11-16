@@ -325,11 +325,14 @@ impl Builder {
             progress(PackageProgress::Part { name: name.clone() });
             let part = self.part(name.clone())?;
             let damaged = |error: io::Error| member_error(&name, error);
+            let mut reader = self.members[index].open().map_err(damaged)?;
             let region = match self.members[index].region().map_err(damaged)? {
-                Some(region) => region,
+                Some(region) => {
+                    io::copy(&mut reader, &mut io::sink()).map_err(damaged)?;
+                    region
+                }
                 None => {
                     let mut spool = Spool::create(self.spool_remaining).map_err(damaged)?;
-                    let mut reader = self.members[index].open().map_err(damaged)?;
                     io::copy(&mut reader, &mut spool).map_err(damaged)?;
                     self.spool_remaining -= spool.len();
                     spool.into_region()
@@ -1217,6 +1220,16 @@ mod tests {
         assert_eq!(package.summary.parts, ["export.zip"]);
         assert_eq!(listed(&package, false), [fixture::id(1)]);
         assert_eq!(member_bytes(&package, "file-Report1"), report);
+    }
+
+    #[test]
+    fn stored_nested_zip_with_a_wrong_outer_checksum_refuses() {
+        let directory = tempfile::tempdir().unwrap();
+        let inner = Export::new().conversations(&[picnic(1)]).zip_bytes();
+        let path = Forge::new(&Export::new().stored("Conversations__x.zip", &inner))
+            .crc("Conversations__x.zip", crc32fast::hash(&inner) ^ 1)
+            .write(&directory.path().join("portal.zip"));
+        assert_eq!(corruption(refused(open(&path))), Corruption::CrcMismatch);
     }
 
     #[test]

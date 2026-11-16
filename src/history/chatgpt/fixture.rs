@@ -284,6 +284,13 @@ impl Forge {
         self
     }
 
+    pub fn crc(mut self, name: &str, crc: u32) -> Self {
+        let (central, local) = (self.central(name), self.local(name));
+        self.put_u32(central + 16, crc);
+        self.put_u32(local + 14, crc);
+        self
+    }
+
     pub fn mode(mut self, name: &str, mode: u32) -> Self {
         let central = self.central(name);
         self.bytes[central + 5] = 3;
