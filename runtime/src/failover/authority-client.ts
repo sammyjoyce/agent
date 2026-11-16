@@ -66,6 +66,7 @@ export class AuthorityClient implements AuthorityLink {
   }
 
   private async exchange(method: string, path: string, body: string | Uint8Array | null = null): Promise<Uint8Array> {
+    const request = `${method} ${path.split("?")[0]}`;
     let status: number, bytes: Uint8Array;
     try {
       const response = await fetch(`${this.base}/${path}`, {
@@ -75,10 +76,10 @@ export class AuthorityClient implements AuthorityLink {
       status = response.status;
       bytes = new Uint8Array(await response.arrayBuffer());
     } catch (error) {
-      throw new AuthorityUnreachable(`The authority did not answer ${method} ${path.split("?")[0]}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+      throw new AuthorityUnreachable(`The authority did not answer ${request}: ${error instanceof Error ? error.message : String(error)}.`, { cause: error });
     }
     if (status < 300) return bytes;
-    const sentence = errorSentence(bytes) ?? `The authority answered ${method} ${path.split("?")[0]} with HTTP ${status}.`;
+    const sentence = errorSentence(bytes) ?? `The authority answered ${request} with HTTP ${status}.`;
     if (status >= 500) throw new AuthorityUnreachable(sentence);
     if (status === 401 || status === 403) throw new AuthorityDenied(status, sentence);
     throw new AuthorityRejected(status, sentence);
@@ -89,7 +90,7 @@ function json<T>(bytes: Uint8Array): T {
   try {
     return JSON.parse(new TextDecoder().decode(bytes)) as T;
   } catch (error) {
-    throw new AuthorityUnreachable("The authority answered with a body that is not JSON, so something else answered at its address", { cause: error });
+    throw new AuthorityUnreachable("The authority answered with a body that is not JSON, so something else answered at its address.", { cause: error });
   }
 }
 

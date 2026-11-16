@@ -91,9 +91,12 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
 
   await t.test("of two appends for one position sent at the same time, one is accepted and one is a conflict", async () => {
     const coordinator = fresh();
+    const bytes = Buffer.from("invented bytes that make each append wait on the blob store");
+    await link(coordinator).putBlob(sha256(bytes), bytes);
     await play(coordinator, [[enroll, "accepted"]]);
+    const files = [{ path: "attachments/a1/content", sha256: sha256(bytes), size: bytes.length }];
     for (let at = 1; at <= 20; at += 1) {
-      const replies = await Promise.all(digests.map((digest) => link(coordinator).command(append(at, { digest }))));
+      const replies = await Promise.all(digests.map((digest) => link(coordinator).command(append(at, { digest, files }))));
       assert.deepEqual(replies.map(outcome).sort(), ["accepted", "conflict"], `position ${at}`);
     }
     assert.equal(await head(coordinator), 20);
