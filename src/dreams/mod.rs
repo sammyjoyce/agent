@@ -951,6 +951,70 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drop_count_that_a_queued_receipt_carries_is_a_gap_before_that_receipt_is_written() {
+        let mut sealed_quiet = Vec::new();
+        for trial in 0..5 {
+            let night = Night::new();
+            night.seed_receipts("");
+            let directory = night.dreams.state.join("diagnostics");
+            let lock = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(directory.join("writer.lock"))
+                .unwrap();
+            fs2::FileExt::lock_exclusive(&lock).unwrap();
+            let mut actor = diagnostics::Diagnostics::start(&night.dreams.state);
+            let trace = diagnostics::Trace::unowned();
+            for id in 1..=300 {
+                actor.record(id, &trace, diagnostics::Event::RequestReceived);
+            }
+            fs2::FileExt::unlock(&lock).unwrap();
+            let draining = || {
+                fs::read_to_string(directory.join("runtime.jsonl"))
+                    .unwrap()
+                    .contains("request_received")
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !draining() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("The writer starts once the lock is free");
+            // This receipt takes the drop count with it into the backlog.
+            actor.record(301, &trace, diagnostics::Event::Done);
+            let page = night.review("night").await.text;
+            let quiet = night.abstain_as_quiet("night").await;
+            if !page.contains("gap channel_overflow") || quiet.decided {
+                sealed_quiet.push(trial);
+            }
+            drop(actor);
+        }
+        assert!(
+            sealed_quiet.is_empty(),
+            "Quiet nights sealed over 44 dropped receipts in trials {sealed_quiet:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drops_reported_only_by_a_receipt_after_the_window_end_are_a_gap_in_the_window() {
+        let night = Night::new();
+        let later = diagnostics::now_ms() + 30_000;
+        night.seed_receipts(&format!(
+            "{{\"timestamp_ms\":{later},\"request_id\":0,\"elapsed_ms\":null,\"dropped_before\":25,\"event\":\"heartbeat\"}}\n"
+        ));
+        let page = night.review("night").await.text;
+        assert!(
+            page.contains("gap channel_overflow: 25 receipts were dropped"),
+            "{page}"
+        );
+        let quiet = night.abstain_as_quiet("night").await;
+        assert!(!quiet.decided, "{}", quiet.text);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn receipts_dropped_on_a_full_channel_are_a_gap_whoever_records_next_or_nobody_does() {
         for (name, dropping_fork, records_again) in [
             ("another fork records next", true, true),

@@ -7,10 +7,7 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex, PoisonError, Weak,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, PoisonError, Weak},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -628,7 +625,23 @@ fn host_kind(bytes: &[u8]) -> Option<String> {
         .leaf()
 }
 
-static LIVE_DROP_COUNTS: Mutex<Vec<(PathBuf, Weak<AtomicU64>)>> = Mutex::new(Vec::new());
+/// Receipts lost on a full channel, from the drop until a written receipt
+/// reports them. A reader in this process counts both fields, so a loss is
+/// never invisible while its report waits in the channel or in the writer.
+#[derive(Default)]
+struct DropLedger {
+    /// Dropped, and not yet carried by any receipt.
+    unreported: u64,
+    /// Carried by a receipt that was sent and is not on disk yet.
+    reported_unwritten: u64,
+}
+type SharedDrops = Arc<Mutex<DropLedger>>;
+
+/// The ledgers of live writers in this process, by diagnostics directory. The
+/// reader finds them here because the runtime that owns a writer and the
+/// broker that owns a review are built apart, and a retiring writer and its
+/// replacement can both be live for one directory.
+static LIVE_DROP_LEDGERS: Mutex<Vec<(PathBuf, Weak<Mutex<DropLedger>>)>> = Mutex::new(Vec::new());
 
 fn registry_key(directory: &Path) -> PathBuf {
     std::path::absolute(directory).unwrap_or_else(|_| directory.to_owned())
@@ -636,14 +649,17 @@ fn registry_key(directory: &Path) -> PathBuf {
 
 fn undelivered_drops(directory: &Path) -> u64 {
     let key = registry_key(directory);
-    LIVE_DROP_COUNTS
+    LIVE_DROP_LEDGERS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .iter()
         .filter(|(live, _)| *live == key)
-        .filter_map(|(_, count)| count.upgrade())
-        .fold(0, |total, count| {
-            total.saturating_add(count.load(Ordering::Relaxed))
+        .filter_map(|(_, ledger)| ledger.upgrade())
+        .fold(0, |total, ledger| {
+            let ledger = ledger.lock().unwrap_or_else(PoisonError::into_inner);
+            total
+                .saturating_add(ledger.unreported)
+                .saturating_add(ledger.reported_unwritten)
         })
 }
 
@@ -660,44 +676,86 @@ fn heartbeat(dropped_before: u64) -> Record {
     }
 }
 
-fn deliver(sender: &mpsc::Sender<Record>, dropped: &AtomicU64, mut record: Record) -> bool {
-    let pending = dropped.swap(0, Ordering::Relaxed);
-    record.dropped_before = pending;
-    let Err(refused) = sender.try_send(record) else {
-        return false;
-    };
-    dropped.fetch_add(pending, Ordering::Relaxed);
-    matches!(refused, mpsc::error::TrySendError::Full(_))
+/// What a record that finds the channel full means for the ledger.
+#[derive(Clone, Copy)]
+enum WhenFull {
+    /// The record is a receipt, and losing it is a loss to report.
+    CountAsLost,
+    /// The record is a heartbeat, which witnesses time and reports nothing.
+    Forget,
+}
+
+/// Sends without waiting. A record that gets through carries the count of the
+/// receipts that did not, whichever sender dropped them.
+fn deliver(
+    sender: &mpsc::Sender<Record>,
+    drops: &Mutex<DropLedger>,
+    mut record: Record,
+    when_full: WhenFull,
+) {
+    let mut ledger = drops.lock().unwrap_or_else(PoisonError::into_inner);
+    record.dropped_before = ledger.unreported;
+    match sender.try_send(record) {
+        Ok(()) => {
+            ledger.reported_unwritten = ledger.reported_unwritten.saturating_add(ledger.unreported);
+            ledger.unreported = 0;
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            if let WhenFull::CountAsLost = when_full {
+                ledger.unreported = ledger.unreported.saturating_add(1);
+            }
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
+    }
+}
+
+/// Appends a record, and only then stops counting the drops it reports.
+fn append_reported(
+    writer: &mut Writer,
+    drops: &Mutex<DropLedger>,
+    record: &Record,
+) -> io::Result<()> {
+    writer.append(record)?;
+    if record.dropped_before > 0 {
+        let mut ledger = drops.lock().unwrap_or_else(PoisonError::into_inner);
+        ledger.reported_unwritten = ledger
+            .reported_unwritten
+            .saturating_sub(record.dropped_before);
+    }
+    Ok(())
 }
 
 pub(crate) struct Diagnostics {
     sender: mpsc::Sender<Record>,
-    dropped: Arc<AtomicU64>,
+    drops: SharedDrops,
 }
 impl Diagnostics {
     pub fn fork(&self) -> Self {
         Self {
             sender: self.sender.clone(),
-            dropped: self.dropped.clone(),
+            drops: self.drops.clone(),
         }
     }
     pub fn start(state: &Path) -> Self {
         Self::start_with_heartbeat(state, HEARTBEAT)
     }
+    /// The producer side for `directory`, with its ledger visible to readers.
+    fn open_channel(directory: &Path, capacity: usize) -> (Self, mpsc::Receiver<Record>) {
+        let (sender, records) = mpsc::channel(capacity);
+        let drops = SharedDrops::default();
+        let mut live = LIVE_DROP_LEDGERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        live.retain(|(_, ledger)| ledger.strong_count() > 0);
+        live.push((registry_key(directory), Arc::downgrade(&drops)));
+        (Self { sender, drops }, records)
+    }
     fn start_with_heartbeat(state: &Path, interval: Duration) -> Self {
-        let (sender, mut records) = mpsc::channel(CAPACITY);
-        let dropped = Arc::new(AtomicU64::new(0));
         let directory = state.join("diagnostics");
-        {
-            let mut live = LIVE_DROP_COUNTS
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            live.retain(|(_, count)| count.strong_count() > 0);
-            live.push((registry_key(&directory), Arc::downgrade(&dropped)));
-        }
+        let (diagnostics, mut records) = Self::open_channel(&directory, CAPACITY);
         // A weak sender lets the writer end when its last real producer does.
-        let witness = sender.downgrade();
-        let pending = dropped.clone();
+        let witness = diagnostics.sender.downgrade();
+        let drops = diagnostics.drops.clone();
         tokio::spawn(async move {
             let mut ticks =
                 tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
@@ -707,19 +765,21 @@ impl Diagnostics {
                 let Some(sender) = witness.upgrade() else {
                     return;
                 };
-                deliver(&sender, &pending, heartbeat(0));
+                deliver(&sender, &drops, heartbeat(0), WhenFull::Forget);
             }
         });
-        let pending = dropped.clone();
+        let drops = diagnostics.drops.clone();
         tokio::task::spawn_blocking(move || {
             let result = (|| -> io::Result<()> {
                 let mut writer = Writer::open(directory, MAX_BYTES)?;
                 while let Some(record) = records.blocking_recv() {
-                    writer.append(&record)?;
+                    append_reported(&mut writer, &drops, &record)?;
                 }
-                let unreported = pending.swap(0, Ordering::Relaxed);
-                if unreported > 0 {
-                    writer.append(&heartbeat(unreported))?;
+                // The last sender is gone, so nothing else can report these.
+                let mut ledger = drops.lock().unwrap_or_else(PoisonError::into_inner);
+                if ledger.unreported > 0 {
+                    writer.append(&heartbeat(ledger.unreported))?;
+                    ledger.unreported = 0;
                 }
                 Ok(())
             })();
@@ -727,7 +787,7 @@ impl Diagnostics {
                 eprintln!("Runtime diagnostics unavailable; chat continues.");
             }
         });
-        Self { sender, dropped }
+        diagnostics
     }
     pub fn record(&mut self, request_id: u32, trace: &Trace, event: Event) {
         let record = Record {
@@ -740,9 +800,7 @@ impl Diagnostics {
             dropped_before: 0,
             event,
         };
-        if deliver(&self.sender, &self.dropped, record) {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-        }
+        deliver(&self.sender, &self.drops, record, WhenFull::CountAsLost);
     }
 }
 
@@ -1560,7 +1618,7 @@ mod tests {
         let (sender, mut records) = mpsc::channel(1);
         let mut log = Diagnostics {
             sender,
-            dropped: Default::default(),
+            drops: Default::default(),
         };
         let trace = Trace::new(&RuntimeCommand::Status);
         log.record(1, &trace, Event::RequestReceived);
@@ -1644,7 +1702,7 @@ mod tests {
         let (sender, mut received) = mpsc::channel(16);
         let mut diagnostics = Diagnostics {
             sender,
-            dropped: Default::default(),
+            drops: Default::default(),
         };
         let commands = [
             RuntimeCommand::MainInput {
@@ -1849,6 +1907,44 @@ mod tests {
         })
         .await
         .expect("Dropped receipts must be reported without another record() call")
+    }
+
+    #[tokio::test]
+    async fn a_dropped_receipt_stays_visible_to_a_reader_until_its_report_is_on_disk() {
+        let state = tempfile::tempdir().unwrap();
+        let directory = state.path().join("diagnostics");
+        let mut writer = Writer::open(directory.clone(), super::MAX_BYTES).unwrap();
+        let (mut log, mut records) = Diagnostics::open_channel(&directory, 1);
+        let trace = Trace::new(&RuntimeCommand::Status);
+        let seen = || {
+            let read = read_window(state.path(), (0, u64::MAX), 100, u64::MAX).unwrap();
+            let written: u64 = read
+                .records
+                .iter()
+                .map(|record| record.dropped_before)
+                .sum();
+            (read.undelivered_drops, written)
+        };
+        for id in 1..=3 {
+            log.record(id, &trace, Event::RequestReceived);
+        }
+        assert_eq!(seen(), (2, 0), "Dropped and not yet carried by a receipt");
+        super::append_reported(&mut writer, &log.drops, &records.recv().await.unwrap()).unwrap();
+        log.record(4, &trace, Event::Done);
+        assert_eq!(
+            seen(),
+            (2, 0),
+            "Carried by a receipt that waits in the channel"
+        );
+        let report = records.recv().await.unwrap();
+        assert_eq!(report.dropped_before, 2);
+        assert_eq!(
+            seen(),
+            (2, 0),
+            "Received by the writer and not yet appended"
+        );
+        super::append_reported(&mut writer, &log.drops, &report).unwrap();
+        assert_eq!(seen(), (0, 2), "On disk, and no longer counted as pending");
     }
 
     #[tokio::test]

@@ -22,6 +22,10 @@ pub(crate) struct ReceiptWindow {
     pub truncated_at_ms: Option<u64>,
     pub rotated_during_read: bool,
     pub undelivered_drops: u64,
+    /// Drops reported by receipts stamped at or after the window end. Those
+    /// receipts are outside the window, but what they report as lost before
+    /// them may lie inside it.
+    pub drops_reported_after_window: u64,
     /// Set when receipt timestamps prove that the clock moved around the
     /// window. A receipt near such a move may be stamped outside the window
     /// although it was written inside it, so the window cannot be trusted whole.
@@ -237,6 +241,7 @@ fn read_once(
         truncated_at_ms: None,
         rotated_during_read: false,
         undelivered_drops: 0,
+        drops_reported_after_window: 0,
         clock_moves: None,
     };
     let mut clock = ClockWatch {
@@ -262,6 +267,11 @@ fn read_once(
                     );
                     placement.receipt(timestamp, start);
                     clock.receipt(timestamp);
+                    if timestamp >= end {
+                        window.drops_reported_after_window = window
+                            .drops_reported_after_window
+                            .saturating_add(record.dropped_before);
+                    }
                     if (start..end).contains(&timestamp) {
                         if window.records.len() < max_records && bytes <= max_bytes {
                             window.records.push(record);
@@ -304,7 +314,10 @@ pub(crate) fn read_window(
     max_bytes: u64,
 ) -> io::Result<ReceiptWindow> {
     let directory = state.join("diagnostics");
-    let dropped_before_pass = undelivered_drops(&directory);
+    // Read before the disk pass. A writer appends the receipt that reports a
+    // drop before it stops counting that drop, so a count that is gone by now
+    // is already on disk for the pass to read.
+    let undelivered = undelivered_drops(&directory);
     let first = read_once(&directory, window, max_records, max_bytes)?;
     let mut read = if first.segments_moved || first.unfinished_last_line {
         let mut second = read_once(&directory, window, max_records, max_bytes)?;
@@ -313,6 +326,6 @@ pub(crate) fn read_window(
     } else {
         first.window
     };
-    read.undelivered_drops = dropped_before_pass.max(undelivered_drops(&directory));
+    read.undelivered_drops = undelivered;
     Ok(read)
 }

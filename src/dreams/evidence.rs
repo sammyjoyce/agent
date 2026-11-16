@@ -148,6 +148,14 @@ pub(crate) fn receipt_coverage(window: Interval, receipts: &ReceiptWindow) -> Re
         }
         previous = record.timestamp_ms;
     }
+    if receipts.drops_reported_after_window > 0 {
+        gaps.push(Gap {
+            interval: within(previous, window.end_ms),
+            cause: GapCause::ChannelOverflow {
+                dropped: receipts.drops_reported_after_window,
+            },
+        });
+    }
     if receipts.undelivered_drops > 0 {
         gaps.push(Gap {
             interval: None,
@@ -577,6 +585,7 @@ mod tests {
             truncated_at_ms: None,
             rotated_during_read: false,
             undelivered_drops: 0,
+            drops_reported_after_window: 0,
             clock_moves: None,
         }
     }
@@ -718,6 +727,16 @@ mod tests {
                     largest_back_ms: 90 * MINUTE
                 },
                 Some((1_000, 1_040))
+            )]
+        );
+
+        let mut receipts = witnessed((1_000..1_100).step_by(5));
+        receipts.drops_reported_after_window = 25;
+        assert_eq!(
+            causes(&receipts),
+            vec![(
+                GapCause::ChannelOverflow { dropped: 25 },
+                Some((1_095, 1_100))
             )]
         );
 
