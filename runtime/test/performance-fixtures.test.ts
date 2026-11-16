@@ -109,7 +109,6 @@ test("the performance seed indexes a copy of the session so search finds the lon
     }
     assert.equal(ids.search_corpus?.conversations, conversations);
     assert.ok((ids.search_corpus?.chunks ?? 0) >= 5_040);
-    // The benchmark's query in examples/cli_performance/load.rs.
     const result = await index.search("previous task context remains readable", undefined, [], 8, "keyword");
     assert.equal(result.candidates[0]?.conversation_id, ids.long_history);
     assert.deepEqual(result.gaps, []);

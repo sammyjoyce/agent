@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::gate::{Mark, Marks};
 
-/// What a scenario's coordinator runs beside the measured foreground work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Background {
@@ -48,8 +47,7 @@ pub enum Evidence {
     Import(Vec<ImportProgress>),
 }
 
-/// Proves that the load was running from Enter until activity was visible.
-pub fn verify(background: Background, evidence: &Evidence, marks: &Marks) -> Result<()> {
+pub fn verify_overlap(background: Background, evidence: &Evidence, marks: &Marks) -> Result<()> {
     let window = || -> Result<(Instant, Instant)> {
         Ok((marks.get(Mark::Enter)?, marks.get(Mark::ActivityVisible)?))
     };
@@ -162,7 +160,7 @@ mod tests {
 
     fn search_verdict(intervals: &[(u64, u64)]) -> Result<()> {
         let origin = Instant::now();
-        verify(
+        verify_overlap(
             Background::Search,
             &searches(origin, intervals),
             &marks(origin),
@@ -213,7 +211,7 @@ mod tests {
         };
         requests[2].expected_found = false;
         assert!(
-            verify(
+            verify_overlap(
                 Background::Search,
                 &Evidence::Search(requests),
                 &marks(origin)
@@ -238,7 +236,7 @@ mod tests {
 
     fn import_verdict(events: &[(u64, ImportPhase, u32)]) -> Result<()> {
         let origin = Instant::now();
-        verify(
+        verify_overlap(
             Background::Import,
             &progress(origin, events),
             &marks(origin),
@@ -301,12 +299,12 @@ mod tests {
     fn evidence_must_come_from_the_scenarios_own_load() {
         let origin = Instant::now();
         let marks = marks(origin);
-        assert!(verify(Background::None, &Evidence::None, &marks).is_ok());
+        assert!(verify_overlap(Background::None, &Evidence::None, &marks).is_ok());
         let search = searches(origin, &[WARM, (900, 1_350)]);
-        assert!(verify(Background::Search, &search, &marks).is_ok());
-        assert!(verify(Background::Import, &search, &marks).is_err());
-        assert!(verify(Background::None, &search, &marks).is_err());
-        assert!(verify(Background::Search, &Evidence::None, &marks).is_err());
-        assert!(verify(Background::Import, &Evidence::None, &marks).is_err());
+        assert!(verify_overlap(Background::Search, &search, &marks).is_ok());
+        assert!(verify_overlap(Background::Import, &search, &marks).is_err());
+        assert!(verify_overlap(Background::None, &search, &marks).is_err());
+        assert!(verify_overlap(Background::Search, &Evidence::None, &marks).is_err());
+        assert!(verify_overlap(Background::Import, &Evidence::None, &marks).is_err());
     }
 }

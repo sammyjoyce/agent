@@ -21,9 +21,7 @@ use crate::{
     resources::Role,
 };
 
-/// Each loop is between requests for a few microseconds per request; with
-/// four loops, a moment with none outstanding needs all four there at once.
-const SEARCH_LOOPS: usize = 4;
+const SEARCH_LOOPS_FOR_CONTINUOUS_OVERLAP: usize = 4;
 pub const SEARCH_QUERY: &str = "previous task context remains readable";
 const SEARCH_LIMIT: u32 = 8;
 
@@ -43,8 +41,6 @@ fn push<T>(log: &Log<T>, value: T) -> Result<()> {
     Ok(())
 }
 
-/// A load that the benchmark drives from a second client on the coordinator's
-/// socket, with the same requests that `history search` and `import codex` send.
 pub enum Load {
     None,
     Search {
@@ -60,8 +56,6 @@ pub enum Load {
 }
 
 impl Load {
-    /// Returns once the load is visibly under way: a search found the expected
-    /// conversation, or the import committed its first items.
     pub async fn start(coordinator: &Coordinator, expected: &str) -> Result<Self> {
         let background = coordinator.background();
         let directory = coordinator.directory().to_path_buf();
@@ -71,7 +65,7 @@ impl Load {
                 let (stop, stopped) = watch::channel(false);
                 let log = Log::default();
                 let mut loops = JoinSet::new();
-                for _ in 0..SEARCH_LOOPS {
+                for _ in 0..SEARCH_LOOPS_FOR_CONTINUOUS_OVERLAP {
                     let (directory, expected, stopped, log) = (
                         directory.clone(),
                         expected.to_owned(),
@@ -90,7 +84,7 @@ impl Load {
             Background::Import => {
                 let log = Log::default();
                 let mut reader = JoinSet::new();
-                reader.spawn(import(directory, log.clone()));
+                reader.spawn(import_from_every_registered_node(directory, log.clone()));
                 Self::Import {
                     reader,
                     log,
@@ -147,9 +141,7 @@ impl Load {
         }
     }
 
-    /// Stops a search load at the end of its overlap window. Requests in
-    /// flight complete; none starts after this.
-    pub async fn settle(&mut self) -> Result<()> {
+    pub async fn stop_searches(&mut self) -> Result<()> {
         if let Self::Search { stop, loops, .. } = self {
             stop.send_replace(true);
             while let Some(ended) = loops.join_next().await {
@@ -160,7 +152,7 @@ impl Load {
     }
 
     pub async fn finish(mut self) -> Result<Evidence> {
-        self.settle().await?;
+        self.stop_searches().await?;
         match self {
             Self::None => Ok(Evidence::None),
             Self::Search { log, .. } => Ok(Evidence::Search(snapshot(&log)?)),
@@ -257,9 +249,10 @@ enum ImportEvent {
     Other,
 }
 
-/// Imports from every registered node. The Rex stand-in registers only the
-/// coordinator's own node, whose Codex history is the invented corpus.
-async fn import(directory: PathBuf, log: Log<ImportProgress>) -> Result<()> {
+async fn import_from_every_registered_node(
+    directory: PathBuf,
+    log: Log<ImportProgress>,
+) -> Result<()> {
     let stream = agent_cli::service::connect(&directory).await?;
     let (reader, mut writer) = stream.into_split();
     let command = json!({ "type": "import_codex", "hosts": [] });

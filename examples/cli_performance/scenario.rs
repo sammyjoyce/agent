@@ -74,28 +74,32 @@ const CTRL_HOME: &[u8] = b"\x1b[1;5H";
 const PAGE_DOWN: &[u8] = b"\x1b[6~";
 const PAGE_UP: &[u8] = b"\x1b[5~";
 
-/// From the live bottom, Ctrl+Home opens the history view at its oldest
-/// message. PageDown then leaves that page untimed, so PageUp is measured
-/// inside the history view, where every PageUp moves one page.
-const SCROLL_KEYS: [(&[u8], &str, Mark, Mark); 3] = [
-    (
-        CTRL_HOME,
-        OLDEST_MESSAGE,
-        Mark::CtrlHome,
-        Mark::OldestVisible,
-    ),
-    (
-        PAGE_DOWN,
-        NEWER_PAGE_MESSAGE,
-        Mark::PageDown,
-        Mark::NewerPageVisible,
-    ),
-    (
-        PAGE_UP,
-        OLDER_PAGE_MESSAGE,
-        Mark::PageUp,
-        Mark::OlderPageVisible,
-    ),
+struct ScrollKey {
+    bytes: &'static [u8],
+    shows: &'static str,
+    pressed: Mark,
+    visible: Mark,
+}
+
+const SCROLL_FROM_LIVE_BOTTOM_TO_OLDEST_THEN_BACK_ONE_PAGE: [ScrollKey; 3] = [
+    ScrollKey {
+        bytes: CTRL_HOME,
+        shows: OLDEST_MESSAGE,
+        pressed: Mark::CtrlHome,
+        visible: Mark::OldestVisible,
+    },
+    ScrollKey {
+        bytes: PAGE_DOWN,
+        shows: NEWER_PAGE_MESSAGE,
+        pressed: Mark::PageDown,
+        visible: Mark::NewerPageVisible,
+    },
+    ScrollKey {
+        bytes: PAGE_UP,
+        shows: OLDER_PAGE_MESSAGE,
+        pressed: Mark::PageUp,
+        visible: Mark::OlderPageVisible,
+    },
 ];
 
 pub const PRIME_ANSWER: &str = "Priming finished without changes.";
@@ -307,20 +311,22 @@ pub async fn drive(scenario: Scenario, context: &Context<'_>) -> Result<Outcome>
         Scenario::ScrollHistory => {
             let resume = format!("/resume {}", context.seed.long_history);
             session::browse(context, resume, LONG_SENTENCE, async |terminal, marks| {
-                for (key, text, pressed, visible) in SCROLL_KEYS {
+                for key in SCROLL_FROM_LIVE_BOTTOM_TO_OLDEST_THEN_BACK_ONE_PAGE {
                     let Keystroke {
                         before_write,
                         sightings: mut seen,
-                    } = terminal.press(key, vec![Sight::Shows(text)]).await?;
-                    marks.record(pressed, before_write)?;
-                    marks.record(visible, seen.next().await?)?;
+                    } = terminal
+                        .press(key.bytes, vec![Sight::Shows(key.shows)])
+                        .await?;
+                    marks.record(key.pressed, before_write)?;
+                    marks.record(key.visible, seen.next().await?)?;
                 }
                 Ok(())
             })
             .await
         }
         Scenario::Submit | Scenario::SubmitDuringSearch | Scenario::SubmitDuringImport => {
-            session::interactive(context, submit).await
+            session::interactive(context, submit_then_stop_searches).await
         }
         Scenario::Steer => {
             session::interactive(context, async |terminal, marks, _| {
@@ -412,9 +418,11 @@ pub async fn drive(scenario: Scenario, context: &Context<'_>) -> Result<Outcome>
     }
 }
 
-/// A background load stops once activity is visible, the end of the
-/// window it must overlap.
-async fn submit(terminal: &Terminal, marks: &mut Marks, load: &mut Load) -> Result<()> {
+async fn submit_then_stop_searches(
+    terminal: &Terminal,
+    marks: &mut Marks,
+    load: &mut Load,
+) -> Result<()> {
     terminal.compose(SUBMIT.prompt).await?;
     let Keystroke {
         before_write: enter,
@@ -432,7 +440,7 @@ async fn submit(terminal: &Terminal, marks: &mut Marks, load: &mut Load) -> Resu
     marks.record(Mark::Enter, enter)?;
     marks.record(Mark::Admitted, seen.next().await?)?;
     marks.record(Mark::ActivityVisible, seen.next().await?)?;
-    load.settle().await?;
+    load.stop_searches().await?;
     marks.record(Mark::ReplyVisible, seen.next().await?)
 }
 
@@ -448,7 +456,7 @@ fn ensure_reaped(tool: i32) -> Result<()> {
 
 pub fn verify(scenario: Scenario, outcome: &Outcome, requests: &[Request]) -> Result<()> {
     let definition = scenario.definition();
-    background::verify(definition.background, &outcome.background, &outcome.marks)?;
+    background::verify_overlap(definition.background, &outcome.background, &outcome.marks)?;
     let turns = definition.turns;
     ensure!(
         requests.len() == turns.len(),

@@ -23,8 +23,6 @@ use crate::{
     scenario::Turn,
 };
 
-/// Snapshot subdirectories that the seed fills. Only coordinators whose
-/// background needs them receive a copy.
 pub const SEARCH_INDEX: &str = "search";
 pub const CODEX_CORPUS: &str = "codex";
 
@@ -93,9 +91,7 @@ fn quoted(path: &Path) -> Result<String> {
     Ok(format!("'{text}'"))
 }
 
-/// Records the pid of the Codex history reader the coordinator starts, which
-/// then replaces the wrapper under the same pid.
-fn codex_wrapper(pid_file: &Path) -> Result<String> {
+fn pid_recording_codex(pid_file: &Path) -> Result<String> {
     Ok(format!(
         "#!/bin/sh\nprintf '%s' \"$$\" > {}\nexec {} \"$@\"\n",
         quoted(pid_file)?,
@@ -285,7 +281,7 @@ impl Coordinator {
             Background::Import => {
                 copy_tree(&snapshot.join(CODEX_CORPUS), &path.join(".codex"))?;
                 let codex = path.join("bin/codex");
-                fs::write(&codex, codex_wrapper(&path.join("codex.pid"))?)?;
+                fs::write(&codex, pid_recording_codex(&path.join("codex.pid"))?)?;
                 fs::set_permissions(codex, fs::Permissions::from_mode(0o700))?;
             }
         }

@@ -15,7 +15,6 @@ import type { HistoryItem } from "../../src/generated/HistoryItem.js";
 
 globalThis.fetch = async () => { throw new Error("Performance scenarios must not contact a provider"); };
 
-// Snapshot subdirectories named in examples/cli_performance/coordinator.rs.
 const SEARCH_INDEX = "search", CODEX_CORPUS = "codex";
 const ROLLOUTS = 200, ITEMS_PER_ROLLOUT = 50;
 
@@ -63,7 +62,6 @@ function vector(text: string): number[] {
   return values.map((value) => value / norm);
 }
 
-/** Indexes a copy of the session so coordinators without search start from unchanged files. */
 async function searchIndex(): Promise<{ conversations: number; chunks: number }> {
   const target = join(directory!, SEARCH_INDEX);
   await mkdir(target, { mode: 0o700 });
@@ -88,7 +86,6 @@ async function searchIndex(): Promise<{ conversations: number; chunks: number }>
   } finally { index.close(); }
 }
 
-/** Invented legacy rollouts. Codex reads each as a user message turn and an agent turn of agent_message items. */
 async function codexCorpus(): Promise<{ rollouts: number; items_per_rollout: number }> {
   const home = join(directory!, CODEX_CORPUS), folder = join(home, "sessions", "2026", "01", "02");
   await mkdir(folder, { recursive: true, mode: 0o700 });
@@ -110,8 +107,7 @@ async function codexCorpus(): Promise<{ rollouts: number; items_per_rollout: num
   return { rollouts: ROLLOUTS, items_per_rollout: ITEMS_PER_ROLLOUT };
 }
 
-// The search index needs sqlite-vec; the benchmark passes it only when a
-// selected scenario searches.
-const search_corpus = process.env.AGENT_SQLITE_VEC === undefined ? null : await searchIndex();
+const benchmarkSelectedASearchScenario = process.env.AGENT_SQLITE_VEC !== undefined;
+const search_corpus = benchmarkSelectedASearchScenario ? await searchIndex() : null;
 const import_corpus = await codexCorpus();
 process.stdout.write(JSON.stringify({ ...ids, search_corpus, import_corpus }) + "\n");

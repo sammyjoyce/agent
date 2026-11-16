@@ -21,17 +21,14 @@ pub const ROWS: u16 = 32;
 pub const COLUMNS: u16 = 100;
 const PLACEHOLDER: &str = "Ask Beep Boop to do anything";
 const BUSY: &str = "esc to interrupt";
-/// Writing a long replayed history to the terminal takes longer than one
-/// response; this bounds an untimed wait for that output to end.
-const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+const REPLAY_OUTPUT_DEADLINE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug)]
 pub enum Sight {
     Shows(&'static str),
     Admitted(&'static str),
     Settled(&'static str),
-    /// The text is visible and the history replay status has cleared.
-    Replayed(&'static str),
+    ReplayFinished(&'static str),
     Stopped,
 }
 
@@ -49,7 +46,7 @@ impl Sight {
                     && !shows("sending…")
             }
             Self::Settled(text) => shows(text) && !shows(BUSY),
-            Self::Replayed(text) => {
+            Self::ReplayFinished(text) => {
                 shows(text)
                     && shows(PLACEHOLDER)
                     && !shows("• Loading history")
@@ -217,10 +214,8 @@ impl Terminal {
             .map(drop)
     }
 
-    /// Waits until the CLI has written nothing for `quiet` and returns when
-    /// it last wrote.
-    pub async fn settled(&self, quiet: Duration) -> Result<Instant> {
-        timeout(SETTLE_DEADLINE, async {
+    pub async fn last_output_before_quiet(&self, quiet: Duration) -> Result<Instant> {
+        timeout(REPLAY_OUTPUT_DEADLINE, async {
             loop {
                 let last = locked(&self.screen)?.last_output;
                 if last.elapsed() >= quiet {
@@ -374,11 +369,11 @@ mod tests {
         let sentence = "Stored long conversation is ready.";
         for status in ["• Loading history", "• Connecting"] {
             let replaying = observed(&[sentence, status, PLACEHOLDER]);
-            assert!(!Sight::Replayed(sentence).holds(replaying.parser.screen()));
+            assert!(!Sight::ReplayFinished(sentence).holds(replaying.parser.screen()));
         }
         let replayed = observed(&[sentence, "› ", PLACEHOLDER]);
-        assert!(Sight::Replayed(sentence).holds(replayed.parser.screen()));
-        assert!(!Sight::Replayed(sentence).holds(observed(&[PLACEHOLDER]).parser.screen()));
+        assert!(Sight::ReplayFinished(sentence).holds(replayed.parser.screen()));
+        assert!(!Sight::ReplayFinished(sentence).holds(observed(&[PLACEHOLDER]).parser.screen()));
     }
 
     #[tokio::test]
@@ -390,7 +385,7 @@ mod tests {
         ]);
         let (spawned, terminal, _) = Terminal::spawn(command, Vec::new()).unwrap();
         let quiet = Duration::from_millis(500);
-        let last = terminal.settled(quiet).await.unwrap();
+        let last = terminal.last_output_before_quiet(quiet).await.unwrap();
         let detected = Instant::now();
         assert!(terminal.contents().contains("abc"));
         assert!(

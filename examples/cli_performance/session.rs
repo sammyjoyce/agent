@@ -18,9 +18,7 @@ use crate::{
 };
 
 const QUIET: Duration = Duration::from_secs(1);
-/// The TUI draws every frame within about 40 ms of the last while it has
-/// output to emit, so this much silence means it has nothing left to draw.
-const OUTPUT_QUIET: Duration = Duration::from_millis(500);
+const SILENCE_AFTER_LAST_FRAME: Duration = Duration::from_millis(500);
 
 pub struct Context<'a> {
     pub terminal: &'a Path,
@@ -122,8 +120,6 @@ pub async fn launch(
     }
 }
 
-/// Resumes a stored conversation and runs the steps once its whole history is
-/// replayed and every replayed message has been written to the terminal.
 pub async fn browse(
     context: &Context<'_>,
     resume: String,
@@ -134,14 +130,19 @@ pub async fn browse(
     let pid_file = pids.path().join("cli.pid");
     let (origin, terminal, mut seen) = Terminal::spawn(
         cli(context, &pid_file, Some(resume))?,
-        vec![Sight::Shows(sentence), Sight::Replayed(sentence)],
+        vec![Sight::Shows(sentence), Sight::ReplayFinished(sentence)],
     )?;
     let mut marks = Marks::default();
     marks.record(Mark::Spawn, origin)?;
     let measured = async {
         marks.record(Mark::StoredTextVisible, seen.next().await?)?;
         marks.record(Mark::ReplayFinished, seen.next().await?)?;
-        marks.record(Mark::OutputSettled, terminal.settled(OUTPUT_QUIET).await?)?;
+        marks.record(
+            Mark::OutputSettled,
+            terminal
+                .last_output_before_quiet(SILENCE_AFTER_LAST_FRAME)
+                .await?,
+        )?;
         let window = Window::open(&services(context, &pid_file)?)?;
         let opened = Anchor::now();
         steps(&terminal, &mut marks).await?;
@@ -163,8 +164,6 @@ pub async fn browse(
     }
 }
 
-/// Primes the chief, starts the coordinator's background load, then runs the
-/// steps inside the measured window.
 pub async fn interactive(
     context: &Context<'_>,
     steps: impl AsyncFnOnce(&Terminal, &mut Marks, &mut Load) -> Result<()>,
