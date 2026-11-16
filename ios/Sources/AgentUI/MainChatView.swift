@@ -601,7 +601,8 @@ public struct MainChatView: View {
       ActivityGroupView(
         group: group, expansion: $activityExpansion,
         details: { row in try await loadDetails(row, lane: group.lane) },
-        onExpand: { followsLatest = false })
+        onExpand: { followsLatest = false },
+        preview: { file in Task { await model.preview(file, lane: group.lane) } })
     }
   }
   private func loadDetails(_ row: ChatRow, lane: ProfileID?) async throws -> ToolDetails {

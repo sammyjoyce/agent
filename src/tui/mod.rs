@@ -608,6 +608,18 @@ impl Message {
         self.output = output;
         self
     }
+    fn attach(&mut self, attachments: &[crate::attachments::AttachmentRef]) {
+        for attachment in attachments {
+            if !self
+                .attachments
+                .iter()
+                .any(|label| label.id.as_ref() == Some(&attachment.id))
+            {
+                self.attachments.push(AttachmentLabel::uploaded(attachment));
+            }
+        }
+        self.rendered = None;
+    }
     fn cached(&mut self) -> &mut CachedText {
         let content = cells::Content {
             role: self.role,
@@ -802,7 +814,7 @@ impl State {
             CellOutput::Mutable
         };
         if let Some(tool) = message.tool.take() {
-            self.tool_message(tool, message, historical);
+            self.tool_message(tool, message, &attachments, historical);
             return;
         }
         let presentation = message.presentation.take();
@@ -925,19 +937,7 @@ impl State {
                 .iter()
                 .rposition(|saved| saved.id.as_ref() == Some(&entry_id) && saved.role == role)
         {
-            let saved = &mut self.messages[index];
-            for attachment in &attachments {
-                if !saved
-                    .attachments
-                    .iter()
-                    .any(|label| label.id.as_ref() == Some(&attachment.id))
-                {
-                    saved
-                        .attachments
-                        .push(AttachmentLabel::uploaded(attachment));
-                }
-            }
-            saved.rendered = None;
+            self.messages[index].attach(&attachments);
             self.invalidate(index);
         }
         if role == Role::Notice
@@ -1094,6 +1094,7 @@ impl State {
         &mut self,
         tool: crate::protocol::ToolHistory,
         message: HistoryMessage,
+        attachments: &[crate::attachments::AttachmentRef],
         historical: bool,
     ) {
         let HistoryMessage {
@@ -1172,8 +1173,13 @@ impl State {
                 *offset = (*offset).max(index + 1);
             }
         }
-        if let Some(message) = self.messages.iter_mut().find(|message| matches!(&message.kind, MessageKind::Tool { call_id, .. } if call_id == &identity))
+        if let Some(index) = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Tool { call_id, .. } if call_id == &identity))
         {
+            if !attachments.is_empty() {
+                self.messages[index].attach(attachments);
+                self.invalidate(index);
+            }
+            let message = &mut self.messages[index];
             message.presentation = merge_tool_presentation(message.presentation.take(), presentation, stale);
             if !name.trim().is_empty() && (!stale || message.tool_name.trim().is_empty()) { message.tool_name = name; }
             message.rendered = None;

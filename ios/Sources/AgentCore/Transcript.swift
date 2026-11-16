@@ -338,11 +338,16 @@ struct Transcript: Sendable {
           storage[index].entryID = message.entryId
           dirtyRows.insert(id)
         }
+        for attachment in message.attachments ?? []
+        where !storage[index].attachments.contains(where: { $0.id == attachment.id }) {
+          storage[index].attachments.append(attachment)
+          dirtyRows.insert(id)
+        }
       } else {
         append(
           ChatRow(
             id: id, entryID: message.entryId, role: .tool, text: boundedText(message.text),
-            tool: tool, presentation: message.presentation))
+            tool: tool, presentation: message.presentation, attachments: message.attachments ?? []))
       }
     } else if message.continuation,
       let index = storage.lastIndex(where: {
