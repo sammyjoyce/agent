@@ -1,6 +1,7 @@
 #if canImport(AppIntentsTesting)
   import AgentCore
   import AppIntentsTesting
+  import Network
   import XCTest
 
   @MainActor
@@ -193,6 +194,234 @@
       try await assertAnnotations(of: coordinators, become: [], "the opened job over the feed")
     }
 
+    /// The app is terminated before the intent, so the system starts it in the background.
+    func testSendMessageDeliversFromTheBackgroundAndKeepsTheDraft() async throws {
+      guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
+      let (app, work, personal) = try await launchWithAWorkDraft(origins: ["siri"])
+      goHome()
+      terminate(app)
+      let workEntity = try await coordinator(named: "Work")
+      terminate(app)
+
+      let sent = try await send("Check the build", to: workEntity, answering: "Send")
+
+      XCTAssertEqual(sent.value, "delivered")
+      let submits = await work.submitRequests()
+      XCTAssertEqual(submits.map(\.text), ["Check the build"])
+      XCTAssertEqual(submits.map(\.origin), [.siri])
+      let elsewhere = await personal.submitRequests()
+      XCTAssertEqual(elsewhere.map(\.text), [], "Personal got a message")
+      XCTAssertNotEqual(app.state, .runningForeground, "Send Message opened the app")
+      app.launch()
+      assertTheWorkDraftIsKept(app)
+      capture("siri-send-delivered-draft-kept", app)
+    }
+
+    /// A held reply is a coordinator whose answer is lost. Asking again writes the saved copy
+    /// under its own input ID, so the coordinator's deduplication sees one input.
+    func testSendMessageAsksAgainWithTheSavedCopy() async throws {
+      guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
+      let (app, work, _) = try await launchWithAWorkDraft(origins: ["siri"])
+      goHome()
+      terminate(app)
+      let workEntity = try await coordinator(named: "Work")
+      await work.holdSubmits()
+
+      let first = try await send("Rotate the Work logs", to: workEntity, answering: "Send")
+      XCTAssertEqual(first.value, "saved")
+      await work.releaseSubmits()
+      let again = try await send("Rotate the Work logs", to: workEntity, answering: "Send")
+
+      XCTAssertTrue(["delivered", "alreadyDelivered"].contains(again.value), again.value)
+      let submits = await work.submitRequests()
+      XCTAssertGreaterThanOrEqual(submits.count, 2, "\(submits)")
+      XCTAssertEqual(Set(submits.map(\.inputId)).count, 1, "\(submits)")
+      XCTAssertEqual(Set(submits.map(\.text)), ["Rotate the Work logs"])
+    }
+
+    func testSendMessageSaysWhenTheCoordinatorFailsTheSend() async throws {
+      guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
+      let (app, work, _) = try await launchWithAWorkDraft(origins: ["siri"])
+      goHome()
+      terminate(app)
+      let workEntity = try await coordinator(named: "Work")
+      await work.failSubmits("The coordinator execution host is offline")
+
+      let sent = try await send("Check the build", to: workEntity, answering: "Send")
+
+      XCTAssertEqual(sent.value, "refused")
+      XCTAssertLessThan(sent.afterAnswer, .seconds(6), "The failure waited for the deadline")
+      let submits = await work.submitRequests()
+      XCTAssertEqual(submits.map(\.text), ["Check the build"])
+    }
+
+    func testSendMessageNeverSendsACommand() async throws {
+      guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
+      let (app, work, personal) = try await launchWithAWorkDraft(origins: ["siri"])
+      goHome()
+      let workEntity = try await coordinator(named: "Work")
+
+      for command in ["/status", " /goal clear", "?"] {
+        let sent = try await send(command, to: workEntity, answering: nil)
+        XCTAssertEqual(sent.value, "refusal.command", command)
+      }
+
+      let submits = await work.submitRequests() + personal.submitRequests()
+      XCTAssertEqual(submits.map(\.text), [])
+      app.activate()
+      assertTheWorkDraftIsKept(app)
+    }
+
+    func testSendMessageNeedsTheSiriOrigin() async throws {
+      guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
+      let (app, work, _) = try await launchWithAWorkDraft(origins: ["cli", "ios"])
+      goHome()
+      terminate(app)
+      let workEntity = try await coordinator(named: "Work")
+
+      let sent = try await send("Check the build", to: workEntity, answering: "Send")
+
+      XCTAssertEqual(sent.value, "notSent.notAdvertised")
+      let submits = await work.submitRequests()
+      XCTAssertEqual(submits.map(\.text), [])
+    }
+
+    func testCancellingSendMessageSendsNothing() async throws {
+      guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
+      let (app, work, _) = try await launchWithAWorkDraft(origins: ["siri"])
+      goHome()
+      terminate(app)
+      let workEntity = try await coordinator(named: "Work")
+
+      let sent = try await send("Check the build", to: workEntity, answering: "Cancel")
+
+      XCTAssertTrue(sent.value.hasPrefix("threw"), sent.value)
+      try await Task.sleep(for: .seconds(3))
+      let submits = await work.submitRequests()
+      XCTAssertEqual(submits.map(\.text), [])
+      app.launch()
+      assertTheWorkDraftIsKept(app)
+    }
+
+    /// Runs against a private coordinator that `runtime/test/fixtures/siri-world.ts` serves: the
+    /// real service, Pi and bridge with a synthetic model. Its runner passes
+    /// `TEST_RUNNER_AGENT_SIRI_WORLD`, and the test is skipped without it.
+    func testSendMessageToAPrivateCoordinator() async throws {
+      guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
+      guard let world = SiriWorld(ProcessInfo.processInfo.environment["AGENT_SIRI_WORLD"]) else {
+        throw XCTSkip("Needs a private coordinator from runtime/test/fixtures/siri-world.ts")
+      }
+      let app = try launch(ports: [world.relay], coordinators: [world.coordinator])
+      try chooseWorkAndType("Keep this Work draft", in: app)
+      goHome()
+      terminate(app)
+      let work = try await coordinator(named: "Work", among: ["Work"])
+      terminate(app)
+
+      let delivered = try await send("Check the build", to: work, answering: "Send")
+      XCTAssertEqual(delivered.value, "delivered")
+      var state = try await world.state()
+      XCTAssertEqual(state.generations["Check the build"], 1)
+      XCTAssertEqual(state.submits.map(\.origin), ["siri"])
+
+      try await world.holdNextSubmitReply()
+      let saved = try await send("Rotate the Work logs", to: work, answering: "Send")
+      XCTAssertEqual(saved.value, "saved")
+      let again = try await send("Rotate the Work logs", to: work, answering: "Send")
+      XCTAssertTrue(["delivered", "alreadyDelivered"].contains(again.value), again.value)
+      state = try await world.state()
+      let rotations = state.submits.filter { $0.text == "Rotate the Work logs" }
+      XCTAssertEqual(Set(rotations.map(\.inputId)).count, 1, "\(rotations)")
+      XCTAssertEqual(state.generations["Rotate the Work logs"], 1)
+
+      let cancelled = try await send("Check the build", to: work, answering: "Cancel")
+      XCTAssertTrue(cancelled.value.hasPrefix("threw"), cancelled.value)
+      try await Task.sleep(for: .seconds(3))
+      state = try await world.state()
+      XCTAssertEqual(state.submits.filter { $0.text == "Check the build" }.count, 1)
+      XCTAssertEqual(state.generations["Check the build"], 1)
+
+      app.launch()
+      assertTheWorkDraftIsKept(app)
+      capture("siri-send-private-coordinator-draft-kept", app)
+    }
+
+    private struct Sent {
+      /// The intent's value, or `threw: <error>`.
+      let value: String
+      let afterAnswer: Duration
+    }
+
+    /// Runs Send Message and taps `answer` on its confirmation. With `answer` nil, the intent
+    /// must finish without asking.
+    @available(iOS 27, *)
+    private func send(_ text: String, to coordinator: AnyAppEntity, answering answer: String?)
+      async throws -> Sent
+    {
+      let intent = definitions.intents["SendMessageIntent"].makeIntent(
+        message: text, coordinator: coordinator)
+      let finished = Finished()
+      let run = Task { @MainActor () -> String in
+        defer { finished.value = true }
+        do {
+          let value: String = try await intent.run().value
+          return value
+        } catch { return "threw: \(error)" }
+      }
+      let limit = Task {
+        try await Task.sleep(for: .seconds(45))
+        run.cancel()
+      }
+      defer { limit.cancel() }
+      var answered = ContinuousClock.now
+      if let answer {
+        guard let button = try await confirmationButton(answer, until: finished) else {
+          run.cancel()
+          let value = await run.value
+          XCTFail("Send Message showed no \(answer) button and returned \(value)")
+          return Sent(value: value, afterAnswer: .zero)
+        }
+        capture("siri-send-confirmation-\(answer.lowercased())", XCUIApplication())
+        button.tap()
+        answered = .now
+      }
+      let value = await run.value
+      return Sent(value: value, afterAnswer: .now - answered)
+    }
+
+    @MainActor private final class Finished { var value = false }
+
+    /// The confirmation's button, or nil when the intent finished or 20 seconds passed first.
+    private func confirmationButton(_ label: String, until finished: Finished) async throws
+      -> XCUIElement?
+    {
+      let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+      let deadline = ContinuousClock.now + .seconds(20)
+      repeat {
+        for button in [springboard.buttons[label], XCUIApplication().buttons[label]]
+        where button.exists {
+          return button
+        }
+        try await Task.sleep(for: .milliseconds(250))
+      } while ContinuousClock.now < deadline && !finished.value
+      return nil
+    }
+
+    private func goHome() {
+      XCUIDevice.shared.press(.home)
+      let home = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+      XCTAssertTrue(home.wait(for: .runningForeground, timeout: 10))
+    }
+
+    private func assertTheWorkDraftIsKept(_ app: XCUIApplication) {
+      let menu = app.buttons["scopeMenu"]
+      XCTAssertTrue(menu.waitForExistence(timeout: 15), app.debugDescription)
+      XCTAssertTrue(becomes(menu, "label BEGINSWITH %@", "Work"), menu.label)
+      let field = app.textViews["Message the coordinator"]
+      XCTAssertTrue(
+        becomes(field, "value == %@", "Keep this Work draft"), String(describing: field.value))
+    }
+
     private func assertTheQueryRefusesWithoutItsFixture(of entity: String) async throws {
       guard #available(iOS 27, *) else { throw XCTSkip("App Intents Testing needs iOS 27") }
       let launches: [(environment: [String: String], screen: String)] = [
@@ -225,8 +454,17 @@
 
     /// Launches the app on two fixture peers, Work and Personal, with a draft for Work.
     private func launchWithAWorkDraft() async throws -> XCUIApplication {
+      try await launchWithAWorkDraft(origins: nil).app
+    }
+
+    /// Launches the app on Work and Personal, which accept `origins`, with a draft for Work.
+    private func launchWithAWorkDraft(origins: [String]?) async throws -> (
+      app: XCUIApplication, work: InteractionPeer, personal: InteractionPeer
+    ) {
       let work = InteractionPeer()
       let personal = InteractionPeer()
+      await work.acceptOrigins(origins)
+      await personal.acceptOrigins(origins)
       let empty = NativeEventHistory(messages: [], nextCursor: nil, pageComplete: true)
       await work.history(initial: empty, pages: [:], latest: empty)
       let history = NativeEventHistory(
@@ -248,7 +486,7 @@
       XCTAssertTrue(field.wait(for: \.isEnabled, toEqual: true, timeout: 10))
       field.tap()
       field.typeText("Keep this Work draft")
-      return app
+      return (app, work, personal)
     }
 
     private func launchWithJobs() async throws -> (
@@ -302,18 +540,26 @@
     private func launch(work: InteractionPeer, personal: InteractionPeer) async throws
       -> XCUIApplication
     {
-      continueAfterFailure = false
-      executionTimeAllowance = 180
-      var ports: [String] = []
+      var ports: [UInt16] = []
       for peer in [work, personal] {
         addTeardownBlock { await peer.stop() }
-        ports.append(String(try await peer.start()))
+        ports.append(try await peer.start())
       }
+      return try launch(
+        ports: ports, coordinators: [work, personal].map { $0.coordinator.uuidString })
+    }
+
+    /// Launches the app with one saved coordinator for each loopback port, Work then Personal.
+    private func launch(ports: [UInt16], coordinators: [String]) throws -> XCUIApplication {
+      continueAfterFailure = false
+      executionTimeAllowance = 180
       let app = XCUIApplication()
       app.launchEnvironment["AGENT_INTERACTION_ID"] = UUID().uuidString
-      app.launchEnvironment["AGENT_INTERACTION_PORT"] = ports.joined(separator: ",")
-      app.launchEnvironment["AGENT_INTERACTION_COORDINATOR"] = [work, personal]
-        .map { $0.coordinator.uuidString }.joined(separator: ",")
+      app.launchEnvironment["AGENT_INTERACTION_PORT"] = ports.map(String.init)
+        .joined(separator: ",")
+      app.launchEnvironment["AGENT_INTERACTION_COORDINATOR"] =
+        coordinators
+        .joined(separator: ",")
       app.launchEnvironment["AGENT_INTERACTION_INTENTS"] = "1"
       app.launchArguments += ["-notificationsEnabled", "NO"]
       addTeardownBlock { @MainActor in
@@ -329,10 +575,12 @@
     }
 
     @available(iOS 27, *)
-    private func coordinator(named name: String) async throws -> AnyAppEntity {
+    private func coordinator(named name: String, among saved: [String] = ["Work", "Personal"])
+      async throws -> AnyAppEntity
+    {
       let coordinators = try await definitions.entities["CoordinatorEntity"].allEntities()
       let names = try coordinators.map { try $0.name.as(String.self) }
-      XCTAssertEqual(names, ["Work", "Personal"])
+      XCTAssertEqual(names, saved)
       return try XCTUnwrap(names.firstIndex(of: name).map { coordinators[$0] }, "\(names)")
     }
 
@@ -422,6 +670,82 @@
       attachment.name = name
       attachment.lifetime = .keepAlways
       add(attachment)
+    }
+  }
+
+  /// A private coordinator that `runtime/test/fixtures/siri-world.ts` serves on loopback, read
+  /// and steered through its control port.
+  private struct SiriWorld {
+    let relay: UInt16
+    let control: UInt16
+    let coordinator: String
+
+    struct Submit: Decodable {
+      let inputId: String
+      let text: String
+      let origin: String?
+    }
+    struct State: Decodable {
+      let submits: [Submit]
+      /// Model requests per scripted text. More than one for a text is a second generation.
+      let generations: [String: Int]
+    }
+
+    /// Reads `<relay port>,<control port>,<coordinator ID>`.
+    init?(_ value: String?) {
+      guard let parts = value?.split(separator: ","), parts.count == 3,
+        let relay = UInt16(parts[0]), let control = UInt16(parts[1])
+      else { return nil }
+      (self.relay, self.control, coordinator) = (relay, control, String(parts[2]))
+    }
+
+    func state() async throws -> State {
+      let decoder = JSONDecoder()
+      decoder.keyDecodingStrategy = .convertFromSnakeCase
+      return try decoder.decode(State.self, from: try await request("GET", "/state"))
+    }
+
+    func holdNextSubmitReply() async throws {
+      _ = try await request("POST", "/hold-next-submit-reply")
+    }
+
+    /// HTTP/1.0 over Network.framework, which App Transport Security leaves alone.
+    private func request(_ method: String, _ path: String) async throws -> Data {
+      let connection = NWConnection(
+        host: .ipv4(.loopback), port: try XCTUnwrap(NWEndpoint.Port(rawValue: control)),
+        using: .tcp)
+      defer { connection.cancel() }
+      connection.start(queue: .global())
+      let head = Data(
+        "\(method) \(path) HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n".utf8)
+      try await withCheckedThrowingContinuation { (done: CheckedContinuation<Void, any Error>) in
+        connection.send(
+          content: head,
+          completion: .contentProcessed { error in
+            if let error { done.resume(throwing: error) } else { done.resume() }
+          })
+      }
+      var reply = Data()
+      while true {
+        let (chunk, complete) = try await withCheckedThrowingContinuation {
+          (done: CheckedContinuation<(Data?, Bool), any Error>) in
+          connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) {
+            data, _, complete, error in
+            if let error {
+              done.resume(throwing: error)
+            } else {
+              done.resume(returning: (data, complete))
+            }
+          }
+        }
+        reply.append(chunk ?? Data())
+        if complete { break }
+      }
+      let separator = Data("\r\n\r\n".utf8)
+      let body = try XCTUnwrap(reply.range(of: separator), "No HTTP reply from the world")
+      let status = String(decoding: reply[..<body.lowerBound], as: UTF8.self)
+      XCTAssertTrue(status.hasPrefix("HTTP/1.1 2") || status.hasPrefix("HTTP/1.0 2"), status)
+      return reply[body.upperBound...]
     }
   }
 #endif
