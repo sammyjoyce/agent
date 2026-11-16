@@ -53,46 +53,20 @@ pub(super) enum Disposition {
     Emit { kind: String, role: HistoryRole },
 }
 
-const INSTRUCTION_CONTENT: [&str; 4] = [
-    "user_editable_context",
-    "model_editable_context",
-    "about_user_message",
-    "about_model_message",
-];
+fn flag(object: &Value, name: &str) -> bool {
+    object
+        .get("metadata")
+        .and_then(|metadata| metadata.get(name))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
 
-pub(super) fn classify(message: &Value) -> Disposition {
+fn emitted(message: &Value) -> Disposition {
     let author = message
         .pointer("/author/role")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     let content_type = content_type(message);
-    let flag = |name: &str| {
-        message
-            .pointer(&format!("/metadata/{name}"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    };
-    let instruction_part = message
-        .pointer("/content/parts")
-        .and_then(Value::as_array)
-        .is_some_and(|parts| {
-            parts.iter().any(|part| {
-                part.get("content_type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|kind| INSTRUCTION_CONTENT.contains(&kind))
-            })
-        });
-    if matches!(author, "system" | "developer")
-        || INSTRUCTION_CONTENT.contains(&content_type)
-        || instruction_part
-        || flag("is_user_system_message")
-        || flag("is_visually_hidden_from_conversation")
-    {
-        return Disposition::Excluded;
-    }
-    if visible_text(message).trim().is_empty() && references(message, &[]).is_empty() {
-        return Disposition::Skipped;
-    }
     let recipient = message
         .get("recipient")
         .and_then(Value::as_str)
@@ -103,7 +77,7 @@ pub(super) fn classify(message: &Value) -> Disposition {
         "assistant" if recipient != "all" => HistoryRole::Tool,
         "assistant"
             if matches!(content_type, "thoughts" | "reasoning_recap")
-                || flag("is_thinking_preamble_message") =>
+                || flag(message, "is_thinking_preamble_message") =>
         {
             HistoryRole::Thinking
         }
@@ -185,9 +159,140 @@ pub(super) struct LibraryFile {
     pub created_at: Option<f64>,
 }
 
-pub(super) fn references(message: &Value, library: &[&LibraryFile]) -> Vec<FileRef> {
-    let mut found: Vec<FileRef> = Vec::new();
-    let mut add = |file: Option<FileId>, name: Option<&str>, mime_type: Option<&str>| {
+mod screening {
+    use serde_json::Value;
+
+    use super::{
+        Disposition, FileId, FileRef, LibraryFile, content_type, emitted, flag, visible_text,
+    };
+
+    const INSTRUCTION_CONTENT: [&str; 4] = [
+        "user_editable_context",
+        "model_editable_context",
+        "about_user_message",
+        "about_model_message",
+    ];
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Policy {
+        Kept,
+        Excluded,
+    }
+
+    pub(super) struct Screened<'a> {
+        pub disposition: Disposition,
+        pub excluded: u32,
+        pub ids: Vec<(&'a str, Policy)>,
+        references: Vec<FileRef>,
+    }
+
+    impl<'a> Screened<'a> {
+        pub fn empty() -> Self {
+            Self {
+                disposition: Disposition::Skipped,
+                excluded: 0,
+                ids: Vec::new(),
+                references: Vec::new(),
+            }
+        }
+
+        pub fn screen(node: &'a str, message: &'a Value) -> Self {
+            let (mut references, mut ids, mut excluded) = (Vec::new(), Vec::new(), 0);
+            let mut pending = vec![(message, Policy::Kept)];
+            while let Some((value, around)) = pending.pop() {
+                match value {
+                    Value::Object(object) => {
+                        let policy = match around {
+                            Policy::Excluded => Policy::Excluded,
+                            Policy::Kept => policy_for(value),
+                        };
+                        if around == Policy::Kept && policy == Policy::Excluded {
+                            excluded += 1;
+                        }
+                        if let Some(id) = object.get("id").and_then(Value::as_str) {
+                            ids.push((id, policy));
+                        }
+                        if policy == Policy::Kept {
+                            add_own_references(value, &mut references);
+                        }
+                        pending.extend(object.values().rev().map(|nested| (nested, policy)));
+                    }
+                    Value::Array(values) => {
+                        pending.extend(values.iter().rev().map(|nested| (nested, around)));
+                    }
+                    _ => {}
+                }
+            }
+            let own = policy_for(message);
+            if message.get("id").and_then(Value::as_str).is_none() {
+                ids.push((node, own));
+            }
+            let disposition = match own {
+                Policy::Excluded => Disposition::Excluded,
+                Policy::Kept
+                    if visible_text(message).trim().is_empty() && references.is_empty() =>
+                {
+                    Disposition::Skipped
+                }
+                Policy::Kept => emitted(message),
+            };
+            Self {
+                disposition,
+                excluded,
+                ids,
+                references,
+            }
+        }
+
+        pub fn files(&self) -> impl Iterator<Item = &FileId> {
+            self.references.iter().map(|reference| &reference.file)
+        }
+
+        pub fn with_library(&self, library: &[&LibraryFile]) -> Vec<FileRef> {
+            let mut found = self.references.clone();
+            for entry in library {
+                add(
+                    &mut found,
+                    Some(entry.file.clone()),
+                    entry.name.as_deref(),
+                    entry.mime_type.as_deref(),
+                );
+            }
+            found
+        }
+    }
+
+    fn policy_for(object: &Value) -> Policy {
+        let instruction_part = object
+            .pointer("/content/parts")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    part.get("content_type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| INSTRUCTION_CONTENT.contains(&kind))
+                })
+            });
+        let excluded = matches!(
+            object.pointer("/author/role").and_then(Value::as_str),
+            Some("system" | "developer")
+        ) || INSTRUCTION_CONTENT.contains(&content_type(object))
+            || instruction_part
+            || flag(object, "is_user_system_message")
+            || flag(object, "is_visually_hidden_from_conversation");
+        if excluded {
+            Policy::Excluded
+        } else {
+            Policy::Kept
+        }
+    }
+
+    fn add(
+        found: &mut Vec<FileRef>,
+        file: Option<FileId>,
+        name: Option<&str>,
+        mime_type: Option<&str>,
+    ) {
         let Some(file) = file else { return };
         if let Some(existing) = found.iter_mut().find(|known| known.file == file) {
             existing.name = existing.name.take().or(name.map(str::to_owned));
@@ -199,68 +304,33 @@ pub(super) fn references(message: &Value, library: &[&LibraryFile]) -> Vec<FileR
             name: name.map(str::to_owned),
             mime_type: mime_type.map(str::to_owned),
         });
-    };
-    let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
-    if let Some(attachments) = message
-        .pointer("/metadata/attachments")
-        .and_then(Value::as_array)
-    {
-        for attachment in attachments {
+    }
+
+    fn add_own_references(object: &Value, found: &mut Vec<FileRef>) {
+        fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+            value.get(key).and_then(Value::as_str)
+        }
+        for attachment in object
+            .pointer("/metadata/attachments")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|attachment| policy_for(attachment) == Policy::Kept)
+        {
             add(
-                text(attachment, "id").as_deref().and_then(FileId::find),
-                text(attachment, "name").as_deref(),
-                text(attachment, "mime_type").as_deref(),
+                found,
+                text(attachment, "id").and_then(FileId::find),
+                text(attachment, "name"),
+                text(attachment, "mime_type"),
             );
         }
-    }
-    if let Some(parts) = message.pointer("/content/parts").and_then(Value::as_array) {
-        let mut pointers = Vec::new();
-        for part in parts {
-            asset_pointers(part, 0, &mut pointers);
-        }
-        for pointer in pointers {
-            add(FileId::find(&pointer), None, None);
+        for key in ["asset_pointer", "image_url"] {
+            add(found, text(object, key).and_then(FileId::find), None, None);
         }
     }
-    if let Some(messages) = message
-        .pointer("/metadata/aggregate_result/messages")
-        .and_then(Value::as_array)
-    {
-        for output in messages {
-            add(
-                text(output, "image_url").as_deref().and_then(FileId::find),
-                None,
-                None,
-            );
-        }
-    }
-    for entry in library {
-        add(
-            Some(entry.file.clone()),
-            entry.name.as_deref(),
-            entry.mime_type.as_deref(),
-        );
-    }
-    found
 }
 
-fn library_origin_id<'a>(node: &'a str, message: &'a Value) -> &'a str {
-    message.get("id").and_then(Value::as_str).unwrap_or(node)
-}
-
-fn asset_pointers(value: &Value, depth: usize, found: &mut Vec<String>) {
-    if depth > 4 {
-        return;
-    }
-    if let Value::Object(object) = value {
-        if let Some(pointer) = object.get("asset_pointer").and_then(Value::as_str) {
-            found.push(pointer.to_owned());
-        }
-        for nested in object.values() {
-            asset_pointers(nested, depth + 1, found);
-        }
-    }
-}
+use screening::{Policy, Screened};
 
 pub(super) struct Survey {
     pub excluded: u32,
@@ -289,19 +359,17 @@ pub(super) fn survey(raw: &Value) -> Survey {
         let Some(message) = entry.get("message").filter(|message| message.is_object()) else {
             continue;
         };
-        match classify(message) {
-            Disposition::Excluded => {
-                survey.excluded += 1;
-                survey
-                    .excluded_ids
-                    .insert(library_origin_id(node, message).to_owned());
-            }
-            Disposition::Skipped => {}
-            Disposition::Emit { .. } => survey.files.extend(
-                references(message, &[])
-                    .into_iter()
-                    .map(|reference| reference.file),
-            ),
+        let screened = Screened::screen(node, message);
+        survey.excluded += screened.excluded;
+        survey.excluded_ids.extend(
+            screened
+                .ids
+                .iter()
+                .filter(|(_, policy)| *policy == Policy::Excluded)
+                .map(|(id, _)| (*id).to_owned()),
+        );
+        if matches!(screened.disposition, Disposition::Emit { .. }) {
+            survey.files.extend(screened.files().cloned());
         }
     }
     survey
@@ -403,7 +471,7 @@ struct Node<'a> {
     parent: Option<&'a str>,
     message: Option<&'a Value>,
     created: f64,
-    disposition: Disposition,
+    screened: Screened<'a>,
 }
 
 impl<'a> Tree<'a> {
@@ -437,7 +505,8 @@ impl<'a> Tree<'a> {
                         .and_then(|message| message.get("create_time"))
                         .and_then(seconds)
                         .unwrap_or(0.0),
-                    disposition: message.map_or(Disposition::Skipped, classify),
+                    screened: message
+                        .map_or_else(Screened::empty, |message| Screened::screen(id, message)),
                 },
             );
         }
@@ -467,7 +536,10 @@ impl<'a> Tree<'a> {
     }
 
     fn emitted(&self, id: &str) -> bool {
-        matches!(self.nodes[id].disposition, Disposition::Emit { .. })
+        matches!(
+            self.nodes[id].screened.disposition,
+            Disposition::Emit { .. }
+        )
     }
 
     fn children(&self, id: &str) -> &[&'a str] {
@@ -585,7 +657,7 @@ impl<'a> Turns<'a> {
                 }
                 path.push(node);
                 if matches!(
-                    tree.nodes[node].disposition,
+                    tree.nodes[node].screened.disposition,
                     Disposition::Emit {
                         role: HistoryRole::User,
                         ..
@@ -623,18 +695,17 @@ pub(super) fn normalize(
     let turns = Turns::find(&tree);
     let mut origins: HashMap<&str, Option<&str>> = HashMap::new();
     for (node, entry) in &tree.nodes {
-        let Some(message) = entry.message else {
-            continue;
-        };
-        let origin = library_origin_id(node, message);
-        match entry.disposition {
-            Disposition::Excluded => {
-                origins.insert(origin, None);
+        let shown = tree.emitted(node);
+        for &(id, policy) in &entry.screened.ids {
+            match policy {
+                Policy::Excluded => {
+                    origins.insert(id, None);
+                }
+                Policy::Kept if shown => {
+                    origins.entry(id).or_insert(Some(node));
+                }
+                Policy::Kept => {}
             }
-            Disposition::Emit { .. } => {
-                origins.entry(origin).or_insert(Some(node));
-            }
-            Disposition::Skipped => {}
         }
     }
     let mut attached: HashMap<&str, Vec<&LibraryFile>> = HashMap::new();
@@ -661,7 +732,7 @@ pub(super) fn normalize(
         let Some(message) = tree.nodes[node].message else {
             continue;
         };
-        let Disposition::Emit { kind, role } = &tree.nodes[node].disposition else {
+        let Disposition::Emit { kind, role } = &tree.nodes[node].screened.disposition else {
             continue;
         };
         let branch = HistoryBranch {
@@ -678,7 +749,7 @@ pub(super) fn normalize(
             role: role.clone(),
             turn: turns.of(node),
             branch,
-            references: references(message, attached_to(node)),
+            references: tree.nodes[node].screened.with_library(attached_to(node)),
             text: visible_text(message),
             files,
         });
@@ -733,7 +804,7 @@ pub(super) fn normalize(
         let Some(message) = tree.nodes[node].message else {
             continue;
         };
-        let Disposition::Emit { kind, role } = &tree.nodes[node].disposition else {
+        let Disposition::Emit { kind, role } = &tree.nodes[node].screened.disposition else {
             continue;
         };
         output.push(Draft {
@@ -749,7 +820,7 @@ pub(super) fn normalize(
                 alternates: 0,
                 follows: None,
             },
-            references: references(message, attached_to(node)),
+            references: tree.nodes[node].screened.with_library(attached_to(node)),
             text: visible_text(message),
             files,
         });
