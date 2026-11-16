@@ -251,8 +251,10 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Transfer interactive worker execution to a daemon before its terminal
   client exits, retaining ownership of pending host effects. The coordinator
   owns each task actor and the execution host's worker service owns every
-  issued effect before the terminal is ready, so closing or killing the
-  terminal only stops observation.
+  issued effect before the terminal is ready, so closing or killing an updated
+  terminal only stops observation. A task terminal from an older build that ran
+  host effects itself still stops the turn when you leave its TUI, until that
+  host updates.
 - [ ] Tested coordinator backups and restoration, including retained assets.
 - [ ] Replicated coordinator state and failover, retaining one active owner so
   additional coordinators do not duplicate work or external effects.

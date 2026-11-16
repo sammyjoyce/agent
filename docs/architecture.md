@@ -217,10 +217,15 @@ Interactive tasks execute on the host recorded with their allocation. Job-owned
 tasks execute on the coordinator's default host; timers, source handoffs and
 chat continuations retain this mode without allocating Rex terminals. Task
 terminals and native views observe the conversation independently of
-execution. Stopping an actor cancels only its host calls; issued effects still
-return their actual receipts. One actor exists per task or child agent. A
-terminal that attaches while that actor runs observes it and never starts a
-second execution.
+execution. Stopping an actor cancels only its host calls. The worker service
+sends back the actual result of each issued effect, but the model gets that
+receipt only if it arrives before the call's reply timer expires and while the
+coordinator that issued the call is still running. A command waits for its own
+timeout plus 10 seconds. A file read or write, like most other host calls,
+waits 30 seconds. After a late reply or a coordinator restart, the model gets
+an error or an interrupted result in place of the receipt, even when the effect
+completed. One actor exists per task or child agent. A terminal that attaches
+while that actor runs observes it and never starts a second execution.
 Coordinator shutdown detaches execution while preserving admitted Pi work.
 An explicit user Stop withdraws inputs through Pi's interruption path.
 
@@ -245,24 +250,27 @@ The Rust TUI renders Markdown with model, reasoning and directory status.
 Completed activity groups emit one compact terminal scrollback row. Ctrl+T
 opens the retained reasoning and tool details; progress commentary stays prose.
 Enter steers, Tab queues a separate turn, and Esc stops the current Pi turn and
-drains owned host operations. Leaving or closing a task terminal stops
-observation only; its task keeps working. Tool results remain recorded;
-stopping cannot undo an external effect that already completed.
+drains owned host operations. Leaving or closing an updated task terminal
+stops observation only; its task keeps working. A task terminal from an older
+build that ran host effects itself still sends a Stop when you leave its TUI,
+so leaving it stops the turn until that host updates. Tool results remain
+recorded; stopping cannot undo an external effect that already completed.
 Pi submission commits publish terminal input receipts to connected observers,
 including inputs admitted after attachment and recovered runs without a
 transport owner. Live delivery and reconnect use the same receipt projection;
 stopped, unplaced inputs return as unsent drafts instead of waiting forever.
 
 Main, task and resumed views detach from coordinator-owned execution. A task
-terminal runs no host effect. Closing it, or losing its process, leaves the
-turn, its issued effects and its queued inputs with the coordinator and the
-execution host's worker service, so task commands run in that service's
-environment, not the terminal's. While its execution host is offline, a task's
-tools are blocked or fail as not started, and no other host runs them. Input
-already admitted for that task is retained and runs when the host reconnects;
-the main agent's delegation to an offline host is refused before its input is
-saved. After a coordinator restart, admitted work resumes once its host is
-connected. An effect that was in flight at the restart is not run again.
+terminal runs no host effect. Closing an updated task terminal, or losing
+its process, leaves the turn, its issued effects and its queued inputs with
+the coordinator and the execution host's worker service, so task commands
+run in that service's environment, not the terminal's. While its execution
+host is offline, a task's tools are blocked or fail as not started, and no
+other host runs them. Input already admitted for that task is retained and
+runs when the host reconnects; the main agent's delegation to an offline
+host is refused before its input is saved. After a coordinator restart,
+admitted work resumes once its host is connected. An effect that was in
+flight at the restart is not run again.
 
 Recovery binds the main conversation's execution context before native Pi work
 can depend on it. New input uses Pi's steering or follow-up admission while
