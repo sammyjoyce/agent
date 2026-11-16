@@ -252,13 +252,15 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Private retrieval evals: paraphrases, exact references, similar threads,
   rich older context versus sparse recent context, and incomplete coverage.
   Track recall, wrong-thread selection and latency.
-- [ ] End-to-end loop-closing tests and model evals: incoming reply → relevant
+- [x] End-to-end loop-closing tests and model evals: incoming reply → relevant
   existing task → resumed worker → action → verified outcome. Cover unrelated
   noise, exchanges already handled by the user, malicious source instructions,
   duplicate events and source failures.
-  [Live source-routing evaluation](architecture.md#validation) covers standing
-  workflows, protected mail and ambiguous outreach; external effects remain
-  outside that evaluation.
+  [Loop-closing tests and the live evaluation](architecture.md#validation) use
+  a local ledger command as the action. Real mailbox and provider effects stay
+  outside both. The latest live run, on `gpt-6.1-sol` from the `openai`
+  provider, passed six of seven cases. In the already-handled case the model
+  sent the user a needless completion notice.
 - [x] CLI startup and retained-history first-render benchmarks, with paired
   baseline comparisons and a separate CI regression gate.
 - [ ] Benchmarks for input admission, first visible activity, steering/stop,
