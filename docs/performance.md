@@ -176,8 +176,9 @@ sets the measured pairs per scenario.
 
 Two runs on one build show the gates' range:
 
-1. Run the same build and `runtime/dist/src/bridge.js` on both sides. Every
-   gate passes, and the spread between the sides is the noise floor.
+1. Run the same build and `runtime/dist/src/bridge.js` on both sides. The
+   spread between the sides is the noise floor. A gate usually passes, but
+   one near a visible step can fail, as the limits below describe.
 2. Run the same build on both sides with
    `--candidate-runtime runtime/dist/test/fixtures/slow-runtime.js`. That
    runtime delays every write to the coordinator by 500 ms, so every gate
