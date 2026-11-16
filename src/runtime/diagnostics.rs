@@ -1991,6 +1991,56 @@ mod tests {
     }
 
     #[test]
+    fn a_rollback_stays_with_a_segments_last_bad_line_until_a_later_segment_places_it() {
+        let line = |timestamp| serde_json::to_string(&at(timestamp, Event::Heartbeat)).unwrap();
+        let unplaced = |segments: &[(&str, String)]| {
+            let state = tempfile::tempdir().unwrap();
+            let directory = state.path().join("diagnostics");
+            fs::create_dir(&directory).unwrap();
+            for (name, content) in segments {
+                fs::write(directory.join(name), content).unwrap();
+            }
+            read_window(state.path(), (500, 2_000), 100, u64::MAX)
+                .unwrap()
+                .unplaced_lines
+        };
+        assert_eq!(
+            unplaced(&[
+                (
+                    "runtime.jsonl.1",
+                    format!("{}\n{}\nbad\n", line(200), line(100))
+                ),
+                ("runtime.jsonl", format!("{}\n{}\n", line(150), line(1_000))),
+            ]),
+            1,
+            "The clock went back in the segment that holds the bad line"
+        );
+        assert_eq!(
+            unplaced(&[
+                (
+                    "runtime.jsonl.2",
+                    format!("{}\n{}\nbad\n", line(200), line(100))
+                ),
+                ("runtime.jsonl.1", "also bad\n".to_owned()),
+                ("runtime.jsonl", format!("{}\n{}\n", line(150), line(1_000))),
+            ]),
+            1,
+            "Only the line from the segment whose clock went back loses its proof"
+        );
+        assert_eq!(
+            unplaced(&[
+                ("runtime.jsonl.1", format!("{}\nbad\n", line(100))),
+                (
+                    "runtime.jsonl",
+                    format!("{}\n{}\n{}\n", line(150), line(120), line(1_000))
+                ),
+            ]),
+            1,
+            "The clock went back in the segment whose receipt would place the line"
+        );
+    }
+
+    #[test]
     fn a_window_read_counts_only_bad_lines_that_may_hide_a_receipt_in_the_window() {
         let state = tempfile::tempdir().unwrap();
         let directory = state.path().join("diagnostics");

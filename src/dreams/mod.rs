@@ -814,6 +814,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rotated_segment_whose_clock_went_back_keeps_its_last_malformed_line_a_gap() {
+        let night = Night::new();
+        night.seed_receipts("");
+        let now = diagnostics::now_ms();
+        fs::write(
+            night.dreams.state.join("diagnostics/runtime.jsonl.1"),
+            format!(
+                "{}\n{}\n{{\"timestamp_ms\":{},\"request_id\":7,\"event\":\n",
+                heartbeat(now - 25 * 60 * MINUTE),
+                heartbeat(now - 26 * 60 * MINUTE),
+                now - MINUTE
+            ),
+        )
+        .unwrap();
+        let page = night.review("night").await.text;
+        assert!(page.contains("gap unparseable"), "{page}");
+        let quiet = night.abstain_as_quiet("night").await;
+        assert!(!quiet.decided, "{}", quiet.text);
+    }
+
+    #[tokio::test]
     async fn a_witnessed_night_is_complete_and_a_malformed_receipt_that_nothing_places_is_a_gap() {
         let quiet = Night::new();
         quiet.seed_receipts("");

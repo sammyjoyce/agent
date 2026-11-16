@@ -21,43 +21,68 @@ pub(crate) struct ReceiptWindow {
     pub undelivered_drops: u64,
 }
 
+/// Decides which lines that are not receipts may hide a receipt inside the
+/// window. Segments are append ordered, so a later receipt that is older than
+/// the window places a bad line before the window too. That proof needs honest
+/// timestamps in the segment that holds the line and in the segment that holds
+/// the receipt. A timestamp that goes back in either one removes it.
 #[derive(Default)]
 struct Placement {
-    awaiting: u32,
-    placed_in_segment: u32,
-    clock_went_back_in_segment: bool,
     previous_ms: Option<u64>,
+    segment: SegmentPlacement,
+    /// Bad lines that ended an earlier segment whose clock never went back.
+    /// The next receipt, in a later segment, decides them.
+    carried: u32,
     unplaced: u32,
+}
+
+#[derive(Default)]
+struct SegmentPlacement {
+    clock_went_back: bool,
+    /// Bad lines with no receipt after them yet.
+    awaiting: u32,
+    /// Bad lines that a receipt of this segment placed before the window. They
+    /// stay placed only if this segment's clock never goes back.
+    placed_before_window: u32,
 }
 
 impl Placement {
     fn bad_line(&mut self) {
-        self.awaiting = self.awaiting.saturating_add(1);
+        self.segment.awaiting = self.segment.awaiting.saturating_add(1);
     }
     fn receipt(&mut self, timestamp_ms: u64, window_start_ms: u64) {
         if self
             .previous_ms
             .is_some_and(|previous| timestamp_ms < previous)
         {
-            self.clock_went_back_in_segment = true;
+            self.segment.clock_went_back = true;
         }
         self.previous_ms = Some(timestamp_ms);
+        let decided = self.segment.awaiting.saturating_add(self.carried);
         if timestamp_ms < window_start_ms {
-            self.placed_in_segment = self.placed_in_segment.saturating_add(self.awaiting);
+            self.segment.placed_before_window =
+                self.segment.placed_before_window.saturating_add(decided);
         } else {
-            self.unplaced = self.unplaced.saturating_add(self.awaiting);
+            self.unplaced = self.unplaced.saturating_add(decided);
         }
-        self.awaiting = 0;
+        self.segment.awaiting = 0;
+        self.carried = 0;
     }
     fn end_segment(&mut self) {
-        if self.clock_went_back_in_segment {
-            self.unplaced = self.unplaced.saturating_add(self.placed_in_segment);
+        let segment = std::mem::take(&mut self.segment);
+        if segment.clock_went_back {
+            self.unplaced = self
+                .unplaced
+                .saturating_add(segment.placed_before_window)
+                .saturating_add(segment.awaiting);
+        } else {
+            self.carried = self.carried.saturating_add(segment.awaiting);
         }
-        self.placed_in_segment = 0;
-        self.clock_went_back_in_segment = false;
     }
-    fn unplaced(self) -> u32 {
-        self.unplaced.saturating_add(self.awaiting)
+    /// Ends the last segment. A bad line with no receipt after it stays unplaced.
+    fn finish(mut self) -> u32 {
+        self.end_segment();
+        self.unplaced.saturating_add(self.carried)
     }
 }
 
@@ -189,7 +214,7 @@ fn read_once(
         }
         placement.end_segment();
     }
-    window.unplaced_lines = placement.unplaced();
+    window.unplaced_lines = placement.finish();
     let after = match segment_files(directory) {
         Ok(files) => identities(&files)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
