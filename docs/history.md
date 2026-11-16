@@ -153,12 +153,17 @@ The command reads every file in the export and checks it before anything is
 saved. It refuses an export with missing or unlisted conversation shards, a gap
 in its part numbering, member names that leave the export, symlinks or special
 files, encrypted members, sizes or CRCs that do not match the bytes, or more
-expansion than its limits allow. A privacy-portal ZIP of ZIPs opens one level
-deep. A refused export exits 1 and saves nothing. A single conversation that
-cannot be read, such as invalid JSON or one over the size limit, is reported
-and becomes a gap, so the import ends partial. `--check` prints the counts and
-any such problems without contacting a coordinator; `--check --json` prints the
-summary as one JSON object.
+expansion than its limits allow. The symlink refusal covers files inside the
+export. A path named on the command line is resolved first, so a symlink to the
+export is followed. A hard link inside the export is an ordinary file and is
+accepted. The command holds an extracted folder open from the check onward, so
+renaming the folder or putting another one at its path does not change what is
+read. A privacy-portal ZIP of ZIPs opens one level deep. A refused export exits
+1 and saves nothing. A single conversation that cannot be read, such as invalid
+JSON or one over the size limit, is reported and becomes a gap, so the import
+ends partial. `--check` prints the counts and any such problems without
+contacting a coordinator; `--check --json` prints the summary as one JSON
+object.
 
 Once checked, the coordinator imports the export through the same checkpointed
 importer as Codex. The client that ran the command serves every read, so the
@@ -172,23 +177,30 @@ and ChatGPT on separate lines.
 
 The path to the message ChatGPT last showed is the transcript. Edited prompts
 and regenerated replies on other branches are retained as evidence and are not
-shown, searched or used as continuation context; the transcript states how many
-other versions a message has. A later export that moves the selected branch or
-edits a message adds new versions and keeps the earlier ones. A message that a
-later export no longer contains keeps its last imported version and placement,
-so it stays in the transcript if it was shown. An older export imported after a
-newer one does not replace the newer view.
+shown, searched or used as continuation context. A later export that moves the
+selected branch or edits a message adds new versions and keeps the earlier ones.
+A message that a later export no longer contains keeps its last imported version
+and placement, so it stays in the transcript if it was shown. An older export
+imported after a newer one does not replace the newer view. When other branches
+of the export that supplied a shown message start beside it, a notice before the
+message gives their count. The notice does not count versions kept from other
+exports, so a message whose only change is an attachment's bytes shows none.
 
-Attachments referenced by `sediment://` or `file-service://` pointers,
-`metadata.attachments` and the export's file library are copied from the export
-with a verified size and SHA-256. Those bytes are part of the message's
-version, so a later export whose file has different bytes, or has a file the
-earlier export lacked, adds a new version of the message and keeps the earlier
-one. A referenced file that is not in the export is an explicit `missing` gap;
-nothing is downloaded.
+Files that a kept message names, through `sediment://` or `file-service://`
+pointers or `metadata.attachments` at any depth inside it, and the export's file
+library entries are copied from the export with a verified size and SHA-256.
+Those bytes are part of the message's version, so a later export whose file has
+different bytes, or has a file the earlier export lacked, adds a new version of
+the message and keeps the earlier one. A referenced file that is not in the
+export is an explicit `missing` gap; nothing is downloaded.
 
 System, developer, custom-instruction and hidden messages are never imported,
-and neither is a file-library entry that belongs to one. Each imported message
+including ones nested inside another message's metadata or content. The import
+decides which messages it keeps before it looks at any file they name, so a file
+that only an excluded message names is not copied. A file-library entry whose
+origin is an excluded message, at any depth, is dropped. A file that a kept
+message also names is copied, because the kept message refers to it. The
+`--check` count of left-out messages includes nested ones. Each imported message
 stores its text, author, recipient, channel, status, content type and IDs, and
 the ID, name, type and SHA-256 of each attachment. Other export metadata,
 including messages nested inside it, is not stored. Historical tool calls and
