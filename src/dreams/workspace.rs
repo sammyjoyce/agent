@@ -8,12 +8,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use tokio::sync::watch;
 
 use crate::{
     dreams::{
-        CheckResult, ContentDigest, Revision,
+        AttemptError, CheckResult, ContentDigest, ProposedFile, Rejection, Revision,
         policy::{CheckSpec, EditablePath},
     },
     host::{
@@ -153,10 +153,16 @@ pub(crate) async fn resolve_base(repository: &Path) -> Result<Revision> {
     Revision::parse(head.trim())
 }
 
-pub(crate) async fn checkout(repository: &Path, base: &Revision, directory: &Path) -> Result<()> {
+/// A private clone of `repository` that shares its objects, detached at `base`.
+/// The repository itself is only read.
+pub(crate) async fn clone_detached(
+    repository: &Path,
+    base: &Revision,
+    directory: &Path,
+) -> Result<()> {
     let parent = directory
         .parent()
-        .context("A Dreams checkout needs a parent directory")?;
+        .context("A Dreams clone needs a parent directory")?;
     let (source, destination) = (
         repository
             .to_str()
@@ -255,12 +261,39 @@ pub(crate) async fn run_checks(
     Ok(results)
 }
 
+/// What Git derived from a candidate's edits. The bytes stay in memory until
+/// the checks have run, so no check can touch the patch a reviewer will approve.
 pub(crate) struct Patch {
+    pub bytes: Vec<u8>,
     pub digest: ContentDigest,
-    pub files: Vec<String>,
+    pub changes: Vec<ProposedFile>,
 }
 
-fn write_edit(candidate: &Path, path: &EditablePath, content: &str) -> Result<Option<String>> {
+/// Parses `git diff --raw -z --no-abbrev` and accepts only what a proposal may
+/// contain: a plain file whose content changed, or a new plain file. A mode
+/// change, a deletion, a rename, a symlink or a submodule is an error.
+pub fn plain_changes(raw: &str) -> Result<Vec<ProposedFile>> {
+    let mut changes = Vec::new();
+    let mut fields = raw.split('\0').filter(|field| !field.is_empty());
+    while let (Some(change), Some(path)) = (fields.next(), fields.next()) {
+        let parts: Vec<&str> = change.split(' ').collect();
+        let (base_blob, proposed_blob) = match parts.as_slice() {
+            [":100644", "100644", base, proposed, "M"] => (Some((*base).to_owned()), *proposed),
+            [":000000", "100644", _, proposed, "A"] => (None, *proposed),
+            _ => bail!(
+                "A Dreams patch may only change or add plain files, but it has {change} for {path}"
+            ),
+        };
+        changes.push(ProposedFile {
+            path: path.to_owned(),
+            base_blob,
+            proposed_blob: proposed_blob.to_owned(),
+        });
+    }
+    Ok(changes)
+}
+
+fn write_edit(candidate: &Path, path: &EditablePath, content: &str) -> Result<(), AttemptError> {
     let mut current = candidate.to_owned();
     let mut parts: Vec<&str> = path.as_str().split('/').collect();
     let name = parts.pop().context("An editable path has a file name")?;
@@ -268,7 +301,12 @@ fn write_edit(candidate: &Path, path: &EditablePath, content: &str) -> Result<Op
         current.push(part);
         match fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => return Ok(Some(format!("{path} has a parent that is not a directory"))),
+            Ok(_) => {
+                return Err(Rejection::because(format!(
+                    "{path} has a parent that is not a directory"
+                ))
+                .into());
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(&current)?,
             Err(error) => return Err(error.into()),
         }
@@ -276,10 +314,10 @@ fn write_edit(candidate: &Path, path: &EditablePath, content: &str) -> Result<Op
     current.push(name);
     match fs::symlink_metadata(&current) {
         Ok(metadata) if !metadata.is_file() => {
-            return Ok(Some(format!("{path} is not a regular file")));
+            return Err(Rejection::because(format!("{path} is not a regular file")).into());
         }
         Ok(_) if String::from_utf8(fs::read(&current)?).is_err() => {
-            return Ok(Some(format!("{path} is not UTF-8 text")));
+            return Err(Rejection::because(format!("{path} is not UTF-8 text")).into());
         }
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -292,15 +330,15 @@ fn write_edit(candidate: &Path, path: &EditablePath, content: &str) -> Result<Op
         .custom_flags(libc::O_NOFOLLOW)
         .open(&current)?
         .write_all(content.as_bytes())?;
-    Ok(None)
+    Ok(())
 }
 
+/// Writes the edits into the candidate clone and has Git derive the patch.
 pub(crate) async fn write_candidate(
     candidate: &Path,
     base: &Revision,
     edits: &[(EditablePath, &str)],
-    patch: &Path,
-) -> Result<std::result::Result<Patch, String>> {
+) -> Result<Patch, AttemptError> {
     let git = Git::writing(candidate);
     for (path, content) in edits {
         let entry = git
@@ -308,20 +346,20 @@ pub(crate) async fn write_candidate(
             .await?;
         let mode = entry.split(' ').next().unwrap_or_default();
         if !matches!(mode, "" | "100644") {
-            return Ok(Err(format!(
+            return Err(Rejection::because(format!(
                 "{path} is a symlink, a submodule or an executable at the base"
-            )));
+            ))
+            .into());
         }
-        if let Some(reason) = write_edit(candidate, path, content)? {
-            return Ok(Err(reason));
-        }
+        write_edit(candidate, path, content)?;
     }
     let mut add = vec!["add", "--"];
     add.extend(edits.iter().map(|(path, _)| path.as_str()));
     if git.run(&add).await?.exit_code != 0 {
-        return Ok(Err(
-            "Git could not stage these paths; an ignored path cannot be proposed".into(),
-        ));
+        return Err(Rejection::because(
+            "Git could not stage these paths; an ignored path cannot be proposed",
+        )
+        .into());
     }
     let raw = git
         .text(&[
@@ -334,48 +372,40 @@ pub(crate) async fn write_candidate(
             base.as_str(),
         ])
         .await?;
-    let mut files = Vec::new();
-    let mut fields = raw.split('\0').filter(|field| !field.is_empty());
-    while let (Some(change), Some(path)) = (fields.next(), fields.next()) {
-        let parts: Vec<&str> = change.split(' ').collect();
-        let plain = matches!(
-            parts.as_slice(),
-            [":100644" | ":000000", "100644", _, _, "M" | "A"]
-        );
-        ensure!(
-            plain && edits.iter().any(|(edited, _)| edited.as_str() == path),
-            "A Dreams candidate changed more than the contents of its edited files"
-        );
-        files.push(path.to_owned());
+    let changes = plain_changes(&raw)?;
+    if !changes.iter().all(|change| {
+        edits
+            .iter()
+            .any(|(edited, _)| edited.as_str() == change.path)
+    }) {
+        return Err(anyhow!("A Dreams candidate changed more than its edited files").into());
     }
-    if files.is_empty() {
-        return Ok(Err("the edits change nothing at the base".into()));
+    if changes.is_empty() {
+        return Err(Rejection::because("the edits change nothing at the base").into());
     }
-    let output = format!(
-        "--output={}",
-        patch.to_str().context("Dreams state path is not UTF-8")?
-    );
     // Fixed prefixes and context, so the operator's diff settings cannot
     // change the bytes a reviewer approves.
-    git.text(&[
-        "diff",
-        "--cached",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-renames",
-        "--no-color",
-        "--full-index",
-        "--src-prefix=a/",
-        "--dst-prefix=b/",
-        "-U3",
-        &output,
-        base.as_str(),
-    ])
-    .await?;
-    Ok(Ok(Patch {
-        digest: ContentDigest::of(&fs::read(patch)?),
-        files,
-    }))
+    let bytes = git
+        .text(&[
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--no-color",
+            "--full-index",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "-U3",
+            base.as_str(),
+        ])
+        .await?
+        .into_bytes();
+    Ok(Patch {
+        digest: ContentDigest::of(&bytes),
+        bytes,
+        changes,
+    })
 }
 
 #[cfg(test)]
@@ -384,7 +414,44 @@ mod tests {
 
     use tokio::sync::watch;
 
-    use crate::dreams::{policy::CheckSpec, workspace::run_checks};
+    use crate::dreams::{
+        ProposedFile,
+        policy::CheckSpec,
+        workspace::{plain_changes, run_checks},
+    };
+
+    #[test]
+    fn only_changed_and_new_plain_files_are_changes_a_proposal_may_make() {
+        let (zero, old, new) = ("0".repeat(40), "1".repeat(40), "2".repeat(40));
+        let raw = format!(
+            ":100644 100644 {old} {new} M\0AGENTS.md\0:000000 100644 {zero} {new} A\0playbooks/new file.md\0"
+        );
+        assert_eq!(
+            plain_changes(&raw).unwrap(),
+            vec![
+                ProposedFile {
+                    path: "AGENTS.md".into(),
+                    base_blob: Some(old.clone()),
+                    proposed_blob: new.clone(),
+                },
+                ProposedFile {
+                    path: "playbooks/new file.md".into(),
+                    base_blob: None,
+                    proposed_blob: new.clone(),
+                },
+            ]
+        );
+        assert_eq!(plain_changes("").unwrap(), vec![]);
+        for refused in [
+            format!(":100644 100755 {old} {new} M\0tool.md\0"),
+            format!(":100644 000000 {old} {zero} D\0gone.md\0"),
+            format!(":000000 120000 {zero} {new} A\0link.md\0"),
+            format!(":000000 160000 {zero} {new} A\0module\0"),
+            format!(":100644 100644 {old} {new} T\0typed.md\0"),
+        ] {
+            assert!(plain_changes(&refused).is_err(), "{refused:?}");
+        }
+    }
 
     fn check(name: &str, argv: &[&str], seconds: u64) -> CheckSpec {
         CheckSpec {

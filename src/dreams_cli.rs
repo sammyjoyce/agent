@@ -8,8 +8,9 @@ use agent_cli::{
     config::ClientConfig,
     dreams::{
         Abstention, CheckResult, ContentDigest, DreamsPolicy, DreamsStore, EvidenceItem,
-        MAX_ATTEMPTS, Outcome, Proposal, Review, Revision, RunId, RunView, count, format_utc,
-        workspace::Git,
+        MAX_ATTEMPTS, Outcome, Proposal, ProposedFile, Review, Revision, RunId, RunView, count,
+        format_utc,
+        workspace::{Git, plain_changes},
     },
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -115,7 +116,7 @@ enum Inspection {
     /// proposed content. `half_applied` lists the paths that an interrupted
     /// apply already moved to the proposed content.
     Ready {
-        half_applied: Vec<TouchedPath>,
+        half_applied: Vec<ProposedFile>,
     },
 }
 
@@ -139,52 +140,6 @@ impl Inspection {
             },
         }
     }
-}
-
-#[derive(Clone, Debug)]
-struct TouchedPath {
-    path: String,
-    base_blob: Option<String>,
-    proposed_blob: String,
-}
-
-fn touched_paths(patch: &str) -> Result<Vec<TouchedPath>> {
-    let mut touched = Vec::new();
-    let mut current: Option<String> = None;
-    for line in patch.lines() {
-        if let Some(names) = line.strip_prefix("diff --git a/") {
-            // `<path> b/<path>`: both halves are the same path, which may itself contain " b/".
-            let path = names
-                .len()
-                .checked_sub(" b/".len())
-                .and_then(|length| names.get(..length / 2))
-                .filter(|path| names == format!("{path} b/{path}"))
-                .context("The Dreams patch renames a file or has an unreadable header")?;
-            current = Some(path.to_owned());
-        } else if let Some(ids) = line.strip_prefix("index ")
-            && let Some(path) = current.take()
-        {
-            let (base, proposed) = ids
-                .split(' ')
-                .next()
-                .and_then(|ids| ids.split_once(".."))
-                .context("The Dreams patch has an unreadable index header")?;
-            ensure!(
-                proposed.bytes().any(|byte| byte != b'0'),
-                "The Dreams patch deletes a file"
-            );
-            touched.push(TouchedPath {
-                path,
-                base_blob: base
-                    .bytes()
-                    .any(|byte| byte != b'0')
-                    .then(|| base.to_owned()),
-                proposed_blob: proposed.to_owned(),
-            });
-        }
-    }
-    ensure!(!touched.is_empty(), "The Dreams patch changes no file");
-    Ok(touched)
 }
 
 /// The patch file is read once. The digest check and Git both use those bytes,
@@ -228,7 +183,7 @@ async fn index_entries(git: &Git, path: &str) -> Result<Vec<(String, String, Str
 
 /// Every local change that a fast-forward would trip over or write through is
 /// found here, before apply writes anything to the target.
-async fn path_state(git: &Git, repository: &Path, file: &TouchedPath) -> Result<PathState> {
+async fn path_state(git: &Git, repository: &Path, file: &ProposedFile) -> Result<PathState> {
     const PLAIN_FILE: &str = "100644";
     let mut parent = PathBuf::new();
     let mut parts: Vec<&str> = file.path.split('/').collect();
@@ -352,11 +307,13 @@ async fn inspect(
     if !admitted {
         return Ok(Inspection::PolicyChanged);
     }
-    let touched =
-        touched_paths(std::str::from_utf8(patch).context("The Dreams patch is not text")?)?;
     ensure!(
-        touched.iter().map(|file| &file.path).eq(&proposal.files),
-        "The Dreams patch does not touch the files its record names"
+        proposal
+            .changes
+            .iter()
+            .map(|change| &change.path)
+            .eq(&proposal.files),
+        "The Dreams record names files that its changes do not"
     );
 
     let git = Git::reading(&proposal.repository);
@@ -393,10 +350,10 @@ async fn inspect(
     }
 
     let mut half_applied = Vec::new();
-    for file in touched {
-        match path_state(&git, &proposal.repository, &file).await? {
+    for file in &proposal.changes {
+        match path_state(&git, &proposal.repository, file).await? {
             PathState::AtBase => {}
-            PathState::HalfApplied => half_applied.push(file),
+            PathState::HalfApplied => half_applied.push(file.clone()),
             PathState::LocallyChanged => return Ok(Inspection::TargetDirty),
         }
     }
@@ -663,22 +620,16 @@ async fn build_commit(
             tree,
         ])
         .await?;
-    let mut fields = changed.split('\0').filter(|field| !field.is_empty());
-    let mut files = Vec::new();
-    while let (Some(change), Some(path)) = (fields.next(), fields.next()) {
-        let parts: Vec<&str> = change.split(' ').collect();
-        ensure!(
-            matches!(
-                parts.as_slice(),
-                [":100644" | ":000000", "100644", _, _, "M" | "A"]
-            ) && policy.editable(path).is_ok(),
-            "The approved patch changes more than the contents of editable files"
-        );
-        files.push(path);
-    }
+    let built = plain_changes(&changed)?;
     ensure!(
-        files.iter().eq(&proposal.files),
-        "The approved patch does not change the files its record names"
+        built == proposal.changes,
+        "The approved patch does not make the changes its record names"
+    );
+    ensure!(
+        built
+            .iter()
+            .all(|change| policy.editable(&change.path).is_ok()),
+        "The approved patch changes a file that is not editable"
     );
 
     let trailers = format!(
@@ -708,7 +659,7 @@ async fn build_commit(
 async fn fast_forward(
     proposal: &Proposal,
     commit: &str,
-    half_applied: &[TouchedPath],
+    half_applied: &[ProposedFile],
 ) -> Result<()> {
     let git = Git::writing(&proposal.repository);
     for file in half_applied {
@@ -912,7 +863,7 @@ mod tests {
 
     use crate::dreams_cli::{
         ProposalStatus, RunReport, apply, apply_command, escape_terminal_controls, inspect,
-        read_patch, render, status_of, touched_paths,
+        read_patch, render, status_of,
     };
 
     fn git(repository: &Path, arguments: &[&str]) -> String {
@@ -1084,33 +1035,6 @@ mod tests {
             ),
             "A recorded apply stays applied without the policy, and Git is not consulted"
         );
-    }
-
-    #[test]
-    fn patch_headers_name_each_touched_path_with_both_blob_ids() {
-        let (old, new) = ("1".repeat(40), "2".repeat(40));
-        let patch = format!(
-            "diff --git a/AGENTS.md b/AGENTS.md\nindex {old}..{new} 100644\n--- a/AGENTS.md\n+++ b/AGENTS.md\n@@ -1 +1 @@\n-index 0..0\n+diff --git a/x b/y\ndiff --git a/playbooks/new.md b/playbooks/new.md\nnew file mode 100644\nindex {}..{new}\n",
-            "0".repeat(40)
-        );
-        let touched = touched_paths(&patch).unwrap();
-        assert_eq!(touched.len(), 2);
-        assert_eq!(touched[0].path, "AGENTS.md");
-        assert_eq!(touched[0].base_blob.as_deref(), Some(old.as_str()));
-        assert_eq!(touched[0].proposed_blob, new);
-        assert_eq!(touched[1].path, "playbooks/new.md");
-        assert_eq!(touched[1].base_blob, None);
-
-        for refused in [
-            String::new(),
-            format!("diff --git a/a.md b/b.md\nindex {old}..{new} 100644\n"),
-            format!(
-                "diff --git a/a.md b/a.md\nindex {old}..{} 100644\n",
-                "0".repeat(40)
-            ),
-        ] {
-            assert!(touched_paths(&refused).is_err(), "{refused:?}");
-        }
     }
 
     #[test]

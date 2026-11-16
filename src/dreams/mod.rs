@@ -22,6 +22,7 @@ pub use evidence::{EvidenceItem, EvidenceKind, Finding};
 pub use policy::{
     CheckSpec, DreamsCheckFile, DreamsPolicy, DreamsPolicyFile, EditablePath, ProtectedPaths,
 };
+use store::ReviewSeal;
 pub use store::{AppliedRecord, DreamsStore, RunView};
 
 use crate::{protocol::HostResult, runtime::diagnostics};
@@ -504,6 +505,15 @@ pub enum Abstention {
     },
 }
 
+/// One file of a proposal's patch: a changed plain file, or a new one when
+/// `base_blob` is None. The blobs are Git object ids.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposedFile {
+    pub path: String,
+    pub base_blob: Option<String>,
+    pub proposed_blob: String,
+}
+
 /// A sealed proposal. Every after check passed, the evidence is contained in
 /// the review, and the files were editable under the review's policy.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -513,7 +523,11 @@ pub struct Proposal {
     pub repository: PathBuf,
     pub base: Revision,
     pub patch_sha256: ContentDigest,
+    /// The paths of `changes`, in the same order.
     pub files: Vec<String>,
+    /// What the patch does to each file, as Git recorded it when the patch was
+    /// derived. Apply compares the target and its own result against these.
+    pub changes: Vec<ProposedFile>,
     pub evidence: Vec<EvidenceId>,
     pub rationale: UntrustedText,
     pub before: Vec<CheckResult>,
@@ -535,16 +549,42 @@ pub fn count(number: usize, noun: &str) -> String {
     format!("{number} {noun}{}", if number == 1 { "" } else { "s" })
 }
 
-struct Rejection {
+/// Why an attempt was not sealed, in words the model can act on.
+pub(crate) struct Rejection {
     reason: String,
+    /// Quoted check output, when a check is the reason.
     output: Vec<String>,
 }
 impl Rejection {
-    fn because(reason: impl Into<String>) -> Self {
+    pub(crate) fn because(reason: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
             output: Vec::new(),
         }
+    }
+}
+
+/// How an attempt ends without a proposal. A rejection is the model's to fix:
+/// it is told why and the attempt is spent. A failure is the host's: the call
+/// fails. Returning the wrong one would hide a host fault from the operator or
+/// a fixable mistake from the model, so every step of an attempt uses this type.
+pub(crate) enum AttemptError {
+    Rejected(Rejection),
+    Failed(anyhow::Error),
+}
+impl From<Rejection> for AttemptError {
+    fn from(rejection: Rejection) -> Self {
+        Self::Rejected(rejection)
+    }
+}
+impl From<anyhow::Error> for AttemptError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Failed(error)
+    }
+}
+impl From<std::io::Error> for AttemptError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Failed(error.into())
     }
 }
 
@@ -693,40 +733,31 @@ impl Dreams {
 
         let staged = self.store.stage_review(run)?;
         let built = async {
-            let base = workspace::resolve_base(self.policy.repository()).await?;
-            let checkout = staged.join("base");
-            workspace::checkout(self.policy.repository(), &base, &checkout).await?;
-            store::write_json(
-                &staged.join("files.json"),
-                &self.editable_files(&checkout).await?,
-            )?;
-            let before = workspace::run_checks(&checkout, self.policy.checks(), cancelled).await?;
-            let evidence_lines = items
-                .iter()
-                .map(serde_json::to_string)
-                .collect::<Result<Vec<_>, _>>()?
-                .join("\n");
-            store::write_private(
-                &staged.join("evidence.jsonl"),
-                if evidence_lines.is_empty() {
-                    String::new()
-                } else {
-                    evidence_lines + "\n"
-                }
-                .as_bytes(),
-            )?;
-            store::write_json(
-                &staged.join("review.json"),
+            let repository = self.policy.repository();
+            let base = workspace::resolve_base(repository).await?;
+            // The model reads the editable files from a clone that no check ever
+            // runs in, so what it is shown cannot depend on what a check wrote.
+            let reading = DreamsStore::files_clone(&staged);
+            workspace::clone_detached(repository, &base, &reading).await?;
+            let files = self.editable_files(&reading).await?;
+            std::fs::remove_dir_all(&reading)?;
+            let checking = DreamsStore::base_clone(&staged);
+            workspace::clone_detached(repository, &base, &checking).await?;
+            let before = workspace::run_checks(&checking, self.policy.checks(), cancelled).await?;
+            DreamsStore::write_review(
+                &staged,
                 &Review {
                     run: run.clone(),
                     request_id: request_id.to_owned(),
                     coverage,
-                    repository: self.policy.repository().to_owned(),
+                    repository: repository.to_owned(),
                     base,
                     policy_digest: self.policy.digest().to_owned(),
                     before,
                     findings,
                 },
+                &items,
+                &files,
             )?;
             self.store.seal_review(&staged, run)
         }
@@ -734,7 +765,8 @@ impl Dreams {
         if built.is_err() {
             let _ = std::fs::remove_dir_all(&staged);
         }
-        built.map(|_| ())
+        // Whichever review was sealed first is the run's review. The caller reads it back.
+        built.map(|_: ReviewSeal| ())
     }
 
     async fn editable_files(&self, checkout: &Path) -> Result<Vec<(String, String)>> {
@@ -832,20 +864,19 @@ impl Dreams {
         };
         let rejection = match self
             .attempt(&view, attempt, &directory, &draft, cancelled)
-            .await?
+            .await
         {
             Ok(proposal) => {
+                DreamsStore::write_verdict(&directory, None)?;
                 let outcome = self
                     .store
                     .seal_outcome(&run, &Outcome::Proposed(Box::new(proposal)))?;
                 return Ok(Self::decided(&run, &outcome));
             }
-            Err(rejection) => rejection,
+            Err(AttemptError::Failed(error)) => return Err(error),
+            Err(AttemptError::Rejected(rejection)) => rejection,
         };
-        store::write_json(
-            &directory.join("verdict.json"),
-            &serde_json::json!({ "accepted": false, "reason": rejection.reason }),
-        )?;
+        DreamsStore::write_verdict(&directory, Some(&rejection.reason))?;
         let mut lines = vec![format!(
             "Dreams proposal attempt {attempt} of {MAX_ATTEMPTS} rejected: {}. {} of {MAX_ATTEMPTS} attempts remain.",
             rejection.reason,
@@ -867,93 +898,81 @@ impl Dreams {
         directory: &Path,
         draft: &Draft<'_>,
         cancelled: &watch::Receiver<bool>,
-    ) -> Result<std::result::Result<Proposal, Rejection>> {
+    ) -> Result<Proposal, AttemptError> {
+        let reject = |reason: String| AttemptError::from(Rejection::because(reason));
         let review = &view.review;
         if review.policy_digest != self.policy.digest() {
-            return Ok(Err(Rejection::because(
-                "the Dreams policy changed after this review was sealed",
-            )));
+            return Err(reject(
+                "the Dreams policy changed after this review was sealed".into(),
+            ));
         }
         if draft.edits.is_empty() || draft.edits.len() > MAX_EDITS {
-            return Ok(Err(Rejection::because(format!(
-                "a proposal changes 1 to {MAX_EDITS} files"
-            ))));
+            return Err(reject(format!("a proposal changes 1 to {MAX_EDITS} files")));
         }
         let mut edits: Vec<(EditablePath, &str)> = Vec::new();
         for edit in draft.edits {
-            let path = match self.policy.editable(&edit.path) {
-                Ok(path) => path,
-                Err(reason) => return Ok(Err(Rejection::because(reason))),
-            };
+            let path = self.policy.editable(&edit.path).map_err(reject)?;
             if edit.content.len() > MAX_EDIT_BYTES {
-                return Ok(Err(Rejection::because(format!(
+                return Err(reject(format!(
                     "{path} is larger than {MAX_EDIT_BYTES} bytes"
-                ))));
+                )));
             }
             if edits.iter().any(|(edited, _)| edited == &path) {
-                return Ok(Err(Rejection::because(format!("{path} is edited twice"))));
+                return Err(reject(format!("{path} is edited twice")));
             }
             edits.push((path, &edit.content));
         }
         if draft.evidence.is_empty() || draft.evidence.len() > MAX_EVIDENCE_CITATIONS {
-            return Ok(Err(Rejection::because(format!(
+            return Err(reject(format!(
                 "a proposal cites 1 to {MAX_EVIDENCE_CITATIONS} evidence ids"
-            ))));
+            )));
         }
         let reviewed = self.store.evidence(&view.id)?;
         let mut evidence = Vec::new();
         for cited in draft.evidence {
-            match reviewed.iter().find(|item| item.id.as_str() == cited) {
-                Some(item) => evidence.push(item.id.clone()),
-                None => {
-                    let shown: String = cited.chars().take(96).collect();
-                    return Ok(Err(Rejection::because(format!(
-                        "evidence id {shown:?} is not in this review"
-                    ))));
-                }
-            }
+            let Some(item) = reviewed.iter().find(|item| item.id.as_str() == cited) else {
+                let shown: String = cited.chars().take(96).collect();
+                return Err(reject(format!(
+                    "evidence id {shown:?} is not in this review"
+                )));
+            };
+            evidence.push(item.id.clone());
         }
 
-        let candidate = directory.join("candidate");
-        let patch_path = directory.join("patch.diff");
-        workspace::checkout(&review.repository, &review.base, &candidate).await?;
-        let patch = match workspace::write_candidate(&candidate, &review.base, &edits, &patch_path)
-            .await?
-        {
-            Ok(patch) => patch,
-            Err(reason) => return Ok(Err(Rejection::because(reason))),
-        };
+        let candidate = DreamsStore::candidate_clone(directory);
+        workspace::clone_detached(&review.repository, &review.base, &candidate).await?;
+        let patch = workspace::write_candidate(&candidate, &review.base, &edits).await?;
         let after = workspace::run_checks(&candidate, self.policy.checks(), cancelled).await?;
-        store::write_json(&directory.join("after.json"), &after)?;
-        ensure!(
-            ContentDigest::of(&std::fs::read(&patch_path)?) == patch.digest,
-            "The Dreams patch changed while its checks ran"
-        );
+        DreamsStore::write_after(directory, &after)?;
+        // Written from memory after the checks, which ran beside this directory.
+        DreamsStore::write_patch(directory, &patch.bytes)?;
         if let Some(failed) = after.iter().find(|check| !check.passed()) {
             let mut output = Vec::new();
             evidence::check_lines(&mut output, "After", failed);
-            return Ok(Err(Rejection {
+            return Err(Rejection {
                 reason: format!("after check {} did not pass", failed.name),
                 output,
-            }));
+            }
+            .into());
         }
-        store::write_json(
-            &directory.join("verdict.json"),
-            &serde_json::json!({ "accepted": true }),
-        )?;
-        Ok(Ok(Proposal {
+        Ok(Proposal {
             run: view.id.clone(),
             attempt,
             repository: review.repository.clone(),
             base: review.base.clone(),
             patch_sha256: patch.digest,
-            files: patch.files,
+            files: patch
+                .changes
+                .iter()
+                .map(|change| change.path.clone())
+                .collect(),
+            changes: patch.changes,
             evidence,
             rationale: UntrustedText::bounded(draft.rationale, 4_000),
             before: review.before.clone(),
             after,
             policy_digest: review.policy_digest.clone(),
-        }))
+        })
     }
 }
 
@@ -1284,16 +1303,7 @@ mod tests {
         assert_eq!(proposal.evidence[0].as_str(), EVIDENCE);
         assert_eq!(night.target(), before, "Only apply may touch the target");
 
-        let sealed = fs::read(
-            night
-                .dreams
-                .store
-                .root()
-                .join("runs")
-                .join(run.as_str())
-                .join("review/review.json"),
-        )
-        .unwrap();
+        let sealed = view.review;
         git(
             &night.repository,
             &["commit", "--quiet", "--allow-empty", "-m", "Move on"],
@@ -1305,16 +1315,7 @@ mod tests {
             "A later review of the same run rereads what was sealed"
         );
         assert_eq!(
-            fs::read(
-                night
-                    .dreams
-                    .store
-                    .root()
-                    .join("runs")
-                    .join(run.as_str())
-                    .join("review/review.json")
-            )
-            .unwrap(),
+            night.dreams.store.read(&run).unwrap().unwrap().review,
             sealed
         );
     }

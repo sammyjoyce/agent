@@ -10,15 +10,39 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
-use crate::dreams::{ContentDigest, EvidenceItem, MAX_ATTEMPTS, Outcome, Review, Revision, RunId};
+use crate::dreams::{
+    CheckResult, ContentDigest, EvidenceItem, MAX_ATTEMPTS, Outcome, Review, Revision, RunId,
+};
 
 const STALE_STAGING: Duration = Duration::from_secs(60 * 60);
+
+// The run directory layout. Only this module spells these names.
+const RUNS_DIRECTORY: &str = "runs";
+const REVIEW_DIRECTORY: &str = "review";
+const REVIEW_STAGING_PREFIX: &str = ".review-";
+const REVIEW_FILE: &str = "review.json";
+const EVIDENCE_FILE: &str = "evidence.jsonl";
+const FILES_FILE: &str = "files.json";
+const BASE_CLONE: &str = "base";
+const FILES_CLONE: &str = "files";
+const ATTEMPTS_DIRECTORY: &str = "attempts";
+const CANDIDATE_CLONE: &str = "candidate";
+const PATCH_FILE: &str = "patch.diff";
+const AFTER_FILE: &str = "after.json";
+const VERDICT_FILE: &str = "verdict.json";
+const OUTCOME_FILE: &str = "outcome.json";
+const APPLIED_FILE: &str = "applied.json";
+
+/// Whether this call sealed the run's review or found one already sealed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReviewSeal {
+    Sealed,
+    AlreadySealed,
+}
 
 pub struct DreamsStore {
     root: PathBuf,
 }
-
-const APPLIED_FILE: &str = "applied.json";
 
 /// Written by `dreams apply` after its fast-forward. Git history alone forgets
 /// an apply once HEAD moves back to the base.
@@ -51,7 +75,7 @@ fn private_directory(path: &Path) -> io::Result<()> {
     }
 }
 
-pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -62,7 +86,7 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
-pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
+fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(write_private(path, &serde_json::to_vec_pretty(value)?)?)
 }
 
@@ -82,7 +106,7 @@ impl DreamsStore {
     pub fn open(state: &Path) -> Result<Self> {
         let root = state.join("dreams");
         private_directory(&root)
-            .and_then(|()| private_directory(&root.join("runs")))
+            .and_then(|()| private_directory(&root.join(RUNS_DIRECTORY)))
             .context("Dreams state is unavailable")?;
         Ok(Self { root })
     }
@@ -92,31 +116,31 @@ impl DreamsStore {
     }
 
     pub fn run_directory(&self, run: &RunId) -> PathBuf {
-        self.root.join("runs").join(run.as_str())
+        self.root.join(RUNS_DIRECTORY).join(run.as_str())
     }
 
     pub fn outcome_path(&self, run: &RunId) -> PathBuf {
-        self.run_directory(run).join("outcome.json")
+        self.run_directory(run).join(OUTCOME_FILE)
     }
 
     pub fn attempt_directory(&self, run: &RunId, attempt: u8) -> PathBuf {
         self.run_directory(run)
-            .join("attempts")
+            .join(ATTEMPTS_DIRECTORY)
             .join(attempt.to_string())
     }
 
     pub fn patch_path(&self, run: &RunId, attempt: u8) -> PathBuf {
-        self.attempt_directory(run, attempt).join("patch.diff")
+        self.attempt_directory(run, attempt).join(PATCH_FILE)
     }
 
     pub(crate) fn review_directory(&self, run: &RunId) -> PathBuf {
-        self.run_directory(run).join("review")
+        self.run_directory(run).join(REVIEW_DIRECTORY)
     }
 
     /// Runs with a sealed review, newest window first.
     pub fn list(&self) -> Result<Vec<RunView>> {
         let mut runs = Vec::new();
-        for entry in fs::read_dir(self.root.join("runs"))? {
+        for entry in fs::read_dir(self.root.join(RUNS_DIRECTORY))? {
             let name = entry?.file_name();
             if let Some(run) = name.to_str().and_then(|name| RunId::parse(name).ok())
                 && let Some(view) = self.read(&run)?
@@ -137,7 +161,7 @@ impl DreamsStore {
     }
 
     pub fn read(&self, run: &RunId) -> Result<Option<RunView>> {
-        let Some(review) = read_json::<Review>(&self.review_directory(run).join("review.json"))?
+        let Some(review) = read_json::<Review>(&self.review_directory(run).join(REVIEW_FILE))?
         else {
             return Ok(None);
         };
@@ -152,7 +176,7 @@ impl DreamsStore {
             .map(serde_json::from_slice::<Outcome>)
             .transpose()
             .context("Dreams outcome is unreadable")?;
-        let attempts_used = match fs::read_dir(self.run_directory(run).join("attempts")) {
+        let attempts_used = match fs::read_dir(self.run_directory(run).join(ATTEMPTS_DIRECTORY)) {
             Ok(entries) => u8::try_from(entries.count()).unwrap_or(u8::MAX),
             Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
             Err(error) => return Err(error).context("Could not read Dreams attempts"),
@@ -167,7 +191,7 @@ impl DreamsStore {
     }
 
     pub fn evidence(&self, run: &RunId) -> Result<Vec<EvidenceItem>> {
-        let path = self.review_directory(run).join("evidence.jsonl");
+        let path = self.review_directory(run).join(EVIDENCE_FILE);
         fs::read_to_string(&path)
             .with_context(|| format!("Could not read Dreams evidence {path:?}"))?
             .lines()
@@ -176,7 +200,7 @@ impl DreamsStore {
     }
 
     pub(crate) fn files(&self, run: &RunId) -> Result<Vec<(String, String)>> {
-        Ok(read_json(&self.review_directory(run).join("files.json"))?.unwrap_or_default())
+        Ok(read_json(&self.review_directory(run).join(FILES_FILE))?.unwrap_or_default())
     }
 
     pub(crate) fn stage_review(&self, run: &RunId) -> Result<PathBuf> {
@@ -192,32 +216,88 @@ impl DreamsStore {
                         .duration_since(modified)
                         .is_ok_and(|age| age > STALE_STAGING)
                 });
-            if stale && entry.file_name().to_string_lossy().starts_with(".review-") {
+            if stale
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(REVIEW_STAGING_PREFIX)
+            {
                 fs::remove_dir_all(entry.path())?;
             }
         }
-        let staged = directory.join(format!(".review-{}", Uuid::new_v4()));
+        let staged = directory.join(format!("{REVIEW_STAGING_PREFIX}{}", Uuid::new_v4()));
         private_directory(&staged)?;
         Ok(staged)
     }
 
-    pub(crate) fn seal_review(&self, staged: &Path, run: &RunId) -> Result<bool> {
+    /// Where a staged review keeps the clone its before checks run in.
+    pub(crate) fn base_clone(staged: &Path) -> PathBuf {
+        staged.join(BASE_CLONE)
+    }
+
+    /// Where a staged review clones the base to read the editable files. The
+    /// clone is removed again before the review is sealed.
+    pub(crate) fn files_clone(staged: &Path) -> PathBuf {
+        staged.join(FILES_CLONE)
+    }
+
+    pub(crate) fn write_review(
+        staged: &Path,
+        review: &Review,
+        evidence: &[EvidenceItem],
+        files: &[(String, String)],
+    ) -> Result<()> {
+        let mut lines = String::new();
+        for item in evidence {
+            lines.push_str(&serde_json::to_string(item)?);
+            lines.push('\n');
+        }
+        write_json(&staged.join(FILES_FILE), &files)?;
+        write_private(&staged.join(EVIDENCE_FILE), lines.as_bytes())?;
+        write_json(&staged.join(REVIEW_FILE), review)
+    }
+
+    pub(crate) fn seal_review(&self, staged: &Path, run: &RunId) -> Result<ReviewSeal> {
         let sealed = self.review_directory(run);
         // Renaming onto a directory that already holds a review fails, so the first seal wins.
-        let won = match fs::rename(staged, &sealed) {
-            Ok(()) => true,
-            Err(_) if sealed.join("review.json").exists() => {
+        let seal = match fs::rename(staged, &sealed) {
+            Ok(()) => ReviewSeal::Sealed,
+            Err(_) if sealed.join(REVIEW_FILE).exists() => {
                 fs::remove_dir_all(staged)?;
-                false
+                ReviewSeal::AlreadySealed
             }
             Err(error) => return Err(error).context("Could not seal the Dreams review"),
         };
         File::open(self.run_directory(run))?.sync_all()?;
-        Ok(won)
+        Ok(seal)
+    }
+
+    /// Where an attempt keeps the clone its edits and after checks run in.
+    pub(crate) fn candidate_clone(attempt: &Path) -> PathBuf {
+        attempt.join(CANDIDATE_CLONE)
+    }
+
+    pub(crate) fn write_patch(attempt: &Path, patch: &[u8]) -> Result<()> {
+        Ok(write_private(&attempt.join(PATCH_FILE), patch)?)
+    }
+
+    pub(crate) fn write_after(attempt: &Path, after: &[CheckResult]) -> Result<()> {
+        write_json(&attempt.join(AFTER_FILE), &after)
+    }
+
+    /// `rejected` is the reason an attempt was not sealed, or None when it was.
+    pub(crate) fn write_verdict(attempt: &Path, rejected: Option<&str>) -> Result<()> {
+        write_json(
+            &attempt.join(VERDICT_FILE),
+            &match rejected {
+                Some(reason) => serde_json::json!({ "accepted": false, "reason": reason }),
+                None => serde_json::json!({ "accepted": true }),
+            },
+        )
     }
 
     pub(crate) fn allocate_attempt(&self, run: &RunId) -> Result<Option<(u8, PathBuf)>> {
-        private_directory(&self.run_directory(run).join("attempts"))?;
+        private_directory(&self.run_directory(run).join(ATTEMPTS_DIRECTORY))?;
         for attempt in 1..=MAX_ATTEMPTS {
             let directory = self.attempt_directory(run, attempt);
             match fs::DirBuilder::new().mode(0o700).create(&directory) {
@@ -230,7 +310,7 @@ impl DreamsStore {
     }
 
     pub(crate) fn seal_outcome(&self, run: &RunId, outcome: &Outcome) -> Result<Outcome> {
-        self.seal_once(run, "outcome.json", outcome)
+        self.seal_once(run, OUTCOME_FILE, outcome)
             .context("Could not seal the Dreams outcome")
     }
 
@@ -281,7 +361,7 @@ mod tests {
     use crate::dreams::{
         Abstention, Coverage, DreamsAbstainReason, Interval, Outcome, ReceiptCoverage, Review,
         Revision, RunId, SummarySnapshot, UntrustedText,
-        store::{DreamsStore, write_json},
+        store::{DreamsStore, RUNS_DIRECTORY, ReviewSeal},
     };
 
     fn review(run: &RunId, end_ms: u64) -> Review {
@@ -315,9 +395,11 @@ mod tests {
     fn sealed(store: &DreamsStore, name: &str, end_ms: u64) -> RunId {
         let run = RunId::from_request(name).unwrap();
         let staged = store.stage_review(&run).unwrap();
-        write_json(&staged.join("review.json"), &review(&run, end_ms)).unwrap();
-        fs::write(staged.join("evidence.jsonl"), "").unwrap();
-        assert!(store.seal_review(&staged, &run).unwrap());
+        DreamsStore::write_review(&staged, &review(&run, end_ms), &[], &[]).unwrap();
+        assert_eq!(
+            store.seal_review(&staged, &run).unwrap(),
+            ReviewSeal::Sealed
+        );
         run
     }
 
@@ -337,10 +419,13 @@ mod tests {
 
         let first = store.stage_review(&run).unwrap();
         let second = store.stage_review(&run).unwrap();
-        write_json(&first.join("review.json"), &review(&run, 10)).unwrap();
-        write_json(&second.join("review.json"), &review(&run, 99)).unwrap();
-        assert!(store.seal_review(&first, &run).unwrap());
-        assert!(!store.seal_review(&second, &run).unwrap());
+        DreamsStore::write_review(&first, &review(&run, 10), &[], &[]).unwrap();
+        DreamsStore::write_review(&second, &review(&run, 99), &[], &[]).unwrap();
+        assert_eq!(store.seal_review(&first, &run).unwrap(), ReviewSeal::Sealed);
+        assert_eq!(
+            store.seal_review(&second, &run).unwrap(),
+            ReviewSeal::AlreadySealed
+        );
         assert!(!second.exists(), "The losing staging directory is removed");
         let view = store.read(&run).unwrap().unwrap();
         assert_eq!(view.review.coverage.window.end_ms, 10);
@@ -395,7 +480,7 @@ mod tests {
         store
             .stage_review(&RunId::from_request("crashed").unwrap())
             .unwrap();
-        fs::create_dir(store.root().join("runs/not-a-run")).unwrap();
+        fs::create_dir(store.root().join(RUNS_DIRECTORY).join("not-a-run")).unwrap();
         let listed: Vec<RunId> = store
             .list()
             .unwrap()
