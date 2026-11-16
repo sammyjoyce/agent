@@ -282,6 +282,43 @@ test("a Dreams actor withdraws every saved input that the scheduler did not send
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
+test("only the scheduler writes to a Dreams task: main's record_task and triage's link_source_events are refused", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-dreams-")), app = await openDreams(directory);
+  try {
+    app.scripted(() => fauxAssistantMessage("Dreams reviewed the night."));
+    await runScheduled(dreamsOccurrence, new AbortController().signal, app); await app.settled();
+    const task = (await app.tasks.list()).find(isDreamsTask); assert.ok(task);
+    const refused = /Only the scheduler writes to a confined task/, allowed: string[] = [];
+
+    const recorded = await fromMain(app, "task-main", { name: "record_task", arguments: { task_id: task.id,
+      summary: "EXAMPLE_MAIN_WROTE_DREAMS_SUMMARY", state: { state: "resolved", evidence: "Example evidence." },
+      sources: [{ provider: "agent_feedback", account: "local", thread_id: "example-feedback" }] } });
+    if (!refused.test(JSON.stringify(recorded.result))) allowed.push("record_task");
+
+    await app.sources.admit({ source: { provider: "mail", account: "example" }, checkpoint: { value: "one" }, coverage: { status: "complete" },
+      events: [{ id: "example-mail", version: "one", source: { provider: "mail", account: "example", thread_id: "example-thread" },
+        title: "Example nightly note", text: "An ordinary example signal." }] }, null);
+    const keys = (await app.sources.events({ provider: "mail", pending: true })).map((record) => record.key);
+    let linked: unknown;
+    app.faux.setResponses([
+      () => fauxAssistantMessage(fauxToolCall("link_source_events", { keys, task_id: task.id }), { stopReason: "toolUse" }),
+      (context) => { linked = context.messages.at(-1);
+        return fauxAssistantMessage(fauxToolCall("dismiss_source_events", { keys, reason: "The example signal needs no action." }), { stopReason: "toolUse" }); },
+      () => fauxAssistantMessage("Example signal handled."),
+    ]);
+    await app.sources.triage({ type: "triage_sources", instructions: "Handle the example signal.", model: fixtureModel, cwd: "/workspace/example", hosts: [] },
+      (conversation, model) => app.executions.bind(conversation.id.toString(), { cwd: "/workspace/example", hosts: [], model, role: "triage", call: app.call }),
+      [app.guidance, app.sourceTools.main]);
+    if (!refused.test(JSON.stringify(linked))) allowed.push("link_source_events");
+
+    assert.deepEqual(allowed, [], "A route other than the scheduler wrote to the Dreams task");
+    const after = await app.tasks.get(task.id);
+    assert.equal(after.summary, "Dreams reviewed the night.");
+    assert.deepEqual(after.state, task.state);
+    assert.deepEqual(after.sources, task.sources);
+  } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
 function importedBatch(id: string): HistoryImportBatch {
   return { host_id: "fixture-source", thread: { id, title: "Example imported conversation", cwd: "/workspace/example", created_at: 1, updated_at: 2,
     version: "v1", version_reliable: true, archived: true, forked_from_id: null, parent_thread_id: null },
