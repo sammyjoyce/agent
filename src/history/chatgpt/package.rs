@@ -13,7 +13,7 @@ use super::{
         self, Admission, Hashing, Limits, MemberDigest, MemberPath, Method, Region, Spool, Tee,
         ZipMember,
     },
-    conversation::{self, FileId, FileLookup, LibraryFile},
+    conversation::{self, FileId, FileLookup, LibraryFile, StoredFile},
     json::{self, Element, Split, SplitError},
 };
 use crate::history::HistoryThread;
@@ -195,12 +195,10 @@ impl Package {
 }
 
 impl FileLookup for Package {
-    fn stored(&self, file: &FileId) -> Option<(&str, &MemberDigest)> {
-        self.file(file).map(|indexed| {
-            (
-                self.member(indexed.member).path.file_name(),
-                &indexed.digest,
-            )
+    fn stored(&self, file: &FileId) -> Option<StoredFile<'_>> {
+        self.file(file).map(|indexed| StoredFile {
+            name: self.member(indexed.member).path.file_name(),
+            digest: &indexed.digest,
         })
     }
 
@@ -676,8 +674,6 @@ fn library_file(entry: Value) -> Option<(String, LibraryFile)> {
     ))
 }
 
-/// Reads every member to its end, so a damaged byte anywhere in the export refuses it before
-/// anything is imported. Shards and nested archives were already read whole while opening.
 fn verify(
     members: &[Member],
     index: HashMap<FileId, MemberId>,

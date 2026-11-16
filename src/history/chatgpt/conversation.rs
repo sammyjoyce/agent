@@ -244,9 +244,7 @@ pub(super) fn references(message: &Value, library: &[&LibraryFile]) -> Vec<FileR
     found
 }
 
-/// The id a library entry's `origination_message_id` names: `message.id`, else the node's
-/// mapping key.
-fn message_id<'a>(node: &'a str, message: &'a Value) -> &'a str {
+fn library_origin_id<'a>(node: &'a str, message: &'a Value) -> &'a str {
     message.get("id").and_then(Value::as_str).unwrap_or(node)
 }
 
@@ -271,8 +269,6 @@ pub(super) struct Survey {
 }
 
 impl Survey {
-    /// A library file that names an excluded message is left out with it: no item, no asset
-    /// and no count.
     pub fn keeps(&self, file: &LibraryFile) -> bool {
         file.origination_message
             .as_deref()
@@ -298,7 +294,7 @@ pub(super) fn survey(raw: &Value) -> Survey {
                 survey.excluded += 1;
                 survey
                     .excluded_ids
-                    .insert(message_id(node, message).to_owned());
+                    .insert(library_origin_id(node, message).to_owned());
             }
             Disposition::Skipped => {}
             Disposition::Emit { .. } => survey.files.extend(
@@ -370,9 +366,13 @@ pub(super) fn thread(id: &str, raw: &Value, version: String) -> HistoryThread {
     }
 }
 
+pub(super) struct StoredFile<'a> {
+    pub name: &'a str,
+    pub digest: &'a archive::MemberDigest,
+}
+
 pub(super) trait FileLookup {
-    /// The stored member name and checked digest of a file in the export.
-    fn stored(&self, file: &FileId) -> Option<(&str, &archive::MemberDigest)>;
+    fn stored(&self, file: &FileId) -> Option<StoredFile<'_>>;
     fn original_name(&self, stored: &str) -> Option<&str>;
 }
 
@@ -607,8 +607,6 @@ impl<'a> Turns<'a> {
     }
 }
 
-/// `library` holds the conversation's files that `Survey::keeps`. A file follows the emitted
-/// message it names, else it becomes its own `library:file` item.
 pub(super) fn normalize(
     id: &str,
     raw: &Value,
@@ -623,10 +621,20 @@ pub(super) fn normalize(
     let tree = Tree::build(mapping);
     let placement = Placement::place(&tree, raw.get("current_node").and_then(Value::as_str));
     let turns = Turns::find(&tree);
-    let mut emitted: HashMap<&str, &str> = HashMap::new();
+    let mut origins: HashMap<&str, Option<&str>> = HashMap::new();
     for (node, entry) in &tree.nodes {
-        if let (Some(message), Disposition::Emit { .. }) = (entry.message, &entry.disposition) {
-            emitted.entry(message_id(node, message)).or_insert(node);
+        let Some(message) = entry.message else {
+            continue;
+        };
+        let origin = library_origin_id(node, message);
+        match entry.disposition {
+            Disposition::Excluded => {
+                origins.insert(origin, None);
+            }
+            Disposition::Emit { .. } => {
+                origins.entry(origin).or_insert(Some(node));
+            }
+            Disposition::Skipped => {}
         }
     }
     let mut attached: HashMap<&str, Vec<&LibraryFile>> = HashMap::new();
@@ -635,9 +643,10 @@ pub(super) fn normalize(
         match file
             .origination_message
             .as_deref()
-            .and_then(|origin| emitted.get(origin))
+            .and_then(|origin| origins.get(origin))
         {
-            Some(node) => attached.entry(node).or_default().push(file),
+            Some(Some(node)) => attached.entry(node).or_default().push(file),
+            Some(None) => {}
             None => standalone.push(file),
         }
     }
@@ -790,7 +799,7 @@ impl Normalized {
                 file_id: reference.file.as_str().to_owned(),
                 name: reference.name.clone(),
                 mime_type: reference.mime_type.clone(),
-                sha256: found.map(|(_, checked)| checked.sha256.clone()),
+                sha256: found.as_ref().map(|stored| stored.digest.sha256.clone()),
             })
             .collect();
         let envelope = serde_json::to_value(ChatGptEnvelope {
@@ -818,7 +827,11 @@ impl Normalized {
         ]));
         let mut assets = Vec::new();
         for (reference, found) in considered {
-            let Some((stored, checked)) = found else {
+            let Some(StoredFile {
+                name: stored,
+                digest: checked,
+            }) = found
+            else {
                 let named = reference
                     .name
                     .as_deref()
@@ -990,11 +1003,11 @@ mod tests {
     }
 
     impl FileLookup for Files {
-        fn stored(&self, file: &FileId) -> Option<(&str, &archive::MemberDigest)> {
+        fn stored(&self, file: &FileId) -> Option<StoredFile<'_>> {
             self.0
                 .iter()
                 .find(|(name, _)| FileId::find(name).as_ref() == Some(file))
-                .map(|(name, digest)| (*name, digest))
+                .map(|(name, digest)| StoredFile { name, digest })
         }
 
         fn original_name(&self, _stored: &str) -> Option<&str> {
@@ -1535,6 +1548,27 @@ mod tests {
             .map(|item| item.id.as_str())
             .collect();
         assert_eq!(ids, ["u1", "a1", "library:file_00e3", "library:file_00e4"]);
+    }
+
+    #[test]
+    fn library_file_of_an_excluded_message_is_never_an_item() {
+        let mut briefing = text_message("system", "Invented briefing");
+        briefing["id"] = json!("briefing-message");
+        let normalized = run_with(
+            &Conversation::new(1, "Briefed")
+                .node("briefing", Some("root"), briefing)
+                .say("u1", "briefing", "user", "Make a plan")
+                .build(),
+            &[library("file_00e5", Some("briefing-message"))],
+            &Files::new(&["file_00e5-plan.dat"]),
+        );
+        let ids: Vec<&str> = normalized
+            .items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect();
+        assert_eq!(ids, ["u1"]);
+        assert!(normalized.assets.is_empty());
     }
 
     #[test]
