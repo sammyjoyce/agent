@@ -483,6 +483,96 @@ fn a_coordinator_admits_no_command_until_its_log_records_its_start() {
     assert_eq!(admitted, 0);
 }
 
+const DIAGNOSTICS_FAULTS: [&str; 3] = [
+    "read-only live segment",
+    "file in place of the directory",
+    "malformed retention watermark",
+];
+
+fn break_diagnostics(fixture: &Fixture, fault: &str) {
+    fixture.seed_witnessed_night();
+    let diagnostics = fixture.state.join("diagnostics");
+    match fault {
+        "read-only live segment" => fs::set_permissions(
+            diagnostics.join("runtime.jsonl"),
+            fs::Permissions::from_mode(0o400),
+        )
+        .unwrap(),
+        "file in place of the directory" => {
+            fs::remove_dir_all(&diagnostics).unwrap();
+            fs::write(&diagnostics, "Invented file that obstructs the log.\n").unwrap();
+        }
+        "malformed retention watermark" => {
+            fs::write(diagnostics.join("retention.json"), "not valid JSON\n").unwrap();
+        }
+        _ => unreachable!("{fault}"),
+    }
+}
+
+#[test]
+fn without_dreams_a_coordinator_serves_chat_when_its_diagnostics_cannot_record_its_start() {
+    for fault in DIAGNOSTICS_FAULTS {
+        let fixture = Fixture::without_policy();
+        break_diagnostics(&fixture, fault);
+        let mut server = fixture.start();
+        let tasks = fixture.cli(&["tasks", "list"], true);
+        server.stop();
+        assert!(
+            tasks.status.success(),
+            "{fault}: {}",
+            String::from_utf8_lossy(&tasks.stderr)
+        );
+        let stderr = fs::read_to_string(fixture.directory.path().join("server.stderr")).unwrap();
+        assert!(
+            stderr.contains("Runtime diagnostics unavailable; chat continues."),
+            "{fault}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn with_dreams_a_coordinator_that_cannot_record_its_start_names_the_path_and_the_remedy() {
+    for fault in DIAGNOSTICS_FAULTS {
+        let fixture = Fixture::new();
+        break_diagnostics(&fixture, fault);
+        let mut server = fixture
+            .command(&["serve", "--local-only", "--no-sources"], true)
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while server.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if server.try_wait().unwrap().is_none() {
+            let group = libc::pid_t::try_from(server.id()).unwrap();
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        }
+        let output = server.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{fault}: a Dreams coordinator served without a start record: {stderr}"
+        );
+        assert!(
+            !fixture.state.join("agent.sock").exists(),
+            "{fault}: {stderr}"
+        );
+        let path = fixture.state.join("diagnostics");
+        assert!(
+            stderr.contains(path.to_str().unwrap()),
+            "{fault}: the error must name {}: {stderr}",
+            path.display()
+        );
+        assert!(
+            stderr.contains("remove [dreams]"),
+            "{fault}: the error must say how to run chat without Dreams: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn injected_receipt_text_never_reaches_the_model_and_an_obedient_model_reaches_no_tool() {
     let fixture = Fixture::new();

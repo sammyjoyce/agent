@@ -1443,7 +1443,8 @@ createInterface({input:process.stdin}).on('line',line=>{
     }
 
     #[tokio::test]
-    async fn unavailable_diagnostics_refuse_to_start_the_runtime_and_leave_the_path_alone() {
+    async fn unavailable_diagnostics_does_not_block_or_change_runtime_results() {
+        use crate::protocol::{RuntimeCommand, RuntimeEventKind};
         use crate::runtime::Runtime;
         let state = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1452,14 +1453,35 @@ createInterface({input:process.stdin}).on('line',line=>{
         )
         .unwrap();
         let script = state.path().join("fixture.mjs");
-        std::fs::write(&script, "process.stdin.resume();\n").unwrap();
-        let Err(error) = Runtime::start(&script, state.path()) else {
-            panic!("A runtime whose log cannot record its start must not serve");
-        };
-        assert!(
-            format!("{error:#}").contains("could not record this coordinator's start"),
-            "{error:#}"
-        );
+        std::fs::write(
+            &script,
+            r#"
+import {createInterface} from 'node:readline';
+createInterface({input:process.stdin}).on('line',line=>{
+ const {id}=JSON.parse(line);
+ process.stdout.write(JSON.stringify({version:1,id,event:{type:'configured'}})+'\n');
+ process.stdout.write(JSON.stringify({version:1,id,event:{type:'done'}})+'\n');
+});
+"#,
+        )
+        .unwrap();
+        let runtime = Runtime::start(&script, state.path()).unwrap();
+        for _ in 0..3 {
+            let mut call = runtime.request(RuntimeCommand::Status).await.unwrap();
+            timeout(Duration::from_secs(3), async {
+                assert!(matches!(
+                    call.events.recv().await,
+                    Some(RuntimeEventKind::Configured)
+                ));
+                assert!(matches!(
+                    call.events.recv().await,
+                    Some(RuntimeEventKind::Done)
+                ));
+            })
+            .await
+            .unwrap();
+        }
+        runtime.close().await.unwrap();
         assert_eq!(
             std::fs::read_to_string(state.path().join("diagnostics")).unwrap(),
             "Preserve existing unrelated file"
