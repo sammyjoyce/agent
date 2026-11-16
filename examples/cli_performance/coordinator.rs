@@ -23,6 +23,7 @@ use crate::{
     scenario::Turn,
 };
 
+const CODEX_EXIT_AFTER_CLOSE: Duration = Duration::from_secs(2);
 pub const SEARCH_INDEX: &str = "search";
 pub const CODEX_CORPUS: &str = "codex";
 
@@ -395,6 +396,11 @@ impl Coordinator {
     }
 
     pub async fn close(mut self) -> Result<Closed> {
+        let codex_pid_file = self.codex_pid_file();
+        let codex = codex_pid_file
+            .exists()
+            .then(|| read_pid(&codex_pid_file))
+            .transpose()?;
         if let Some(pid) = self.child.id() {
             // Only this fixture-owned coordinator is signaled and reaped.
             ensure!(unsafe { libc::kill(i32::try_from(pid)?, libc::SIGTERM) } == 0);
@@ -410,6 +416,11 @@ impl Coordinator {
         let requests = provider.close()?;
         let stderr = fs::read_to_string(directory.path().join("coordinator.stderr"))?;
         ensure!(status.success(), "Synthetic coordinator failed: {stderr}");
+        if let Some(pid) = codex {
+            exits_within(pid, CODEX_EXIT_AFTER_CLOSE)
+                .await
+                .with_context(|| format!("The Codex app-server {pid} outlived its coordinator"))?;
+        }
         Ok(Closed {
             requests,
             receipts: receipts(&directory.path().join("diagnostics"))?,
@@ -421,6 +432,20 @@ pub fn sqlite_vec() -> Result<std::ffi::OsString> {
     std::env::var_os("AGENT_SQLITE_VEC").context(
         "Search contention needs sqlite-vec; set AGENT_SQLITE_VEC, as the Nix development shells do",
     )
+}
+
+async fn exits_within(pid: i32, within: Duration) -> Result<()> {
+    let gone = || {
+        let alive = unsafe { libc::kill(pid, 0) };
+        alive != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    };
+    timeout(within, async {
+        while !gone() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("Process {pid} was still running after {within:?}"))
 }
 
 pub fn read_pid(path: &Path) -> Result<i32> {
@@ -485,4 +510,37 @@ fn receipts(directory: &Path) -> Result<Receipts> {
     receipts.kept = earliest.into_values().collect();
     receipts.kept.sort_by_key(|receipt| receipt.epoch_ms);
     Ok(receipts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_process_that_exits_passes_and_one_that_keeps_running_fails() {
+        let mut quick = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let quick_pid = i32::try_from(quick.id().unwrap()).unwrap();
+        quick.wait().await.unwrap();
+        assert!(
+            exits_within(quick_pid, Duration::from_secs(1))
+                .await
+                .is_ok()
+        );
+
+        let mut lingering = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 5"])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let lingering_pid = i32::try_from(lingering.id().unwrap()).unwrap();
+        assert!(
+            exits_within(lingering_pid, Duration::from_millis(50))
+                .await
+                .is_err()
+        );
+        lingering.kill().await.unwrap();
+    }
 }
