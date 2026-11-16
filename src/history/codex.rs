@@ -28,12 +28,11 @@ use tokio::{
 use crate::{
     history::{
         HistoryAssetKind, HistoryAssetRef, HistoryGap, HistoryGapCode, HistoryItem, HistoryRequest,
-        HistoryResponse, HistorySource, HistoryThread,
+        HistoryResponse, HistorySource, HistoryThread, PAGE_BYTES, excerpt,
     },
     protocol::HistoryRole,
 };
 
-const PAGE_BYTES: usize = 500 * 1024;
 const ITEM_BYTES: usize = 128 * 1024;
 const NATIVE_BYTES: usize = 64 * 1024 * 1024;
 const INVENTORY_RPC_DEADLINE: Duration = Duration::from_secs(60);
@@ -1292,19 +1291,6 @@ fn flatten(turns: Vec<NativeTurn>) -> Vec<NativeEntry> {
 }
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
-}
-fn excerpt(text: &str, maximum: usize) -> String {
-    let end = text
-        .char_indices()
-        .map(|(index, _)| index)
-        .take_while(|index| *index <= maximum)
-        .last()
-        .unwrap_or(0);
-    if text.len() <= maximum {
-        text.into()
-    } else {
-        text[..end].into()
-    }
 }
 fn bounded(response: HistoryResponse) -> Result<HistoryResponse> {
     ensure!(

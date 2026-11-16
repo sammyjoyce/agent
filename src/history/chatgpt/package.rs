@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use super::{
     ChatGptPackageSummary, Corruption, Incompleteness, PackageError, PackageProgress, UnsafeReason,
     archive::{self, Limits, MemberPath, Method, Region, Spool, Tee, ZipMember},
-    conversation::{self, FileId, LibraryFile},
+    conversation::{self, FileId, FileLookup, LibraryFile},
     json::{self, Element, Split, SplitError},
 };
 use crate::history::HistoryThread;
@@ -207,12 +207,18 @@ impl Package {
         &self.members[id.0]
     }
 
-    pub fn original_name(&self, stored: &str) -> Option<&str> {
-        self.original_names.get(stored).map(String::as_str)
-    }
-
     pub fn library(&self, conversation: &str) -> &[LibraryFile] {
         self.library.get(conversation).map_or(&[], Vec::as_slice)
+    }
+}
+
+impl FileLookup for Package {
+    fn stored_name(&self, file: &FileId) -> Option<&str> {
+        self.file(file).map(|(_, member)| member.path.file_name())
+    }
+
+    fn original_name(&self, stored: &str) -> Option<&str> {
+        self.original_names.get(stored).map(String::as_str)
     }
 }
 
@@ -1599,6 +1605,103 @@ mod tests {
             .collect();
         assert_eq!(files, ["file_00cc"]);
         assert_eq!(package.summary.attachments, 1);
+    }
+
+    fn normalized(package: &Package, id: &str) -> conversation::Normalized {
+        let entry = package.conversation(id).unwrap();
+        let Ok(raw) = package.read_conversation(entry) else {
+            panic!("the checked conversation could not be reread");
+        };
+        conversation::normalize(id, &raw, package.library(id), package)
+    }
+
+    #[test]
+    fn unicode_survives_and_lone_surrogates_are_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let text = "Emoji 🧺, 漢字, עברית, e\u{301} and a broken LONE half";
+        let conversation = Conversation::new(1, "Unicode")
+            .say("u1", "root", "user", text)
+            .build();
+        let shard = serde_json::to_string(&[conversation])
+            .unwrap()
+            .replace("LONE", "\\ud83d");
+        let path = directory.path().join("conversations.json");
+        std::fs::write(&path, shard).unwrap();
+        let package = open(&path).unwrap();
+        assert_eq!(
+            package.summary.notes,
+            ["1 broken characters are replaced with U+FFFD"]
+        );
+        let normalized = normalized(&package, &fixture::id(1));
+        assert_eq!(normalized.items[0].text, text.replace("LONE", "\u{FFFD}"));
+    }
+
+    #[test]
+    fn trashed_and_writing_block_library_entries_are_ignored() {
+        let directory = tempfile::tempdir().unwrap();
+        let entry = |file: &str, extra: Value| {
+            let mut entry = json!({"file_id": file, "file_name": "draft.txt",
+                "origination_thread_id": fixture::id(1)});
+            entry
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            entry
+        };
+        let library = json!([
+            entry("file_0a01", json!({"trashed_at": 1_767_300_000.0})),
+            entry("file_0a02", json!({"deleted_at": 1_767_300_000.0})),
+            entry(
+                "file_0a03",
+                json!({"library_artifact_type": "writing_block"})
+            ),
+        ]);
+        let path = Export::new()
+            .conversations(&[picnic(1)])
+            .json("library_files.json", &library)
+            .zip(&directory.path().join("export.zip"));
+        let package = open(&path).unwrap();
+        let normalized = normalized(&package, &fixture::id(1));
+        assert_eq!(normalized.items.len(), 2);
+        assert!(normalized.items.iter().all(|item| item.assets.is_empty()));
+        assert!(normalized.gaps.is_empty());
+    }
+
+    fn thread_version(conversation: &Value) -> String {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("conversations.json");
+        std::fs::write(&path, serde_json::to_vec(&[conversation]).unwrap()).unwrap();
+        open(&path).unwrap().conversations()[0]
+            .thread
+            .version
+            .clone()
+    }
+
+    #[test]
+    fn thread_version_is_stable_and_content_defined() {
+        let raw = picnic(1);
+        let text = serde_json::to_string(&raw).unwrap();
+        let mut reordered = serde_json::Map::new();
+        for (key, value) in raw.as_object().unwrap().iter().rev() {
+            reordered.insert(key.clone(), value.clone());
+        }
+        let reordered = serde_json::to_string(&reordered)
+            .unwrap()
+            .replace(r#""title":"Picnic 1""#, r#""title" : "Picnic 1""#);
+        assert_ne!(text, reordered);
+        let version = thread_version(&raw);
+        assert_eq!(version, thread_version(&raw));
+        assert_eq!(
+            version,
+            thread_version(&serde_json::from_str(&reordered).unwrap())
+        );
+    }
+
+    #[test]
+    fn thread_version_changes_when_current_node_moves() {
+        let mut moved = picnic(1);
+        moved["current_node"] = json!("u1");
+        assert_ne!(thread_version(&picnic(1)), thread_version(&moved));
     }
 
     #[test]
