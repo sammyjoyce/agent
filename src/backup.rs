@@ -285,6 +285,7 @@ pub fn held_after_restore(command: &RuntimeCommand) -> Option<&'static str> {
         | RuntimeCommand::Feedback { .. }
         | RuntimeCommand::ReadFeedback { .. }
         | RuntimeCommand::ImportCodex { .. }
+        | RuntimeCommand::ImportChatGpt { .. }
         | RuntimeCommand::ImportStatus
         | RuntimeCommand::RetryHistoryIndex
         | RuntimeCommand::TaskInput { .. }
