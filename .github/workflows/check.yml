@@ -65,6 +65,8 @@ jobs:
           printf 'path=%s\n' "$package" >> "$GITHUB_OUTPUT"
       - name: Check native embeddings
         run: nix develop --command cargo test --locked --lib embeddings::llama::tests::native_runner_is_private_warm_and_returns_retrieval_vectors -- --ignored --exact
+      - name: Check ChatGPT import end to end
+        run: nix develop --command node --test runtime/dist/test/chatgpt-import-e2e.test.js
       - name: Smoke test package
         run: |
           ./result/bin/beep-boop --version
