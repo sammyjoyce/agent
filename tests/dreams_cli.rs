@@ -200,7 +200,7 @@ fn a_witnessed_quiet_night_reports_complete_coverage_and_seals_a_quiet_abstentio
     server.stop();
 }
 
-fn incomplete_night() -> (Fixture, u64) {
+fn lossy_night_first_claimed_quiet() -> (Fixture, u64) {
     let fixture = Fixture::new();
     let now = now_ms();
     let mut lines = heartbeats(now - 18 * HOUR, now - 10 * HOUR);
@@ -244,7 +244,7 @@ fn incomplete_night() -> (Fixture, u64) {
 
 #[test]
 fn incomplete_coverage_lists_each_gap_and_refuses_a_quiet_abstention() {
-    let (fixture, _) = incomplete_night();
+    let (fixture, _) = lossy_night_first_claimed_quiet();
     let page = fixture.output_of(DREAMS_KEY, "dreams_review", 0);
     assert!(page.contains("Coverage: incomplete"), "{page}");
     for cause in [
@@ -272,7 +272,7 @@ fn incomplete_coverage_lists_each_gap_and_refuses_a_quiet_abstention() {
 
 #[test]
 fn list_and_show_report_each_gap_of_an_abstained_night_and_apply_refuses_it() {
-    let (fixture, now) = incomplete_night();
+    let (fixture, now) = lossy_night_first_claimed_quiet();
     let listed = fixture.latest_run();
     assert_eq!(listed["coverage"], "incomplete");
     assert_eq!(listed["outcome"], "abstained: insufficient_coverage");

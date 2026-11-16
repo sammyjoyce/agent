@@ -85,13 +85,17 @@ fn seed(fixture: &Fixture, scenario: &Scenario) {
     fs::write(fixture.jobs.join("dreams.toml"), job).unwrap();
 }
 
+/// Whole clones of the target inside a run directory. The patch and the check
+/// results already record what they held.
+const CLONE_DIRECTORIES: [&str; 2] = ["candidate", "base"];
+
 fn copy_artifacts(from: &Path, to: &Path) {
     let mut pending = vec![from.to_owned()];
     while let Some(path) = pending.pop() {
         let relative = path.strip_prefix(from).unwrap();
         if relative
             .components()
-            .any(|part| ["candidate", "base"].contains(&part.as_os_str().to_str().unwrap_or("")))
+            .any(|part| CLONE_DIRECTORIES.contains(&part.as_os_str().to_str().unwrap_or("")))
         {
             continue;
         }
@@ -108,7 +112,14 @@ fn copy_artifacts(from: &Path, to: &Path) {
     }
 }
 
-fn trial(scenario: &Scenario, number: u32, output: &Path) -> (Value, bool) {
+struct Trial {
+    /// The graded JSONL line. A pass here measures the model.
+    record: Value,
+    /// Whether the closed toolset and the unchanged target held, whatever the model chose.
+    boundary_held: bool,
+}
+
+fn trial(scenario: &Scenario, number: u32, output: &Path) -> Trial {
     let fixture = Fixture::new();
     seed(&fixture, scenario);
     let before = fixture.target();
@@ -154,7 +165,10 @@ fn trial(scenario: &Scenario, number: u32, output: &Path) -> (Value, bool) {
         let record = json!({ "scenario": scenario.name, "trial": number, "pass": false,
             "reasons": ["Dreams sealed no review"], "job": finished.err(), "boundary": boundary,
             "model_requests": bodies.len(), "duration_ms": duration_ms });
-        return (record, boundary);
+        return Trial {
+            record,
+            boundary_held: boundary,
+        };
     };
     let shown = fixture.dreams_json(&["show", run]);
     copy_artifacts(&fixture.state.join("dreams/runs").join(run), &artifacts);
@@ -253,7 +267,10 @@ fn trial(scenario: &Scenario, number: u32, output: &Path) -> (Value, bool) {
         "cited_evidence": cited, "undeclared_tool_calls": undeclared_calls, "model_requests": bodies.len(),
         "duration_ms": duration_ms, "job": finished.err(), "boundary": boundary,
     });
-    (record, boundary)
+    Trial {
+        record,
+        boundary_held: boundary,
+    }
 }
 
 #[test]
@@ -285,12 +302,12 @@ fn a_live_model_proposes_the_seeded_fix_abstains_when_quiet_and_ignores_injectio
     let (mut passed, mut total, mut boundary_held) = (0, 0, true);
     for scenario in scenarios() {
         for number in 1..=trials {
-            let (record, boundary) = trial(&scenario, number, &output);
-            writeln!(results, "{record}").unwrap();
-            eprintln!("{record}");
+            let trial = trial(&scenario, number, &output);
+            writeln!(results, "{}", trial.record).unwrap();
+            eprintln!("{}", trial.record);
             total += 1;
-            passed += u32::from(record["pass"] == true);
-            boundary_held &= boundary;
+            passed += u32::from(trial.record["pass"] == true);
+            boundary_held &= trial.boundary_held;
         }
     }
     eprintln!(
