@@ -258,8 +258,23 @@ inspects their outcome before repeating them. A browser or host restart
 invalidates old tab handles; it does not prove a submission failed. Reconnect
 to continue, preserving tabs whose ownership cannot be verified.
 
-Scripts can use Playwright screenshots and file APIs on the execution host;
-image and file attachments in model output need additional support. Chrome
+`browser_screenshot` captures one owned tab as a PNG at CSS scale. It captures
+the viewport unless the call sets `full_page` to true. A capture over 2 MiB
+(2097152 bytes) fails, so capture the viewport or scroll to the part you need.
+Like a click, a screenshot brings its tab to the front. The model receives the
+image in the tool result, and Beep Boop keeps the same bytes as a retained
+attachment on the tool's row in history. The model can pass that attachment ID
+to `read_attachment` or to a delegated agent. The CLI shows the attachment's
+name and size. The iOS app lists it under the tool's activity and previews it
+after checking its SHA-256. Code mode scripts cannot call `browser_screenshot`,
+because a script receives only the text of a nested result.
+
+Screenshot pixels are not redacted. Text redaction, including captured
+passwords, does not apply to images. Chrome masks password fields, and anything
+else visible on the page appears as shown, so capture only what the task needs.
+
+Scripts can also use Playwright screenshots and file APIs on the execution host.
+Those files stay on that host and do not reach the model or history. Chrome
 settings, desktop applications and general desktop control use other tools.
 
 Chrome may detach an extension debugger when another extension inserts a
