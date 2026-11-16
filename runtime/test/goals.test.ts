@@ -603,6 +603,53 @@ test("continuations stop at the budget and exhaustion pauses the goal", async ()
   });
 });
 
+test("a crash after a continuation commits and before Pi admits it runs that continuation once after restart", async () => {
+  await scenario(2, async (fixture) => {
+    const first = fixture.app;
+    const task = await first.task("Crash cut");
+    const target = inTask(task.id);
+    const goal = goalOf(await first.goal(target, { type: "set", request_id: "set-crash", objective: "Keep refining the notes" }));
+    const continuation = `goal:${goal.id}:1:1`;
+    first.script([fauxAssistantMessage("Drafted the notes.")]);
+    let crash = () => {};
+    const crashed = new Promise<void>((resolve) => { crash = resolve; });
+    const observer: WorkerSession = { signal: new AbortController().signal, async ready() {}, idle() {}, answer() {},
+      async beforeTurn() {
+        if (goalOf(await first.goal(target, show)).activation.continuations === 0) return;
+        crash();
+        await new Promise<never>(() => {});
+      } };
+    const running = first.run(await first.command(task.id), observer);
+    await Promise.race([crashed, running.then(() => { throw new Error("The actor went idle without committing a continuation"); })]);
+    assert.equal(first.prompts.length, 1);
+    assert.match(first.prompts[0] ?? "", /^Goal set with \/goal: Keep refining the notes/);
+
+    const app = await fixture.reopen();
+    assert.equal(goalOf(await app.goal(target, show)).activation.continuations, 1);
+    assert.deepEqual((await app.tasks.get(task.id)).pending.map((input) => input.id), [continuation]);
+    assert.equal(await app.submission(task.id, continuation), undefined, "The crash came before Pi admitted the continuation");
+    app.script([fauxAssistantMessage("Refined the notes."), fauxAssistantMessage("Refined them again."), fauxAssistantMessage("Must not run.")]);
+    await app.tasks.dispatch(task.id, workerHost, fixture.host.call);
+    await app.run(await app.command(task.id));
+
+    assert.equal(app.faux.state.callCount, 2);
+    assert.match(app.prompts[0] ?? "", /^Goal continuation 1 of 2 \(activation 1\): /);
+    assert.match(app.prompts[1] ?? "", /^Goal continuation 2 of 2 \(activation 1\): /);
+    const view = await (await app.conversation(task.id)).context(BACKGROUND_CONTEXT);
+    const carrying = (text: string) => view.entries.flatMap((entry, index) =>
+      (view.contributions[index] ?? []).some((message) => message.role === "user" && said(message).startsWith(text)) ? [entry.id] : []);
+    for (const [sequence, text] of [[1, "Goal continuation 1 of 2"], [2, "Goal continuation 2 of 2"]] as const) {
+      const placed = await app.submission(task.id, `goal:${goal.id}:1:${sequence}`);
+      assert.ok(placed?.type === "input" && placed.status === "done");
+      assert.deepEqual(carrying(text), [placed.entry], `One user message carries continuation ${sequence}`);
+    }
+    const settled = goalOf(await app.goal(target, show));
+    assert.deepEqual(settled.state, { state: "paused", reason: "budget_exhausted" });
+    assert.equal(settled.activation.continuations, 2);
+    assert.equal(await app.submission(task.id, `goal:${goal.id}:1:3`), undefined);
+  });
+});
+
 test("a task waiting on another actor is not continued until new input reopens it", async () => {
   await scenario(1, async ({ app }) => {
     const task = await app.task("Waiting task");
