@@ -583,6 +583,12 @@ pub enum RuntimeCommand {
         #[ts(optional)]
         embedding_host: Option<String>,
     },
+    /// Import one checked ChatGPT export. The requesting client serves every history read
+    /// for this request from the package it checked; the coordinator never sees a path.
+    #[serde(rename = "import_chatgpt")]
+    ImportChatGpt {
+        package: crate::history::chatgpt::ChatGptPackageSummary,
+    },
     ImportStatus,
     RetryHistoryIndex,
     TaskInput {
@@ -1789,10 +1795,24 @@ pub enum SearchMode {
     Keyword,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Deserialize, Serialize, JsonSchema, TS,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryProvider {
+    #[default]
     Codex,
+    #[serde(rename = "chatgpt")]
+    ChatGpt,
+}
+
+impl HistoryProvider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::ChatGpt => "ChatGPT",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -1825,6 +1845,10 @@ pub struct ImportedConversationSummary {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct HistoryImportBatch {
+    /// Absent means Codex, for batches built before other sources existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub source: Option<HistoryProvider>,
     pub host_id: String,
     pub thread: HistoryThread,
     pub items: Vec<HistoryItem>,
@@ -1870,6 +1894,9 @@ pub enum ImportPhase {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ImportProgress {
+    /// Older coordinators report only Codex progress and omit this field.
+    #[serde(default)]
+    pub source: HistoryProvider,
     pub phase: ImportPhase,
     pub host_id: Option<String>,
     pub threads_seen: u32,

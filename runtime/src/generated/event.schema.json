@@ -1859,7 +1859,8 @@
     "HistoryProvider": {
       "type": "string",
       "enum": [
-        "codex"
+        "codex",
+        "chatgpt"
       ]
     },
     "HistoryRequest": {
@@ -2688,6 +2689,11 @@
         },
         "phase": {
           "$ref": "#/$defs/ImportPhase"
+        },
+        "source": {
+          "description": "Older coordinators report only Codex progress and omit this field.",
+          "$ref": "#/$defs/HistoryProvider",
+          "default": "codex"
         },
         "threads_imported": {
           "type": "integer",

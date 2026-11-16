@@ -14,7 +14,12 @@ pub enum RequestLifecycle {
     Once,
     Login,
     Chat,
-    Worker { interactive: bool },
+    Worker {
+        interactive: bool,
+    },
+    /// A one-shot request whose history reads belong to the requesting client, because the
+    /// export it checked is on the client's disk. Only `HostCommand::History` is delegated.
+    ClientHistory,
     View(View),
     Background,
     Coordinator,
@@ -33,6 +38,7 @@ impl RequestLifecycle {
             RuntimeCommand::ObserveMain { .. } => Self::View(View::MainObserver),
             RuntimeCommand::AttachConversation { .. } => Self::View(View::Conversation),
             RuntimeCommand::RunBackground { .. } => Self::Background,
+            RuntimeCommand::ImportChatGpt { .. } => Self::ClientHistory,
             RuntimeCommand::ConfigureCoordinator { .. }
             | RuntimeCommand::RegisterNode { .. }
             | RuntimeCommand::SetConnectedNodes { .. } => Self::Coordinator,
@@ -131,8 +137,8 @@ impl RequestLifecycle {
     }
 
     pub fn delegates_host_call(self, command: &HostCommand) -> bool {
-        self.is_worker()
-            && !matches!(
+        match self {
+            Self::Worker { .. } => !matches!(
                 command,
                 HostCommand::Browser { .. }
                     | HostCommand::OnNode { .. }
@@ -140,7 +146,10 @@ impl RequestLifecycle {
                     | HostCommand::SearchContext { .. }
                     | HostCommand::ReloadGuidance
                     | HostCommand::Embed { .. }
-            )
+            ),
+            Self::ClientHistory => matches!(command, HostCommand::History { .. }),
+            _ => false,
+        }
     }
 
     /// Release a connection's attachment once, without revoking admitted work.

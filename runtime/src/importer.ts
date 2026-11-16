@@ -19,7 +19,7 @@ import type { HistoryStore, ImportCheckpoint } from "./history.js";
 // Keep source progress separate from index errors so retries need no native walk.
 const Progress = defineDoc<{ progress: ImportProgress | null; indexing?: ImportProgress | null }>({ kind: "agent.import-progress", scope: "session", version: 1,
   initial: () => ({ progress: null, indexing: null }), checkpointWhen: () => true });
-function initial(): ImportProgress { return { phase: "discovering", host_id: null, threads_seen: 0, threads_imported: 0,
+function initial(): ImportProgress { return { source: "codex", phase: "discovering", host_id: null, threads_seen: 0, threads_imported: 0,
   threads_unchanged: 0, items_added: 0, items_unchanged: 0, assets_saved: 0, gap_count: 0, gaps: [] }; }
 function unique(gaps: HistoryGap[]): HistoryGap[] { return [...new Map(gaps.map((gap) => [JSON.stringify(gap), gap])).values()]; }
 function assetGap(gap: HistoryGap): boolean {
