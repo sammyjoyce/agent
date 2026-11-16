@@ -1106,6 +1106,7 @@ final class ChatModel {
     guard targets.count == recipients.count else { return ignoreSend() }
     let mode = mode
     let original = source
+    let addressedTo = DraftAddressing(destination: destination, restoredFrom: restoredFrom)
     let files = attachments
     let submission = submission(
       ComposerInputIdentity(composerID: composerID), text: text, files: files, at: targets)
@@ -1119,18 +1120,11 @@ final class ChatModel {
     let clearedRevision = draftRevision
     return Task {
       var admitted = false
+      var departing: [ControlDeparture] = []
       defer {
         admission = nil
-        if !admitted, !text.isEmpty {
-          // Nothing went, so no outbox holds the message. Preserve both the original and
-          // anything typed while admission or attachment preparation was pending. It returns as
-          // the draft it was, so the scope shown now does not begin it again.
-          changingDraft = true
-          draft = text + (draft.isEmpty ? "" : "\n\n" + draft)
-          changingDraft = false
-          scheduleDraftSave()
-          logComposer(.localDraftRestored)
-        }
+        // Nothing went, so no outbox holds the message.
+        if !admitted { putBack(text) }
         // A composer emptied during the Send kept whom its draft was for until now.
         forgetClearedSource()
       }
@@ -1138,14 +1132,20 @@ final class ChatModel {
       // claim it. New typing and files remain separate from this submitted note.
       guard await saveDraft() else { return }
       admitted = await admit { [self] in
-        await deliver(
+        let delivery = await deliver(
           body, mode: mode, files: files, to: targets, receipt: submission.identity)
+        departing = delivery.departing
+        return delivery.admitted
       }
       // Nothing went, so the text comes back for another try.
       guard admitted else { return }
       // The outboxes own this message even if their connections have since stopped.
       admission = .saved
       logComposer(.outboxSaved)
+      // Started only now, so the text never returns while the pending record still holds it.
+      if !departing.isEmpty {
+        Task { await putBack(text, addressedTo: addressedTo, unlessAnyWrote: departing) }
+      }
       // Who the draft is for goes with the Send only while nothing changed since its tap.
       if draftRevision == clearedRevision {
         restoredFrom = nil
@@ -1161,14 +1161,43 @@ final class ChatModel {
     }
   }
 
+  /// Puts a Send's `text` back ahead of anything typed since. It returns as the draft it was, so
+  /// the scope shown now does not begin it again, and an empty composer gets back `addressing`.
+  private func putBack(_ text: String, addressedTo addressing: DraftAddressing? = nil) {
+    guard !text.isEmpty else { return }
+    let empty = draft.isEmpty && attachments.isEmpty
+    changingDraft = true
+    draft = text + (draft.isEmpty ? "" : "\n\n" + draft)
+    if empty, let addressing {
+      restoredFrom = addressing.restoredFrom
+      destination = addressing.destination
+    }
+    changingDraft = false
+    scheduleDraftSave()
+    logComposer(.localDraftRestored)
+  }
+
+  /// Puts a control's `text` back once every copy that started stopped before it left the phone.
+  /// A copy that was written may have run, so the text stays sent.
+  private func putBack(
+    _ text: String, addressedTo addressing: DraftAddressing,
+    unlessAnyWrote departing: [ControlDeparture]
+  ) async {
+    for departure in departing {
+      if await departure.wrote { return }
+    }
+    putBack(text, addressedTo: addressing)
+  }
+
   /// Saves the message in every target's outbox, then starts each. A refusal withdraws every
   /// staged copy, so nothing is queued anywhere. Every copy carries the composer's receipt, and a
   /// copy that does not go releases only its own, so recovery offers the text again only when no
-  /// recipient took it. True once any recipient has the message or still will.
+  /// recipient took it. Admitted once any recipient has the message or still will. `departing`
+  /// holds each started control's departure, since a control can still stop before it leaves.
   private func deliver(
     _ body: String, mode: InputMode, files: [LocalAttachment], to targets: [Target],
     receipt: ComposerInputIdentity
-  ) async -> Bool {
+  ) async -> (admitted: Bool, departing: [ControlDeparture]) {
     let recipients = targets.map(\.id)
     let sendID = UUID().uuidString
     // Cleared before staging, so what a retirement cancels during this Send stays named.
@@ -1190,19 +1219,22 @@ final class ChatModel {
         } else if addressesByName {
           report("Nothing was sent. \(name(target.id)) did not take the message.")
         }
-        return false
+        return (false, [])
       }
       staged.append((target, input))
     }
     var misses: [(ProfileID, StagedInput, Missed)] = []
+    var departing: [ControlDeparture] = []
     for item in staged {
       let outcome = await item.target.session.start(item.input)
       if let why = missed(item.target.id, item.input, outcome) {
         misses.append((item.target.id, item.input, why))
+      } else if let departure = item.input.departure {
+        departing.append(departure)
       }
     }
     report(misses)
-    return misses.count < staged.count
+    return (misses.count < staged.count, departing)
   }
 
   /// The composer's receipt for a Send, held in the outbox of each of its `targets`.
