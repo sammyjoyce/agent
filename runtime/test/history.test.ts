@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -234,6 +234,30 @@ test("retained cold originals remain readable offline and full user text is avai
     await assert.rejects(app.imported.import(batch([foreign])), /outside coordinator storage/);
     assert.equal((await app.imported.import(batch([original]))).added_items, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a store restored at another path reads cold originals from its own assets, not the old path", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "agent-moved-assets-")), first = join(parent, "first"), second = join(parent, "second");
+  const bytes = Buffer.from(JSON.stringify({ type: "userMessage", content: [{ type: "text", text: "The moved detail is a zirconium connector." }] }));
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  let conversation: string, entry: string;
+  try {
+    await mkdir(join(first, "assets"), { recursive: true }); await writeFile(join(first, "assets", digest), bytes, { mode: 0o600 });
+    let app = await open(first);
+    try {
+      const original = item("item1", "Bounded excerpt only."); original.data = null;
+      original.assets = [{ path: join(first, "assets", digest), item_id: original.id, version: original.version, kind: "cold_evidence",
+        media_type: "application/json", sha256: digest, size: bytes.length }];
+      const result = await app.imported.import(batch([original]));
+      conversation = result.conversation.conversation_id; const last = result.entry_ids.at(-1); assert.ok(last); entry = last;
+    } finally { await app.session.close(BACKGROUND_CONTEXT); }
+    await rename(first, second);
+    app = await open(second);
+    try {
+      const [page] = await app.tasks.originals(conversation, [entry]); assert.ok(page);
+      assert.deepEqual(JSON.parse(page.data), JSON.parse(bytes.toString("utf8")));
+    } finally { await app.session.close(BACKGROUND_CONTEXT); }
+  } finally { await rm(parent, { recursive: true, force: true }); }
 });
 
 test("media-only evidence versions alias one immutable message and survive reopen without repeating text", async () => {
