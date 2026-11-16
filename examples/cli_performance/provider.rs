@@ -20,12 +20,17 @@ use crate::{
 
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 
-/// A tool the stop missed exits once its parent does, so the benchmark never
-/// signals a pid the OS may have reused.
 #[derive(Clone)]
 pub struct ToolFixture {
     pub node: PathBuf,
     pub pid_file: PathBuf,
+    pub owner: u32,
+}
+
+impl ToolFixture {
+    fn call(&self) -> Value {
+        json!({ "program": self.node, "args": ["-e", TOOL_SCRIPT, self.pid_file, self.owner.to_string()] })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -49,15 +54,12 @@ pub struct Request {
 type Log = Arc<Mutex<Vec<Request>>>;
 
 pub struct Provider {
-    pub base_url: String,
     log: Log,
     server: JoinHandle<()>,
 }
 
 impl Provider {
-    pub async fn start(turns: &'static [Turn], tool: ToolFixture) -> Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let base_url = format!("http://{}", listener.local_addr()?);
+    pub fn start(listener: TcpListener, turns: &'static [Turn], tool: ToolFixture) -> Self {
         let log = Log::default();
         let shared = log.clone();
         let server = tokio::spawn(async move {
@@ -67,11 +69,7 @@ impl Provider {
                 connections.spawn(async move { serve(stream, turns, &tool, &log).await });
             }
         });
-        Ok(Self {
-            base_url,
-            log,
-            server,
-        })
+        Self { log, server }
     }
 
     pub fn requests(&self) -> Result<Vec<Request>> {
@@ -284,9 +282,7 @@ async fn respond(
             (item, added, text.len())
         }
         Ending::Exec { .. } => {
-            let arguments =
-                json!({ "program": tool.node, "args": ["-e", TOOL_SCRIPT, tool.pid_file] })
-                    .to_string();
+            let arguments = tool.call().to_string();
             let item = json!({ "id": format!("fc_{index}"), "type": "function_call", "call_id": format!("call_{index}"), "name": "exec",
                 "arguments": arguments, "status": "completed" });
             let added = with(&item, json!({ "status": "in_progress", "arguments": "" }));
@@ -316,7 +312,7 @@ async fn respond(
     })
 }
 
-pub const TOOL_SCRIPT: &str = "require('node:fs').writeFileSync(process.argv[1], String(process.pid)); const parent = process.ppid; setInterval(() => { if (process.ppid !== parent) process.exit(1); }, 200);";
+const TOOL_SCRIPT: &str = "require('node:fs').writeFileSync(process.argv[1], String(process.pid)); const parent = process.ppid; setInterval(() => { if (process.ppid !== parent) process.exit(1); }, 200);";
 
 fn with(base: &Value, extra: Value) -> Value {
     let mut merged = base.clone();
@@ -364,4 +360,148 @@ fn record_hold(
     update(log, index, |request| {
         request.holds.push((Hold { kind, from, to }, scripted_ms))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        io::{BufRead, BufReader, Write},
+        os::unix::process::CommandExt,
+        process::{Child, Command, Stdio},
+        sync::mpsc::{self, Receiver},
+        thread,
+    };
+
+    use super::*;
+    use crate::coordinator::node;
+
+    const EXIT_DEADLINE: Duration = Duration::from_secs(10);
+
+    const OWNER_STARTS_TOOL_AFTER_RELEASE: &str = r#"while IFS= read -r argument; do set -- "$@" "$argument"; done
+(until [ -e "$0" ]; do sleep 0.01; done; exec "$@") &
+echo $!
+exec sleep 60 >/dev/null"#;
+
+    struct Tool {
+        owner: Child,
+        pid: u32,
+        release: PathBuf,
+        pid_file: PathBuf,
+        output_closed: Receiver<()>,
+        _directory: tempfile::TempDir,
+    }
+
+    impl Tool {
+        fn start() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let release = directory.path().join("release");
+            let pid_file = directory.path().join("tool.pid");
+            let mut owner = Command::new("sh")
+                .arg("-c")
+                .arg(OWNER_STARTS_TOOL_AFTER_RELEASE)
+                .arg(&release)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let call = ToolFixture {
+                node: node().unwrap(),
+                pid_file: pid_file.clone(),
+                owner: owner.id(),
+            }
+            .call();
+            let mut arguments = owner.stdin.take().unwrap();
+            for argument in
+                std::iter::once(&call["program"]).chain(call["args"].as_array().unwrap())
+            {
+                let argument = argument.as_str().unwrap();
+                assert!(!argument.contains('\n'), "{argument}");
+                writeln!(arguments, "{argument}").unwrap();
+            }
+            drop(arguments);
+            let mut output = BufReader::new(owner.stdout.take().unwrap());
+            let mut pid = String::new();
+            output.read_line(&mut pid).unwrap();
+            let (closed, output_closed) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = std::io::copy(&mut output, &mut std::io::sink());
+                let _ = closed.send(());
+            });
+            Self {
+                owner,
+                pid: pid.trim().parse().unwrap(),
+                release,
+                pid_file,
+                output_closed,
+                _directory: directory,
+            }
+        }
+
+        fn release(&self) {
+            fs::write(&self.release, "").unwrap();
+        }
+
+        fn kill_owner(&self) {
+            let owner = i32::try_from(self.owner.id()).unwrap();
+            assert_eq!(unsafe { libc::kill(owner, libc::SIGKILL) }, 0);
+            // WNOWAIT leaves the owner unreaped, which keeps its process group
+            // ID reserved for the cleanup in drop.
+            let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let waited = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.owner.id(),
+                    &mut information,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            assert_eq!(waited, 0);
+        }
+
+        fn exits_within(&self, duration: Duration) -> bool {
+            self.output_closed.recv_timeout(duration).is_ok()
+        }
+    }
+
+    impl Drop for Tool {
+        fn drop(&mut self) {
+            if let Ok(group) = i32::try_from(self.owner.id()) {
+                unsafe { libc::killpg(group, libc::SIGKILL) };
+            }
+            let _ = self.owner.wait();
+        }
+    }
+
+    #[test]
+    fn the_exec_tool_runs_while_its_owner_lives_and_exits_after_it_dies() {
+        let tool = Tool::start();
+        tool.release();
+        let started = Instant::now();
+        while fs::read_to_string(&tool.pid_file).ok() != Some(tool.pid.to_string()) {
+            assert!(started.elapsed() < EXIT_DEADLINE, "the tool never started");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !tool.exits_within(Duration::from_millis(600)),
+            "the tool exited while its owner lived"
+        );
+        tool.kill_owner();
+        assert!(
+            tool.exits_within(EXIT_DEADLINE),
+            "the tool outlived its owner"
+        );
+    }
+
+    #[test]
+    fn the_exec_tool_exits_when_its_owner_died_before_it_started() {
+        let tool = Tool::start();
+        tool.kill_owner();
+        tool.release();
+        assert!(
+            tool.exits_within(EXIT_DEADLINE),
+            "the tool outlived an owner that died before it started"
+        );
+    }
 }

@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::TcpListener,
     process::{Child, Command},
     time::{sleep, timeout},
 };
@@ -44,16 +45,20 @@ const RECEIPTS: &[&str] = &[
     "interrupted",
 ];
 
+pub fn node() -> Result<PathBuf> {
+    let paths = std::env::var_os("PATH").context("PATH is required")?;
+    let node = std::env::split_paths(&paths)
+        .map(|path| path.join("node"))
+        .find(|path| path.is_file())
+        .context("Node is required")?;
+    Ok(fs::canonicalize(node)?)
+}
+
 pub fn isolated(command: &mut Command, directory: &Path) -> Result<()> {
     let bin = directory.join("bin");
     if !bin.exists() {
         fs::create_dir(&bin)?;
-        let paths = std::env::var_os("PATH").context("PATH is required")?;
-        let node = std::env::split_paths(&paths)
-            .map(|path| path.join("node"))
-            .find(|path| path.is_file())
-            .context("Node is required")?;
-        std::os::unix::fs::symlink(fs::canonicalize(node)?, bin.join("node"))?;
+        std::os::unix::fs::symlink(node()?, bin.join("node"))?;
         fs::write(bin.join("rex"), REX)?;
         fs::set_permissions(bin.join("rex"), fs::Permissions::from_mode(0o700))?;
     }
@@ -217,19 +222,24 @@ impl Coordinator {
             .stdout(Stdio::null())
             .stderr(fs::File::create(path.join("coordinator.stderr"))?);
         isolated(&mut command, path)?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        command
+            .env("AGENT_PERFORMANCE_RUNTIME", runtime)
+            .env(
+                "AGENT_PERFORMANCE_PROVIDER",
+                format!("http://{}", listener.local_addr()?),
+            )
+            .env("AGENT_PERFORMANCE_RUNTIME_PID", path.join("runtime.pid"));
+        let child = command.spawn()?;
         let provider = Provider::start(
+            listener,
             turns,
             ToolFixture {
                 node: fs::canonicalize(path.join("bin/node"))?,
                 pid_file: path.join("tool.pid"),
+                owner: child.id().context("The coordinator has exited")?,
             },
-        )
-        .await?;
-        command
-            .env("AGENT_PERFORMANCE_RUNTIME", runtime)
-            .env("AGENT_PERFORMANCE_PROVIDER", &provider.base_url)
-            .env("AGENT_PERFORMANCE_RUNTIME_PID", path.join("runtime.pid"));
-        let child = command.spawn()?;
+        );
         let mut coordinator = Self {
             child,
             directory,
