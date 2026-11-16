@@ -1381,6 +1381,99 @@ mod tests {
         json!({"content_type": "image_asset_pointer", "asset_pointer": pointer})
     }
 
+    fn unread(normalized: &Normalized) -> Vec<&str> {
+        normalized
+            .gaps
+            .iter()
+            .filter(|gap| matches!(gap.code, HistoryGapCode::Unsupported))
+            .map(|gap| gap.message.as_str())
+            .collect()
+    }
+
+    fn labels(raw: &Value) -> Vec<(String, u32)> {
+        survey(raw, &[]).unsupported.into_iter().collect()
+    }
+
+    #[test]
+    fn fallback_markdown_is_not_used_when_a_part_holds_a_file_or_was_left_out() {
+        let fallback = json!({"model_dil_v2": {"fallbackMarkdown": "Rendered HIDDEN-PART-TEXT"}});
+        let with_file = json!({"author": {"role": "assistant"},
+            "content": {"content_type": "multimodal_text", "parts": ["Widget markup",
+                {"content_type": "image_asset_pointer", "asset_pointer": "sediment://file_00ab12",
+                    "text": "Chart caption"}]},
+            "metadata": fallback});
+        let with_hidden = json!({"author": {"role": "assistant"},
+            "content": {"content_type": "multimodal_text", "parts": ["Widget markup",
+                {"content_type": "text", "text": "HIDDEN-PART-TEXT",
+                    "metadata": {"is_visually_hidden_from_conversation": true}}]},
+            "metadata": fallback});
+        let raw = Conversation::new(1, "Widget")
+            .node("file", Some("root"), with_file)
+            .node("hidden", Some("file"), with_hidden)
+            .build();
+        let normalized = run_with(&raw, &[], &Files::new(&["file_00ab12-chart.dat"]));
+        let carrier = item(&normalized, "file");
+        assert_eq!(carrier.text, "Widget markup\n\nChart caption");
+        assert_eq!(paths(carrier), ["file_00ab12"]);
+        assert_eq!(item(&normalized, "hidden").text, "Widget markup");
+        assert!(
+            !serde_json::to_string(&normalized.items)
+                .unwrap()
+                .contains("HIDDEN-PART-TEXT")
+        );
+        assert_eq!(
+            labels(&raw),
+            [
+                ("metadata model_dil_v2 (not used)".to_owned(), 2),
+                ("part text (hidden)".to_owned(), 1)
+            ]
+        );
+        assert_eq!(unread(&normalized).len(), 3);
+    }
+
+    #[test]
+    fn a_stream_output_with_text_the_message_does_not_show_is_reported() {
+        let output = json!({"author": {"role": "tool", "name": "python"},
+            "content": {"content_type": "execution_output", "text": "first line\nsecond line"},
+            "metadata": {"aggregate_result": {"messages": [
+                {"message_type": "stream", "text": "first line\n"},
+                {"message_type": "stream"},
+                {"message_type": "stream", "text": "UNSEEN-STREAM-TEXT"}]}}});
+        let raw = Conversation::new(1, "Streams")
+            .node("out", Some("root"), output)
+            .build();
+        let normalized = run(&raw);
+        assert_eq!(item(&normalized, "out").text, "first line\nsecond line");
+        let unread = unread(&normalized);
+        assert_eq!(unread.len(), 1, "{unread:?}");
+        assert!(unread[0].contains("out"), "{unread:?}");
+        assert_eq!(
+            labels(&raw),
+            [("output stream (text not in the message)".to_owned(), 1)]
+        );
+    }
+
+    #[test]
+    fn a_message_that_is_not_an_object_is_reported() {
+        let raw = Conversation::new(1, "Odd")
+            .say("u1", "root", "user", "Hello")
+            .node("list", Some("u1"), json!(["NOT-A-MESSAGE"]))
+            .node("word", Some("list"), json!("NOT-A-MESSAGE"))
+            .build();
+        let normalized = run(&raw);
+        assert_eq!(placed(&normalized), [("u1", Current)]);
+        let unread = unread(&normalized);
+        assert_eq!(unread.len(), 2, "{unread:?}");
+        assert!(
+            unread[0].contains("list") && unread[1].contains("word"),
+            "{unread:?}"
+        );
+        assert_eq!(
+            labels(&raw),
+            [("message (none) (unreadable)".to_owned(), 2)]
+        );
+    }
+
     fn paths(item: &HistoryItem) -> Vec<&str> {
         item.assets
             .iter()
