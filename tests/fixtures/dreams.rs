@@ -3,9 +3,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    os::unix::{fs::PermissionsExt, net::UnixStream},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Child, Command, Output, Stdio},
+    process::{Command, Output, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -17,11 +17,14 @@ use agent_cli::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+#[path = "coordinator.rs"]
+mod coordinator_fixture;
+use coordinator_fixture::Coordinator;
+pub use coordinator_fixture::Server;
 #[path = "executable.rs"]
 mod executable_fixture;
 use executable_fixture::write_executable;
 
-pub const COORDINATOR_READY_TIMEOUT: Duration = Duration::from_secs(60);
 pub const JOB_TIMEOUT: Duration = Duration::from_secs(90);
 pub const DREAMS_TOOLS: [&str; 3] = ["dreams_abstain", "dreams_propose", "dreams_review"];
 pub const DREAMS_KEY: &str = "DREAMS_NIGHT";
@@ -287,32 +290,21 @@ impl Fixture {
         fs::write(&self.queue, serde_json::to_vec(&queue).unwrap()).unwrap();
     }
 
-    pub fn command(&self, args: &[&str], json: bool) -> Command {
-        let binary = std::env::var_os("AGENT_CLI_PATH")
-            .unwrap_or_else(|| env!("CARGO_BIN_EXE_beep-boop").into());
-        let mut command = Command::new(binary);
-        let mut paths = vec![self.bin.clone()];
-        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
-        if json {
-            command.arg("--json");
+    fn coordinator(&self) -> Coordinator<'_> {
+        Coordinator {
+            directory: self.directory.path(),
+            config: &self.config,
+            state: &self.state,
+            bin: &self.bin,
+            instructions: &self.instructions,
+            runtime: &self.runtime,
         }
-        command
-            .arg("--config")
-            .arg(&self.config)
-            .arg("--state-dir")
-            .arg(&self.state)
-            .arg("--runtime")
-            .arg(&self.runtime)
-            .arg("--instructions")
-            .arg(&self.instructions)
-            .args(args)
-            .env("PATH", std::env::join_paths(paths).unwrap())
-            .env("HOME", self.directory.path())
-            .env(
-                "AGENT_TEST_EXTERNAL_CALLS",
-                self.directory.path().join("external-calls"),
-            )
-            .stdin(Stdio::null());
+    }
+
+    pub fn command(&self, args: &[&str], json: bool) -> Command {
+        let mut command = self.coordinator().command(args, json);
+        // The developer's Git identity and settings must not decide a test.
+        command.env("HOME", self.directory.path());
         command
     }
 
@@ -368,36 +360,10 @@ impl Fixture {
 
     pub fn start(&self) -> Server {
         self.ok(&["jobs", "check"], false);
-        let stderr = self.directory.path().join("server.stderr");
-        let child = self
-            .command(&["serve", "--local-only", "--no-sources"], true)
-            .stdout(Stdio::null())
-            .stderr(fs::File::create(&stderr).unwrap())
-            .spawn()
-            .unwrap();
-        let server = Server(Some(child));
-        let deadline = Instant::now() + COORDINATOR_READY_TIMEOUT;
-        while UnixStream::connect(self.state.join("agent.sock")).is_err() {
-            assert!(
-                Instant::now() < deadline,
-                "Fixture coordinator did not bind: {}",
-                fs::read_to_string(&stderr).unwrap_or_default()
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
-        loop {
-            let output = self.cli(&["jobs", "sync"], true);
-            if output.status.success() {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "Fixture coordinator did not accept its job catalog: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            thread::sleep(Duration::from_millis(50));
-        }
-        server
+        self.coordinator().start(
+            || self.cli(&["jobs", "sync"], true).status.success(),
+            "Fixture coordinator did not accept its job catalog",
+        )
     }
 
     pub fn job(&self, id: &str) -> ScheduledJobStatus {
@@ -445,8 +411,7 @@ impl Fixture {
                 return Err(format!(
                     "Job {id} did not finish: {:?}\n{}",
                     job.last_run,
-                    fs::read_to_string(self.directory.path().join("server.stderr"))
-                        .unwrap_or_default()
+                    self.coordinator().startup_diagnostics()
                 ));
             }
             thread::sleep(Duration::from_millis(50));
@@ -625,38 +590,4 @@ pub fn tree_snapshot(root: &Path) -> BTreeMap<PathBuf, (u32, Vec<u8>)> {
         }
     }
     snapshot
-}
-
-pub struct Server(Option<Child>);
-
-impl Server {
-    pub fn stop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            let pid = libc::pid_t::try_from(child.id()).unwrap();
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while child.try_wait().unwrap().is_none() {
-                if Instant::now() >= deadline {
-                    child.kill().unwrap();
-                    child.wait().unwrap();
-                    assert!(
-                        thread::panicking(),
-                        "Fixture coordinator did not stop gracefully"
-                    );
-                    return;
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            assert!(
-                child.wait().unwrap().success() || thread::panicking(),
-                "Fixture coordinator shutdown failed"
-            );
-        }
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.stop();
-    }
 }
