@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { readdir, readFile, rename } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -15,7 +15,7 @@ import type { LogEntry } from "../src/generated/LogEntry.js";
 import { HistoryStore, ImportedItemEntry } from "../src/history.js";
 import type { HistoryImportBatch } from "../src/generated/HistoryImportBatch.js";
 import { AuthorityUnreachable } from "../src/failover/authority-link.js";
-import { authorities, enroll, follow, logBatches, logEntries, note, openOwner, openScoped, OWNER, replaceOwner, sessionPath, stage, STANDBY,
+import { authorities, enroll, follow, logBatches, logEntries, note, openOwner, openScoped, OWNER, replaceOwner, sessionPath, stage, stamp, STANDBY,
   stateDirectory, tables } from "./fixtures/failover-state.js";
 
 const context = BACKGROUND_CONTEXT;
@@ -68,6 +68,8 @@ async function appendStamped(link: AuthorityLink, epoch: number, at: number, sta
 async function promotedHistory(t: TestContext, link: AuthorityLink) {
   const epoch = await enroll(link), root = await stateDirectory(t), standby = await stateDirectory(t);
   const directory = join(root, "owner");
+  await mkdir(directory);
+  await stamp(directory);
   const original = { text: "Invented accepted garden transcript, in full." };
   const bytes = Buffer.from(JSON.stringify(original)), path = `history/assets/${sha256Hex(bytes)}`;
   const owner = await openOwner(directory, link, { epoch });
@@ -332,7 +334,7 @@ for (const [name, connect] of Object.entries(authorities)) {
     await link.putBlob(sha256Hex(snapshot), snapshot);
     assert.equal((await link.command(checkpoint)).result, "accepted");
     const stale = tables(behind);
-    const behindCheckpoint = new RegExp(`does not belong to this log: it is at position ${early}, and the log runs from ${head} to ${head}`);
+    const behindCheckpoint = new RegExp(`is at position ${early}, behind the checkpoint at ${head}, and the log no longer holds the entries between them. Rebuild it with \`beep-boop failover join --replace\``);
     await assert.rejects(follow(behind, link), behindCheckpoint);
     await assert.rejects(openOwner(behind, link, { epoch }), behindCheckpoint);
     assert.deepEqual(tables(behind), stale);

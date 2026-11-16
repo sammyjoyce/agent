@@ -6,8 +6,8 @@ import { defineDoc, type Storage, type StorageWrite } from "@earendil-works/pi-d
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { openConversationDatabase } from "../src/conversation-database.js";
 import { versions } from "../src/failover/log-entry.js";
-import { UnloggedWrite, type EntryApplication } from "../src/failover/scoped-database.js";
-import { note, openPi, openScoped, sessionPath, stateDirectory, tables } from "./fixtures/failover-state.js";
+import { PositionMissing, UnloggedWrite, type EntryApplication } from "../src/failover/scoped-database.js";
+import { note, openPi, openScoped, sessionPath, stamp, stateDirectory, tables, unstampedDirectory } from "./fixtures/failover-state.js";
 
 const Tally = defineDoc<{ count: number }>({ kind: "fixture.tally", scope: "session", version: 1, initial: () => ({ count: 0 }), checkpointWhen: () => false });
 
@@ -52,7 +52,7 @@ test("a dry run returns the sequence the commit then assigns, changes no table, 
   let counted: ReturnType<typeof counting> | undefined;
   const database = await openScoped(directory, (raw) => (counted = counting(raw)).database);
   assert.ok(counted);
-  const storage = await database.openStorage(0);
+  const storage = await database.openStorage();
   t.after(() => storage.close(BACKGROUND_CONTEXT));
   for (const [index, batch] of batches.entries()) {
     const before = tables(directory);
@@ -70,7 +70,7 @@ test("a dry run returns the sequence the commit then assigns, changes no table, 
 
 test("a batch Pi refuses fails the dry run and leaves the database unchanged", async (t) => {
   const batches = await piBatches(t), directory = await stateDirectory(t);
-  const database = await openScoped(directory), storage = await database.openStorage(0);
+  const database = await openScoped(directory), storage = await database.openStorage();
   t.after(() => storage.close(BACKGROUND_CONTEXT));
   for (const [index, batch] of batches.entries()) await database.apply(index + 1, index + 1, withoutFiles(() => storage.commit(batch, BACKGROUND_CONTEXT)));
   const reused = batches.flat().find((write) => write.type === "entry");
@@ -83,7 +83,7 @@ test("a batch Pi refuses fails the dry run and leaves the database unchanged", a
 test("an entry applies only at its own position and its own Pi sequence", async (t) => {
   const [first, second] = await piBatches(t), directory = await stateDirectory(t);
   assert.ok(first && second);
-  const database = await openScoped(directory), storage = await database.openStorage(0);
+  const database = await openScoped(directory), storage = await database.openStorage();
   t.after(() => storage.close(BACKGROUND_CONTEXT));
   const empty = tables(directory);
   await assert.rejects(database.apply(2, 1, withoutFiles(() => storage.commit(first, BACKGROUND_CONTEXT))), /position 0/);
@@ -99,7 +99,7 @@ test("an entry applies only at its own position and its own Pi sequence", async 
 
 test("Pi reads a document inside a transaction, and a transaction outside the log can only read", async (t) => {
   const batches = await piBatches(t), directory = await stateDirectory(t);
-  const database = await openScoped(directory), storage = await database.openStorage(0);
+  const database = await openScoped(directory), storage = await database.openStorage();
   t.after(() => storage.close(BACKGROUND_CONTEXT));
   for (const [index, batch] of batches.entries()) await database.apply(index + 1, index + 1, withoutFiles(() => storage.commit(batch, BACKGROUND_CONTEXT)));
   const created = batches.flat().find((write) => write.type === "document.create" && write.record.kind === "fixture.tally");
@@ -115,4 +115,17 @@ test("Pi reads a document inside a transaction, and a transaction outside the lo
   await assert.rejects(database.get("UPDATE durable_metadata SET next_seq = 99 RETURNING next_seq"), UnloggedWrite);
   assert.deepEqual(tables(directory), before);
   assert.equal((await database.transaction((transaction) => transaction.get<{ next_seq: number }>("SELECT next_seq FROM durable_metadata")))?.next_seq, batches.length + 1);
+});
+
+test("a directory opens only after it was stamped, and a stamp never moves a position", async (t) => {
+  const directory = await unstampedDirectory(t);
+  await assert.rejects(async () => (await openScoped(directory)).openStorage(), (error) =>
+    error instanceof PositionMissing && /beep-boop failover enroll/.test(error.message) && /beep-boop failover join/.test(error.message));
+  assert.deepEqual(tables(directory), {}, "a refused open leaves the database without Pi's schema");
+  await stamp(directory, 3);
+  await stamp(directory, 3);
+  await assert.rejects(stamp(directory, 4), /is at replication position 3, so it cannot be stamped at 4/);
+  const database = await openScoped(directory), storage = await database.openStorage();
+  t.after(() => storage.close(BACKGROUND_CONTEXT));
+  assert.equal(await database.position(), 3);
 });

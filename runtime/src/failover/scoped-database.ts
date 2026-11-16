@@ -17,6 +17,7 @@ export interface EntryApplication<T> {
 const REFUSE_WRITES = "PRAGMA query_only = ON";
 const ALLOW_WRITES = "PRAGMA query_only = OFF";
 const READ_POSITION = "SELECT position FROM beep_boop_failover WHERE singleton = 1";
+const HAS_POSITION_TABLE = "SELECT 1 AS present FROM sqlite_schema WHERE type = 'table' AND name = 'beep_boop_failover'";
 const SQLITE_READONLY = 8;
 
 /** A write reached the session database outside a dry run and outside the application of a log entry. */
@@ -24,6 +25,14 @@ export class UnloggedWrite extends Error {
   constructor(cause: unknown) {
     super("A write to the session database must be a dry run or the application of one log entry", { cause });
     this.name = "UnloggedWrite";
+  }
+}
+
+/** The state directory was never enrolled or joined, so nothing says which log entries it holds. */
+export class PositionMissing extends Error {
+  constructor() {
+    super("This state directory holds no replication position. Run `beep-boop failover enroll` to enroll it as a replicated coordinator, or `beep-boop failover join` to make it a standby of an enrolled one");
+    this.name = "PositionMissing";
   }
 }
 
@@ -59,18 +68,28 @@ export class ScopedDatabase implements SqliteDatabase {
   }
 
   /**
-   * Opens Pi's storage over this database. A directory that opens in replicated
-   * mode for the first time is taken to hold the checkpoint, at `through`.
+   * Opens Pi's storage over this database. It refuses a directory that holds
+   * no position, before Pi changes anything in it: nothing is taken to hold a
+   * checkpoint that `stampPosition` did not say holds it.
    */
-  async openStorage(through: number): Promise<SqliteStorage> {
-    return this.#mode.run({ kind: "schema" }, async () => {
-      const storage = await SqliteStorage.open(this);
-      await this.transaction(async (transaction) => {
-        await transaction.exec("CREATE TABLE IF NOT EXISTS beep_boop_failover (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), position INTEGER NOT NULL)");
-        await transaction.run("INSERT OR IGNORE INTO beep_boop_failover (singleton, position) VALUES (1, ?)", through);
-      });
-      return storage;
-    });
+  async openStorage(): Promise<SqliteStorage> {
+    await readPosition(this.#inner);
+    return this.#mode.run({ kind: "schema" }, () => SqliteStorage.open(this));
+  }
+
+  /**
+   * Records that this directory holds the log through `position`. Only
+   * `failover enroll`, at 0, and `failover join`, at its checkpoint's
+   * position, call it. A directory that already holds `position` is left as
+   * it is, and one that holds another position is refused.
+   */
+  async stampPosition(position: number): Promise<void> {
+    await this.#mode.run({ kind: "schema" }, () => this.transaction(async (transaction) => {
+      await transaction.exec("CREATE TABLE IF NOT EXISTS beep_boop_failover (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), position INTEGER NOT NULL)");
+      await transaction.run("INSERT OR IGNORE INTO beep_boop_failover (singleton, position) VALUES (1, ?)", position);
+      const held = await readPosition(transaction);
+      if (held !== position) throw new Error(`This state directory is at replication position ${held}, so it cannot be stamped at ${position}`);
+    }));
   }
 
   /** The position of the last log entry applied to this directory. */
@@ -148,7 +167,7 @@ async function runInMode<T>(mode: TransactionMode, transaction: SqliteExecutor, 
 }
 
 async function readPosition(executor: SqliteExecutor): Promise<number> {
-  const row = await executor.get<{ position: number }>(READ_POSITION);
-  if (row === undefined) throw new Error("The session database has no replication position");
+  const row = await executor.get(HAS_POSITION_TABLE) === undefined ? undefined : await executor.get<{ position: number }>(READ_POSITION);
+  if (row === undefined) throw new PositionMissing();
   return row.position;
 }
