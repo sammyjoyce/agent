@@ -847,8 +847,8 @@ mod tests {
                 page.items[1].version.as_str(),
             ],
             [
-                "6d9add3c44295b197c450a40e3165106e69ca05acb48f1decbf721872aadf5f8",
-                "22bf46faad64cc152e1159ac4ba66f6ba7a8a970a26e0205cb1423f10480c493",
+                "4533b7025b4c69176cbfba5d73f1d68474b851200ee969a1b67298ab433d6c93",
+                "23a8986dea5960b5b49b9dc1d80b6315a4eb534a96b455fd9abca191f2c66926",
                 "6b273e3331333be4d762a3bc73367b4f6b077ddefc2c49bacd8c40ad04b29b78",
             ],
             "A pinned version changed. If the change is meant, bump PACKAGE_FORMAT, THREAD_FORMAT or ITEM_FORMAT and update these values."

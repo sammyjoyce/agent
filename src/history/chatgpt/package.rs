@@ -806,6 +806,7 @@ impl Scan {
                 .collect();
             entry.thread.version = digest(&serde_json::json!([
                 THREAD_FORMAT,
+                conversation::ITEM_FORMAT,
                 entry.thread.id,
                 hex::encode(entry.content),
                 entries,

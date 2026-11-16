@@ -367,7 +367,7 @@ pub(super) struct Normalized {
     pub assets: HashMap<String, AssetSource>,
 }
 
-const ITEM_FORMAT: u32 = 1;
+pub(super) const ITEM_FORMAT: u32 = 1;
 const INLINE_EVIDENCE_BYTES: usize = 128 * 1024;
 const TEXT_EXCERPT_BYTES: usize = 16 * 1024;
 const INSTRUCTION_METADATA: [&str; 5] = [
