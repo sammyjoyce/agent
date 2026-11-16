@@ -433,10 +433,12 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         !lifecycle.is_service_owned(),
         "Coordinator metadata is owned by its local service"
     );
-    if lifecycle.is_worker() && runtime.restore_held() {
+    if runtime.restore_held()
+        && let Some(message) = crate::backup::held_after_restore(&command)
+    {
         let refusal = RuntimeEventKind::Failure {
             code: crate::protocol::ErrorCode::CoordinatorUnavailable,
-            message: "Task workers are held after a restore until `backup release`".into(),
+            message: message.into(),
         };
         return write_client_frame(&mut writer, &refusal, &runtime).await;
     }

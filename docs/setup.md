@@ -680,12 +680,29 @@ refuses a target that is not empty, and it never reads or changes the existing
 state directory. To check a backup without using it, restore it into a scratch
 directory and then delete that directory.
 
-A restored store starts held. Its coordinator serves history, attachments and
-chats, but scheduled jobs, source polling, worktree collection, history
-indexing, task workers and phone notifications do not run. The restored coordinator
-has the same coordinator ID, so do not run it while the original still runs.
-Check the hosts first, for example that work a restored job would start has not
-already happened elsewhere. Then stop the coordinator and release the hold:
+A restored store starts held. Until the release, the held coordinator does not
+run this work:
+
+- Scheduled jobs, source polling, automatic triage and automatic history
+  indexing.
+- Phone notifications.
+- Task workers, so no backed-up task turn resumes.
+- Worktree collection, both the collection that each registered worker requests
+  on its own and `beep-boop resources collect`.
+
+A held store is not a read-only copy. It serves history and attachments, and it
+runs chats and the other commands you send. A chat's tool calls run on hosts
+and in the browser, and its own tool can still collect worktrees. A chat can
+create tasks and open their terminals, but the coordinator refuses their task
+workers until the release. `/feedback` saves its report and opens a repair
+terminal on the reporting machine, and the coordinator refuses the task worker
+in that terminal too. `beep-boop import codex` imports history and indexes
+what it imports.
+
+The restored coordinator has the same coordinator ID, so do not run it while
+the original still runs. Check the hosts first, for example that work a
+restored job would start has not already happened elsewhere. Then stop the
+coordinator and release the hold:
 
 ```sh
 beep-boop --state-dir ~/agent-restored backup release

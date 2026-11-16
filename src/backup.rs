@@ -19,7 +19,10 @@ use sha2::{Digest, Sha256};
 use ts_rs::TS;
 use uuid::Uuid;
 
-use crate::{attachments::AttachmentRef, coordinator_id::CoordinatorId, runtime::WriterLock};
+use crate::{
+    attachments::AttachmentRef, coordinator_id::CoordinatorId, protocol::RuntimeCommand,
+    runtime::WriterLock,
+};
 
 const MANIFEST: &str = "manifest.json";
 const ARCHIVE_DATA: &str = "data";
@@ -210,9 +213,84 @@ pub fn restore_held(_owner: &WriterLock, state: &Path) -> bool {
 
 pub fn hold_notice(state: &Path) -> String {
     format!(
-        "Background work and phone notifications are held after a restore until `beep-boop --state-dir {} backup release`.",
+        "Background work, task workers, automatic worktree collection and phone notifications are held after a restore until `beep-boop --state-dir {} backup release`.",
         state.display()
     )
+}
+
+/// The refusal a held store gives a request that waits for `backup release`.
+pub fn held_after_restore(command: &RuntimeCommand) -> Option<&'static str> {
+    match command {
+        RuntimeCommand::RunTask { .. } => {
+            Some("Task workers are held after a restore until `backup release`")
+        }
+        RuntimeCommand::CollectResources { .. } => {
+            Some("Worktree collection is held after a restore until `backup release`")
+        }
+        RuntimeCommand::RunBackground { .. } => {
+            Some("Background work is held after a restore until `backup release`")
+        }
+        RuntimeCommand::Login
+        | RuntimeCommand::Chat { .. }
+        | RuntimeCommand::AttachMain
+        | RuntimeCommand::ObserveMain { .. }
+        | RuntimeCommand::AttachConversation { .. }
+        | RuntimeCommand::ConfigureCoordinator { .. }
+        | RuntimeCommand::RegisterNode { .. }
+        | RuntimeCommand::SetConnectedNodes { .. }
+        | RuntimeCommand::OAuthCallback { .. }
+        | RuntimeCommand::WorkerInput { .. }
+        | RuntimeCommand::SubmitInput { .. }
+        | RuntimeCommand::DetachWorker
+        | RuntimeCommand::DetachMain
+        | RuntimeCommand::DetachConversation
+        | RuntimeCommand::Interrupt
+        | RuntimeCommand::HostReply { .. }
+        | RuntimeCommand::Watch
+        | RuntimeCommand::ConnectWorker { .. }
+        | RuntimeCommand::Native { .. }
+        | RuntimeCommand::ConversationUsage { .. }
+        | RuntimeCommand::Attachment { .. }
+        | RuntimeCommand::SyncJobs { .. }
+        | RuntimeCommand::JobStatus
+        | RuntimeCommand::ListJobs
+        | RuntimeCommand::ReadJob { .. }
+        | RuntimeCommand::RetryJob { .. }
+        | RuntimeCommand::RunJob { .. }
+        | RuntimeCommand::Environment { .. }
+        | RuntimeCommand::SourceStates
+        | RuntimeCommand::IngestSource { .. }
+        | RuntimeCommand::TriageSources { .. }
+        | RuntimeCommand::Status
+        | RuntimeCommand::Usage { .. }
+        | RuntimeCommand::MainInput { .. }
+        | RuntimeCommand::MainInterrupt
+        | RuntimeCommand::MainFeedback { .. }
+        | RuntimeCommand::ConversationSettings { .. }
+        | RuntimeCommand::Logout
+        | RuntimeCommand::SearchTasks { .. }
+        | RuntimeCommand::ListTasks
+        | RuntimeCommand::ReadTaskGraph
+        | RuntimeCommand::ListConversations { .. }
+        | RuntimeCommand::ConversationInput { .. }
+        | RuntimeCommand::ConversationInterrupt { .. }
+        | RuntimeCommand::ListResources
+        | RuntimeCommand::ReadTask { .. }
+        | RuntimeCommand::ReadHistory { .. }
+        | RuntimeCommand::ReadToolDetails { .. }
+        | RuntimeCommand::Feedback { .. }
+        | RuntimeCommand::ReadFeedback { .. }
+        | RuntimeCommand::ImportCodex { .. }
+        | RuntimeCommand::ImportStatus
+        | RuntimeCommand::RetryHistoryIndex
+        | RuntimeCommand::TaskInput { .. }
+        | RuntimeCommand::AnnotateTranscript { .. }
+        | RuntimeCommand::Notifications { .. }
+        | RuntimeCommand::SearchHistory { .. }
+        | RuntimeCommand::ReadConversation { .. }
+        | RuntimeCommand::OpenConversation { .. }
+        | RuntimeCommand::RevokeAllocation { .. } => None,
+    }
 }
 
 #[derive(Debug, Serialize)]
