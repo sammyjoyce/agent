@@ -1725,7 +1725,7 @@ export class TaskStore {
       const conversation = await this.conversation(actor.conversation_id);
       if (confined !== undefined && await this.session.commit((tx) => this.predatesConfinementIn(tx, input.task_id), BACKGROUND_CONTEXT)) {
         await conversation.abort(BACKGROUND_CONTEXT);
-        await this.withdrawUnplaced(input, conversation, actor.pending);
+        await this.session.commit((tx) => this.withdrawIn(tx, input.task_id, input.agent_id, () => true), BACKGROUND_CONTEXT);
         throw new TaskError(PREDATES_CONFINEMENT);
       }
       if (confined !== undefined) await this.inference.withholdHostedTools(conversation);
@@ -1834,7 +1834,8 @@ export class TaskStore {
           delete active.wake;
           continue;
         }
-        if (confined !== undefined && next.scheduled === undefined && (await this.withdrawUnplaced(input, conversation, [next])).length > 0) {
+        if (confined !== undefined && next.scheduled === undefined && (await this.session.commit((tx) =>
+          this.withdrawIn(tx, input.task_id, input.agent_id, (queued) => queued.id === next.id), BACKGROUND_CONTEXT)).length > 0) {
           this.publish(active, (session) => session.rejected?.(next.id, CONFINED_ACTOR_ONLY));
           continue;
         }
