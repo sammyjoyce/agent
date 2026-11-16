@@ -6,7 +6,7 @@ import { defineDoc, type Storage, type StorageWrite } from "@earendil-works/pi-d
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { openConversationDatabase } from "../src/conversation-database.js";
 import { versions } from "../src/failover/log-entry.js";
-import { UnloggedWrite } from "../src/failover/scoped-database.js";
+import { UnloggedWrite, type EntryApplication } from "../src/failover/scoped-database.js";
 import { note, openPi, openScoped, sessionPath, stateDirectory, tables } from "./fixtures/failover-state.js";
 
 const Tally = defineDoc<{ count: number }>({ kind: "fixture.tally", scope: "session", version: 1, initial: () => ({ count: 0 }), checkpointWhen: () => false });
@@ -28,6 +28,8 @@ async function piBatches(t: TestContext): Promise<StorageWrite[][]> {
   await harness.close(BACKGROUND_CONTEXT);
   return batches;
 }
+
+const withoutFiles = <T>(commit: () => Promise<T>): EntryApplication<T> => ({ publish: async () => {}, commit });
 
 function counting(database: SqliteDatabase) {
   const counted = { transactions: 0, database: { exec: (sql) => database.exec(sql), run: (sql, ...params) => database.run(sql, ...params),
@@ -59,7 +61,7 @@ test("a dry run returns the sequence the commit then assigns, changes no table, 
     assert.equal(counted.transactions, 1, "the dry run of one Pi commit is one transaction");
     assert.deepEqual(tables(directory), before, "a dry run leaves every table and durable_metadata unchanged");
     counted.transactions = 0;
-    assert.equal(await database.apply(index + 1, predicted, () => storage.commit(batch, BACKGROUND_CONTEXT)), predicted);
+    assert.equal(await database.apply(index + 1, predicted, withoutFiles(() => storage.commit(batch, BACKGROUND_CONTEXT))), predicted);
     assert.equal(counted.transactions, 1, "one Pi commit is one transaction");
     assert.equal(await database.position(), index + 1);
   }
@@ -70,7 +72,7 @@ test("a batch Pi refuses fails the dry run and leaves the database unchanged", a
   const batches = await piBatches(t), directory = await stateDirectory(t);
   const database = await openScoped(directory), storage = await database.openStorage(0);
   t.after(() => storage.close(BACKGROUND_CONTEXT));
-  for (const [index, batch] of batches.entries()) await database.apply(index + 1, index + 1, () => storage.commit(batch, BACKGROUND_CONTEXT));
+  for (const [index, batch] of batches.entries()) await database.apply(index + 1, index + 1, withoutFiles(() => storage.commit(batch, BACKGROUND_CONTEXT)));
   const reused = batches.flat().find((write) => write.type === "entry");
   assert.ok(reused);
   const before = tables(directory);
@@ -84,14 +86,14 @@ test("an entry applies only at its own position and its own Pi sequence", async 
   const database = await openScoped(directory), storage = await database.openStorage(0);
   t.after(() => storage.close(BACKGROUND_CONTEXT));
   const empty = tables(directory);
-  await assert.rejects(database.apply(2, 1, () => storage.commit(first, BACKGROUND_CONTEXT)), /position 0/);
-  await assert.rejects(database.apply(1, 2, () => storage.commit(first, BACKGROUND_CONTEXT)), /Pi sequence 2/);
+  await assert.rejects(database.apply(2, 1, withoutFiles(() => storage.commit(first, BACKGROUND_CONTEXT))), /position 0/);
+  await assert.rejects(database.apply(1, 2, withoutFiles(() => storage.commit(first, BACKGROUND_CONTEXT))), /Pi sequence 2/);
   assert.deepEqual(tables(directory), empty, "a refused entry rolls back whole");
-  await database.apply(1, 1, () => storage.commit(first, BACKGROUND_CONTEXT));
+  await database.apply(1, 1, withoutFiles(() => storage.commit(first, BACKGROUND_CONTEXT)));
   const applied = tables(directory);
-  await assert.rejects(database.apply(1, 1, () => storage.commit(first, BACKGROUND_CONTEXT)), /position 1/);
+  await assert.rejects(database.apply(1, 1, withoutFiles(() => storage.commit(first, BACKGROUND_CONTEXT))), /position 1/);
   assert.deepEqual(tables(directory), applied, "an entry does not apply twice");
-  await database.apply(2, 2, () => storage.commit(second, BACKGROUND_CONTEXT));
+  await database.apply(2, 2, withoutFiles(() => storage.commit(second, BACKGROUND_CONTEXT)));
   assert.equal(await database.position(), 2);
 });
 
@@ -99,7 +101,7 @@ test("Pi reads a document inside a transaction, and a transaction outside the lo
   const batches = await piBatches(t), directory = await stateDirectory(t);
   const database = await openScoped(directory), storage = await database.openStorage(0);
   t.after(() => storage.close(BACKGROUND_CONTEXT));
-  for (const [index, batch] of batches.entries()) await database.apply(index + 1, index + 1, () => storage.commit(batch, BACKGROUND_CONTEXT));
+  for (const [index, batch] of batches.entries()) await database.apply(index + 1, index + 1, withoutFiles(() => storage.commit(batch, BACKGROUND_CONTEXT)));
   const created = batches.flat().find((write) => write.type === "document.create" && write.record.kind === "fixture.tally");
   assert.ok(created?.type === "document.create");
   assert.deepEqual((await storage.document(created.record.id, "current", BACKGROUND_CONTEXT))?.value, { count: 1 });

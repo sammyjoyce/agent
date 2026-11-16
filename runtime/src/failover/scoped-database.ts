@@ -6,7 +6,13 @@ type TransactionMode =
   | { readonly kind: "read" }
   | { readonly kind: "schema" }
   | { readonly kind: "dry-run" }
-  | { readonly kind: "apply"; readonly at: number; readonly piSeq: number | null };
+  | { readonly kind: "apply"; readonly at: number; readonly piSeq: number | null; readonly publish: () => Promise<void> };
+
+/** The two steps that apply one log entry: `publish` gives its files their final names, then `commit` writes its Pi batch. */
+export interface EntryApplication<T> {
+  readonly publish: () => Promise<void>;
+  readonly commit: () => Promise<T>;
+}
 
 const REFUSE_WRITES = "PRAGMA query_only = ON";
 const ALLOW_WRITES = "PRAGMA query_only = OFF";
@@ -78,17 +84,19 @@ export class ScopedDatabase implements SqliteDatabase {
   }
 
   /**
-   * Runs `commit` as the application of the log entry at `at`. Its transaction
-   * commits only if this directory is at `at - 1` and, for a Pi batch, Pi
-   * assigned it `piSeq`. The position moves to `at` in the same transaction.
+   * Applies the log entry at `at` in the one transaction that `commit` opens.
+   * That transaction holds the session database's write lock, so appliers of
+   * one directory take turns. It runs `publish` only once it finds this
+   * directory at `at - 1`, then the writes of `commit`. It commits only if Pi
+   * assigned the batch `piSeq`, and the position moves to `at` in it.
    */
-  apply<T>(at: number, piSeq: number | null, commit: () => Promise<T>): Promise<T> {
-    return this.#mode.run({ kind: "apply", at, piSeq }, commit);
+  apply<T>(at: number, piSeq: number, { publish, commit }: EntryApplication<T>): Promise<T> {
+    return this.#mode.run({ kind: "apply", at, piSeq, publish }, commit);
   }
 
-  /** Applies a log entry that carries no Pi batch. */
-  applyWithoutBatch(at: number): Promise<void> {
-    return this.apply(at, null, () => this.transaction(async () => {}));
+  /** Applies a log entry that carries no Pi batch, as `apply` does. */
+  applyWithoutBatch(at: number, publish: () => Promise<void>): Promise<void> {
+    return this.#mode.run({ kind: "apply", at, piSeq: null, publish }, () => this.transaction(async () => {}));
   }
 
   transaction<T>(callback: (transaction: SqliteExecutor) => Promise<T>): Promise<T> {
@@ -124,6 +132,7 @@ async function runInMode<T>(mode: TransactionMode, transaction: SqliteExecutor, 
     case "apply": {
       const position = await readPosition(transaction);
       if (position !== mode.at - 1) throw new Error(`Log entry ${mode.at} does not apply to a directory at position ${position}`);
+      await mode.publish();
       const value = await callback(transaction);
       if (mode.piSeq !== null) {
         const metadata = await transaction.get<{ next_seq: number }>("SELECT next_seq FROM durable_metadata WHERE singleton = 1");
