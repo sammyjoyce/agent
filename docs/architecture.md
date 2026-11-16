@@ -613,12 +613,16 @@ contexts; rebuild affected context when necessary and retain the audit history.
 
 ### Speech and terminal recovery
 
-Speech-to-text is a separate Rust input trait with sibling provider modules.
-Transcription produces ordinary coordinator input, retaining conversation and
-task ownership. Follow the current
-[OpenAI transcription guide](https://developers.openai.com/api/docs/guides/transcription)
-when selecting recorded or streaming input. Pi's existing inference interfaces
-remain the model boundary.
+Speech-to-text runs on the iPhone. `SpeechEngine` in `AgentUI` is the
+transcription provider interface. It covers model state, installation,
+microphone permission and a recording that streams partial words and returns
+the final text. The app adapts on-device Parakeet to it, and
+`ios/scripts/check.sh` keeps the FluidAudio and Parakeet imports behind that
+adapter. Transcribed words become ordinary draft text that the normal Send
+submits, so conversation and task ownership do not change. Dictation never
+uploads its audio. `/feedback` recordings are separate and can include
+microphone audio sent to Scrawl. Pi's existing inference interfaces remain the
+model boundary.
 
 Rex server restart behavior needs investigation: what persists, how bindings
 become stale, and how to reattach without duplicate workers. Conversation

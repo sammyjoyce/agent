@@ -146,7 +146,11 @@ recovery; [history](history.md) describes import and retrieval.
   See [notification setup](notifications.md).
 - [x] Direct coordination between task sessions through their durable inboxes:
   sender identity, admission receipts, steering or queueing, and shared history.
-- [ ] Voice input through a transcription provider interface.
+- [x] Voice input through a transcription provider interface. The iPhone
+  composer transcribes on the device with Parakeet behind `SpeechEngine`. Tap
+  the mic to transcribe into the draft, or hold it to send through the same
+  Send. Dictation transcribes on the phone and never uploads its audio. A held
+  take passed a real-phone recheck.
 - [x] File/photo attachments on iOS and dragged files in the terminal, retained
   with the conversation and delivered to Pi on the selected execution host.
 - [x] Paste clipboard images into removable, unsent iOS attachments while
