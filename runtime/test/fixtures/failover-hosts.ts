@@ -34,7 +34,8 @@ export interface Running {
 export interface StatusReceipt { coordinator_id: string; record: AuthorityRecord | null; state_dir: string; applied: number | null }
 export interface EnrolledReceipt { coordinator_id: string; holder: string; epoch: number; checkpoint: CheckpointRecord;
   uploaded: { files: number; bytes: number; not_included: string[] } | null }
-export interface CheckpointedReceipt { coordinator_id: string; epoch: number; checkpoint: CheckpointRecord; head: number; uploaded: { files: number; bytes: number } }
+export interface CheckpointedReceipt { coordinator_id: string; epoch: number; checkpoint: CheckpointRecord; head: number;
+  uploaded: { files: number; bytes: number; not_included: string[] } }
 export interface JoinedReceipt { coordinator_id: string; state_dir: string; through: number; files: number; bytes: number; replaced: string | null }
 export interface FollowedReceipt { coordinator_id: string; from: number; applied: number }
 export interface ReleasedReceipt { coordinator_id: string; epoch: number; evidence: string; candidate: string }
