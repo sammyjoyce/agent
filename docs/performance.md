@@ -1,56 +1,203 @@
 # CLI performance
 
 The separate **CLI performance** CI job compares a change with its pull request
-base or previous main commit on the same runner. It builds both in release mode,
-alternates baseline and candidate launches, and saves every timing in JSON.
+base or previous main commit on the same runner. It builds both in release
+mode, alternates baseline and candidate samples, and saves every timing in
+JSON.
 
-The clock starts before launching the real CLI through the existing PTY fixture.
-It stops when a sentence from persisted conversation history appears in the
-terminal's visible cells. A `vt100` screen parser applies cursor movement,
-clearing and wrapping. A menu, composer, ANSI-stripped byte match, or text already
-scrolled offscreen does not satisfy the measurement.
+Every sample drives the real CLI through the existing PTY fixture. A `vt100`
+screen parser applies cursor movement, clearing and wrapping, and every check
+reads only visible cells. A menu, an ANSI-stripped byte match, or text already
+scrolled offscreen does not satisfy a check. Each version runs its own Rust
+coordinator and TypeScript runtime on the same synthetic state: the chief's
+40-message history, a saved 5,000-message conversation, and 3,000 unrelated
+saved discussions, all in real Pi/SQLite storage.
 
-Current scenarios open the chief's 40-message history with cold and warm
-coordinators, and resume a saved 5,000-message conversation. The corpus also
-contains 3,000 unrelated saved discussions. All use real Pi/SQLite storage,
-the coordinator, native history pagination and the regular TUI. Each version
-runs its own Rust
-coordinator and TypeScript runtime. Seeding and coordinator startup
-are outside the timed interval. Every CLI launch is fresh. The cold scenario
-also starts a fresh service for each sample; other scenarios retain theirs.
-The first pair warms the services and is recorded but excluded from the gate.
-The isolated environment exposes only Node on PATH, and provider requests are
-rejected. No model, credentials, network provider or Rex is involved. `/resume`
-opens saved history and `/exit` closes each sample; no model prompt is submitted.
+## Scenarios and gates
 
-Seven measured pairs run per scenario. Each candidate gets the greater of a
-25% or 20-millisecond allowance over its paired baseline. CI fails when the
-median fraction of that budget exceeds 1. Pairing prevents uneven runner
-stalls from turning separate medians into a false regression.
-There are no automatic retries or discarded slow samples. A missing conversation
-or failed CLI also fails the job. `performance/results.json` contains the raw
-samples and thresholds. A JSONL file retains completed samples if a later run
-fails; a failure JSON records the error.
+`examples/cli_performance/scenario.rs` defines every scenario: its coordinator
+lifetime, its scripted model turns, its gates, and the steps that drive it. A
+gate runs from one benchmark mark to a later one.
 
-Run locally after building both revisions' runtime and CLI:
+| Scenario | Coordinator | Gate | From | To |
+| --- | --- | --- | --- | --- |
+| `chief_cold` | Fresh per sample | `conversation_visible` | CLI spawn | The chief's last stored sentence is visible. |
+| `chief` | Shared per version | `conversation_visible` | CLI spawn | The chief's last stored sentence is visible. |
+| `long_history` | Shared per version | `conversation_visible` | Spawn of `chat /resume <id>` | The long conversation's last sentence is visible. |
+| `submit` | Fresh per sample | `admission` | Enter | The composer is empty and the prompt is a placed `›` line with no pending `sending…` state. |
+| `submit` | Fresh per sample | `first_activity` | Enter | The turn's reasoning summary is visible. |
+| `steer` | Fresh per sample | `steer_admission` | Enter on a second prompt while the first turn streams | `Steering messages, waiting` is visible. |
+| `steer` | Fresh per sample | `steer_reply` | The same Enter | The steering turn's answer is visible and the turn is idle. |
+| `stop_stream` | Fresh per sample | `stop` | Esc while the reasoning stream is open | `• Interrupted` is visible and the turn is idle. |
+| `stop_tool` | Fresh per sample | `stop` | Esc while an `exec` tool runs | `• Interrupted` is visible and the turn is idle. |
+
+The launch scenarios measure what they measured before: process spawn until
+stored text is visible, with no model request. An interactive sample starts a
+fresh coordinator from the snapshot and prepares outside timing. It launches
+the CLI, waits for the chief, and settles one short turn. Each prompt is typed
+first, and Enter is pressed only once the composer shows the prompt, so Enter
+is a keystroke of its own. `/exit` ends every sample.
+
+## Application delay
+
+The gated number is application delay. It is the gate's wall time minus the
+scripted provider holds that the gate subtracts:
+
+| Gate | Provider time subtracted |
+| --- | --- |
+| `conversation_visible`, `admission`, `steer_admission`, `stop` | None. Launch, admission and stopping never wait for the model. |
+| `first_activity` | The request's first-chunk hold, from the request body read until the reasoning write. The tail hold that keeps the stream open is not subtracted. |
+| `steer_reply` | Every hold after `Steering messages, waiting` became visible. These are the rest of the first turn's stream and the steering turn's own holds. |
+
+The provider records each hold on the benchmark's clock, so a slow reader in
+the runtime counts as application delay. Overlapping holds count once. A
+missing or reversed mark fails the sample, and a negative result is an error
+rather than zero.
+
+Seven measured pairs run per scenario. For every scenario and gate, each
+candidate gets the greater of a 25% or 20-millisecond allowance over its
+paired baseline. CI fails when the median fraction of that budget exceeds 1.
+Pairing prevents uneven runner stalls from turning separate medians into a
+false regression. The first pair warms the services and is recorded but
+excluded from the gate. There are no automatic retries or discarded slow
+samples.
+
+## Loopback model provider
+
+`runtime/test/fixtures/performance.ts` starts the real runtime with an
+invented `OPENAI_API_KEY`. It rewrites only
+`https://api.openai.com/v1/responses` to the benchmark's loopback server,
+through the original `fetch` with Pi's method, headers, body and abort signal.
+Every other URL throws. The server in `examples/cli_performance/provider.rs`
+accepts only `POST /v1/responses` and answers with OpenAI Responses
+server-sent events. Each request must match the next scripted turn by the
+prompt in its latest user input.
+
+| Turn | First-chunk hold | Tail hold | Ends with |
+| --- | ---: | ---: | --- |
+| `prime` | 20 ms | 150 ms | An answer |
+| `submit` | 150 ms | 1,500 ms | An answer |
+| `steer_base` | 150 ms | 2,500 ms | An answer |
+| `steer` | 150 ms | 100 ms | An answer |
+| `stop_stream` | 150 ms | Until the client closes | Nothing |
+| `stop_tool` | 150 ms | 300 ms | An `exec` call of a Node process that writes its pid and idles |
+
+The long tails keep a turn busy long enough for Pi to commit the reasoning
+partial and for the steering prompt to arrive while the first turn streams.
+They stay long enough under the slow candidate below.
+
+Every coordinator also has a `/bin/sh` Rex stand-in on its private `PATH`. It
+answers `whoami` and `hosts`, so the coordinator has a local node to run
+`exec`, and the CLI's identity check on each input starts no Node process.
+
+## Correctness
+
+A sample fails, and the run with it, when any of these happen:
+
+- The provider sees requests other than the scenario's turns in order, or a
+  turn ends differently than scripted. The stopped stream must end with the
+  client closing its connection.
+- The steering request reaches the provider before the first turn's response
+  completed.
+- A provider request arrives after Esc. The benchmark checks one second after
+  `Interrupted` is visible, and again from the full log at coordinator
+  shutdown.
+- The `exec` tool process is not running before Esc, or still exists when
+  `Interrupted` becomes visible.
+- Pi's token ledger for the chief changes by a total other than the sum of the
+  responses that completed inside the measured window.
+- A launch scenario contacts the provider.
+
+The error includes the visible screen, the marks and the provider log.
+
+## CPU, memory and tokens
+
+Each sample reports CPU time and memory for the CLI, the coordinator and the
+runtime, and Pi's token use. These are never gated. The benchmark reads each
+process only when the window opens and closes. The interactive window covers
+the measured steps. The launch window runs from before the spawn until the
+text is visible, so the CLI's CPU time covers its whole life.
+
+| Platform | CPU time | Resident | Peak |
+| --- | --- | --- | --- |
+| macOS | `proc_pid_rusage` user and system time | `ri_resident_size` | `ri_lifetime_max_phys_footprint`, the lifetime physical footprint |
+| Linux | `clock_getcpuclockid` | `VmRSS` | `VmHWM` |
+
+A runtime that respawns inside the window fails the sample. Token use is the
+change in Pi's `conversation_usage` ledger for the chief across the window.
+The provider reports synthetic usage, so the token counts are synthetic too:
+`input_tokens` is the request body bytes divided by 4, rounded up.
+`reasoning_tokens` is the reasoning bytes divided by 4, rounded up.
+`output_tokens` adds the answer or `exec` argument bytes divided by 4, rounded
+up. Cached tokens are 0, and the total is input plus output. Pi records no
+usage for the stopped stream, so `stop_stream` reports a change of zero.
+
+## Results
+
+`performance/results.json` uses schema 3. Its header names the terminal size,
+the corpus sizes, the allowances, each scenario's turns and gates, the usage
+formula, and `synthetic: true`. Each sample keeps its gate spans and a
+timeline in milliseconds from the sample's start. The timeline holds the
+marks, the provider's request, first chunk, completion and client close, and
+coordinator diagnostics receipts at their 1 ms resolution. Receipts only
+explain a sample. Each sample also keeps every provider request with its
+scripted and observed holds, the process readings, and the token change. The
+report ends with each comparison and the medians of CPU time, memory and
+tokens. A JSONL file keeps completed samples if a later sample fails, and a
+failure JSON records the error.
+
+## Run the benchmark
+
+Build both revisions' runtime and CLI, then compare:
 
 ```sh
 nix develop --command cargo build --release --bin beep-boop \
-  --example terminal-fixture --example cli-performance
+	--example terminal-fixture --example cli-performance
+nix develop --command npm --prefix runtime run build
 nix develop --command target/release/examples/cli-performance \
-  --baseline /path/to/base/target/release/beep-boop \
-  --baseline-runtime /path/to/base/runtime/dist/src/bridge.js \
-  --candidate target/release/beep-boop \
-  --candidate-runtime runtime/dist/src/bridge.js \
-  --terminal target/release/examples/terminal-fixture \
-  --seed runtime/dist/test/fixtures/performance.js \
-  --output performance/results.json
+	--baseline /path/to/base/target/release/beep-boop \
+	--baseline-runtime /path/to/base/runtime/dist/src/bridge.js \
+	--candidate target/release/beep-boop \
+	--candidate-runtime runtime/dist/src/bridge.js \
+	--terminal target/release/examples/terminal-fixture \
+	--seed runtime/dist/test/fixtures/performance.js \
+	--output performance/results.json
 ```
 
-Add a scenario to the typed `Scenario` enum in `examples/cli_performance/main.rs` and
-seed its synthetic retained data in `runtime/test/fixtures/performance.ts`.
-The paired sampling and regression gate apply to every enum variant. Keep
-conversation text synthetic and test the real path the scenario is measuring.
+Add `--scenario submit`, repeated as needed, to run a subset. `--samples`
+sets the measured pairs per scenario.
+
+## Prove that every gate can fail
+
+Two runs on one build show the gates' range:
+
+1. Run the same build and `runtime/dist/src/bridge.js` on both sides. Every
+   gate passes, and the spread between the sides is the noise floor.
+2. Run the same build on both sides with
+   `--candidate-runtime runtime/dist/test/fixtures/slow-runtime.js`. That
+   runtime delays every write to the coordinator by 500 ms, so every gate
+   reports `REGRESSION` and the benchmark exits with status 1.
+
+## Limits
+
+- The benchmark makes no claim about native iOS frame pacing.
+- The TUI draws a runtime update after waiting up to 40 ms for input, and Pi
+  commits a streamed partial on a trailing 100 ms timer. Both count as
+  application delay.
+- Rex is a shell stand-in, and the model provider is a local script.
+- Token counts are synthetic.
+- Scrolling to older text in a long history, and foreground work during search
+  and import, are not measured yet.
+
+## Add a scenario
+
+Add a variant to `Scenario` in `examples/cli_performance/scenario.rs`, its
+definition, and its arm in `drive`. Seed any retained data it needs in
+`runtime/test/fixtures/performance.ts`. The paired sampling and regression
+gate apply to every gate of every variant. Keep text synthetic and test the
+real path the scenario is measuring.
+
+## Native search and cached indexing
 
 The same job measures native search and cached indexing against 65,536
 file-backed chunks with 1,024-dimensional synthetic vectors. Dense retrieval,
@@ -59,8 +206,8 @@ measurements. Seeding, candidate preparation and inference stay outside the
 clock; each sample checks the returned rankings, hydrated text and provenance
 against the other revision. Query samples contain eight lookups; cached-index
 samples contain four updates. The same
-paired-budget gate applies. Both reports use schema 2 and retain the raw
-medians alongside the paired budget score. Native results are in
+paired-budget gate applies. The native report uses schema 2 and retains the
+raw medians alongside the paired budget score. Native results are in
 `performance/search.json` and JSONL.
 
 Run that comparison after building both runtimes:
