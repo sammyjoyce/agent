@@ -61,7 +61,12 @@ export type ActorExecution = {
   call(command: HostCommand, host: WorkerHost, signal: AbortSignal): Promise<HostResult>;
   prepare?(model: ModelSelection): Promise<void>;
 };
-export type ActorConfinement = (task: TaskRecord) => readonly Extension[] | undefined;
+/** Whether a scheduled job owns this task: any job, or the one named. */
+export function isJobTask(task: Pick<TaskRecord, "sources">, jobId?: string): boolean {
+  return task.sources.some((source) => source.provider === "scheduled_jobs" && source.account === "local" &&
+    (jobId === undefined || source.thread_id === jobId));
+}
+export type ActorConfinement = (task: Pick<TaskRecord, "sources">) => readonly Extension[] | undefined;
 /** A terminal's view of its actor. Its signal ends the observation only, never the actor's work. */
 export type WorkerSession = {
   signal: AbortSignal;
@@ -264,9 +269,8 @@ export class TaskStore {
   useAttachments(attachments: AttachmentStore): void { this.attachments = attachments; }
   useActorExecution(execution: ActorExecution): void { this.execution = execution; }
   useConfinement(rule: ActorConfinement): void { this.confinement = rule; }
-  isBackgroundTask(task: TaskRecord): boolean {
-    return task.sources.some((source) => source.provider === "scheduled_jobs" && source.account === "local");
-  }
+  isConfined(task: Pick<TaskRecord, "sources">): boolean { return this.confinement(task) !== undefined; }
+  isBackgroundTask(task: TaskRecord): boolean { return isJobTask(task); }
   private async backgroundHost(task: TaskRecord, agentId?: string): Promise<WorkerHost> {
     if (this.environment === undefined) throw new TaskError("The coordinator execution environment is unavailable");
     const actor = this.actor(task, agentId);
@@ -1626,7 +1630,7 @@ export class TaskStore {
     const ref: ActorRef = { task_id: input.task_id, ...(input.agent_id === undefined ? {} : { agent_id: input.agent_id }) };
     const key = this.actorKey(ref.task_id, ref.agent_id);
     if (observer === undefined && (this.running.get(key)?.phase ?? "closing") !== "closing") throw new TaskError("This task already has an attached worker");
-    if (this.confinement(await this.get(input.task_id)) !== undefined) throw new TaskError(CONFINED_ACTOR_ONLY);
+    if (this.isConfined(await this.get(input.task_id))) throw new TaskError(CONFINED_ACTOR_ONLY);
     const { task, worker } = await this.confirmBinding(input, call);
     const record = this.actor(task, ref.agent_id);
     const attached: ActorObserver | undefined = observer === undefined ? undefined

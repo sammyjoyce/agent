@@ -15,7 +15,6 @@ import type { TaskOutcome } from "./generated/TaskOutcome.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { publishMainNotice, sourceReference, TaskError, TaskStore, type NoticePublication } from "./tasks.js";
 import { Executions } from "./tools.js";
-import { isDreamsTask } from "./dreams.js";
 import { PartitionedRecords } from "./partitioned-records.js";
 
 type Decision = { type: "task"; task_id: string } | { type: "dismissed"; reason: string };
@@ -156,7 +155,7 @@ export class SourceJournal {
       }
     }
     const decision: Decision | null = settled ? { type: "dismissed", reason: "Already handled by the coordinator" }
-      : isDreamsTask(outcome) ? { type: "dismissed", reason: "Dreams results are reviewed with beep-boop dreams and never enter triage" } : null;
+      : this.tasks.isConfined(outcome) ? { type: "dismissed", reason: "A confined task's results are reviewed outside the coordinator and never enter triage" } : null;
     const record = await this.records.insertIn(tx, key, { key, event, outcome, decision });
     await this.indexIn(tx, record.value, record.inserted);
     const previous = journal.sources.find((state) => sameSource(state.source, OUTCOMES));

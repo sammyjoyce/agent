@@ -7,14 +7,12 @@ import type { DreamsTaskSummary } from "./generated/DreamsTaskSummary.js";
 import type { HostResult } from "./generated/HostResult.js";
 import type { SourceRef } from "./generated/SourceRef.js";
 import { output } from "./host-output.js";
-import { TaskError, type TaskStore } from "./tasks.js";
+import { isJobTask, TaskError, type TaskStore } from "./tasks.js";
 import type { Executions } from "./tools.js";
 
 export const DREAMS_TOOL_NAMES: readonly string[] = ["dreams_review", "dreams_propose", "dreams_abstain"];
 
-export function isDreamsTask(task: { sources: readonly SourceRef[] }): boolean {
-  return task.sources.some((source) => source.provider === "scheduled_jobs" && source.account === "local" && source.thread_id === DREAMS_JOB_ID);
-}
+export function isDreamsTask(task: { sources: SourceRef[] }): boolean { return isJobTask(task, DREAMS_JOB_ID); }
 
 export async function currentRunRequest(session: Harness, conversationId: ConversationId): Promise<string> {
   const first = (await session.snapshot(LiveDoc, conversationId, BACKGROUND_CONTEXT))?.run?.inputs[0];
