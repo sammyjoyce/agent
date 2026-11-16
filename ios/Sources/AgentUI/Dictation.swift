@@ -391,7 +391,12 @@ public final class Dictation {
 
   @ObservationIgnored private let engine: SpeechEngine
   @ObservationIgnored private let holdDelay: Duration
-  @ObservationIgnored private var work: Task<Void, Never>?
+  private struct Work {
+    let task: Task<Void, Never>
+    var downloadNext = false
+  }
+
+  @ObservationIgnored private var work: Work?
   @ObservationIgnored private var timers: [Task<Void, Never>] = []
 
   public init(engine: SpeechEngine, holdDelay: Duration = .milliseconds(300)) {
@@ -408,8 +413,7 @@ public final class Dictation {
       return
     }
     guard work == nil, take == nil else { return }
-    work = Task {
-      defer { work = nil }
+    perform { [self] in
       if await engine.model() == .stale {
         model = .preparing
         await engine.prewarm()
@@ -443,8 +447,7 @@ public final class Dictation {
 
   private func offer(_ bytes: Int64) {
     guard work == nil else { return }
-    work = Task {
-      defer { work = nil }
+    perform { [self] in
       let cellular = await engine.onCellular()
       guard model == .missing(download: bytes) else { return }
       offering = Offer(bytes: bytes, cellular: cellular)
@@ -452,15 +455,18 @@ public final class Dictation {
   }
 
   func download() {
-    guard work == nil, case .missing(let bytes) = model else { return }
+    guard case .missing(let bytes) = model else { return }
+    guard work == nil else {
+      work?.downloadNext = true
+      return
+    }
     offering = nil
     notice = nil
     if engine.permission() == .undetermined {
       Task { _ = await engine.requestPermission() }
     }
     model = .downloading(0, of: bytes)
-    work = Task {
-      defer { work = nil }
+    perform { [self] in
       do {
         try await engine.install { fraction in
           Task { @MainActor in self.progressed(fraction) }
@@ -481,7 +487,7 @@ public final class Dictation {
   }
 
   func cancelDownload() {
-    if case .downloading = model { work?.cancel() }
+    if case .downloading = model { work?.task.cancel() }
   }
 
   var canRemoveModel: Bool {
@@ -494,11 +500,20 @@ public final class Dictation {
 
   func removeModel() {
     guard work == nil, canRemoveModel else { return }
-    work = Task {
-      defer { work = nil }
+    perform { [self] in
       await engine.remove()
       await settle()
     }
+  }
+
+  private func perform(_ job: @escaping @MainActor () async -> Void) {
+    work = Work(
+      task: Task {
+        await job()
+        let downloadNext = work?.downloadNext == true
+        work = nil
+        if downloadNext { download() }
+      })
   }
 
   func dismissNotice() { notice = nil }
