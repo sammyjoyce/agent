@@ -1446,8 +1446,8 @@ export class TaskStore {
     else await this.ensureActor({ task_id: saved.id });
     return outcome;
   }
-  /** An exact-run abort, which /goal pause uses, ends Pi's run without the boundary that places queued inputs. An
-   * empty passive write runs that boundary and changes nothing the model sees. */
+  /** An exact-run abort, which /goal pause uses, ends Pi's run without the boundary that places queued inputs. Pi places
+   * them at the next input or queued write, so an empty write runs that boundary and changes nothing the model sees. */
   private async placeStranded(conversation: Conversation, requestId: string): Promise<void> {
     const stranded = await this.session.commit(async (tx) => (await tx.submissionByRequest(conversation.id, requestId))?.status === "queued" &&
       (await tx.doc(LiveDoc, conversation.id)).run === undefined, BACKGROUND_CONTEXT);
@@ -1614,6 +1614,7 @@ export class TaskStore {
     let answerEntry: EntryRecord | undefined;
     let childResultPending = input.agent_id !== undefined && active.observers.size === 0;
     let recoverPrevious = true;
+    let goalStopped = false;
     const published = new Set<string>();
     const scope = () => active.turn.controller.signal;
     // The turn that was current when the work in hand began. reopenTurn replaces a stopped turn,
@@ -1782,12 +1783,13 @@ export class TaskStore {
         // Inputs admitted during configuration could not enter Pi yet. Drain
         // them now rather than waiting for this turn's answer to wake the actor.
         await this.admitActiveInputs(active);
-        await this.placeStranded(conversation, next.id);
+        if (goalStopped) { goalStopped = false; await this.placeStranded(conversation, next.id); }
         const settled = await submission.wait(BACKGROUND_CONTEXT).finally(() => { active.nativeActive = false; });
         if (active.fenced) { await conversation.waitForIdle(BACKGROUND_CONTEXT); break; }
         if (settled.type === "input" && settled.status === "unanswered" && settled.reason === "aborted" && input.agent_id === undefined &&
             await this.goals?.stopped(input.task_id, next.id) === true) {
           await conversation.waitForIdle(BACKGROUND_CONTEXT);
+          goalStopped = true;
           continue;
         }
         if (settled.type === "input" && settled.status === "unanswered" && settled.reason === "aborted" &&
