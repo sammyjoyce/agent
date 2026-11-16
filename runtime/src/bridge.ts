@@ -12,7 +12,7 @@ import { CoordinatorEnvironment, EnvironmentError } from "./environment.js";
 import { ConversationModels, ModelError, modelFailureMessage } from "./models.js";
 import { ChatGptAuth } from "./auth.js";
 import { validRequest, validEvent, validApnsConfig, errorEvent, invalidHostReply, protocolLines } from "./protocol.js";
-import { TaskError, TaskStore, type HostCall } from "./tasks.js";
+import { TaskError, TaskStore, type BackgroundExecution, type HostCall } from "./tasks.js";
 import { readTaskGraph } from "./task-graph.js";
 import { HistoryStore } from "./history.js";
 import { CodexImporter } from "./importer.js";
@@ -31,6 +31,7 @@ import { BrowserStore, createBrowserTools } from "./browser.js";
 import { activity, history, toolDetails } from "./transcript.js";
 import type { SearchMode } from "./generated/SearchMode.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
+import type { WorkerHost } from "./generated/WorkerHost.js";
 import { conversationSettings } from "./settings.js";
 import { createInputOrigins, INPUT_ORIGIN_CAPABILITIES } from "./input_origin.js";
 import { watchInputDelivery } from "./input_delivery.js";
@@ -133,7 +134,7 @@ function backgroundCall(command: import("./generated/HostCommand.js").HostComman
 
 type Application = TriageApplication & { stopInputDelivery(): void; harness: Harness; tasks: TaskStore; resources: ResourceStore; notifications: Notifications;
   histories: HistoryStore; catalog: ConversationCatalog; attachments: AttachmentStore; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler;
-  telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics; discovery: ToolDiscovery };
+  telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics; discovery: ToolDiscovery; serviceExecution: BackgroundExecution };
 async function openApplication(): Promise<Application> {
   const startup = new StartupDiagnostics(state);
   const storage = await startup.run("storage_open", async () => {
@@ -247,23 +248,24 @@ async function openApplication(): Promise<Application> {
   const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools }),
     { responsePolicy, inputOrigins }), TOOL_SURFACES, discovery);
   for (const extension of installed) registry.install(extension);
-  tasks.useBackgroundExecution({
+  const serviceExecution: BackgroundExecution = {
     available: () => backgroundAvailable,
     extensions: (agentId) => agentId === undefined ? toolsets.worker : toolsets.agent,
     call: (operation, host, signal) => backgroundCall(environment.route(operation, host), signal),
     prepare: (selected) => inference.preflight(selected),
-    bind: (conversation, host, model, signal) => executions.bind(conversation.id.toString(), {
+    bind: (conversation, host, model, scope) => executions.bind(conversation.id.toString(), {
       model, cwd: host.cwd, hosts: [host], default_host: host, origin_host_id: host.host_id,
       connectedHosts: () => environment.hosts(host.cwd, host.host_id, [host]), role: "worker",
       project: () => backgroundCall(host.host_id === null ? { type: "project_guidance", cwd: host.cwd }
-        : { type: "on_node", host_id: host.host_id, command: { type: "project_guidance", cwd: host.cwd } }, signal),
+        : { type: "on_node", host_id: host.host_id, command: { type: "project_guidance", cwd: host.cwd } }, scope()),
       search: (query, refs, limit, mode = "semantic") => retrieval.search(query, refs, limit,
-        (operation) => backgroundCall(operation, signal), importer.isRunning(), mode),
-      call: (operation) => backgroundCall(environment.route(operation, host), signal),
+        (operation) => backgroundCall(operation, scope()), importer.isRunning(), mode),
+      call: (operation) => backgroundCall(environment.route(operation, host), scope()),
     }),
-  });
+  };
+  tasks.useBackgroundExecution(serviceExecution);
   if (await notifications.start()) harness.resume();
-  return { ...core, background, toolsets, startup, discovery };
+  return { ...core, background, toolsets, startup, discovery, serviceExecution };
   }); } catch (error) {
     await harness.close(BACKGROUND_CONTEXT).catch(() => {}); await discovery.close().catch(() => {}); await telemetry.close(); throw error;
   }
@@ -281,6 +283,8 @@ const activeCommands = new Set<number>();
 const interrupted = new Set<number>();
 const interrupts = new Map<number, Promise<void>>();
 const workers = new Map<number, { command: Extract<RuntimeCommand, { type: "run_task" }>; controller: AbortController }>();
+/** One host-call scope per worker turn, so Stop cancels this worker's calls and no other actor's. */
+const workerTurns = new Map<number, AbortController>();
 type MainTurn = { conversation?: Conversation; accepting: boolean; admissions: number; wake?: () => void;
   info?: Extract<RuntimeEventKind, { type: "main_ready" }>;
   ready: Promise<boolean>; start(ready: boolean): void; inputs: { input_id?: string; submission: Submission }[] };
@@ -334,6 +338,7 @@ async function interrupt(id: number): Promise<void> {
   interrupted.add(id);
   if (interrupts.has(id)) return interrupts.get(id);
   hostRequests.cancelRequest(id);
+  workerTurns.get(id)?.abort();
   const conversation = activeConversations.get(id);
   if (conversation === undefined) return;
   const operation = (async () => { await conversation.abort(BACKGROUND_CONTEXT); emit(id, { type: "interrupted" }); })();
@@ -676,10 +681,17 @@ async function handle(request: RuntimeRequest): Promise<void> {
       }
       case "run_task": {
         const application = await app();
-        const { tasks, executions, toolsets, environment } = application;
+        const { tasks, executions, serviceExecution } = application;
         let stop: (() => Promise<void>) | undefined;
         try {
         const worker = workers.get(id);
+        workerTurns.set(id, new AbortController());
+        const turn = () => {
+          const scope = workerTurns.get(id);
+          if (scope === undefined) throw new TaskError("This worker's request has ended");
+          return scope.signal;
+        };
+        let host: WorkerHost | undefined;
         const configured = async (conversation: Conversation, title: string) => {
           if (interrupted.has(id)) await interrupt(id);
           emit(id, { type: "task_ready", conversation_id: conversation.id.toString(), title });
@@ -688,12 +700,10 @@ async function handle(request: RuntimeRequest): Promise<void> {
           emit(id, { type: "conversation_settings", settings: { conversation_id: conversation.id.toString(),
             task_id: command.task_id, agent_id: command.agent_id ?? null, model, catalog: [] } });
         };
-        const answer = await tasks.run(command, (conversation, host, model) => executions.bind(conversation.id.toString(), {
-          model, cwd: host.cwd, hosts: [host], default_host: host, origin_host_id: host.host_id ?? null,
-          connectedHosts: () => environment.hosts(host.cwd, host.host_id ?? null, [host]),
-          role: "worker", search: searchFor(application, id), call: (operation) => hostRequests.call(id, operation),
-        }),
-        command.agent_id === undefined ? toolsets.worker : toolsets.agent, (operation) => hostRequests.call(id, operation), (selected) => inference.preflight(selected),
+        // Allocation checks inspect a pane before the actor binds its host. Those commands name their own node.
+        const answer = await tasks.run(command, (conversation, bound, model) => { host = bound; return serviceExecution.bind(conversation, bound, model, turn); },
+        serviceExecution.extensions(command.agent_id), (operation) => host === undefined ? backgroundCall(operation, turn())
+          : serviceExecution.call(operation, host, turn()), serviceExecution.prepare,
         worker === undefined ? undefined : {
           signal: worker.controller.signal,
           async fence() { await interrupt(id); },
@@ -704,6 +714,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
               await stopping;
               if (interrupts.get(id) !== stopping) continue;
               interrupts.delete(id); interrupted.delete(id); hostRequests.resumeRequest(id);
+              workerTurns.set(id, new AbortController());
             }
           },
           async ready(conversation, title) {
@@ -929,7 +940,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
     await Promise.allSettled([...(inputControls.get(id) ?? [])]); inputControls.delete(id);
     await interrupts.get(id)?.catch(() => {});
     activeCommands.delete(id); activeConversations.delete(id); interrupted.delete(id); interrupts.delete(id);
-    workers.delete(id);
+    workers.delete(id); workerTurns.delete(id);
     hostRequests.finish(id);
     emit(id, { type: "done" });
     mainTurns.delete(id);

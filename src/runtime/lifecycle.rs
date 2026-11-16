@@ -1,6 +1,6 @@
 //! Request ownership and connection controls, independent of wire transport.
 
-use crate::protocol::{HostCommand, RuntimeCommand};
+use crate::protocol::RuntimeCommand;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
@@ -130,17 +130,10 @@ impl RequestLifecycle {
         matches!(self, Self::Background | Self::Coordinator)
     }
 
-    pub fn delegates_host_call(self, command: &HostCommand) -> bool {
-        self.is_worker()
-            && !matches!(
-                command,
-                HostCommand::Browser { .. }
-                    | HostCommand::OnNode { .. }
-                    | HostCommand::ReadContext { .. }
-                    | HostCommand::SearchContext { .. }
-                    | HostCommand::ReloadGuidance
-                    | HostCommand::Embed { .. }
-            )
+    /// A task terminal observes its actor and sends input. Its connection can end at any
+    /// moment, so the coordinator's service request owns every effect the actor issues.
+    pub fn owns_host_effects(self) -> bool {
+        !self.is_worker()
     }
 
     /// Release a connection's attachment once, without revoking admitted work.

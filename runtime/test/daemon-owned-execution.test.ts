@@ -264,7 +264,8 @@ test("an offline owning host never runs the worker's command in its terminal or 
   }
   const offline = await receipt(world, "offline-attempt"); assert.ok(offline !== undefined);
   const result = hostResult(offline);
-  assert.ok(object(result) && (result.type === "not_started" || result.delivery === "not_started"),
+  // The task's host serves its project guidance, so an offline host blocks the tool before the command is issued.
+  assert.ok((object(result) && (result.type === "not_started" || result.delivery === "not_started")) || offline.includes("Workspace guidance is unavailable"),
     "The model must be told the command was not started\n" + offline);
 
   start(1, ["maintain"]); await online([coordinator, laptop]);

@@ -97,14 +97,20 @@ createInterface({{input:process.stdin}}).on('line',line=>{{
 
 #[tokio::test]
 async fn noninteractive_worker_interrupt_reaches_its_own_request() {
-    let service = Running::start().await;
+    let service = fixture(
+        r#"
+ if(command.type==='run_task') emit(id,{type:'notice',task_id:null,text:'Working'});
+ else if(command.type==='interrupt') emit(id,{type:'done'});
+"#,
+    )
+    .await;
     let mut client = service.client().await;
     write_frame(&mut client, &attached_command()).await.unwrap();
     let (reader, mut writer) = client.into_split();
     let mut reader = FrameReader::new(BufReader::new(reader));
     let event: RuntimeEventKind =
         serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
-    assert!(matches!(event, RuntimeEventKind::HostCall { .. }));
+    assert!(matches!(event, RuntimeEventKind::Notice { .. }));
     write_frame(&mut writer, &RuntimeCommand::Interrupt)
         .await
         .unwrap();

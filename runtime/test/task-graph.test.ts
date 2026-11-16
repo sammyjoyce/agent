@@ -23,6 +23,8 @@ import { binding, host, open, within } from "./delegation.js";
 import type { ModelQueue } from "./fixtures/coordinator-runtime.js";
 
 type HostCall = { id: number; call_id: string; command: HostCommand };
+/** A worker's effect names its owning node. The command inside is what the test answers. */
+function effect(command: HostCommand): HostCommand { return command.type === "on_node" ? effect(command.command) : command; }
 
 test("the task graph request joins live generations and tool calls with main, task and agent identity", { timeout: 30_000 }, async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "agent-task-graph-")); await chmod(directory, 0o700);
@@ -52,11 +54,12 @@ test("the task graph request joins live generations and tool calls with main, ta
   lines.on("line", (line) => {
     const frame: unknown = JSON.parse(line); assert.ok(validEvent(frame), "The bridge must emit typed protocol events: " + line); frames.push(frame);
     if (frame.event.type === "host_call") {
-      const call = { id: frame.id, call_id: frame.event.call_id, command: frame.event.command };
+      const call = { id: frame.id, call_id: frame.event.call_id, command: effect(frame.event.command) };
       if (call.command.type === "reload_guidance") reply(call, { type: "shared_guidance", global: { text: "Brief fixture instructions.", sources: [] },
         workflow_policy: "", context_repositories: [], context_sources: [] });
       else if (call.command.type === "project_guidance") reply(call, { type: "project_guidance", snapshot: { text: "", sources: [] } });
       else if (call.command.type === "embed") reply(call, { type: "failed", message: "The fixture has no embedding host" });
+      else if (call.command.type === "background") reply(call, { type: "failed", message: "The fixture schedules nothing" });
     }
     for (const notify of listeners) notify();
   });
@@ -71,11 +74,11 @@ test("the task graph request joins live generations and tool calls with main, ta
   });
   const event = async (id: number, predicate: (event: RuntimeEventKind) => boolean): Promise<RuntimeEventKind> =>
     (await wait("request " + id, () => frames.find((frame) => frame.id === id && (predicate(frame.event) || frame.event.type === "failure")))).event;
-  const hostCall = async <T extends HostCommand["type"]>(id: number, type: T): Promise<HostCall & { command: Extract<HostCommand, { type: T }> }> => {
-    const frame = await wait(type + " in request " + id, () => frames.find((frame) => frame.id === id &&
-      (frame.event.type === "failure" || (frame.event.type === "host_call" && frame.event.command.type === type))));
+  const hostCall = async <T extends HostCommand["type"]>(id: number, type: T, nth = 0): Promise<HostCall & { command: Extract<HostCommand, { type: T }> }> => {
+    const frame = await wait(type + " in request " + id, () => frames.filter((frame) => frame.id === id &&
+      (frame.event.type === "failure" || (frame.event.type === "host_call" && effect(frame.event.command).type === type)))[nth]);
     assert.ok(frame.event.type === "host_call", JSON.stringify(frame.event));
-    const command = frame.event.command; assert.ok(command.type === type);
+    const command = effect(frame.event.command); assert.ok(command.type === type);
     return { id, call_id: frame.event.call_id, command: command as Extract<HostCommand, { type: T }> };
   };
   const chat = (input: string, input_id: string): RuntimeCommand => ({ type: "chat", input, input_id, model: DEFAULT_MODEL, instructions: "Brief answers.",
@@ -83,24 +86,29 @@ test("the task graph request joins live generations and tool calls with main, ta
   const attach = (id: number, taskId: string, allocationId: string, worker: WorkerRef, agentId?: string) => send(id, { type: "run_task", task_id: taskId,
     ...(agentId === undefined ? {} : { agent_id: agentId }), allocation_id: allocationId, binding: worker, instructions: "", model: DEFAULT_MODEL,
     cwd: host.cwd, interactive: true });
+  // The service-owned request carries every worker effect. A terminal's request carries none.
+  const service = 9;
   try {
+    send(service, { type: "run_background", settings: { poll_interval_seconds: 3600, sources: false, jobs: null } });
     send(1, chat("fixture-graph-main: start the board review", "first-input"));
     const spawned = await hostCall(1, "spawn_worker"); reply(spawned, { type: "spawned", binding });
     assert.equal((await event(1, (event) => event.type === "done")).type, "done", errors);
     attach(2, spawned.command.task_id, spawned.command.allocation_id, binding);
-    const subagent = await hostCall(2, "spawn_subagent");
+    const subagent = await hostCall(service, "spawn_subagent");
     const agentBinding = { ...binding, block_id: "block:55555555-5555-4555-8555-555555555555" };
     reply(subagent, { type: "spawned", binding: agentBinding });
     attach(3, subagent.command.task_id, subagent.command.allocation_id, agentBinding, subagent.command.agent_id);
-    await hostCall(2, "exec"); await hostCall(3, "exec");
+    await hostCall(service, "exec", 0); await hostCall(service, "exec", 1);
     send(4, chat("fixture-graph-second: start the connector audit", "second-input"));
     await hostCall(4, "spawn_worker");
 
     send(5, { type: "read_task_graph" });
     const response = await event(5, (event) => event.type === "task_graph");
     assert.ok(response.type === "task_graph", "The runtime must answer a task graph request: " + JSON.stringify(response));
-    const { nodes, conversations, omitted } = response.graph;
+    const { conversations, omitted } = response.graph;
     assert.equal(omitted, 0);
+    // The service request that carries worker effects also runs the scheduler, whose sleeping timers are not this test's subject.
+    const nodes = response.graph.nodes.filter((node) => !(node.kind.type === "other" && node.kind.name === "agent.background"));
     const work = (type: TaskGraphActor["type"]): TaskGraphNode[] => nodes.filter((node) =>
       conversations.find((conversation) => conversation.conversation_id === node.conversation_id)?.actor.type === type);
     const shape = (list: readonly TaskGraphNode[]) => list.map((node) => [node.kind, node.state.status,

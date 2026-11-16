@@ -52,7 +52,8 @@ type BackgroundInput = Pick<WorkerInput, "task_id" | "agent_id"> & { type: "back
 type ActorInput = WorkerInput | BackgroundInput;
 export type BackgroundExecution = {
   available(): boolean;
-  bind(conversation: Conversation, host: WorkerHost, model: ModelSelection, signal: AbortSignal): () => void;
+  /** `scope` yields the signal of the actor's current turn, read at each host call. */
+  bind(conversation: Conversation, host: WorkerHost, model: ModelSelection, scope: () => AbortSignal): () => void;
   extensions(agentId?: string): readonly Extension[];
   call(command: HostCommand, host: WorkerHost, signal: AbortSignal): Promise<HostResult>;
   prepare?(model: ModelSelection): Promise<void>;
@@ -244,7 +245,7 @@ export class TaskStore {
     const input: BackgroundInput = { type: "background", task_id: id, ...(agentId === undefined ? {} : { agent_id: agentId }) };
     let executionHost: WorkerHost | undefined;
     try {
-      await this.runActor(input, (conversation, host, model) => { executionHost = host; return execution.bind(conversation, host, model, controller.signal); },
+      await this.runActor(input, (conversation, host, model) => { executionHost = host; return execution.bind(conversation, host, model, () => controller.signal); },
         execution.extensions(agentId), (command) => {
           if (executionHost === undefined) throw new TaskError("Background execution has not bound its owning host");
           return execution.call(command, executionHost, controller.signal);
