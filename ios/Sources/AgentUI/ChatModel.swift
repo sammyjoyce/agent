@@ -400,15 +400,13 @@ final class ChatModel {
       addressing: DraftAddressing(
         destination: destination, restoredFrom: restoredFrom, source: source))
     if case .pending(let text, let submission) = admission {
-      let (returnedText, rest) = splitAfterReturns()
-      value.returnedText = String(returnedText)
-      value.text = String(rest)
       if let submission {
         let submittedIDs = Set(submission.attachments.map(\.id))
         value.submission = submission
+        value.returnedText = String(splitAfterReturns().returned)
         value.attachments.removeAll { submittedIDs.contains($0.id) }
       } else if !text.isEmpty {
-        value.text = text + (value.text.isEmpty ? "" : "\n\n" + value.text)
+        value.text = insertedAfterReturns(text)
       }
     }
     return value
@@ -1175,12 +1173,13 @@ final class ChatModel {
 
   private var leadingReturns: [(returned: ReturnedText, paragraphEnd: String.Index)] {
     var leading: [(returned: ReturnedText, paragraphEnd: String.Index)] = []
+    var later = textsReturnedSinceEmpty[...]
     var rest = draft[...]
-    for entry in textsReturnedSinceEmpty {
-      guard rest.starts(with: entry.text) else { break }
-      let paragraph = rest.dropFirst(entry.text.count)
+    while let match = later.firstIndex(where: { rest.starts(with: $0.text) }) {
+      let paragraph = rest.dropFirst(later[match].text.count)
       let paragraphEnd = paragraph.firstRange(of: "\n\n")?.lowerBound ?? paragraph.endIndex
-      leading.append((entry, paragraphEnd))
+      leading.append((later[match], paragraphEnd))
+      later = later[(match + 1)...]
       rest = draft[paragraphEnd...].dropFirst(2)
     }
     return leading
@@ -1205,14 +1204,13 @@ final class ChatModel {
   ) {
     guard !text.isEmpty else { return }
     let empty = draft.isEmpty && attachments.isEmpty
-    let leading = leadingReturns.map(\.returned)
     // It returns as the draft it was, so the scope shown now does not begin it again.
     changingDraft = true
     draft = insertedAfterReturns(text, olderThan: sendOrder)
-    textsReturnedSinceEmpty =
-      leading.filter { $0.sendOrder < sendOrder }
-      + [ReturnedText(sendOrder: sendOrder, text: text)]
-      + leading.filter { $0.sendOrder > sendOrder }
+    textsReturnedSinceEmpty.insert(
+      ReturnedText(sendOrder: sendOrder, text: text),
+      at: textsReturnedSinceEmpty.firstIndex { $0.sendOrder > sendOrder }
+        ?? textsReturnedSinceEmpty.endIndex)
     if empty, let addressing {
       restoredFrom = addressing.restoredFrom
       destination = addressing.destination

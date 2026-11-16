@@ -169,8 +169,7 @@ public struct ComposerDraft: Sendable, Equatable {
   public var consumedTransfers: Set<UUID>
   public var composerID: UUID?
   public var submission: ComposerSubmission?
-  /// Older Sends' text that came back while `submission` was admitting. Recovery puts it ahead of
-  /// the submission's text, which goes ahead of `text`.
+  /// The start of `text` that older Sends returned while `submission` was admitting.
   public var returnedText: String
   public var addressing: DraftAddressing
   public init(
@@ -281,15 +280,14 @@ public actor ComposerDraftStore {
     guard try contents() == data else { throw ComposerDraftError.staleOwner }
     savedData = data
     savedRevision = max(savedRevision ?? record.revision, record.revision)
-    let returned = record.returnedText ?? ""
-    let text = [returned, owned ? "" : submitted?.text ?? "", record.text]
+    let returned = record.returnedText.flatMap { record.text.hasPrefix($0) ? $0 : nil } ?? ""
+    let typed = record.text.dropFirst(returned.count).dropFirst(returned.isEmpty ? 0 : 2)
+    let text = [returned[...], owned ? "" : submitted?.text[...] ?? "", typed]
       .filter { !$0.isEmpty }.joined(separator: "\n\n")
     var addressing = record.addressing ?? DraftAddressing()
     // An outbox holds the Send this record was saved for, and whom that draft was for went with
     // it. Only a draft begun since keeps an address.
-    if owned, returned.isEmpty, record.text.isEmpty, record.attachments.isEmpty {
-      addressing = DraftAddressing()
-    }
+    if owned, record.text.isEmpty, record.attachments.isEmpty { addressing = DraftAddressing() }
     return (
       ComposerDraft(
         text: text, mode: record.mode, attachments: files,
