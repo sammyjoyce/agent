@@ -188,8 +188,18 @@ actor FixtureCoordinator {
   func refuseUploads() { rejectUploads = true }
   func acceptUploads() { rejectUploads = false }
   private var rejectsSubmits = false
+  private var rejection = "Invented: the coordinator refused this input"
   /// Rejects each submit once read, as a coordinator refusing an input does, and keeps nothing.
-  func rejectSubmits(_ rejects: Bool = true) { rejectsSubmits = rejects }
+  func rejectSubmits(
+    _ rejects: Bool = true, saying message: String = "Invented: the coordinator refused this input"
+  ) {
+    rejectsSubmits = rejects
+    rejection = message
+  }
+  private var submitFailure: String?
+  /// Answers each submit with a `failure` carrying `message`, then `done`, and keeps nothing, as a
+  /// coordinator whose execution host is offline does.
+  func failSubmits(_ message: String?) { submitFailure = message }
   private var holdsSubmitReply = false
   private var submitReplyRelease: CheckedContinuation<Void, Never>?
   /// Keeps the next submit and holds its answer until `releaseSubmitReply`, as a slow coordinator
@@ -426,12 +436,14 @@ actor FixtureCoordinator {
         inspectionsClosed.continuation.yield(request.conversationId)
         return
       case .submit(let request):
+        if let submitFailure {
+          try await emit(.failure(.init(message: submitFailure)), on: socket)
+          try await emit(.done, on: socket)
+          return
+        }
         if rejectsSubmits {
           try await emit(
-            .rejected(
-              .init(
-                inputId: request.inputId, message: "Invented: the coordinator refused this input")
-            ), on: socket)
+            .rejected(.init(inputId: request.inputId, message: rejection)), on: socket)
           try await emit(.done, on: socket)
           return
         }

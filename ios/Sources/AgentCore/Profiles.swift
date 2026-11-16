@@ -488,7 +488,10 @@ private func savedQueue<Item: Decodable>(_: Item.Type, from data: Data) throws -
 private struct SavedQueue<Item: Decodable>: Decodable { let pending: [Item] }
 
 /// Atomic, readable only by this app, excluded from backup.
-func writePrivately(_ data: Data, to url: URL, readableAfterFirstUnlock: Bool = false) throws {
+func writePrivately(
+  _ data: Data, to url: URL, readableAfterFirstUnlock: Bool = false,
+  excludingFromBackup: (inout URL) throws -> Void = excludeFromBackup
+) throws {
   try FileManager.default.createDirectory(
     at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
     attributes: [.posixPermissions: 0o700])
@@ -505,6 +508,10 @@ func writePrivately(_ data: Data, to url: URL, readableAfterFirstUnlock: Bool = 
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
   #endif
   var url = url
+  try excludingFromBackup(&url)
+}
+
+private func excludeFromBackup(_ url: inout URL) throws {
   var values = URLResourceValues()
   values.isExcludedFromBackup = true
   try url.setResourceValues(values)

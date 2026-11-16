@@ -78,6 +78,15 @@ public final class AppNotifications: NSObject {
     get throws { try receiver().coordinators }
   }
 
+  /// False while the phone is locked and files it protects cannot be read or written.
+  var protectedDataAvailable: Bool {
+    #if os(iOS)
+      UIApplication.shared.isProtectedDataAvailable
+    #else
+      true
+    #endif
+  }
+
   func open(_ origin: AlertOrigin) {
     openRequest = OpenRequest(destination: .feed(notice: coordinators.show(opening: origin)))
   }

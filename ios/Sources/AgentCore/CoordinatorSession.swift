@@ -536,6 +536,30 @@ public actor CoordinatorSession {
       departure: nil)
   }
 
+  /// What this phone holds of earlier Siri copies of `message`.
+  public func siriEarlier(_ message: SiriMessage) throws(SiriNotSent) -> SiriEarlier { .none }
+
+  /// Saves `message` as a fresh input and sends it, waiting until `deadline` for the coordinator
+  /// to accept or place it.
+  public func sendFromSiri(
+    _ message: SiriMessage, copy: SiriCopy, earlier: SiriEarlier,
+    until deadline: ContinuousClock.Instant
+  ) async -> SiriSendResult {
+    guard
+      let staged = await stage(message.text, sendID: UUID().uuidString, recipients: [profile])
+    else { return .notSent(.outboxNotSaved) }
+    start(staged)
+    while ContinuousClock.now < deadline {
+      if Task.isCancelled { return .notSent(.unanswered) }
+      guard let item = pending.first(where: { $0.request.inputId == staged.inputID }) else {
+        return .delivered
+      }
+      if item.accepted == true { return .delivered }
+      try? await Task.sleep(for: .milliseconds(10))
+    }
+    return .saved
+  }
+
   /// Sends a staged input on this coordinator's own verified socket. While this lane is not
   /// connected, a durable one waits and goes once it connects. One this session is too busy to
   /// send stays queued as unconfirmed, for Check.

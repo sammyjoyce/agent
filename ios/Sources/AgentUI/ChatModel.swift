@@ -836,7 +836,7 @@ final class ChatModel {
   }
 
   /// Lane `id`'s session, or why it has none.
-  private func session(on id: ProfileID) throws -> CoordinatorSession {
+  func session(on id: ProfileID) throws -> CoordinatorSession {
     if let name = removed[id] { throw LaneError.gone(name) }
     guard let lane = lanes.first(where: { $0.id == id }) else { throw LaneError.gone(name(id)) }
     guard let session = lane.session else { throw LaneError.notPaired(name(id)) }
