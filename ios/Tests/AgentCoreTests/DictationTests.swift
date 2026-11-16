@@ -595,3 +595,102 @@ func completeFilesWithoutAReceiptCompileWithoutAskingToDownload() async throws {
     #expect(speech.installs == 1 && speech.recordings == 0)
   }
 }
+
+private actor HeldFiles {
+  private var files = SpeechModel.missing(download: 609_440_571)
+  private var holding = false
+  private var failing = false
+  private var held: [CheckedContinuation<Void, Never>] = []
+  private(set) var installs = 0
+
+  var reading: Bool { !held.isEmpty }
+  func hold() { holding = true }
+  func failInstalls() { failing = true }
+  func release(finding found: SpeechModel? = nil) {
+    if let found { files = found }
+    holding = false
+    for continuation in held { continuation.resume() }
+    held = []
+  }
+
+  func read() async -> SpeechModel {
+    if holding { await withCheckedContinuation { held.append($0) } }
+    return files
+  }
+
+  func install() async throws {
+    installs += 1
+    if failing { throw ScriptedFailure() }
+    try await Task.sleep(for: .milliseconds(300))
+    files = .ready
+  }
+
+  nonisolated var engine: SpeechEngine {
+    let scripted = ScriptedSpeech().engine
+    return SpeechEngine(
+      model: { await self.read() }, install: { _ in try await self.install() }, prewarm: {},
+      remove: {}, diskUsage: { 0 }, onCellular: { false }, permission: scripted.permission,
+      requestPermission: scripted.requestPermission, record: scripted.record)
+  }
+}
+
+@MainActor private func downloadTappedDuringACheck(_ files: HeldFiles) async throws -> Dictation {
+  let dictation = Dictation(engine: files.engine)
+  dictation.setForeground(true)
+  try await until("missing") { dictation.model == .missing(download: 609_440_571) }
+  await files.hold()
+  dictation.setForeground(true)
+  try await until("the check reads the files") { await files.reading }
+  dictation.download()
+  return dictation
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aDownloadTappedDuringACheckStartsOnceWhenTheCheckEnds() async throws {
+  let files = HeldFiles()
+  let dictation = try await downloadTappedDuringACheck(files)
+  dictation.download()
+  #expect(dictation.model == .missing(download: 609_440_571), "Nothing starts during the check")
+  await files.release()
+  try await until("ready") { dictation.notice == .ready }
+  let installs = await files.installs
+  #expect(installs == 1, "Two taps download once")
+  #expect(dictation.model == .ready)
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aDownloadTappedDuringACheckThatFindsTheModelDownloadsNothing() async throws {
+  let files = HeldFiles()
+  let dictation = try await downloadTappedDuringACheck(files)
+  await files.release(finding: .ready)
+  try await until("ready") { dictation.model == .ready }
+  try await Task.sleep(for: .milliseconds(200))
+  let installs = await files.installs
+  #expect(installs == 0 && dictation.notice == nil)
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aDownloadTappedDuringACheckCanBeCancelled() async throws {
+  let files = HeldFiles()
+  let dictation = try await downloadTappedDuringACheck(files)
+  await files.release()
+  try await until("the download") { await files.installs == 1 }
+  dictation.cancelDownload()
+  try await until("missing again") { dictation.model == .missing(download: 609_440_571) }
+  #expect(dictation.notice == nil)
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aDownloadTappedDuringACheckThatFailsIsNotRetried() async throws {
+  let files = HeldFiles()
+  await files.failInstalls()
+  let dictation = try await downloadTappedDuringACheck(files)
+  await files.release()
+  try await until("the failure") {
+    dictation.notice == .downloadFailed(ScriptedFailure().localizedDescription)
+  }
+  try await Task.sleep(for: .milliseconds(200))
+  let installs = await files.installs
+  #expect(installs == 1, "Only Try again downloads again")
+  #expect(dictation.model == .missing(download: 609_440_571))
+}
