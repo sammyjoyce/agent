@@ -1167,3 +1167,39 @@ func deletingAnEarlierReturnKeepsALaterControlAControl(attempt: Int) async throw
     for coordinator in coordinators { #expect(await coordinator.fixture.count() == 0) }
   }
 }
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRecordSavedWhileASendAdmitsKeepsTheWholeDraftForAnOlderBuild() async throws {
+  try await withGatedCoordinators(1) { coordinators, root in
+    let coordinator = coordinators[0]
+    let gate = ComposerOwnershipGate()
+    let next = NextAdmission()
+    let model = try await connectedModel(
+      to: coordinators, under: root,
+      admit: { deliver in
+        if next.refused { _ = await gate.wait(after: false) }
+        return await deliver()
+      })
+    await coordinator.gate.arm()
+    model.draft = "/status"
+    await model.send()
+    try await held(coordinator.gate)
+    next.refused = true
+    model.draft = "An invented newer note"
+    let newer = try #require(model.startSend())
+    for await _ in gate.entered.stream { break }
+    await failDial(of: coordinator, in: model)
+    model.draft += "\n\nInvented typing"
+    #expect(await model.saveDraft())
+    let data = try Data(contentsOf: root.appending(path: "Composer/draft.json"))
+    let record = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    #expect(record["text"] as? String == "/status\n\nInvented typing")
+    #expect(
+      try await recoveredText(under: root)
+        == "/status\n\nAn invented newer note\n\nInvented typing",
+      "This build still puts the newer Send after /status")
+    await gate.finish()
+    await newer.value
+    await model.setActive(false)
+  }
+}

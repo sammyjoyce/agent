@@ -5,13 +5,7 @@ import Testing
 @testable import AgentCore
 @testable import AgentUI
 
-/// One event in a composer's history. A step that does not apply to the state it meets does
-/// nothing, so every subsequence of a history is a history, and a failing one shrinks by dropping
-/// steps.
 enum ReturnOrderStep: Hashable, Sendable, CustomStringConvertible {
-  /// Sends the draft, or a new text of this kind when the draft is empty. `holdAdmission` keeps
-  /// the Send admitting until `refuse` or `admit`, and `holdDial` keeps a control's dial waiting
-  /// until `dialFails` or `dialPasses`.
   case send(control: Bool, to: Int, holdAdmission: Bool, holdDial: Bool)
   case refuse
   case admit
@@ -41,8 +35,6 @@ enum ReturnOrderStep: Hashable, Sendable, CustomStringConvertible {
   }
 }
 
-/// The composer as the user should see it. Each paragraph's origin comes from the history, never
-/// from reading the draft's text back.
 struct ReturnOrderReference {
   enum Block: Equatable {
     case returned(send: Int, text: String, typed: String)
@@ -57,7 +49,6 @@ struct ReturnOrderReference {
   struct Send: Equatable {
     let number: Int
     let text: String
-    let control: Bool
     let to: Int
     let holdsDial: Bool
   }
@@ -83,7 +74,6 @@ struct ReturnOrderReference {
   init(restorable: Bool) { self.restorable = restorable }
 
   var draft: String { blocks.map(\.shown).joined(separator: "\n\n") }
-  /// What a relaunch offers: the draft a refusal of the admitting Send would leave now.
   var recovered: String {
     guard let admitting else { return draft }
     var cold = self
@@ -91,8 +81,7 @@ struct ReturnOrderReference {
     return cold.draft
   }
 
-  /// How many blocks begin the draft as returned texts in the order they were sent.
-  private var run: Int {
+  private var leadingReturnCount: Int {
     var last = 0
     for (index, block) in blocks.enumerated() {
       guard case .returned(let send, _, _) = block, send > last else { return index }
@@ -102,7 +91,7 @@ struct ReturnOrderReference {
   }
 
   private mutating func comeBack(_ send: Send) {
-    let older = blocks[..<run].lastIndex { block in
+    let older = blocks[..<leadingReturnCount].lastIndex { block in
       guard case .returned(let number, _, _) = block else { return false }
       return number < send.number
     }
@@ -132,8 +121,7 @@ struct ReturnOrderReference {
         .first { dialing[$0] == nil }
       let holdsDial = text.hasPrefix("/") && holdDial && free != nil
       let send = Send(
-        number: sends, text: text, control: text.hasPrefix("/"), to: holdsDial ? free ?? to : to,
-        holdsDial: holdsDial)
+        number: sends, text: text, to: holdsDial ? free ?? to : to, holdsDial: holdsDial)
       blocks = []
       if holdAdmission { admitting = send } else { deliver(send) }
       return .send(send, fresh: fresh, holdAdmission: holdAdmission)
@@ -185,7 +173,7 @@ struct ReturnOrderReference {
       restorable = false
       let returning = withReturn ? dialing.removeValue(forKey: 0) : nil
       if let returning { comeBack(returning) }
-      blocks.insert(.other(Self.restoredText), at: run)
+      blocks.insert(.other(Self.restoredText), at: leadingReturnCount)
       return .restore(withReturn: returning != nil)
     }
   }
@@ -229,8 +217,6 @@ struct ReturnOrderHistory: CustomStringConvertible {
     self.init(seed: seed, restorable: restorable, steps: steps)
   }
 
-  /// Picks among the steps that apply now, weighted toward several Sends in flight that come back
-  /// around edits.
   private static func step(
     after reference: ReturnOrderReference, number: Int, using random: inout SeededRandom
   ) -> ReturnOrderStep {
@@ -297,11 +283,8 @@ struct ReturnOrderHistory: CustomStringConvertible {
   return await condition()
 }
 
-/// A dial the phone itself refuses, which stops the input before it leaves and keeps the session
-/// connected, so the next step need not wait for a redial.
-private let neverLeft = NWError.posix(.EACCES)
+private let dialRefusedWithoutRedial = NWError.posix(.EACCES)
 
-/// Whether the production session stages `text` as a control, the way a retry of it would go.
 private func stagesAsControl(_ text: String, on session: CoordinatorSession) async -> Bool? {
   guard
     let staged = await session.stage(
@@ -311,12 +294,22 @@ private func stagesAsControl(_ text: String, on session: CoordinatorSession) asy
   return staged.departure != nil
 }
 
+/// A session renames a temporary file into its outbox, and a copy can meet that file in flight.
+private func copyWhileSessionsWrite(_ source: URL, to destination: URL) async throws {
+  for attempt in 1...5 {
+    do { return try FileManager.default.copyItem(at: source, to: destination) } catch {
+      try? FileManager.default.removeItem(at: destination)
+      guard attempt < 5, (error as NSError).code == NSFileNoSuchFileError else { throw error }
+      try await Task.sleep(for: .milliseconds(10))
+    }
+  }
+}
+
 private func kind(_ control: Bool?) -> String {
   control.map { $0 ? "control" : "message" } ?? "unstaged"
 }
 
-/// A message the coordinator rejected, which Restore can copy back into the composer.
-@MainActor private func rejectedNote(
+@MainActor private func rejectedNoteInputID(
   in model: ChatModel, at coordinator: GatedCoordinator
 ) async throws -> String {
   await coordinator.fixture.rejectSubmits()
@@ -334,18 +327,15 @@ private func kind(_ control: Bool?) -> String {
   return try #require(inputID, "The coordinator rejected the note")
 }
 
-/// Plays `history` against the production composer, its saved record and four loopback
-/// coordinators whose dials it holds, and answers the first way they differ from the reference.
-@MainActor func playReturnOrder(_ history: ReturnOrderHistory) async throws -> String? {
+@MainActor func firstReturnOrderViolation(_ history: ReturnOrderHistory) async throws -> String? {
   var violation: String?
   try await withGatedCoordinators(ReturnOrderReference.coordinators) { coordinators, root in
     for coordinator in coordinators { await coordinator.fixture.holdPlacements() }
     let hold = AdmissionHold()
     let model = try await connectedModel(
       to: coordinators, under: root, admit: { deliver in await hold.admit(deliver) })
-    let files = AttachmentStore(directory: root.appending(path: "Composer/Files"))
-    let record = root.appending(path: "Composer/draft.json")
-    let rejected = history.restorable ? try await rejectedNote(in: model, at: coordinators[0]) : nil
+    let rejected =
+      history.restorable ? try await rejectedNoteInputID(in: model, at: coordinators[0]) : nil
     var reference = ReturnOrderReference(restorable: history.restorable)
     var sending: Task<Void, Never>?
 
@@ -390,7 +380,7 @@ private func kind(_ control: Bool?) -> String {
         }
       case .dialFails(let index):
         let before = model.draft
-        await coordinators[index].gate.fail(neverLeft)
+        await coordinators[index].gate.fail(dialRefusedWithoutRedial)
         return await returned(coordinators[index], from: before)
       case .dialPasses(let index):
         await coordinators[index].gate.open()
@@ -407,7 +397,7 @@ private func kind(_ control: Bool?) -> String {
         }
         let restoring = Task { await model.restore(rejected) }
         _ = await settles { model.preparingAttachments || !model.draft.isEmpty }
-        await coordinators[0].gate.fail(neverLeft)
+        await coordinators[0].gate.fail(dialRefusedWithoutRedial)
         await restoring.value
         let expected = reference.draft
         _ = await settles { model.draft == expected }
@@ -426,10 +416,20 @@ private func kind(_ control: Bool?) -> String {
           + "\(reference.draft.debugDescription) (\(expectedKind))"
       }
       guard await model.saveDraft() else { return "the draft did not save" }
-      let cold = try await ComposerDraftStore(url: record).load(from: files).draft.text
-      guard cold == reference.recovered else {
-        return
-          "recovery \(cold.debugDescription), reference \(reference.recovered.debugDescription)"
+      let copy = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+      try await copyWhileSessionsWrite(root, to: copy)
+      defer { try? FileManager.default.removeItem(at: copy) }
+      for relaunch in 1...2 {
+        let cold = ChatModel(
+          draftStore: AttachmentStore(directory: copy.appending(path: "Composer/Files")),
+          persistence: ComposerDraftStore(url: copy.appending(path: "Composer/draft.json")))
+        cold.profiles = model.profiles
+        await cold.restoreDraft()
+        guard cold.draftError == nil, cold.draft == reference.recovered else {
+          return "relaunch \(relaunch) \(cold.draft.debugDescription) "
+            + "(\(cold.draftError ?? "restored")), reference "
+            + reference.recovered.debugDescription
+        }
       }
       return nil
     }
@@ -466,7 +466,6 @@ private func kind(_ control: Bool?) -> String {
   return violation
 }
 
-/// Drops steps from a failing history while it still fails.
 @MainActor func shrunk(_ history: ReturnOrderHistory) async -> ReturnOrderHistory {
   var current = history
   var changed = true
@@ -475,7 +474,7 @@ private func kind(_ control: Bool?) -> String {
     for index in current.steps.indices.reversed() where index < current.steps.count {
       var candidate = current
       candidate.steps.remove(at: index)
-      if (try? await playReturnOrder(candidate)) != nil {
+      if (try? await firstReturnOrderViolation(candidate)) != nil {
         current = candidate
         changed = true
       }
@@ -484,39 +483,35 @@ private func kind(_ control: Bool?) -> String {
   if current.restorable {
     var candidate = current
     candidate.restorable = false
-    if (try? await playReturnOrder(candidate)) != nil { current = candidate }
+    if (try? await firstReturnOrderViolation(candidate)) != nil { current = candidate }
   }
   return current
 }
 
-/// Seeds 1 through 100, and every seed of the first 3000 that failed at 7f1aaa3, which read a
-/// deleted returned text as the end of the run.
-let returnOrderSeeds: [UInt64] =
-  Array(1...100) + [
-    119, 133, 309, 335, 398, 686, 709, 872, 873, 1016, 1121, 1216, 1280, 1403, 1421, 1496, 1581,
-    1601, 1725, 2123, 2172, 2208, 2283, 2363, 2370, 2385, 2551, 2664, 2706, 2722, 2779, 2833, 2838,
-    2917, 2973,
-  ]
+let deletedReturnEndedRunSeeds: [UInt64] = [
+  119, 133, 309, 335, 398, 686, 709, 872, 873, 1016, 1121, 1216, 1280, 1403, 1421, 1496, 1581,
+  1601, 1725, 2123, 2172, 2208, 2283, 2363, 2370, 2385, 2551, 2664, 2706, 2722, 2779, 2833, 2838,
+  2917, 2973,
+]
+let returnOrderSeeds = Array(UInt64(1)...100) + deletedReturnEndedRunSeeds
 
 @MainActor @Test(.timeLimit(.minutes(1)), arguments: returnOrderSeeds)
 func returnedTextsKeepTheOrderTheyWereSentInAnyHistory(seed: UInt64) async throws {
   let history = ReturnOrderHistory(seed: seed)
-  let violation = try await playReturnOrder(history)
+  let violation = try await firstReturnOrderViolation(history)
   #expect(violation == nil, "\(violation ?? "")\n\(history)")
 }
 
-private let explorationSeeds = ProcessInfo.processInfo.environment["COMPOSER_RETURN_SEEDS"]
+private let explorationLastSeed = ProcessInfo.processInfo.environment["COMPOSER_RETURN_SEEDS"]
   .flatMap { UInt64($0) }
 private let explorationLanes = 8
 
-/// Plays seeds 1 through `COMPOSER_RETURN_SEEDS` across eight lanes and prints every failure, with
-/// the first two in each lane shrunk.
 @MainActor
 @Test(
-  .enabled(if: explorationSeeds != nil), .timeLimit(.minutes(120)),
+  .enabled(if: explorationLastSeed != nil), .timeLimit(.minutes(120)),
   arguments: 0..<explorationLanes)
 func returnOrderExploration(lane: Int) async throws {
-  let last = explorationSeeds ?? 0
+  let last = explorationLastSeed ?? 0
   var played = 0
   var failed: [ReturnOrderHistory] = []
   var errors = 0
@@ -524,7 +519,7 @@ func returnOrderExploration(lane: Int) async throws {
     let history = ReturnOrderHistory(seed: seed)
     played += 1
     do {
-      if let violation = try await playReturnOrder(history) {
+      if let violation = try await firstReturnOrderViolation(history) {
         failed.append(history)
         print("RETURN ORDER seed=\(seed) FAIL \(violation)")
       }
@@ -535,7 +530,7 @@ func returnOrderExploration(lane: Int) async throws {
   }
   for history in failed.prefix(2) {
     let small = await shrunk(history)
-    let violation = try? await playReturnOrder(small)
+    let violation = try? await firstReturnOrderViolation(small)
     print("RETURN ORDER SHRUNK \(small)\n  -> \(violation ?? "passes")")
   }
   print(
