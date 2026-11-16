@@ -241,8 +241,10 @@ export class BackgroundScheduler {
     if (previous !== undefined && !previous.sources.some((source) => source.provider === "scheduled_jobs" &&
         source.account === "local" && source.thread_id === job.id)) throw new TaskError("This task is not owned by the scheduled job");
     if (previous === undefined && id !== scheduledTaskId("job:" + job.id)) throw new TaskError("The scheduled job's owned actor is unavailable; reconcile its existing task");
-    const created = await this.tasks.createIn(tx, { id, title: job.title, outcome: job.prompt, model: job.model,
+    const replaced = previous !== undefined && await this.tasks.predatesConfinementIn(tx, previous);
+    const created = await this.tasks.createIn(tx, { id: replaced ? scheduledTaskId("confined:" + id) : id, title: job.title, outcome: job.prompt, model: job.model,
       job_id: job.id });
+    if (replaced && lane.actor_task_id === id) lane.actor_task_id = created.id;
     lane.actor_task_id ??= created.id;
     return created;
   }

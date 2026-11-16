@@ -101,6 +101,7 @@ type TaskActor = { readonly ref: ActorRef; readonly mode: ActorMode; readonly ex
 type ActorPlacement = { type: "placed"; host: WorkerHost } | { type: "host_at_start" } | { type: "unplaced" | "host_offline"; reason: string };
 function isAbortedJob(actor: TaskActor): boolean { return actor.mode === "job" && actor.turn.controller.signal.aborted; }
 const CONFINED_ACTOR_ONLY = "A confined task runs only its scheduler's input, as coordinator background work without agents or terminals";
+const PREDATES_CONFINEMENT = "This task held work before Dreams reserved its job id; it does not run, and a new task runs Dreams";
 function refuseScheduledJobSources(sources: readonly SourceRef[]): void {
   if (sources.some((source) => source.provider === "scheduled_jobs")) throw new TaskError("Scheduled job ownership is assigned only by the scheduler");
 }
@@ -117,6 +118,8 @@ const SourceOwners = defineDocFamily<{ ids: string[] }, null>({ kind: "agent.tas
   initial: () => ({ ids: [] }), checkpointWhen: () => false });
 const ConversationOwner = defineDocFamily<{ task_id: string | null; agent_id: string | null }, null>({ kind: "agent.task.owners", scope: "session", family: true, version: 1,
   initial: () => ({ task_id: null, agent_id: null }), checkpointWhen: () => true });
+const ConfinedConversation = defineDocFamily<{ confined: boolean }, null>({ kind: "agent.task.confined", scope: "session", family: true, version: 1,
+  initial: () => ({ confined: false }), checkpointWhen: () => true });
 function conversationIdentity(value: unknown): value is ConversationId {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
@@ -273,6 +276,10 @@ export class TaskStore {
   useActorExecution(execution: ActorExecution): void { this.execution = execution; }
   useConfinement(rule: ActorConfinement): void { this.confinement = rule; }
   isConfined(task: Pick<TaskRecord, "sources">): boolean { return this.confinement(task) !== undefined; }
+  /** A confined task whose conversation was not created confined may hold history and input from before its confinement. */
+  async predatesConfinementIn(tx: Tx, task: Pick<TaskRecord, "sources" | "conversation_id">): Promise<boolean> {
+    return this.isConfined(task) && !(await tx.doc(ConfinedConversation, task.conversation_id, null)).confined;
+  }
   private requireSchedulerAdmission(task: Pick<TaskRecord, "sources">, scheduled?: ScheduledOccurrence): void {
     if (this.isConfined(task) && scheduled === undefined) throw new TaskError(CONFINED_ACTOR_ONLY);
   }
@@ -916,6 +923,7 @@ export class TaskStore {
       summary: "", state: { state: "open" }, worker: { state: "unassigned" }, sources, pending: [], agents: [], updated_at: Date.now(),
       ...(input.scheduled_run === undefined ? {} : { scheduled_run: input.scheduled_run }) };
     const { value: saved } = await this.recordsStore.insertIn(tx, id, task); await this.indexTaskIn(tx, saved);
+    if (this.isConfined(task)) (await tx.doc(ConfinedConversation, task.conversation_id, null)).confined = true;
     return { id, native: conversation.id };
   }
   async create(input: TaskCreate): Promise<TaskRecord> {
@@ -1707,6 +1715,11 @@ export class TaskStore {
       if (confined !== undefined && (active.mode !== "job" || input.agent_id !== undefined)) throw new TaskError(CONFINED_ACTOR_ONLY);
       const extensions = () => confined ?? execution.extensions(input.agent_id);
       const conversation = await this.conversation(actor.conversation_id);
+      if (confined !== undefined && await this.session.commit((tx) => this.predatesConfinementIn(tx, task), BACKGROUND_CONTEXT)) {
+        await conversation.abort(BACKGROUND_CONTEXT);
+        await this.withdrawUnplaced(input, conversation, actor.pending);
+        throw new TaskError(PREDATES_CONFINEMENT);
+      }
       if (confined !== undefined) await this.inference.withholdHostedTools(conversation);
       if (active.mode === "job") active.conversation = conversation;
       if (isAbortedJob(active)) throw new TaskError("Background execution stopped; its native input is retained");
