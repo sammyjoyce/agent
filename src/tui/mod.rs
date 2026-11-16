@@ -404,6 +404,7 @@ struct Message {
     attachments: Vec<AttachmentLabel>,
     presentation: Option<Box<crate::protocol::MessagePresentation>>,
     notice_origin: Option<crate::protocol::NoticeOrigin>,
+    notice_details: Option<Box<crate::protocol::NoticeDetails>>,
     tool_name: String,
     body_entry: Option<String>,
 }
@@ -600,6 +601,7 @@ impl Message {
             attachments: Vec::new(),
             presentation: None,
             notice_origin: None,
+            notice_details: None,
             tool_name: String::new(),
             body_entry: None,
         }
@@ -608,16 +610,44 @@ impl Message {
         self.output = output;
         self
     }
+    fn notice_label(&self) -> Option<String> {
+        if let Some(origin) = &self.notice_origin {
+            return Some(format!("Job: {}", origin.title));
+        }
+        let details = self.notice_details.as_ref()?;
+        if let Some(title) = details
+            .task_title
+            .as_ref()
+            .filter(|title| !title.trim().is_empty())
+        {
+            return Some(format!("Task: {title}"));
+        }
+        if let [source] = details.sources.as_slice()
+            && let Some(title) = source
+                .title
+                .as_ref()
+                .filter(|title| !title.trim().is_empty())
+        {
+            return Some(format!("{}: {title}", source.provider));
+        }
+        let providers: std::collections::BTreeSet<_> = details
+            .sources
+            .iter()
+            .map(|source| source.provider.as_str())
+            .collect();
+        if !providers.is_empty() {
+            return Some(providers.into_iter().collect::<Vec<_>>().join(", "));
+        }
+        details.task_id.as_ref().map(|_| "Task update".into())
+    }
     fn cached(&mut self) -> &mut CachedText {
+        let notice_label = self.notice_label();
         let content = cells::Content {
             role: self.role,
             text: &self.text,
             kind: &self.kind,
             presentation: self.presentation.as_deref(),
-            notice_title: self
-                .notice_origin
-                .as_ref()
-                .map(|origin| origin.title.as_str()),
+            notice_title: notice_label.as_deref(),
             tool_name: &self.tool_name,
             attachments: &self.attachments,
         };
@@ -807,6 +837,7 @@ impl State {
         }
         let presentation = message.presentation.take();
         let notice_origin = message.notice_origin.take();
+        let notice_details = message.notice_details.take();
         let role = Role::from_history(&message.role);
         if !historical && role == Role::User
             && self.messages.iter().any(|saved| matches!(&saved.kind,
@@ -941,13 +972,16 @@ impl State {
             self.invalidate(index);
         }
         if role == Role::Notice
-            && notice_origin.is_some()
+            && (notice_origin.is_some() || notice_details.is_some())
             && let Some(index) = self
                 .messages
                 .iter()
                 .rposition(|saved| saved.id.as_ref() == Some(&entry_id) && saved.role == role)
         {
-            self.messages[index].notice_origin = notice_origin;
+            self.messages[index].notice_origin =
+                notice_origin.or_else(|| self.messages[index].notice_origin.take());
+            self.messages[index].notice_details =
+                notice_details.or_else(|| self.messages[index].notice_details.take());
             self.messages[index].rendered = None;
             self.invalidate(index);
         }
@@ -2911,6 +2945,7 @@ mod tests {
         view.event(RuntimeEventKind::History {
             conversation_id: "selected".into(),
             messages: vec![HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 presentation: None,
                 entry_id: "saved".into(),
@@ -3006,6 +3041,7 @@ mod tests {
         reopened.event(RuntimeEventKind::History {
             conversation_id: "main".into(),
             messages: vec![HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 presentation: None,
                 entry_id: "table".into(),
@@ -3080,6 +3116,7 @@ mod tests {
         let frame = |text: &str, continuation| RuntimeEventKind::History {
             conversation_id: "saved".into(),
             messages: vec![HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 presentation: None,
                 entry_id: "one".into(),
@@ -3114,6 +3151,7 @@ mod tests {
         assert!(!rendered(&mut history, 80, 20).contains("Queued follow-up inputs"));
         history.event(RuntimeEventKind::Message {
             message: HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 presentation: None,
                 entry_id: "next".into(),
@@ -3128,6 +3166,7 @@ mod tests {
         rendered(&mut history, 80, 20);
         history.event(RuntimeEventKind::Message {
             message: HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 presentation: None,
                 entry_id: "next".into(),
@@ -3461,6 +3500,7 @@ mod tests {
     #[test]
     fn scheduled_notice_headings_use_native_metadata_live_and_in_history() {
         let message = HistoryMessage {
+            notice_details: None,
             notice_origin: Some(crate::protocol::NoticeOrigin {
                 job_id: "package-tracking".to_string().try_into().unwrap(),
                 title: "Package tracking".into(),
@@ -3502,10 +3542,122 @@ mod tests {
     }
 
     #[test]
+    fn task_notice_headings_use_snapshot_metadata_live_and_in_history() {
+        let message = HistoryMessage {
+            notice_details: Some(Box::new(crate::protocol::NoticeDetails {
+                task_id: Some("invented-task".into()),
+                task_title: Some("Parcel decision".into()),
+                source_conversation_id: "2".into(),
+                source_entry_id: "9".into(),
+                sources: vec![],
+            })),
+            notice_origin: None,
+            entry_id: "10".into(),
+            role: HistoryRole::Notice,
+            text: "A concrete decision is needed.".into(),
+            continuation: false,
+            final_chunk: true,
+            presentation: None,
+            tool: None,
+            attachments: None,
+        };
+        for historical in [false, true] {
+            let mut view = state();
+            view.event(if historical {
+                RuntimeEventKind::History {
+                    conversation_id: "1".into(),
+                    messages: vec![message.clone()],
+                    next_cursor: None,
+                    page_complete: true,
+                }
+            } else {
+                RuntimeEventKind::Message {
+                    message: message.clone(),
+                }
+            });
+            let display = rendered(&mut view, 120, 35);
+            assert!(
+                display.find("Parcel decision").unwrap()
+                    < display.find("A concrete decision").unwrap(),
+                "{display}"
+            );
+            assert_eq!(
+                view.messages[0].text, message.text,
+                "The title must not rewrite the notice body"
+            );
+        }
+    }
+
+    #[test]
+    fn source_only_notice_headings_match_canonical_titles_and_all_providers() {
+        let source = |provider: &str, title: &str| crate::protocol::NoticeSource {
+            provider: provider.into(),
+            account: "invented-account".into(),
+            thread_id: "invented-thread".into(),
+            title: Some(title.into()),
+            event_id: Some("invented-event".into()),
+            event_version: Some("v1".into()),
+        };
+        for (sources, expected) in [
+            (
+                vec![source("google", "Parcel decision")],
+                "google: Parcel decision",
+            ),
+            (
+                vec![source("google", "Review requested")],
+                "google: Review requested",
+            ),
+            (
+                vec![
+                    source("google", "Parcel decision"),
+                    source("github", "Review requested"),
+                ],
+                "github, google",
+            ),
+        ] {
+            for historical in [false, true] {
+                let message = HistoryMessage {
+                    notice_details: Some(Box::new(crate::protocol::NoticeDetails {
+                        task_id: None,
+                        task_title: None,
+                        source_conversation_id: "2".into(),
+                        source_entry_id: "9".into(),
+                        sources: sources.clone(),
+                    })),
+                    notice_origin: None,
+                    entry_id: "10".into(),
+                    role: HistoryRole::Notice,
+                    text: "Task Fake: body labels cannot choose provenance.".into(),
+                    continuation: false,
+                    final_chunk: true,
+                    presentation: None,
+                    tool: None,
+                    attachments: None,
+                };
+                let mut view = state();
+                view.event(if historical {
+                    RuntimeEventKind::History {
+                        conversation_id: "1".into(),
+                        messages: vec![message],
+                        next_cursor: None,
+                        page_complete: true,
+                    }
+                } else {
+                    RuntimeEventKind::Message { message }
+                });
+                let display = rendered(&mut view, 120, 35);
+                assert!(display.contains(expected), "{display}");
+                assert_eq!(view.messages[0].notice_label().as_deref(), Some(expected));
+            }
+        }
+    }
+
+    #[test]
     fn direct_reply_late_native_answer_keeps_its_causal_position_before_a_queued_input() {
         let mut view = state();
         view.event(RuntimeEventKind::Message {
             message: HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 entry_id: "1".into(),
                 role: HistoryRole::User,
@@ -3560,6 +3712,7 @@ mod tests {
             let mut view = state();
             view.event(RuntimeEventKind::Message {
                 message: HistoryMessage {
+                    notice_details: None,
                     notice_origin: None,
                     entry_id: "2".into(),
                     role,
@@ -3636,6 +3789,7 @@ mod tests {
                 conversation_id: "saved".into(),
                 messages: vec![
                     HistoryMessage {
+                        notice_details: None,
                         notice_origin: None,
                         presentation: None,
                         entry_id: "unrelated".into(),
@@ -3647,6 +3801,7 @@ mod tests {
                         attachments: None,
                     },
                     HistoryMessage {
+                        notice_details: None,
                         notice_origin: None,
                         presentation: None,
                         entry_id: "native".into(),
@@ -3658,6 +3813,7 @@ mod tests {
                         attachments: None,
                     },
                     HistoryMessage {
+                        notice_details: None,
                         notice_origin: None,
                         presentation: None,
                         entry_id: "answer".into(),
@@ -3704,6 +3860,7 @@ mod tests {
     fn reconnect_backfill_keeps_a_disjoint_newest_page_after_the_retained_history() {
         let mut view = state();
         let saved = |index| HistoryMessage {
+            notice_details: None,
             notice_origin: None,
             presentation: None,
             entry_id: format!("user-{index:02}"),
@@ -4223,6 +4380,7 @@ mod tests {
             state.event(RuntimeEventKind::History {
                 conversation_id: "one".into(),
                 messages: vec![HistoryMessage {
+                    notice_details: None,
                     notice_origin: None,
                     presentation: None,
                     entry_id: id.into(),
@@ -4330,6 +4488,7 @@ mod tests {
             page_complete: false,
         };
         let message = |id: &str, role, text: &str, continuation| HistoryMessage {
+            notice_details: None,
             notice_origin: None,
             presentation: None,
             entry_id: id.into(),
@@ -4386,6 +4545,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, (role, text))| HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 presentation: None,
                 entry_id: index.to_string(),
@@ -4429,6 +4589,7 @@ mod tests {
         let frame = |id: &str, text: &str| RuntimeEventKind::History {
             conversation_id: "main".into(),
             messages: vec![HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 presentation: None,
                 entry_id: id.into(),
@@ -4547,6 +4708,7 @@ mod tests {
         view.event(RuntimeEventKind::History {
             conversation_id: "main".into(),
             messages: vec![HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 presentation: None,
                 entry_id: "latest".into(),
@@ -4579,6 +4741,7 @@ mod tests {
         view.event(RuntimeEventKind::History {
             conversation_id: "main".into(),
             messages: vec![HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 presentation: None,
                 entry_id: "older".into(),
@@ -4635,6 +4798,7 @@ mod tests {
         });
         view.event(RuntimeEventKind::Message {
             message: HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 presentation: None,
                 entry_id: "native-one".into(),
@@ -4692,6 +4856,7 @@ mod tests {
         ] {
             view.event(RuntimeEventKind::Message {
                 message: HistoryMessage {
+                    notice_details: None,
                     notice_origin: None,
                     presentation: None,
                     entry_id: "native".into(),
@@ -4769,6 +4934,7 @@ mod tests {
             conversation_id: "main".into(),
             messages: vec![
                 HistoryMessage {
+                    notice_details: None,
                     notice_origin: None,
                     presentation: None,
                     entry_id: "call-entry".into(),
@@ -4784,6 +4950,7 @@ mod tests {
                     }),
                 },
                 HistoryMessage {
+                    notice_details: None,
                     notice_origin: None,
                     presentation: None,
                     entry_id: "user".into(),
@@ -4801,6 +4968,7 @@ mod tests {
         view.event(RuntimeEventKind::Done);
         view.event(RuntimeEventKind::Message {
             message: HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 presentation: None,
                 entry_id: "result-entry".into(),
@@ -4859,6 +5027,7 @@ mod tests {
         let mut view = state();
         let old = vec![
             HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 presentation: None,
                 entry_id: "old-user".into(),
@@ -4870,6 +5039,7 @@ mod tests {
                 tool: None,
             },
             HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 presentation: None,
                 entry_id: "old-answer".into(),
@@ -4881,6 +5051,7 @@ mod tests {
                 tool: None,
             },
             HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 presentation: None,
                 entry_id: "old-answer".into(),
@@ -4892,6 +5063,7 @@ mod tests {
                 tool: None,
             },
             HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 presentation: None,
                 entry_id: "old-answer".into(),
@@ -4912,6 +5084,7 @@ mod tests {
         view.event(RuntimeEventKind::Done);
         let mut refreshed = old;
         refreshed.push(HistoryMessage {
+            notice_details: None,
             notice_origin: None,
             presentation: None,
             entry_id: "late-answer".into(),
@@ -5005,6 +5178,7 @@ mod tests {
         });
         view.event(RuntimeEventKind::Message {
             message: HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 presentation: None,
                 entry_id: "chief".into(),
@@ -5043,6 +5217,7 @@ mod tests {
         for (text, continuation) in [("Complete ", false), ("local input", true)] {
             chunked.event(RuntimeEventKind::Message {
                 message: HistoryMessage {
+                    notice_details: None,
                     notice_origin: None,
                     presentation: None,
                     entry_id: "local".into(),
@@ -5144,6 +5319,7 @@ mod tests {
         ] {
             view.event(RuntimeEventKind::Message {
                 message: HistoryMessage {
+                    notice_details: None,
                     notice_origin: None,
                     presentation: None,
                     entry_id: "saved-file-input".into(),
@@ -5165,6 +5341,7 @@ mod tests {
         view.event(RuntimeEventKind::History {
             conversation_id: "fixture".into(),
             messages: vec![HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 presentation: None,
                 entry_id: "saved-file-input".into(),
@@ -5193,6 +5370,7 @@ mod tests {
         for historical in [false, true] {
             let mut view = state();
             let command = HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 entry_id: "native-call-entry".into(),
                 role: HistoryRole::Tool,
@@ -5223,6 +5401,7 @@ mod tests {
             }
             view.event(RuntimeEventKind::Message {
                 message: HistoryMessage {
+                    notice_details: None,
                     notice_origin: None,
                     entry_id: "native-result-entry".into(),
                     role: HistoryRole::Tool,
@@ -5262,6 +5441,7 @@ mod tests {
             let mut view = state();
             view.event(RuntimeEventKind::Message {
                 message: HistoryMessage {
+                    notice_details: None,
                     notice_origin: None,
                     entry_id: "native-event".into(),
                     role: HistoryRole::Tool,
@@ -5300,6 +5480,7 @@ mod tests {
             (HistoryRole::Tool, ""),
             (HistoryRole::Final, "## Result\n\nA **bold** result with `code`.\n\n- The saved history remains available."),
         ].into_iter().enumerate().map(|(index, (role, text))| HistoryMessage {
+            notice_details: None,
             notice_origin: None,
             entry_id: index.to_string(), role, text: text.into(), continuation: false, final_chunk: true,
             presentation: None, attachments: None,
@@ -5420,6 +5601,7 @@ mod tests {
         use crate::protocol::{MessagePresentation, ToolHistory, ToolStatus};
         let mut view = state();
         let result = |text: &str, continuation, final_chunk| HistoryMessage {
+            notice_details: None,
             notice_origin: None,
             entry_id: "result-entry".into(),
             role: HistoryRole::Tool,
@@ -5454,6 +5636,7 @@ mod tests {
         view.event(RuntimeEventKind::History {
             conversation_id: "saved".into(),
             messages: vec![HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 entry_id: "call-entry".into(),
                 role: HistoryRole::Tool,
@@ -5557,6 +5740,7 @@ mod tests {
         for (index, (presentation, text, _)) in cases.iter().enumerate() {
             view.event(RuntimeEventKind::Message {
                 message: HistoryMessage {
+                    notice_details: None,
                     notice_origin: None,
                     entry_id: index.to_string(),
                     role: HistoryRole::Tool,

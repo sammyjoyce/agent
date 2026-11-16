@@ -168,6 +168,7 @@ fn validate_tool_merge_traces(fixtures: &Path) -> Result<()> {
                 role: protocol::HistoryRole::Tool,
                 continuation: false,
                 final_chunk: true,
+                notice_details: None,
                 notice_origin: None,
                 attachments: None,
             },

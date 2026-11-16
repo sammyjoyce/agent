@@ -26,10 +26,22 @@ public struct ChatRow: Identifiable, Sendable, Equatable {
   public var attachments: [AttachmentRef]
   public var inputOrigin: InputOrigin?
   public var noticeOrigin: NoticeOrigin?
+  public var noticeDetails: NoticeDetails?
 
   public var provenanceLabel: String? {
     if role == .user { return inputOrigin?.label }
     if role == .notice, let noticeOrigin { return "Job: \(noticeOrigin.title)" }
+    if role == .notice, let details = noticeDetails {
+      if let title = details.taskTitle, !title.isEmpty { return "Task: \(title)" }
+      if details.sources.count == 1, let source = details.sources.first,
+        let title = source.title, !title.isEmpty
+      {
+        return "\(source.provider): \(title)"
+      }
+      let providers = Array(Set(details.sources.map(\.provider))).sorted()
+      if !providers.isEmpty { return providers.joined(separator: ", ") }
+      if details.taskId != nil { return "Task update" }
+    }
     return nil
   }
   /// When this phone received the row. The owning session sets it, and it never decreases in
@@ -44,7 +56,7 @@ public struct ChatRow: Identifiable, Sendable, Equatable {
     work: InputWorkState? = nil,
     inputID: String? = nil,
     attachments: [AttachmentRef] = [], inputOrigin: InputOrigin? = nil,
-    noticeOrigin: NoticeOrigin? = nil
+    noticeOrigin: NoticeOrigin? = nil, noticeDetails: NoticeDetails? = nil
   ) {
     self.id = id
     self.entryID = entryID
@@ -60,6 +72,7 @@ public struct ChatRow: Identifiable, Sendable, Equatable {
     self.attachments = attachments
     self.inputOrigin = inputOrigin
     self.noticeOrigin = noticeOrigin
+    self.noticeDetails = noticeDetails
   }
 }
 
@@ -256,6 +269,16 @@ struct Transcript: Sendable {
           current.presentation, row.presentation, preferIncoming: preferIncoming)
         return merged
       }
+      if row.role == .notice,
+        let current = storage.first(where: {
+          $0.id == row.id && $0.entryID == row.entryID && $0.role == .notice
+        })
+      {
+        var merged = olderPage ? current : row
+        merged.noticeOrigin = merged.noticeOrigin ?? current.noticeOrigin ?? row.noticeOrigin
+        merged.noticeDetails = merged.noticeDetails ?? current.noticeDetails ?? row.noticeDetails
+        return merged
+      }
       if olderPage, let current = storage.first(where: { $0.id == row.id }) { return current }
       return row
     }
@@ -353,6 +376,7 @@ struct Transcript: Sendable {
       storage[index].text = boundedText(storage[index].text + message.text)
       storage[index].presentation = message.presentation ?? storage[index].presentation
       storage[index].noticeOrigin = message.noticeOrigin ?? storage[index].noticeOrigin
+      storage[index].noticeDetails = message.noticeDetails ?? storage[index].noticeDetails
       dirtyRows.insert(storage[index].id)
       for attachment in message.attachments ?? []
       where !storage[index].attachments.contains(where: { $0.id == attachment.id }) {
@@ -365,7 +389,8 @@ struct Transcript: Sendable {
         ChatRow(
           id: "entry:\(message.entryId):\(segment)", entryID: message.entryId, role: message.role,
           text: boundedText(message.text), presentation: message.presentation,
-          attachments: message.attachments ?? [], noticeOrigin: message.noticeOrigin))
+          attachments: message.attachments ?? [], noticeOrigin: message.noticeOrigin,
+          noticeDetails: message.noticeDetails))
     }
     if !historical { bound() }
   }

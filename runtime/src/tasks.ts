@@ -97,7 +97,7 @@ export type OutcomeSink = {
 /** Only an explicit coordinator notification becomes user-visible context. */
 export async function publishMainNotice(session: Harness, conversation: Conversation, entry: EntryRecord,
   taskId: string | null, sources: readonly SourceRef[],
-  notice: { key: string; text: string; events: readonly SourceEvent[]; origin?: NoticeOrigin }): Promise<NoticePublication> {
+  notice: { key: string; text: string; events: readonly SourceEvent[]; taskTitle?: string; origin?: NoticeOrigin }): Promise<NoticePublication> {
   const root = await session.root(BACKGROUND_CONTEXT);
   const requestId = "notice:" + entry.id.toString() + ":" + notice.key;
   // Legacy model-bearing notices already own their eventual visible entry.
@@ -125,7 +125,11 @@ export async function publishMainNotice(session: Harness, conversation: Conversa
   }) ?? [];
   if (model.length === 0) throw new TaskError("The notification has no assistant origin");
   const data: UserNoticeData = { task_id: taskId, source_conversation_id: conversation.id.toString(),
-    source_entry_id: entry.id.toString(), text: notice.text, ...(notice.origin === undefined ? {} : { notice_origin: notice.origin }) };
+    source_entry_id: entry.id.toString(), text: notice.text,
+    notice_details: { ...(taskId === null ? {} : { task_id: taskId }), ...(taskId === null || notice.taskTitle === undefined ? {} : { task_title: notice.taskTitle }),
+      source_conversation_id: conversation.id.toString(), source_entry_id: entry.id.toString(),
+      sources: notice.events.map((event) => ({ provider: event.source.provider, account: event.source.account, thread_id: event.source.thread_id,
+        title: event.title, event_id: event.id, event_version: event.version })) }, ...(notice.origin === undefined ? {} : { notice_origin: notice.origin }) };
   // Pi can publish display-only writes while main is busy. Model context stays
   // in its ordered inbox so compaction and resets retain their native boundary.
   const display = await root.submit({ type: "write", requestId, entry: {

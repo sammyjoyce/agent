@@ -488,6 +488,7 @@ mod tests {
         });
         state.event(RuntimeEventKind::Message {
             message: HistoryMessage {
+                notice_details: None,
                 notice_origin: None,
                 entry_id: "entry".into(),
                 role: HistoryRole::Tool,
