@@ -43,6 +43,8 @@ export interface WorldOptions {
   readonly apns?: boolean;
   /** Gives the worker host a read-only credential and makes it read the owner record this often. */
   readonly watchSeconds?: number;
+  /** Top-level settings for both coordinator hosts' private config, given each host's home. */
+  readonly settings?: (home: string) => Promise<string>;
   /** What the fixture source helper on the owner's host answers as that host's Codex history. */
   readonly history?: { readonly threads: readonly unknown[]; readonly turns: readonly unknown[] };
 }
@@ -53,6 +55,12 @@ export interface PromoteOptions {
   readonly statement?: string;
   /** How many seconds the command waits for stop evidence. */
   readonly wait?: number;
+}
+
+export interface SendOptions {
+  /** The client's own id for the input. A repeat with the same id is the same input. */
+  readonly id?: string;
+  readonly attachments?: AttachmentRef[];
 }
 
 /** One input a client sent: every event so far, and the end of the exchange. */
@@ -118,7 +126,7 @@ export async function failoverWorld(t: TestContext, options: WorldOptions = {}) 
       const { team_id, key_id, topic, key_file, environment: target } = await apnsConfig(join(home, "AuthKey.p8"));
       config += `[apns]\nteam_id = "${team_id}"\nkey_id = "${key_id}"\ntopic = "${topic}"\nkey_file = "${key_file}"\nenvironment = "${target}"\n`;
     }
-    await appendFile(join(home, "agent.toml"), config);
+    await appendFile(join(home, "agent.toml"), (await options.settings?.(home) ?? "") + config);
     return { name, holder, home, state: join(home, "state"), socket: join(home, "state", "agent.sock"), nodeId, proxy, environment: { ...environment, ...apns?.environment } };
   }
   const second = join(directory, "standby");
@@ -166,7 +174,7 @@ export async function failoverWorld(t: TestContext, options: WorldOptions = {}) 
     return pid;
   };
 
-  function sending(host: CoordinatorHost, input: string, sent: { id?: string; attachments?: AttachmentRef[] } = {}): Sent {
+  function sending(host: CoordinatorHost, input: string, sent: SendOptions = {}): Sent {
     const id = sent.id ?? randomUUID(), events: RuntimeEventKind[] = [];
     const done = base.exchange({ type: "main_input", input_id: id, input, mode: "follow_up",
       context: { instructions: "Brief answers.", origin_host_id: null, cwd: host.home, hosts: [] },
@@ -243,7 +251,7 @@ export async function failoverWorld(t: TestContext, options: WorldOptions = {}) 
     /** Sends one client input and returns without waiting for its end. */
     sending,
     /** Sends one client input and returns its events once the coordinator says `done`. */
-    send: (host: CoordinatorHost, input: string, sent: { id?: string; attachments?: AttachmentRef[] } = {}) => sending(host, input, sent).done,
+    send: (host: CoordinatorHost, input: string, sent: SendOptions = {}) => sending(host, input, sent).done,
     /** One request of a client on a host's socket, to its `done`. */
     request: (host: CoordinatorHost, command: RuntimeCommand, observe?: (event: RuntimeEventKind) => void) => base.exchange(command, observe, host.socket),
 
