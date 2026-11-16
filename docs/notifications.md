@@ -89,6 +89,13 @@ node --input-type=module - --database <state directory>/session.sqlite \
   --text <codeword> < runtime/scripts/notification-deliveries.mjs
 ```
 
-Add `--tasks-since-entry <entry ID>` to list the tasks that were running when
-a notice was committed. If the phone showed the notice before the job's last
-task ended, the notice arrived while the job still ran.
+Add `--tasks-since-entry <entry ID>` to list candidate tasks for a notice. The
+list is wider than the job that sent the notice. It holds tasks in any
+conversation that existed when the notice was committed and were still running
+or ended after its delivery was queued. It also holds every task the notice's
+source conversation started later. To show that the notice arrived mid-job,
+take a task with `notice_source: true` that belongs to the work that called
+`notify_user`. Its `started_at` must come before the time the phone showed the
+notice and its `ended_at` after it. An unrelated task, or a later end time
+alone, does not show this. The comparison assumes that the phone's clock and
+the coordinator's clock agree.
