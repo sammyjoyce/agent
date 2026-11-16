@@ -330,6 +330,84 @@ fn list_and_show_report_each_gap_of_an_abstained_night_and_apply_refuses_it() {
 }
 
 #[test]
+fn a_changed_review_or_evidence_of_a_sealed_abstention_refuses_show_and_list() {
+    let fixture = Fixture::new();
+    fixture.seed_witnessed_night();
+    let mut server = fixture.start();
+    fixture.script(
+        DREAMS_KEY,
+        vec![
+            tool("dreams_review", json!({ "page": 1 })),
+            tool(
+                "dreams_abstain",
+                json!({ "reason": "quiet", "note": "Nothing failed in the window." }),
+            ),
+            text("Dreams abstained."),
+        ],
+    );
+    fixture.run_job("dreams");
+    server.stop();
+    let listed = fixture.latest_run();
+    assert_eq!(listed["outcome"], "abstained: quiet");
+    let run = listed["run"].as_str().unwrap();
+    let review = fixture.state.join("dreams/runs").join(run).join("review");
+
+    let change_review = |sealed: &[u8]| {
+        let mut review: Value = serde_json::from_slice(sealed).unwrap();
+        review["coverage"]["summaries"]["items"] = json!(123);
+        serde_json::to_vec(&review).unwrap()
+    };
+    let add_evidence = |sealed: &[u8]| {
+        let mut evidence = sealed.to_vec();
+        evidence.extend(
+            json!({ "id": "t:example-task@1", "at_ms": 1, "kind": "summary",
+                "title": "Example", "body": "An example failure added after the night was sealed." })
+            .to_string()
+            .bytes(),
+        );
+        evidence.push(b'\n');
+        evidence
+    };
+    for (file, change) in [
+        ("review.json", &change_review as &dyn Fn(&[u8]) -> Vec<u8>),
+        ("evidence.jsonl", &add_evidence),
+    ] {
+        let path = review.join(file);
+        let sealed = fs::read(&path).unwrap();
+        fs::write(&path, change(&sealed)).unwrap();
+        for args in [&["dreams", "show", run][..], &["dreams", "list"]] {
+            let output = fixture.cli(args, true);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success()
+                    && stderr.contains("Dreams review changed since it was sealed"),
+                "{args:?} accepted a sealed quiet night whose {file} changed: exit {:?} {stderr}{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(
+                args[1] == "show" || stderr.contains(run),
+                "list must name the run: {stderr}"
+            );
+        }
+        fs::write(&path, &sealed).unwrap();
+    }
+    let review_bytes = fs::read(review.join("review.json")).unwrap();
+    let mut digested = u64::try_from(review_bytes.len())
+        .unwrap()
+        .to_be_bytes()
+        .to_vec();
+    digested.extend(review_bytes);
+    digested.extend(fs::read(review.join("evidence.jsonl")).unwrap());
+    assert_eq!(
+        fixture.dreams_json(&["show", run])["outcome"]["review_sha256"],
+        sha256(&digested),
+        "show prints the review digest the abstention was sealed with"
+    );
+    assert_eq!(fixture.latest_run()["run"], run);
+}
+
+#[test]
 fn a_coordinator_admits_no_command_until_its_log_records_its_start() {
     let fixture = Fixture::new();
     fixture.seed_witnessed_night();
