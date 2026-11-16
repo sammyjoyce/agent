@@ -1,7 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    fs::File,
     io::{self, Read},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use serde_json::Value;
@@ -41,6 +43,7 @@ pub(super) struct Member {
 
 enum Location {
     File(PathBuf),
+    Folder(Arc<File>),
     Entry { archive: Region, entry: ZipMember },
 }
 
@@ -52,6 +55,11 @@ impl Member {
                 self.size,
                 None,
             ))),
+            Location::Folder(root) => Ok(Box::new(archive::Exact::new(
+                archive::open_beneath(root, &self.path)?,
+                self.size,
+                None,
+            ))),
             Location::Entry { archive, entry } => entry.open(archive),
         }
     }
@@ -59,6 +67,9 @@ impl Member {
     pub fn region(&self) -> io::Result<Option<Region>> {
         match &self.location {
             Location::File(path) => Region::whole(archive::open_regular(path)?).map(Some),
+            Location::Folder(root) => {
+                Region::whole(archive::open_beneath(root, &self.path)?).map(Some)
+            }
             Location::Entry { archive, entry }
                 if entry.method == Method::Stored && entry.size == entry.compressed =>
             {
@@ -267,12 +278,15 @@ impl Builder {
         let part = self.part(name.clone())?;
         match input(path)? {
             Input::Folder(root) => {
+                let directory = archive::open_directory(&root)
+                    .map(Arc::new)
+                    .map_err(|error| unreadable(&root, error))?;
                 for member in archive::walk_folder(&root, &mut self.admission)? {
                     self.members.push(Member {
                         path: member.path,
                         size: member.size,
                         part,
-                        location: Location::File(member.file),
+                        location: Location::Folder(directory.clone()),
                     });
                 }
             }

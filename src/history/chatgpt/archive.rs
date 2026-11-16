@@ -1,7 +1,11 @@
 use std::{
+    ffi::CString,
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    os::unix::fs::{FileExt, OpenOptionsExt},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::{FileExt, OpenOptionsExt},
+    },
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -574,7 +578,6 @@ pub(super) fn zip_members(
 pub(super) struct FolderMember {
     pub path: MemberPath,
     pub size: u64,
-    pub file: PathBuf,
 }
 
 pub(super) fn walk_folder(
@@ -625,7 +628,6 @@ pub(super) fn walk_folder(
             members.push(FolderMember {
                 path: member,
                 size: metadata.len(),
-                file: path,
             });
             if members.len() > limits.members_per_archive {
                 return Err(PackageError::Bounds {
@@ -639,13 +641,57 @@ pub(super) fn walk_folder(
     Ok(members)
 }
 
-/// Opens a file that must still be the regular file the walk saw. `O_NOFOLLOW` refuses a
-/// swapped-in link and `O_NONBLOCK` keeps a swapped-in FIFO from hanging the open.
+/// Opens an export part that must still be the regular file the check saw. `O_NOFOLLOW`
+/// refuses a swapped-in link and `O_NONBLOCK` keeps a swapped-in FIFO from hanging the open.
 pub(super) fn open_regular(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "An export file is no longer a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+pub(super) fn open_directory(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Opens a folder member through the export's held directory, one component at a time with
+/// `O_NOFOLLOW`, so a parent swapped for a link after the walk cannot lead outside the export.
+pub(super) fn open_beneath(root: &File, path: &MemberPath) -> io::Result<File> {
+    let mut components = path.as_str().split('/').peekable();
+    let mut opened: Option<File> = None;
+    while let Some(component) = components.next() {
+        let kind = if components.peek().is_some() {
+            libc::O_DIRECTORY
+        } else {
+            libc::O_NONBLOCK
+        };
+        let name = CString::new(component)?;
+        let parent = opened.as_ref().unwrap_or(root).as_raw_fd();
+        // `parent` stays open across the call and `name` is NUL-terminated. A successful
+        // openat returns a descriptor that nothing else owns.
+        let descriptor = unsafe {
+            libc::openat(
+                parent,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | kind,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        opened = Some(unsafe { File::from_raw_fd(descriptor) });
+    }
+    let file = opened.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
