@@ -25,6 +25,8 @@ const PINNED: Record<string, { readonly why: string; readonly calls: Readonly<Re
   "attachment-upload.ts": { why: "An upload before it completes, which no reader takes as real until RetainedFiles writes its complete metadata.",
     calls: { mkdir: 2, chmod: 1, writeFile: 2, open: 2, rename: 1, write: 1 } },
   "protocol.ts": { why: "StringDecoder.write decodes the input stream and writes no file.", calls: { write: 1 } },
+  "failover/checkpoint-store.ts": { why: "A checkpoint is downloaded into a new archive directory beside the state directory, and `backup restore` checks that archive before any file takes a name under a retained tree.",
+    calls: { mkdir: 2, open: 1, writeFile: 1, rename: 1 } },
   "failover/ownership.ts": { why: "writeSync puts the fenced owner's last line on stderr before the exit that follows it, and writes no file.", calls: { write: 1 } },
 };
 

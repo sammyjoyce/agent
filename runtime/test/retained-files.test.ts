@@ -3,14 +3,14 @@ import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { cleanRetainedFiles, LocalFiles, StagingFile } from "../src/failover/retained-files.js";
-import { filesUnder, stateDirectory } from "./fixtures/failover-state.js";
+import { filesUnder, unstampedDirectory } from "./fixtures/failover-state.js";
 
 const BUNDLE = "11111111-1111-4111-8111-111111111111", ATTACHMENT = "33333333-3333-4333-8333-333333333333";
 
 const temporary = (path: string) => path.split("/").some((name) => name.startsWith(".") || name.endsWith(".tmp"));
 
 test("the local implementation names each file privately and leaves no temporary file, on success and on failure", async (t) => {
-  const directory = await stateDirectory(t), files = new LocalFiles(directory);
+  const directory = await unstampedDirectory(t), files = new LocalFiles(directory);
   const bundle = Buffer.from(JSON.stringify({ invented: "feedback bundle" }));
   await files.write([{ path: `feedback/${BUNDLE}.json`, bytes: bundle }, { path: "feedback/latest", bytes: Buffer.from(BUNDLE) }]);
   assert.deepEqual(await filesUnder(directory), [`feedback/${BUNDLE}.json`, "feedback/latest"]);
@@ -27,7 +27,7 @@ test("the local implementation names each file privately and leaves no temporary
 });
 
 test("a staged file that already has its final path keeps it, and a staged file elsewhere takes it", async (t) => {
-  const directory = await stateDirectory(t), files = new LocalFiles(directory);
+  const directory = await unstampedDirectory(t), files = new LocalFiles(directory);
   const content = join(directory, "attachments", ATTACHMENT, "content");
   await mkdir(join(directory, "attachments", ATTACHMENT), { recursive: true });
   await writeFile(content, "invented attachment content");
@@ -49,7 +49,7 @@ test("a staged file that already has its final path keeps it, and a staged file 
 });
 
 test("a write refuses a path outside the three trees, or one with a temporary name, before it writes anything", async (t) => {
-  const directory = await stateDirectory(t), files = new LocalFiles(directory);
+  const directory = await unstampedDirectory(t), files = new LocalFiles(directory);
   for (const path of ["auth.json", "session.sqlite", "diagnostics/startup.jsonl", "attachments", "feedback/", "/feedback/latest", "feedback//latest",
     "feedback/../auth.json", "./feedback/latest", "history/other", "historyX/assets/a", "attachmentsX/a", "feedback/a\\b",
     "feedback/.hidden", "feedback/latest.tmp", `attachments/.${ATTACHMENT}/content`]) {
@@ -60,7 +60,7 @@ test("a write refuses a path outside the three trees, or one with a temporary na
 });
 
 test("startup cleanup removes temporary files and unfinished uploads, and nothing a write could name", async (t) => {
-  const directory = await stateDirectory(t), files = new LocalFiles(directory);
+  const directory = await unstampedDirectory(t), files = new LocalFiles(directory);
   const complete = "44444444-4444-4444-8444-444444444444", unfinished = "55555555-5555-4555-8555-555555555555", unnamed = "66666666-6666-4666-8666-666666666666";
   await files.write([{ path: `attachments/${complete}/content`, bytes: Buffer.from("kept") },
     { path: `attachments/${complete}/metadata.json`, bytes: Buffer.from(JSON.stringify({ complete: true, retained: false })) },
