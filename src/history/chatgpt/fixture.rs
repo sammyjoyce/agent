@@ -78,10 +78,6 @@ impl Conversation {
         }
     }
 
-    pub fn id(&self) -> String {
-        self.value["id"].as_str().unwrap_or_default().to_owned()
-    }
-
     /// Adds a node and moves `current_node` to it. Fills the message's id and time.
     pub fn node(mut self, node: &str, parent: Option<&str>, message: Value) -> Self {
         self.clock += 1.0;

@@ -55,9 +55,11 @@ impl Member {
         }
     }
 
-    /// The decompressed bytes as a positioned region, when they are stored as-is.
-    fn in_place(&self) -> io::Result<Option<Region>> {
+    /// The member's bytes as a positioned region, when they are stored as-is. Deflated
+    /// members have none and must be inflated.
+    pub fn region(&self) -> io::Result<Option<Region>> {
         match &self.location {
+            Location::File(path) => Region::whole(archive::open_regular(path)?).map(Some),
             Location::Entry { archive, entry }
                 if entry.method == Method::Stored && entry.size == entry.compressed =>
             {
@@ -66,12 +68,6 @@ impl Member {
             _ => Ok(None),
         }
     }
-}
-
-/// Where a shard's decompressed bytes can be read again after the check.
-enum ShardBytes {
-    File(PathBuf),
-    Region(Region),
 }
 
 /// One conversation's bytes inside its shard, with the digest that proves a later read saw
@@ -96,7 +92,8 @@ pub(super) struct SpanChanged;
 
 pub(super) struct Package {
     members: Vec<Member>,
-    shards: Vec<ShardBytes>,
+    /// Each shard's decompressed bytes: in place when stored, otherwise a private spool.
+    shards: Vec<Region>,
     /// Inventory order: newest update first, then id.
     conversations: Vec<ConversationEntry>,
     by_id: HashMap<String, usize>,
@@ -181,16 +178,9 @@ impl Package {
     pub fn read_conversation(&self, entry: &ConversationEntry) -> Result<Value, SpanChanged> {
         let span = &entry.span;
         let mut bytes = vec![0; usize::try_from(span.len).map_err(|_| SpanChanged)?];
-        match &self.shards[span.shard] {
-            ShardBytes::File(path) => {
-                let file = archive::open_regular(path).map_err(|_| SpanChanged)?;
-                std::os::unix::fs::FileExt::read_exact_at(&file, &mut bytes, span.start)
-                    .map_err(|_| SpanChanged)?;
-            }
-            ShardBytes::Region(region) => region
-                .read_exact_at(&mut bytes, span.start)
-                .map_err(|_| SpanChanged)?,
-        }
+        self.shards[span.shard]
+            .read_exact_at(&mut bytes, span.start)
+            .map_err(|_| SpanChanged)?;
         if <[u8; 32]>::from(Sha256::digest(&bytes)) != span.sha256 {
             return Err(SpanChanged);
         }
@@ -357,7 +347,7 @@ impl Builder {
         for index in nested {
             let name = self.members[index].path.as_str().to_owned();
             let damaged = |error: io::Error| member_error(&name, error);
-            let region = match self.members[index].in_place().map_err(damaged)? {
+            let region = match self.members[index].region().map_err(damaged)? {
                 Some(region) => region,
                 None => {
                     let mut spool = Spool::create(self.spool_remaining).map_err(damaged)?;
@@ -497,35 +487,25 @@ impl Builder {
         member: MemberId,
         shard: usize,
         scan: &mut Scan,
-    ) -> Result<ShardBytes, PackageError> {
+    ) -> Result<Region, PackageError> {
         let name = self.members[member.0].path.as_str().to_owned();
         let damaged = |error: io::Error| member_error(&name, error);
         let maximum = self.limits.conversation_bytes;
         let source = &self.members[member.0];
         let mut reader = source.open().map_err(damaged)?;
         let mut handle = |element: Element<'_>| scan.element(&name, shard, element);
-        let in_place = source.in_place().map_err(damaged)?;
-        let bytes = match (&source.location, in_place) {
-            (_, Some(region)) => {
-                split(&name, &mut reader, maximum, &mut handle)?;
-                ShardBytes::Region(region)
-            }
-            (Location::File(path), None) => {
-                split(&name, &mut reader, maximum, &mut handle)?;
-                ShardBytes::File(path.clone())
-            }
-            (Location::Entry { .. }, None) => {
-                let mut spool = Spool::create(self.spool_remaining).map_err(damaged)?;
-                let mut tee = Tee {
-                    inner: reader,
-                    spool: &mut spool,
-                };
-                split(&name, &mut tee, maximum, &mut handle)?;
-                self.spool_remaining -= spool.len();
-                ShardBytes::Region(spool.into_region())
-            }
+        if let Some(region) = source.region().map_err(damaged)? {
+            split(&name, &mut reader, maximum, &mut handle)?;
+            return Ok(region);
+        }
+        let mut spool = Spool::create(self.spool_remaining).map_err(damaged)?;
+        let mut tee = Tee {
+            inner: reader,
+            spool: &mut spool,
         };
-        Ok(bytes)
+        split(&name, &mut tee, maximum, &mut handle)?;
+        self.spool_remaining -= spool.len();
+        Ok(spool.into_region())
     }
 }
 
@@ -546,6 +526,16 @@ fn split(
 }
 
 fn member_error(name: &str, error: io::Error) -> PackageError {
+    if let Some(full) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<archive::SpoolFull>())
+    {
+        return PackageError::Bounds {
+            what: "private spool",
+            limit: full.limit,
+            found: full.limit.saturating_add(1),
+        };
+    }
     match archive::corruption(&error) {
         Some(reason) => PackageError::Corrupt {
             member: archive::shown(name),
@@ -813,7 +803,7 @@ impl Scan {
     fn finish(
         mut self,
         members: Vec<Member>,
-        shards: Vec<ShardBytes>,
+        shards: Vec<Region>,
         files: HashMap<FileId, MemberId>,
         library: HashMap<String, Vec<LibraryFile>>,
         original_names: HashMap<String, String>,
