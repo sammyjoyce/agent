@@ -44,16 +44,16 @@ export interface ReplicatedOwnershipOptions {
 
 /**
  * Opens the owner's side of a replicated coordinator: the session database
- * and the retained files caught up with the log, the leftovers of a crash
- * removed, and a check with the authority every 5 s. Without that check an
- * idle owner would never learn that a promotion sealed the log.
+ * and the retained files caught up with the log, the files no log entry
+ * names removed, and a check with the authority every 5 s. Without that check
+ * an idle owner would never learn that a promotion sealed the log.
  */
 export async function openReplicatedOwnership({ session, stateDirectory, onFenced, signal }: ReplicatedOwnershipOptions): Promise<ReplicatedOwnership> {
   const { link, holder, epoch } = await ownerSession(session, { signal });
   const database = await ScopedDatabase.over(await openConversationDatabase(join(stateDirectory, "session.sqlite")));
   const { storage, log } = await openReplicatedStorage({ database, link, holder, epoch, stateDirectory, onFenced, signal });
-  // The catch-up has named every file the log names, so what is left under a
-  // temporary name or in an unfinished upload is what a crash left behind.
+  // The catch-up has given every logged file its name, so a temporary file or
+  // an unfinished upload that remains is one no log entry names.
   try { await cleanRetainedFiles(stateDirectory); }
   catch (error) { await storage.close(BACKGROUND_CONTEXT).catch(() => {}); throw error; }
   const gate = new ConfirmGate({ link, holder, epoch, onFenced });
