@@ -171,7 +171,6 @@ final class ChatModel {
       indexSaved()
     }
   }
-  /// Remove marks a coordinator before its first await, so Spotlight drops it from then on.
   private func indexSaved() { spotlight?.save(profiles.filter { removed[$0.id] == nil }) }
   /// What the composer holds. A draft changed in code replaces the field's text, composition
   /// included, so all of it is committed.
@@ -320,7 +319,6 @@ final class ChatModel {
   var draftError: String?
   @ObservationIgnored private let persistence: ComposerDraftStore?
   @ObservationIgnored private let sharedInbox: SharedDraftInbox?
-  /// What Spotlight holds of the saved coordinators. An inspection has none.
   @ObservationIgnored let spotlight: SpotlightIndex?
   @ObservationIgnored private var persistentRevision: UInt64 = 0
   @ObservationIgnored private var composerID = UUID()

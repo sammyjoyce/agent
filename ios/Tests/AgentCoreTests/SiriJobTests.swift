@@ -62,7 +62,6 @@ private func jobReads(_ fixture: FixtureCoordinator) async -> Int {
 private let updateTheCoordinator =
   "Update the coordinator to inspect scheduled jobs and saved work."
 
-/// Work serves an interrupted Nightly deps and Personal a healthy one.
 private func serveNightlyDeps(work: FixtureCoordinator, personal: FixtureCoordinator) async {
   for (peer, title, state) in [
     (work, "Work nightly deps", parked), (personal, "Personal nightly deps", .completed),
@@ -88,9 +87,6 @@ private func serveNightlyDeps(work: FixtureCoordinator, personal: FixtureCoordin
   }
 }
 
-/// Work and Personal served as `withJobPeers` serves them. Each `launch` starts the app again over
-/// one folder and `spotlight`, with nothing saved at first and no scene active. The body
-/// deactivates what it launched.
 @MainActor private func withRelaunches(
   spotlight: SpotlightFake,
   _ body: (
@@ -128,8 +124,6 @@ private func serveNightlyDeps(work: FixtureCoordinator, personal: FixtureCoordin
   try outcome.get()
 }
 
-/// Activates the scene and returns once the job read it starts, and every Spotlight write since,
-/// have finished.
 @MainActor private func activate(_ coordinators: Coordinators) async {
   await coordinators.setActive(true)
   await coordinators.chat.spotlight?.settled()
@@ -599,8 +593,6 @@ struct SiriJobTests {
     }
   }
 
-  /// Remove marks Work removed, saves, then waits on Work for its alert withdrawal before it
-  /// detaches Work's lane. A job list Work answers in that wait still reaches the caller.
   @MainActor @Test(.timeLimit(.minutes(1)))
   func aJobListThatArrivesAfterRemoveBeganPutsNothingBack() async throws {
     let spotlight = SpotlightFake()
@@ -673,7 +665,6 @@ struct SiriJobTests {
     }
   }
 
-  /// The Jobs and work screen's inspection holds one coordinator as its saved list.
   @MainActor @Test(.timeLimit(.minutes(1)))
   func anInspectionModelNeverIndexes() async throws {
     let spotlight = SpotlightFake()

@@ -116,8 +116,6 @@ public final class AppNotifications: NSObject {
     AppDependencyManager.shared.add(dependency: self)
   }
 
-  /// The app's own index on a phone. A Mac test host has none, so no test writes the Mac's own
-  /// Spotlight.
   private static var appSpotlight: (any SpotlightStore)? {
     #if os(iOS)
       CoreSpotlightStore()

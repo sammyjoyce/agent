@@ -75,8 +75,6 @@ public struct JobEntity: AppEntity {
     nextRun = status.schedules.compactMap(\.nextAt).min().map(Self.date)
   }
 
-  /// What Spotlight keeps of a job. The system reads its schedule and run times through `JobQuery`
-  /// when a result is used.
   init(indexing id: ScopedEntityID, title: String, coordinator: String, state: JobRunState) {
     self.id = id
     self.title = title
@@ -263,7 +261,6 @@ extension JobEntity: Transferable {
 
   var summary: String { "\(title), \(coordinatorAndState)" }
 
-  /// Such as "Work, Interrupted".
   var coordinatorAndState: String {
     let state = JobRunState.caseDisplayRepresentations[state].map { String(localized: $0.title) }
     return "\(coordinator), \(state ?? self.state.rawValue)"

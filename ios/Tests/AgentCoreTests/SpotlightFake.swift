@@ -1,8 +1,6 @@
 @testable import AgentCore
 @testable import AgentUI
 
-/// The app's named Spotlight index as a test reads it. One fake outlives each launch built over
-/// it, as the real index outlives the app.
 actor SpotlightFake: SpotlightStore {
   struct Job: Equatable {
     let title: String
@@ -31,7 +29,6 @@ actor SpotlightFake: SpotlightStore {
     }
   }
 
-  /// The entries of `profile`'s coordinator: its own and its jobs'.
   func keys(of profile: ProfileID) -> [SpotlightEntry.Key] {
     entries.keys.filter { key in
       switch key {
@@ -41,18 +38,14 @@ actor SpotlightFake: SpotlightStore {
     }
   }
 
-  /// The next write waits until `abandonHeldWrite`.
   func holdNextWrite() { next = .hold }
 
-  /// Fails the held write once it has arrived, and it changes nothing, as when the app stopped
-  /// under it.
   func abandonHeldWrite() async {
     if held == nil { await withCheckedContinuation { arrival = $0 } }
     held?.resume(throwing: WriteFailed())
     held = nil
   }
 
-  /// The next write fails and changes nothing, as a locked phone refuses it.
   func refuseNextWrite() { next = .refuse }
 
   func deleteAll() async throws {

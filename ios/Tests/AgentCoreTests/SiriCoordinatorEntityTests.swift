@@ -40,7 +40,6 @@ struct SiriCoordinatorEntityTests {
         spotlight: spotlight, permission: permission)
     }
 
-    /// The app started again over the same folder and Spotlight index.
     func relaunch() -> AppNotifications {
       AppNotifications(
         defaults: defaults, applicationSupport: root, caches: root, transport: transport,
@@ -65,8 +64,6 @@ struct SiriCoordinatorEntityTests {
 
   private func named(_ entities: [CoordinatorEntity]) -> [String] { entities.map(\.name) }
 
-  /// Work, Personal and Home, indexed into `spotlight`. They are unpaired and every dial fails at
-  /// once, so an activation reads no jobs and reaches no network.
   private func indexing(
     _ spotlight: SpotlightFake, names: [String] = ["Work", "Personal", "Home"]
   ) throws -> SavedFixture {
@@ -75,7 +72,6 @@ struct SiriCoordinatorEntityTests {
       paired: false, spotlight: spotlight)
   }
 
-  /// Returns once every Spotlight write `notifications` started has finished.
   private func settle(_ notifications: AppNotifications) async {
     await notifications.coordinators.chat.spotlight?.settled()
   }
@@ -100,7 +96,6 @@ struct SiriCoordinatorEntityTests {
     #expect(await spotlight.entries.count == 3, "No job and no All")
   }
 
-  /// Under the interaction fixture the app delegate's coordinators live on, never activated.
   @Test func coordinatorsNoSceneActivatedNeverWriteTheIndex() async throws {
     let spotlight = SpotlightFake()
     let delegate = try indexing(spotlight, names: ["Home"])
