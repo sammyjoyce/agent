@@ -146,8 +146,11 @@ impl fmt::Display for RunId {
 #[serde(transparent)]
 pub struct EvidenceId(String);
 impl EvidenceId {
-    pub(crate) fn receipt(digest: &[u8]) -> Self {
-        Self(format!("r:{}", hex::encode(&digest[..8.min(digest.len())])))
+    pub(crate) fn receipt(canonical: &[u8]) -> Self {
+        Self(format!(
+            "r:{}",
+            hex::encode(&Sha256::digest(canonical)[..8])
+        ))
     }
     pub(crate) fn task(task_id: &str, updated_at: u64) -> Self {
         Self(format!("t:{task_id}@{updated_at}"))

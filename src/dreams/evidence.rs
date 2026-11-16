@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::{
     dreams::{
@@ -62,7 +61,7 @@ pub(crate) fn redacted_receipt(record: &Record) -> EvidenceItem {
     redact(&mut value);
     let body = value.to_string();
     EvidenceItem {
-        id: EvidenceId::receipt(&Sha256::digest(body.as_bytes())),
+        id: EvidenceId::receipt(body.as_bytes()),
         at_ms: record.timestamp_ms,
         kind: EvidenceKind::Receipt,
         title: None,
@@ -507,18 +506,18 @@ pub(crate) fn render_page(
     files: &[(String, String)],
     page: u32,
 ) -> String {
-    let mut pages: Vec<Vec<String>> = vec![Vec::new()];
+    let mut pages: Vec<Vec<String>> = Vec::new();
+    let mut page_lines = Vec::new();
     let mut bytes = 0;
     for line in review_lines(review, items, files) {
         if bytes > 0 && bytes + line.len() > PAGE_BYTES {
-            pages.push(Vec::new());
+            pages.push(std::mem::take(&mut page_lines));
             bytes = 0;
         }
         bytes += line.len() + 1;
-        if let Some(last) = pages.last_mut() {
-            last.push(line);
-        }
+        page_lines.push(line);
     }
+    pages.push(page_lines);
     let count = pages.len();
     let index = usize::try_from(page).unwrap_or(usize::MAX);
     match index.checked_sub(1).and_then(|index| pages.get(index)) {

@@ -34,7 +34,6 @@ pub const MAX_WINDOW_HOURS: u8 = 48;
 pub const MAX_SUMMARIES: usize = 200;
 /// One review request carries the summaries as JSON, which can expand them.
 pub const MAX_SUMMARY_BYTES: usize = crate::runtime::MAX_FRAME_BYTES / 4;
-const _: () = assert!(MAX_SUMMARY_BYTES * 4 <= crate::runtime::MAX_FRAME_BYTES);
 pub const MAX_EDITS: usize = 4;
 pub const MAX_EDIT_BYTES: usize = 64 * 1024;
 pub const MAX_PATH_BYTES: usize = 512;
@@ -49,7 +48,6 @@ pub const NOT_CONFIGURED: &str = "Dreams is not configured";
 
 const MAX_SHOWN_FILES: usize = 32;
 const MAX_RECEIPT_BYTES: u64 = diagnostics::RETENTION_CAP_BYTES + 32 * 1024 * 1024;
-const _: () = assert!(MAX_RECEIPT_BYTES > diagnostics::RETENTION_CAP_BYTES);
 const MAX_RECEIPTS: usize = 400_000;
 
 /// Why an attempt was not sealed, in words the model can act on.
@@ -291,8 +289,13 @@ impl Dreams {
                 Ok(metadata) if metadata.len() > MAX_EDIT_BYTES as u64 => {
                     format!("[larger than {MAX_EDIT_BYTES} bytes; not shown and not editable]")
                 }
-                Ok(_) => std::fs::read_to_string(&file)
-                    .unwrap_or_else(|_| "[not UTF-8 text; not editable]".into()),
+                Ok(_) => match std::fs::read_to_string(&file) {
+                    Ok(content) => content,
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        "[not UTF-8 text; not editable]".into()
+                    }
+                    Err(error) => return Err(error).context("Could not read an editable file"),
+                },
                 Err(error) => return Err(error).context("Could not read an editable file"),
             };
             files.push((path, content));
