@@ -93,6 +93,7 @@ final class Capture: Sendable {
     input.installTap(onBus: 0, bufferSize: 4_096, format: hardware) { [weak capture] buffer, _ in
       capture?.hear(buffer)
     }
+    capture.observe()
     do {
       engine.prepare()
       try engine.start()
@@ -181,25 +182,32 @@ final class Capture: Sendable {
     return heard
   }
 
-  /// The engine stops itself when a new input changes the hardware format. A notice while it
-  /// still runs changed nothing it hears, so the take goes on.
+  /// The engine stops itself and posts this notice when the input's channel count or sample rate
+  /// changes. A notice while it still runs did not stop its audio, so the take goes on.
   private func engineChanged() {
     guard let engine = state.withLockUnchecked({ $0.engine }), !engine.isRunning else { return }
     halt(interrupted: true)
   }
 
+  /// The engine posts its notice on an internal queue, where tearing the engine down can deadlock,
+  /// so the check runs on another queue. The engine may have stopped itself before the observer
+  /// existed, so the check also runs once here.
   private func observe(_ engine: AVAudioEngine) {
-    let center = NotificationCenter.default
-    var observers = [
-      center.addObserver(
+    holdUntilHalt([
+      NotificationCenter.default.addObserver(
         forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
       ) { [weak self] _ in
-        self?.engineChanged()
+        DispatchQueue.global().async { [weak self] in self?.engineChanged() }
       }
-    ]
+    ])
+    engineChanged()
+  }
+
+  private func observe() {
     #if os(iOS)
+      let center = NotificationCenter.default
       let session = AVAudioSession.sharedInstance()
-      observers += [
+      let observers = [
         center.addObserver(
           forName: AVAudioSession.interruptionNotification, object: session, queue: nil
         ) { [weak self] note in
@@ -222,8 +230,18 @@ final class Capture: Sendable {
           self?.halt(interrupted: true)
         },
       ]
+      holdUntilHalt(observers)
     #endif
-    state.withLockUnchecked { $0.observers = observers }
+  }
+
+  private func holdUntilHalt(_ observers: [any NSObjectProtocol]) {
+    let halted = state.withLockUnchecked { state in
+      guard state.engine != nil else { return true }
+      state.observers += observers
+      return false
+    }
+    guard halted else { return }
+    for observer in observers { NotificationCenter.default.removeObserver(observer) }
   }
 
   private static func deactivate() {
