@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeSet,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 
@@ -139,6 +139,15 @@ impl Glob {
                 .zip(parts)
                 .all(|(pattern, part)| wildcard(pattern.as_bytes(), part.as_bytes()))
     }
+    /// `lowered` is already lowercase.
+    fn matches_ignoring_case(&self, lowered: &[String]) -> bool {
+        self.0.len() == lowered.len()
+            && self
+                .0
+                .iter()
+                .zip(lowered)
+                .all(|(pattern, part)| wildcard(pattern.to_lowercase().as_bytes(), part.as_bytes()))
+    }
 }
 
 fn editable_in(globs: &[Glob], path: &str) -> Result<EditablePath, String> {
@@ -150,22 +159,71 @@ fn editable_in(globs: &[Glob], path: &str) -> Result<EditablePath, String> {
     }
 }
 
+/// `.` and empty components dropped, and `..` resolved by name alone.
+fn normalize(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normal.pop();
+            }
+            other => normal.push(other),
+        }
+    }
+    normal
+}
+
 /// An approved edit must not be able to rewrite the program that judges the
 /// next proposal, so no argument of a check may name an editable path.
+///
+/// A check runs in a clone of the repository, so a relative argument is
+/// resolved against the repository root. Each argument is followed both by
+/// name and through the file system, which resolves symlinks and, on a volume
+/// that folds case, the stored spelling. Names are compared without case, so a
+/// file that does not exist yet is covered on such a volume too.
+///
+/// This catches a path written as an argument. It cannot see a file that the
+/// check program opens by itself.
 fn refuse_editable_argv(
     repository: &Path,
     editable: &[Glob],
     check: &DreamsCheckFile,
 ) -> Result<()> {
     for argument in &check.argv {
-        let relative = Path::new(argument)
-            .strip_prefix(repository)
-            .ok()
-            .and_then(Path::to_str)
-            .unwrap_or(argument.trim_start_matches("./"));
-        if editable_in(editable, relative).is_ok() {
+        let written = Path::new(argument);
+        let anchored = repository.join(written);
+        let landings: Vec<PathBuf> = [
+            normalize(&anchored),
+            normalize(&canonicalize_existing_ancestor(&anchored)),
+        ]
+        .into_iter()
+        .filter_map(|landing| Some(landing.strip_prefix(repository).ok()?.to_owned()))
+        .collect();
+        let names_editable = landings.iter().any(|relative| {
+            let parts: Vec<String> = relative
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+                .collect();
+            !parts.is_empty()
+                && editable
+                    .iter()
+                    .any(|glob| glob.matches_ignoring_case(&parts))
+        });
+        if names_editable {
             bail!(
                 "Dreams check {} names an editable path: {argument}",
+                check.name
+            );
+        }
+        // A symlink followed by `..` lands somewhere its spelling does not say,
+        // and a relative `..` can leave the clone for the private run directory.
+        let climbs = written
+            .components()
+            .any(|part| part == Component::ParentDir);
+        if climbs && (written.is_relative() || !landings.is_empty()) {
+            bail!(
+                "Dreams check {} reaches a path through `..`: {argument}. Write the path without `..`",
                 check.name
             );
         }
@@ -309,7 +367,7 @@ impl DreamsPolicy {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{fs, os::unix::fs::symlink, path::Path};
 
     use crate::dreams::policy::{DreamsCheckFile, DreamsPolicy, DreamsPolicyFile, ProtectedPaths};
 
@@ -468,6 +526,83 @@ mod tests {
             },
         ] {
             assert!(DreamsPolicy::parse(&broken, &UNPROTECTED).is_err());
+        }
+    }
+
+    #[test]
+    fn a_check_argument_is_refused_under_every_spelling_that_reaches_an_editable_file() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = repository(root.path());
+        fs::write(repository.join("AGENTS.md"), "Example guidance.\n").unwrap();
+        fs::write(repository.join("Makefile"), "test:\n").unwrap();
+        fs::create_dir(repository.join("playbooks")).unwrap();
+        fs::write(
+            repository.join("playbooks/review.md"),
+            "Example playbook.\n",
+        )
+        .unwrap();
+        symlink("AGENTS.md", repository.join("alias.txt")).unwrap();
+        symlink("playbooks", repository.join("linked")).unwrap();
+        symlink(&repository, root.path().join("elsewhere")).unwrap();
+        let canonical = repository.canonicalize().unwrap();
+        let under =
+            |base: &Path, relative: &str| base.join(relative).to_string_lossy().into_owned();
+        let valid = file(&repository);
+        let parsed = |argument: &str| {
+            let mut policy = valid.clone();
+            policy.checks[0].argv.push(argument.to_owned());
+            DreamsPolicy::parse(&policy, &UNPROTECTED)
+        };
+
+        let accepted: Vec<String> = [
+            "AGENTS.md".to_owned(),
+            "./AGENTS.md".into(),
+            ".//AGENTS.md".into(),
+            "AGENTS.md/".into(),
+            "playbooks//review.md".into(),
+            "playbooks/../AGENTS.md".into(),
+            "nested/../AGENTS.md".into(),
+            "../guidance/AGENTS.md".into(),
+            "scripts/../Makefile".into(),
+            "agents.md".into(),
+            "PLAYBOOKS/Review.MD".into(),
+            "Playbooks/new.md".into(),
+            "alias.txt".into(),
+            "linked/review.md".into(),
+            under(&canonical, "AGENTS.md"),
+            under(&canonical, "playbooks/../AGENTS.md"),
+            under(&canonical, "scripts/../Makefile"),
+            under(root.path(), "guidance/AGENTS.md"),
+            under(root.path(), "elsewhere/AGENTS.md"),
+            under(root.path(), "elsewhere/linked/review.md"),
+        ]
+        .into_iter()
+        .filter(|argument| parsed(argument).is_ok())
+        .collect();
+        assert!(
+            accepted.is_empty(),
+            "The policy accepted check arguments that reach an editable file: {accepted:?}"
+        );
+        assert!(
+            parsed(".//AGENTS.md")
+                .unwrap_err()
+                .to_string()
+                .contains("names an editable path")
+        );
+
+        for argument in [
+            "-c".to_owned(),
+            "exit 0".into(),
+            "--range=1..3".into(),
+            "Makefile".into(),
+            "README.md".into(),
+            under(&canonical, "Makefile"),
+            under(root.path(), "checks/commands-exist.sh"),
+        ] {
+            assert!(
+                parsed(&argument).is_ok(),
+                "{argument:?} names no editable file and must stay allowed"
+            );
         }
     }
 }

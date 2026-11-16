@@ -721,6 +721,34 @@ fn policy_refuses_a_repository_that_holds_private_paths_and_a_check_that_names_a
 }
 
 #[test]
+fn jobs_check_refuses_each_spelling_of_an_editable_path_in_a_check_argv() {
+    let fixture = Fixture::new();
+    let spelled = fixture.directory.path().join("guidance");
+    let spelled_agents = spelled.join("AGENTS.md");
+    let cases: Vec<(&std::path::Path, &str)> = vec![
+        (&fixture.repository, ".//AGENTS.md"),
+        (&fixture.repository, "playbooks/../AGENTS.md"),
+        (&fixture.repository, "playbooks//review.md"),
+        (&fixture.repository, "agents.md"),
+        (&spelled, spelled_agents.to_str().unwrap()),
+    ];
+    let mut accepted = Vec::new();
+    for (repository, argument) in cases {
+        fixture.write_policy(repository, &["/bin/sh", argument]);
+        let output = fixture.cli(&["jobs", "check"], false);
+        if output.status.success()
+            || !String::from_utf8_lossy(&output.stderr).contains("names an editable path")
+        {
+            accepted.push(argument);
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "jobs check accepted check arguments that name an editable path: {accepted:?}"
+    );
+}
+
+#[test]
 fn the_shipped_example_jobs_load_and_name_the_reserved_dreams_job() {
     let fixture = Fixture::new();
     let examples = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/scheduled_jobs");

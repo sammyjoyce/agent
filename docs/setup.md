@@ -486,8 +486,12 @@ before and after results. See the
 
 The policy loader refuses a repository that contains the configuration file, a
 job directory or the state directory. It also refuses a check whose arguments
-name an editable path. Keep check programs outside the repository. Restart the
-coordinator after you change the policy.
+name an editable path. The loader follows each argument as the check would see
+it, from the repository root, through symlinks and without regard to case, and
+it refuses a relative argument that contains `..`. That rule catches a path
+written in the configuration. It cannot see a file that a check program opens
+by itself, so the rule about checks below still applies. Keep check programs
+outside the repository. Restart the coordinator after you change the policy.
 
 Copy the [example job](../examples/scheduled_jobs/dreams.toml) into a job
 directory, then check and sync as for any job. The job id `dreams` is reserved.
