@@ -596,7 +596,7 @@
 
       try await definitions.intents["OpenCoordinatorIntent"].makeIntent(target: personal).run()
 
-      assertShowsPersonalWithTheWorkDraft(app)
+      assertShowsPersonalKeepingTheWorkDraft(app)
     }
 
     func testASpotlightTapOpensTheJobFromAColdLaunchAndKeepsTheDraft() async throws {
@@ -714,16 +714,18 @@
 
     private func replaceText(of field: XCUIElement, with text: String, in app: XCUIApplication) {
       XCTAssertTrue(field.waitForExistence(timeout: 10), app.debugDescription)
-      field.press(forDuration: 1)
-      let selectAll = app.menuItems["Select All"]
-      XCTAssertTrue(selectAll.waitForExistence(timeout: 3), app.debugDescription)
-      selectAll.tap()
-      field.typeText(text)
+      field.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.5)).tap()
+      let current = field.value as? String ?? ""
+      field.typeText(
+        String(repeating: XCUIKeyboardKey.delete.rawValue, count: current.count) + text)
       XCTAssertTrue(becomes(field, "value == %@", text), String(describing: field.value))
     }
 
     private func searchHome(_ home: XCUIApplication, for search: String) throws -> XCUIElement {
-      home.swipeDown()
+      let pill = home.descendants(matching: .any)["spotlight-pill"]
+      XCTAssertTrue(pill.waitForExistence(timeout: 10), home.debugDescription)
+      pill.tap()
+      XCTAssertTrue(home.keyboards.firstMatch.waitForExistence(timeout: 10), home.debugDescription)
       home.typeText(search)
       let result = home.descendants(matching: .any)
         .matching(NSPredicate(format: "label CONTAINS %@", search)).element(boundBy: 0)
@@ -963,6 +965,13 @@
     }
 
     private func assertShowsPersonalWithTheWorkDraft(_ app: XCUIApplication) {
+      assertShowsPersonalKeepingTheWorkDraft(app)
+      XCTAssertTrue(
+        app.staticTexts["Personal's latest invented reply"].waitForExistence(timeout: 10))
+    }
+
+    /// The Spotlight fixture serves no history, so this leaves out Personal's reply.
+    private func assertShowsPersonalKeepingTheWorkDraft(_ app: XCUIApplication) {
       let menu = app.buttons["scopeMenu"]
       XCTAssertTrue(menu.waitForExistence(timeout: 15), app.debugDescription)
       XCTAssertTrue(becomes(menu, "label CONTAINS %@", "Personal"), menu.label)
@@ -971,8 +980,6 @@
         becomes(field, "value == %@", "Keep this Work draft"), String(describing: field.value))
       let recipient = app.staticTexts["recipientLine"]
       XCTAssertTrue(becomes(recipient, "label == %@", "This draft goes to Work"), recipient.label)
-      XCTAssertTrue(
-        app.staticTexts["Personal's latest invented reply"].waitForExistence(timeout: 10))
     }
 
     private func becomes(_ element: XCUIElement, _ format: String, _ value: String) -> Bool {
