@@ -107,8 +107,8 @@ final class Capture: Sendable {
 
   var isRunning: Bool { state.withLockUnchecked { $0.engine != nil } }
 
-  /// Halts, then waits for any halt a converter error queued, so that halt cannot deactivate the
-  /// shared audio session after the next take activates it.
+  /// Halts, then waits for any halt queued on `teardown`, so that halt cannot deactivate the shared
+  /// audio session after the next take activates it.
   func stop() {
     halt(interrupted: false)
     teardown.sync {}
@@ -182,23 +182,24 @@ final class Capture: Sendable {
     return heard
   }
 
-  /// The engine stops itself and posts this notice when the input's channel count or sample rate
-  /// changes. A notice while it still runs did not stop its audio, so the take goes on.
+  /// `AVAudioEngine` stops itself and posts `AVAudioEngineConfigurationChange` when the input's
+  /// channel count or sample rate changes. A notice while it still runs did not stop its audio, so
+  /// the take goes on.
   private func engineChanged() {
     guard let engine = state.withLockUnchecked({ $0.engine }), !engine.isRunning else { return }
     halt(interrupted: true)
   }
 
-  /// The engine posts its notice on an internal queue, where tearing the engine down can deadlock,
-  /// so the check runs on another queue. The engine may have stopped itself before the observer
-  /// existed, so the check also runs once here.
+  /// `AVAudioEngine` posts `AVAudioEngineConfigurationChange` on an internal queue, where releasing
+  /// the engine can deadlock. The handler queues the check on `teardown`, which `stop()` waits for.
+  /// It reaches the capture only through `check`, so the internal queue never holds the capture
+  /// strongly. The engine may stop itself before the observer is added, so the check runs here too.
   private func observe(_ engine: AVAudioEngine) {
+    let check: @Sendable () -> Void = { [weak self] in self?.engineChanged() }
     holdUntilHalt([
       NotificationCenter.default.addObserver(
         forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
-      ) { [weak self] _ in
-        DispatchQueue.global().async { [weak self] in self?.engineChanged() }
-      }
+      ) { [teardown] _ in teardown.async(execute: check) }
     ])
     engineChanged()
   }
