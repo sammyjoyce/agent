@@ -681,8 +681,8 @@ state directory. To check a backup without using it, restore it into a scratch
 directory and then delete that directory.
 
 A restored store starts held. Its coordinator serves history, attachments and
-chats, but its background owner stays off: scheduled jobs, source polling,
-worktree collection and history indexing do not run. The restored coordinator
+chats, but scheduled jobs, source polling, worktree collection, history
+indexing and phone notifications do not run. The restored coordinator
 has the same coordinator ID, so do not run it while the original still runs.
 Check the hosts first, for example that work a restored job would start has not
 already happened elsewhere. Then stop the coordinator and release the hold:

@@ -74,6 +74,7 @@ pub struct Runtime {
     service_diagnostics: Mutex<Diagnostics>,
     stopping: watch::Sender<bool>,
     coordinator_id: CoordinatorId,
+    restore_held: bool,
 }
 
 enum CommandMessage {
@@ -126,6 +127,7 @@ impl Runtime {
             "Pi runtime is not built; build the runtime first"
         );
         let guard = WriterLock::acquire(state)?;
+        let restore_held = crate::backup::restore_held(&guard, state);
         let coordinator_id = CoordinatorId::load_or_mint(state)?;
         let lock_fd = guard.0.as_raw_fd();
         let mut command = Command::new("node");
@@ -140,7 +142,7 @@ impl Runtime {
         // This is a local child bootstrap, never a public command or shared
         // setting. Workers and ad-hoc runtimes must not inherit this capability.
         command.env_remove("AGENT_APNS_CONFIG");
-        if let Some(config) = apns {
+        if let Some(config) = apns.filter(|_| !restore_held) {
             config.validate()?;
             command.env("AGENT_APNS_CONFIG", serde_json::to_string(config)?);
         }
@@ -197,11 +199,18 @@ impl Runtime {
             service_diagnostics,
             stopping: quiescing,
             coordinator_id,
+            restore_held,
         })
     }
 
     pub fn coordinator_id(&self) -> CoordinatorId {
         self.coordinator_id
+    }
+
+    /// Whether this store waits for `backup release`, read once under this
+    /// runtime's writer lock. A held runtime starts without phone notifications.
+    pub fn restore_held(&self) -> bool {
+        self.restore_held
     }
 
     pub async fn request(&self, command: RuntimeCommand) -> Result<RuntimeCall> {
@@ -721,6 +730,55 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncWriteExt, BufReader};
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn a_restored_store_starts_its_runtime_without_the_apns_capability_until_released() {
+        use crate::notifications::{ApnsConfig, ApnsEnvironment};
+        let apns = ApnsConfig {
+            team_id: "TEAM000001".into(),
+            key_id: "KEY0000001".into(),
+            topic: "dev.example.Agent".into(),
+            key_file: "/tmp/invented-apns/AuthKey.p8".into(),
+            environment: ApnsEnvironment::Sandbox,
+        };
+        for (held, expected) in [(true, "absent"), (false, "present")] {
+            let state = tempfile::tempdir().unwrap();
+            if held {
+                std::fs::write(state.path().join("restore-hold.json"), "{}").unwrap();
+            }
+            let script = state.path().join("apns.mjs");
+            std::fs::write(
+                &script,
+                r#"import {writeFileSync} from 'node:fs';import {join} from 'node:path';
+writeFileSync(join(process.argv[2],'apns'),process.env.AGENT_APNS_CONFIG===undefined?'absent':'present');
+setInterval(()=>{},1000);
+"#,
+            )
+            .unwrap();
+            let runtime = crate::runtime::Runtime::start_with_notifications(
+                &script,
+                state.path(),
+                Some(&apns),
+            )
+            .unwrap();
+            let reported = state.path().join("apns");
+            let seen = timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&reported)
+                        && !text.is_empty()
+                    {
+                        return text;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(seen, expected, "held: {held}");
+            assert_eq!(runtime.restore_held(), held);
+            drop(runtime);
+        }
+    }
 
     #[tokio::test]
     async fn native_duplex_backpressure_keeps_stdout_readable_during_a_partial_command_write() {

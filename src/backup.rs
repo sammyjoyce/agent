@@ -198,10 +198,10 @@ pub fn release(state: &Path) -> Result<Released> {
     }
 }
 
-/// Whether `serve` must start without its background owner. Call it only while
-/// holding the writer lock, so `release` cannot change the answer before the
-/// caller acts on it. Anything at the name, or an unreadable name, is a hold.
-pub fn restore_held(state: &Path) -> bool {
+/// Whether a restored store still waits for `backup release`. The writer lock
+/// keeps `release` from changing the answer while the caller acts on it.
+/// Anything at the name, or an unreadable name, is a hold.
+pub fn restore_held(_owner: &WriterLock, state: &Path) -> bool {
     !matches!(
         fs::symlink_metadata(state.join(RESTORE_HOLD_FILE)),
         Err(error) if error.kind() == io::ErrorKind::NotFound
@@ -210,7 +210,7 @@ pub fn restore_held(state: &Path) -> bool {
 
 pub fn hold_notice(state: &Path) -> String {
     format!(
-        "Background work is held after a restore until `beep-boop --state-dir {} backup release`.",
+        "Background work and phone notifications are held after a restore until `beep-boop --state-dir {} backup release`.",
         state.display()
     )
 }

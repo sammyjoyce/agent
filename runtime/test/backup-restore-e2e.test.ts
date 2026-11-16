@@ -261,14 +261,17 @@ test("an offline backup restores into a new directory that the production coordi
     const killed = spawn(binary, ["--runtime", runtime, "--state-dir", original, "backup", "create", killedArchive],
       { cwd: directory, env, stdio: "ignore" });
     const killedClosed = new Promise<void>((resolve) => killed.once("close", () => resolve()));
+    let interrupted = false;
     for (const deadline = Date.now() + 30_000; Date.now() < deadline && killed.exitCode === null;) {
-      if ((await readdir(directory)).some((name) => name.startsWith(".killed.partial-"))) { killed.kill("SIGKILL"); break; }
+      if ((await readdir(directory)).some((name) => name.startsWith(".killed.partial-"))) { interrupted = killed.kill("SIGKILL"); break; }
       await delay(1);
     }
     await killedClosed;
+    assert.ok(interrupted, "the backup was killed while it was still writing its staging directory");
     if (await exists(killedArchive)) {
-      const published = JSON.parse(await readFile(join(killedArchive, "manifest.json"), "utf8")) as { files: unknown[] };
-      assert.equal(published.files.length, manifest.files.length, "an archive at its final name is complete");
+      const published = JSON.parse(await readFile(join(killedArchive, "manifest.json"), "utf8")) as typeof manifest;
+      assert.deepEqual(published.files, manifest.files, "an archive at its final name is complete");
+      for (const file of published.files) assert.equal(sha256(await readFile(join(killedArchive, "data", file.path))), file.sha256, file.path);
     } else {
       const leftovers = (await readdir(directory)).filter((name) => name.startsWith(".killed.partial-"));
       for (const leftover of leftovers) {
