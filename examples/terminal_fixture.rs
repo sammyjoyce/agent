@@ -42,6 +42,9 @@ fn main() -> Result<ExitCode> {
     // forkpty transferred this descriptor to the parent. Closing the master's
     // final handle also hangs up the test CLI if its driver is terminated.
     let mut output = unsafe { File::from_raw_fd(master) };
+    if let Some(path) = std::env::var_os("AGENT_TEST_TERMINAL_PID") {
+        std::fs::write(path, child.to_string())?;
+    }
     let mut input = InputWriter(Arc::new(Mutex::new(output.try_clone()?)));
     let mut replies = input.clone();
     let mut cursor = std::env::var_os("AGENT_TEST_TERMINAL_REPLY")
