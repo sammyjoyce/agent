@@ -763,12 +763,13 @@ func aSendStoppedEverywhereBeforeItLeftThePhoneIsOfferedAgainAfterACrash(
 }
 
 @MainActor private func connectedModel(
-  to coordinators: [GatedCoordinator], under root: URL
+  to coordinators: [GatedCoordinator], under root: URL,
+  admit: @escaping ChatModel.Admit = { deliver in await deliver() }
 ) async throws -> ChatModel {
   let directory = root.appending(path: "Composer")
   let model = ChatModel(
     draftStore: AttachmentStore(directory: directory.appending(path: "Files")),
-    persistence: ComposerDraftStore(url: directory.appending(path: "draft.json")))
+    persistence: ComposerDraftStore(url: directory.appending(path: "draft.json")), admit: admit)
   model.profiles = coordinators.map(\.profile)
   await model.restoreDraft()
   for coordinator in coordinators { model.attach(lane(coordinator.session)) }
@@ -880,6 +881,60 @@ func aNewerSendDoesNotWaitForAnOlderControlThatComesBack() async throws {
     }
     #expect(model.draft == "/status", "/status comes back and /help stays sent")
     #expect(await coordinator.fixture.count() == 1, "Only /help reached the coordinator")
+    await model.setActive(false)
+  }
+}
+
+@MainActor private final class NextAdmission {
+  var refused = false
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true])
+func anOlderControlComesBackOnceWhileANewerSendIsAdmitting(newerRefused: Bool) async throws {
+  try await withGatedCoordinators(1) { coordinators, root in
+    let coordinator = coordinators[0]
+    let gate = ComposerOwnershipGate()
+    let next = NextAdmission()
+    let model = try await connectedModel(
+      to: coordinators, under: root,
+      admit: { deliver in
+        let admitted = next.refused ? false : await deliver()
+        return await gate.wait(after: admitted)
+      })
+    await coordinator.gate.arm()
+    model.draft = "/status"
+    let older = Task { await model.send() }
+    for await _ in gate.entered.stream { break }
+    await gate.finish()
+    await older.value
+    try await held(coordinator.gate)
+    next.refused = newerRefused
+    model.draft = "An invented newer note"
+    let newer = Task { await model.send() }
+    for await _ in gate.entered.stream { break }
+    await coordinator.gate.fail()
+    let deadline = ContinuousClock.now + .seconds(5)
+    while model.draft.isEmpty, ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(model.draft == "/status", "/status comes back while the newer note is admitting")
+    #expect(await model.saveDraft())
+    let files = AttachmentStore(directory: root.appending(path: "Composer/Files"))
+    let url = root.appending(path: "Composer/draft.json")
+    let both = "An invented newer note\n\n/status"
+    let recovered = try await ComposerDraftStore(url: url).load(from: files)
+    #expect(
+      recovered.draft.text == (newerRefused ? both : "/status"),
+      "Recovery offers each text once, and the newer note only if no outbox took it")
+    await gate.finish()
+    await newer.value
+    #expect(model.draft == (newerRefused ? both : "/status"))
+    #expect(await model.saveDraft())
+    let cold = try await ComposerDraftStore(url: url).load(from: files)
+    #expect(cold.draft.text == model.draft, "Recovery offers what the composer shows")
+    let queued = try queuedRequests(coordinator.session.outboxURL).map(\.text)
+    #expect(queued == (newerRefused ? [] : ["An invented newer note"]))
+    #expect(await coordinator.fixture.count() == (newerRefused ? 0 : 1), "/status never went")
     await model.setActive(false)
   }
 }
