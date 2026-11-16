@@ -64,7 +64,7 @@ const first: ChatGptNode[] = [
   { id: "c", parent: "b", turn: "c", kind: "user:text", role: "user", text: "Six guests" },
 ];
 const regenerated: ChatGptNode[] = [
-  { ...first[0]!, message: { metadata: { edited_title: true } } },
+  { ...first[0]!, message: { status: "finished_partial_completion" } },
   { id: "b-prime", parent: "a", turn: "a", kind: "assistant:text", role: "assistant", text: "Who is coming to the picnic?", alternates: 1 },
   { id: "c-prime", parent: "b-prime", turn: "c-prime", kind: "user:text", role: "user", text: "Eight guests" },
   { ...first[1]!, state: "alternate" },
@@ -95,8 +95,8 @@ test("older export imported after a newer one does not change the view", () => w
 
 test("a reversioned current item reappends every later current item", () => withApp("chain", async (app) => {
   const before = await app.store.import(chatGptBatch(CONVERSATION, 10, first)), conversation = before.conversation.conversation_id;
-  const metadataOnly = [first[0]!, { ...first[1]!, message: { metadata: { model_slug: "invented-model-2" } } }, first[2]!];
-  const after = await app.store.import(chatGptBatch(CONVERSATION, 20, metadataOnly));
+  const statusOnly = [first[0]!, { ...first[1]!, message: { status: "finished_partial_completion" } }, first[2]!];
+  const after = await app.store.import(chatGptBatch(CONVERSATION, 20, statusOnly));
   assert.equal(after.added_items, 2, "The changed reply and every current item after it are new versions");
   const rows = (await transcript(app, conversation)).filter((message) => !message.continuation);
   assert.deepEqual(rows.map((row) => [row.role, row.text]), firstView);
@@ -110,12 +110,12 @@ const kinds: ChatGptNode[] = [
   { id: "thoughts", parent: "prompt", turn: "prompt", kind: "assistant:thoughts", role: "thinking", text: "Counting the guests" },
   { id: "recap", parent: "thoughts", turn: "prompt", kind: "assistant:reasoning_recap", role: "thinking", text: "Thought for 3 seconds" },
   { id: "call", parent: "recap", turn: "prompt", kind: "assistant:code", role: "tool", text: "print(8 * 2)",
-    message: { recipient: "python", content: { content_type: "code", language: "python", text: "print(8 * 2)" } } },
+    message: { recipient: "python" } },
   { id: "output", parent: "call", turn: "prompt", kind: "tool:execution_output", role: "tool", text: MALICIOUS,
-    message: { author: { role: "tool", name: "python", metadata: {} }, content: { content_type: "execution_output", text: MALICIOUS } } },
+    message: { author: { role: "tool", name: "python" } } },
   { id: "progress", parent: "output", turn: "prompt", kind: "assistant:text", role: "commentary", text: "Checking the weather" },
   { id: "drawing", parent: "progress", turn: "prompt", kind: "tool:multimodal_text", role: "tool", text: "",
-    message: { author: { role: "tool", name: "image_gen", metadata: {} } } },
+    message: { author: { role: "tool", name: "image_gen" } } },
   { id: "widget", parent: "drawing", turn: "prompt", kind: "assistant:future_widget", role: "assistant", text: "Widget caption" },
   { id: "answer", parent: "widget", turn: "prompt", kind: "assistant:text", role: "final", text: "Bring sixteen sandwiches." },
   { id: "library:file_00aa", parent: null, turn: "library:file_00aa", kind: "library:file", role: "tool", text: "picnic-menu.pdf" },
@@ -154,7 +154,7 @@ test("tool details for a chatgpt code call show code and output", () => withApp(
 
 test("a parts-shaped tool output is inspected in full up to the detail limit", () => withApp("tool-output", async (app) => {
   const complete = "Sandwich count: 16\n".repeat(1_100), long = "Blanket count: 2\n".repeat(2_500);
-  const python = { author: { role: "tool", name: "python", metadata: {} } };
+  const python = { author: { role: "tool", name: "python" } };
   const conversation = await importAll(app, chatGptBatch(CONVERSATION, 10, [kinds[0]!, kinds[3]!,
     { id: "complete", parent: "call", turn: "prompt", kind: "tool:execution_output", role: "tool", text: complete, message: python },
     { id: "long", parent: "complete", turn: "prompt", kind: "tool:execution_output", role: "tool", text: long, message: python }]));
