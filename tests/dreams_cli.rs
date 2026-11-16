@@ -13,6 +13,7 @@ use std::{
 };
 
 use agent_cli::{
+    background::JobExecutionState,
     config,
     dreams::{Dreams, DreamsFileEdit, DreamsRequest, DreamsTaskSummary},
     protocol::HostResult,
@@ -662,6 +663,115 @@ fn runs_without_dreams_that_the_log_never_saw_refuse_the_next_quiet_night() {
             && gap["interval"]["start_ms"].as_u64().unwrap() < unrecorded_starts[1]),
         "The gap must start with the first unrecorded run, before {}: {gaps:?}",
         unrecorded_starts[1]
+    );
+}
+
+#[test]
+fn a_store_restored_from_a_backup_reviews_the_time_before_the_restore_as_a_gap() {
+    let fixture = Fixture::new();
+    fixture.seed_witnessed_night();
+    fixture.start().stop();
+    let backup = |state: Option<&PathBuf>, args: &[&std::ffi::OsStr]| {
+        let mut command = Command::new(
+            std::env::var_os("AGENT_CLI_PATH")
+                .unwrap_or_else(|| env!("CARGO_BIN_EXE_beep-boop").into()),
+        );
+        command
+            .arg("--runtime")
+            .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/dist/src/bridge.js"));
+        if let Some(state) = state {
+            command.arg("--state-dir").arg(state);
+        }
+        let output = command
+            .args(["--json", "backup"])
+            .args(args)
+            .env("HOME", fixture.directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "backup {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let archive = fixture.directory.path().join("backup");
+    let created = backup(
+        Some(&fixture.state),
+        &["create".as_ref(), archive.as_os_str()],
+    );
+    let backed_up_at = now_ms();
+
+    fs::rename(&fixture.state, fixture.directory.path().join("lost-state")).unwrap();
+    backup(
+        None,
+        &[
+            "restore".as_ref(),
+            archive.as_os_str(),
+            fixture.state.as_os_str(),
+        ],
+    );
+    assert!(
+        !fixture.state.join("diagnostics").exists(),
+        "A restore must not bring back the log that witnessed the lost store: {created}"
+    );
+    fixture.script(
+        DREAMS_KEY,
+        vec![
+            tool("dreams_review", json!({ "page": 1 })),
+            tool(
+                "dreams_abstain",
+                json!({ "reason": "quiet", "note": "Looked quiet." }),
+            ),
+            tool(
+                "dreams_abstain",
+                json!({ "reason": "insufficient_coverage", "note": "Receipts are missing." }),
+            ),
+            text("Dreams abstained."),
+        ],
+    );
+    let mut held = fixture.start();
+    fixture.ok(&["jobs", "run", "dreams"], true);
+    thread::sleep(Duration::from_secs(3));
+    assert!(
+        fixture.requests(DREAMS_KEY).is_empty(),
+        "A held store sent a Dreams turn to the model"
+    );
+    held.stop();
+    backup(Some(&fixture.state), &["release".as_ref()]);
+
+    let mut server = fixture.start();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !matches!(
+        fixture.job("dreams").last_run.map(|run| run.state),
+        Some(JobExecutionState::Completed)
+    ) {
+        assert!(
+            Instant::now() < deadline,
+            "The Dreams run admitted while held did not finish after release: {:?}",
+            fixture.job("dreams").last_run
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    server.stop();
+
+    let sealed = fixture.output_of(DREAMS_KEY, "dreams_abstain", 0);
+    assert!(
+        !sealed.contains("sealed: abstained: quiet"),
+        "A restored store sealed a quiet night over time it never witnessed: {}",
+        fixture.output_of(DREAMS_KEY, "dreams_review", 0)
+    );
+    let shown = fixture.dreams_json(&["show", fixture.latest_run()["run"].as_str().unwrap()]);
+    let gaps = shown["review"]["coverage"]["receipts"]["gaps"]
+        .as_array()
+        .unwrap();
+    assert!(
+        gaps.iter().any(|gap| {
+            let interval = &gap["interval"];
+            interval["start_ms"].as_u64().unwrap() < backed_up_at - HOUR
+                && interval["end_ms"].as_u64().unwrap() >= backed_up_at
+        }),
+        "The hours before the restore must be one gap: {gaps:?}"
     );
 }
 
