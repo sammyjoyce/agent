@@ -113,7 +113,8 @@ test("a Dreams task refuses an attached worker, a child agent and any change to 
     await assert.rejects(app.session.commit((tx) => app.tasks.relinkSourcesIn(tx, task.id, [], [scheduler]), BACKGROUND_CONTEXT), owned);
     const ordinary = await app.tasks.create({ title: "Example task", outcome: "Stay ordinary." });
     await assert.rejects(app.session.commit((tx) => app.tasks.relinkSourcesIn(tx, ordinary.id, [scheduler], []), BACKGROUND_CONTEXT), owned);
-    assert.equal(isDreamsTask(await app.tasks.get(task.id)), true);
+    await app.session.commit((tx) => app.tasks.relinkSourcesIn(tx, task.id, [scheduler], []), BACKGROUND_CONTEXT);
+    assert.equal(isDreamsTask(await app.tasks.get(task.id)), true, "Naming the source a task already has changes nothing");
     assert.equal(isDreamsTask(await app.tasks.get(ordinary.id)), false);
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
 });

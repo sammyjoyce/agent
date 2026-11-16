@@ -839,11 +839,13 @@ mod tests {
         assert!(again.contains("already applied"), "{again}");
         assert_eq!(git(&repository, &["rev-parse", "HEAD~1"]), head);
 
-        // Without the private policy, nothing is admitted.
-        assert!(matches!(
-            classify(&store, None, proposal).await.unwrap(),
-            ProposalStatus::PolicyChanged
-        ));
+        assert!(
+            matches!(
+                classify(&store, None, proposal).await.unwrap(),
+                ProposalStatus::PolicyChanged
+            ),
+            "Without the private policy, nothing is admitted"
+        );
     }
 
     #[test]

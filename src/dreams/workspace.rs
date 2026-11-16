@@ -22,6 +22,8 @@ use crate::{
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 const GIT_OUTPUT_BYTES: usize = 1024 * 1024;
 const CHECK_OUTPUT_BYTES: usize = 16 * 1024;
+/// A path argument names exactly one path, never a glob or pathspec magic.
+const LITERAL_PATHS: (&str, &str) = ("GIT_LITERAL_PATHSPECS", "1");
 
 /// Only PATH, HOME, LANG and TMPDIR survive. An inherited GIT_* variable could
 /// point Git at another repository, index or configuration, and a check must
@@ -63,7 +65,7 @@ impl Git {
     pub fn reading(directory: &Path) -> Self {
         Self {
             directory: directory.to_owned(),
-            environment: environment(&[("GIT_OPTIONAL_LOCKS", "0")]),
+            environment: environment(&[("GIT_OPTIONAL_LOCKS", "0"), LITERAL_PATHS]),
         }
     }
 
@@ -71,7 +73,7 @@ impl Git {
     pub fn writing(directory: &Path) -> Self {
         Self {
             directory: directory.to_owned(),
-            environment: environment(&[]),
+            environment: environment(&[LITERAL_PATHS]),
         }
     }
 

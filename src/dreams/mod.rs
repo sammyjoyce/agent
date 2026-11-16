@@ -1277,7 +1277,6 @@ mod tests {
         assert_eq!(proposal.evidence[0].as_str(), EVIDENCE);
         assert_eq!(night.target(), before, "Only apply may touch the target");
 
-        // A later review of the same run rereads what was sealed.
         let sealed = fs::read(
             night
                 .dreams
@@ -1294,7 +1293,10 @@ mod tests {
         );
         let again = night.review("night").await;
         assert!(again.decided);
-        assert_eq!(again.text, first.text);
+        assert_eq!(
+            again.text, first.text,
+            "A later review of the same run rereads what was sealed"
+        );
         assert_eq!(
             fs::read(
                 night

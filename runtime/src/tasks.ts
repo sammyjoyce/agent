@@ -930,7 +930,6 @@ export class TaskStore {
   }
   /** Journal decisions and current routing change atomically; immutable receipts advance every affected index tail. */
   async relinkSourcesIn(tx: Tx, id: string, add: readonly SourceRef[], remove: readonly SourceRef[]): Promise<void> {
-    if ([...add, ...remove].some((source) => source.provider === "scheduled_jobs")) throw new TaskError("Scheduled job ownership is assigned only by the scheduler");
     const task = await this.taskIn(tx, id);
     if (task === undefined) throw new TaskError("Unknown task");
     const added = add.filter((source, index) => !task.sources.some((saved) => related(saved, source)) &&
@@ -938,6 +937,7 @@ export class TaskStore {
     const removed = task.sources.filter((source) => remove.some((other) => related(other, source)))
       .map((source) => ({ ...source }));
     if (added.length === 0 && removed.length === 0) return;
+    if ([...added, ...removed].some((source) => source.provider === "scheduled_jobs")) throw new TaskError("Scheduled job ownership is assigned only by the scheduler");
     const sources = task.sources.filter((source) => !removed.some((other) => related(other, source))).map((source) => ({ ...source }));
     task.sources = [...sources, ...added]; task.updated_at = Date.now();
     await this.indexTaskIn(tx, task, [...sources, ...removed]);

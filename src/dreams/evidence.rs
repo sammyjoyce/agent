@@ -573,8 +573,10 @@ mod tests {
         assert!(coverage.gaps.is_empty(), "{:?}", coverage.gaps);
         assert_eq!(coverage.covered, vec![WINDOW]);
         assert_eq!(coverage.items, 20);
-        // Exactly two heartbeat intervals of silence is still witnessed.
-        assert!(causes(&witnessed((1_000..=1_100).step_by(10))).is_empty());
+        assert!(
+            causes(&witnessed((1_000..=1_100).step_by(10))).is_empty(),
+            "Exactly two heartbeat intervals of silence is still witnessed"
+        );
     }
 
     #[test]
@@ -653,7 +655,6 @@ mod tests {
             ]
         );
 
-        // Loss that ended before the window started is not a gap in it.
         let mut receipts = witnessed((1_000..1_100).step_by(5));
         receipts.retention = Some(RetentionFacts {
             prior_history_unknown: true,
@@ -666,7 +667,10 @@ mod tests {
                 bytes: 1,
             }),
         });
-        assert!(causes(&receipts).is_empty());
+        assert!(
+            causes(&receipts).is_empty(),
+            "Loss that ended before the window started is not a gap in it"
+        );
 
         let mut receipts = witnessed((1_000..1_050).step_by(5));
         receipts.truncated_at_ms = Some(1_050 * MINUTE);
