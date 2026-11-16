@@ -459,6 +459,46 @@ with the same sentences. Open Job has no phrase, because a phrase would make
 each refresh of the app's phrases read every coordinator's jobs. Add it in the
 Shortcuts app.
 
+**Send Message** sends one line to one saved coordinator after you confirm it.
+Say "Send a message to Work in Beep Boop", or add the action in the Shortcuts
+app. It runs without opening the app and leaves the composer, its draft and its
+chosen coordinator as they were. It declares
+`.requiresLocalDeviceAuthentication`, which Apple documents as requiring an
+unlock of the device that runs it. The confirmation names the coordinator
+first and ends with the message, after "The message reads:", so the text
+cannot change which coordinator the sentence names. The message sent is the
+message shown, trimmed of surrounding spaces.
+
+The action refuses before it asks, and saves nothing, when the message is
+blank, longer than 1,000 characters, more than one line, or holds a character
+the confirmation cannot show, such as a control, format or tag character.
+Ordinary emoji pass. A message that starts with `/`, or is `?`, is a command
+the coordinator would run, and the action says "Beep Boop does not run
+commands from Siri." When the phone's protected data is unavailable, it says
+"Unlock your iPhone to send messages to Work. Nothing was sent."
+
+A confirmed message goes through the coordinator's saved outbox, as a
+composer send does, with the `siri` origin. A coordinator that does not list
+`siri` among the origins it accepts gets nothing, and the action says the
+coordinator needs an update. The action waits 8 seconds in all for the
+connection and the coordinator's answer, then says one of these:
+
+- "Sent to Work." The coordinator accepted or placed the message.
+- "Saved on this iPhone, but Work has not confirmed it." No answer came in
+  time. The app sends the saved copy the next time it connects to Work.
+- "Work did not accept the message." or "Work reported a problem: …" The
+  copy stays on this iPhone.
+- A sentence that ends "Nothing was sent." The phone saved nothing.
+
+Asking again for the same text to the same coordinator never makes a second
+copy by accident. A copy that Work has not confirmed is offered again under
+its own input ID, which the coordinator recognizes, so the agent answers it
+once. A copy that Work has accepted but not yet placed is not sent again. For
+an hour after Work places a copy, the confirmation says Work already has it
+and when it was sent. After that hour, the same text is a new message. The
+phone checks again when it saves the copy, and sends nothing if another copy
+appeared while you were confirming.
+
 The feed of one coordinator, Jobs and work, and a job's screen tell the system
 which coordinator or jobs they show, by identifier alone, so no message text
 is part of it.

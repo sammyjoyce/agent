@@ -155,6 +155,10 @@ position stays anchored; Latest restores the recent window. At most 500 display
 rows and 4 MiB of text remain in memory. A full MagicDNS name is resolved and
 validated on each connection. Pending input and immutable attachment copies
 stay in a protected, endpoint-specific outbox until admission is acknowledged.
+A confirmed Siri or Shortcuts message enters the same outbox with the `siri`
+origin, only for a coordinator that advertises that origin. Asking again for
+an unconfirmed copy writes it under its original input ID, so the
+coordinator's input-ID deduplication starts at most one generation.
 
 Rust owns the shared attachment types and transfer limits. Files travel in
 bounded chunks over the existing authenticated connection, are verified by
