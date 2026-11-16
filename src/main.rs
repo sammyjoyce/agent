@@ -2197,6 +2197,10 @@ fn local_command_from_ui(
         .selected
         .as_ref()
         .map(|item| item.conversation_id.clone());
+    let goal_target = selected.clone().map_or_else(
+        || agent_cli::protocol::GoalTarget::from(target.clone()),
+        |conversation_id| agent_cli::protocol::GoalTarget::Conversation { conversation_id },
+    );
     while ui.controls.try_join_next().is_some() {}
     ui.controls.spawn(async move {
         let client = ClientContext {
@@ -2208,12 +2212,18 @@ fn local_command_from_ui(
             terminal: &terminal,
         };
         let changed = async {
-            if let Some(request) = command.request() {
+            let goal = command
+                .goal(goal_target, uuid::Uuid::new_v4())
+                .transpose()?;
+            if let Some(request) = goal.or_else(|| command.request()) {
                 let events = exchange(client, request).await?;
                 for event in events {
                     let text = match &event {
                         RuntimeEventKind::Resources { resources } => {
                             Some(agent_cli::resources::format_inventory(resources))
+                        }
+                        RuntimeEventKind::Goal { status } => {
+                            Some(agent_cli::goal_view::format(status))
                         }
                         _ => agent_cli::job_view::event(&event),
                     };
@@ -2366,7 +2376,13 @@ async fn local_command_plain(
         }
         return Ok(());
     }
-    if let Some(request) = command.request() {
+    let goal = command
+        .goal(
+            agent_cli::protocol::GoalTarget::from(target.clone()),
+            uuid::Uuid::new_v4(),
+        )
+        .transpose()?;
+    if let Some(request) = goal.or_else(|| command.request()) {
         for event in exchange(client, request).await? {
             display(&event, json)?;
         }
@@ -3979,6 +3995,7 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
         RuntimeEventKind::TaskGraph { graph } => {
             println!("{}", agent_cli::task_graph_view::format(graph));
         }
+        RuntimeEventKind::Goal { status } => println!("{}", agent_cli::goal_view::format(status)),
         RuntimeEventKind::Environment {
             nodes,
             online_host_ids,

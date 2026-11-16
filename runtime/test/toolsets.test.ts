@@ -13,6 +13,8 @@ import { Type } from "typebox";
 import { AttachmentStore } from "../src/attachments.js";
 import { BackgroundScheduler } from "../src/background.js";
 import { BrowserStore, createBrowserTools } from "../src/browser.js";
+import { CoordinatorEnvironment } from "../src/environment.js";
+import { createGoalTools, GoalStore } from "../src/goals.js";
 import { createGuidance } from "../src/guidance.js";
 import { createInputOrigins } from "../src/input_origin.js";
 import { createMainResponsePolicy } from "../src/main_response.js";
@@ -41,7 +43,7 @@ const ADOPTED_SURFACES: Record<ToolRole, readonly string[]> = {
   main: ["exec", "read_attachment", "read_file", "write_file", "edit_file", "search_tasks", "read_task", "delegate_task", "record_task",
     "list_jobs", "read_job", "run_job", "finish_without_reply", "tool_search", "browser_screenshot"],
   triage: ["read_attachment", "read_file", "browser_screenshot", "record_task", "codemode"],
-  worker: ["read_attachment", "read_file", "browser_screenshot", "record_task", "codemode"],
+  worker: ["read_attachment", "read_file", "browser_screenshot", "record_task", "complete_goal", "codemode"],
   agent: ["read_attachment", "read_file", "browser_screenshot", "codemode"],
 };
 type ToolArguments = Parameters<typeof fauxToolCall>[1];
@@ -54,6 +56,7 @@ function offered(app: App, input: Context, role: ToolRole): void {
     assert.ok(names.includes(name), `${role} offers ${name} directly`);
   }
   if (role === "triage" || role === "worker") assert.ok(names.includes("record_task"), `${role} offers record_task directly`);
+  assert.equal(names.includes("complete_goal"), role === "worker", `${role} offers complete_goal directly only as the worker`);
   const owned = [...new Set(app.toolsets[role].flatMap((extension) => extension.tools ?? []).map((tool) => tool.name))];
   const expected = role === "main" || role === "triage"
     ? ["search_tasks", "read_task", "revoke_allocation", "delegate_task", "record_task"]
@@ -66,6 +69,7 @@ function offered(app: App, input: Context, role: ToolRole): void {
   assert.equal(owned.includes("collect_worktrees"), role === "main");
   assert.equal(owned.includes("allocate_worktree"), role === "worker" || role === "agent");
   assert.equal(owned.includes("list_jobs"), role === "main" || role === "triage");
+  assert.equal(owned.includes("complete_goal"), role === "worker");
 }
 function callTools(input: Context, ...calls: [string, ToolArguments][]): AssistantMessage {
   const names = offeredNames(input);
@@ -99,9 +103,11 @@ async function open(directory: string, guidanceText = "CURRENT_PROFILE_GUIDANCE"
     async runJob() { throw new Error("No scheduled execution is requested by this fixture"); },
   });
   const discovery = createToolDiscovery();
+  const goals = new GoalStore(session, tasks, new CoordinatorEnvironment(session));
   const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance: createGuidance(executions), tools, sourceTools,
     resourceTools: createResourceTools(resources, tasks, executions), browserTools: createBrowserTools(new BrowserStore(session), executions, new AttachmentStore(directory)),
-    jobTools: createJobTools(background, executions) }), { responsePolicy: createMainResponsePolicy(session), inputOrigins: createInputOrigins(session) }),
+    jobTools: createJobTools(background, executions), goalTools: createGoalTools(goals, executions) }),
+  { responsePolicy: createMainResponsePolicy(session), inputOrigins: createInputOrigins(session) }),
   surfaces, discovery);
   for (const extension of new Set([...Object.values(toolsets).flat(), ...installed])) registry.install(extension);
   registry.install(tools.legacy);

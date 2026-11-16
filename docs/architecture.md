@@ -313,6 +313,29 @@ and `tasks read` remain the record of what exists. A snapshot holds at most
 larger than 1 MiB fails that request. `--json` prints the typed event. A live
 watch, the TUI and the phone do not show the graph yet.
 
+A goal binds one objective to one task. It lives in the Pi document family
+`agent.goal`, keyed by task, and main keeps a pointer to its goal. Every goal
+transition happens inside a TaskStore commit. At the actor's idle point, a
+continuation enters the task's outbox in the same commit that counts it. Pause
+commits first, withdraws the goal's queued inputs, then aborts only the task's
+live generation through Pi, so other queued inputs stay. Pi ends an aborted run
+without placing the inputs queued behind it. While the actor waits on an input
+that is still queued with no live run, it writes an empty boundary entry so Pi
+places it. The actor reads that state from Pi on every wait, so the repair
+survives a restart between the abort and the placement. Pause cancels the
+aborted run's host calls as a Stop does, but keeps the actor's turn open, so
+inputs admitted behind the run still reach Pi and a later Esc withdraws them.
+The worker tool `complete_goal` reads the file on the execution
+host. A result whose turn still runs in the live activation is retained as an
+`agent.goal_verification` entry. A passed or failed result that returns after a
+pause, Esc or a new activation is discarded without one, through the same
+stopped-turn check. A pass completes the goal and resolves
+the task in that same commit. A failed check pins its predicate for the rest of the
+activation. `record_task` cannot resolve a goal-bound task, and the refusal is
+recorded on the goal. Controls keep their request IDs, so a replayed native
+submit changes nothing. The model picks the predicate, so a goal proves that an
+artifact exists, not that it is right.
+
 Delegate and child-agent conversations stay ownerless in Pi. Two prototypes ran
 against `runtime/test/delegate-lifetime.test.ts`, which drives the real
 `delegate_task` and `spawn_agent` tools on SQLite storage. Ownership by the

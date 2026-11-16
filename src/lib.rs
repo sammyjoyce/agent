@@ -6,6 +6,7 @@ pub mod coordinator_id;
 pub mod discovery;
 pub mod embeddings;
 pub mod feedback;
+pub mod goal_view;
 pub mod history;
 pub mod host;
 pub mod models;

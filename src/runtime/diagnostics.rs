@@ -16,7 +16,10 @@ use uuid::Uuid;
 
 use crate::{
     browser::BrowserResponse,
-    protocol::{ErrorCode, HostResult, InputMode, ModelActivity, RuntimeCommand, RuntimeEventKind},
+    protocol::{
+        ErrorCode, GoalTarget, HostResult, InputMode, ModelActivity, RuntimeCommand,
+        RuntimeEventKind,
+    },
 };
 
 const MAX_BYTES: u64 = 1024 * 1024;
@@ -347,6 +350,19 @@ impl Trace {
             }
             RuntimeCommand::ReadTask { task_id } => {
                 trace.task_id = Some(task_id.to_string());
+            }
+            RuntimeCommand::Goal {
+                target: GoalTarget::Task { task_id, agent_id },
+                ..
+            } => {
+                trace.task_id = Some(task_id.to_string());
+                trace.agent_id = agent_id.as_deref().and_then(token);
+            }
+            RuntimeCommand::Goal {
+                target: GoalTarget::Conversation { conversation_id },
+                ..
+            } => {
+                trace.conversation_id = token(conversation_id);
             }
             RuntimeCommand::ReadHistory {
                 task_id, agent_id, ..

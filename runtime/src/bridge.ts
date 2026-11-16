@@ -24,6 +24,7 @@ import { FeedbackStore } from "./feedback.js";
 import { FeedbackDispatcher } from "./feedback-dispatch.js";
 import { createGuidance } from "./guidance.js";
 import { createAppTools, createJobTools, Executions, HostRequests } from "./tools.js";
+import { createGoalTools, GoalStore } from "./goals.js";
 import { applyToolSurfaces, createToolDiscovery, createToolsets, TOOL_SURFACES, withActorPolicies, type ToolDiscovery, type Toolsets } from "./toolsets.js";
 import { createSourceTools, SourceJournal } from "./sources.js";
 import { createResourceTools, ResourceStore } from "./resources.js";
@@ -133,7 +134,7 @@ function backgroundCall(command: import("./generated/HostCommand.js").HostComman
 
 type Application = TriageApplication & { stopInputDelivery(): void; harness: Harness; tasks: TaskStore; resources: ResourceStore; notifications: Notifications;
   histories: HistoryStore; catalog: ConversationCatalog; attachments: AttachmentStore; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler;
-  telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics; discovery: ToolDiscovery; serviceExecution: ActorExecution };
+  telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics; discovery: ToolDiscovery; serviceExecution: ActorExecution; goals: GoalStore };
 async function openApplication(): Promise<Application> {
   const startup = new StartupDiagnostics(state);
   const storage = await startup.run("storage_open", async () => {
@@ -243,8 +244,10 @@ async function openApplication(): Promise<Application> {
     async runJob(occurrence, signal, actor) { await runScheduled(occurrence, signal, { session: harness, tasks, sources }, actor); },
   });
   const jobTools = createJobTools(background, executions); registry.install(jobTools);
+  const goals = new GoalStore(harness, tasks, environment);
+  const goalTools = createGoalTools(goals, executions); registry.install(goalTools);
   const responsePolicy = createMainResponsePolicy(harness); registry.install(responsePolicy);
-  const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools }),
+  const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools, goalTools }),
     { responsePolicy, inputOrigins }), TOOL_SURFACES, discovery);
   for (const extension of installed) registry.install(extension);
   const serviceExecution: ActorExecution = {
@@ -264,7 +267,7 @@ async function openApplication(): Promise<Application> {
   };
   tasks.useActorExecution(serviceExecution);
   if (await notifications.start()) harness.resume();
-  return { ...core, background, toolsets, startup, discovery, serviceExecution };
+  return { ...core, background, toolsets, startup, discovery, serviceExecution, goals };
   }); } catch (error) {
     await harness.close(BACKGROUND_CONTEXT).catch(() => {}); await discovery.close().catch(() => {}); await telemetry.close(); throw error;
   }
@@ -535,6 +538,11 @@ async function handle(request: RuntimeRequest): Promise<void> {
           }
         }
         emit(id, { type: "conversation_settings", settings }); break;
+      }
+      case "goal": {
+        const { goals } = await app();
+        emit(id, { type: "goal", status: await goals.handle(command, (operation) => hostRequests.call(id, operation)) });
+        break;
       }
       case "logout":
         await auth.logout();

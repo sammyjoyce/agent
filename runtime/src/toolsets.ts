@@ -3,6 +3,7 @@ import { defineExtension, wrapTool, type Extension } from "@earendil-works/pi-du
 import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
 import { createToolSearchExtension } from "@earendil-works/pi-durable/tool-search";
 import type { createBrowserTools } from "./browser.js";
+import type { createGoalTools } from "./goals.js";
 import type { createGuidance } from "./guidance.js";
 import type { createResourceTools } from "./resources.js";
 import type { createSourceTools } from "./sources.js";
@@ -13,18 +14,19 @@ export type Toolsets = Record<ToolRole, readonly Extension[]>;
 export const TOOL_ROLES: readonly ToolRole[] = ["main", "triage", "worker", "agent"];
 
 /** Compose existing tools by actor ownership; execution guards remain on the tools. */
-export function createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools }: {
+export function createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools, goalTools }: {
   guidance: ReturnType<typeof createGuidance>;
   tools: ReturnType<typeof createAppTools>;
   sourceTools: ReturnType<typeof createSourceTools>;
   resourceTools: ReturnType<typeof createResourceTools>;
   browserTools: ReturnType<typeof createBrowserTools>;
   jobTools: ReturnType<typeof createJobTools>;
+  goalTools: ReturnType<typeof createGoalTools>;
 }): Toolsets {
   return {
     main: [guidance, tools.host, tools.main, sourceTools.main, resourceTools.main, browserTools, jobTools],
     triage: [guidance, tools.host, tools.main, sourceTools.main, browserTools, jobTools],
-    worker: [guidance, tools.host, tools.worker, sourceTools.worker, resourceTools.worker, browserTools],
+    worker: [guidance, tools.host, tools.worker, sourceTools.worker, resourceTools.worker, browserTools, goalTools],
     agent: [guidance, tools.host, tools.agent, sourceTools.worker, resourceTools.worker, browserTools],
   };
 }
@@ -54,7 +56,7 @@ export const TOOL_SURFACES = {
   main: { deferred: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "read_resources", "collect_worktrees", "revoke_allocation",
     "read_source_events", "notify_user", "notify", "link_source_events", "dismiss_source_events"] },
   triage: { deferred: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "revoke_allocation"], codemode: { keepDirect: ["record_task"] } },
-  worker: { deferred: CHILD_DEFERRED, codemode: { keepDirect: ["record_task"] } },
+  worker: { deferred: CHILD_DEFERRED, codemode: { keepDirect: ["record_task", "complete_goal"] } },
   agent: { deferred: CHILD_DEFERRED, codemode: { keepDirect: [] } },
 } as const satisfies Record<ToolRole, ToolSurface>;
 
