@@ -9,16 +9,26 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import struct
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+import zlib
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("phone_acceptance", HERE / "phone-acceptance.py")
 phone = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(phone)
 EVIDENCE = os.environ.get("PHONE_ACCEPTANCE_EVIDENCE")
+
+
+def png_chunk(kind, data):
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+
+PNG = (b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0))
+       + png_chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00\x00\xff\x00" * 2)) + png_chunk(b"IEND", b""))
 
 
 def plan(path, value):
@@ -204,7 +214,7 @@ class ReportTests(unittest.TestCase):
             (attachments / "B.json").write_text(json.dumps({"work": 0, "personal": 0}))
             (attachments / "E.json").write_text(json.dumps({"work": 9, "personal": 9}))
             for image in ("C.png", "D.png"):
-                (attachments / image).write_bytes(b"invented image")
+                (attachments / image).write_bytes(PNG)
             (attachments / "manifest.json").write_text(json.dumps([{"testIdentifier": test, "attachments": [
                 {"exportedFileName": "A.json", "suggestedHumanReadableName": "send-first_0_A.json"},
                 {"exportedFileName": "E.json", "suggestedHumanReadableName": "first-composer_0_E.json"},
@@ -249,8 +259,8 @@ class MissingEvidenceTests(unittest.TestCase):
                 "sentGlyphsAbsent": True, "keyboardShown": True, "recipientLine": "To Work",
                 "cropAttachment": "first-composer", "screenAttachment": "first-screen"}}
             (attachments / "record.json").write_text(json.dumps(record))
-            for name in files_written:
-                (attachments / name).write_bytes(b"invented image")
+            for name, data in files_written.items():
+                (attachments / name).write_bytes(data)
             listed = [{"exportedFileName": "record.json",
                        "suggestedHumanReadableName": "send-first_0_record.json"}]
             listed += [{"exportedFileName": file, "suggestedHumanReadableName": f"{name}_0_{file}"}
@@ -266,13 +276,13 @@ class MissingEvidenceTests(unittest.TestCase):
 
     def test_every_capture_present_passes(self):
         passed, report = self.run_with(
-            [("first-composer", "crop.png"), ("first-screen", "screen.png")], ["crop.png", "screen.png"])
+            [("first-composer", "crop.png"), ("first-screen", "screen.png")], {"crop.png": PNG, "screen.png": PNG})
         self.assertTrue(passed)
         self.assertIn("| [crop.png](attachments/crop.png) | [screen.png](attachments/screen.png) | ok |", report)
         self.assertIn("Overall: PASS.", report)
 
     def test_a_crop_the_export_never_listed_fails_the_run(self):
-        passed, report = self.run_with([("first-screen", "screen.png")], ["screen.png"])
+        passed, report = self.run_with([("first-screen", "screen.png")], {"screen.png": PNG})
         self.assertFalse(passed)
         self.assertIn("| missing | [screen.png](attachments/screen.png) | FAIL: ", report)
         self.assertIn("cropAttachment", report)
@@ -280,11 +290,32 @@ class MissingEvidenceTests(unittest.TestCase):
 
     def test_a_listed_crop_whose_file_is_gone_fails_the_run(self):
         passed, report = self.run_with(
-            [("first-composer", "crop.png"), ("first-screen", "screen.png")], ["screen.png"])
+            [("first-composer", "crop.png"), ("first-screen", "screen.png")], {"screen.png": PNG})
         self.assertFalse(passed)
         self.assertIn("| missing | [screen.png](attachments/screen.png) | FAIL: ", report)
         self.assertIn("cropAttachment", report)
         self.assertIn("Overall: FAIL.", report)
+
+    def test_an_empty_crop_fails_the_run(self):
+        passed, report = self.run_with(
+            [("first-composer", "crop.png"), ("first-screen", "screen.png")], {"crop.png": b"", "screen.png": PNG})
+        self.assertFalse(passed)
+        self.assertIn("| missing | [screen.png](attachments/screen.png) | FAIL: ", report)
+        self.assertIn("cropAttachment", report)
+        self.assertIn("Overall: FAIL.", report)
+
+    def test_a_crop_that_is_not_a_whole_png_fails_the_run(self):
+        zero_width = PNG[:8] + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 0, 2, 8, 2, 0, 0, 0)) + PNG[33:]
+        for label, crop in {"first 12 bytes": PNG[:12], "cut before IEND": PNG[:-6],
+                            "zero width": zero_width}.items():
+            with self.subTest(label):
+                passed, report = self.run_with(
+                    [("first-composer", "crop.png"), ("first-screen", "screen.png")],
+                    {"crop.png": crop, "screen.png": PNG})
+                self.assertFalse(passed)
+                self.assertIn("| missing | [screen.png](attachments/screen.png) | FAIL: ", report)
+                self.assertIn("cropAttachment", report)
+                self.assertIn("Overall: FAIL.", report)
 
 
 @unittest.skipUnless(EVIDENCE, "set PHONE_ACCEPTANCE_EVIDENCE to a simulator run's --out directory")
