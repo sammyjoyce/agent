@@ -16,8 +16,8 @@ use uuid::Uuid;
 use super::{
     AuthorityCommand, AuthorityRecord, AuthorityRefusal, AuthorityReply, AuthorityState,
     AuthorityUnreachable, CheckpointRecord, FailoverConfig, FailoverOperator, FailoverSession,
-    HolderId, LogPosition, OperatorReport, OperatorRequest, OwnerEpoch, ReleaseEvidence,
-    StopEvidence, UnfinishedDelivery, UnfinishedToolCall,
+    HolderId, LogPosition, OperatorReport, OperatorRequest, OwnerEpoch, REPLICATED_FILE_ROOTS,
+    ReleaseEvidence, StopEvidence, UnfinishedDelivery, UnfinishedToolCall,
 };
 use crate::{backup, coordinator_id::CoordinatorId, runtime::WriterLock};
 
@@ -326,6 +326,23 @@ fn store_checkpoint(
 ) -> Result<(CheckpointRecord, Uploaded)> {
     let scratch = Scratch::beside(state, "checkpoint")?;
     let created = backup::create_locked(lock, state, &scratch.0, script)?;
+    let left_out: Vec<&str> = created
+        .not_included
+        .iter()
+        .map(String::as_str)
+        .filter(|path| {
+            REPLICATED_FILE_ROOTS.iter().any(|root| {
+                path.strip_prefix(root)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+        })
+        .collect();
+    ensure!(
+        left_out.is_empty(),
+        "A checkpoint would leave out {}: a backup does not carry them, and they lie in a replicated tree, so a standby that joins would lack them. Move them out of {}",
+        left_out.join(", "),
+        state.display()
+    );
     match authority.run(&OperatorRequest::StoreCheckpoint {
         archive: scratch.0.clone(),
         part_bytes,

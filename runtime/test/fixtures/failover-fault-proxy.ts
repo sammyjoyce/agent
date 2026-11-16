@@ -8,7 +8,9 @@ export type Fault =
   | { readonly kind: "blackhole" }
   | { readonly kind: "drop-after-apply" }
   | { readonly kind: "reply-late"; readonly release: Promise<void> }
-  | { readonly kind: "unavailable" };
+  | { readonly kind: "unavailable" }
+  /** Forwards, then answers with the first byte of the reply's body changed. */
+  | { readonly kind: "corrupt" };
 
 export interface FaultRule {
   readonly fault: Fault;
@@ -61,7 +63,7 @@ export async function startFaultProxy(t: TestContext, upstream: string) {
       case "delay":
         await new Promise((resolve) => setTimeout(resolve, fault.ms));
         break;
-      case "pass": case "drop-after-apply": case "reply-late":
+      case "pass": case "drop-after-apply": case "reply-late": case "corrupt":
         break;
       default:
         return fault satisfies never;
@@ -74,6 +76,7 @@ export async function startFaultProxy(t: TestContext, upstream: string) {
       await fault.release;
       held.delete(response);
     }
+    if (fault.kind === "corrupt" && reply.body.length > 0) reply.body.writeUInt8(reply.body.readUInt8(0) ^ 0xff, 0);
     response.writeHead(reply.status, reply.headers).end(reply.body);
   }
 
