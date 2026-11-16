@@ -278,8 +278,9 @@ export class TaskStore {
   useConfinement(rule: ActorConfinement): void { this.confinement = rule; }
   isConfined(task: Pick<TaskRecord, "sources">): boolean { return this.confinement(task) !== undefined; }
   /** A confined task whose conversation was not created confined may hold history and input from before its confinement. */
-  async predatesConfinementIn(tx: Tx, task: Pick<TaskRecord, "sources" | "conversation_id">): Promise<boolean> {
-    return this.isConfined(task) && !(await tx.doc(ConfinedConversation, task.conversation_id, null)).confined;
+  async predatesConfinementIn(tx: Tx, id: string): Promise<boolean> {
+    const task = await this.taskIn(tx, id);
+    return task !== undefined && this.isConfined(task) && !(await tx.doc(ConfinedConversation, task.conversation_id, null)).confined;
   }
   refuseConfinedWrite(task: Pick<TaskRecord, "sources">): void {
     if (this.isConfined(task)) throw new TaskError(CONFINED_SCHEDULER_WRITES);
@@ -1723,7 +1724,7 @@ export class TaskStore {
       if (confined !== undefined && (active.mode !== "job" || input.agent_id !== undefined)) throw new TaskError(CONFINED_ACTOR_ONLY);
       const extensions = () => confined ?? execution.extensions(input.agent_id);
       const conversation = await this.conversation(actor.conversation_id);
-      if (confined !== undefined && await this.session.commit((tx) => this.predatesConfinementIn(tx, task), BACKGROUND_CONTEXT)) {
+      if (confined !== undefined && await this.session.commit((tx) => this.predatesConfinementIn(tx, input.task_id), BACKGROUND_CONTEXT)) {
         await conversation.abort(BACKGROUND_CONTEXT);
         await this.withdrawUnplaced(input, conversation, actor.pending);
         throw new TaskError(PREDATES_CONFINEMENT);

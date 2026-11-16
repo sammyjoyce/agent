@@ -145,8 +145,9 @@ export class BackgroundScheduler {
               case "job":
               case "manual_job": {
                 const occurrence = input.work.occurrence;
-                let actorId = await runtime.memo<string>("job_actor_task_id", context);
-                if (actorId === undefined) {
+                const memoized = await runtime.memo<string>("job_actor_task_id", context);
+                let actorId = memoized;
+                if (memoized === undefined || await this.session.commit((tx) => this.tasks.predatesConfinementIn(tx, memoized), context)) {
                   // Work admitted before actor reuse still owns its original task.
                   const legacy = await this.session.commit(async (tx) =>
                     (await this.tasks.findIn(tx, scheduledTaskId(occurrence.id)))?.id, context);
@@ -159,7 +160,7 @@ export class BackgroundScheduler {
                     return created;
                   }, context);
                   if (created.native !== undefined) this.tasks.rememberConversation(created.native);
-                  actorId = await runtime.memo("job_actor_task_id", created.id, context);
+                  actorId = memoized === undefined ? await runtime.memo("job_actor_task_id", created.id, context) : created.id;
                 }
                 await callbacks.runJob(occurrence, runtime.signal, actorId);
                 break;
@@ -241,7 +242,7 @@ export class BackgroundScheduler {
     if (previous !== undefined && !previous.sources.some((source) => source.provider === "scheduled_jobs" &&
         source.account === "local" && source.thread_id === job.id)) throw new TaskError("This task is not owned by the scheduled job");
     if (previous === undefined && id !== scheduledTaskId("job:" + job.id)) throw new TaskError("The scheduled job's owned actor is unavailable; reconcile its existing task");
-    const replaced = previous !== undefined && await this.tasks.predatesConfinementIn(tx, previous);
+    const replaced = await this.tasks.predatesConfinementIn(tx, id);
     const created = await this.tasks.createIn(tx, { id: replaced ? scheduledTaskId("confined:" + id) : id, title: job.title, outcome: job.prompt, model: job.model,
       job_id: job.id });
     if (replaced && lane.actor_task_id === id) lane.actor_task_id = created.id;
