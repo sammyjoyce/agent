@@ -1,7 +1,9 @@
 //! Paired process-to-visible-conversation benchmarks, using the real CLI and Pi.
 
+mod gate;
+mod scenario;
+
 use std::{
-    collections::BTreeMap,
     fs,
     io::Write,
     num::NonZeroU16,
@@ -14,6 +16,11 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
+
+use gate::{
+    ABSOLUTE_ALLOWANCE_MS, Comparison, Mark, Marks, Observation, RELATIVE_ALLOWANCE, Span, Version,
+};
+use scenario::Scenario;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
@@ -21,8 +28,6 @@ use tokio::{
 };
 
 const DEADLINE: Duration = Duration::from_secs(20);
-const RELATIVE_ALLOWANCE: f64 = 0.25;
-const ABSOLUTE_ALLOWANCE_MS: f64 = 20.0;
 
 #[derive(Parser)]
 #[command(about = "Measure actual CLI conversation rendering against a paired baseline")]
@@ -46,30 +51,6 @@ struct Arguments {
     output: PathBuf,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, ValueEnum, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum Scenario {
-    ChiefCold,
-    Chief,
-    LongHistory,
-}
-
-impl Scenario {
-    fn sentence(self) -> &'static str {
-        match self {
-            Self::ChiefCold | Self::Chief => "Stored chief conversation is ready.",
-            Self::LongHistory => "Stored long conversation is ready.",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum Version {
-    Baseline,
-    Candidate,
-}
-
 #[derive(Deserialize)]
 struct Seed {
     chief: String,
@@ -82,17 +63,8 @@ struct Sample {
     version: Version,
     pair: u8,
     warmup: bool,
-    first_conversation_ms: f64,
+    spans: Vec<Span>,
     received_bytes: usize,
-}
-
-#[derive(Serialize)]
-struct Comparison {
-    scenario: Scenario,
-    baseline_median_ms: f64,
-    candidate_median_ms: f64,
-    paired_budget_median: f64,
-    passed: bool,
 }
 
 #[derive(Serialize)]
@@ -275,7 +247,8 @@ async fn sample(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     isolated(&mut command, directory)?;
-    let started = Instant::now();
+    let mut marks = Marks::default();
+    marks.record(Mark::Spawn, Instant::now())?;
     let mut child = command.spawn()?;
     let mut input = child.stdin.take().context("Missing terminal input")?;
     let mut output = child.stdout.take().context("Missing terminal output")?;
@@ -297,15 +270,15 @@ async fn sample(
                     .await?;
             }
             if screen.screen().contents().contains(scenario.sentence()) {
-                return Ok::<_, anyhow::Error>(started.elapsed().as_secs_f64() * 1000.0);
+                return Ok::<_, anyhow::Error>(Instant::now());
             }
         }
     })
     .await
     .context("Stored conversation text did not become visible")
     .and_then(|result| result);
-    let measured = match measured {
-        Ok(measured) => measured,
+    let visible = match measured {
+        Ok(visible) => visible,
         Err(error) => {
             if child.try_wait()?.is_none() {
                 child.start_kill()?;
@@ -319,6 +292,7 @@ async fn sample(
             );
         }
     };
+    marks.record(Mark::StoredTextVisible, visible)?;
     // Keep output draining during terminal cleanup and any final cursor query.
     input.write_all(b"/exit\r").await?;
     let drain = async {
@@ -353,80 +327,13 @@ async fn sample(
         version,
         pair,
         warmup: pair == 0,
-        first_conversation_ms: measured,
+        spans: scenario
+            .gates()
+            .iter()
+            .map(|definition| gate::span(definition, &marks, &[]))
+            .collect::<Result<_>>()?,
         received_bytes: received,
     })
-}
-
-fn comparisons(samples: &[Sample]) -> Result<Vec<Comparison>> {
-    Scenario::value_variants()
-        .iter()
-        .map(|scenario| {
-            let mut pairs: BTreeMap<u8, (Option<f64>, Option<f64>)> = BTreeMap::new();
-            for sample in samples
-                .iter()
-                .filter(|sample| sample.scenario == *scenario && !sample.warmup)
-            {
-                ensure!(
-                    sample.first_conversation_ms.is_finite() && sample.first_conversation_ms >= 0.0,
-                    "{scenario:?} pair {} has an invalid measurement",
-                    sample.pair
-                );
-                let pair = pairs.entry(sample.pair).or_default();
-                let measurement = match sample.version {
-                    Version::Baseline => &mut pair.0,
-                    Version::Candidate => &mut pair.1,
-                };
-                ensure!(
-                    measurement.is_none(),
-                    "{scenario:?} pair {} repeats {:?}",
-                    sample.pair,
-                    sample.version
-                );
-                *measurement = Some(sample.first_conversation_ms);
-            }
-            let mut baseline = Vec::new();
-            let mut candidate = Vec::new();
-            let mut fractions = Vec::new();
-            for (pair, (before, after)) in pairs {
-                let before = before
-                    .with_context(|| format!("{scenario:?} pair {pair} is missing its baseline"))?;
-                let after = after.with_context(|| {
-                    format!("{scenario:?} pair {pair} is missing its candidate")
-                })?;
-                let allowed =
-                    (before * (1.0 + RELATIVE_ALLOWANCE)).max(before + ABSOLUTE_ALLOWANCE_MS);
-                ensure!(
-                    allowed.is_finite(),
-                    "{scenario:?} pair {pair} has an invalid budget"
-                );
-                baseline.push(before);
-                candidate.push(after);
-                fractions.push(after / allowed);
-            }
-            let median = |mut values: Vec<f64>| -> Result<f64> {
-                ensure!(
-                    values.len() >= 3,
-                    "{scenario:?} requires at least three measurement pairs"
-                );
-                values.sort_by(f64::total_cmp);
-                values
-                    .get(values.len() / 2)
-                    .copied()
-                    .context("Measurement median is unavailable")
-            };
-            // Alternating measurements must stay paired: separate medians can
-            // turn uneven runner stalls into a regression in a faster candidate.
-            let paired_budget_median = median(fractions)?;
-            Ok(Comparison {
-                scenario: *scenario,
-                baseline_median_ms: median(baseline)?,
-                candidate_median_ms: median(candidate)?,
-                paired_budget_median,
-                passed: paired_budget_median <= 1.0,
-            })
-        })
-        .collect()
 }
 
 async fn run(mut options: Arguments) -> Result<()> {
@@ -562,14 +469,29 @@ async fn run(mut options: Arguments) -> Result<()> {
         unrelated_saved_conversations: 3_000,
         relative_allowance: RELATIVE_ALLOWANCE,
         absolute_allowance_ms: ABSOLUTE_ALLOWANCE_MS,
-        comparisons: comparisons(&samples)?,
+        comparisons: gate::comparisons(
+            Scenario::value_variants(),
+            &samples
+                .iter()
+                .flat_map(|sample| {
+                    sample.spans.iter().map(|span| Observation {
+                        scenario: sample.scenario,
+                        version: sample.version,
+                        pair: sample.pair,
+                        warmup: sample.warmup,
+                        span: *span,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )?,
         samples,
     };
     fs::write(&options.output, serde_json::to_vec_pretty(&report)?)?;
     for comparison in &report.comparisons {
         println!(
-            "{:?}: base {:.1} ms, candidate {:.1} ms, paired budget {:.3} (limit 1.000), {}",
+            "{:?} {:?}: base {:.1} ms, candidate {:.1} ms, paired budget {:.3} (limit 1.000), {}",
             comparison.scenario,
+            comparison.gate,
             comparison.baseline_median_ms,
             comparison.candidate_median_ms,
             comparison.paired_budget_median,
@@ -624,132 +546,5 @@ mod tests {
         assert!(screen.screen().contents().contains(sentence));
         screen.process(b"\x1b[6n");
         assert_eq!(screen.callbacks().0, b"\x1b[1;36R");
-    }
-
-    #[test]
-    fn paired_gate_excludes_warmups_and_rejects_a_material_visible_text_regression() {
-        let samples = Scenario::value_variants()
-            .iter()
-            .flat_map(|scenario| {
-                [(Version::Baseline, 100.0), (Version::Candidate, 140.0)]
-                    .into_iter()
-                    .flat_map(move |(version, milliseconds)| {
-                        (0..=3).map(move |pair| Sample {
-                            scenario: *scenario,
-                            version,
-                            pair,
-                            warmup: pair == 0,
-                            first_conversation_ms: if pair == 0 { 5_000.0 } else { milliseconds },
-                            received_bytes: 1,
-                        })
-                    })
-            })
-            .collect::<Vec<_>>();
-        for result in comparisons(&samples).unwrap() {
-            assert_eq!(result.baseline_median_ms, 100.0);
-            assert_eq!(result.candidate_median_ms, 140.0);
-            assert_eq!(result.paired_budget_median, 140.0 / 125.0);
-            assert!(!result.passed);
-        }
-    }
-
-    fn paired_samples(baseline: &[f64], candidate: &[f64]) -> Vec<Sample> {
-        assert_eq!(baseline.len(), candidate.len());
-        Scenario::value_variants()
-            .iter()
-            .flat_map(|scenario| {
-                baseline.iter().zip(candidate).enumerate().flat_map(
-                    move |(index, (before, after))| {
-                        [(Version::Baseline, *before), (Version::Candidate, *after)].map(
-                            |(version, milliseconds)| Sample {
-                                scenario: *scenario,
-                                version,
-                                pair: u8::try_from(index + 1).unwrap(),
-                                warmup: false,
-                                first_conversation_ms: milliseconds,
-                                received_bytes: 1,
-                            },
-                        )
-                    },
-                )
-            })
-            .collect()
-    }
-
-    #[test]
-    fn paired_gate_preserves_faster_pairs_despite_uneven_runner_stalls() {
-        let baseline = [
-            439.37029, 1310.91328, 366.57530, 904.75781, 298.85085, 302.64821, 929.83019,
-        ];
-        let candidate = [
-            284.22749, 1163.28675, 266.54889, 300.55142, 610.78433, 758.52455, 703.86416,
-        ];
-        assert_eq!(
-            baseline
-                .iter()
-                .zip(candidate)
-                .filter(|(before, after)| after < *before)
-                .count(),
-            5
-        );
-        for result in comparisons(&paired_samples(&baseline, &candidate)).unwrap() {
-            assert!(
-                result.candidate_median_ms
-                    > (result.baseline_median_ms * 1.25).max(result.baseline_median_ms + 20.0)
-            );
-            assert!(
-                result.passed,
-                "{:?} has five faster measurement pairs",
-                result.scenario
-            );
-        }
-    }
-
-    #[test]
-    fn paired_gate_preserves_relative_and_absolute_budget_boundaries() {
-        for (baseline, candidate, passed) in [
-            (100.0, 125.0, true),
-            (100.0, 125.1, false),
-            (10.0, 30.0, true),
-            (10.0, 30.1, false),
-            (0.0, 20.0, true),
-            (0.0, 20.1, false),
-        ] {
-            for result in comparisons(&paired_samples(&[baseline; 3], &[candidate; 3])).unwrap() {
-                assert_eq!(result.passed, passed);
-            }
-        }
-    }
-
-    #[test]
-    fn paired_gate_rejects_incomplete_duplicate_and_invalid_measurements() {
-        let valid = || paired_samples(&[100.0; 3], &[100.0; 3]);
-        for version in [Version::Baseline, Version::Candidate] {
-            let mut incomplete = valid();
-            incomplete.retain(|sample| {
-                !(sample.scenario == Scenario::Chief
-                    && sample.pair == 2
-                    && sample.version == version)
-            });
-            assert!(comparisons(&incomplete).is_err());
-        }
-        let mut duplicate = valid();
-        duplicate.push(Sample {
-            scenario: Scenario::Chief,
-            version: Version::Baseline,
-            pair: 1,
-            warmup: false,
-            first_conversation_ms: 100.0,
-            received_bytes: 1,
-        });
-        assert!(comparisons(&duplicate).is_err());
-        for milliseconds in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
-            let mut invalid = valid();
-            invalid[0].first_conversation_ms = milliseconds;
-            assert!(comparisons(&invalid).is_err());
-        }
-        assert!(comparisons(&paired_samples(&[100.0; 2], &[100.0; 2])).is_err());
-        assert!(comparisons(&paired_samples(&[f64::MAX; 3], &[f64::MAX; 3])).is_err());
-        assert!(comparisons(&[]).is_err());
     }
 }
