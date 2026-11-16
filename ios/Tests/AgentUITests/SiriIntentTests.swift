@@ -111,7 +111,7 @@
       let state = app.descendants(matching: .any)["jobRunState"]
       XCTAssertTrue(becomes(state, "label CONTAINS %@", "Completed"), app.debugDescription)
       capture("siri-open-job-cold-start", app)
-      assertBackStepsToTheFeed(app, from: "Weekly report", through: "Personal · Jobs and work")
+      assertBackShowsTheFeed(app, from: "Weekly report")
       let menu = app.buttons["scopeMenu"]
       XCTAssertTrue(becomes(menu, "label BEGINSWITH %@", "Work"), menu.label)
       let field = app.textViews["Message the coordinator"]
@@ -130,7 +130,7 @@
       XCTAssertTrue(
         app.navigationBars["Weekly report"].waitForExistence(timeout: 15), app.debugDescription)
       capture("siri-open-job-foreground", app)
-      assertBackStepsToTheFeed(app, from: "Weekly report", through: "Personal · Jobs and work")
+      assertBackShowsTheFeed(app, from: "Weekly report")
       let menu = app.buttons["scopeMenu"]
       XCTAssertTrue(becomes(menu, "label BEGINSWITH %@", "Work"), menu.label)
       let field = app.textViews["Message the coordinator"]
@@ -151,7 +151,8 @@
         try await intent.run()
         XCTFail("The intent opened a job that Work no longer has")
       } catch {
-        XCTAssertTrue("\(error)".contains("no longer on Work"), "\(error)")
+        XCTAssertTrue(
+          "\(error)".contains("The scheduled job nightly:deps is no longer on Work."), "\(error)")
       }
     }
 
@@ -171,6 +172,7 @@
       capture("siri-onscreen-work-feed", app)
 
       app.buttons["Connection"].tap()
+      try await assertAnnotations(of: coordinators, become: [], "Connection over the feed")
       app.buttons["Jobs and work"].tap()
       XCTAssertTrue(
         app.buttons["job-nightly:deps"].waitForExistence(timeout: 15), app.debugDescription)
@@ -184,6 +186,14 @@
 
       assertBackStepsToTheFeed(app, from: "Nightly deps", through: "Work · Jobs and work")
       try await assertAnnotations(of: jobs, become: [], "Work's feed after Back")
+      try await assertAnnotations(of: coordinators, become: [work], "Work's feed after Back")
+
+      let weeklyReport = try await job(titled: "Weekly report")
+      try await definitions.intents["OpenJobIntent"].makeIntent(target: weeklyReport).run()
+      XCTAssertTrue(app.navigationBars["Weekly report"].waitForExistence(timeout: 15))
+      let personalJob = weeklyReport.identifier.instanceIdentifier
+      try await assertAnnotations(of: jobs, become: [personalJob], "the opened job's screen")
+      try await assertAnnotations(of: coordinators, become: [], "the opened job over the feed")
     }
 
     private func assertTheQueryRefusesWithoutItsFixture(of entity: String) async throws {
@@ -384,6 +394,13 @@
         try await Task.sleep(for: .milliseconds(250))
       } while ContinuousClock.now < deadline
       XCTFail("\(screen): annotations \(shown), expected \(identifiers)")
+    }
+
+    /// Back from a job that Open Job showed returns to the feed in one step.
+    private func assertBackShowsTheFeed(_ app: XCUIApplication, from job: String) {
+      app.navigationBars[job].buttons.element(boundBy: 0).tap()
+      XCTAssertTrue(app.buttons["scopeMenu"].waitForExistence(timeout: 5), app.debugDescription)
+      XCTAssertFalse(app.navigationBars["Connection"].exists, app.debugDescription)
     }
 
     private func terminate(_ app: XCUIApplication) {
