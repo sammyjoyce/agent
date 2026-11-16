@@ -176,7 +176,7 @@ struct SiriCoordinatorEntityTests {
     #expect(await spotlight.entries.count == 3)
   }
 
-  @Test func aWriteTheLockedPhoneRefusedIsRedoneAtTheNextActivation() async throws {
+  @Test func aWriteRefusedWhileActiveIsRetriedWithNoFurtherChange() async throws {
     let spotlight = SpotlightFake()
     let fixture = try indexing(spotlight)
     defer { fixture.clean() }
@@ -186,8 +186,23 @@ struct SiriCoordinatorEntityTests {
     await spotlight.refuseNextWrite()
     try await coordinators.update(personal.id, name: TagName("Family"), address: personal.address)
     await settle(fixture.notifications)
-    #expect(await spotlight.coordinators[personal.id] == "Personal", "The rename was refused")
+    #expect(await spotlight.coordinators == names(fixture, [0: "Work", 1: "Family", 2: "Home"]))
+    #expect(await spotlight.entries.count == 3)
+  }
+
+  @Test func aWriteRefusedWhileInactiveWaitsForTheNextActivation() async throws {
+    let spotlight = SpotlightFake()
+    let fixture = try indexing(spotlight)
+    defer { fixture.clean() }
+    await activate(fixture.notifications)
+    let coordinators = fixture.notifications.coordinators
+    let personal = fixture.profiles[1]
     await coordinators.setActive(false)
+    await spotlight.refuseNextWrite()
+    try await coordinators.update(personal.id, name: TagName("Family"), address: personal.address)
+    await settle(fixture.notifications)
+    #expect(
+      await spotlight.coordinators[personal.id] == "Personal", "No retry while the app is inactive")
     await activate(fixture.notifications)
     #expect(await spotlight.coordinators == names(fixture, [0: "Work", 1: "Family", 2: "Home"]))
     #expect(await spotlight.entries.count == 3)
