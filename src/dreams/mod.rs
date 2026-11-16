@@ -22,7 +22,7 @@ pub use evidence::{EvidenceItem, EvidenceKind, Finding};
 pub use policy::{
     CheckSpec, DreamsCheckFile, DreamsPolicy, DreamsPolicyFile, EditablePath, ProtectedPaths,
 };
-pub use store::{DreamsStore, RunView};
+pub use store::{AppliedRecord, DreamsStore, RunView};
 
 use crate::{protocol::HostResult, runtime::diagnostics};
 

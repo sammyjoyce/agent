@@ -8,7 +8,8 @@ use agent_cli::{
     config::ClientConfig,
     dreams::{
         Abstention, CheckResult, ContentDigest, DreamsPolicy, DreamsStore, EvidenceItem,
-        MAX_ATTEMPTS, Outcome, Proposal, Review, RunId, RunView, count, format_utc, workspace::Git,
+        MAX_ATTEMPTS, Outcome, Proposal, Review, Revision, RunId, RunView, count, format_utc,
+        workspace::Git,
     },
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -42,6 +43,9 @@ enum ProposalStatus {
     },
     Applied {
         commit: String,
+        /// Whether HEAD still contains the commit. Unknown when the policy no
+        /// longer names the repository, because Git only runs in the policy's.
+        reachable: Option<bool>,
     },
     Stale {
         head: String,
@@ -62,7 +66,20 @@ impl ProposalStatus {
             Self::Pending { interrupted: true } => {
                 "pending (target HEAD is the base; an interrupted apply left proposed content that apply will finish)".into()
             }
-            Self::Applied { commit } => format!("applied as commit {commit}"),
+            Self::Applied {
+                commit,
+                reachable: Some(true),
+            } => format!("applied as commit {commit}"),
+            Self::Applied {
+                commit,
+                reachable: Some(false),
+            } => format!("applied as commit {commit}, which is no longer reachable from HEAD"),
+            Self::Applied {
+                commit,
+                reachable: None,
+            } => format!(
+                "applied as commit {commit} (HEAD was not checked: the policy no longer names this repository)"
+            ),
             Self::Stale { head } => format!("stale (target HEAD is {head})"),
             Self::TargetDirty => "target_dirty (local changes in touched paths)".into(),
             Self::PatchChanged { actual } => {
@@ -85,6 +102,10 @@ enum Inspection {
     PolicyChanged,
     Applied {
         commit: String,
+        reachable: Option<bool>,
+        /// False when only the commit trailer shows the apply, which is the
+        /// state a crash between the fast-forward and the record leaves.
+        recorded: bool,
     },
     Stale {
         head: String,
@@ -105,8 +126,11 @@ impl Inspection {
                 actual: actual.clone(),
             },
             Self::PolicyChanged => ProposalStatus::PolicyChanged,
-            Self::Applied { commit } => ProposalStatus::Applied {
+            Self::Applied {
+                commit, reachable, ..
+            } => ProposalStatus::Applied {
                 commit: commit.clone(),
+                reachable: *reachable,
             },
             Self::Stale { head } => ProposalStatus::Stale { head: head.clone() },
             Self::TargetDirty => ProposalStatus::TargetDirty,
@@ -279,8 +303,42 @@ async fn path_state(git: &Git, repository: &Path, file: &TouchedPath) -> Result<
     })
 }
 
+/// A recorded apply stays applied whatever else changed since. HEAD is
+/// consulted only when the policy still names the repository.
+async fn recorded_apply(
+    store: &DreamsStore,
+    policy: Option<&DreamsPolicy>,
+    proposal: &Proposal,
+) -> Result<Option<Inspection>> {
+    let Some(record) = store.applied(&proposal.run)? else {
+        return Ok(None);
+    };
+    let commit = record.commit.as_str();
+    let reachable = if policy.is_some_and(|policy| policy.repository() == proposal.repository) {
+        let contained = Git::reading(&proposal.repository)
+            .run(&["merge-base", "--is-ancestor", commit, "HEAD"])
+            .await?;
+        Some(contained.exit_code == 0)
+    } else {
+        None
+    };
+    Ok(Some(Inspection::Applied {
+        commit: commit.to_owned(),
+        reachable,
+        recorded: true,
+    }))
+}
+
 /// Reads the target and writes nothing to it.
-async fn inspect(policy: &DreamsPolicy, proposal: &Proposal, patch: &[u8]) -> Result<Inspection> {
+async fn inspect(
+    store: &DreamsStore,
+    policy: &DreamsPolicy,
+    proposal: &Proposal,
+    patch: &[u8],
+) -> Result<Inspection> {
+    if let Some(applied) = recorded_apply(store, Some(policy), proposal).await? {
+        return Ok(applied);
+    }
     let actual = ContentDigest::of(patch);
     if actual != proposal.patch_sha256 {
         return Ok(Inspection::PatchChanged { actual });
@@ -325,6 +383,8 @@ async fn inspect(policy: &DreamsPolicy, proposal: &Proposal, patch: &[u8]) -> Re
         {
             return Ok(Inspection::Applied {
                 commit: (*commit).to_owned(),
+                reachable: Some(true),
+                recorded: false,
             });
         }
     }
@@ -430,8 +490,10 @@ async fn status_of(
     };
     let patch = read_patch(store, proposal)?;
     let status = match policy {
-        Some(policy) => inspect(policy, proposal, &patch).await?.status(),
-        None => ProposalStatus::PolicyChanged,
+        Some(policy) => inspect(store, policy, proposal, &patch).await?.status(),
+        None => recorded_apply(store, None, proposal)
+            .await?
+            .map_or(ProposalStatus::PolicyChanged, |applied| applied.status()),
     };
     Ok(Some((status, patch)))
 }
@@ -710,7 +772,7 @@ async fn apply(
         bail!("Dreams run did not propose a change");
     };
     let patch = read_patch(store, proposal)?;
-    match inspect(policy, proposal, &patch).await? {
+    match inspect(store, policy, proposal, &patch).await? {
         Inspection::PatchChanged { .. } => bail!("Dreams patch changed since it was proposed"),
         Inspection::PolicyChanged => bail!("{POLICY_CHANGED}"),
         Inspection::Stale { head } => bail!(
@@ -718,13 +780,23 @@ async fn apply(
             proposal.base
         ),
         Inspection::TargetDirty => bail!("Dreams target has local changes in touched paths"),
-        Inspection::Applied { commit } => Ok(format!(
-            "Dreams run {run} is already applied as commit {}; nothing changed.",
-            short(&commit)
-        )),
+        Inspection::Applied {
+            commit, recorded, ..
+        } => {
+            if !recorded {
+                store.record_applied(run, &Revision::parse(&commit)?)?;
+            }
+            Ok(format!(
+                "Dreams run {run} is already applied as commit {}; nothing changed.",
+                short(&commit)
+            ))
+        }
         Inspection::Ready { half_applied } => {
             let commit = build_commit(store, policy, proposal, &patch).await?;
             fast_forward(proposal, &commit, &half_applied).await?;
+            // After the fast-forward. A crash in between leaves the trailer,
+            // which the next apply finds and records.
+            store.record_applied(run, &Revision::parse(&commit)?)?;
             Ok(format!(
                 "Applied Dreams run {run} as commit {} to {}.",
                 short(&commit),
@@ -937,14 +1009,20 @@ mod tests {
         let approval = view.review_sha256.clone().unwrap();
         let patch = read_patch(&store, proposal).unwrap();
         assert!(matches!(
-            inspect(&policy, proposal, &patch).await.unwrap().status(),
+            inspect(&store, &policy, proposal, &patch)
+                .await
+                .unwrap()
+                .status(),
             ProposalStatus::Pending { interrupted: false }
         ));
 
         fs::create_dir(repository.join("playbooks")).unwrap();
         fs::write(repository.join("playbooks/build.md"), playbook).unwrap();
         git(&repository, &["add", "playbooks/build.md"]);
-        let status = inspect(&policy, proposal, &patch).await.unwrap().status();
+        let status = inspect(&store, &policy, proposal, &patch)
+            .await
+            .unwrap()
+            .status();
         assert!(matches!(
             &status,
             ProposalStatus::Pending { interrupted: true }
@@ -973,6 +1051,14 @@ mod tests {
             "{shown}"
         );
 
+        assert!(
+            matches!(
+                status_of(&store, None, &view).await.unwrap(),
+                Some((ProposalStatus::PolicyChanged, _))
+            ),
+            "Without the private policy, nothing is admitted"
+        );
+
         let message = apply(&store, &policy, &run, &approval).await.unwrap();
         assert!(message.starts_with("Applied Dreams run"), "{message}");
         assert_eq!(git(&repository, &["status", "--porcelain"]), "");
@@ -988,9 +1074,15 @@ mod tests {
         assert!(
             matches!(
                 status_of(&store, None, &view).await.unwrap(),
-                Some((ProposalStatus::PolicyChanged, _))
+                Some((
+                    ProposalStatus::Applied {
+                        reachable: None,
+                        ..
+                    },
+                    _
+                ))
             ),
-            "Without the private policy, nothing is admitted"
+            "A recorded apply stays applied without the policy, and Git is not consulted"
         );
     }
 

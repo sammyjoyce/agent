@@ -532,8 +532,11 @@ hash and refuses with one of these messages, without changing the repository:
 
 A successful apply adds one commit with `Dreams-Run`, `Dreams-Base` and
 `Dreams-Patch-Sha256` trailers and fast-forwards the checked-out branch. The
-commit uses your Git identity and is not signed. A second apply of the same run
-reports `already applied` and changes nothing. If an apply was interrupted
+commit uses your Git identity and is not signed. Apply then records that commit
+in the run's directory. A second apply of the same run reports
+`already applied` and changes nothing, even after `HEAD` has moved back to the
+base, and `dreams show` says when the recorded commit is no longer reachable
+from `HEAD`. If an apply was interrupted
 after Git wrote the proposed content but before `HEAD` moved, `dreams show`
 still reports `pending`, and the next apply finishes the same commit once. A
 context repository serves approved guidance on the next turn. Revert the commit

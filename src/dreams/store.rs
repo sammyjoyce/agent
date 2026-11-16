@@ -7,15 +7,24 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
-use crate::dreams::{ContentDigest, EvidenceItem, MAX_ATTEMPTS, Outcome, Review, RunId};
+use crate::dreams::{ContentDigest, EvidenceItem, MAX_ATTEMPTS, Outcome, Review, Revision, RunId};
 
 const STALE_STAGING: Duration = Duration::from_secs(60 * 60);
 
 pub struct DreamsStore {
     root: PathBuf,
+}
+
+const APPLIED_FILE: &str = "applied.json";
+
+/// Written by `dreams apply` after its fast-forward. Git history alone forgets
+/// an apply once HEAD moves back to the base.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedRecord {
+    pub commit: Revision,
 }
 
 pub struct RunView {
@@ -221,17 +230,47 @@ impl DreamsStore {
     }
 
     pub(crate) fn seal_outcome(&self, run: &RunId, outcome: &Outcome) -> Result<Outcome> {
+        self.seal_once(run, "outcome.json", outcome)
+            .context("Could not seal the Dreams outcome")
+    }
+
+    /// The commit that `dreams apply` moved the target to, if it has.
+    pub fn applied(&self, run: &RunId) -> Result<Option<AppliedRecord>> {
+        read_json(&self.run_directory(run).join(APPLIED_FILE))
+    }
+
+    /// Records a finished apply. The first record stands, so a repeat returns it.
+    pub fn record_applied(&self, run: &RunId, commit: &Revision) -> Result<AppliedRecord> {
+        self.seal_once(
+            run,
+            APPLIED_FILE,
+            &AppliedRecord {
+                commit: commit.clone(),
+            },
+        )
+        .context("Could not record the Dreams apply")
+    }
+
+    /// Writes `name` in the run directory unless it exists, and returns what
+    /// the file holds: this value, or the one that was linked first.
+    fn seal_once<T: Serialize + DeserializeOwned>(
+        &self,
+        run: &RunId,
+        name: &str,
+        value: &T,
+    ) -> Result<T> {
         let directory = self.run_directory(run);
-        let temporary = directory.join(format!(".outcome-{}", Uuid::new_v4()));
-        write_json(&temporary, outcome)?;
-        let linked = fs::hard_link(&temporary, self.outcome_path(run));
+        let sealed = directory.join(name);
+        let temporary = directory.join(format!(".{name}-{}", Uuid::new_v4()));
+        write_json(&temporary, value)?;
+        let linked = fs::hard_link(&temporary, &sealed);
         fs::remove_file(&temporary)?;
         match linked {
             Ok(()) => File::open(&directory)?.sync_all()?,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error).context("Could not seal the Dreams outcome"),
+            Err(error) => return Err(error.into()),
         }
-        read_json(&self.outcome_path(run))?.context("The sealed Dreams outcome is missing")
+        read_json(&sealed)?.with_context(|| format!("The sealed Dreams record {name} is missing"))
     }
 }
 
