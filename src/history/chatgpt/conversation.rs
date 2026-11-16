@@ -6,7 +6,7 @@ use std::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{ChatGptEnvelope, archive, json};
+use super::{ChatGptAttachment, ChatGptEnvelope, archive, json};
 use crate::{
     history::{
         HistoryAssetKind, HistoryAssetRef, HistoryBranch, HistoryBranchState, HistoryGap,
@@ -352,7 +352,8 @@ pub(super) fn thread(id: &str, raw: &Value, version: String) -> HistoryThread {
 }
 
 pub(super) trait FileLookup {
-    fn stored_name(&self, file: &FileId) -> Option<&str>;
+    /// The stored member name and checked digest of a file in the export.
+    fn stored(&self, file: &FileId) -> Option<(&str, &archive::MemberDigest)>;
     fn original_name(&self, stored: &str) -> Option<&str>;
 }
 
@@ -763,6 +764,23 @@ impl Normalized {
             }
         }
         let text = without_citations(&draft.text);
+        let omitted = draft.references.len().saturating_sub(MAXIMUM_REFERENCES);
+        let considered: Vec<_> = draft
+            .references
+            .into_iter()
+            .take(MAXIMUM_REFERENCES)
+            .map(|reference| {
+                let found = draft.files.stored(&reference.file);
+                (reference, found)
+            })
+            .collect();
+        let attachments = considered
+            .iter()
+            .map(|(reference, found)| ChatGptAttachment {
+                file_id: reference.file.as_str().to_owned(),
+                sha256: found.map(|(_, checked)| checked.sha256.clone()),
+            })
+            .collect();
         let envelope = serde_json::to_value(ChatGptEnvelope {
             conversation_id: draft.conversation.to_owned(),
             node_id: draft.node.to_owned(),
@@ -770,6 +788,7 @@ impl Normalized {
             text: text.clone(),
             message,
             library_files: draft.library,
+            attachments,
         })
         .unwrap_or(Value::Null);
         let timestamp_ms = draft
@@ -787,9 +806,8 @@ impl Normalized {
             timestamp_ms,
         ]));
         let mut assets = Vec::new();
-        let omitted = draft.references.len().saturating_sub(MAXIMUM_REFERENCES);
-        for reference in draft.references.into_iter().take(MAXIMUM_REFERENCES) {
-            let Some(stored) = draft.files.stored_name(&reference.file) else {
+        for (reference, found) in considered {
+            let Some((stored, checked)) = found else {
                 let named = reference
                     .name
                     .as_deref()
@@ -811,6 +829,7 @@ impl Normalized {
                 .or_else(|| reference.name.as_deref().and_then(media_type))
                 .or_else(|| draft.files.original_name(stored).and_then(media_type))
                 .or_else(|| media_type(stored))
+                .or_else(|| checked.sniffed.map(str::to_owned))
                 .unwrap_or_else(|| UNKNOWN_MEDIA.to_owned());
             assets.push(HistoryAssetRef {
                 path: reference.file.as_str().to_owned(),
@@ -818,8 +837,8 @@ impl Normalized {
                 version: version.clone(),
                 kind: HistoryAssetKind::LocalMedia,
                 media_type,
-                sha256: None,
-                size: None,
+                sha256: Some(checked.sha256.clone()),
+                size: Some(checked.size),
             });
             self.assets.insert(
                 reference.file.as_str().to_owned(),
@@ -870,7 +889,7 @@ impl Normalized {
     }
 }
 
-pub(super) const UNKNOWN_MEDIA: &str = "application/octet-stream";
+const UNKNOWN_MEDIA: &str = "application/octet-stream";
 
 fn media_type(name: &str) -> Option<String> {
     let extension = name.rsplit_once('.')?.1.to_ascii_lowercase();
@@ -923,14 +942,28 @@ mod tests {
     use crate::history::chatgpt::fixture::{Conversation, text_message};
     use crate::history::{HistoryAssetKind, HistoryBranchState, HistoryGapCode};
 
-    struct Files(&'static [&'static str]);
+    struct Files(Vec<(&'static str, archive::MemberDigest)>);
+
+    impl Files {
+        fn new(names: &[&'static str]) -> Self {
+            Self(names.iter().map(|name| (*name, checked(name))).collect())
+        }
+    }
+
+    fn checked(name: &str) -> archive::MemberDigest {
+        archive::MemberDigest {
+            sha256: hex::encode(Sha256::digest(name)),
+            size: name.len() as u64,
+            sniffed: None,
+        }
+    }
 
     impl FileLookup for Files {
-        fn stored_name(&self, file: &FileId) -> Option<&str> {
+        fn stored(&self, file: &FileId) -> Option<(&str, &archive::MemberDigest)> {
             self.0
                 .iter()
-                .find(|name| FileId::find(name).as_ref() == Some(file))
-                .copied()
+                .find(|(name, _)| FileId::find(name).as_ref() == Some(file))
+                .map(|(name, digest)| (*name, digest))
         }
 
         fn original_name(&self, _stored: &str) -> Option<&str> {
@@ -939,7 +972,7 @@ mod tests {
     }
 
     fn run(raw: &Value) -> Normalized {
-        run_with(raw, &[], &Files(&[]))
+        run_with(raw, &[], &Files::new(&[]))
     }
 
     fn run_with(raw: &Value, library: &[LibraryFile], files: &dyn FileLookup) -> Normalized {
@@ -1346,15 +1379,29 @@ mod tests {
                 .node("u1", Some("root"), message)
                 .build(),
             &[],
-            &Files(&["file_00ab12-beach.dat", "file-Xy9Ab-dog.dat"]),
+            &Files::new(&["file_00ab12-beach.dat", "file-Xy9Ab-dog.dat"]),
         );
         let upload = item(&normalized, "u1");
         assert_eq!(paths(upload), ["file_00ab12", "file-Xy9Ab"]);
-        assert!(upload.assets.iter().all(|asset| matches!(
-            asset.kind,
-            HistoryAssetKind::LocalMedia
-        ) && asset.sha256.is_none()
-            && asset.version == upload.version));
+        assert!(
+            upload
+                .assets
+                .iter()
+                .all(|asset| matches!(asset.kind, HistoryAssetKind::LocalMedia)
+                    && asset.version == upload.version)
+        );
+        let digests: Vec<Option<&str>> = upload
+            .assets
+            .iter()
+            .map(|asset| asset.sha256.as_deref())
+            .collect();
+        assert_eq!(
+            digests,
+            [
+                Some(checked("file_00ab12-beach.dat").sha256.as_str()),
+                Some(checked("file-Xy9Ab-dog.dat").sha256.as_str())
+            ]
+        );
         assert!(normalized.gaps.is_empty());
     }
 
@@ -1368,7 +1415,7 @@ mod tests {
                 .node("u1", Some("root"), message)
                 .build(),
             &[],
-            &Files(&["file_00ab12-beach.dat"]),
+            &Files::new(&["file_00ab12-beach.dat"]),
         );
         let upload = item(&normalized, "u1");
         assert_eq!(paths(upload), ["file_00ab12"]);
@@ -1385,7 +1432,7 @@ mod tests {
                 .node("out", Some("root"), output)
                 .build(),
             &[],
-            &Files(&["file-Chart1-chart.dat"]),
+            &Files::new(&["file-Chart1-chart.dat"]),
         );
         assert_eq!(paths(item(&normalized, "out")), ["file-Chart1"]);
     }
@@ -1410,7 +1457,7 @@ mod tests {
                 .say("a1", "root", "assistant", "Here is the plan")
                 .build(),
             &[library("file_00ee", Some("a1"))],
-            &Files(&["file_00ee-plan.dat"]),
+            &Files::new(&["file_00ee-plan.dat"]),
         );
         let answer = item(&normalized, "a1");
         assert_eq!(paths(answer), ["file_00ee"]);
@@ -1429,7 +1476,7 @@ mod tests {
                 .current("a1")
                 .build(),
             &[library("file_00ef", None)],
-            &Files(&["file_00ef-map.dat"]),
+            &Files::new(&["file_00ef-map.dat"]),
         );
         assert_eq!(
             placed(&normalized),

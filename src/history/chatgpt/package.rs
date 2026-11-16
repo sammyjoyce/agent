@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    io::{self, Read, Write},
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 
@@ -9,7 +9,10 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ChatGptPackageSummary, Corruption, Incompleteness, PackageError, PackageProgress, UnsafeReason,
-    archive::{self, Admission, Limits, MemberPath, Method, Region, Spool, Tee, ZipMember},
+    archive::{
+        self, Admission, Hashing, Limits, MemberDigest, MemberPath, Method, Region, Spool, Tee,
+        ZipMember,
+    },
     conversation::{self, FileId, FileLookup, LibraryFile},
     json::{self, Element, Split, SplitError},
 };
@@ -20,18 +23,9 @@ const THREAD_FORMAT: u32 = 1;
 const MAXIMUM_PROBLEMS: usize = 100;
 const MAXIMUM_ID_BYTES: usize = 256;
 const MANIFEST: &str = "export_manifest.json";
-const SNIFF_BYTES: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) struct MemberId(usize);
-
-/// The checked bytes of a file-index member, measured while the package is opened.
-#[derive(Clone, Debug)]
-pub(super) struct MemberDigest {
-    pub sha256: String,
-    pub size: u64,
-    pub sniffed: Option<&'static str>,
-}
 
 pub(super) struct IndexedFile {
     pub member: MemberId,
@@ -201,9 +195,13 @@ impl Package {
 }
 
 impl FileLookup for Package {
-    fn stored_name(&self, file: &FileId) -> Option<&str> {
-        self.file(file)
-            .map(|indexed| self.member(indexed.member).path.file_name())
+    fn stored(&self, file: &FileId) -> Option<(&str, &MemberDigest)> {
+        self.file(file).map(|indexed| {
+            (
+                self.member(indexed.member).path.file_name(),
+                &indexed.digest,
+            )
+        })
     }
 
     fn original_name(&self, stored: &str) -> Option<&str> {
@@ -708,11 +706,7 @@ fn verify(
             Some(file) => {
                 let mut hashing = Hashing::default();
                 io::copy(&mut reader, &mut hashing).map_err(damaged)?;
-                let digest = MemberDigest {
-                    sha256: hex::encode(hashing.sha256.finalize()),
-                    size: source.size,
-                    sniffed: sniff(&hashing.head),
-                };
+                let digest = hashing.finish(source.size);
                 files.insert(file, IndexedFile { member, digest });
             }
             None => {
@@ -721,45 +715,6 @@ fn verify(
         }
     }
     Ok(files)
-}
-
-#[derive(Default)]
-struct Hashing {
-    sha256: Sha256,
-    head: Vec<u8>,
-}
-
-impl Write for Hashing {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let wanted = SNIFF_BYTES
-            .saturating_sub(self.head.len())
-            .min(buffer.len());
-        self.head.extend_from_slice(&buffer[..wanted]);
-        self.sha256.update(buffer);
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn sniff(head: &[u8]) -> Option<&'static str> {
-    let riff = |kind: &[u8]| head.starts_with(b"RIFF") && head.get(8..12) == Some(kind);
-    Some(match head {
-        _ if head.starts_with(b"\x89PNG") => "image/png",
-        _ if head.starts_with(&[0xFF, 0xD8, 0xFF]) => "image/jpeg",
-        _ if head.starts_with(b"GIF8") => "image/gif",
-        _ if riff(b"WEBP") => "image/webp",
-        _ if riff(b"WAVE") => "audio/wav",
-        _ if head.starts_with(b"%PDF-") => "application/pdf",
-        _ if head.starts_with(b"ID3") || head.starts_with(&[0xFF, 0xFB]) => "audio/mpeg",
-        _ if head.get(4..8) == Some(b"ftyp") => "video/mp4",
-        _ if head.starts_with(b"OggS") => "audio/ogg",
-        _ if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) => "video/webm",
-        _ if head.starts_with(b"PK\x03\x04") => "application/zip",
-        _ => return None,
-    })
 }
 
 fn file_index(members: &[Member]) -> HashMap<FileId, MemberId> {
@@ -901,28 +856,35 @@ impl Scan {
     ) -> Package {
         let mut referenced = BTreeSet::new();
         let (mut excluded, mut repaired) = (0, 0);
-        for Surveyed { survey, repairs } in self.surveys.into_values() {
+        for Surveyed { survey, repairs } in self.surveys.values() {
             excluded += survey.excluded;
             repaired += repairs;
-            referenced.extend(survey.files);
         }
         for entry in &mut self.conversations {
-            let entries: Vec<&Value> = library
-                .get(&entry.thread.id)
-                .into_iter()
-                .flatten()
-                .map(|file| &file.raw)
+            let library_files = library.get(&entry.thread.id).map_or(&[][..], Vec::as_slice);
+            let mut own: BTreeSet<&FileId> = library_files.iter().map(|file| &file.file).collect();
+            if let Some(surveyed) = self.surveys.get(&entry.thread.id) {
+                own.extend(&surveyed.survey.files);
+            }
+            let checked: Vec<(&str, Option<&str>)> = own
+                .iter()
+                .map(|file| {
+                    let sha256 = files
+                        .get(*file)
+                        .map(|indexed| indexed.digest.sha256.as_str());
+                    (file.as_str(), sha256)
+                })
                 .collect();
+            let entries: Vec<&Value> = library_files.iter().map(|file| &file.raw).collect();
             entry.thread.version = digest(&serde_json::json!([
                 THREAD_FORMAT,
                 conversation::ITEM_FORMAT,
                 entry.thread.id,
                 hex::encode(entry.content),
                 entries,
+                checked,
             ]));
-            for file in library.get(&entry.thread.id).into_iter().flatten() {
-                referenced.insert(file.file.clone());
-            }
+            referenced.extend(own.into_iter().cloned());
         }
         self.conversations.sort_by(|left, right| {
             right
@@ -964,13 +926,13 @@ impl Scan {
             .map(|entry| (entry.thread.id.as_str(), entry.thread.version.as_str()))
             .collect();
         pairs.sort();
-        let mut sizes: Vec<(&str, u64)> = files
+        let mut hashes: Vec<(&str, &str)> = files
             .iter()
-            .map(|(file, indexed)| (file.as_str(), indexed.digest.size))
+            .map(|(file, indexed)| (file.as_str(), indexed.digest.sha256.as_str()))
             .collect();
-        sizes.sort();
+        hashes.sort();
         let summary = ChatGptPackageSummary {
-            digest: digest(&serde_json::json!([PACKAGE_FORMAT, pairs, sizes])),
+            digest: digest(&serde_json::json!([PACKAGE_FORMAT, pairs, hashes])),
             parts,
             conversations: self.conversations.len() as u32,
             archived: self

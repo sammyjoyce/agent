@@ -6,6 +6,8 @@ use std::{
     sync::Arc,
 };
 
+use sha2::{Digest, Sha256};
+
 use super::{Corruption, Incompleteness, PackageError, UnsafeReason};
 
 #[derive(Clone, Copy, Debug)]
@@ -399,6 +401,64 @@ impl<R: Read> Read for Exact<R> {
         }
         Ok(count)
     }
+}
+
+const SNIFF_BYTES: usize = 16;
+
+/// The checked bytes of a file-index member, measured while the package is opened.
+pub(super) struct MemberDigest {
+    pub sha256: String,
+    pub size: u64,
+    pub sniffed: Option<&'static str>,
+}
+
+#[derive(Default)]
+pub(super) struct Hashing {
+    sha256: Sha256,
+    head: Vec<u8>,
+}
+
+impl Write for Hashing {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let wanted = SNIFF_BYTES
+            .saturating_sub(self.head.len())
+            .min(buffer.len());
+        self.head.extend_from_slice(&buffer[..wanted]);
+        self.sha256.update(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Hashing {
+    pub fn finish(self, size: u64) -> MemberDigest {
+        MemberDigest {
+            sha256: hex::encode(self.sha256.finalize()),
+            size,
+            sniffed: sniff(&self.head),
+        }
+    }
+}
+
+fn sniff(head: &[u8]) -> Option<&'static str> {
+    let riff = |kind: &[u8]| head.starts_with(b"RIFF") && head.get(8..12) == Some(kind);
+    Some(match head {
+        _ if head.starts_with(b"\x89PNG") => "image/png",
+        _ if head.starts_with(&[0xFF, 0xD8, 0xFF]) => "image/jpeg",
+        _ if head.starts_with(b"GIF8") => "image/gif",
+        _ if riff(b"WEBP") => "image/webp",
+        _ if riff(b"WAVE") => "audio/wav",
+        _ if head.starts_with(b"%PDF-") => "application/pdf",
+        _ if head.starts_with(b"ID3") || head.starts_with(&[0xFF, 0xFB]) => "audio/mpeg",
+        _ if head.get(4..8) == Some(b"ftyp") => "video/mp4",
+        _ if head.starts_with(b"OggS") => "audio/ogg",
+        _ if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) => "video/webm",
+        _ if head.starts_with(b"PK\x03\x04") => "application/zip",
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

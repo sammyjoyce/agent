@@ -21,8 +21,7 @@ use sha2::{Digest, Sha256};
 use ts_rs::TS;
 
 use crate::history::{
-    HistoryAssetKind, HistoryGap, HistoryGapCode, HistoryItem, HistoryRequest, HistoryResponse,
-    HistorySource, PAGE_BYTES,
+    HistoryGap, HistoryGapCode, HistoryRequest, HistoryResponse, HistorySource, PAGE_BYTES,
 };
 
 const ASSET_CHUNK_BYTES: usize = 320 * 1024;
@@ -61,6 +60,20 @@ pub struct ChatGptEnvelope {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[ts(optional, type = "unknown[]")]
     pub library_files: Vec<serde_json::Value>,
+    /// The files the item references, up to its attachment limit. The checked digest is part of
+    /// the evidence, so other bytes under the same file id are a new item version, never a
+    /// refresh of the old one.
+    pub attachments: Vec<ChatGptAttachment>,
+}
+
+/// A file one ChatGPT item references.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ChatGptAttachment {
+    pub file_id: String,
+    /// The SHA-256 of the checked bytes. Absent when the export does not hold the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub sha256: Option<String>,
 }
 
 /// One checked, immutable export served as history. Cheap to clone.
@@ -236,14 +249,13 @@ impl ChatGptHistory {
         };
         let mut bytes = PAGE_SLACK + serde_json::to_vec(&gaps)?.len();
         for item in normalized.items.iter().skip(start) {
-            let mut item = item.clone();
+            let item = item.clone();
             let mut item_gaps: Vec<HistoryGap> = normalized
                 .gaps
                 .iter()
                 .filter(|gap| gap.item_id.as_deref() == Some(item.id.as_str()))
                 .cloned()
                 .collect();
-            self.fill_digests(&mut item, &mut item_gaps);
             let length = serde_json::to_vec(&item)?.len() + serde_json::to_vec(&item_gaps)?.len();
             if bytes + length > PAGE_BYTES && !items.is_empty() {
                 break;
@@ -297,36 +309,6 @@ impl ChatGptHistory {
         ));
         state.current = Some((thread_id.to_owned(), normalized.clone()));
         Some(normalized)
-    }
-
-    fn fill_digests(&self, item: &mut HistoryItem, gaps: &mut Vec<HistoryGap>) {
-        let mut kept = Vec::new();
-        for mut asset in std::mem::take(&mut item.assets) {
-            if !matches!(asset.kind, HistoryAssetKind::LocalMedia) {
-                kept.push(asset);
-                continue;
-            }
-            match conversation::FileId::find(&asset.path).and_then(|file| self.package.file(&file))
-            {
-                Some(indexed) => {
-                    let digest = &indexed.digest;
-                    if asset.media_type == conversation::UNKNOWN_MEDIA
-                        && let Some(sniffed) = digest.sniffed
-                    {
-                        asset.media_type = sniffed.to_owned();
-                    }
-                    asset.sha256 = Some(digest.sha256.clone());
-                    asset.size = Some(digest.size);
-                    kept.push(asset);
-                }
-                None => gaps.push(HistoryGap {
-                    code: HistoryGapCode::Missing,
-                    item_id: Some(item.id.clone()),
-                    message: format!("Attachment {} is not in this export", asset.path),
-                }),
-            }
-        }
-        item.assets = kept;
     }
 
     fn asset(
@@ -778,9 +760,9 @@ mod tests {
                 page.items[1].version.as_str(),
             ],
             [
-                "4533b7025b4c69176cbfba5d73f1d68474b851200ee969a1b67298ab433d6c93",
-                "23a8986dea5960b5b49b9dc1d80b6315a4eb534a96b455fd9abca191f2c66926",
-                "6b273e3331333be4d762a3bc73367b4f6b077ddefc2c49bacd8c40ad04b29b78",
+                "b54f3a3b38e2dedfcb4de7e71773a36a40b160bc32547b3cd687c49efcacf35d",
+                "4d51a21777f8a0cb006d2402f64359ca9820472e7cf1a8c3f01906b116537c3b",
+                "3d0789f8a1906fda4cd5aeea867e651c3e63e63a47aa53e3d8e2eb0a61a0bc2f",
             ],
             "A pinned version changed. If the change is meant, bump PACKAGE_FORMAT, THREAD_FORMAT or ITEM_FORMAT and update these values."
         );
@@ -1165,6 +1147,15 @@ mod tests {
         let items = item_versions(&first, &notes).await;
         let other_items = item_versions(&other, &notes).await;
         assert_ne!(items["u2"], other_items["u2"]);
+        let upload = async |history| {
+            let (items, _) = read_all(history, &notes).await;
+            items.into_iter().find(|item| item.id == "u2").unwrap().data
+        };
+        assert_ne!(
+            upload(&first).await,
+            upload(&other).await,
+            "the importer refreshes an item whose evidence is unchanged instead of keeping a new revision"
+        );
         for unchanged in ["u1", "a1"] {
             assert_eq!(items[unchanged], other_items[unchanged], "{unchanged}");
         }
