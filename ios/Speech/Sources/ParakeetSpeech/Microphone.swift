@@ -93,10 +93,10 @@ final class Capture: Sendable {
     input.installTap(onBus: 0, bufferSize: 4_096, format: hardware) { [weak capture] buffer, _ in
       capture?.hear(buffer)
     }
-    capture.observe()
     do {
       engine.prepare()
       try engine.start()
+      capture.observe(engine)
     } catch {
       capture.stop()
       throw error
@@ -181,11 +181,25 @@ final class Capture: Sendable {
     return heard
   }
 
-  private func observe() {
+  /// The engine stops itself when a new input changes the hardware format. A notice while it
+  /// still runs changed nothing it hears, so the take goes on.
+  private func engineChanged() {
+    guard let engine = state.withLockUnchecked({ $0.engine }), !engine.isRunning else { return }
+    halt(interrupted: true)
+  }
+
+  private func observe(_ engine: AVAudioEngine) {
+    let center = NotificationCenter.default
+    var observers = [
+      center.addObserver(
+        forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
+      ) { [weak self] _ in
+        self?.engineChanged()
+      }
+    ]
     #if os(iOS)
-      let center = NotificationCenter.default
       let session = AVAudioSession.sharedInstance()
-      let observers = [
+      observers += [
         center.addObserver(
           forName: AVAudioSession.interruptionNotification, object: session, queue: nil
         ) { [weak self] note in
@@ -208,8 +222,8 @@ final class Capture: Sendable {
           self?.halt(interrupted: true)
         },
       ]
-      state.withLockUnchecked { $0.observers = observers }
     #endif
+    state.withLockUnchecked { $0.observers = observers }
   }
 
   private static func deactivate() {
