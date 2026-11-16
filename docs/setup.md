@@ -484,6 +484,11 @@ check on the base commit and again on the candidate, so each proposal records
 before and after results. See the
 [example check](../examples/dreams/commands-exist.sh).
 
+The `[dreams]` table is validated with the rest of the configuration. An
+invalid table, such as one whose repository does not exist, makes `serve`,
+`jobs check`, `dreams` and every other `beep-boop` command that reads the
+configuration fail until you fix or remove the table.
+
 The policy loader refuses a repository that contains the configuration file, a
 job directory or the state directory. It also refuses a check whose arguments
 name an editable path. The loader follows each argument as the check would see
@@ -554,7 +559,11 @@ A local change is any difference in a touched path or its parent directories:
 content, file type, a deletion, or an executable bit. Apply reads the
 executable bit from the file itself, so it refuses even when `core.fileMode` is
 off. A held index lock means that another Git command is running or that one
-crashed. Remove a stale `index.lock` and apply again.
+crashed. Remove a stale `index.lock` and apply again. Apply inspects the
+target once and then writes. A process that writes to a touched path while
+apply runs can lose that change, and one that takes the Git index lock can
+make apply fail and leave `ORIG_HEAD` behind. Stop other writers to the target
+repository while apply runs.
 
 A successful apply adds one commit with `Dreams-Run`, `Dreams-Base` and
 `Dreams-Patch-Sha256` trailers and fast-forwards the checked-out branch. The
