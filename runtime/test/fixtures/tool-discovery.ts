@@ -10,6 +10,7 @@ import { BackgroundScheduler } from "../../src/background.js";
 import { BrowserStore, createBrowserTools } from "../../src/browser.js";
 import { CoordinatorEnvironment } from "../../src/environment.js";
 import type { AgentNode } from "../../src/generated/AgentNode.js";
+import { createGoalTools, GoalStore } from "../../src/goals.js";
 import type { HostCommand } from "../../src/generated/HostCommand.js";
 import type { HostResult } from "../../src/generated/HostResult.js";
 import type { ModelSelection } from "../../src/generated/ModelSelection.js";
@@ -101,8 +102,10 @@ export async function openDiscoveryApp(directory: string, { models, model, arm, 
   });
   const jobTools = createJobTools(scheduler, executions);
   const attachments = new AttachmentStore(directory);
+  const goals = new GoalStore(session, tasks, environment, async (_task, run) => { await session.abortTask(run, BACKGROUND_CONTEXT); });
   const production = withActorPolicies(createToolsets({ guidance: createGuidance(executions), tools, sourceTools,
     resourceTools: createResourceTools(resources, tasks, executions), browserTools: createBrowserTools(new BrowserStore(session), executions, attachments), jobTools,
+    goalTools: createGoalTools(goals, executions),
   }), { responsePolicy: createMainResponsePolicy(session), inputOrigins: createInputOrigins(session) });
   const discovery = createToolDiscovery();
   const { toolsets, installed } = applyToolSurfaces(production, arm, discovery);

@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { AttachmentStore, AttachmentError, validateInput } from "./attachments.js";
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { createRegistry, Harness, ROOT_CONVERSATION_ID, type Conversation, type Submission } from "@earendil-works/pi-durable";
+import { createRegistry, Harness, ROOT_CONVERSATION_ID, type Conversation, type Submission, type TaskId as NativeTaskId } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { RuntimeRequest } from "./generated/RuntimeRequest.js";
 import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
@@ -24,6 +24,7 @@ import { FeedbackStore } from "./feedback.js";
 import { FeedbackDispatcher } from "./feedback-dispatch.js";
 import { createGuidance } from "./guidance.js";
 import { createAppTools, createJobTools, Executions, HostRequests } from "./tools.js";
+import { createGoalTools, GoalStore } from "./goals.js";
 import { applyToolSurfaces, createToolDiscovery, createToolsets, TOOL_SURFACES, withActorPolicies, type ToolDiscovery, type Toolsets } from "./toolsets.js";
 import { createSourceTools, SourceJournal } from "./sources.js";
 import { createResourceTools, ResourceStore } from "./resources.js";
@@ -133,7 +134,7 @@ function backgroundCall(command: import("./generated/HostCommand.js").HostComman
 
 type Application = TriageApplication & { stopInputDelivery(): void; harness: Harness; tasks: TaskStore; resources: ResourceStore; notifications: Notifications;
   histories: HistoryStore; catalog: ConversationCatalog; attachments: AttachmentStore; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler;
-  telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics; discovery: ToolDiscovery; serviceExecution: ActorExecution };
+  telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics; discovery: ToolDiscovery; serviceExecution: ActorExecution; goals: GoalStore };
 async function openApplication(): Promise<Application> {
   const startup = new StartupDiagnostics(state);
   const storage = await startup.run("storage_open", async () => {
@@ -243,8 +244,10 @@ async function openApplication(): Promise<Application> {
     async runJob(occurrence, signal, actor) { await runScheduled(occurrence, signal, { session: harness, tasks, sources }, actor); },
   });
   const jobTools = createJobTools(background, executions); registry.install(jobTools);
+  const goals = new GoalStore(harness, tasks, environment, (taskId, run) => stopGoalTurn(harness, taskId, run));
+  const goalTools = createGoalTools(goals, executions); registry.install(goalTools);
   const responsePolicy = createMainResponsePolicy(harness); registry.install(responsePolicy);
-  const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools }),
+  const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools, goalTools }),
     { responsePolicy, inputOrigins }), TOOL_SURFACES, discovery);
   for (const extension of installed) registry.install(extension);
   const serviceExecution: ActorExecution = {
@@ -264,7 +267,7 @@ async function openApplication(): Promise<Application> {
   };
   tasks.useActorExecution(serviceExecution);
   if (await notifications.start()) harness.resume();
-  return { ...core, background, toolsets, startup, discovery, serviceExecution };
+  return { ...core, background, toolsets, startup, discovery, serviceExecution, goals };
   }); } catch (error) {
     await harness.close(BACKGROUND_CONTEXT).catch(() => {}); await discovery.close().catch(() => {}); await telemetry.close(); throw error;
   }
@@ -331,14 +334,26 @@ async function triageSources(application: TriageApplication, id: number, command
     notify: (task_id, text) => emit(id, { type: "notice", task_id, text }),
   }), toolsets.triage, signal);
 }
-async function interrupt(id: number): Promise<void> {
+/** Esc stops the conversation. A goal pause names one run, so the conversation keeps its other queued inputs. */
+async function interrupt(id: number, run?: { harness: Harness; task: NativeTaskId }): Promise<void> {
   interrupted.add(id);
   if (interrupts.has(id)) return interrupts.get(id);
   hostRequests.cancelRequest(id);
   const conversation = activeConversations.get(id);
   if (conversation === undefined) return;
-  const operation = (async () => { await conversation.abort(BACKGROUND_CONTEXT); emit(id, { type: "interrupted" }); })();
+  const operation = (async () => {
+    if (run === undefined) await conversation.abort(BACKGROUND_CONTEXT);
+    else await run.harness.abortTask(run.task, BACKGROUND_CONTEXT);
+    emit(id, { type: "interrupted" });
+  })();
   interrupts.set(id, operation); await operation;
+}
+/** An attached worker also gets Esc's host-call cancel and interrupted frame. */
+async function stopGoalTurn(harness: Harness, taskId: string, run: NativeTaskId): Promise<void> {
+  const owner = [...workers].find(([request, worker]) => !ending.has(request) &&
+    worker.command.task_id === taskId && worker.command.agent_id === undefined)?.[0];
+  if (owner !== undefined) await interrupt(owner, { harness, task: run });
+  else await harness.abortTask(run, BACKGROUND_CONTEXT);
 }
 function submitInput(id: number, command: Extract<RuntimeCommand, { type: "submit_input" }>, responseId = id): Promise<void> {
   if (!activeCommands.has(id) || ending.has(id)) {
@@ -535,6 +550,11 @@ async function handle(request: RuntimeRequest): Promise<void> {
           }
         }
         emit(id, { type: "conversation_settings", settings }); break;
+      }
+      case "goal": {
+        const { goals } = await app();
+        emit(id, { type: "goal", status: await goals.handle(command, (operation) => hostRequests.call(id, operation)) });
+        break;
       }
       case "logout":
         await auth.logout();
