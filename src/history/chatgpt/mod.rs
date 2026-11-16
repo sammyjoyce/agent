@@ -608,7 +608,7 @@ impl std::error::Error for PackageError {}
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{collections::HashMap, path::Path};
 
     use base64::{Engine, engine::general_purpose::STANDARD};
     use serde_json::{Value, json};
@@ -1115,6 +1115,63 @@ mod tests {
                 "{flipped}: {error}"
             );
         }
+    }
+
+    async fn thread_versions(history: &ChatGptHistory) -> HashMap<String, String> {
+        let (threads, _) = list(history, false, None).await.unwrap();
+        threads
+            .into_iter()
+            .map(|thread| (thread.id, thread.version))
+            .collect()
+    }
+
+    async fn item_versions(history: &ChatGptHistory, thread: &str) -> HashMap<String, String> {
+        read_all(history, thread)
+            .await
+            .0
+            .into_iter()
+            .map(|item| (item.id, item.version))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn same_size_attachment_with_other_bytes_changes_only_what_references_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let export = |folder: &str, attachment: &[u8]| {
+            let root = directory.path().join(folder);
+            std::fs::create_dir(&root).unwrap();
+            open(
+                &Export::new()
+                    .conversations(&[
+                        Conversation::new(1, "Notes")
+                            .say("u1", "root", "user", "Keep my notes")
+                            .say("a1", "u1", "assistant", "Send them over")
+                            .node("u2", Some("a1"), upload(&[("file_0h01", "notes.txt")]))
+                            .build(),
+                        picnic(2),
+                    ])
+                    .stored("file_0h01-notes.txt", attachment)
+                    .folder(&root),
+            )
+        };
+        let first = export("one", b"First attachment");
+        let other = export("two", b"Other attachment");
+        assert_ne!(first.summary().digest, other.summary().digest);
+        let (threads, other_threads) =
+            (thread_versions(&first).await, thread_versions(&other).await);
+        let (notes, picnic) = (fixture::id(1), fixture::id(2));
+        assert_ne!(threads[&notes], other_threads[&notes]);
+        assert_eq!(threads[&picnic], other_threads[&picnic]);
+        let items = item_versions(&first, &notes).await;
+        let other_items = item_versions(&other, &notes).await;
+        assert_ne!(items["u2"], other_items["u2"]);
+        for unchanged in ["u1", "a1"] {
+            assert_eq!(items[unchanged], other_items[unchanged], "{unchanged}");
+        }
+        assert_eq!(
+            item_versions(&first, &picnic).await,
+            item_versions(&other, &picnic).await
+        );
     }
 
     #[tokio::test]
