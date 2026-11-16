@@ -1206,8 +1206,6 @@ mod tests {
         cold_evidence: usize,
     }
 
-    /// Every list and read response an import requests, and the bytes of every asset its
-    /// items reference.
     async fn serve_everything(history: &ChatGptHistory) -> Served {
         let mut served = Served {
             text: String::new(),

@@ -405,7 +405,6 @@ impl<R: Read> Read for Exact<R> {
 
 const SNIFF_BYTES: usize = 16;
 
-/// The checked bytes of a file-index member, measured while the package is opened.
 pub(super) struct MemberDigest {
     pub sha256: String,
     pub size: u64,

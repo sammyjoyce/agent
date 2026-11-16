@@ -59,7 +59,6 @@ fn export(path: &Path, extra: Option<(&str, &[u8])>) -> PathBuf {
     )
 }
 
-/// A stored attachment with one payload byte flipped and both CRC fields left as written.
 fn damaged_export(path: &Path) -> PathBuf {
     let attachment: &[u8] = b"Invented attachment bytes";
     zip(

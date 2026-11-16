@@ -134,14 +134,12 @@ export function chatGptExports(blob: Uint8Array): { first: ExportMember[]; secon
   };
 }
 
-/** The same export with the photo's bytes changed and its length kept. */
 export function withChangedPhoto(members: readonly ExportMember[]): { members: ExportMember[]; digest: string } {
   const photo = Buffer.from(onePixelPng());
   photo.writeUInt8(photo.readUInt8(photo.length - 1) ^ 0xff, photo.length - 1);
   return { members: members.map((member) => member.name === PNG_FILE.member ? { ...member, bytes: photo } : member), digest: sha256(photo) };
 }
 
-/** A ZIP whose stored photo has one flipped byte while both of its CRC fields still describe the original. */
 export async function writeDamagedExportZip(path: string, members: readonly ExportMember[]): Promise<void> {
   const photo = members.find((member) => member.name === PNG_FILE.member);
   if (photo === undefined) throw new Error("The export has no photo to damage");
