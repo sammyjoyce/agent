@@ -17,8 +17,9 @@ await mkdir(output, { recursive: true });
 const cleanups: ((context: unknown) => Promise<void> | void)[] = [];
 const owner = { after: (cleanup: (context: unknown) => Promise<void> | void) => { cleanups.push(cleanup); } };
 const world = await coordinatorWorld(owner as unknown as TestContext);
-await world.script("Check the build", [{ text: "The build is green." }]);
-await world.script("Rotate the Work logs", [{ text: "The Work logs are rotated." }]);
+// Spare answers let a second generation run and be counted instead of failing the model call.
+await world.script("Check the build", Array.from({ length: 3 }, () => ({ text: "The build is green." })));
+await world.script("Rotate the Work logs", Array.from({ length: 3 }, () => ({ text: "The Work logs are rotated." })));
 
 async function identify(): Promise<string> {
   const socket = createConnection(world.socket);
