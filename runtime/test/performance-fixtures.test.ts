@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -13,6 +13,7 @@ import { createModels } from "@earendil-works/pi-ai";
 import { createRegistry, Harness, type Cursor } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { HistoryStore, ImportedItemEntry } from "../src/history.js";
+import { SearchIndex } from "../src/search.js";
 
 const fixture = (name: string) => fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url));
 
@@ -52,10 +53,20 @@ async function treesWithCandidateShim(directory: string, bridge: string) {
   } };
 }
 
-test("the performance seed stores the chief, 3,000 unrelated discussions and a 5,000-message conversation", () => inTemporaryDirectory(async directory => {
-  const seeded = await run([fixture("performance.js"), directory]);
+type Seeded = { chief: string; long_history: string; search_corpus: { conversations: number; chunks: number } | null;
+  import_corpus: { rollouts: number; items_per_rollout: number } };
+
+async function seed(directory: string, env: Record<string, string> = {}): Promise<Seeded> {
+  const seeded = await run([fixture("performance.js"), directory], env);
   assert.equal(seeded.code, 0, seeded.stderr);
-  const ids = JSON.parse(seeded.stdout) as { chief: string; long_history: string };
+  return JSON.parse(seeded.stdout) as Seeded;
+}
+
+test("the performance seed stores the chief, 3,000 unrelated discussions and a 5,000-message conversation", () => inTemporaryDirectory(async directory => {
+  const ids = await seed(directory);
+  assert.equal(ids.search_corpus, null);
+  const files = (await readdir(directory, { withFileTypes: true })).filter(entry => entry.isFile()).map(entry => entry.name);
+  assert.deepEqual(files.filter(name => !name.startsWith("session.sqlite")), [], "Coordinators copy every top-level file");
   const storage = await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite")));
   const session = await Harness.open(storage, { models: createModels(), registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
   try {
@@ -81,6 +92,55 @@ test("the performance seed stores the chief, 3,000 unrelated discussions and a 5
     assert.equal(imported, 5_000);
     assert.match(JSON.stringify(last), /Stored long conversation is ready/);
   } finally { await session.close(BACKGROUND_CONTEXT); }
+}));
+
+test("the performance seed indexes a copy of the session so search finds the long conversation with nothing left to reindex", () => inTemporaryDirectory(async directory => {
+  const extension = process.env.AGENT_SQLITE_VEC; assert.ok(extension);
+  const ids = await seed(directory, { AGENT_SQLITE_VEC: extension });
+  assert.deepEqual(await readdir(join(directory, "search")), ["search.sqlite"]);
+  const storage = await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite")));
+  const session = await Harness.open(storage, { models: createModels(), registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  const index = new SearchIndex(join(directory, "search", "search.sqlite"), extension);
+  try {
+    let conversations = 0;
+    for await (const { conversation_id, watermark } of new HistoryStore(session).inventory()) {
+      conversations += 1;
+      assert.deepEqual(index.checkpoint(conversation_id), { watermark, dirty: false }, conversation_id);
+    }
+    assert.equal(ids.search_corpus?.conversations, conversations);
+    assert.ok((ids.search_corpus?.chunks ?? 0) >= 5_040);
+    // The benchmark's query in examples/cli_performance/load.rs.
+    const result = await index.search("previous task context remains readable", undefined, [], 8, "keyword");
+    assert.equal(result.candidates[0]?.conversation_id, ids.long_history);
+    assert.deepEqual(result.gaps, []);
+  } finally { await index.close(); await session.close(BACKGROUND_CONTEXT); }
+}));
+
+test("the performance seed writes invented legacy Codex rollouts with unique thread and item ids", () => inTemporaryDirectory(async directory => {
+  const { import_corpus: { rollouts: count, items_per_rollout: perRollout } } = await seed(directory);
+  assert.ok(count > 0 && perRollout > 0);
+  const home = join(directory, "codex"), folder = join(home, "sessions", "2026", "01", "02");
+  assert.equal(await readFile(join(home, "config.toml"), "utf8"), "model_provider = \"openai\"\n");
+  const rollouts = await readdir(folder), threads = new Set<string>(), items = new Set<string>();
+  assert.equal(rollouts.length, count);
+  for (const name of rollouts) {
+    const records = (await readFile(join(folder, name), "utf8")).trimEnd().split("\n")
+      .map(line => JSON.parse(line) as { type: string; payload: Record<string, unknown> });
+    const [meta, ...events] = records;
+    assert.equal(meta?.type, "session_meta");
+    assert.equal(meta?.payload.history_mode, "legacy");
+    const thread = String(meta?.payload.id);
+    assert.ok(name.endsWith(`-${thread}.jsonl`), name);
+    threads.add(thread);
+    const completed = events.filter(event => event.payload.type === "item_completed");
+    assert.equal(completed.length, perRollout);
+    for (const event of completed) {
+      assert.equal(event.payload.thread_id, thread);
+      items.add(String((event.payload.item as { id: string }).id));
+    }
+  }
+  assert.equal(threads.size, count);
+  assert.equal(items.size, count * perRollout);
 }));
 
 test("the runtime shim starts the requested runtime with that runtime's own packages", () => inTemporaryDirectory(async directory => {
