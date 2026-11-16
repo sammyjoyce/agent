@@ -337,6 +337,26 @@ test("only the scheduler changes a Dreams conversation's model: a settings chang
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("a terminal bound to a Dreams task is refused before it claims an actor, so it records no outcome on the Dreams task", { timeout: 20_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-dreams-")), app = await openDreams(directory);
+  try {
+    app.scripted(() => fauxAssistantMessage("Dreams reviewed the night."));
+    await runScheduled(dreamsOccurrence, new AbortController().signal, app); await app.settled();
+    const task = (await app.tasks.list()).find(isDreamsTask); assert.ok(task);
+    const host = await app.environment.defaultHost(await app.environment.hosts("/workspace/example", null, [])); assert.ok(host);
+    await app.tasks.update(task.id, (saved) => { saved.worker = { state: "bound", allocation_id: "example-allocation", host, binding }; });
+    const outcomes = (await app.sources.events({ provider: "task_outcomes", thread_id: task.id })).length;
+    let binds = 0;
+    const terminal = { type: "run_task", task_id: task.id, allocation_id: "example-allocation", binding,
+      instructions: "", model: fixtureModel, cwd: "/workspace/example" } as const;
+    await assert.rejects(app.tasks.run(terminal, () => { binds += 1; return () => {}; }, [app.guidance]), /A confined task runs only its scheduler's input/);
+    assert.equal(binds, 0);
+    assert.equal((await app.sources.events({ provider: "task_outcomes", thread_id: task.id })).length, outcomes,
+      "A refused terminal recorded an outcome on the Dreams task");
+    assert.equal(app.faux.state.callCount, 1);
+  } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
 function importedBatch(id: string): HistoryImportBatch {
   return { host_id: "fixture-source", thread: { id, title: "Example imported conversation", cwd: "/workspace/example", created_at: 1, updated_at: 2,
     version: "v1", version_reliable: true, archived: true, forked_from_id: null, parent_thread_id: null },
