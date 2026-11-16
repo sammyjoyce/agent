@@ -129,6 +129,10 @@ impl Runtime {
         let guard = WriterLock::acquire(state)?;
         let restore_held = crate::backup::restore_held(&guard, state);
         let coordinator_id = CoordinatorId::load_or_mint(state)?;
+        let (diagnostics, started) = Diagnostics::start(state);
+        started
+            .wait()
+            .context("Runtime diagnostics could not record this coordinator's start")?;
         let lock_fd = guard.0.as_raw_fd();
         let mut command = Command::new("node");
         command
@@ -170,7 +174,6 @@ impl Runtime {
         let (shutdown, stopping) = watch::channel(false);
         let (notices, _) = broadcast::channel(64);
         let notifications = notices.clone();
-        let diagnostics = Diagnostics::start(state);
         let service_diagnostics = Mutex::new(diagnostics.fork());
         let (quiescing, _) = watch::channel(false);
         let actor = tokio::spawn(async move {
@@ -1440,8 +1443,7 @@ createInterface({input:process.stdin}).on('line',line=>{
     }
 
     #[tokio::test]
-    async fn unavailable_diagnostics_does_not_block_or_change_runtime_results() {
-        use crate::protocol::{RuntimeCommand, RuntimeEventKind};
+    async fn unavailable_diagnostics_refuse_to_start_the_runtime_and_leave_the_path_alone() {
         use crate::runtime::Runtime;
         let state = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1450,35 +1452,14 @@ createInterface({input:process.stdin}).on('line',line=>{
         )
         .unwrap();
         let script = state.path().join("fixture.mjs");
-        std::fs::write(
-            &script,
-            r#"
-import {createInterface} from 'node:readline';
-createInterface({input:process.stdin}).on('line',line=>{
- const {id}=JSON.parse(line);
- process.stdout.write(JSON.stringify({version:1,id,event:{type:'configured'}})+'\n');
- process.stdout.write(JSON.stringify({version:1,id,event:{type:'done'}})+'\n');
-});
-"#,
-        )
-        .unwrap();
-        let runtime = Runtime::start(&script, state.path()).unwrap();
-        for _ in 0..3 {
-            let mut call = runtime.request(RuntimeCommand::Status).await.unwrap();
-            timeout(Duration::from_secs(3), async {
-                assert!(matches!(
-                    call.events.recv().await,
-                    Some(RuntimeEventKind::Configured)
-                ));
-                assert!(matches!(
-                    call.events.recv().await,
-                    Some(RuntimeEventKind::Done)
-                ));
-            })
-            .await
-            .unwrap();
-        }
-        runtime.close().await.unwrap();
+        std::fs::write(&script, "process.stdin.resume();\n").unwrap();
+        let Err(error) = Runtime::start(&script, state.path()) else {
+            panic!("A runtime whose log cannot record its start must not serve");
+        };
+        assert!(
+            format!("{error:#}").contains("could not record this coordinator's start"),
+            "{error:#}"
+        );
         assert_eq!(
             std::fs::read_to_string(state.path().join("diagnostics")).unwrap(),
             "Preserve existing unrelated file"

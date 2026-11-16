@@ -32,6 +32,7 @@ const MAX_BYTES: u64 = 1024 * 1024;
 pub(crate) const RETENTION_CAP_BYTES: u64 = 128 * MAX_BYTES;
 const CAPACITY: usize = 256;
 pub(crate) const HEARTBEAT: Duration = Duration::from_secs(5 * 60);
+const LOCK_WAIT: Duration = Duration::from_secs(10);
 /// A sender stamps a receipt and then enqueues it without waiting, so two
 /// senders can land a few milliseconds out of order, and a replacement writer
 /// starts with receipts stamped while the retired one drained its queue. Both
@@ -731,6 +732,17 @@ pub(crate) struct Diagnostics {
     sender: mpsc::Sender<Record>,
     drops: SharedDrops,
 }
+
+/// Resolves once the writer has appended `writer_started`, or with the error
+/// that stopped it first. A coordinator admits no work before it resolves.
+#[must_use]
+pub(crate) struct WriterStart(std::sync::mpsc::Receiver<io::Result<()>>);
+impl WriterStart {
+    pub fn wait(self) -> io::Result<()> {
+        self.0.recv().map_err(io::Error::other)?
+    }
+}
+
 impl Diagnostics {
     pub fn fork(&self) -> Self {
         Self {
@@ -738,7 +750,7 @@ impl Diagnostics {
             drops: self.drops.clone(),
         }
     }
-    pub fn start(state: &Path) -> Self {
+    pub fn start(state: &Path) -> (Self, WriterStart) {
         Self::start_with_heartbeat(state, HEARTBEAT)
     }
     fn open_channel(directory: &Path, capacity: usize) -> (Self, mpsc::Receiver<Record>) {
@@ -751,7 +763,7 @@ impl Diagnostics {
         live.push((registry_key(directory), Arc::downgrade(&drops)));
         (Self { sender, drops }, records)
     }
-    fn start_with_heartbeat(state: &Path, interval: Duration) -> Self {
+    fn start_with_heartbeat(state: &Path, interval: Duration) -> (Self, WriterStart) {
         let directory = state.join("diagnostics");
         let (diagnostics, mut records) = Self::open_channel(&directory, CAPACITY);
         // A weak sender lets the writer end when its last real producer does.
@@ -775,10 +787,22 @@ impl Diagnostics {
             }
         });
         let drops = diagnostics.drops.clone();
+        let (started, start) = std::sync::mpsc::sync_channel(1);
         tokio::task::spawn_blocking(move || {
+            let opened = Writer::open(directory, MAX_BYTES).and_then(|mut writer| {
+                writer
+                    .append(&writer_receipt(Event::WriterStarted, 0))
+                    .map(|()| writer)
+            });
+            let mut writer = match opened {
+                Ok(writer) => writer,
+                Err(error) => {
+                    let _ = started.send(Err(error));
+                    return;
+                }
+            };
+            let _ = started.send(Ok(()));
             let result = (|| -> io::Result<()> {
-                let mut writer = Writer::open(directory, MAX_BYTES)?;
-                writer.append(&writer_receipt(Event::WriterStarted, 0))?;
                 while let Some(record) = records.blocking_recv() {
                     append_reported(&mut writer, &drops, &record)?;
                 }
@@ -792,7 +816,7 @@ impl Diagnostics {
                 eprintln!("Runtime diagnostics unavailable; chat continues.");
             }
         });
-        diagnostics
+        (diagnostics, WriterStart(start))
     }
     pub fn record(&mut self, request_id: u32, trace: &Trace, event: Event) {
         let record = Record {
@@ -965,8 +989,10 @@ impl Writer {
             return Err(io::Error::other("Diagnostics directory is unavailable"));
         }
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-        // A retired runtime may still be draining its bounded queue. Only the
-        // background writer waits here; chat admission never waits on this lock.
+        // A retired runtime may still be draining its bounded queue. The
+        // coordinator admits no work until this writer records its start, so
+        // the wait is bounded and a holder that never lets go fails startup.
+        let path = directory.join("writer.lock");
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -974,9 +1000,22 @@ impl Writer {
             .truncate(false)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(directory.join("writer.lock"))?;
+            .open(&path)?;
         lock.set_permissions(fs::Permissions::from_mode(0o600))?;
-        fs2::FileExt::lock_exclusive(&lock)?;
+        let deadline = Instant::now() + LOCK_WAIT;
+        while let Err(error) = fs2::FileExt::try_lock_exclusive(&lock) {
+            if error.kind() != io::ErrorKind::WouldBlock {
+                return Err(error);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::other(format!(
+                    "Another process has held {} for {} seconds",
+                    path.display(),
+                    LOCK_WAIT.as_secs()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let file = Self::file(&directory)?;
         let current = Segment::read(&file, 0)?;
         let mut archives = Vec::new();
@@ -1842,7 +1881,7 @@ mod tests {
     #[tokio::test]
     async fn heartbeats_witness_an_idle_writer_without_keeping_it_alive() {
         let state = tempfile::tempdir().unwrap();
-        let diagnostics =
+        let (diagnostics, _) =
             Diagnostics::start_with_heartbeat(state.path(), std::time::Duration::from_millis(20));
         let directory = state.path().join("diagnostics");
         let heartbeats = || {
@@ -1888,7 +1927,7 @@ mod tests {
             .open(directory.join("writer.lock"))
             .unwrap();
         fs2::FileExt::lock_exclusive(&lock).unwrap();
-        let mut log = Diagnostics::start_with_heartbeat(state, heartbeat);
+        let (mut log, _) = Diagnostics::start_with_heartbeat(state, heartbeat);
         let trace = Trace::new(&RuntimeCommand::Status);
         for id in 1..=records {
             log.record(id, &trace, Event::RequestReceived);

@@ -1059,7 +1059,7 @@ mod tests {
                 .open(directory.join("writer.lock"))
                 .unwrap();
             fs2::FileExt::lock_exclusive(&lock).unwrap();
-            let mut actor = diagnostics::Diagnostics::start(&night.dreams.state);
+            let (mut actor, _) = diagnostics::Diagnostics::start(&night.dreams.state);
             let trace = diagnostics::Trace::unowned();
             for id in 1..=300 {
                 actor.record(id, &trace, diagnostics::Event::RequestReceived);
@@ -1117,7 +1117,7 @@ mod tests {
         ] {
             let night = Night::new();
             night.seed_receipts("");
-            let mut actor = diagnostics::Diagnostics::start(&night.dreams.state);
+            let (mut actor, _) = diagnostics::Diagnostics::start(&night.dreams.state);
             let mut service = actor.fork();
             let sent = 400;
             let written = overflow(
@@ -1151,24 +1151,9 @@ mod tests {
         }
     }
 
-    async fn start_writer_until_ready(night: &Night) -> diagnostics::Diagnostics {
-        let log = night.dreams.state.join("diagnostics/runtime.jsonl");
-        let ready = || {
-            fs::read_to_string(&log)
-                .unwrap()
-                .matches("\"event\":\"ready\"")
-                .count()
-        };
-        let before = ready();
-        let mut writer = diagnostics::Diagnostics::start(&night.dreams.state);
-        writer.record(1, &diagnostics::Trace::unowned(), diagnostics::Event::Ready);
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while ready() == before {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("The writer opens and appends");
+    fn start_writer(night: &Night) -> diagnostics::Diagnostics {
+        let (writer, started) = diagnostics::Diagnostics::start(&night.dreams.state);
+        started.wait().expect("The writer records its start");
         writer
     }
 
@@ -1177,7 +1162,7 @@ mod tests {
         let now = diagnostics::now_ms();
         let killed = Night::new();
         killed.seed_receipts("");
-        let restarted = start_writer_until_ready(&killed).await;
+        let restarted = start_writer(&killed);
         let page = killed.review("night").await.text;
         let quiet = killed.abstain_as_quiet("night").await;
         assert!(
@@ -1192,8 +1177,8 @@ mod tests {
             "{{\"timestamp_ms\":{},\"request_id\":0,\"elapsed_ms\":null,\"event\":\"writer_stopped\"}}\n",
             now - 4 * MINUTE
         ));
-        drop(start_writer_until_ready(&stopped).await);
-        let restarted = start_writer_until_ready(&stopped).await;
+        drop(start_writer(&stopped));
+        let restarted = start_writer(&stopped);
         let page = stopped.review("night").await.text;
         assert!(page.contains("Coverage: complete"), "{page}");
         let quiet = stopped.abstain_as_quiet("night").await;
