@@ -288,7 +288,7 @@ return { found, tabs: opened.response.tabs.map((tab) => tab.id) };`);
     assert.deepEqual(env.commands.flatMap((command) => command.type === "browser" ? [command.request.action.type] : []), ["open", "screenshot", "release"]);
 
     const conversation = await app.tasks.conversation((await ownTask(app)).conversation_id);
-    const rows = (await history(conversation, null, app.session)).flatMap((page) => page.messages)
+    const rows = (await history(conversation, null, new HistoryStore(app.session))).flatMap((page) => page.messages)
       .filter((message) => message.tool?.name === "browser_screenshot");
     const [row, ...others] = rows.filter((message) => message.tool?.status === "finished");
     assert.ok(row !== undefined && others.length === 0, "History holds one finished screenshot row");
