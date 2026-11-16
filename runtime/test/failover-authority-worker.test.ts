@@ -78,10 +78,14 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
       }
       return outcome(await link(coordinator, caller).command(cellCommand(name, caller)));
     };
-    const observed = Object.fromEntries(await Promise.all(Object.keys(cells).map(async (name) => [name, [
-      await answer(undefined, name, tarantula),
-      ...await Promise.all(setups.map((setup) => Promise.all(holders.map((caller) => answer(setup, name, caller))))),
-    ]])));
+    // One operation at a time: wrangler dev's proxy drops connections when every cell's coordinator is set up at once.
+    const observed: Record<string, unknown> = {};
+    for (const name of Object.keys(cells)) {
+      observed[name] = [
+        await answer(undefined, name, tarantula),
+        ...await Promise.all(setups.map((setup) => Promise.all(holders.map((caller) => answer(setup, name, caller))))),
+      ];
+    }
     assert.deepEqual(observed, cells);
   });
 
