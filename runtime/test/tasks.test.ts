@@ -886,6 +886,161 @@ test("replacement confirmation preserves queued work when ownership or native pr
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+const ownedHost: WorkerHost = { ...host, host_id: binding.host_id };
+
+for (const child of [false, true]) for (const lost of ["creation_uncertain", "thrown"] as const) {
+  test(`a started ${child ? "child" : "task"} terminal is adopted from its claim after its ${lost} create reply`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-create-claim-")); let app = await open(directory);
+    try {
+      const task = await app.tasks.create({ title: "Adopt the started worker", outcome: "Run the queued input once", model: fixtureModel });
+      const lose = async (): Promise<HostResult> => {
+        if (lost === "thrown") throw new Error("Lost create reply");
+        return { type: "creation_uncertain", session_id: null };
+      };
+      if (child) {
+        await app.tasks.dispatch(task.id, ownedHost, async () => ({ type: "spawned", binding }));
+        await app.tasks.createAgent(task.id, { id: "review", title: "Review", outcome: "Review the change", input: "Inspect the evidence.", inputId: "queued-input" });
+        await app.tasks.dispatchAgent(task.id, "review", lose);
+      } else {
+        await app.tasks.enqueue(task.id, "Run the queued check", "queued-input");
+        await app.tasks.dispatch(task.id, ownedHost, lose).catch(() => {});
+      }
+      const actorOf = async () => { const saved = await app.tasks.get(task.id); return child ? saved.agents[0] : saved; };
+      const uncertain = (await actorOf())?.worker; assert.ok(uncertain?.state === "uncertain");
+      await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+      const claimed = { ...binding, ...(child ? { window_id: "window:55555555-5555-4555-8555-555555555555", block_id: "block:66666666-6666-4666-8666-666666666666" } : {}),
+        rex_instance_id: "instance:99999999-9999-4999-8999-999999999999" };
+      const inspections: WorkerRef[] = [];
+      app.faux.setResponses([fauxAssistantMessage("The queued input ran")]);
+      const result = await app.tasks.run({ type: "run_task", task_id: task.id, ...(child ? { agent_id: "review" } : {}), allocation_id: uncertain.allocation_id,
+        binding: claimed, instructions: "", cwd: host.cwd, model: fixtureModel }, () => () => {}, [], async (command) => {
+        if (command.type === "resume_worker") return { type: "written" };
+        if (command.type !== "on_node" || command.command.type !== "inspect_worker") throw new Error(`Unexpected ${command.type}`);
+        inspections.push(command.command.binding);
+        return { type: "worker_presence", presence: { state: "present", running: true } };
+      });
+      assert.equal(result.text, "The queued input ran"); assert.equal(app.faux.state.callCount, 1);
+      assert.deepEqual(inspections, [claimed]);
+      const adopted = await actorOf();
+      assert.deepEqual(adopted?.worker, { state: "bound", allocation_id: uncertain.allocation_id, host: uncertain.host, binding: claimed });
+      assert.deepEqual(adopted?.pending, []);
+      const sent: string[] = [];
+      const next = async (command: HostCommand): Promise<HostResult> => {
+        sent.push(command.type);
+        return command.type === "on_node" ? { type: "worker_presence", presence: { state: "present", running: false } } : { type: "written" };
+      };
+      if (child) await app.tasks.dispatchAgent(task.id, "review", next); else await app.tasks.dispatch(task.id, ownedHost, next);
+      assert.deepEqual(sent, child ? ["on_node", "resume_agent_worker"] : ["resume_worker"]);
+    } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  });
+}
+
+test("a lost create's claim is refused unless its allocation, host, session and running pane all match", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-create-claim-refused-")); const app = await open(directory);
+  try {
+    const task = await app.tasks.create({ title: "Keep an unresolved create", outcome: "Run only under its exact allocation", model: fixtureModel });
+    await app.tasks.enqueue(task.id, "Keep this check", "retained-input");
+    await app.tasks.dispatch(task.id, ownedHost, async () => ({ type: "creation_uncertain", session_id: binding.session_id }));
+    const before = await app.tasks.get(task.id); assert.ok(before.worker.state === "uncertain");
+    const allocationId = before.worker.allocation_id;
+    const claim = (allocation: string, candidate: WorkerRef, presence: HostResult | undefined) => app.tasks.run({ type: "run_task", task_id: task.id,
+      allocation_id: allocation, binding: candidate, instructions: "", cwd: host.cwd, model: fixtureModel }, () => () => {}, [],
+      presence === undefined ? undefined : async () => presence);
+    const running: HostResult = { type: "worker_presence", presence: { state: "present", running: true } };
+    for (const [allocation, candidate, presence] of [
+      ["another-allocation", binding, running],
+      [allocationId, { ...binding, host_id: "99999999-9999-4999-8999-999999999999" }, running],
+      [allocationId, { ...binding, session_id: "session:77777777-7777-4777-8777-777777777777" }, running],
+      [allocationId, binding, { type: "worker_presence", presence: { state: "present", running: false } }],
+      [allocationId, binding, { type: "failed", message: "Native inspection unavailable" }],
+      [allocationId, binding, undefined],
+    ] satisfies [string, WorkerRef, HostResult | undefined][]) {
+      await assert.rejects(claim(allocation, candidate, presence), /binding is not confirmed/);
+      const retained = await app.tasks.get(task.id);
+      assert.deepEqual(retained.worker, before.worker); assert.deepEqual(retained.pending, before.pending);
+      assert.equal(app.faux.state.callCount, 0);
+    }
+    app.faux.setResponses([fauxAssistantMessage("The exact claim ran")]);
+    assert.equal((await claim(allocationId, binding, running)).text, "The exact claim ran");
+    assert.deepEqual((await app.tasks.get(task.id)).worker, { state: "bound", allocation_id: allocationId, host: before.worker.host, binding });
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a lost resume receipt is confirmed by its replacement while the old pane stays without its worker", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-resume-restored-")); const app = await open(directory);
+  try {
+    const task = await app.tasks.create({ title: "Retained restored work", outcome: "Finish the original run", model: fixtureModel });
+    const allocated = await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+    assert.ok(allocated.worker.state === "bound");
+    const allocationId = allocated.worker.allocation_id;
+    await app.tasks.enqueue(task.id, "Run the retained check", "original-run");
+    await assert.rejects(app.tasks.dispatch(task.id, host, async () => ({ type: "creation_uncertain", session_id: binding.session_id })), /resume needs reconciliation/);
+    const before = await app.tasks.get(task.id);
+    const replacement = { ...binding, window_id: "window:55555555-5555-4555-8555-555555555555", block_id: "block:66666666-6666-4666-8666-666666666666" };
+    const claim = (original: HostResult) => app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: allocationId,
+      binding: replacement, instructions: "", cwd: host.cwd, model: fixtureModel }, () => () => {}, [], async (command) => {
+      if (command.type !== "on_node" || command.command.type !== "inspect_worker") throw new Error("Only native worker inspection is expected");
+      return command.command.binding.block_id === binding.block_id ? original : { type: "worker_presence", presence: { state: "present", running: true } };
+    });
+    for (const original of [
+      { type: "worker_presence", presence: { state: "pending" } },
+      { type: "worker_presence", presence: { state: "missing_session" } },
+      { type: "failed", message: "Native inspection unavailable" },
+    ] satisfies HostResult[]) {
+      await assert.rejects(claim(original), /binding is not confirmed/);
+      const retained = await app.tasks.get(task.id);
+      assert.deepEqual(retained.worker, before.worker); assert.deepEqual(retained.pending, before.pending);
+    }
+    assert.equal(app.faux.state.callCount, 0);
+    app.faux.setResponses([fauxAssistantMessage("The retained check completed")]);
+    assert.equal((await claim({ type: "worker_presence", presence: { state: "present", running: false } })).text, "The retained check completed");
+    const completed = await app.tasks.get(task.id);
+    assert.deepEqual(completed.worker, { ...before.worker, state: "bound", binding: replacement });
+    assert.deepEqual(completed.pending, []); assert.equal(app.faux.state.callCount, 1);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+for (const child of [false, true]) for (const [label, recorded] of [["an idle", { state: "present", running: false }], ["a missing", { state: "missing_terminal" }]] as const) {
+  test(`an unconfirmed ${child ? "child" : "task"} resume with ${label} recorded pane resumes once under a fresh allocation`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-resume-fenced-")); const app = await open(directory);
+    try {
+      const task = await app.tasks.create({ title: "Resume after restart", outcome: "Continue the retained work", model: fixtureModel });
+      await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+      const childBinding = { ...binding, block_id: "block:55555555-5555-4555-8555-555555555555" };
+      if (child) {
+        await app.tasks.createAgent(task.id, { id: "review", title: "Review", outcome: "Review the change", input: "Inspect the evidence.", inputId: "retained-input" });
+        await app.tasks.dispatchAgent(task.id, "review", async () => ({ type: "spawned", binding: childBinding }));
+      } else await app.tasks.enqueue(task.id, "Continue the retained work", "retained-input");
+      const dispatch = (call: (command: HostCommand) => Promise<HostResult>) => child ? app.tasks.dispatchAgent(task.id, "review", call) : app.tasks.dispatch(task.id, host, call);
+      const actorOf = async () => { const saved = await app.tasks.get(task.id); return child ? saved.agents[0] : saved; };
+      await assert.rejects(dispatch(async (command) => command.type === "on_node"
+        ? { type: "worker_presence", presence: { state: "present", running: false } } : { type: "creation_uncertain", session_id: binding.session_id }));
+      const before = await actorOf(); assert.ok(before?.worker.state === "resume_uncertain");
+      const sent: HostCommand[] = [];
+      await assert.rejects(dispatch(async (command) => { sent.push(command); return { type: "failed", message: "Native inspection unavailable" }; }),
+        /needs reconciliation|still unconfirmed/);
+      assert.deepEqual(sent.map((command) => command.type), ["on_node"]);
+      assert.deepEqual((await actorOf())?.worker, before.worker);
+      const replacement = { ...(child ? childBinding : binding), block_id: "block:66666666-6666-4666-8666-666666666666" };
+      sent.length = 0;
+      await dispatch(async (command) => {
+        sent.push(command);
+        return command.type === "on_node" ? { type: "worker_presence", presence: recorded } : { type: "spawned", binding: replacement };
+      });
+      assert.deepEqual(sent.map((command) => command.type), ["on_node", child ? "resume_agent_worker" : "resume_worker"]);
+      const resume = sent[1]; assert.ok(resume?.type === "resume_worker" || resume?.type === "resume_agent_worker");
+      assert.notEqual(resume.allocation_id, before.worker.allocation_id); assert.deepEqual(resume.binding, before.worker.binding);
+      const resumed = await actorOf();
+      assert.deepEqual(resumed?.worker, { state: "bound", allocation_id: resume.allocation_id, host: before.worker.host, binding: replacement });
+      assert.deepEqual(resumed?.pending, before.pending);
+      await assert.rejects(app.tasks.run({ type: "run_task", task_id: task.id, ...(child ? { agent_id: "review" } : {}), allocation_id: before.worker.allocation_id,
+        binding: { ...replacement, block_id: "block:77777777-7777-4777-8777-777777777777" }, instructions: "", cwd: host.cwd, model: fixtureModel },
+        () => () => {}, [], async () => ({ type: "worker_presence", presence: { state: "present", running: true } })), /binding is not confirmed/);
+      assert.deepEqual((await actorOf())?.worker, resumed?.worker); assert.equal(app.faux.state.callCount, 0);
+    } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  });
+}
+
 test("host replies are correlated to their request and release resources when a request ends", async () => {
   const emitted: { request: number; call: string; command: HostCommand }[] = [];
   const requests = new HostRequests((request, call, command) => emitted.push({ request, call, command }));
