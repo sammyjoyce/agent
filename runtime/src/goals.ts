@@ -287,10 +287,10 @@ export class GoalStore implements GoalPolicy {
     return { type: "allowed", evidence: `Goal verified by the runtime. ${describe(proof.check)} (verification entry ${entry.id}, sha256 ${proof.observed.sha256})` };
   }
 
-  async stopped(taskId: string, inputId: string): Promise<boolean> {
+  async stopped(taskId: string, id: string): Promise<boolean> {
     const goal = (await this.session.snapshot(GoalDoc, taskId, BACKGROUND_CONTEXT))?.goal ?? null;
-    if (goal === null || !inputId.startsWith(inputPrefix(goal))) return false;
-    return goal.state.state === "paused" || !inputId.startsWith(`${inputPrefix(goal)}${goal.activation.number}:`);
+    if (goal === null || !id.startsWith(inputPrefix(goal))) return false;
+    return goal.state.state === "paused" || fromEarlierActivation(goal, id);
   }
 
   async complete(origin: { conversation_id: string; call_id: string; native_task_id: NativeTaskId },
@@ -375,7 +375,10 @@ function remember(requests: string[], request: string): void {
 }
 
 function inputPrefix(goal: Goal): string { return `goal:${goal.id}:`; }
-function inputId(goal: Goal, sequence: number): string { return `${inputPrefix(goal)}${goal.activation.number}:${sequence}`; }
+function activationPrefix(goal: Goal): string { return `${inputPrefix(goal)}${goal.activation.number}:`; }
+function inputId(goal: Goal, sequence: number): string { return `${activationPrefix(goal)}${sequence}`; }
+/** A resume can land before the actor sees its stopped input, so that input belongs to an earlier activation. */
+function fromEarlierActivation(goal: Goal, id: string): boolean { return id.startsWith(inputPrefix(goal)) && !id.startsWith(activationPrefix(goal)); }
 function pauseIn(goal: Goal, reason: GoalPause): undefined {
   goal.state = { state: "paused", reason }; goal.updated_at = Date.now(); return undefined;
 }
