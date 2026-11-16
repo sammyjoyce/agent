@@ -211,11 +211,31 @@ async fn classify(
     Ok(ProposalStatus::Pending { half_applied })
 }
 
-fn visible(text: &str) -> String {
+/// Characters that change how a terminal lays text out without showing as
+/// text: bidirectional overrides and isolates, zero-width characters, line and
+/// paragraph separators, and the tag block. A reviewer approves what they
+/// read, so these must not make the display differ from the bytes.
+fn is_format_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{00ad}'
+            | '\u{061c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{e0000}'..='\u{e007f}'
+    )
+}
+
+/// Shows control and format characters as escapes. Newlines and tabs stay.
+fn escape_terminal_controls(text: &str) -> String {
     text.chars()
         .flat_map(|character| match character {
             '\n' | '\t' => vec![character],
-            other if other.is_control() || matches!(other, '\u{2028}' | '\u{2029}') => {
+            other if other.is_control() || is_format_control(other) => {
                 other.escape_unicode().collect()
             }
             other => vec![other],
@@ -224,7 +244,7 @@ fn visible(text: &str) -> String {
 }
 
 fn quoted(text: &str) -> String {
-    visible(text)
+    escape_terminal_controls(text)
         .lines()
         .map(|line| format!("  > {line}\n"))
         .collect()
@@ -302,7 +322,7 @@ fn render(report: &RunReport) -> String {
     let mut text = format!(
         "Run         {} (request {})\nWindow      {} to {} ({hours}h)\nReceipts    {}, {}\n",
         report.run,
-        visible(&review.request_id),
+        escape_terminal_controls(&review.request_id),
         format_utc(coverage.window.start_ms),
         format_utc(coverage.window.end_ms),
         coverage_word(review),
@@ -331,7 +351,9 @@ fn render(report: &RunReport) -> String {
     for finding in &review.findings {
         text += &format!(
             "Finding     {} x{} {}\n",
-            finding.kind, finding.count, finding.detail
+            finding.kind,
+            finding.count,
+            escape_terminal_controls(&finding.detail)
         );
     }
     match report.outcome {
@@ -377,7 +399,7 @@ fn render(report: &RunReport) -> String {
             text += "Rationale (model-written, untrusted):\n";
             text += &quoted(proposal.rationale.as_str());
             text += "--- patch ---\n";
-            text += &visible(report.patch.unwrap_or_default());
+            text += &escape_terminal_controls(report.patch.unwrap_or_default());
             text += "--- end of patch ---\n";
             if let Some(command) = &report.apply {
                 text += &format!("Approve this exact review and apply it once:\n  {command}\n");
@@ -672,7 +694,8 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::dreams_cli::{
-        ProposalStatus, RunReport, apply, apply_command, classify, render, touched_paths, visible,
+        ProposalStatus, RunReport, apply, apply_command, classify, escape_terminal_controls,
+        render, touched_paths,
     };
 
     fn git(repository: &Path, arguments: &[&str]) -> String {
@@ -853,8 +876,12 @@ mod tests {
 
     #[test]
     fn terminal_control_sequences_in_reviewed_text_are_shown_not_obeyed() {
-        let shown = visible("+safe\u{1b}[2K\r+hidden\n\tkept");
+        let shown = escape_terminal_controls("+safe\u{1b}[2K\r+hidden\n\tkept");
         assert!(!shown.contains('\u{1b}') && !shown.contains('\r'));
         assert!(shown.contains("\\u{1b}[2K\\u{d}+hidden\n\tkept"));
+        assert_eq!(
+            escape_terminal_controls("a\u{202e}b\u{200b}c\u{2066}d\u{feff}e\u{2029}f\u{e0041}g"),
+            "a\\u{202e}b\\u{200b}c\\u{2066}d\\u{feff}e\\u{2029}f\\u{e0041}g"
+        );
     }
 }
