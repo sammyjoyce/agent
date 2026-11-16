@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { defineDocFamily, ROOT_CONVERSATION_ID, type Cursor, type EntryRecord } from "@earendil-works/pi-durable";
+import { CodemodeStoreDoc } from "@earendil-works/pi-durable/codemode";
 import type { Goal } from "../../src/generated/Goal.js";
 import { ResourceStore } from "../../src/resources.js";
 import { openStateStorage } from "./state-storage.js";
@@ -32,22 +33,22 @@ try {
     }
     return null;
   };
-  const receipts: unknown[] = [], conversations: unknown[] = [];
+  const tool_results: unknown[] = [], conversations: unknown[] = [], codemode_stores: unknown[] = [];
   for (const { id } of await app.database.all<{ id: number }>("SELECT id FROM conversations ORDER BY id")) {
-    const calls = new Map<string, { args: unknown; at: number }>(), listed: unknown[] = [];
+    const issued = new Map<string, number>(), listed: unknown[] = [];
     for (const entry of await entries(String(id))) {
       listed.push({ id: entry.id, kind: entry.kind, user: entry.model?.some((message) => message.role === "user") ?? false,
         data: entry.kind === "agent.notice_context" ? cited(entry) : entry.kind.startsWith("agent.") ? entry.data ?? null : null });
       for (const message of entry.model ?? []) {
-        if (message.role === "assistant") for (const part of message.content) if (part.type === "toolCall") calls.set(part.id, { args: part.arguments, at: message.timestamp });
+        if (message.role === "assistant") for (const part of message.content) if (part.type === "toolCall") issued.set(part.id, entry.id);
         if (message.role !== "toolResult") continue;
-        const details: unknown = message.details, call = calls.get(message.toolCallId);
-        receipts.push({ conversation_id: String(id), entry_id: entry.id, tool: message.toolName, error: message.isError,
-          args: call?.args ?? null, called_at: call?.at ?? null, finished_at: message.timestamp,
-          nested: typeof details === "object" && details !== null && "calls" in details && Array.isArray(details.calls) ? details.calls : [] });
+        tool_results.push({ conversation_id: String(id), entry_id: entry.id, call_entry_id: issued.get(message.toolCallId) ?? null, tool: message.toolName,
+          text: message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n") });
       }
     }
     conversations.push({ id: String(id), entries: listed });
+    const saved = await app.session.snapshot(CodemodeStoreDoc, (await app.tasks.conversation(String(id))).id, BACKGROUND_CONTEXT);
+    if (saved !== undefined) codemode_stores.push({ conversation_id: String(id), values: saved.values });
   }
   const kinds = await app.database.all<{ kind: string }>("SELECT DISTINCT kind FROM documents ORDER BY kind");
   const goals: unknown[] = [];
@@ -62,7 +63,7 @@ try {
     sources: await app.sources.states(),
     resources: await new ResourceStore(app.session, app.tasks).list(),
     root: ROOT_CONVERSATION_ID.toString(),
-    conversations, receipts, goals,
+    conversations, tool_results, codemode_stores, goals,
     documents: kinds.map(({ kind }): unknown => JSON.parse(kind)),
   }));
 } finally { await app.session.close(BACKGROUND_CONTEXT); }
