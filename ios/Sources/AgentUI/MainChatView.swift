@@ -287,10 +287,13 @@ public struct MainChatView: View {
         guard let request else { return }
         settings = false
         sourceDetails = false
-        followsLatest = true
-        alertNotice = request.notice
-        pendingAlertLatest = model.connection == .connected ? nil : model.scope
-        historyRequest = .latest(UUID(), scope: model.scope)
+        switch request.destination {
+        case .feed(let notice):
+          followsLatest = true
+          alertNotice = notice
+          pendingAlertLatest = model.connection == .connected ? nil : model.scope
+          historyRequest = .latest(UUID(), scope: model.scope)
+        }
       }
     }
     .preferredColorScheme(appearance.colorScheme)
@@ -554,10 +557,9 @@ public struct MainChatView: View {
         }
       }
       .onChange(of: notifications?.openRequest, initial: true) { _, request in
-        if request != nil {
-          followsLatest = true
-          scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
-        }
+        guard case .feed? = request?.destination else { return }
+        followsLatest = true
+        scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
       }
       .overlay(alignment: .bottomTrailing) {
         if (!latestVisible || !model.includesLatest) && !model.rows.isEmpty {

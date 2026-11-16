@@ -14,9 +14,16 @@ enum AlertOrigin: Equatable {
   case malformed
 }
 
+/// Where an open request leaves the app.
+enum OpenDestination: Hashable {
+  /// The feed, in whatever scope `Coordinators.show(opening:)` left it, with a notice when the
+  /// alert named no saved coordinator.
+  case feed(notice: String?)
+}
+
 struct OpenRequest: Equatable {
   let id = UUID()
-  let notice: String?
+  let destination: OpenDestination
 }
 
 public enum MainVisibility: Equatable {
@@ -74,7 +81,7 @@ public final class AppNotifications: NSObject {
   }
 
   func open(_ origin: AlertOrigin) {
-    openRequest = OpenRequest(notice: coordinators.show(opening: origin))
+    openRequest = OpenRequest(destination: .feed(notice: coordinators.show(opening: origin)))
   }
 
   func presents(_ origin: AlertOrigin?) -> Bool {
