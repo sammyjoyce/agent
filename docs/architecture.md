@@ -762,10 +762,12 @@ authentication, and is separate from the deterministic CI suite.
 production coordinator. Invented mail comes from a fake `switchboard` command
 through the real Gmail adapter, background polling and source triage, into
 Pi SQLite. A standing job's task waits on a supplier thread, and its
-background worker runs on a disposable host. The action is a local ledger
-command. A reply must reach that task, resume its worker, book once, and
-resolve only after a ledger readback. The other cases cover an unrelated
-newsletter, a reply the user already handled, a lookalike sender who tells
+background worker runs on a disposable host. A decoy standing job waits on
+another supplier's delivery date in the same mailbox, so a reply has a wrong
+task it could reach. The action is a local ledger command. A reply must reach
+the right task, resume its worker, book once, and resolve only after a ledger
+readback. The decoy must keep its state and inputs, and no ledger call may name
+its order. The other cases cover an unrelated newsletter, a reply the user already handled, a lookalike sender who tells
 assistants to change other bookings, repeated deliveries of one message, and a
 mail helper that fails before it recovers. One case kills the runtime after
 routing and before the action, reopens the same state and replays the message.
