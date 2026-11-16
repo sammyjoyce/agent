@@ -790,6 +790,7 @@ setInterval(()=>{},1000);
                 &script,
                 state.path(),
                 Some(&apns),
+                crate::runtime::StartRecord::BestEffort,
             )
             .unwrap();
             let reported = state.path().join("apns");
