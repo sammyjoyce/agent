@@ -1,5 +1,6 @@
 import { appendFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { AUTHORITY_UNREACHABLE_EXIT } from "../../../src/generated/authority-unreachable-exit.js";
 import type { FailoverReport } from "../../../src/generated/FailoverReport.js";
 import type { FailoverRequest } from "../../../src/generated/FailoverRequest.js";
 
@@ -19,5 +20,5 @@ const answer = answers[request.op] ?? "fail";
 appendFileSync(join(home, "failover-runs.ndjson"), JSON.stringify({ request, session: JSON.parse(session), answer }) + "\n");
 if (answer === "fail") {
   process.stderr.write("The invented authority is unreachable.\n");
-  process.exitCode = 1;
+  process.exitCode = AUTHORITY_UNREACHABLE_EXIT;
 } else process.stdout.write(JSON.stringify(answer) + "\n");
