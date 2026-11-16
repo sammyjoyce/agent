@@ -1,10 +1,61 @@
 use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    cell::Cell,
     io::{Cursor, Write},
     path::{Path, PathBuf},
 };
 
 use serde_json::{Value, json};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+
+/// Counts heap bytes per thread so a test can bound what one call retains.
+struct Tracked;
+
+thread_local! {
+    static HEAP: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+}
+
+fn track(grow: usize, shrink: usize) {
+    let _ = HEAP.try_with(|heap| {
+        if let Some((live, peak)) = heap.get() {
+            let live = (live + grow).saturating_sub(shrink);
+            heap.set(Some((live, peak.max(live))));
+        }
+    });
+}
+
+unsafe impl GlobalAlloc for Tracked {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        track(layout.size(), 0);
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        track(0, layout.size());
+        unsafe { System.dealloc(pointer, layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        track(layout.size(), 0);
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        track(size, layout.size());
+        unsafe { System.realloc(pointer, layout, size) }
+    }
+}
+
+#[global_allocator]
+static TRACKED: Tracked = Tracked;
+
+/// The most heap this thread held at once while `run` ran, above what it held before.
+pub(super) fn peak_heap<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    HEAP.with(|heap| heap.set(Some((0, 0))));
+    let output = run();
+    let peak = HEAP.with(|heap| heap.take()).map_or(0, |(_, peak)| peak);
+    (output, peak)
+}
 
 pub(super) const PNG: &[u8] = &[
     0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,

@@ -36,13 +36,14 @@ pub(super) fn split_conversations<E>(
         Some(b'[') => scanner.array(maximum_element, element)?,
         Some(b'{') => {
             let start = scanner.offset - 1;
-            let mut bytes = vec![b'{'];
+            let mut retained = Retained::new(maximum_element);
+            retained.keep(b'{');
             let mut lexer = Lexer {
                 depth: 1,
                 string: false,
                 escaped: false,
             };
-            let key = scanner.first_key(&mut lexer, &mut bytes)?;
+            let key = scanner.first_key(&mut lexer, &mut retained)?;
             if key.as_deref() == Some("conversations") {
                 if scanner.next_significant()? != Some(b':')
                     || scanner.next_significant()? != Some(b'[')
@@ -50,10 +51,10 @@ pub(super) fn split_conversations<E>(
                     return Err(Split::Shape(SplitError::NotJson));
                 }
                 scanner.array(maximum_element, element)?;
-                scanner.finish(&mut lexer, &mut Vec::new(), 0)?;
+                scanner.finish(&mut lexer, &mut Retained::new(0))?;
             } else {
-                let oversized = scanner.finish(&mut lexer, &mut bytes, maximum_element)?;
-                let reported = if oversized {
+                scanner.finish(&mut lexer, &mut retained)?;
+                let reported = if retained.oversized {
                     element(Element::Oversized {
                         offset: start,
                         len: scanner.offset - start,
@@ -61,7 +62,7 @@ pub(super) fn split_conversations<E>(
                 } else {
                     element(Element::Value {
                         offset: start,
-                        bytes: &bytes,
+                        bytes: &retained.bytes,
                     })
                 };
                 reported.map_err(Split::Element)?;
@@ -124,15 +125,31 @@ impl Lexer {
     }
 }
 
-fn keep(bytes: &mut Vec<u8>, byte: u8, maximum: usize, oversized: &mut bool) {
-    if *oversized {
-        return;
+struct Retained {
+    bytes: Vec<u8>,
+    maximum: usize,
+    oversized: bool,
+}
+
+impl Retained {
+    fn new(maximum: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            maximum,
+            oversized: false,
+        }
     }
-    if bytes.len() >= maximum {
-        *oversized = true;
-        *bytes = Vec::new();
-    } else {
-        bytes.push(byte);
+
+    fn keep(&mut self, byte: u8) {
+        if self.oversized {
+            return;
+        }
+        if self.bytes.len() >= self.maximum {
+            self.oversized = true;
+            self.bytes = Vec::new();
+        } else {
+            self.bytes.push(byte);
+        }
     }
 }
 
@@ -186,8 +203,8 @@ impl<R: Read> Scanner<R> {
             }
             first = false;
             let start = self.offset - 1;
-            let mut bytes = vec![byte];
-            let mut oversized = false;
+            let mut retained = Retained::new(maximum);
+            retained.keep(byte);
             let mut lexer = Lexer {
                 depth: 0,
                 string: false,
@@ -200,20 +217,21 @@ impl<R: Read> Scanner<R> {
                     break byte;
                 }
                 lexer.step(byte)?;
-                keep(&mut bytes, byte, maximum, &mut oversized);
+                retained.keep(byte);
             };
-            let reported = if oversized {
+            let reported = if retained.oversized {
                 element(Element::Oversized {
                     offset: start,
                     len: self.offset - 1 - start,
                 })
             } else {
+                let bytes = &mut retained.bytes;
                 while bytes.last().is_some_and(u8::is_ascii_whitespace) {
                     bytes.pop();
                 }
                 element(Element::Value {
                     offset: start,
-                    bytes: &bytes,
+                    bytes,
                 })
             };
             reported.map_err(Split::Element)?;
@@ -226,14 +244,14 @@ impl<R: Read> Scanner<R> {
     fn first_key(
         &mut self,
         lexer: &mut Lexer,
-        bytes: &mut Vec<u8>,
+        retained: &mut Retained,
     ) -> Result<Option<String>, SplitError> {
         let mut byte = self.required()?;
         while byte.is_ascii_whitespace() {
-            bytes.push(byte);
+            retained.keep(byte);
             byte = self.required()?;
         }
-        bytes.push(byte);
+        retained.keep(byte);
         lexer.step(byte)?;
         if byte != b'"' {
             return Ok(None);
@@ -241,7 +259,7 @@ impl<R: Read> Scanner<R> {
         let mut key = Vec::new();
         while lexer.string {
             let byte = self.required()?;
-            bytes.push(byte);
+            retained.keep(byte);
             lexer.step(byte)?;
             if lexer.string && key.len() <= 64 {
                 key.push(byte);
@@ -250,19 +268,13 @@ impl<R: Read> Scanner<R> {
         Ok(String::from_utf8(key).ok())
     }
 
-    fn finish(
-        &mut self,
-        lexer: &mut Lexer,
-        bytes: &mut Vec<u8>,
-        maximum: usize,
-    ) -> Result<bool, SplitError> {
-        let mut oversized = bytes.len() > maximum;
+    fn finish(&mut self, lexer: &mut Lexer, retained: &mut Retained) -> Result<(), SplitError> {
         while lexer.depth > 0 {
             let byte = self.required()?;
             lexer.step(byte)?;
-            keep(bytes, byte, maximum, &mut oversized);
+            retained.keep(byte);
         }
-        Ok(oversized)
+        Ok(())
     }
 }
 
@@ -389,10 +401,15 @@ fn write_canonical(value: &Value, output: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::chatgpt::fixture;
 
     fn split(input: &str, maximum: usize) -> Result<Vec<String>, ()> {
+        split_from(&mut input.as_bytes(), maximum)
+    }
+
+    fn split_from(input: &mut dyn Read, maximum: usize) -> Result<Vec<String>, ()> {
         let mut found = Vec::new();
-        let result = split_conversations::<()>(&mut input.as_bytes(), maximum, &mut |element| {
+        let result = split_conversations::<()>(input, maximum, &mut |element| {
             found.push(match element {
                 Element::Value { offset, bytes } => {
                     format!("{offset}:{}", String::from_utf8_lossy(bytes))
@@ -423,6 +440,33 @@ mod tests {
         assert!(split(r#"[{"a":1}"#, 100).is_err());
         assert!(split(r#"[1] 2"#, 100).is_err());
         assert!(split("nonsense", 100).is_err());
+    }
+
+    #[test]
+    fn a_long_first_key_or_whitespace_run_retains_at_most_the_element_limit() {
+        let run = 8 << 20;
+        let tail = br#""conversations": [{"id":"1"}]}"#;
+        let mut wrapped = b"{".chain(io::repeat(b' ').take(run)).chain(&tail[..]);
+        let mut bare = br#"{""#.chain(io::repeat(b'k').take(run)).chain(&br#"":1}"#[..]);
+        let element = 1 + run + tail.iter().position(|byte| *byte == b'{').unwrap() as u64;
+        let retained: Vec<(String, usize)> = [
+            (
+                &mut wrapped as &mut dyn Read,
+                format!(r#"{element}:{{"id":"1"}}"#),
+            ),
+            (&mut bare, format!("0:oversized {}", run + 6)),
+        ]
+        .into_iter()
+        .map(|(input, expected)| {
+            let (found, peak) = fixture::peak_heap(|| split_from(input, 1024));
+            assert_eq!(found.unwrap(), [expected.as_str()]);
+            (expected, peak)
+        })
+        .collect();
+        assert!(
+            retained.iter().all(|(_, peak)| *peak < 1 << 20),
+            "{retained:?}"
+        );
     }
 
     #[test]
