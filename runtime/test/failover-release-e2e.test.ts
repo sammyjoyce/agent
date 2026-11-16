@@ -5,6 +5,7 @@ import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { OWNER_FENCED_EXIT } from "../src/generated/owner-fenced-exit.js";
 import type { ModelStep } from "./fixtures/coordinator-runtime.js";
+import { pidsMatching } from "./fixtures/coordinator-world.js";
 import { failoverWorld, type FailoverWorld } from "./fixtures/failover-world.js";
 
 const exists = (path: string) => stat(path).then(() => true, () => false);
@@ -15,6 +16,16 @@ function groupAlive(group: number): boolean {
 
 const HELD_WRITE = "const fs=require('node:fs');const [started,latch]=process.argv.slice(1);fs.writeFileSync(started,String(process.pid));"
   + "(async()=>{while(!fs.existsSync(latch))await new Promise(r=>setTimeout(r,20));fs.writeFileSync(started+'.finished','written')})()";
+
+/**
+ * A local command whose output pipe stays open after its process group is killed, because a process it started left
+ * the group and holds the pipe for `seconds`. The coordinator that cancels it waits for that output before its drain ends.
+ */
+const SLOW_DRAIN = "const fs=require('node:fs'),cp=require('node:child_process');const [started,seconds]=process.argv.slice(1);"
+  + "const holder=cp.spawn(process.execPath,['-e','setTimeout(()=>{},'+seconds+'*1000)'],{detached:true,stdio:['ignore','inherit','inherit']});"
+  + "fs.writeFileSync(started,String(holder.pid));setInterval(()=>{},1000)";
+
+const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
 /** One local command on the owner's own machine that has started and makes its write only once the latch file exists. */
 interface LocalEffect {
@@ -61,6 +72,33 @@ test("lock_held is posted only when no process of the old owner is alive on its 
     await delay(300);
     assert.equal(await effect.finished(), false, "the command never made its write");
     assert.deepEqual((await world.promote({ replaceEpoch: 2 })).evidence, { kind: "lock_held" });
+  });
+
+  await t.test("a release started while the old owner still drains a local command after its Pi child exited is refused by the writer lock", async (t) => {
+    const world = await failoverWorld(t), { owner } = world, started = join(world.directory, "slow-drain.started");
+    await world.enroll();
+    const serving = await world.serve(owner);
+    await world.join();
+    await world.script("fixture-slow-drain", [{ tool: "exec", args: { host: owner.nodeId, program: process.execPath, timeout_seconds: 120, args: ["-e", SLOW_DRAIN, started, "8"] } },
+      { text: "The local command ended." }]);
+    world.sending(owner, "fixture-slow-drain");
+    await world.until(() => exists(started), "The local command must start on the owner's machine");
+    const holder = Number(await readFile(started, "utf8"));
+    t.after(() => { try { process.kill(holder, "SIGKILL"); } catch { /* It already ended. */ } });
+    const supervisor = serving.child.pid;
+    const children = (await pidsMatching(owner.state)).filter((pid) => pid !== supervisor);
+    assert.ok(children.length >= 1, "the coordinator has a Pi child");
+
+    const promoting = world.promoting({ replaceEpoch: 2, wait: 60 });
+    await world.until(async () => !children.some(alive), "The fenced Pi child must exit");
+    assert.equal(serving.child.exitCode, null, "the supervisor is still draining the local command");
+    const refused = world.launch(owner, ["failover", "release"], "");
+    assert.notEqual(await refused.exited, 0);
+    assert.match(refused.errors(), /Another agent process owns this state directory/);
+
+    assert.equal(await serving.exited, OWNER_FENCED_EXIT, serving.errors().slice(-2000));
+    assert.equal(await promoting.exited, 0, promoting.errors());
+    assert.deepEqual((JSON.parse(promoting.output()) as { evidence: unknown }).evidence, { kind: "released" }, "the old owner posted its own evidence after its drain");
   });
 
   await t.test("a survivor that release may not stop: release names it and posts nothing, the restarted sealed holder exits 75 and posts nothing, and release succeeds after it ends", async (t) => {

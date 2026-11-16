@@ -4,7 +4,7 @@ use std::{
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::Path,
     process::Stdio,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -110,6 +110,10 @@ pub struct Runtime {
     coordinator_id: CoordinatorId,
     owner_epoch: Option<crate::failover::OwnerEpoch>,
     restore_held: bool,
+    /// Shared with the actor. The state directory stays locked until the
+    /// service that owns this value has drained its effects and dropped it,
+    /// and until Pi is reaped, whichever is later.
+    _claim: Arc<OwnerClaim>,
 }
 
 enum CommandMessage {
@@ -229,6 +233,8 @@ impl Runtime {
         let notifications = notices.clone();
         let service_diagnostics = Mutex::new(diagnostics.fork());
         let (quiescing, _) = watch::channel(false);
+        let claim = Arc::new(claim);
+        let held = claim.clone();
         let actor = tokio::spawn(async move {
             let result = run_actor(
                 child,
@@ -257,6 +263,7 @@ impl Runtime {
             coordinator_id,
             owner_epoch,
             restore_held,
+            _claim: held,
         })
     }
 
@@ -518,7 +525,7 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
     mut stdin: ChildStdin,
     output: R,
     control: ActorControl,
-    _owner: OwnerClaim,
+    _owner: Arc<OwnerClaim>,
     notices: broadcast::Sender<RuntimeNotice>,
     mut diagnostics: Diagnostics,
 ) -> Result<()> {
