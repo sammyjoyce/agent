@@ -57,7 +57,15 @@ export async function runScheduled(occurrence: ScheduledOccurrence, signal: Abor
   const aborted = () => wake?.(); signal.addEventListener("abort", aborted);
   try {
     const previousOutcome = (await sources.events({ provider: "task_outcomes", thread_id: id, limit: 1 }))[0]?.key;
-    void tasks.runBackground(id).catch((error: unknown) => { failure = error; }).finally(() => { revision += 1; wake?.(); });
+    const start = await tasks.ensureActor({ task_id: id });
+    switch (start.state) {
+      case "started": case "running":
+        void start.exit.then(() => {}, (error: unknown) => { failure = error; }).finally(() => { revision += 1; wake?.(); });
+        break;
+      case "idle": break;
+      case "unplaced": case "host_offline": case "unavailable": throw new TaskError(start.reason);
+      default: { const unknown: never = start; throw new TaskError(`Unknown actor start ${JSON.stringify(unknown)}`); }
+    }
     for (;;) {
       if (signal.aborted) throw new TaskError("Scheduled work stopped with the coordinator; its admission is retained");
       const observed = revision;

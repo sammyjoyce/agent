@@ -262,7 +262,7 @@ async function openApplication(): Promise<Application> {
       call: (operation) => backgroundCall(environment.route(operation, host), scope()),
     }),
   };
-  tasks.useBackgroundExecution(serviceExecution);
+  tasks.useActorExecution(serviceExecution);
   if (await notifications.start()) harness.resume();
   return { ...core, background, toolsets, startup, discovery, serviceExecution };
   }); } catch (error) {
@@ -447,13 +447,13 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const stopped = new Promise<void>((resolve) => { stopBackground = resolve; });
         try {
           const application = await app();
-          await application.tasks.resumeBackground();
+          await application.tasks.resumeActors();
           await application.background.start(command.settings);
           admissions.delete(id);
           await stopped;
         } finally {
           backgroundAvailable = false;
-          void (await app()).tasks.detachBackground();
+          void (await app()).tasks.detachActors();
           backgroundOwner = undefined; stopBackground = undefined;
         }
         break;
@@ -474,8 +474,14 @@ async function handle(request: RuntimeRequest): Promise<void> {
         await application.startup.run("node_registration", () => application.environment.register(command.node));
         emit(id, { type: "node_registered", host_id: command.node.host_id }); break;
       }
-      case "set_connected_nodes":
-        (await app()).environment.setConnected(command.host_ids); emit(id, { type: "configured" }); break;
+      case "set_connected_nodes": {
+        const { environment, tasks } = await app();
+        const arrived = new Set(command.host_ids.filter((hostId) => !environment.isConnected(hostId)));
+        environment.setConnected(command.host_ids); emit(id, { type: "configured" });
+        // Work kept for an offline host runs when that host connects. This request does not wait for it.
+        if (arrived.size > 0) void tasks.resumeActors(arrived).catch(() => {});
+        break;
+      }
       case "environment": emit(id, await (await app()).environment.environment(command.telemetry ? (operation) => hostRequests.call(id, operation) : undefined)); break;
       case "login": {
         try {
@@ -1001,7 +1007,7 @@ try {
     pending.add(operation);
   }
   const opened = application === undefined ? undefined : await application.catch(() => undefined);
-  if (opened !== undefined) void opened.tasks.detachBackground();
+  if (opened !== undefined) void opened.tasks.detachActors();
   if (backgroundOwner !== undefined) hostRequests.finish(backgroundOwner);
   stopBackground?.();
   conversationViews.close();
@@ -1014,9 +1020,9 @@ try {
     if (opened !== undefined) {
       opened.notifications.close(); opened.stopInputDelivery();
       try {
-        void opened.tasks.detachBackground();
+        void opened.tasks.detachActors();
         await opened.harness.close(BACKGROUND_CONTEXT);
-        await opened.tasks.detachBackground();
+        await opened.tasks.detachActors();
         await opened.discovery.close();
         await opened.retrieval.close();
       }

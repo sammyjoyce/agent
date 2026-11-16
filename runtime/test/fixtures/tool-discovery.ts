@@ -107,12 +107,12 @@ export async function openDiscoveryApp(directory: string, { models, model, arm, 
   for (const extension of new Set([...Object.values(production).flat(), ...installed, tools.legacy])) {
     registry.install(extension);
   }
-  tasks.useBackgroundExecution({ available: () => true, extensions: (agentId) => agentId === undefined ? toolsets.worker : toolsets.agent,
+  tasks.useActorExecution({ available: () => true, extensions: (agentId) => agentId === undefined ? toolsets.worker : toolsets.agent,
     call: (command, _host, signal) => { signal.throwIfAborted(); return host.call(command); },
     bind: (conversation) => bind(conversation, "worker"),
   });
   async function close(): Promise<void> {
-    const detached = tasks.detachBackground();
+    const detached = tasks.detachActors();
     await session.close(BACKGROUND_CONTEXT); await detached; await discovery.close();
   }
   return { session, registry, inference, tasks, environment, sources, resources, scheduler, executions, tools, toolsets, worker, bind, close };

@@ -251,7 +251,7 @@ test("an interactive task serializes local and chief inputs, wakes while idle an
     controller.abort(); await running; running = undefined; await stop?.(); stop = undefined;
     assert.equal(live.flatMap((event) => event.type === "thinking" ? [event.text] : []).join(""), "Published reasoning summary.");
     assert.deepEqual(inputs, ["Initial chief instruction", "Chief follow-up while the tab is idle", "Reply typed directly in the task tab", "Chief input while the local turn runs"]);
-    await app.tasks.detachBackground();
+    await app.tasks.detachActors();
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
     const reopened = await app.tasks.get(task.id); assert.equal(reopened.conversation_id, task.conversation_id);
     const frames = await history(await app.tasks.conversation(reopened.conversation_id), null, app.session);
@@ -305,7 +305,7 @@ test("an idle interactive child delivers its result and accepts another assignme
     assert.equal((await app.tasks.get(task.id)).pending.length, 2, "Detaching and reattaching does not publish the child result again");
     assert.equal(app.faux.state.callCount, 4);
     reattached.abort(); await running; running = undefined;
-  } finally { controller.abort(); await running?.catch(() => {}); await app.tasks.detachBackground(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  } finally { controller.abort(); await running?.catch(() => {}); await app.tasks.detachActors(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("a child whose terminal detaches before its first turn still runs its assignment and reports it once", async () => {
@@ -329,7 +329,7 @@ test("a child whose terminal detaches before its first turn still runs its assig
     assert.equal(finished.agents[0]?.pending.length, 0); assert.equal(finished.agents[0]?.summary, "Reviewed with no terminal attached");
     assert.equal(finished.pending.filter((input) => input.id.startsWith("agent-result:review:")).length, 1, "The parent receives the child's result once");
     assert.equal(app.faux.state.callCount, 1);
-  } finally { await app.tasks.detachBackground(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  } finally { await app.tasks.detachActors(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("task agents own conversations and named terminals in one Rex session, then wake their parent", async () => {

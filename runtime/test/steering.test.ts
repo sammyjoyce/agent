@@ -99,7 +99,7 @@ test("attached worker admits native steering before the current tool finishes an
     const recovered = await tasks.run({ ...command, interactive: false }, () => () => {});
     assert.equal(recovered.text, "Queued answer after detach"); assert.equal(faux.state.callCount, beforeRecovery);
     assert.deepEqual((await tasks.get(task.id)).pending, []);
-  } finally { release(); controller.abort(); await running?.catch(() => {}); await tasks.detachBackground(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  } finally { release(); controller.abort(); await running?.catch(() => {}); await tasks.detachActors(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
 test("main native steering keeps the execution lease until queued inputs finish and emits each answer once", { timeout: 10_000 }, async () => {

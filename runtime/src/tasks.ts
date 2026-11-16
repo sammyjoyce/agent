@@ -5,7 +5,7 @@ import { AttachmentStore, validateInput } from "./attachments.js";
 import type { AttachmentRef } from "./generated/AttachmentRef.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AgentDoc, AssistantEntry, defineDoc, defineDocFamily, defineEntry, GenerationTask, InboxDoc, LiveDoc, ROOT_CONVERSATION_ID, ToolTask, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness, type TaskId as NativeTaskId, type Tx } from "@earendil-works/pi-durable";
-import type { CoordinatorEnvironment } from "./environment.js";
+import { EnvironmentError, type CoordinatorEnvironment } from "./environment.js";
 import { ConversationModels, DEFAULT_MODEL, ModelError, modelFailureMessage, savedHost, savedModel } from "./models.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
 import type { WorkerState } from "./generated/WorkerState.js";
@@ -74,6 +74,13 @@ export type WorkerSession = {
   rejected?(inputId: string, message: string): void;
 };
 type ActorAnswer = { conversation_id: string; text: string; entry_id?: string };
+/** What `ensureActor` found or did. `exit` rejects when the actor fails. */
+export type ActorStart =
+  | { state: "started" | "running"; exit: Promise<ActorAnswer> }
+  /** No work is admitted, so no actor is needed. */
+  | { state: "idle" }
+  /** `unplaced`: no host is recorded yet. `host_offline`: the recorded host is not connected, and no other host is chosen. */
+  | { state: "unplaced" | "host_offline" | "unavailable"; reason: string };
 /** `held` keeps the events that arrive while the observer's own `ready` is still running. */
 type ActorObserver = { session: WorkerSession; interactive: boolean; held?: ((session: WorkerSession) => void)[] };
 /** The scope of the current turn's host calls. Stop aborts it, and the next turn opens a new one. */
@@ -184,7 +191,7 @@ export class TaskStore {
   private environment: CoordinatorEnvironment | undefined;
   private histories: HistoryStore | undefined;
   private attachments: AttachmentStore | undefined;
-  private background: ActorExecution | undefined;
+  private execution: ActorExecution | undefined;
   constructor(readonly session: Harness, readonly inference = new ConversationModels()) { inference.bind(session); }
   async prepare(): Promise<void> {
     await this.recordsStore.prepare(this.session, async () => (await this.session.snapshot(Tasks, BACKGROUND_CONTEXT))?.tasks ?? [], task => task.id,
@@ -222,7 +229,8 @@ export class TaskStore {
   useEnvironment(environment: CoordinatorEnvironment): void { this.environment = environment; }
   useHistory(history: HistoryStore): void { this.histories = history; }
   useAttachments(attachments: AttachmentStore): void { this.attachments = attachments; }
-  useBackgroundExecution(execution: ActorExecution): void { this.background = execution; }
+  /** The coordinator's service-owned adapter. Every actor that starts with no terminal executes through it. */
+  useActorExecution(execution: ActorExecution): void { this.execution = execution; }
   isBackgroundTask(task: TaskRecord): boolean {
     return task.sources.some((source) => source.provider === "scheduled_jobs" && source.account === "local");
   }
@@ -239,60 +247,82 @@ export class TaskStore {
     if (host === null) throw new TaskError("The scheduled job's coordinator execution host is offline; its task is retained");
     return { ...host, cwd };
   }
-  /** Background jobs use the same actor and native outbox, without a terminal transport. */
-  async runBackground(id: string, signal?: AbortSignal, agentId?: string): Promise<void> {
-    const ref: ActorRef = { task_id: id, ...(agentId === undefined ? {} : { agent_id: agentId }) };
-    const key = this.actorKey(id, agentId), active = this.running.get(key);
-    if (active !== undefined) {
-      // A terminal already started this conversation's actor.
-      // Its durable outbox drains normally; no replacement terminal is launched.
-      if (active.mode !== "job") return;
-      await active.exit.catch(() => {});
-      if (this.actor(await this.get(id), agentId).pending.length > 0) await this.runBackground(id, signal, agentId);
-      return;
-    }
-    const execution = this.background;
-    if (execution === undefined || !execution.available()) throw new TaskError("Coordinator background execution is unavailable; its input is retained");
-    const task = await this.get(id);
-    if (!this.isBackgroundTask(task)) throw new TaskError("Only job-owned tasks use coordinator background execution");
-    const conversationId = this.actor(task, agentId).conversation_id;
-    if (this.running.has(key)) return this.runBackground(id, signal, agentId);
-    const actor = this.claim(ref, "job", execution, { conversation_id: conversationId, call: execution.call });
-    const aborted = () => void this.interrupt(actor);
-    signal?.addEventListener("abort", aborted, { once: true });
-    if (signal?.aborted) aborted();
-    try { await actor.exit; } finally { signal?.removeEventListener("abort", aborted); }
+  private mode(task: TaskRecord): ActorMode { return this.isBackgroundTask(task) ? "job" : "interactive"; }
+  /** Execution reads only the recorded host. The Rex session, window and block are presentation. */
+  private recordedWorker(task: TaskRecord, agentId?: string): Exclude<WorkerState, { state: "unassigned" }> | undefined {
+    const own = this.actor(task, agentId).worker;
+    // A child with no pane of its own runs where its parent runs.
+    const worker = own.state === "unassigned" && agentId !== undefined ? task.worker : own;
+    return worker.state === "unassigned" ? undefined : worker;
   }
-  private async dispatchBackground(id: string, agentId?: string): Promise<TaskRecord> {
-    const active = this.running.get(this.actorKey(id, agentId));
-    if (active?.turn.controller.signal.aborted) await active.exit.catch(() => {});
-    if (!this.running.has(this.actorKey(id, agentId))) {
-      if (this.background === undefined || !this.background.available()) throw new TaskError("Coordinator background execution is unavailable; its input is retained");
-      // The actor records failures in the existing outcome journal. A chat input
-      // acknowledges admission without waiting for the model or an external effect.
-      void this.runBackground(id, undefined, agentId).catch(() => {});
+  private async placement(task: TaskRecord, ref: ActorRef, mode: ActorMode): Promise<{ type: "placed"; host?: WorkerHost } | { type: "unplaced" | "host_offline"; reason: string }> {
+    // A job resolves the coordinator's default host when it starts, so an offline host is recorded as that run's failure.
+    if (mode === "job") return { type: "placed" };
+    if (this.recordedWorker(task, ref.agent_id) === undefined) return { type: "unplaced", reason: "This task has no execution host yet; its input is retained" };
+    try { return { type: "placed", host: await this.workerHost(task.id, this.actor(task, ref.agent_id).worker.state === "unassigned" ? undefined : ref.agent_id) }; }
+    catch (error) {
+      if (error instanceof EnvironmentError) return { type: "host_offline", reason: error.message };
+      throw error;
     }
-    return this.get(id);
   }
-  /** Rebind only admitted work. Open or waiting task metadata alone is not a new turn. */
-  async resumeBackground(): Promise<void> {
-    if (this.background === undefined || !this.background.available()) return;
+  /** Open or waiting task metadata alone is not a new turn. Work is admitted while Pi or the outbox still holds it. */
+  private async hasAdmittedWork(task: TaskRecord, ref: ActorRef): Promise<boolean> {
+    const actor = this.actor(task, ref.agent_id);
+    const conversation = await this.conversation(actor.conversation_id);
+    return this.session.commit(async (tx) => {
+      if ((await tx.doc(LiveDoc, conversation.id)).run !== undefined ||
+          (await tx.doc(InboxDoc, conversation.id)).items.some((item) => item.mode !== "write")) return true;
+      for (const input of actor.pending) {
+        const native = await tx.submissionByRequest(conversation.id, input.id);
+        if (native === undefined || native.status === "queued" || native.status === "placed") return true;
+      }
+      return false;
+    }, BACKGROUND_CONTEXT);
+  }
+  /**
+   * Start the actor that owns a task's admitted work, with no terminal. It reads the registry and the durable
+   * outbox, so a repeat, or a retry after a crash, finds the same actor or nothing left to start.
+   */
+  async ensureActor(ref: ActorRef): Promise<ActorStart> {
+    const key = this.actorKey(ref.task_id, ref.agent_id);
+    for (;;) {
+      const current = this.running.get(key);
+      if (current !== undefined) {
+        // A closing actor, or a job that Stop is ending, takes no more input. Its successor starts after it.
+        if (current.phase !== "closing" && !(current.mode === "job" && current.turn.phase === "stopping")) return { state: "running", exit: current.exit };
+        await current.exit.catch(() => {});
+        continue;
+      }
+      const execution = this.execution;
+      if (execution === undefined || !execution.available()) return { state: "unavailable", reason: "Coordinator background execution is unavailable; its input is retained" };
+      const task = await this.get(ref.task_id), mode = this.mode(task);
+      const placement = await this.placement(task, ref, mode);
+      if (placement.type !== "placed") return { state: placement.type, reason: placement.reason };
+      if (!await this.hasAdmittedWork(task, ref)) return { state: "idle" };
+      if (this.running.has(key)) continue;
+      const actor = this.claim(ref, mode, execution, { conversation_id: this.actor(task, ref.agent_id).conversation_id, call: execution.call,
+        ...(placement.host === undefined ? {} : { host: placement.host }) });
+      return { state: "started", exit: actor.exit };
+    }
+  }
+  /** Start an actor for every task that holds admitted work. With `hosts`, only for work recorded on those hosts. */
+  async resumeActors(hosts?: ReadonlySet<string>): Promise<void> {
+    if (this.execution === undefined || !this.execution.available()) return;
+    const live = new Set<string>();
+    for (const submission of (await this.session.inspect(BACKGROUND_CONTEXT)).submissions) {
+      if (submission.type === "input" && (submission.status === "queued" || submission.status === "placed")) live.add(submission.conversationId.toString());
+    }
     for (const task of await this.list()) {
-      if (!this.isBackgroundTask(task)) continue;
       for (const agentId of [undefined, ...task.agents.map((agent) => agent.id)]) {
         const actor = this.actor(task, agentId);
-        if (this.running.has(this.actorKey(task.id, agentId))) continue;
-        const conversation = await this.conversation(actor.conversation_id);
-        const admitted = await this.session.commit(async (tx) => {
-          if ((await tx.doc(LiveDoc, conversation.id)).run !== undefined ||
-              (await tx.doc(InboxDoc, conversation.id)).items.some((item) => item.mode !== "write")) return true;
-          for (const input of actor.pending) {
-            const native = await tx.submissionByRequest(conversation.id, input.id);
-            if (native === undefined || native.status === "queued" || native.status === "placed") return true;
-          }
-          return false;
-        }, BACKGROUND_CONTEXT);
-        if (admitted) await this.dispatchBackground(task.id, agentId);
+        if (actor.pending.length === 0 && !live.has(actor.conversation_id)) continue;
+        if (hosts !== undefined) {
+          const worker = this.isBackgroundTask(task) ? undefined : this.recordedWorker(task, agentId);
+          const hostId = worker === undefined ? undefined : worker.host.host_id ?? ("binding" in worker ? worker.binding.host_id : undefined);
+          if (hostId === undefined || hostId === null || !hosts.has(hostId)) continue;
+        }
+        // One actor's failure to start must not stop the others.
+        await this.ensureActor({ task_id: task.id, ...(agentId === undefined ? {} : { agent_id: agentId }) }).catch(() => {});
       }
     }
   }
@@ -347,7 +377,7 @@ export class TaskStore {
     }
   }
   /** Fence app bindings before Harness.close checkpoints native work for its next owner. */
-  async detachBackground(): Promise<void> {
+  async detachActors(): Promise<void> {
     const active = [...this.running.values()];
     for (const actor of active) {
       actor.fenced = true;
@@ -876,12 +906,14 @@ export class TaskStore {
   }
   async continueAgent(id: string, agentId: string, content: string, inputId: string, call?: HostCall, mode?: InputMode, admitted?: () => void, attachments?: AttachmentRef[], origin?: InputOrigin, sender?: TaskMessageSender): Promise<TaskRecord> {
     const active = this.running.get(this.actorKey(id, agentId));
-    const attached = active !== undefined && active.phase !== "closing";
-    if (!attached && call === undefined) throw new TaskError("This agent is no longer attached; its conversation is retained");
+    const owned = (active !== undefined && active.phase !== "closing") || call !== undefined || this.execution?.available() === true;
+    if (!owned) throw new TaskError("This agent is no longer attached; its conversation is retained");
     const task = await this.enqueueActor(id, content, inputId, agentId, undefined, mode, attachments, undefined, origin, sender);
     admitted?.();
-    const current = this.running.get(this.actorKey(id, agentId));
-    return (current !== undefined && current.phase !== "closing") || call === undefined ? task : this.dispatchAgent(id, agentId, call);
+    if (call !== undefined) return this.dispatchAgent(id, agentId, call);
+    const start = await this.ensureActor({ task_id: id, agent_id: agentId });
+    if (start.state === "unplaced" || start.state === "host_offline" || start.state === "unavailable") throw new TaskError(start.reason);
+    return task;
   }
   private async enqueueActor(id: string, content: string, inputId: string, agentId?: string, delivered?: TaskOutcome, mode?: InputMode, attachments?: AttachmentRef[], scheduled?: ScheduledOccurrence, origin?: InputOrigin, sender?: TaskMessageSender): Promise<TaskRecord> {
     validateInput(content, attachments);
@@ -990,14 +1022,35 @@ export class TaskStore {
     return agent;
   }
   async dispatchAgent(taskId: string, agentId: string, call: HostCall): Promise<TaskRecord> {
-    let task = await this.get(taskId);
-    if (this.isBackgroundTask(task)) return this.dispatchBackground(taskId, agentId);
-    const key = this.actorKey(taskId, agentId), active = this.running.get(key);
-    if (active !== undefined && active.phase !== "closing" && active.observers.size > 0) return task;
-    if (active?.phase === "closing") {
-      await active.exit.catch(() => {});
-      task = await this.get(taskId);
+    return this.ownThenPresent({ task_id: taskId, agent_id: agentId }, () => this.presentAgent(taskId, agentId, call));
+  }
+  /**
+   * Execution takes admitted input first. The pane is presented only when no terminal observes the actor,
+   * and its failure matters only when execution did not take the input.
+   */
+  private async ownThenPresent(ref: ActorRef, present: () => Promise<unknown>): Promise<TaskRecord> {
+    let start = await this.ensureActor(ref);
+    const job = this.isBackgroundTask(await this.get(ref.task_id));
+    let failure: { error: unknown } | undefined;
+    if (!job && (this.running.get(this.actorKey(ref.task_id, ref.agent_id))?.observers.size ?? 0) === 0) {
+      try { await present(); } catch (error) { failure = { error }; }
+      // A new task records its host inside the allocation commit.
+      if (start.state !== "started" && start.state !== "running") start = await this.ensureActor(ref);
     }
+    switch (start.state) {
+      case "started": case "running": break;
+      case "idle": if (failure !== undefined) throw failure.error; break;
+      case "unplaced": case "host_offline": case "unavailable":
+        if (failure !== undefined) throw failure.error;
+        if (job) throw new TaskError(start.reason);
+        break;
+      default: { const unknown: never = start; throw new TaskError(`Unknown actor start ${JSON.stringify(unknown)}`); }
+    }
+    return this.get(ref.task_id);
+  }
+  private async presentAgent(taskId: string, agentId: string, call: HostCall): Promise<TaskRecord> {
+    const key = this.actorKey(taskId, agentId);
+    let task = await this.get(taskId);
     let existing = this.actor(task, agentId);
     if ("binding" in existing.worker) {
       if (this.resuming.has(key)) throw new TaskError("An agent resume is already in progress; its pending input is retained");
@@ -1150,15 +1203,11 @@ export class TaskStore {
   }
   async dispatch(id: string, host: WorkerHost, call: HostCall): Promise<TaskRecord> {
     await this.resources?.attach(id);
-    let current = await this.get(id);
-    if (this.isBackgroundTask(current)) return this.dispatchBackground(id);
-    const active = this.running.get(id);
-    // A running actor takes the input. The pane is presented again only when no terminal observes it.
-    if (active !== undefined && active.phase !== "closing" && active.observers.size > 0) return current;
-    if (active?.phase === "closing") {
-      await active.exit.catch(() => {});
-      current = await this.get(id);
-    }
+    return this.ownThenPresent({ task_id: id }, () => this.present(id, host, call));
+  }
+  /** The Rex session, window and block of a task. It allocates, spawns, resumes and reopens, and never touches the actor. */
+  private async present(id: string, host: WorkerHost, call: HostCall): Promise<TaskRecord> {
+    const current = await this.get(id);
     if (current.worker.state === "allocating" || current.worker.state === "uncertain") {
       throw new TaskError("Worker allocation needs reconciliation; no duplicate session was created");
     }
@@ -1334,9 +1383,11 @@ export class TaskStore {
     const delivery = entry?.id.toString() ?? "attempt:" + attemptId;
     await this.enqueue(saved.id, result, "agent-result:" + input.agent_id + ":" + delivery + ":" + createHash("sha256").update(result).digest("hex"), outcome);
     if (this.isBackgroundTask(saved)) {
-      if (this.background?.available() && !this.running.get(saved.id)?.turn.controller.signal.aborted) await this.dispatchBackground(saved.id);
+      // A job that Stop is ending must not be restarted by its child's result.
+      if (!this.running.get(saved.id)?.turn.controller.signal.aborted) await this.ensureActor({ task_id: saved.id });
     }
     else if (call !== undefined && saved.worker.state === "bound") await this.dispatch(saved.id, saved.worker.host, call);
+    else await this.ensureActor({ task_id: saved.id });
     return outcome;
   }
   /** A terminal attaches only as the confirmed allocation and binding its task records now. */
@@ -1393,7 +1444,10 @@ export class TaskStore {
         if (actor.host === undefined) throw new TaskError("Background execution has not bound its owning host");
         return call(command, actor.host, actor.turn.controller.signal);
       } }) };
-    actor.exit.catch(() => {});
+    // Input admitted while the last turn wound down still needs an owner. Native-only work was already drained.
+    actor.exit.then(async () => {
+      if (!actor.fenced && this.actor(await this.get(ref.task_id), ref.agent_id).pending.length > 0) await this.ensureActor(ref);
+    }).catch(() => {});
     this.running.set(this.actorKey(ref.task_id, ref.agent_id), actor);
     return actor;
   }

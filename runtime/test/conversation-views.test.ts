@@ -609,7 +609,7 @@ test("presenting a parent whose terminal detached claims folder ownership so chi
     assert.ok((await app.tasks.get(task.id)).agents[0]?.pending.some((item) => item.id === "retained"));
     releaseInspection(); await recovering; releaseReady(); await running; running = undefined;
     assert.equal(app.faux.state.callCount, 0);
-  } finally { releaseInspection(); releaseReady(); controller.abort(); await recovering; await running; await app.tasks.detachBackground();
+  } finally { releaseInspection(); releaseReady(); controller.abort(); await recovering; await running; await app.tasks.detachActors();
     app.views.close(); app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 

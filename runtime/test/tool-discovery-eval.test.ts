@@ -24,6 +24,7 @@ import { DEFAULT_MODEL } from "../src/models.js";
 import type { ToolRole } from "../src/toolsets.js";
 import { declarationSize, DISCOVERY_ARMS, isDiscoveryArmName, openDiscoveryApp, type DiscoveryApp, type DiscoveryArmName } from "./fixtures/tool-discovery.js";
 import { statesExpiredCertificateCause } from "./fixtures/tool-discovery-oracle.js";
+import { runAdmitted } from "./fixtures/run-admitted.js";
 
 type ProviderRequest = {
   context: string; tool_errors: number; stop: string; input: number; cache_read: number; cache_write: number; output: number; reasoning: number; total: number;
@@ -160,7 +161,7 @@ async function askMain({ app, workspace, model }: World, content: string): Promi
 async function runJobTask({ app, model, signal }: World, title: string, outcome: string, input: string): Promise<TaskRecord> {
   const task = await app.tasks.create({ title, outcome, model, sources: [{ provider: "scheduled_jobs", account: "local", thread_id: "eval-maintenance" }] });
   await app.tasks.enqueue(task.id, input);
-  await app.tasks.runBackground(task.id, signal);
+  await runAdmitted(app.tasks, task.id, undefined, signal);
   for (let saved = await app.tasks.get(task.id); ; saved = await app.tasks.get(task.id)) {
     if (saved.agents.every((agent) => agent.state.state !== "open") || signal.aborted) return saved;
     await new Promise((settle) => setTimeout(settle, 500));

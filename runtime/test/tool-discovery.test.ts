@@ -18,6 +18,7 @@ import { history, toolDetails, UserNoticeEntry } from "../src/transcript.js";
 import { declarationSize, DISCOVERY_ARMS, openDiscoveryApp, type DeclarationSize, type DiscoveryApp, type DiscoveryArm,
   type DiscoveryArmName } from "./fixtures/tool-discovery.js";
 import { fixtureModel } from "./model.js";
+import { runAdmitted } from "./fixtures/run-admitted.js";
 
 const node: AgentNode = { host_id: "11111111-1111-4111-8111-111111111111", name: "example", rex_server: null, agent_program: "/example/agent",
   home_directory: "/workspace/example", coordinator: null, launch: { state_dir: null, runtime: null, config: null, instructions: null, model: fixtureModel } };
@@ -91,13 +92,13 @@ const startRole: Record<ToolRole, (app: DiscoveryApp, input: string) => Promise<
   },
   async worker(app, input) {
     const task = await backgroundTask(app);
-    return { responsesFromFirstRequest: [done], async run() { await app.tasks.enqueue(task.id, input); await app.tasks.runBackground(task.id); } };
+    return { responsesFromFirstRequest: [done], async run() { await app.tasks.enqueue(task.id, input); await runAdmitted(app.tasks, task.id); } };
   },
   async agent(app, input) {
     const task = await backgroundTask(app);
     return { responsesFromFirstRequest: [done], async run() {
       const agent = await app.tasks.createAgent(task.id, { id: "example-agent", title: "Example agent", outcome: "Finish the example check", input, inputId: "example-agent-input" });
-      await app.tasks.runBackground(task.id, undefined, agent.id);
+      await runAdmitted(app.tasks, task.id, agent.id);
     } };
   },
 };

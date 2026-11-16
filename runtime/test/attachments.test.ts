@@ -249,5 +249,5 @@ test("Pi receives native images and delegation keeps immutable files on each act
       "A terminal that detaches during attachment preparation must not strand the admitted input");
     assert.equal(faux.state.callCount, calls + 1); assert.ok(writes.includes("detached:" + file.id));
     assert.equal((await tasks.get(detached.id)).summary, "Read the evidence after the terminal detached.");
-  } finally { await tasks.detachBackground(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  } finally { await tasks.detachActors(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

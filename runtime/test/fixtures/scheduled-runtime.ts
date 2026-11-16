@@ -65,7 +65,7 @@ export async function openScheduled(directory: string, guidanceVersion = "origin
     return { type: "failed", message: "The fixture received an unsupported host command" };
   };
   function configureBackground(hostCall: (command: HostCommand, signal: AbortSignal) => Promise<HostResult> = call) {
-    tasks.useBackgroundExecution({
+    tasks.useActorExecution({
       available: () => true,
       extensions: (agentId) => [guidance, tools.host, agentId === undefined ? tools.worker : tools.agent, sourceTools.worker],
       call: (command, host, signal) => hostCall(environment.route(command, host), signal),
@@ -81,7 +81,7 @@ export async function openScheduled(directory: string, guidanceVersion = "origin
   const views = new ConversationViews(async () => ({ harness: session, tasks, sources, histories, inference, environment, catalog }), () => () => {});
   const close = async () => {
     views.close(); catalog.close();
-    const detached = tasks.detachBackground();
+    const detached = tasks.detachActors();
     await session.close(BACKGROUND_CONTEXT); await detached;
   };
   return { session, tasks, sources, environment, call, commands, faux, executions, registry, sourceTools, configureBackground, views, close };

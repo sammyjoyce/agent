@@ -139,7 +139,7 @@ for (const boundaryHeld of [false, true]) {
       assert.equal((await app.harness.snapshot(InboxDoc, conversation.id, BACKGROUND_CONTEXT))?.items.length, 1);
       assert.equal(frames.some(frame => frame.type === "input_accepted" && frame.input_id === "current-correction"), true);
 
-      const fenced = app.tasks.detachBackground();
+      const fenced = app.tasks.detachActors();
       await app.tasks.enqueue(task.id, "Retain after stop", "after-stop", undefined, "steer");
       assert.equal(await receipt("after-stop"), undefined, "An actor fenced for shutdown must not inject steering into its old turn");
       await conversation.abort(BACKGROUND_CONTEXT); await fenced; await worker; worker = undefined;
