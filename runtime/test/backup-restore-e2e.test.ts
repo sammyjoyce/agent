@@ -260,14 +260,13 @@ test("an offline backup restores into a new directory that the production coordi
     const killedArchive = join(directory, "killed");
     const killed = spawn(binary, ["--runtime", runtime, "--state-dir", original, "backup", "create", killedArchive],
       { cwd: directory, env, stdio: "ignore" });
-    const killedClosed = new Promise<void>((resolve) => killed.once("close", () => resolve()));
+    const killedClosed = new Promise<NodeJS.Signals | null>((resolve) => killed.once("close", (_code, signal) => resolve(signal)));
     let interrupted = false;
     for (const deadline = Date.now() + 30_000; Date.now() < deadline && killed.exitCode === null;) {
       if ((await readdir(directory)).some((name) => name.startsWith(".killed.partial-"))) { interrupted = killed.kill("SIGKILL"); break; }
       await delay(1);
     }
-    await killedClosed;
-    assert.ok(interrupted, "the backup was killed while it was still writing its staging directory");
+    assert.ok(interrupted && await killedClosed === "SIGKILL", "SIGKILL ended the backup after its staging directory appeared");
     if (await exists(killedArchive)) {
       const published = JSON.parse(await readFile(join(killedArchive, "manifest.json"), "utf8")) as typeof manifest;
       assert.deepEqual(published.files, manifest.files, "an archive at its final name is complete");
@@ -348,6 +347,11 @@ test("an offline backup restores into a new directory that the production coordi
     const held = await request(restored, { type: "list_jobs" });
     assert.ok(held[0]?.type === "scheduled_jobs");
     assert.equal(held[0].jobs.some((status) => status.job.id === HELD_JOB), false, "a held store does not start background work");
+    const heldWorker = request(restored, { type: "run_task", task_id: seeded.taskId, allocation_id: "invented-allocation",
+      binding: { host_id: "invented-host", session_id: "invented-session", window_id: "invented-window", block_id: "invented-block" },
+      instructions: "", cwd: "/workspace/example", model: { provider: "openai", model_id: "invented-model", reasoning: null, fast: false } });
+    await assert.rejects(Promise.race([heldWorker, delay(10_000).then((): never => { throw new Error("run_task was admitted"); })]),
+      /held after a restore/, "a held store refuses a task worker that could resume a backed-up turn");
     assert.match(server.errors(), /backup release/, "the held coordinator says how to release it");
     await stop(server);
 

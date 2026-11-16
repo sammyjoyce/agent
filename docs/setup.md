@@ -682,7 +682,7 @@ directory and then delete that directory.
 
 A restored store starts held. Its coordinator serves history, attachments and
 chats, but scheduled jobs, source polling, worktree collection, history
-indexing and phone notifications do not run. The restored coordinator
+indexing, task workers and phone notifications do not run. The restored coordinator
 has the same coordinator ID, so do not run it while the original still runs.
 Check the hosts first, for example that work a restored job would start has not
 already happened elsewhere. Then stop the coordinator and release the hold:
