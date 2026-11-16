@@ -65,7 +65,7 @@ pub async fn local_node(
             resume_agent: true,
             browser: true,
             browser_user_tabs: true,
-            browser_screenshots: false,
+            browser_screenshots: true,
         }),
         machine: crate::machines::observe(daemon).await.ok(),
     };

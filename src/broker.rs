@@ -28,6 +28,7 @@ struct Peer {
     resume_agent: bool,
     browser: bool,
     browser_user_tabs: bool,
+    browser_screenshots: bool,
 }
 struct Effect {
     command: HostCommand,
@@ -144,6 +145,10 @@ impl Broker {
                     .capabilities
                     .as_ref()
                     .is_some_and(|capabilities| capabilities.browser_user_tabs),
+                browser_screenshots: node
+                    .capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities.browser_screenshots),
             },
         );
         if let Err(error) = control(
@@ -199,26 +204,36 @@ impl Broker {
                 peer.resume_agent,
                 peer.browser,
                 peer.browser_user_tabs,
+                peer.browser_screenshots,
             )
         });
-        let Some((sender, resume_agent, browser, browser_user_tabs)) = sender else {
+        let Some((sender, resume_agent, browser, browser_user_tabs, browser_screenshots)) = sender
+        else {
             return not_started();
         };
         if let HostCommand::Browser { request, .. } = &command {
-            let user_tabs = matches!(
-                request.action,
+            let refusal = match request.action {
+                _ if !browser => {
+                    Some("Update Beep Boop on this host before using its Chrome browser tools.")
+                }
                 crate::browser::BrowserAction::ListUserTabs
-                    | crate::browser::BrowserAction::ClaimUserTab { .. }
-            );
-            if !browser || user_tabs && !browser_user_tabs {
+                | crate::browser::BrowserAction::ClaimUserTab { .. }
+                    if !browser_user_tabs =>
+                {
+                    Some(
+                        "Update Beep Boop on this host before discovering or claiming existing Chrome tabs.",
+                    )
+                }
+                crate::browser::BrowserAction::Screenshot { .. } if !browser_screenshots => {
+                    Some("Update Beep Boop on this host before taking browser screenshots.")
+                }
+                _ => None,
+            };
+            if let Some(message) = refusal {
                 return HostResult::Browser {
                     response: crate::browser::BrowserResponse::Failed {
                         session_id: request.session_id,
-                        message: if browser && user_tabs {
-                            "Update Beep Boop on this host before discovering or claiming existing Chrome tabs."
-                        } else {
-                            "Update Beep Boop on this host before using its Chrome browser tools."
-                        }.into(),
+                        message: message.into(),
                     },
                 };
             }

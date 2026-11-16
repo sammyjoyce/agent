@@ -582,7 +582,8 @@ test("a native screenshot carries the owned tab's real pixels with their digest 
     } else if (request.url === "/tall") {
       response.end(`<!doctype html><title>Invented tall noise</title><body style="margin:0"><canvas width="1200" height="4000"></canvas>
         <script>const context = document.querySelector('canvas').getContext('2d'), image = context.createImageData(1200, 4000);
-        let seed = 7; for (let i = 0; i < image.data.length; i++) { seed = (seed * 1103515245 + 12345) >>> 0; image.data[i] = i % 4 === 3 ? 255 : seed >>> 24; }
+        for (let i = 0; i < image.data.length; i += 65536) crypto.getRandomValues(image.data.subarray(i, i + 65536));
+        for (let i = 3; i < image.data.length; i += 4) image.data[i] = 255;
         context.putImageData(image, 0, 0);</script>`);
     } else response.end("<!doctype html><h1>Unrelated page</h1>");
   });
@@ -629,6 +630,9 @@ test("a native screenshot carries the owned tab's real pixels with their digest 
   assert.deepEqual(shot.tabs.map(owned => owned.title), ["Invented color blocks"]);
 
   observer = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout: 10_000 });
+  const ownedPage = observer.contexts()[0]!.pages().find(page => page.url() === `${origin}/blocks`);
+  assert.ok(ownedPage !== undefined, "The observer sees the owned tab");
+  const viewport: unknown = await ownedPage.evaluate("[innerWidth, innerHeight]");
   const viewer = await observer.contexts()[0]!.newPage();
   await viewer.setContent(`<img src="data:image/png;base64,${shot.capture.data_base64}">`);
   const pixels: unknown = await viewer.evaluate(`(async () => {
@@ -640,7 +644,7 @@ test("a native screenshot carries the owned tab's real pixels with their digest 
   })()`);
   await viewer.close();
   assert.ok(object(pixels) && Array.isArray(pixels.samples));
-  assert.deepEqual([pixels.width, pixels.height], [800, 600], "The capture is the viewport at CSS scale");
+  assert.deepEqual([pixels.width, pixels.height], viewport, "The capture is the viewport at CSS scale");
   assert.deepEqual(pixels.samples, [[208, 48, 48], [48, 160, 64], [48, 80, 208]], "Each block's color appears where the page drew it");
 
   assert.equal((await execute({ type: "navigate", tab_id: tab, url: `${origin}/tall` })).type, "ready");
