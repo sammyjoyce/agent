@@ -49,10 +49,14 @@ scripted provider holds that the gate subtracts:
 | `first_activity` | The request's first-chunk hold, from the request body read until the reasoning write. The tail hold that keeps the stream open is not subtracted. |
 | `steer_reply` | Every hold after `Steering messages, waiting` became visible. These are the rest of the first turn's stream and the steering turn's own holds. |
 
-The provider records each hold on the benchmark's clock, so a slow reader in
-the runtime counts as application delay. Overlapping holds count once. A
-missing or reversed mark fails the sample, and a negative result is an error
-rather than zero.
+The provider records each hold on the benchmark's clock. Work that moves the
+gate's end mark later counts as application delay, such as a slow runtime
+reader after the first chunk. Work that runs during a subtracted hold and
+still finishes inside it does not count. Each gate therefore measures the
+latency outside its subtracted waits, not all application work, and not a run
+with an instant model. The CPU readings below can show such work but are not
+gated. Overlapping holds count once. A missing or reversed mark fails the
+sample, and a negative result is an error rather than zero.
 
 Fifteen measured pairs run per scenario. For every scenario and gate, each
 candidate gets the greater of a 25% or 20-millisecond allowance over its
@@ -63,12 +67,14 @@ excluded from the gate. There are no automatic retries or discarded slow
 samples.
 
 Visible marks move in steps of about 41 ms, so one pair can exceed its budget
-with no change. How often varies between runs on the same host. Resampling
-three same-build Linux runs put the chance that a whole run fails with no
-change at 8 to 13% with seven pairs and 2 to 5% with fifteen. Three later runs
-on the same host put it under 1% with either count. Keep the count odd,
-because with an even count the gate reads the upper of the two middle
-fractions.
+with no change. How often varies between runs on the same host. Two bootstrap
+models over three same-build Linux runs estimate that a whole run fails with no
+change 8 to 13% of the time with seven pairs and 1.6 to 4.5% with fifteen. The
+same models over six later runs on that host estimate under 1% with either
+count. These are model estimates from a few runs on one host. They treat gates
+and samples as independent and are not calibrated failure rates for CI
+runners. Keep the count odd, because with an even count the gate reads the
+upper of the two middle fractions.
 
 ## Loopback model provider
 
@@ -94,6 +100,11 @@ prompt in its latest user input.
 The long tails keep a turn busy long enough for Pi to commit the reasoning
 partial and for the steering prompt to arrive while the first turn streams.
 They stay long enough under the slow candidate below.
+
+The `exec` call passes the tool the coordinator's pid. At start and every
+200 ms after, the tool exits unless that coordinator is still its parent. A
+tool the stop missed therefore ends with its coordinator, even one that died
+before the tool started, and the benchmark never signals the tool's pid.
 
 Every coordinator also has a `/bin/sh` Rex stand-in on its private `PATH`. It
 answers `whoami` and `hosts`, so the coordinator has a local node to run
@@ -200,8 +211,11 @@ Two runs on one build show the gates' range:
   application delay. Visible marks land on steps of about 41 ms, so a sample
   near a step boundary can move by a whole step, and a gate can fail with no
   change. Which gates sit near a boundary depends on the platform. CI gates on
-  Linux only. On macOS, resampling three local runs put the chance that a
-  whole run fails with no change at about 3 to 5% with fifteen pairs.
+  Linux only. On macOS, the same bootstrap models over three local runs
+  estimate that a whole run fails with no change about 3 to 5% of the time
+  with fifteen pairs.
+- A gate does not see work that overlaps a subtracted hold and finishes
+  inside it, as described under application delay.
 - Rex is a shell stand-in, and the model provider is a local script.
 - Token counts are synthetic.
 - Scrolling to older text in a long history, and foreground work during search
