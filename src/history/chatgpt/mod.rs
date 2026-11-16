@@ -39,10 +39,12 @@ pub struct ChatGptPackageSummary {
     pub shards: u32,
     pub attachments: u32,
     pub missing_attachments: u32,
-    /// System, developer, custom-instruction and hidden messages left out on purpose.
+    /// System, developer, custom-instruction and hidden messages, and code-interpreter outputs of
+    /// those kinds, left out on purpose.
     pub excluded_messages: u32,
     /// Messages, parts, outputs, attachments and metadata of a kind this import does not read,
-    /// counted by label. Each one is also an import gap of its conversation.
+    /// counted by label. Each is also an unsupported gap of its conversation; past 32 in one
+    /// conversation, the rest are summed in one further gap.
     pub unsupported: Vec<ChatGptUnsupported>,
     /// Library files whose origin is no kept message in this export.
     pub dropped_library_files: u32,
@@ -55,8 +57,8 @@ pub struct ChatGptPackageSummary {
 }
 
 /// How often one kind of export content that this import does not read occurs, such as
-/// `message future_widget` or `part image_asset_pointer (hidden)`. Past 32 labels, the rest
-/// count under `other`.
+/// `message future_widget` or `part image_asset_pointer (hidden)`. Listed in label order; labels
+/// after the first 32 are summed into one entry whose content is `other`.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ChatGptUnsupported {
     pub content: String,
@@ -1528,8 +1530,7 @@ mod tests {
                 .map(|(bytes, _, _)| bytes)
         }
 
-        /// The reports of content this import does not read: thread gaps, never item gaps.
-        fn unread(&self) -> Vec<&str> {
+        fn unread_thread_gaps(&self) -> Vec<&str> {
             self.gaps
                 .iter()
                 .map(|gap| {
@@ -1600,7 +1601,7 @@ mod tests {
                 metadata_container(case, marker),
             )
             .await;
-            let unread = import.unread();
+            let unread = import.unread_thread_gaps();
             observed.push(format!(
                 "{case}: prompt {}, answer {}, file named {}, bytes served {}, file served {}, unread {}, says metadata {}",
                 import.shows(&format!("VISIBLE_USER_PROMPT_CASE_{case_name}_CANARY")),
@@ -1655,7 +1656,7 @@ mod tests {
         assert_eq!(import.items.len(), 1);
         assert_eq!(import.items[0].text, "VISIBLE_OUTER_ANSWER_CANARY");
         assert!(!import.shows("EXCLUDED_HIDDEN_PART_TEXT_CANARY"));
-        let unread = import.unread();
+        let unread = import.unread_thread_gaps();
         assert_eq!(unread.len(), 1, "{unread:?}");
         assert!(unread[0].contains("hidden"), "{unread:?}");
     }
@@ -1677,7 +1678,7 @@ mod tests {
         assert_eq!(import.items[0].text, "VISIBLE_OUTER_ANSWER_CANARY");
         assert!(!import.shows("EXCLUDED_DEVELOPER_PART_TEXT_CANARY"));
         assert!(!import.shows("EXCLUDED_OTHER_TEXT_CANARY"));
-        let unread = import.unread();
+        let unread = import.unread_thread_gaps();
         assert_eq!(unread.len(), 1, "{unread:?}");
         assert!(unread[0].contains("type text"), "{unread:?}");
     }
@@ -1727,7 +1728,7 @@ mod tests {
         assert!(!import.shows("VISIBLE_CANVAS_BYTES_CANVAS_USER_CANARY"));
         assert!(!import.shows("file-Canvas"));
         assert!(import.serves("file-Canvas").await.is_none());
-        let unread = import.unread();
+        let unread = import.unread_thread_gaps();
         assert_eq!(unread.len(), 1, "{unread:?}");
         assert!(unread[0].contains("hidden"), "{unread:?}");
     }
@@ -1752,7 +1753,7 @@ mod tests {
         let ids: Vec<&str> = import.items.iter().map(|item| item.id.as_str()).collect();
         assert_eq!(ids, ["u1"]);
         assert!(!import.shows("FUTURE_WIDGET_TEXT"));
-        let unread = import.unread();
+        let unread = import.unread_thread_gaps();
         assert_eq!(unread.len(), 1, "{unread:?}");
         assert!(
             unread[0].contains("future_widget") && unread[0].contains("Message w "),
@@ -1782,7 +1783,7 @@ mod tests {
         assert!(import.items[0].assets.is_empty());
         assert!(!import.shows("FUTURE_PART_TEXT"));
         assert!(!import.shows("FUTURE_PART_BYTES"));
-        let unread = import.unread();
+        let unread = import.unread_thread_gaps();
         assert_eq!(unread.len(), 1, "{unread:?}");
         assert!(unread[0].contains("future_part"), "{unread:?}");
     }
@@ -1821,7 +1822,7 @@ mod tests {
             assert!(!import.shows(hidden), "{hidden}");
         }
         assert!(import.serves("file_0a12").await.is_none());
-        let unread = import.unread();
+        let unread = import.unread_thread_gaps();
         assert_eq!(unread.len(), 1, "{unread:?}");
         assert!(
             unread[0].contains("attachment") && unread[0].contains("hidden"),
@@ -1951,7 +1952,7 @@ mod tests {
             ),
             (2, 1, 1, 3)
         );
-        assert_eq!(import.unread().len(), 7);
+        assert_eq!(import.unread_thread_gaps().len(), 7);
         assert_eq!(import.items.len(), 2);
     }
 
@@ -2009,7 +2010,7 @@ mod tests {
         )
         .await;
         assert_eq!(import.items[0].text, "Visible");
-        let unread = import.unread();
+        let unread = import.unread_thread_gaps();
         assert_eq!(unread.len(), 33);
         assert!(unread[32].starts_with("8 more "), "{}", unread[32]);
     }

@@ -154,8 +154,8 @@ fn check_reports_what_the_import_leaves_out() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     for line in [
-        "  1 system, custom-instruction and hidden messages are left out",
-        "  1 messages or parts are of a kind this import does not read: 1 × message future_widget",
+        "  1 system, developer, custom-instruction and hidden messages and code outputs are left out",
+        "  1 entries are of a kind this import does not read: 1 × message future_widget",
         "  1 library files have no kept message in this export and are left out",
         "  2 files in this export are not named by any imported message and are left out",
     ] {

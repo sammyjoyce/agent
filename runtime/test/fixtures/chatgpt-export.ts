@@ -157,7 +157,6 @@ export const CONTENT_SHAPE_TEXT = {
 } as const;
 const MEADOW_CHART = Buffer.from("An invented meadow chart the assistant showed.");
 
-/** One conversation per message shape the importer must refuse to read past, or must read whole. */
 export function contentShapeExport(): { members: ExportMember[]; meadowDigest: string } {
   const leftOut = (what: string) => `${LEFT_OUT_MARKER}: ${what}`, at = 1_768_176_000;
   const hidden = { is_visually_hidden_from_conversation: true };

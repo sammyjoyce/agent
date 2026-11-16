@@ -143,7 +143,7 @@ impl Package {
         let shard_members = builder.shard_members()?;
         let mut scan = Scan::default();
         let (library, original_names) = sidecars(&builder.members, &limits, &mut scan);
-        scan.library = library;
+        scan.library_by_conversation = library;
         let mut shards = Vec::new();
         let count = shard_members.len() as u32;
         for (index, member) in shard_members.into_iter().enumerate() {
@@ -745,8 +745,7 @@ struct Surveyed {
 
 #[derive(Default)]
 struct Scan {
-    /// Every live library entry, by the conversation it names.
-    library: HashMap<String, Vec<LibraryFile>>,
+    library_by_conversation: HashMap<String, Vec<LibraryFile>>,
     conversations: Vec<ConversationEntry>,
     by_id: HashMap<String, usize>,
     surveys: HashMap<String, Surveyed>,
@@ -822,7 +821,10 @@ impl Scan {
             },
             content,
         };
-        let library = self.library.get(id).map_or(&[][..], Vec::as_slice);
+        let library = self
+            .library_by_conversation
+            .get(id)
+            .map_or(&[][..], Vec::as_slice);
         let survey = Surveyed {
             survey: conversation::survey(&value, library),
             repairs,
@@ -860,7 +862,7 @@ impl Scan {
         shard_count: u32,
     ) -> Package {
         let mut dropped_library_files: u32 = self
-            .library
+            .library_by_conversation
             .iter()
             .filter(|(conversation, _)| !self.surveys.contains_key(*conversation))
             .map(|(_, entries)| entries.len() as u32)
@@ -870,21 +872,24 @@ impl Scan {
         let mut referenced = BTreeSet::new();
         let (mut excluded, mut repaired) = (0, 0);
         for (conversation, Surveyed { survey, repairs }) in &mut self.surveys {
-            excluded += survey.excluded;
+            excluded += survey.excluded_messages_and_outputs;
             repaired += *repairs;
             dropped_library_files += survey.dropped_library_files;
             for (label, count) in &survey.unsupported {
                 *unsupported.entry(label.clone()).or_default() += count;
             }
-            if !survey.library.is_empty() {
-                library.insert(conversation.clone(), std::mem::take(&mut survey.library));
+            if !survey.attached_library_files.is_empty() {
+                library.insert(
+                    conversation.clone(),
+                    std::mem::take(&mut survey.attached_library_files),
+                );
             }
         }
         for entry in &mut self.conversations {
             let library_files = library.get(&entry.thread.id).map_or(&[][..], Vec::as_slice);
             let mut own: BTreeSet<&FileId> = library_files.iter().map(|file| &file.file).collect();
             if let Some(surveyed) = self.surveys.get(&entry.thread.id) {
-                own.extend(&surveyed.survey.files);
+                own.extend(&surveyed.survey.kept_message_files);
             }
             let checked: Vec<(&str, Option<&str>)> = own
                 .iter()

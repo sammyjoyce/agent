@@ -1,7 +1,3 @@
-//! The one reader of an export message. Every field the importer takes from a message is a
-//! named field of a struct below, read through serde, so content this module does not name
-//! never reaches History.
-
 use std::{fmt, marker::PhantomData};
 
 use serde::{
@@ -25,20 +21,15 @@ const INSTRUCTION_CONTENT: [&str; 4] = [
     "about_model_message",
 ];
 
-/// One mapping message as this import reads it.
 pub(super) struct Reading {
-    /// The message's own id, or its node key when it has none. Library files name it.
-    pub id: String,
+    pub message_or_node_id: String,
     pub created: Option<f64>,
     pub disposition: Disposition,
-    /// What the message holds that this import does not read. Each one is reported.
     pub left_out: Vec<LeftOut>,
 }
 
 pub(super) enum Disposition {
-    /// System, developer, custom-instruction or hidden. Nothing of it is read.
     Excluded,
-    /// Its markers or its content are unreadable, or its content type is not modeled.
     Unsupported,
     Kept(Box<Kept>),
 }
@@ -49,7 +40,7 @@ pub(super) struct Kept {
     pub kind: String,
     contributions: Vec<Contribution>,
     attachments: Vec<FileRef>,
-    outputs: Vec<Output>,
+    outputs: Vec<AggregateOutput>,
     fallback: Option<String>,
 }
 
@@ -58,8 +49,7 @@ struct Contribution {
     file: Option<FileId>,
 }
 
-/// A code-interpreter output in `metadata.aggregate_result.messages`.
-enum Output {
+enum AggregateOutput {
     Excluded {
         id: Option<String>,
     },
@@ -75,8 +65,6 @@ pub(super) enum Origin {
     Excluded,
 }
 
-/// Content of a message that this import does not read. Each becomes an import gap and a
-/// counted label in the package summary.
 pub(super) enum LeftOut {
     Message(String),
     Part(String),
@@ -153,19 +141,17 @@ impl Reading {
         }
     }
 
-    /// The ids a library file may name as its origin: the message's own id and each modeled
-    /// output's id, with whether each is kept or excluded.
-    pub fn origins(&self) -> impl Iterator<Item = (&str, Origin)> {
+    pub fn library_origins(&self) -> impl Iterator<Item = (&str, Origin)> {
         let (own, outputs) = match &self.disposition {
             Disposition::Excluded => (Some(Origin::Excluded), &[][..]),
             Disposition::Unsupported => (None, &[][..]),
             Disposition::Kept(kept) => (Some(Origin::Kept), kept.outputs.as_slice()),
         };
-        own.map(|origin| (self.id.as_str(), origin))
+        own.map(|origin| (self.message_or_node_id.as_str(), origin))
             .into_iter()
             .chain(outputs.iter().filter_map(|output| match output {
-                Output::Excluded { id } => Some((id.as_deref()?, Origin::Excluded)),
-                Output::Kept { id, .. } => Some((id.as_deref()?, Origin::Kept)),
+                AggregateOutput::Excluded { id } => Some((id.as_deref()?, Origin::Excluded)),
+                AggregateOutput::Kept { id, .. } => Some((id.as_deref()?, Origin::Kept)),
             }))
     }
 
@@ -176,7 +162,7 @@ impl Reading {
             Disposition::Kept(kept) => kept
                 .outputs
                 .iter()
-                .filter(|output| matches!(output, Output::Excluded { .. }))
+                .filter(|output| matches!(output, AggregateOutput::Excluded { .. }))
                 .count() as u32,
         }
     }
@@ -206,10 +192,10 @@ impl Kept {
             .iter()
             .filter_map(|contribution| contribution.file.as_ref().map(bare));
         let outputs = self.outputs.iter().filter_map(|output| match output {
-            Output::Kept {
+            AggregateOutput::Kept {
                 file: Some(file), ..
             } => Some(bare(file)),
-            Output::Kept { file: None, .. } | Output::Excluded { .. } => None,
+            AggregateOutput::Kept { file: None, .. } | AggregateOutput::Excluded { .. } => None,
         });
         let mut found = Vec::new();
         for reference in parts.chain(self.attachments.iter().cloned()).chain(outputs) {
@@ -226,7 +212,7 @@ impl Kept {
 pub(super) fn read(node: &str, message: &Value) -> Reading {
     let Ok(Record(head)) = Record::<Head>::deserialize(message) else {
         return Reading {
-            id: node.to_owned(),
+            message_or_node_id: node.to_owned(),
             created: None,
             disposition: Disposition::Unsupported,
             left_out: vec![LeftOut::Message(unreadable(None))],
@@ -244,7 +230,7 @@ pub(super) fn read(node: &str, message: &Value) -> Reading {
     } = head;
     let id = id.value();
     let mut reading = Reading {
-        id: id.clone().unwrap_or_else(|| node.to_owned()),
+        message_or_node_id: id.clone().unwrap_or_else(|| node.to_owned()),
         created: create_time.value().and_then(Time::seconds),
         disposition: Disposition::Unsupported,
         left_out: Vec::new(),
@@ -255,8 +241,8 @@ pub(super) fn read(node: &str, message: &Value) -> Reading {
         Field::Unreadable => (Field::Unreadable, None),
     };
     let content_type = content.then(|Record(content)| content.content_type);
-    let markers = metadata.map(|Record(markers)| markers);
-    if excludes(&role, &content_type, &markers) {
+    let flags = metadata.map(|Record(flags)| flags);
+    if excludes(&role, &content_type, &flags) {
         reading.disposition = Disposition::Excluded;
         return reading;
     }
@@ -270,13 +256,13 @@ pub(super) fn read(node: &str, message: &Value) -> Reading {
             return reading;
         }
     };
-    if unreadable_markers(&markers) {
+    if unreadable_flags(&flags) {
         reading
             .left_out
             .push(LeftOut::Message(unreadable(Some(&content_type))));
         return reading;
     }
-    let contributions = match body(&content_type, message) {
+    let contributions = match supported_body(&content_type, message) {
         None => {
             reading
                 .left_out
@@ -305,13 +291,9 @@ pub(super) fn read(node: &str, message: &Value) -> Reading {
             })
             .collect(),
     };
-    let extras = match markers {
-        Field::Read(markers) if markers.message_shaped() => {
-            reading.left_out.push(LeftOut::MessageShapedMetadata);
-            Extras::default()
-        }
-        Field::Read(_) => Extras::read(message, &mut reading.left_out),
-        Field::Absent | Field::Unreadable => Extras::default(),
+    let extras = match flags {
+        Field::Read(_) => MetadataExtras::read(message, &mut reading.left_out),
+        Field::Absent | Field::Unreadable => MetadataExtras::default(),
     };
     let recipient = recipient.value();
     let channel = channel.value();
@@ -372,18 +354,20 @@ fn unreadable(content_type: Option<&str>) -> String {
     format!("{} (unreadable)", named(content_type.unwrap_or("(none)")))
 }
 
-/// Whether a message or an output is system, developer, custom-instruction or hidden by its own
-/// markers. Markers on any other object never decide this.
-fn excludes(role: &Field<String>, content_type: &Field<String>, markers: &Field<Markers>) -> bool {
+fn excludes(
+    role: &Field<String>,
+    content_type: &Field<String>,
+    flags: &Field<ExclusionFlags>,
+) -> bool {
     matches!(role, Field::Read(role) if matches!(role.as_str(), "system" | "developer"))
         || matches!(content_type, Field::Read(kind) if INSTRUCTION_CONTENT.contains(&kind.as_str()))
-        || matches!(markers, Field::Read(markers)
-            if markers.flags().any(|flag| matches!(flag, Field::Read(true))))
+        || matches!(flags, Field::Read(flags)
+            if flags.flags().any(|flag| matches!(flag, Field::Read(true))))
 }
 
-fn unreadable_markers(markers: &Field<Markers>) -> bool {
-    match markers {
-        Field::Read(markers) => markers.flags().any(Field::is_unreadable),
+fn unreadable_flags(flags: &Field<ExclusionFlags>) -> bool {
+    match flags {
+        Field::Read(flags) => flags.flags().any(Field::is_unreadable),
         Field::Absent => false,
         Field::Unreadable => true,
     }
@@ -398,7 +382,7 @@ struct Head {
     channel: Field<String>,
     status: Field<String>,
     content: Field<Record<ContentType>>,
-    metadata: Field<Record<Markers>>,
+    metadata: Field<Record<ExclusionFlags>>,
 }
 
 #[derive(Deserialize)]
@@ -412,28 +396,19 @@ struct ContentType {
     content_type: Field<String>,
 }
 
-/// The exclusion flags of a message's or an output's own metadata, and the three keys whose
-/// presence makes a message's metadata look like a message itself.
 #[derive(Deserialize)]
-struct Markers {
+struct ExclusionFlags {
     is_user_system_message: Field<bool>,
     is_visually_hidden_from_conversation: Field<bool>,
-    author: Option<IgnoredAny>,
-    content: Option<IgnoredAny>,
-    metadata: Option<IgnoredAny>,
 }
 
-impl Markers {
+impl ExclusionFlags {
     fn flags(&self) -> impl Iterator<Item = &Field<bool>> {
         [
             &self.is_user_system_message,
             &self.is_visually_hidden_from_conversation,
         ]
         .into_iter()
-    }
-
-    fn message_shaped(&self) -> bool {
-        self.author.is_some() || self.content.is_some() || self.metadata.is_some()
     }
 }
 
@@ -478,8 +453,7 @@ struct RecapContent {
     content: String,
 }
 
-/// The supported content types and the fields each one shows. `None` for any other type.
-fn body(content_type: &str, message: &Value) -> Option<Result<Body, serde_json::Error>> {
+fn supported_body(content_type: &str, message: &Value) -> Option<Result<Body, serde_json::Error>> {
     fn content<'a, C: Deserialize<'a>>(message: &'a Value) -> Result<C, serde_json::Error> {
         Record::<ContentOf<C>>::deserialize(message).map(|Record(of)| of.content.0)
     }
@@ -523,7 +497,6 @@ enum Part {
     Other(IgnoredAny),
 }
 
-/// Its whole content reaches History, so a key outside this shape makes the part unsupported.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TextPart {
@@ -579,7 +552,6 @@ struct NamedPart {
     content_type: Field<String>,
 }
 
-/// The one marker a part or an attachment entry carries about itself.
 #[derive(Deserialize)]
 struct PartFlags {
     is_visually_hidden_from_conversation: Field<bool>,
@@ -649,12 +621,11 @@ fn contribution(part: Part) -> Result<Contribution, LeftOut> {
     Ok(Contribution { text, file })
 }
 
-/// What a message's own metadata adds when it is not shaped like a message.
 #[derive(Default)]
-struct Extras {
+struct MetadataExtras {
     preamble: bool,
     attachments: Vec<FileRef>,
-    outputs: Vec<Output>,
+    outputs: Vec<AggregateOutput>,
     fallback: Option<String>,
 }
 
@@ -669,6 +640,9 @@ struct Metadata {
     attachments: Field<Vec<Record<Attachment>>>,
     aggregate_result: Field<Record<Aggregate>>,
     model_dil_v2: Field<Record<Widget>>,
+    author: Option<IgnoredAny>,
+    content: Option<IgnoredAny>,
+    metadata: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -681,15 +655,15 @@ struct Attachment {
 
 #[derive(Deserialize)]
 struct Aggregate {
-    messages: Field<Vec<Record<OutputEntry>>>,
+    messages: Field<Vec<Record<AggregateOutputEntry>>>,
 }
 
 #[derive(Deserialize)]
-struct OutputEntry {
+struct AggregateOutputEntry {
     id: Field<String>,
     author: Field<Record<OutputAuthor>>,
     content: Field<Record<ContentType>>,
-    metadata: Field<Record<Markers>>,
+    metadata: Field<Record<ExclusionFlags>>,
     message_type: Field<String>,
     image_url: Field<String>,
 }
@@ -705,7 +679,7 @@ struct Widget {
     fallback_markdown: Field<String>,
 }
 
-impl Extras {
+impl MetadataExtras {
     fn read(message: &Value, left_out: &mut Vec<LeftOut>) -> Self {
         let Ok(Record(MetadataOf {
             metadata: Field::Read(Record(metadata)),
@@ -713,6 +687,10 @@ impl Extras {
         else {
             return Self::default();
         };
+        if metadata.author.is_some() || metadata.content.is_some() || metadata.metadata.is_some() {
+            left_out.push(LeftOut::MessageShapedMetadata);
+            return Self::default();
+        }
         let mut extras = Self {
             preamble: matches!(metadata.is_thinking_preamble_message, Field::Read(true)),
             ..Self::default()
@@ -747,7 +725,7 @@ impl Extras {
             Field::Unreadable => left_out.push(LeftOut::UnreadableOutputs),
             Field::Read(entries) => {
                 for Record(entry) in entries {
-                    match output(entry) {
+                    match read_aggregate_output(entry) {
                         Ok(output) => extras.outputs.push(output),
                         Err(entry) => left_out.push(entry),
                     }
@@ -766,19 +744,17 @@ impl Extras {
     }
 }
 
-/// An output has its own disposition by rule 1. Only image and stream outputs are modeled,
-/// and nothing inside an output is read beyond the fields named here.
-fn output(entry: OutputEntry) -> Result<Output, LeftOut> {
+fn read_aggregate_output(entry: AggregateOutputEntry) -> Result<AggregateOutput, LeftOut> {
     let id = entry.id.value();
     let role = entry.author.then(|Record(author)| author.role);
     let content_type = entry.content.then(|Record(content)| content.content_type);
-    let markers = entry.metadata.map(|Record(markers)| markers);
-    if excludes(&role, &content_type, &markers) {
-        return Ok(Output::Excluded { id });
+    let flags = entry.metadata.map(|Record(flags)| flags);
+    if excludes(&role, &content_type, &flags) {
+        return Ok(AggregateOutput::Excluded { id });
     }
     let kind = entry.message_type.value();
     let name = named(kind.as_deref().unwrap_or("(none)"));
-    if role.is_unreadable() || content_type.is_unreadable() || unreadable_markers(&markers) {
+    if role.is_unreadable() || content_type.is_unreadable() || unreadable_flags(&flags) {
         return Err(LeftOut::Output(format!("{name} (unreadable)")));
     }
     match kind.as_deref() {
@@ -787,12 +763,12 @@ fn output(entry: OutputEntry) -> Result<Output, LeftOut> {
             .value()
             .as_deref()
             .and_then(FileId::find)
-            .map(|file| Output::Kept {
+            .map(|file| AggregateOutput::Kept {
                 id,
                 file: Some(file),
             })
             .ok_or(LeftOut::Output(name)),
-        Some("stream") => Ok(Output::Kept { id, file: None }),
+        Some("stream") => Ok(AggregateOutput::Kept { id, file: None }),
         _ => Err(LeftOut::Output(name)),
     }
 }

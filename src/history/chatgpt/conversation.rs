@@ -76,22 +76,24 @@ pub(super) fn add(found: &mut Vec<FileRef>, reference: FileRef) {
     found.push(reference);
 }
 
-/// Each id a library file can name as its origin, resolved to the node whose item the file
-/// joins. An id that an excluded message or output uses resolves to nothing, whatever else
-/// uses it.
-struct Origins<'r, 'a>(HashMap<&'r str, Option<&'a str>>);
+enum LibraryOrigin<'a> {
+    Joins(&'a str),
+    Withheld,
+}
+
+struct Origins<'r, 'a>(HashMap<&'r str, LibraryOrigin<'a>>);
 
 impl<'r, 'a> Origins<'r, 'a> {
     fn new(readings: impl Iterator<Item = (&'a str, &'r Reading)>) -> Self {
-        let mut ids: HashMap<&'r str, Option<&'a str>> = HashMap::new();
+        let mut ids: HashMap<&'r str, LibraryOrigin<'a>> = HashMap::new();
         for (node, reading) in readings {
-            for (id, origin) in reading.origins() {
+            for (id, origin) in reading.library_origins() {
                 match origin {
                     Origin::Excluded => {
-                        ids.insert(id, None);
+                        ids.insert(id, LibraryOrigin::Withheld);
                     }
                     Origin::Kept => {
-                        ids.entry(id).or_insert(Some(node));
+                        ids.entry(id).or_insert(LibraryOrigin::Joins(node));
                     }
                 }
             }
@@ -101,7 +103,10 @@ impl<'r, 'a> Origins<'r, 'a> {
 
     fn node(&self, file: &LibraryFile) -> Option<&'a str> {
         let origin = file.origination_message.as_deref()?;
-        self.0.get(origin).copied().flatten()
+        match self.0.get(origin)? {
+            LibraryOrigin::Joins(node) => Some(*node),
+            LibraryOrigin::Withheld => None,
+        }
     }
 }
 
@@ -114,14 +119,10 @@ fn message_of(node: &Value) -> Option<&Value> {
 }
 
 pub(super) struct Survey {
-    /// Messages and outputs left out on purpose.
-    pub excluded: u32,
-    /// The files kept messages name.
-    pub files: BTreeSet<FileId>,
-    /// The library files that attach to a kept origin, in library order.
-    pub library: Vec<LibraryFile>,
+    pub excluded_messages_and_outputs: u32,
+    pub kept_message_files: BTreeSet<FileId>,
+    pub attached_library_files: Vec<LibraryFile>,
     pub dropped_library_files: u32,
-    /// Each label of content this import does not read, with how often it occurs.
     pub unsupported: BTreeMap<String, u32>,
 }
 
@@ -136,39 +137,40 @@ pub(super) fn survey(raw: &Value, library: &[LibraryFile]) -> Survey {
         .iter()
         .partition(|file| origins.node(file).is_some());
     let mut survey = Survey {
-        excluded: 0,
-        files: BTreeSet::new(),
-        library: attached.into_iter().cloned().collect(),
+        excluded_messages_and_outputs: 0,
+        kept_message_files: BTreeSet::new(),
+        attached_library_files: attached.into_iter().cloned().collect(),
         dropped_library_files: dropped.len() as u32,
         unsupported: BTreeMap::new(),
     };
     for (_, reading) in &readings {
-        survey.excluded += reading.excluded();
+        survey.excluded_messages_and_outputs += reading.excluded();
         for entry in &reading.left_out {
             *survey.unsupported.entry(entry.label()).or_default() += 1;
         }
         if let Some(kept) = reading.kept() {
             survey
-                .files
+                .kept_message_files
                 .extend(kept.files().into_iter().map(|reference| reference.file));
         }
     }
     survey
 }
 
-/// A time as the export writes it: seconds or milliseconds since the epoch, or RFC 3339 text.
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub(super) enum Time {
-    Number(f64),
-    Text(String),
+    EpochSecondsOrMillis(f64),
+    Rfc3339(String),
 }
 
 impl Time {
     pub fn seconds(self) -> Option<f64> {
         match self {
-            Self::Number(value) => Some(if value > 1e12 { value / 1000.0 } else { value }),
-            Self::Text(text) => chrono::DateTime::parse_from_rfc3339(&text)
+            Self::EpochSecondsOrMillis(value) => {
+                Some(if value > 1e12 { value / 1000.0 } else { value })
+            }
+            Self::Rfc3339(text) => chrono::DateTime::parse_from_rfc3339(&text)
                 .ok()
                 .map(|time| time.timestamp_millis() as f64 / 1000.0),
         }
@@ -563,7 +565,7 @@ pub(super) fn normalize(
         output.gaps.push(HistoryGap {
             code: HistoryGapCode::Unsupported,
             item_id: None,
-            message: entry.gap(&reading.id),
+            message: entry.gap(&reading.message_or_node_id),
         });
     }
     let more = unread.count();
@@ -1078,7 +1080,7 @@ mod tests {
                 "A part of message about has type about_model_message, which this import does not read"
             ]
         );
-        assert_eq!(survey(&raw, &[]).excluded, 5);
+        assert_eq!(survey(&raw, &[]).excluded_messages_and_outputs, 5);
     }
 
     #[test]
@@ -1270,7 +1272,7 @@ mod tests {
                 .contains(MARKER)
         );
         let surveyed = survey(&raw, &[]);
-        assert_eq!(surveyed.excluded, 1);
+        assert_eq!(surveyed.excluded_messages_and_outputs, 1);
         assert_eq!(
             surveyed.unsupported,
             BTreeMap::from([
@@ -1543,7 +1545,7 @@ mod tests {
         );
         assert!(!normalized.assets.contains_key("file_00e3"));
         let attached: Vec<&str> = surveyed
-            .library
+            .attached_library_files
             .iter()
             .map(|file| file.file.as_str())
             .collect();
@@ -1663,8 +1665,8 @@ mod tests {
                     .count(),
                 items.contains("PrivateNested"),
                 items.contains(MARKER),
-                surveyed.files.len(),
-                surveyed.excluded,
+                surveyed.kept_message_files.len(),
+                surveyed.excluded_messages_and_outputs,
             ));
             expected.push(format!(
                 "{case}: assets 0, unread {unread}, named false, text false, surveyed files 0, excluded {excluded}"
@@ -1688,13 +1690,13 @@ mod tests {
         let surveyed = survey(&raw, &[]);
         assert_eq!(
             surveyed
-                .files
+                .kept_message_files
                 .iter()
                 .map(FileId::as_str)
                 .collect::<Vec<_>>(),
             ["file-Shared"]
         );
-        assert_eq!(surveyed.excluded, 1);
+        assert_eq!(surveyed.excluded_messages_and_outputs, 1);
     }
 
     #[test]
@@ -1740,7 +1742,9 @@ mod tests {
         let (mut observed, mut expected) = (Vec::new(), Vec::new());
         for (case, raw) in cases {
             let file = library("file_00e7", Some("origin"));
-            let kept = !survey(&raw, std::slice::from_ref(&file)).library.is_empty();
+            let kept = !survey(&raw, std::slice::from_ref(&file))
+                .attached_library_files
+                .is_empty();
             let normalized = run_with(&raw, &[file], &Files::new(&["file_00e7-plan.dat"]));
             let ids: Vec<&str> = normalized
                 .items
@@ -1767,7 +1771,7 @@ mod tests {
             library("file_00e9", Some("table-output")),
         ];
         let surveyed = survey(&raw, &library);
-        assert_eq!(surveyed.library.len(), 1);
+        assert_eq!(surveyed.attached_library_files.len(), 1);
         assert_eq!(surveyed.dropped_library_files, 1);
         let normalized = run_with(
             &raw,
@@ -1801,7 +1805,7 @@ mod tests {
         );
         assert!(normalized.assets.is_empty());
         let surveyed = survey(&raw, &library);
-        assert!(surveyed.library.is_empty());
+        assert!(surveyed.attached_library_files.is_empty());
         assert_eq!(surveyed.dropped_library_files, 1);
     }
 

@@ -2,7 +2,7 @@
 
 /**
  * How often one kind of export content that this import does not read occurs, such as
- * `message future_widget` or `part image_asset_pointer (hidden)`. Past 32 labels, the rest
- * count under `other`.
+ * `message future_widget` or `part image_asset_pointer (hidden)`. Listed in label order; labels
+ * after the first 32 are summed into one entry whose content is `other`.
  */
 export type ChatGptUnsupported = { content: string, count: number, };

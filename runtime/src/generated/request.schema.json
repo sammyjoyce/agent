@@ -572,7 +572,7 @@
           "minimum": 0
         },
         "excluded_messages": {
-          "description": "System, developer, custom-instruction and hidden messages left out on purpose.",
+          "description": "System, developer, custom-instruction and hidden messages, and code-interpreter outputs of\nthose kinds, left out on purpose.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0
@@ -614,7 +614,7 @@
           "minimum": 0
         },
         "unsupported": {
-          "description": "Messages, parts, outputs, attachments and metadata of a kind this import does not read,\ncounted by label. Each one is also an import gap of its conversation.",
+          "description": "Messages, parts, outputs, attachments and metadata of a kind this import does not read,\ncounted by label. Each is also an unsupported gap of its conversation; past 32 in one\nconversation, the rest are summed in one further gap.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/ChatGptUnsupported"
@@ -638,7 +638,7 @@
       ]
     },
     "ChatGptUnsupported": {
-      "description": "How often one kind of export content that this import does not read occurs, such as\n`message future_widget` or `part image_asset_pointer (hidden)`. Past 32 labels, the rest\ncount under `other`.",
+      "description": "How often one kind of export content that this import does not read occurs, such as\n`message future_widget` or `part image_asset_pointer (hidden)`. Listed in label order; labels\nafter the first 32 are summed into one entry whose content is `other`.",
       "type": "object",
       "properties": {
         "content": {

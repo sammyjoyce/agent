@@ -4215,7 +4215,7 @@ async fn check_chatgpt_export(
         summary.attachments, summary.missing_attachments
     );
     eprintln!(
-        "  {} system, custom-instruction and hidden messages are left out",
+        "  {} system, developer, custom-instruction and hidden messages and code outputs are left out",
         summary.excluded_messages
     );
     if !summary.unsupported.is_empty() {
@@ -4226,7 +4226,7 @@ async fn check_chatgpt_export(
             .map(|kind| format!("{} × {}", kind.count, kind.content))
             .collect();
         eprintln!(
-            "  {total} messages or parts are of a kind this import does not read: {}",
+            "  {total} entries are of a kind this import does not read: {}",
             kinds.join(", ")
         );
     }

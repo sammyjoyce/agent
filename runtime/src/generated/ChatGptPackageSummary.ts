@@ -11,12 +11,14 @@ export type ChatGptPackageSummary = {
  */
 digest: string, parts: Array<string>, conversations: number, archived: number, shards: number, attachments: number, missing_attachments: number,
 /**
- * System, developer, custom-instruction and hidden messages left out on purpose.
+ * System, developer, custom-instruction and hidden messages, and code-interpreter outputs of
+ * those kinds, left out on purpose.
  */
 excluded_messages: number,
 /**
  * Messages, parts, outputs, attachments and metadata of a kind this import does not read,
- * counted by label. Each one is also an import gap of its conversation.
+ * counted by label. Each is also an unsupported gap of its conversation; past 32 in one
+ * conversation, the rest are summed in one further gap.
  */
 unsupported: Array<ChatGptUnsupported>,
 /**
