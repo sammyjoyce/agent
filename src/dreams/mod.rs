@@ -835,6 +835,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_receipt_that_a_moved_clock_stamped_outside_the_window_makes_the_night_incomplete() {
+        let now = diagnostics::now_ms();
+        for (name, stamped) in [
+            ("the clock went back two hours", now - 120 * MINUTE),
+            ("the clock ran two hours ahead", now + 120 * MINUTE),
+        ] {
+            let night = Night::new();
+            night.seed_receipts("");
+            let beats = |from: u64| -> Vec<String> {
+                (0..=6)
+                    .map(|step| heartbeat(from + step * 5 * MINUTE))
+                    .collect()
+            };
+            let mut lines = beats(now - 65 * MINUTE);
+            lines.push(format!(
+                "{{\"timestamp_ms\":{stamped},\"request_id\":7,\"elapsed_ms\":null,\"event\":\"failure\",\"code\":\"storage_unavailable\"}}"
+            ));
+            lines.extend(beats(now - 30 * MINUTE));
+            fs::write(
+                night.dreams.state.join("diagnostics/runtime.jsonl"),
+                lines.join("\n") + "\n",
+            )
+            .unwrap();
+            let page = night.review("night").await.text;
+            assert!(
+                page.contains("finding failure") || page.contains("gap clock_moved"),
+                "{name}: a receipt written inside the window was left out with no gap:\n{}",
+                page.lines()
+                    .filter(|line| line.starts_with("Coverage") || line.starts_with("gap "))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            let quiet = night.abstain_as_quiet("night").await;
+            assert!(!quiet.decided, "{name}: {}", quiet.text);
+        }
+    }
+
+    #[tokio::test]
     async fn a_witnessed_night_is_complete_and_a_malformed_receipt_that_nothing_places_is_a_gap() {
         let quiet = Night::new();
         quiet.seed_receipts("");

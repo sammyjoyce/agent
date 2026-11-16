@@ -27,12 +27,19 @@ use crate::{
 };
 
 mod window;
+#[cfg(test)]
+pub(crate) use window::ClockMoves;
 pub(crate) use window::{ReceiptWindow, read_window};
 
 const MAX_BYTES: u64 = 1024 * 1024;
 pub(crate) const RETENTION_CAP_BYTES: u64 = 128 * MAX_BYTES;
 const CAPACITY: usize = 256;
 pub(crate) const HEARTBEAT: Duration = Duration::from_secs(5 * 60);
+/// A sender stamps a receipt and then enqueues it without waiting, so two
+/// senders can land a few milliseconds out of order, and a replacement writer
+/// starts with receipts stamped while the retired one drained its queue. Both
+/// are far below a minute. A timestamp that goes back by more is a moved clock.
+pub(crate) const STAMP_REORDER_TOLERANCE: Duration = Duration::from_secs(60);
 pub(crate) const UNWITNESSED_AFTER: Duration = Duration::from_secs(2 * HEARTBEAT.as_secs());
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2038,6 +2045,48 @@ mod tests {
             1,
             "The clock went back in the segment whose receipt would place the line"
         );
+    }
+
+    #[test]
+    fn a_timestamp_that_goes_back_past_the_reorder_tolerance_around_the_window_is_a_clock_move() {
+        const HOUR: u64 = 3_600_000;
+        let line = |timestamp| serde_json::to_string(&at(timestamp, Event::Heartbeat)).unwrap();
+        let now = super::now_ms();
+        let window = (now - 2 * HOUR, now);
+        let moves = |stamps: &[u64]| {
+            let state = tempfile::tempdir().unwrap();
+            let directory = state.path().join("diagnostics");
+            fs::create_dir(&directory).unwrap();
+            let log: String = stamps.iter().map(|stamp| line(*stamp) + "\n").collect();
+            fs::write(directory.join("runtime.jsonl"), log).unwrap();
+            read_window(state.path(), window, 100, u64::MAX)
+                .unwrap()
+                .clock_moves
+        };
+        assert_eq!(moves(&[now - HOUR, now - HOUR + 5, now - HOUR + 1]), None);
+        assert_eq!(
+            moves(&[now - HOUR, now - HOUR - 59_000, now - 1_000]),
+            None,
+            "Senders and a replacement writer reorder stamps by less than a minute"
+        );
+        assert_eq!(
+            moves(&[now - 5 * HOUR, now - 6 * HOUR, now - HOUR]),
+            None,
+            "A move wholly before the window hides nothing in it"
+        );
+        let back = moves(&[now - HOUR, now - 4 * HOUR, now - 1_000]).unwrap();
+        assert_eq!((back.times, back.largest_back_ms), (1, 3 * HOUR));
+        assert_eq!(back.span_ms, (now - 4 * HOUR, now - HOUR));
+        let ahead = moves(&[now - HOUR, now + 2 * HOUR, now - 1_000]).unwrap();
+        assert_eq!(ahead.times, 1);
+        assert_eq!(ahead.span_ms, (now - 1_000, now + 2 * HOUR));
+        let trailing = moves(&[now - HOUR, now + 2 * HOUR]).unwrap();
+        assert_eq!(
+            trailing.times, 1,
+            "A last receipt stamped ahead of the present"
+        );
+        let twice = moves(&[now - HOUR, now - 3 * HOUR, now - HOUR, now - 2 * HOUR - 1]).unwrap();
+        assert_eq!((twice.times, twice.largest_back_ms), (2, 2 * HOUR));
     }
 
     #[test]

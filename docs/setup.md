@@ -552,7 +552,12 @@ unparseable receipts, a read that stopped early, or more than ten minutes with
 no receipt. The coordinator writes a `heartbeat` receipt every five minutes, so
 a stopped coordinator or a failed log writer appears as an `unwitnessed` gap
 instead of a quiet night. A machine that sleeps for more than ten minutes
-leaves the same gap. A gap never blocks a proposal. It blocks only the claim
+leaves the same gap. A `clock_moved` gap means that receipt timestamps went
+back by more than a minute around the window, or that a receipt is stamped
+ahead of the present. A receipt near such a move can carry a time outside the
+window although it was written inside it, so the night is not counted whole.
+Smaller steps back are normal, because several senders stamp a receipt before
+they enqueue it. A gap never blocks a proposal. It blocks only the claim
 that the night was quiet. Task summaries are the text retained when the review
 was sealed. They are a snapshot, not a history of the window.
 

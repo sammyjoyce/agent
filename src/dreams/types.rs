@@ -243,6 +243,10 @@ pub enum GapCause {
     ConcurrentRotation,
     /// No receipt, not even a heartbeat, for longer than two heartbeat intervals.
     Unwitnessed,
+    /// Receipt timestamps went back by more than senders can reorder them, or
+    /// run ahead of the present. A receipt near the move may be stamped outside
+    /// the window although it was written inside it.
+    ClockMoved { times: u32, largest_back_ms: u64 },
     /// Summaries the runtime or the executor left out.
     SummariesOmitted { count: u32 },
     /// Summaries at the retention limit, which may have lost their beginning.
@@ -262,6 +266,7 @@ impl GapCause {
             Self::ReadBudget => "read_budget",
             Self::ConcurrentRotation => "concurrent_rotation",
             Self::Unwitnessed => "unwitnessed",
+            Self::ClockMoved { .. } => "clock_moved",
             Self::SummariesOmitted { .. } => "summaries_omitted",
             Self::SummariesTruncated { .. } => "summaries_truncated",
         }
@@ -311,6 +316,15 @@ impl fmt::Display for Gap {
             GapCause::Unwitnessed => {
                 write!(formatter, "no receipt or heartbeat was written{between}")
             }
+            GapCause::ClockMoved {
+                times,
+                largest_back_ms,
+            } => write!(
+                formatter,
+                "receipt timestamps went back {}, by up to {} seconds{between}, so a receipt may be stamped outside the window",
+                count(*times as usize, "time"),
+                largest_back_ms / 1000
+            ),
             GapCause::SummariesOmitted { count } => {
                 write!(formatter, "{count} task summaries were left out")
             }
@@ -576,6 +590,10 @@ mod tests {
             GapCause::ReadBudget,
             GapCause::ConcurrentRotation,
             GapCause::Unwitnessed,
+            GapCause::ClockMoved {
+                times: 1,
+                largest_back_ms: 1,
+            },
             GapCause::SummariesOmitted { count: 1 },
             GapCause::SummariesTruncated { count: 1 },
         ] {

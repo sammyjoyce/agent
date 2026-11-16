@@ -6,7 +6,10 @@ use std::{
     path::Path,
 };
 
-use super::{Record, RetentionWatermark, Segment, WATERMARK_BYTES, undelivered_drops};
+use super::{
+    Record, RetentionWatermark, STAMP_REORDER_TOLERANCE, Segment, WATERMARK_BYTES, now_ms,
+    undelivered_drops,
+};
 
 const LIVE_SEGMENT: u32 = 0;
 
@@ -19,6 +22,65 @@ pub(crate) struct ReceiptWindow {
     pub truncated_at_ms: Option<u64>,
     pub rotated_during_read: bool,
     pub undelivered_drops: u64,
+    /// Set when receipt timestamps prove that the clock moved around the
+    /// window. A receipt near such a move may be stamped outside the window
+    /// although it was written inside it, so the window cannot be trusted whole.
+    pub clock_moves: Option<ClockMoves>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClockMoves {
+    pub times: u32,
+    pub largest_back_ms: u64,
+    /// The earliest and the latest timestamp on either side of a move.
+    pub span_ms: (u64, u64),
+}
+
+/// Finds timestamps that go back by more than senders can reorder them.
+struct ClockWatch {
+    window: (u64, u64),
+    previous_ms: Option<u64>,
+    moves: Option<ClockMoves>,
+}
+
+impl ClockWatch {
+    fn moved(&mut self, from_ms: u64, to_ms: u64) {
+        let back_ms = from_ms.saturating_sub(to_ms);
+        let moves = self.moves.get_or_insert(ClockMoves {
+            times: 0,
+            largest_back_ms: back_ms,
+            span_ms: (to_ms, from_ms),
+        });
+        moves.times = moves.times.saturating_add(1);
+        moves.largest_back_ms = moves.largest_back_ms.max(back_ms);
+        moves.span_ms = (moves.span_ms.0.min(to_ms), moves.span_ms.1.max(from_ms));
+    }
+    fn receipt(&mut self, timestamp_ms: u64) {
+        let tolerance = u64::try_from(STAMP_REORDER_TOLERANCE.as_millis()).unwrap_or(u64::MAX);
+        let (start, end) = self.window;
+        // A move that lies wholly before the window hides nothing in it: every
+        // receipt stamped on the old clock is older than the window either way.
+        if let Some(previous) = self.previous_ms
+            && previous.saturating_sub(timestamp_ms) > tolerance
+            && previous >= start
+            && timestamp_ms < end
+        {
+            self.moved(previous, timestamp_ms);
+        }
+        self.previous_ms = Some(timestamp_ms);
+    }
+    /// The last receipt has no later one to go back to. A stamp ahead of the
+    /// present clock shows the move just as well.
+    fn finish(mut self) -> Option<ClockMoves> {
+        let tolerance = u64::try_from(STAMP_REORDER_TOLERANCE.as_millis()).unwrap_or(u64::MAX);
+        let now = now_ms();
+        if let Some(last) = self.previous_ms
+            && last.saturating_sub(now) > tolerance
+        {
+            self.moved(last, now);
+        }
+        self.moves
+    }
 }
 
 /// Decides which lines that are not receipts may hide a receipt inside the
@@ -175,6 +237,12 @@ fn read_once(
         truncated_at_ms: None,
         rotated_during_read: false,
         undelivered_drops: 0,
+        clock_moves: None,
+    };
+    let mut clock = ClockWatch {
+        window: (start, end),
+        previous_ms: None,
+        moves: None,
     };
     let mut placement = Placement::default();
     let mut unfinished_last_line = false;
@@ -193,6 +261,7 @@ fn read_once(
                             .map_or(timestamp, |oldest| oldest.min(timestamp)),
                     );
                     placement.receipt(timestamp, start);
+                    clock.receipt(timestamp);
                     if (start..end).contains(&timestamp) {
                         if window.records.len() < max_records && bytes <= max_bytes {
                             window.records.push(record);
@@ -215,6 +284,7 @@ fn read_once(
         placement.end_segment();
     }
     window.unplaced_lines = placement.finish();
+    window.clock_moves = clock.finish();
     let after = match segment_files(directory) {
         Ok(files) => identities(&files)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),

@@ -170,6 +170,15 @@ pub(crate) fn receipt_coverage(window: Interval, receipts: &ReceiptWindow) -> Re
             cause: GapCause::ReadBudget,
         });
     }
+    if let Some(moves) = receipts.clock_moves {
+        gaps.push(Gap {
+            interval: within(moves.span_ms.0, moves.span_ms.1),
+            cause: GapCause::ClockMoved {
+                times: moves.times,
+                largest_back_ms: moves.largest_back_ms,
+            },
+        });
+    }
     if receipts.rotated_during_read {
         gaps.push(Gap {
             interval: None,
@@ -526,7 +535,8 @@ mod tests {
         },
         protocol::ErrorCode,
         runtime::diagnostics::{
-            CapacityLoss, Event, ReceiptWindow, Record, RetentionPolicy, RetentionWatermark,
+            CapacityLoss, ClockMoves, Event, ReceiptWindow, Record, RetentionPolicy,
+            RetentionWatermark,
         },
     };
 
@@ -567,6 +577,7 @@ mod tests {
             truncated_at_ms: None,
             rotated_during_read: false,
             undelivered_drops: 0,
+            clock_moves: None,
         }
     }
 
@@ -691,6 +702,23 @@ mod tests {
         assert!(
             causes(&receipts).is_empty(),
             "Loss that ended before the window started is not a gap in it"
+        );
+
+        let mut receipts = witnessed((1_000..1_100).step_by(5));
+        receipts.clock_moves = Some(ClockMoves {
+            times: 2,
+            largest_back_ms: 90 * MINUTE,
+            span_ms: (950 * MINUTE, 1_040 * MINUTE),
+        });
+        assert_eq!(
+            causes(&receipts),
+            vec![(
+                GapCause::ClockMoved {
+                    times: 2,
+                    largest_back_ms: 90 * MINUTE
+                },
+                Some((1_000, 1_040))
+            )]
         );
 
         let mut receipts = witnessed((1_000..1_050).step_by(5));
