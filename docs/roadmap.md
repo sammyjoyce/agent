@@ -179,11 +179,17 @@ recovery; [history](history.md) describes import and retrieval.
   App Intents. **Open Coordinator** and the coordinator entity ship first, with
   a build check that the app carries its intents metadata and phrase. Reading
   jobs, sending, opening a job, onscreen entities and Spotlight follow.
+- [ ] A macOS menu bar app that shows Beep Boop's status on the Mac, including
+  whether the service is running and its installed and running versions.
 
 ## Retrieval, learning and proof
 
 - [ ] ChatGPT conversation import from a verified export, with resumable,
   idempotent ingestion and attachment coverage.
+- [ ] [Grok Bot](https://docs.x.ai/grok-bot/overview) conversation import, with
+  resumable, idempotent ingestion and attachment coverage. Grok Bot documents
+  no account-wide export, only per-call transcripts and per-message downloads,
+  so the import source is still open.
 - [x] Representative SQL plans and paired CI benchmarks for history loading,
   dense/FTS retrieval, hydration and cached indexing. See
   [performance checks](performance.md).
