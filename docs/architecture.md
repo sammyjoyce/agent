@@ -693,6 +693,34 @@ authority.
 An unrestricted same-user shell can bypass a CLI allowlist, so prove that
 separation before enabling activation. Learning cannot grant new permissions.
 
+Dreams implements this for one target repository. The separation it proves is
+narrow: the actor that reads untrusted nightly evidence holds no shell and no
+channel to an actor that holds one. Tests cover each link.
+
+- `TaskStore.runActor` gives the task of the job `dreams` exactly
+  `dreams_review`, `dreams_propose` and `dreams_abstain` on every path, and it
+  refuses an attached worker or a child agent on that task.
+- The scheduler source that marks the task cannot be added or removed by a
+  tool, and the task's outcomes are recorded already dismissed, so triage never
+  reads them.
+- The only host command those tools send has no apply, command, target or
+  policy variant. The broker runs it on the coordinator and nodes refuse it.
+- The executor reads the target repository and writes only under
+  `<state_dir>/dreams/runs/`. Its checks are the operator's programs from
+  private configuration.
+- `dreams apply` is in the `beep-boop` binary, which the coordinator library
+  cannot link. It applies only the patch whose review digest a human passed,
+  onto the unchanged base.
+
+Dreams does not claim more than that. The main, triage and worker actors still
+hold same-user shells, so each of them can run `beep-boop dreams apply` or edit
+the repository directly. A shell-bearing actor that reads a Dreams record reads
+untrusted text, as it does with any email or web page. A check that executes an
+editable file runs proposed content before approval, so checks must treat
+candidate files as data. Approval is a digest typed by whoever runs the
+command. The policy, the editable set and the tool list are code and private
+configuration, which no Dreams path writes.
+
 Evaluate actual retrieval and task execution against a simple baseline with the
 same model, tools and budget, including unrelated tasks and withdrawn advice.
 Measure verified outcomes, regressions, later corrections and cost; a better

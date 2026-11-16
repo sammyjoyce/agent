@@ -452,6 +452,112 @@ BYMINUTE, BYSECOND and WKST. DTSTART must agree with the named timezone and
 rule. Nonexistent local occurrences are skipped; repeated local times use the
 first instant. Source polling uses elapsed intervals through the same Pi timer.
 
+### Dreams
+
+Dreams is one scheduled job that reads the coordinator's private runtime
+receipts and task summaries each night. It proposes at most one diff to a
+private Git repository, or it abstains. A proposal changes nothing until you
+approve that exact review with `beep-boop dreams apply`.
+
+Point Dreams at a repository of guidance that your agents read, such as one of
+your `context_repositories`. Add the policy to the coordinator's private
+configuration file:
+
+```toml
+[dreams]
+repository = "/Users/example/context"
+editable = ["AGENTS.md", "playbooks/*.md"]
+window_hours = 24
+
+[[dreams.checks]]
+name = "commands-exist"
+argv = ["/bin/sh", "/Users/example/dreams-checks/commands-exist.sh"]
+timeout_seconds = 60
+```
+
+`repository` is the root of a Git work tree. `editable` lists the only paths a
+proposal may change, relative to that root. A `*` matches within one path
+component. A path with a component that starts with `.git` is never editable.
+`window_hours` is 1 to 48 and defaults to 24. Each check is a program with
+literal arguments that exits 0 when a checkout is healthy. Dreams runs every
+check on the base commit and again on the candidate, so each proposal records
+before and after results. See the
+[example check](../examples/dreams/commands-exist.sh).
+
+The policy loader refuses a repository that contains the configuration file, a
+job directory or the state directory. It also refuses a check whose arguments
+name an editable path. Keep check programs outside the repository. Restart the
+coordinator after you change the policy.
+
+Copy the [example job](../examples/scheduled_jobs/dreams.toml) into a job
+directory, then check and sync as for any job. The job id `dreams` is reserved.
+A job with that id can call `dreams_review`, `dreams_propose` and
+`dreams_abstain`, and it has no shell, file, browser or delegation tool. A
+`dreams` job without a `[dreams]` policy still runs with only those tools, and
+each tool answers `Dreams is not configured`.
+
+```sh
+beep-boop jobs check && beep-boop jobs sync
+beep-boop jobs run dreams
+beep-boop dreams list
+beep-boop dreams show RUN
+beep-boop dreams apply RUN --approve sha256:REVIEW_DIGEST
+```
+
+`dreams list` shows each run's window, coverage, outcome and status.
+`dreams show RUN` prints the coverage gaps, the before and after check results,
+the cited evidence, the rationale, the patch, and the exact `apply` command.
+Text that a model wrote is labeled and quoted, and control characters are shown
+as escapes. Add `--json` for the typed record. These commands read the
+coordinator's state directory, so run them on the coordinator's machine.
+
+Read the patch before you approve it. The review digest is the SHA-256 of the
+sealed outcome record, which holds the patch hash, the base commit, the cited
+evidence ids and the check results. `apply` recomputes the digest and the patch
+hash and refuses with one of these messages, without changing the repository:
+
+- `Dreams approval does not match the review`
+- `Dreams patch changed since it was proposed`
+- `Dreams policy changed since this proposal`
+- `Dreams base is stale: target HEAD is <commit>, proposal base is <commit>`
+- `Dreams target has local changes in touched paths`
+- `Dreams run did not propose a change`
+
+A successful apply adds one commit with `Dreams-Run`, `Dreams-Base` and
+`Dreams-Patch-Sha256` trailers and fast-forwards the checked-out branch. The
+commit uses your Git identity and is not signed. A second apply of the same run
+reports `already applied` and changes nothing. If an apply was interrupted
+after Git wrote the proposed content but before `HEAD` moved, `dreams show`
+still reports `pending`, and the next apply finishes the same commit once. A
+context repository serves approved guidance on the next turn. Revert the commit
+to withdraw it.
+
+A run abstains as `quiet` only when its coverage has no gaps. A gap is any way
+the window may be missing evidence: expired or evicted segments, dropped or
+unparseable receipts, a read that stopped early, or more than ten minutes with
+no receipt. The coordinator writes a `heartbeat` receipt every five minutes, so
+a stopped coordinator or a failed log writer appears as an `unwitnessed` gap
+instead of a quiet night. Task summaries are the text retained when the review
+was sealed. They are a snapshot, not a history of the window.
+
+A check runs with only `PATH`, `HOME`, `LANG` and `TMPDIR` in its environment,
+in a private clone under `<state_dir>/dreams/runs/`. Write checks that read
+candidate files as data. A check that executes or sources an editable file
+runs proposed content before you have approved it. Dreams keeps every run
+under `<state_dir>/dreams/runs/` and does not prune them.
+
+To measure a model on Dreams, run the opt-in eval against your provider. It
+writes one JSON line per trial, with each patch and check result, to the output
+directory:
+
+```sh
+AGENT_DREAMS_EVAL=1 AGENT_DREAMS_EVAL_OUTPUT=/tmp/dreams-eval \
+  cargo test --locked --test dreams_eval -- --ignored --nocapture
+```
+
+Set `OPENAI_API_KEY` and `OPENAI_BASE_URL` first. The eval covers a seeded
+defect, a quiet night and injected text, three trials each by default.
+
 ### Coordinator settings
 
 The commented [coordinator example](../examples/coordinator.toml) is parsed by
@@ -574,7 +680,9 @@ receipt files to establish the available interval; the watermark is coverage
 evidence, not an inventory of retained files. An interrupted prune can report a
 conservative possible gap. `dropped_before` counts channel overflow only, so
 zero does not establish complete log coverage. No finite cap guarantees a full
-audit interval at an unbounded event rate.
+audit interval at an unbounded event rate. The writer also records a
+`heartbeat` receipt every five minutes, so an interval with no receipt at all
+means that nothing was written, not that nothing happened.
 
 ### Scrawl feedback
 
