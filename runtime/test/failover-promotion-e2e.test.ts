@@ -9,9 +9,9 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { createRegistry, defineExtension, defineTool } from "@earendil-works/pi-durable";
 import { OWNER_FENCED_EXIT } from "../src/generated/owner-fenced-exit.js";
 import { NotificationDeliveries } from "../src/notifications.js";
-import { exists, HOLDERS, replicatedPair, until, World, type Host, type PromotedReceipt, type ReleasedReceipt,
+import { exists, HOLDERS, replicatedPair, until, World, type EnrolledReceipt, type Host, type PromotedReceipt, type ReleasedReceipt,
   type StatusReceipt } from "./fixtures/failover-hosts.js";
-import { claimStart, openOwner, tables } from "./fixtures/failover-state.js";
+import { claimStart, commitOutsideTheLog, openOwner, tables } from "./fixtures/failover-state.js";
 import { fixtureModel } from "./model.js";
 
 const [OWNER, STANDBY] = HOLDERS;
@@ -137,6 +137,34 @@ test("promotion moves ownership to a standby only on stop evidence", { timeout: 
     const back = await owner.receipt<PromotedReceipt>("promote", "--replace-epoch", String(epoch));
     assert.equal(back.holder, OWNER, "the old owner can still take ownership back");
     assert.deepEqual(await owner.authorityState(), { kind: "active", epoch: epoch + 1, holder: OWNER, head });
+  });
+
+  await t.test("a standby whose session database holds a commit that the log lacks is not activated", async () => {
+    const { owner, standby, epoch, head } = await replicatedPair(world);
+    await standby.receipt("follow", "--once");
+    await commitOutsideTheLog(standby.state, "never logged");
+    const refused = await standby.failover("promote", "--replace-epoch", String(epoch), "--old-owner-stopped", STATEMENT);
+    assert.notEqual(refused.code, 0, "the promotion activated a standby that holds a commit the log lacks");
+    assert.match(refused.stderr, /is at Pi sequence \d+, and the log is at Pi sequence \d+, which entry \d+ records/);
+    assert.match(refused.stderr, /`beep-boop failover join --replace`/);
+    assert.deepEqual(await owner.authorityState(),
+      { kind: "vacant", epoch, candidate: STANDBY, evidence: { kind: "operator_attested", statement: STATEMENT }, head }, "nobody was activated");
+
+    const back = await owner.receipt<PromotedReceipt>("promote", "--replace-epoch", String(epoch));
+    assert.equal(back.holder, OWNER, "the old owner can still take ownership back");
+  });
+
+  await t.test("a standby at a checkpoint that no batch follows is checked against the checkpoint's Pi sequence", async () => {
+    const coordinator = world.coordinator(), owner = await world.host(coordinator, OWNER), standby = await world.host(coordinator, STANDBY);
+    await owner.create();
+    const { epoch } = await owner.receipt<EnrolledReceipt>("enroll");
+    await standby.receipt("join", coordinator);
+    await commitOutsideTheLog(standby.state, "never logged");
+    const refused = await standby.failover("promote", "--replace-epoch", String(epoch), "--old-owner-stopped", STATEMENT);
+    assert.notEqual(refused.code, 0, "the promotion activated a standby that holds a commit the log lacks");
+    assert.match(refused.stderr, /is at Pi sequence \d+, and the log is at Pi sequence \d+, which its checkpoint records/);
+    assert.deepEqual(await owner.authorityState(),
+      { kind: "vacant", epoch, candidate: STANDBY, evidence: { kind: "operator_attested", statement: STATEMENT }, head: 0 }, "nobody was activated");
   });
 
   await t.test("the report a person reads carries the statement word for word and what to do next", async () => {
