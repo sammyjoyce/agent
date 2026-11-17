@@ -706,9 +706,20 @@ three kinds:
 
 | Evidence | What it proves |
 | --- | --- |
-| `released` | The old owner saw the seal, stopped its listeners, cancelled and drained its local effects, closed its worker links, and then said so. |
-| `lock_held` | A command on the old host took `writer.lock`, so no supervisor or Pi child of the old owner is alive. Effects on workers end when their link ends. |
+| `released` | The old owner saw the seal, stopped its listeners, cancelled and reaped its local effects, closed its worker links, and then said so. It held `writer.lock` until then. |
+| `lock_held` | No process of the old owner is alive on its host. A command there took `writer.lock`, which the supervisor and its Pi child hold, and then `effects.lock`, which every local effect process holds. It first stopped each recorded process group that was still alive. |
 | `operator_attested` | Nothing about the old host. It stores the operator's statement that the host is stopped. |
+
+Neither `released` nor `lock_held` proves that an effect on a worker has ended.
+The old owner closes its worker links, and it does not wait for a worker to
+confirm. An effect on a worker ends when that worker's daemon sees its link
+end, or reads the new owner's epoch and drops the link. Until then it can still
+run, and the promotion report lists it as unfinished.
+
+`lock_held` is refused while a local effect process survives that the command
+may not stop: one that left its recorded process group, or a group whose leader
+is no longer the process the coordinator recorded. The refusal names it, and
+nothing is posted.
 
 Under every kind, the authority refuses the old owner's appends and owner
 checks without the old host's help. After an attestation that is wrong, one

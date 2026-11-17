@@ -188,11 +188,13 @@ impl From<StatePath> for String {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StopEvidence {
-    /// The old owner saw the seal, cancelled and reaped its effects, closed its
-    /// worker links, then said so.
+    /// The old owner saw the seal, cancelled and reaped its local effects,
+    /// closed its worker links, then said so. It does not prove that an effect
+    /// on a worker has ended.
     Released,
-    /// `failover release` on the old host took `writer.lock`, so no supervisor
-    /// or Pi child of the old owner survives.
+    /// A command on the old host took `writer.lock` and then `effects.lock`,
+    /// so no supervisor, Pi child or local effect process of the old owner
+    /// survives. It does not prove that an effect on a worker has ended.
     LockHeld,
     /// The old host cannot be reached. The operator's statement is stored verbatim.
     OperatorAttested { statement: String },

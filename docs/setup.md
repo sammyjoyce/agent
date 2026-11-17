@@ -1003,7 +1003,10 @@ backup does, and the promotion releases the hold.
 3. If the old coordinator process is dead and its host is up, run `beep-boop
    failover release` on the old host, then run the `promote` command again. A
    coordinator that the service manager restarts after a seal does this release by
-   itself.
+   itself. The release stops each local command the old coordinator left running
+   and posts `lock_held` only when no process of the old coordinator is alive on
+   that host. If one survives that it may not stop, it names that process and
+   posts nothing. Stop the process and run the release again, or go to step 4.
 4. If the old host cannot be reached, make sure it is powered off, then run
    `beep-boop failover promote --replace-epoch <epoch> --old-owner-stopped "<why
    you know it is stopped>"`. The statement is stored. Read what a wrong statement
@@ -1011,6 +1014,10 @@ backup does, and the promotion releases the hold.
    first.
 5. Read the report. It lists each tool call and each notification that the old
    owner started and that has no result, and each credential this host lacks.
+   `released` and `lock_held` cover the old owner's own host. Neither proves that
+   a command on a worker has ended. That command ends when the worker's daemon
+   sees its link to the old owner end or reads the new owner's epoch, and the
+   report lists it as unfinished.
 6. Start the service on the new owner, and change the address on each phone.
    The phones keep their pairing because the coordinator ID is the same. Send
    again any input whose turn was in flight.
