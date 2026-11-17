@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { readdir, readFile, rename } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rename, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -336,6 +337,23 @@ for (const [name, connect] of Object.entries(authorities)) {
     await assert.rejects(follow(behind, link), behindCheckpoint);
     await assert.rejects(openOwner(behind, link, { epoch }), behindCheckpoint);
     assert.deepEqual(tables(behind), stale);
+  });
+
+  test(`${name}: a standby nobody restored a checkpoint into is refused, and never reported at the head`, async (t) => {
+    const link = await connect(), epoch = await enroll(link), owner = await stateDirectory(t);
+    const unrestored = await mkdtemp(join(tmpdir(), "agent-failover-unrestored-"));
+    t.after(() => rm(unrestored, { recursive: true, force: true }));
+    const opened = await openOwner(owner, link, { epoch });
+    for (let index = 1; index <= 3; index += 1) await opened.root.submit(note(`acknowledged ${index}`, `request-${index}`), context);
+    await opened.harness.close(context);
+    const head = (await link.record())?.state.head ?? 0;
+    const manifest = Buffer.from("invented backup manifest of the owner at the head");
+    await link.putBlob(sha256Hex(manifest), manifest);
+    assert.equal((await link.command({ op: "checkpoint", holder: OWNER, epoch, record: { through: head, manifest: sha256Hex(manifest) } })).result, "accepted");
+
+    await assert.rejects(applyLog({ database: await openScoped(unrestored), link, stateDirectory: unrestored }), /holds no replication position/,
+      `an empty standby must not report position ${head}, the head whose acknowledged commits it lacks`);
+    assert.deepEqual(tables(unrestored), {}, "a refused standby is left without Pi's schema");
   });
 
   test(`${name}: a promoted standby reads an imported cold original from its own directory`, async (t) => {
