@@ -1902,8 +1902,8 @@ final class HistoryInteractionTests: XCTestCase {
     app.launchArguments += ["-notificationsEnabled", "NO"]
     app.launch()
     defer { app.terminate() }
-    XCTAssertTrue(app.staticTexts["Job: Original run title"].waitForExistence(timeout: 5))
-    XCTAssertTrue(app.staticTexts["Notice"].exists)
+    XCTAssertTrue(app.buttons["Details for Job: Original run title"].waitForExistence(timeout: 5))
+    XCTAssertTrue(app.buttons["Details for Update"].exists)
     let composer = editor(app)
     composer.tap()
     let note = "Keep this unsent note."
