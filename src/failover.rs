@@ -4,22 +4,24 @@
 
 use std::{
     fmt, fs,
-    marker::PhantomData,
     net::{Ipv4Addr, Ipv6Addr},
     os::unix::fs::MetadataExt,
-    path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    path::PathBuf,
     time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 use uuid::Uuid;
 
-use crate::{coordinator_id::CoordinatorId, runtime::WriterLock};
+use crate::coordinator_id::CoordinatorId;
 
 pub mod commands;
+mod receipts;
+mod script;
+
+pub use script::{AuthorityUnreachable, FailoverHelper, FailoverOperator, FailoverScript};
 
 /// JavaScript carries these counters as numbers, so they stay exact only below 2^53.
 const MAX_EXACT: u64 = 9_007_199_254_740_991;
@@ -750,131 +752,6 @@ pub struct UnfinishedDelivery {
     pub entry_id: String,
     pub installation_id: String,
     pub apns_id: String,
-}
-
-/// The authority did not answer the helper or the operator. The same request is safe to repeat.
-#[derive(Debug)]
-pub struct AuthorityUnreachable(String);
-
-impl fmt::Display for AuthorityUnreachable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for AuthorityUnreachable {}
-
-/// A script under `failover/` beside the runtime script, run once per request
-/// with the session in `AGENT_FAILOVER`. It prints one report.
-pub struct FailoverScript<Request, Report> {
-    path: PathBuf,
-    name: &'static str,
-    exchange: PhantomData<fn(&Request) -> Report>,
-}
-
-/// `failover/helper.js`, which a coordinator start and an owner watch use.
-pub type FailoverHelper = FailoverScript<FailoverRequest, FailoverReport>;
-
-/// `failover/operator.js`, which the `beep-boop failover` commands use.
-pub type FailoverOperator = FailoverScript<OperatorRequest, OperatorReport>;
-
-impl FailoverHelper {
-    pub fn locate(script: &Path) -> Result<Self> {
-        Self::beside(script, "helper.js", "failover helper")
-    }
-}
-
-impl FailoverOperator {
-    pub fn locate(script: &Path) -> Result<Self> {
-        Self::beside(script, "operator.js", "failover operator")
-    }
-}
-
-impl<Request: Serialize, Report: DeserializeOwned> FailoverScript<Request, Report> {
-    fn beside(script: &Path, file: &str, name: &'static str) -> Result<Self> {
-        let path = script.with_file_name("failover").join(file);
-        ensure!(
-            path.is_file(),
-            "Pi runtime is not built; build the runtime first"
-        );
-        Ok(Self {
-            path,
-            name,
-            exchange: PhantomData,
-        })
-    }
-
-    pub fn run(&self, session: &FailoverSession, request: &Request) -> Result<Report> {
-        self.finish(self.command(session, request)?)
-    }
-
-    /// Runs the script as a holder of `lock`, so the state directory stays
-    /// locked while the script still writes to it, also when this process dies.
-    pub(crate) fn run_holding(
-        &self,
-        lock: &WriterLock,
-        session: &FailoverSession,
-        request: &Request,
-    ) -> Result<Report> {
-        let mut command = self.command(session, request)?;
-        lock.inherit(&mut command);
-        self.finish(command)
-    }
-
-    /// Runs the script without blocking a runtime thread, and kills it after `limit`.
-    pub async fn run_within(
-        &self,
-        session: &FailoverSession,
-        request: &Request,
-        limit: Duration,
-    ) -> Result<Report> {
-        let mut command = tokio::process::Command::from(self.command(session, request)?);
-        command.kill_on_drop(true);
-        let output = tokio::time::timeout(limit, command.output())
-            .await
-            .with_context(|| format!("The {} did not answer in time", self.name))?
-            .with_context(|| format!("Could not start the {}", self.name))?;
-        self.report(output)
-    }
-
-    fn finish(&self, mut command: Command) -> Result<Report> {
-        let output = command
-            .output()
-            .with_context(|| format!("Could not start the {}", self.name))?;
-        self.report(output)
-    }
-
-    fn command(&self, session: &FailoverSession, request: &Request) -> Result<Command> {
-        let mut command = Command::new("node");
-        command
-            .arg("--no-warnings")
-            .arg(&self.path)
-            .arg(serde_json::to_string(request)?)
-            .env("AGENT_FAILOVER", serde_json::to_string(session)?)
-            .stdin(Stdio::null());
-        Ok(command)
-    }
-
-    fn report(&self, output: Output) -> Result<Report> {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if output.status.code() == Some(i32::from(AUTHORITY_UNREACHABLE_EXIT)) {
-            return Err(AuthorityUnreachable(stderr.trim().to_owned()).into());
-        }
-        ensure!(
-            output.status.success(),
-            "The {} failed ({}): {}",
-            self.name,
-            output.status,
-            stderr.trim()
-        );
-        serde_json::from_slice(&output.stdout).with_context(|| {
-            format!(
-                "The {} returned an invalid report: {}",
-                self.name,
-                stderr.trim()
-            )
-        })
-    }
 }
 
 impl fmt::Display for AuthorityState {
