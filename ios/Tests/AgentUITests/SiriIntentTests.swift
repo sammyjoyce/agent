@@ -619,6 +619,8 @@
       XCTAssertTrue(app.wait(for: .runningForeground, timeout: 15), "state \(app.state.rawValue)")
       XCTAssertTrue(
         app.navigationBars["Weekly report"].waitForExistence(timeout: 15), app.debugDescription)
+      let state = app.descendants(matching: .any)["jobRunState"]
+      XCTAssertTrue(becomes(state, "label CONTAINS %@", "Completed"), app.debugDescription)
       capture("spotlight-tap-opened-weekly-report", app)
       assertBackShowsTheFeed(app, from: "Weekly report")
       let menu = app.buttons["scopeMenu"]
