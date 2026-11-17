@@ -22,6 +22,7 @@ import type { HostCommand } from "../src/generated/HostCommand.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 import { fixtureModel } from "./model.js";
 import { until } from "./fixtures/until.js";
+import { LocalFiles } from "../src/failover/retained-files.js";
 
 test("attached worker admits native steering before the current tool finishes and queues a separate turn", { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-native-steer-")); const registry = createRegistry();
@@ -205,7 +206,7 @@ async function openStopFixture() {
   const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
     { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
   const tasks = new TaskStore(session, new ConversationModels(models)), executions = new Executions(), tools = createAppTools(tasks, executions);
-  const attachments = new AttachmentStore(directory); registry.install(tools.host); tasks.useAttachments(attachments);
+  const attachments = new AttachmentStore(new LocalFiles(directory)); registry.install(tools.host); tasks.useAttachments(attachments);
   const host = { host_id: null, rex_server: null, coordinator: null, name: "fixture", cwd: "/tmp", agent_program: "/fixture/agent" };
   const binding = { host_id: "11111111-1111-4111-8111-111111111111", session_id: "session:22222222-2222-4222-8222-222222222222",
     window_id: "window:33333333-3333-4333-8333-333333333333", block_id: "block:44444444-4444-4444-8444-444444444444" };

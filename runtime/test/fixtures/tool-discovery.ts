@@ -25,6 +25,7 @@ import { TaskStore } from "../../src/tasks.js";
 import { createAppTools, createJobTools, Executions } from "../../src/tools.js";
 import { applyToolSurfaces, BROWSER_TOOLS, CONTEXT_TOOLS, createToolDiscovery, createToolsets, TOOL_ROLES, TOOL_SURFACES, withActorPolicies, type ToolRole,
   type ToolSurface, type ToolSurfaces } from "../../src/toolsets.js";
+import { LocalFiles } from "../../src/failover/retained-files.js";
 
 export type DiscoveryArm = ToolSurfaces;
 
@@ -101,7 +102,7 @@ export async function openDiscoveryApp(directory: string, { models, model, arm, 
     jobActor: (job) => openJobActor(job, tasks), runJob: (occurrence, signal, id) => runScheduled(occurrence, signal, { session, tasks, sources }, id),
   });
   const jobTools = createJobTools(scheduler, executions);
-  const attachments = new AttachmentStore(directory);
+  const attachments = new AttachmentStore(new LocalFiles(directory));
   const goals = new GoalStore(session, tasks, environment);
   const production = withActorPolicies(createToolsets({ guidance: createGuidance(executions), tools, sourceTools,
     resourceTools: createResourceTools(resources, tasks, executions), browserTools: createBrowserTools(new BrowserStore(session), executions, attachments), jobTools,

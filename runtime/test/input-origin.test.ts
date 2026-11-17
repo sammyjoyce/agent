@@ -21,6 +21,7 @@ import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import type { RuntimeEvent } from "../src/generated/RuntimeEvent.js";
 import type { TaskRecord } from "../src/generated/TaskRecord.js";
 import type { HostResult } from "../src/generated/HostResult.js";
+import { LocalFiles } from "../src/failover/retained-files.js";
 
 function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
 
@@ -31,7 +32,7 @@ test("request-local origin follows durable input entries, not text, handoffs, co
   const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
     { models, registry, identity: { attribution: null }, settings: { compaction: { enabled: false, keepRecentTokens: 0 } } }, BACKGROUND_CONTEXT);
   const origins = createInputOrigins(session); registry.install(origins);
-  const store = new AttachmentStore(directory);
+  const store = new AttachmentStore(new LocalFiles(directory));
   const root = await session.root(BACKGROUND_CONTEXT);
   await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [origins] }, BACKGROUND_CONTEXT);
   const input = async (origin?: InputOrigin) => {

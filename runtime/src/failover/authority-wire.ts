@@ -15,7 +15,8 @@ import { REPLICATED_FILE_ROOTS } from "../generated/replicated-file-roots.js";
 
 export const COMMAND_BODY_LIMIT_BYTES = 1024 * 1024;
 
-type Field<T> = (value: unknown, path: string) => T;
+/** Parses one value of untrusted JSON, or throws an Error that names `path`. */
+export type Field<T> = (value: unknown, path: string) => T;
 type Fields<T> = { readonly [K in keyof T]-?: Field<T[K]> };
 type Variants<U, Tag extends keyof U> = {
   readonly [V in U[Tag] & string]: Fields<Omit<Extract<U, Record<Tag, V>>, Tag>>;
@@ -33,10 +34,10 @@ function invalid(path: string, problem: string): never {
 
 const join = (path: string, key: string) => path === "" ? key : `${path}.${key}`;
 
-const counter: Field<number> = (value, path) =>
+export const counter: Field<number> = (value, path) =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : invalid(path, "is not a whole number from 0 to 2^53 - 1");
 
-const text: Field<string> = (value, path) => typeof value === "string" ? value : invalid(path, "is not a string");
+export const text: Field<string> = (value, path) => typeof value === "string" ? value : invalid(path, "is not a string");
 
 const textWhere = (check: (value: string) => boolean, problem: string): Field<string> => (value, path) => {
   const parsed = text(value, path);
@@ -44,12 +45,14 @@ const textWhere = (check: (value: string) => boolean, problem: string): Field<st
 };
 
 const statement = textWhere((value) => /\S/.test(value), "is blank");
-const uuid = textWhere(isLowercaseUuid, "is not a lowercase UUID");
+export const uuid = textWhere(isLowercaseUuid, "is not a lowercase UUID");
 const sha256 = textWhere(isSha256Hex, "is not 64 lowercase hexadecimal characters");
-const statePath = textWhere((value) =>
-  value.split("/").every((segment) => segment !== "" && segment !== "." && segment !== ".." && !/[\\\0]/.test(segment))
-    && REPLICATED_FILE_ROOTS.some((root) => value.startsWith(`${root}/`)),
-  "is not a relative path under attachments, history/assets or feedback");
+/** The rule of `StatePath` in `src/failover.rs`: relative, plain segments, under one of the replicated file trees. */
+export function isStatePath(value: string): boolean {
+  return value.split("/").every((segment) => segment !== "" && segment !== "." && segment !== ".." && !/[\\\0]/.test(segment))
+    && REPLICATED_FILE_ROOTS.some((root) => value.startsWith(`${root}/`));
+}
+const statePath = textWhere(isStatePath, "is not a relative path under attachments, history/assets or feedback");
 
 const nullable = <T>(field: Field<T>): Field<T | null> => (value, path) => value === null ? null : field(value, path);
 
@@ -71,9 +74,10 @@ function readFields<T>(given: ReadonlyMap<string, unknown>, fields: Fields<T>, p
   return Object.fromEntries(parsed) as T;
 }
 
-const object = <T>(fields: Fields<T>): Field<T> => (value, path) => readFields(members(value, path), fields, path);
+/** An object with exactly these fields: a missing field and an unknown field both throw. */
+export const object = <T>(fields: Fields<T>): Field<T> => (value, path) => readFields(members(value, path), fields, path);
 
-function tagged<U, Tag extends keyof U & string>(tag: Tag, variants: Variants<U, Tag>): Field<U> {
+export function tagged<U, Tag extends keyof U & string>(tag: Tag, variants: Variants<U, Tag>): Field<U> {
   return (value, path) => {
     const given = members(value, path);
     const name = given.get(tag);
@@ -103,6 +107,7 @@ const logEntry = object<LogEntry>({
   digest: sha256,
   versions,
   files: list(fileRecord),
+  removed: list(statePath),
   batch: nullable(loggedBatch),
 });
 
@@ -133,7 +138,7 @@ const logPage = object<LogPage>({ record: authorityRecord, entries: list(logEntr
 
 const authorityCommand = tagged<AuthorityCommand, "op">("op", {
   enroll: { holder: uuid, checkpoint: checkpointRecord },
-  claim: { holder: uuid },
+  claim: { holder: uuid, expected_epoch: counter },
   append: { holder: uuid, entry: logEntry },
   confirm: { holder: uuid, epoch: counter },
   promote: { candidate: uuid, expected_epoch: counter, attestation: nullable(statement) },
@@ -177,6 +182,31 @@ export const parseAuthorityCommand = whole("command", authorityCommand);
 export const parseAuthorityReply = whole("reply", authorityReply);
 export const parseAuthorityRecord = whole("record", authorityRecord);
 export const parseLogPage = whole("log page", logPage);
+
+/** Every field of a log entry but its digest, in a fixed key order. The digest is the SHA-256 of this text. */
+export function logEntryCanonical(entry: Omit<LogEntry, "digest">): string {
+  const { application, pi_durable, chord } = entry.versions;
+  return JSON.stringify({
+    at: entry.at, epoch: entry.epoch, versions: { application, pi_durable, chord },
+    files: entry.files.map(({ path, sha256, size }) => ({ path, sha256, size })),
+    removed: entry.removed,
+    batch: entry.batch === null ? null : { pi_seq: entry.batch.pi_seq, body: canonicalBody(entry.batch.body) },
+  });
+}
+
+function canonicalBody(body: BatchBody): BatchBody {
+  switch (body.kind) {
+    case "inline": return { kind: body.kind, json: body.json };
+    case "blob": return { kind: body.kind, sha256: body.sha256, size: body.size };
+    default: return body satisfies never;
+  }
+}
+
+/** Whether an inline batch is what a standby parses before it applies the entry: a JSON list. */
+export function isBatchJson(json: string): boolean {
+  try { return Array.isArray(JSON.parse(json)); }
+  catch { return false; }
+}
 
 /** The holder a command speaks for, which its credential must name. */
 export function commandHolder(command: AuthorityCommand): string {

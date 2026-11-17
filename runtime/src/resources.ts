@@ -161,7 +161,7 @@ export function createResourceTools(resources: ResourceStore, tasks: TaskStore, 
       return { output: [{ type: "text", text: JSON.stringify(visible) }] };
     } });
   const collect = defineTool({ name: "collect_worktrees", description: "Run the background collector for eligible Beep Boop-owned worktrees on their recorded hosts. Active, dirty, unmerged or uncertain work is retained. Returns inventory and any collection gaps.",
-    replay: "safe", parameters: Type.Object({}), async execute(_args, api) {
+    parameters: Type.Object({}), async execute(_args, api) {
       const execution = executions.get(api.conversationId.toString());
       const hosts = [...new Set((await resources.list()).filter((resource) => resource.state.state !== "removed" && resource.state.state !== "partial").map((resource) => resource.host_id))];
       const results = await Promise.allSettled(hosts.map((host_id) => resources.collect(host_id,

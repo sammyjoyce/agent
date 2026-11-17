@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import http2 from "node:http2";
+import { syncBuiltinESMExports } from "node:module";
 import type { JsonObject } from "@earendil-works/pi-ai";
+import type { FailoverSession } from "../../src/generated/FailoverSession.js";
 
 export type ModelStep = { text: string } | { tool: string; args: JsonObject; commentary?: string } |
   { code: string; commentary?: string } | { hold_and_write_pid: string };
@@ -16,10 +19,27 @@ function codemodeCall(id: string, code: string, codemode: unknown): ResponseItem
     : { id, type: "function_call", call_id: id, name: "codemode", arguments: JSON.stringify({ code }), status: "completed" };
 }
 
+// A replicated coordinator also reaches its authority, which a test runs on loopback.
+const authority = process.env.AGENT_FAILOVER === undefined ? undefined : new URL((JSON.parse(process.env.AGENT_FAILOVER) as FailoverSession).url);
+assert.ok(authority === undefined || authority.hostname === "127.0.0.1", "The fixture's authority must be on loopback");
+const network = globalThis.fetch;
+
+// A test with a local APNs origin redirects only Apple's address. Signing, the dispatcher and the HTTP/2 client run unchanged.
+const apnsOrigin = process.env.AGENT_TEST_APNS_ORIGIN;
+if (apnsOrigin !== undefined) {
+  const connect = http2.connect;
+  http2.connect = ((authority: string | URL, ...rest: unknown[]) => {
+    assert.equal(String(authority), "https://api.sandbox.push.apple.com", "The fixture must never contact an external service");
+    return (connect as (...args: unknown[]) => http2.ClientHttp2Session)(apnsOrigin, ...rest);
+  }) as typeof http2.connect;
+  syncBuiltinESMExports();
+}
+
 // Only the external provider is synthetic. Pi, application tools and the bridge
 // are imported unchanged and consume actual Responses API event frames.
 globalThis.fetch = async (input, options) => {
   const url = input instanceof Request ? input.url : input.toString();
+  if (authority !== undefined && new URL(url).origin === authority.origin) return network(input, options);
   assert.equal(url, "https://api.openai.com/v1/responses", "The fixture must never contact an external service");
   assert.equal(typeof options?.body, "string");
   const body: unknown = JSON.parse(String(options?.body));

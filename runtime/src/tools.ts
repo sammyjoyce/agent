@@ -25,6 +25,7 @@ import { importedSummary } from "./history.js";
 import type { BackgroundScheduler } from "./background.js";
 import { hostOutput, output } from "./host-output.js";
 import { imageInput, readImageFile, type ReadFileCommand } from "./images.js";
+import type { OwnerGate } from "./failover/owner-gate.js";
 
 export const MAX_FILE_READ_BYTES = 262_144;
 export type Execution = { model?: ModelSelection; cwd: string; hosts: WorkerHost[]; default_host?: WorkerHost | null; call: HostCall; role?: "worker" | "triage";
@@ -107,12 +108,41 @@ export class HostRequests {
     request: number; resolve: (value: HostResult) => void; reject: (error: Error) => void;
     timer: ReturnType<typeof setTimeout>; cancelled: boolean; cancellable: boolean; dispose(): void;
   }>();
+  private readonly gateWaitAbortsByRequest = new Map<AbortController, number>();
+  /**
+   * `gate` is the owner gate of a replicated coordinator. A call waits there
+   * before its frame is emitted. Without one, the frame is emitted at once.
+   */
   constructor(private readonly emit: (request: number, call: string, command: HostCommand) => void,
-    private readonly cancel: (request: number, call: string) => void = () => {}) {}
-  call(request: number, command: HostCommand, signal?: AbortSignal): Promise<HostResult> {
-    if (signal?.aborted) return Promise.reject(new TaskError("This actor stopped before the host operation started"));
-    if (this.cancelled.has(request)) return Promise.reject(new TaskError("This turn was interrupted before the host operation started"));
-    if (this.pending.size >= 128) return Promise.reject(new TaskError("Too many pending host operations"));
+    private readonly cancel: (request: number, call: string) => void = () => {}, private readonly gate?: OwnerGate) {}
+  async call(request: number, command: HostCommand, signal?: AbortSignal): Promise<HostResult> {
+    this.admit(request, signal);
+    if (this.gate !== undefined) {
+      await this.approved(this.gate, request, signal);
+      this.admit(request, signal);
+    }
+    return this.dispatch(request, command, signal);
+  }
+  private admit(request: number, signal: AbortSignal | undefined): void {
+    if (signal?.aborted) throw new TaskError("This actor stopped before the host operation started");
+    if (this.cancelled.has(request)) throw new TaskError("This turn was interrupted before the host operation started");
+    if (this.pending.size + this.gateWaitAbortsByRequest.size >= 128) throw new TaskError("Too many pending host operations");
+  }
+  private async approved(gate: OwnerGate, request: number, signal: AbortSignal | undefined): Promise<void> {
+    const ended = new AbortController();
+    this.gateWaitAbortsByRequest.set(ended, request);
+    try {
+      await gate.fresh(signal === undefined ? ended.signal : AbortSignal.any([signal, ended.signal]));
+    } catch (error) {
+      if (signal?.aborted) throw new TaskError("This actor stopped before the host operation started");
+      throw ended.signal.aborted ? ended.signal.reason : error;
+    } finally { this.gateWaitAbortsByRequest.delete(ended); }
+  }
+  private endGated(request: number, reason: TaskError): void {
+    for (const [ended, owner] of this.gateWaitAbortsByRequest) if (owner === request) ended.abort(reason);
+  }
+  /** The timeout and the pending entry start here, when the frame is emitted, and not while the call waits at the gate. */
+  private dispatch(request: number, command: HostCommand, signal: AbortSignal | undefined): Promise<HostResult> {
     const call = randomUUID();
     return new Promise<HostResult>((resolve, reject) => {
       const aborted = () => this.cancelCall(call);
@@ -149,6 +179,7 @@ export class HostRequests {
   }
   cancelRequest(request: number): void {
     this.cancelled.add(request);
+    this.endGated(request, new TaskError("This turn was interrupted before the host operation started"));
     for (const [call, pending] of this.pending) {
       if (pending.request === request) this.cancelCall(call);
     }
@@ -168,6 +199,7 @@ export class HostRequests {
   resumeRequest(request: number): void { this.cancelled.delete(request); }
   finish(request: number): void {
     this.cancelled.delete(request);
+    this.endGated(request, new TaskError("The execution request ended before the host operation completed"));
     for (const [call, pending] of this.pending) {
       if (pending.request !== request) continue;
       clearTimeout(pending.timer);
@@ -210,7 +242,7 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
   host: Extension; main: Extension; worker: Extension; agent: Extension; legacy: Extension;
 } {
   const host = defineExtension({ name: "host-tools", tools: [
-    defineTool({ name: "read_attachment", replay: "safe", description: "Read a user attachment by its stable attachment ID. Images use native image content; original files are materialized privately on this actor's execution host. Pass attachment IDs with delegation when another agent needs the files.",
+    defineTool({ name: "read_attachment", description: "Read a user attachment by its stable attachment ID. Images use native image content; original files are materialized privately on this actor's execution host. Pass attachment IDs with delegation when another agent needs the files.",
       parameters: Type.Object({ id: Type.String() }), async execute(args, api) {
         const prepared = await tasks.openAttachment(args.id, executions.get(api.conversationId.toString()).call);
         return { output: typeof prepared.content === "string" ? [{ type: "text", text: prepared.content }] : prepared.content };

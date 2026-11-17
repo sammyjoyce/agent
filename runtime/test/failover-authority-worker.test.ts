@@ -10,17 +10,21 @@ import { commandHolder } from "../src/failover/authority-wire.js";
 import type { AuthorityCommand } from "../src/generated/AuthorityCommand.js";
 import type { AuthorityReply } from "../src/generated/AuthorityReply.js";
 import type { LogEntry } from "../src/generated/LogEntry.js";
-import { cellCheckpoint, cellCommand, cellLog, cells, cellStates, digests, entry, holders, manifest, manifestBytes, orion, scriptedSequences, tarantula,
+import { cellCheckpoint, cellCommand, cellLog, cells, cellStates, digested, digests, entry, holders, manifest, manifestBytes, orion, scriptedSequences, tarantula,
   type Outcome, type Script } from "./fixtures/failover-authority-cells.js";
 import { startAuthority } from "./fixtures/failover-workerd.js";
 
-const coordinatorIds = Array.from({ length: 120 }, (_, index) => `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`);
+const coordinatorIds = Array.from({ length: 140 }, (_, index) => `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`);
 const readOnlyCoordinator = coordinatorIds[0]!;
 const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 const outcome = (reply: AuthorityReply): Outcome => reply.result === "accepted" ? "accepted" : reply.reason;
 const enroll: AuthorityCommand = { op: "enroll", holder: tarantula, checkpoint: { through: 0, manifest } };
-const append = (at: number, change: Partial<LogEntry> = {}, epoch = 1): Extract<AuthorityCommand, { op: "append" }> =>
-  ({ op: "append", holder: tarantula, entry: { ...entry(epoch, at, digests[0]), ...change } });
+/** An append by tarantula. `content` picks one of several entries for the position, and the other fields replace the entry's own. */
+function append(at: number, change: Partial<Omit<LogEntry, "digest">> & { content?: string } = {}, epoch = 1): Extract<AuthorityCommand, { op: "append" }> {
+  const { content = digests[0], ...fields } = change;
+  return { op: "append", holder: tarantula, entry: digested({ ...entry(epoch, at, content), ...fields }) };
+}
+const batchOf = (bytes: number) => JSON.stringify(["x".repeat(bytes - 4)]);
 const status = (expected: number, type: typeof AuthorityRejected | typeof AuthorityDenied) => (error: unknown) =>
   error instanceof type && error.status === expected;
 
@@ -61,10 +65,10 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
   await t.test("every cell of the rules' table gives the same answer through HTTP", async () => {
     const active: Script = [
       [{ op: "enroll", holder: tarantula, checkpoint: cellCheckpoint }, "accepted"],
-      [{ op: "claim", holder: tarantula }, "accepted"],
-      [{ op: "claim", holder: tarantula }, "accepted"],
-      [append(1, { digest: digests[0] }, 3), "accepted"],
-      [append(2, { digest: digests[1] }, 3), "accepted"],
+      [{ op: "claim", holder: tarantula, expected_epoch: 1 }, "accepted"],
+      [{ op: "claim", holder: tarantula, expected_epoch: 2 }, "accepted"],
+      [append(1, { content: digests[0] }, 3), "accepted"],
+      [append(2, { content: digests[1] }, 3), "accepted"],
     ];
     const sealed: Script = [...active, [{ op: "promote", candidate: orion, expected_epoch: 3, attestation: null }, "accepted"]];
     const vacant: Script = [...sealed, [{ op: "release", holder: tarantula, epoch: 3, evidence: "released" }, "accepted"]];
@@ -107,10 +111,10 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
     const files = [{ path: "attachments/a1/content", sha256: sha256(bytes), size: bytes.length }];
     const winners: Record<number, string> = {};
     for (let at = 1; at <= 20; at += 1) {
-      const contenders = Array.from({ length: 6 }, (_, index) => sha256(Buffer.from(`invented entry ${at}.${index}`)));
-      const replies = await Promise.all(contenders.map((digest) => link(coordinator).command(append(at, { digest, files }))));
+      const contenders = Array.from({ length: 6 }, (_, index) => append(at, { content: `invented entry ${at}.${index}`, files }));
+      const replies = await Promise.all(contenders.map((contender) => link(coordinator).command(contender)));
       assert.deepEqual(replies.map(outcome).sort(), ["accepted", ...Array<Outcome>(5).fill("conflict")], `position ${at}`);
-      winners[at] = contenders[replies.findIndex((reply) => reply.result === "accepted")]!;
+      winners[at] = contenders[replies.findIndex((reply) => reply.result === "accepted")]!.entry.digest;
     }
     assert.equal(await head(coordinator), 20);
     assert.deepEqual(await logDigests(coordinator), winners);
@@ -130,7 +134,24 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
     const repeat = await link(coordinator).command(append(1));
     assert.deepEqual(repeat, { result: "accepted", state: { kind: "active", epoch: 1, holder: tarantula, head: 1 } });
     assert.deepEqual(await link(coordinator).log(0, 64), before);
-    assert.equal(outcome(await link(coordinator).command(append(1, { digest: digests[1] }))), "conflict");
+    assert.equal(outcome(await link(coordinator).command(append(1, { content: digests[1] }))), "conflict");
+  });
+
+  await t.test("an entry that no standby could apply is refused before the log takes it: a digest that does not match its fields, or an inline batch that is not a JSON list", async () => {
+    const coordinator = await fresh();
+    await play(coordinator, [[enroll, "accepted"]]);
+    const sound = append(1);
+    const unappliable = [
+      { ...sound.entry, digest: digests[1] },
+      digested({ ...sound.entry, batch: { pi_seq: 1, body: { kind: "inline", json: "not json at all" } } }),
+      digested({ ...sound.entry, batch: { pi_seq: 1, body: { kind: "inline", json: '{"a":"list is what a standby applies"}' } } }),
+    ];
+    for (const entry of unappliable) {
+      await assert.rejects(link(coordinator).command({ op: "append", holder: tarantula, entry }), status(422, AuthorityRejected), JSON.stringify(entry.batch));
+    }
+    assert.equal(await head(coordinator), 0, "the log took none of them");
+    await play(coordinator, [[sound, "accepted"], [{ op: "promote", candidate: orion, expected_epoch: 1, attestation: "Invented: the old host is powered off" }, "accepted"],
+      [{ op: "activate", candidate: orion, applied: 1 }, "accepted"]]);
   });
 
   await t.test("an append naming a missing blob is refused until the blob is stored", async () => {
@@ -186,10 +207,10 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
   await t.test("a command body over 1 MiB is refused and an inline batch of 256 KiB is accepted", async () => {
     const coordinator = await fresh();
     await play(coordinator, [[enroll, "accepted"]]);
-    const oversized = append(1, { batch: { pi_seq: 1, body: { kind: "inline", json: "x".repeat(1024 * 1024) } } });
+    const oversized = append(1, { batch: { pi_seq: 1, body: { kind: "inline", json: batchOf(1024 * 1024) } } });
     await assert.rejects(link(coordinator).command(oversized), status(413, AuthorityRejected));
     assert.equal(await head(coordinator), 0);
-    const largest = append(1, { batch: { pi_seq: 1, body: { kind: "inline", json: "x".repeat(256 * 1024) } } });
+    const largest = append(1, { batch: { pi_seq: 1, body: { kind: "inline", json: batchOf(256 * 1024) } } });
     await play(coordinator, [[largest, "accepted"]]);
     const [stored] = (await link(coordinator).log(0, 64)).entries;
     assert.deepEqual(stored, largest.entry);
@@ -206,7 +227,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
     assert.deepEqual(await link(first).record(), { state: { kind: "active", epoch: 1, holder: tarantula, head: 1 }, checkpoint: { through: 0, manifest } });
     const borrowed = new AuthorityClient({ url: authority.url, coordinatorId: second, token: token(first, tarantula) });
     await assert.rejects(borrowed.record(), status(401, AuthorityDenied));
-    await assert.rejects(borrowed.command({ op: "claim", holder: tarantula }), status(401, AuthorityDenied));
+    await assert.rejects(borrowed.command({ op: "claim", holder: tarantula, expected_epoch: 1 }), status(401, AuthorityDenied));
   });
 
   await t.test("credentials: tokens are checked, holders run only their own commands, and read-only reads only the record", async () => {
@@ -219,7 +240,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
 
     await link(coordinator).putBlob(manifest, manifestBytes);
     await play(coordinator, [[enroll, "accepted"]]);
-    await assert.rejects(link(coordinator, tarantula).command({ op: "claim", holder: orion }), status(403, AuthorityDenied));
+    await assert.rejects(link(coordinator, tarantula).command({ op: "claim", holder: orion, expected_epoch: 1 }), status(403, AuthorityDenied));
     await assert.rejects(link(coordinator, tarantula).command({ op: "activate", candidate: orion, applied: 0 }), status(403, AuthorityDenied));
 
     const reader = link(coordinator, null);
@@ -240,7 +261,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
     assert.deepEqual((await pages(coordinator, 7)).flat(), capped.flat());
 
     const heavy = await fresh();
-    const large = (at: number) => append(at, { batch: { pi_seq: at, body: { kind: "inline", json: "y".repeat(900 * 1024) } } });
+    const large = (at: number) => append(at, { batch: { pi_seq: at, body: { kind: "inline", json: batchOf(900 * 1024) } } });
     await play(heavy, [[enroll, "accepted"], ...[1, 2, 3, 4, 5].map((at) => [large(at), "accepted"] as const)]);
     const sized = await pages(heavy);
     assert.ok(sized.length > 1, "five entries of 900 KiB came back in one page");
@@ -267,7 +288,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
     await refusal(`${base}/log?after=0&limit=0`);
     await refusal(`${base}/log?after=0&limit=5&extra=1`);
     await refusal(`${base}/commands`, { method: "POST", body: "{ not json" });
-    assert.match(await refusal(`${base}/commands`, { method: "POST", body: JSON.stringify({ op: "claim", holder: tarantula, extra: 1 }) }), /extra/);
+    assert.match(await refusal(`${base}/commands`, { method: "POST", body: JSON.stringify({ op: "claim", holder: tarantula, expected_epoch: 1, extra: 1 }) }), /extra/);
   });
 
   await t.test("the record, the log and a blob survive a restart of workerd", async () => {

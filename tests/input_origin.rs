@@ -8,7 +8,7 @@ use agent_cli::{
         AgentNode, CoordinatorBootstrap, CoordinatorSettings, HostCommand, HostResult,
         RuntimeCommand, RuntimeEventKind, WorkerLaunch,
     },
-    runtime::{FrameReader, Runtime, RuntimeCall},
+    runtime::{FrameReader, OwnerClaim, Runtime, RuntimeCall},
 };
 use serde::Deserialize;
 use std::{
@@ -186,7 +186,13 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
     fs::create_dir(&fake_bin).unwrap();
     let rex = fake_bin.join("rex");
     write_executable(&rex, "#!/bin/sh\nexit 1\n");
-    let runtime = Arc::new(Runtime::start(&script, directory.path()).unwrap());
+    let runtime = Arc::new(
+        Runtime::start(
+            &script,
+            OwnerClaim::acquire(directory.path(), &script, None).unwrap(),
+        )
+        .unwrap(),
+    );
     let host = "11111111-1111-4111-8111-111111111111";
     collect(
         &runtime,

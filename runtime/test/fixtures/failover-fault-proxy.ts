@@ -5,10 +5,13 @@ import type { TestContext } from "node:test";
 export type Fault =
   | { readonly kind: "pass" }
   | { readonly kind: "delay"; readonly ms: number }
+  | { readonly kind: "hold"; readonly release: Promise<void> }
   | { readonly kind: "blackhole" }
   | { readonly kind: "drop-after-apply" }
   | { readonly kind: "reply-late"; readonly release: Promise<void> }
-  | { readonly kind: "unavailable" };
+  | { readonly kind: "unavailable" }
+  /** Forwards, then answers with the first byte of the reply's body changed. */
+  | { readonly kind: "corrupt" };
 
 export interface FaultRule {
   readonly fault: Fault;
@@ -19,6 +22,12 @@ export interface FaultRule {
 export const commands = (op?: string): NonNullable<FaultRule["match"]> => ({ method, path, body }) =>
   method === "POST" && path.endsWith("/commands") && (op === undefined || body.includes(`"op":"${op}"`));
 export const blobs: NonNullable<FaultRule["match"]> = ({ path }) => path.includes("/blobs/");
+
+export function latch(): { readonly released: Promise<void>; release(): void } {
+  let release = () => {};
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  return { released, release };
+}
 
 export async function startFaultProxy(t: TestContext, upstream: string) {
   const rules: FaultRule[] = [];
@@ -61,7 +70,10 @@ export async function startFaultProxy(t: TestContext, upstream: string) {
       case "delay":
         await new Promise((resolve) => setTimeout(resolve, fault.ms));
         break;
-      case "pass": case "drop-after-apply": case "reply-late":
+      case "hold":
+        await fault.release;
+        break;
+      case "pass": case "drop-after-apply": case "reply-late": case "corrupt":
         break;
       default:
         return fault satisfies never;
@@ -74,6 +86,7 @@ export async function startFaultProxy(t: TestContext, upstream: string) {
       await fault.release;
       held.delete(response);
     }
+    if (fault.kind === "corrupt" && reply.body.length > 0) reply.body.writeUInt8(reply.body.readUInt8(0) ^ 0xff, 0);
     response.writeHead(reply.status, reply.headers).end(reply.body);
   }
 
