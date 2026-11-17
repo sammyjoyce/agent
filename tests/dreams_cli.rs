@@ -1284,8 +1284,9 @@ impl Sealed {
             },
         ] {
             let (_owner, cancelled) = watch::channel(false);
-            let HostResult::Dreams { reply } = dreams.execute(request, cancelled).await else {
-                panic!("Dreams could not serve the request");
+            let result = dreams.execute(request, cancelled).await;
+            let HostResult::Dreams { reply } = result else {
+                panic!("Dreams could not serve the request: {result:?}");
             };
             assert!(
                 !reply.text.contains("rejected"),
