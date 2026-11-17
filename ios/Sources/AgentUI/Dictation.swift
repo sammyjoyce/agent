@@ -393,7 +393,7 @@ public final class Dictation {
   @ObservationIgnored private let holdDelay: Duration
   private struct Work {
     let task: Task<Void, Never>
-    var downloadNext = false
+    var approvedDownload: Int64?
   }
 
   @ObservationIgnored private var work: Work?
@@ -457,7 +457,7 @@ public final class Dictation {
   func download() {
     guard case .missing(let bytes) = model else { return }
     guard work == nil else {
-      work?.downloadNext = true
+      work?.approvedDownload = bytes
       return
     }
     offering = nil
@@ -510,9 +510,10 @@ public final class Dictation {
     work = Work(
       task: Task {
         await job()
-        let downloadNext = work?.downloadNext == true
+        let approved = work?.approvedDownload
         work = nil
-        if downloadNext { download() }
+        guard let approved, case .missing(let bytes) = model else { return }
+        if bytes <= approved { download() } else { offer(bytes) }
       })
   }
 
