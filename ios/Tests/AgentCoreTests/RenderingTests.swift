@@ -1258,26 +1258,27 @@
         var frames: [Int: CGRect] = [:]
         let line = ComposerField.singleLineHeight(at: .large)
         func row(_ layout: AnyLayout, id: Int, text: String) -> some View {
-          layout {
-            ForEach(0..<4) { index in
-              if index == 2 {
-                Text(text).font(.body).padding(.vertical, 11).padding(.horizontal, 2)
-                  .frame(maxWidth: .infinity)
-                  .layoutValue(key: ComposerEditorLayoutKey.self, value: true)
-                  .onGeometryChange(for: CGRect.self) {
-                    $0.frame(in: .global)
-                  } action: {
-                    frames[id + index] = $0
-                  }
-              } else {
-                Color.gray.frame(width: 44, height: 44)
-                  .onGeometryChange(for: CGRect.self) {
-                    $0.frame(in: .global)
-                  } action: {
-                    frames[id + index] = $0
-                  }
+          func control(_ index: Int) -> some View {
+            Color.gray.frame(width: 44, height: 44)
+              .onGeometryChange(for: CGRect.self) {
+                $0.frame(in: .global)
+              } action: {
+                frames[id + index] = $0
               }
-            }
+          }
+          return layout {
+            control(0)
+            control(1)
+            Text(text).font(.body).padding(.vertical, 11).padding(.horizontal, 2)
+              .frame(maxWidth: .infinity)
+              .onGeometryChange(for: CGRect.self) {
+                $0.frame(in: .global)
+              } action: {
+                frames[id + 2] = $0
+              }
+              // Match production: the key belongs to the complete editor expression.
+              .layoutValue(key: ComposerEditorLayoutKey.self, value: true)
+            control(3)
           }
           .frame(width: 320)
         }
