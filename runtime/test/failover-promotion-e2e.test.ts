@@ -11,7 +11,7 @@ import { OWNER_FENCED_EXIT } from "../src/generated/owner-fenced-exit.js";
 import { NotificationDeliveries } from "../src/notifications.js";
 import { exists, HOLDERS, replicatedPair, until, World, type Host, type PromotedReceipt, type ReleasedReceipt,
   type StatusReceipt } from "./fixtures/failover-hosts.js";
-import { openOwner, tables } from "./fixtures/failover-state.js";
+import { claimStart, openOwner, tables } from "./fixtures/failover-state.js";
 import { fixtureModel } from "./model.js";
 
 const [OWNER, STANDBY] = HOLDERS;
@@ -21,7 +21,7 @@ const held = (state: string) => exists(join(state, "restore-hold.json"));
 
 /** The owner claims a start, begins a tool call that never returns, and claims a phone notification it never finishes. */
 async function unfinishedEffects(owner: Host): Promise<{ epoch: number; callId: string }> {
-  const claimed = await owner.link.command({ op: "claim", holder: owner.holder });
+  const claimed = await claimStart(owner.link, owner.holder);
   assert.ok(claimed.result === "accepted" && claimed.state.kind === "active");
   let begin = () => {};
   const started = new Promise<void>((resolve) => { begin = resolve; }), registry = createRegistry();
@@ -91,7 +91,7 @@ test("promotion moves ownership to a standby only on stop evidence", { timeout: 
     assert.equal(await held(standby.state), false, "promotion removes the restore hold");
     assert.deepEqual(tables(standby.state), tables(owner.state));
 
-    const claim = await owner.link.command({ op: "claim", holder: OWNER });
+    const claim = await claimStart(owner.link, OWNER);
     assert.equal(claim.result, "refused", "the old holder's claim is refused");
     const again = await owner.failover("release");
     assert.notEqual(again.code, 0);

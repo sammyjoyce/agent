@@ -12,7 +12,7 @@ import { digests, entry, manifest, orion, tarantula } from "./fixtures/failover-
 const file = { path: "attachments/a1/content", sha256: digests[1], size: 12 };
 const wellFormed: readonly AuthorityCommand[] = [
   { op: "enroll", holder: tarantula, checkpoint: { through: 0, manifest } },
-  { op: "claim", holder: tarantula },
+  { op: "claim", holder: tarantula, expected_epoch: 1 },
   { op: "append", holder: tarantula, entry: entry(1, 1, digests[0]) },
   { op: "append", holder: tarantula, entry: { ...entry(1, 2, digests[0]), batch: null, removed: ["attachments/a1", "feedback/latest"], files: [file, { ...file, path: "history/assets/ab/cd.png" }, { ...file, path: "feedback/latest" }] } },
   { op: "append", holder: tarantula, entry: { ...entry(1, 3, digests[0]), files: [file], batch: { pi_seq: 9_007_199_254_740_991, body: { kind: "blob", sha256: digests[1], size: 9_007_199_254_740_991 } } } },
@@ -33,7 +33,7 @@ test("every well-formed command is accepted unchanged", () => {
   }
 });
 
-const claim = { op: "claim", holder: tarantula };
+const claim = { op: "claim", holder: tarantula, expected_epoch: 1 };
 const append = { op: "append", holder: tarantula, entry: entry(1, 1, digests[0]) };
 const withEntry = (change: Record<string, unknown>) => ({ ...append, entry: { ...append.entry, ...change } });
 const withFile = (change: Record<string, unknown>) => withEntry({ files: [{ ...file, ...change }] });
@@ -61,11 +61,13 @@ const malformed: Malformed = [
   ["op", { ...claim, op: "seize" }],
   ["op", { ...claim, op: 1 }],
   ["extra", { ...claim, extra: 1 }],
-  ["__proto__", JSON.parse(`{"op":"claim","holder":"${tarantula}","__proto__":{}}`)],
+  ["__proto__", JSON.parse(`{"op":"claim","holder":"${tarantula}","expected_epoch":1,"__proto__":{}}`)],
   ["holder", { op: "claim" }],
   ["holder", { op: "claim", holder: "tarantula" }],
   ["holder", { op: "claim", holder: "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE" }],
   ["holder", { op: "claim", holder: `{${tarantula}}` }],
+  ["expected_epoch", { op: "claim", holder: tarantula }],
+  ["expected_epoch", { op: "claim", holder: tarantula, expected_epoch: -1 }],
   ["candidate", { op: "activate", candidate: 7, applied: 0 }],
   ["applied", { op: "activate", candidate: orion, applied: null }],
   ["epoch", { op: "confirm", holder: tarantula, epoch: -1 }],

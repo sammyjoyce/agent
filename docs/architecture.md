@@ -672,9 +672,12 @@ that entry. The blob store keeps the removed file's bytes.
 **The authority.** One Cloudflare Durable Object per coordinator ID holds the
 owner record and the replication log, and an R2 bucket holds large batches and
 files by SHA-256. The record names one owner and its epoch. Only the authority
-raises the epoch, at every coordinator start and at every promotion. An append
-succeeds only from the current owner, at the current epoch, at the next log
-position.
+raises the epoch, at every coordinator start and at every promotion. A start
+names the epoch it read, so a claim that arrives late or twice raises the epoch
+once and never fences the start that came after it. An append succeeds only
+from the current owner, at the current epoch, at the next log position. The
+authority recomputes an entry's digest and parses its inline batch before it
+logs the entry, so the log never takes an entry that a standby would refuse.
 
 **Commits go to the log first.** For each Pi commit the coordinator runs the
 batch in a transaction that it rolls back, appends the batch to the log, and

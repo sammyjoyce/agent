@@ -5,8 +5,10 @@ import { test } from "node:test";
 import { logEntryDigest, versions } from "../src/failover/log-entry.js";
 import { AUTHORITY_UNREACHABLE_EXIT } from "../src/generated/authority-unreachable-exit.js";
 import type { FailoverReport } from "../src/generated/FailoverReport.js";
-import { failoverCoordinator, runHelper, runScript } from "./fixtures/failover-bridge.js";
-import { enroll, OWNER, STANDBY, stateDirectory, unstampedDirectory } from "./fixtures/failover-state.js";
+import { failoverCoordinator, runHelper, runScript, startScript } from "./fixtures/failover-bridge.js";
+import { commands, latch } from "./fixtures/failover-fault-proxy.js";
+import { claimStart, enroll, OWNER, STANDBY, stateDirectory, unstampedDirectory } from "./fixtures/failover-state.js";
+import { until } from "./fixtures/until.js";
 
 const RECORD = JSON.stringify({ op: "record" });
 const claim = (state: string) => JSON.stringify({ op: "claim", state });
@@ -56,6 +58,39 @@ test("the failover helper against the Worker on local workerd", { timeout: 120_0
       current = claimed.epoch;
     }
     assert.deepEqual((await coordinator.reader.record())?.state, { kind: "active", epoch: 4, holder: OWNER, head: 0 }, "no refused append moved the head");
+  });
+
+  await t.test("a claim that reaches the authority after a later start claimed is refused, so the running owner keeps its epoch", async (t) => {
+    const coordinator = await failoverCoordinator(t), state = await stateDirectory(t), session = await coordinator.session(OWNER), delayed = latch();
+    assert.equal(await enroll(coordinator.owner), 1);
+    const claims = () => coordinator.proxy.seen.filter(commands("claim"));
+    coordinator.proxy.inject({ fault: { kind: "hold", release: delayed.released }, times: 1, match: commands("claim") });
+    const gaveUp = startScript("helper", session, claim(state));
+    await until(() => claims().length === 1, "The first start must send its claim");
+    // The start that sent the claim is gone, as after a timeout and a restart by the service manager.
+    gaveUp.child.kill("SIGKILL");
+    await gaveUp.done;
+
+    const restarted = await runHelper(session, claim(state));
+    assert.deepEqual(report(restarted.stdout), { result: "claimed", epoch: 2, head: 0 }, restarted.stderr);
+    delayed.release();
+    await until(() => claims().every((request) => request.forwarded), "The delayed claim must reach the authority");
+    assert.equal(claims().length, 2);
+    assert.deepEqual((await coordinator.reader.record())?.state, { kind: "active", epoch: 2, holder: OWNER, head: 0 }, "the delayed claim raised no epoch");
+    assert.equal((await coordinator.owner.command({ op: "confirm", holder: OWNER, epoch: 2 })).result, "accepted", "the running owner is not fenced by its own earlier claim");
+  });
+
+  await t.test("a claim that finds the epoch moved by another claim of its holder reads the epoch again and claims the next one", async (t) => {
+    const coordinator = await failoverCoordinator(t), state = await stateDirectory(t), held = latch();
+    assert.equal(await enroll(coordinator.owner), 1);
+    coordinator.proxy.inject({ fault: { kind: "hold", release: held.released }, times: 1, match: commands("claim") });
+    const starting = startScript("helper", await coordinator.session(OWNER), claim(state));
+    await until(() => coordinator.proxy.seen.some(commands("claim")), "The start must send its claim");
+    assert.equal((await claimStart(coordinator.owner, OWNER)).result, "accepted");
+    held.release();
+    const run = await starting.done;
+    assert.deepEqual(report(run.stdout), { result: "claimed", epoch: 3, head: 0 }, run.stderr);
+    assert.deepEqual(coordinator.proxy.seen.filter(commands("claim")).map((request) => (JSON.parse(request.body) as { expected_epoch: number }).expected_epoch), [1, 2]);
   });
 
   await t.test("claim by a holder that is not the owner prints refused with the owner's state and exits 0", async (t) => {

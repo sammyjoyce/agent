@@ -362,9 +362,12 @@ pub enum AuthorityCommand {
         holder: HolderId,
         checkpoint: CheckpointRecord,
     },
-    /// A coordinator start by the current owner. Raises the epoch.
+    /// A coordinator start by the current owner. Raises the epoch while it
+    /// is still `expected_epoch`, so a claim that arrives late or twice raises
+    /// it once.
     Claim {
         holder: HolderId,
+        expected_epoch: OwnerEpoch,
     },
     Append {
         holder: HolderId,

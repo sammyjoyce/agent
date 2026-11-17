@@ -4,6 +4,7 @@ import type { AuthorityRecord } from "../../src/generated/AuthorityRecord.js";
 import type { AuthorityRefusal } from "../../src/generated/AuthorityRefusal.js";
 import type { AuthorityState } from "../../src/generated/AuthorityState.js";
 import type { LogEntry } from "../../src/generated/LogEntry.js";
+import { logEntryDigest } from "../../src/failover/log-entry.js";
 
 export const tarantula = "11111111-1111-4111-8111-111111111111";
 export const orion = "22222222-2222-4222-8222-222222222222";
@@ -15,12 +16,16 @@ export const manifestBytes = Buffer.from(JSON.stringify({ invented: "backup mani
 export const manifest = createHash("sha256").update(manifestBytes).digest("hex");
 export const versions = { application: "0.1.0", pi_durable: "1.4.0", chord: "1.4.0" };
 
-export const entry = (epoch: number, at: number, digest: string): LogEntry =>
-  ({ at, epoch, digest, versions, files: [], removed: [], batch: { pi_seq: at, body: { kind: "inline", json: "[]" } } });
+/** An entry with the digest of its fields, which the Worker requires of every append. */
+export const digested = (fields: Omit<LogEntry, "digest">): LogEntry => ({ ...fields, digest: logEntryDigest(fields) });
+
+/** A log entry whose batch holds `content`, so two contents make two entries with two digests for one position. */
+export const entry = (epoch: number, at: number, content: string): LogEntry =>
+  digested({ at, epoch, versions, files: [], removed: [], batch: { pi_seq: at, body: { kind: "inline", json: JSON.stringify([content]) } } });
 
 export type Outcome = "accepted" | AuthorityRefusal;
 
-export const cellLog = { 1: digests[0], 2: digests[1] } as const;
+export const cellLog = { 1: entry(3, 1, digests[0]).digest, 2: entry(3, 2, digests[1]).digest } as const;
 export const cellCheckpoint = { through: 0, manifest };
 export const cellStates: readonly AuthorityState[] = [
   { kind: "active", epoch: 3, holder: tarantula, head: 2 },
@@ -33,6 +38,7 @@ type ByCaller = readonly [owner: Outcome, candidate: Outcome, third: Outcome];
 export const cells: Record<string, readonly [none: Outcome, active: ByCaller, sealed: ByCaller, vacant: ByCaller]> = {
   enroll: ["accepted", ["accepted", "enrolled", "enrolled"], ["enrolled", "enrolled", "enrolled"], ["enrolled", "enrolled", "enrolled"]],
   claim: ["not_enrolled", ["accepted", "fenced", "fenced"], ["sealed", "sealed", "sealed"], ["sealed", "sealed", "sealed"]],
+  "claim at an epoch that has moved": ["not_enrolled", ["epoch_moved", "fenced", "fenced"], ["sealed", "sealed", "sealed"], ["sealed", "sealed", "sealed"]],
   append: ["not_enrolled", ["accepted", "fenced", "fenced"], ["sealed", "sealed", "sealed"], ["sealed", "sealed", "sealed"]],
   confirm: ["not_enrolled", ["accepted", "fenced", "fenced"], ["sealed", "sealed", "sealed"], ["sealed", "sealed", "sealed"]],
   checkpoint: ["not_enrolled", ["accepted", "fenced", "fenced"], ["sealed", "sealed", "sealed"], ["sealed", "sealed", "sealed"]],
@@ -45,7 +51,8 @@ export const cells: Record<string, readonly [none: Outcome, active: ByCaller, se
 export function cellCommand(name: string, caller: string): AuthorityCommand {
   switch (name) {
     case "enroll": return { op: "enroll", holder: caller, checkpoint: cellCheckpoint };
-    case "claim": return { op: "claim", holder: caller };
+    case "claim": return { op: "claim", holder: caller, expected_epoch: 3 };
+    case "claim at an epoch that has moved": return { op: "claim", holder: caller, expected_epoch: 2 };
     case "append": return { op: "append", holder: caller, entry: entry(3, 3, digests[0]) };
     case "confirm": return { op: "confirm", holder: caller, epoch: 3 };
     case "checkpoint": return { op: "checkpoint", holder: caller, epoch: 3, record: { through: 2, manifest } };
@@ -85,12 +92,27 @@ export const scriptedSequences: Record<string, ScriptedSequence> = {
       [{ op: "activate", candidate: orion, applied: 1 }, "accepted"],
       [first, "fenced"],
       [{ op: "confirm", holder: tarantula, epoch: 1 }, "fenced"],
-      [{ op: "claim", holder: tarantula }, "fenced"],
+      [{ op: "claim", holder: tarantula, expected_epoch: 2 }, "fenced"],
       [{ op: "append", holder: orion, entry: entry(1, 2, digests[1]) }, "fenced"],
       [{ op: "append", holder: orion, entry: entry(2, 2, digests[1]) }, "accepted"],
     ],
     record: record({ kind: "active", epoch: 2, holder: orion, head: 2 }),
-    log: { 1: digests[0], 2: digests[1] },
+    log: { 1: entry(1, 1, digests[0]).digest, 2: entry(2, 2, digests[1]).digest },
+  },
+  "a claim that arrives twice, or after a later claim, raises the epoch once and fences nobody": {
+    steps: [
+      ...enroll,
+      [{ op: "claim", holder: tarantula, expected_epoch: 1 }, "accepted"],
+      [{ op: "claim", holder: tarantula, expected_epoch: 1 }, "epoch_moved"],
+      [{ op: "append", holder: tarantula, entry: entry(2, 1, digests[0]) }, "accepted"],
+      [{ op: "claim", holder: tarantula, expected_epoch: 2 }, "accepted"],
+      [{ op: "claim", holder: tarantula, expected_epoch: 1 }, "epoch_moved"],
+      [{ op: "claim", holder: tarantula, expected_epoch: 2 }, "epoch_moved"],
+      [{ op: "append", holder: tarantula, entry: entry(2, 2, digests[1]) }, "fenced"],
+      [{ op: "append", holder: tarantula, entry: entry(3, 2, digests[1]) }, "accepted"],
+    ],
+    record: record({ kind: "active", epoch: 3, holder: tarantula, head: 2 }),
+    log: { 1: entry(2, 1, digests[0]).digest, 2: entry(3, 2, digests[1]).digest },
   },
   "a promotion whose candidate is lost is completed by another standby": {
     steps: [
@@ -132,7 +154,7 @@ export const scriptedSequences: Record<string, ScriptedSequence> = {
       [{ op: "append", holder: tarantula, entry: entry(1, 2, digests[1]) }, "accepted"],
     ],
     record: record({ kind: "active", epoch: 1, holder: tarantula, head: 2 }, 1),
-    log: { 2: digests[1] },
+    log: { 2: entry(1, 2, digests[1]).digest },
   },
   "an enrollment must start from an empty checkpoint": {
     steps: [[{ op: "enroll", holder: tarantula, checkpoint: { through: 4, manifest } }, "checkpoint_out_of_range"]],

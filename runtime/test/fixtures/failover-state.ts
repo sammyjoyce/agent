@@ -18,6 +18,7 @@ import { ReplicatedFiles } from "../../src/failover/retained-files.js";
 import { ScopedDatabase } from "../../src/failover/scoped-database.js";
 import { applyLog } from "../../src/failover/standby.js";
 import type { AuthorityCommand } from "../../src/generated/AuthorityCommand.js";
+import type { AuthorityReply } from "../../src/generated/AuthorityReply.js";
 import type { AuthorityState } from "../../src/generated/AuthorityState.js";
 import type { FileRecord } from "../../src/generated/FileRecord.js";
 import type { LogEntry } from "../../src/generated/LogEntry.js";
@@ -107,6 +108,13 @@ export async function filesUnder(directory: string): Promise<string[]> {
 export async function retainedFiles(directory: string): Promise<Record<string, string>> {
   const paths = (await filesUnder(directory)).filter((path) => REPLICATED_FILE_ROOTS.some((root) => path.startsWith(`${root}/`)));
   return Object.fromEntries(await Promise.all(paths.map(async (path) => [path, sha256Hex(await readFile(join(directory, path)))] as const)));
+}
+
+/** A coordinator start by `holder`: reads the epoch and claims the next one, as the helper does. Returns the authority's reply. */
+export async function claimStart(link: AuthorityLink, holder: string): Promise<AuthorityReply> {
+  const record = await link.record();
+  if (record === undefined) throw new Error("A start can only be claimed for an enrolled coordinator");
+  return link.command({ op: "claim", holder, expected_epoch: record.state.epoch });
 }
 
 export async function enroll(link: AuthorityLink, holder = OWNER): Promise<number> {

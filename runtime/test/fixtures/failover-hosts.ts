@@ -16,7 +16,7 @@ import type { StopEvidence } from "../../src/generated/StopEvidence.js";
 import type { UnfinishedDelivery } from "../../src/generated/UnfinishedDelivery.js";
 import type { UnfinishedToolCall } from "../../src/generated/UnfinishedToolCall.js";
 import { protocolLines } from "../../src/protocol.js";
-import { note, openOwner, stage } from "./failover-state.js";
+import { claimStart, note, openOwner, stage } from "./failover-state.js";
 import { startAuthority } from "./failover-workerd.js";
 
 export const HOLDERS = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"] as const;
@@ -217,7 +217,7 @@ async function linkRuntime(runtime: string, bridge: string): Promise<void> {
 
 /** One run of an owner between two commands: it claims its start, does `work` and closes. Returns the epoch it ran at. */
 export async function ownerRun(owner: Host, work: (opened: Awaited<ReturnType<typeof openOwner>>) => Promise<void>): Promise<number> {
-  const claimed = await owner.link.command({ op: "claim", holder: owner.holder });
+  const claimed = await claimStart(owner.link, owner.holder);
   assert.ok(claimed.result === "accepted" && claimed.state.kind === "active", JSON.stringify(claimed));
   const { epoch } = claimed.state;
   const opened = await openOwner(owner.state, owner.link, { holder: owner.holder, epoch });

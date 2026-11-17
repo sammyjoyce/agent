@@ -176,8 +176,8 @@ export async function connectHost(bridge: Bridge): Promise<void> {
 export const chat = (input: string, input_id: string): RuntimeCommand => ({ type: "chat", input, input_id, model: DEFAULT_MODEL,
   instructions: "Brief answers.", cwd: "/example/project", origin_host_id: null, hosts: [] });
 
-/** Runs a one-shot failover script as Rust does and returns what it printed. */
-export async function runScript(script: "helper" | "operator", session: string | undefined, request: string) {
+/** Starts a one-shot failover script as Rust does. `done` resolves with what it printed. */
+export function startScript(script: "helper" | "operator", session: string | undefined, request: string) {
   const { AGENT_FAILOVER: _inherited, ...inherited } = process.env;
   const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL(`../../src/failover/${script}.js`, import.meta.url)), request],
     { stdio: ["ignore", "pipe", "pipe"], env: { ...inherited, ...(session === undefined ? {} : { AGENT_FAILOVER: session }) } });
@@ -185,8 +185,12 @@ export async function runScript(script: "helper" | "operator", session: string |
   child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
   child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
   const started = Date.now();
-  const code = await new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
-  return { code, stdout, stderr, elapsedMs: Date.now() - started };
+  const done = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); })
+    .then((code) => ({ code, stdout, stderr, elapsedMs: Date.now() - started }));
+  return { child, done };
 }
+
+/** Runs a one-shot failover script as Rust does and returns what it printed. */
+export const runScript = (script: "helper" | "operator", session: string | undefined, request: string) => startScript(script, session, request).done;
 
 export const runHelper = (session: string | undefined, request: string) => runScript("helper", session, request);

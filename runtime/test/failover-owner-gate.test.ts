@@ -6,7 +6,7 @@ import { OwnerFenced } from "../src/failover/replicated-storage.js";
 import type { AuthorityCommand } from "../src/generated/AuthorityCommand.js";
 import { MemoryAuthority } from "./fixtures/failover-memory-authority.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { enroll, note, openOwner, OWNER, replaceOwner, STANDBY, stateDirectory } from "./fixtures/failover-state.js";
+import { claimStart, enroll, note, openOwner, OWNER, replaceOwner, STANDBY, stateDirectory } from "./fixtures/failover-state.js";
 import { until } from "./fixtures/until.js";
 
 function held() {
@@ -148,7 +148,7 @@ test("the log writer reports a fence where it reads the refusal, though Pi keeps
 
 test("opening storage at an epoch the authority has moved past reports the fence", async (t) => {
   const authority = new MemoryAuthority(), epoch = await enroll(authority), directory = await stateDirectory(t), fences: OwnerFenced[] = [];
-  assert.equal((await authority.command({ op: "claim", holder: OWNER })).result, "accepted");
+  assert.equal((await claimStart(authority, OWNER)).result, "accepted");
   await assert.rejects(openOwner(directory, authority, { epoch, onFenced: (error) => fences.push(error) }), OwnerFenced);
   assert.deepEqual(fences.map((error) => error.reason), ["fenced"]);
 });

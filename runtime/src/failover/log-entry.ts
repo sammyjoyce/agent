@@ -1,10 +1,9 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { StorageWrite } from "@earendil-works/pi-durable";
-import type { BatchBody } from "../generated/BatchBody.js";
 import type { LogEntry } from "../generated/LogEntry.js";
 import type { Versions } from "../generated/Versions.js";
-import { COMMAND_BODY_LIMIT_BYTES } from "./authority-wire.js";
+import { COMMAND_BODY_LIMIT_BYTES, logEntryCanonical } from "./authority-wire.js";
 
 /**
  * A Pi batch whose JSON is longer than this goes to the blob store, and its
@@ -18,29 +17,15 @@ export function sha256Hex(bytes: Uint8Array | string): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-/** SHA-256 over every field of a log entry but its digest, in a fixed key order. */
+/** SHA-256 over every field of a log entry but its digest. */
 export function logEntryDigest(entry: Omit<LogEntry, "digest">): string {
-  const { application, pi_durable, chord } = entry.versions;
-  return sha256Hex(JSON.stringify({
-    at: entry.at, epoch: entry.epoch, versions: { application, pi_durable, chord },
-    files: entry.files.map(({ path, sha256, size }) => ({ path, sha256, size })),
-    removed: entry.removed,
-    batch: entry.batch === null ? null : { pi_seq: entry.batch.pi_seq, body: canonicalBody(entry.batch.body) },
-  }));
+  return sha256Hex(logEntryCanonical(entry));
 }
 
 export function parseBatch(json: string, at: number): StorageWrite[] {
   const writes: unknown = JSON.parse(json);
   if (!Array.isArray(writes)) throw new Error(`The batch of log entry ${at} is not a list of writes`);
   return writes as StorageWrite[];
-}
-
-function canonicalBody(body: BatchBody): BatchBody {
-  switch (body.kind) {
-    case "inline": return { kind: body.kind, json: body.json };
-    case "blob": return { kind: body.kind, sha256: body.sha256, size: body.size };
-    default: return body satisfies never;
-  }
 }
 
 let installed: Promise<Versions> | undefined;

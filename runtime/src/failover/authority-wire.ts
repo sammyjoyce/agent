@@ -138,7 +138,7 @@ const logPage = object<LogPage>({ record: authorityRecord, entries: list(logEntr
 
 const authorityCommand = tagged<AuthorityCommand, "op">("op", {
   enroll: { holder: uuid, checkpoint: checkpointRecord },
-  claim: { holder: uuid },
+  claim: { holder: uuid, expected_epoch: counter },
   append: { holder: uuid, entry: logEntry },
   confirm: { holder: uuid, epoch: counter },
   promote: { candidate: uuid, expected_epoch: counter, attestation: nullable(statement) },
@@ -182,6 +182,31 @@ export const parseAuthorityCommand = whole("command", authorityCommand);
 export const parseAuthorityReply = whole("reply", authorityReply);
 export const parseAuthorityRecord = whole("record", authorityRecord);
 export const parseLogPage = whole("log page", logPage);
+
+/** Every field of a log entry but its digest, in a fixed key order. The digest is the SHA-256 of this text. */
+export function logEntryCanonical(entry: Omit<LogEntry, "digest">): string {
+  const { application, pi_durable, chord } = entry.versions;
+  return JSON.stringify({
+    at: entry.at, epoch: entry.epoch, versions: { application, pi_durable, chord },
+    files: entry.files.map(({ path, sha256, size }) => ({ path, sha256, size })),
+    removed: entry.removed,
+    batch: entry.batch === null ? null : { pi_seq: entry.batch.pi_seq, body: canonicalBody(entry.batch.body) },
+  });
+}
+
+function canonicalBody(body: BatchBody): BatchBody {
+  switch (body.kind) {
+    case "inline": return { kind: body.kind, json: body.json };
+    case "blob": return { kind: body.kind, sha256: body.sha256, size: body.size };
+    default: return body satisfies never;
+  }
+}
+
+/** Whether an inline batch is what a standby parses before it applies the entry: a JSON list. */
+export function isBatchJson(json: string): boolean {
+  try { return Array.isArray(JSON.parse(json)); }
+  catch { return false; }
+}
 
 /** The holder a command speaks for, which its credential must name. */
 export function commandHolder(command: AuthorityCommand): string {

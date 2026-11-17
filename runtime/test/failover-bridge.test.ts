@@ -9,7 +9,7 @@ import { OWNER_FENCED_EXIT } from "../src/generated/owner-fenced-exit.js";
 import { DEFAULT_MODEL } from "../src/models.js";
 import { chat, failoverCoordinator, startBridge } from "./fixtures/failover-bridge.js";
 import { commands } from "./fixtures/failover-fault-proxy.js";
-import { enroll, filesUnder, follow, logBatches, loggedFiles, OWNER, retainedFiles, STANDBY, stateDirectory, tables, unstampedDirectory } from "./fixtures/failover-state.js";
+import { claimStart, enroll, filesUnder, follow, logBatches, loggedFiles, OWNER, retainedFiles, STANDBY, stateDirectory, tables, unstampedDirectory } from "./fixtures/failover-state.js";
 import { until } from "./fixtures/until.js";
 
 /** How many submissions the log holds for the input with this id. Each one is an admission of it. */
@@ -26,7 +26,7 @@ const localInputs = (directory: string, inputId: string) =>
   (tables(directory).submissions ?? []).filter((row) => row.includes(inputId)).length;
 
 async function claim(link: AuthorityLink): Promise<number> {
-  const reply = await link.command({ op: "claim", holder: OWNER });
+  const reply = await claimStart(link, OWNER);
   assert.equal(reply.result, "accepted");
   return reply.state!.epoch;
 }

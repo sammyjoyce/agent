@@ -362,7 +362,14 @@ pub fn checkpoint(
     let holder = holder(config)?;
     let (lock, coordinator_id) = lock_state(state)?;
     let authority = Authority::open(script, config, coordinator_id)?;
-    let claimed = authority.command("this checkpoint", AuthorityCommand::Claim { holder })?;
+    let expected_epoch = state_epoch(&authority.enrolled()?.state);
+    let claimed = authority.command(
+        "this checkpoint",
+        AuthorityCommand::Claim {
+            holder,
+            expected_epoch,
+        },
+    )?;
     let AuthorityState::Active { epoch, head, .. } = claimed else {
         bail!("The authority accepted a claim and reported no owner");
     };
@@ -592,19 +599,19 @@ fn released(epoch: OwnerEpoch, report: OperatorReport) -> Result<()> {
             reply: AuthorityReply::Accepted { .. },
         } => Ok(()),
         OperatorReport::Reply {
-            reply: AuthorityReply::Refused { reason, state },
-        } => Err(Refused {
-            action: "this release",
-            reason,
-            state,
-        }
-        OperatorReport::Reply {
             reply:
                 AuthorityReply::Refused {
                     reason: AuthorityRefusal::NotSealed,
                     state: Some(state),
                 },
         } if release_evidence(&state, epoch).is_some() => Ok(()),
+        OperatorReport::Reply {
+            reply: AuthorityReply::Refused { reason, state },
+        } => Err(Refused {
+            action: "this release",
+            reason,
+            state,
+        }
         .into()),
         other => Err(unexpected("authority", &other)),
     }
@@ -617,13 +624,6 @@ pub fn release(state: &Path, script: &Path, config: &FailoverConfig) -> Result<R
     let (lock, coordinator_id) = lock_state(state)?;
     let authority = Authority::open(script, config, coordinator_id)?;
     let record = authority.enrolled()?;
-    let AuthorityState::Sealed {
-        epoch,
-        holder: sealed,
-        candidate,
-        ..
-    } = record.state
-    else {
     if let AuthorityState::Vacant { epoch, .. } = record.state
         && let Some((evidence, candidate)) = release_evidence(&record.state, epoch)
     {
@@ -635,6 +635,13 @@ pub fn release(state: &Path, script: &Path, config: &FailoverConfig) -> Result<R
             posted: false,
         });
     }
+    let AuthorityState::Sealed {
+        epoch,
+        holder: sealed,
+        candidate,
+        ..
+    } = record.state
+    else {
         return Err(Refused {
             action: "this release",
             reason: AuthorityRefusal::NotSealed,
@@ -663,6 +670,7 @@ pub fn release(state: &Path, script: &Path, config: &FailoverConfig) -> Result<R
         epoch,
         evidence: ReleaseEvidence::LockHeld,
         candidate,
+        posted: true,
     })
 }
 
@@ -670,7 +678,6 @@ pub fn release(state: &Path, script: &Path, config: &FailoverConfig) -> Result<R
 /// its cleanup. It posts `released` only when the record is sealed at `epoch`
 /// with `session`'s holder, and only with the proof `lock_held` rests on: the
 /// writer lock, then no recorded process group alive and nothing holding
-        posted: true,
 /// `effects.lock`. A drain that returned is not that proof, because a helper
 /// it asked to exit may not have exited. It answers whether it posted.
 pub(crate) async fn post_released(
