@@ -30,6 +30,53 @@ enum SpotlightEntry: Hashable, Sendable {
   }
 }
 
+extension SpotlightEntry.Key {
+  /// `indexAppEntities` identifies each item by the entity's type name, a slash and the entity's ID.
+  init?(tapped activity: NSUserActivity) {
+    guard let item = activity.userInfo?[CSSearchableItemActivityIdentifier] as? String,
+      let slash = item.firstIndex(of: "/")
+    else { return nil }
+    let id = String(item[item.index(after: slash)...])
+    switch item[..<slash] {
+    case "\(CoordinatorEntity.self)":
+      guard let profile = ProfileID(wire: id) else { return nil }
+      self = .coordinator(profile)
+    case "\(JobEntity.self)":
+      guard let job = ScopedEntityID(parsing: id) else { return nil }
+      self = .job(job)
+    default: return nil
+    }
+  }
+}
+
+extension AppNotifications {
+  /// Opens the coordinator or job that a tapped Spotlight result names, as Open Coordinator and
+  /// Open Job do. One that is gone opens nothing, and the feed says why.
+  public func openSpotlightResult(_ activity: NSUserActivity) async {
+    await (try? receiver())?.open(spotlight: activity)
+  }
+
+  func open(spotlight activity: NSUserActivity) async {
+    switch SpotlightEntry.Key(tapped: activity) {
+    case .coordinator(let id):
+      guard coordinators.route(.named(id)) != nil else {
+        return showNotice("This coordinator is no longer saved in Beep Boop.")
+      }
+      open(.named(id))
+    case .job(let id):
+      do {
+        let jobs = try await JobQuery.jobs(identifiedBy: [id], in: coordinators)
+        if let job = jobs.first { open(job) }
+      } catch let error as any CustomLocalizedStringResourceConvertible {
+        showNotice(String(localized: error.localizedStringResource))
+      } catch {
+        showNotice(error.localizedDescription)
+      }
+    case nil: return
+    }
+  }
+}
+
 protocol SpotlightStore: Sendable {
   func deleteAll() async throws
   func index(_ entries: [SpotlightEntry]) async throws

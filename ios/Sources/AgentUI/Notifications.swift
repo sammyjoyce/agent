@@ -95,7 +95,9 @@ public final class AppNotifications: NSObject {
     openRequest = OpenRequest(destination: .job(job.id))
   }
 
-  func open(spotlight activity: NSUserActivity) async {}
+  func showNotice(_ notice: String) {
+    openRequest = OpenRequest(destination: .feed(notice: notice))
+  }
 
   func presents(_ origin: AlertOrigin?) -> Bool {
     guard registration.enabled else { return false }
