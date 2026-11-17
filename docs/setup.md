@@ -933,6 +933,129 @@ directory to the default location while no coordinator runs. Run
 `beep-boop login` again, because credentials are not in the backup. After the
 release, the coordinator rebuilds the search index in the background.
 
+## Failover
+
+Failover is opt-in. Without a `[failover]` section a coordinator behaves as
+before. With one, every commit waits for one request to a Cloudflare Worker in
+your own account, and the coordinator accepts no input while that Worker is
+unreachable. Conversations, attachments and feedback are stored there
+unencrypted. [Cross-host recovery](architecture.md#cross-host-recovery)
+explains the mechanism.
+
+### Deploy the authority
+
+Deploy `runtime/failover/wrangler.jsonc` to your Cloudflare account with an R2
+bucket of its own. Set the Worker secret `AUTHORITY_CREDENTIALS` to a JSON
+array with one entry per host:
+
+```json
+[
+  { "coordinator": "11111111-1111-4111-8111-111111111111",
+    "holder": "22222222-2222-4222-8222-222222222222",
+    "token_sha256": "<SHA-256 of that host's token>" },
+  { "coordinator": "11111111-1111-4111-8111-111111111111",
+    "holder": null,
+    "token_sha256": "<SHA-256 of a worker's read-only token>" }
+]
+```
+
+`coordinator` is the content of `coordinator-id` in the state directory. Choose
+one `holder` UUID for each coordinator host. An entry with `holder: null` can
+only read the owner record, and worker hosts use it. Write UUIDs in lowercase.
+
+### Configure each host
+
+```toml
+[failover]
+url = "https://authority.example.workers.dev"
+holder = "22222222-2222-4222-8222-222222222222"
+token_file = "~/.config/agent/failover-token"
+```
+
+The token file holds that host's token and must be readable only by you. The
+holder lives in this private file and never in the state directory, so a copied
+state directory owns nothing. Use one state directory for each holder: the
+stop evidence of a holder is a proof about the directory its command runs in. On a worker host, leave `holder` out and use the
+read-only token. `watch_interval_seconds` sets how often a worker reads the
+owner record, and it defaults to 30.
+
+### Enroll the coordinator
+
+Stop the coordinator, then run `beep-boop failover enroll` on its host. It
+stores a checkpoint of the state directory and makes this host the owner at
+epoch 1. Start the service again. `beep-boop failover status` shows the owner,
+its epoch, the log head and the log position this directory holds.
+
+### Add a standby
+
+On the second host, with its own holder and token, run `beep-boop failover join
+<coordinator-id>` with a state directory that is absent or empty. Then keep
+`beep-boop failover follow` running as a service. Run `beep-boop login` there,
+because credentials are not replicated. A standby starts held, as a restored
+backup does, and the promotion releases the hold.
+
+### Promote the standby
+
+1. Run `beep-boop failover status` and note the epoch.
+2. On the standby, run `beep-boop failover promote --replace-epoch <epoch>`. A
+   running old owner sees the seal within a few seconds, stops by itself, and the
+   command completes.
+3. If the old coordinator process is dead and its host is up, run `beep-boop
+   failover release` on the old host, then run the `promote` command again. A
+   coordinator that the service manager restarts after a seal does this release by
+   itself. The release stops each local command the old coordinator left running
+   and posts `lock_held` only when it finds nothing of the old coordinator alive
+   on that host. If something survives that it may not stop, it names it and
+   posts nothing. Stop the process and run the release again, or go to step 4.
+   A release that got no reply from the authority is safe to run again: when
+   the authority already holds the evidence, the command posts nothing and says
+   so.
+   A fenced coordinator that is still running applies the same test before it
+   posts `released`, and prints the same sentence when the test fails.
+4. If the old host cannot be reached, make sure it is powered off, then run
+   `beep-boop failover promote --replace-epoch <epoch> --old-owner-stopped "<why
+   you know it is stopped>"`. The statement is stored. Read what a wrong statement
+   leaves possible in [Cross-host recovery](architecture.md#cross-host-recovery)
+   first.
+5. Read the report. It lists each tool call and each notification that the old
+   owner started and that has no result, and each credential this host lacks.
+   `released` and `lock_held` cover the old owner's own host. Neither proves that
+   a command on a worker has ended. That command ends when the worker's daemon
+   sees its link to the old owner end or reads the new owner's epoch, and the
+   report lists it as unfinished.
+   Neither covers a detached helper that a local command started and that
+   closed the files it inherited. [Cross-host recovery](architecture.md#cross-host-recovery)
+   states that limit.
+6. Start the service on the new owner, and change the address on each phone.
+   The phones keep their pairing because the coordinator ID is the same. Send
+   again any input whose turn was in flight.
+
+A fenced coordinator exits with status 75. Under launchd it restarts, is
+refused at its claim before it sets up anything, and exits 75 again. Under
+systemd, set `RestartPreventExitStatus=75` and let every other failure restart.
+A start that finds the state directory still locked by the claim of a
+coordinator that was killed fails with an ordinary status. That lock ends
+within about 20 seconds, and the next start claims. To make the old host a standby
+again, run `beep-boop failover join <coordinator-id> --replace` there. It keeps
+the old state directory under a new name.
+
+### Keep the log short
+
+The log grows with every commit, and one Durable Object holds 10 GB. Stop the
+owner and run `beep-boop failover checkpoint` from time to time. It stores a
+new checkpoint and drops the log entries the checkpoint covers. A standby that
+was behind the checkpoint must join again with `--replace`.
+
+### What a replicated coordinator does differently
+
+- It removes unfinished attachment uploads at every start, so a client that was
+  in the middle of an upload starts that upload again.
+- It asks the authority once before each host call and each notification.
+  Sending a large attachment to a host asks once for each 64 KiB chunk.
+- Dreams run records under `dreams/` stay on the host that made them. After a
+  promotion, `dreams show` and `dreams apply` on the new owner find no earlier
+  run.
+
 ## nix-darwin service
 
 The flake exports `darwinModules.default`. Import it and reference a private

@@ -176,12 +176,13 @@ Overflow ends that view with an explicit recovery error. Retained conversation
 history remains the recovery source, and transport errors do not become saved
 conversation messages.
 
-The MVP does not replicate the store or recover onto another host. If the
-coordinator is down, the client reports that it is unavailable. Copying a live
-SQLite database or starting two coordinators is not a recovery mechanism. An
-[offline backup](setup.md#backups-and-restore) of a stopped coordinator
-restores into a new directory with background work held until the operator
-releases it.
+By default the store is not replicated, and a coordinator that is down is
+unavailable. Copying a live SQLite database or starting two coordinators is not
+a recovery mechanism. An [offline backup](setup.md#backups-and-restore) of a
+stopped coordinator restores into a new directory with background work held
+until the operator releases it. A coordinator with a `[failover]` section also
+[replicates its state](#cross-host-recovery) to a log that a standby on another
+host follows.
 
 ## Tasks and execution
 
@@ -689,25 +690,111 @@ and history projection as the CLI; inspection detaches without aborting work.
 
 ### Cross-host recovery
 
-Cross-host recovery needs replicated conversation/event data, one fenced writer
-and explicit host transfer of execution. A synced record remains history until
-ownership is transferred. The [history implementation](history.md) covers inert
-Codex import, hybrid retrieval and same-host reopening today.
+Replication is opt-in. A coordinator with a `[failover]` section replicates
+`session.sqlite` and the retained files under `attachments/`, `history/assets/`
+and `feedback/`. It does not replicate credentials, the search index,
+diagnostics, browser sign-in or the Dreams run records under `dreams/`. Removal
+of a retained file goes through the log like a write: the owner logs the
+removal before it removes the file, and a standby removes it when it applies
+that entry. The blob store keeps the removed file's bytes.
 
-Choose and qualify an existing replication or backup backend before promising
-takeover. Pi commit subscriptions are live notifications, not a historical
-replication log. Never synchronize an open SQLite file with a general file-sync
-tool. Define which acknowledgements require independent durability and expose
-the recoverable watermark, including referenced asset bytes.
+**The authority.** One Cloudflare Durable Object per coordinator ID holds the
+owner record and the replication log, and an R2 bucket holds large batches and
+files by SHA-256. The record names one owner and its epoch. Only the authority
+raises the epoch, at every coordinator start and at every promotion. A start
+names the epoch it read, so a claim that arrives late or twice raises the epoch
+once and never fences the start that came after it. The process that sends the
+claim holds the writer lock, so the next start on that host is refused until
+it has ended. An append succeeds only
+from the current owner, at the current epoch, at the next log position. Before
+it logs an entry, the authority recomputes the entry's digest and checks that
+an inline batch is a JSON list, and it refuses an entry that fails either
+check. It does not read a batch that is in the blob store.
 
-Begin with explicit promotion after fencing both the old writer and its effect
-executors, including detached workers. An unreachable host cannot establish
-that fencing. Restore the complete acknowledged prefix and reconcile in-flight
-provider operations before resuming effects. A returning host refreshes its
-authority and cannot reclaim transferred work automatically. Automatic takeover
-needs independently enforceable fencing; a custom two-machine election service
-is not planned. Replicated history also does not replicate provider credentials
-or browser sign-in.
+**Commits go to the log first.** For each Pi commit the coordinator runs the
+batch in a transaction that it rolls back, appends the batch to the log, and
+only then commits it locally. A retained file takes its final name only after a
+log entry names it. So local disk never holds a commit or a file that the log
+lacks, and every acknowledgement a client receives is true on a standby that
+has applied the log. An append that the authority refuses because the epoch is
+sealed or fenced ends the Pi child, and the coordinator exits with status 75.
+Any other failed append or local commit is final for that process: it commits
+nothing more, and the next start applies what the log holds before Pi opens.
+
+**Effects.** Every tool intent is a Pi commit, so it is in the log before its
+effect starts. Before each host call and each APNs send, the coordinator waits
+for one exchange with the authority that started after the call was requested
+and that confirms it is still the owner. A worker daemon keeps the highest
+epoch it has served for each coordinator in a file outside every state
+directory. It refuses a lower epoch at registration and before each effect,
+also after a restart. A worker with a `[failover]` section reads the owner
+record on an interval and ends the link of a replaced owner, which cancels the
+effects that link started.
+
+**Standby.** A standby is a state directory that never runs `serve`. `failover
+join` restores a checkpoint, and `failover follow` replays log entries through
+Pi's own storage commit, each at its own log position and Pi sequence. It never
+opens a Harness, so it schedules nothing and emits nothing.
+
+**Promotion.** Promotion is an operator command on the standby. It seals the
+log, waits for evidence that the old owner stopped, applies the log to the
+sealed head, verifies the directory, and activates the next epoch. No step
+treats a timeout or an unreachable host as evidence. The evidence is one of
+three kinds:
+
+| Evidence | What it proves |
+| --- | --- |
+| `released` | The old owner saw the seal, stopped its listeners, cancelled and drained its local effects and closed its worker links. It then took the two locks that `lock_held` rests on, and only then said so. |
+| `lock_held` | No supervisor, no Pi child and no local effect of the old owner is alive on its host, within the limit below. A command there took `writer.lock`, which the supervisor and its Pi child hold. It stopped each recorded process group whose leader was still the recorded process. It then took `effects.lock`, which every process the coordinator started inherits and every effect task holds. |
+| `operator_attested` | Nothing about the old host. It stores the operator's statement that the host is stopped. |
+
+Neither `released` nor `lock_held` proves that an effect on a worker has ended.
+The old owner closes its worker links, and it does not wait for a worker to
+confirm. An effect on a worker ends when that worker's daemon sees its link
+end, or reads the new owner's epoch and drops the link. Until then it can still
+run, and the promotion report lists it as unfinished.
+
+Both are refused while something of the old owner survives that the command
+may not stop: a process that still holds `effects.lock` and that no record
+names, or a recorded process group that is alive and whose leader is no longer
+the process the coordinator recorded. The refusal names it, and nothing is
+posted.
+
+The limit of both: a process that left the process group it was started in and
+also closed the files it inherited is outside this evidence. A command that
+starts a detached helper through Node's `child_process` or Python's
+`subprocess` makes such a process, because both close inherited files by
+default. Its work was started once, the log holds its tool call, and the new
+owner reports that call as interrupted and does not repeat it. So it is no
+second effect, but it can still be running after the promotion.
+
+Under every kind, the authority refuses the old owner's appends and owner
+checks without the old host's help. After an attestation that is wrong, one
+thing remains possible: an old process that was paused and later resumes can
+still dispatch, once, an effect that the authority confirmed just before the
+seal. Its intent is in the log, and the promotion report lists it as
+unfinished. A promoted owner recovers as a restarted coordinator does. It asks
+the model again for a generation that was in flight when a client resubmits or
+the turn resumes, and it reruns only tools declared `replay: "safe"`. Those
+are reads, and tools whose only effect is a Pi commit. `read_attachment` and
+`collect_worktrees` change something on a host, and `dreams_review` runs the
+operator's checks before it seals a review. None of them is declared safe, so
+a coordinator that recovers one of these calls, after a promotion or a
+restart, reports it as interrupted.
+
+**When the authority is unreachable.** Commits wait and retry, so the
+coordinator accepts no input and starts no effect. An attachment download
+completes. A history read completes unless it was asked after a commit started
+to wait, because Pi answers reads on the same line its commits wait on. A
+coordinator cannot start, and nobody can promote. There is no switch to detach
+from the authority, because a detached owner plus a later promotion is two
+owners.
+
+Automatic takeover is not planned. Host transfer of a task's execution is
+separate from coordinator promotion: a bound task stays on its execution host,
+and to that host a promotion looks like a coordinator restart. The [history
+implementation](history.md) covers inert Codex import, hybrid retrieval and
+same-host reopening.
 
 ### Reviewed learning
 
