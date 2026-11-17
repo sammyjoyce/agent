@@ -2,9 +2,16 @@
 import type { CheckpointFile } from "./CheckpointFile.js";
 import type { CoordinatorId } from "./CoordinatorId.js";
 import type { LogPosition } from "./LogPosition.js";
+import type { PiSequence } from "./PiSequence.js";
 
 /**
  * The blob that `CheckpointRecord.manifest` names: a backup archive of the
  * state directory at log position `through`, its `manifest.json` included.
  */
-export type CheckpointManifest = { format: number, through: LogPosition, coordinator_id: CoordinatorId, files: Array<CheckpointFile>, };
+export type CheckpointManifest = { format: number, through: LogPosition,
+/**
+ * The sequence of the last Pi commit in the snapshot's database, or 0
+ * when it holds none. A directory at `through` is at this sequence
+ * until it applies a batch.
+ */
+pi_seq: PiSequence, coordinator_id: CoordinatorId, files: Array<CheckpointFile>, };

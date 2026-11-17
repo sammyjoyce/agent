@@ -39,6 +39,19 @@ function position(database: DatabaseSync): number | undefined {
   return typeof value === "number" ? value : undefined;
 }
 
+function piSequence(database: DatabaseSync): number {
+  if (!hasTable(database, "durable_metadata")) return 0;
+  const next = database.prepare("SELECT next_seq FROM durable_metadata WHERE singleton = 1").get()?.next_seq;
+  if (typeof next !== "number") throw new Error("The session database names no next Pi sequence");
+  return next - 1;
+}
+
+/** The sequence of the last Pi commit a state directory holds, or 0 when Pi committed nothing there. */
+export function lastPiSequence(state: string): number {
+  const database = readOnly(state);
+  try { return piSequence(database); } finally { database.close(); }
+}
+
 /** The log position a state directory holds, or undefined when it has no session database or was never stamped. */
 export function appliedPosition(state: string): number | undefined {
   if (!existsSync(sessionDatabasePath(state))) return undefined;
@@ -58,16 +71,20 @@ async function hashFile(path: string): Promise<{ sha256: string; size: number }>
  * ownership: the database's integrity, the coordinator id against the
  * checkpoint's, and the bytes of every replicated file that the checkpoint or
  * a later log entry names and no later entry removed. The latest record of a
- * path is the one that counts.
+ * path is the one that counts. It also checks Pi's sequence against the last
+ * batch the log holds, or against the checkpoint when no batch follows it: a
+ * directory that committed outside the log is at a later sequence, and no
+ * other copy could apply what it logs as the owner.
  */
 export async function verifyStandby(link: AuthorityLink, state: string): Promise<{ applied: number; files: number }> {
   const record = await link.record();
   if (record === undefined) throw new Error("This coordinator is not enrolled with the authority");
   const { state: { head }, checkpoint } = record;
   const database = readOnly(state);
-  let applied: number | undefined;
+  let applied: number | undefined, sequence: number;
   try {
     applied = position(database);
+    sequence = piSequence(database);
     const integrity = database.prepare("PRAGMA integrity_check").all().map((row) => String(row.integrity_check));
     if (integrity.length !== 1 || integrity[0] !== "ok") throw new Error(`The session database of ${state} failed its integrity check: ${integrity.join("; ")}`);
   } finally { database.close(); }
@@ -78,6 +95,7 @@ export async function verifyStandby(link: AuthorityLink, state: string): Promise
   if (coordinatorId !== manifest.coordinator_id) throw new Error(`${state} belongs to coordinator ${coordinatorId}, and the checkpoint to coordinator ${manifest.coordinator_id}`);
 
   const expected = new Map<string, FileRecord>();
+  let logged = { sequence: manifest.pi_seq, source: "its checkpoint" };
   for (const { path, sha256, size } of manifest.files) {
     const local = path.startsWith(ARCHIVE_DATA) ? path.slice(ARCHIVE_DATA.length) : undefined;
     if (local !== undefined && REPLICATED_FILE_ROOTS.some((root) => local.startsWith(`${root}/`))) expected.set(local, { path: local, sha256, size });
@@ -87,12 +105,17 @@ export async function verifyStandby(link: AuthorityLink, state: string): Promise
     const last = entries.at(-1);
     if (last === undefined) throw new Error(`The log returned no entry after position ${after}, and its head is ${head}`);
     for (const entry of entries) {
+      if (entry.batch !== null) logged = { sequence: entry.batch.pi_seq, source: `entry ${entry.at}` };
       for (const file of entry.files) expected.set(file.path, file);
       for (const removed of entry.removed) {
         for (const path of expected.keys()) if (path === removed || path.startsWith(`${removed}/`)) expected.delete(path);
       }
     }
     after = last.at;
+  }
+  if (sequence !== logged.sequence) {
+    throw new Error(`The session database of ${state} is at Pi sequence ${sequence}, and the log is at Pi sequence ${logged.sequence}, which ${logged.source} records. `
+      + "The directory holds a commit that the log lacks, or lacks one the log holds, so it cannot take ownership. Rebuild it with `beep-boop failover join --replace`");
   }
   for (const file of expected.values()) {
     const found = await hashFile(replicatedFilePath(state, file)).catch((error: NodeJS.ErrnoException) => {

@@ -40,7 +40,7 @@ pub const AUTHORITY_UNREACHABLE_EXIT: u8 = 69;
 pub const CHECKPOINT_PART_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The `format` of every checkpoint manifest this build writes and reads.
-pub const CHECKPOINT_FORMAT: u32 = 1;
+pub const CHECKPOINT_FORMAT: u32 = 2;
 
 /// Granted only by the authority. Rises at every coordinator start and at every promotion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
@@ -349,6 +349,10 @@ pub struct CheckpointFile {
 pub struct CheckpointManifest {
     pub format: u32,
     pub through: LogPosition,
+    /// The sequence of the last Pi commit in the snapshot's database, or 0
+    /// when it holds none. A directory at `through` is at this sequence
+    /// until it applies a batch.
+    pub pi_seq: PiSequence,
     pub coordinator_id: CoordinatorId,
     pub files: Vec<CheckpointFile>,
 }
@@ -906,6 +910,7 @@ mod tests {
             serde_json::json!({
                 "format": CHECKPOINT_FORMAT,
                 "through": 3,
+                "pi_seq": 12,
                 "coordinator_id": Uuid::nil(),
                 "files": [{ "path": path, "size": 0, "sha256": "ab".repeat(32), "parts": [] }],
             })

@@ -10,7 +10,7 @@ import { fetchCheckpoint, readCheckpointManifest, storeCheckpoint } from "./chec
 import { PositionMissing, ScopedDatabase } from "./scoped-database.js";
 import { scriptSession, type ScriptSession } from "./session.js";
 import { applyLog } from "./standby.js";
-import { appliedPosition, sessionDatabasePath, unfinishedEffects, verifyStandby } from "./state-directory.js";
+import { appliedPosition, lastPiSequence, sessionDatabasePath, unfinishedEffects, verifyStandby } from "./state-directory.js";
 
 /** A part of 16 MiB on a slow uplink needs longer than the client's default. */
 const REQUEST_TIMEOUT_MS = 120_000;
@@ -42,7 +42,7 @@ async function answer({ link, coordinatorId }: ScriptSession, request: OperatorR
       if (through === undefined) throw new PositionMissing();
       const archived = await readFile(join(data, "coordinator-id"), "utf8");
       if (archived !== coordinatorId) throw new Error(`The archive holds coordinator ${archived}, and this session is for coordinator ${coordinatorId}`);
-      const { manifest, files, bytes } = await storeCheckpoint(link, request.archive, { through, coordinator_id: coordinatorId }, request.part_bytes ?? undefined);
+      const { manifest, files, bytes } = await storeCheckpoint(link, request.archive, { through, pi_seq: lastPiSequence(data), coordinator_id: coordinatorId }, request.part_bytes ?? undefined);
       return { result: "stored", checkpoint: { through, manifest }, files, bytes };
     }
     case "fetch_checkpoint": {
