@@ -1004,9 +1004,11 @@ backup does, and the promotion releases the hold.
    failover release` on the old host, then run the `promote` command again. A
    coordinator that the service manager restarts after a seal does this release by
    itself. The release stops each local command the old coordinator left running
-   and posts `lock_held` only when no process of the old coordinator is alive on
-   that host. If one survives that it may not stop, it names that process and
+   and posts `lock_held` only when it finds nothing of the old coordinator alive
+   on that host. If something survives that it may not stop, it names it and
    posts nothing. Stop the process and run the release again, or go to step 4.
+   A fenced coordinator that is still running applies the same test before it
+   posts `released`, and prints the same sentence when the test fails.
 4. If the old host cannot be reached, make sure it is powered off, then run
    `beep-boop failover promote --replace-epoch <epoch> --old-owner-stopped "<why
    you know it is stopped>"`. The statement is stored. Read what a wrong statement
@@ -1018,6 +1020,9 @@ backup does, and the promotion releases the hold.
    a command on a worker has ended. That command ends when the worker's daemon
    sees its link to the old owner end or reads the new owner's epoch, and the
    report lists it as unfinished.
+   Neither covers a detached helper that a local command started and that
+   closed the files it inherited. [Cross-host recovery](architecture.md#cross-host-recovery)
+   states that limit.
 6. Start the service on the new owner, and change the address on each phone.
    The phones keep their pairing because the coordinator ID is the same. Send
    again any input whose turn was in flight.

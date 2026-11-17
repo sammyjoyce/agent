@@ -28,7 +28,7 @@ setInterval(() => {
   if (existsSync(exit)) process.exit(Number(readFileSync(exit, "utf8")));
 }, 20);
 const input = createInterface({ input: process.stdin });
-input.on("close", () => process.exit(0));
+input.on("close", () => { if (!existsSync(join(root, "outlive"))) process.exit(0); });
 input.on("line", line => {
   const { id, command } = JSON.parse(line);
   if (command.type === "run_background") return;
@@ -217,6 +217,13 @@ impl Supervisor {
             thread::sleep(Duration::from_millis(20));
         }
         child.wait_with_output().unwrap()
+    }
+
+    /// Ends the supervisor as a host that loses power does, with no cleanup.
+    fn kill(mut self) {
+        let mut child = self.0.take().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     fn terminate(self) -> Output {
@@ -606,4 +613,29 @@ fn a_coordinator_without_failover_starts_while_a_process_of_an_earlier_run_holds
     assert!(world.helper_runs().is_empty());
     drop(supervisor);
     drop(orphan);
+}
+
+#[test]
+fn a_process_that_the_supervisor_started_without_an_effect_record_holds_the_effects_lock_until_it_ends()
+ {
+    let world = World::new(Failover::Absent);
+    // The Pi child is started by code that knows nothing of the effects lock.
+    fs::write(world.runtime.join("outlive"), "").unwrap();
+    let supervisor = world.serve();
+    until("the Pi child", || world.bridge().is_some());
+    supervisor.kill();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(world.state.join("effects.lock"))
+        .unwrap();
+    let held = fs2::FileExt::try_lock_exclusive(&lock).is_err();
+    fs::write(world.runtime.join("exit"), "0").unwrap();
+    assert!(
+        held,
+        "A process that outlived the supervisor must hold the share it inherited"
+    );
+    until("the Pi child to end", || {
+        fs2::FileExt::try_lock_exclusive(&lock).is_ok()
+    });
 }

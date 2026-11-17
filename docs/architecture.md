@@ -707,8 +707,8 @@ three kinds:
 
 | Evidence | What it proves |
 | --- | --- |
-| `released` | The old owner saw the seal, stopped its listeners, cancelled and reaped its local effects, closed its worker links, and then said so. It held `writer.lock` until then. |
-| `lock_held` | No process of the old owner is alive on its host. A command there took `writer.lock`, which the supervisor and its Pi child hold, and then `effects.lock`, which every local effect process holds. It first stopped each recorded process group that was still alive. |
+| `released` | The old owner saw the seal, stopped its listeners, cancelled and drained its local effects and closed its worker links. It then took the two locks that `lock_held` rests on, and only then said so. |
+| `lock_held` | No supervisor, no Pi child and no local effect of the old owner is alive on its host, within the limit below. A command there took `writer.lock`, which the supervisor and its Pi child hold. It stopped each recorded process group whose leader was still the recorded process. It then took `effects.lock`, which every process the coordinator started inherits and every effect task holds. |
 | `operator_attested` | Nothing about the old host. It stores the operator's statement that the host is stopped. |
 
 Neither `released` nor `lock_held` proves that an effect on a worker has ended.
@@ -717,10 +717,19 @@ confirm. An effect on a worker ends when that worker's daemon sees its link
 end, or reads the new owner's epoch and drops the link. Until then it can still
 run, and the promotion report lists it as unfinished.
 
-`lock_held` is refused while a local effect process survives that the command
-may not stop: one that left its recorded process group, or a group whose leader
-is no longer the process the coordinator recorded. The refusal names it, and
-nothing is posted.
+Both are refused while something of the old owner survives that the command
+may not stop: a process that still holds `effects.lock` and that no record
+names, or a recorded process group that is alive and whose leader is no longer
+the process the coordinator recorded. The refusal names it, and nothing is
+posted.
+
+The limit of both: a process that left the process group it was started in and
+also closed the files it inherited is outside this evidence. A command that
+starts a detached helper through Node's `child_process` or Python's
+`subprocess` makes such a process, because both close inherited files by
+default. Its work was started once, the log holds its tool call, and the new
+owner reports that call as interrupted and does not repeat it. So it is no
+second effect, but it can still be running after the promotion.
 
 Under every kind, the authority refuses the old owner's appends and owner
 checks without the old host's help. After an attestation that is wrong, one

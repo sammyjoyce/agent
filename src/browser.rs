@@ -21,7 +21,7 @@ use tokio::{
 use ts_rs::TS;
 use uuid::Uuid;
 
-use crate::runtime::{FrameReader, effects::EffectProcess};
+use crate::runtime::FrameReader;
 
 /// Selects an existing Chrome connection. Pairing credentials arrive through the
 /// helper environment and never enter these serialized helper arguments.
@@ -291,7 +291,6 @@ impl Process {
         } else {
             Command::new("node")
         };
-        let _effect = EffectProcess::of(&mut command);
         let mut child = command
             .env(crate::host::ACTOR_CONVERSATION_ENV, owner_id)
             .arg(helper)

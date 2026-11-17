@@ -24,7 +24,7 @@ use crate::{
         BlockId, HostId, RexClient, RexError, RexIdentity, SessionId, WindowId, WorkerBinding,
         WorkerResume,
     },
-    runtime::effects::EffectProcess,
+    runtime::effects::EffectGroup,
 };
 use uuid::Uuid;
 
@@ -975,7 +975,6 @@ pub(crate) async fn run_process_ending(
     } else {
         command.env_remove(ACTOR_CONVERSATION_ENV);
     }
-    let mut effect = EffectProcess::of(&mut command);
     let mut child = command
         .args(args)
         .current_dir(cwd)
@@ -995,7 +994,7 @@ pub(crate) async fn run_process_ending(
                     .context(format!("Could not start command {program:?} in {cwd:?}")),
             )
         })?;
-    effect.leads(child.id());
+    let _recorded = EffectGroup::led_by(child.id());
     let result = async {
         let mut group = ProcessGroup(
             child

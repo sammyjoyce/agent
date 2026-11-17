@@ -616,9 +616,13 @@ pub fn release(state: &Path, script: &Path, config: &FailoverConfig) -> Result<R
 
 /// The stop evidence of an owner that saw its epoch fenced and has finished
 /// its cleanup. It posts `released` only when the record is sealed at `epoch`
-/// with `session`'s holder, and answers whether it posted.
+/// with `session`'s holder, and only with the proof `lock_held` rests on: the
+/// writer lock, then no recorded process group alive and nothing holding
+/// `effects.lock`. A drain that returned is not that proof, because a helper
+/// it asked to exit may not have exited. It answers whether it posted.
 pub(crate) async fn post_released(
     script: &Path,
+    state: &Path,
     session: &FailoverSession,
     epoch: OwnerEpoch,
     limit: Duration,
@@ -648,6 +652,13 @@ pub(crate) async fn post_released(
     if !sealed_here {
         return Ok(false);
     }
+    let directory = state.to_owned();
+    let _stopped = tokio::task::spawn_blocking(move || {
+        let lock = WriterLock::acquire(&directory)?;
+        let stopped = effects::stop_survivors(&lock, &directory)?;
+        Ok::<_, anyhow::Error>((lock, stopped))
+    })
+    .await??;
     let command = AuthorityCommand::Release {
         holder,
         epoch,

@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { once } from "node:events";
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { OWNER_FENCED_EXIT } from "../src/generated/owner-fenced-exit.js";
 import type { ModelStep } from "./fixtures/coordinator-runtime.js";
@@ -26,6 +29,21 @@ const SLOW_DRAIN = "const fs=require('node:fs'),cp=require('node:child_process')
   + "fs.writeFileSync(started,String(holder.pid));setInterval(()=>{},1000)";
 
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+/** A shell command that leaves one process behind in a process group of its own. That process keeps every file the command inherited. */
+const LEFT_BEHIND = 'set -m; sleep 600 </dev/null >/dev/null 2>&1 & echo $! > "$1"';
+
+/** A process group that this test started and whose leader has ended, as an id that another program's group took after the recorded process ended. */
+async function leaderlessGroup(t: TestContext, directory: string): Promise<{ readonly group: number; readonly member: number }> {
+  const started = join(directory, `leaderless-${randomUUID()}`);
+  const leader = spawn(process.execPath, ["-e", "const child=require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});"
+    + "require('node:fs').writeFileSync(process.argv[1],String(child.pid));child.unref()", started], { detached: true, stdio: "ignore" });
+  assert.ok(leader.pid !== undefined);
+  await once(leader, "exit");
+  const member = Number(await readFile(started, "utf8"));
+  t.after(() => { try { process.kill(member, "SIGKILL"); } catch { /* It already ended. */ } });
+  return { group: leader.pid, member };
+}
 
 /** One local command on the owner's own machine that has started and makes its write only once the latch file exists. */
 interface LocalEffect {
@@ -124,6 +142,58 @@ test("lock_held is posted only when no process of the old owner is alive on its 
 
     await writeFile(effect.latch, "");
     await world.until(async () => !groupAlive(effect.group), "The local command must end by itself");
+    assert.equal((await world.release()).evidence, "lock_held");
+  });
+
+  await t.test("a record whose id now names another program's process group with no leader: release stops the old owner's command, never signals that group, and posts nothing while it lives", async (t) => {
+    const world = await failoverWorld(t), { owner } = world, effect = await ownerWithLocalEffect(world, "stale-record");
+    await world.crash(owner);
+    const state = await sealed(world);
+    const unrelated = await leaderlessGroup(t, world.directory);
+    assert.ok(groupAlive(unrelated.group) && !alive(unrelated.group), "the group is alive and its leader is gone");
+    // The record of an effect that ended before its supervisor was killed, whose id the other program's group then took.
+    await writeFile(join(owner.state, "effects", String(unrelated.group)), "1");
+
+    const refused = world.launch(owner, ["failover", "release"], "");
+    assert.notEqual(await refused.exited, 0);
+    assert.match(refused.errors(), new RegExp(`process group ${unrelated.group} is alive and was not signalled`));
+    assert.match(refused.errors(), /--old-owner-stopped/);
+    assert.ok(alive(unrelated.member), "release does not signal a group that no recorded process leads");
+    assert.equal(groupAlive(effect.group), false, "release stopped the old owner's own command");
+    assert.deepEqual((await world.record())?.state, state, "a refused release posts no evidence");
+
+    process.kill(unrelated.member, "SIGKILL");
+    await world.until(async () => !groupAlive(unrelated.group), "The other program's group must end");
+    assert.equal((await world.release()).evidence, "lock_held");
+  });
+
+  await t.test("a process that a finished local command left behind holds effects.lock: the fenced owner posts no released, release names the lock and posts nothing, and lock_held follows once the process ends", async (t) => {
+    const world = await failoverWorld(t), { owner } = world, started = join(world.directory, "left-behind.started");
+    await world.enroll();
+    const serving = await world.serve(owner);
+    await world.join();
+    await world.script("fixture-left-behind", [{ tool: "exec", args: { host: owner.nodeId, program: "sh", timeout_seconds: 120, args: ["-c", LEFT_BEHIND, "sh", started] } },
+      { text: "The local command ended." }]);
+    await world.send(owner, "fixture-left-behind");
+    const survivor = Number((await readFile(started, "utf8")).trim());
+    t.after(() => { try { process.kill(survivor, "SIGKILL"); } catch { /* It already ended. */ } });
+    assert.ok(alive(survivor), "the command ended and left a process behind");
+
+    const state = await sealed(world);
+    assert.equal(await serving.exited, OWNER_FENCED_EXIT, serving.errors().slice(-2000));
+    assert.match(serving.errors(), /Did not tell the failover authority that this coordinator stopped/);
+    assert.match(serving.errors(), /A process still holds .*effects\.lock/);
+    assert.deepEqual((await world.record())?.state, state, "the fenced owner posted no evidence while a process it started is alive");
+
+    const refused = world.launch(owner, ["failover", "release"], "");
+    assert.notEqual(await refused.exited, 0);
+    assert.match(refused.errors(), /A process still holds .*effects\.lock/);
+    assert.match(refused.errors(), /lsof/);
+    assert.ok(alive(survivor), "release does not signal a process that no record names");
+    assert.deepEqual((await world.record())?.state, state, "a refused release posts no evidence");
+
+    process.kill(survivor, "SIGKILL");
+    await world.until(async () => !alive(survivor), "The process must end");
     assert.equal((await world.release()).evidence, "lock_held");
   });
 });

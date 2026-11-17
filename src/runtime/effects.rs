@@ -1,10 +1,16 @@
-//! Kernel evidence of whether a local effect process of a state directory is alive.
+//! Kernel evidence of whether anything a coordinator started is still alive.
 //!
-//! A coordinator holds a shared lock on `effects.lock`, and every effect
-//! process it starts inherits that open file. The kernel ends the share only
-//! when the last process that holds the file exits. An exclusive lock therefore
+//! A coordinator holds a shared lock on `effects.lock` through a descriptor
+//! that every process it starts inherits, whichever code starts it. Each
+//! effect task of the coordinator holds the same share. The kernel ends the
+//! share only when the last holder closes the file. An exclusive lock therefore
 //! proves that none is left, which a recorded process id cannot, because an id
 //! can be reused.
+//!
+//! A process can close the descriptors it inherited. So the coordinator also
+//! records each process group that an effect leads, and a recorded group that
+//! is still alive refuses the proof too. Only a process that both left its
+//! group and closed the file is outside this evidence.
 
 use std::{
     fmt,
@@ -29,7 +35,7 @@ const RECORDS: &str = "effects";
 const STOP_LIMIT: Duration = Duration::from_secs(5);
 
 struct Scope {
-    lock: File,
+    _lock: File,
     records: PathBuf,
 }
 
@@ -63,12 +69,21 @@ impl EffectsLock {
             .with_context(|| format!("Could not create {}", records.display()))?;
         let lock = open(state).context("Could not open effects.lock")?;
         fs2::FileExt::try_lock_shared(&lock).context("Could not share effects.lock")?;
+        // Inheritance is the default and not a step of each spawn, so a
+        // process started by code that knows nothing of this lock holds it too.
+        if unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_SETFD, 0) } == -1 {
+            return Err(io::Error::last_os_error())
+                .context("Could not let child processes inherit effects.lock");
+        }
         for (group, _) in recorded(&records) {
             if !group_alive(group) {
                 let _ = fs::remove_file(records.join(group.to_string()));
             }
         }
-        let scope = Arc::new(Scope { lock, records });
+        let scope = Arc::new(Scope {
+            _lock: lock,
+            records,
+        });
         if let Ok(mut current) = SCOPE.lock() {
             *current = Some(scope.clone());
         }
@@ -88,55 +103,38 @@ impl Drop for EffectsLock {
     }
 }
 
-/// One effect process of the coordinator this process runs. Made before the
-/// spawn, so the child inherits the coordinator's share of `effects.lock`.
-/// Keep it until the child is reaped: it then removes the group's record.
-pub(crate) struct EffectProcess {
-    scope: Option<Arc<Scope>>,
+/// A share of `effects.lock` for work that runs inside the coordinator's
+/// process. `None` in a process that runs no coordinator.
+pub(crate) struct EffectShare(#[allow(dead_code)] Arc<Scope>);
+
+impl EffectShare {
+    pub(crate) fn hold() -> Option<Self> {
+        SCOPE.lock().ok()?.clone().map(Self)
+    }
+}
+
+/// The record of a process group that an effect's child leads, with the time
+/// its leader started, so a release can stop that group and no other. Keep it
+/// until the child is reaped: it then removes the record.
+pub(crate) struct EffectGroup {
     record: Option<PathBuf>,
 }
 
-impl EffectProcess {
-    pub(crate) fn of(command: &mut tokio::process::Command) -> Self {
-        let scope = SCOPE.lock().ok().and_then(|current| current.clone());
-        if let Some(scope) = &scope {
-            let lock = scope.lock.as_raw_fd();
-            // `scope` keeps this descriptor open until after the spawn.
-            unsafe {
-                command.pre_exec(move || {
-                    if libc::fcntl(lock, libc::F_SETFD, 0) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
-        Self {
-            scope,
-            record: None,
-        }
-    }
-
-    /// Records the process group the child leads, with the time its leader
-    /// started, so a release can stop that group and no other. A record that
-    /// cannot be written loses the name and not the proof: the child still
-    /// holds the lock.
-    pub(crate) fn leads(&mut self, group: Option<u32>) {
-        let (Some(scope), Some(group)) = (&self.scope, group) else {
-            return;
-        };
-        let Ok(leader) = libc::pid_t::try_from(group) else {
-            return;
-        };
-        let started = process_started(leader).map_or(String::new(), |time| time.to_string());
-        let path = scope.records.join(group.to_string());
-        if fs::write(&path, started).is_ok() {
-            self.record = Some(path);
-        }
+impl EffectGroup {
+    /// A record that cannot be written loses the name and not the proof: the
+    /// child still holds the lock.
+    pub(crate) fn led_by(child: Option<u32>) -> Self {
+        let record = EffectShare::hold().zip(child).and_then(|(share, group)| {
+            let leader = libc::pid_t::try_from(group).ok()?;
+            let started = process_started(leader).map_or(String::new(), |time| time.to_string());
+            let path = share.0.records.join(group.to_string());
+            fs::write(&path, started).ok().map(|()| path)
+        });
+        Self { record }
     }
 }
 
-impl Drop for EffectProcess {
+impl Drop for EffectGroup {
     fn drop(&mut self) {
         if let Some(record) = self.record.take() {
             let _ = fs::remove_file(record);
@@ -144,27 +142,26 @@ impl Drop for EffectProcess {
     }
 }
 
-/// Proof that no effect process of the state directory is alive. It holds
-/// `effects.lock` exclusively, so keep it until the evidence is posted.
+/// Proof that no effect of the state directory is alive, as far as the kernel
+/// can tell. It holds `effects.lock` exclusively, so keep it until the
+/// evidence is posted.
 pub(crate) struct EffectsStopped(#[allow(dead_code)] File);
 
-/// An effect process of the state directory is alive and could not be stopped.
+/// An effect of the state directory is alive, or cannot be shown to have ended.
 #[derive(Debug)]
 pub struct SurvivingEffects {
     lock: PathBuf,
+    /// Whether a process or an effect task still holds the lock.
+    held: bool,
     /// Recorded groups that were sent SIGKILL and are still alive.
     killed: Vec<libc::pid_t>,
-    /// Recorded groups whose leader is not the recorded process.
+    /// Recorded groups that are alive and whose leader is not the recorded process.
     unverified: Vec<libc::pid_t>,
 }
 
 impl fmt::Display for SurvivingEffects {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "A process that this coordinator started is still alive: it holds {}.",
-            self.lock.display()
-        )?;
+        f.write_str("This coordinator's local effects are not shown to have ended.")?;
         for group in &self.killed {
             write!(
                 f,
@@ -174,15 +171,18 @@ impl fmt::Display for SurvivingEffects {
         for group in &self.unverified {
             write!(
                 f,
-                " The process group {group} was not signalled, because its leader is not the process this coordinator recorded."
+                " The process group {group} is alive and was not signalled, because the process this coordinator recorded no longer leads it."
             )?;
         }
-        if self.killed.is_empty() && self.unverified.is_empty() {
-            write!(
-                f,
-                " It left the process group it was started in, so no record names it. `lsof {}` lists it.",
-                self.lock.display()
-            )?;
+        if self.held {
+            write!(f, " A process still holds {}.", self.lock.display())?;
+            if self.killed.is_empty() && self.unverified.is_empty() {
+                write!(
+                    f,
+                    " No record names it: it left the process group it was started in, or it never led one. `lsof {}` lists it.",
+                    self.lock.display()
+                )?;
+            }
         }
         f.write_str(
             " Stop it and run `beep-boop failover release` again, or promote the standby on your own statement with `beep-boop failover promote --old-owner-stopped \"<statement>\"`.",
@@ -193,48 +193,47 @@ impl fmt::Display for SurvivingEffects {
 impl std::error::Error for SurvivingEffects {}
 
 /// Under the writer lock, which proves that no supervisor and no Pi child is
-/// alive: stops every recorded process group that is still alive, and returns
-/// only once the kernel says that no effect process is left.
+/// alive: stops every recorded process group whose leader is still the
+/// recorded process, and returns only once no recorded group is alive and the
+/// kernel says that nothing holds `effects.lock`.
 pub(crate) fn stop_survivors(_lock: &WriterLock, state: &Path) -> Result<EffectsStopped> {
     let lock = open(state).context("Could not open effects.lock")?;
     let records = state.join(RECORDS);
     let mut killed = Vec::new();
     let mut unverified = Vec::new();
-    if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
-        for (group, recorded_start) in recorded(&records) {
-            if !group_alive(group) {
-                continue;
-            }
-            let leader = process_started(group);
-            // A group outlives its leader, and its id is not given to a new
-            // process while a member is alive.
-            let same = match (recorded_start, leader) {
-                (Some(recorded_start), Some(leader)) => recorded_start == leader,
-                (Some(_), None) => !process_alive(group),
-                (None, _) => false,
-            };
-            if same {
-                unsafe {
-                    libc::kill(-group, libc::SIGKILL);
-                }
-                killed.push(group);
-            } else {
-                unverified.push(group);
-            }
+    for (group, recorded_start) in recorded(&records) {
+        if !group_alive(group) {
+            continue;
         }
-        let deadline = Instant::now() + STOP_LIMIT;
-        while fs2::FileExt::try_lock_exclusive(&lock).is_err() {
-            if Instant::now() >= deadline {
-                killed.retain(|group| group_alive(*group));
-                return Err(SurvivingEffects {
-                    lock: state.join(LOCK_FILE),
-                    killed,
-                    unverified,
-                }
-                .into());
+        // Only its recorded leader names a group. Once that process is gone,
+        // the id may belong to a group that another program started.
+        if recorded_start.is_some() && recorded_start == process_started(group) {
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
             }
-            thread::sleep(Duration::from_millis(25));
+            killed.push(group);
+        } else {
+            unverified.push(group);
         }
+    }
+    let deadline = Instant::now() + STOP_LIMIT;
+    let held = loop {
+        killed.retain(|group| group_alive(*group));
+        let held = fs2::FileExt::try_lock_exclusive(&lock).is_err();
+        if (!held && killed.is_empty()) || Instant::now() >= deadline {
+            break held;
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    unverified.retain(|group| group_alive(*group));
+    if held || !killed.is_empty() || !unverified.is_empty() {
+        return Err(SurvivingEffects {
+            lock: state.join(LOCK_FILE),
+            held,
+            killed,
+            unverified,
+        }
+        .into());
     }
     for (group, _) in recorded(&records) {
         let _ = fs::remove_file(records.join(group.to_string()));
@@ -257,17 +256,9 @@ fn recorded(records: &Path) -> Vec<(libc::pid_t, Option<u64>)> {
         .collect()
 }
 
-fn signalled(target: libc::pid_t) -> bool {
-    let sent = unsafe { libc::kill(target, 0) };
-    sent == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
 fn group_alive(group: libc::pid_t) -> bool {
-    signalled(-group)
-}
-
-fn process_alive(process: libc::pid_t) -> bool {
-    signalled(process)
+    let sent = unsafe { libc::kill(-group, 0) };
+    sent == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// When the process started, in units that only compare for equality.

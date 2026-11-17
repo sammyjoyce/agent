@@ -23,7 +23,10 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::runtime::{FrameReader, OwnerClaim, OwnerFenced, Runtime, ShutdownSignal, StartRecord};
+use crate::runtime::{
+    FrameReader, OwnerClaim, OwnerFenced, Runtime, ShutdownSignal, StartRecord,
+    effects::SurvivingEffects,
+};
 
 const SOCKET_NAME: &str = "agent.sock";
 /// How long a fenced owner waits for the authority to take its stop evidence.
@@ -117,8 +120,9 @@ async fn serve_until(
 /// Runs the coordinator, then posts a fenced owner's stop evidence. When
 /// `serve_owner` returns, its listeners are closed, every connection has
 /// cancelled and drained the effects it owned, the worker links have ended
-/// and Pi is reaped. That is what `released` states, so it is posted here,
-/// before the process exits. A failed post changes nothing else.
+/// and Pi is reaped. `released` states that and that no local effect is left,
+/// which `post_released` proves before it posts. A failed post changes
+/// nothing else.
 #[allow(clippy::too_many_arguments)]
 async fn serve_with_transport(
     script: &Path,
@@ -131,6 +135,7 @@ async fn serve_with_transport(
     shutdown: impl Future<Output = Result<ShutdownReason>>,
 ) -> Result<()> {
     let session = claim.pi_session();
+    let state = claim.state().to_owned();
     let served = serve_owner(
         script, claim, port, policy, daemon, rex, bootstrap, shutdown,
     )
@@ -139,13 +144,24 @@ async fn serve_with_transport(
         && let Some(OwnerFenced::Runtime) = error.downcast_ref()
         && let Some(epoch) = session.epoch
     {
-        match crate::failover::commands::post_released(script, &session, epoch, RELEASE_LIMIT).await
+        match crate::failover::commands::post_released(
+            script,
+            &state,
+            &session,
+            epoch,
+            RELEASE_LIMIT,
+        )
+        .await
         {
             Ok(true) => eprintln!(
                 "Told the failover authority that this coordinator stopped its effects at epoch {}",
                 epoch.get()
             ),
             Ok(false) => {}
+            // A survivor's own sentence already says what an operator can do.
+            Err(error) if error.is::<SurvivingEffects>() => eprintln!(
+                "Did not tell the failover authority that this coordinator stopped. {error:#}"
+            ),
             Err(error) => eprintln!(
                 "Could not tell the failover authority that this coordinator stopped: {error:#}. Run `beep-boop failover release` on this host"
             ),
