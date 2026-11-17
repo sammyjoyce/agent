@@ -1,4 +1,5 @@
 //! Effects run on the attached CLI's machine, never an implicit fallback host.
+use crate::serialized_spawn::SerializedTokioSpawn;
 use std::{
     future::Future,
     path::{Path, PathBuf},
@@ -1023,7 +1024,7 @@ pub(crate) async fn run_process_ending(
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true)
-        .spawn()
+        .spawn_serialized()
         .map_err(|error| {
             ProcessFailure::NotStarted(
                 anyhow::Error::new(error)

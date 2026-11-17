@@ -1,3 +1,4 @@
+use agent_cli::serialized_spawn::SerializedSpawn;
 use std::{fs, path::Path, process::Command};
 
 fn binary() -> &'static str {
@@ -9,12 +10,18 @@ fn binary() -> &'static str {
 #[test]
 fn cli_exposes_the_canonical_name_in_help_and_version() {
     for args in [["--help"].as_slice(), ["chat", "--help"].as_slice()] {
-        let output = Command::new(binary()).args(args).output().unwrap();
+        let output = Command::new(binary())
+            .args(args)
+            .output_serialized()
+            .unwrap();
         assert!(output.status.success());
         let help = String::from_utf8(output.stdout).unwrap();
         assert!(help.contains("Usage: beep-boop"), "{help}");
     }
-    let output = Command::new(binary()).arg("--version").output().unwrap();
+    let output = Command::new(binary())
+        .arg("--version")
+        .output_serialized()
+        .unwrap();
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
@@ -26,7 +33,7 @@ fn initialize(config_home: &Path) -> std::process::Output {
     Command::new(binary())
         .env("XDG_CONFIG_HOME", config_home)
         .args(["init", "--coordinator", "tailscale://100.64.0.10"])
-        .output()
+        .output_serialized()
         .unwrap()
 }
 

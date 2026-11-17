@@ -1,3 +1,4 @@
+use agent_cli::serialized_spawn::SerializedSpawn;
 use std::{
     fs::{self, OpenOptions},
     io::ErrorKind,
@@ -80,7 +81,7 @@ fn killing_supervisor_preserves_lock_until_pi_child_exits() {
             .stderr(Stdio::piped());
         command
     };
-    let mut supervisor = Supervisor(Some(command().spawn().unwrap()));
+    let mut supervisor = Supervisor(Some(command().spawn_serialized().unwrap()));
     let deadline = Instant::now() + Duration::from_secs(5);
     let pid_path = state.path().join("child-pid");
     let socket = state.path().join("agent.sock");
@@ -95,7 +96,11 @@ fn killing_supervisor_preserves_lock_until_pi_child_exits() {
     }
     let original_socket = fs::metadata(&socket).unwrap();
     supervisor.stop();
-    let competing = command().output().unwrap();
+    let competing = command()
+        .spawn_serialized()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
     assert!(!competing.status.success());
     assert!(
         String::from_utf8(competing.stderr)

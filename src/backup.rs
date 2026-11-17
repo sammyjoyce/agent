@@ -1,3 +1,4 @@
+use crate::serialized_spawn::SerializedSpawn;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{CString, OsString},
@@ -452,7 +453,7 @@ impl DatabaseHelper {
             .arg(&self.0)
             .arg(serde_json::to_string(request)?)
             .stdin(Stdio::null())
-            .output()
+            .output_serialized()
             .context("Could not start the SQLite backup helper")?;
         ensure!(
             output.status.success(),

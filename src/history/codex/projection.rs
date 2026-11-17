@@ -1,5 +1,6 @@
 //! Content-free checkpoints over Codex's existing projection. Native APIs still
 //! own item decoding, history repair and lineage. Unknown stores fall back to them.
+use crate::serialized_spawn::SerializedTokioSpawn;
 use std::{os::unix::fs::MetadataExt, path::PathBuf, process::Stdio};
 
 use anyhow::{Context, Result, ensure};
@@ -147,7 +148,7 @@ pub(super) async fn page(
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true)
-            .output(),
+            .output_serialized(),
     )
     .await??;
     ensure!(

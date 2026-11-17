@@ -3,6 +3,7 @@ mod executable_fixture;
 #[path = "fixtures/fake_rex.rs"]
 mod fake_rex;
 
+use agent_cli::serialized_spawn::SerializedTokioSpawn;
 use std::{
     fs,
     hash::{BuildHasher, Hasher, RandomState},
@@ -747,7 +748,7 @@ async fn a_registered_worker_serves_image_reads_from_its_own_host() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     let served = timeout(Duration::from_secs(30), served_reads).await;
     worker.start_kill().unwrap();

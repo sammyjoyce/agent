@@ -1,3 +1,4 @@
+use agent_cli::serialized_spawn::SerializedSpawn;
 use std::{
     fs,
     os::unix::fs::{MetadataExt, PermissionsExt},
@@ -38,7 +39,7 @@ fn apply(path: &Path, settings: &Path) -> Output {
         .arg(path)
         .args(["--json", "config", "apply"])
         .arg(settings)
-        .output()
+        .output_serialized()
         .unwrap()
 }
 

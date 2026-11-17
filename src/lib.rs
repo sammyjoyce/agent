@@ -1,3 +1,5 @@
+extern crate self as agent_cli;
+
 pub mod attachments;
 pub mod backup;
 pub mod chat_commands;
@@ -18,6 +20,7 @@ pub mod resources;
 pub mod rex;
 pub mod runtime;
 pub mod scrawl_feedback;
+pub mod serialized_spawn;
 pub mod service;
 
 pub mod background;

@@ -1,6 +1,7 @@
 #[path = "fixtures/executable.rs"]
 mod executable_fixture;
 
+use agent_cli::serialized_spawn::SerializedSpawn;
 use std::{
     fs,
     ops::RangeInclusive,
@@ -1375,7 +1376,7 @@ fn readback(world: &World) -> Readback {
         .arg("--no-warnings")
         .arg(fixture)
         .arg(&world.state)
-        .output()
+        .output_serialized()
         .unwrap();
     assert!(
         output.status.success(),

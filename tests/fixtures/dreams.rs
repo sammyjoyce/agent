@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use agent_cli::serialized_spawn::SerializedSpawn;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -90,7 +91,7 @@ pub fn git(repository: &Path, args: &[&str]) -> String {
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
+        .output_serialized()
         .unwrap();
     assert!(
         output.status.success(),
@@ -317,7 +318,7 @@ impl Fixture {
             .command(args, json)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_serialized()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         while child.try_wait().unwrap().is_none() {
@@ -533,7 +534,7 @@ impl Fixture {
             .arg(&self.check)
             .current_dir(&self.repository)
             .stdout(Stdio::null())
-            .status()
+            .status_serialized()
             .unwrap()
             .success()
     }

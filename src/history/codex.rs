@@ -3,6 +3,7 @@
 
 mod projection;
 
+use crate::serialized_spawn::SerializedTokioSpawn;
 use std::{
     collections::HashMap,
     os::unix::fs::PermissionsExt,
@@ -1695,7 +1696,7 @@ impl Connection {
             command.env("CODEX_HOME", home);
         }
         let mut child = command
-            .spawn()
+            .spawn_serialized()
             .context("Could not start the installed Codex history reader")?;
         let input = child
             .stdin
@@ -1840,6 +1841,7 @@ fn classify(error: &anyhow::Error) -> HistoryGapCode {
 
 #[cfg(test)]
 mod tests {
+    use crate::serialized_spawn::SerializedTokioSpawn;
     use std::{
         os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
@@ -2050,7 +2052,7 @@ try{
 }finally{await app.session.close(BACKGROUND_CONTEXT);}
 "#])
             .arg(&runtime).current_dir(runtime_root).stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn_serialized().unwrap();
         use tokio::io::AsyncWriteExt;
         child
             .stdin
@@ -3195,7 +3197,7 @@ try{
 }finally{await session.close(BACKGROUND_CONTEXT);}
 "#])
             .arg(&runtime).current_dir(runtime_root).stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn_serialized().unwrap();
         use tokio::io::AsyncWriteExt;
         child
             .stdin
@@ -3411,7 +3413,7 @@ try{
 }finally{await app.retrieval.close();await app.session.close(BACKGROUND_CONTEXT);}
 "#])
             .arg(&runtime).current_dir(runtime_root).stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn_serialized().unwrap();
         child
             .stdin
             .take()
@@ -3649,7 +3651,7 @@ try{
 }finally{await app.session.close(BACKGROUND_CONTEXT);}
 "#])
             .arg(&runtime).current_dir(runtime_root).stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn_serialized().unwrap();
         child
             .stdin
             .take()
@@ -4280,7 +4282,7 @@ try{
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
-            .spawn()
+            .spawn_serialized()
             .unwrap();
         let mut input = child.stdin.take().unwrap();
         let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();

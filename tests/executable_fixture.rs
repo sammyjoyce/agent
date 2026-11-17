@@ -4,6 +4,7 @@
 #[path = "fixtures/executable.rs"]
 mod executable_fixture;
 
+use agent_cli::serialized_spawn::SerializedSpawn;
 use std::{
     os::unix::process::CommandExt,
     process::Command,
@@ -25,17 +26,18 @@ fn fixture_runs_while_sibling_spawns_hold_inherited_descriptors() {
             let stop = stop.clone();
             thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    let mut sibling = Command::new("true");
+                    let mut foreign_fork = Command::new("true");
                     // A loaded scheduler can leave a sibling test's child
                     // between fork and exec. The pause makes that window
                     // reliable without changing what the child inherits.
                     unsafe {
-                        sibling.pre_exec(|| {
+                        foreign_fork.pre_exec(|| {
                             thread::sleep(Duration::from_millis(5));
                             Ok(())
                         });
                     }
-                    sibling.status().unwrap();
+                    #[allow(clippy::disallowed_methods)]
+                    foreign_fork.status().unwrap();
                 }
             })
         })
@@ -44,7 +46,7 @@ fn fixture_runs_while_sibling_spawns_hold_inherited_descriptors() {
     let failure = (0..500).find_map(|attempt| {
         let program = directory.path().join(format!("fixture-{attempt}"));
         write_executable(&program, "#!/bin/sh\nexit 0\n");
-        match Command::new(&program).status() {
+        match Command::new(&program).status_serialized() {
             Ok(status) if status.success() => None,
             outcome => Some(format!("attempt {attempt}: {outcome:?}")),
         }

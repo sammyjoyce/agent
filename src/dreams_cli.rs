@@ -865,6 +865,7 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
+    use agent_cli::serialized_spawn::SerializedSpawn;
     use std::{fs, path::Path, process::Command};
 
     use agent_cli::{
@@ -888,7 +889,7 @@ mod tests {
             .args(arguments)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .output()
+            .output_serialized()
             .unwrap();
         assert!(
             output.status.success(),

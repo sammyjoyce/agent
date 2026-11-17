@@ -1,3 +1,4 @@
+use agent_cli::serialized_spawn::SerializedTokioSpawn;
 use std::{process::Stdio, time::Duration};
 
 use anyhow::{Context, Result, ensure};
@@ -147,7 +148,7 @@ async fn run(mut command: Command, deadline: Duration) -> Result<Vec<u8>> {
         .process_group(0)
         .kill_on_drop(true);
     let mut child = command
-        .spawn()
+        .spawn_serialized()
         .context("Could not run Switchboard; install and configure its CLI")?;
     let mut group = ProcessGroup(
         child

@@ -1,5 +1,6 @@
 //! Real CLI/native producers -> Rust runtime transport -> Pi -> provider payload.
 //! Only provider responses and the execution host are synthetic.
+use agent_cli::serialized_spawn::SerializedTokioSpawn;
 use agent_cli::{
     instructions::GuidanceSnapshot,
     models::ModelSelection,
@@ -331,7 +332,7 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     let (id, call_id) = match timeout(Duration::from_secs(8), held).await {
         Ok(Ok(held)) => held,

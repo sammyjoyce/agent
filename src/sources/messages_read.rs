@@ -122,6 +122,7 @@ pub async fn capture(argv: &[String]) -> Result<HostResult> {
 
 #[cfg(test)]
 mod tests {
+    use crate::serialized_spawn::SerializedSpawn;
     use std::path::Path;
 
     use serde::{Deserialize, Serialize};
@@ -152,7 +153,7 @@ mod tests {
     fn producer(directory: &Path, script: &str) -> String {
         let output = std::process::Command::new("node")
             .args(["--print", "process.execPath"])
-            .output()
+            .output_serialized()
             .unwrap();
         assert!(output.status.success());
         let executable = String::from_utf8(output.stdout).unwrap();
