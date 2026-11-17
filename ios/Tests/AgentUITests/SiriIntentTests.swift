@@ -611,7 +611,8 @@
       XCTAssertTrue(home.wait(for: .runningForeground, timeout: 10))
       terminate(app)
 
-      let result = try searchHome(home, for: "Weekly report")
+      let result = try searchHome(
+        home, for: "Weekly report", result: "Weekly report, Personal, Completed")
       capture("spotlight-search-weekly-report", home)
       result.tap()
 
@@ -721,16 +722,50 @@
       XCTAssertTrue(becomes(field, "value == %@", text), String(describing: field.value))
     }
 
-    private func searchHome(_ home: XCUIApplication, for search: String) throws -> XCUIElement {
-      let pill = home.descendants(matching: .any)["spotlight-pill"]
+    /// Spotlight runs as its own app over the Home screen. Web suggestions repeat the search, so
+    /// the result is found by its whole label. The search field and the keyboard cover the lower
+    /// results, and dragging the results up hides the keyboard.
+    private func searchHome(_ home: XCUIApplication, for search: String, result label: String)
+      throws -> XCUIElement
+    {
+      let pill = home.descendants(matching: .any).matching(identifier: "spotlight-pill").firstMatch
       XCTAssertTrue(pill.waitForExistence(timeout: 10), home.debugDescription)
       pill.tap()
-      XCTAssertTrue(home.keyboards.firstMatch.waitForExistence(timeout: 10), home.debugDescription)
-      home.typeText(search)
-      let result = home.descendants(matching: .any)
-        .matching(NSPredicate(format: "label CONTAINS %@", search)).element(boundBy: 0)
-      XCTAssertTrue(result.waitForExistence(timeout: 15), home.debugDescription)
+      let spotlight = XCUIApplication(bundleIdentifier: "com.apple.Spotlight")
+      let field = try XCTUnwrap(
+        shown(in: [spotlight, home], within: 10) {
+          $0.descendants(matching: .any)
+            .matching(NSPredicate(format: "elementType IN %@", Self.searchFieldTypes)).firstMatch
+        }, "No search field\n\(spotlight.debugDescription)\n\(home.debugDescription)")
+      field.typeText(search)
+      let result = try XCTUnwrap(
+        shown(in: [spotlight, home], within: 30) { $0.cells[label].firstMatch },
+        "No result \(label)\n\(spotlight.debugDescription)\n\(home.debugDescription)")
+      if result.frame.maxY > field.frame.minY {
+        let lower = home.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.57))
+        lower.press(
+          forDuration: 0.05,
+          thenDragTo: home.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.34)))
+        XCTAssertTrue(result.waitForExistence(timeout: 10), spotlight.debugDescription)
+      }
       return result
+    }
+
+    private static let searchFieldTypes = [
+      XCUIElement.ElementType.searchField.rawValue, XCUIElement.ElementType.textField.rawValue,
+    ]
+
+    /// The first element that `find` names in one of `apps`, once it exists.
+    private func shown(
+      in apps: [XCUIApplication], within seconds: TimeInterval,
+      _ find: (XCUIApplication) -> XCUIElement
+    ) -> XCUIElement? {
+      let deadline = Date.now.addingTimeInterval(seconds)
+      repeat {
+        if let element = apps.lazy.map(find).first(where: \.exists) { return element }
+        RunLoop.current.run(until: .now.addingTimeInterval(0.25))
+      } while Date.now < deadline
+      return nil
     }
 
     private func attach(_ name: String, _ text: String) {
