@@ -188,7 +188,7 @@ process.stdout.write(JSON.stringify(row ? row.position : null));
 "#;
 
 /// The log position `state` holds. Rust links no SQLite, so Node reads it.
-/// The script is inline because this check runs on every start, whichever
+/// The script is inline because this check runs on every start without failover, whichever
 /// script stands in for Pi and whatever lies beside it.
 fn held_log_position(state: &Path) -> Result<Option<LogPosition>> {
     let database = state.join("session.sqlite");
@@ -196,7 +196,7 @@ fn held_log_position(state: &Path) -> Result<Option<LogPosition>> {
         return Ok(None);
     }
     let output = Command::new("node")
-        .args(["--no-warnings", "-e", PRINT_LOG_POSITION])
+        .args(["--no-warnings", "-e", PRINT_LOG_POSITION, "--"])
         .arg(&database)
         .stdin(Stdio::null())
         .output()
