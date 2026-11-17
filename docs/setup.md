@@ -878,11 +878,10 @@ The backup leaves out credentials (`auth.json`), the search index, diagnostics,
 logs, sockets, locks and this machine's client state: worker caches, the Scrawl
 ledger, the feedback outbox and saved TUI drafts. It also leaves out Dreams
 state: `<state_dir>/dreams` with every run, review, patch, proposal and
-applied-run record, and `<state_dir>/unrecorded-start`. The receipt lists both
-as not included. The restored coordinator starts a new diagnostics log, so a
-Dreams review that covers the time between the backup and the restored
-coordinator's first start shows it as an `unwitnessed` gap and never seals a
-quiet night. Dreams runs wait for `backup release`. The private TOML configuration
+applied-run record, and `<state_dir>/unrecorded-start`. The restored
+coordinator starts a new diagnostics log, so a Dreams review that covers the
+time between the backup and the restored coordinator's first start shows it as
+an `unwitnessed` gap and never seals a quiet night. Dreams runs wait for `backup release`. The private TOML configuration
 is outside the state directory, so keep a separate copy of it. The command
 lists any other name in the state directory as not included. A backup contains
 private conversations, attachments and feedback; keep it as private as the
