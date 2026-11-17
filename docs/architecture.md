@@ -736,10 +736,21 @@ join` restores a checkpoint, and `failover follow` replays log entries through
 Pi's own storage commit, each at its own log position and Pi sequence. It never
 opens a Harness, so it schedules nothing and emits nothing.
 
+**A replicated directory never opens without its claim.** A state directory
+that holds a log position, an owner's or a standby's, opens for a coordinator
+only under an epoch the authority granted to that start. A start whose config
+has no `[failover]` section reads the position under the writer lock, before
+it sets up anything, and is refused. So neither a client command on a standby
+nor a replaced owner with its section removed can commit what the log lacks.
+
 **Promotion.** Promotion is an operator command on the standby. It seals the
 log, waits for evidence that the old owner stopped, applies the log to the
-sealed head, verifies the directory, and activates the next epoch. No step
-treats a timeout or an unreachable host as evidence. The evidence is one of
+sealed head, verifies the directory, and activates the next epoch. The
+verification covers the database's integrity, every replicated file's bytes,
+and Pi's sequence. The sequence must equal the one in the last batch the log
+holds, or the one the checkpoint records when no batch follows it, so a
+directory that committed outside the log is not activated. No step treats a
+timeout or an unreachable host as evidence. The evidence is one of
 three kinds:
 
 | Evidence | What it proves |
@@ -788,7 +799,7 @@ completes. A history read completes unless it was asked after a commit started
 to wait, because Pi answers reads on the same line its commits wait on. A
 coordinator cannot start, and nobody can promote. There is no switch to detach
 from the authority, because a detached owner plus a later promotion is two
-owners.
+owners. Removing the `[failover]` section is not one: that start is refused.
 
 Automatic takeover is not planned. Host transfer of a task's execution is
 separate from coordinator promotion: a bound task stays on its execution host,
