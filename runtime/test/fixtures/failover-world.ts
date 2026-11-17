@@ -67,6 +67,14 @@ export interface Sent {
   readonly done: Promise<RuntimeEventKind[]>;
 }
 
+/**
+ * How long a worker that was pointed at a new owner may take to come online there. The worker reads its address only
+ * when it dials, so it first ends the dial it has in flight at the old address. An old owner that does not answer
+ * holds that dial for 30 seconds, the worker's `WORKER_REGISTRATION_LIMIT` in `src/main.rs`. The worker then waits
+ * its retry delay, 2 seconds after one failed dial, and registers. The rest is room for a loaded machine.
+ */
+export const REDIRECTED_WORKER_LIMIT = 60_000;
+
 const isSocket = (path: string) => stat(path).then((entry) => entry.isSocket(), () => false);
 
 /** Whether a process accepts connections on the socket. A coordinator that was killed leaves its socket file behind. */
@@ -170,6 +178,15 @@ export async function failoverWorld(t: TestContext, options: WorldOptions = {}) 
     return pid;
   };
 
+  async function online(host: CoordinatorHost, ids: readonly string[], limit?: number): Promise<void> {
+    await until(async () => {
+      const nodes = launch(host, ["nodes"], "");
+      if (await nodes.exited !== 0) return false;
+      const state = base.events(nodes.output()).find((event) => event.type === "environment");
+      return state?.type === "environment" && ids.every((id) => state.online_host_ids.includes(id));
+    }, `The ${host.name} must see ${ids.join(" and ")} online`, undefined, limit);
+  }
+
   function sending(host: CoordinatorHost, input: string, sent: SendOptions = {}): Sent {
     const id = sent.id ?? randomUUID(), events: RuntimeEventKind[] = [];
     const done = base.exchange({ type: "main_input", input_id: id, input, mode: "follow_up",
@@ -227,15 +244,10 @@ export async function failoverWorld(t: TestContext, options: WorldOptions = {}) 
     work(): OwnedProcess { return worker.daemon = base.start(1, ["maintain"], undefined, { AGENT_TEST_COORDINATOR_SOCKET: address }); },
     /** Points the worker's coordinator address at a host, as an operator does after a promotion. */
     direct,
-    /** Waits until a coordinator reports exactly these execution hosts online. */
-    async online(host: CoordinatorHost, ids: readonly string[]): Promise<void> {
-      await until(async () => {
-        const nodes = launch(host, ["nodes"], "");
-        if (await nodes.exited !== 0) return false;
-        const state = base.events(nodes.output()).find((event) => event.type === "environment");
-        return state?.type === "environment" && ids.every((id) => state.online_host_ids.includes(id));
-      }, `The ${host.name} must see ${ids.join(" and ")} online`);
-    },
+    /** Waits until a coordinator reports these execution hosts online. */
+    online: (host: CoordinatorHost, ids: readonly string[]) => online(host, ids),
+    /** Waits until a new owner reports the worker online, after `direct` pointed the worker at it. */
+    redirected: (host: CoordinatorHost) => online(host, [worker.nodeId], REDIRECTED_WORKER_LIMIT),
     /** The highest owner epoch the worker host has served this coordinator at, or undefined before any. */
     async floor(): Promise<number | undefined> {
       const text = await readFile(floorFile(worker.home, authority.id), "utf8").catch(() => undefined);

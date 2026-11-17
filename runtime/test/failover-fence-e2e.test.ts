@@ -9,7 +9,7 @@ import type { ModelStep } from "./fixtures/coordinator-runtime.js";
 import { pidsMatching } from "./fixtures/coordinator-world.js";
 import { commands, latch, type FaultRule } from "./fixtures/failover-fault-proxy.js";
 import { STANDBY } from "./fixtures/failover-state.js";
-import { admissions, answers, failoverWorld, type CoordinatorHost, type FailoverWorld } from "./fixtures/failover-world.js";
+import { admissions, answers, failoverWorld, REDIRECTED_WORKER_LIMIT, type CoordinatorHost, type FailoverWorld } from "./fixtures/failover-world.js";
 
 const STATEMENT = "Invented: the old host stopped answering at 09:14";
 type Match = NonNullable<FaultRule["match"]>;
@@ -228,3 +228,21 @@ function confirmedAfterMarker(host: CoordinatorHost, marker: string, confirm: Fa
   const { seen } = host.proxy;
   return seen.slice(0, seen.indexOf(confirm)).some((request) => commands("append")(request) && request.body.includes(marker));
 }
+
+test("a worker that dialed a paused old owner stops waiting for it and serves the new owner once its address moves", { timeout: 180_000 }, async (t) => {
+  const world = await failoverWorld(t, { watchSeconds: 1 }), { owner, standby } = world;
+  const serving = await linkedPair(world);
+  world.suspend(owner);
+  await world.promote({ replaceEpoch: 2, statement: STATEMENT });
+  await world.serve(standby);
+  await world.until(async () => world.worker.daemon?.errors().includes("The coordinator did not answer this worker's registration") === true,
+    "The worker must stop waiting for the paused old owner", undefined, REDIRECTED_WORKER_LIMIT);
+  await world.direct(standby);
+  await world.redirected(standby);
+  await world.script("fixture-after-wait", [mark(world, "new-owner"), { text: "The new owner ran its command." }]);
+  assert.deepEqual(answers(await world.send(standby, "fixture-after-wait")), ["The new owner ran its command."]);
+
+  world.resume(owner);
+  assert.equal(await serving.exited, OWNER_FENCED_EXIT, serving.errors().slice(-2000));
+  assert.deepEqual(await markers(world), ["new-owner"], "the resumed owner ran nothing on the worker");
+});
