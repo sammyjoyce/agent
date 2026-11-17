@@ -7,6 +7,8 @@ find related history; import does not create work or revive old instructions.
 beep-boop import codex                  # all registered online hosts
 beep-boop import codex --host desktop   # one announced host name
 beep-boop import codex --embedding-host workstation  # indexing compute only
+beep-boop import chatgpt --check ~/Downloads/chatgpt-export.zip  # check only
+beep-boop import chatgpt ~/Downloads/chatgpt-export.zip
 beep-boop import status
 beep-boop history search "fabrication files"
 beep-boop history search "ERR_SURFACE_413" --mode keyword
@@ -112,10 +114,10 @@ paging mode while validating their page and cursor; a later inventory discovers
 changed source versions.
 
 Rust owns a small `HistorySource` trait for enumeration, transcript reads and
-asset reads. Codex is its first implementation. Rust also owns import records
-and provenance types, generating TypeScript bindings for the Pi adapter.
-Cloud-only or Dot history needs a separately verified export path; local Codex
-access does not establish access to those conversations.
+asset reads. Codex and checked ChatGPT exports implement it. Rust also owns
+import records and provenance types, generating TypeScript bindings for the Pi
+adapter. Other cloud-only or Dot history needs its own verified export path;
+local Codex access does not establish access to those conversations.
 Persistent attached-thread sessions require separate enumeration; the ordinary
 native list excludes them.
 
@@ -139,6 +141,152 @@ same host, not page arrival order. Equal timestamps across hosts or unverified
 observations keep conflicting versions visibly ambiguous. Page receipts
 advance only the items actually observed. Background indexing migrates older
 ledgers using cached vectors; opening history never waits for that scan.
+
+## ChatGPT exports
+
+`beep-boop import chatgpt` reads a ChatGPT data export from the machine that
+runs the command. Pass the downloaded ZIP, every part of a split download, an
+extracted folder or a conversations JSON file. Numbered sibling parts beside
+the first part are found automatically.
+
+The command reads every file in the export and checks it before anything is
+saved. It refuses an export with missing or unlisted conversation shards, a gap
+in its part numbering, member names that leave the export, symlinks or special
+files, encrypted members, sizes or CRCs that do not match the bytes, or more
+expansion than its limits allow. The symlink refusal covers files inside the
+export. A path named on the command line is resolved first, so a symlink to the
+export is followed. A hard link inside the export is an ordinary file and is
+accepted. The command holds an extracted folder open from the check onward, so
+renaming the folder or putting another one at its path does not change what is
+read. A privacy-portal ZIP of ZIPs opens one level deep. A refused export exits
+1 and saves nothing. A single conversation that cannot be read, such as invalid
+JSON or one over the size limit, is reported and becomes a gap, so the import
+ends partial. `--check` prints the counts and any such problems without
+contacting a coordinator; `--check --json` prints the summary as one JSON
+object.
+
+Once checked, the coordinator imports the export through the same checkpointed
+importer as Codex. The client that ran the command serves every read, so the
+export never needs to be on the coordinator's disk. Keep the command running
+until it finishes, and leave the export unchanged meanwhile. An attachment whose
+bytes no longer match the check is not kept; it becomes a gap. If the command
+stops, the import ends partial; run the same command again. Finished
+conversations are skipped, an interrupted one resumes from its committed page,
+and retained attachments are reused by digest. `import status` reports Codex
+and ChatGPT on separate lines.
+
+The path to the message ChatGPT last showed is the transcript. Edited prompts
+and regenerated replies on other branches are retained as evidence and are not
+shown, searched or used as continuation context. A later export that moves the
+selected branch or edits a message adds new versions and keeps the earlier ones.
+A message that a later export no longer contains keeps its last imported version
+and placement, so it stays in the transcript if it was shown. An older export
+imported after a newer one does not replace the newer view. When other branches
+of the export that supplied a shown message start beside it, a notice before the
+message gives their count. The notice does not count versions kept from other
+exports, so a message whose only change is an attachment's bytes shows none.
+
+The import decides one message at a time, from that message's own fields. A
+message is left out when its own author is `system` or `developer`, when its
+own content type is `user_editable_context`, `model_editable_context`,
+`about_user_message` or `about_model_message`, or when its own metadata sets
+`is_user_system_message` or `is_visually_hidden_from_conversation`. `--check`
+counts the messages left out. A marker on any other object in the export does
+not change whether a message is kept.
+
+A kept message contributes only through the fields in this table. The import
+reads nothing else in a message, for text or for files.
+
+| Field | What the import reads |
+| --- | --- |
+| Content of type `text` or `multimodal_text` | Each part, in order. |
+| Content of type `code`, `execution_output`, `tether_quote` or `system_error` | `text` |
+| Content of type `tether_browsing_display` | `result` |
+| Content of type `thoughts` | The `summary` and `content` of each thought. |
+| Content of type `reasoning_recap` | `content` |
+| `id`, `create_time`, `author.role`, `author.name`, `recipient`, `channel`, `status` | The message's header. |
+| `metadata.is_thinking_preamble_message` | Whether the message is shown as thinking. |
+| `metadata.attachments` | The `id`, `name` and `mime_type` of each entry. The `id` is a file ID that starts with `file-` or `file_`, bare or after the last `://`. |
+| `metadata.aggregate_result.messages` | Code-interpreter output. An `image` entry contributes the file that its `image_url` names with a `sediment://` or `file-service://` pointer. A `stream` entry adds nothing when the text that History stores for the message already holds the stream's `text`. That stored text is the fallback Markdown when the import uses it. Each entry is kept or left out by its own author, content type and flags, by the same rule as a message. |
+| `metadata.model_dil_v2.fallbackMarkdown` | The message's text in place of widget markup, when every part is plain text and no part was left out. |
+
+A part is read when it is one of these shapes:
+
+- A string.
+- A text object: `content_type` is `text` and the only other keys are `text`
+  and `metadata`. An `audio_transcription` object may also carry `direction`
+  and `decoding_id`.
+- A file object: `content_type` is `image_asset_pointer` or
+  `audio_asset_pointer`, or is absent, and `asset_pointer` names a file with a
+  `sediment://` or `file-service://` pointer. The part contributes that file
+  and, when it has one, its `text` caption. The import reads no other key of a
+  file object. A pointer with another scheme, or a bare file ID, names no file.
+
+A part contributes its text and its file together, or neither. A part or an
+attachment entry whose own metadata sets `is_visually_hidden_from_conversation`
+contributes neither.
+
+The import reads nothing outside these lists. It reports each of the following
+as an `unsupported` gap with the message ID and the type name, so the import
+ends partial and History shows nothing of that content. `--check` prints the
+count of each kind.
+
+- A message with another content type, or whose content lacks the field its
+  type needs or holds it as the wrong JSON type.
+- A `metadata.attachments`, `metadata.aggregate_result.messages` or
+  `fallbackMarkdown` value of the wrong JSON type.
+- A message that is not a JSON object, or whose own author, content type or
+  flags cannot be read. Such a message is never kept.
+- A part of another shape, or a file object whose pointer names no file.
+- A hidden part, a hidden attachment entry, or an attachment entry that names no
+  file.
+- A code-interpreter entry of another type, an `image` entry whose `image_url`
+  names no file, or a `stream` entry that has no `text` or whose `text` is not
+  in the text that History stores for the message.
+- Fallback Markdown beside a part that holds a file or was left out. The import
+  reads the parts instead.
+- Message metadata that itself carries an `author`, `content` or `metadata` key,
+  whatever the key's value, null included. Such metadata is shaped like a
+  message. The import keeps the message's own content and reads nothing from
+  that metadata.
+
+The import reports only what it detects, and two limits remain:
+
+- Text or a file pointer in a field outside these lists is never read. If the
+  export holds that file and no imported message names it, `--check` counts it
+  among the files that no imported message names. If the export lacks the
+  file, nothing records the pointer.
+- An optional field in these lists that holds the wrong JSON type is ignored
+  without a gap. These fields are the message's `id`, `create_time`,
+  `author.name`, `recipient`, `channel` and `status`, the
+  `is_thinking_preamble_message` flag, an attachment entry's `name` and
+  `mime_type`, and a code-interpreter entry's `id`.
+
+A file reaches History only through a kept message: a part's pointer, an
+attachment entry, an image entry of code-interpreter output, or a file-library
+entry whose `origination_message_id` names a kept message or a kept
+code-interpreter entry. A library entry's `file_id` names its file the same way
+as an attachment entry's `id`. The import drops a library entry that has no
+origin, an origin that is not in the conversation, or an origin that was left
+out, and `--check` counts the dropped entries. `--check` also counts the files
+in the export that no imported message names. Each copied file has a verified
+size and SHA-256. Those bytes are part of the message's version, so a later
+export whose file has different bytes, or has a file that the earlier export
+lacked, adds a new version of the message and keeps the earlier one. A named
+file that is not in the export is an explicit `missing` gap. Nothing is
+downloaded.
+
+Each imported message stores its text, author, recipient, channel, status,
+content type and IDs, and the ID, name, type and SHA-256 of each attachment.
+Nothing else from the export is stored. Historical tool calls and their output
+are inert text. ChatGPT and Codex keys are separate, so a ChatGPT conversation
+never merges with a Codex thread that has the same ID. Imported text is indexed
+with the same local embedding model as Codex history. No chat model, tool or
+Rex session runs.
+
+A build from before ChatGPT import misreads ChatGPT records after a rollback.
+It looks up a ChatGPT conversation's link as a Codex one, so it shows the Codex
+conversation with the same native ID, or nothing.
 
 ## Native Pi storage, inert history
 

@@ -1,4 +1,5 @@
 import type { HistoryItem } from "./generated/HistoryItem.js";
+import type { HistoryProvider } from "./generated/HistoryProvider.js";
 import type { MessagePresentation } from "./generated/MessagePresentation.js";
 import type { ToolStatus } from "./generated/ToolStatus.js";
 import type { AgentAction } from "./generated/AgentAction.js";
@@ -7,7 +8,8 @@ import type { AgentActivityState } from "./generated/AgentActivityState.js";
 import type { FileOperation } from "./generated/FileOperation.js";
 import type { WebSearchAction } from "./generated/WebSearchAction.js";
 import type { ToolDetailContent } from "./generated/ToolDetailContent.js";
-import { bounded, content, field, label, list, milliseconds, object, string, type MessageContent } from "./message-presentation.js";
+import { chatGptAdapter } from "./imported-chatgpt.js";
+import { bounded, content, field, historyToolId, label, list, milliseconds, object, string, type MessageContent } from "./message-presentation.js";
 
 function exitCode(value: unknown): number | null { return typeof value === "number" && Number.isInteger(value) && value >= -2_147_483_648 && value <= 2_147_483_647 ? value : null; }
 function status(value: unknown): ToolStatus {
@@ -29,11 +31,15 @@ function webAction(value: unknown): WebSearchAction | null {
   switch (value) { case "search": return "search"; case "openPage": return "open_page"; case "findInPage": return "find_in_page"; case "other": return "other"; default: return null; }
 }
 
-/** Immutable evidence versions own distinct rows; their original native IDs remain untouched. */
-export function historyToolId(entryId: string): string { return "history:" + entryId; }
+export type ImportedToolDetail = { input: string | null; output: string | null; truncated: boolean };
+export type ImportedAdapter = {
+  message(item: HistoryItem, data: unknown, entryId: string): MessageContent;
+  display(item: HistoryItem, data: unknown, entryId: string): MessageContent;
+  toolDetail(item: HistoryItem, data: unknown, next: () => Promise<{ item: HistoryItem; data: unknown } | undefined>): Promise<ImportedToolDetail>;
+};
 
 /** Structured MCP output is evidence alongside its prose, never executable input. */
-export function codexToolOutput(item: HistoryItem, data: unknown): Extract<ToolDetailContent, { type: "text" }> {
+function codexToolOutput(item: HistoryItem, data: unknown): Extract<ToolDetailContent, { type: "text" }> {
   const plain = content(field(data, "output")) || content(field(data, "result")) ||
     content(field(data, "contentItems")) || content(field(field(data, "error"), "message"));
   const output: Extract<ToolDetailContent, { type: "text" }> = { type: "text", text: plain, truncated: plain.length > 32_768 };
@@ -62,7 +68,7 @@ function userReferences(data: unknown): string | undefined {
 }
 
 /** Codex is a source adapter into the same messages and renderer used by live Pi. */
-export function codexMessage(item: HistoryItem, data: unknown, entryId: string): MessageContent {
+function codexMessage(item: HistoryItem, data: unknown, entryId: string): MessageContent {
   const tool = (name: string, presentation: MessagePresentation, text = "", explicitStatus = status(field(data, "status"))): MessageContent =>
     ({ role: "tool", text, tool: { call_id: historyToolId(entryId), name, status: explicitStatus }, presentation });
   switch (item.kind) {
@@ -106,7 +112,7 @@ export function codexMessage(item: HistoryItem, data: unknown, entryId: string):
 }
 
 /** Display bodies are separate from the stable legacy formatter and indexed native excerpts. */
-export function codexDisplayMessage(item: HistoryItem, data: unknown, entryId: string): MessageContent {
+function codexDisplayMessage(item: HistoryItem, data: unknown, entryId: string): MessageContent {
   const message = codexMessage(item, data, entryId);
   if (item.kind === "userMessage") return { ...message, text: userReferences(data) ?? message.text };
   switch (message.presentation?.type) {
@@ -117,3 +123,19 @@ export function codexDisplayMessage(item: HistoryItem, data: unknown, entryId: s
     default: return message;
   }
 }
+
+async function codexToolDetail(item: HistoryItem, data: unknown): Promise<ImportedToolDetail> {
+  const input = field(data, "command") ?? field(data, "arguments") ?? field(data, "changes") ?? field(data, "prompt");
+  const agents = field(data, "agentsStates");
+  const aggregated = string(field(data, "aggregatedOutput")), projected = codexToolOutput(item, data);
+  return { input: input === undefined ? null : typeof input === "string" ? input : JSON.stringify(input, null, 2),
+    output: aggregated ?? (projected.text || (string(field(field(data, "error"), "message")) ?? (agents === undefined ? null : JSON.stringify(agents, null, 2)))),
+    // Inspection's byte limit cannot erase an earlier per-part display cutoff.
+    truncated: aggregated === null && projected.text.length > 0 && projected.truncated };
+}
+
+const IMPORTED_ADAPTERS = {
+  codex: { message: codexMessage, display: codexDisplayMessage, toolDetail: codexToolDetail },
+  chatgpt: chatGptAdapter,
+} satisfies Record<HistoryProvider, ImportedAdapter>;
+export function importedAdapter(source: HistoryProvider): ImportedAdapter { return IMPORTED_ADAPTERS[source]; }

@@ -10,7 +10,7 @@ import { createRegistry, defineExtension, defineTool, Harness } from "@earendil-
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { Type } from "typebox";
 import { HistoryStore, ImportedItemEntry } from "../src/history.js";
-import { codexMessage } from "../src/imported-history.js";
+import { importedAdapter } from "../src/imported-history.js";
 import { renderMessage } from "../src/message-presentation.js";
 import { ConversationModels } from "../src/models.js";
 import { validEvent } from "../src/protocol.js";
@@ -82,7 +82,7 @@ test("real application exec producer keeps typed command/output/status through l
     assert.deepEqual(historic.presentation, finished.presentation); assert.equal(historic.text, finished.text); assert.equal(historic.tool?.status, finished.tool?.status);
     const retained = (await conversation.entries({ order: "ascending" }, 20, undefined, BACKGROUND_CONTEXT)).items.find(ImportedItemEntry.is); assert.ok(retained);
     assert.equal(await store.indexText(retained), "Legacy indexed excerpt", "Display enrichment must not change embedding input");
-    assert.equal(renderMessage(codexMessage(item, original, retained.id.toString())), `exec failed · exit 7 · ${finished.presentation.duration_ms} ms`, "Legacy formatted text remains stable");
+    assert.equal(renderMessage(importedAdapter("codex").message(item, original, retained.id.toString())), `exec failed · exit 7 · ${finished.presentation.duration_ms} ms`, "Legacy formatted text remains stable");
     const calls = app.faux.state.callCount;
     unbind(); await app.session.close(BACKGROUND_CONTEXT); app = await fixture(directory);
     assert.deepEqual((await history(await app.session.root(BACKGROUND_CONTEXT), null, new HistoryStore(app.session))).flatMap((frame) => frame.messages), before);

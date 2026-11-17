@@ -1,6 +1,6 @@
 //! Request ownership and connection controls, independent of wire transport.
 
-use crate::protocol::RuntimeCommand;
+use crate::protocol::{HostCommand, RuntimeCommand};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
@@ -15,6 +15,7 @@ pub enum RequestLifecycle {
     Login,
     Chat,
     Worker { interactive: bool },
+    ClientHistory,
     View(View),
     Background,
     Coordinator,
@@ -33,6 +34,7 @@ impl RequestLifecycle {
             RuntimeCommand::ObserveMain { .. } => Self::View(View::MainObserver),
             RuntimeCommand::AttachConversation { .. } => Self::View(View::Conversation),
             RuntimeCommand::RunBackground { .. } => Self::Background,
+            RuntimeCommand::ImportChatGpt { .. } => Self::ClientHistory,
             RuntimeCommand::ConfigureCoordinator { .. }
             | RuntimeCommand::RegisterNode { .. }
             | RuntimeCommand::SetConnectedNodes { .. } => Self::Coordinator,
@@ -135,6 +137,10 @@ impl RequestLifecycle {
         !self.is_worker()
     }
 
+    pub fn serves_client_history(self, command: &HostCommand) -> bool {
+        self == Self::ClientHistory && matches!(command, HostCommand::History { .. })
+    }
+
     /// Release a connection's attachment once, without revoking admitted work.
     pub fn detach(&mut self) -> Option<RuntimeCommand> {
         std::mem::replace(self, Self::Detached).disconnect_command()
@@ -146,6 +152,63 @@ impl RequestLifecycle {
             Self::View(View::Main | View::MainObserver) => Some(RuntimeCommand::DetachMain),
             Self::View(View::Conversation) => Some(RuntimeCommand::DetachConversation),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RequestLifecycle;
+    use crate::{embeddings::EmbeddingPurpose, history::HistoryRequest, protocol::HostCommand};
+
+    #[test]
+    fn only_an_export_import_reads_history_from_its_client() {
+        let history = HostCommand::History {
+            request: HistoryRequest::List {
+                archived: false,
+                cursor: None,
+            },
+        };
+        let exec = HostCommand::Exec {
+            program: "true".into(),
+            args: Vec::new(),
+            cwd: "/".into(),
+            timeout_seconds: 1,
+            sender_conversation_id: None,
+        };
+        let others = [
+            exec.clone(),
+            HostCommand::ReadFile {
+                path: "/invented".into(),
+                offset: 0,
+                limit: 1,
+                image: None,
+            },
+            HostCommand::WriteFile {
+                path: "/invented".into(),
+                content: String::new(),
+            },
+            HostCommand::OnNode {
+                host_id: "invented-host".into(),
+                command: Box::new(history.clone()),
+            },
+            HostCommand::Embed {
+                texts: vec!["Invented".into()],
+                purpose: EmbeddingPurpose::Document,
+            },
+        ];
+        let client = RequestLifecycle::ClientHistory;
+        assert!(client.serves_client_history(&history) && client.owns_host_effects());
+        for command in &others {
+            assert!(!client.serves_client_history(command), "{command:?}");
+        }
+        for lifecycle in [
+            RequestLifecycle::Once,
+            RequestLifecycle::Worker { interactive: false },
+            RequestLifecycle::Worker { interactive: true },
+            RequestLifecycle::Background,
+        ] {
+            assert!(!lifecycle.serves_client_history(&history), "{lifecycle:?}");
         }
     }
 }

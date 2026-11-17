@@ -15,7 +15,7 @@ import { validRequest, validEvent, validApnsConfig, errorEvent, invalidHostReply
 import { TaskError, TaskStore, type ActorExecution, type HostCall } from "./tasks.js";
 import { readTaskGraph } from "./task-graph.js";
 import { HistoryStore } from "./history.js";
-import { CodexImporter } from "./importer.js";
+import { HistoryImports } from "./importer.js";
 import { ConversationCatalog } from "./catalog.js";
 import { ConversationViews } from "./conversation-views.js";
 import { Observation } from "./observation.js";
@@ -159,7 +159,7 @@ async function openApplication(): Promise<Application> {
   const assets = join(state, "history", "assets");
   const histories = new HistoryStore(harness, assets); tasks.useHistory(histories);
   const catalog = new ConversationCatalog(harness, histories, tasks);
-  const importer = new CodexImporter(harness, histories, assets);
+  const imports = new HistoryImports(harness, histories, assets);
   const retrieval = new Retrieval(harness, histories, tasks, join(state, "search.sqlite"));
   const feedback = new FeedbackStore(state, tasks);
   const repairs = new FeedbackDispatcher(feedback, tasks, environment);
@@ -198,7 +198,7 @@ async function openApplication(): Promise<Application> {
       for (const observer of mainObservers.values()) observer.publish(event);
     }
   });
-  const core = { stopInputDelivery, harness, tasks, environment, executions, sources, resources, histories, catalog, importer, retrieval, attachments, feedback, repairs, notifications, telemetry };
+  const core = { stopInputDelivery, harness, tasks, environment, executions, sources, resources, histories, catalog, imports, retrieval, attachments, feedback, repairs, notifications, telemetry };
   const background = new BackgroundScheduler(harness, registry, tasks, {
     ready: waitForBackground,
     async plan(cadence, after, now, signal) {
@@ -265,7 +265,7 @@ async function openApplication(): Promise<Application> {
       project: () => backgroundCall(host.host_id === null ? { type: "project_guidance", cwd: host.cwd }
         : { type: "on_node", host_id: host.host_id, command: { type: "project_guidance", cwd: host.cwd } }, scope()),
       search: (query, refs, limit, mode = "semantic") => retrieval.search(query, refs, limit,
-        (operation) => backgroundCall(operation, scope()), importer.isRunning(), mode),
+        (operation) => backgroundCall(operation, scope()), imports.isRunning(), mode),
       call: (operation) => backgroundCall(environment.route(operation, host), scope()),
     }),
   };
@@ -320,10 +320,10 @@ const ending = new Set<number>();
 
 function searchFor(application: Awaited<ReturnType<typeof openApplication>>, id: number) {
   return (query: string, refs: string[], limit: number, mode: SearchMode = "semantic") => application.retrieval.search(query, refs, limit,
-    (command) => hostRequests.call(id, command), application.importer.isRunning(), mode);
+    (command) => hostRequests.call(id, command), application.imports.isRunning(), mode);
 }
 type TriageApplication = { sources: SourceJournal; environment: CoordinatorEnvironment; executions: Executions;
-  toolsets: Toolsets; retrieval: Retrieval; importer: CodexImporter };
+  toolsets: Toolsets; retrieval: Retrieval; imports: HistoryImports };
 async function triageSources(application: TriageApplication, id: number, command: Extract<RuntimeCommand, { type: "triage_sources" }>, signal?: AbortSignal): Promise<void> {
   const { sources, environment, executions, toolsets } = application;
   signal?.throwIfAborted();
@@ -331,7 +331,7 @@ async function triageSources(application: TriageApplication, id: number, command
   const hosts = await environment.hosts(command.cwd, null, command.hosts);
   const default_host = await environment.defaultHost(hosts);
   const search = (query: string, refs: string[], limit: number, mode: SearchMode = "semantic") => application.retrieval.search(query, refs, limit,
-    (operation) => hostRequests.call(id, operation, signal), application.importer.isRunning(), mode);
+    (operation) => hostRequests.call(id, operation, signal), application.imports.isRunning(), mode);
   await sources.triage({ ...command, hosts }, (conversation, model) => executions.bind(conversation.id.toString(), {
     model, cwd: command.cwd, hosts, default_host, connectedHosts: () => environment.hosts(command.cwd, null, command.hosts),
     role: "triage", search, call: (operation) => hostRequests.call(id, environment.route(operation, default_host), signal),
@@ -579,12 +579,21 @@ async function handle(request: RuntimeRequest): Promise<void> {
           // locally; returned vectors still undergo normal index validation.
           return result.type === "failed" ? call(operation) : result;
         };
-        await application.importer.run(available.nodes, available.online_host_ids, command.hosts,
+        await application.imports.codex(available.nodes, available.online_host_ids, command.hosts,
           call, (progress) => emit(id, { type: "import_progress", progress }),
           () => application.retrieval.sync(indexCall, true));
         break;
       }
-      case "import_status": emit(id, { type: "import_progress", progress: await (await app()).importer.status() }); break;
+      case "import_chatgpt": {
+        const application = await app();
+        const call: HostCall = (operation) => hostRequests.call(id, operation);
+        await application.imports.chatgpt(command.package, call, (progress) => emit(id, { type: "import_progress", progress }),
+          () => application.retrieval.sync(call, true));
+        break;
+      }
+      case "import_status":
+        for (const progress of await (await app()).imports.statuses()) emit(id, { type: "import_progress", progress });
+        break;
       case "retry_history_index": emit(id, { type: "job_status", status: await (await app()).background.retryHistoryIndex() }); break;
       case "notifications": emit(id, { type: "notifications", status: await (await app()).notifications.request(command.request) }); break;
       case "task_input": {

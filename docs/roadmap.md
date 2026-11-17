@@ -238,7 +238,12 @@ recovery; [history](history.md) describes import and retrieval.
 ## Retrieval, learning and proof
 
 - [ ] ChatGPT conversation import from a verified export, with resumable,
-  idempotent ingestion and attachment coverage.
+  idempotent ingestion and attachment coverage. `beep-boop import chatgpt`
+  checks and imports invented exports end to end, including interruption,
+  reruns and later edited exports. Checking and importing a real export, with
+  its counts, digests, gaps and unsupported content recorded, remains to
+  verify.
+  See [ChatGPT exports](history.md#chatgpt-exports).
 - [ ] [Grok Bot](https://docs.x.ai/grok-bot/overview) conversation import, with
   resumable, idempotent ingestion and attachment coverage. Grok Bot documents
   no account-wide export, only per-call transcripts and per-message downloads,

@@ -7,15 +7,16 @@ import { AssistantEntry, CompactionEntry, defineDocFamily, defineEntry, LiveDoc,
   type DocumentReader, type Harness, type JsonObject, type LiveState } from "@earendil-works/pi-durable";
 import { readNoticeOrigin } from "./notice_origin.js";
 import type { NoticeOrigin } from "./generated/NoticeOrigin.js";
+import type { HistoryBranch } from "./generated/HistoryBranch.js";
 import type { HistoryMessage } from "./generated/HistoryMessage.js";
 import type { HistoryRole } from "./generated/HistoryRole.js";
 import type { ModelActivity } from "./generated/ModelActivity.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import type { ToolDetails } from "./generated/ToolDetails.js";
 import type { ToolDetailContent } from "./generated/ToolDetailContent.js";
-import { HistoryError, HistoryStore, ImportedItemEntry, ImportedThreadEntry, isHistoryEntry } from "./history.js";
-import { codexDisplayMessage, codexMessage, codexToolOutput, historyToolId } from "./imported-history.js";
-import { field, piToolPresentation, piToolResult, string, type MessageContent } from "./message-presentation.js";
+import { entryThread, HistoryError, HistoryStore, ImportedItemEntry, ImportedThreadEntry, isHistoryEntry, shownInConversation } from "./history.js";
+import { importedAdapter } from "./imported-history.js";
+import { historyToolId, piToolPresentation, piToolResult, type MessageContent } from "./message-presentation.js";
 import { observeTranscriptVisibility, readTranscriptVisibility, transcriptVisible, type TranscriptVisibilityState } from "./transcript_visibility.js";
 import { REVISION_AMBIGUOUS, REVISION_PENDING, revisionStatus, type RevisionView } from "./history-revisions.js";
 
@@ -78,20 +79,27 @@ export async function projectTranscript(entry: EntryRecord, originals: Pick<Hist
     const response = await reader.snapshot(MainResponses, entry.conversationId, entry.id.toString(), BACKGROUND_CONTEXT);
     return response === undefined ? rows : [...rows.filter((row) => !["assistant", "commentary", "final"].includes(row.role) || row.text.trim()), ...messageRows(entry, { role: "final", text: response.text })];
   }
+  if (!shownInConversation(entry.data.item)) return [];
   const status = revisions === undefined ? "current" : revisionStatus(entry.id, revisions);
   if (status === "superseded" || status === "outside_snapshot") return [];
   let message: MessageContent;
-  try { message = codexDisplayMessage(entry.data.item, await originals.original(entry), entry.id.toString()); }
+  try { message = importedAdapter(entry.data.source).display(entry.data.item, await originals.original(entry), entry.id.toString()); }
   catch (error) {
     if (!missingOriginal(error)) throw error;
     message = { role: entry.data.item.role, text: entry.data.item.role === "tool" ? "" : entry.data.item.text,
       presentation: { type: "unavailable", kind: entry.data.item.kind } };
   }
-  const rows = messageRows(entry, message);
-  if (rows.length > 0 && status === "ambiguous") rows.unshift({ entry_id: entry.id.toString(), role: "notice",
-    text: `${REVISION_AMBIGUOUS} (${entry.data.item.version.slice(0, 12)})`,
-    continuation: false, final_chunk: true });
-  return rows;
+  return importedRows(entry, entry.data.item, message, status === "ambiguous");
+}
+function alternatesNotice(count: number): string {
+  return count === 1 ? "1 other version of this message is retained as evidence and not shown."
+    : `${count} other versions of this message are retained as evidence and not shown.`;
+}
+function importedRows(entry: EntryRecord, item: { version: string; branch?: HistoryBranch }, message: MessageContent, ambiguous: boolean): HistoryMessage[] {
+  const rows = messageRows(entry, message), alternates = item.branch?.alternates ?? 0;
+  if (rows.length === 0) return rows;
+  const notices = [...ambiguous ? [`${REVISION_AMBIGUOUS} (${item.version.slice(0, 12)})`] : [], ...alternates > 0 ? [alternatesNotice(alternates)] : []];
+  return [...notices.map((text): HistoryMessage => ({ entry_id: entry.id.toString(), role: "notice", text, continuation: false, final_chunk: true })), ...rows];
 }
 function messageRows(entry: EntryRecord, message: MessageContent): HistoryMessage[] {
   const value = message.text; let offset = 0, continuation = false;
@@ -137,7 +145,8 @@ function nativeTranscript(entry: EntryRecord, tools?: Map<string, ToolCall>): Hi
     add("user", entry.data.text); return messages;
   }
   if (ImportedItemEntry.is(entry)) {
-    return messageRows(entry, codexDisplayMessage(entry.data.item, entry.data.item.data, entry.id.toString()));
+    const { source, item } = entry.data;
+    return shownInConversation(item) ? importedRows(entry, item, importedAdapter(source).display(item, item.data, entry.id.toString()), false) : [];
   }
   if (ImportedThreadEntry.is(entry) || CompactionEntry.is(entry)) return messages;
   for (const message of entry.model ?? []) {
@@ -184,7 +193,7 @@ export async function history(conversation: Conversation, value: string | null,
       if (ImportedItemEntry.is(entry)) {
         view = revisions.get(entry.data.thread_id);
         if (view === undefined) {
-          view = await originals.revisionView(entry.data.thread_id);
+          view = await originals.revisionView(entryThread(entry));
           if (maximum !== undefined && view.watermark !== null && view.watermark > maximum) view = { ...view, ready: false };
           revisions.set(entry.data.thread_id, view);
         }
@@ -216,6 +225,7 @@ export async function history(conversation: Conversation, value: string | null,
 
 const TOOL_DETAIL_BYTES = 32_768;
 const TOOL_DETAIL_ENTRIES = 128;
+const IMPORTED_PAIR_ENTRIES = 8;
 function entryId(value: unknown): value is EntryId { return typeof value === "number" && Number.isSafeInteger(value) && value > 0; }
 function detailText(text: string): ToolDetailContent {
   const bytes = Buffer.from(text, "utf8");
@@ -244,22 +254,23 @@ export async function toolDetails(conversation: Conversation, value: string, cal
   if (selected === undefined) return { type: "unavailable", call_id: callId };
   if (ImportedItemEntry.is(selected)) {
     if (historyToolId(selected.id.toString()) !== callId) return { type: "unavailable", call_id: callId };
-    let original;
-    try { original = await originals.original(selected); }
-    catch (error) { if (missingOriginal(error)) return { type: "unavailable", call_id: callId }; throw error; }
-    const canonical = codexMessage(selected.data.item, original, selected.id.toString());
-    if (canonical.tool === undefined) return { type: "unavailable", call_id: callId };
-    const input = field(original, "command") ?? field(original, "arguments") ?? field(original, "changes") ?? field(original, "prompt");
-    const agents = field(original, "agentsStates");
-    const aggregated = string(field(original, "aggregatedOutput")), projected = codexToolOutput(selected.data.item, original);
-    const output = aggregated ?? (projected.text ||
-      (string(field(field(original, "error"), "message")) ?? (agents === undefined ? null : JSON.stringify(agents, null, 2))));
-    const inspected: ToolDetailContent = output === null || output === undefined ? { type: "unavailable", reason: "not_recorded" } : detailText(output);
-    // Inspection's byte limit cannot erase an earlier per-part display cutoff.
-    if (aggregated === null && projected.text.length > 0 && projected.truncated && inspected.type === "text") inspected.truncated = true;
+    const adapter = importedAdapter(selected.data.source), item = selected.data.item;
+    const next = async () => {
+      const page = await conversation.entries({ minEntryId: id, order: "ascending" }, IMPORTED_PAIR_ENTRIES, undefined, BACKGROUND_CONTEXT);
+      const following = page.items.find((entry) => entry.id !== id && ImportedItemEntry.is(entry));
+      return following === undefined || !ImportedItemEntry.is(following) ? undefined : { item: following.data.item, data: await originals.original(following) };
+    };
+    let canonical: MessageContent, detail;
+    try {
+      const original = await originals.original(selected);
+      canonical = adapter.message(item, original, selected.id.toString());
+      if (canonical.tool === undefined) return { type: "unavailable", call_id: callId };
+      detail = await adapter.toolDetail(item, original, next);
+    } catch (error) { if (missingOriginal(error)) return { type: "unavailable", call_id: callId }; throw error; }
+    const output: ToolDetailContent = detail.output === null ? { type: "unavailable", reason: "not_recorded" } : detailText(detail.output);
+    if (detail.truncated && output.type === "text") output.truncated = true;
     return { type: "available", call_id: callId, name: canonical.tool.name, status: canonical.tool.status,
-      input: input === undefined ? { type: "unavailable", reason: "not_recorded" } : detailText(typeof input === "string" ? input : JSON.stringify(input, null, 2)),
-      output: inspected };
+      input: detail.input === null ? { type: "unavailable", reason: "not_recorded" } : detailText(detail.input), output };
   }
   let { call, result } = toolParts(selected, callId);
   if (call === undefined && result === undefined) return { type: "unavailable", call_id: callId };

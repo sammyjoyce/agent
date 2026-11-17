@@ -40,6 +40,7 @@ fn main() -> Result<()> {
     AllocationDecision::export_all(&config)?;
     HistoryImportBatch::export_all(&config)?;
     HistoryImportReceipt::export_all(&config)?;
+    agent_cli::history::chatgpt::ChatGptEnvelope::export_all(&config)?;
     agent_cli::browser::BrowserRequest::export_all(&config)?;
     agent_cli::browser::BrowserReply::export_all(&config)?;
     agent_cli::browser::BrowserHelperInput::export_all(&config)?;

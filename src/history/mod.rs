@@ -1,5 +1,6 @@
 //! Inert, checkpointed history reads. Importing history never starts work.
 
+pub mod chatgpt;
 pub mod codex;
 
 use anyhow::Result;
@@ -9,6 +10,22 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::protocol::HistoryRole;
+
+pub(crate) const PAGE_BYTES: usize = 500 * 1024;
+
+pub(crate) fn excerpt(text: &str, maximum: usize) -> String {
+    let end = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= maximum)
+        .last()
+        .unwrap_or(0);
+    if text.len() <= maximum {
+        text.into()
+    } else {
+        text[..end].into()
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -82,6 +99,36 @@ pub struct HistoryItem {
     #[ts(type = "unknown")]
     pub data: serde_json::Value,
     pub assets: Vec<HistoryAssetRef>,
+    /// Placement in a source's branch tree. Absent for sources without branches and for
+    /// items saved before branches existed; readers treat absence as shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub branch: Option<HistoryBranch>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+pub struct HistoryBranch {
+    pub state: HistoryBranchState,
+    /// Sibling subtrees the source kept but did not select at this point. Nonzero only on
+    /// current items.
+    pub alternates: u32,
+    /// Version of the previous current item. A re-versioned current item therefore
+    /// re-versions every later one, and they re-append in path order instead of
+    /// aliasing to entries that sit before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub follows: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryBranchState {
+    /// On the path from the root to the leaf the source last displayed.
+    Current,
+    /// Reachable from a root, on a branch the source did not select.
+    Alternate,
+    /// Unreachable from every root, as in a parent cycle.
+    Detached,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -141,4 +188,26 @@ pub enum HistoryResponse {
 #[async_trait]
 pub trait HistorySource: Send + Sync {
     async fn request(&self, request: HistoryRequest) -> Result<HistoryResponse>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HistoryBranchState, HistoryItem};
+
+    #[test]
+    fn history_item_without_branch_still_decodes() {
+        let saved = r#"{"id":"item","turn_id":"turn","kind":"userMessage","role":"user","text":"Hello","version":"v1","order":0,"timestamp_ms":null,"data":null,"assets":[]}"#;
+        let item: HistoryItem = serde_json::from_str(saved).unwrap();
+        assert!(item.branch.is_none());
+        assert_eq!(serde_json::to_string(&item).unwrap(), saved);
+        let placed: HistoryItem = serde_json::from_str(&saved.replace(
+            r#""assets":[]"#,
+            r#""assets":[],"branch":{"state":"alternate","alternates":0}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            placed.branch.map(|branch| (branch.state, branch.follows)),
+            Some((HistoryBranchState::Alternate, None))
+        );
+    }
 }

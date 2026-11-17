@@ -9,6 +9,8 @@ export type MessageContent = Pick<HistoryMessage, "role" | "text" | "tool" | "pr
 export function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
 export function field(value: unknown, key: string): unknown { return object(value) ? value[key] : undefined; }
 export function string(value: unknown): string | null { return typeof value === "string" ? value : null; }
+/** Immutable evidence versions own distinct rows; their original native IDs remain untouched. */
+export function historyToolId(entryId: string): string { return "history:" + entryId; }
 export function list(value: unknown): unknown[] { return Array.isArray(value) ? value : []; }
 export function bounded(value: string, maximum = 32_768, suffix = "\n[Excerpt; full original retained]"): string {
   if (value.length <= maximum) return value;
