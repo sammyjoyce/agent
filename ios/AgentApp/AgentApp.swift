@@ -1,4 +1,5 @@
 import AgentUI
+import CoreSpotlight
 import Observation
 import ScrawlKit
 import SwiftUI
@@ -31,6 +32,9 @@ struct AgentApp: App {
       .scrawl(isEnabled: feedback.target != nil)
       // A disabled `.scrawl` ignores setup links, and pairing must work with no coordinator shown.
       .onOpenURL { _ = Scrawl.handleSetupURL($0) }
+      .onContinueUserActivity(CSSearchableItemActionType) { activity in
+        Task { await notifications.openSpotlightResult(activity) }
+      }
     }
     // Under the interaction fixture the app delegate's coordinators stay idle, so the two never
     // share an inbox or a registration.

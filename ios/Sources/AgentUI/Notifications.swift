@@ -95,6 +95,10 @@ public final class AppNotifications: NSObject {
     openRequest = OpenRequest(destination: .job(job.id))
   }
 
+  func showNotice(_ notice: String) {
+    openRequest = OpenRequest(destination: .feed(notice: notice))
+  }
+
   func presents(_ origin: AlertOrigin?) -> Bool {
     guard registration.enabled else { return false }
     guard case .visible(let atLatest) = mainVisible else { return true }
@@ -112,13 +116,22 @@ public final class AppNotifications: NSObject {
       caches: .cachesDirectory, transport: .tailnet,
       persistence: ComposerDraftStore(
         url: URL.applicationSupportDirectory.appending(path: "Agent/Composer/draft.json")),
-      sharedInbox: try? SharedDraftInbox.configured())
+      sharedInbox: try? SharedDraftInbox.configured(), spotlight: Self.appSpotlight)
     AppDependencyManager.shared.add(dependency: self)
+  }
+
+  private static var appSpotlight: (any SpotlightStore)? {
+    #if os(iOS)
+      CoreSpotlightStore()
+    #else
+      nil
+    #endif
   }
 
   init(
     defaults: UserDefaults, applicationSupport: URL, caches: URL, transport: CoordinatorTransport,
     persistence: ComposerDraftStore? = nil, sharedInbox: SharedDraftInbox? = nil,
+    spotlight: (any SpotlightStore)? = nil,
     permission: @escaping @MainActor () async throws -> Bool = AppNotifications.alertPermission
   ) {
     let registration = NotificationRegistration(
@@ -134,7 +147,8 @@ public final class AppNotifications: NSObject {
     self.registration = registration
     coordinators = Coordinators(
       registration: registration, defaults: defaults, applicationSupport: applicationSupport,
-      caches: caches, transport: transport, persistence: persistence, sharedInbox: sharedInbox)
+      caches: caches, transport: transport, persistence: persistence, sharedInbox: sharedInbox,
+      spotlight: spotlight)
     super.init()
   }
 
