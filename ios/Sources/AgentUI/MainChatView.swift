@@ -42,6 +42,7 @@ public struct MainChatView: View {
   #if os(iOS)
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var composerEditor = ComposerEditor()
+    @Environment(\.dynamicTypeSize) private var composerTextSize
   #endif
   @AppStorage(AppAppearance.preferenceKey) private var appearance = AppAppearance.system
   @Environment(\.scenePhase) private var scenePhase
@@ -645,6 +646,14 @@ public struct MainChatView: View {
       && model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
       && model.attachments.isEmpty
   }
+  private var composerLayout: AnyLayout {
+    #if os(iOS)
+      AnyLayout(
+        ComposerLayout(singleLineHeight: ComposerField.singleLineHeight(at: composerTextSize)))
+    #else
+      AnyLayout(HStackLayout(alignment: .bottom, spacing: 4))
+    #endif
+  }
   private var composer: some View {
     VStack(spacing: 6) {
       if !model.pickerMatches.isEmpty, !dictating { picker }
@@ -671,7 +680,7 @@ public struct MainChatView: View {
           }
         }
       }
-      HStack(alignment: .bottom, spacing: 4) {
+      composerLayout {
         Menu {
           Section("Attachments") {
             Button("Choose files", systemImage: "folder") { importingFiles = true }
@@ -740,6 +749,7 @@ public struct MainChatView: View {
             }
           #endif
         }
+        .layoutValue(key: ComposerEditorLayoutKey.self, value: true)
         .disabled(!model.draftReady)
         // The field drops a rewrite made inside its own write, so the tag moves after it. Tags are
         // read from committed text alone, so one an input method composes moves once committed.
