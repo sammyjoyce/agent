@@ -23,7 +23,7 @@ test = true
 
 [[example]]
 name = "cli-performance"
-path = "examples/cli_performance.rs"
+path = "examples/cli_performance/main.rs"
 test = true
 
 [dependencies]
