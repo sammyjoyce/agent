@@ -734,7 +734,7 @@ pub(crate) struct Diagnostics {
     drops: SharedDrops,
 }
 
-const UNRECORDED_START_STAMP: &str = "unrecorded-start";
+pub(crate) const UNRECORDED_START_STAMP: &str = "unrecorded-start";
 
 fn read_unrecorded_start(stamp: &Path) -> Option<u64> {
     fs::read_to_string(stamp)

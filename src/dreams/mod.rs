@@ -19,6 +19,7 @@ pub use evidence::{
 pub use policy::{
     CheckSpec, DreamsCheckFile, DreamsPolicy, DreamsPolicyFile, EditablePath, ProtectedPaths,
 };
+pub(crate) use store::DREAMS_DIRECTORY;
 pub use store::{AppliedRecord, DreamsStore, RunView};
 use store::{ReviewSeal, Verdict};
 pub use types::{
