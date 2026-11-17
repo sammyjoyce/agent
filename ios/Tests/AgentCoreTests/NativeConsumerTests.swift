@@ -121,3 +121,90 @@ func settingsForAnotherConversationCannotReplaceTheMainSelection() async throws 
     #expect(await fixture.count() == 0)
   }
 }
+
+@Test func noticeDetailsSurviveSplitLiveAndHistoryWithoutBorrowingOtherOrigins() throws {
+  let details = NoticeDetails(
+    sourceConversationId: "invented-conversation", sourceEntryId: "invented-entry",
+    sources: [
+      .init(
+        account: "invented-account", eventId: "event", eventVersion: "v1",
+        provider: "mail", threadId: "invented-thread", title: "Delivery")
+    ],
+    taskId: "invented-task", taskTitle: "Parcel decision")
+  var transcript = Transcript()
+  transcript.history(
+    .init(
+      messages: [
+        .init(
+          continuation: false, entryId: "details:1", finalChunk: false,
+          noticeDetails: details, role: .notice, text: "Job: misleading body."),
+        .init(
+          continuation: true, entryId: "details:1", finalChunk: true,
+          role: .notice, text: "More text"),
+        .init(
+          continuation: false, entryId: "details:2", finalChunk: true,
+          role: .notice, text: "Parcel decision"),
+      ], nextCursor: nil, pageComplete: true))
+  let rows = transcript.rows
+  #expect(rows[0].noticeDetails == details)
+  #expect(rows[0].provenanceLabel == "Task: Parcel decision")
+  #expect(rows[1].noticeDetails == nil)
+  #expect(rows[1].provenanceLabel == nil)
+  let wire = try JSONEncoder().encode(
+    HistoryMessage(
+      continuation: false, entryId: "details:1", finalChunk: true,
+      noticeDetails: details, role: .notice, text: "Invented"))
+  #expect(try JSONDecoder().decode(HistoryMessage.self, from: wire).noticeDetails == details)
+}
+
+@Test func aHistoryRefreshRetainsOnlyTheSameNoticeLiveSnapshot() {
+  let details = NoticeDetails(
+    sourceConversationId: "invented-conversation", sourceEntryId: "invented-entry",
+    sources: [], taskId: "invented-task", taskTitle: "Parcel decision")
+  var transcript = Transcript()
+  transcript.message(
+    .init(
+      continuation: false, entryId: "snapshot:1", finalChunk: false,
+      noticeDetails: details, role: .notice, text: "Live"))
+  transcript.message(
+    .init(
+      continuation: true, entryId: "snapshot:1", finalChunk: true,
+      role: .notice, text: " continuation"))
+  #expect(transcript.rows[0].noticeDetails == details)
+  transcript.history(
+    .init(
+      messages: [
+        .init(
+          continuation: false, entryId: "snapshot:1", finalChunk: true,
+          role: .notice, text: "Saved body"),
+        .init(
+          continuation: false, entryId: "snapshot:2", finalChunk: true,
+          role: .notice, text: "Unrelated body"),
+      ], nextCursor: nil, pageComplete: true))
+  #expect(transcript.rows[0].noticeDetails == details)
+  #expect(transcript.rows[1].noticeDetails == nil)
+}
+
+@Test func sourceOnlyHeadersUseCanonicalProviderAndTitleNeverBodyOrLaterTask() {
+  var transcript = Transcript()
+  for (index, source) in [
+    NoticeSource(
+      account: "invented-account", provider: "google", threadId: "invented-mail",
+      title: "Parcel decision"),
+    NoticeSource(
+      account: "invented-account", provider: "github", threadId: "invented-review",
+      title: "Review requested"),
+  ].enumerated() {
+    transcript.message(
+      .init(
+        continuation: false, entryId: "source:\(index)", finalChunk: true,
+        noticeDetails: .init(
+          sourceConversationId: "invented-main", sourceEntryId: "original-\(index)",
+          sources: [source]), role: .notice, text: "Task: fake title"))
+  }
+  #expect(
+    transcript.rows.map(\.provenanceLabel) == [
+      "google: Parcel decision", "github: Review requested",
+    ])
+  #expect(transcript.rows.allSatisfy { $0.noticeDetails?.taskId == nil && $0.noticeOrigin == nil })
+}
