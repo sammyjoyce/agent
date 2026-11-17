@@ -103,7 +103,7 @@ public final class Coordinators {
     to id: ProfileID, within limit: Duration = ConnectionLease.connectionWait,
     _ body: () async throws -> T
   ) async throws -> T {
-    try await chat.withConnection(to: id, within: limit, body)
+    try await chat.withConnection(to: id, within: limit) { _ in try await body() }
   }
 
   func route(_ origin: AlertOrigin) -> ProfileID? {

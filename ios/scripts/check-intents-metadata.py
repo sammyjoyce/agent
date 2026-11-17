@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Fails unless a built Agent.app ships every App Intents action, entity with its properties,
-enum and query, at least one shortcut, each for Open Coordinator, the retry behind
-authentication, and each open action as the system's open intent for its entity. Every shortcut
-must hold a phrase that is not empty, and one of Open Coordinator's phrases must name ${target}
+enum and query, at least one shortcut, the retry behind authentication, Send Message behind an
+unlock of the device that runs it, and each open action as the system's open intent for its
+entity. Every shortcut must hold a phrase that is not empty. One of Open Coordinator's phrases
+must name ${target} and ${applicationName}, and one of Send Message's must name ${coordinator}
 and ${applicationName}. No other action has a phrase. Open Job has none, because a phrase on its
-job would make each refresh of the app's phrases read every coordinator's jobs.
+job would make each refresh of the app's phrases read every coordinator's jobs. Send Message
+takes exactly a message and one saved coordinator, and runs without opening the app.
 
 A shortcuts provider in the wrong target still builds, and only the extracted metadata shows that
 the app ships no phrase.
@@ -16,7 +18,12 @@ import json
 import sys
 from pathlib import Path
 
-ACTIONS = {"OpenCoordinatorIntent", "OpenJobIntent", "RetryInterruptedRunIntent"}
+ACTIONS = {
+    "OpenCoordinatorIntent",
+    "OpenJobIntent",
+    "RetryInterruptedRunIntent",
+    "SendMessageIntent",
+}
 ENTITIES = {
     "CoordinatorEntity": {"name"},
     "JobEntity": {"title", "coordinator", "schedule", "state", "lastRun", "nextRun"},
@@ -24,9 +31,19 @@ ENTITIES = {
 ENUMS = {"JobRunState"}
 QUERIES = {"CoordinatorQuery", "JobQuery"}
 # Each action a phrase runs, and what one of its phrases must name.
-PHRASED = {"OpenCoordinatorIntent": {"${target}", "${applicationName}"}}
-# `authenticationPolicy` 1 is `.requiresAuthentication`.
-AUTHENTICATED = {"RetryInterruptedRunIntent": 1}
+PHRASED = {
+    "OpenCoordinatorIntent": {"${target}", "${applicationName}"},
+    "SendMessageIntent": {"${coordinator}", "${applicationName}"},
+}
+# `authenticationPolicy` 1 is `.requiresAuthentication`, 2 `.requiresLocalDeviceAuthentication`.
+AUTHENTICATED = {"RetryInterruptedRunIntent": 1, "SendMessageIntent": 2}
+POLICIES = {1: "require authentication", 2: "require an unlock of the device that runs it"}
+# `typeIdentifier` 0 is a String.
+STRING = "primitive 0"
+# Each action's parameters, by name and the type it takes: an entity's name or STRING.
+PARAMETERS = {"SendMessageIntent": {"message": STRING, "coordinator": "CoordinatorEntity"}}
+# Actions that run without opening the app.
+IN_BACKGROUND = {"SendMessageIntent"}
 OPENS = {"OpenCoordinatorIntent": "CoordinatorEntity", "OpenJobIntent": "JobEntity"}
 OPEN_ENTITY = "com.apple.link.systemProtocol.OpenEntity"
 
@@ -36,6 +53,14 @@ def metadata_path(argument: str) -> Path:
     if path.is_dir():
         return path / "Metadata.appintents" / "extract.actionsdata"
     return path
+
+
+def value_type(value: dict) -> str | None:
+    if "entity" in value:
+        return (value["entity"].get("wrapper") or {}).get("typeName")
+    if "primitive" in value:
+        return f"primitive {(value['primitive'].get('wrapper') or {}).get('typeIdentifier')}"
+    return None
 
 
 def problems(metadata: dict) -> list[str]:
@@ -80,7 +105,18 @@ def problems(metadata: dict) -> list[str]:
     actions = metadata.get("actions") or {}
     for action, policy in AUTHENTICATED.items():
         if action in actions and actions[action].get("authenticationPolicy") != policy:
-            found.append(f"{action} does not require authentication")
+            found.append(f"{action} does not {POLICIES[policy]}")
+    for action, expected in PARAMETERS.items():
+        if action in actions:
+            taken = {
+                p.get("name"): value_type(p.get("valueType") or {})
+                for p in actions[action].get("parameters") or []
+            }
+            if taken != expected:
+                found.append(f"{action} takes {taken}, not {expected}")
+    for action in IN_BACKGROUND:
+        if action in actions and actions[action].get("openAppWhenRun") is not False:
+            found.append(f"{action} opens the app")
     for action, entity in OPENS.items():
         if action not in actions:
             continue

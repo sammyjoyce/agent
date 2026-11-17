@@ -25,7 +25,11 @@ export const held = (path: string): ModelStep => ({ tool: "exec", args: { progra
   'async function run(){while(!fs.existsSync(path+".release"))await new Promise(resolve=>setTimeout(resolve,20));' +
   'fs.appendFileSync(path+".finished","once\\n");process.stdout.write("Completed the held action.");}void run();', path] } });
 
-export async function coordinatorWorld(t: TestContext) {
+export type WorldEnd = Pick<TestContext, "passed" | "diagnostic">;
+/** Owns a world's lifetime: a test, or a long-lived fixture that runs the cleanup itself. */
+export type WorldOwner = { after(cleanup: (end: WorldEnd) => Promise<void>): void };
+
+export async function coordinatorWorld(t: WorldOwner) {
   const directory = await realpath(await mkdtemp("/tmp/agent-e2e-"));
   const binary = process.env.AGENT_TEST_BINARY ?? fileURLToPath(new URL("../../../../target/debug/beep-boop", import.meta.url));
   const terminalFixture = fileURLToPath(new URL("../../../../target/debug/examples/terminal-fixture", import.meta.url));
@@ -53,7 +57,7 @@ export async function coordinatorWorld(t: TestContext) {
       await Promise.allSettled(children.map((owned) => owned.exited));
     } finally { await rm(directory, { recursive: true, force: true }); }
   });
-  async function diagnose(context: TestContext) {
+  async function diagnose(context: WorldEnd) {
     const durable = await Promise.all(homes.flatMap((home) => ["state/runtime.jsonl", "state/session.sqlite", "rex.json", "rex.json.calls"].map(async (name) => {
       try {
         const file = await open(join(home, name), "r");

@@ -43,6 +43,24 @@ actor InteractionPeer {
   private var releases: [String: CheckedContinuation<Void, Never>] = [:]
   private var rejecting = false
   private var announced: [SlashCommand] = []
+  private var origins: [String]?
+  private var attempts: [NativeRequestSubmit] = []
+  private var holdingSubmits = false
+  private var heldSubmits: [CheckedContinuation<Void, Never>] = []
+  private var submitFailure: String?
+  /// Advertises these input origins in each observation's `ready`.
+  func acceptOrigins(_ values: [String]?) { origins = values }
+  /// Every submit this peer received, in order, whatever it answered.
+  func submitRequests() -> [NativeRequestSubmit] { attempts }
+  /// Answers no submit until `releaseSubmits`, as a coordinator whose reply is lost does.
+  func holdSubmits() { holdingSubmits = true }
+  func releaseSubmits() {
+    holdingSubmits = false
+    for continuation in heldSubmits { continuation.resume() }
+    heldSubmits = []
+  }
+  /// Answers each submit with this `failure` while set, as a coordinator whose host is offline does.
+  func failSubmits(_ message: String?) { submitFailure = message }
 
   func history(
     initial: NativeEventHistory, pages: [String: NativeEventHistory], latest: NativeEventHistory
@@ -110,6 +128,7 @@ actor InteractionPeer {
   func stop() {
     for continuation in releases.values { continuation.resume() }
     releases = [:]
+    releaseSubmits()
     listener?.cancel()
     listener = nil
     for socket in sockets.values { socket.cancel() }
@@ -141,9 +160,10 @@ actor InteractionPeer {
         try await emit(
           .ready(
             .init(
-              conversationId: "fixture-root",
+              acceptedInputOrigins: origins, conversationId: "fixture-root",
               conversationSettings: settingsValue == nil ? nil : true,
-              inputOrigins: settingsValue == nil ? nil : true, model: "fixture/model",
+              inputOrigins: settingsValue == nil && origins == nil ? nil : true,
+              model: "fixture/model",
               workInspection: servedJobs.isEmpty ? nil : true, working: working)), to: socket)
         try await emitHistory(try XCTUnwrap(initial), to: socket)
         if !commandValues.isEmpty {
@@ -202,7 +222,11 @@ actor InteractionPeer {
         try await emit(.done, to: socket)
       case .submit(let request):
         submitCount += 1
-        if rejecting {
+        attempts.append(request)
+        if holdingSubmits { await withCheckedContinuation { heldSubmits.append($0) } }
+        if let submitFailure {
+          try await emit(.failure(.init(message: submitFailure)), to: socket)
+        } else if rejecting {
           try await emit(
             .rejected(
               .init(inputId: request.inputId, message: "Invented: the coordinator is busy")),
