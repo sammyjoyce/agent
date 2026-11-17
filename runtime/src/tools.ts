@@ -244,7 +244,7 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
   host: Extension; main: Extension; worker: Extension; agent: Extension; legacy: Extension;
 } {
   const host = defineExtension({ name: "host-tools", tools: [
-    defineTool({ name: "read_attachment", replay: "safe", description: "Read a user attachment by its stable attachment ID. Images use native image content; original files are materialized privately on this actor's execution host. Pass attachment IDs with delegation when another agent needs the files.",
+    defineTool({ name: "read_attachment", description: "Read a user attachment by its stable attachment ID. Images use native image content; original files are materialized privately on this actor's execution host. Pass attachment IDs with delegation when another agent needs the files.",
       parameters: Type.Object({ id: Type.String() }), async execute(args, api) {
         const prepared = await tasks.openAttachment(args.id, executions.get(api.conversationId.toString()).call);
         return { output: typeof prepared.content === "string" ? [{ type: "text", text: prepared.content }] : prepared.content };

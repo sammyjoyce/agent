@@ -13,26 +13,24 @@ const STATEMENT = "Invented: the old host stopped answering";
 const JOB = "invented-ledger-review";
 const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 
-/** One replay-safe tool, run to the point where only its result is still to be recorded, then run again by a new owner. */
-interface Overlap {
+/** One tool call that the old owner runs to the point where only its result is still to be recorded, and that a new owner then recovers. */
+interface Held {
   readonly tool: string;
   readonly world?: WorldOptions;
   /** The words the model searches for to load the tool, when the main conversation defers it. */
   readonly load?: string;
   /** What must exist before the model calls the tool. Returns the tool's arguments. */
   prepare(world: FailoverWorld): Promise<Record<string, string>>;
-  /** Text that only the tool's result carries, which marks the append that records it. */
-  readonly result: string;
   /** How many times the tool's effect exists. It must not ask the old owner, whose reads wait behind its held commit. */
   effects(world: FailoverWorld, args: Record<string, string>): Promise<number>;
 }
 
 /**
  * Holds the first run open on the old owner after its effect and before its
- * result is recorded, promotes on a statement, lets the new owner run the tool
- * again, then releases the first run. Returns how the new owner treated the call.
+ * result is recorded, promotes on a statement, lets the new owner recover the
+ * turn, then releases the first run. Returns how the new owner treated the call.
  */
-async function overlap(t: TestContext, { tool, world: options, load, prepare, result, effects }: Overlap) {
+async function overlap(t: TestContext, { tool, world: options, load, prepare, effects }: Held) {
   const world = await failoverWorld(t, { watchSeconds: 1, ...options }), { owner, standby, worker } = world, key = `fixture-overlap-${tool}`;
   await world.enroll();
   const serving = await world.serve(owner);
@@ -43,12 +41,12 @@ async function overlap(t: TestContext, { tool, world: options, load, prepare, re
   const call: ModelStep = { tool, args };
   await world.script(key, [...(load === undefined ? [] : [{ tool: "tool_search", args: { query: load } }]), call, { text: "The new owner finished the turn." }]);
 
-  const first = latch();
+  const first = latch(), result = String.raw`\"toolName\":\"${tool}\"`;
   let open = false;
   owner.proxy.inject({ fault: { kind: "hold", release: first.released }, match: (request) => open ||= commands("append")(request) && request.body.includes(result) });
   const sent = world.sending(owner, key);
   await world.until(async () => open, `The old owner must reach the result of ${tool}`, () => serving.errors().slice(-1000));
-  assert.equal(await effects(world, args), 1, "the first run made its effect once");
+  const before = await effects(world, args);
 
   await world.promote({ replaceEpoch: 2, statement: STATEMENT });
   await world.serve(standby);
@@ -59,17 +57,17 @@ async function overlap(t: TestContext, { tool, world: options, load, prepare, re
   const told = await world.lastAsked(key);
   first.release();
   assert.equal(await serving.exited, OWNER_FENCED_EXIT, serving.errors().slice(-2000));
-  return { world, args, interrupted: told.includes(`Tool ${tool} was interrupted`), effects: await effects(world, args) };
+  return { interrupted: told.includes(`Tool ${tool} was interrupted`), before, after: await effects(world, args) };
 }
 
-const cases: readonly Overlap[] = [
-  { tool: "notify_user", load: "notify user", result: "Published to the main chat.",
+/** Tools whose effect is a Pi commit. The authority refuses that commit from a fenced owner, so they keep `replay: "safe"`. */
+const rerun: readonly Held[] = [
+  { tool: "notify_user", load: "notify user",
     prepare: async () => ({ text: "Invented notice: the ledger review found a zirconium connector." }),
     // A notice is a submission whose request id names the tool call that published it.
     effects: async (world) => new Set((await logBatches(world.authority.standby)).flat()
       .flatMap((write) => write.type === "submission" && write.value.requestId?.startsWith("notice:") ? [write.value.id] : [])).size },
-  // The receipt is JSON in the tool's text, so its quotes are escaped once more than those of the stored receipt.
-  { tool: "run_job", result: String.raw`\\\"admitted_at`,
+  { tool: "run_job",
     world: { settings: async (home) => {
       const jobs = join(home, "jobs");
       await mkdir(jobs, { mode: 0o700 });
@@ -83,15 +81,18 @@ const cases: readonly Overlap[] = [
     },
     // Each admitted run is an occurrence named after the request that asked for it.
     effects: async (world) => new Set(JSON.stringify(await logBatches(world.authority.standby)).match(/manual:[0-9a-f-]{36}/g)).size },
-  { tool: "read_attachment", result: "Attached file",
+];
+
+/** Tools whose effect is on a host, where no test holds a first run open while a second one starts. A new owner must not run them again. */
+const interrupted: readonly Held[] = [
+  { tool: "read_attachment",
     async prepare(world) {
       const bytes = Buffer.from("Invented attachment text that the tool reads back"), id = randomUUID();
       await world.request(world.owner, { type: "attachment", request: { type: "upload", id, name: "evidence.txt", media_type: "text/plain", size_bytes: bytes.length, offset: 0,
         data_base64: bytes.toString("base64"), complete: true } });
       return { id };
     },
-    // The main conversation reads an attachment on its coordinator's own machine, so each owner materializes it on its own host.
-    // The effect is one copy in a host's cache, and the count is that of the host that holds the most.
+    // The effect is one copy in a host's cache. The main conversation reads on its coordinator's own machine, so a second run would add a copy on the new owner's host.
     async effects(world) {
       const expected = sha256(Buffer.from("Invented attachment text that the tool reads back"));
       const copies = await Promise.all([world.owner.state, world.standby.state, join(world.worker.home, "state")].map(async (state) => {
@@ -99,17 +100,29 @@ const cases: readonly Overlap[] = [
         const hashes = await Promise.all(cached.filter((entry) => entry.isFile()).map(async (entry) => sha256(await readFile(join(entry.parentPath, entry.name)))));
         return hashes.filter((hash) => hash === expected).length;
       }));
-      return Math.max(...copies);
+      return copies.reduce((sum, count) => sum + count, 0);
     } },
+  // With no owned worktree the collector asks no host, so the only thing to count is whether the call ran: its result names the inventory.
+  { tool: "collect_worktrees", load: "collect worktrees", prepare: async () => ({}),
+    effects: async (world) => (await logBatches(world.authority.standby)).flat()
+      .filter((write) => write.type === "entry" && JSON.stringify(write.value).includes('"toolName":"collect_worktrees"') && !JSON.stringify(write.value).includes("was interrupted")).length },
 ];
 
 test("a replay-safe tool that a new owner runs again while its first run is still open leaves one effect", { timeout: 180_000 }, async (t) => {
-  for (const scenario of cases) {
+  for (const scenario of rerun) {
     await t.test(`${scenario.tool}, rerun while its first run is held open, leaves one effect`, async (t) => {
       const outcome = await overlap(t, scenario);
-      t.diagnostic(`${scenario.tool}: the new owner ${outcome.interrupted ? "reported the call as interrupted" : "ran the call again"}, and its effect exists ${outcome.effects} time(s)`);
-      assert.equal(outcome.interrupted, false, "a replay-safe call is run again, not reported as interrupted");
-      assert.equal(outcome.effects, 1);
+      assert.deepEqual(outcome, { interrupted: false, before: 1, after: 1 });
+    });
+  }
+});
+
+test("a host tool that the old owner left without a result is reported as interrupted by the new owner and is not run again", { timeout: 180_000 }, async (t) => {
+  for (const scenario of interrupted) {
+    await t.test(`${scenario.tool}, left without a result, is reported as interrupted and not run again`, async (t) => {
+      const outcome = await overlap(t, scenario);
+      assert.equal(outcome.interrupted, true, "the model is told that the call was interrupted");
+      assert.equal(outcome.after, outcome.before, "the new owner made no effect of its own");
     });
   }
 });
