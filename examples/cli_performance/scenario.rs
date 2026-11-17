@@ -7,11 +7,13 @@ use tokio::time::sleep;
 
 use crate::{
     DEADLINE,
+    background::{self, Background},
     coordinator::read_pid,
-    gate::{Gate, GateDefinition, HoldDiscount, Mark},
+    gate::{Gate, GateDefinition, HoldDiscount, Mark, Marks},
+    load::Load,
     provider::{End, Request},
     session::{self, Context, Outcome},
-    terminal::{Keystroke, Sight},
+    terminal::{Keystroke, Sight, Terminal},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, ValueEnum)]
@@ -20,7 +22,10 @@ pub enum Scenario {
     ChiefCold,
     Chief,
     LongHistory,
+    ScrollHistory,
     Submit,
+    SubmitDuringSearch,
+    SubmitDuringImport,
     Steer,
     StopStream,
     StopTool,
@@ -53,14 +58,49 @@ pub enum Ending {
 #[derive(Debug, Serialize)]
 pub struct Definition {
     pub coordinator: Lifetime,
+    pub background: Background,
     pub turns: &'static [Turn],
     pub gates: &'static [GateDefinition],
 }
 
 pub const CHIEF_SENTENCE: &str = "Stored chief conversation is ready.";
 const LONG_SENTENCE: &str = "Stored long conversation is ready.";
+const OLDEST_MESSAGE: &str = "Synthetic retained conversation message 0.";
+const OLDER_PAGE_MESSAGE: &str = "Synthetic retained conversation message 3.";
+const NEWER_PAGE_MESSAGE: &str = "Synthetic retained conversation message 12.";
 pub const ENTER: &[u8] = b"\r";
 const ESC: &[u8] = b"\x1b";
+const CTRL_HOME: &[u8] = b"\x1b[1;5H";
+const PAGE_DOWN: &[u8] = b"\x1b[6~";
+const PAGE_UP: &[u8] = b"\x1b[5~";
+
+struct ScrollKey {
+    bytes: &'static [u8],
+    shows: &'static str,
+    pressed: Mark,
+    visible: Mark,
+}
+
+const SCROLL_FROM_LIVE_BOTTOM_TO_OLDEST_THEN_BACK_ONE_PAGE: [ScrollKey; 3] = [
+    ScrollKey {
+        bytes: CTRL_HOME,
+        shows: OLDEST_MESSAGE,
+        pressed: Mark::CtrlHome,
+        visible: Mark::OldestVisible,
+    },
+    ScrollKey {
+        bytes: PAGE_DOWN,
+        shows: NEWER_PAGE_MESSAGE,
+        pressed: Mark::PageDown,
+        visible: Mark::NewerPageVisible,
+    },
+    ScrollKey {
+        bytes: PAGE_UP,
+        shows: OLDER_PAGE_MESSAGE,
+        pressed: Mark::PageUp,
+        visible: Mark::OlderPageVisible,
+    },
+];
 
 pub const PRIME_ANSWER: &str = "Priming finished without changes.";
 const SUBMIT_ANSWER: &str = "Three synthetic invoices await review.";
@@ -137,6 +177,20 @@ static LAUNCH_GATES: [GateDefinition; 1] = [gate(
     Mark::StoredTextVisible,
     HoldDiscount::None,
 )];
+static SUBMIT_GATES: [GateDefinition; 2] = [
+    gate(
+        Gate::Admission,
+        Mark::Enter,
+        Mark::Admitted,
+        HoldDiscount::None,
+    ),
+    gate(
+        Gate::FirstActivity,
+        Mark::Enter,
+        Mark::ActivityVisible,
+        HoldDiscount::FirstChunkHolds,
+    ),
+];
 static STOP_GATES: [GateDefinition; 1] = [gate(
     Gate::Stop,
     Mark::Esc,
@@ -146,34 +200,56 @@ static STOP_GATES: [GateDefinition; 1] = [gate(
 
 static CHIEF_COLD_DEFINITION: Definition = Definition {
     coordinator: Lifetime::PerSample,
+    background: Background::None,
     turns: &[],
     gates: &LAUNCH_GATES,
 };
 static RETAINED_DEFINITION: Definition = Definition {
     coordinator: Lifetime::SharedPerVersion,
+    background: Background::None,
     turns: &[],
     gates: &LAUNCH_GATES,
 };
-static SUBMIT_DEFINITION: Definition = Definition {
-    coordinator: Lifetime::PerSample,
-    turns: &[PRIME, SUBMIT],
+static SCROLL_HISTORY_DEFINITION: Definition = Definition {
+    coordinator: Lifetime::SharedPerVersion,
+    background: Background::None,
+    turns: &[],
     gates: &[
         gate(
-            Gate::Admission,
-            Mark::Enter,
-            Mark::Admitted,
+            Gate::ScrollToOldest,
+            Mark::CtrlHome,
+            Mark::OldestVisible,
             HoldDiscount::None,
         ),
         gate(
-            Gate::FirstActivity,
-            Mark::Enter,
-            Mark::ActivityVisible,
-            HoldDiscount::FirstChunkHolds,
+            Gate::PageUp,
+            Mark::PageUp,
+            Mark::OlderPageVisible,
+            HoldDiscount::None,
         ),
     ],
 };
+static SUBMIT_DEFINITION: Definition = Definition {
+    coordinator: Lifetime::PerSample,
+    background: Background::None,
+    turns: &[PRIME, SUBMIT],
+    gates: &SUBMIT_GATES,
+};
+static SUBMIT_DURING_SEARCH_DEFINITION: Definition = Definition {
+    coordinator: Lifetime::PerSample,
+    background: Background::Search,
+    turns: &[PRIME, SUBMIT],
+    gates: &SUBMIT_GATES,
+};
+static SUBMIT_DURING_IMPORT_DEFINITION: Definition = Definition {
+    coordinator: Lifetime::PerSample,
+    background: Background::Import,
+    turns: &[PRIME, SUBMIT],
+    gates: &SUBMIT_GATES,
+};
 static STEER_DEFINITION: Definition = Definition {
     coordinator: Lifetime::PerSample,
+    background: Background::None,
     turns: &[PRIME, STEER_BASE, STEER],
     gates: &[
         gate(
@@ -192,11 +268,13 @@ static STEER_DEFINITION: Definition = Definition {
 };
 static STOP_STREAM_DEFINITION: Definition = Definition {
     coordinator: Lifetime::PerSample,
+    background: Background::None,
     turns: &[PRIME, STOP_STREAM],
     gates: &STOP_GATES,
 };
 static STOP_TOOL_DEFINITION: Definition = Definition {
     coordinator: Lifetime::PerSample,
+    background: Background::None,
     turns: &[PRIME, STOP_TOOL],
     gates: &STOP_GATES,
 };
@@ -206,7 +284,10 @@ impl Scenario {
         match self {
             Self::ChiefCold => &CHIEF_COLD_DEFINITION,
             Self::Chief | Self::LongHistory => &RETAINED_DEFINITION,
+            Self::ScrollHistory => &SCROLL_HISTORY_DEFINITION,
             Self::Submit => &SUBMIT_DEFINITION,
+            Self::SubmitDuringSearch => &SUBMIT_DURING_SEARCH_DEFINITION,
+            Self::SubmitDuringImport => &SUBMIT_DURING_IMPORT_DEFINITION,
             Self::Steer => &STEER_DEFINITION,
             Self::StopStream => &STOP_STREAM_DEFINITION,
             Self::StopTool => &STOP_TOOL_DEFINITION,
@@ -227,31 +308,28 @@ pub async fn drive(scenario: Scenario, context: &Context<'_>) -> Result<Outcome>
             let resume = format!("/resume {}", context.seed.long_history);
             session::launch(context, Some(resume), LONG_SENTENCE).await
         }
-        Scenario::Submit => {
-            session::interactive(context, async |terminal, marks| {
-                terminal.compose(SUBMIT.prompt).await?;
-                let Keystroke {
-                    before_write: enter,
-                    sightings: mut seen,
-                } = terminal
-                    .press(
-                        ENTER,
-                        vec![
-                            Sight::Admitted(SUBMIT.prompt),
-                            Sight::Shows(SUBMIT.reasoning),
-                            Sight::Settled(SUBMIT_ANSWER),
-                        ],
-                    )
-                    .await?;
-                marks.record(Mark::Enter, enter)?;
-                marks.record(Mark::Admitted, seen.next().await?)?;
-                marks.record(Mark::ActivityVisible, seen.next().await?)?;
-                marks.record(Mark::ReplyVisible, seen.next().await?)
+        Scenario::ScrollHistory => {
+            let resume = format!("/resume {}", context.seed.long_history);
+            session::browse(context, resume, LONG_SENTENCE, async |terminal, marks| {
+                for key in SCROLL_FROM_LIVE_BOTTOM_TO_OLDEST_THEN_BACK_ONE_PAGE {
+                    let Keystroke {
+                        before_write,
+                        sightings: mut seen,
+                    } = terminal
+                        .press(key.bytes, vec![Sight::Shows(key.shows)])
+                        .await?;
+                    marks.record(key.pressed, before_write)?;
+                    marks.record(key.visible, seen.next().await?)?;
+                }
+                Ok(())
             })
             .await
         }
+        Scenario::Submit | Scenario::SubmitDuringSearch | Scenario::SubmitDuringImport => {
+            session::interactive(context, submit_then_stop_searches).await
+        }
         Scenario::Steer => {
-            session::interactive(context, async |terminal, marks| {
+            session::interactive(context, async |terminal, marks, _| {
                 terminal.compose(STEER_BASE.prompt).await?;
                 let Keystroke {
                     before_write: enter,
@@ -283,7 +361,7 @@ pub async fn drive(scenario: Scenario, context: &Context<'_>) -> Result<Outcome>
             .await
         }
         Scenario::StopStream => {
-            session::interactive(context, async |terminal, marks| {
+            session::interactive(context, async |terminal, marks, _| {
                 terminal.compose(STOP_STREAM.prompt).await?;
                 let Keystroke {
                     before_write: enter,
@@ -304,7 +382,7 @@ pub async fn drive(scenario: Scenario, context: &Context<'_>) -> Result<Outcome>
         }
         Scenario::StopTool => {
             let pid_file = context.coordinator.tool_pid_file();
-            session::interactive(context, async |terminal, marks| {
+            session::interactive(context, async |terminal, marks, _| {
                 terminal.compose(STOP_TOOL.prompt).await?;
                 let Keystroke {
                     before_write: enter,
@@ -340,6 +418,32 @@ pub async fn drive(scenario: Scenario, context: &Context<'_>) -> Result<Outcome>
     }
 }
 
+async fn submit_then_stop_searches(
+    terminal: &Terminal,
+    marks: &mut Marks,
+    load: &mut Load,
+) -> Result<()> {
+    terminal.compose(SUBMIT.prompt).await?;
+    let Keystroke {
+        before_write: enter,
+        sightings: mut seen,
+    } = terminal
+        .press(
+            ENTER,
+            vec![
+                Sight::Admitted(SUBMIT.prompt),
+                Sight::Shows(SUBMIT.reasoning),
+                Sight::Settled(SUBMIT_ANSWER),
+            ],
+        )
+        .await?;
+    marks.record(Mark::Enter, enter)?;
+    marks.record(Mark::Admitted, seen.next().await?)?;
+    marks.record(Mark::ActivityVisible, seen.next().await?)?;
+    load.stop_searches().await?;
+    marks.record(Mark::ReplyVisible, seen.next().await?)
+}
+
 fn ensure_reaped(tool: i32) -> Result<()> {
     let alive = unsafe { libc::kill(tool, 0) };
     let error = std::io::Error::last_os_error();
@@ -351,7 +455,9 @@ fn ensure_reaped(tool: i32) -> Result<()> {
 }
 
 pub fn verify(scenario: Scenario, outcome: &Outcome, requests: &[Request]) -> Result<()> {
-    let turns = scenario.definition().turns;
+    let definition = scenario.definition();
+    background::verify_overlap(definition.background, &outcome.background, &outcome.marks)?;
+    let turns = definition.turns;
     ensure!(
         requests.len() == turns.len(),
         "Expected {} provider requests, received {}",
@@ -417,6 +523,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        background::Evidence,
         coordinator::Tokens,
         gate::{Hold, HoldKind, Marks, span},
         session::Anchor,
@@ -444,6 +551,7 @@ mod tests {
                 total: recorded_tokens,
                 ..Tokens::default()
             }),
+            background: Evidence::None,
             screen: String::new(),
             received_bytes: 1,
         }
@@ -541,11 +649,13 @@ mod tests {
                 to: origin + ms(90),
             },
         ];
-        let mut checked = 0;
+        let mut checked = Vec::new();
         for scenario in Scenario::value_variants() {
             for definition in scenario.gates() {
                 match definition.gate {
                     Gate::ConversationVisible
+                    | Gate::ScrollToOldest
+                    | Gate::PageUp
                     | Gate::Admission
                     | Gate::SteerAdmission
                     | Gate::Stop => {}
@@ -560,10 +670,18 @@ mod tests {
                     "{scenario:?} {:?}",
                     definition.gate
                 );
-                checked += 1;
+                checked.push((*scenario, definition.gate));
             }
         }
-        assert!(checked > 0);
+        for required in [
+            (Scenario::Submit, Gate::Admission),
+            (Scenario::ScrollHistory, Gate::ScrollToOldest),
+            (Scenario::ScrollHistory, Gate::PageUp),
+            (Scenario::SubmitDuringSearch, Gate::Admission),
+            (Scenario::SubmitDuringImport, Gate::Admission),
+        ] {
+            assert!(checked.contains(&required), "{required:?} was not checked");
+        }
     }
 
     #[test]
@@ -604,6 +722,9 @@ mod tests {
         let mut texts = vec![
             CHIEF_SENTENCE,
             LONG_SENTENCE,
+            OLDEST_MESSAGE,
+            OLDER_PAGE_MESSAGE,
+            NEWER_PAGE_MESSAGE,
             "Synthetic chief conversation message 38.",
             "Synthetic retained conversation message 4998.",
             "Unrelated saved discussion 2999",
