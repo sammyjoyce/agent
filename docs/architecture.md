@@ -731,9 +731,10 @@ unfinished. A promoted owner recovers as a restarted coordinator does. It asks
 the model again for a generation that was in flight when a client resubmits or
 the turn resumes, and it reruns only tools declared `replay: "safe"`. Those
 are reads, and tools whose only effect is a Pi commit. `read_attachment` and
-`collect_worktrees` change something on a host and are not declared safe, so a
-coordinator that recovers one of these calls, after a promotion or a restart,
-reports it as interrupted.
+`collect_worktrees` change something on a host, and `dreams_review` runs the
+operator's checks before it seals a review. None of them is declared safe, so
+a coordinator that recovers one of these calls, after a promotion or a
+restart, reports it as interrupted.
 
 **When the authority is unreachable.** Commits wait and retry, so the
 coordinator accepts no input and starts no effect. An attachment download

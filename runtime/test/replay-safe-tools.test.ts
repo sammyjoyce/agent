@@ -31,7 +31,6 @@ const SAFE_UNDER_OVERLAP: Readonly<Record<string, string>> = {
   search_tasks: READS_A_HOST,
   read_context: `${READS_A_HOST} Only the coordinator's own host answers it.`,
   search_context: `${READS_A_HOST} Only the coordinator's own host answers it.`,
-  dreams_review: "Seals the run's review on the coordinator's own host, where the first seal wins. dreams/ is not replicated, so two owners on two hosts share no review.",
 };
 
 test("every tool declared replay-safe is listed with the reason a second run beside the first duplicates nothing", async () => {
