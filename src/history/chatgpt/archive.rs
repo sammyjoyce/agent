@@ -167,6 +167,11 @@ impl Region {
         self.len
     }
 
+    #[cfg(test)]
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+
     pub fn slice(&self, offset: u64, len: u64) -> io::Result<Self> {
         let end = offset.checked_add(len).ok_or_else(out_of_bounds)?;
         if end > self.len {

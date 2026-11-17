@@ -644,7 +644,7 @@ impl std::error::Error for PackageError {}
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, path::Path};
+    use std::{collections::HashMap, os::unix::fs::MetadataExt, path::Path};
 
     use base64::{Engine, engine::general_purpose::STANDARD};
     use serde_json::{Value, json};
@@ -2083,14 +2083,6 @@ mod tests {
         assert_eq!(envelope.text, canvas);
     }
 
-    fn spools() -> Vec<std::ffi::OsString> {
-        std::fs::read_dir(std::env::temp_dir())
-            .unwrap()
-            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
-            .filter(|name| name.to_string_lossy().starts_with(".beep-boop-chatgpt-"))
-            .collect()
-    }
-
     #[tokio::test]
     async fn deflated_asset_spool_is_unlinked() {
         let directory = tempfile::tempdir().unwrap();
@@ -2116,9 +2108,16 @@ mod tests {
             panic!("expected an asset chunk");
         };
         assert!(next_offset.is_some(), "the transfer is still in progress");
-        assert!(spools().is_empty());
-        drop(history);
-        assert!(spools().is_empty());
+        let state = history.state.lock().unwrap();
+        let (_, spool) = state
+            .transfer
+            .as_ref()
+            .expect("the deflated asset is spooled");
+        assert_eq!(
+            spool.file().metadata().unwrap().nlink(),
+            0,
+            "the open spool has no name in any directory"
+        );
     }
 
     #[tokio::test]
