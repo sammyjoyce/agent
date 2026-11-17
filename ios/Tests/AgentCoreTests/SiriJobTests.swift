@@ -478,8 +478,6 @@ struct SiriJobTests {
     }
   }
 
-  /// Work is saved first and is still connecting when the query starts. Personal is read
-  /// meanwhile, and the jobs come back in saved order.
   @MainActor @Test(.timeLimit(.minutes(1)))
   func anActivationIndexesEveryPairedCoordinatorsJobs() async throws {
     let spotlight = SpotlightFake()
@@ -687,6 +685,8 @@ struct SiriJobTests {
     }
   }
 
+  /// Work is saved first and is still connecting when the query starts. Personal is read
+  /// meanwhile, and the jobs come back in saved order.
   @MainActor @Test(.timeLimit(.minutes(1)))
   func aCoordinatorStillConnectingDoesNotDelayTheNextOnesRead() async throws {
     try await withJobPeers { coordinators, _, _, workPeer, personalPeer in
