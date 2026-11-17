@@ -63,7 +63,13 @@ struct World {
     config: PathBuf,
     home: PathBuf,
     rex: PathBuf,
+    /// Whether the command runs in the state directory's parent and names the directory as
+    /// `DASHED_STATE`.
+    dashed: bool,
 }
+
+/// A valid directory name that reads as an option where a program parses options.
+const DASHED_STATE: &str = "--state";
 
 enum Failover {
     Absent,
@@ -112,8 +118,20 @@ impl World {
             config: config_path,
             home,
             rex,
+            dashed: false,
             _root: root,
         }
+    }
+
+    /// Renames the state directory to `DASHED_STATE`. The command then runs in the parent directory and
+    /// names the state directory by that relative path, as an operator does who names it relative to
+    /// where the service runs.
+    fn with_dashed_relative_state(mut self) -> Self {
+        let dashed = self.state.with_file_name(DASHED_STATE);
+        fs::rename(&self.state, &dashed).unwrap();
+        self.state = dashed;
+        self.dashed = true;
+        self
     }
 
     /// Makes the session database, stamped at `position` as `failover enroll`
@@ -158,9 +176,14 @@ impl World {
         ))
         .unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_beep-boop"));
+        if self.dashed {
+            command
+                .arg(format!("--state-dir={DASHED_STATE}"))
+                .current_dir(self.state.parent().unwrap());
+        } else {
+            command.arg("--state-dir").arg(&self.state);
+        }
         command
-            .arg("--state-dir")
-            .arg(&self.state)
             .arg("--runtime")
             .arg(self.runtime.join("bridge.mjs"))
             .arg("--config")
@@ -317,6 +340,34 @@ fn a_start_without_failover_refuses_a_directory_that_holds_a_log_position_before
     assert_eq!(world.bridge(), None);
     assert_eq!(world.rex_calls(), None);
     assert!(world.helper_runs().is_empty());
+}
+
+#[test]
+fn a_start_without_failover_serves_a_directory_named_by_a_relative_path_that_begins_with_dashes() {
+    let world = World::new(Failover::Absent).with_dashed_relative_state();
+    world.session_database(None);
+    let supervisor = world.serve();
+    assert_eq!(world.bridge().unwrap(), json!({ "failover": null }));
+    drop(supervisor);
+}
+
+#[test]
+fn a_start_without_failover_refuses_a_replicated_directory_named_by_a_relative_path_that_begins_with_dashes()
+ {
+    let world = World::new(Failover::Absent)
+        .with_dashed_relative_state()
+        .with_coordinator_id();
+    world.session_database(Some(4));
+    let output = world.run();
+    let message = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{message}");
+    assert!(
+        message.contains("is a replicated state directory")
+            && message.contains("through position 4"),
+        "{message}"
+    );
+    assert!(!world.socket().exists());
+    assert_eq!(world.bridge(), None);
 }
 
 #[test]
