@@ -8,6 +8,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { SqliteDatabase } from "@earendil-works/chord/sqlite";
 import { createModels, fauxProvider } from "@earendil-works/pi-ai";
 import { createRegistry, Harness, type Registry, type Storage, type StorageWrite } from "@earendil-works/pi-durable";
+import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { openConversationDatabase } from "../../src/conversation-database.js";
 import { AuthorityClient } from "../../src/failover/authority-client.js";
 import type { AuthorityLink } from "../../src/failover/authority-link.js";
@@ -165,6 +166,12 @@ export async function openOwner(directory: string, link: AuthorityLink, options:
   const { storage, log } = await openReplicatedStorage(opened);
   try { return { database, storage, log, files: new ReplicatedFiles(log, opened), ...await openPi(storage, options) }; }
   catch (error) { await storage.close(BACKGROUND_CONTEXT).catch(() => {}); throw error; }
+}
+
+/** Commits as a coordinator without the commit barrier does. */
+export async function commitOutsideTheLog(directory: string, text: string): Promise<void> {
+  const { harness, root } = await openPi(await SqliteStorage.open(await openConversationDatabase(sessionPath(directory))));
+  try { await root.submit(note(text, `request-${text}`), BACKGROUND_CONTEXT); } finally { await harness.close(BACKGROUND_CONTEXT); }
 }
 
 export async function stage(directory: string, link: AuthorityLink, path: string, bytes: Uint8Array): Promise<StagedFile> {

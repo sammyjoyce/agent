@@ -108,6 +108,11 @@ export class Host {
       "serve", "--local-only", "--no-sources"], this.home);
   }
 
+  /** The command starts a coordinator on this state directory when none answers. */
+  clientWithoutFailover(...command: string[]): Promise<Run> {
+    return this.world.spawn([...this.arguments(false), ...command], this.home).done;
+  }
+
   start(...command: string[]): Running {
     return this.world.spawn([...this.arguments(true), "--json", "failover", ...command], this.home);
   }
