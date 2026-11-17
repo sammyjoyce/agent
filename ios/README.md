@@ -472,9 +472,10 @@ message shown, trimmed of surrounding spaces.
 The action refuses before it asks, and saves nothing, when the message is
 blank, longer than 1,000 characters, more than one line, or holds a character
 the confirmation cannot show, such as a control, format or tag character.
-Ordinary emoji pass. A message that starts with `/`, or is `?`, is a command
-the coordinator would run, and the action says "Beep Boop does not run
-commands from Siri." When the phone's protected data is unavailable, it says
+Ordinary emoji pass, but flags built from tag characters, such as England's,
+are refused. A message that starts with `/`, or is `?`, is a command the
+coordinator would run, and the action says "Beep Boop does not run commands
+from Siri." When the phone's protected data is unavailable, it says
 "Unlock your iPhone to send messages to Work. Nothing was sent."
 
 A confirmed message goes through the coordinator's saved outbox, as a
@@ -484,8 +485,12 @@ coordinator needs an update. The action waits 8 seconds in all for the
 connection and the coordinator's answer, then says one of these:
 
 - "Sent to Work." The coordinator accepted or placed the message.
-- "Saved on this iPhone, but Work has not confirmed it." No answer came in
-  time. The app sends the saved copy the next time it connects to Work.
+- "Saved on this iPhone, but Work has not confirmed it. Ask again to retry
+  this copy." No answer came in time. The copy stays on this iPhone, and
+  nothing sends it again by itself. Asking again writes it again under its
+  original input ID, as **Check / retry** in the app does. Each time the app
+  connects to Work, it asks Work about that input ID. If Work has the copy,
+  its row in the app reads Sent, and asking again says Work already has it.
 - "Work did not accept the message." or "Work reported a problem: …" The
   copy stays on this iPhone.
 - A sentence that ends "Nothing was sent." The phone saved nothing.
@@ -544,10 +549,13 @@ runs the App Shortcut from the Shortcuts app, which shows the confirmation,
 and checks that Cancel sends nothing. It skips when the Shortcuts app does not
 reach the confirmation. `testSendMessageToAPrivateCoordinator`
 runs against the real service with a synthetic model, served by
-`runtime/test/fixtures/siri-world.ts`, and checks that a retry after a lost
-reply starts one generation. It runs only when the test runner's
-`TEST_RUNNER_AGENT_SIRI_WORLD` names that world's relay port, control port
-and coordinator ID, and is skipped otherwise.
+`runtime/test/fixtures/siri-world.ts`. It loses the reply to one message and
+checks that the message runs once. It asks again only when the first answer
+is "saved", and then checks that the retry reuses the input ID.
+`runtime/test/siri-send.test.ts` checks against the real coordinator runtime
+that a write repeated under one input ID starts one generation. The UI test
+runs only when the test runner's `TEST_RUNNER_AGENT_SIRI_WORLD` names that
+world's relay port, control port and coordinator ID, and is skipped otherwise.
 
 ## Validation
 
