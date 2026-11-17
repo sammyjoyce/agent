@@ -581,8 +581,8 @@ out-of-process tests of Send Message check what follows it: the intent's
 value, what each fixture coordinator received, and the draft. A package test
 checks each sentence and each confirmation. `testShortcutsAsksBeforeItSends`
 runs the App Shortcut from the Shortcuts app, which shows the confirmation,
-and checks that Cancel sends nothing. It skips when the Shortcuts app does not
-reach the confirmation. `testSendMessageToAPrivateCoordinator`
+and checks that Cancel sends nothing. It fails when the Shortcuts app does not
+show the confirmation. `testSendMessageToAPrivateCoordinator`
 runs against the real service with a synthetic model, served by
 `runtime/test/fixtures/siri-world.ts`. It loses the reply to one message and
 checks that the message runs once. It asks again only when the first answer
