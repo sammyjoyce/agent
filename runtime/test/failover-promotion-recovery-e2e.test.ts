@@ -18,6 +18,25 @@ const KILL_POINTS: readonly { after: string; stop: FaultRule; release: boolean }
   { after: "activate", stop: { fault: { kind: "reply-late", release: never }, match: commands("activate") }, release: true },
 ];
 
+test("a release whose reply was lost posts nothing when it is run again, and reports the evidence the authority holds", { timeout: 60_000 }, async (t) => {
+  const world = await World.start(t), proxy = await startFaultProxy(t, world.authorityUrl);
+  const { owner, standby, epoch } = await replicatedPair(world, { owner: proxy.url });
+  const releases = () => proxy.seen.filter(commands("release")).length;
+  // Sealed by hand, so no promotion activates between the two releases.
+  assert.equal((await standby.link.command({ op: "promote", candidate: STANDBY, expected_epoch: epoch, attestation: null })).result, "accepted");
+
+  proxy.inject({ fault: { kind: "drop-after-apply" }, times: 1, match: commands("release") });
+  const lost = await owner.failover("release");
+  assert.notEqual(lost.code, 0, "the release that got no reply fails");
+  assert.equal(releases(), 1);
+
+  const again = await owner.receipt<ReleasedReceipt>("release");
+  assert.deepEqual(again, { coordinator_id: owner.coordinatorId, epoch, evidence: "lock_held", candidate: STANDBY, posted: false });
+  assert.equal(releases(), 1, "the rerun sent no second release");
+  assert.match(await owner.plain("release"), /already holds the old owner's stop evidence/);
+  assert.deepEqual((await standby.receipt<PromotedReceipt>("promote", "--replace-epoch", String(epoch))).evidence, { kind: "lock_held" });
+});
+
 test("a promotion that stops partway ends in the same state when it is run again", { timeout: 120_000 }, async (t) => {
   const world = await World.start(t);
 

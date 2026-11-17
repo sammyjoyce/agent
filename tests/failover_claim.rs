@@ -414,10 +414,14 @@ appendFileSync(join(__dirname, "operator-runs.ndjson"), process.argv[2] + "\n");
 const request = JSON.parse(process.argv[2]);
 const sealed = { kind: "sealed", epoch: 8, holder: "22222222-2222-4222-8222-222222222222",
   candidate: "33333333-3333-4333-8333-333333333333", head: 3 };
+const { existsSync } = require("node:fs");
+const vacant = (kind) => ({ kind: "vacant", epoch: 8, candidate: sealed.candidate, evidence: { kind }, head: 3 });
+// With this file, an earlier release already landed: the authority refuses the repeat and names the evidence it holds.
+const landed = existsSync(join(__dirname, "release-landed"));
 const report = request.op === "status"
   ? { result: "status", record: { state: sealed, checkpoint: { through: 0, manifest: "ab".repeat(32) } }, applied: null }
-  : { result: "reply", reply: { result: "accepted", state: { kind: "vacant", epoch: 8, candidate: sealed.candidate,
-      evidence: { kind: request.command.evidence }, head: 3 } } };
+  : { result: "reply", reply: landed ? { result: "refused", reason: "not_sealed", state: vacant("lock_held") }
+      : { result: "accepted", state: vacant(request.command.evidence) } };
 process.stdout.write(JSON.stringify(report) + "\n");
 "#;
 
@@ -477,6 +481,39 @@ fn a_start_refused_as_the_sealed_holder_posts_lock_held_and_exits_75_whether_or_
         message.contains("beep-boop failover release"),
         "a failed post names the command that posts the same evidence: {message}"
     );
+}
+
+#[test]
+fn a_release_that_the_authority_refuses_because_an_earlier_one_landed_is_reported_as_posted() {
+    let restarted = World::new(Failover::Holder)
+        .with_coordinator_id()
+        .with_operator();
+    fs::write(restarted.runtime.join("failover/release-landed"), "").unwrap();
+    restarted.answer(sealed(HOLDER), "", 0);
+    let output = restarted.run();
+    let message = stderr(&output);
+    assert_eq!(output.status.code(), Some(OWNER_FENCED), "{message}");
+    assert!(
+        message.contains("Told the failover authority"),
+        "the restarted sealed holder: {message}"
+    );
+    assert!(!message.contains("Could not tell"), "{message}");
+
+    let fenced = World::new(Failover::Holder)
+        .with_coordinator_id()
+        .with_operator();
+    fs::write(fenced.runtime.join("failover/release-landed"), "").unwrap();
+    fenced.answer(json!({ "result": "claimed", "epoch": 8, "head": 3 }), "", 0);
+    let running = fenced.serve();
+    fs::write(fenced.runtime.join("exit"), OWNER_FENCED.to_string()).unwrap();
+    let output = running.finish();
+    let message = stderr(&output);
+    assert_eq!(output.status.code(), Some(OWNER_FENCED), "{message}");
+    assert!(
+        message.contains("Told the failover authority"),
+        "the fenced owner: {message}"
+    );
+    assert!(!message.contains("Could not tell"), "{message}");
 }
 
 #[test]

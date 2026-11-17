@@ -81,7 +81,7 @@ test("promotion moves ownership to a standby only on stop evidence", { timeout: 
     alive.child.kill("SIGINT");
     await alive.done;
 
-    assert.deepEqual(await owner.receipt<ReleasedReceipt>("release"), { coordinator_id: coordinator, epoch, evidence: "lock_held", candidate: STANDBY });
+    assert.deepEqual(await owner.receipt<ReleasedReceipt>("release"), { coordinator_id: coordinator, epoch, evidence: "lock_held", candidate: STANDBY, posted: true });
     assert.deepEqual(await owner.authorityState(), { kind: "vacant", epoch, candidate: STANDBY, evidence: { kind: "lock_held" }, head });
 
     const promoted = await standby.receipt<PromotedReceipt>("promote", "--replace-epoch", String(epoch));

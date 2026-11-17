@@ -553,7 +553,41 @@ pub(crate) fn release_by_lock(
         epoch,
         evidence: ReleaseEvidence::LockHeld,
     };
-    match operator.run(session, &OperatorRequest::Authority { command })? {
+    released(
+        epoch,
+        operator.run(session, &OperatorRequest::Authority { command })?,
+    )
+}
+
+/// The stop evidence a sealed holder posted for `epoch`, with the candidate it
+/// was posted for, when the record holds it.
+fn release_evidence(
+    state: &AuthorityState,
+    epoch: OwnerEpoch,
+) -> Option<(ReleaseEvidence, HolderId)> {
+    let AuthorityState::Vacant {
+        epoch: vacant_at,
+        candidate,
+        evidence,
+        ..
+    } = state
+    else {
+        return None;
+    };
+    let evidence = match evidence {
+        StopEvidence::Released => ReleaseEvidence::Released,
+        StopEvidence::LockHeld => ReleaseEvidence::LockHeld,
+        StopEvidence::OperatorAttested { .. } => return None,
+    };
+    (*vacant_at == epoch).then_some((evidence, *candidate))
+}
+
+/// Whether the authority holds the stop evidence after a release at `epoch`.
+/// A release that finds the record already vacant with a holder's evidence at
+/// that epoch is a repeat: an earlier release landed and its reply was lost,
+/// or another process of this holder posted first.
+fn released(epoch: OwnerEpoch, report: OperatorReport) -> Result<()> {
+    match report {
         OperatorReport::Reply {
             reply: AuthorityReply::Accepted { .. },
         } => Ok(()),
@@ -564,6 +598,13 @@ pub(crate) fn release_by_lock(
             reason,
             state,
         }
+        OperatorReport::Reply {
+            reply:
+                AuthorityReply::Refused {
+                    reason: AuthorityRefusal::NotSealed,
+                    state: Some(state),
+                },
+        } if release_evidence(&state, epoch).is_some() => Ok(()),
         .into()),
         other => Err(unexpected("authority", &other)),
     }
@@ -583,6 +624,17 @@ pub fn release(state: &Path, script: &Path, config: &FailoverConfig) -> Result<R
         ..
     } = record.state
     else {
+    if let AuthorityState::Vacant { epoch, .. } = record.state
+        && let Some((evidence, candidate)) = release_evidence(&record.state, epoch)
+    {
+        return Ok(Released {
+            coordinator_id,
+            epoch,
+            evidence,
+            candidate,
+            posted: false,
+        });
+    }
         return Err(Refused {
             action: "this release",
             reason: AuthorityRefusal::NotSealed,
@@ -618,6 +670,7 @@ pub fn release(state: &Path, script: &Path, config: &FailoverConfig) -> Result<R
 /// its cleanup. It posts `released` only when the record is sealed at `epoch`
 /// with `session`'s holder, and only with the proof `lock_held` rests on: the
 /// writer lock, then no recorded process group alive and nothing holding
+        posted: true,
 /// `effects.lock`. A drain that returned is not that proof, because a helper
 /// it asked to exit may not have exited. It answers whether it posted.
 pub(crate) async fn post_released(
@@ -664,23 +717,13 @@ pub(crate) async fn post_released(
         epoch,
         evidence: ReleaseEvidence::Released,
     };
-    match operator
-        .run_within(&session, &OperatorRequest::Authority { command }, limit)
-        .await?
-    {
-        OperatorReport::Reply {
-            reply: AuthorityReply::Accepted { .. },
-        } => Ok(true),
-        OperatorReport::Reply {
-            reply: AuthorityReply::Refused { reason, state },
-        } => Err(Refused {
-            action: "this release",
-            reason,
-            state,
-        }
-        .into()),
-        other => Err(unexpected("authority", &other)),
-    }
+    released(
+        epoch,
+        operator
+            .run_within(&session, &OperatorRequest::Authority { command }, limit)
+            .await?,
+    )
+    .map(|()| true)
 }
 
 pub struct Promotion {

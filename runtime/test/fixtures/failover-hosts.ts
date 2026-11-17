@@ -37,7 +37,7 @@ export interface CheckpointedReceipt { coordinator_id: string; epoch: number; ch
   uploaded: { files: number; bytes: number; not_included: string[] } }
 export interface JoinedReceipt { coordinator_id: string; state_dir: string; through: number; files: number; bytes: number; replaced: string | null }
 export interface FollowedReceipt { coordinator_id: string; from: number; applied: number }
-export interface ReleasedReceipt { coordinator_id: string; epoch: number; evidence: string; candidate: string }
+export interface ReleasedReceipt { coordinator_id: string; epoch: number; evidence: string; candidate: string; posted: boolean }
 export interface PromotedReceipt { coordinator_id: string; holder: string; epoch: number; sealed_head: number; evidence: StopEvidence | null;
   missing_credentials: string[]; unfinished_tools: UnfinishedToolCall[]; unfinished_deliveries: UnfinishedDelivery[]; unreadable: string[] }
 
@@ -234,8 +234,8 @@ export function ownerActivity(owner: Host, notes: readonly string[], files: Read
 }
 
 /** An enrolled owner that has logged notes and a file, and a standby that joined at the checkpoint and has not followed. */
-export async function replicatedPair(world: World, urls: { standby?: string } = {}) {
-  const coordinator = world.coordinator(), owner = await world.host(coordinator, HOLDERS[0]), standby = await world.host(coordinator, HOLDERS[1], urls.standby);
+export async function replicatedPair(world: World, urls: { owner?: string; standby?: string } = {}) {
+  const coordinator = world.coordinator(), owner = await world.host(coordinator, HOLDERS[0], urls.owner), standby = await world.host(coordinator, HOLDERS[1], urls.standby);
   await owner.create();
   await owner.receipt<EnrolledReceipt>("enroll");
   await standby.receipt<JoinedReceipt>("join", coordinator);

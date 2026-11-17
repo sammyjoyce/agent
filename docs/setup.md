@@ -1007,6 +1007,9 @@ backup does, and the promotion releases the hold.
    and posts `lock_held` only when it finds nothing of the old coordinator alive
    on that host. If something survives that it may not stop, it names it and
    posts nothing. Stop the process and run the release again, or go to step 4.
+   A release that got no reply from the authority is safe to run again: when
+   the authority already holds the evidence, the command posts nothing and says
+   so.
    A fenced coordinator that is still running applies the same test before it
    posts `released`, and prints the same sentence when the test fails.
 4. If the old host cannot be reached, make sure it is powered off, then run

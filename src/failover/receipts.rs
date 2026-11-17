@@ -252,15 +252,31 @@ pub struct Released {
     pub epoch: OwnerEpoch,
     pub evidence: ReleaseEvidence,
     pub candidate: HolderId,
+    /// False when the authority already held this evidence, so this command
+    /// posted nothing.
+    pub posted: bool,
 }
 
 impl fmt::Display for Released {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.posted {
+            write!(
+                f,
+                "Released coordinator {} at epoch {}: no process of this state directory is alive.",
+                self.coordinator_id,
+                self.epoch.get(),
+            )?;
+        } else {
+            write!(
+                f,
+                "The authority already holds the old owner's stop evidence for coordinator {} at epoch {}, so this command posted nothing.",
+                self.coordinator_id,
+                self.epoch.get(),
+            )?;
+        }
         write!(
             f,
-            "Released coordinator {} at epoch {}: no process of this state directory is alive. Holder {} can now finish `beep-boop failover promote`.",
-            self.coordinator_id,
-            self.epoch.get(),
+            " Holder {} can now finish `beep-boop failover promote`.",
             self.candidate.get()
         )
     }
