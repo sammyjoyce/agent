@@ -20,8 +20,11 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 use crate::{
-    attachments::AttachmentRef, coordinator_id::CoordinatorId, protocol::RuntimeCommand,
-    runtime::WriterLock,
+    attachments::AttachmentRef,
+    coordinator_id::CoordinatorId,
+    dreams::DREAMS_DIRECTORY,
+    protocol::RuntimeCommand,
+    runtime::{WriterLock, diagnostics::UNRECORDED_START_STAMP},
 };
 
 const MANIFEST: &str = "manifest.json";
@@ -810,6 +813,8 @@ const STATE_ENTRIES: &[(EntryName, Disposition)] = &[
     (EntryName::Exact("scrawl-feedback.lock"), Disposition::Local),
     (EntryName::Exact("coordinator-id.tmp"), Disposition::Local),
     (EntryName::Exact(RESTORE_HOLD_FILE), Disposition::Local),
+    (EntryName::Exact(UNRECORDED_START_STAMP), Disposition::Local),
+    (EntryName::Exact(DREAMS_DIRECTORY), Disposition::Local),
 ];
 
 #[derive(Clone, Copy)]

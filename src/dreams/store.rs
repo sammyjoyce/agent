@@ -17,6 +17,7 @@ use crate::dreams::{
 
 const STALE_STAGING: Duration = Duration::from_secs(60 * 60);
 
+pub(crate) const DREAMS_DIRECTORY: &str = "dreams";
 const RUNS_DIRECTORY: &str = "runs";
 const REVIEW_DIRECTORY: &str = "review";
 const REVIEW_STAGING_PREFIX: &str = ".review-";
@@ -115,7 +116,7 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 
 impl DreamsStore {
     pub fn open(state: &Path) -> Result<Self> {
-        let root = state.join("dreams");
+        let root = state.join(DREAMS_DIRECTORY);
         private_directory(&root)
             .and_then(|()| private_directory(&root.join(RUNS_DIRECTORY)))
             .context("Dreams state is unavailable")?;
