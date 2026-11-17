@@ -509,10 +509,14 @@ which coordinator or jobs they show, by identifier alone, so no message text
 is part of it.
 
 **Spotlight** finds each saved coordinator by name, and each scheduled job by
-title, with its coordinator and its run state, such as "Work, Interrupted". A
-result opens through Open Coordinator or Open Job, so the composer draft stays
-as it is. Nothing else is indexed: no message, prompt, working directory,
-schedule, run time or output. The app writes one named index,
+title, with its coordinator and its run state, such as "Work, Interrupted".
+iOS hands a tap on a result to the app as a `CSSearchableItemActionType`
+activity that names the item. The app then opens that coordinator or job the
+way Open Coordinator and Open Job do, so the composer draft stays as it is. A
+job opens once its coordinator has listed it. A result whose coordinator or
+job is gone opens nothing, and a notice over the feed says why. Nothing else
+is indexed: no message, prompt, working directory, schedule, run time or
+output. The app writes one named index,
 `coordinators-and-jobs`, with the complete file protection class, so its
 contents should not be readable while the phone is locked. That is inferred
 from the protection class. No simulator enforces it, and it was not measured
