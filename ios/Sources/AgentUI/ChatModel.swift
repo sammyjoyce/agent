@@ -136,6 +136,7 @@ final class ChatModel {
       endAnsweredQuestion()
       followScope()
       pushFeedbackTarget()
+      indexSaved()
     }
   }
   /// The scope last asked for, as saved. Only `show(_:)` changes it.
@@ -167,8 +168,10 @@ final class ChatModel {
       endAnsweredQuestion()
       followScope()
       pushFeedbackTarget()
+      indexSaved()
     }
   }
+  private func indexSaved() { spotlight?.save(profiles.filter { removed[$0.id] == nil }) }
   /// What the composer holds. A draft changed in code replaces the field's text, composition
   /// included, so all of it is committed.
   var draft = "" {
@@ -316,6 +319,7 @@ final class ChatModel {
   var draftError: String?
   @ObservationIgnored private let persistence: ComposerDraftStore?
   @ObservationIgnored private let sharedInbox: SharedDraftInbox?
+  @ObservationIgnored let spotlight: SpotlightIndex?
   @ObservationIgnored private var persistentRevision: UInt64 = 0
   @ObservationIgnored private var composerID = UUID()
   @ObservationIgnored private var consumedTransfers: Set<UUID> = []
@@ -361,13 +365,14 @@ final class ChatModel {
     inspecting conversation: SavedConversation? = nil,
     draftStore: AttachmentStore? = nil, persistence: ComposerDraftStore? = nil,
     sharedInbox: SharedDraftInbox? = nil, registration: NotificationRegistration? = nil,
-    scope preference: ScopePreference = .memory,
+    scope preference: ScopePreference = .memory, spotlight: SpotlightIndex? = nil,
     admit: @escaping Admit = { deliver in await deliver() }
   ) {
     inspectedConversation = conversation
     self.draftStore = draftStore
     self.persistence = persistence
     self.sharedInbox = sharedInbox
+    self.spotlight = spotlight
     draftReady = persistence == nil
     self.registration = registration
     self.admit = admit
@@ -872,7 +877,9 @@ final class ChatModel {
     for session in sessions { await session.retire() }
   }
   func jobs(_ id: String? = nil, lane: ProfileID) async throws -> NativeJobStatus {
-    try await onLane(lane) { try await $0.jobs(id) }
+    let status = try await onLane(lane) { try await $0.jobs(id) }
+    if case .list(let listing) = status { spotlight?.list(listing.jobs, of: lane) }
+    return status
   }
   func retryJob(_ id: String, lane: ProfileID) async throws -> ScheduledJobStatus {
     try await onLane(lane) { try await $0.retryJob(id) }

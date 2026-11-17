@@ -199,10 +199,12 @@ recovery; [history](history.md) describes import and retrieval.
   native chat clients.
 - [ ] Bring the iPhone app's actions and content to Siri and Shortcuts through
   App Intents. **Open Coordinator**, **Open Job**, **Retry Interrupted Run**,
-  **Send Message**, reading jobs, and onscreen coordinators and jobs ship, with
-  a build check that the app carries its intents metadata and phrases. Send
-  Message asks before it sends, sends one confirmed copy through the outbox,
-  and never runs a command. Spotlight follows.
+  **Send Message**, reading jobs, onscreen coordinators and jobs, and
+  coordinators and jobs in Spotlight ship, with a build check that the app
+  carries its intents metadata and phrases. Send Message asks before it sends,
+  sends one confirmed copy through the outbox, and never runs a command. These
+  checks on a real iPhone remain: Siri by voice, and Send Message and the
+  Spotlight index on a locked phone.
 - [ ] A macOS menu bar app that shows Beep Boop's status on the Mac, including
   whether the service is running and its installed and running versions.
 - [ ] Typed read and write access to Apple Notes, Reminders, Mail and Messages
