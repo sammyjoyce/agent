@@ -145,11 +145,11 @@ test("a delegate keeps its conversation, allocation and delegated input when the
     const task = await app.tasks.get(before.task_id);
     assert.equal(task.conversation_id, before.conversation_id); assert.deepEqual(task.worker, before.worker);
     assert.deepEqual(task.pending.map((input) => input.content), ["Inspect the board repository"]);
-    await app.tasks.revokeAllocation(task.id, before.worker.allocation_id);
-    const bound = await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
-    assert.ok(bound.worker.state === "bound");
-    const recovered = await within(app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: bound.worker.allocation_id,
-      binding, instructions: "", model: fixtureModel, cwd: host.cwd }, () => () => {}),
+    // A session-less workspace claim cannot be discarded through task revocation.
+    // The exact original worker must positively prove its native presence.
+    const recovered = await within(app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: before.worker.allocation_id,
+      binding, instructions: "", model: fixtureModel, cwd: host.cwd }, () => () => {}, [],
+      async () => ({ type: "worker_presence", presence: { state: "present", running: true } })),
     "The delegate must run the input that delegate_task admitted before the kill");
     assert.equal(recovered.text, "Recovered the delegated work."); assert.equal(recovered.conversation_id, before.conversation_id);
     assert.equal(await delegatedInputs(app, task), 1);

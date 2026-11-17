@@ -121,6 +121,19 @@ const ConversationOwner = defineDocFamily<{ task_id: string | null; agent_id: st
   initial: () => ({ task_id: null, agent_id: null }), checkpointWhen: () => true });
 const ConfinedConversation = defineDocFamily<{ confined: boolean }, null>({ kind: "agent.task.confined", scope: "session", family: true, version: 1,
   initial: () => ({ confined: false }), checkpointWhen: () => true });
+// Session scope is the durable coordinator namespace; host keys never select
+// user sessions. A claim without a binding survives an unanswered create.
+const WorkerWorkspace = defineDocFamily<{ claim: string | null; owner: string | null; session_id: string | null; binding: WorkerRef | null; retired: string[]; revision: number }, null>({
+  kind: "agent.worker.workspace", scope: "session", family: true, version: 1,
+  initial: () => ({ claim: null, owner: null, session_id: null, binding: null, retired: [], revision: 0 }), checkpointWhen: () => true });
+function workspaceKey(host: WorkerHost): string {
+  return JSON.stringify([host.host_id ?? host.name]);
+}
+function sameWorkerClaim(current: WorkerState | undefined, expected: WorkerState): boolean {
+  return current !== undefined && current.state === expected.state && "allocation_id" in current &&
+    "allocation_id" in expected && current.allocation_id === expected.allocation_id &&
+    "binding" in current && "binding" in expected && sameBinding(current.binding, expected.binding);
+}
 function conversationIdentity(value: unknown): value is ConversationId {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
@@ -228,6 +241,7 @@ export class TaskStore {
   /** Turns a Stop ended, as opposed to a pause, which aborts the same signal but keeps the actor's inputs. */
   private readonly stoppedTurns = new WeakSet<AbortController>();
   private readonly resuming = new Set<string>();
+  private readonly workspaceTurns = new Map<string, Promise<unknown>>();
   private readonly nativeIds = new Map<string, ConversationId>();
   private resources: { attach(taskId: string): Promise<void> } | undefined;
   private outcomes: OutcomeSink | undefined;
@@ -983,19 +997,26 @@ export class TaskStore {
     return this.get(id);
   }
   private async allocation(id: string, operation: AllocationOperation,
-    change: (task: TaskRecord) => { result: AllocationResult; reason: string }, agentId?: string): Promise<TaskRecord> {
+    change: (task: TaskRecord, tx: Tx) => { result: AllocationResult; reason: string } | Promise<{ result: AllocationResult; reason: string }>, agentId?: string): Promise<TaskRecord> {
     const actor = this.actor(await this.get(id), agentId);
     const conversation = await this.conversation(actor.conversation_id);
     await this.session.commit(async (tx) => {
       let previous: WorkerState | undefined;
       let current: WorkerState | undefined;
       let decision: { result: AllocationResult; reason: string } | undefined;
-      await this.updateIn(tx, id, (task) => {
+      await this.updateIn(tx, id, async (task) => {
         previous = this.savedWorker(this.actor(task, agentId).worker);
-        decision = change(task);
+        decision = await change(task, tx);
         current = this.savedWorker(this.actor(task, agentId).worker);
       });
       if (previous === undefined || current === undefined || decision === undefined) throw new TaskError("Allocation decision did not commit");
+      if (current.state === "bound") {
+        const workspace = await tx.doc(WorkerWorkspace, workspaceKey(current.host), null);
+        if (workspace.binding?.session_id === current.binding.session_id && workspace.binding.host_id === current.binding.host_id) {
+          if (decision.result.type === "spawned") workspace.binding = { ...current.binding };
+          workspace.revision = (workspace.revision ?? 0) + 1;
+        }
+      }
       await tx.appendEntry(AllocationDecisionEntry, conversation.id, { data: { task_id: id,
         ...(agentId === undefined ? {} : { agent_id: agentId }), operation, previous, current, ...decision } });
     }, BACKGROUND_CONTEXT);
@@ -1329,11 +1350,11 @@ export class TaskStore {
       throw new TaskError("Worker allocation changed; its late creation result was ignored");
     }
   }
-  async dispatch(id: string, host: WorkerHost, call: HostCall): Promise<TaskRecord> {
+  async dispatch(id: string, host: WorkerHost, call: HostCall, origin?: WorkerRef): Promise<TaskRecord> {
     await this.resources?.attach(id);
-    return this.ownThenPresent({ task_id: id }, () => this.presentPane(id, host, call));
+    return this.ownThenPresent({ task_id: id }, () => this.presentPane(id, host, call, origin));
   }
-  private async presentPane(id: string, host: WorkerHost, call: HostCall): Promise<TaskRecord> {
+  private async presentPane(id: string, host: WorkerHost, call: HostCall, origin?: WorkerRef): Promise<TaskRecord> {
     let current = await this.get(id);
     if (current.worker.state === "allocating" || current.worker.state === "uncertain") {
       throw new TaskError("Worker allocation needs reconciliation; no duplicate session was created");
@@ -1410,7 +1431,7 @@ export class TaskStore {
       task.worker = { state: "allocating", allocation_id, host };
       return { result: { type: "pending" }, reason: "Claimed one new session before requesting native creation" };
     });
-    return this.spawn(id, current.title, host, allocation_id, call);
+    return this.spawn(id, current.title, host, allocation_id, call, origin);
   }
   private async inspect(binding: WorkerRef, call: HostCall) {
     try {
@@ -1424,13 +1445,58 @@ export class TaskStore {
       throw new TaskError("Worker resume changed; its late result was ignored");
     }
   }
+  private workspaceTurn<T>(host: WorkerHost, action: () => Promise<T>): Promise<T> {
+    const key = workspaceKey(host);
+    const turn = (this.workspaceTurns.get(key) ?? Promise.resolve()).catch(() => {}).then(action);
+    this.workspaceTurns.set(key, turn);
+    return turn.finally(() => { if (this.workspaceTurns.get(key) === turn) this.workspaceTurns.delete(key); });
+  }
+  /** Only exact native not-found authorizes retirement. A durable retired session
+   * is a fence for every old allocation, including late replies and attachments. */
+  private async retireMissingWorkspace(host: WorkerHost, expected: WorkerRef, call: HostCall, guard?: { id: string; previous: WorkerState }): Promise<void> {
+    const saved = await this.session.commit(async tx => {
+      const doc = await tx.doc(WorkerWorkspace, workspaceKey(host), null);
+      if (guard !== undefined) {
+        const current = (await this.taskIn(tx, guard.id))?.worker;
+        if (!sameWorkerClaim(current, guard.previous)) throw new TaskError("The worker allocation changed during recovery");
+      }
+      return doc.binding === null ? null : { binding: { ...doc.binding }, revision: doc.revision ?? 0 };
+    }, BACKGROUND_CONTEXT);
+    if (saved === null || !sameBinding(saved.binding, expected)) return;
+    if ((await this.inspect(saved.binding, call))?.state !== "missing_session") return;
+    await this.session.commit(async tx => {
+      const doc = await tx.doc(WorkerWorkspace, workspaceKey(host), null);
+      if (guard !== undefined && !sameWorkerClaim((await this.taskIn(tx, guard.id))?.worker, guard.previous)) {
+        throw new TaskError("The worker allocation changed during recovery");
+      }
+      if (doc.binding === null || (!sameBinding(doc.binding, saved.binding) || (doc.revision ?? 0) !== saved.revision)) return;
+      (doc.retired ??= []).push(saved.binding.session_id);
+      doc.binding = null; doc.claim = null; doc.owner = null; doc.session_id = null; doc.revision = (doc.revision ?? 0) + 1;
+      for await (const task of this.recordsStore.valuesIn(tx)) {
+        for (const actor of [task, ...task.agents]) {
+          const worker = actor.worker;
+          if (("binding" in worker && worker.binding.host_id === saved.binding.host_id && worker.binding.session_id === saved.binding.session_id) ||
+              (worker.state === "uncertain" && worker.session_id === saved.binding.session_id && recordedHostId(worker) === saved.binding.host_id)) {
+            actor.worker = { state: "unassigned" }; task.updated_at = Date.now();
+          }
+        }
+      }
+    }, BACKGROUND_CONTEXT);
+  }
   private async reopen(id: string, previous: Extract<WorkerState, { state: "bound" | "resuming" | "resume_uncertain" }>, call: HostCall): Promise<TaskRecord> {
     const host = await this.workerHost(id);
+    await this.workspaceTurn(host, () => this.retireMissingWorkspace(host, previous.binding, call, { id, previous }));
+    const refreshed = await this.get(id);
+    const retired = refreshed.worker.state === "unassigned";
     const allocation_id = randomUUID();
     const task = await this.allocation(id, "reopen", (task) => {
-      if (!("binding" in task.worker) || task.worker.state !== previous.state) throw new TaskError("The worker allocation changed during recovery");
-      if (task.worker.allocation_id !== previous.allocation_id ||
-          !sameBinding(task.worker.binding, previous.binding)) throw new TaskError("The worker allocation changed during recovery");
+      if (retired) {
+        if (task.worker.state !== "unassigned") throw new TaskError("The worker allocation changed during recovery");
+      } else {
+        if (!("binding" in task.worker) || task.worker.state !== previous.state) throw new TaskError("The worker allocation changed during recovery");
+        if (task.worker.allocation_id !== previous.allocation_id ||
+            !sameBinding(task.worker.binding, previous.binding)) throw new TaskError("The worker allocation changed during recovery");
+      }
       task.worker = { state: "allocating", allocation_id, host };
       for (const agent of task.agents) {
         if (agent.worker.state !== "unassigned") agent.worker = { state: "unassigned" };
@@ -1439,18 +1505,93 @@ export class TaskStore {
     });
     return this.spawn(id, task.title, host, allocation_id, call);
   }
-  private async spawn(id: string, title: string, host: WorkerHost, allocation_id: string, call: HostCall): Promise<TaskRecord> {
+  private async spawn(id: string, title: string, host: WorkerHost, allocation_id: string, call: HostCall, origin?: WorkerRef): Promise<TaskRecord> {
     let result: HostResult;
-    try { result = await call({ type: "spawn_worker", host, task_id: id, allocation_id, title }); }
-    catch {
-      await this.allocation(id, "create", (task) => {
-        this.requireAllocation(task.worker, allocation_id);
-        task.worker = { state: "uncertain", allocation_id, host, session_id: null };
-        return { result: { type: "creation_uncertain", session_id: null }, reason: "New session creation returned no confirmed receipt" };
+    let transportFailed = false;
+    // Feedback origin is an explicit security binding, never an owned workspace.
+    if (origin !== undefined) {
+      try { result = await call({ type: "spawn_worker", host, task_id: id, allocation_id, title, parent: origin }); }
+      catch { transportFailed = true; result = { type: "creation_uncertain", session_id: null }; }
+    } else {
+      const key = workspaceKey(host);
+      // Serialize siblings in this process; the durable claim also excludes a
+      // second process and survives a crash between RPC and receipt persistence.
+      const ownedClaim = await this.session.commit(async tx => {
+        const saved = await tx.doc(WorkerWorkspace, key, null);
+        return saved.binding === null && saved.claim !== null && saved.owner === id;
+      }, BACKGROUND_CONTEXT);
+      if (ownedClaim) {
+        await this.allocation(id, "create", task => {
+          this.requireAllocation(task.worker, allocation_id); task.worker = { state: "unassigned" };
+          return { result: { type: "not_started", message: "Workspace claim retained" }, reason: "An earlier workspace claim owns this task" };
+        });
+        throw new TaskError("Workspace creation needs reconciliation; an earlier claim cannot be revoked through a task");
+      }
+      const turn = this.workspaceTurn(host, async (): Promise<HostResult> => {
+        const known = await this.session.commit(async tx => {
+          const saved = await tx.doc(WorkerWorkspace, key, null);
+          return saved.binding === null ? null : { ...saved.binding };
+        }, BACKGROUND_CONTEXT);
+        if (known !== null) await this.retireMissingWorkspace(host, known, call);
+        let workspace: WorkerRef | undefined;
+        let claimed = false;
+        await this.session.commit(async (tx) => {
+          const saved = await tx.doc(WorkerWorkspace, key, null);
+          if (saved.binding !== null) workspace = { ...saved.binding };
+          else if (saved.claim !== null) return;
+          else { saved.claim = allocation_id; saved.owner = id; claimed = true; }
+        }, BACKGROUND_CONTEXT);
+        if (workspace === undefined && !claimed) return { type: "not_started",
+          message: "Workspace creation is unconfirmed; reconcile its durable claim before creating another session" };
+        let result: HostResult;
+        try { result = await call({ type: "spawn_workspace_worker", host, task_id: id, allocation_id,
+          title: title.replace(/[\r\n\t]/g, " ").slice(0, 80), workspace: workspace ?? null }); }
+        catch { transportFailed = true; result = { type: "creation_uncertain", session_id: workspace?.session_id ?? null }; }
+        await this.session.commit(async (tx) => {
+          const saved = await tx.doc(WorkerWorkspace, key, null);
+          const worker = (await this.taskIn(tx, id))?.worker;
+          // The worker may have proved this exact allocation while its create
+          // RPC was still in flight. Only the completion transaction below can
+          // validate that receipt; never overwrite its proven workspace here.
+          if (worker?.state === "bound" && worker.allocation_id === allocation_id) return;
+          if (workspace !== undefined) {
+            if ((saved.retired ?? []).includes(workspace.session_id)) {
+              result = { type: "creation_uncertain", session_id: workspace.session_id };
+            } else if (result.type === "spawned" && (result.binding.host_id !== workspace.host_id ||
+                result.binding.session_id !== workspace.session_id)) {
+              result = { type: "creation_uncertain", session_id: workspace.session_id };
+            } else if (result.type === "spawned" && saved.binding !== null && sameBinding(saved.binding, workspace)) saved.binding = result.binding;
+          } else if (saved.claim === allocation_id) {
+            if (result.type === "spawned" && (host.host_id == null || result.binding.host_id === host.host_id)) saved.binding = result.binding;
+            else if (result.type === "not_started") { saved.claim = null; saved.owner = null; }
+            else if (result.type === "creation_uncertain") saved.session_id = result.session_id;
+            else if (result.type === "spawned") result = { type: "creation_uncertain", session_id: result.binding.session_id };
+            // Never clear an unanswered claim, including after restart.
+          }
+        }, BACKGROUND_CONTEXT);
+        return result;
       });
-      throw new TaskError("Worker creation could not be confirmed; reconcile it before retrying");
+      result = await turn;
     }
-    const task = await this.allocation(id, "create", (task) => {
+    let provedCompletion = false;
+    const task = await this.allocation(id, "create", async (task, tx) => {
+      const worker = task.worker;
+      if (worker.state === "bound" && worker.allocation_id === allocation_id) {
+        const workspace = await tx.doc(WorkerWorkspace, workspaceKey(host), null);
+        const sameHost = workspaceKey(worker.host) === workspaceKey(host) &&
+          (host.host_id == null || worker.binding.host_id === host.host_id);
+        const matching = result.type === "spawned" && sameBinding(result.binding, worker.binding) &&
+          result.binding.rex_instance_id === worker.binding.rex_instance_id;
+        const lost = (result.type === "creation_uncertain" &&
+          (result.session_id === null || result.session_id === worker.binding.session_id)) ||
+          (result.type === "failed" && result.delivery !== "not_started");
+        if (!sameHost || (workspace.retired ?? []).includes(worker.binding.session_id) || (!matching && !lost)) {
+          throw new TaskError("Worker creation receipt disagrees with its confirmed allocation or binding");
+        }
+        provedCompletion = true;
+        return { result: { type: "spawned", binding: { ...worker.binding } },
+          reason: "The original worker proved this exact allocation before its creation RPC settled" };
+      }
       this.requireAllocation(task.worker, allocation_id);
       if (result.type === "spawned") task.worker = { state: "bound", allocation_id, host, binding: result.binding };
       else if (result.type === "not_started") task.worker = { state: "unassigned" };
@@ -1461,6 +1602,7 @@ export class TaskStore {
           ? "Worker creation did not start; no session was created" : "New session creation remains uncertain and cannot be repeated" };
     });
     if (result.type === "not_started") throw notStarted(result.message);
+    if (transportFailed && !provedCompletion) throw new TaskError("Worker creation could not be confirmed; reconcile it before retrying");
     return task;
   }
   private async finishOutcome(id: string, conversationId: string, entryId: string, answer: string): Promise<TaskOutcome> {
@@ -1551,23 +1693,33 @@ export class TaskStore {
     const deadline = Date.now() + 10_000;
     let task = await this.get(input.task_id);
     let actor = this.actor(task, input.agent_id);
-    while ((actor.worker.state === "allocating" || actor.worker.state === "resuming") && Date.now() < deadline) {
+    const startingHost = actor.worker.state === "allocating" ? actor.worker.host : undefined;
+    const earlyPresence = startingHost !== undefined && call !== undefined
+      ? await this.inspect(input.binding, command => call(command, startingHost, new AbortController().signal))
+      : undefined;
+    while ((actor.worker.state === "allocating" || actor.worker.state === "resuming") && Date.now() < deadline && !(earlyPresence?.state === "present" && earlyPresence.running)) {
       await new Promise<void>((resolve) => setTimeout(resolve, 25));
       task = await this.get(input.task_id);
       actor = this.actor(task, input.agent_id);
     }
-    const created = actor.worker.state === "uncertain" ? actor.worker : undefined;
+    const created = actor.worker.state === "uncertain" ? actor.worker : actor.worker.state === "allocating" ? { ...actor.worker, session_id: null } : undefined;
     const createdHostId = created === undefined ? null : recordedHostId(created);
     if (created !== undefined && call !== undefined && created.allocation_id === input.allocation_id &&
         (createdHostId === null || createdHostId === input.binding.host_id) &&
         (created.session_id === null || created.session_id === input.binding.session_id)) {
       const signal = new AbortController().signal;
-      const presence = await this.inspect(input.binding, (command) => call(command, created.host, signal));
+      const presence = earlyPresence ?? await this.inspect(input.binding, (command) => call(command, created.host, signal));
       if (presence?.state === "present" && presence.running) {
-        task = await this.allocation(input.task_id, "reconcile", (saved) => {
+        task = await this.allocation(input.task_id, "reconcile", async (saved, tx) => {
           const current = this.actor(saved, input.agent_id);
-          if (current.worker.state !== "uncertain" || current.worker.allocation_id !== created.allocation_id ||
-              current.worker.session_id !== created.session_id) throw new TaskError("Worker allocation changed; its late claim was ignored");
+          if ((current.worker.state !== "uncertain" && current.worker.state !== "allocating") || current.worker.allocation_id !== created.allocation_id ||
+              ("session_id" in current.worker ? current.worker.session_id : null) !== created.session_id) throw new TaskError("Worker allocation changed; its late claim was ignored");
+          const workspace = await tx.doc(WorkerWorkspace, workspaceKey(created.host), null);
+          if ((workspace.retired ?? []).includes(input.binding.session_id)) throw new TaskError("Worker binding is not confirmed: workspace generation was retired");
+          if (input.agent_id === undefined && workspace.binding === null && workspace.owner === input.task_id &&
+              workspace.claim === input.allocation_id && (workspace.session_id === null || workspace.session_id === input.binding.session_id)) {
+            workspace.binding = { ...input.binding };
+          }
           current.worker = { state: "bound", allocation_id: created.allocation_id, host: created.host, binding: { ...input.binding } };
           return { result: { type: "presence", presence },
             reason: "The terminal that started confirmed its own allocation after the create reply was lost" };
@@ -1597,6 +1749,11 @@ export class TaskStore {
         }
       }
     }
+    const owningHost = actor.worker.state === "unassigned" ? undefined : actor.worker.host;
+    const retired = owningHost === undefined ? false : await this.session.commit(async tx =>
+      (await tx.doc(WorkerWorkspace, workspaceKey(owningHost), null)).retired?.includes(input.binding.session_id) ?? false,
+      BACKGROUND_CONTEXT);
+    if (retired) throw new TaskError("Worker binding is not confirmed: workspace generation was retired");
     if (actor.worker.state !== "bound" || actor.worker.allocation_id !== input.allocation_id ||
         !sameBinding(actor.worker.binding, input.binding)) {
       throw new TaskError("Worker binding is not confirmed for this task");

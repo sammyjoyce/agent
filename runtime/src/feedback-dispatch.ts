@@ -49,8 +49,7 @@ export class FeedbackDispatcher {
       `Read agent --json feedback show ${bundle.id} for the private diagnostic context. Keep that context private and preserve unrelated work.\n\n` +
       "User feedback: " + bundle.description;
     await this.tasks.enqueue(taskId, input, "feedback:" + bundle.id, undefined, undefined, bundle.context.attachments);
-    const dispatched = await this.tasks.dispatch(taskId, host, (command) => call(command.type === "spawn_worker" &&
-      command.task_id === taskId && context.binding !== null ? { ...command, parent: context.binding } : command));
+    const dispatched = await this.tasks.dispatch(taskId, host, call, context.binding ?? undefined);
     if (dispatched.worker.state !== "bound") {
       throw new TaskError(`Feedback ${bundle.id} is retained on task ${taskId}, but its debugging terminal was not confirmed.`);
     }

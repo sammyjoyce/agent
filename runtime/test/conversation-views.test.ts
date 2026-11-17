@@ -347,7 +347,7 @@ test("imported views and settings are inert; actual input uses one normal Rex ac
       task_id: null, agent_id: null, change: { type: "set_reasoning", reasoning: "high" }, catalog: false });
     assert.deepEqual(await app.tasks.list(), [], "Changing an imported view's model must not adopt or execute it");
     let spawns = 0;
-    const call: HostCall = async (command) => { assert.equal(command.type, "spawn_worker"); if (command.type !== "spawn_worker") throw new Error("Unexpected host operation");
+    const call: HostCall = async (command) => { assert.equal(command.type, "spawn_workspace_worker"); if (command.type !== "spawn_workspace_worker") throw new Error("Unexpected host operation");
       assert.equal(command.host.cwd, "/example/project"); spawns += 1; return { type: "spawned", binding }; };
     const receipts: RuntimeEventKind[] = [];
     await app.views.input(input(saved.conversation_id, "first", "Continue this hardware work"), call, (event) => receipts.push(event));
@@ -484,7 +484,7 @@ test("active child steering reuses its actor and closed child or task folders re
     await app.views.input(input(child.conversation_id, "fourth", "Continue after closing the task folder"), async (command) => {
       const operation = local(command);
       if (operation.type === "inspect_worker") return { type: "worker_presence", presence: { state: "missing_session" } };
-      if (operation.type === "spawn_worker") { folders += 1; return { type: "spawned", binding: nextParent }; }
+      if (operation.type === "spawn_workspace_worker") { folders += 1; return { type: "spawned", binding: nextParent }; }
       assert.equal(operation.type, "spawn_subagent"); if (operation.type !== "spawn_subagent") throw new Error("Unexpected folder recovery");
       assert.equal(operation.parent.session_id, nextParent.session_id); panes += 1; return { type: "spawned", binding: nextChild };
     }, () => {});
@@ -518,7 +518,7 @@ test("a stale child missing-folder read cannot replace a parent folder confirmed
         if (inspected === 1) { entered(); await gate; return { type: "worker_presence", presence: { state: "missing_session" } }; }
         return { type: "worker_presence", presence: { state: "present", running: true } };
       }
-      if (operation.type === "spawn_worker") { folders += 1; return { type: "spawned", binding }; }
+      if (operation.type === "spawn_workspace_worker") { folders += 1; return { type: "spawned", binding }; }
       if (operation.type === "spawn_subagent") return { type: "spawned", binding: childBinding };
       throw new Error("Unexpected recovery operation");
     });
@@ -571,7 +571,7 @@ test("two missing child folders share parent recovery and retain both admitted i
         inspected += 1; if (inspected <= 2) { if (inspected === 2) bothEntered(); await inspections; }
         return { type: "worker_presence", presence: { state: "missing_session" } };
       }
-      if (operation.type === "spawn_worker") { folders += 1; creating(); await creation; return { type: "spawned", binding: next }; }
+      if (operation.type === "spawn_workspace_worker") { folders += 1; creating(); await creation; return { type: "spawned", binding: next }; }
       assert.equal(operation.type, "spawn_subagent"); if (operation.type !== "spawn_subagent") throw new Error("Unexpected recovery");
       assert.equal(operation.parent.session_id, next.session_id); panes += 1;
       return { type: "spawned", binding: { ...next, block_id: operation.agent_id } };
@@ -681,7 +681,7 @@ test("continuing a chatgpt conversation uses the default host", { timeout: 10_00
     await view.detach();
     const spawned: [string | null | undefined, string][] = [];
     const call: HostCall = async (command) => {
-      if (command.type !== "spawn_worker") throw new Error("Unexpected host operation");
+      if (command.type !== "spawn_workspace_worker") throw new Error("Unexpected host operation");
       spawned.push([command.host.host_id, command.host.cwd]); return { type: "spawned", binding };
     };
     await app.views.input(input(saved.conversation_id, "continue", "Continue the picnic plan"), call, () => {});

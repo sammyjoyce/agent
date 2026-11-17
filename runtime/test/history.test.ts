@@ -432,7 +432,7 @@ test("native tools search and inspect several historical candidates before expli
       matches: [{ entry_id: result.entry_ids.at(-1)!, text: "Related historical quote", source_refs: [] }] }));
     const unbind = app.executions.bind(root.id.toString(), { cwd: host.cwd, hosts: [host], model: fixtureModel,
       async search(_query, _refs, _limit, mode = "semantic") { queries += 1; modes.push(mode); return { candidates, gaps: [] }; }, async call(command) {
-        if (command.type === "spawn_worker") { creates += 1; return { type: "spawned", binding }; }
+        if (command.type === "spawn_workspace_worker") { creates += 1; return { type: "spawned", binding }; }
         assert.equal(command.type, "resume_worker"); resumes += 1; return { type: "written" };
       } });
     const lastResult = (context: TranscriptContext): unknown => {

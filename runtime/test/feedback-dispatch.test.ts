@@ -117,7 +117,7 @@ test("concurrent raw CLI feedback opens one initial repair folder and reuses it 
     const raw = { ...context, binding: null };
     const first = await app.store.capture("First report.", raw), second = await app.store.capture("Second report.", raw);
     const call: HostCall = async (command) => {
-      if (command.type === "spawn_worker") { assert.equal(command.parent, undefined); spawns += 1; return { type: "spawned", binding }; }
+      if (command.type === "spawn_workspace_worker") { assert.equal(command.workspace, null); spawns += 1; return { type: "spawned", binding }; }
       assert.equal(command.type, "resume_worker"); return { type: "written" };
     };
     const [left, right] = await Promise.all([app.dispatcher.dispatch(first, call), app.dispatcher.dispatch(second, call)]);

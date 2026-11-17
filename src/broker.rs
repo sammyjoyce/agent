@@ -463,7 +463,9 @@ fn target(command: &HostCommand) -> Option<&str> {
         HostCommand::ResourceInspect { record }
         | HostCommand::ResourcePlanCleanup { record }
         | HostCommand::ResourceCollect { record, .. } => Some(&record.host_id),
-        HostCommand::SpawnWorker { host, .. } => host.host_id.as_deref(),
+        HostCommand::SpawnWorker { host, .. } | HostCommand::SpawnWorkspaceWorker { host, .. } => {
+            host.host_id.as_deref()
+        }
         HostCommand::SpawnSubagent { parent, .. } => Some(&parent.host_id),
         HostCommand::ResumeWorker { binding, .. }
         | HostCommand::ResumeAgentWorker { binding, .. }

@@ -61,7 +61,7 @@ test("timer and manual runs reuse one background job conversation with each admi
     assert.equal(task.conversation_id, conversationId); assert.equal((await app.tasks.list()).length, 1);
     const page = await conversation.entries({}, 100, undefined, BACKGROUND_CONTEXT);
     assert.equal(page.items.filter((entry) => entry.model?.some((message) => message.role === "user")).length, 3);
-    assert.equal(app.commands.filter((command) => command.type === "spawn_worker").length, 0);
+    assert.equal(app.commands.filter((command) => command.type === "spawn_workspace_worker").length, 0);
     assert.equal(app.commands.filter((command) => command.type === "resume_worker").length, 0);
     assert.deepEqual((await scheduler.status()).errors, []);
     await app.tasks.update(task.id, (saved) => { saved.model = { ...original.model, model_id: "retired-model" }; });

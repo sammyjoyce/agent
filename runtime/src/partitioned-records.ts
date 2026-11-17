@@ -45,6 +45,16 @@ export class PartitionedRecords<T extends JsonObject> {
     if (slot.value === null) throw new Error("Partitioned record was not admitted");
     return { value: slot.value, inserted };
   }
+  /** Transactional inventory for atomic ownership-generation transitions. */
+  async *valuesIn(tx: Tx): AsyncIterable<Draft<T>> {
+    const { count } = await tx.doc(this.directory);
+    for (let page = 0; page < Math.ceil(count / PAGE_SIZE); page++) {
+      for (const key of (await tx.doc(this.pages, String(page), null)).keys) {
+        const value = await this.valueIn(tx, key);
+        if (value !== undefined) yield value;
+      }
+    }
+  }
   async get(session: Harness, key: string): Promise<T | undefined> {
     return (await session.snapshot(this.records, key, BACKGROUND_CONTEXT))?.value ?? undefined;
   }

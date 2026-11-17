@@ -203,8 +203,28 @@ with task metadata as a fallback. Read relevant originals before choosing;
 several conversations may inform one task. [History](history.md) owns the
 retrieval details.
 
-Interactive tasks own a top-level Rex session on their execution host. Child
-agents have independent conversations and named terminals inside that session.
+New interactive task terminals share one coordinator-owned Rex session per
+execution host. A session-scoped durable host claim precedes its first create;
+siblings use the exact confirmed session identity and get named windows. Child
+agents have independent conversations and named windows inside their task's
+session. Existing bound tasks retain their legacy sessions; nothing is moved,
+closed or adopted from ambient Rex selection, labels or other tasks. Explicit
+feedback origin bindings remain separate and never seed workspace ownership.
+
+An unanswered first create fences that host workspace across restart, even if
+its task allocation is revoked. The original root worker can repair its exact
+claim only after positive native presence verification, in the same transaction
+as its task binding. Child, feedback-origin and legacy bindings cannot repair it.
+
+Authoritative not-found for the exact known session retires its generation and
+fences all recorded task/child allocations atomically, preserving conversations,
+pending inputs and running coordinator actors. One serialized replacement claim
+then serves concurrent siblings and lazy re-presentation of existing work.
+Transport errors do not authorize retirement. A newer confirmed worker or
+workspace revision invalidates stale absence observations. After a Rex restart,
+an existing session can be reused only after positive verification of its exact
+recorded pane and host under the current native identity; no label adoption.
+
 They return results to their parent; the parent returns the outcome to the
 main chat. The same task cannot acquire a second active execution. Recent task
 activity promotes its session in the host's sidebar.

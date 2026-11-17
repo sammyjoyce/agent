@@ -80,8 +80,8 @@ test("native main observation survives idle, correlates notices, streams text an
       let command = frame.event.command; while (command.type === "on_node") command = command.command;
       if (command.type === "exec") { held = { request: frame.id, call: frame.event.call_id }; continue; }
       if (command.type === "attachment_write" && command.attachment.id === "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa") send(67, { type: "main_interrupt" });
-      if (command.type === "spawn_worker") feedbackSpawns += 1;
-      const result: HostResult = command.type === "spawn_worker" ? { type: "spawned", binding: { host_id: command.host.host_id ?? "11111111-1111-4111-8111-111111111111",
+      if ((command.type === "spawn_worker" || command.type === "spawn_workspace_worker")) feedbackSpawns += 1;
+      const result: HostResult = (command.type === "spawn_worker" || command.type === "spawn_workspace_worker") ? { type: "spawned", binding: { host_id: command.host.host_id ?? "11111111-1111-4111-8111-111111111111",
         session_id: "session:22222222-2222-4222-8222-222222222222", window_id: "window:33333333-3333-4333-8333-333333333333", block_id: "block:44444444-4444-4444-8444-444444444444" } }
         : command.type === "attachment_write" ? { type: "attachment_written", next_offset: command.offset + Buffer.from(command.data_base64, "base64").length,
         path: command.complete ? `/invented/execution-host/${command.attachment.id}` : null }

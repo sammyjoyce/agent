@@ -503,6 +503,26 @@ impl RexClient {
         Ok(view)
     }
 
+    /// Dedicated workspace ownership is durable in the coordinator, not inferred
+    /// from this display label. Its first task gets a named window too.
+    pub async fn create_workspace_session(
+        &self,
+        title: &str,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+    ) -> Result<WorkerBinding, RexError> {
+        let mut request = CreateRequest::worker(title, program, args, cwd)?;
+        request.label = "Beep Boop".to_owned();
+        request.initial_windows[0].window_label = title.to_owned();
+        request.initial_windows[0].layout.block.label = title.to_owned();
+        let output = self
+            .api("session.create", &request)
+            .await
+            .map_err(|error| creation_failure(error, None))?;
+        decode_creation(&output)
+    }
+
     /// One native create attempt. Lost or malformed receipts never authorize a retry.
     pub async fn create_session(
         &self,

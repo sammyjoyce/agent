@@ -1394,6 +1394,14 @@ pub enum HostCommand {
         allocation_id: String,
         title: String,
     },
+    /// Distinct command so older hosts reject workspace routing before effects.
+    SpawnWorkspaceWorker {
+        host: WorkerHost,
+        workspace: Option<WorkerRef>,
+        task_id: TaskId,
+        allocation_id: String,
+        title: String,
+    },
     SpawnSubagent {
         host: WorkerHost,
         parent: WorkerRef,

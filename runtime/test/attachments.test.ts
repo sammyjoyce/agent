@@ -175,7 +175,7 @@ test("Pi receives native images and delegation keeps immutable files on each act
   const tools = createAppTools(tasks, executions); registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker); registry.install(tools.agent);
   const writes: string[] = [];
   const call = (machine: string): HostCall => async (command) => {
-    if (command.type === "spawn_worker") return { type: "spawned", binding };
+    if (command.type === "spawn_workspace_worker") return { type: "spawned", binding };
     if (command.type !== "attachment_write") throw new Error(`Unexpected attachment effect ${command.type}`);
     const bytes = Buffer.from(command.data_base64, "base64"); assert.ok(bytes.length <= ATTACHMENT_CHUNK_BYTES);
     writes.push(machine + ":" + command.attachment.id);

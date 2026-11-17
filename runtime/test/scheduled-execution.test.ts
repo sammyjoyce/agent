@@ -62,7 +62,7 @@ test("background children execute, report and continue through their original sa
     const retained = await app.tasks.conversation(child.conversation_id);
     assert.deepEqual((await retained.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items.slice(0, original.length), original);
     assert.equal((await app.session.commit((tx) => tx.submissionByRequest(retained.id, "child-followup"), BACKGROUND_CONTEXT))?.status, "done");
-    assert.equal(app.commands.some((command) => command.type === "spawn_worker" || command.type === "spawn_subagent" || command.type === "resume_agent_worker"), false);
+    assert.equal(app.commands.some((command) => command.type === "spawn_workspace_worker" || command.type === "spawn_subagent" || command.type === "resume_agent_worker"), false);
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -109,7 +109,7 @@ test("an existing interactive job actor drains a scheduled occurrence without wa
     assert.equal(closed, false, "The old interactive transport remains attached after its scheduled answer");
     const conversation = await app.tasks.conversation(task.conversation_id);
     assert.equal((await app.session.commit((tx) => tx.submissionByRequest(conversation.id, scheduledOccurrence.id), BACKGROUND_CONTEXT))?.status, "done");
-    assert.equal(app.commands.some((command) => command.type === "spawn_worker" || command.type === "resume_worker"), false);
+    assert.equal(app.commands.some((command) => command.type === "spawn_workspace_worker" || command.type === "resume_worker"), false);
   } finally { release(); controller.abort(); await running?.catch(() => {}); await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
 

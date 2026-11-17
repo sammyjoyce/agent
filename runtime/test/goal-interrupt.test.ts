@@ -47,7 +47,7 @@ async function goalRuntime(responses: Record<string, ModelStep[]>) {
         runtime.execs.push(exec); runtime.held ??= exec;
         for (const watcher of [...watchers]) watcher(); continue;
       }
-      const result: HostResult = command.type === "spawn_worker" ? { type: "spawned", binding }
+      const result: HostResult = command.type === "spawn_workspace_worker" ? { type: "spawned", binding }
         : command.type === "inspect_worker" ? { type: "worker_presence", presence: { state: "present", running: true } }
         : command.type === "reload_guidance" ? { type: "shared_guidance", global: { text: "", sources: [] }, workflow_policy: "",
           context_repositories: [], context_sources: [] }

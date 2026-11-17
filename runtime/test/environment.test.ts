@@ -192,7 +192,7 @@ test("main chat keeps its Pi history and coordinator default while a laptop disc
       if (command.command.type === "project_guidance") return { type: "project_guidance", snapshot: { text: `Current project on ${node.name}.`, sources: [] } };
       if (command.command.type === "exec") return { type: "process", exit_code: 0, stdout: node.name, stderr: "", truncated: false };
     }
-    if (command.type === "spawn_worker") {
+    if (command.type === "spawn_workspace_worker") {
       assert.ok((await app.environment.environment()).online_host_ids.includes(command.host.host_id ?? ""));
       return { type: "spawned", binding: { host_id: command.host.host_id ?? "", session_id: `session:${randomUUID()}`,
         window_id: `window:${randomUUID()}`, block_id: `block:${randomUUID()}` } };
@@ -292,7 +292,7 @@ test("main chat keeps its Pi history and coordinator default while a laptop disc
       assert.ok(command.type === "on_node" && command.command.type === "exec");
       assert.equal(command.host_id, coordinator.host_id); assert.equal(command.command.cwd, coordinator.home_directory);
     }
-    const spawns = commands.filter((command) => command.type === "spawn_worker");
+    const spawns = commands.filter((command) => command.type === "spawn_workspace_worker");
     assert.deepEqual(spawns.map((command) => command.host.host_id), [laptop.host_id, coordinator.host_id, coordinator.host_id, coordinator.host_id, laptop.host_id]);
     const resumed = commands.filter((command) => command.type === "resume_worker");
     assert.equal(resumed.length, 1); assert.equal(resumed[0]?.task_id, old.id); assert.deepEqual(resumed[0]?.binding, original.binding);

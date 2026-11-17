@@ -26,7 +26,7 @@ if (moment === "working") root = (await attachMainAndSpawnedWorkers(app, new Abo
 else {
   root = await app.session.root(BACKGROUND_CONTEXT);
   app.executions.bind(root.id.toString(), { model: fixtureModel, cwd: host.cwd, hosts: [host], call: async (command) => {
-    if (command.type !== "spawn_worker") throw new Error("Unexpected host effect: " + command.type);
+    if (command.type !== "spawn_workspace_worker") throw new Error("Unexpected host effect: " + command.type);
     const task = await app.tasks.get(command.task_id);
     report({ task_id: task.id, conversation_id: task.conversation_id, worker: task.worker });
     return new Promise(() => {});

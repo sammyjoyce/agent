@@ -117,7 +117,7 @@ test("confirmed session loss reopens the same history while its actor keeps work
     const reopened = await app.tasks.dispatch(task.id, host, async (command) => {
       if (command.type === "on_node") { assert.equal(command.host_id, binding.host_id); assert.equal(command.command.type, "inspect_worker"); return { type: "worker_presence", presence: { state: "missing_session" } }; }
       if (command.type === "resume_worker") return { type: "failed", message: "The session no longer exists", delivery: "not_started" };
-      assert.equal(command.type, "spawn_worker"); creates += 1; return { type: "spawned", binding: replacement };
+      assert.equal(command.type, "spawn_workspace_worker"); creates += 1; return { type: "spawned", binding: replacement };
     });
     assert.equal(app.tasks.isRunning(task.id), true, "Presenting a new session must not stop the actor that is still working");
     assert.equal(app.faux.state.callCount, 1);
@@ -154,7 +154,7 @@ test("a failed Rex resume retains its binding for a later retry without substitu
     await app.tasks.enqueue(task.id, "Keep this request", "pending"); let creates = 0;
     const original = await app.tasks.get(task.id);
     await assert.rejects(app.tasks.dispatch(task.id, host, async (command) => {
-      if (command.type === "spawn_worker") creates += 1;
+      if (command.type === "spawn_workspace_worker") creates += 1;
       return { type: "failed", delivery: "not_started", message: "The owning host is unreachable" };
     }), /resume failed/);
     const retained = await app.tasks.get(task.id);
@@ -519,8 +519,8 @@ test("delegation persists the chosen repository cwd and bound tasks reuse it", a
     const root = await app.session.root(BACKGROUND_CONTEXT);
     const cwd = "/workspace/board"; let nativeCalls = 0;
     const release = app.executions.bind(root.id.toString(), { model: fixtureModel, cwd: host.cwd, hosts: [host], call: async (command) => {
-      assert.ok(command.type === "spawn_worker" || command.type === "resume_worker");
-      if (command.type !== "spawn_worker" && command.type !== "resume_worker") throw new Error("Expected a task worker");
+      assert.ok(command.type === "spawn_workspace_worker" || command.type === "resume_worker");
+      if (command.type !== "spawn_workspace_worker" && command.type !== "resume_worker") throw new Error("Expected a task worker");
       assert.equal(command.host.cwd, cwd); nativeCalls += 1;
       return { type: "spawned", binding };
     } });
@@ -574,7 +574,7 @@ test("allocation is committed before the native create and concurrent dispatch c
     let calls = 0;
     const call = async (command: HostCommand): Promise<HostResult> => {
       calls += 1;
-      assert.equal(command.type, "spawn_worker");
+      assert.equal(command.type, "spawn_workspace_worker");
       const saved = await app.tasks.get(task.id);
       assert.equal(saved.worker.state, "allocating"); assert.equal(saved.pending.length, 1);
       return { type: "spawned", binding };
@@ -605,7 +605,7 @@ test("a root create that Rex never received leaves the task unassigned and the n
     await app.tasks.enqueue(task.id, "Keep this request", "retained");
     const allocations: string[] = [];
     const spawn = (result: HostResult) => async (command: HostCommand): Promise<HostResult> => {
-      if (command.type !== "spawn_worker") throw new Error(`Unexpected ${command.type}`);
+      if (command.type !== "spawn_workspace_worker") throw new Error(`Unexpected ${command.type}`);
       allocations.push(command.allocation_id); return result;
     };
     await assert.rejects(app.tasks.dispatch(task.id, host, spawn({ type: "not_started", message: "Rex CLI or server is unavailable" })),
@@ -663,7 +663,7 @@ for (const outcome of ["failed", "thrown"] as const) {
       if (outcome === "thrown") await assert.rejects(created, /could not be confirmed/); else await created;
       assert.equal((await app.tasks.get(root.id)).worker.state, "uncertain");
       const parent = await app.tasks.create({ title: "Parent", outcome: "Keep child uncertainty", model: fixtureModel });
-      await app.tasks.dispatch(parent.id, host, async () => ({ type: "spawned", binding }));
+      await app.tasks.dispatch(parent.id, { ...host, name: "separate-host" }, async () => ({ type: "spawned", binding }));
       const child = await app.tasks.createAgent(parent.id, { id: "review", title: "Review", outcome: "Review the change", input: "Inspect.", inputId: "review-input" });
       await app.tasks.dispatchAgent(parent.id, child.id, fail);
       assert.equal((await app.tasks.get(parent.id)).agents[0]?.worker.state, "uncertain");
@@ -710,12 +710,10 @@ for (const transition of ["spawn", "spawn-error"]) {
       void original.catch(() => {}); await started;
       const allocating = await app.tasks.get(task.id); if (allocating.worker.state !== "allocating") throw new Error("Expected allocation");
       await app.tasks.revokeAllocation(task.id, allocating.worker.allocation_id);
-      const replacementBinding = { ...binding, session_id: "session:88888888-8888-4888-8888-888888888888" };
-      const replacement = await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding: replacementBinding }));
-      assert.equal(replacement.worker.state, "bound");
+      await assert.rejects(app.tasks.dispatch(task.id, host, async () => { throw new Error("No duplicate create"); }), /earlier claim cannot be revoked/);
       release(); await assert.rejects(original, /late creation result was ignored/);
       const current = await app.tasks.get(task.id);
-      assert.deepEqual(current.worker, replacement.worker); assert.equal(current.pending.length, 1);
+      assert.equal(current.worker.state, "unassigned"); assert.equal(current.pending.length, 1);
       await assert.rejects(app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: allocating.worker.allocation_id,
         binding, instructions: "", cwd: host.cwd, model: fixtureModel }, () => { throw new Error("No old attachment"); }), /binding is not confirmed/);
       assert.equal(app.faux.state.callCount, 0);
@@ -960,6 +958,10 @@ test("a lost create's claim is refused unless its allocation, host, session and 
       assert.deepEqual(retained.worker, before.worker); assert.deepEqual(retained.pending, before.pending);
       assert.equal(app.faux.state.callCount, 0);
     }
+    const sibling = await app.tasks.create({ title: "Fenced sibling", outcome: "Do not adopt unproven ownership" });
+    let siblingCalls = 0;
+    await assert.rejects(app.tasks.dispatch(sibling.id, ownedHost, async () => { siblingCalls++; return { type: "spawned", binding }; }), /durable claim/);
+    assert.equal(siblingCalls, 0, "Wrong allocation/host/session or non-running/unknown presence cannot repair workspace ownership");
     app.faux.setResponses([fauxAssistantMessage("The exact claim ran")]);
     assert.equal((await claim(allocationId, binding, running)).text, "The exact claim ran");
     assert.deepEqual((await app.tasks.get(task.id)).worker, { state: "bound", allocation_id: allocationId, host: before.worker.host, binding });
@@ -1198,3 +1200,89 @@ test("worker tools reject unrelated task writes and oversized reads while main m
     releaseMain?.(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("workspace claims fence unrelated tasks after lost create and task revocation across reopen", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-workspace-")); let app = await open(directory);
+  try {
+    const first = await app.tasks.create({ title: "First", outcome: "Retain ownership" });
+    await assert.rejects(app.tasks.dispatch(first.id, host, async () => { throw new Error("Ambiguous create"); }));
+    const saved = await app.tasks.get(first.id); assert.ok(saved.worker.state === "uncertain");
+    await app.tasks.revokeAllocation(first.id, saved.worker.allocation_id);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    const second = await app.tasks.create({ title: "Second", outcome: "Do not duplicate" });
+    let calls = 0;
+    await assert.rejects(app.tasks.dispatch(second.id, host, async () => { calls++; return { type: "spawned", binding }; }), /durable claim/);
+    assert.equal(calls, 0);
+    assert.equal((await app.tasks.get(second.id)).worker.state, "unassigned");
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("workspace scope isolates hosts and coordinator databases, and ignores legacy sessions", async () => {
+  const one = await mkdtemp(join(tmpdir(), "agent-workspace-one-")), two = await mkdtemp(join(tmpdir(), "agent-workspace-two-"));
+  const a = await open(one), b = await open(two);
+  try {
+    const commands: HostCommand[] = [];
+    const call = async (command: HostCommand): Promise<HostResult> => { commands.push(command); return { type: "spawned", binding }; };
+    for (const [app, node] of [[a, host], [a, { ...host, name: "remote" }], [b, host]] as const) {
+      const task = await app.tasks.create({ title: "Scoped", outcome: "Isolate" });
+      await app.tasks.dispatch(task.id, node, call);
+    }
+    assert.equal(commands.length, 3);
+    for (const command of commands) {
+      assert.ok(command.type === "spawn_workspace_worker");
+      assert.equal(command.workspace, null, "A different host/coordinator cannot adopt an existing binding");
+    }
+  } finally {
+    await a.session.close(BACKGROUND_CONTEXT); await b.session.close(BACKGROUND_CONTEXT);
+    await rm(one, { recursive: true, force: true }); await rm(two, { recursive: true, force: true });
+  }
+});
+
+for (const completion of ["matching", "lost", "uncertain", "wrong-pane", "wrong-host", "wrong-instance", "different-allocation", "newer-binding", "retired", "revoked"] as const) {
+  test(`native-proven early root adoption reconciles only its exact in-flight create: ${completion}`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-early-adoption-")); const app = await open(directory);
+    let release = () => {}; let dispatch: Promise<unknown> | undefined;
+    try {
+      const task = await app.tasks.create({ title: "In-flight ownership", outcome: "Keep the proven original", model: fixtureModel });
+      let started = () => {}; const entered = new Promise<void>(resolve => { started = resolve; });
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const stamped = { ...binding, rex_instance_id: "66666666-6666-4666-8666-666666666666" };
+      dispatch = app.tasks.dispatch(task.id, ownedHost, async () => {
+        started(); await gate;
+        if (completion === "lost") throw new Error("Lost application receipt");
+        if (completion === "uncertain") return { type: "creation_uncertain", session_id: stamped.session_id };
+        return { type: "spawned", binding: { ...stamped,
+          ...(completion === "wrong-pane" ? { block_id: "block:77777777-7777-4777-8777-777777777777" } : {}),
+          ...(completion === "wrong-host" ? { host_id: "77777777-7777-4777-8777-777777777777" } : {}),
+          ...(completion === "wrong-instance" ? { rex_instance_id: "77777777-7777-4777-8777-777777777777" } : {}) } };
+      });
+      void dispatch.catch(() => {}); await entered;
+      const allocating = await app.tasks.get(task.id); assert.ok(allocating.worker.state === "allocating");
+      if (completion === "revoked") await app.tasks.revokeAllocation(task.id, allocating.worker.allocation_id);
+      else {
+        await app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: allocating.worker.allocation_id,
+          binding: stamped, model: fixtureModel, instructions: "", cwd: host.cwd }, () => () => {}, [],
+          async () => ({ type: "worker_presence", presence: { state: "present", running: true } }));
+        if (completion === "different-allocation") await app.tasks.update(task.id, saved => {
+          assert.ok(saved.worker.state === "bound"); saved.worker.allocation_id = "replacement-allocation";
+        });
+        if (completion === "newer-binding") await app.tasks.update(task.id, saved => {
+          assert.ok(saved.worker.state === "bound"); saved.worker.binding = { ...stamped, block_id: "block:88888888-8888-4888-8888-888888888888" };
+        });
+        if (completion === "retired") {
+          const otherStore = new TaskStore(app.session, new ConversationModels());
+          const sibling = await otherStore.create({ title: "Replacement generation", outcome: "Retire absent original" });
+          await otherStore.dispatch(sibling.id, ownedHost, async command => command.type === "on_node"
+            ? { type: "worker_presence", presence: { state: "missing_session" } }
+            : { type: "spawned", binding: { ...stamped, session_id: "session:88888888-8888-4888-8888-888888888888" } });
+        }
+      }
+      const proven = await app.tasks.get(task.id);
+      release();
+      if (["matching", "lost", "uncertain"].includes(completion)) await dispatch;
+      else await assert.rejects(dispatch, /disagrees|late creation result was ignored/);
+      assert.deepEqual((await app.tasks.get(task.id)).worker, proven.worker, "Late settlement must not replace proven or revoked state");
+      assert.equal(app.faux.state.callCount, 0);
+    } finally { release(); await dispatch?.catch(() => {}); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+  });
+}

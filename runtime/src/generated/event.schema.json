@@ -3115,6 +3115,45 @@
           ]
         },
         {
+          "description": "Distinct command so older hosts reject workspace routing before effects.",
+          "type": "object",
+          "properties": {
+            "allocation_id": {
+              "type": "string"
+            },
+            "host": {
+              "$ref": "#/$defs/WorkerHost"
+            },
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            },
+            "title": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "spawn_workspace_worker"
+            },
+            "workspace": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkerRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "host",
+            "task_id",
+            "allocation_id",
+            "title"
+          ]
+        },
+        {
           "type": "object",
           "properties": {
             "agent_id": {
