@@ -107,7 +107,9 @@ test("an owner the authority no longer answers, or has replaced, starts no effec
     owner.proxy.inject({ fault: { kind: "hold", release: approval.released }, match: confirmsAfter("asked-then-suspended") });
     await world.script("fixture-suspended", [mark(world, "asked-then-suspended"), { text: "A replaced owner must not answer." }]);
     const sent = world.sending(owner, "fixture-suspended");
-    await world.until(async () => owner.proxy.seen.some((request) => commands("confirm")(request) && !request.forwarded), "The owner must ask to confirm before it sends the host call");
+    // Any confirm is unforwarded while it is on its way, so the wait names the one the proxy holds: the first after the tool call was logged.
+    await world.until(async () => owner.proxy.seen.some((request) => commands("confirm")(request) && !request.forwarded && confirmedAfterMarker(owner, "asked-then-suspended", request)),
+      "The owner must ask to confirm before it sends the host call");
     world.suspend(owner);
     const before = world.tables(owner);
     const promoted = await world.promote({ replaceEpoch: 2, statement: STATEMENT });
