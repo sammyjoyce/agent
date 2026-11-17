@@ -597,13 +597,20 @@ func completeFilesWithoutAReceiptCompileWithoutAskingToDownload() async throws {
 }
 
 private actor HeldFiles {
-  private var files = SpeechModel.missing(download: 609_440_571)
+  private var files: SpeechModel
+  private let cellular: Bool
   private var holding = false
   private var failing = false
   private var held: [CheckedContinuation<Void, Never>] = []
   private(set) var installs = 0
 
-  var reading: Bool { !held.isEmpty }
+  init(_ files: SpeechModel = .missing(download: 609_440_571), cellular: Bool = false) {
+    self.files = files
+    self.cellular = cellular
+  }
+
+  var waiting: Bool { !held.isEmpty }
+  var usage: Int64 { files == .missing(download: 609_440_571) ? 0 : 609_440_571 }
   func hold() { holding = true }
   func failInstalls() { failing = true }
   func release(finding found: SpeechModel? = nil) {
@@ -613,9 +620,18 @@ private actor HeldFiles {
     held = []
   }
 
-  func read() async -> SpeechModel {
+  private func wait() async {
     if holding { await withCheckedContinuation { held.append($0) } }
+  }
+
+  func read() async -> SpeechModel {
+    await wait()
     return files
+  }
+
+  func remove() async {
+    await wait()
+    files = .missing(download: 609_440_571)
   }
 
   func install() async throws {
@@ -629,7 +645,8 @@ private actor HeldFiles {
     let scripted = ScriptedSpeech().engine
     return SpeechEngine(
       model: { await self.read() }, install: { _ in try await self.install() }, prewarm: {},
-      remove: {}, diskUsage: { 0 }, onCellular: { false }, permission: scripted.permission,
+      remove: { await self.remove() }, diskUsage: { await self.usage },
+      onCellular: { self.cellular }, permission: scripted.permission,
       requestPermission: scripted.requestPermission, record: scripted.record)
   }
 }
@@ -640,7 +657,7 @@ private actor HeldFiles {
   try await until("missing") { dictation.model == .missing(download: 609_440_571) }
   await files.hold()
   dictation.setForeground(true)
-  try await until("the check reads the files") { await files.reading }
+  try await until("the check reads the files") { await files.waiting }
   dictation.download()
   return dictation
 }
@@ -692,5 +709,27 @@ func aDownloadTappedDuringACheckThatFailsIsNotRetried() async throws {
   try await Task.sleep(for: .milliseconds(200))
   let installs = await files.installs
   #expect(installs == 1, "Only Try again downloads again")
+  #expect(dictation.model == .missing(download: 609_440_571))
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: ["a removal", "a check"])
+func aMicTapOnCompleteFilesOffersTheDownloadIfTheyAreGoneAfter(_ work: String) async throws {
+  let files = HeldFiles(.missing(download: 0), cellular: true)
+  let dictation = Dictation(engine: files.engine)
+  dictation.setForeground(true)
+  try await until("complete files") { dictation.model == .missing(download: 0) }
+  #expect(dictation.diskUsage == 609_440_571)
+  await files.hold()
+  if work == "a removal" { dictation.removeModel() } else { dictation.setForeground(true) }
+  try await until("\(work) holds the files") { await files.waiting }
+  tap(dictation, DictationTarget(chat: ChatModel()))
+  #expect(dictation.model == .missing(download: 0), "Nothing starts during \(work)")
+  await files.release(finding: .missing(download: 609_440_571))
+  try await until("the offer or a download") {
+    await files.installs > 0 || dictation.offering != nil
+  }
+  let installs = await files.installs
+  #expect(installs == 0, "Only an answer to the offer downloads")
+  #expect(dictation.offering == Dictation.Offer(bytes: 609_440_571, cellular: true))
   #expect(dictation.model == .missing(download: 609_440_571))
 }
