@@ -297,6 +297,44 @@ for (const [name, connect] of Object.entries(authorities)) {
     assert.deepEqual(await retainedFiles(directory), await retainedFiles(standby), "the cleanup removes it from the owner");
   });
 
+  test(`${name}: a discarded upload leaves the owner, the log's files and a standby that already held it`, async (t) => {
+    const link = await connect(), epoch = await enroll(link), directory = await stateDirectory(t), standby = await stateDirectory(t);
+    const owner = await openOwner(directory, link, { epoch });
+    t.after(() => owner.harness.close(context));
+    const { attachments } = storesOf(owner);
+    const kept = await upload(attachments, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", Buffer.from("Invented kept upload"));
+    const discarded = await upload(attachments, "cccccccc-cccc-4ccc-8ccc-cccccccccccc", Buffer.from("Invented discarded upload"));
+    await follow(standby, link);
+    assert.equal(Object.keys(await retainedFiles(standby)).filter((path) => path.includes(discarded.id)).length, 2, "the standby holds the upload before the discard");
+    assert.deepEqual(await attachments.request({ type: "discard", id: discarded.id }), { type: "discarded" });
+    const remaining = [`attachments/${kept.id}/content`, `attachments/${kept.id}/metadata.json`];
+    assert.deepEqual(Object.keys(await retainedFiles(directory)).sort(), remaining);
+    assert.deepEqual([...(await loggedFiles(link)).keys()].sort(), remaining, "the log no longer names the discarded upload");
+    await follow(standby, link);
+    assert.deepEqual(await retainedFiles(standby), await retainedFiles(directory), "the standby holds what the owner holds");
+    assert.equal(existsSync(join(standby, "attachments", discarded.id)), false, "the upload's directory is gone from the standby");
+  });
+
+  test(`${name}: a discard that stopped after the authority applied its entry is finished by the restart`, async (t) => {
+    const link = await connect(), epoch = await enroll(link), directory = await stateDirectory(t), stopped = new AbortController();
+    const owner = await openOwner(directory, link, { epoch, signal: stopped.signal });
+    const { attachments } = storesOf(owner);
+    const ref = await upload(attachments, "dddddddd-dddd-4ddd-8ddd-dddddddddddd", Buffer.from("Invented upload whose discard is cut off"));
+    link.afterApplied = (command) => {
+      if (command.op !== "append" || command.entry.removed.length === 0) return;
+      stopped.abort();
+      throw new AuthorityUnreachable("The process stopped once the authority applied the removal and its reply was lost");
+    };
+    await assert.rejects(attachments.request({ type: "discard", id: ref.id }), /Stopped waiting for the authority/);
+    assert.equal(Object.keys(await retainedFiles(directory)).length, 2, "the stopped owner still holds the upload");
+    await owner.harness.close(context).catch(() => {});
+    link.afterApplied = () => {};
+    const restarted = await openOwner(directory, link, { epoch });
+    t.after(() => restarted.harness.close(context));
+    assert.deepEqual(await retainedFiles(directory), {}, "the catch-up on open removes what the log removed");
+    assert.deepEqual(await storesOf(restarted).attachments.request({ type: "discard", id: ref.id }), { type: "discarded" }, "a repeat of the discard finds nothing left to remove");
+  });
+
   test(`${name}: admission that retains an attachment, and one that restores it, leave the same metadata on owner and standby`, async (t) => {
     const link = await connect(), epoch = await enroll(link), directory = await stateDirectory(t), standby = await stateDirectory(t);
     const owner = await openOwner(directory, link, { epoch });

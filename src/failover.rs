@@ -272,8 +272,8 @@ pub struct LoggedBatch {
     pub body: BatchBody,
 }
 
-/// One replication log entry: the files a commit needs, then the commit. A
-/// file-only entry has no batch.
+/// One replication log entry: the files a commit needs, the paths the owner
+/// removed, then the commit. An entry that only names or removes files has no batch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct LogEntry {
@@ -283,6 +283,9 @@ pub struct LogEntry {
     pub digest: Sha256Hex,
     pub versions: Versions,
     pub files: Vec<FileRecord>,
+    /// Each path is a file or a whole directory tree. A standby removes them
+    /// after it gives this entry's files their names.
+    pub removed: Vec<StatePath>,
     pub batch: Option<LoggedBatch>,
 }
 
@@ -871,6 +874,7 @@ mod tests {
                 "digest": "ab".repeat(32),
                 "versions": { "application": "0.1.0", "pi_durable": "1.4.0", "chord": "1.4.0" },
                 "files": [],
+                "removed": [],
             });
             if let (Some(entry), Some(fields)) = (entry.as_object_mut(), fields.as_object()) {
                 entry.extend(fields.clone());
@@ -883,6 +887,10 @@ mod tests {
         assert!(entry(serde_json::json!({ "batch": { "body": inline.clone() } })).is_err());
         assert!(entry(serde_json::json!({ "batch": { "pi_seq": 4, "body": inline } })).is_ok());
         assert!(entry(serde_json::json!({ "batch": null })).is_ok());
+        let removed = |path: &str| entry(serde_json::json!({ "batch": null, "removed": [path] }));
+        assert!(removed("attachments/a1").is_ok());
+        assert!(removed("auth.json").is_err());
+        assert!(removed("attachments/../auth.json").is_err());
     }
 
     #[test]

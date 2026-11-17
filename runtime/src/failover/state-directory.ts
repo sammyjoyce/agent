@@ -58,7 +58,8 @@ async function hashFile(path: string): Promise<{ sha256: string; size: number }>
  * Checks a state directory that must hold the whole log before it takes
  * ownership: the database's integrity, the coordinator id against the
  * checkpoint's, and the bytes of every replicated file that the checkpoint or
- * a later log entry names. The latest record of a path is the one that counts.
+ * a later log entry names and no later entry removed. The latest record of a
+ * path is the one that counts.
  */
 export async function verifyStandby(link: AuthorityLink, state: string): Promise<{ applied: number; files: number }> {
   const record = await link.record();
@@ -86,7 +87,12 @@ export async function verifyStandby(link: AuthorityLink, state: string): Promise
     const { entries } = await link.log(after, LOG_PAGE_ENTRIES);
     const last = entries.at(-1);
     if (last === undefined) throw new Error(`The log returned no entry after position ${after}, and its head is ${head}`);
-    for (const entry of entries) for (const file of entry.files) expected.set(file.path, file);
+    for (const entry of entries) {
+      for (const file of entry.files) expected.set(file.path, file);
+      for (const removed of entry.removed) {
+        for (const path of expected.keys()) if (path === removed || path.startsWith(`${removed}/`)) expected.delete(path);
+      }
+    }
     after = last.at;
   }
   for (const file of expected.values()) {

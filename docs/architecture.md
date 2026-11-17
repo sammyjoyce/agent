@@ -665,8 +665,9 @@ Replication is opt-in. A coordinator with a `[failover]` section replicates
 `session.sqlite` and the retained files under `attachments/`, `history/assets/`
 and `feedback/`. It does not replicate credentials, the search index,
 diagnostics, browser sign-in or the Dreams run records under `dreams/`. Removal
-of a retained file is local, so a standby keeps an attachment that the owner
-discarded until the standby's own expiry rule removes it.
+of a retained file goes through the log like a write: the owner logs the
+removal before it removes the file, and a standby removes it when it applies
+that entry. The blob store keeps the removed file's bytes.
 
 **The authority.** One Cloudflare Durable Object per coordinator ID holds the
 owner record and the replication log, and an R2 bucket holds large batches and

@@ -215,16 +215,22 @@ async function linkRuntime(runtime: string, bridge: string): Promise<void> {
   await symlink(built("../../src/failover/helper.js"), join(runtime, "failover", "helper.js"));
 }
 
-/** What a running owner does between two commands: it claims its start, commits notes and logs files. Returns the epoch it ran at. */
-export async function ownerActivity(owner: Host, notes: readonly string[], files: Readonly<Record<string, string>> = {}): Promise<number> {
+/** One run of an owner between two commands: it claims its start, does `work` and closes. Returns the epoch it ran at. */
+export async function ownerRun(owner: Host, work: (opened: Awaited<ReturnType<typeof openOwner>>) => Promise<void>): Promise<number> {
   const claimed = await owner.link.command({ op: "claim", holder: owner.holder });
   assert.ok(claimed.result === "accepted" && claimed.state.kind === "active", JSON.stringify(claimed));
   const { epoch } = claimed.state;
   const opened = await openOwner(owner.state, owner.link, { holder: owner.holder, epoch });
-  for (const text of notes) await opened.root.submit(note(text, `request-${text}`), BACKGROUND_CONTEXT);
-  for (const [path, text] of Object.entries(files)) await opened.log.appendFiles([await stage(owner.state, owner.link, path, Buffer.from(text))]);
-  await opened.harness.close(BACKGROUND_CONTEXT);
+  try { await work(opened); } finally { await opened.harness.close(BACKGROUND_CONTEXT); }
   return epoch;
+}
+
+/** An owner's run that commits notes and logs files. */
+export function ownerActivity(owner: Host, notes: readonly string[], files: Readonly<Record<string, string>> = {}): Promise<number> {
+  return ownerRun(owner, async (opened) => {
+    for (const text of notes) await opened.root.submit(note(text, `request-${text}`), BACKGROUND_CONTEXT);
+    for (const [path, text] of Object.entries(files)) await opened.log.appendFiles([await stage(owner.state, owner.link, path, Buffer.from(text))]);
+  });
 }
 
 /** An enrolled owner that has logged notes and a file, and a standby that joined at the checkpoint and has not followed. */

@@ -8,7 +8,7 @@ import type { LogEntry } from "../generated/LogEntry.js";
 import { untilReachable, type AuthorityLink } from "./authority-link.js";
 import { INLINE_BATCH_LIMIT_BYTES, logEntryDigest, parseBatch, sha256Hex, versions } from "./log-entry.js";
 import type { ScopedDatabase } from "./scoped-database.js";
-import { followLog, publishFiles, replicatedFilePath, type LogFollower } from "./standby.js";
+import { followLog, publishFiles, removePaths, replicatedFilePath, type LogFollower } from "./standby.js";
 
 /**
  * The authority no longer takes this holder for the owner. The process must
@@ -39,6 +39,8 @@ export interface LogWriter {
   readonly head: number;
   /** Logs a file-only entry, then gives each file its final name. */
   appendFiles(files: readonly StagedFile[]): Promise<void>;
+  /** Logs an entry that removes each path, a file or a whole tree, then removes it here. */
+  removeFiles(paths: readonly string[]): Promise<void>;
   /** Holds files for the entry of the next Pi batch, which names them ahead of the batch that references them. */
   carry(files: readonly StagedFile[]): void;
 }
@@ -115,8 +117,16 @@ class OwnerLog implements LogWriter {
 
   appendFiles(files: readonly StagedFile[]): Promise<void> {
     return this.#serialized(async () => {
-      const at = await this.#append(files, null);
+      const at = await this.#append({ files, removed: [], batch: null });
       await this.#options.database.applyWithoutBatch(at, () => this.#publish(files));
+      this.#head = at;
+    });
+  }
+
+  removeFiles(paths: readonly string[]): Promise<void> {
+    return this.#serialized(async () => {
+      const at = await this.#append({ files: [], removed: paths, batch: null });
+      await this.#options.database.applyWithoutBatch(at, () => removePaths(this.#options.stateDirectory, paths));
       this.#head = at;
     });
   }
@@ -127,7 +137,7 @@ class OwnerLog implements LogWriter {
     const logged = parseBatch(json, this.#head + 1);
     const piSeq = await database.dryRun(() => this.#storage.commit(logged, context));
     const files = this.#carried.splice(0);
-    const at = await this.#append(files, { piSeq, json });
+    const at = await this.#append({ files, removed: [], batch: { piSeq, json } });
     const committed = await database.apply(at, piSeq, { publish: () => this.#publish(files), commit: () => this.#storage.commit(logged, context) });
     this.#head = at;
     return committed;
@@ -139,9 +149,10 @@ class OwnerLog implements LogWriter {
     return result;
   }
 
-  async #append(files: readonly StagedFile[], batch: { readonly piSeq: number; readonly json: string } | null): Promise<number> {
+  async #append({ files, removed, batch }: { readonly files: readonly StagedFile[]; readonly removed: readonly string[];
+    readonly batch: { readonly piSeq: number; readonly json: string } | null }): Promise<number> {
     const { link, holder, epoch, signal } = this.#options;
-    const body = { at: this.#head + 1, epoch, versions: await versions(), files: files.map(({ record }) => record),
+    const body = { at: this.#head + 1, epoch, versions: await versions(), files: files.map(({ record }) => record), removed: [...removed],
       batch: batch === null ? null : { pi_seq: batch.piSeq, body: await this.#batchBody(batch.json) } };
     const entry: LogEntry = { ...body, digest: logEntryDigest(body) };
     // The authority takes a repeated append from the current owner as the same

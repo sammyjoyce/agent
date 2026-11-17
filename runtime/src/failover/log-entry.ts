@@ -24,6 +24,7 @@ export function logEntryDigest(entry: Omit<LogEntry, "digest">): string {
   return sha256Hex(JSON.stringify({
     at: entry.at, epoch: entry.epoch, versions: { application, pi_durable, chord },
     files: entry.files.map(({ path, sha256, size }) => ({ path, sha256, size })),
+    removed: entry.removed,
     batch: entry.batch === null ? null : { pi_seq: entry.batch.pi_seq, body: canonicalBody(entry.batch.body) },
   }));
 }

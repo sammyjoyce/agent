@@ -61,7 +61,7 @@ async function position(directory: string): Promise<number> {
 }
 
 async function appendStamped(link: AuthorityLink, epoch: number, at: number, stamped: Partial<LogEntry["versions"]>): Promise<void> {
-  const body = { at, epoch, versions: { ...await versions(), ...stamped }, files: [], batch: null };
+  const body = { at, epoch, versions: { ...await versions(), ...stamped }, files: [], removed: [], batch: null };
   assert.equal((await link.command({ op: "append", holder: OWNER, entry: { ...body, digest: logEntryDigest(body) } })).result, "accepted");
 }
 

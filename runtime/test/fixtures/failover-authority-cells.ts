@@ -16,7 +16,7 @@ export const manifest = createHash("sha256").update(manifestBytes).digest("hex")
 export const versions = { application: "0.1.0", pi_durable: "1.4.0", chord: "1.4.0" };
 
 export const entry = (epoch: number, at: number, digest: string): LogEntry =>
-  ({ at, epoch, digest, versions, files: [], batch: { pi_seq: at, body: { kind: "inline", json: "[]" } } });
+  ({ at, epoch, digest, versions, files: [], removed: [], batch: { pi_seq: at, body: { kind: "inline", json: "[]" } } });
 
 export type Outcome = "accepted" | AuthorityRefusal;
 

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { test } from "node:test";
-import { crash, exists, HOLDERS, replicatedPair, sealedFor, until, World, type Host, type JoinedReceipt, type PromotedReceipt, type ReleasedReceipt } from "./fixtures/failover-hosts.js";
+import { AttachmentStore } from "../src/attachments.js";
+import { crash, exists, HOLDERS, ownerRun, replicatedPair, sealedFor, until, World, type FollowedReceipt, type Host, type JoinedReceipt, type PromotedReceipt, type ReleasedReceipt } from "./fixtures/failover-hosts.js";
 import { tables } from "./fixtures/failover-state.js";
 
 const [OWNER, STANDBY, THIRD] = HOLDERS;
@@ -74,6 +75,23 @@ test("a promotion that others contend for leaves one owner", { timeout: 120_000 
     const late = await standby.failover("promote", "--replace-epoch", String(epoch));
     assert.notEqual(late.code, 0);
     assert.match(late.stderr, new RegExp(`holder ${OWNER} owns it at epoch ${epoch + 1}`));
+  });
+
+  await t.test("the old owner takes ownership back after it discarded an upload that the log names", async () => {
+    const { owner, standby } = await replicatedPair(world), id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc", bytes = Buffer.from("Invented upload that its sender discards");
+    const epoch = await ownerRun(owner, async ({ files }) => {
+      const attachments = new AttachmentStore(files);
+      await attachments.request({ type: "upload", id, name: "draft.txt", media_type: "text/plain", size_bytes: bytes.length, offset: 0, data_base64: bytes.toString("base64"), complete: true });
+      assert.deepEqual(await attachments.request({ type: "discard", id }), { type: "discarded" });
+    });
+    assert.equal(await exists(join(owner.state, "attachments", id)), false, "the owner no longer holds the upload");
+    assert.notEqual((await standby.failover("promote", "--replace-epoch", String(epoch), "--wait", "0")).code, 0);
+    const back = await owner.receipt<PromotedReceipt>("promote", "--replace-epoch", String(epoch), "--wait", "0");
+    assert.equal(back.holder, OWNER);
+    const state = await owner.authorityState();
+    assert.deepEqual(state, { kind: "active", epoch: epoch + 1, holder: OWNER, head: state.head });
+    await standby.receipt<FollowedReceipt>("follow", "--once");
+    assert.equal(await exists(join(standby.state, "attachments", id)), false, "a standby that follows the log does not keep the upload");
   });
 
   await t.test("a promotion is refused while follow applies to the same directory, and then catches up", async () => {

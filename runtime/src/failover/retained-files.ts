@@ -23,10 +23,7 @@ export interface RetainedFiles {
    * Removes the temporary files it made, and never a staged file it was given.
    */
   write(files: readonly RetainedWrite[]): Promise<void>;
-  /**
-   * Removes a file or a directory. Removal is local on every coordinator: the
-   * log names files and never removes one, so a standby keeps what an owner removes.
-   */
+  /** Removes a file or a directory. The replicated implementation logs the removal first, so a standby removes it too. */
   remove(path: string): Promise<void>;
 }
 
@@ -73,7 +70,7 @@ export class ReplicatedFiles implements RetainedFiles {
     });
   }
 
-  remove(path: string): Promise<void> { return removeRetained(this.stateDirectory, path); }
+  remove(path: string): Promise<void> { return this.#log.removeFiles([statePath(path)]); }
 }
 
 /** A temporary file beside a retained file's final path, for content that arrives in chunks. */

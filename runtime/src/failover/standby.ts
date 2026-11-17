@@ -70,13 +70,16 @@ export async function followLog(follower: LogFollower, storage: SqliteStorage): 
 
 async function applyEntry({ database, link, stateDirectory }: LogFollower, storage: SqliteStorage, installed: Versions, entry: LogEntry): Promise<void> {
   const { digest, ...digested } = entry;
-  const { at, versions: written, files, batch } = entry;
+  const { at, versions: written, files, removed, batch } = entry;
   if (written.pi_durable !== installed.pi_durable || written.chord !== installed.chord) {
     throw new Error(`Log entry ${at} was written by Pi Durable ${written.pi_durable} and Chord ${written.chord}, and this host runs Pi Durable ${installed.pi_durable} and Chord ${installed.chord}`);
   }
   if (logEntryDigest(digested) !== digest) throw new Error(`Log entry ${at} does not match its digest`);
   const pending = await downloadFiles(link, stateDirectory, files);
-  const publish = () => publishFiles(pending);
+  const publish = async () => {
+    await publishFiles(pending);
+    await removePaths(stateDirectory, removed);
+  };
   try {
     if (batch === null) return await database.applyWithoutBatch(at, publish);
     const writes = parseBatch(await batchJson(link, at, batch.body), at);
@@ -100,7 +103,7 @@ async function batchJson(link: AuthorityLink, at: number, body: BatchBody): Prom
 }
 
 /** The path of a replicated file under a state directory. Refuses a record whose path leaves it. */
-export function replicatedFilePath(stateDirectory: string, file: FileRecord): string {
+export function replicatedFilePath(stateDirectory: string, file: Pick<FileRecord, "path">): string {
   const path = join(stateDirectory, file.path), inside = relative(stateDirectory, path);
   if (inside === "" || inside.startsWith("..") || isAbsolute(inside)) throw new Error(`The replicated file path ${file.path} leaves the state directory`);
   return path;
@@ -148,6 +151,21 @@ export async function publishFiles(files: readonly PendingFile[]): Promise<void>
     await makeDirectory(dirname(path));
     await rename(synced, path);
     await syncDirectory(dirname(path));
+  }
+}
+
+/**
+ * Removes each path a log entry removed, a file or a whole tree, in a way that
+ * survives a crash. A path that is already gone needs nothing, so a repeat
+ * after a crash ends the same.
+ */
+export async function removePaths(stateDirectory: string, paths: readonly string[]): Promise<void> {
+  for (const removed of paths) {
+    const path = replicatedFilePath(stateDirectory, { path: removed });
+    await rm(path, { recursive: true, force: true });
+    await syncDirectory(dirname(path)).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+    });
   }
 }
 

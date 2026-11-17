@@ -198,8 +198,14 @@ export async function logEntries(link: AuthorityLink): Promise<LogEntry[]> {
 }
 
 /** The newest record of each path the log names. */
+/** The files the log names and no later entry removed, by path. */
 export async function loggedFiles(link: AuthorityLink): Promise<Map<string, FileRecord>> {
-  return new Map((await logEntries(link)).flatMap((entry) => entry.files.map((file) => [file.path, file] as const)));
+  const named = new Map<string, FileRecord>();
+  for (const entry of await logEntries(link)) {
+    for (const file of entry.files) named.set(file.path, file);
+    for (const removed of entry.removed) for (const path of named.keys()) if (path === removed || path.startsWith(`${removed}/`)) named.delete(path);
+  }
+  return named;
 }
 
 export async function logBatches(link: AuthorityLink): Promise<StorageWrite[][]> {

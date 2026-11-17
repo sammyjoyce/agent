@@ -107,6 +107,7 @@ const logEntry = object<LogEntry>({
   digest: sha256,
   versions,
   files: list(fileRecord),
+  removed: list(statePath),
   batch: nullable(loggedBatch),
 });
 
