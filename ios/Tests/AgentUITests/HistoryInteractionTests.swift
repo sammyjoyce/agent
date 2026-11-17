@@ -1242,9 +1242,127 @@ final class HistoryInteractionTests: XCTestCase {
     screenshot.name = "rotation-preserves-older-reading-position"
     screenshot.lifetime = .keepAlways
     add(screenshot)
-    for _ in 0..<8 {
+    // The transcript's accessibility frame includes the overlaid composer. A default swipe
+    // can start in its editor in landscape; target only the actually exposed feed instead.
+    typealias OrchardSample = (rank: Int, frame: CGRect)
+    func finiteFrame(_ frame: CGRect) -> Bool {
+      !frame.isNull && !frame.isInfinite && !frame.isEmpty
+        && [frame.minX, frame.minY, frame.maxX, frame.maxY].allSatisfy { $0.isFinite }
+    }
+    func exposedTranscript() throws -> CGRect {
+      let navigation = app.navigationBars.firstMatch
+      let composer = app.descendants(matching: .any).matching(identifier: "messageComposer")
+        .firstMatch
+      _ = try XCTUnwrap(
+        app.exists && transcript.exists && navigation.exists && composer.exists ? true : nil,
+        "ROTATION_GESTURE_NOT_READY: missing app/transcript/navigation/composer")
+      let frames = [app.frame, transcript.frame, navigation.frame, composer.frame]
+      _ = try XCTUnwrap(
+        frames.allSatisfy(finiteFrame) ? true : nil,
+        "ROTATION_GESTURE_NOT_READY: invalid frames \(frames)")
+      let clipped = frames[0].intersection(frames[1])
+      let upper = max(clipped.minY, frames[2].maxY)
+      let lower = min(clipped.maxY, frames[3].minY)
+      // Twelve-point endpoint margins leave at least a 64-point vertical stroke.
+      _ = try XCTUnwrap(
+        finiteFrame(clipped) && clipped.width >= 68 && lower - upper >= 88 ? true : nil,
+        "ROTATION_GESTURE_NOT_READY: no usable feed in \(frames)")
+      return CGRect(x: clipped.minX, y: upper, width: clipped.width, height: lower - upper)
+    }
+    func visibleOrchard(in exposed: CGRect) -> [OrchardSample] {
+      let prefix = "Orchard section "
+      let samples: [OrchardSample] = app.staticTexts.matching(
+        NSPredicate(format: "label BEGINSWITH %@", prefix)
+      ).allElementsBoundByIndex.compactMap { element -> OrchardSample? in
+        guard element.isHittable else { return nil }
+        let frame = element.frame
+        guard finiteFrame(frame), frame.intersection(exposed).height >= 12,
+          let rank = Int(element.label.dropFirst(prefix.count).prefix(while: { $0.isNumber })),
+          (0..<messages.count).contains(rank)
+        else { return nil }
+        return (rank: rank, frame: frame)
+      }.sorted { $0.rank < $1.rank }
+      return samples
+    }
+    func displacement(_ before: [OrchardSample], _ after: [OrchardSample]) -> CGFloat? {
+      for old in before {
+        if let current = after.first(where: { $0.rank == old.rank }) {
+          return old.frame.minY - current.frame.minY
+        }
+      }
+      return nil
+    }
+    func advanced(_ before: [OrchardSample], _ after: [OrchardSample]) -> Bool {
+      guard !before.isEmpty, !after.isEmpty else { return false }
+      if let movement = displacement(before, after) { return movement > 4 }
+      // A fast drag may move every sampled row offscreen. Only accept strictly later
+      // fixture ranks, not a missing/unhittable element or an unrelated incoming reply.
+      return after[0].rank > before[before.count - 1].rank
+    }
+    for attempt in 0..<8 {
       if !app.buttons["latest-messages"].exists { break }
-      transcript.swipeUp(velocity: .fast)
+      let exposed = try exposedTranscript()
+      let startPoint = CGPoint(x: exposed.midX, y: exposed.maxY - 12)
+      let endPoint = CGPoint(x: exposed.midX, y: exposed.minY + 12)
+      let path = CGRect(
+        x: startPoint.x - 1, y: endPoint.y, width: 2, height: startPoint.y - endPoint.y)
+      let latestButton = app.buttons["latest-messages"]
+      let latestFrame = latestButton.exists ? latestButton.frame : nil
+      _ = try XCTUnwrap(
+        (latestFrame.map(finiteFrame) ?? true) ? true : nil,
+        "ROTATION_GESTURE_NOT_READY: invalid Latest frame")
+      _ = try XCTUnwrap(
+        exposed.contains(startPoint) && exposed.contains(endPoint)
+          && path.height >= 64
+          && !(latestFrame.map { path.intersects($0.insetBy(dx: -8, dy: -8)) } ?? false)
+          ? true : nil,
+        "ROTATION_GESTURE_OCCLUDED: exposed=\(exposed) start=\(startPoint) end=\(endPoint)")
+      let observedBefore = visibleOrchard(in: exposed)
+      let before = try XCTUnwrap(
+        observedBefore.isEmpty ? nil : observedBefore,
+        "ROTATION_NO_VISIBLE_ORCHARD: exposed=\(exposed)")
+      print(
+        "ROTATION_SCROLL before attempt=\(attempt) exposed=\(exposed)"
+          + " start=\(startPoint) end=\(endPoint) rows=\(before)")
+      // Offset from the app's actual origin, not the full transcript's normalized height.
+      let appFrame = app.frame
+      let origin = app.coordinate(withNormalizedOffset: .zero)
+      let start = origin.withOffset(
+        CGVector(dx: startPoint.x - appFrame.minX, dy: startPoint.y - appFrame.minY))
+      let end = origin.withOffset(
+        CGVector(dx: endPoint.x - appFrame.minX, dy: endPoint.y - appFrame.minY))
+      start.press(
+        forDuration: 0.05, thenDragTo: end, withVelocity: .fast, thenHoldForDuration: 0)
+      let deadline = ContinuousClock.now + .seconds(2)
+      var after = visibleOrchard(in: exposed)
+      func actualTailReached() -> Bool {
+        latest.isHittable && !app.buttons["latest-messages"].exists
+      }
+      // After a drag, a transient empty AX sample is not progress, but it must not
+      // abort settling or prevent the original actual-tail alternative being checked.
+      while !advanced(before, after) && !actualTailReached()
+        && ContinuousClock.now < deadline
+      {
+        try await Task.sleep(for: .milliseconds(100))
+        after = visibleOrchard(in: exposed)
+      }
+      let afterExposed = try exposedTranscript()
+      _ = try XCTUnwrap(
+        afterExposed == exposed ? true : nil,
+        "ROTATION_GEOMETRY_CHANGED: before=\(exposed) after=\(afterExposed)")
+      let reachedTail = actualTailReached()
+      print(
+        "ROTATION_SCROLL after attempt=\(attempt) exposed=\(exposed)"
+          + " start=\(startPoint) end=\(endPoint) rows=\(after)"
+          + " rankAdvance=\(String(describing: after.first.map { $0.rank - before[0].rank }))"
+          + " displacement=\(String(describing: displacement(before, after)))"
+          + " reachedTail=\(reachedTail)")
+      guard reachedTail || advanced(before, after) else {
+        XCTFail(
+          "ROTATION_NO_PROGRESS: attempt=\(attempt) exposed=\(exposed)"
+            + " start=\(startPoint) end=\(endPoint) before=\(before) after=\(after)")
+        break
+      }
     }
     XCTAssertFalse(app.buttons["latest-messages"].exists)
     let fresh = "A fresh reply follows the reader's return to the live tail."
