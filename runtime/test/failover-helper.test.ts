@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createServer } from "node:net";
 import { test } from "node:test";
+import { logEntryDigest, versions } from "../src/failover/log-entry.js";
 import { AUTHORITY_UNREACHABLE_EXIT } from "../src/generated/authority-unreachable-exit.js";
 import type { FailoverReport } from "../src/generated/FailoverReport.js";
 import { failoverCoordinator, runHelper, runScript } from "./fixtures/failover-bridge.js";
@@ -31,6 +32,30 @@ test("the failover helper against the Worker on local workerd", { timeout: 120_0
     assert.deepEqual(report(run.stdout), { result: "claimed", epoch: 2, head: 0 });
     assert.equal(run.stdout.trim().split("\n").length, 1, "the helper prints exactly one value");
     assert.deepEqual((await coordinator.reader.record())?.state, { kind: "active", epoch: 2, holder: OWNER, head: 0 });
+  });
+
+  await t.test("each claim by the owner fences every epoch an earlier process of that owner held", async (t) => {
+    const coordinator = await failoverCoordinator(t), state = await stateDirectory(t), session = await coordinator.session(OWNER);
+    const earlier: number[] = [];
+    let current = await enroll(coordinator.owner);
+    for (let restart = 1; restart <= 3; restart += 1) {
+      const run = await runHelper(session, claim(state));
+      assert.equal(run.code, 0, run.stderr);
+      const claimed = report(run.stdout);
+      assert.ok(claimed.result === "claimed", run.stdout);
+      earlier.push(current);
+      for (const epoch of earlier) {
+        const body = { at: 1, epoch, versions: await versions(), files: [], removed: [], batch: null };
+        const append = await coordinator.owner.command({ op: "append", holder: OWNER, entry: { ...body, digest: logEntryDigest(body) } });
+        assert.deepEqual([append.result, append.result === "refused" ? append.reason : null], ["refused", "fenced"], `after restart ${restart}, an append at epoch ${epoch} is refused`);
+        const confirm = await coordinator.owner.command({ op: "confirm", holder: OWNER, epoch });
+        assert.deepEqual([confirm.result, confirm.result === "refused" ? confirm.reason : null], ["refused", "fenced"], `after restart ${restart}, a confirm at epoch ${epoch} is refused`);
+      }
+      assert.equal(claimed.epoch, current + 1, "each claim grants the next epoch");
+      assert.equal((await coordinator.owner.command({ op: "confirm", holder: OWNER, epoch: claimed.epoch })).result, "accepted", "the process that just claimed is the owner");
+      current = claimed.epoch;
+    }
+    assert.deepEqual((await coordinator.reader.record())?.state, { kind: "active", epoch: 4, holder: OWNER, head: 0 }, "no refused append moved the head");
   });
 
   await t.test("claim by a holder that is not the owner prints refused with the owner's state and exits 0", async (t) => {
