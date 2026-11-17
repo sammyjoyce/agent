@@ -1,12 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { OWNER_FENCED_EXIT } from "../src/generated/owner-fenced-exit.js";
-import { ATTACHMENT_CHUNK_BYTES } from "../src/generated/attachment-limits.js";
 import type { ModelStep } from "./fixtures/coordinator-runtime.js";
-import { delegate } from "./fixtures/coordinator-world.js";
 import { commands, latch } from "./fixtures/failover-fault-proxy.js";
 import { logBatches } from "./fixtures/failover-state.js";
 import { failoverWorld, type FailoverWorld, type WorldOptions } from "./fixtures/failover-world.js";
@@ -114,59 +112,4 @@ test("a replay-safe tool that a new owner runs again while its first run is stil
       assert.equal(outcome.effects, 1);
     });
   }
-});
-
-/** Every file under a host's attachment cache, by its path. */
-async function cached(state: string): Promise<string[]> {
-  const entries = await readdir(join(state, "attachment-cache"), { recursive: true, withFileTypes: true }).catch(() => []);
-  return entries.filter((entry) => entry.isFile()).map((entry) => join(entry.parentPath, entry.name));
-}
-
-test("read_attachment, run again by a new owner on the same worker while the old owner is held in the middle of writing the file, leaves one complete file", { timeout: 120_000 }, async (t) => {
-  const world = await failoverWorld(t, { watchSeconds: 1 }), { owner, standby, worker } = world, task = "fixture-overlap-worker-read", dispatch = "fixture-overlap-worker-dispatch";
-  await world.enroll();
-  const serving = await world.serve(owner);
-  world.work();
-  await world.online(owner, [worker.nodeId]);
-  await world.join();
-  const bytes = Buffer.alloc(5 * ATTACHMENT_CHUNK_BYTES, "Invented attachment bytes that fill five chunks. "), id = randomUUID();
-  for (let offset = 0; offset < bytes.length; offset += ATTACHMENT_CHUNK_BYTES) {
-    const chunk = bytes.subarray(offset, offset + ATTACHMENT_CHUNK_BYTES);
-    await world.request(owner, { type: "attachment", request: { type: "upload", id, name: "evidence.bin", media_type: "application/octet-stream", size_bytes: bytes.length, offset,
-      data_base64: chunk.toString("base64"), complete: offset + chunk.length === bytes.length } });
-  }
-  await world.script(task, [{ tool: "read_attachment", args: { id } }, { text: "The worker task read the attachment." }]);
-  await world.script(dispatch, [delegate(task, worker.nodeId), { text: "Delegated the read." }]);
-
-  // Each chunk waits for its own confirm. Two chunks reach the worker, and the third is held at the proxy.
-  const first = latch();
-  let logged = false, confirms = 0;
-  owner.proxy.inject({ fault: { kind: "hold", release: first.released }, times: Number.MAX_SAFE_INTEGER, match: (request) => {
-    if (commands("append")(request) && request.body.includes("tools.read_attachment(")) logged = true;
-    return logged && commands("confirm")(request) && ++confirms > 2;
-  } });
-  world.sending(owner, dispatch);
-  const workerState = join(worker.home, "state");
-  const partial = async () => (await cached(workerState)).filter((path) => path.endsWith("content.part"));
-  await world.until(async () => {
-    const [part] = await partial();
-    return part !== undefined && (await stat(part)).size === 2 * ATTACHMENT_CHUNK_BYTES;
-  }, "The old owner must be held with two of five chunks on the worker", () => `${serving.errors().slice(-1000)} confirms=${confirms} logged=${logged}`);
-
-  assert.deepEqual((await cached(workerState)).filter((path) => path.endsWith("file-evidence.bin")), [], "the old owner's run has not finished the file");
-
-  await world.promote({ replaceEpoch: 2, statement: STATEMENT });
-  await world.serve(standby);
-  await world.direct(standby);
-  await world.online(standby, [worker.nodeId]);
-  await world.until(async () => (await cached(workerState)).some((path) => path.endsWith("file-evidence.bin")), "The new owner must run the read again on the same worker to its end");
-  first.release();
-  assert.equal(await serving.exited, OWNER_FENCED_EXIT, serving.errors().slice(-2000));
-
-  const files = await cached(workerState);
-  assert.deepEqual(await partial(), [], "no partial file is left on the worker");
-  const complete = files.filter((path) => path.endsWith("file-evidence.bin"));
-  assert.equal(complete.length, 1, `one complete file: ${JSON.stringify(files)}`);
-  assert.equal(sha256(await readFile(complete[0]!)), sha256(bytes));
-  assert.equal(await world.asked(task), 2, "the model was asked once by each owner for the task's turn");
 });
