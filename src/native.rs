@@ -771,7 +771,9 @@ mod tests {
             job_id: "package-tracking".to_string().try_into().unwrap(),
             title: "Package tracking".into(),
         };
+        let details: crate::protocol::NoticeDetails = serde_json::from_str(r#"{"task_id":"invented-task","task_title":"Parcel decision","source_conversation_id":"2","source_entry_id":"9","sources":[{"provider":"mail","account":"invented-account","thread_id":"invented-thread","title":"Delivery","event_id":"event","event_version":"v1"}]}"#).unwrap();
         let row = HistoryMessage {
+            notice_details: Some(Box::new(details.clone())),
             notice_origin: Some(origin.clone()),
             entry_id: "10".into(),
             role: HistoryRole::Notice,
@@ -802,6 +804,7 @@ mod tests {
                 other => panic!("Unexpected native projection: {other:?}"),
             };
             assert_eq!(actual.notice_origin, Some(origin.clone()));
+            assert_eq!(actual.notice_details, Some(Box::new(details.clone())));
             assert_eq!(actual.entry_id, "10");
             #[derive(serde::Deserialize)]
             struct LegacyRow {
@@ -813,6 +816,7 @@ mod tests {
         }
         let legacy: HistoryMessage = serde_json::from_str(r#"{"entry_id":"1","role":"notice","text":"Legacy notice","continuation":false,"final_chunk":true}"#).unwrap();
         assert_eq!(legacy.notice_origin, None);
+        assert_eq!(legacy.notice_details, None);
     }
 
     #[test]

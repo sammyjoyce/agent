@@ -367,16 +367,18 @@ public struct HistoryMessage: Codable, Sendable, Equatable {
     public var `continuation`: Bool
     public var `entryId`: String
     public var `finalChunk`: Bool
+    public var `noticeDetails`: NoticeDetails?
     public var `noticeOrigin`: NoticeOrigin?
     public var `presentation`: MessagePresentation?
     public var `role`: HistoryRole
     public var `text`: String
     public var `tool`: ToolHistory?
-    public init(`attachments`: [AttachmentRef]? = nil, `continuation`: Bool, `entryId`: String, `finalChunk`: Bool, `noticeOrigin`: NoticeOrigin? = nil, `presentation`: MessagePresentation? = nil, `role`: HistoryRole, `text`: String, `tool`: ToolHistory? = nil) {
+    public init(`attachments`: [AttachmentRef]? = nil, `continuation`: Bool, `entryId`: String, `finalChunk`: Bool, `noticeDetails`: NoticeDetails? = nil, `noticeOrigin`: NoticeOrigin? = nil, `presentation`: MessagePresentation? = nil, `role`: HistoryRole, `text`: String, `tool`: ToolHistory? = nil) {
         self.`attachments` = `attachments`
         self.`continuation` = `continuation`
         self.`entryId` = `entryId`
         self.`finalChunk` = `finalChunk`
+        self.`noticeDetails` = `noticeDetails`
         self.`noticeOrigin` = `noticeOrigin`
         self.`presentation` = `presentation`
         self.`role` = `role`
@@ -388,6 +390,7 @@ public struct HistoryMessage: Codable, Sendable, Equatable {
         case `continuation` = "continuation"
         case `entryId` = "entry_id"
         case `finalChunk` = "final_chunk"
+        case `noticeDetails` = "notice_details"
         case `noticeOrigin` = "notice_origin"
         case `presentation` = "presentation"
         case `role` = "role"
@@ -1724,6 +1727,28 @@ public struct NativeSettingsSnapshot: Codable, Sendable, Equatable {
     }
 }
 
+public struct NoticeDetails: Codable, Sendable, Equatable {
+    public var `sourceConversationId`: String
+    public var `sourceEntryId`: String
+    public var `sources`: [NoticeSource]
+    public var `taskId`: String?
+    public var `taskTitle`: String?
+    public init(`sourceConversationId`: String, `sourceEntryId`: String, `sources`: [NoticeSource], `taskId`: String? = nil, `taskTitle`: String? = nil) {
+        self.`sourceConversationId` = `sourceConversationId`
+        self.`sourceEntryId` = `sourceEntryId`
+        self.`sources` = `sources`
+        self.`taskId` = `taskId`
+        self.`taskTitle` = `taskTitle`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `sourceConversationId` = "source_conversation_id"
+        case `sourceEntryId` = "source_entry_id"
+        case `sources` = "sources"
+        case `taskId` = "task_id"
+        case `taskTitle` = "task_title"
+    }
+}
+
 public struct NoticeOrigin: Codable, Sendable, Equatable {
     public var `jobId`: JobId
     public var `title`: String
@@ -1733,6 +1758,31 @@ public struct NoticeOrigin: Codable, Sendable, Equatable {
     }
     enum CodingKeys: String, CodingKey {
         case `jobId` = "job_id"
+        case `title` = "title"
+    }
+}
+
+public struct NoticeSource: Codable, Sendable, Equatable {
+    public var `account`: String
+    public var `eventId`: String?
+    public var `eventVersion`: String?
+    public var `provider`: String
+    public var `threadId`: String
+    public var `title`: String?
+    public init(`account`: String, `eventId`: String? = nil, `eventVersion`: String? = nil, `provider`: String, `threadId`: String, `title`: String? = nil) {
+        self.`account` = `account`
+        self.`eventId` = `eventId`
+        self.`eventVersion` = `eventVersion`
+        self.`provider` = `provider`
+        self.`threadId` = `threadId`
+        self.`title` = `title`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `account` = "account"
+        case `eventId` = "event_id"
+        case `eventVersion` = "event_version"
+        case `provider` = "provider"
+        case `threadId` = "thread_id"
         case `title` = "title"
     }
 }

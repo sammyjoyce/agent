@@ -117,6 +117,7 @@ async fn repeated_control_c_detaches_while_admission_is_held_and_retains_its_ori
                             }
                             RuntimeCommand::ReadConversation { conversation_id, cursor: None } => vec![RuntimeEventKind::History {
                                 conversation_id, messages: vec![HistoryMessage {
+                                    notice_details: None,
                                     notice_origin: None,
                                     entry_id: "saved-answer".into(), role: HistoryRole::Final,
                                     text: "The saved chief transcript is ready.".into(), continuation: false,
@@ -302,6 +303,7 @@ async fn known_chief_history_renders_while_its_observer_readiness_is_held() {
                             }
                             RuntimeCommand::ReadConversation { conversation_id, cursor: None } => {
                                 let mut messages = vec![HistoryMessage {
+                                    notice_details: None,
                                     notice_origin: None,
                                     entry_id: "saved-answer".into(), role: HistoryRole::Final,
                                     text: "Saved conversation text can appear before observation is ready.".into(), continuation: false,
@@ -309,6 +311,7 @@ async fn known_chief_history_renders_while_its_observer_readiness_is_held() {
                                 }];
                                 if reads.fetch_add(1, Ordering::SeqCst) > 0 {
                                     messages.push(HistoryMessage {
+                                        notice_details: None,
                                         notice_origin: None,
                                         entry_id: "answer-during-attach".into(), role: HistoryRole::Final,
                                         text: "The entry committed during attachment remains visible.".into(), continuation: false,
@@ -619,6 +622,7 @@ async fn recovery_connection(
                 drop(known);
                 receipts.push(RuntimeEventKind::Message {
                     message: HistoryMessage {
+                        notice_details: None,
                         notice_origin: None,
                         presentation: None,
                         entry_id: "recovered-answer".into(),
@@ -662,6 +666,7 @@ async fn recovery_connection(
                 .iter()
                 .filter(|input| input.placed)
                 .map(|input| HistoryMessage {
+                    notice_details: None,
                     notice_origin: None,
                     presentation: None,
                     entry_id: format!("native-{}", input.id),
@@ -1170,6 +1175,7 @@ async fn chief_startup(mode: ChiefStartup) {
                         vec![RuntimeEventKind::History {
                             conversation_id,
                             messages: vec![HistoryMessage {
+                                notice_details: None,
                                 notice_origin: None,
                                 presentation: None,
                                 attachments: None,
@@ -1656,6 +1662,7 @@ async fn exact_resume_renders_history_without_fetching_fuzzy_catalog_pages() {
                         vec![RuntimeEventKind::History {
                             conversation_id,
                             messages: vec![HistoryMessage {
+                                notice_details: None,
                                 notice_origin: None,
                                 presentation: None,
                                 attachments: None,
@@ -1811,6 +1818,7 @@ async fn main_history(older: bool) {
                             conversation_id: "persisted-main".into(),
                             messages: vec![
                                 HistoryMessage {
+                                    notice_details: None,
                                     notice_origin: None,
                                     presentation: None,
                                     attachments: None,
@@ -1827,6 +1835,7 @@ async fn main_history(older: bool) {
                                     tool: None,
                                 },
                                 HistoryMessage {
+                                    notice_details: None,
                                     notice_origin: None,
                                     presentation: None,
                                     attachments: None,

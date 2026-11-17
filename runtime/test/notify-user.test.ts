@@ -112,7 +112,9 @@ for (const { child, main } of cases) test(`a running ${child ? "child" : "worker
     await publication;
     const entry = saved[0]; assert.ok(entry);
     assert.deepEqual(entry.data, { task_id: task.id, source_conversation_id: worker.conversation_id,
-      source_entry_id: (await app.tasks.origin(await app.tasks.conversation(worker.conversation_id), callId)).id.toString(), text });
+      source_entry_id: (await app.tasks.origin(await app.tasks.conversation(worker.conversation_id), callId)).id.toString(), text,
+      notice_details: { task_id: task.id, task_title: task.title, source_conversation_id: worker.conversation_id,
+        source_entry_id: (await app.tasks.origin(await app.tasks.conversation(worker.conversation_id), callId)).id.toString(), sources: [] } });
     assert.deepEqual(live, [entry.id.toString()]);
     await app.sources.notify(worker.conversation_id, callId, [], task.id, text, () => {});
     assert.equal((await notices(root)).length, 1, "Replaying the same native call must not append a second notice");
