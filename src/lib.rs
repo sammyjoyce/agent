@@ -15,6 +15,7 @@ pub mod goal_view;
 pub mod history;
 pub mod host;
 pub mod models;
+pub mod owner_floor;
 pub mod protocol;
 pub mod resources;
 pub mod rex;

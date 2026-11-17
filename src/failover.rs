@@ -2,13 +2,45 @@
 //! coordinator that grants the owner epoch and holds the replication log.
 //! The authority's rules are `decide` in `runtime/src/failover/authority-core.ts`.
 
-use anyhow::{Result, ensure};
+use std::{
+    fmt, fs,
+    net::{Ipv4Addr, Ipv6Addr},
+    os::unix::fs::MetadataExt,
+    path::PathBuf,
+    time::Duration,
+};
+
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 use uuid::Uuid;
 
+use crate::coordinator_id::CoordinatorId;
+
+pub mod commands;
+mod receipts;
+mod script;
+
+pub use script::{AuthorityUnreachable, FailoverHelper, FailoverOperator, FailoverScript};
+
 /// JavaScript carries these counters as numbers, so they stay exact only below 2^53.
 const MAX_EXACT: u64 = 9_007_199_254_740_991;
+
+/// The exit status of a coordinator the authority fenced, from the supervisor
+/// and from its Pi child alike, so a service manager can leave it stopped.
+pub const OWNER_FENCED_EXIT: u8 = 75;
+
+/// The exit status of `failover/helper.js` and `failover/operator.js` when the
+/// authority did not answer, so a caller can tell a request that is safe to
+/// repeat from a failure.
+pub const AUTHORITY_UNREACHABLE_EXIT: u8 = 69;
+
+/// The largest part of a checkpoint file. One Worker request body holds at
+/// most 100 MB and a Worker has 128 MB of memory.
+pub const CHECKPOINT_PART_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The `format` of every checkpoint manifest this build writes and reads.
+pub const CHECKPOINT_FORMAT: u32 = 2;
 
 /// Granted only by the authority. Rises at every coordinator start and at every promotion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
@@ -158,11 +190,14 @@ impl From<StatePath> for String {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StopEvidence {
-    /// The old owner saw the seal, cancelled and reaped its effects, closed its
-    /// worker links, then said so.
+    /// The old owner saw the seal, drained its local effects and closed its
+    /// worker links, took the two locks `LockHeld` rests on, then said so. It
+    /// does not prove that an effect on a worker has ended.
     Released,
-    /// `failover release` on the old host took `writer.lock`, so no supervisor
-    /// or Pi child of the old owner survives.
+    /// A command on the old host took `writer.lock` and then `effects.lock`,
+    /// and found no recorded process group alive. So no supervisor, no Pi
+    /// child and no process that kept the files it inherited from the old
+    /// owner survives. It does not prove that an effect on a worker has ended.
     LockHeld,
     /// The old host cannot be reached. The operator's statement is stored verbatim.
     OperatorAttested { statement: String },
@@ -238,8 +273,8 @@ pub struct LoggedBatch {
     pub body: BatchBody,
 }
 
-/// One replication log entry: the files a commit needs, then the commit. A
-/// file-only entry has no batch.
+/// One replication log entry: the files a commit needs, the paths the owner
+/// removed, then the commit. An entry that only names or removes files has no batch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct LogEntry {
@@ -249,6 +284,9 @@ pub struct LogEntry {
     pub digest: Sha256Hex,
     pub versions: Versions,
     pub files: Vec<FileRecord>,
+    /// Each path is a file or a whole directory tree. A standby removes them
+    /// after it gives this entry's files their names.
+    pub removed: Vec<StatePath>,
     pub batch: Option<LoggedBatch>,
 }
 
@@ -261,6 +299,64 @@ pub struct CheckpointRecord {
     pub manifest: Sha256Hex,
 }
 
+/// A file path inside a checkpoint archive, relative to the archive.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(try_from = "String", into = "String")]
+pub struct ArchivePath(String);
+
+impl ArchivePath {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ArchivePath {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        ensure!(
+            value.split('/').all(|segment| {
+                !matches!(segment, "" | "." | "..") && !segment.contains(['\\', '\0'])
+            }),
+            "A checkpoint file path is relative and has no empty, `.` or `..` segment"
+        );
+        Ok(Self(value))
+    }
+}
+
+impl From<ArchivePath> for String {
+    fn from(value: ArchivePath) -> String {
+        value.0
+    }
+}
+
+/// One file of a checkpoint. Each part is a blob of at most
+/// `CHECKPOINT_PART_BYTES`, and the parts in order are the file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointFile {
+    pub path: ArchivePath,
+    #[ts(type = "number")]
+    pub size: u64,
+    pub sha256: Sha256Hex,
+    pub parts: Vec<Sha256Hex>,
+}
+
+/// The blob that `CheckpointRecord.manifest` names: a backup archive of the
+/// state directory at log position `through`, its `manifest.json` included.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointManifest {
+    pub format: u32,
+    pub through: LogPosition,
+    /// The sequence of the last Pi commit in the snapshot's database, or 0
+    /// when it holds none. A directory at `through` is at this sequence
+    /// until it applies a batch.
+    pub pi_seq: PiSequence,
+    pub coordinator_id: CoordinatorId,
+    pub files: Vec<CheckpointFile>,
+}
+
 /// A change to the authority. Each one is a single transaction in the object.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -270,9 +366,12 @@ pub enum AuthorityCommand {
         holder: HolderId,
         checkpoint: CheckpointRecord,
     },
-    /// A coordinator start by the current owner. Raises the epoch.
+    /// A coordinator start by the current owner. Raises the epoch while it
+    /// is still `expected_epoch`, so a claim that arrives late or twice raises
+    /// it once.
     Claim {
         holder: HolderId,
+        expected_epoch: OwnerEpoch,
     },
     Append {
         holder: HolderId,
@@ -367,6 +466,341 @@ pub struct LogPage {
     pub entries: Vec<LogEntry>,
 }
 
+/// The authority's address: https, or http on a loopback address for tests and
+/// local workerd. It carries no user name, password or escapes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(try_from = "String", into = "String")]
+pub struct AuthorityUrl(String);
+
+impl AuthorityUrl {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for AuthorityUrl {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        ensure!(
+            authority_url_allowed(&value),
+            "The failover url must be https, or http on a loopback address, without a user name, password or escapes"
+        );
+        Ok(Self(value))
+    }
+}
+
+impl From<AuthorityUrl> for String {
+    fn from(value: AuthorityUrl) -> String {
+        value.0
+    }
+}
+
+fn authority_url_allowed(value: &str) -> bool {
+    let (secure, rest) = match (
+        value.strip_prefix("https://"),
+        value.strip_prefix("http://"),
+    ) {
+        (Some(rest), _) => (true, rest),
+        (None, Some(rest)) => (false, rest),
+        (None, None) => return false,
+    };
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'\\' | b'@' | b'%'))
+    {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let (host, port, loopback) = match authority.strip_prefix('[') {
+        Some(bracketed) => {
+            let Some((host, after)) = bracketed.split_once(']') else {
+                return false;
+            };
+            let Ok(address) = host.parse::<Ipv6Addr>() else {
+                return false;
+            };
+            let port = match after {
+                "" => None,
+                after => match after.strip_prefix(':') {
+                    Some(port) => Some(port),
+                    None => return false,
+                },
+            };
+            (host, port, address.is_loopback())
+        }
+        None => {
+            let (host, port) = match authority.split_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (authority, None),
+            };
+            let loopback = host.eq_ignore_ascii_case("localhost")
+                || host.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback());
+            (host, port, loopback)
+        }
+    };
+    let port_valid = port.is_none_or(|port| {
+        !port.is_empty()
+            && port.bytes().all(|byte| byte.is_ascii_digit())
+            && port.parse::<u16>().is_ok_and(|port| port != 0)
+    });
+    !host.is_empty() && port_valid && (secure || loopback)
+}
+
+const DEFAULT_WATCH_INTERVAL_SECONDS: u64 = 30;
+
+/// `[failover]` in the private config file. Managed settings cannot set it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailoverConfig {
+    pub url: AuthorityUrl,
+    /// Absent on a host that only watches the owner record.
+    pub holder: Option<HolderId>,
+    pub token_file: PathBuf,
+    /// How often a worker daemon reads the owner record.
+    pub watch_interval_seconds: Option<u64>,
+}
+
+impl FailoverConfig {
+    pub fn watch_interval(&self) -> Duration {
+        Duration::from_secs(
+            self.watch_interval_seconds
+                .unwrap_or(DEFAULT_WATCH_INTERVAL_SECONDS),
+        )
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.watch_interval_seconds
+                .is_none_or(|seconds| (1..=3600).contains(&seconds)),
+            "The failover watch_interval_seconds must be between 1 and 3600"
+        );
+        ensure!(
+            self.token_file.is_absolute() && !self.token_file.starts_with("/nix/store"),
+            "The failover token_file must be an absolute private file outside the Nix store"
+        );
+        let metadata = fs::metadata(&self.token_file).with_context(|| {
+            format!(
+                "Could not read the failover token_file {}",
+                self.token_file.display()
+            )
+        })?;
+        ensure!(
+            metadata.is_file() && metadata.mode() & 0o077 == 0,
+            "The failover token_file {} must be a regular file only its owner can read; run chmod 600 on it",
+            self.token_file.display()
+        );
+        Ok(())
+    }
+}
+
+/// What the Pi child and the failover helper need to reach the authority,
+/// passed as private JSON in `AGENT_FAILOVER`. The helper's session has no
+/// epoch. The child's carries the epoch its coordinator start was granted.
+/// A worker that only watches the owner record has no holder.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct FailoverSession {
+    pub url: AuthorityUrl,
+    #[ts(type = "string")]
+    pub token_file: PathBuf,
+    pub coordinator_id: CoordinatorId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub holder: Option<HolderId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub epoch: Option<OwnerEpoch>,
+}
+
+/// One request to `failover/helper.js`. The helper reports facts and Rust decides.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FailoverRequest {
+    /// Raise the epoch for a coordinator start by the current owner, whose
+    /// state directory `state` must already hold a log position.
+    Claim {
+        #[ts(type = "string")]
+        state: PathBuf,
+    },
+    /// Read the owner record. Writes nothing.
+    Record,
+}
+
+/// The helper's one line of output. An authority it could not reach is an
+/// exit with `AUTHORITY_UNREACHABLE_EXIT`, never a refusal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FailoverReport {
+    Claimed {
+        epoch: OwnerEpoch,
+        head: LogPosition,
+    },
+    Refused {
+        reason: AuthorityRefusal,
+        state: Option<AuthorityState>,
+    },
+    /// The state directory of a claim holds no log position, so the helper
+    /// asked the authority nothing.
+    Unstamped,
+    /// The owner record, or null before enrollment.
+    Record { record: Option<AuthorityRecord> },
+}
+
+/// One request to `failover/operator.js`, which does what a `beep-boop
+/// failover` command needs from the authority and the blob store. The
+/// operator reports facts and Rust decides.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OperatorRequest {
+    /// Read the owner record and, when `state` holds a session database, the
+    /// log position it holds. Writes nothing.
+    Status {
+        #[ts(type = "string | null")]
+        state: Option<PathBuf>,
+    },
+    /// Record that the state directory holds the log through `position`.
+    Stamp {
+        #[ts(type = "string")]
+        state: PathBuf,
+        position: LogPosition,
+    },
+    /// Store the backup archive at `archive` as a checkpoint at the position
+    /// its database holds. `part_bytes` is for tests only.
+    StoreCheckpoint {
+        #[ts(type = "string")]
+        archive: PathBuf,
+        #[ts(type = "number | null")]
+        part_bytes: Option<u64>,
+    },
+    /// Download the current checkpoint into the new directory `archive`.
+    FetchCheckpoint {
+        #[ts(type = "string")]
+        archive: PathBuf,
+    },
+    /// Run one command and report the authority's reply.
+    Authority { command: AuthorityCommand },
+    /// Apply the log entries the state directory lacks, with their files.
+    Follow {
+        #[ts(type = "string")]
+        state: PathBuf,
+    },
+    /// Check a state directory that must hold the whole log: the database's
+    /// integrity, the coordinator id, and every replicated file's hash.
+    Verify {
+        #[ts(type = "string")]
+        state: PathBuf,
+    },
+    /// List the effects the session database records as started and unfinished.
+    Unfinished {
+        #[ts(type = "string")]
+        state: PathBuf,
+    },
+}
+
+/// The operator's one line of output. An authority it could not reach is an
+/// exit with `AUTHORITY_UNREACHABLE_EXIT`, never a report.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OperatorReport {
+    Status {
+        /// Null before enrollment.
+        record: Option<AuthorityRecord>,
+        /// Null when the state directory holds no log position.
+        applied: Option<LogPosition>,
+    },
+    Stamped,
+    Stored {
+        checkpoint: CheckpointRecord,
+        #[ts(type = "number")]
+        files: u64,
+        #[ts(type = "number")]
+        bytes: u64,
+    },
+    Fetched {
+        checkpoint: CheckpointRecord,
+        #[ts(type = "number")]
+        files: u64,
+        #[ts(type = "number")]
+        bytes: u64,
+    },
+    Reply {
+        reply: AuthorityReply,
+    },
+    Followed {
+        from: LogPosition,
+        applied: LogPosition,
+    },
+    Verified {
+        applied: LogPosition,
+        /// How many replicated files matched their records.
+        #[ts(type = "number")]
+        files: u64,
+    },
+    Unfinished {
+        tools: Vec<UnfinishedToolCall>,
+        deliveries: Vec<UnfinishedDelivery>,
+        /// One sentence for each stored record the operator could not read.
+        unreadable: Vec<String>,
+    },
+}
+
+/// A tool call whose intent Pi committed and whose result it did not. A
+/// restarted owner reruns it only when it is replay-safe, and otherwise
+/// reports it to the model as interrupted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct UnfinishedToolCall {
+    pub conversation_id: String,
+    pub tool: String,
+    pub call_id: String,
+    pub replay_safe: bool,
+}
+
+/// A phone notification claimed for sending whose outcome was not stored. A
+/// restarted owner marks it uncertain and does not send it again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct UnfinishedDelivery {
+    pub conversation_id: String,
+    pub entry_id: String,
+    pub installation_id: String,
+    pub apns_id: String,
+}
+
+impl fmt::Display for AuthorityState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Active { epoch, holder, .. } => write!(
+                f,
+                "holder {} owns it at epoch {}",
+                holder.get(),
+                epoch.get()
+            ),
+            Self::Sealed {
+                epoch,
+                holder,
+                candidate,
+                ..
+            } => write!(
+                f,
+                "the log is sealed at epoch {} while holder {} replaces holder {}",
+                epoch.get(),
+                candidate.get(),
+                holder.get()
+            ),
+            Self::Vacant {
+                epoch, candidate, ..
+            } => write!(
+                f,
+                "holder {} is taking ownership after epoch {}",
+                candidate.get(),
+                epoch.get()
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +885,7 @@ mod tests {
                 "digest": "ab".repeat(32),
                 "versions": { "application": "0.1.0", "pi_durable": "1.4.0", "chord": "1.4.0" },
                 "files": [],
+                "removed": [],
             });
             if let (Some(entry), Some(fields)) = (entry.as_object_mut(), fields.as_object()) {
                 entry.extend(fields.clone());
@@ -463,6 +898,49 @@ mod tests {
         assert!(entry(serde_json::json!({ "batch": { "body": inline.clone() } })).is_err());
         assert!(entry(serde_json::json!({ "batch": { "pi_seq": 4, "body": inline } })).is_ok());
         assert!(entry(serde_json::json!({ "batch": null })).is_ok());
+        let removed = |path: &str| entry(serde_json::json!({ "batch": null, "removed": [path] }));
+        assert!(removed("attachments/a1").is_ok());
+        assert!(removed("auth.json").is_err());
+        assert!(removed("attachments/../auth.json").is_err());
+    }
+
+    #[test]
+    fn a_checkpoint_manifest_names_only_paths_inside_its_archive() {
+        let manifest = |path: &str| {
+            serde_json::json!({
+                "format": CHECKPOINT_FORMAT,
+                "through": 3,
+                "pi_seq": 12,
+                "coordinator_id": Uuid::nil(),
+                "files": [{ "path": path, "size": 0, "sha256": "ab".repeat(32), "parts": [] }],
+            })
+        };
+        for accepted in [
+            "manifest.json",
+            "data/session.sqlite",
+            "data/history/assets/ab",
+        ] {
+            assert!(
+                serde_json::from_value::<CheckpointManifest>(manifest(accepted)).is_ok(),
+                "{accepted}"
+            );
+        }
+        for refused in [
+            "",
+            "/etc/passwd",
+            "data/../../auth.json",
+            "data//a",
+            "./a",
+            "data\\a",
+        ] {
+            assert!(
+                serde_json::from_value::<CheckpointManifest>(manifest(refused)).is_err(),
+                "{refused}"
+            );
+        }
+        let mut unknown = manifest("manifest.json");
+        unknown["note"] = "invented".into();
+        assert!(serde_json::from_value::<CheckpointManifest>(unknown).is_err());
     }
 
     #[test]

@@ -5093,6 +5093,23 @@
             "connection_id": {
               "type": "string"
             },
+            "coordinator_id": {
+              "description": "Missing from coordinators older than owner floors.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "uuid"
+            },
+            "owner_epoch": {
+              "description": "The epoch the failover authority granted this coordinator start.\nAbsent for a coordinator without a `[failover]` section.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
             "type": {
               "type": "string",
               "const": "worker_ready"

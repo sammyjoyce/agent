@@ -239,7 +239,16 @@ export class HistoryStore {
     if (!ImportedItemEntry.is(entry)) return [];
     const { source, thread_id, item } = entry.data;
     const retained = await this.session.snapshot(RetainedAssets, historyKey(source, thread_id, item.id, item.version), BACKGROUND_CONTEXT);
-    return mergeAssets(item.assets, retained?.assets ?? []);
+    return mergeAssets(item.assets.map((asset) => this.liveAsset(asset)), (retained?.assets ?? []).map((asset) => this.liveAsset(asset)));
+  }
+  /**
+   * An entry records the absolute path its asset had where it was imported. A
+   * replayed log and a restored backup carry that path into another state
+   * directory, so the path is rebuilt from this asset root and the hash that
+   * names the retained file.
+   */
+  private liveAsset(asset: HistoryAssetRef): HistoryAssetRef {
+    return this.assetRoot === undefined || asset.sha256 === null ? asset : { ...asset, path: join(this.assetRoot, asset.sha256) };
   }
   async indexText(entry: EntryRecord): Promise<string | undefined> {
     if (!ImportedItemEntry.is(entry)) return importedText(entry);

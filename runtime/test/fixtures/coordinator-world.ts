@@ -29,11 +29,15 @@ export type WorldEnd = Pick<TestContext, "passed" | "diagnostic">;
 /** Owns a world's lifetime: a test, or a long-lived fixture that runs the cleanup itself. */
 export type WorldOwner = { after(cleanup: (end: WorldEnd) => Promise<void>): void };
 
-export async function coordinatorWorld(t: WorldOwner) {
+/**
+ * `prepare` runs after each home has its default files and before either
+ * service starts. `runtime` is the script both services run as their Pi child.
+ */
+export async function coordinatorWorld(t: WorldOwner, prepare: (homes: readonly [string, string]) => Promise<void> = async () => {},
+  runtime = fileURLToPath(new URL("./coordinator-runtime.js", import.meta.url))) {
   const directory = await realpath(await mkdtemp("/tmp/agent-e2e-"));
   const binary = process.env.AGENT_TEST_BINARY ?? fileURLToPath(new URL("../../../../target/debug/beep-boop", import.meta.url));
   const terminalFixture = fileURLToPath(new URL("../../../../target/debug/examples/terminal-fixture", import.meta.url));
-  const runtime = fileURLToPath(new URL("./coordinator-runtime.js", import.meta.url));
   const coordinator = "11111111-1111-4111-8111-111111111111", laptop = "22222222-2222-4222-8222-222222222222";
   const bin = join(directory, "bin"), queue = join(directory, "responses.json"), feedbackGate = join(directory, "feedback-gate");
   const homes = [join(directory, "desktop"), join(directory, "laptop")] as const;
@@ -85,7 +89,8 @@ export async function coordinatorWorld(t: WorldOwner) {
       "--runtime", runtime, "--instructions", join(home, "AGENTS.md"), ...args];
     const command = terminal ? [clientBinary, ...arguments_]
       : ["--json", "--no-tui", ...arguments_];
-    const child = spawn(terminal ? terminalFixture : clientBinary, command, { cwd: home, detached: true, stdio: ["pipe", "pipe", "pipe"], env: {
+    // A process given another HOME belongs to a host this fixture did not make, and runs there.
+    const child = spawn(terminal ? terminalFixture : clientBinary, command, { cwd: extra.HOME ?? home, detached: true, stdio: ["pipe", "pipe", "pipe"], env: {
       PATH: bin + delimiter + process.env.PATH, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local"),
       TMPDIR: directory, TERM: "xterm-256color", AGENT_SQLITE_VEC: process.env.AGENT_SQLITE_VEC, OPENAI_API_KEY: "sk-synthetic-fixture",
       AGENT_TEST_NODE_ID: host === 0 ? coordinator : laptop, AGENT_TEST_REX_STATE: join(home, "rex.json"),
@@ -106,8 +111,8 @@ export async function coordinatorWorld(t: WorldOwner) {
   async function cli(host: number, args: string[], input = "", clientBinary = binary) {
     const process = start(host, args, input, {}, false, false, clientBinary); assert.equal(await process.exited, 0, process.errors()); return events(process.output());
   }
-  async function exchange(command: RuntimeCommand, observe?: (event: RuntimeEventKind) => void): Promise<RuntimeEventKind[]> {
-    const channel = createConnection(socket); let output = "", done = false, observed = 0;
+  async function exchange(command: RuntimeCommand, observe?: (event: RuntimeEventKind) => void, path = socket): Promise<RuntimeEventKind[]> {
+    const channel = createConnection(path); let output = "", done = false, observed = 0;
     try {
       return await new Promise<RuntimeEventKind[]>((resolve, reject) => {
         channel.on("error", reject).on("data", (bytes: Buffer) => {
@@ -121,8 +126,8 @@ export async function coordinatorWorld(t: WorldOwner) {
       });
     } finally { channel.destroy(); }
   }
-  async function until(check: () => Promise<boolean>, message = "", diagnostic: () => string = () => ""): Promise<void> {
-    const deadline = Date.now() + 10_000;
+  async function until(check: () => Promise<boolean>, message = "", diagnostic: () => string = () => "", limit = 10_000): Promise<void> {
+    const deadline = Date.now() + limit;
     while (!await check()) { assert.ok(Date.now() < deadline, message + "\n" + diagnostic() + "\n" + children.map((process) => process.errors()).join("\n") +
       children.slice(-3).map((process) => process.output().slice(-2400)).join("\n")); await new Promise((resolve) => setTimeout(resolve, 20)); }
   }
@@ -149,6 +154,7 @@ export async function coordinatorWorld(t: WorldOwner) {
     await writeFile(join(home, "agent.toml"), `node_name = "${index === 0 ? "desktop" : "laptop"}"\n` +
       (index === 0 ? "" : "coordinator = \"synthetic-coordinator\"\n"));
   }
+  await prepare(homes);
   const server = start(0, ["serve", "--local-only", "--no-sources"]);
   await until(async () => { try { return (await stat(socket)).isSocket(); } catch { return false; } });
   const worker = start(1, ["maintain"]); await online([coordinator, laptop]);

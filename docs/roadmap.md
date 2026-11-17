@@ -319,8 +319,22 @@ recovery; [history](history.md) describes import and retrieval.
   directory. Background work, task turns and automatic worktree collection stay
   held until `backup release`. See
   [backups and restore](setup.md#backups-and-restore).
-- [ ] Replicated coordinator state and failover, retaining one active owner so
-  additional coordinators do not duplicate work or external effects.
+- [x] Replicated coordinator state and failover, retaining one active owner so
+  additional coordinators do not duplicate work or external effects. A
+  coordinator with a `[failover]` section writes every commit and retained file
+  to a log on a Cloudflare Durable Object before local disk, a standby replays
+  that log, and `beep-boop failover promote` moves ownership to it under an
+  epoch that only the authority grants. The authority refuses every append and
+  every effect approval from any other epoch, so a coordinator without the
+  current epoch commits nothing, accepts no input and gets no new effect
+  approved. A coordinator opens a replicated state directory only under that
+  epoch. After a wrong statement that the old host is stopped, an effect
+  approved before the seal can still be dispatched once; promotion reports it
+  and does not repeat it. Promotion is an operator command, and nothing takes
+  over by itself. See
+  [failover](setup.md#failover), and
+  [cross-host recovery](architecture.md#cross-host-recovery) for what the stop
+  evidence does not prove.
 
 ## Upstream reuse follow-ups
 

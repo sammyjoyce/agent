@@ -23,6 +23,7 @@ import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
 import { ATTACHMENT_CHUNK_BYTES } from "../src/generated/attachment-limits.js";
 import { chatGptBatch } from "./fixtures/chatgpt-history.js";
 import { node, openScheduled, scheduledOccurrence } from "./fixtures/scheduled-runtime.js";
+import { LocalFiles } from "../src/failover/retained-files.js";
 
 type Server = { child: ChildProcessWithoutNullStreams; closed: Promise<number | null>; errors(): string };
 type Run = { code: number | null; stdout: string; stderr: string };
@@ -71,7 +72,7 @@ async function seed(state: string): Promise<Seeded> {
     await runScheduled(scheduledOccurrence, new AbortController().signal, app);
     const scheduledTask = (await app.tasks.list())[0]; assert.ok(scheduledTask, "the scheduled occurrence owns a task");
 
-    const attachments = new AttachmentStore(state); app.tasks.useAttachments(attachments);
+    const attachments = new AttachmentStore(new LocalFiles(state)); app.tasks.useAttachments(attachments);
     const attachmentBytes = Buffer.from("Invented ledger line one.\nInvented ledger line two.\n".repeat(4000));
     let attachment: AttachmentRef | null = null;
     for (let offset = 0; offset < attachmentBytes.length; offset += ATTACHMENT_CHUNK_BYTES) {
@@ -116,7 +117,7 @@ async function seed(state: string): Promise<Seeded> {
     const chatGpt = await history.import(edited);
     const large = randomBytes(16 * 1024 * 1024); await writeFile(join(assets, sha256(large)), large, { mode: 0o600 });
 
-    const feedback = new FeedbackStore(state, app.tasks);
+    const feedback = new FeedbackStore(new LocalFiles(state), app.tasks);
     const bundle = await feedback.capture("Invented feedback about the ledger task.", { attachments: [attachment], origin_host_id: node.host_id,
       cwd: "/workspace/example", conversation_id: null, task_id: task.id, agent_id: null, model: null, binding: null, draft: "",
       queued_inputs: [], client_errors: [] });

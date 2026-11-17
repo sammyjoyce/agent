@@ -25,6 +25,7 @@ use crate::{
         BlockId, HostId, RexClient, RexError, RexIdentity, SessionId, WindowId, WorkerBinding,
         WorkerResume,
     },
+    runtime::effects::EffectGroup,
 };
 use uuid::Uuid;
 
@@ -1031,6 +1032,7 @@ pub(crate) async fn run_process_ending(
                     .context(format!("Could not start command {program:?} in {cwd:?}")),
             )
         })?;
+    let _recorded = EffectGroup::led_by(child.id());
     let result = async {
         let mut group = ProcessGroup(
             child

@@ -6,6 +6,7 @@ import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
 import { connect, type ClientHttp2Session } from "node:http2";
 import { stripVTControlCharacters } from "node:util";
+import type { OwnerGate } from "./failover/owner-gate.js";
 import type { ApnsConfig } from "./generated/ApnsConfig.js";
 import type { NotificationRequest } from "./generated/NotificationRequest.js";
 import type { NotificationStatus } from "./generated/NotificationStatus.js";
@@ -19,7 +20,9 @@ type Delivery = { installation_id: string; generation: string; conversation_id: 
   state: "queued" | "attempting" | "retrying" | "accepted" | "rejected" | "uncertain" | "superseded" | "expired";
   status: number | null; attempts: number; retry_at: number | null; expires_at: number };
 type Checkpoint = { phase: "deliver"; last: { key: string; state: Delivery["state"]; attempts: number } | null };
-type Result = { state: "accepted" | "rejected" | "retrying" | "uncertain"; status: number | null; invalid_device: boolean };
+type Sent = { state: "accepted" | "rejected" | "retrying" | "uncertain"; status: number | null; invalid_device: boolean };
+/** `unsent` means the owner gate never opened for the attempt, so no request left this host. */
+type Result = Sent | { state: "unsent" };
 export const NotificationState = defineDoc<State>({ kind: "agent.notifications", scope: "session", version: 1,
   initial: () => ({ initialized: false, cursor: null, installations: [], pending: [], active: null }), checkpointWhen: () => true });
 export const NotificationDeliveries = defineDocFamily<{ delivery: Delivery | null }, null>({ kind: "agent.notification-delivery", scope: "session", family: true, version: 1,
@@ -76,8 +79,9 @@ export class ApnsClient {
   private jwt: { at: number; value: string } | undefined;
   private connection: ClientHttp2Session | undefined;
   private closed = false;
+  /** `gate` is the owner gate of a replicated coordinator. Each send waits there before its request leaves this host. */
   constructor(private readonly config: ApnsConfig, private readonly origin = config.environment === "sandbox"
-    ? "https://api.sandbox.push.apple.com" : "https://api.push.apple.com") {}
+    ? "https://api.sandbox.push.apple.com" : "https://api.push.apple.com", private readonly gate?: OwnerGate) {}
   async ready(): Promise<void> { this.key = await privateKey(this.config.key_file); }
   close(): void { this.closed = true; this.connection?.destroy(); this.connection = undefined; }
   private authorization(): string {
@@ -90,8 +94,13 @@ export class ApnsClient {
     this.jwt = { at, value }; return value;
   }
   async send(delivery: Delivery, token: string, preview: string, signal: AbortSignal): Promise<Result> {
-    const uncertain: Result = { state: "uncertain", status: null, invalid_device: false };
+    const uncertain: Sent = { state: "uncertain", status: null, invalid_device: false };
     if (this.closed || signal.aborted) return uncertain;
+    if (this.gate !== undefined) {
+      // A refusal has already ended the process where the gate read it.
+      try { await this.gate.fresh(signal); } catch { return { state: "unsent" }; }
+      if (this.closed) return { state: "unsent" };
+    }
     try {
       const authorization = this.authorization();
       if (this.connection === undefined || this.connection.closed || this.connection.destroyed) {
@@ -103,9 +112,9 @@ export class ApnsClient {
         "apns-topic": this.config.topic, "apns-push-type": "alert", "apns-priority": "10", "apns-expiration": String(Math.floor(delivery.expires_at / 1000)), "content-type": "application/json",
         "apns-id": delivery.apns_id, "apns-collapse-id": notificationDeliveryKey(delivery.installation_id, delivery.entry_id) },
       { signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]) });
-      return await new Promise<Result>((resolve) => {
+      return await new Promise<Sent>((resolve) => {
         let status: number | undefined, body = "", settled = false;
-        const finish = (result: Result) => { if (!settled) { settled = true; resolve(result); } };
+        const finish = (result: Sent) => { if (!settled) { settled = true; resolve(result); } };
         request.on("response", (headers) => { if (typeof headers[":status"] === "number") status = headers[":status"]; });
         request.setEncoding("utf8").on("data", (chunk: string) => { body += chunk; if (Buffer.byteLength(body) > 4096) request.destroy(); });
         request.once("error", () => finish(uncertain)); request.once("close", () => finish(uncertain));
@@ -136,8 +145,8 @@ export class Notifications {
   private stop: (() => void) | undefined;
   private serial: Promise<void> = Promise.resolve();
   private closed = false;
-  constructor(private readonly session: Harness, registry: Registry, config?: ApnsConfig, origin?: string) {
-    this.client = config === undefined ? undefined : new ApnsClient(config, origin);
+  constructor(private readonly session: Harness, registry: Registry, config?: ApnsConfig, origin?: string, gate?: OwnerGate) {
+    this.client = config === undefined ? undefined : new ApnsClient(config, origin, gate);
     this.task = defineTask<null, Checkpoint, null>({ name: "agent.notifications", version: 1, initial: () => ({ phase: "deliver", last: null }), phases: {
       deliver: async (task, runtime, context) => {
         let attempt: { key: string; delivery: Delivery; token: string; preview: string } | undefined;
@@ -182,6 +191,12 @@ export class Notifications {
         const current = attempt, result = await this.client?.send(current.delivery, current.token, current.preview, runtime.signal);
         await runtime.commit(async (tx) => {
           const state = await tx.doc(NotificationState), saved = await tx.doc(NotificationDeliveries, current.key, null);
+          if (result?.state === "unsent") {
+            // The delivery waits, unclaimed, for the dispatcher that the next reply or the next start creates.
+            if (saved.delivery?.state === "attempting") { saved.delivery.state = "queued"; saved.delivery.attempts -= 1; }
+            if (state.active === runtime.taskId) state.active = null;
+            return terminal();
+          }
           if (saved.delivery?.state === "attempting") { saved.delivery.state = result?.state ?? "uncertain"; saved.delivery.status = result?.status ?? null; }
           if (saved.delivery?.state === "retrying") {
             // Apple permits delayed retries of explicit 429/5xx rejections.

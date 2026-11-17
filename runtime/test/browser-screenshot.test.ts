@@ -29,6 +29,7 @@ import { Executions } from "../src/tools.js";
 import { history } from "../src/transcript.js";
 import { HistoryStore } from "../src/history.js";
 import { capturePng, pngSize } from "./fixtures/png.js";
+import { LocalFiles } from "../src/failover/retained-files.js";
 
 const hostId = "11111111-1111-4111-8111-111111111111";
 const host = { host_id: hostId, name: "fixture", rex_server: null, coordinator: null, cwd: "/example/project", agent_program: "/example/agent" };
@@ -42,7 +43,7 @@ async function open(directory: string) {
   models.setProvider(faux.provider);
   const registry = createRegistry();
   const session = await Harness.open(await SqliteStorage.open(database), { models, registry }, BACKGROUND_CONTEXT);
-  const browsers = new BrowserStore(session), executions = new Executions(), attachments = new AttachmentStore(directory);
+  const browsers = new BrowserStore(session), executions = new Executions(), attachments = new AttachmentStore(new LocalFiles(directory));
   const tools = createBrowserTools(browsers, executions, attachments); registry.install(tools);
   const root = await session.root(BACKGROUND_CONTEXT);
   await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [tools] }, BACKGROUND_CONTEXT);

@@ -24,7 +24,7 @@ use agent_cli::{
         InputMode, RuntimeCommand, RuntimeEventKind, TaskId, WorkerLaunch,
     },
     rex::RexClient,
-    runtime::{FrameReader, Runtime, RuntimeCall},
+    runtime::{FrameReader, OwnerClaim, Runtime, RuntimeCall},
 };
 use base64::Engine;
 use serde_json::{Value, json};
@@ -200,7 +200,9 @@ impl Coordinator {
             },
             background: None,
         };
-        let runtime = Arc::new(Runtime::start(&script, files).unwrap());
+        let runtime = Arc::new(
+            Runtime::start(&script, OwnerClaim::acquire(files, &script, None).unwrap()).unwrap(),
+        );
         for command in [
             RuntimeCommand::ConfigureCoordinator {
                 bootstrap: bootstrap.clone(),
@@ -659,6 +661,8 @@ async fn a_registered_worker_serves_image_reads_from_its_own_host() {
                     attached
                         .send([RuntimeEventKind::WorkerReady {
                             connection_id: "invented-connection".into(),
+                            coordinator_id: None,
+                            owner_epoch: None,
                         }])
                         .await;
                     let mut received = Vec::new();
@@ -737,6 +741,8 @@ async fn a_registered_worker_serves_image_reads_from_its_own_host() {
         .arg(files.join("AGENTS.md"))
         .arg("maintain")
         .env("PATH", path)
+        .env("HOME", &files)
+        .env("XDG_DATA_HOME", files.join("data"))
         .env("AGENT_TEST_FAKE_REX", &bin)
         .env("AGENT_TEST_FAKE_REX_ORIGIN_SERVER", SERVER)
         .env("AGENT_TEST_COORDINATOR_SOCKET", files.join("agent.sock"))

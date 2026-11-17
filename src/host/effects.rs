@@ -5,7 +5,7 @@ use std::{collections::HashMap, future::Future};
 use anyhow::{Context, Result, ensure};
 use tokio::{sync::watch, task::JoinSet};
 
-use crate::protocol::HostResult;
+use crate::{protocol::HostResult, runtime::effects::EffectShare};
 
 pub enum Capacity {
     Unbounded,
@@ -70,7 +70,11 @@ impl HostEffects {
         let (cancel, cancelled) = watch::channel(false);
         self.cancellations.insert(call_id.clone(), cancel);
         let future = execute(cancelled);
+        // A task that outlives its connection is detached and not drained, so
+        // the task and not the connection says that an effect is still alive.
+        let alive = EffectShare::hold();
         self.tasks.spawn(async move {
+            let _alive = alive;
             Reply {
                 call_id,
                 result: future.await,

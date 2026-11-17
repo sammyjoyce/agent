@@ -36,6 +36,17 @@ const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 
 pub fn create(state: &Path, destination: &Path, runtime: &Path) -> Result<Created> {
     existing_private_directory(state)?;
+    let lock = WriterLock::acquire(state)?;
+    create_locked(&lock, state, destination, runtime)
+}
+
+pub(crate) fn create_locked(
+    _lock: &WriterLock,
+    state: &Path,
+    destination: &Path,
+    runtime: &Path,
+) -> Result<Created> {
+    existing_private_directory(state)?;
     ensure!(
         absent(destination)?,
         "{} already exists",
@@ -47,7 +58,6 @@ pub fn create(state: &Path, destination: &Path, runtime: &Path) -> Result<Create
         "The backup destination must be outside the state directory"
     );
     let helper = DatabaseHelper::locate(runtime)?;
-    let _lock = WriterLock::acquire(state)?;
     let coordinator_id = CoordinatorId::read(state)?.context(
         "The state directory has no coordinator-id; back up a store that a coordinator created",
     )?;
@@ -187,7 +197,11 @@ pub fn restore(archive: &Path, target: &Path, runtime: &Path) -> Result<Restored
 /// without a hold succeeds.
 pub fn release(state: &Path) -> Result<Released> {
     existing_private_directory(state)?;
-    let _lock = WriterLock::acquire(state)?;
+    let lock = WriterLock::acquire(state)?;
+    release_locked(&lock, state)
+}
+
+pub(crate) fn release_locked(_lock: &WriterLock, state: &Path) -> Result<Released> {
     let state_dir = std::path::absolute(state)?;
     match fs::remove_file(state.join(RESTORE_HOLD_FILE)) {
         Ok(()) => {
@@ -806,6 +820,8 @@ const STATE_ENTRIES: &[(EntryName, Disposition)] = &[
     (EntryName::Exact("coordinator.log"), Disposition::Local),
     (EntryName::Exact("agent.sock"), Disposition::Local),
     (EntryName::Exact("writer.lock"), Disposition::Local),
+    (EntryName::Exact("effects.lock"), Disposition::Local),
+    (EntryName::Exact("effects"), Disposition::Local),
     (EntryName::Exact("embeddings"), Disposition::Local),
     (EntryName::Exact("attachment-cache"), Disposition::Local),
     (EntryName::Exact("feedback-outbox"), Disposition::Local),
@@ -1729,6 +1745,21 @@ mod tests {
             "{:?}",
             inventory.not_included
         );
+    }
+
+    #[test]
+    fn the_effects_lock_and_its_records_are_local_and_not_reported_as_unknown() {
+        let (_root, state, _) = stopped_store();
+        fs::write(state.join("effects.lock"), "").unwrap();
+        fs::create_dir(state.join("effects")).unwrap();
+        fs::write(state.join("effects").join("4242"), "1794872808").unwrap();
+
+        let inventory = Inventory::scan(&state).unwrap();
+        assert_eq!(
+            inventory.files.keys().cloned().collect::<Vec<_>>(),
+            vec![StateFile::Database, StateFile::CoordinatorId]
+        );
+        assert_eq!(inventory.not_included, Vec::<String>::new());
     }
 
     #[test]
