@@ -942,6 +942,11 @@ unreachable. Conversations, attachments and feedback are stored there
 unencrypted. [Cross-host recovery](architecture.md#cross-host-recovery)
 explains the mechanism.
 
+Once a state directory is enrolled or joined, it opens only with its
+`[failover]` section. Every command that starts a coordinator on it with a
+config that lacks the section is refused, and the refusal names the log
+position the directory holds. Removing the section does not turn failover off.
+
 ### Deploy the authority
 
 Deploy `runtime/failover/wrangler.jsonc` to your Cloudflare account with an R2
@@ -990,34 +995,41 @@ its epoch, the log head and the log position this directory holds.
 
 On the second host, with its own holder and token, run `beep-boop failover join
 <coordinator-id>` with a state directory that is absent or empty. Then keep
-`beep-boop failover follow` running as a service. Run `beep-boop login` there,
-because credentials are not replicated. A standby starts held, as a restored
-backup does, and the promotion releases the hold.
+`beep-boop failover follow` running as a service. A standby starts held, as a
+restored backup does, and the promotion releases the hold. Credentials are not
+replicated, and a standby cannot sign in: `beep-boop login` needs a running
+coordinator, and a standby's start is refused at its claim. Sign in after the
+promotion.
 
 ### Promote the standby
 
 1. Run `beep-boop failover status` and note the epoch.
-2. On the standby, run `beep-boop failover promote --replace-epoch <epoch>`. A
+2. On the standby, stop the `failover follow` service and keep it stopped. It
+   holds the state directory's lock, so a promotion beside it is refused before
+   it asks the authority for anything. The promotion applies the rest of the
+   log itself. Do not start the follower on this host again: the coordinator
+   needs the same lock.
+3. On the standby, run `beep-boop failover promote --replace-epoch <epoch>`. A
    running old owner sees the seal within a few seconds, stops by itself, and the
    command completes.
-3. If the old coordinator process is dead and its host is up, run `beep-boop
+4. If the old coordinator process is dead and its host is up, run `beep-boop
    failover release` on the old host, then run the `promote` command again. A
    coordinator that the service manager restarts after a seal does this release by
    itself. The release stops each local command the old coordinator left running
    and posts `lock_held` only when it finds nothing of the old coordinator alive
    on that host. If something survives that it may not stop, it names it and
-   posts nothing. Stop the process and run the release again, or go to step 4.
+   posts nothing. Stop the process and run the release again, or go to step 5.
    A release that got no reply from the authority is safe to run again: when
    the authority already holds the evidence, the command posts nothing and says
    so.
    A fenced coordinator that is still running applies the same test before it
    posts `released`, and prints the same sentence when the test fails.
-4. If the old host cannot be reached, make sure it is powered off, then run
+5. If the old host cannot be reached, make sure it is powered off, then run
    `beep-boop failover promote --replace-epoch <epoch> --old-owner-stopped "<why
    you know it is stopped>"`. The statement is stored. Read what a wrong statement
    leaves possible in [Cross-host recovery](architecture.md#cross-host-recovery)
    first.
-5. Read the report. It lists each tool call and each notification that the old
+6. Read the report. It lists each tool call and each notification that the old
    owner started and that has no result, and each credential this host lacks.
    `released` and `lock_held` cover the old owner's own host. Neither proves that
    a command on a worker has ended. That command ends when the worker's daemon
@@ -1026,9 +1038,10 @@ backup does, and the promotion releases the hold.
    Neither covers a detached helper that a local command started and that
    closed the files it inherited. [Cross-host recovery](architecture.md#cross-host-recovery)
    states that limit.
-6. Start the service on the new owner, and change the address on each phone.
-   The phones keep their pairing because the coordinator ID is the same. Send
-   again any input whose turn was in flight.
+7. Start the service on the new owner, and run `beep-boop login` there,
+   because the report names `auth.json` as missing. Change the address on each
+   phone. The phones keep their pairing because the coordinator ID is the same.
+   Send again any input whose turn was in flight.
 
 A fenced coordinator exits with status 75. Under launchd it restarts, is
 refused at its claim before it sets up anything, and exits 75 again. Under
@@ -1044,7 +1057,8 @@ the old state directory under a new name.
 The log grows with every commit, and one Durable Object holds 10 GB. Stop the
 owner and run `beep-boop failover checkpoint` from time to time. It stores a
 new checkpoint and drops the log entries the checkpoint covers. A standby that
-was behind the checkpoint must join again with `--replace`.
+was behind the checkpoint must join again with `--replace`. Stop its follower
+first, because the join takes the lock the follower holds.
 
 ### What a replicated coordinator does differently
 
