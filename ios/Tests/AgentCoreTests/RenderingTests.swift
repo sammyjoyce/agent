@@ -1251,6 +1251,131 @@
         try await body(model, box, work)
       }
 
+      /// A bounded layout parity check against SwiftUI's own HStack in each direction.
+      /// The interaction tests above exercise the production editor and controls separately.
+      @MainActor @Test(arguments: [false, true])
+      func composerLayoutKeepsHStackDirectionAndControlAnchors(rightToLeft: Bool) async throws {
+        var frames: [Int: CGRect] = [:]
+        let line = ComposerField.singleLineHeight(at: .large)
+        func row(_ layout: AnyLayout, id: Int, text: String) -> some View {
+          layout {
+            ForEach(0..<4) { index in
+              if index == 2 {
+                Text(text).font(.body).padding(.vertical, 11).padding(.horizontal, 2)
+                  .frame(maxWidth: .infinity)
+                  .layoutValue(key: ComposerEditorLayoutKey.self, value: true)
+                  .onGeometryChange(for: CGRect.self) {
+                    $0.frame(in: .global)
+                  } action: {
+                    frames[id + index] = $0
+                  }
+              } else {
+                Color.gray.frame(width: 44, height: 44)
+                  .onGeometryChange(for: CGRect.self) {
+                    $0.frame(in: .global)
+                  } action: {
+                    frames[id + index] = $0
+                  }
+              }
+            }
+          }
+          .frame(width: 320)
+        }
+        let content = VStack {
+          row(AnyLayout(HStackLayout(alignment: .bottom, spacing: 4)), id: 0, text: "Hi")
+          row(AnyLayout(ComposerLayout(singleLineHeight: line)), id: 10, text: "Hi")
+          row(
+            AnyLayout(ComposerLayout(singleLineHeight: line)), id: 20,
+            text: "Invented draft wrapping over multiple lines without moving controls.")
+        }
+        .environment(\.layoutDirection, rightToLeft ? .rightToLeft : .leftToRight)
+        .environment(\.dynamicTypeSize, .large)
+        let host = UIHostingController(rootView: content)
+        let scene = try #require(
+          UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let previous = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer {
+          window.isHidden = true
+          window.rootViewController = nil
+          previous?.makeKey()
+        }
+        window.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(400))
+        host.view.layoutIfNeeded()
+        for index in 0..<4 {
+          let reference = try #require(frames[index])
+          let compact = try #require(frames[10 + index])
+          #expect(abs(reference.minX - compact.minX) < 1)
+          #expect(abs(reference.width - compact.width) < 1)
+          if index != 2 {
+            let expanded = try #require(frames[20 + index])
+            #expect(abs(expanded.minX - compact.minX) < 1, "Control anchors match HStack")
+          }
+        }
+        let menu = try #require(frames[20])
+        let send = try #require(frames[23])
+        let editor = try #require(frames[22])
+        #expect((menu.minX > send.minX) == rightToLeft)
+        #expect(editor.minX <= min(menu.minX, send.minX) + 1)
+        #expect(editor.maxX >= max(menu.maxX, send.maxX) - 1)
+        #expect(editor.maxY <= menu.minY + 1)
+      }
+
+      @MainActor @Test
+      func composerReflowKeepsTheNativeEditorSelectionAndComposition() async throws {
+        try await withComposer(size: .large) { model, box, _ in
+          let field = box.draft
+          field.insertText("Invented note")
+          try await Task.sleep(for: .milliseconds(300))
+          let compactWidth = box.bounds.width
+          let selection = NSRange(location: 3, length: 4)
+          field.selectedRange = selection
+          let window = try #require(box.window)
+          let host = try #require(window.rootViewController)
+          host.traitOverrides.preferredContentSizeCategory = .accessibilityExtraExtraExtraLarge
+          try await Task.sleep(for: .milliseconds(400))
+          window.layoutIfNeeded()
+          #expect(box.bounds.width > compactWidth, "The same draft reflows above its controls")
+          #expect(field.isFirstResponder && field.selectedRange == selection)
+          #expect(box.draft === field && field.window === window)
+          #expect(field.text == "Invented note" && model.draft == field.text)
+
+          // Choose CJK provisional text using the actual huge font/compact width: it must wrap
+          // there yet fit at normal size. This checks a transition WHILE marked, not merely
+          // a trait change while a long committed draft stays stacked in both sizes.
+          field.selectedRange = NSRange(location: 0, length: field.text.utf16.count)
+          field.deleteBackward()
+          let hugeFont = try #require(field.font)
+          let glyphWidth = ("界" as NSString).size(withAttributes: [.font: hugeFont]).width
+          let provisional = String(
+            repeating: "界", count: max(3, Int(ceil(compactWidth / glyphWidth)) + 1))
+          field.setMarkedText(provisional, selectedRange: NSRange(location: 1, length: 2))
+          try await Task.sleep(for: .milliseconds(400))
+          window.layoutIfNeeded()
+          let marked = try #require(field.markedTextRange)
+          let composing = field.text(in: marked)
+          let selected = field.selectedRange
+          let stackedWidth = box.bounds.width
+          #expect(
+            stackedWidth > compactWidth + 1, "Marked text actually occupies the stacked width")
+          #expect(field.isFirstResponder && composing == provisional)
+          host.traitOverrides.preferredContentSizeCategory = .large
+          try await Task.sleep(for: .milliseconds(400))
+          window.layoutIfNeeded()
+          #expect(
+            box.bounds.width < stackedWidth - 1,
+            "The marked draft actually collapsed from stacked to compact")
+          #expect(abs(box.bounds.width - compactWidth) < 1)
+          #expect(field.isFirstResponder && field.selectedRange == selected)
+          #expect(field.text(in: try #require(field.markedTextRange)) == composing)
+          #expect(box.draft === field && field.window === window)
+          field.unmarkText()
+        }
+      }
+
       @MainActor private func dictationTarget(_ model: ChatModel, _ field: UITextView)
         -> DictationTarget
       {

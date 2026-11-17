@@ -16,6 +16,31 @@
     }
     static let inset = UIEdgeInsets(top: 11, left: 2, bottom: 11, right: 2)
     static let maximumLines: CGFloat = 6
+
+    /// Match the editor's actual body font at its environment's content size, not the controls'
+    /// fixed 44pt targets (a single line is taller than those at accessibility sizes).
+    static func singleLineHeight(at size: DynamicTypeSize) -> CGFloat {
+      let category: UIContentSizeCategory
+      switch size {
+      case .xSmall: category = .extraSmall
+      case .small: category = .small
+      case .medium: category = .medium
+      case .large: category = .large
+      case .xLarge: category = .extraLarge
+      case .xxLarge: category = .extraExtraLarge
+      case .xxxLarge: category = .extraExtraExtraLarge
+      case .accessibility1: category = .accessibilityMedium
+      case .accessibility2: category = .accessibilityLarge
+      case .accessibility3: category = .accessibilityExtraLarge
+      case .accessibility4: category = .accessibilityExtraExtraLarge
+      case .accessibility5: category = .accessibilityExtraExtraExtraLarge
+      @unknown default: category = .large
+      }
+      let traits = UITraitCollection(preferredContentSizeCategory: category)
+      let font = UIFont.preferredFont(forTextStyle: .body, compatibleWith: traits)
+      return font.lineHeight + inset.top + inset.bottom
+    }
+
     let text: String
     let placeholder: String
     let chip: Chip?
@@ -128,7 +153,6 @@
       let fitting = view.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude)).height
       let limit =
         (view.font?.lineHeight ?? 0) * Self.maximumLines + Self.inset.top + Self.inset.bottom
-      view.isScrollEnabled = fitting > limit
       return CGSize(width: width, height: min(fitting, limit))
     }
 
@@ -212,6 +236,21 @@
         super.layoutSubviews()
         draft.frame = bounds
         fitChip(width: bounds.width)
+        // Layout probes both the hypothetical compact width and the placed width. A probe must
+        // not toggle scrolling (which can reset contentOffset); only the real bounds decide it.
+        let fitting = draft.sizeThatFits(
+          CGSize(width: bounds.width, height: .greatestFiniteMagnitude)
+        ).height
+        let limit =
+          (draft.font?.lineHeight ?? 0) * ComposerField.maximumLines
+          + ComposerField.inset.top + ComposerField.inset.bottom
+        let scrolling = fitting > limit
+        if draft.isScrollEnabled != scrolling {
+          draft.isScrollEnabled = scrolling
+          if scrolling && draft.isFirstResponder {
+            draft.scrollRangeToVisible(draft.selectedRange)
+          }
+        }
         button.frame.origin = CGPoint(
           x: ComposerField.inset.left, y: ComposerField.inset.top - draft.contentOffset.y)
         // VoiceOver reads the recipient, then the draft. It reaches the chip only while all of
