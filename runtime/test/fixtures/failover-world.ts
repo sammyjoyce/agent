@@ -75,6 +75,16 @@ export interface Sent {
  */
 export const REDIRECTED_WORKER_LIMIT = 60_000;
 
+/**
+ * How long a coordinator may take from its start to accepting clients. `serve` binds its socket once Pi has
+ * answered its configuration, and the only limit the product sets on that step is the 10 minutes of `initialize`
+ * in `src/broker.rs`, so this limit is measured. Of 48 starts on an 18-core Mac with the 1-minute load held at
+ * 45 to 60, 47 took 0.9 to 5.6 seconds. One took 14.7 seconds, 13.9 of them between spawning the Pi child and Pi
+ * answering its configuration. That start outlasts the default 10 seconds of `until` in `coordinator-world.ts`.
+ * The rest is room for a busier machine.
+ */
+export const COORDINATOR_START_LIMIT = 60_000;
+
 const isSocket = (path: string) => stat(path).then((entry) => entry.isSocket(), () => false);
 
 /** Whether a process accepts connections on the socket. A coordinator that was killed leaves its socket file behind. */
@@ -219,7 +229,7 @@ export async function failoverWorld(t: TestContext, options: WorldOptions = {}) 
       await until(async () => {
         assert.equal(serving.child.exitCode, null, `serve on the ${host.name} exited ${serving.child.exitCode}: ${serving.errors()}`);
         return accepts(host.socket);
-      }, `The ${host.name} must accept clients on its socket`, () => serving.errors().slice(-2000));
+      }, `The ${host.name} must accept clients on its socket`, () => serving.errors().slice(-2000), COORDINATOR_START_LIMIT);
       return serving;
     },
     /** Starts `serve` on a host that is expected to be refused, and returns the process. */
