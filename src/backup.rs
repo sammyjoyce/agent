@@ -1706,6 +1706,25 @@ mod tests {
     }
 
     #[test]
+    fn an_unclean_stop_leaves_coordinator_state_that_is_neither_carried_nor_unknown() {
+        let (_root, state, _) = stopped_store();
+        fs::write(state.join("unrecorded-start"), "1700000000000").unwrap();
+        fs::create_dir_all(state.join("dreams/runs/invented-run")).unwrap();
+        fs::write(state.join("dreams/runs/invented-run/run.json"), "{}").unwrap();
+
+        let inventory = Inventory::scan(&state).unwrap();
+        assert_eq!(
+            inventory.files.keys().cloned().collect::<Vec<_>>(),
+            vec![StateFile::Database, StateFile::CoordinatorId]
+        );
+        assert!(
+            inventory.not_included.is_empty(),
+            "{:?}",
+            inventory.not_included
+        );
+    }
+
+    #[test]
     fn create_refuses_a_symlinked_carried_file() {
         let (root, state, runtime) = stopped_store();
         fs::create_dir_all(state.join("history/assets")).unwrap();
