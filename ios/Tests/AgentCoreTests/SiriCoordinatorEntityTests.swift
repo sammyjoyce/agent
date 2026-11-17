@@ -208,6 +208,26 @@ struct SiriCoordinatorEntityTests {
     #expect(await spotlight.entries.count == 3)
   }
 
+  @Test func goingInactiveCancelsAWaitingRetry() async throws {
+    let spotlight = SpotlightFake()
+    let fixture = try indexing(spotlight)
+    defer { fixture.clean() }
+    await activate(fixture.notifications)
+    let coordinators = fixture.notifications.coordinators
+    let personal = fixture.profiles[1]
+    await spotlight.refuseNextWrite()
+    try await coordinators.update(personal.id, name: TagName("Family"), address: personal.address)
+    while await spotlight.refused == 0 { try await Task.sleep(for: .milliseconds(5)) }
+    await Task.yield()
+    await coordinators.setActive(false)
+    try await Task.sleep(for: .seconds(3))
+    #expect(
+      await spotlight.coordinators[personal.id] == "Personal",
+      "A retry wrote after the app went inactive")
+    await activate(fixture.notifications)
+    #expect(await spotlight.coordinators == names(fixture, [0: "Work", 1: "Family", 2: "Home"]))
+  }
+
   @Test func aSpotlightCoordinatorOpensLikeOpenCoordinatorAndKeepsTheDraft() async throws {
     let spotlight = SpotlightFake()
     let fixture = try indexing(spotlight)

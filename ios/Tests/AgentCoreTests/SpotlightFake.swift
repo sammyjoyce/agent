@@ -9,6 +9,7 @@ actor SpotlightFake: SpotlightStore {
   }
 
   private(set) var entries: [SpotlightEntry.Key: SpotlightEntry] = [:]
+  private(set) var refused = 0
   private enum Plan { case hold, refuse }
   private var next: Plan?
   private var held: CheckedContinuation<Void, any Error>?
@@ -67,7 +68,9 @@ actor SpotlightFake: SpotlightStore {
     let plan = next
     next = nil
     switch plan {
-    case .refuse: throw WriteFailed()
+    case .refuse:
+      refused += 1
+      throw WriteFailed()
     case .hold:
       try await withCheckedThrowingContinuation { continuation in
         held = continuation
