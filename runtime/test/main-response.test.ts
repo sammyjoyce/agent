@@ -12,6 +12,7 @@ import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { DEFAULT_MODEL } from "../src/models.js";
 import { history } from "../src/transcript.js";
+import { HistoryStore } from "../src/history.js";
 import { protocolLines, validEvent } from "../src/protocol.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
@@ -140,7 +141,7 @@ for (const commentary of [false, true]) test(`main replies cover silent direct i
       { models: createModels(), registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
     try {
       const root = await reopened.root(BACKGROUND_CONTEXT);
-      const recovered = (await history(root, null, reopened)).flatMap((event) => event.messages);
+      const recovered = (await history(root, null, new HistoryStore(reopened))).flatMap((event) => event.messages);
       assert.ok(recovered.findIndex((row) => row.entry_id === firstReply.entry_id) < recovered.findIndex((row) => row.entry_id === followup.entry_id),
         "Reopening must retain the same causal answer placement without timestamp sorting");
       const original = await root.commit((tx) => tx.submissionByRequest(root.id, "active"), BACKGROUND_CONTEXT);

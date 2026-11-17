@@ -53,7 +53,7 @@ async function save(app: App, items: HistoryItem[], at = 10, version = "thread-o
 }
 async function rows(app: App, id: string) {
   const conversation = await app.store.conversation(id); assert.ok(conversation);
-  const frames = await history(conversation, null, app.session);
+  const frames = await history(conversation, null, new HistoryStore(app.session));
   return frames.flatMap((frame) => frame.messages);
 }
 async function nativeEntries(app: App, id: string) {
@@ -105,7 +105,7 @@ test("a concurrent source publication cannot erase the older bounded history sna
       if (limit === 20 && !injected) { injected = true; await save(app, [current], 20, "concurrent-source"); }
       return page;
     };
-    const snapshot = (await history(conversation, null, app.session)).flatMap((frame) => frame.messages);
+    const snapshot = (await history(conversation, null, new HistoryStore(app.session))).flatMap((frame) => frame.messages);
     assert.equal(injected, true);
     assert.deepEqual(snapshot.filter((row) => row.role === "user").map((row) => row.text), [old.text]);
     assert.ok(snapshot.some((row) => row.role === "notice" && /coverage is unverified/u.test(row.text)));
@@ -133,14 +133,14 @@ test("a superseded source tail returns a bounded empty page and continuation ins
     const conversation = await app.store.conversation(id); assert.ok(conversation);
     let scanned = 0; const scan = app.storage.scanEntries.bind(app.storage);
     app.storage.scanEntries = async (query, limit, cursor, context) => { const page = await scan(query, limit, cursor, context); scanned += page.items.length; return page; };
-    const initial = await history(conversation, null, app.session);
+    const initial = await history(conversation, null, new HistoryStore(app.session));
     assert.ok(scanned <= 23, `The first page read ${scanned} native rows`);
     assert.equal(initial.flatMap((frame) => frame.messages).length, 0);
     let cursor = initial.at(-1)?.next_cursor; assert.ok(cursor);
     app.storage.scanEntries = scan;
     let visible = false;
     while (cursor !== null && cursor !== undefined && !visible) {
-      const page = await history(conversation, cursor, app.session);
+      const page = await history(conversation, cursor, new HistoryStore(app.session));
       visible = page.some((frame) => frame.messages.some((message) => message.role === "user"));
       cursor = page.at(-1)?.next_cursor;
     }

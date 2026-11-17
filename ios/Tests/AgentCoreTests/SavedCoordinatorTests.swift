@@ -2310,8 +2310,12 @@ func removingACoordinatorKeepsHeldMessagesQueuedForAnother(_ path: String) async
     } else {
       await bringBack()
       try await coordinators.add(name: TagName("Personal"), address: install.address)
+      let personal = try #require(coordinators.profiles.last).id
       try await eventually("the migrated profile's pairing refused") {
         coordinators.pairingError[migrated.id]?.hasPrefix("Already saved") == true
+      }
+      try await eventually("Personal connected") {
+        chat.snapshots[personal]?.connection == .connected
       }
     }
     try await eventually("held rows") { chat.held.count == 2 }

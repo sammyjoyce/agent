@@ -11,6 +11,7 @@ import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { Type } from "typebox";
 import { createMainResponsePolicy, mainResponse } from "../src/main_response.js";
 import { activity, history, MainResponses, UserNoticeEntry } from "../src/transcript.js";
+import { HistoryStore } from "../src/history.js";
 import { annotateTranscript } from "../src/transcript_visibility.js";
 
 test("visible commentary satisfies only inputs it follows, across pages and hidden or unrelated notices", { timeout: 10_000 }, async () => {
@@ -49,7 +50,7 @@ test("visible commentary satisfies only inputs it follows, across pages and hidd
     const response = await mainResponse(session, root, second.entry, second.answer);
     assert.ok(response.text); assert.equal(response.entry_id, first.answer.toString(), "Earlier commentary and another worker's notice do not answer steering");
     assert.deepEqual(await mainResponse(session, root, second.entry, second.answer), response, "Repeated owner settlement reuses the same durable reply");
-    assert.equal((await history(root, null, session)).flatMap((event) => event.messages).filter((message) => message.entry_id === response.entry_id && message.role === "final").length, 1);
+    assert.equal((await history(root, null, new HistoryStore(session))).flatMap((event) => event.messages).filter((message) => message.entry_id === response.entry_id && message.role === "final").length, 1);
     const commentary = visible[0]; assert.ok(commentary);
     await annotateTranscript(session, root, [{ entry_id: commentary.entry_id, classification: "internal_receipt" }]);
     assert.deepEqual(await mainResponse(session, root, first.entry, first.answer), response, "Hidden commentary cannot satisfy the visible response contract");
@@ -74,7 +75,7 @@ for (const stopReason of ["stop", "length", "toolUse"] satisfies ("stop" | "leng
       assert.ok(result.type === "input" && result.status === "done");
       const response = await mainResponse(session, root, result.entry, result.answer); assert.ok(response.text.trim());
       await session.close(BACKGROUND_CONTEXT); session = await open();
-      const rows = (await history(await session.root(BACKGROUND_CONTEXT), null, session)).flatMap((event) => event.messages).filter((row) => row.entry_id === result.answer.toString());
+      const rows = (await history(await session.root(BACKGROUND_CONTEXT), null, new HistoryStore(session))).flatMap((event) => event.messages).filter((row) => row.entry_id === result.answer.toString());
       assert.deepEqual(rows, [{ entry_id: response.entry_id, role: "final", text: response.text, continuation: false, final_chunk: true }]);
       assert.equal(faux.state.callCount, 1);
     } finally { await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }

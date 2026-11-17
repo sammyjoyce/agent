@@ -6,6 +6,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ModelsError } from "@earendil-works/pi-ai/utils/models-error";
+import type { GoalStatus } from "../src/generated/GoalStatus.js";
 import type { MachineSnapshot } from "../src/generated/MachineSnapshot.js";
 import type { RuntimeRequest } from "../src/generated/RuntimeRequest.js";
 
@@ -86,6 +87,28 @@ test("generated protocol rejects out-of-range and lossy numeric values", () => {
       status: { ...connected.event.status, expires_at } } }), false);
   }
   assert.equal(validRequest({ version: 1, id: 1, command: { type: "chat", input: "hello" } }), false);
+});
+
+test("goal controls and a completed goal status round-trip the generated protocol", () => {
+  const target = { type: "main" };
+  for (const action of [{ type: "show" }, { type: "set", request_id: "5f0c1d2e-3a4b-4c5d-8e6f-7a8b9c0d1e2f", objective: "Write the notes" },
+    { type: "pause", request_id: "pause-1" }, { type: "resume", request_id: "resume-1" }]) {
+    assert.equal(validRequest({ version: 1, id: 1, command: { type: "goal", target, action } }), true);
+  }
+  assert.equal(validRequest({ version: 1, id: 1, command: { type: "goal", target, action: { type: "pause" } } }), false);
+  const check = { type: "file_contains", path: "/workspace/example/notes.md", text: "GOAL-DONE" } as const;
+  const evidence = { entry_id: "42", activation: 2, check, observed: { bytes: 10, complete: true, sha256: "a".repeat(64) },
+    tool_call_id: "call-check", verified_at: 1_800_000_000 };
+  const status: GoalStatus = { conversation_id: "0", goal: {
+    goal: { id: "5f0c1d2e-3a4b-4c5d-8e6f-7a8b9c0d1e2f", task_id: "5f0c1d2e-3a4b-4c5d-8e6f-7a8b9c0d1e2f", objective: "Write the notes",
+      activation: { number: 2, request_id: "resume-1", continuations: 1, budget: 5, check }, state: { state: "complete", evidence },
+      last_rejection: null, created_at: 1_800_000_000, updated_at: 1_800_000_000 },
+    task: { id: "5f0c1d2e-3a4b-4c5d-8e6f-7a8b9c0d1e2f", conversation_id: "7", title: "Write the notes", outcome: "Write the notes", summary: "",
+      model: null, state: { state: "resolved", evidence: "Goal verified by the runtime" }, worker: { state: "unassigned" }, sources: [], pending: [],
+      agents: [], updated_at: 1_800_000_000 } } };
+  assert.equal(validEvent({ version: 1, id: 1, event: { type: "goal", status } }), true);
+  const unproven = { ...status, goal: status.goal === null ? null : { ...status.goal, goal: { ...status.goal.goal, state: { state: "complete" } } } };
+  assert.equal(validEvent({ version: 1, id: 1, event: { type: "goal", status: unproven } }), false);
 });
 
 test("malformed host replies require a valid transport identity and retain only schema diagnostics", () => {

@@ -14,7 +14,7 @@ public struct FeedbackTarget: Equatable, Sendable {
     scope: FeedScope, profiles: [CoordinatorProfile], removed: [ProfileID: String],
     owners: [ProfileID?]
   ) -> FeedbackTarget? {
-    let id = scope.coordinator ?? (profiles.count == 1 ? profiles[0].id : nil)
+    let id = scope.shownCoordinator(among: profiles)
     guard let profile = profiles.first(where: { $0.id == id }), removed[profile.id] == nil,
       let pin = profile.pin, owners.allSatisfy({ $0 == profile.id })
     else { return nil }

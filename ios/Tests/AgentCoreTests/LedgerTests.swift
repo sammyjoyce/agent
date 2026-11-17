@@ -840,7 +840,7 @@ func anInputAnOlderBuildQueuedIsNeverWithdrawn() async throws {
     await session.unstage(
       StagedInput(
         inputID: request.inputId, sendID: item.sendID, profile: directory.profile, control: nil,
-        composer: nil))
+        composer: nil, departure: nil))
     let queued = try outboxItems(directory.outbox).map(\.request.inputId)
     print("IF12-1[older build] queued once a session withdrew it=\(queued.count)")
     #expect(queued == [request.inputId])

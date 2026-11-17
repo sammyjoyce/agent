@@ -113,6 +113,8 @@ pub struct WorkerCapabilities {
     pub browser: bool,
     #[serde(default)]
     pub browser_user_tabs: bool,
+    #[serde(default)]
+    pub browser_screenshots: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -490,6 +492,11 @@ pub enum RuntimeCommand {
         #[serde(default)]
         catalog: bool,
     },
+    /// `/goal` for one selected conversation: show, set, pause or resume its objective.
+    Goal {
+        target: GoalTarget,
+        action: GoalAction,
+    },
     Logout,
     Chat {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -741,6 +748,13 @@ pub struct WorkerRef {
     pub session_id: String,
     pub window_id: String,
     pub block_id: String,
+    /// `whoami.instance_id` of the Rex server that started this pane's process.
+    /// Rex restores a saved pane with a fresh shell under a new instance, so a
+    /// process in the pane is the worker terminal only under this instance.
+    /// Absent on a binding saved before this field, or made by an older host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub rex_instance_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -1060,6 +1074,197 @@ pub enum TaskOutcomeState {
     },
 }
 
+/// The conversation a `/goal` control addresses. The runtime resolves every form
+/// to main or to exactly one existing task, and refuses an agent conversation.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GoalTarget {
+    /// The root conversation.
+    Main,
+    Task {
+        task_id: TaskId,
+        agent_id: Option<String>,
+    },
+    Conversation {
+        conversation_id: String,
+    },
+}
+
+impl From<Option<(TaskId, Option<String>)>> for GoalTarget {
+    fn from(target: Option<(TaskId, Option<String>)>) -> Self {
+        match target {
+            Some((task_id, agent_id)) => Self::Task { task_id, agent_id },
+            None => Self::Main,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GoalAction {
+    Show,
+    /// `request_id` becomes the goal ID, and in main also the new task's ID, so a
+    /// replayed set finds the goal it created instead of being refused.
+    Set {
+        request_id: String,
+        objective: String,
+    },
+    /// A goal retains the request IDs it accepted, so a replayed pause or resume
+    /// changes nothing even after later controls.
+    Pause {
+        request_id: String,
+    },
+    Resume {
+        request_id: String,
+    },
+}
+
+/// What `/goal` shows for the selected conversation.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct GoalStatus {
+    /// Root for main, otherwise the task's conversation.
+    pub conversation_id: String,
+    pub goal: Option<Box<GoalView>>,
+}
+
+/// A goal with the task that executes it, read together so progress is current.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct GoalView {
+    pub goal: Goal,
+    pub task: TaskRecord,
+}
+
+/// One persistent objective, executed by exactly one existing task.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct Goal {
+    pub id: String,
+    pub task_id: TaskId,
+    pub objective: String,
+    pub activation: GoalActivation,
+    pub state: GoalState,
+    /// The latest attempt to finish the goal that the runtime refused.
+    pub last_rejection: Option<GoalRejection>,
+    #[ts(type = "number")]
+    pub created_at: u64,
+    #[ts(type = "number")]
+    pub updated_at: u64,
+}
+
+/// A set or resume starts an activation. Its continuations, budget and pinned
+/// check belong to it, and a verification counts only in the current one.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct GoalActivation {
+    pub number: u32,
+    pub request_id: String,
+    pub continuations: u32,
+    pub budget: u32,
+    /// Pinned by the first verification in this activation.
+    pub check: Option<GoalCheck>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum GoalState {
+    Active,
+    Paused {
+        reason: GoalPause,
+    },
+    /// Written only in the commit that resolves the owning task after a passing
+    /// runtime check of the current activation.
+    Complete {
+        evidence: GoalEvidence,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalPause {
+    Requested,
+    /// The activation used its continuation budget without a passing check.
+    BudgetExhausted,
+    /// The task's last turn was stopped.
+    Interrupted,
+}
+
+/// A check the runtime runs itself against an artifact.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GoalCheck {
+    /// `path` is absolute on the owning task's execution host once pinned.
+    FileContains { path: String, text: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+pub struct ObservedFile {
+    pub bytes: u32,
+    /// False when the file was longer than the check's single read window.
+    pub complete: bool,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct GoalEvidence {
+    /// The retained `agent.goal_verification` entry in the task conversation.
+    pub entry_id: String,
+    pub activation: u32,
+    pub check: GoalCheck,
+    pub observed: ObservedFile,
+    pub tool_call_id: String,
+    #[ts(type = "number")]
+    pub verified_at: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GoalCheckFailure {
+    TextMissing { observed: ObservedFile },
+    Unreadable { message: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GoalRejection {
+    /// `complete_goal` ran its check and it failed. The entry is retained.
+    FailedCheck {
+        entry_id: String,
+        activation: u32,
+        check: GoalCheck,
+        failure: GoalCheckFailure,
+        tool_call_id: String,
+        #[ts(type = "number")]
+        at: u64,
+    },
+    /// Something tried to resolve the owning task without a passing check.
+    PrematureResolution {
+        conversation_id: String,
+        entry_id: String,
+        tool_call_id: String,
+        #[ts(type = "number")]
+        at: u64,
+    },
+}
+
+/// Data of the retained Pi entry `agent.goal_verification`, appended to the
+/// owning task's conversation for every check the runtime runs.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct GoalVerification {
+    pub goal_id: String,
+    pub task_id: TaskId,
+    pub activation: u32,
+    pub check: GoalCheck,
+    pub result: GoalCheckResult,
+    /// The assistant entry and tool call that asked for this check.
+    pub origin_entry_id: String,
+    pub tool_call_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GoalCheckResult {
+    Passed { observed: ObservedFile },
+    Failed { failure: GoalCheckFailure },
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct SourceState {
     pub source: SourceKey,
@@ -1092,6 +1297,10 @@ pub enum HostCommand {
     },
     Background {
         request: crate::background::BackgroundRequest,
+    },
+    /// Coordinator-local Dreams review. Its request type has no apply variant.
+    Dreams {
+        request: crate::dreams::DreamsRequest,
     },
     MachineSnapshot,
     ReadUsage {
@@ -1202,6 +1411,9 @@ pub enum HostCommand {
     },
 }
 
+/// The runtime keeps this much of the end of a task's or an agent's answer as
+/// its summary, counted in UTF-16 code units.
+pub const TASK_SUMMARY_MAX_UTF16_UNITS: usize = 4000;
 pub const IMAGE_CHUNK_BYTES: u32 = 1024 * 1024;
 pub const MAX_IMAGE_READ_BYTES: u32 = crate::attachments::MAX_ATTACHMENT_BYTES;
 
@@ -1242,6 +1454,9 @@ pub enum HostResult {
     },
     Background {
         response: crate::background::BackgroundResponse,
+    },
+    Dreams {
+        reply: crate::dreams::DreamsReply,
     },
     MachineSnapshot {
         snapshot: MachineSnapshot,
@@ -1438,6 +1653,9 @@ pub enum RuntimeEventKind {
     },
     ConversationSettings {
         settings: ConversationSettings,
+    },
+    Goal {
+        status: GoalStatus,
     },
     MainReady {
         /// Advertised by the runtime that persists and projects transport provenance.

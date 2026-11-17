@@ -139,7 +139,7 @@ test("new canonical replies and curated notices reach APNs once per device, with
   }
   assert.equal(new Set(f.requests.map((request) => request.headers.authorization)).size, 1, "Reuse the token rather than rotating it per delivery");
   assert.equal(new Set(f.requests.map((request) => request.headers["apns-id"])).size, 4);
-  await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session); await app.notifications.start();
+  await history(await app.session.root(BACKGROUND_CONTEXT), null, new HistoryStore(app.session)); await app.notifications.start();
   await f.reopen(); app = f.current.value; app.session.resume();
   assert.equal((await delivery(app.session, first, reply))?.state, "accepted"); assert.equal(f.requests.length, 4);
   const sameText = await append(app.session);

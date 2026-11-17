@@ -59,7 +59,7 @@ recovery; [history](history.md) describes import and retrieval.
   Delivery and processing have separate states; completed work is normal,
   blocked work is visible, and explicit continuation can recover a parked
   main generation without duplicating its saved inputs.
-- [ ] Clear the iOS composer immediately on Send while retaining its backup
+- [x] Clear the iOS composer immediately on Send while retaining its backup
   until outbox admission. Preserve newer typing and restore local rejections;
   connection changes cannot resurrect saved text. Native tests keep the
   keyboard active through consecutive sends and use production persistence.
@@ -70,8 +70,16 @@ recovery; [history](history.md) describes import and retrieval.
   The native text view copies and clears its buffer in the Send event, before
   asynchronous admission work. Native checks cover marked text, consecutive
   sends, foreground recovery and active responses. The replacement is available
-  in TestFlight; physical-phone verification of the recurrence remains open.
-- [ ] Return a control's text, such as `/status`, to the live iOS composer when
+  in TestFlight. A [phone acceptance](../ios/README.md#phone-acceptance) run on
+  an installed build showed the placeholder and the keyboard in the first
+  composer capture after every Send. It covered consecutive sends, an active
+  response across Home and an app switch, a long multiline draft, identical
+  newer typing and a relaunch with a newer draft. A started control that never
+  left the phone comes back to the live composer ahead of newer typing, and
+  `ChatModel` tests drive a failed dial, a disconnect and an address edit
+  before any recipient writes it
+  ([#34](https://github.com/sammyjoyce/agent/issues/34)).
+- [x] Return a control's text, such as `/status`, to the live iOS composer when
   no recipient of its Send wrote it, as crash recovery already does, and keep
   newer typing. A control that any recipient wrote does not come back. A
   `ChatModel` test drives a dial that fails after the start. See
@@ -125,8 +133,9 @@ recovery; [history](history.md) describes import and retrieval.
 
 ## Inputs and automation
 
-- [ ] `/goal` for persistent objectives, visible progress, pause/resume and
-  completion tied to a verified outcome.
+- [x] Ship `/goal` for persistent objectives, visible progress, pause/resume and
+  completion tied to a verified outcome. A goal completes only when the runtime
+  itself finds the required text in a file on the task's host.
 - [x] Ship hosted web search and page retrieval with source links for supported
   OpenAI models. The existing ChatGPT login has passed an isolated search,
   open-page and find-in-page check. Other providers need their own integration.
@@ -139,16 +148,24 @@ recovery; [history](history.md) describes import and retrieval.
   drafts; return explicit browser-script results without automatic page dumps.
 - [ ] Complete unattended Chrome lifecycle acceptance across OS reboots,
   ordinary browser relaunch and interruption recovery with autofill enabled.
-- [ ] Deliver browser screenshot attachments.
+  A disposable macOS guest with installed Chrome, the extension and
+  saved-password autofill passed OS reboot, relaunch, and helper and service
+  interruption. Chrome for Testing on a disposable profile passed relaunch and
+  interruption. See `docs/chrome-acceptance.md`. A reboot of an existing
+  deployment host remains.
+- [x] Deliver browser screenshot attachments.
 - [x] A phone client for the main conversation, using the same submission,
   steering and queueing path as the CLI. The native iPhone app fulfills the
   planned WhatsApp/iMessage client use case. System appearance is the default,
   with saved Light/Dark overrides and native keyboard dismissal.
-- [ ] Enable iPhone alerts for completed main-chat replies and explicit
-  `notify_user` notices, including mid-job requests. The durable delivery path
-  and automatic enrollment are implemented; signed-build enrollment and
-  real-phone delivery remain to verify.
-  See [notification setup](notifications.md).
+- [x] Enable iPhone alerts for completed main-chat replies and explicit
+  `notify_user` notices, including mid-job requests. On a real phone, a
+  development-signed build had alerts on and was registered with the
+  coordinator. A [phone acceptance](../ios/README.md#phone-acceptance) run
+  showed a completed reply as an alert with the app in the background and
+  after it was terminated, and a mid-job notice while its job still ran. Each
+  alert matched an accepted durable delivery. TestFlight builds need the
+  production APNs environment. See [notification setup](notifications.md).
 - [x] Direct coordination between task sessions through their durable inboxes:
   sender identity, admission receipts, steering or queueing, and shared history.
 - [x] Voice input through a transcription provider interface. The iPhone
@@ -181,9 +198,9 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Shared worktree inventory through the CLI and `/worktrees`, including
   native chat clients.
 - [ ] Bring the iPhone app's actions and content to Siri and Shortcuts through
-  App Intents. **Open Coordinator** and the coordinator entity ship first, with
-  a build check that the app carries its intents metadata and phrase. Reading
-  jobs, sending, opening a job, onscreen entities and Spotlight follow.
+  App Intents. **Open Coordinator**, **Open Job**, **Retry Interrupted Run**,
+  reading jobs, and onscreen coordinators and jobs ship, with a build check that
+  the app carries its intents metadata and phrase. Sending and Spotlight follow.
 - [ ] A macOS menu bar app that shows Beep Boop's status on the Mac, including
   whether the service is running and its installed and running versions.
 - [ ] Typed read and write access to Apple Notes, Reminders, Mail and Messages
@@ -195,6 +212,26 @@ recovery; [history](history.md) describes import and retrieval.
   first needs four guarantees it lacks today. Per-send approval, triage writes
   and the design's other open questions are the owner's decisions. See the
   [design](https://github.com/sammyjoyce/agent/issues/31).
+- [ ] Computer use for desktop apps on the selected host, based on or using
+  [agent-desktop](https://github.com/vercel-labs/agent-desktop). Computer use
+  is the final fallback, after supported APIs, configured CLIs and Chrome
+  tools, as the [architecture](architecture.md#integrations-and-scheduling)
+  orders them. agent-desktop reads an app's accessibility tree as JSON with a
+  ref for each element, acts on a ref, then reads the tree again to check the
+  result. It needs no screenshots or pixel matching and has no model inside,
+  so the loop stays in Pi. It ships under Apache-2.0 as a CLI, an MCP server
+  and a C library for macOS, Windows and Linux. Ref actions do not move the
+  pointer or take focus unless `--headed` is set, and macOS needs the
+  Accessibility grant. Whether to run agent-desktop or build on its design is
+  open. Snapshots, screenshots and clipboard reads can hold private desktop
+  content.
+- [ ] Reply to a specific message in the iPhone app, as Apple Messages does.
+  Choose **Reply** on a message, and the composer shows that message above the
+  draft until you send or cancel. The sent input names the message it answers,
+  so the transcript shows that message quoted with the reply and the model
+  knows which message the reply is about. Today a message's menu offers only
+  **Copy message**, **Select text** and **Share text**, and an input cannot
+  name an earlier message.
 
 ## Retrieval, learning and proof
 
@@ -215,13 +252,15 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Private retrieval evals: paraphrases, exact references, similar threads,
   rich older context versus sparse recent context, and incomplete coverage.
   Track recall, wrong-thread selection and latency.
-- [ ] End-to-end loop-closing tests and model evals: incoming reply → relevant
+- [x] End-to-end loop-closing tests and model evals: incoming reply → relevant
   existing task → resumed worker → action → verified outcome. Cover unrelated
   noise, exchanges already handled by the user, malicious source instructions,
   duplicate events and source failures.
-  [Live source-routing evaluation](architecture.md#validation) covers standing
-  workflows, protected mail and ambiguous outreach; external effects remain
-  outside that evaluation.
+  [Loop-closing tests and the live evaluation](architecture.md#validation) use
+  a local ledger command as the action. Real mailbox and provider effects stay
+  outside both. The latest live run, on `gpt-6.1-sol` from the `openai`
+  provider, passed six of seven cases. In the already-handled case the model
+  sent the user a needless completion notice.
 - [x] CLI startup and retained-history first-render benchmarks, with paired
   baseline comparisons and a separate CI regression gate.
 - [ ] Benchmarks for input admission, first visible activity, steering/stop,
@@ -230,9 +269,13 @@ recovery; [history](history.md) describes import and retrieval.
 - [x] Nightly operational log review through scheduled jobs, with coordinator
   collection, retained task summaries and explicit coverage gaps. Repeat a
   review through the [scheduled-job run command](setup.md#scheduled-jobs).
-- [ ] Dreams and Dreams evals: inspect private logs nightly and propose useful
+- [x] Dreams and Dreams evals: inspect private logs nightly and propose useful
   improvements as reviewable diffs with before/after evidence. Learned changes
   take effect only after approval of that diff.
+  [Dreams](setup.md#dreams) proposes at most one patch to a private guidance
+  repository, with checks run before and after, and `beep-boop dreams apply`
+  applies it only for the approved outcome digest. An opt-in live eval
+  measures proposals, quiet abstentions and injected text.
 - [x] Connect Pi's native telemetry to the same diagnostics. Show token use,
   cache hits and estimated cost for every chat, separately from subscription
   quota; keep estimates distinct from billed amounts. Native tests, review and
@@ -246,11 +289,28 @@ recovery; [history](history.md) describes import and retrieval.
 
 ## Recovery
 
-- [ ] Reconcile Rex server restarts, terminal exits and reconnects without
-  duplicate sessions or lost pending inputs.
-- [ ] Transfer interactive worker execution to a daemon before its terminal
-  client exits, retaining ownership of pending host effects.
-- [ ] Tested coordinator backups and restoration, including retained assets.
+- [x] Reconcile Rex server restarts, terminal exits and reconnects without
+  duplicate sessions or lost pending inputs. A binding records the Rex server
+  instance read just before its terminal was created, or read by the terminal
+  as it attached, so a shell that Rex restores after a restart is never taken
+  for the task's terminal. A terminal's own attachment confirms a create or
+  resume whose reply was lost. The task keeps its session and gets its terminal
+  back the next time it is presented. If Rex answers that the session is gone,
+  that same presentation opens one new session for the task.
+- [x] Transfer interactive worker execution to a daemon before its terminal
+  client exits, retaining ownership of pending host effects. The coordinator
+  owns each task actor and the execution host's worker service owns every
+  issued effect before the terminal is ready, so closing or killing an updated
+  terminal only stops observation. A task terminal from an older build that ran
+  host effects itself still stops the turn when you leave its TUI, until that
+  host updates.
+- [x] Tested coordinator backups and restoration, including retained assets.
+  `beep-boop backup create` copies a stopped coordinator's database,
+  coordinator ID, attachments, history assets and feedback with a checksummed
+  manifest. `backup restore` checks the archive and rebuilds the store in a new
+  directory. Background work, task turns and automatic worktree collection stay
+  held until `backup release`. See
+  [backups and restore](setup.md#backups-and-restore).
 - [ ] Replicated coordinator state and failover, retaining one active owner so
   additional coordinators do not duplicate work or external effects.
 

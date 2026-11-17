@@ -366,7 +366,7 @@ test("imported views and settings are inert; actual input uses one normal Rex ac
     await app.views.input(input(saved.conversation_id, "third", "Keep going after detach"), noAllocation, () => {}); await idle(3);
     await app.views.input(input(saved.conversation_id, "third", "Keep going after detach"), noAllocation, () => {});
     assert.equal(app.faux.state.callCount, 3); assert.equal(spawns, 1);
-    const messages = (await history(conversation, null, app.harness)).flatMap((frame) => frame.messages);
+    const messages = (await history(conversation, null, new HistoryStore(app.harness))).flatMap((frame) => frame.messages);
     assert.equal(messages.filter((message) => message.role === "user" && message.text === "Keep going after detach").length, 1);
     assert.ok(messages.some((message) => message.text === "Original retained hardware context"));
     const reconciled = observe(app, 2, saved.conversation_id, ["third", "not-sent"]); viewHandles.push(reconciled);
@@ -425,12 +425,19 @@ test("a closed child resumes its own conversation in the existing task folder an
         : { type: "creation_uncertain", session_id: binding.session_id }, () => {}), /not confirmed/u);
     const uncertain = (await app.tasks.get(task.id)).agents[0]; assert.ok(uncertain?.worker.state === "resume_uncertain");
     assert.deepEqual(uncertain.worker.binding, replaced); assert.ok(uncertain.pending.some((item) => item.id === "review-uncertain"));
-    let writes = 0;
-    await assert.rejects(app.views.input(input(child.conversation_id, "retry-uncertain", "Retain this too"), async (command) => {
-      if (local(command).type !== "inspect_worker") writes += 1;
-      return { type: "worker_presence", presence: { state: "missing_terminal" } };
-    }, () => {}), /unconfirmed/u);
-    assert.equal(writes, 0, "Uncertain pane creation must only inspect its retained binding");
+    const sent: HostCommand[] = [], resumed = { ...replaced, block_id: "block:77777777-7777-4777-8777-777777777777" };
+    await app.views.input(input(child.conversation_id, "retry-uncertain", "Retain this too"), async (command) => {
+      const operation = local(command); sent.push(operation);
+      return operation.type === "inspect_worker" ? { type: "worker_presence", presence: { state: "missing_terminal" } } : { type: "spawned", binding: resumed };
+    }, () => {});
+    assert.deepEqual(sent.map((operation) => operation.type), ["inspect_worker", "resume_agent_worker"]);
+    const resume = sent[1]; assert.ok(resume?.type === "resume_agent_worker");
+    assert.equal(resume.agent_id, child.id); assert.deepEqual(resume.binding, replaced);
+    assert.notEqual(resume.allocation_id, uncertain.worker.allocation_id);
+    const recovered = (await app.tasks.get(task.id)).agents[0]; assert.ok(recovered?.worker.state === "bound");
+    assert.equal(recovered.worker.allocation_id, resume.allocation_id); assert.equal(recovered.worker.binding.session_id, binding.session_id);
+    assert.equal(recovered.conversation_id, child.conversation_id);
+    assert.deepEqual(recovered.pending.map((item) => item.id), [...uncertain.pending.map((item) => item.id), "retry-uncertain"]);
   } finally { app.views.close(); await view?.running; app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -485,7 +492,7 @@ test("active child steering reuses its actor and closed child or task folders re
     assert.equal(recovered.conversation_id, child.conversation_id);
     await app.tasks.run({ ...command, allocation_id: recovered.worker.allocation_id, binding: nextChild, interactive: false }, () => () => {});
     assert.equal(app.faux.state.callCount, 4);
-    const conversation = await app.tasks.conversation(child.conversation_id), messages = (await history(conversation, null, app.harness)).flatMap((frame) => frame.messages);
+    const conversation = await app.tasks.conversation(child.conversation_id), messages = (await history(conversation, null, new HistoryStore(app.harness))).flatMap((frame) => frame.messages);
     assert.equal(messages.filter((message) => message.role === "user").length, 4, "Each actual input must appear exactly once across recovery");
   } finally { app.views.close(); await view?.running; controller.abort(); await running;
     app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
@@ -582,7 +589,7 @@ test("two missing child folders share parent recovery and retain both admitted i
   } finally { releaseInspections(); releaseCreation(); await Promise.allSettled(pending); app.views.close(); app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("a detaching parent claims folder ownership before inspection so child recovery cannot overtake its read", async () => {
+test("presenting a parent whose terminal detached claims folder ownership so child recovery cannot overtake its read", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-parent-guard-")), app = await open(directory);
   const controller = new AbortController(); let releaseReady = () => {}, releaseInspection = () => {};
   let running: Promise<unknown> | undefined, recovering: Promise<unknown> | undefined;
@@ -595,7 +602,7 @@ test("a detaching parent claims folder ownership before inspection so child reco
     let enteredReady = () => {}; const ready = new Promise<void>((resolve) => { enteredReady = resolve; }), readyGate = new Promise<void>((resolve) => { releaseReady = resolve; });
     const worker = (await app.tasks.get(task.id)).worker; assert.ok(worker.state === "bound");
     running = app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: worker.allocation_id, binding, instructions: "Current rules", model: fixtureModel, cwd: host.cwd, interactive: true },
-      () => () => {}, [], undefined, undefined, { signal: controller.signal, async ready() { enteredReady(); await readyGate; }, async fence() { releaseReady(); }, answer() {}, idle() {} });
+      () => () => {}, [], undefined, undefined, { signal: controller.signal, async ready() { enteredReady(); await readyGate; }, answer() {}, idle() {} });
     await ready; controller.abort();
     let inspected = () => {}; const entered = new Promise<void>((resolve) => { inspected = resolve; }), held = new Promise<void>((resolve) => { releaseInspection = resolve; });
     recovering = app.tasks.dispatch(task.id, host, async () => { inspected(); await held; return { type: "worker_presence", presence: { state: "present", running: true } }; }).catch((error: unknown) => error);
@@ -609,7 +616,7 @@ test("a detaching parent claims folder ownership before inspection so child reco
     assert.ok((await app.tasks.get(task.id)).agents[0]?.pending.some((item) => item.id === "retained"));
     releaseInspection(); await recovering; releaseReady(); await running; running = undefined;
     assert.equal(app.faux.state.callCount, 0);
-  } finally { releaseInspection(); releaseReady(); controller.abort(); await recovering; await running;
+  } finally { releaseInspection(); releaseReady(); controller.abort(); await recovering; await running; await app.tasks.detachActors();
     app.views.close(); app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 

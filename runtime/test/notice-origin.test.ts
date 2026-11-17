@@ -14,13 +14,14 @@ import { watchMainNotices } from "../src/main_observation.js";
 import { runScheduled } from "../src/scheduled.js";
 import { publishMainNotice } from "../src/tasks.js";
 import { history, UserNoticeEntry } from "../src/transcript.js";
+import { HistoryStore } from "../src/history.js";
 import { validEvent, protocolLines } from "../src/protocol.js";
 import type { NativeEvent } from "../src/generated/NativeEvent.js";
 import type { HistoryMessage } from "../src/generated/HistoryMessage.js";
 import type { TaskRecord } from "../src/generated/TaskRecord.js";
-import { fixtureModel } from "./model.js";
 import { DAY, exampleJob, FakeClock } from "./fixtures/background-runtime.js";
 import { openScheduled } from "./fixtures/scheduled-runtime.js";
+import { runAdmitted } from "./fixtures/run-admitted.js";
 
 function scheduler(app: Awaited<ReturnType<typeof openScheduled>>, completed: string[]) {
   return new BackgroundScheduler(app.session, app.registry, app.tasks, {
@@ -41,7 +42,7 @@ function origin(row: HistoryMessage | undefined, job: { id: string; title: strin
 }
 async function continued(app: Awaited<ReturnType<typeof openScheduled>>, task: TaskRecord, id: string, text: string): Promise<void> {
   app.faux.setResponses([notice(text), fauxAssistantMessage("")]);
-  await app.tasks.enqueue(task.id, "Continue this saved workflow.", id); await app.tasks.runBackground(task.id);
+  await app.tasks.enqueue(task.id, "Continue this saved workflow.", id); await runAdmitted(app.tasks, task.id);
 }
 
 test("actual concurrent scheduler publications retain run titles live and after rename, deletion and reopen", { timeout: 20_000 }, async () => {
@@ -84,11 +85,11 @@ test("actual concurrent scheduler publications retain run titles live and after 
     const count = live.length, calls = app.faux.state.callCount;
     await background.runJob({ type: "run_job", job_id: packages.id, schedule_id: null, request_id: "packages" });
     assert.equal(live.length, count); assert.equal(app.faux.state.callCount, calls, "Replay must not generate an extra publication");
-    const durable = (await history(root, null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
+    const durable = (await history(root, null, new HistoryStore(app.session))).flatMap((event) => event.messages).filter((row) => row.role === "notice");
     assert.deepEqual(durable, live, "Live and historical native rows carry the same captured snapshot");
     stop(); stop = () => {}; await app.session.close(BACKGROUND_CONTEXT);
     app = await openScheduled(directory, "original", clock); scheduler(app, []);
-    const reopened = (await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
+    const reopened = (await history(await app.session.root(BACKGROUND_CONTEXT), null, new HistoryStore(app.session))).flatMap((event) => event.messages).filter((row) => row.role === "notice");
     assert.deepEqual(reopened, durable, "Historical rows must not look up renamed or deleted job/task titles");
     origin(reopened.find((row) => row.text.includes("parcel")), packages);
   } finally { stop(); await app.close(); await rm(directory, { recursive: true, force: true }); }
@@ -119,15 +120,15 @@ test("a scheduled child inherits its trusted lineage through deletion and its ow
     const task = await app.tasks.get(run.task_id), child = task.agents[0]; assert.ok(child); assert.equal(child.worker.state, "unassigned");
     await background.syncJobs([]); await app.tasks.update(task.id, (saved) => { saved.title = "Wrong renamed parent title"; });
     release(); await eventually(() => !app.tasks.isRunning(task.id));
-    const root = await app.session.root(BACKGROUND_CONTEXT), rows = (await history(root, null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
+    const root = await app.session.root(BACKGROUND_CONTEXT), rows = (await history(root, null, new HistoryStore(app.session))).flatMap((event) => event.messages).filter((row) => row.role === "notice");
     assert.equal(rows.length, 1); origin(rows[0], job);
     await app.close(); app = await openScheduled(directory, "original", new FakeClock()); scheduler(app, []);
-    const saved = (await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
+    const saved = (await history(await app.session.root(BACKGROUND_CONTEXT), null, new HistoryStore(app.session))).flatMap((event) => event.messages).filter((row) => row.role === "notice");
     assert.deepEqual(saved, rows);
     app.faux.setResponses([notice("The same child has a second necessary decision."), fauxAssistantMessage(fauxToolCall("report_result", { summary: "Rechecked the same evidence." }), { stopReason: "toolUse" }), fauxAssistantMessage("")]);
     await app.tasks.continueAgent(task.id, child.id, "Recheck this same workflow.", "child-followup", app.call);
-    await app.tasks.runBackground(task.id, undefined, child.id);
-    const continuedRows = (await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
+    await runAdmitted(app.tasks, task.id, child.id);
+    const continuedRows = (await history(await app.session.root(BACKGROUND_CONTEXT), null, new HistoryStore(app.session))).flatMap((event) => event.messages).filter((row) => row.role === "notice");
     assert.equal(continuedRows.length, 2); origin(continuedRows[1], job);
   } finally { release(); await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
@@ -135,10 +136,10 @@ test("a scheduled child inherits its trusted lineage through deletion and its ow
 test("main, generic and legacy notices never guess a job from titles, source links or body text", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-notice-generic-")), app = await openScheduled(directory);
   try {
-    const task = await app.tasks.create({ title: "Morning brief", outcome: "An ordinary task", sources: [{ provider: "scheduled_jobs", account: "local", thread_id: "morning-brief" }] });
+    const task = await app.tasks.create({ title: "Morning brief", outcome: "An ordinary task", job_id: "morning-brief" });
     const host = await app.environment.defaultHost(await app.environment.hosts("/workspace/example", null, [])); assert.ok(host);
     await app.tasks.enqueue(task.id, "Package tracking: a claimed job name is not transport metadata.", "generic"); await app.tasks.dispatch(task.id, host, app.call);
-    app.faux.setResponses([notice("Morning brief: actionable generic work."), fauxAssistantMessage("")]); await app.tasks.runBackground(task.id);
+    app.faux.setResponses([notice("Morning brief: actionable generic work."), fauxAssistantMessage("")]); await runAdmitted(app.tasks, task.id);
     const root = await app.session.root(BACKGROUND_CONTEXT);
     await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [app.sourceTools.main] }, BACKGROUND_CONTEXT);
     const unbind = app.executions.bind(root.id.toString(), { cwd: host.cwd, hosts: [host], call: app.call });
@@ -149,7 +150,7 @@ test("main, generic and legacy notices never guess a job from titles, source lin
     for (const metadata of [{ job_id: "", title: "Package tracking" }, { job_id: "package-tracking", title: "  " }]) {
       await root.submit({ type: "write", entry: { kind: UserNoticeEntry.kind, data: { task_id: null, source_conversation_id: "legacy", source_entry_id: "1", text: "Unreliable legacy metadata", notice_origin: metadata } } }, BACKGROUND_CONTEXT);
     }
-    const rows = (await history(root, null, app.session)).flatMap((event) => event.messages).filter((row) => row.role === "notice");
+    const rows = (await history(root, null, new HistoryStore(app.session))).flatMap((event) => event.messages).filter((row) => row.role === "notice");
     assert.equal(rows.length, 5); for (const row of rows) assert.equal("notice_origin" in row, false);
     const legacy = rows.find(row => row.text === "Legacy generic notice");
     assert.equal(legacy?.notice_details?.task_title, undefined,
@@ -191,10 +192,10 @@ test("real publication snapshots distinct task and source evidence through live/
     assert.deepEqual(live.map(row => row.notice_details?.task_title), ["Parcel decision", "Meeting review"]);
     assert.deepEqual(live.map(row => row.notice_details?.sources[0]?.provider), ["mail", "calendar"]);
     assert.ok(live.every(row => row.notice_origin === undefined && !JSON.stringify(row.notice_details).includes("Never copy")));
-    const durable = (await history(root, null, app.session)).flatMap(event => event.messages).filter(row => row.role === "notice");
+    const durable = (await history(root, null, new HistoryStore(app.session))).flatMap(event => event.messages).filter(row => row.role === "notice");
     assert.deepEqual(durable, live);
     stop(); stop = () => {}; await app.close(); app = await openScheduled(directory);
-    const fresh = (await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap(event => event.messages).filter(row => row.role === "notice");
+    const fresh = (await history(await app.session.root(BACKGROUND_CONTEXT), null, new HistoryStore(app.session))).flatMap(event => event.messages).filter(row => row.role === "notice");
     assert.deepEqual(fresh, durable);
     console.log("Publication -> live -> persisted history -> fresh SQLite reopen: mail/Parcel decision, calendar/Meeting review; immutable and body-independent.");
   } finally { stop(); await app.close(); await rm(directory, { recursive: true, force: true }); }
@@ -238,14 +239,14 @@ test("source-only journal publications retain canonical provider/title evidence 
       assert.equal(JSON.stringify(row.notice_details).includes("body"), false);
       assert.equal(JSON.stringify(row.notice_details).includes("unknown field"), false);
     }
-    const durable = (await history(root, null, app.session)).flatMap(event => event.messages).filter(row => row.role === "notice");
+    const durable = (await history(root, null, new HistoryStore(app.session))).flatMap(event => event.messages).filter(row => row.role === "notice");
     assert.deepEqual(durable, live);
     stop(); stop = () => {}; await app.close();
     const native = await retainedNativeHistory(directory);
     assert.deepEqual(native.filter(row => row.role === "notice"), durable,
       "Built Rust coordinator native endpoint must preserve the actual producer's persisted metadata");
     app = await openScheduled(directory);
-    const fresh = (await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap(event => event.messages).filter(row => row.role === "notice");
+    const fresh = (await history(await app.session.root(BACKGROUND_CONTEXT), null, new HistoryStore(app.session))).flatMap(event => event.messages).filter(row => row.role === "notice");
     assert.deepEqual(fresh, durable);
     console.log("Source-only task=null: google/Parcel decision and github/Review requested; canonical revision v2 does not alter publication v1; fresh SQLite read matches live.");
   } finally { stop(); await app.close(); await rm(directory, { recursive: true, force: true }); }
@@ -267,13 +268,7 @@ test("keyless notify_user task-only publication retains its title through the re
     await app.tasks.enqueue(task.id, "Check the authorized invented task.", "task-only");
     await app.tasks.dispatch(task.id, host, app.call);
     app.faux.setResponses([notice("Source Google: this body is not provenance."), fauxAssistantMessage("")]);
-    const actor = await app.tasks.get(task.id);
-    assert.ok(actor.worker.state === "bound");
-    await app.tasks.run({ type: "run_task", task_id: task.id,
-      allocation_id: actor.worker.allocation_id, binding: actor.worker.binding, instructions: "", model: fixtureModel, cwd: host.cwd },
-      conversation => app.executions.bind(conversation.id.toString(), {
-        cwd: host.cwd, hosts: [host], role: "worker", call: app.call,
-      }), [app.sourceTools.worker]);
+    await runAdmitted(app.tasks, task.id);
     await eventually(() => live.length === 1);
     const row = live[0]; assert.ok(row);
     assert.equal(row.notice_details?.task_id, task.id);
@@ -281,13 +276,13 @@ test("keyless notify_user task-only publication retains its title through the re
     assert.deepEqual(row.notice_details?.sources, []);
     assert.equal(row.notice_origin, undefined);
     await app.tasks.update(task.id, saved => { saved.title = "Later unrelated task title"; });
-    const durable = (await history(root, null, app.session)).flatMap(event => event.messages).filter(row => row.role === "notice");
+    const durable = (await history(root, null, new HistoryStore(app.session))).flatMap(event => event.messages).filter(row => row.role === "notice");
     assert.deepEqual(durable, live);
     stop(); stop = () => {}; await app.close();
     const native = await retainedNativeHistory(directory);
     assert.deepEqual(native.filter(row => row.role === "notice"), durable);
     app = await openScheduled(directory);
-    const fresh = (await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap(event => event.messages).filter(row => row.role === "notice");
+    const fresh = (await history(await app.session.root(BACKGROUND_CONTEXT), null, new HistoryStore(app.session))).flatMap(event => event.messages).filter(row => row.role === "notice");
     assert.deepEqual(fresh, durable);
     console.log("Keyless real notify_user -> task-only Inspect parcel -> built Rust native history -> fresh SQLite history: exact immutable metadata, no sources or job.");
   } finally { stop(); await app.close(); await rm(directory, { recursive: true, force: true }); }
@@ -321,7 +316,7 @@ test("stored notice metadata is allowlisted and conflicting nested bindings fall
       .find(entry => UserNoticeEntry.is(entry) && entry.data.text === "Publisher sentinel");
     assert.ok(stored);
     assert.equal(JSON.stringify(stored.data).includes("Invented extra"), false);
-    const rows = (await history(root, null, app.session)).flatMap(event => event.messages)
+    const rows = (await history(root, null, new HistoryStore(app.session))).flatMap(event => event.messages)
       .filter(row => row.role === "notice" && row.text !== "Publisher sentinel");
     assert.equal(rows.length, 4);
     for (const row of rows) {
@@ -343,7 +338,7 @@ test("stored notice metadata is allowlisted and conflicting nested bindings fall
       text: "No task exists", notice_details: { source_conversation_id: "original-conversation", source_entry_id: "original-entry",
         sources: snapshot.sources, task_title: "Unbound task title" },
     } } }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
-    const noTask = (await history(root, null, app.session)).flatMap(event => event.messages).find(row => row.text === "No task exists");
+    const noTask = (await history(root, null, new HistoryStore(app.session))).flatMap(event => event.messages).find(row => row.text === "No task exists");
     assert.equal(noTask?.notice_details?.task_id, undefined);
     assert.equal(noTask?.notice_details?.task_title, undefined);
     console.log("Privacy projection: unknown top-level/body keys removed; conflicting entry/task/conversation bindings use recorded outer IDs only.");

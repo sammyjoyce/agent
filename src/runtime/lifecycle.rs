@@ -1,6 +1,6 @@
 //! Request ownership and connection controls, independent of wire transport.
 
-use crate::protocol::{HostCommand, RuntimeCommand};
+use crate::protocol::RuntimeCommand;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
@@ -88,7 +88,8 @@ impl RequestLifecycle {
             | RuntimeCommand::SearchHistory { .. }
             | RuntimeCommand::ReadConversation { .. }
             | RuntimeCommand::OpenConversation { .. }
-            | RuntimeCommand::RevokeAllocation { .. } => Self::Once,
+            | RuntimeCommand::RevokeAllocation { .. }
+            | RuntimeCommand::Goal { .. } => Self::Once,
         })
     }
 
@@ -130,17 +131,8 @@ impl RequestLifecycle {
         matches!(self, Self::Background | Self::Coordinator)
     }
 
-    pub fn delegates_host_call(self, command: &HostCommand) -> bool {
-        self.is_worker()
-            && !matches!(
-                command,
-                HostCommand::Browser { .. }
-                    | HostCommand::OnNode { .. }
-                    | HostCommand::ReadContext { .. }
-                    | HostCommand::SearchContext { .. }
-                    | HostCommand::ReloadGuidance
-                    | HostCommand::Embed { .. }
-            )
+    pub fn owns_host_effects(self) -> bool {
+        !self.is_worker()
     }
 
     /// Release a connection's attachment once, without revoking admitted work.

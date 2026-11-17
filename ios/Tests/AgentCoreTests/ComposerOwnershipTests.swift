@@ -547,7 +547,8 @@ private func held(_ gate: DialGate) async throws {
 
 /// A fixture coordinator and a session that dials it through `gate`, which can hold a Send's dial
 /// so that its exchange waits before it writes anything, and can then fail that dial.
-private struct GatedCoordinator {
+struct GatedCoordinator {
+  let profile: CoordinatorProfile
   let fixture: FixtureCoordinator
   let endpoint: NWEndpoint
   let directory: ProfileDirectory
@@ -557,7 +558,7 @@ private struct GatedCoordinator {
 
 /// Runs `body` with `count` gated coordinators whose profiles share a fresh temporary root, then
 /// opens every gate and stops them.
-@MainActor private func withGatedCoordinators(
+@MainActor func withGatedCoordinators(
   _ count: Int, _ body: ([GatedCoordinator], URL) async throws -> Void
 ) async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
@@ -567,14 +568,17 @@ private struct GatedCoordinator {
     try? FileManager.default.removeItem(at: root)
   }
   var coordinators: [GatedCoordinator] = []
-  for _ in 0..<count {
+  for index in 0..<count {
     let fixture = FixtureCoordinator()
     let (listener, endpoint) = try await listen(fixture)
     listeners.append(listener)
     let gate = DialGate()
-    let directory = ProfileDirectory(ProfileID(), applicationSupport: root, caches: root)
+    let address = try CoordinatorAddress(host: "100.64.1.2")
+    var profile = CoordinatorProfile(name: try TagName("Coordinator\(index + 1)"), address: address)
+    profile.pin = fixture.id
+    let directory = ProfileDirectory(profile.id, applicationSupport: root, caches: root)
     let session = CoordinatorSession(
-      directory: directory, address: try CoordinatorAddress(host: "100.64.1.2"), pin: fixture.id,
+      directory: directory, address: address, pin: fixture.id,
       stamps: StampSource(),
       transport: CoordinatorTransport { _ in
         try await gate.pass()
@@ -582,7 +586,8 @@ private struct GatedCoordinator {
       })
     coordinators.append(
       GatedCoordinator(
-        fixture: fixture, endpoint: endpoint, directory: directory, gate: gate, session: session))
+        profile: profile, fixture: fixture, endpoint: endpoint, directory: directory, gate: gate,
+        session: session))
   }
   func stop() async {
     for coordinator in coordinators {
@@ -713,20 +718,7 @@ func aSendStoppedEverywhereBeforeItLeftThePhoneIsOfferedAgainAfterACrash(
       break
     }
     for coordinator in coordinators { try await held(coordinator.gate) }
-    switch stop {
-    case .addressEdit:
-      for coordinator in coordinators {
-        await model.detach(coordinator.session.profile)
-        let next = CoordinatorSession(
-          directory: coordinator.directory, address: try CoordinatorAddress(host: "100.64.1.2"),
-          pin: coordinator.fixture.id, stamps: StampSource(),
-          transport: loopback(coordinator.endpoint))
-        model.attach(lane(next))
-        await next.connect()
-      }
-    case .disconnect: await model.setActive(false)
-    case .dialFails: for coordinator in coordinators { await coordinator.gate.fail() }
-    }
+    try await stopEveryCopy(stop, of: coordinators, in: model)
     let deadline = ContinuousClock.now + .seconds(5)
     while try await ComposerDraftStore(url: url).load(from: files).draft.text.isEmpty,
       ContinuousClock.now < deadline
@@ -747,6 +739,471 @@ func aSendStoppedEverywhereBeforeItLeftThePhoneIsOfferedAgainAfterACrash(
     for coordinator in coordinators {
       #expect(await coordinator.fixture.count() == 0, "A coordinator got /status")
     }
+    await model.setActive(false)
+  }
+}
+
+@MainActor private func stopEveryCopy(
+  _ stop: UnwrittenStop, of coordinators: [GatedCoordinator], in model: ChatModel
+) async throws {
+  switch stop {
+  case .addressEdit:
+    for coordinator in coordinators {
+      await model.detach(coordinator.session.profile)
+      let next = CoordinatorSession(
+        directory: coordinator.directory, address: try CoordinatorAddress(host: "100.64.1.2"),
+        pin: coordinator.fixture.id, stamps: StampSource(),
+        transport: loopback(coordinator.endpoint))
+      model.attach(lane(next))
+      await next.connect()
+    }
+  case .disconnect: await model.setActive(false)
+  case .dialFails: for coordinator in coordinators { await coordinator.gate.fail() }
+  }
+}
+
+@MainActor func connectedModel(
+  to coordinators: [GatedCoordinator], under root: URL,
+  admit: @escaping ChatModel.Admit = { deliver in await deliver() }
+) async throws -> ChatModel {
+  let directory = root.appending(path: "Composer")
+  let model = ChatModel(
+    draftStore: AttachmentStore(directory: directory.appending(path: "Files")),
+    persistence: ComposerDraftStore(url: directory.appending(path: "draft.json")), admit: admit)
+  model.profiles = coordinators.map(\.profile)
+  await model.restoreDraft()
+  for coordinator in coordinators { model.attach(lane(coordinator.session)) }
+  await model.setActive(true)
+  for coordinator in coordinators {
+    _ = try await snapshot(of: coordinator.session, in: model) { $0.connection == .connected }
+  }
+  return model
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: UnwrittenStop.allCases, [1, 2])
+func aControlNoRecipientWroteComesBackToTheLiveComposer(
+  stop: UnwrittenStop, recipients: Int
+) async throws {
+  try await withGatedCoordinators(recipients) { coordinators, root in
+    let model = try await connectedModel(to: coordinators, under: root)
+    for coordinator in coordinators { await coordinator.gate.arm() }
+    model.draft = "/status"
+    await model.send()
+    #expect(model.draft.isEmpty, "Send took /status from the composer")
+    for coordinator in coordinators { try await held(coordinator.gate) }
+    model.draft = "An invented newer note"
+    try await stopEveryCopy(stop, of: coordinators, in: model)
+    let restored = "/status\n\nAn invented newer note"
+    let deadline = ContinuousClock.now + .seconds(5)
+    while model.draft != restored, ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(model.draft == restored, "/status comes back ahead of the newer note")
+    for coordinator in coordinators {
+      #expect(await coordinator.fixture.count() == 0, "A coordinator got /status")
+    }
+    await model.setActive(false)
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aControlOneRecipientWroteDoesNotComeBack() async throws {
+  try await withGatedCoordinators(2) { coordinators, root in
+    let (first, second) = (coordinators[0], coordinators[1])
+    let model = try await connectedModel(to: coordinators, under: root)
+    await first.gate.arm()
+    await second.gate.arm()
+    model.draft = "/status"
+    await model.send()
+    try await held(first.gate)
+    try await held(second.gate)
+    model.draft = "An invented newer note"
+    await second.gate.fail()
+    await first.gate.open()
+    for await input in first.fixture.observedInputs {
+      #expect(input.text == "/status")
+      break
+    }
+    let settled = ContinuousClock.now + .milliseconds(500)
+    while model.draft == "An invented newer note", ContinuousClock.now < settled {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(model.draft == "An invented newer note", "/status does not come back")
+    #expect(await second.fixture.count() == 0, "The second coordinator got nothing")
+    await model.setActive(false)
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aControlThatComesBackToAnEmptyComposerKeepsItsChip() async throws {
+  try await withGatedCoordinators(2) { coordinators, root in
+    let (first, second) = (coordinators[0], coordinators[1])
+    let model = try await connectedModel(to: coordinators, under: root)
+    await first.gate.arm()
+    model.setChip(first.profile.id)
+    model.draft = "/status"
+    await model.send()
+    try await held(first.gate)
+    #expect(model.draft.isEmpty && model.destination == .open, "The chip went with the Send")
+    await first.gate.fail()
+    let deadline = ContinuousClock.now + .seconds(5)
+    while model.draft.isEmpty, ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(model.draft == "/status")
+    #expect(model.destination == .chip(first.profile.id), "/status comes back under its chip")
+    #expect(await first.fixture.count() == 0, "The first coordinator got nothing")
+    #expect(await second.fixture.count() == 0, "The second coordinator got nothing")
+    await model.setActive(false)
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aNewerSendDoesNotWaitForAnOlderControlThatComesBack() async throws {
+  try await withGatedCoordinators(1) { coordinators, root in
+    let coordinator = coordinators[0]
+    let model = try await connectedModel(to: coordinators, under: root)
+    await coordinator.gate.arm()
+    model.draft = "/status"
+    await model.send()
+    try await held(coordinator.gate)
+    model.draft = "/help"
+    await model.send()
+    #expect(model.draft.isEmpty, "Send took /help while /status was dialing")
+    for await input in coordinator.fixture.observedInputs {
+      #expect(input.text == "/help")
+      break
+    }
+    await coordinator.gate.fail()
+    let deadline = ContinuousClock.now + .seconds(5)
+    while model.draft.isEmpty, ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(model.draft == "/status", "/status comes back and /help stays sent")
+    #expect(await coordinator.fixture.count() == 1, "Only /help reached the coordinator")
+    await model.setActive(false)
+  }
+}
+
+@MainActor private final class NextAdmission {
+  var refused = false
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true])
+func anOlderControlComesBackOnceWhileANewerSendIsAdmitting(newerRefused: Bool) async throws {
+  try await withGatedCoordinators(1) { coordinators, root in
+    let coordinator = coordinators[0]
+    let gate = ComposerOwnershipGate()
+    let next = NextAdmission()
+    let model = try await connectedModel(
+      to: coordinators, under: root,
+      admit: { deliver in
+        let admitted = next.refused ? false : await deliver()
+        return await gate.wait(after: admitted)
+      })
+    await coordinator.gate.arm()
+    model.draft = "/status"
+    let older = Task { await model.send() }
+    for await _ in gate.entered.stream { break }
+    await gate.finish()
+    await older.value
+    try await held(coordinator.gate)
+    next.refused = newerRefused
+    model.draft = "An invented newer note"
+    let newer = Task { await model.send() }
+    for await _ in gate.entered.stream { break }
+    await coordinator.gate.fail()
+    let deadline = ContinuousClock.now + .seconds(5)
+    while model.draft.isEmpty, ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(model.draft == "/status", "/status comes back while the newer note is admitting")
+    #expect(await model.saveDraft())
+    let files = AttachmentStore(directory: root.appending(path: "Composer/Files"))
+    let url = root.appending(path: "Composer/draft.json")
+    let both = "/status\n\nAn invented newer note"
+    let recovered = try await ComposerDraftStore(url: url).load(from: files)
+    #expect(
+      recovered.draft.text == (newerRefused ? both : "/status"),
+      "Recovery offers each text once, and the newer note only if no outbox took it")
+    await gate.finish()
+    await newer.value
+    #expect(model.draft == (newerRefused ? both : "/status"))
+    #expect(await model.saveDraft())
+    let cold = try await ComposerDraftStore(url: url).load(from: files)
+    #expect(cold.draft.text == model.draft, "Recovery offers what the composer shows")
+    if !newerRefused {
+      for await input in coordinator.fixture.observedInputs {
+        #expect(input.text == "An invented newer note", "/status never went")
+        break
+      }
+    }
+    #expect(await coordinator.fixture.count() == (newerRefused ? 0 : 1), "/status never went")
+    let outbox = coordinator.session.outboxURL
+    let drainDeadline = ContinuousClock.now + .seconds(10)
+    while try !queuedRequests(outbox).isEmpty, ContinuousClock.now < drainDeadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(try queuedRequests(outbox).isEmpty, "Nothing stays queued")
+    await model.setActive(false)
+  }
+}
+
+private func recoveredText(under root: URL) async throws -> String {
+  try await ComposerDraftStore(url: root.appending(path: "Composer/draft.json"))
+    .load(from: AttachmentStore(directory: root.appending(path: "Composer/Files"))).draft.text
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: 0..<10)
+func aBackgroundStopDuringANewerSendKeepsTheOrderTheyWereSent(attempt: Int) async throws {
+  try await withGatedCoordinators(1) { coordinators, root in
+    let coordinator = coordinators[0]
+    let model = try await connectedModel(to: coordinators, under: root)
+    await coordinator.gate.arm()
+    model.draft = "/status"
+    await model.send()
+    try await held(coordinator.gate)
+    model.draft = "An invented newer note"
+    let newer = try #require(model.startSend())
+    await model.setActive(false)
+    await newer.value
+    let deadline = ContinuousClock.now + .seconds(5)
+    while !model.draft.contains("/status"), ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    let queued = try queuedRequests(coordinator.session.outboxURL).map(\.text)
+    let expected = queued.isEmpty ? "/status\n\nAn invented newer note" : "/status"
+    #expect(model.draft == expected, "/status comes back ahead of the newer note")
+    #expect(await model.saveDraft())
+    #expect(try await recoveredText(under: root) == expected, "Recovery offers the same order")
+    #expect(await coordinator.fixture.count() == 0, "The coordinator got nothing")
+    await coordinator.gate.open()
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true])
+func twoControlsThatComeBackKeepTheOrderTheyWereSent(newerFailsFirst: Bool) async throws {
+  try await withGatedCoordinators(2) { coordinators, root in
+    let (first, second) = (coordinators[0], coordinators[1])
+    let model = try await connectedModel(to: coordinators, under: root)
+    await first.gate.arm()
+    await second.gate.arm()
+    model.setChip(first.profile.id)
+    model.draft = "/status"
+    await model.send()
+    try await held(first.gate)
+    model.setChip(second.profile.id)
+    model.draft = "/help"
+    await model.send()
+    try await held(second.gate)
+    model.draft = "An invented latest note"
+    for coordinator in newerFailsFirst ? [second, first] : [first, second] {
+      let before = model.draft
+      await coordinator.gate.fail()
+      let deadline = ContinuousClock.now + .seconds(5)
+      while model.draft == before, ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(5))
+      }
+    }
+    let expected = "/status\n\n/help\n\nAn invented latest note"
+    #expect(model.draft == expected, "Older Sends come back first, then the note typed since")
+    #expect(await model.saveDraft())
+    #expect(try await recoveredText(under: root) == expected, "Recovery offers the same order")
+    #expect(await first.fixture.count() == 0, "The first coordinator got nothing")
+    #expect(await second.fixture.count() == 0, "The second coordinator got nothing")
+    await model.setActive(false)
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func typingOntoAReturnedControlKeepsItFirst() async throws {
+  try await withGatedCoordinators(2) { coordinators, root in
+    let (first, second) = (coordinators[0], coordinators[1])
+    let model = try await connectedModel(to: coordinators, under: root)
+    await first.gate.arm()
+    await second.gate.arm()
+    model.setChip(first.profile.id)
+    model.draft = "/status"
+    await model.send()
+    try await held(first.gate)
+    model.setChip(second.profile.id)
+    model.draft = "/help"
+    await model.send()
+    try await held(second.gate)
+    await first.gate.fail()
+    let firstDeadline = ContinuousClock.now + .seconds(5)
+    while model.draft.isEmpty, ContinuousClock.now < firstDeadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    model.draft += " invented"
+    await second.gate.fail()
+    let secondDeadline = ContinuousClock.now + .seconds(5)
+    while !model.draft.contains("/help"), ContinuousClock.now < secondDeadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(model.draft == "/status invented\n\n/help", "/status keeps what was typed onto it")
+    await model.setActive(false)
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: 0..<10)
+func aRestoreWhileSendsComeBackKeepsTheirOrder(attempt: Int) async throws {
+  try await withGatedCoordinators(2) { coordinators, root in
+    let (first, second) = (coordinators[0], coordinators[1])
+    let model = try await connectedModel(to: coordinators, under: root)
+    await first.fixture.rejectSubmits()
+    model.setChip(first.profile.id)
+    model.draft = "An invented refused note"
+    await model.send()
+    let refused = try #require(
+      try await snapshot(of: first.session, in: model) { snapshot in
+        snapshot.rows.contains { $0.delivery == .rejected }
+      }.rows.first { $0.delivery == .rejected }?.inputID)
+    await first.fixture.rejectSubmits(false)
+    await first.gate.arm()
+    await second.gate.arm()
+    model.setChip(first.profile.id)
+    model.draft = "/status"
+    await model.send()
+    try await held(first.gate)
+    model.setChip(second.profile.id)
+    model.draft = "/help"
+    await model.send()
+    try await held(second.gate)
+    let restoring = Task { @MainActor in await model.restore(refused) }
+    await first.session.disconnect()
+    await restoring.value
+    let firstDeadline = ContinuousClock.now + .seconds(5)
+    while !model.draft.contains("/status"), ContinuousClock.now < firstDeadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    await second.gate.fail()
+    let secondDeadline = ContinuousClock.now + .seconds(5)
+    while !model.draft.contains("/help"), ContinuousClock.now < secondDeadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    let expected = "/status\n\n/help\n\nAn invented refused note"
+    #expect(model.draft == expected, "The Sends come back in order, ahead of the restored note")
+    #expect(await model.saveDraft())
+    #expect(try await recoveredText(under: root) == expected, "Recovery offers the same order")
+    #expect(await first.fixture.count() == 0, "The first coordinator kept nothing")
+    #expect(await second.fixture.count() == 0, "The second coordinator got nothing")
+    await model.setActive(false)
+  }
+}
+
+@MainActor private func failDial(of coordinator: GatedCoordinator, in model: ChatModel) async {
+  let before = model.draft
+  await coordinator.gate.fail()
+  let deadline = ContinuousClock.now + .seconds(5)
+  while model.draft == before, ContinuousClock.now < deadline {
+    try? await Task.sleep(for: .milliseconds(5))
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func deletingAnEarlierReturnKeepsTheRestInTheOrderTheyWereSent() async throws {
+  try await withGatedCoordinators(3) { coordinators, root in
+    let model = try await connectedModel(to: coordinators, under: root)
+    for (coordinator, text) in zip(coordinators, ["/status", "/help", "/compact"]) {
+      await coordinator.gate.arm()
+      model.setChip(coordinator.profile.id)
+      model.draft = text
+      await model.send()
+      try await held(coordinator.gate)
+    }
+    for coordinator in coordinators.prefix(2) { await failDial(of: coordinator, in: model) }
+    #expect(model.draft == "/status\n\n/help")
+    model.draft = "/help"
+    await failDial(of: coordinators[2], in: model)
+    let expected = "/help\n\n/compact"
+    #expect(
+      model.draft == expected, "/help, which the user kept, stays ahead of the newer /compact")
+    #expect(await model.saveDraft())
+    #expect(try await recoveredText(under: root) == expected, "Recovery offers the same order")
+    for coordinator in coordinators { #expect(await coordinator.fixture.count() == 0) }
+    await model.setActive(false)
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)), arguments: 0..<10)
+func deletingAnEarlierReturnKeepsALaterControlAControl(attempt: Int) async throws {
+  try await withGatedCoordinators(2) { coordinators, root in
+    let gate = ComposerOwnershipGate()
+    let next = NextAdmission()
+    let model = try await connectedModel(
+      to: coordinators, under: root,
+      admit: { deliver in
+        if next.refused { _ = await gate.wait(after: false) }
+        return await deliver()
+      })
+    for (coordinator, text) in zip(coordinators, ["/status", "/help"]) {
+      await coordinator.gate.arm()
+      model.setChip(coordinator.profile.id)
+      model.draft = text
+      await model.send()
+      try await held(coordinator.gate)
+    }
+    next.refused = true
+    model.draft = "An invented third Send"
+    let third = try #require(model.startSend())
+    for await _ in gate.entered.stream { break }
+    for coordinator in coordinators { await failDial(of: coordinator, in: model) }
+    #expect(model.draft == "/status\n\n/help")
+    model.draft = "/help"
+    let expected = "/help\n\nAn invented third Send"
+    #expect(await model.saveDraft())
+    #expect(
+      try await recoveredText(under: root) == expected,
+      "Recovery during the third Send keeps /help ahead of it")
+    await model.setActive(false)
+    await gate.finish()
+    await third.value
+    #expect(model.draft == expected, "The refused third Send comes back after /help")
+    try await withCoordinator { session, _, _ in
+      try await connected(session)
+      let retry = try #require(
+        await session.stage(model.draft, sendID: "invented-retry", recipients: [session.profile]))
+      #expect(retry.departure != nil, "A retry of the draft still goes as a control")
+    }
+    #expect(await model.saveDraft())
+    #expect(try await recoveredText(under: root) == expected, "Recovery offers the same order")
+    for coordinator in coordinators { #expect(await coordinator.fixture.count() == 0) }
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aRecordSavedWhileASendAdmitsKeepsTheWholeDraftForAnOlderBuild() async throws {
+  try await withGatedCoordinators(1) { coordinators, root in
+    let coordinator = coordinators[0]
+    let gate = ComposerOwnershipGate()
+    let next = NextAdmission()
+    let model = try await connectedModel(
+      to: coordinators, under: root,
+      admit: { deliver in
+        if next.refused { _ = await gate.wait(after: false) }
+        return await deliver()
+      })
+    await coordinator.gate.arm()
+    model.draft = "/status"
+    await model.send()
+    try await held(coordinator.gate)
+    next.refused = true
+    model.draft = "An invented newer note"
+    let newer = try #require(model.startSend())
+    for await _ in gate.entered.stream { break }
+    await failDial(of: coordinator, in: model)
+    model.draft += "\n\nInvented typing"
+    #expect(await model.saveDraft())
+    let data = try Data(contentsOf: root.appending(path: "Composer/draft.json"))
+    let record = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    #expect(record["text"] as? String == "/status\n\nInvented typing")
+    #expect(
+      try await recoveredText(under: root)
+        == "/status\n\nAn invented newer note\n\nInvented typing",
+      "This build still puts the newer Send after /status")
+    await gate.finish()
+    await newer.value
     await model.setActive(false)
   }
 }

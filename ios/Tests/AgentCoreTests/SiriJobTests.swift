@@ -5,11 +5,12 @@ import Testing
 @testable import AgentUI
 
 private func nightlyDeps(
-  title: String, lastRun: JobExecutionState?, scheduleError: String? = nil
+  title: String, lastRun: JobExecutionState?, scheduleError: String? = nil,
+  id: String = "nightly:deps"
 ) -> ScheduledJobStatus {
   ScheduledJobStatus(
     job: .init(
-      cwd: "/workspace/example", id: "nightly:deps",
+      cwd: "/workspace/example", id: id,
       model: .init(fast: false, modelId: "example-model", provider: .openai),
       prompt: "Update the invented dependencies.", revision: "example-revision", schedules: [],
       timezone: "America/Los_Angeles", title: title),
@@ -303,6 +304,70 @@ struct SiriJobTests {
       }
       #expect(refused?.localizedDescription == "Personal: \(outboxCouldNotBeRead)")
       #expect(await personalPeer.retryRequests().isEmpty)
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func aJobWhoseCoordinatorIsNoLongerSavedSaysSo() async throws {
+    try await withJobPeers { coordinators, work, _, workPeer, _ in
+      try await coordinators.remove(coordinators.removal(work))
+      let asked = await jobReads(workPeer)
+      for id in [work, ProfileID()].map({ ScopedEntityID(profile: $0, item: "nightly:deps") }) {
+        let refused = await #expect(throws: JobUnavailable.self, "\(id)") {
+          try await JobQuery.jobs(identifiedBy: [id], in: coordinators)
+        }
+        #expect(refused == .coordinatorNotSaved)
+        #expect(shown(refused) == "This job's coordinator is no longer saved in Beep Boop.")
+      }
+      #expect(await jobReads(workPeer) == asked, "A coordinator no longer saved is never asked")
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func aJobItsCoordinatorNoLongerHasSaysSoUnderItsName() async throws {
+    try await withJobPeers { coordinators, work, _, workPeer, _ in
+      await workPeer.serveWork(
+        jobs: [nightlyDeps(title: "Docs sweep", lastRun: .completed, id: "docs:sweep")],
+        conversations: [], pageSize: 10)
+      let id = ScopedEntityID(profile: work, item: "nightly:deps")
+      let refused = await #expect(throws: JobUnavailable.self) {
+        try await JobQuery.jobs(identifiedBy: [id], in: coordinators)
+      }
+      #expect(refused == .notOnCoordinator(job: "nightly:deps", coordinator: "Work"))
+      #expect(shown(refused) == "The scheduled job nightly:deps is no longer on Work.")
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func aRenamedCoordinatorAndARenamedJobStillResolve() async throws {
+    try await withJobPeers { coordinators, work, _, workPeer, _ in
+      let address = try #require(coordinators.profiles.first { $0.id == work }).address
+      try await coordinators.update(work, name: TagName("Office"), address: address)
+      await workPeer.serveWork(
+        jobs: [nightlyDeps(title: "Nightly deps v2", lastRun: parked)], conversations: [],
+        pageSize: 10)
+      let id = ScopedEntityID(profile: work, item: "nightly:deps")
+      let found = try await JobQuery.jobs(identifiedBy: [id], in: coordinators)
+      #expect(found.map(\.id) == [id])
+      #expect(found.map(\.coordinator) == ["Office"])
+      #expect(found.map(\.title) == ["Nightly deps v2"])
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func aCoordinatorsSilenceIsReportedBeforeAMissingJob() async throws {
+    try await withJobPeers { coordinators, work, personal, workPeer, personalPeer in
+      try await background(coordinators)
+      await workPeer.serveWork(
+        jobs: [nightlyDeps(title: "Docs sweep", lastRun: .completed, id: "docs:sweep")],
+        conversations: [], pageSize: 10)
+      await personalPeer.leaveObserveUnanswered(.silent)
+      let ids = [work, personal].map { ScopedEntityID(profile: $0, item: "nightly:deps") }
+      let refused = await #expect(throws: CoordinatorDidNotAnswer.self) {
+        try await JobQuery.jobs(identifiedBy: ids, in: coordinators, within: .seconds(3))
+      }
+      #expect(shown(refused) == "Personal did not answer. Check that it is running and reachable.")
+      #expect(await jobReads(workPeer) == 1, "Work answered without the job")
     }
   }
 

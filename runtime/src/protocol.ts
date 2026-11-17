@@ -6,6 +6,7 @@ import type { RuntimeRequest } from "./generated/RuntimeRequest.js";
 import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import type { ApnsConfig } from "./generated/ApnsConfig.js";
+import { ModelTurnError } from "./models.js";
 import { AuthError } from "./auth.js";
 import { ModelsError } from "@earendil-works/pi-ai/utils/models-error";
 
@@ -84,6 +85,7 @@ export function invalidHostReply(value: unknown, version: number): HostReply | u
 }
 
 export function errorEvent(error: unknown): Extract<RuntimeEventKind, { type: "failure" }> {
+  if (error instanceof ModelTurnError) return { type: "failure", code: /authentication/u.test(error.message) ? "authentication_failed" : "provider_unavailable", message: error.message };
   if (error instanceof AuthError) {
     return {
       type: "failure",

@@ -12,6 +12,7 @@ import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { DEFAULT_MODEL } from "../src/models.js";
 import { history } from "../src/transcript.js";
+import { HistoryStore } from "../src/history.js";
 import { protocolLines, validEvent } from "../src/protocol.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
@@ -81,7 +82,7 @@ for (const first of ["retry", "reconnect"]) test(`legacy explicit no-reply inten
       try {
         const root = await reopened.root(BACKGROUND_CONTEXT), original = await root.commit((tx) => tx.submissionByRequest(root.id, "quiet"), BACKGROUND_CONTEXT);
         assert.ok(original?.type === "input" && original.status === "done"); assert.equal(original.answer.toString(), answer);
-        const rows = (await history(root, null, reopened)).flatMap((event) => event.messages);
+        const rows = (await history(root, null, new HistoryStore(reopened))).flatMap((event) => event.messages);
         assert.equal(rows.some((row) => ["assistant", "commentary", "final", "notice"].includes(row.role) && row.text.trim()), false);
       } finally { await reopened.close(BACKGROUND_CONTEXT); }
     }

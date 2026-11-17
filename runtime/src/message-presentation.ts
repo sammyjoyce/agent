@@ -5,7 +5,7 @@ import type { ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
 import type { AgentStatePresentation } from "./generated/AgentStatePresentation.js";
 import { validEvent, validRequest } from "./protocol.js";
 
-export type MessageContent = Pick<HistoryMessage, "role" | "text" | "tool" | "presentation">;
+export type MessageContent = Pick<HistoryMessage, "role" | "text" | "tool" | "presentation" | "attachments">;
 export function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
 export function field(value: unknown, key: string): unknown { return object(value) ? value[key] : undefined; }
 export function string(value: unknown): string | null { return typeof value === "string" ? value : null; }
@@ -129,6 +129,14 @@ function savedPresentation(result: ToolResultMessage): MessageContent | undefine
   return message?.role === "tool" && (message.presentation?.type === "command" || message.presentation?.type === "agent_coordination") ? message : undefined;
 }
 
+function savedAttachments(result: ToolResultMessage): HistoryMessage["attachments"] {
+  const attachments = field(result.details, "attachments");
+  if (attachments === undefined) return undefined;
+  const frame: unknown = { version: 1, id: 0, event: { type: "message", message: { entry_id: "0", role: "tool", text: "",
+    continuation: false, final_chunk: true, attachments } } };
+  return validEvent(frame) && frame.event.type === "message" ? frame.event.message.attachments : undefined;
+}
+
 /** The same receipt metadata is persisted by real tools and read by live/reopened views. */
 export function agentPresentation(call: Pick<ToolCall, "name" | "arguments">, sender: string, output: unknown, targetAgentId?: string): Extract<MessagePresentation, { type: "agent_coordination" }> {
   let agents: AgentStatePresentation[];
@@ -184,5 +192,7 @@ export function piToolResult(result: ToolResultMessage, sender: string, call?: T
   } else if (result.toolName === "codemode") {
     text = bounded([...scriptedCalls(result.details), content(result.content)].join("\n"));
   }
-  return { role: "tool", text, presentation, tool: { call_id: result.toolCallId, name: result.toolName, status: result.isError ? "failed" : "finished" } };
+  const attachments = result.toolName === "browser_screenshot" ? savedAttachments(result) : undefined;
+  return { role: "tool", text, presentation, tool: { call_id: result.toolCallId, name: result.toolName, status: result.isError ? "failed" : "finished" },
+    ...(attachments === undefined ? {} : { attachments }) };
 }

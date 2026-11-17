@@ -5,10 +5,12 @@ import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai/u
 import { createRegistry, Harness, type CompactionSettings, type Conversation, type Registry } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { join } from "node:path";
+import { AttachmentStore } from "../../src/attachments.js";
 import { BackgroundScheduler } from "../../src/background.js";
 import { BrowserStore, createBrowserTools } from "../../src/browser.js";
 import { CoordinatorEnvironment } from "../../src/environment.js";
 import type { AgentNode } from "../../src/generated/AgentNode.js";
+import { createGoalTools, GoalStore } from "../../src/goals.js";
 import type { HostCommand } from "../../src/generated/HostCommand.js";
 import type { HostResult } from "../../src/generated/HostResult.js";
 import type { ModelSelection } from "../../src/generated/ModelSelection.js";
@@ -99,22 +101,25 @@ export async function openDiscoveryApp(directory: string, { models, model, arm, 
     jobActor: (job) => openJobActor(job, tasks), runJob: (occurrence, signal, id) => runScheduled(occurrence, signal, { session, tasks, sources }, id),
   });
   const jobTools = createJobTools(scheduler, executions);
+  const attachments = new AttachmentStore(directory);
+  const goals = new GoalStore(session, tasks, environment);
   const production = withActorPolicies(createToolsets({ guidance: createGuidance(executions), tools, sourceTools,
-    resourceTools: createResourceTools(resources, tasks, executions), browserTools: createBrowserTools(new BrowserStore(session), executions), jobTools,
+    resourceTools: createResourceTools(resources, tasks, executions), browserTools: createBrowserTools(new BrowserStore(session), executions, attachments), jobTools,
+    goalTools: createGoalTools(goals, executions),
   }), { responsePolicy: createMainResponsePolicy(session), inputOrigins: createInputOrigins(session) });
   const discovery = createToolDiscovery();
   const { toolsets, installed } = applyToolSurfaces(production, arm, discovery);
   for (const extension of new Set([...Object.values(production).flat(), ...installed, tools.legacy])) {
     registry.install(extension);
   }
-  tasks.useBackgroundExecution({ available: () => true, extensions: (agentId) => agentId === undefined ? toolsets.worker : toolsets.agent,
+  tasks.useActorExecution({ available: () => true, extensions: (agentId) => agentId === undefined ? toolsets.worker : toolsets.agent,
     call: (command, _host, signal) => { signal.throwIfAborted(); return host.call(command); },
     bind: (conversation) => bind(conversation, "worker"),
   });
   async function close(): Promise<void> {
-    const detached = tasks.detachBackground();
+    const detached = tasks.detachActors();
     await session.close(BACKGROUND_CONTEXT); await detached; await discovery.close();
   }
-  return { session, registry, inference, tasks, environment, sources, resources, scheduler, executions, tools, toolsets, worker, bind, close };
+  return { session, registry, inference, tasks, environment, sources, resources, scheduler, executions, attachments, tools, toolsets, worker, bind, close };
 }
 export type DiscoveryApp = Awaited<ReturnType<typeof openDiscoveryApp>>;

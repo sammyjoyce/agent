@@ -90,6 +90,10 @@ pub enum BrowserAction {
         tab_id: u32,
         text: String,
     },
+    Screenshot {
+        tab_id: u32,
+        full_page: bool,
+    },
     HandleDialog {
         tab_id: u32,
         accept: bool,
@@ -138,6 +142,11 @@ pub enum BrowserResponse {
         tabs: Vec<BrowserTab>,
         output: String,
     },
+    Screenshot {
+        session_id: Uuid,
+        tabs: Vec<BrowserTab>,
+        capture: BrowserCapture,
+    },
     Disconnected {
         session_id: Uuid,
         message: String,
@@ -158,11 +167,24 @@ impl BrowserResponse {
             Self::UserTabs { session_id, .. }
             | Self::Ready { session_id, .. }
             | Self::Closed { session_id, .. }
+            | Self::Screenshot { session_id, .. }
             | Self::Disconnected { session_id, .. }
             | Self::Failed { session_id, .. }
             | Self::Uncertain { session_id, .. } => *session_id,
         }
     }
+}
+
+/// The most PNG bytes one screenshot may carry. Its base64 form and the
+/// reply around it must fit one 4 MiB host frame.
+pub const MAX_SCREENSHOT_BYTES: u32 = 2 * 1024 * 1024;
+
+/// One PNG capture of an owned tab, with the SHA-256 of its decoded bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserCapture {
+    pub data_base64: String,
+    pub sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -550,7 +572,7 @@ impl BrowserHost {
         }
         let Some(process) = sessions.get(&request.owner_id).cloned() else {
             return Ok(BrowserResponse::Disconnected { session_id: request.session_id,
-                message: "This host has no live browser connection for this conversation. Previous tab handles are stale; open a new connection to continue.".into() });
+                message: "This host has no live browser connection for this conversation. Native tabs that an earlier connection did not confirm closed may still be open, and their cleanup was not verified. Previous tab handles are stale; inspect Chrome or open a new connection to continue.".into() });
         };
         drop(sessions);
         let mut live = process.lock().await;
@@ -661,8 +683,34 @@ mod tests {
     use uuid::Uuid;
 
     use crate::browser::{
-        BrowserAction, BrowserConfig, BrowserHost, BrowserRequest, BrowserResponse,
+        BrowserAction, BrowserCapture, BrowserConfig, BrowserHost, BrowserRequest, BrowserResponse,
+        BrowserTab, MAX_SCREENSHOT_BYTES,
     };
+
+    #[test]
+    fn the_largest_screenshot_reply_fits_one_host_frame() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let reply = crate::protocol::RuntimeCommand::HostReply {
+            call_id: Uuid::new_v4().to_string(),
+            result: crate::protocol::HostResult::Browser {
+                response: BrowserResponse::Screenshot {
+                    session_id: Uuid::new_v4(),
+                    tabs: (0..32)
+                        .map(|id| BrowserTab {
+                            id,
+                            url: format!("https://example.com/{}", "a".repeat(8192)),
+                            title: "Invented title ".repeat(64),
+                        })
+                        .collect(),
+                    capture: BrowserCapture {
+                        data_base64: STANDARD.encode(vec![0xa5; MAX_SCREENSHOT_BYTES as usize]),
+                        sha256: "0".repeat(64),
+                    },
+                },
+            },
+        };
+        assert!(serde_json::to_vec(&reply).unwrap().len() < crate::runtime::MAX_FRAME_BYTES);
+    }
 
     const FIXTURE: &str = r#"
 import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
@@ -1056,20 +1104,42 @@ input.on('close', () => { writeFileSync(join(directory, 'closed'), 'closed'); })
         assert_eq!(session_id, session);
         assert!(!message.contains("PRIVATE_FIXTURE_SENTINEL"));
         wait_for(&directory.path().join("closed")).await;
-        assert!(matches!(
-            host.execute(
+        let inspected = host
+            .execute(
                 request(owner, session, "inspect", BrowserAction::Status),
-                cancelled
+                cancelled,
             )
-            .await,
-            BrowserResponse::Disconnected { .. }
-        ));
+            .await;
+        assert!(
+            matches!(&inspected, BrowserResponse::Disconnected { message, .. } if message.contains("cleanup was not verified")),
+            "The tab the lost helper opened may still be open: {inspected:?}"
+        );
         assert_eq!(
             fs::read_to_string(directory.path().join("effects"))
                 .await
                 .unwrap(),
             "wrong-receipt\n"
         );
+    }
+
+    #[tokio::test]
+    async fn a_host_that_lost_a_conversations_connection_reports_unverified_tab_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let restarted = host(directory.path()).await;
+        let (_stop, cancelled) = watch::channel(false);
+        let session = Uuid::new_v4();
+        for action in [BrowserAction::Status, BrowserAction::Release] {
+            let reply = restarted
+                .execute(
+                    request(Uuid::new_v4(), session, "after-restart", action),
+                    cancelled.clone(),
+                )
+                .await;
+            assert!(
+                matches!(&reply, BrowserResponse::Disconnected { session_id, message } if *session_id == session && message.contains("cleanup was not verified")),
+                "A restarted host cannot know whether an earlier helper's tabs closed: {reply:?}"
+            );
+        }
     }
 
     #[tokio::test]

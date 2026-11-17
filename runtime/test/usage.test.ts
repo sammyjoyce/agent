@@ -17,6 +17,7 @@ import { DiagnosticsTelemetry } from "../src/telemetry.js";
 import { conversationUsage } from "../src/usage.js";
 import { validEvent } from "../src/protocol.js";
 import { history } from "../src/transcript.js";
+import { HistoryStore } from "../src/history.js";
 import { publishMainNotice } from "../src/tasks.js";
 
 const toolUsage: Usage = { input: 3, output: 4, cacheRead: 5, cacheWrite: 6, cacheWrite1h: 2, reasoning: 1, totalTokens: 18,
@@ -67,7 +68,7 @@ test("native model/tool usage survives reopen and history reads without double c
     const final = (await child.entries({ order: "descending" }, 5, undefined, BACKGROUND_CONTEXT)).items.find(AssistantEntry.is); assert.ok(final);
     await publishMainNotice(app.session, child, final, null, [], { key: "synthetic", text: "Curated child update", events: [] });
     assert.deepEqual(await app.usage(), usage, "A notice copies child context, never a new root model request or extra spend");
-    await history(app.root, null, app.session); assert.deepEqual(await app.usage(), usage);
+    await history(app.root, null, new HistoryStore(app.session)); assert.deepEqual(await app.usage(), usage);
     await app.close(); app = await open(directory);
     assert.deepEqual(await app.usage(), usage, "Native ledger and durations are durable; reopening must not re-meter retained entries");
     assert.equal(app.first.state.callCount + app.second.state.callCount, 0);

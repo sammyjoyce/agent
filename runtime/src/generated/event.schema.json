@@ -949,6 +949,29 @@
         {
           "type": "object",
           "properties": {
+            "full_page": {
+              "type": "boolean"
+            },
+            "tab_id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "screenshot"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "tab_id",
+            "full_page"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "accept": {
               "type": "boolean"
             },
@@ -1402,6 +1425,156 @@
         }
       ]
     },
+    "DreamsAbstainReason": {
+      "description": "Model-selectable reasons. Exhausted attempts are absent: only the executor seals them.",
+      "type": "string",
+      "enum": [
+        "quiet",
+        "insufficient_coverage",
+        "no_supported_change"
+      ]
+    },
+    "DreamsFileEdit": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ]
+    },
+    "DreamsRequest": {
+      "description": "Everything a Dreams actor can ask the coordinator to do.\nInvariant: no variant applies, executes a caller-chosen command, names a\ntarget, or carries policy. Adding one is a security change, not a feature.",
+      "oneOf": [
+        {
+          "description": "Seal (or reread) this run's window, coverage, base, before checks and evidence.\n`summaries` is used only by the first, sealing call of a run.",
+          "type": "object",
+          "properties": {
+            "page": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "run": {
+              "type": "string"
+            },
+            "summaries": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/DreamsTaskSummary"
+              }
+            },
+            "summaries_omitted": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "review"
+            }
+          },
+          "required": [
+            "type",
+            "run",
+            "summaries",
+            "summaries_omitted",
+            "page"
+          ]
+        },
+        {
+          "description": "One proposal attempt. Edits are full file contents; the patch is derived by git.",
+          "type": "object",
+          "properties": {
+            "edits": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/DreamsFileEdit"
+              }
+            },
+            "evidence": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "rationale": {
+              "type": "string"
+            },
+            "run": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "propose"
+            }
+          },
+          "required": [
+            "type",
+            "run",
+            "edits",
+            "rationale",
+            "evidence"
+          ]
+        },
+        {
+          "description": "Seal an explicit abstention.",
+          "type": "object",
+          "properties": {
+            "note": {
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/$defs/DreamsAbstainReason"
+            },
+            "run": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "abstain"
+            }
+          },
+          "required": [
+            "type",
+            "run",
+            "reason",
+            "note"
+          ]
+        }
+      ]
+    },
+    "DreamsTaskSummary": {
+      "type": "object",
+      "properties": {
+        "summary": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "task_id",
+        "title",
+        "summary",
+        "updated_at"
+      ]
+    },
     "EmbeddingPurpose": {
       "type": "string",
       "enum": [
@@ -1758,6 +1931,425 @@
         "update"
       ]
     },
+    "GitHubOwnerFilter": {
+      "description": "Partition notifications using repository.full_name, never subject/title text.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "include"
+            },
+            "owners": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "owners"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "exclude"
+            },
+            "owners": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "owners"
+          ]
+        }
+      ]
+    },
+    "Goal": {
+      "description": "One persistent objective, executed by exactly one existing task.",
+      "type": "object",
+      "properties": {
+        "activation": {
+          "$ref": "#/$defs/GoalActivation"
+        },
+        "created_at": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string"
+        },
+        "last_rejection": {
+          "description": "The latest attempt to finish the goal that the runtime refused.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GoalRejection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "objective": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/GoalState"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "task_id",
+        "objective",
+        "activation",
+        "state",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "GoalActivation": {
+      "description": "A set or resume starts an activation. Its continuations, budget and pinned\ncheck belong to it, and a verification counts only in the current one.",
+      "type": "object",
+      "properties": {
+        "budget": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "check": {
+          "description": "Pinned by the first verification in this activation.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GoalCheck"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "continuations": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "number": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "request_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "number",
+        "request_id",
+        "continuations",
+        "budget"
+      ]
+    },
+    "GoalCheck": {
+      "description": "A check the runtime runs itself against an artifact.",
+      "oneOf": [
+        {
+          "description": "`path` is absolute on the owning task's execution host once pinned.",
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "file_contains"
+            }
+          },
+          "required": [
+            "type",
+            "path",
+            "text"
+          ]
+        }
+      ]
+    },
+    "GoalCheckFailure": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "observed": {
+              "$ref": "#/$defs/ObservedFile"
+            },
+            "type": {
+              "type": "string",
+              "const": "text_missing"
+            }
+          },
+          "required": [
+            "type",
+            "observed"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "unreadable"
+            }
+          },
+          "required": [
+            "type",
+            "message"
+          ]
+        }
+      ]
+    },
+    "GoalEvidence": {
+      "type": "object",
+      "properties": {
+        "activation": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "check": {
+          "$ref": "#/$defs/GoalCheck"
+        },
+        "entry_id": {
+          "description": "The retained `agent.goal_verification` entry in the task conversation.",
+          "type": "string"
+        },
+        "observed": {
+          "$ref": "#/$defs/ObservedFile"
+        },
+        "tool_call_id": {
+          "type": "string"
+        },
+        "verified_at": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "entry_id",
+        "activation",
+        "check",
+        "observed",
+        "tool_call_id",
+        "verified_at"
+      ]
+    },
+    "GoalPause": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "requested"
+          ]
+        },
+        {
+          "description": "The activation used its continuation budget without a passing check.",
+          "type": "string",
+          "const": "budget_exhausted"
+        },
+        {
+          "description": "The task's last turn was stopped.",
+          "type": "string",
+          "const": "interrupted"
+        }
+      ]
+    },
+    "GoalRejection": {
+      "oneOf": [
+        {
+          "description": "`complete_goal` ran its check and it failed. The entry is retained.",
+          "type": "object",
+          "properties": {
+            "activation": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "at": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "check": {
+              "$ref": "#/$defs/GoalCheck"
+            },
+            "entry_id": {
+              "type": "string"
+            },
+            "failure": {
+              "$ref": "#/$defs/GoalCheckFailure"
+            },
+            "tool_call_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "failed_check"
+            }
+          },
+          "required": [
+            "type",
+            "entry_id",
+            "activation",
+            "check",
+            "failure",
+            "tool_call_id",
+            "at"
+          ]
+        },
+        {
+          "description": "Something tried to resolve the owning task without a passing check.",
+          "type": "object",
+          "properties": {
+            "at": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "conversation_id": {
+              "type": "string"
+            },
+            "entry_id": {
+              "type": "string"
+            },
+            "tool_call_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "premature_resolution"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id",
+            "entry_id",
+            "tool_call_id",
+            "at"
+          ]
+        }
+      ]
+    },
+    "GoalState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "active"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/GoalPause"
+            },
+            "state": {
+              "type": "string",
+              "const": "paused"
+            }
+          },
+          "required": [
+            "state",
+            "reason"
+          ]
+        },
+        {
+          "description": "Written only in the commit that resolves the owning task after a passing\nruntime check of the current activation.",
+          "type": "object",
+          "properties": {
+            "evidence": {
+              "$ref": "#/$defs/GoalEvidence"
+            },
+            "state": {
+              "type": "string",
+              "const": "complete"
+            }
+          },
+          "required": [
+            "state",
+            "evidence"
+          ]
+        }
+      ]
+    },
+    "GoalStatus": {
+      "description": "What `/goal` shows for the selected conversation.",
+      "type": "object",
+      "properties": {
+        "conversation_id": {
+          "description": "Root for main, otherwise the task's conversation.",
+          "type": "string"
+        },
+        "goal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GoalView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "conversation_id"
+      ]
+    },
+    "GoalView": {
+      "description": "A goal with the task that executes it, read together so progress is current.",
+      "type": "object",
+      "properties": {
+        "goal": {
+          "$ref": "#/$defs/Goal"
+        },
+        "task": {
+          "$ref": "#/$defs/TaskRecord"
+        }
+      },
+      "required": [
+        "goal",
+        "task"
+      ]
+    },
     "HistoryGap": {
       "type": "object",
       "properties": {
@@ -2081,6 +2673,23 @@
             "type": {
               "type": "string",
               "const": "background"
+            }
+          },
+          "required": [
+            "type",
+            "request"
+          ]
+        },
+        {
+          "description": "Coordinator-local Dreams review. Its request type has no apply variant.",
+          "type": "object",
+          "properties": {
+            "request": {
+              "$ref": "#/$defs/DreamsRequest"
+            },
+            "type": {
+              "type": "string",
+              "const": "dreams"
             }
           },
           "required": [
@@ -3889,6 +4498,28 @@
         "registered"
       ]
     },
+    "ObservedFile": {
+      "type": "object",
+      "properties": {
+        "bytes": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "complete": {
+          "description": "False when the file was longer than the check's single read window.",
+          "type": "boolean"
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "bytes",
+        "complete",
+        "sha256"
+      ]
+    },
     "OperatingSystem": {
       "type": "string",
       "enum": [
@@ -4764,6 +5395,22 @@
         {
           "type": "object",
           "properties": {
+            "status": {
+              "$ref": "#/$defs/GoalStatus"
+            },
+            "type": {
+              "type": "string",
+              "const": "goal"
+            }
+          },
+          "required": [
+            "type",
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "accepted_input_origins": {
               "description": "The origins this runtime validates, persists and names to the model.",
               "anyOf": [
@@ -5403,6 +6050,17 @@
               "items": {
                 "type": "string"
               }
+            },
+            "owner_filter": {
+              "description": "Exact repository owner partition; omitted preserves unfiltered intake.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/GitHubOwnerFilter"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "provider": {
               "type": "string",
@@ -6878,6 +7536,10 @@
           "type": "boolean",
           "default": false
         },
+        "browser_screenshots": {
+          "type": "boolean",
+          "default": false
+        },
         "browser_user_tabs": {
           "type": "boolean",
           "default": false
@@ -7040,6 +7702,13 @@
         },
         "host_id": {
           "type": "string"
+        },
+        "rex_instance_id": {
+          "description": "`whoami.instance_id` of the Rex server that started this pane's process.\nRex restores a saved pane with a fresh shell under a new instance, so a\nprocess in the pane is the worker terminal only under this instance.\nAbsent on a binding saved before this field, or made by an older host.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "session_id": {
           "type": "string"

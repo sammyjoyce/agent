@@ -11,6 +11,7 @@ import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type TranscriptContext } from "@earendil-works/pi-ai";
 import { createRegistry, Harness, ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { AttachmentStore } from "../src/attachments.js";
 import { BrowserStore, createBrowserTools } from "../src/browser.js";
 import type { BrowserRequest } from "../src/generated/BrowserRequest.js";
 import type { HostCommand } from "../src/generated/HostCommand.js";
@@ -34,7 +35,7 @@ async function open(directory: string) {
   const registry = createRegistry();
   const session = await Harness.open(await SqliteStorage.open(database), { models, registry }, BACKGROUND_CONTEXT);
   const browsers = new BrowserStore(session), executions = new Executions();
-  const tools = createBrowserTools(browsers, executions); registry.install(tools);
+  const tools = createBrowserTools(browsers, executions, new AttachmentStore(directory)); registry.install(tools);
   return { session, browsers, executions, tools, faux };
 }
 

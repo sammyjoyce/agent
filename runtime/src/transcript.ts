@@ -102,7 +102,8 @@ function messageRows(entry: EntryRecord, message: MessageContent): HistoryMessag
     offset += text.length;
     const row: HistoryMessage = { entry_id: entry.id.toString(), role: message.role, text, continuation, final_chunk: offset === value.length,
       ...(message.tool === undefined ? {} : { tool: message.tool }),
-      ...(message.presentation === undefined || continuation ? {} : { presentation: message.presentation }) };
+      ...(message.presentation === undefined || continuation ? {} : { presentation: message.presentation }),
+      ...(message.attachments === undefined || continuation ? {} : { attachments: message.attachments }) };
     continuation = true; return row;
   });
 }
@@ -208,10 +209,10 @@ function recordedNoticeDetails(entry: EntryRecord): NoticeDetails | undefined {
 }
 
 /** Native fork-aware pages, rendered without loading history back into model input. */
-export async function history(conversation: Conversation, value: string | null, reader: Harness): Promise<Extract<RuntimeEventKind, { type: "history" }>[]> {
-  const id = conversation.id.toString();
+export async function history(conversation: Conversation, value: string | null,
+  originals: Pick<HistoryStore, "session" | "original" | "revisionView">): Promise<Extract<RuntimeEventKind, { type: "history" }>[]> {
+  const id = conversation.id.toString(), reader = originals.session;
   const visibility = await readTranscriptVisibility(reader, conversation.id);
-  const originals = new HistoryStore(reader);
   const revisions = new Map<string, RevisionView>();
   const pending = new Set<string>();
   const saved = cursor(value, id);
@@ -280,7 +281,7 @@ function toolParts(entry: EntryRecord, callId: string): { call?: ToolCall; resul
 }
 
 /** Read only the selected durable tool, with a bounded fork-aware search for its other half. */
-export async function toolDetails(conversation: Conversation, value: string, callId: string, session: Harness): Promise<ToolDetails> {
+export async function toolDetails(conversation: Conversation, value: string, callId: string, originals: Pick<HistoryStore, "original">): Promise<ToolDetails> {
   const id: unknown = Number(value);
   if (!entryId(id) || id.toString() !== value) throw new Error("Invalid native entry ID");
   if (callId.length === 0 || Buffer.byteLength(callId, "utf8") > 1024) throw new Error("Invalid tool call ID");
@@ -289,7 +290,7 @@ export async function toolDetails(conversation: Conversation, value: string, cal
   if (ImportedItemEntry.is(selected)) {
     if (historyToolId(selected.id.toString()) !== callId) return { type: "unavailable", call_id: callId };
     let original;
-    try { original = await new HistoryStore(session).original(selected); }
+    try { original = await originals.original(selected); }
     catch (error) { if (missingOriginal(error)) return { type: "unavailable", call_id: callId }; throw error; }
     const canonical = codexMessage(selected.data.item, original, selected.id.toString());
     if (canonical.tool === undefined) return { type: "unavailable", call_id: callId };

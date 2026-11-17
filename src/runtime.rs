@@ -22,7 +22,7 @@ use tokio::{
     time::timeout,
 };
 
-mod diagnostics;
+pub(crate) mod diagnostics;
 pub mod lifecycle;
 use crate::runtime::diagnostics::{Diagnostics, Event as DiagnosticEvent, HostTiming, Trace};
 use crate::runtime::lifecycle::RequestLifecycle;
@@ -36,6 +36,21 @@ pub(crate) enum ShutdownSignal {
     Sigterm,
 }
 
+pub(crate) enum StartRecord {
+    RequiredByDreams,
+    BestEffort,
+}
+
+impl StartRecord {
+    pub(crate) fn for_config(config: Option<&crate::config::ClientConfig>) -> Self {
+        if config.is_some_and(|config| config.dreams.is_some()) {
+            Self::RequiredByDreams
+        } else {
+            Self::BestEffort
+        }
+    }
+}
+
 pub struct RuntimeCall {
     pub request_id: u32,
     pub events: mpsc::Receiver<RuntimeEventKind>,
@@ -47,6 +62,24 @@ pub struct RuntimeNotice {
     pub event: RuntimeEventKind,
 }
 
+pub struct WriterLock(File);
+
+impl WriterLock {
+    pub fn acquire(state: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(state.join("writer.lock"))?;
+        fs2::FileExt::try_lock_exclusive(&file)
+            .context("Another agent process owns this state directory")?;
+        Ok(Self(file))
+    }
+}
+
 pub struct Runtime {
     commands: mpsc::Sender<CommandMessage>,
     alive: watch::Receiver<bool>,
@@ -56,6 +89,7 @@ pub struct Runtime {
     service_diagnostics: Mutex<Diagnostics>,
     stopping: watch::Sender<bool>,
     coordinator_id: CoordinatorId,
+    restore_held: bool,
 }
 
 enum CommandMessage {
@@ -95,30 +129,39 @@ struct Pending {
 
 impl Runtime {
     pub fn start(script: &Path, state: &Path) -> Result<Self> {
-        Self::start_with_notifications(script, state, None)
+        Self::start_with_notifications(script, state, None, StartRecord::BestEffort)
     }
 
-    pub fn start_with_notifications(
+    pub(crate) fn start_with_notifications(
         script: &Path,
         state: &Path,
         apns: Option<&crate::notifications::ApnsConfig>,
+        start_record: StartRecord,
     ) -> Result<Self> {
         ensure!(
             script.is_file(),
             "Pi runtime is not built; build the runtime first"
         );
-        let guard = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(state.join("writer.lock"))?;
-        fs2::FileExt::try_lock_exclusive(&guard)
-            .context("Another agent process owns this state directory")?;
+        let guard = WriterLock::acquire(state)?;
+        let restore_held = crate::backup::restore_held(&guard, state);
         let coordinator_id = CoordinatorId::load_or_mint(state)?;
-        let lock_fd = guard.as_raw_fd();
+        let diagnostics = match start_record {
+            StartRecord::BestEffort => Diagnostics::start(state),
+            StartRecord::RequiredByDreams => {
+                let (diagnostics, started) = Diagnostics::start_recorded(state);
+                started.wait().with_context(|| {
+                    format!(
+                        "Runtime diagnostics could not record this coordinator's start in {}. \
+                         Dreams needs that record to tell a quiet night from a missed one. Fix \
+                         that path, or remove [dreams] from the config to run chat without \
+                         nightly review",
+                        state.join("diagnostics").display()
+                    )
+                })?;
+                diagnostics
+            }
+        };
+        let lock_fd = guard.0.as_raw_fd();
         let mut command = Command::new("node");
         command
             .arg("--no-warnings")
@@ -131,7 +174,7 @@ impl Runtime {
         // This is a local child bootstrap, never a public command or shared
         // setting. Workers and ad-hoc runtimes must not inherit this capability.
         command.env_remove("AGENT_APNS_CONFIG");
-        if let Some(config) = apns {
+        if let Some(config) = apns.filter(|_| !restore_held) {
             config.validate()?;
             command.env("AGENT_APNS_CONFIG", serde_json::to_string(config)?);
         }
@@ -159,7 +202,6 @@ impl Runtime {
         let (shutdown, stopping) = watch::channel(false);
         let (notices, _) = broadcast::channel(64);
         let notifications = notices.clone();
-        let diagnostics = Diagnostics::start(state);
         let service_diagnostics = Mutex::new(diagnostics.fork());
         let (quiescing, _) = watch::channel(false);
         let actor = tokio::spawn(async move {
@@ -188,11 +230,18 @@ impl Runtime {
             service_diagnostics,
             stopping: quiescing,
             coordinator_id,
+            restore_held,
         })
     }
 
     pub fn coordinator_id(&self) -> CoordinatorId {
         self.coordinator_id
+    }
+
+    /// Whether this store waits for `backup release`, read once under this
+    /// runtime's writer lock. A held runtime starts without phone notifications.
+    pub fn restore_held(&self) -> bool {
+        self.restore_held
     }
 
     pub async fn request(&self, command: RuntimeCommand) -> Result<RuntimeCall> {
@@ -438,7 +487,7 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
     mut stdin: ChildStdin,
     output: R,
     control: ActorControl,
-    _writer_guard: File,
+    _writer_guard: WriterLock,
     notices: broadcast::Sender<RuntimeNotice>,
     mut diagnostics: Diagnostics,
 ) -> Result<()> {
@@ -712,6 +761,56 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncWriteExt, BufReader};
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn a_restored_store_starts_its_runtime_without_the_apns_capability_until_released() {
+        use crate::notifications::{ApnsConfig, ApnsEnvironment};
+        let apns = ApnsConfig {
+            team_id: "TEAM000001".into(),
+            key_id: "KEY0000001".into(),
+            topic: "dev.example.Agent".into(),
+            key_file: "/tmp/invented-apns/AuthKey.p8".into(),
+            environment: ApnsEnvironment::Sandbox,
+        };
+        for (held, expected) in [(true, "absent"), (false, "present")] {
+            let state = tempfile::tempdir().unwrap();
+            if held {
+                std::fs::write(state.path().join("restore-hold.json"), "{}").unwrap();
+            }
+            let script = state.path().join("apns.mjs");
+            std::fs::write(
+                &script,
+                r#"import {writeFileSync} from 'node:fs';import {join} from 'node:path';
+writeFileSync(join(process.argv[2],'apns'),process.env.AGENT_APNS_CONFIG===undefined?'absent':'present');
+setInterval(()=>{},1000);
+"#,
+            )
+            .unwrap();
+            let runtime = crate::runtime::Runtime::start_with_notifications(
+                &script,
+                state.path(),
+                Some(&apns),
+                crate::runtime::StartRecord::BestEffort,
+            )
+            .unwrap();
+            let reported = state.path().join("apns");
+            let seen = timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&reported)
+                        && !text.is_empty()
+                    {
+                        return text;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(seen, expected, "held: {held}");
+            assert_eq!(runtime.restore_held(), held);
+            drop(runtime);
+        }
+    }
 
     #[tokio::test]
     async fn native_duplex_backpressure_keeps_stdout_readable_during_a_partial_command_write() {
@@ -1412,6 +1511,37 @@ createInterface({input:process.stdin}).on('line',line=>{
             .unwrap();
         }
         runtime.close().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(state.path().join("diagnostics")).unwrap(),
+            "Preserve existing unrelated file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_requires_its_start_record_refuses_to_start_and_names_the_remedy() {
+        use crate::runtime::{Runtime, StartRecord};
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(
+            state.path().join("diagnostics"),
+            "Preserve existing unrelated file",
+        )
+        .unwrap();
+        let script = state.path().join("fixture.mjs");
+        std::fs::write(&script, "process.stdin.resume();\n").unwrap();
+        let Err(error) = Runtime::start_with_notifications(
+            &script,
+            state.path(),
+            None,
+            StartRecord::RequiredByDreams,
+        ) else {
+            panic!("A runtime whose log cannot record its start must not serve");
+        };
+        let error = format!("{error:#}");
+        assert!(
+            error.contains(&state.path().join("diagnostics").display().to_string()),
+            "{error}"
+        );
+        assert!(error.contains("remove [dreams]"), "{error}");
         assert_eq!(
             std::fs::read_to_string(state.path().join("diagnostics")).unwrap(),
             "Preserve existing unrelated file"

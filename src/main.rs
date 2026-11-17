@@ -1,6 +1,7 @@
 mod chat_admission;
 mod chat_history;
 mod chat_view;
+mod dreams_cli;
 mod mail;
 mod state;
 
@@ -106,6 +107,11 @@ enum Action {
         #[command(subcommand)]
         command: JobsAction,
     },
+    /// Review nightly Dreams proposals and apply an approved one. Local to the coordinator.
+    Dreams {
+        #[command(subcommand)]
+        command: dreams_cli::DreamsAction,
+    },
     /// Show shared settings and registered machines.
     Nodes,
     /// Inspect owned worktrees or collect eligible merged worktrees.
@@ -137,6 +143,12 @@ enum Action {
     Feedback {
         #[command(subcommand)]
         command: FeedbackAction,
+    },
+    /// Back up a stopped coordinator, restore one into a new directory, or
+    /// release a restored coordinator's background work.
+    Backup {
+        #[command(subcommand)]
+        command: BackupAction,
     },
     /// Run this machine's coordinator or registered worker service.
     Serve {
@@ -332,6 +344,16 @@ enum FeedbackAction {
 }
 
 #[derive(Subcommand)]
+enum BackupAction {
+    /// Copy the stopped coordinator's state into DESTINATION, which must not exist.
+    Create { destination: PathBuf },
+    /// Rebuild a state directory at TARGET, which must be absent or empty, from ARCHIVE.
+    Restore { archive: PathBuf, target: PathBuf },
+    /// Let a restored coordinator run background work again.
+    Release,
+}
+
+#[derive(Subcommand)]
 enum ConfigAction {
     Apply { settings: PathBuf },
 }
@@ -421,6 +443,15 @@ fn startup_jobs(config: &ClientConfig) -> Option<Vec<jobs::ScheduledJob>> {
             None
         }
     }
+}
+
+fn print_receipt(json: bool, receipt: &(impl serde::Serialize + std::fmt::Display)) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(receipt)?);
+    } else {
+        println!("{receipt}");
+    }
+    Ok(())
 }
 
 fn runtime_script(explicit: Option<PathBuf>) -> PathBuf {
@@ -553,6 +584,16 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
+        Action::Dreams { command } => {
+            let config = config::load(arguments.config.as_deref())?;
+            return dreams_cli::run(
+                &state::directory(arguments.state_dir.clone())?,
+                &config,
+                arguments.json,
+                command,
+            )
+            .await;
+        }
         Action::Mail { command } => {
             match command {
                 MailAction::Accounts => println!(
@@ -571,6 +612,34 @@ async fn main() -> Result<()> {
                             .await?
                     )?
                 ),
+            }
+            return Ok(());
+        }
+        Action::Backup { command } => {
+            let runtime = runtime_script(arguments.runtime.clone());
+            match command {
+                BackupAction::Create { destination } => print_receipt(
+                    arguments.json,
+                    &agent_cli::backup::create(
+                        &state::path(arguments.state_dir.clone())?,
+                        &destination,
+                        &runtime,
+                    )?,
+                )?,
+                BackupAction::Restore { archive, target } => {
+                    ensure!(
+                        arguments.state_dir.is_none(),
+                        "backup restore writes TARGET; it does not take --state-dir"
+                    );
+                    print_receipt(
+                        arguments.json,
+                        &agent_cli::backup::restore(&archive, &target, &runtime)?,
+                    )?
+                }
+                BackupAction::Release => print_receipt(
+                    arguments.json,
+                    &agent_cli::backup::release(&state::path(arguments.state_dir.clone())?)?,
+                )?,
             }
             return Ok(());
         }
@@ -2197,6 +2266,10 @@ fn local_command_from_ui(
         .selected
         .as_ref()
         .map(|item| item.conversation_id.clone());
+    let goal_target = selected.clone().map_or_else(
+        || agent_cli::protocol::GoalTarget::from(target.clone()),
+        |conversation_id| agent_cli::protocol::GoalTarget::Conversation { conversation_id },
+    );
     while ui.controls.try_join_next().is_some() {}
     ui.controls.spawn(async move {
         let client = ClientContext {
@@ -2208,12 +2281,18 @@ fn local_command_from_ui(
             terminal: &terminal,
         };
         let changed = async {
-            if let Some(request) = command.request() {
+            let goal = command
+                .goal(goal_target, uuid::Uuid::new_v4())
+                .transpose()?;
+            if let Some(request) = goal.or_else(|| command.request()) {
                 let events = exchange(client, request).await?;
                 for event in events {
                     let text = match &event {
                         RuntimeEventKind::Resources { resources } => {
                             Some(agent_cli::resources::format_inventory(resources))
+                        }
+                        RuntimeEventKind::Goal { status } => {
+                            Some(agent_cli::goal_view::format(status))
                         }
                         _ => agent_cli::job_view::event(&event),
                     };
@@ -2366,7 +2445,13 @@ async fn local_command_plain(
         }
         return Ok(());
     }
-    if let Some(request) = command.request() {
+    let goal = command
+        .goal(
+            agent_cli::protocol::GoalTarget::from(target.clone()),
+            uuid::Uuid::new_v4(),
+        )
+        .transpose()?;
+    if let Some(request) = goal.or_else(|| command.request()) {
         for event in exchange(client, request).await? {
             display(&event, json)?;
         }
@@ -3147,6 +3232,7 @@ async fn local_worker_binding(rex: &RexClient, terminal: &RexClient) -> Result<W
         session_id: session.to_string(),
         window_id: window.to_string(),
         block_id: block.to_string(),
+        rex_instance_id: Some(identity.instance_id.to_string()),
     })
 }
 
@@ -3392,16 +3478,7 @@ async fn request_presented(
     let mut ready = false;
     let mut history_cursor = None;
     let mut input = BufReader::new(tokio::io::stdin()).lines();
-    let mut operations = HostEffects::new(Capacity::Unbounded);
     let mut feedback = tokio::task::JoinSet::new();
-    let executor = Arc::new(
-        host::Executor::with_tailscale(
-            directory,
-            agent_cli::tailnet::Daemon::new(config.tailscale_socket.as_deref())?,
-            rex.clone(),
-        )
-        .with_browser(script, config.browser.clone()),
-    );
     let mut thinking = false;
     let mut wire = connection(client, lifecycle == RequestLifecycle::Login).await?;
     let relay_needed = match (
@@ -3513,7 +3590,6 @@ async fn request_presented(
                             ui.exiting = true;
                         }
                         if lifecycle == RequestLifecycle::Chat || lifecycle.is_view() { return Ok(history_cursor); }
-                        if active_turn { write_command(&mut *wire.writer, &RuntimeCommand::Interrupt).await?; }
                         if lifecycle.is_worker() { write_command(&mut *wire.writer, &RuntimeCommand::DetachWorker).await?; }
                         ui_controls = false;
                     }
@@ -3584,12 +3660,6 @@ async fn request_presented(
                 signal?;
                 write_command(&mut *wire.writer, &RuntimeCommand::DetachWorker).await?;
                 interactive = false;
-                continue;
-            }
-            completed = operations.next(), if !operations.is_empty() => {
-                if let Some(reply) = completed? {
-                    write_command(&mut *wire.writer, &RuntimeCommand::HostReply { call_id: reply.call_id, result: reply.result }).await?;
-                }
                 continue;
             }
         };
@@ -3665,21 +3735,16 @@ async fn request_presented(
             view.handle.event(event.clone())?;
         }
         match event {
-            RuntimeEventKind::HostCall { call_id, command } => {
-                ensure!(
-                    lifecycle.delegates_host_call(&command),
-                    "Only an attached task worker may execute coordinator host calls"
-                );
-                let executor = executor.clone();
-                if let Admission::Rejected(reply) = operations.spawn(call_id, |cancelled| async move {
-                    executor.execute_cancelled(*command, cancelled).await
-                })? {
-                    write_command(&mut *wire.writer, &RuntimeCommand::HostReply { call_id: reply.call_id, result: reply.result }).await?;
+            RuntimeEventKind::HostCall { call_id, .. } => {
+                write_command(&mut *wire.writer, &RuntimeCommand::HostReply { call_id, result: outdated_coordinator_effect() }).await?;
+                let notice = "Update the coordinator so this task's host runs its commands.";
+                match &presentation {
+                    Some(view) => view.handle.event(RuntimeEventKind::Notice { task_id: None, text: notice.into() })?,
+                    None if !arguments.json => eprintln!("{notice}"),
+                    None => {}
                 }
             }
-            RuntimeEventKind::HostCancel { call_id } => {
-                operations.cancel(&call_id);
-            }
+            RuntimeEventKind::HostCancel { .. } => {}
             RuntimeEventKind::Interrupted => {
                 outcome = true;
                 if presentation.is_none() {
@@ -3852,27 +3917,16 @@ async fn request_presented(
     ensure!(outcome || lifecycle.is_view(), "Coordinator completed without a result");
     Ok(history_cursor)
     }.await;
-    let mut draining = operations.shutdown();
-    let mut drained = Ok(());
-    while let Some(reply) = draining.next().await {
-        let delivery = match reply {
-            Ok(reply) => {
-                write_command(
-                    &mut *wire.writer,
-                    &RuntimeCommand::HostReply {
-                        call_id: reply.call_id,
-                        result: reply.result,
-                    },
-                )
-                .await
-            }
-            Err(error) => Err(error),
-        };
-        drained = drained.and(delivery);
-    }
     let closed = close_connection(&mut *wire.writer, wire.child).await;
     finish_controls(&mut feedback).await;
-    result.and_then(|cursor| drained.and(closed).map(|()| cursor))
+    result.and_then(|cursor| closed.map(|()| cursor))
+}
+
+fn outdated_coordinator_effect() -> agent_cli::protocol::HostResult {
+    agent_cli::protocol::HostResult::Failed {
+        delivery: Some(agent_cli::protocol::HostDelivery::NotStarted),
+        message: "This terminal no longer runs task commands, so nothing was started. Update the coordinator so the task's host runs them.".into(),
+    }
 }
 
 fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
@@ -4011,6 +4065,7 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
         RuntimeEventKind::TaskGraph { graph } => {
             println!("{}", agent_cli::task_graph_view::format(graph));
         }
+        RuntimeEventKind::Goal { status } => println!("{}", agent_cli::goal_view::format(status)),
         RuntimeEventKind::Environment {
             nodes,
             online_host_ids,
@@ -4297,6 +4352,7 @@ mod tests {
                 session_id: SESSION.into(),
                 window_id: "window:22222222-2222-4222-8222-222222222222".into(),
                 block_id: BLOCK.into(),
+                rex_instance_id: None,
             };
             let capture =
                 crate::capture_feedback_view(&personal_rex(), directory.path(), &binding).await;

@@ -297,6 +297,23 @@
         "sources"
       ]
     },
+    "BrowserCapture": {
+      "description": "One PNG capture of an owned tab, with the SHA-256 of its decoded bytes.",
+      "type": "object",
+      "properties": {
+        "data_base64": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "data_base64",
+        "sha256"
+      ]
+    },
     "BrowserResponse": {
       "oneOf": [
         {
@@ -384,6 +401,35 @@
             "session_id",
             "tabs",
             "output"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capture": {
+              "$ref": "#/$defs/BrowserCapture"
+            },
+            "session_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "tabs": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/BrowserTab"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "screenshot"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "session_id",
+            "tabs",
+            "capture"
           ]
         },
         {
@@ -746,6 +792,25 @@
         "sources"
       ]
     },
+    "DreamsReply": {
+      "type": "object",
+      "properties": {
+        "decided": {
+          "type": "boolean"
+        },
+        "run": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run",
+        "decided",
+        "text"
+      ]
+    },
     "EmbeddingBatch": {
       "type": "object",
       "properties": {
@@ -903,6 +968,177 @@
         "draft",
         "queued_inputs",
         "client_errors"
+      ]
+    },
+    "GitHubOwnerFilter": {
+      "description": "Partition notifications using repository.full_name, never subject/title text.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "include"
+            },
+            "owners": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "owners"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "exclude"
+            },
+            "owners": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "owners"
+          ]
+        }
+      ]
+    },
+    "GoalAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "show"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "`request_id` becomes the goal ID, and in main also the new task's ID, so a\nreplayed set finds the goal it created instead of being refused.",
+          "type": "object",
+          "properties": {
+            "objective": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "set"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "objective"
+          ]
+        },
+        {
+          "description": "A goal retains the request IDs it accepted, so a replayed pause or resume\nchanges nothing even after later controls.",
+          "type": "object",
+          "properties": {
+            "request_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "pause"
+            }
+          },
+          "required": [
+            "type",
+            "request_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "request_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "resume"
+            }
+          },
+          "required": [
+            "type",
+            "request_id"
+          ]
+        }
+      ]
+    },
+    "GoalTarget": {
+      "description": "The conversation a `/goal` control addresses. The runtime resolves every form\nto main or to exactly one existing task, and refuses an agent conversation.",
+      "oneOf": [
+        {
+          "description": "The root conversation.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "main"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "agent_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            },
+            "type": {
+              "type": "string",
+              "const": "task"
+            }
+          },
+          "required": [
+            "type",
+            "task_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "conversation"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id"
+          ]
+        }
       ]
     },
     "GuidanceSnapshot": {
@@ -1337,6 +1573,22 @@
           "required": [
             "type",
             "response"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reply": {
+              "$ref": "#/$defs/DreamsReply"
+            },
+            "type": {
+              "type": "string",
+              "const": "dreams"
+            }
+          },
+          "required": [
+            "type",
+            "reply"
           ]
         },
         {
@@ -3243,6 +3495,27 @@
           ]
         },
         {
+          "description": "`/goal` for one selected conversation: show, set, pause or resume its objective.",
+          "type": "object",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/GoalAction"
+            },
+            "target": {
+              "$ref": "#/$defs/GoalTarget"
+            },
+            "type": {
+              "type": "string",
+              "const": "goal"
+            }
+          },
+          "required": [
+            "type",
+            "target",
+            "action"
+          ]
+        },
+        {
           "type": "object",
           "properties": {
             "type": {
@@ -4209,6 +4482,17 @@
                 "type": "string"
               }
             },
+            "owner_filter": {
+              "description": "Exact repository owner partition; omitted preserves unfiltered intake.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/GitHubOwnerFilter"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "provider": {
               "type": "string",
               "const": "github"
@@ -4672,6 +4956,10 @@
           "type": "boolean",
           "default": false
         },
+        "browser_screenshots": {
+          "type": "boolean",
+          "default": false
+        },
         "browser_user_tabs": {
           "type": "boolean",
           "default": false
@@ -4834,6 +5122,13 @@
         },
         "host_id": {
           "type": "string"
+        },
+        "rex_instance_id": {
+          "description": "`whoami.instance_id` of the Rex server that started this pane's process.\nRex restores a saved pane with a fresh shell under a new instance, so a\nprocess in the pane is the worker terminal only under this instance.\nAbsent on a binding saved before this field, or made by an older host.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "session_id": {
           "type": "string"

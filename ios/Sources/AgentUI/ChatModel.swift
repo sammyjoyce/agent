@@ -93,6 +93,10 @@ final class ChatModel {
     case pending(text: String, submission: ComposerSubmission?)
     case saved
   }
+  private struct ReturnedText {
+    let sendOrder: Int
+    let text: String
+  }
   /// Runs a Send's delivery to its recipients' outboxes and answers whether any took it. Tests
   /// wrap the delivery to hold a Send in flight, or answer without it to refuse one.
   typealias Admit = @MainActor (_ deliver: @MainActor () async -> Bool) async -> Bool
@@ -169,6 +173,7 @@ final class ChatModel {
   /// included, so all of it is committed.
   var draft = "" {
     didSet {
+      if draft.isEmpty { textsReturnedSinceEmpty = [] }
       if oldValue.isEmpty, attachments.isEmpty, !draft.isEmpty { stampBegun() }
       committed = draft
       forgetClearedSource()
@@ -318,6 +323,8 @@ final class ChatModel {
   @ObservationIgnored private var restoringDraft = false
   private var admission: Admission?
   var admitting: Bool { admission != nil }
+  @ObservationIgnored private var sendsStarted = 0
+  @ObservationIgnored private var textsReturnedSinceEmpty: [ReturnedText] = []
   @ObservationIgnored private var draftStore: AttachmentStore?
   @ObservationIgnored private var retiredDraftFiles: [LocalAttachment] = []
   @ObservationIgnored private let admit: Admit
@@ -396,9 +403,10 @@ final class ChatModel {
       if let submission {
         let submittedIDs = Set(submission.attachments.map(\.id))
         value.submission = submission
+        value.returnedText = String(splitAfterReturns().returned)
         value.attachments.removeAll { submittedIDs.contains($0.id) }
       } else if !text.isEmpty {
-        value.text = text + (value.text.isEmpty ? "" : "\n\n" + value.text)
+        value.text = insertedAfterReturns(text)
       }
     }
     return value
@@ -1106,9 +1114,12 @@ final class ChatModel {
     guard targets.count == recipients.count else { return ignoreSend() }
     let mode = mode
     let original = source
+    let addressedTo = DraftAddressing(destination: destination, restoredFrom: restoredFrom)
     let files = attachments
     let submission = submission(
       ComposerInputIdentity(composerID: composerID), text: text, files: files, at: targets)
+    sendsStarted += 1
+    let sendOrder = sendsStarted
     // Clear the actual bound value before any await. The pending admission
     // retains the recovery copy until the durable outboxes take ownership.
     admission = .pending(text: text, submission: submission)
@@ -1119,18 +1130,10 @@ final class ChatModel {
     let clearedRevision = draftRevision
     return Task {
       var admitted = false
+      var departing: [ControlDeparture] = []
       defer {
         admission = nil
-        if !admitted, !text.isEmpty {
-          // Nothing went, so no outbox holds the message. Preserve both the original and
-          // anything typed while admission or attachment preparation was pending. It returns as
-          // the draft it was, so the scope shown now does not begin it again.
-          changingDraft = true
-          draft = text + (draft.isEmpty ? "" : "\n\n" + draft)
-          changingDraft = false
-          scheduleDraftSave()
-          logComposer(.localDraftRestored)
-        }
+        if !admitted { putBack(text, of: sendOrder) }
         // A composer emptied during the Send kept whom its draft was for until now.
         forgetClearedSource()
       }
@@ -1138,14 +1141,21 @@ final class ChatModel {
       // claim it. New typing and files remain separate from this submitted note.
       guard await saveDraft() else { return }
       admitted = await admit { [self] in
-        await deliver(
+        let delivery = await deliver(
           body, mode: mode, files: files, to: targets, receipt: submission.identity)
+        departing = delivery.departing
+        return delivery.admitted
       }
       // Nothing went, so the text comes back for another try.
       guard admitted else { return }
       // The outboxes own this message even if their connections have since stopped.
       admission = .saved
       logComposer(.outboxSaved)
+      if !departing.isEmpty {
+        Task {
+          await putBack(text, of: sendOrder, addressedTo: addressedTo, unlessAnyWrote: departing)
+        }
+      }
       // Who the draft is for goes with the Send only while nothing changed since its tap.
       if draftRevision == clearedRevision {
         restoredFrom = nil
@@ -1161,14 +1171,73 @@ final class ChatModel {
     }
   }
 
+  private var leadingReturns: [(returned: ReturnedText, paragraphEnd: String.Index)] {
+    var leading: [(returned: ReturnedText, paragraphEnd: String.Index)] = []
+    var later = textsReturnedSinceEmpty[...]
+    var rest = draft[...]
+    while let match = later.firstIndex(where: { rest.starts(with: $0.text) }) {
+      let paragraph = rest.dropFirst(later[match].text.count)
+      let paragraphEnd = paragraph.firstRange(of: "\n\n")?.lowerBound ?? paragraph.endIndex
+      leading.append((later[match], paragraphEnd))
+      later = later[(match + 1)...]
+      rest = draft[paragraphEnd...].dropFirst(2)
+    }
+    return leading
+  }
+
+  private func splitAfterReturns(olderThan sendOrder: Int = .max) -> (
+    returned: Substring, rest: Substring
+  ) {
+    guard let last = leadingReturns.last(where: { $0.returned.sendOrder < sendOrder }) else {
+      return ("", draft[...])
+    }
+    return (draft[..<last.paragraphEnd], draft[last.paragraphEnd...].dropFirst(2))
+  }
+
+  private func insertedAfterReturns(_ text: String, olderThan sendOrder: Int = .max) -> String {
+    let (returned, rest) = splitAfterReturns(olderThan: sendOrder)
+    return [returned, text[...], rest].filter { !$0.isEmpty }.joined(separator: "\n\n")
+  }
+
+  private func putBack(
+    _ text: String, of sendOrder: Int, addressedTo addressing: DraftAddressing? = nil
+  ) {
+    guard !text.isEmpty else { return }
+    let empty = draft.isEmpty && attachments.isEmpty
+    // It returns as the draft it was, so the scope shown now does not begin it again.
+    changingDraft = true
+    draft = insertedAfterReturns(text, olderThan: sendOrder)
+    textsReturnedSinceEmpty.insert(
+      ReturnedText(sendOrder: sendOrder, text: text),
+      at: textsReturnedSinceEmpty.firstIndex { $0.sendOrder > sendOrder }
+        ?? textsReturnedSinceEmpty.endIndex)
+    if empty, let addressing {
+      restoredFrom = addressing.restoredFrom
+      destination = addressing.destination
+    }
+    changingDraft = false
+    scheduleDraftSave()
+    logComposer(.localDraftRestored)
+  }
+
+  private func putBack(
+    _ text: String, of sendOrder: Int, addressedTo addressing: DraftAddressing,
+    unlessAnyWrote departing: [ControlDeparture]
+  ) async {
+    for departure in departing {
+      if await departure.wrote { return }
+    }
+    putBack(text, of: sendOrder, addressedTo: addressing)
+  }
+
   /// Saves the message in every target's outbox, then starts each. A refusal withdraws every
   /// staged copy, so nothing is queued anywhere. Every copy carries the composer's receipt, and a
   /// copy that does not go releases only its own, so recovery offers the text again only when no
-  /// recipient took it. True once any recipient has the message or still will.
+  /// recipient took it. Admitted once any recipient has the message or still will.
   private func deliver(
     _ body: String, mode: InputMode, files: [LocalAttachment], to targets: [Target],
     receipt: ComposerInputIdentity
-  ) async -> Bool {
+  ) async -> (admitted: Bool, departing: [ControlDeparture]) {
     let recipients = targets.map(\.id)
     let sendID = UUID().uuidString
     // Cleared before staging, so what a retirement cancels during this Send stays named.
@@ -1190,19 +1259,22 @@ final class ChatModel {
         } else if addressesByName {
           report("Nothing was sent. \(name(target.id)) did not take the message.")
         }
-        return false
+        return (false, [])
       }
       staged.append((target, input))
     }
     var misses: [(ProfileID, StagedInput, Missed)] = []
+    var departing: [ControlDeparture] = []
     for item in staged {
       let outcome = await item.target.session.start(item.input)
       if let why = missed(item.target.id, item.input, outcome) {
         misses.append((item.target.id, item.input, why))
+      } else if let departure = item.input.departure {
+        departing.append(departure)
       }
     }
     report(misses)
-    return misses.count < staged.count
+    return (misses.count < staged.count, departing)
   }
 
   /// The composer's receipt for a Send, held in the outbox of each of its `targets`.
@@ -1366,7 +1438,7 @@ final class ChatModel {
       for file in restored.attachments { try? await store.remove(file) }
       return
     }
-    draft = restored.text + (draft.isEmpty ? "" : "\n\n" + draft)
+    draft = insertedAfterReturns(restored.text)
     attachments.insert(contentsOf: restored.attachments, at: 0)
     mode = restored.mode
     restoredFrom = lane

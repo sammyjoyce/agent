@@ -20,6 +20,7 @@ import { openJobActor, runScheduled } from "../src/scheduled.js";
 import { createSourceTools, SourceJournal } from "../src/sources.js";
 import { TaskStore } from "../src/tasks.js";
 import { createAppTools, createJobTools, Executions } from "../src/tools.js";
+import { runAdmitted } from "./fixtures/run-admitted.js";
 
 // Opt in on the already authenticated coordinator:
 // AGENT_SOURCE_WORKFLOWS_EVAL=1 AGENT_EVAL_AUTH_DIR=/existing/agent/state \
@@ -78,7 +79,7 @@ test("live source triage applies standing workflows to pitches while preserving 
   const tools = createAppTools(tasks, executions), sourceTools = createSourceTools(sources, executions);
   for (const extension of [tools.main, tools.worker, sourceTools.main, sourceTools.worker]) registry.install(extension);
   const unavailable = async (): Promise<never> => { throw new Error("External execution is unavailable in this isolated evaluation"); };
-  tasks.useBackgroundExecution({ available: () => true, extensions: () => [tools.worker, sourceTools.worker], call: unavailable,
+  tasks.useActorExecution({ available: () => true, extensions: () => [tools.worker, sourceTools.worker], call: unavailable,
     bind: (conversation, host, model) => executions.bind(conversation.id.toString(), {
       cwd: directory, hosts: [host], default_host: host, model, role: "worker", call: unavailable,
     }),
@@ -93,7 +94,7 @@ test("live source triage applies standing workflows to pitches while preserving 
     cwd: directory, timezone: "Etc/UTC", revision: "evaluation-v1", schedules: [{ id: "daily",
       recurrence: "DTSTART:20300101T090000Z\nRRULE:FREQ=DAILY", focus: null, prompt: null }] };
   const owner = await tasks.create({ title: job.title, outcome: job.prompt, model: job.model,
-    sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.id }] });
+    job_id: job.id });
   const pitch = original("mail-101", "your new constraint solver release",
     "From: Morgan <morgan@pipelinevendor.example>\nTo: alex@designfirm.example\n" +
     "Body: Saw your solver release. We sell outsourced lead generation and can book 30 sales calls a month. " +
@@ -130,7 +131,7 @@ test("live source triage applies standing workflows to pitches while preserving 
       { type: "task", task_id: owner.id }, `${event.id} must reach the existing standing workflow`);
     assert.notDeepEqual(decisions.find((record) => record.event.id === legitimate.id)?.decision,
       { type: "task", task_id: owner.id }, "Expected supplier correspondence must not be routed as unwanted mail");
-    await tasks.runBackground(owner.id, controller.signal);
+    await runAdmitted(tasks, owner.id, undefined, controller.signal);
     const result = await tasks.get(owner.id);
     // A worker's final may replace the display summary. Inspect its actual
     // native record_task call, which retains the classification it saved.
@@ -153,7 +154,7 @@ test("live source triage applies standing workflows to pitches while preserving 
       source.provider === "scheduled_jobs" && source.thread_id === job.id)).length, 1, "Reuse one workflow owner");
   } finally {
     clearTimeout(timer); controller.abort();
-    const detached = tasks.detachBackground();
+    const detached = tasks.detachActors();
     await session.close(BACKGROUND_CONTEXT); await detached;
     await rm(directory, { recursive: true, force: true });
   }

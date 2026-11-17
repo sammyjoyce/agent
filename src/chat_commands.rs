@@ -3,10 +3,12 @@
 use crate::{
     jobs::{JobId, ScheduleId},
     models::{ModelProvider, Reasoning},
-    protocol::{ConversationChange, FastMode, RuntimeCommand, TaskId},
+    protocol::{ConversationChange, FastMode, GoalAction, GoalTarget, RuntimeCommand, TaskId},
 };
+use anyhow::anyhow;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use std::ops::Range;
+use uuid::Uuid;
 
 #[derive(Clone, Debug)]
 pub struct Completion {
@@ -150,6 +152,12 @@ pub enum ChatCommand {
         #[arg(value_enum)]
         level: Option<Reasoning>,
     },
+    /// Show this conversation's goal, set one, or pause or resume it.
+    #[command(override_usage = "/goal [OBJECTIVE | pause | resume]")]
+    Goal {
+        #[arg(value_name = "OBJECTIVE", num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
+        words: Vec<String>,
+    },
     /// Resume a saved chat, optionally finding its title or exact ID.
     Resume {
         #[arg(value_name = "QUERY_OR_ID", num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
@@ -233,6 +241,35 @@ impl ChatCommand {
         })
     }
 
+    /// The `/goal` request for `target`. Set, pause and resume carry `request_id`,
+    /// so a replayed native submit reaches the goal state it already produced.
+    pub fn goal(
+        &self,
+        target: GoalTarget,
+        request_id: Uuid,
+    ) -> Option<anyhow::Result<RuntimeCommand>> {
+        let Self::Goal { words } = self else {
+            return None;
+        };
+        let request_id = request_id.to_string();
+        let action = match words.as_slice() {
+            [] => GoalAction::Show,
+            [word] if word.eq_ignore_ascii_case("pause") => GoalAction::Pause { request_id },
+            [word] if word.eq_ignore_ascii_case("resume") => GoalAction::Resume { request_id },
+            words => {
+                let objective = words.join(" ");
+                if objective.trim().is_empty() {
+                    return Some(Err(anyhow!("Describe the objective after /goal.")));
+                }
+                GoalAction::Set {
+                    request_id,
+                    objective,
+                }
+            }
+        };
+        Some(Ok(RuntimeCommand::Goal { target, action }))
+    }
+
     pub fn request(&self) -> Option<RuntimeCommand> {
         match self {
             Self::Worktrees => Some(RuntimeCommand::ListResources),
@@ -281,8 +318,148 @@ mod tests {
         chat_commands::{ChatCommand, ModelReference, command_help},
         jobs::JobId,
         models::ModelProvider,
-        protocol::{ConversationChange, FastMode, RuntimeCommand},
+        protocol::{ConversationChange, FastMode, GoalAction, GoalTarget, RuntimeCommand, TaskId},
+        runtime::lifecycle::RequestLifecycle,
     };
+
+    fn goal(text: &str, target: GoalTarget, request_id: uuid::Uuid) -> RuntimeCommand {
+        ChatCommand::parse(text)
+            .unwrap()
+            .unwrap()
+            .goal(target, request_id)
+            .expect("/goal must produce a goal request")
+            .unwrap()
+    }
+
+    #[test]
+    fn goal_words_map_to_one_action_per_form() {
+        let id = uuid::Uuid::new_v4();
+        let request_id = id.to_string();
+        let set = |objective: &str| GoalAction::Set {
+            request_id: request_id.clone(),
+            objective: objective.into(),
+        };
+        for (text, action) in [
+            ("/goal", GoalAction::Show),
+            ("/goal   ", GoalAction::Show),
+            (
+                "/goal pause",
+                GoalAction::Pause {
+                    request_id: request_id.clone(),
+                },
+            ),
+            (
+                "/goal PAUSE",
+                GoalAction::Pause {
+                    request_id: request_id.clone(),
+                },
+            ),
+            (
+                "/goal Resume",
+                GoalAction::Resume {
+                    request_id: request_id.clone(),
+                },
+            ),
+            ("/goal write notes", set("write notes")),
+            ("/goal  write\t the\nnotes ", set("write the notes")),
+            ("/goal pause the build", set("pause the build")),
+            (
+                "/goal resume",
+                GoalAction::Resume {
+                    request_id: request_id.clone(),
+                },
+            ),
+            ("/goal --verbose fix", set("--verbose fix")),
+        ] {
+            let command = goal(text, GoalTarget::Main, id);
+            assert_eq!(
+                RequestLifecycle::for_command(&command),
+                Some(RequestLifecycle::Once),
+                "{text}"
+            );
+            let RuntimeCommand::Goal {
+                target,
+                action: actual,
+            } = command
+            else {
+                panic!("{text} must be a goal control");
+            };
+            assert_eq!(target, GoalTarget::Main, "{text}");
+            assert_eq!(actual, action, "{text}");
+        }
+    }
+
+    #[test]
+    fn goal_rejects_an_empty_objective_and_is_never_another_control() {
+        let blank = ChatCommand::Goal {
+            words: vec![String::new(), " ".into()],
+        };
+        let error = blank
+            .goal(GoalTarget::Main, uuid::Uuid::new_v4())
+            .expect("A blank objective is still a /goal form")
+            .unwrap_err();
+        assert!(error.to_string().contains("/goal"), "{error}");
+        for text in ["/goal", "/goal pause", "/goal resume", "/goal ship it"] {
+            let command = ChatCommand::parse(text).unwrap().unwrap();
+            assert!(command.request().is_none(), "{text}");
+            assert!(command.settings(None).is_none(), "{text}");
+        }
+        assert!(
+            ChatCommand::Status
+                .goal(GoalTarget::Main, uuid::Uuid::new_v4())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn goal_target_follows_the_selected_conversation() {
+        let task = TaskId::new();
+        let id = uuid::Uuid::new_v4();
+        for (selected, expected) in [
+            (None, GoalTarget::Main),
+            (
+                Some((task.clone(), None)),
+                GoalTarget::Task {
+                    task_id: task.clone(),
+                    agent_id: None,
+                },
+            ),
+            (
+                Some((task.clone(), Some("reviewer".into()))),
+                GoalTarget::Task {
+                    task_id: task.clone(),
+                    agent_id: Some("reviewer".into()),
+                },
+            ),
+        ] {
+            assert!(matches!(
+                goal("/goal", GoalTarget::from(selected), id),
+                RuntimeCommand::Goal { target, action: GoalAction::Show } if target == expected
+            ));
+        }
+        let saved = GoalTarget::Conversation {
+            conversation_id: "42".into(),
+        };
+        assert!(matches!(
+            goal("/goal pause", saved.clone(), id),
+            RuntimeCommand::Goal { target, .. } if target == saved
+        ));
+    }
+
+    #[test]
+    fn goal_help_shows_its_forms() {
+        assert!(command_help().iter().any(|(usage, description)| usage
+            == "/goal [OBJECTIVE | pause | resume]"
+            && !description.is_empty()));
+        assert!(crate::chat_commands::help().contains("/goal [OBJECTIVE | pause | resume]"));
+        assert_eq!(
+            crate::chat_commands::completions("/go", 3)
+                .into_iter()
+                .map(|item| item.text)
+                .collect::<Vec<_>>(),
+            ["/goal"]
+        );
+    }
 
     #[test]
     fn manual_job_controls_share_typed_selection_and_keep_job_inspection_unambiguous() {

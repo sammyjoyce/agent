@@ -244,6 +244,7 @@ impl RexClient {
     pub async fn worker_presence(
         &self,
         binding: &WorkerBinding,
+        started_by: Option<Uuid>,
         host: &HostId,
     ) -> Result<crate::protocol::WorkerPresence, RexError> {
         use crate::protocol::WorkerPresence;
@@ -262,6 +263,24 @@ impl RexClient {
             return Ok(WorkerPresence::MissingTerminal);
         }
         view.verify_binding(binding, host)?;
+        Ok(match self.pane_holds(binding, started_by).await? {
+            PaneHolds::Worker => WorkerPresence::Present { running: true },
+            PaneHolds::OtherProcess | PaneHolds::Exited => {
+                WorkerPresence::Present { running: false }
+            }
+            PaneHolds::Pending => WorkerPresence::Pending,
+        })
+    }
+
+    /// Rex restores a saved pane with a fresh shell under a new instance, so a
+    /// process is the worker only while the instance that started it runs.
+    /// That instance is read after the process, so a restart between the two
+    /// reads cannot pass a restored shell off as the worker.
+    async fn pane_holds(
+        &self,
+        binding: &WorkerBinding,
+        started_by: Option<Uuid>,
+    ) -> Result<PaneHolds, RexError> {
         let process: TerminalProcess = decode(
             &self
                 .api(
@@ -275,11 +294,28 @@ impl RexClient {
                 .await
                 .map_err(read_failure)?,
         )?;
-        Ok(match process.state() {
-            TerminalState::Running => WorkerPresence::Present { running: true },
-            TerminalState::Exited => WorkerPresence::Present { running: false },
-            TerminalState::Pending => WorkerPresence::Pending,
+        Ok(match (process.state(), started_by) {
+            (TerminalState::Exited, _) => PaneHolds::Exited,
+            (TerminalState::Pending, _) => PaneHolds::Pending,
+            (TerminalState::Running, None) => PaneHolds::OtherProcess,
+            (TerminalState::Running, Some(instance)) => {
+                if self.whoami().await?.instance_id == instance {
+                    PaneHolds::Worker
+                } else {
+                    PaneHolds::OtherProcess
+                }
+            }
         })
+    }
+
+    /// A create is confirmed when Rex shows its pane in the session on this
+    /// host. Its binding carries the instance read before the create, so if
+    /// Rex restarted around it, the next presentation replaces the shell Rex
+    /// restored in the pane.
+    pub async fn confirm_creation(&self, binding: &WorkerBinding, host: &HostId) -> bool {
+        self.inspect_session(&binding.session_id)
+            .await
+            .is_ok_and(|view| view.verify_binding(binding, host).is_ok())
     }
 
     pub fn for_process(server: Option<&str>) -> anyhow::Result<Self> {
@@ -483,10 +519,13 @@ impl RexClient {
         decode_creation(&output)
     }
 
-    /// Keep a live or starting worker; replace an exited process in the same session.
+    /// Keep a live or starting worker. Replace an exited pane, or a pane whose
+    /// process is not the worker, with a new window in the same session.
     pub async fn resume_worker(
         &self,
         binding: &WorkerBinding,
+        started_by: Option<Uuid>,
+        identity: &RexIdentity,
         program: &str,
         args: &[String],
         cwd: &Path,
@@ -497,17 +536,11 @@ impl RexClient {
             args: Empty {},
         };
         for attempt in 0..20 {
-            let process: TerminalProcess = decode(
-                &self
-                    .api("com.superlogical.terminal.process", &process_request)
-                    .await
-                    .map_err(read_failure)?,
-            )?;
-            match process.state() {
-                TerminalState::Exited => break,
-                TerminalState::Running if attempt == 19 => return Ok(WorkerResume::Running),
-                TerminalState::Pending if attempt == 19 => return Ok(WorkerResume::Pending),
-                _ => {}
+            match self.pane_holds(binding, started_by).await? {
+                PaneHolds::Exited | PaneHolds::OtherProcess => break,
+                PaneHolds::Worker if attempt == 19 => return Ok(WorkerResume::Running),
+                PaneHolds::Pending if attempt == 19 => return Ok(WorkerResume::Pending),
+                PaneHolds::Worker | PaneHolds::Pending => {}
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -542,14 +575,7 @@ impl RexClient {
         };
         // Once creation succeeded, every later failure must retain uncertainty
         // about this same session rather than authorize another allocation.
-        let verified = async {
-            let identity = self.whoami().await?;
-            self.inspect_session(&replacement.session_id)
-                .await?
-                .verify_binding(&replacement, &identity.host_id)
-        }
-        .await;
-        if verified.is_err() {
+        if !self.confirm_creation(&replacement, &identity.host_id).await {
             return Err(RexError::CreationUncertain {
                 session_id: Some(binding.session_id.clone()),
             });
@@ -778,6 +804,12 @@ enum TerminalState {
     Exited,
     Pending,
 }
+enum PaneHolds {
+    Worker,
+    OtherProcess,
+    Exited,
+    Pending,
+}
 impl TerminalProcess {
     fn state(&self) -> TerminalState {
         if self.child.is_some() || self.foreground.is_some() {
@@ -965,6 +997,17 @@ mod tests {
     const WINDOW: &str = "window:22222222-2222-4222-8222-222222222222";
     const BLOCK: &str = "block:33333333-3333-4333-8333-333333333333";
     const HOST: &str = "44444444-4444-4444-8444-444444444444";
+    const INSTANCE: &str = "66666666-6666-4666-8666-666666666666";
+
+    fn fixture_identity() -> RexIdentity {
+        RexIdentity {
+            host_id: HostId::parse(HOST).unwrap(),
+            instance_id: Uuid::parse_str(INSTANCE).unwrap(),
+            rex_version: "fixture".into(),
+            endpoint: None,
+            tailscale: None,
+        }
+    }
 
     #[tokio::test]
     async fn terminal_capture_targets_only_the_explicit_pane_and_keeps_rendered_evidence() {
@@ -1104,7 +1147,14 @@ printf '<pre>Current task view 🦀</pre>\n'
             assert_eq!(fake_rex::methods(), ["session.create"]);
         } else {
             let resumed = client
-                .resume_worker(&exited, "/example/agent", &[], cwd)
+                .resume_worker(
+                    &exited,
+                    None,
+                    &fixture_identity(),
+                    "/example/agent",
+                    &[],
+                    cwd,
+                )
                 .await;
             assert!(
                 matches!(&resumed, Err(error) if *error == expected(down, Some(session.clone())))
@@ -1333,8 +1383,10 @@ printf '<pre>Current task view 🦀</pre>\n'
                 revision: 1,
             };
             let case = std::env::var("AGENT_TEST_REX_PROCESS_CASE").unwrap();
+            let identity = fixture_identity();
+            let started_by = Some(identity.instance_id);
             let presence = client
-                .worker_presence(&binding, &HostId::parse(HOST).unwrap())
+                .worker_presence(&binding, started_by, &identity.host_id)
                 .await;
             if case == "unlisted-read-failure" {
                 assert_eq!(presence.unwrap_err(), RexError::ReadFailed);
@@ -1347,7 +1399,14 @@ printf '<pre>Current task view 🦀</pre>\n'
                 assert_eq!(presence.unwrap_err(), RexError::InvalidResponse);
                 assert!(matches!(
                     client
-                        .resume_worker(&binding, "/example/agent", &[], Path::new("/tmp"))
+                        .resume_worker(
+                            &binding,
+                            started_by,
+                            &identity,
+                            "/example/agent",
+                            &[],
+                            Path::new("/tmp")
+                        )
                         .await,
                     Err(RexError::InvalidResponse)
                 ));
@@ -1369,7 +1428,14 @@ printf '<pre>Current task view 🦀</pre>\n'
                     );
                 }
                 let resumed = client
-                    .resume_worker(&binding, "/example/agent", &[], Path::new("/tmp"))
+                    .resume_worker(
+                        &binding,
+                        started_by,
+                        &identity,
+                        "/example/agent",
+                        &[],
+                        Path::new("/tmp"),
+                    )
                     .await
                     .unwrap();
                 if matches!(case.as_str(), "exited" | "unlisted-exited") {
@@ -1696,7 +1762,14 @@ printf '%s\n' "$value"
             assert_native_output(&client, &review, marker).await?;
 
             let resumed = match client
-                .resume_worker(&binding, "/usr/bin/printf", &args, Path::new("/tmp"))
+                .resume_worker(
+                    &binding,
+                    Some(identity.instance_id),
+                    &identity,
+                    "/usr/bin/printf",
+                    &args,
+                    Path::new("/tmp"),
+                )
                 .await?
             {
                 WorkerResume::Started(resumed) => resumed,
@@ -1756,8 +1829,15 @@ printf '%s\n' "$value"
         cleanup?;
         result
             .map_err(|_| anyhow::anyhow!("Native Rex contract exceeded its two-minute limit"))??;
+        let closed = client
+            .worker_presence(&binding, Some(identity.instance_id), &identity.host_id)
+            .await?;
+        anyhow::ensure!(
+            matches!(closed, crate::protocol::WorkerPresence::MissingSession),
+            "Rex's answer for a closed session did not read as missing: {closed:?}"
+        );
         eprintln!(
-            "Native Rex contract verified: three successful marker processes, two named windows in one session, parent reuse, sidebar promotion, and independent cleanup readback."
+            "Native Rex contract verified: three successful marker processes, two named windows in one session, parent reuse, sidebar promotion, independent cleanup readback, and a closed session read as missing."
         );
         Ok(())
     }

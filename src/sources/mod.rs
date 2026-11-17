@@ -254,6 +254,8 @@ pub enum SourceConfig {
         #[serde(default = "source_enabled")]
         enabled: bool,
         namespaces: Option<Vec<String>>,
+        /// Exact repository owner partition; omitted preserves unfiltered intake.
+        owner_filter: Option<github::GitHubOwnerFilter>,
     },
     GoogleCalendar {
         #[serde(default = "source_enabled")]
@@ -341,8 +343,17 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                     "Slack source configuration is invalid; coverage is unknown",
                 )),
             },
-            SourceConfig::GitHub { namespaces, .. } => {
-                match github::GitHubSource::discover(namespaces.as_deref()).await {
+            SourceConfig::GitHub {
+                namespaces,
+                owner_filter,
+                ..
+            } => {
+                match github::GitHubSource::discover_filtered(
+                    namespaces.as_deref(),
+                    owner_filter.clone(),
+                )
+                .await
+                {
                     Ok(discovered) => sources.extend(
                         discovered
                             .into_iter()
@@ -607,6 +618,7 @@ mod tests {
                 namespaces: Some(vec!["not-configured".into()]),
             },
             SourceConfig::GitHub {
+                owner_filter: None,
                 enabled: false,
                 namespaces: Some(vec!["not-configured".into()]),
             },

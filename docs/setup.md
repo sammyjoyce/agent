@@ -132,6 +132,25 @@ Changes persist when the conversation reopens and apply to the next model
 generation. TOML supplies defaults for new work. `/help` has the accepted
 arguments; Pi validates model capabilities.
 
+`/goal <objective>` gives the current conversation one persistent objective.
+In main it starts a task on the default host. In a task view it uses that task.
+When a turn ends without a verified result, the task continues on its own, up
+to five times per activation. A turn that fails, for example on a provider
+error, does not continue. Neither does a turn that leaves the task waiting on
+someone else, until a new message reaches the task. `/goal` shows the
+objective, its state and continuations, the task's latest summary and the last
+refused attempt. `/goal pause` stops the goal's current turn and queues no more
+goal turns. Other messages already queued in the task still run. Pause also
+cancels the host action the turn is running, as Esc does, but it cannot undo
+an effect that already happened, such as a file write. `/goal resume` starts a
+new activation in the same task. A goal completes only when the runtime itself
+finds the required text in the named file on the task's host. The task's
+history keeps the result of each check that returns while its turn and
+activation are still running. A check, passed or failed, that returns after a
+pause, Esc or a new activation is discarded. While a goal is open, the task
+cannot mark itself resolved. The phone accepts the
+same commands for main.
+
 OpenAI Responses models have hosted web search enabled, including page opening
 and find-in-page when the model supports them. The same tools apply to the main
 agent, tasks and child agents. Citations remain copyable links in saved history.
@@ -258,8 +277,23 @@ inspects their outcome before repeating them. A browser or host restart
 invalidates old tab handles; it does not prove a submission failed. Reconnect
 to continue, preserving tabs whose ownership cannot be verified.
 
-Scripts can use Playwright screenshots and file APIs on the execution host;
-image and file attachments in model output need additional support. Chrome
+`browser_screenshot` captures one owned tab as a PNG at CSS scale. It captures
+the viewport unless the call sets `full_page` to true. A capture over 2 MiB
+(2097152 bytes) fails, so capture the viewport or scroll to the part you need.
+Like a click, a screenshot brings its tab to the front. The model receives the
+image in the tool result, and Beep Boop keeps the same bytes as a retained
+attachment on the tool's row in history. The model can pass that attachment ID
+to `read_attachment` or to a delegated agent. The CLI shows the attachment's
+name and size. The iOS app lists it under the tool's activity and previews it
+after checking its SHA-256. Code mode scripts cannot call `browser_screenshot`,
+because a script receives only the text of a nested result.
+
+Screenshot pixels are not redacted. Text redaction, including captured
+passwords, does not apply to images. Chrome masks password fields, and anything
+else visible on the page appears as shown, so capture only what the task needs.
+
+Scripts can also use Playwright screenshots and file APIs on the execution host.
+Those files stay on that host and do not reach the model or history. Chrome
 settings, desktop applications and general desktop control use other tools.
 
 Chrome may detach an extension debugger when another extension inserts a
@@ -418,6 +452,215 @@ BYMINUTE, BYSECOND and WKST. DTSTART must agree with the named timezone and
 rule. Nonexistent local occurrences are skipped; repeated local times use the
 first instant. Source polling uses elapsed intervals through the same Pi timer.
 
+### Dreams
+
+Dreams is one scheduled job that reads the coordinator's private runtime
+receipts and task summaries each night. It proposes at most one diff to a
+private Git repository, or it abstains. A proposal changes nothing until you
+approve that exact outcome with `beep-boop dreams apply`.
+
+Point Dreams at a repository of guidance that your agents read, such as one of
+your `context_repositories`. Add the policy to the coordinator's private
+configuration file:
+
+```toml
+[dreams]
+repository = "/Users/example/context"
+editable = ["AGENTS.md", "playbooks/*.md"]
+window_hours = 24
+
+[[dreams.checks]]
+name = "commands-exist"
+argv = ["/bin/sh", "/Users/example/dreams-checks/commands-exist.sh"]
+timeout_seconds = 60
+```
+
+`repository` is the root of a Git work tree. `editable` lists the only paths a
+proposal may change, relative to that root. A `*` matches within one path
+component. A path with a component that starts with `.git` is never editable.
+`window_hours` is 1 to 48 and defaults to 24. Each check is a program with
+literal arguments that exits 0 when a checkout is healthy. Dreams runs every
+check on the base commit and again on the candidate, so each proposal records
+before and after results. See the
+[example check](../examples/dreams/commands-exist.sh).
+
+The `[dreams]` table is validated with the rest of the configuration. An
+invalid table, such as one whose repository does not exist, makes `serve`,
+`jobs check`, `dreams` and every other `beep-boop` command that reads the
+configuration fail until you fix or remove the table.
+
+The policy loader refuses a repository that contains the configuration file, a
+job directory or the state directory. It also refuses a check whose arguments
+name an editable path. The loader follows each argument as the check would see
+it, from the repository root, through symlinks and without regard to case. It
+treats the value of a `name=value` argument, such as `--file=AGENTS.md`, the
+same way. It refuses a relative argument that contains `..`, and a relative
+argument that is not ASCII, because a volume can fold other characters into an
+editable name. The coordinator applies the same rule again before each run's
+checks, in the clone that they run in, because a later commit can turn a
+harmless argument into a symlink to an editable file. A refused check fails
+that run with the same message, and no check starts. That rule catches a path
+written in the configuration. It does
+not see a short option with an attached value, such as `-fAGENTS.md`, a path
+inside a `-c` string, or a file that a check program opens by itself, so the
+rule about checks below still applies. Keep check programs
+outside the repository. Restart the coordinator after you change the policy.
+
+Copy the [example job](../examples/scheduled_jobs/dreams.toml) into a job
+directory, then check and sync as for any job. The job id `dreams` is reserved.
+A job with that id can call `dreams_review`, `dreams_propose` and
+`dreams_abstain`, and it has no shell, file, browser or delegation tool. Its
+model requests also carry no hosted provider tool, so the model that reads your
+private evidence has no web search. The coordinator records that rule for the
+job's conversation and never lifts it. A `dreams` job without a `[dreams]`
+policy still runs with only those tools, and each tool answers
+`Dreams is not configured`.
+
+If you ran a job with the id `dreams` before you upgraded, its task stops
+running. The coordinator withdraws that task's unrun input and records why as
+the task's outcome, and its history stays readable with `beep-boop tasks read`.
+The next Dreams run starts a new task, so no earlier turn reaches the Dreams
+model.
+
+```sh
+beep-boop jobs check && beep-boop jobs sync
+beep-boop jobs run dreams
+beep-boop dreams list
+beep-boop dreams show RUN
+beep-boop dreams apply RUN --approve sha256:OUTCOME_DIGEST
+```
+
+`dreams list` shows each run's window, coverage, outcome and status.
+`dreams show RUN` prints the coverage gaps, the before and after check results,
+the rationale, the body of each cited piece of evidence, the patch, and the
+exact `apply` command. It prints at most 4,000 bytes of each evidence body and
+16,000 bytes of evidence in all, and says how many bytes it left out. Evidence
+and text that a model wrote are labeled and quoted. Control characters and
+Unicode format characters, such as bidirectional overrides and zero-width characters,
+are shown as escapes in that text and in the patch, so the patch you read is
+the patch that `apply` commits. Add `--json` for the typed record, which keeps
+the exact bytes. These commands read the
+coordinator's state directory, so run them on the coordinator's machine.
+
+Read the patch before you approve it. The outcome digest, which `dreams show`
+prints as `Outcome sha256`, is the SHA-256 of the exact bytes of the sealed
+`outcome.json`. Every sealed outcome, a proposal or an abstention, holds one
+hash of the sealed review record and all of its evidence. A proposal also holds
+the patch hash, the base commit, the changed files with their blob ids, the
+cited evidence ids and the check results. `dreams show` reads the review and
+the evidence once, checks them against that hash, and prints only the bodies
+it checked. So the digest you approve covers the evidence bodies that
+`dreams show` printed, not only their ids. `dreams show` refuses a run whose
+review or evidence changed, and `dreams list` fails and names that run.
+`apply` recomputes the outcome digest, the review hash and the patch hash, and
+refuses with one of these messages, without changing the repository:
+
+- `Dreams approval does not match the review`
+- `Dreams review changed since it was sealed`
+- `Dreams patch changed since it was proposed`
+- `Dreams policy changed since this proposal`
+- `Dreams base is stale: target HEAD is <commit>, proposal base is <commit>`
+- `Dreams target has local changes in touched paths`
+- `Dreams target has a held Git index lock: <path>`
+- `Dreams run did not propose a change`
+
+A local change is any difference in a touched path or its parent directories:
+content, file type, a deletion, or an executable bit. Apply reads the
+executable bit from the file itself, so it refuses even when `core.fileMode` is
+off. A held index lock means that another Git command is running or that one
+crashed. Remove a stale `index.lock` and apply again. Apply inspects the
+target once and then writes. A process that writes to a touched path while
+apply runs can lose that change, and one that takes the Git index lock can
+make apply fail and leave `ORIG_HEAD` behind. Stop other writers to the target
+repository while apply runs.
+
+A successful apply adds one commit with `Dreams-Run`, `Dreams-Base` and
+`Dreams-Patch-Sha256` trailers and fast-forwards the checked-out branch. The
+commit uses your Git identity and is not signed. Apply then records that commit
+in the run's directory. A second apply of the same run reports
+`already applied` and changes nothing, even after `HEAD` has moved back to the
+base, and `dreams show` says when the recorded commit is no longer reachable
+from `HEAD`. If an apply was interrupted
+after Git wrote the proposed content but before `HEAD` moved, `dreams show`
+still reports `pending`, and the next apply finishes the same commit once. A
+context repository serves approved guidance on the next turn. Revert the commit
+to withdraw it.
+
+A run abstains as `quiet` only when its coverage has no gaps. A gap is any way
+the window may be missing evidence: expired or evicted segments, dropped or
+unparseable receipts, a read that stopped early, a restart after a crash, or
+more than ten minutes with no receipt. The coordinator writes a `heartbeat`
+receipt every five minutes, so a stopped coordinator or a failed log writer
+appears as an `unwitnessed` gap instead of a quiet night. A machine that sleeps
+for more than ten minutes leaves the same gap. A `clock_moved` gap means that
+receipt timestamps went back by more than a minute around the window, or that
+a receipt is stamped ahead of the present. A receipt near such a move can carry
+a time outside the window although it was written inside it, so the night is
+not counted whole.
+Smaller steps back are normal, because several senders stamp a receipt before
+they enqueue it. A gap never blocks a proposal. It blocks only the claim
+that the night was quiet. Task summaries are the text retained when the review
+was sealed. They are a snapshot, not a history of the window.
+
+The log writer also records when it starts and when it stops cleanly. When
+`[dreams]` is configured, the coordinator starts no work until the writer has
+written its start record. If the writer cannot write it, the coordinator exits
+with an error that names `<state_dir>/diagnostics`. Causes include a read-only
+`runtime.jsonl`, a file where the directory should be, a malformed
+`retention.json`, and another process that holds
+`<state_dir>/diagnostics/writer.lock` for 10 seconds, which the error also
+names. Fix that path, or remove `[dreams]` from the config to run chat without
+nightly review. While it waits, startup also takes the time the writer needs
+to read the retained log.
+
+Without `[dreams]`, startup does not wait for the writer. A writer that cannot
+start prints `Runtime diagnostics unavailable; chat continues.` and the
+coordinator serves chat, as it did before Dreams. That run leaves no receipts.
+So a coordinator without `[dreams]` writes its start time to
+`<state_dir>/unrecorded-start` before it serves, unless the file is already
+there, and the writer removes the file once the log holds the start record. A
+writer that finds the file left by earlier starts records that time first, and
+the review shows an `unclean_restart` gap from the first unrecorded start to
+the writer's own. A review after you add `[dreams]` back does not call that
+time quiet. If the state directory refuses that file, only the ten-minute rule
+above catches the run.
+
+A writer holds queued receipts and its count of dropped receipts in memory, so
+a crash loses them. When a writer starts and the receipt before its start is
+not a clean stop, the review shows an `unclean_restart` gap from that receipt
+to the start, even when the restart came within ten minutes. The writer leaves
+flushing to the operating system. After an operating-system crash or a power
+loss, the receipts written just before it can be gone, a recent start record
+included, so a review of that time can miss the restart.
+
+The first start after an upgrade from a version without these records leaves
+one `unclean_restart` gap. Every review whose window covers that start shows
+it, so with `window_hours = 48` that one upgrade can refuse a quiet abstention
+in every run for two days.
+
+A check runs with only `PATH`, `HOME`, `LANG` and `TMPDIR` in its environment,
+in a private clone under `<state_dir>/dreams/runs/`. Write checks that read
+candidate files as data. A check that executes or sources an editable file
+runs proposed content before you have approved it. Dreams keeps every run
+under `<state_dir>/dreams/runs/` and does not prune them. A backup leaves
+`<state_dir>/dreams` out. A coordinator restored from a backup has no earlier
+runs, reviews, evidence, patches, proposals or applied-run records. Its
+`dreams list` is empty, and it cannot show or apply an old run ID or approve an
+old digest. The target repository is outside the state directory, so the backup
+does not copy it either.
+
+To measure a model on Dreams, run the opt-in eval against your provider. It
+writes one JSON line per trial, with each patch and check result, to the output
+directory:
+
+```sh
+AGENT_DREAMS_EVAL=1 AGENT_DREAMS_EVAL_OUTPUT=/tmp/dreams-eval \
+  cargo test --locked --test dreams_eval -- --ignored --nocapture
+```
+
+Set `OPENAI_API_KEY` and `OPENAI_BASE_URL` first. The eval covers a seeded
+defect, a quiet night and injected text, three trials each by default.
+
 ### Coordinator settings
 
 The commented [coordinator example](../examples/coordinator.toml) is parsed by
@@ -514,7 +757,8 @@ coverage metadata and its atomic replacement. Whole expired segments leave
 first; capacity pressure can remove younger segments. These record
 input placement, activity, host-call timing and interruption without message
 bodies, reasoning, tool arguments or credentials. The files are private to the
-user; logging failure does not block chat.
+user; logging failure does not block chat. With `[dreams]` configured, a
+coordinator whose log cannot record its start exits instead; see Dreams above.
 
 Browser host-call records correlate the conversation, session, operation and
 local tab handle with duration, outcome and owned-tab count. Cancellation keeps
@@ -539,8 +783,12 @@ It also flags unknown history when upgrading legacy rotations. Read actual
 receipt files to establish the available interval; the watermark is coverage
 evidence, not an inventory of retained files. An interrupted prune can report a
 conservative possible gap. `dropped_before` counts channel overflow only, so
-zero does not establish complete log coverage. No finite cap guarantees a full
-audit interval at an unbounded event rate.
+zero does not establish complete log coverage. Every sender of one writer
+shares that count, so the next receipt written carries it, whether that is
+another sender's receipt, a heartbeat or the writer's last line at shutdown. No finite cap guarantees a full
+audit interval at an unbounded event rate. The writer also records a
+`heartbeat` receipt every five minutes, so an interval with no receipt at all
+means that nothing was written, not that nothing happened.
 
 ### Scrawl feedback
 
@@ -600,6 +848,91 @@ its destination, description and attachments, or `refused` or `incomplete`.
 Before the watcher's first start, every capture present shows `backlog`.
 Add `--state-dir` when the service uses one.
 
+## Backups and restore
+
+Back up a coordinator while it is stopped. Stop the service first; the command
+never stops one. It takes the state directory's writer lock and refuses while a
+coordinator or its Pi child still owns the directory.
+
+```sh
+beep-boop backup create /Volumes/Backup/beep-boop-2026-11-16
+```
+
+Add `--state-dir` when the service uses one. The destination must not exist.
+The backup is a directory with `manifest.json` and a `data` folder that mirrors
+the state directory. It contains:
+
+- A copy of `session.sqlite` made with SQLite's backup API and checked with
+  `PRAGMA integrity_check`.
+- `coordinator-id`, so paired phones recognize the restored coordinator.
+- Uploaded attachments, imported history assets and private feedback.
+
+The manifest records the backup format, the application and Pi versions, the
+database schema version, the coordinator ID, the integrity result and the size
+and SHA-256 of each file. The command writes the backup in a hidden
+`.<name>.partial-<id>` directory beside the destination and renames it only
+after every file is written and synced. An interrupted backup leaves that hidden
+directory, never a partial destination. Delete it when no backup is running.
+
+The backup leaves out credentials (`auth.json`), the search index, diagnostics,
+logs, sockets, locks and this machine's client state: worker caches, the Scrawl
+ledger, the feedback outbox and saved TUI drafts. It also leaves out Dreams
+state: `<state_dir>/dreams` with every run, review, patch, proposal and
+applied-run record, and `<state_dir>/unrecorded-start`. The restored
+coordinator starts a new diagnostics log, so a Dreams review that covers the
+time between the backup and the restored coordinator's first start shows it as
+an `unwitnessed` gap and never seals a quiet night. Dreams runs wait for `backup release`. The private TOML configuration
+is outside the state directory, so keep a separate copy of it. The command
+lists any other name in the state directory as not included. A backup contains
+private conversations, attachments and feedback; keep it as private as the
+state directory.
+
+Restore into a new directory or an empty one:
+
+```sh
+beep-boop backup restore /Volumes/Backup/beep-boop-2026-11-16 ~/agent-restored
+```
+
+Before anything appears at the target, restore checks every path, size and
+SHA-256, the database integrity and schema version, and the coordinator ID. It
+refuses a target that is not empty, and it never reads or changes the existing
+state directory. To check a backup without using it, restore it into a scratch
+directory and then delete that directory.
+
+A restored store starts held. Until the release, the held coordinator does not
+run this work:
+
+- Scheduled jobs, source polling, automatic triage and automatic history
+  indexing.
+- Phone notifications.
+- Task turns. The coordinator starts no task actor and refuses the worker that
+  a task's terminal starts, so no backed-up task turn resumes.
+- Worktree collection, both the collection that each registered worker requests
+  on its own and `beep-boop resources collect`.
+
+A held store is not a read-only copy. It serves history and attachments, and it
+runs chats and the other commands you send. A chat's tool calls run on hosts
+and in the browser, and its own tool can still collect worktrees. A chat can
+create tasks, send them input and open their terminals, but no task turn runs
+until the release. `/goal` saves, pauses and resumes a goal, and the goal's
+task turns and automatic continuations wait for the release. `/feedback` saves its report and opens a repair terminal on
+the reporting machine, and the repair turn waits too. `beep-boop import codex`
+imports history and indexes what it imports.
+
+The restored coordinator has the same coordinator ID, so do not run it while
+the original still runs. Check the hosts first, for example that work a
+restored job would start has not already happened elsewhere. Then stop the
+coordinator and release the hold:
+
+```sh
+beep-boop --state-dir ~/agent-restored backup release
+```
+
+Start the service with `--state-dir` set to the restored directory, or move the
+directory to the default location while no coordinator runs. Run
+`beep-boop login` again, because credentials are not in the backup. After the
+release, the coordinator rebuilds the search index in the background.
+
 ## nix-darwin service
 
 The flake exports `darwinModules.default`. Import it and reference a private
@@ -621,7 +954,9 @@ configuration file that already exists outside the Nix store:
 Include Rex, Switchboard and enabled provider CLIs in `extraPackages` as well.
 The worker's TOML must set `coordinator`; the coordinator's must omit it.
 The macOS module installs a user LaunchAgent: it starts at login and launchd
-restarts it after exit. It does not run before a user logs in after reboot.
+restarts it after exit. It waits for the Nix store volume to mount, because
+launchd never retries a program that is missing at login. It does not run
+before a user logs in after reboot.
 Model settings, source configuration, credentials and context stay in private
 runtime files. Restart the service after changing its settings.
 

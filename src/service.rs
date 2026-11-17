@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     fs,
     future::{Future, pending},
     io,
@@ -23,7 +22,7 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::runtime::{FrameReader, Runtime, ShutdownSignal};
+use crate::runtime::{FrameReader, Runtime, ShutdownSignal, StartRecord};
 
 const SOCKET_NAME: &str = "agent.sock";
 
@@ -128,14 +127,24 @@ async fn serve_with_transport(
     let background = bootstrap
         .as_ref()
         .and_then(|value| value.background.clone());
-    let apns = bootstrap
+    let config = bootstrap
         .as_ref()
         .and_then(|value| value.node.as_ref())
         .and_then(|node| node.launch.config.as_deref())
         .map(|path| crate::config::load(Some(Path::new(path))))
-        .transpose()?
-        .and_then(|config| config.apns);
-    let owner = Runtime::start_with_notifications(script, state, apns.as_ref())?;
+        .transpose()?;
+    let owner = Runtime::start_with_notifications(
+        script,
+        state,
+        config.as_ref().and_then(|config| config.apns.as_ref()),
+        StartRecord::for_config(config.as_ref()),
+    )?;
+    let background = if owner.restore_held() {
+        eprintln!("{}", crate::backup::hold_notice(state));
+        None
+    } else {
+        background
+    };
     let broker = match Broker::with_tailscale(bootstrap.as_ref(), state, daemon.clone(), rex) {
         Ok(broker) => Arc::new(broker),
         Err(error) => {
@@ -428,6 +437,15 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         !lifecycle.is_service_owned(),
         "Coordinator metadata is owned by its local service"
     );
+    if runtime.restore_held()
+        && let Some(message) = crate::backup::held_after_restore(&command)
+    {
+        let refusal = RuntimeEventKind::Failure {
+            code: crate::protocol::ErrorCode::CoordinatorUnavailable,
+            message: message.into(),
+        };
+        return write_client_frame(&mut writer, &refusal, &runtime).await;
+    }
     if native && lifecycle.is_view() {
         write_client_frame(
             &mut writer,
@@ -441,7 +459,6 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     let mut call = runtime.request(command).await?;
     let mut input_closed = false;
     let mut output_closed = false;
-    let mut host_calls = HashSet::new();
     let mut effects = HostEffects::new(Capacity::Unbounded);
     let result: Result<()> = async {
         loop {
@@ -454,24 +471,20 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                 event = call.events.recv() => {
                     let event = event.context("Coordinator closed before completing the request")?;
                     if let RuntimeEventKind::HostCall { call_id, command } = &event {
-                        // The named node service owns browser connections and capability checks.
-                        if !lifecycle.delegates_host_call(command) {
-                            let broker = broker.clone(); let command = (**command).clone(); let call_id = call_id.clone();
-                            if let Admission::Rejected(reply) = effects.spawn(call_id, |cancelled| async move {
-                                broker.execute_cancelled(command, cancelled).await
-                            })? {
-                                runtime.reply(call.request_id, reply.call_id, reply.result).await?;
-                            }
+                        if !lifecycle.owns_host_effects() {
+                            runtime.reply(call.request_id, call_id.clone(), terminal_effect_refused()).await?;
                             continue;
                         }
-                        if input_closed {
-                            runtime.reply(call.request_id, call_id.clone(), disconnected()).await?;
-                            continue;
+                        let broker = broker.clone(); let command = (**command).clone(); let call_id = call_id.clone();
+                        if let Admission::Rejected(reply) = effects.spawn(call_id, |cancelled| async move {
+                            broker.execute_cancelled(command, cancelled).await
+                        })? {
+                            runtime.reply(call.request_id, reply.call_id, reply.result).await?;
                         }
-                        host_calls.insert(call_id.clone());
+                        continue;
                     }
-                    if let RuntimeEventKind::HostCancel { call_id } = &event
-                        && effects.cancel(call_id) {
+                    if let RuntimeEventKind::HostCancel { call_id } = &event {
+                        effects.cancel(call_id);
                         continue;
                     }
                     let done = matches!(event, RuntimeEventKind::Done);
@@ -510,25 +523,18 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                         if lifecycle.allows(&RuntimeCommand::DetachWorker) {
                             runtime.worker_control(call.request_id, lifecycle.disconnect_command().context("Missing worker detach control")?).await?;
                         }
-                        for call_id in host_calls.drain() {
-                            runtime.reply(call.request_id, call_id, disconnected()).await?;
-                        }
                         continue;
                     };
-                    let reply: RuntimeCommand = serde_json::from_slice(&bytes)
-                        .context("Execution client sent an invalid host reply")?;
-                    match reply {
-                        RuntimeCommand::HostReply { call_id, result } => {
-                            ensure!(host_calls.remove(&call_id), "Client replied to an unknown host call");
-                            runtime.reply(call.request_id, call_id, result).await?;
-                        }
+                    let control: RuntimeCommand = serde_json::from_slice(&bytes)
+                        .context("Client sent an invalid control")?;
+                    match control {
                         command if lifecycle.allows(&command) => {
                             match command {
                                 RuntimeCommand::OAuthCallback { target } => runtime.callback(call.request_id, target).await?,
                                 command => runtime.worker_control(call.request_id, command).await?,
                             }
                         }
-                        _ => anyhow::bail!("An active client may only reply to its host calls"),
+                        _ => anyhow::bail!("An active client may only send its own controls"),
                     }
                 }
             }
@@ -581,10 +587,10 @@ async fn identify<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     Ok(Some(next))
 }
 
-fn disconnected() -> crate::protocol::HostResult {
+fn terminal_effect_refused() -> crate::protocol::HostResult {
     crate::protocol::HostResult::Failed {
-        delivery: Some(crate::protocol::HostDelivery::OutcomeUncertain),
-        message: "The execution client disconnected; no command ran on a fallback host.".into(),
+        delivery: Some(crate::protocol::HostDelivery::NotStarted),
+        message: "A task terminal never runs host commands; nothing was started and no fallback host was used.".into(),
     }
 }
 
@@ -743,6 +749,7 @@ mod tests {
                 session_id: "fixture".into(),
                 window_id: "fixture".into(),
                 block_id: "fixture".into(),
+                rex_instance_id: None,
             },
             instructions: String::new(),
             model: crate::models::ModelSelection::default(),
@@ -1434,7 +1441,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attached_browser_requests_use_the_registered_host_and_keep_ordinary_calls() {
+    async fn browser_requests_use_the_registered_host_and_never_reach_the_requesting_client() {
         use crate::browser::{BrowserAction, BrowserRequest, BrowserResponse, BrowserUserTab};
         use crate::protocol::HostCommand;
 
@@ -1456,11 +1463,10 @@ mod tests {
           }
           createInterface({input:process.stdin}).on('line',line=>{
             const {id,command}=JSON.parse(line);
-            if(command.type==='run_task') {
+            if(command.type==='logout') {
               calls.set(id,{commands:JSON.parse(readFileSync(join(process.argv[2],'browser-commands.json'),'utf8')),results:[]});
-              emit(id,{type:'task_ready',conversation_id:'fixture',title:'Browser routing'});next(id);
+              next(id);
             } else if(command.type==='host_reply') {calls.get(id).results.push(command.result);next(id);}
-            else if(command.type==='detach_worker'||command.type==='interrupt') {}
             else {emit(id,{type:'configured'});emit(id,{type:'done'});}
           });
         "#).unwrap();
@@ -1498,12 +1504,6 @@ mod tests {
                 BrowserAction::Status,
             ),
             browser(missing, session_id, "missing-host", BrowserAction::Status),
-            HostCommand::ReadFile {
-                path: "/example/attached-only".into(),
-                offset: 0,
-                limit: 100,
-                image: None,
-            },
         ];
         fs::write(
             directory.path().join("browser-commands.json"),
@@ -1522,16 +1522,11 @@ mod tests {
         assert!(matches!(ready, RuntimeEventKind::WorkerReady { .. }));
 
         let mut client = service.client().await;
-        let mut command = attached_command();
-        if let RuntimeCommand::RunTask { interactive, .. } = &mut command {
-            *interactive = Some(true);
-        }
-        write_frame(&mut client, &command).await.unwrap();
-        let (client_read, mut client_write) = client.into_split();
+        write_frame(&mut client, &RuntimeCommand::Logout)
+            .await
+            .unwrap();
+        let (client_read, client_write) = client.into_split();
         let mut client_read = FrameReader::new(BufReader::new(client_read));
-        let ready: RuntimeEventKind =
-            serde_json::from_slice(&client_read.next_frame().await.unwrap().unwrap()).unwrap();
-        assert!(matches!(ready, RuntimeEventKind::TaskReady { .. }));
         let (from_worker, first) = timeout(Duration::from_secs(3), async {
             tokio::select! {
                 frame = worker_read.next_frame() => (true, frame),
@@ -1544,7 +1539,7 @@ mod tests {
         if !from_worker {
             drop((worker_read, worker_write, client_read, client_write));
             service.stop().await;
-            panic!("Explicit browser requests must not reach the attached client: {first:?}");
+            panic!("Explicit browser requests must not reach the requesting client: {first:?}");
         }
         let RuntimeEventKind::HostCall { call_id, command } = first else {
             panic!("Expected the original browser connection's status");
@@ -1573,26 +1568,6 @@ mod tests {
         .await
         .unwrap();
 
-        let ordinary: RuntimeEventKind =
-            serde_json::from_slice(&client_read.next_frame().await.unwrap().unwrap()).unwrap();
-        let RuntimeEventKind::HostCall { call_id, command } = ordinary else {
-            panic!("Expected the ordinary attached call to survive");
-        };
-        assert!(
-            matches!(*command, HostCommand::ReadFile { path, .. } if path == "/example/attached-only")
-        );
-        write_frame(
-            &mut client_write,
-            &RuntimeCommand::HostReply {
-                call_id,
-                result: HostResult::File {
-                    content: "from attached client".into(),
-                    truncated: false,
-                },
-            },
-        )
-        .await
-        .unwrap();
         let done: RuntimeEventKind =
             serde_json::from_slice(&client_read.next_frame().await.unwrap().unwrap()).unwrap();
         assert!(matches!(done, RuntimeEventKind::Done));
@@ -1600,7 +1575,7 @@ mod tests {
             &fs::read(service.wait_for("browser-replies.json").await).unwrap(),
         )
         .unwrap();
-        assert_eq!(replies.len(), 5);
+        assert_eq!(replies.len(), 4);
         for reply in &replies[..2] {
             assert!(
                 matches!(reply, HostResult::Browser { response: BrowserResponse::Failed { session_id: actual, message } }
@@ -1612,9 +1587,6 @@ mod tests {
         );
         assert!(
             matches!(&replies[3], HostResult::Failed { message, .. } if message.contains("no fallback host"))
-        );
-        assert!(
-            matches!(&replies[4], HostResult::File { content, .. } if content == "from attached client")
         );
         assert!(
             timeout(Duration::from_millis(25), worker_read.next_frame())
@@ -1671,34 +1643,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_replies_are_scoped_to_their_own_client() {
+    async fn a_task_terminal_request_is_refused_its_host_call_and_never_receives_it() {
         let service = Running::start().await;
-        let mut first = service.client().await;
-        let mut second = service.client().await;
-        write_frame(&mut first, &attached_command()).await.unwrap();
-        write_frame(&mut second, &attached_command()).await.unwrap();
-        let (first_read, mut first_write) = first.into_split();
-        let (second_read, mut second_write) = second.into_split();
-        let mut first_read = FrameReader::new(BufReader::new(first_read));
-        let mut second_read = FrameReader::new(BufReader::new(second_read));
-        first_read.next_frame().await.unwrap().unwrap();
-        second_read.next_frame().await.unwrap().unwrap();
-        let reply = || RuntimeCommand::HostReply {
-            call_id: "11111111-1111-4111-8111-111111111111".into(),
-            result: HostResult::Written,
-        };
-        write_frame(&mut first_write, &reply()).await.unwrap();
-        first_read.next_frame().await.unwrap().unwrap();
-        first_read.next_frame().await.unwrap().unwrap();
-        assert!(
-            timeout(Duration::from_millis(20), second_read.next_frame())
+        let mut client = service.client().await;
+        write_frame(&mut client, &attached_command()).await.unwrap();
+        let mut reader = FrameReader::new(BufReader::new(client));
+        let mut frames = Vec::new();
+        loop {
+            let frame = timeout(Duration::from_secs(3), reader.next_frame())
                 .await
-                .is_err()
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let event: RuntimeEventKind = serde_json::from_slice(&frame).unwrap();
+            let done = matches!(event, RuntimeEventKind::Done);
+            frames.push(event);
+            if done {
+                break;
+            }
+        }
+        assert!(
+            !frames.iter().any(|event| matches!(
+                event,
+                RuntimeEventKind::HostCall { .. } | RuntimeEventKind::HostCancel { .. }
+            )),
+            "A task terminal must never be sent an effect to run: {frames:?}"
         );
-        write_frame(&mut second_write, &reply()).await.unwrap();
-        second_read.next_frame().await.unwrap().unwrap();
-        second_read.next_frame().await.unwrap().unwrap();
-        drop((first_read, first_write, second_read, second_write));
+        let reply: HostResult =
+            serde_json::from_slice(&fs::read(service.wait_for("reply.json").await).unwrap())
+                .unwrap();
+        assert!(
+            matches!(
+                reply,
+                HostResult::Failed {
+                    delivery: Some(crate::protocol::HostDelivery::NotStarted),
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+        drop(reader);
         service.stop().await;
     }
 
@@ -1912,7 +1896,11 @@ mod tests {
         assert_eq!(results, 1);
         fs::remove_file(callback).unwrap();
         let mut other = service.client().await;
-        write_frame(&mut other, &attached_command()).await.unwrap();
+        let mut attached = attached_command();
+        if let RuntimeCommand::RunTask { interactive, .. } = &mut attached {
+            *interactive = Some(true);
+        }
+        write_frame(&mut other, &attached).await.unwrap();
         let (other_read, mut other_write) = other.into_split();
         let mut other = FrameReader::new(BufReader::new(other_read));
         other.next_frame().await.unwrap().unwrap();
@@ -1925,26 +1913,29 @@ mod tests {
         )
         .await
         .unwrap();
-        service.wait_for("reply.json").await;
+        service.wait_for("worker-detached").await;
         assert!(!service.directory.path().join("callback.json").exists());
         drop((login, other, other_write));
         service.stop().await;
     }
 
     #[tokio::test]
-    async fn disconnected_executor_gets_no_fallback_host_execution() {
+    async fn a_disconnected_task_terminal_gets_no_fallback_host_execution() {
         let service = Running::start().await;
         let mut client = service.client().await;
         write_frame(&mut client, &attached_command()).await.unwrap();
-        let mut reader = FrameReader::new(BufReader::new(client));
-        let event: RuntimeEventKind =
-            serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
-        assert!(matches!(event, RuntimeEventKind::HostCall { .. }));
-        drop(reader);
+        drop(client);
         let path = service.wait_for("reply.json").await;
         let reply: HostResult = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert!(
-            matches!(reply, HostResult::Failed { message, .. } if message.contains("disconnected"))
+            matches!(
+                reply,
+                HostResult::Failed {
+                    delivery: Some(crate::protocol::HostDelivery::NotStarted),
+                    ..
+                }
+            ),
+            "{reply:?}"
         );
         status(service.client().await).await;
         service.stop().await;

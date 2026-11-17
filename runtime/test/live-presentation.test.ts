@@ -60,7 +60,7 @@ test("real application exec producer keeps typed command/output/status through l
     if (finished.presentation?.type !== "command") assert.fail("Actual exec result needs command metadata");
     assert.equal(finished.presentation.command, "printf 'hello world' 'it'\\''s literal'");
     assert.equal(finished.presentation.exit_code, 7); assert.ok(finished.presentation.duration_ms !== null);
-    const before = (await history(root, null, app.session)).flatMap((frame) => frame.messages);
+    const before = (await history(root, null, new HistoryStore(app.session))).flatMap((frame) => frame.messages);
     assert.deepEqual(before.filter((message) => message.tool?.call_id === call.id), [finished], "A recent result page is self-contained when the call lies outside its bounded window");
     const resultEntry = (await root.entries({ order: "descending" }, 20, undefined, BACKGROUND_CONTEXT)).items.find((entry) => entry.id.toString() === finished.entry_id);
     assert.ok(resultEntry);
@@ -78,16 +78,16 @@ test("real application exec producer keeps typed command/output/status through l
     const imported = await store.import({ host_id: "source", thread: { id: "original-thread", title: "Command evidence", cwd: "/example", created_at: 1, updated_at: 2,
       forked_from_id: null, parent_thread_id: null, version: "v1", version_reliable: true, archived: false }, items: [item], next_cursor: null, complete: true, gaps: [] });
     const conversation = await store.conversation(imported.conversation.conversation_id); assert.ok(conversation);
-    const historic = (await history(conversation, null, app.session)).flatMap((frame) => frame.messages)[0]; assert.ok(historic);
+    const historic = (await history(conversation, null, new HistoryStore(app.session))).flatMap((frame) => frame.messages)[0]; assert.ok(historic);
     assert.deepEqual(historic.presentation, finished.presentation); assert.equal(historic.text, finished.text); assert.equal(historic.tool?.status, finished.tool?.status);
     const retained = (await conversation.entries({ order: "ascending" }, 20, undefined, BACKGROUND_CONTEXT)).items.find(ImportedItemEntry.is); assert.ok(retained);
     assert.equal(await store.indexText(retained), "Legacy indexed excerpt", "Display enrichment must not change embedding input");
     assert.equal(renderMessage(codexMessage(item, original, retained.id.toString())), `exec failed · exit 7 · ${finished.presentation.duration_ms} ms`, "Legacy formatted text remains stable");
     const calls = app.faux.state.callCount;
     unbind(); await app.session.close(BACKGROUND_CONTEXT); app = await fixture(directory);
-    assert.deepEqual((await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap((frame) => frame.messages), before);
+    assert.deepEqual((await history(await app.session.root(BACKGROUND_CONTEXT), null, new HistoryStore(app.session))).flatMap((frame) => frame.messages), before);
     const reopened = await new HistoryStore(app.session).conversation(imported.conversation.conversation_id); assert.ok(reopened);
-    assert.deepEqual((await history(reopened, null, app.session)).flatMap((frame) => frame.messages), [historic]);
+    assert.deepEqual((await history(reopened, null, new HistoryStore(app.session))).flatMap((frame) => frame.messages), [historic]);
     assert.equal(calls, 2); assert.equal(app.faux.state.callCount, 0);
   } finally { release(); await stop(); unbind(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -124,9 +124,9 @@ test("real file/coordination tools normalize known fields while arbitrary tool a
     const output = live.find((message) => message.tool?.call_id === arbitrary.id && message.tool.status === "finished"); assert.ok(output);
     assert.equal(output.text, "Public tool output"); assert.deepEqual(output.presentation, { type: "tool", namespace: null });
     assert.doesNotMatch(JSON.stringify(live), /PRIVATE_(OLD_BODY|NEW_BODY|GENERIC_ARGUMENT)/);
-    const details = await toolDetails(conversation, output.entry_id, arbitrary.id, app.session); assert.equal(details.type, "available");
+    const details = await toolDetails(conversation, output.entry_id, arbitrary.id, new HistoryStore(app.session)); assert.equal(details.type, "available");
     if (details.type === "available") { assert.equal(details.input.type, "text"); if (details.input.type === "text") assert.match(details.input.text, /PRIVATE_GENERIC_ARGUMENT/); }
-    const saved = (await history(conversation, null, app.session)).flatMap((frame) => frame.messages);
+    const saved = (await history(conversation, null, new HistoryStore(app.session))).flatMap((frame) => frame.messages);
     assert.deepEqual(saved.filter((message) => message.role === "tool"), live.filter((message) => message.role === "tool"));
     for (const message of saved) assert.ok(validEvent({ version: 1, id: 1, event: { type: "message", message } }));
     assert.equal(app.faux.state.callCount, 2);
@@ -153,7 +153,7 @@ test("native Pi output limits cannot erase the owned command's typed exit or bou
     const native = entries.flatMap((entry) => entry.model ?? []).find((message) => message.role === "toolResult"); assert.ok(native);
     const original = native.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n");
     assert.throws(() => JSON.parse(original), "Exercise native output truncation of the existing JSON model channel");
-    const page = await history(root, null, app.session); assert.ok(page.at(-1)?.next_cursor);
+    const page = await history(root, null, new HistoryStore(app.session)); assert.ok(page.at(-1)?.next_cursor);
     assert.equal(page.flatMap((frame) => frame.messages).some((message) => message.tool?.status === "running"), false);
     const rows = page.flatMap((frame) => frame.messages).filter((message) => message.tool?.call_id === call.id && message.tool.status === "failed");
     const result = rows[0]; assert.ok(result); assert.equal(result.presentation?.type, "command");
@@ -166,7 +166,7 @@ test("native Pi output limits cannot erase the owned command's typed exit or bou
       assert.equal(last >= 0xd800 && last <= 0xdbff, false); assert.equal(first >= 0xdc00 && first <= 0xdfff, false);
     }
     unbind(); await app.session.close(BACKGROUND_CONTEXT); app = await fixture(directory);
-    assert.deepEqual((await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap((frame) => frame.messages)
+    assert.deepEqual((await history(await app.session.root(BACKGROUND_CONTEXT), null, new HistoryStore(app.session))).flatMap((frame) => frame.messages)
       .filter((message) => message.tool?.call_id === call.id && message.tool.status === "failed"), rows);
     assert.equal(app.faux.state.callCount, 0);
   } finally { release(); unbind(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
@@ -212,20 +212,20 @@ test("actual delegation queues follow-ups and steers with matching live and reop
         receiver_thread_ids: [task.conversation_id], agents: [{ thread_id: task.conversation_id, name: "Existing work", state: null }] },
         "Delivering input names its actual recipient, never an unrelated child's old completion");
     }
-    const saved = (await history(root, null, app.session)).flatMap((frame) => frame.messages);
+    const saved = (await history(root, null, new HistoryStore(app.session))).flatMap((frame) => frame.messages);
     assert.deepEqual(saved.filter((message) => message.role === "tool"), live.filter((message) => message.role === "tool"));
     splitNextResult = true;
     const isolated = fauxToolCall("delegate_task", { task_id: task.id, input: "Queue a pass across the page boundary", mode: "follow_up" });
     app.faux.setResponses([fauxAssistantMessage(isolated, { stopReason: "toolUse" }), fauxAssistantMessage("Queued")]);
     await (await root.submit({ type: "input", content: "Queue another pass" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
-    const paged = (await history(root, null, app.session)).flatMap((frame) => frame.messages);
+    const paged = (await history(root, null, new HistoryStore(app.session))).flatMap((frame) => frame.messages);
     const receipt = paged.find((message) => message.tool?.call_id === isolated.id); assert.ok(receipt);
     assert.equal(receipt.tool?.status, "finished");
     assert.deepEqual(receipt.presentation, { type: "agent_coordination", action: "followup", sender_thread_id: root.id.toString(),
       receiver_thread_ids: [task.conversation_id], agents: [{ thread_id: task.conversation_id, name: "Existing work", state: null }] },
       "A result-only native page retains its exact input mode and recipient without loading the older call");
     unbind(); await app.session.close(BACKGROUND_CONTEXT); app = await fixture(directory);
-    assert.deepEqual((await history(await app.session.root(BACKGROUND_CONTEXT), null, app.session)).flatMap((frame) => frame.messages), paged);
+    assert.deepEqual((await history(await app.session.root(BACKGROUND_CONTEXT), null, new HistoryStore(app.session))).flatMap((frame) => frame.messages), paged);
     assert.equal(app.faux.state.callCount, 0);
   } finally { await stop(); unbind(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -297,12 +297,12 @@ for (const scenario of agentReceiptCases) {
         sender_thread_id: conversation.id.toString(), receiver_thread_ids: [target.conversation_id],
         agents: [{ thread_id: target.conversation_id, name: "Review", state: null }] },
         "A receipt names only the exact current child, without its older namesake's completion");
-      const frames = await history(conversation, null, app.session), rows = frames.flatMap((frame) => frame.messages);
+      const frames = await history(conversation, null, new HistoryStore(app.session)), rows = frames.flatMap((frame) => frame.messages);
       assert.ok(frames.at(-1)?.next_cursor);
       assert.deepEqual(rows.filter((message) => message.tool?.call_id === call.id), [result],
         "The result-only page is identical to the live receipt without reading its older call");
       unbind(); await app.session.close(BACKGROUND_CONTEXT); app = await fixture(directory);
-      assert.deepEqual((await history(await app.tasks.conversation(task.conversation_id), null, app.session))
+      assert.deepEqual((await history(await app.tasks.conversation(task.conversation_id), null, new HistoryStore(app.session)))
         .flatMap((frame) => frame.messages), rows);
       assert.equal(app.faux.state.callCount, 0, "Reopening receipts never executes another model turn");
     } finally { await stop(); unbind(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }

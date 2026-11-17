@@ -210,7 +210,7 @@ func aTapFromPersonalShowsPersonalWithNoNotice() throws {
   notifications.coordinators.chat.show(.one(fixture.profiles[0].id))
   notifications.open(.named(fixture.profiles[1].id))
   #expect(notifications.coordinators.chat.scope == .one(fixture.profiles[1].id))
-  #expect(notifications.openRequest?.notice == nil)
+  #expect(notifications.openRequest?.destination == .feed(notice: nil))
 }
 
 @Test @MainActor
@@ -222,8 +222,8 @@ func aTapWithoutTheKeyShowsAllWithANotice() throws {
   notifications.open(.unnamed)
   #expect(notifications.coordinators.chat.scope == .all)
   #expect(
-    notifications.openRequest?.notice
-      == "This notification did not say which coordinator sent it. Showing all.")
+    notifications.openRequest?.destination
+      == .feed(notice: "This notification did not say which coordinator sent it. Showing all."))
 }
 
 @Test @MainActor
@@ -239,7 +239,8 @@ func aTapNamingNoSavedCoordinatorKeepsTheScopeWithANotice() async throws {
     notifications.open(origin)
     #expect(coordinators.chat.scope == .one(fixture.profiles[0].id))
     #expect(
-      notifications.openRequest?.notice == "This notification did not name a saved coordinator.")
+      notifications.openRequest?.destination
+        == .feed(notice: "This notification did not name a saved coordinator."))
   }
 }
 
@@ -253,7 +254,7 @@ func withOneSavedEveryTapBehavesAsToday() throws {
   ] {
     notifications.open(origin)
     #expect(notifications.coordinators.chat.scope == .all)
-    #expect(notifications.openRequest?.notice == nil)
+    #expect(notifications.openRequest?.destination == .feed(notice: nil))
     #expect(fixture.defaults.object(forKey: "feedScope") == nil)
   }
 }
@@ -272,6 +273,38 @@ func aTapNeverChangesTheDraft() throws {
     #expect(chat.draft == "An invented Work draft")
     #expect(chat.destination == destination)
   }
+}
+
+@Test @MainActor
+func anOpenJobShowsTheJobAndKeepsTheScopeTheDraftAndTheSavedScope() throws {
+  let fixture = try AlertFixture()
+  defer { fixture.clean() }
+  let notifications = fixture.notifications
+  let chat = notifications.coordinators.chat
+  let work = fixture.profiles[0].id
+  let personal = fixture.profiles[1].id
+  chat.show(.one(work))
+  chat.draft = "An invented Work draft"
+  let destination = chat.destination
+  let weeklyReport = JobEntity(
+    ScheduledJobStatus(
+      job: .init(
+        cwd: "/workspace/example", id: "weekly:report",
+        model: .init(fast: false, modelId: "example-model", provider: .openai),
+        prompt: "Summarize the invented week.", revision: "example-revision", schedules: [],
+        timezone: "America/Los_Angeles", title: "Weekly report"),
+      schedules: []), on: personal, coordinator: "Personal")
+  notifications.open(weeklyReport)
+  #expect(
+    notifications.openRequest?.destination
+      == .job(ScopedEntityID(profile: personal, item: "weekly:report")))
+  #expect(chat.scope == .one(work))
+  #expect(chat.draft == "An invented Work draft")
+  #expect(chat.destination == destination)
+  #expect(fixture.defaults.string(forKey: "feedScope") == "\(work)")
+  let first = try #require(notifications.openRequest)
+  notifications.open(weeklyReport)
+  #expect(notifications.openRequest != first, "Asking again opens again")
 }
 
 @Test @MainActor

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { MAX_ATTACHMENTS } from "./generated/attachment-limits.js";
+import { DREAMS_HOST_TIMEOUT_MS } from "./generated/dreams-limits.js";
 import { awaitWithContext, BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import { Type } from "typebox";
 import { Check } from "typebox/value";
@@ -25,12 +26,15 @@ import type { BackgroundScheduler } from "./background.js";
 import { hostOutput, output } from "./host-output.js";
 import { imageInput, readImageFile, type ReadFileCommand } from "./images.js";
 
+export const MAX_FILE_READ_BYTES = 262_144;
 export type Execution = { model?: ModelSelection; cwd: string; hosts: WorkerHost[]; default_host?: WorkerHost | null; call: HostCall; role?: "worker" | "triage";
   origin_host_id?: string | null; connectedHosts?: () => Promise<WorkerHost[]>;
   search?: SearchQuery;
   project?: () => Promise<HostResult>;
   notify?: (task: string | null, text: string) => void };
-/** A conversation can execute only through its currently attached CLI client. */
+export function resolveHostPath(execution: Execution, path: string): string {
+  return resolve(execution.default_host?.cwd ?? execution.cwd, path);
+}
 export class Executions {
   private readonly attached = new Map<string, Execution>();
   private readonly recovering = new Map<string, { ready: Promise<void>; attached(): void }>();
@@ -119,6 +123,7 @@ export class HostRequests {
         : operation.type === "browser" ? 170_000
         : operation.type === "background" && operation.request.type === "poll_sources" ? 930_000
         : operation.type === "history" ? 930_000 : operation.type === "embed" ? 330_000
+        : operation.type === "dreams" ? DREAMS_HOST_TIMEOUT_MS
         : operation.type.startsWith("resource_") ? 310_000 : 30_000;
       const timer = setTimeout(() => {
         this.pending.delete(call); dispose();
@@ -234,7 +239,7 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
     defineTool({ name: "read_context", replay: "safe", description: "Read a bounded file from a named shared context repository on the coordinator.",
       parameters: Type.Object({ repository_id: Type.String(), path: Type.String(),
         offset: Type.Optional(Type.Integer({ minimum: 0, maximum: 0xffff_ffff })),
-        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 262_144 })) }),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_FILE_READ_BYTES })) }),
       async execute(args, api) {
         const execution = executions.get(api.conversationId.toString()); await tasks.context(args.repository_id);
         return hostOutput(await execution.call({ type: "read_context", repository_id: args.repository_id, path: args.path,
@@ -251,10 +256,10 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
     defineTool({ name: "read_file", description: "Read a bounded part of a file on the attached host; offset and limit are bytes. A PNG, JPEG, GIF, WebP or BMP file, recognized by its content, comes back whole as an image scaled to the model's limits.",
       replay: "safe", parameters: Type.Object({ path: Type.String(),
         offset: Type.Optional(Type.Integer({ minimum: 0, maximum: 0xffff_ffff })),
-        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 262_144 })) }),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_FILE_READ_BYTES })) }),
       async execute(args, api, context) {
         const execution = executions.get(api.conversationId.toString());
-        const command: ReadFileCommand = { type: "read_file", path: resolve(execution.default_host?.cwd ?? execution.cwd, args.path),
+        const command: ReadFileCommand = { type: "read_file", path: resolveHostPath(execution, args.path),
           offset: args.offset ?? 0, limit: args.limit ?? 64_000, image: { type: "start" } };
         const result = await execution.call(command);
         return result.type === "image_chunk" ? readImageFile(execution.call, command, result, await imageInput(api, context)) : hostOutput(result);
@@ -263,13 +268,13 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
       parameters: Type.Object({ path: Type.String(), content: Type.String() }),
       async execute(args, api) {
         const execution = executions.get(api.conversationId.toString());
-        return hostOutput(await execution.call({ type: "write_file", ...args, path: resolve(execution.default_host?.cwd ?? execution.cwd, args.path) }));
+        return hostOutput(await execution.call({ type: "write_file", ...args, path: resolveHostPath(execution, args.path) }));
       } }),
     defineTool({ name: "edit_file", description: "Replace one exact occurrence in a UTF-8 file on the attached host.",
       parameters: Type.Object({ path: Type.String(), old: Type.String({ minLength: 1 }), new: Type.String() }),
       async execute(args, api) {
         const execution = executions.get(api.conversationId.toString());
-        return hostOutput(await execution.call({ type: "edit_file", ...args, path: resolve(execution.default_host?.cwd ?? execution.cwd, args.path) }));
+        return hostOutput(await execution.call({ type: "edit_file", ...args, path: resolveHostPath(execution, args.path) }));
       } }),
   ] });
   const record = defineTool({ name: "record_task", description: "Save verified progress and the next actor/check or concrete resolution evidence.",

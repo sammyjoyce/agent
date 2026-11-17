@@ -202,6 +202,7 @@ actor FixtureCoordinator {
   }
   func uploadCount() -> Int { uploads }
   func uploaded(_ id: String) -> Data? { files[id] }
+  func retain(_ data: Data, id: String) { files[id] = data }
   func count() -> Int { submissions.count }
   private var busy = false
   /// Submits the busy turn has not placed, each with the socket still waiting for it.

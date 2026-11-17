@@ -140,7 +140,7 @@ test("legacy per-request task receipts still replay after catalog removal withou
     const receipt = { request_id: "old-request", task_id: scheduledTaskId("manual:old-request"), job_id: job.id,
       schedule_id: "daily", revision: job.revision, admitted_at: START };
     await app.tasks.create({ id: receipt.task_id, title: job.title, outcome: job.prompt, model: job.model,
-      sources: [{ provider: "scheduled_jobs", account: "local", thread_id: job.id }], scheduled_run: receipt });
+      job_id: job.id, scheduled_run: receipt });
     assert.deepEqual(await app.scheduler.runJob(request("old-request")), receipt);
     await assert.rejects(app.scheduler.runJob({ ...request("old-request"), job_id: "different-job" }), /another selection/);
     assert.deepEqual((await app.tasks.get(receipt.task_id)).scheduled_run, receipt);

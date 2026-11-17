@@ -129,10 +129,34 @@ public struct StagedInput: Sendable, Equatable {
   let control: NativeRequestSubmit?
   /// The composer whose receipt this input holds in the outbox, when a composer sent it.
   let composer: ComposerInputIdentity?
+  /// Whether a control was written to its coordinator, or nil for an input the outbox keeps.
+  public let departure: ControlDeparture?
   /// A control's command, such as `/status`, or nil for an input the outbox keeps.
   public var command: String? {
     control.map { $0.text.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? $0.text }
   }
+}
+
+/// Whether a staged control was written to its coordinator. The session that holds the control
+/// answers when its exchange starts to write it, or when it stops before it leaves the phone.
+/// The first answer stands.
+public final class ControlDeparture: Sendable, Equatable {
+  private let answers: AsyncStream<Bool>
+  private let continuation: AsyncStream<Bool>.Continuation
+  init() { (answers, continuation) = AsyncStream.makeStream() }
+  func settle(wrote: Bool) {
+    continuation.yield(wrote)
+    continuation.finish()
+  }
+  /// Waits for the answer, which only the first read gets. A cancelled or later read gets true, so
+  /// the control is never sent twice.
+  public var wrote: Bool {
+    get async {
+      for await wrote in answers { return wrote }
+      return true
+    }
+  }
+  public static func == (lhs: ControlDeparture, rhs: ControlDeparture) -> Bool { lhs === rhs }
 }
 
 /// What `start` did with a staged input. A control that never leaves the phone releases its
@@ -360,7 +384,7 @@ public actor CoordinatorSession {
     guard !retired else { return [] }
     let waiting = pending.filter { unsent[$0.request.inputId] == .waiting }.map { staged($0) }
     let cancelled = waiting + unwritten.compactMap(\.started)
-    releaseReceipts(of: Array(stagedControls.values) + cancelled)
+    markNeverLeft(Array(stagedControls.values) + cancelled)
     retired = true
     let satellites = liveInspectors
     inspectors = []
@@ -371,7 +395,7 @@ public actor CoordinatorSession {
   private func staged(_ item: OutboxItem) -> StagedInput {
     StagedInput(
       inputID: item.request.inputId, sendID: item.sendID, profile: profile, control: nil,
-      composer: nil)
+      composer: nil, departure: nil)
   }
   private func disconnect(generation: UUID) async {
     self.generation = generation
@@ -381,7 +405,7 @@ public actor CoordinatorSession {
     flush = nil
     for action in actions.values { action.cancel() }
     actions = [:]
-    releaseReceipts(of: unwritten.compactMap(\.started))
+    markNeverLeft(unwritten.compactMap(\.started))
     unwritten = []
     historyAction = nil
     let ownedConnections = Array(actionConnections.values) + [connection].compactMap { $0 }
@@ -473,7 +497,7 @@ public actor CoordinatorSession {
       // must survive a failed draft checkpoint just like a queued message's.
       let staged = StagedInput(
         inputID: request.inputId, sendID: sendID, profile: profile, control: request,
-        composer: composer)
+        composer: composer, departure: ControlDeparture())
       if composer != nil {
         do { try saveOutbox() } catch {
           composerInputs = previousComposers
@@ -508,7 +532,8 @@ public actor CoordinatorSession {
     transcript.pending(request, delivery: .sending)
     stampRows()
     return StagedInput(
-      inputID: request.inputId, sendID: sendID, profile: profile, control: nil, composer: composer)
+      inputID: request.inputId, sendID: sendID, profile: profile, control: nil, composer: composer,
+      departure: nil)
   }
 
   /// Sends a staged input on this coordinator's own verified socket. While this lane is not
@@ -528,7 +553,7 @@ public actor CoordinatorSession {
     }
     guard actions.count < 32, snapshot.connection == .connected else {
       guard staged.control == nil else {
-        releaseReceipts(of: [staged])
+        markNeverLeft([staged])
         return .notSent
       }
       transcript.delivery(staged.inputID, .uncertain)
@@ -556,7 +581,7 @@ public actor CoordinatorSession {
     guard staged.control == nil else {
       stagedControls[staged.inputID] = nil
       // The receipt is in the outbox, which a session that has not connected has yet to read.
-      if loadOutbox() { releaseReceipts(of: [staged]) }
+      if loadOutbox() { markNeverLeft([staged]) }
       return true
     }
     switch unsent[staged.inputID] {
@@ -583,10 +608,8 @@ public actor CoordinatorSession {
     await removal.value
     return true
   }
-  /// The controls among `inputs` never left the phone, so this outbox releases, in one save, each
-  /// one's composer receipt that it still holds. A durable input's receipt stays with its outbox
-  /// item.
-  private func releaseReceipts(of inputs: [StagedInput]) {
+  private func markNeverLeft(_ inputs: [StagedInput]) {
+    for input in inputs { input.departure?.settle(wrote: false) }
     let keys = inputs.filter { $0.control != nil }.compactMap(receiptKey)
     guard !keys.isEmpty else { return }
     let previousComposers = composerInputs
@@ -975,7 +998,7 @@ public actor CoordinatorSession {
     var failed = false
     defer {
       if historyAction?.id != id { actions.removeValue(forKey: id) }
-      releaseReceipts(of: unwritten.filter { $0.action == id }.compactMap(\.started))
+      markNeverLeft(unwritten.filter { $0.action == id }.compactMap(\.started))
       unwritten.removeAll { $0.action == id }
       transcript.abandonHistory(id)
     }
@@ -996,6 +1019,9 @@ public actor CoordinatorSession {
       try Task.checkCancellation()
       guard self.generation == generation else { throw CancellationError() }
       if let inputID { try markLeaving(inputID) }
+      for entry in unwritten where entry.action == id {
+        entry.started?.departure?.settle(wrote: true)
+      }
       unwritten.removeAll { $0.action == id }
       try await timedSend(stream, request)
       while !Task.isCancelled {

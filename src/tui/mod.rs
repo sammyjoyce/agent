@@ -640,6 +640,18 @@ impl Message {
         }
         details.task_id.as_ref().map(|_| "Task update".into())
     }
+    fn attach(&mut self, attachments: &[crate::attachments::AttachmentRef]) {
+        for attachment in attachments {
+            if !self
+                .attachments
+                .iter()
+                .any(|label| label.id.as_ref() == Some(&attachment.id))
+            {
+                self.attachments.push(AttachmentLabel::uploaded(attachment));
+            }
+        }
+        self.rendered = None;
+    }
     fn cached(&mut self) -> &mut CachedText {
         let notice_label = self.notice_label();
         let content = cells::Content {
@@ -832,7 +844,7 @@ impl State {
             CellOutput::Mutable
         };
         if let Some(tool) = message.tool.take() {
-            self.tool_message(tool, message, historical);
+            self.tool_message(tool, message, &attachments, historical);
             return;
         }
         let presentation = message.presentation.take();
@@ -956,19 +968,7 @@ impl State {
                 .iter()
                 .rposition(|saved| saved.id.as_ref() == Some(&entry_id) && saved.role == role)
         {
-            let saved = &mut self.messages[index];
-            for attachment in &attachments {
-                if !saved
-                    .attachments
-                    .iter()
-                    .any(|label| label.id.as_ref() == Some(&attachment.id))
-                {
-                    saved
-                        .attachments
-                        .push(AttachmentLabel::uploaded(attachment));
-                }
-            }
-            saved.rendered = None;
+            self.messages[index].attach(&attachments);
             self.invalidate(index);
         }
         if role == Role::Notice
@@ -1128,6 +1128,7 @@ impl State {
         &mut self,
         tool: crate::protocol::ToolHistory,
         message: HistoryMessage,
+        attachments: &[crate::attachments::AttachmentRef],
         historical: bool,
     ) {
         let HistoryMessage {
@@ -1206,8 +1207,13 @@ impl State {
                 *offset = (*offset).max(index + 1);
             }
         }
-        if let Some(message) = self.messages.iter_mut().find(|message| matches!(&message.kind, MessageKind::Tool { call_id, .. } if call_id == &identity))
+        if let Some(index) = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Tool { call_id, .. } if call_id == &identity))
         {
+            if !attachments.is_empty() {
+                self.messages[index].attach(attachments);
+                self.invalidate(index);
+            }
+            let message = &mut self.messages[index];
             message.presentation = merge_tool_presentation(message.presentation.take(), presentation, stale);
             if !name.trim().is_empty() && (!stale || message.tool_name.trim().is_empty()) { message.tool_name = name; }
             message.rendered = None;
@@ -5432,6 +5438,107 @@ mod tests {
             view.input(key(KeyCode::Enter, KeyModifiers::NONE));
             let screen = rendered(&mut view, 120, 28);
             assert!(screen.contains("Ran printf fixture"), "{screen}");
+        }
+    }
+    #[test]
+    fn a_tool_result_attachment_shows_on_its_tool_row_live_and_in_reopened_history() {
+        use crate::protocol::{ToolHistory, ToolStatus};
+        let attachment = crate::attachments::AttachmentRef {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "browser-screenshot-invented.png".into(),
+            media_type: "image/png".into(),
+            size_bytes: 4242,
+            sha256: "b".repeat(64),
+        };
+        let tool = |status| {
+            Some(ToolHistory {
+                call_id: "screenshot-call".into(),
+                name: "browser_screenshot".into(),
+                status,
+            })
+        };
+        let call = HistoryMessage {
+            notice_details: None,
+            notice_origin: None,
+            entry_id: "call-entry".into(),
+            role: HistoryRole::Tool,
+            text: String::new(),
+            continuation: false,
+            final_chunk: true,
+            tool: tool(ToolStatus::Running),
+            presentation: None,
+            attachments: None,
+        };
+        let result = HistoryMessage {
+            entry_id: "result-entry".into(),
+            text: "Saved the screenshot of tab 7.".into(),
+            tool: tool(ToolStatus::Finished),
+            attachments: Some(vec![attachment.clone()]),
+            ..call.clone()
+        };
+        let next = HistoryMessage {
+            entry_id: "release-entry".into(),
+            tool: Some(ToolHistory {
+                call_id: "release-call".into(),
+                name: "browser_release".into(),
+                status: ToolStatus::Running,
+            }),
+            ..call.clone()
+        };
+        for historical in [false, true] {
+            let mut view = state();
+            if historical {
+                view.event(RuntimeEventKind::History {
+                    conversation_id: "saved".into(),
+                    messages: vec![call.clone(), result.clone(), next.clone()],
+                    next_cursor: None,
+                    page_complete: true,
+                });
+            } else {
+                for message in [&call, &result, &next] {
+                    view.event(RuntimeEventKind::Message {
+                        message: message.clone(),
+                    });
+                }
+            }
+            assert_eq!(view.messages.len(), 2, "historical={historical}");
+            assert_eq!(
+                view.messages[0]
+                    .attachments
+                    .iter()
+                    .map(|label| label.id.clone())
+                    .collect::<Vec<_>>(),
+                vec![Some(attachment.id.clone())],
+                "historical={historical}"
+            );
+            let screen = rendered(&mut view, 120, 28);
+            let label = "Attachment: browser-screenshot-invented.png · 4242 bytes";
+            assert_eq!(
+                screen.matches(label).count(),
+                1,
+                "historical={historical}: {screen}"
+            );
+            let rows = screen
+                .chars()
+                .collect::<Vec<_>>()
+                .chunks(120)
+                .map(|row| row.iter().collect::<String>().trim_end().to_owned())
+                .collect::<Vec<_>>();
+            let at = rows.iter().position(|row| row.contains(label)).unwrap();
+            assert_eq!(
+                rows[at - 1].trim(),
+                "└ Saved the screenshot of tab 7.",
+                "historical={historical}: the label belongs to the tool block: {rows:#?}"
+            );
+            assert_eq!(
+                rows[at + 1],
+                "",
+                "historical={historical}: the block's separator follows the label: {rows:#?}"
+            );
+            assert!(
+                rows[at + 2].contains("browser_release"),
+                "historical={historical}: {rows:#?}"
+            );
         }
     }
     #[test]

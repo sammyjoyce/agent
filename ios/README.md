@@ -198,7 +198,18 @@ the phone by cable. To allow that, list the app's bundle ID under `usbApps` in
   A coordinator removed since the Send no longer counts, so recovery offers the
   text again when no coordinator still saved received it.
   A control that never leaves the phone releases its outbox's receipt, whether
-  an address edit, a disconnect or a failed dial stopped it.
+  an address edit, a disconnect or a failed dial stopped it. When no recipient
+  wrote it, its text also comes back to the live composer ahead of newer typing,
+  under its chip if the composer is still empty.
+  Texts that come back, after a local rejection or a stopped control, keep the
+  order they were sent in, ahead of anything typed or restored since. Typing
+  onto a returned text's last paragraph stays with it, and an edit inside one
+  counts as new typing. The composer tells returned texts apart by their words
+  alone. If you delete one returned text and another begins with the deleted
+  text's words, a text that comes back later can land out of Send order.
+  Nothing is lost or duplicated. While a newer Send is still being admitted,
+  the composer record keeps the returned text ahead of it, so recovery after a
+  crash offers the same order.
   Ownership paths are relative to the composer record, allowing storage to move.
   Local rejection restores the unadmitted copy, preserving newer typing.
   Restoring an outbox input saves the complete replacement draft and keeps the
@@ -250,7 +261,7 @@ the phone by cable. To allow that, list the app's bundle ID under `usbApps` in
   Commands are never queued, so one a coordinator did not get because its
   connection dropped, or because you removed it meanwhile, is named under the
   feed ("Work did not get /status. It was removed."). If no coordinator got it,
-  the draft stays. That note stays until your next Send, beside any other
+  its text comes back, even when it stopped after Send. That note stays until your next Send, beside any other
   error, with one coordinator left too.
 - Adding, editing, pairing and removing coordinators run one at a time. Remove
   refuses while the draft is addressed to that coordinator or restored from it.
@@ -436,14 +447,30 @@ output. A job that the action would retry reads Interrupted. The action reads
 the job again before it retries, and says that the job has no interrupted run
 when the run has recovered. It has no phrase. Add it in the Shortcuts app.
 
-An intent holds a coordinator connected with a lease, so the job action works
-with the app in the background. A leased coordinator stays connected whatever
-the scene does. When its last lease ends, it disconnects unless the app is
-open. The Job picker reads every paired coordinator at the same time and gives
-each 8 seconds to connect. It leaves out a coordinator that does not connect
-in that time. With no job to show, it reports a coordinator's refusal, such as
-a request to update the coordinator, and it reports silence only when no
-coordinator answered.
+**Open Job** brings Beep Boop forward on a scheduled job's screen, the one
+Jobs and work opens, from the same Job picker. It starts the app when the app
+is not running. The job opens over the feed, and Back returns to the feed in
+one step, with its scope and the composer draft as they were. A renamed
+coordinator or job still opens. When the job's coordinator is no longer saved,
+the action fails with "This job's coordinator is no longer saved in Beep
+Boop." When the coordinator no longer has the job, it fails with "The
+scheduled job nightly:deps is no longer on Work." Retry Interrupted Run fails
+with the same sentences. Open Job has no phrase, because a phrase would make
+each refresh of the app's phrases read every coordinator's jobs. Add it in the
+Shortcuts app.
+
+The feed of one coordinator, Jobs and work, and a job's screen tell the system
+which coordinator or jobs they show, by identifier alone, so no message text
+is part of it.
+
+An intent holds a coordinator connected with a lease, so the Job picker and
+Retry Interrupted Run work with the app in the background. A leased
+coordinator stays connected whatever the scene does. When its last lease ends,
+it disconnects unless the app is open. The Job picker reads every paired
+coordinator at the same time and gives each 8 seconds to connect. It leaves
+out a coordinator that does not connect in that time. With no job to show, it
+reports a coordinator's refusal, such as a request to update the coordinator,
+and it reports silence only when no coordinator answered.
 
 A session loads its saved outbox before it first dials. While that file
 exists and cannot be read or decoded, the session dials nothing and reports
@@ -572,3 +599,92 @@ Native UI checks exercise copy/partial-selection, clipboard-image drafts and
 actual appearance. Release acceptance also requires protected CI, a matching
 coordinator and signed build/source readback. Current acceptance is tracked in
 the [roadmap](../docs/roadmap.md#finish-the-current-pass).
+
+## Phone acceptance
+
+`ios/PhoneAcceptance` drives a Beep Boop build already installed on a phone and
+keeps evidence for two roadmap rows. The composer row covers clearing on Send
+with the keyboard up, sent text that never comes back, and newer typing that
+survives admission and relaunch. On a phone nothing holds admission back, so
+identical newer typing may start after admission rather than race it. The
+alert row covers a completed main-chat
+reply and a mid-job `notify_user` notice that reach the phone as visible alerts.
+The project's one target is a UI-test runner with no target app, so
+`xcodebuild` installs only the runner and never installs or replaces Beep Boop.
+On a phone the runner attaches to the installed app by bundle ID, with no launch
+arguments or environment.
+
+The runner proves what the phone showed. Each Send record is the first composer
+screenshot after the tap, read by Vision OCR, with the keyboard state. A record
+whose screenshot did not reach the result bundle's export fails the run. Each
+alert record is a SpringBoard banner or Notification Center entry that shows a
+fresh codeword, with the app's state and wall-clock times in epoch
+milliseconds: `sentAt` for each Send, `seenAt` when the runner found an alert,
+and `tappedAt` when it opened one. Compare those times with the coordinator's
+task times, as [Verify on a phone](../docs/notifications.md#verify-on-a-phone)
+describes, to show that a notice arrived while its job still ran. An alert test
+passes when the banner or the Notification Center entry shows the codeword,
+since Focus or the banner style can hide banners. The report keeps both
+observations. The runner does not prove how the coordinator produced an alert,
+and `seenAt` can trail the alert by the runner's poll interval.
+
+The runner refuses to start over a draft, and it sends only text it typed. Every
+message starts with the run label and asks for a short reply. Before each Send it
+checks that the title shows the chosen coordinator. When the app shows a
+recipient line, it also checks that the line reads `To <coordinator>`. It clears the drafts it left and shows the original
+conversation again when it finishes.
+
+Prerequisites for a phone run:
+
+- The phone is unlocked, with Auto-Lock off, Developer Mode on, and Beep Boop
+  installed with at least two saved coordinators.
+- A development team whose provisioning profile admits the phone and the
+  runner's bundle ID. The run uses automatic signing without
+  `-allowProvisioningUpdates`, so Xcode must already hold that profile.
+- Main-chat updates on, and the coordinator's [APNs setup](../docs/notifications.md).
+
+```sh
+python3 ios/PhoneAcceptance/phone-acceptance.py device \
+  --device 00000000-0000000000000001 --app dev.example.Agent --team EXAMPLE123 \
+  --runner-bundle dev.example.PhoneAcceptanceTests --coordinator Studio \
+  --out target/phone-acceptance/phone-0412 --run r15-0412
+```
+
+`--only ComposerRecurrenceTests` or
+`--only NotificationDeliveryTests/testMidJobNotice` runs a part of it. The
+script refuses a locked phone and records the installed app's version and
+build before and after the run. It also copies the saved coordinators into
+`DIR/private`, which only you can read. It fails unless one copy of the app
+remains at the same build with the same saved coordinators. Evidence goes to
+`DIR`: `run.xcresult`, the exported screenshots and JSON records in
+`attachments/`, `manifest.json`, and `report.md`, which has one table for Send
+records and one for alert records.
+
+Rehearse on a simulator before unlocking the phone. The script installs the
+app on the simulator it is given, so boot that simulator first:
+
+```sh
+simulator=$(xcrun simctl create phone-rehearsal com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro)
+xcrun simctl bootstatus "$simulator" -b
+python3 ios/PhoneAcceptance/phone-acceptance.py simulator \
+  --simulator "$simulator" --out target/phone-acceptance/rehearsal
+xcrun simctl shutdown "$simulator"
+xcrun simctl delete "$simulator"
+```
+
+The rehearsal builds and installs the Debug app, launches it with two loopback
+peers saved as Work and Personal, and runs the same scenarios against Work. It
+then checks that the runner left the installed app's container and install time
+unchanged. Its alerts are rehearsal pushes. When a test reaches the point where
+the coordinator would alert, the runner asks the script, and the script sends a
+payload with `xcrun simctl push`. These pushes rehearse the phone-side
+detection. They are never delivery proof. The registration test is skipped,
+because the simulator has no APNs.
+`python3 ios/PhoneAcceptance/test_phone_acceptance.py` checks the script's
+parsing, baseline checks, runner plan inspection and report without a device.
+Set `PHONE_ACCEPTANCE_EVIDENCE` to a rehearsal's `--out` directory to also
+check that run's records and report.
+
+Afterwards, delete the runner app from the phone: touch and hold
+**PhoneAcceptanceTests-Runner**, then choose **Remove App**. Beep Boop
+stays installed.

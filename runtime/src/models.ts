@@ -2,7 +2,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { getSupportedThinkingLevels, type Api, type AuthResult, type Model, type MutableModels, type ProviderStreams } from "@earendil-works/pi-ai";
 import { builtinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { MODEL_THINKING_LEVELS } from "@earendil-works/pi-ai/providers/model-schema";
-import { AgentDoc, configure, defineDoc, ProviderDoc, type AgentChange, type Conversation, type Harness, type Tx } from "@earendil-works/pi-durable";
+import { AgentDoc, LiveDoc, configure, defineDoc, ProviderDoc, type AgentChange, type Conversation, type Harness, type Tx } from "@earendil-works/pi-durable";
 import { AuthError, type ChatGptAuth } from "./auth.js";
 import type { ModelProvider } from "./generated/ModelProvider.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
@@ -16,24 +16,77 @@ import { withWebSearch } from "./web-search.js";
 export const PROVIDERS: readonly ModelProvider[] = getBuiltinProviders();
 export const DEFAULT_MODEL: ModelSelection = { provider: "openai", model_id: "gpt-6.1-sol", reasoning: "xhigh", fast: false };
 export class ModelError extends Error {}
+/** A failed inference is not an invalid user request. Only safe summaries cross the protocol. */
+export class ModelTurnError extends Error {}
+/** Allowlisted diagnostic categories, never raw provider bodies or credentials. */
+export function subscriptionSharingLimit(error: string): boolean {
+  return /\bsubscription_sharing_usage_limit_exceeded\b/u.test(error) ||
+    /\bChatGPT user has reached (?:their |the )?Subscription Sharing usage limit\b/iu.test(error);
+}
+export function providerFailureMessage(error: string): string | undefined {
+  // Pi's blocking-compaction task adds these exact wrappers. Its Responses
+  // serializer formats bare HTTP bodies as "OpenAI API error (status): body".
+  // Read only an anchored transport status, never status-like digits in a body.
+  const request = error.replace(/^Compaction failed: /u, "").replace(/^Summarization failed: /u, "");
+  const match = /^(?:OpenAI API error \((\d{3})\):|(\d{3})(?=[:\s]|$))/u.exec(request);
+  const status = match?.[1] ?? match?.[2];
+  if (subscriptionSharingLimit(error)) return "The upstream app subscription-sharing usage limit was reached. Saved history is retained; changing local credentials does not reset this limit.";
+  if (status === "401" || /\bauthentication_error\b|\binvalid x-api-key\b|\binvalid_api_key\b/u.test(error)) return "The model provider rejected authentication (401/authentication_error). Saved history and credentials are retained.";
+  if (status === "429" || /\brate_limit_error\b|\brate_limit_exceeded\b/u.test(error)) return "The model provider rate limit was reached (429/rate_limit_error). Saved history is retained.";
+  if (/\bcontext_length_exceeded\b|\bprompt is too long\b|\bmaximum context length\b/u.test(error)) return "The model provider rejected the context size (context_length_exceeded). Saved history is retained; this does not imply stored history is corrupt.";
+  return undefined;
+}
+
+const SHARING_LIMIT_MESSAGE = 'ChatGPT plan usage reached a limit for this app. In Settings → Usage → App limits (https://chatgpt.com/settings/usage), review the app limit and enable "Allow other apps to use credits after reaching your usage limit" to use available credits. Its conversation is retained.';
 
 /** Classify known provider failures without exposing their raw responses. */
-export async function modelFailureMessage(conversation: Conversation, fallback: string): Promise<string> {
+export async function modelFailureMessage(conversation: Conversation, fallback: string, harness?: Harness,
+  settlement?: { readonly status: string; readonly detail?: unknown }): Promise<string> {
+  // Pi records blocking-compaction failures on the settled input, without
+  // appending an assistant error. This receipt, not a previous generation, owns
+  // the diagnosis. Unknown or missing details must not borrow older errors.
+  if (settlement !== undefined) {
+    if (settlement.status === "done" || typeof settlement.detail !== "string") return fallback;
+    const detail = settlement.detail;
+    if (/^Compaction failed:/iu.test(detail)) return "Context compaction failed: " +
+      (providerFailureMessage(detail) ?? "the provider request did not complete. Saved history is retained.");
+    if (subscriptionSharingLimit(detail)) return SHARING_LIMIT_MESSAGE;
+    const known = providerFailureMessage(detail);
+    if (known !== undefined) return known;
+    if (detail.includes("web_search")) return "The provider rejected hosted web search for this model or account. Its conversation is retained.";
+    return fallback;
+  }
+  const compaction = harness === undefined ? undefined : (await harness.snapshot(LiveDoc, conversation.id, BACKGROUND_CONTEXT))?.compactionFailure;
+  const compactionMessage = compaction === undefined ? fallback : "Context compaction failed: " +
+    (providerFailureMessage(compaction.error) ?? "the provider request did not complete. Saved history is retained.");
   const page = await conversation.entries({ order: "descending" }, 5, undefined, BACKGROUND_CONTEXT);
   for (const entry of page.items) for (const message of entry.model ?? []) {
     if (message.role !== "assistant") continue;
     // Pi preserves this code in HTTP error bodies and failed response streams.
     // It can mean an app-specific limit, even when the account has credits.
     if (message.stopReason === "error" && message.provider === "openai" &&
-        /\bsubscription_sharing_usage_limit_exceeded\b/u.test(message.errorMessage ?? "")) {
-      return 'ChatGPT plan usage reached a limit for this app. In Settings → Usage → App limits (https://chatgpt.com/settings/usage), review the app limit and enable "Allow other apps to use credits after reaching your usage limit" to use available credits. Its conversation is retained.';
+        subscriptionSharingLimit(message.errorMessage ?? "")) {
+      return SHARING_LIMIT_MESSAGE;
     }
     if (message.stopReason === "error" && message.errorMessage?.includes("web_search")) {
       return "The provider rejected hosted web search for this model or account. Its conversation is retained.";
     }
-    return fallback;
+    if (message.stopReason === "error") {
+      // A previous failed background compaction can outlive a later generation.
+      // Prefer this generation's diagnosis; only consult that failure when the
+      // generation itself says compaction prevented it from running.
+      return providerFailureMessage(message.errorMessage ?? "") ??
+        (/compaction/iu.test(message.errorMessage ?? "") ? compactionMessage : fallback);
+    }
+    if (compaction !== undefined && harness !== undefined && entry.byTaskId !== undefined) {
+      const [generation, failed] = await Promise.all([
+        harness.getTask(entry.byTaskId, BACKGROUND_CONTEXT), harness.getTask(compaction.taskId, BACKGROUND_CONTEXT),
+      ]);
+      if (generation?.endedAt !== undefined && failed?.endedAt !== undefined && generation.endedAt >= failed.endedAt) return fallback;
+    }
+    return compactionMessage;
   }
-  return fallback;
+  return compactionMessage;
 }
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -74,6 +127,10 @@ const Policies = defineDoc<{ sessions: Record<string, ModelSelection> }>({
   kind: "agent.models", scope: "session", version: 1, initial: () => ({ sessions: {} }), checkpointWhen: () => true,
 });
 
+const WithheldHostedToolSessions = defineDoc<{ withheld: Record<string, true> }>({
+  kind: "agent.hosted_tools", scope: "session", version: 1, initial: () => ({ withheld: {} }), checkpointWhen: () => true,
+});
+
 /** Pi owns model catalogs, auth and inference. This adapter owns saved application choices. */
 export class ConversationModels {
   private readonly catalogRefreshes = new Map<ModelProvider, Promise<void>>();
@@ -82,7 +139,7 @@ export class ConversationModels {
   constructor(readonly models: MutableModels = builtinModels(), auth?: ChatGptAuth) {
     for (const id of ["openai", "openai-codex"]) {
       const provider = models.getProvider(id);
-      if (provider !== undefined) models.setProvider({ ...provider, streamSimple: withDetailedReasoning(withWebSearch(provider.streamSimple)) });
+      if (provider !== undefined) models.setProvider({ ...provider, streamSimple: withDetailedReasoning(withWebSearch(provider.streamSimple, (sessionId) => this.hostedToolsOffered(sessionId))) });
     }
     const openai = models.getProvider("openai");
     if (openai !== undefined) {
@@ -120,6 +177,19 @@ export class ConversationModels {
     }
   }
   bind(session: Harness): void { this.bindSession?.(session); this.bindSession = undefined; }
+  async withholdHostedTools(conversation: Conversation): Promise<void> {
+    const session = await this.session;
+    await session.commit(async (tx) => {
+      const native = await tx.doc(ProviderDoc, conversation.id);
+      (await tx.doc(WithheldHostedToolSessions)).withheld[native.sessionId] = true;
+    }, BACKGROUND_CONTEXT);
+  }
+  private async hostedToolsOffered(sessionId: string | undefined): Promise<boolean> {
+    // Pi sends the session of every conversation request. A request without one belongs to no conversation.
+    if (sessionId === undefined) return true;
+    const session = await this.session;
+    return (await session.snapshot(WithheldHostedToolSessions, BACKGROUND_CONTEXT))?.withheld[sessionId] !== true;
+  }
   validate(selection: ModelSelection): void {
     const model = this.models.getModel(selection.provider, selection.model_id);
     if (model === undefined) throw new ModelError(`Unknown model ${selection.provider}/${selection.model_id}.`);

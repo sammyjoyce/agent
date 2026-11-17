@@ -167,17 +167,33 @@ test("lost resume responses retain the full folder through inconclusive inspecti
     await assert.rejects(app.tasks.dispatch(task.id, host, async () => { throw new Error("Synthetic response loss"); }), /needs reconciliation/);
     const uncertain = { ...original.worker, state: "resume_uncertain" };
     assert.deepEqual((await app.tasks.get(task.id)).worker, uncertain);
+    let checks = 0;
+    await assert.rejects(app.tasks.dispatch(task.id, host, async (command): Promise<HostResult> => {
+      assert.ok(command.type === "on_node" && command.command.type === "inspect_worker"); checks += 1;
+      return { type: "failed", message: "Synthetic inspection unavailable" };
+    }), /needs reconciliation/);
+    assert.equal(checks, 1); assert.deepEqual((await app.tasks.get(task.id)).worker, uncertain);
+    await assert.rejects(app.tasks.revokeAllocation(task.id, original.worker.allocation_id), /known session/);
     for (const result of [
-      { type: "failed", message: "Synthetic inspection unavailable" },
       { type: "worker_presence", presence: { state: "present", running: false } },
       { type: "worker_presence", presence: { state: "missing_terminal" } },
     ] satisfies HostResult[]) {
-      let checks = 0;
-      await assert.rejects(app.tasks.dispatch(task.id, host, async (command) => {
-        assert.ok(command.type === "on_node" && command.command.type === "inspect_worker"); checks += 1; return result;
-      }), /needs reconciliation/);
-      assert.equal(checks, 1); assert.deepEqual((await app.tasks.get(task.id)).worker, uncertain);
-      await assert.rejects(app.tasks.revokeAllocation(task.id, original.worker.allocation_id), /known session/);
+      const before = (await app.tasks.get(task.id)).worker; assert.ok(before.state === "resume_uncertain");
+      const sent: HostCommand[] = [];
+      const resumed = await app.tasks.dispatch(task.id, host, async (command): Promise<HostResult> => {
+        sent.push(command); return command.type === "on_node" ? result : { type: "written" };
+      });
+      assert.deepEqual(sent.map((command) => command.type), ["on_node", "resume_worker"]);
+      const inspection = sent[0]; assert.ok(inspection?.type === "on_node" && inspection.command.type === "inspect_worker");
+      const resume = sent[1]; assert.ok(resume?.type === "resume_worker");
+      assert.notEqual(resume.allocation_id, before.allocation_id); assert.deepEqual(resume.binding, binding);
+      assert.deepEqual(resumed.worker, { ...before, state: "bound", allocation_id: resume.allocation_id });
+      assert.deepEqual((await app.tasks.get(task.id)).worker, resumed.worker);
+      await assert.rejects(app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: before.allocation_id, binding,
+        instructions: "", cwd: host.cwd, model: fixtureModel }, () => { throw new Error("A late claim with the fenced allocation must never attach"); },
+        [], async () => ({ type: "worker_presence", presence: { state: "present", running: true } })), /binding is not confirmed/);
+      assert.equal(app.faux.state.callCount, 0);
+      await assert.rejects(app.tasks.dispatch(task.id, host, async () => { throw new Error("Synthetic response loss"); }), /needs reconciliation/);
     }
     const allocationId = original.worker.allocation_id;
     await app.tasks.update(task.id, (saved) => { saved.worker = { state: "uncertain", allocation_id: allocationId, host, session_id: binding.session_id }; });
@@ -185,6 +201,53 @@ test("lost resume responses retain the full folder through inconclusive inspecti
     await assert.rejects(app.tasks.revokeAllocation(task.id, allocationId), /known session/);
     assert.deepEqual((await app.tasks.get(task.id)).worker, legacy.worker);
     assert.equal(app.faux.state.callCount, 0);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a bound task whose session did not survive a Rex restart reopens in the same send only after Rex reports it missing", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-resume-gone-after-restart-")); const app = await open(directory);
+  const stamped = { ...binding, rex_instance_id: "55555555-5555-4555-8555-555555555555" };
+  const reopened = { ...binding, session_id: "session:66666666-6666-4666-8666-666666666666", rex_instance_id: "77777777-7777-4777-8777-777777777777" };
+  const notStarted: HostResult = { type: "failed", delivery: "not_started", message: "The task session was closed; reconcile its allocation before reopening" };
+  try {
+    const task = await app.tasks.create({ title: "Continue after a Rex restart", outcome: "Finish in a reopened session", model: fixtureModel });
+    await app.tasks.enqueue(task.id, "Start the original work", "original");
+    const original = await app.tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding: stamped }));
+    assert.ok(original.worker.state === "bound");
+    await app.tasks.enqueue(task.id, "Continue after the restart", "after-restart");
+    for (const inspection of [
+      async (): Promise<HostResult> => { throw new Error("Synthetic lost inspection reply"); },
+      async (): Promise<HostResult> => ({ type: "failed", message: "Rex returned an unreadable reply" }),
+    ]) {
+      const sent: string[] = [];
+      await assert.rejects(app.tasks.dispatch(task.id, host, async (command) => {
+        sent.push(command.type);
+        if (command.type === "resume_worker") return notStarted;
+        assert.ok(command.type === "on_node" && command.command.type === "inspect_worker"); return inspection();
+      }), /retained for retry/);
+      assert.deepEqual(sent, ["resume_worker", "on_node"]);
+      assert.deepEqual((await app.tasks.get(task.id)).worker, original.worker, "An inconclusive read keeps the binding and opens no session");
+    }
+    const sent: string[] = [];
+    const resumed = await app.tasks.dispatch(task.id, host, async (command): Promise<HostResult> => {
+      sent.push(command.type);
+      if (command.type === "resume_worker") return notStarted;
+      if (command.type === "on_node") return { type: "worker_presence", presence: { state: "missing_session" } };
+      assert.equal(command.type, "spawn_worker"); return { type: "spawned", binding: reopened };
+    });
+    assert.deepEqual(sent, ["resume_worker", "on_node", "spawn_worker"]);
+    assert.ok(resumed.worker.state === "bound"); assert.deepEqual(resumed.worker.binding, reopened);
+    assert.notEqual(resumed.worker.allocation_id, original.worker.allocation_id);
+    assert.equal(resumed.id, task.id); assert.equal(resumed.conversation_id, task.conversation_id);
+    assert.deepEqual(resumed.pending.map((input) => input.id), ["original", "after-restart"]);
+    const conversation = await app.tasks.conversation(task.conversation_id);
+    const entries = await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT);
+    const failedResume = [["resume", "bound", "resuming", "pending"], ["resume", "resuming", "bound", "failed"]];
+    assert.deepEqual(entries.items.filter(Decision.is).map((entry) => [entry.data.operation, entry.data.previous.state, entry.data.current.state, entry.data.result.type]), [
+      ["create", "unassigned", "allocating", "pending"], ["create", "allocating", "bound", "spawned"],
+      ...failedResume, ...failedResume, ...failedResume,
+      ["reopen", "bound", "allocating", "pending"], ["create", "allocating", "bound", "spawned"],
+    ]);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 

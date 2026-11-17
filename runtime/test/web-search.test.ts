@@ -12,10 +12,12 @@ import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import { AssistantEntry, createRegistry, defineExtension, defineTool, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { errorEvent } from "../src/protocol.js";
 import { Type } from "typebox";
-import { ConversationModels, DEFAULT_MODEL, modelFailureMessage } from "../src/models.js";
+import { ConversationModels, DEFAULT_MODEL, ModelTurnError, modelFailureMessage, providerFailureMessage } from "../src/models.js";
 import { TaskStore } from "../src/tasks.js";
 import { history } from "../src/transcript.js";
+import { HistoryStore } from "../src/history.js";
 import type { ModelSelection } from "../src/generated/ModelSelection.js";
 import type { WorkerHost } from "../src/generated/WorkerHost.js";
 import type { WorkerRef } from "../src/generated/WorkerRef.js";
@@ -79,18 +81,18 @@ async function server(handler: (response: ServerResponse, body: Record<string, u
   return { url: `http://127.0.0.1:${address.port}/v1`, requests,
     async close() { server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); if (failure !== undefined) throw failure; } };
 }
-async function open(directory: string, url: string, provider: "openai" | "openai-codex" = "openai") {
+async function open(directory: string, url: string, provider: "openai" | "openai-codex" = "openai", smallContext = false) {
   const models = createModels(), native = provider === "openai" ? openaiProvider() : openaiCodexProvider();
   const original = native.getModels().find((model) => model.id === DEFAULT_MODEL.model_id) ?? native.getModels()[0]; assert.ok(original);
   const selection: ModelSelection = { ...DEFAULT_MODEL, provider, model_id: original.id, fast: provider === "openai" };
   const token = provider === "openai" ? "sk-synthetic" : "fixture." + Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "synthetic-account" } })).toString("base64") + ".fixture";
-  models.setProvider({ ...native, getModels: () => [{ ...original, baseUrl: url }],
+  models.setProvider({ ...native, getModels: () => [{ ...original, baseUrl: url, ...(smallContext ? { contextWindow: 256, maxTokens: 64 } : {}) }],
     auth: { apiKey: { name: "Synthetic authentication", resolve: async () => ({ auth: { apiKey: token } }) } } });
   const inference = new ConversationModels(models), registry = createRegistry();
   const fixture = defineExtension({ name: "fixture", tools: [defineTool({ name: "fixture_tool", description: "An existing application tool", parameters: Type.Object({}),
     execute: async () => ({ output: [{ type: "text", text: "Done" }] }) })] }); registry.install(fixture);
   const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))), {
-    models, registry, identity: { attribution: null }, settings: { stream: { transport: "sse", maxRetries: 0 }, compaction: { enabled: false }, retry: { enabled: false } },
+    models, registry, identity: { attribution: null }, settings: { stream: { transport: "sse", maxRetries: 0 }, compaction: { enabled: smallContext, keepRecentTokens: 0, ...(smallContext ? { reserveTokens: 128, backgroundTokens: 0 } : {}) }, retry: { enabled: false } },
   }, BACKGROUND_CONTEXT);
   const tasks = new TaskStore(session, inference), root = await session.root(BACKGROUND_CONTEXT);
   await inference.configure(root, selection, { extensions: [fixture] });
@@ -128,7 +130,7 @@ test("native hosted search keeps existing tools, fast policy, replay data and ci
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory, wire.url);
     assert.equal((await answer(app)).content.find((part) => part.type === "text")?.text, content.text);
     assert.equal((await answer(app)).content.find((part) => part.type === "text")?.textSignature, content.textSignature);
-    const rendered = (await history(app.root, null, app.session)).flatMap((frame) => frame.messages).filter((item) => item.role === "final");
+    const rendered = (await history(app.root, null, new HistoryStore(app.session))).flatMap((frame) => frame.messages).filter((item) => item.role === "final");
     assert.equal(rendered.length, 1); assert.equal(rendered[0]?.text, content.text); assert.equal(wire.requests.length, 3);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await wire.close(); await rm(directory, { recursive: true, force: true }); }
 });
@@ -152,7 +154,7 @@ test("enabled reasoning requests detailed explanations and preserves every parag
     assert.ok(wire.requests.some((request) => object(request.reasoning) && request.reasoning.summary === "detailed"));
     const thinking = (await answer(app)).content.find((part) => part.type === "thinking");
     assert.equal(thinking?.thinking, exposedReasoning);
-    const rendered = (await history(app.root, null, app.session)).flatMap((frame) => frame.messages).filter((message) => message.role === "thinking");
+    const rendered = (await history(app.root, null, new HistoryStore(app.session))).flatMap((frame) => frame.messages).filter((message) => message.role === "thinking");
     assert.equal(rendered.map((message) => message.text).join(""), exposedReasoning);
     assert.equal(JSON.stringify(rendered).includes("synthetic-encrypted-replay"), false);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await wire.close(); await rm(directory, { recursive: true, force: true }); }
@@ -247,10 +249,12 @@ test("provider capability rejection stays visible and does not silently retry wi
 });
 
 test("subscription-sharing limits explain credit permission while retaining the original worker task", { timeout: 20_000 }, async (t) => {
-  for (const transport of ["http", "stream"]) await t.test(transport, async () => {
+  for (const transport of ["http", "stream", "prose"]) await t.test(transport, async () => {
     const directory = await mkdtemp(join(tmpdir(), "agent-model-limit-"));
     const wire = await server((response) => {
-      const error = { code: "subscription_sharing_usage_limit_exceeded", message: "PRIVATE_PROVIDER_DETAILS", type: "rate_limit_error" };
+      const error = transport === "prose"
+        ? { message: "The ChatGPT user has reached their Subscription Sharing usage limit. Invented account detail.", type: "rate_limit_error" }
+        : { code: "subscription_sharing_usage_limit_exceeded", message: "PRIVATE_PROVIDER_DETAILS", type: "rate_limit_error" };
       if (transport === "http") {
         response.writeHead(429, { "content-type": "application/json" }); response.end(JSON.stringify({ error }));
       } else {
@@ -274,7 +278,7 @@ test("subscription-sharing limits explain credit permission while retaining the 
       assert.deepEqual((await app.tasks.list()).map((item) => item.id), [task.id]);
       const conversation = await app.tasks.conversation(retained.conversation_id);
       assert.equal(await modelFailureMessage(conversation, "Generic failure"), expected);
-      assert.ok((await history(conversation, null, app.session)).some((frame) => frame.messages.some((message) => message.role === "user" && message.text === "Continue this original request.")));
+      assert.ok((await history(conversation, null, new HistoryStore(app.session))).some((frame) => frame.messages.some((message) => message.role === "user" && message.text === "Continue this original request.")));
       const input = await app.root.submit({ type: "input", content: "Continue the main conversation." }, BACKGROUND_CONTEXT);
       assert.equal((await input.wait(BACKGROUND_CONTEXT)).status, "unanswered");
       assert.equal(await modelFailureMessage(app.root, "Generic main failure"), expected);
@@ -284,7 +288,7 @@ test("subscription-sharing limits explain credit permission while retaining the 
 });
 
 test("unrecognized provider failures remain sanitized instead of guessing a credit limit", { timeout: 15_000 }, async () => {
-  for (const code of ["rate_limit_exceeded", "subscription_sharing_usage_limit_exceeded_retry", "subscription_sharing_usage_unavailable"]) {
+  for (const code of [ "subscription_sharing_usage_limit_exceeded_retry", "subscription_sharing_usage_unavailable"]) {
     const directory = await mkdtemp(join(tmpdir(), "agent-model-error-")), wire = await server((response) => {
       response.writeHead(200, { "content-type": "text/event-stream" });
       send(response, { type: "response.failed", response: { id: "unrecognized-response", status: "failed",
@@ -296,5 +300,136 @@ test("unrecognized provider failures remain sanitized instead of guessing a cred
       assert.equal(await modelFailureMessage(app.root, "The model turn did not complete; its state is retained"), "The model turn did not complete; its state is retained");
       assert.equal(wire.requests.length, 1);
     } finally { await app.session.close(BACKGROUND_CONTEXT); await wire.close(); await rm(directory, { recursive: true, force: true }); }
+  }
+});
+
+
+test("native HTTP errors keep safe categories across failed compaction and SQLite reopen without replay", { timeout: 20_000 }, async (t) => {
+  for (const [status, code, expected] of [
+    [401, "authentication_error", "authentication_failed"],
+    [429, "rate_limit_error", "provider_unavailable"],
+    [429, "subscription_sharing_usage_limit_exceeded", "provider_unavailable"],
+    [400, "context_length_exceeded", "provider_unavailable"],
+  ] as const) await t.test(code, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-error-category-"));
+    let healthy = true;
+    const wire = await server((response, _body, id) => {
+      if (healthy) { complete(response, id); return; }
+      response.writeHead(status, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { type: code, code, message: "PRIVATE_SYNTHETIC_BODY" } }));
+    });
+    let app = await open(directory, wire.url);
+    try {
+      assert.equal((await (await app.root.submit({ type: "input", content: "Invented retained request." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
+      healthy = false;
+      await app.session.waitForTask(await app.root.compact(undefined, BACKGROUND_CONTEXT), BACKGROUND_CONTEXT);
+      const diagnostic = await modelFailureMessage(app.root, "Generic failure", app.session);
+      assert.match(diagnostic, /Context compaction failed:/);
+      assert.ok(!diagnostic.includes("PRIVATE_SYNTHETIC_BODY"));
+      assert.equal(errorEvent(new ModelTurnError(diagnostic)).code, expected);
+      assert.equal(wire.requests.length, 2);
+      await app.session.close(BACKGROUND_CONTEXT); app = await open(directory, wire.url);
+      assert.equal(await modelFailureMessage(app.root, "Generic failure", app.session), diagnostic);
+      const retained = await history(app.root, null, new HistoryStore(app.session));
+      assert.equal(retained.flatMap((frame) => frame.messages).filter((message) => message.role === "user" && message.text === "Invented retained request.").length, 1);
+      assert.equal(wire.requests.length, 2, "Reopening must not replay input or provider calls");
+      healthy = true;
+      assert.equal((await (await app.root.submit({ type: "input", content: "Invented explicit recovery." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
+      assert.equal(wire.requests.length, 3, "One explicit recovery input produces one new request");
+      assert.equal(await modelFailureMessage(app.root, "No current failure", app.session), "No current failure", "Completed recovery must not surface an older compaction error");
+      healthy = false;
+      assert.equal((await (await app.root.submit({ type: "input", content: "Invented later failing turn." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "unanswered");
+      const latest = await modelFailureMessage(app.root, "Generic failure", app.session);
+      assert.equal(latest.startsWith("Context compaction failed:"), false, "A retained older compaction must not override a newer generation error");
+      assert.equal(errorEvent(new ModelTurnError(latest)).code, expected);
+      assert.equal(wire.requests.length, 4);
+      console.log(code + ": compaction category persisted; original input count=1; calls=2 then explicit recovery=3; newer failure=4 wins over stale compaction");
+    } finally { await app.session.close(BACKGROUND_CONTEXT); await wire.close(); await rm(directory, { recursive: true, force: true }); }
+  });
+});
+
+
+test("blocking compaction must not borrow a prior generation failure", { timeout: 15_000 }, async (t) => {
+  for (const [prior, current, expected] of [
+    ["subscription_sharing_usage_limit_exceeded", "authentication_error", /authentication/],
+    ["authentication_error", "context_length_exceeded", /context size/],
+  ] as const) await t.test(prior + " then " + current, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-causal-compaction-"));
+    const wire = await server((response, _body, id) => {
+      response.writeHead(id === 1 ? 429 : 400, { "content-type": "application/json" });
+      const code = id === 1 ? prior : current;
+      response.end(JSON.stringify({ error: { type: code, code, message: "INVENTED_PRIVATE_DIAGNOSTIC" } }));
+    });
+    let app = await open(directory, wire.url, "openai", true);
+    try {
+      assert.equal((await (await app.root.submit({ type: "input", content: "Invented first input." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "unanswered");
+      const settled = await (await app.root.submit({ type: "input", requestId: "causal-current", content: "Invented long current input. ".repeat(300) }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+      assert.equal(settled.status, "unanswered");
+      assert.equal(wire.requests.length, 2);
+      const diagnostic = await modelFailureMessage(app.root, "Generic failure", app.session, settled);
+      assert.match(diagnostic, expected);
+      console.log(prior + " → current blocking compaction " + current + ": causal settlement detail wins; calls=" + wire.requests.length);
+      assert.match(diagnostic, /Context compaction failed/);
+      await app.session.close(BACKGROUND_CONTEXT); app = await open(directory, wire.url, "openai", true);
+      const fresh = await app.session.commit((tx) => tx.submissionByRequest(app.root.id, "causal-current"), BACKGROUND_CONTEXT);
+      assert.ok(fresh);
+      assert.equal(await modelFailureMessage(app.root, "Generic failure", app.session, fresh), diagnostic);
+      assert.equal(wire.requests.length, 2, "Reading the persisted causal receipt must not replay either input");
+    } finally { await app.session.close(BACKGROUND_CONTEXT); await wire.close(); await rm(directory, { recursive: true, force: true }); }
+  });
+});
+
+
+test("bare HTTP status wrappers retain direct and blocking-compaction diagnoses across SQLite reopen", { timeout: 15_000 }, async (t) => {
+  for (const status of [401, 429]) for (const blocking of [false, true]) await t.test(status + (blocking ? " blocking compaction" : " direct Responses"), async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-bare-http-error-"));
+    const wire = await server((response, _body, id) => {
+      if (blocking && id === 1) { complete(response, id); return; }
+      response.writeHead(status, { "content-type": "text/plain" });
+      response.end("INVENTED_PRIVATE_HTTP_BODY");
+    });
+    let app = await open(directory, wire.url, "openai", blocking);
+    try {
+      if (blocking) assert.equal((await (await app.root.submit({ type: "input", content: "Invented retained small request." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
+      const settled = await (await app.root.submit({ type: "input", requestId: "bare-http-error", content: blocking ? "Invented current long request. ".repeat(300) : "Invented direct request." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+      assert.equal(settled.status, "unanswered");
+      assert.equal(typeof settled.detail, "string");
+      assert.ok(String(settled.detail).includes("OpenAI API error (" + status + "):"));
+      if (blocking) assert.match(String(settled.detail), /^Compaction failed:/);
+      const diagnostic = await modelFailureMessage(app.root, "Generic failure", app.session, settled);
+      const expected = status === 401 ? "authentication_failed" : "provider_unavailable";
+      assert.equal(errorEvent(new ModelTurnError(diagnostic)).code, expected);
+      assert.match(diagnostic, status === 401 ? /rejected authentication/ : /rate limit/);
+      assert.equal(diagnostic.includes("INVENTED_PRIVATE_HTTP_BODY"), false);
+      if (blocking) assert.match(diagnostic, /^Context compaction failed:/);
+      const calls = blocking ? 2 : 1;
+      assert.equal(wire.requests.length, calls);
+      await app.session.close(BACKGROUND_CONTEXT); app = await open(directory, wire.url, "openai", blocking);
+      const fresh = await app.session.commit((tx) => tx.submissionByRequest(app.root.id, "bare-http-error"), BACKGROUND_CONTEXT);
+      assert.ok(fresh);
+      assert.equal(await modelFailureMessage(app.root, "Generic failure", app.session, fresh), diagnostic);
+      assert.equal(wire.requests.length, calls, "Reopen must not replay the failed request");
+      console.log("bare HTTP " + status + (blocking ? " blocking compaction" : " direct Responses") + ": safe category=" + expected + "; persisted cause identical; calls=" + calls);
+    } finally { await app.session.close(BACKGROUND_CONTEXT); await wire.close(); await rm(directory, { recursive: true, force: true }); }
+  });
+});
+
+test("known anchored wrappers do not classify arbitrary status digits inside bodies", () => {
+  for (const status of [401, 429]) {
+    const expected = status === 401 ? /rejected authentication/ : /rate limit/;
+    for (const wrapped of [
+      status + " INVENTED_PRIVATE_HTTP_BODY",
+      "Compaction failed: " + status + " INVENTED_PRIVATE_HTTP_BODY",
+      "OpenAI API error (" + status + "): INVENTED_PRIVATE_HTTP_BODY",
+      "Compaction failed: Summarization failed: OpenAI API error (" + status + "): INVENTED_PRIVATE_HTTP_BODY",
+    ]) assert.match(providerFailureMessage(wrapped) ?? "", expected);
+    for (const body of [
+      "INVENTED_PRIVATE_BODY mentions " + status,
+      "OpenAI API error (500): INVENTED_PRIVATE_BODY mentions " + status,
+      "Compaction failed: OpenAI API error (500): INVENTED_PRIVATE_BODY mentions " + status,
+      "Compaction failed: INVENTED_PRIVATE_BODY mentions " + status,
+      "INVENTED_PRIVATE_BODY: OpenAI API error (" + status + "): detail",
+      status + "0 is an invented identifier",
+    ]) assert.equal(providerFailureMessage(body), undefined);
   }
 });

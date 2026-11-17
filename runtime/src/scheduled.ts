@@ -29,11 +29,18 @@ export async function openJobActor(job: ScheduledJob, tasks: TaskStore): Promise
     source.provider === "scheduled_jobs" && source.account === "local" && source.thread_id === job.id))?.id;
 }
 
+/** An evidence-only recheck, not another execution attempt. Keep it responsive
+ * to a recovery turn rather than backing off business work for up to an hour. */
+export class ScheduledReconciliationPending extends TaskError {}
+
 async function requireReconciledTask(session: Harness, tasks: TaskStore, sources: SourceJournal, id: string, requestId: string): Promise<void> {
   const conversation = await tasks.conversation((await tasks.get(id)).conversation_id);
-  if (!await session.commit(async (tx) => await tasks.canSettleScheduledIn(tx, id, conversation.id) &&
-      (await tasks.canReleaseIn(tx, id) || await sources.reconcilesIn(tx, id, conversation.id, requestId)), BACKGROUND_CONTEXT)) {
-    throw new TaskError("The scheduled turn stopped without an answer; resolve its task or explicitly reconcile its exact input in a successful recovery turn before this occurrence can settle");
+  // Exact successful recovery is occurrence-scoped. Unrelated later work in
+  // this long-lived task must not keep the recovered occurrence open. Without
+  // that proof, whole-task resolution still requires native/task quiescence.
+  if (!await session.commit(async (tx) => await sources.reconcilesIn(tx, id, conversation.id, requestId) ||
+      await tasks.canSettleScheduledIn(tx, id, conversation.id) && await tasks.canReleaseIn(tx, id), BACKGROUND_CONTEXT)) {
+    throw new ScheduledReconciliationPending("The scheduled turn stopped without an answer; resolve its task or explicitly reconcile its exact input in a successful recovery turn before this occurrence can settle");
   }
 }
 
@@ -44,7 +51,7 @@ export async function runScheduled(occurrence: ScheduledOccurrence, signal: Abor
   const { session, tasks, sources } = services;
   const task = await tasks.create({ id, title: occurrence.job.title,
     outcome: occurrence.job.prompt, model: occurrence.job.model,
-    sources: [{ provider: "scheduled_jobs", account: "local", thread_id: occurrence.job.id }] });
+    job_id: occurrence.job.id });
   const conversation = await tasks.conversation(task.conversation_id);
   let submission = await session.commit((tx) => tx.submissionByRequest(conversation.id, occurrence.id), BACKGROUND_CONTEXT);
   if (submission?.status === "done") return;
@@ -57,7 +64,15 @@ export async function runScheduled(occurrence: ScheduledOccurrence, signal: Abor
   const aborted = () => wake?.(); signal.addEventListener("abort", aborted);
   try {
     const previousOutcome = (await sources.events({ provider: "task_outcomes", thread_id: id, limit: 1 }))[0]?.key;
-    void tasks.runBackground(id).catch((error: unknown) => { failure = error; }).finally(() => { revision += 1; wake?.(); });
+    const start = await tasks.ensureActor({ task_id: id });
+    switch (start.state) {
+      case "started": case "running":
+        void start.exit.then(() => {}, (error: unknown) => { failure = error; }).finally(() => { revision += 1; wake?.(); });
+        break;
+      case "no_work": break;
+      case "unplaced": case "host_offline": case "unavailable": throw new TaskError(start.reason);
+      default: { const unknown: never = start; throw new TaskError(`Unknown actor start ${JSON.stringify(unknown)}`); }
+    }
     for (;;) {
       if (signal.aborted) throw new TaskError("Scheduled work stopped with the coordinator; its admission is retained");
       const observed = revision;

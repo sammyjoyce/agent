@@ -154,8 +154,9 @@ export class SourceJournal {
         await this.decideIn(tx, record, { type: "dismissed", reason: "Superseded by a newer outcome from the same task conversation" });
       }
     }
-    const record = await this.records.insertIn(tx, key, { key, event, outcome,
-      decision: settled ? { type: "dismissed", reason: "Already handled by the coordinator" } : null });
+    const decision: Decision | null = settled ? { type: "dismissed", reason: "Already handled by the coordinator" }
+      : this.tasks.isConfined(outcome) ? { type: "dismissed", reason: "A confined task's results are reviewed outside the coordinator and never enter triage" } : null;
+    const record = await this.records.insertIn(tx, key, { key, event, outcome, decision });
     await this.indexIn(tx, record.value, record.inserted);
     const previous = journal.sources.find((state) => sameSource(state.source, OUTCOMES));
     const state = { ...outcomeState(), checked_at: Date.now() };
@@ -422,7 +423,7 @@ export class SourceJournal {
   }
   private async due(): Promise<DueTask[]> {
     return (await this.tasks.list()).flatMap((task) => task.state.state === "waiting" && task.state.next_check !== null &&
-      task.pending.length === 0 && !this.tasks.isRunning(task.id) &&
+      task.pending.length === 0 && !this.tasks.isRunning(task.id) && !this.tasks.isConfined(task) &&
       Number.isFinite(Date.parse(task.state.next_check)) && Date.parse(task.state.next_check) <= Date.now()
       ? [{ id: task.id, next_check: task.state.next_check }] : []);
   }

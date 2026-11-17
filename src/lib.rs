@@ -1,11 +1,15 @@
 pub mod attachments;
+pub mod backup;
 pub mod chat_commands;
 pub mod config;
 pub mod context;
 pub mod coordinator_id;
 pub mod discovery;
+pub mod dreams;
 pub mod embeddings;
+pub mod failover;
 pub mod feedback;
+pub mod goal_view;
 pub mod history;
 pub mod host;
 pub mod models;
