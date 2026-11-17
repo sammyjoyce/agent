@@ -270,9 +270,10 @@ recovery; [history](history.md) describes import and retrieval.
   sent the user a needless completion notice.
 - [x] CLI startup and retained-history first-render benchmarks, with paired
   baseline comparisons and a separate CI regression gate.
-- [ ] Benchmarks for input admission, first visible activity, steering/stop,
+- [x] Benchmarks for input admission, first visible activity, steering/stop,
   long-history scrolling, search and import contention. Separate application
-  delay from model latency; track CPU, RAM and token use.
+  delay from model latency; track CPU, RAM and token use. See
+  [CLI performance](performance.md#scenarios-and-gates).
 - [x] Nightly operational log review through scheduled jobs, with coordinator
   collection, retained task summaries and explicit coverage gaps. Repeat a
   review through the [scheduled-job run command](setup.md#scheduled-jobs).

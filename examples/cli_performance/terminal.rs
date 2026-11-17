@@ -3,7 +3,7 @@ use std::{
     num::NonZeroU16,
     process::Stdio,
     sync::{Arc, Mutex, MutexGuard},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -12,7 +12,7 @@ use tokio::{
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::oneshot,
     task::JoinHandle,
-    time::timeout,
+    time::{sleep_until, timeout},
 };
 
 use crate::DEADLINE;
@@ -21,12 +21,14 @@ pub const ROWS: u16 = 32;
 pub const COLUMNS: u16 = 100;
 const PLACEHOLDER: &str = "Ask Beep Boop to do anything";
 const BUSY: &str = "esc to interrupt";
+const REPLAY_OUTPUT_DEADLINE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug)]
 pub enum Sight {
     Shows(&'static str),
     Admitted(&'static str),
     Settled(&'static str),
+    ReplayFinished(&'static str),
     Stopped,
 }
 
@@ -44,6 +46,12 @@ impl Sight {
                     && !shows("sending…")
             }
             Self::Settled(text) => shows(text) && !shows(BUSY),
+            Self::ReplayFinished(text) => {
+                shows(text)
+                    && shows(PLACEHOLDER)
+                    && !shows("• Loading history")
+                    && !shows("• Connecting")
+            }
             Self::Stopped => line("• Interrupted") && !shows(BUSY),
         }
     }
@@ -88,6 +96,7 @@ struct Screen {
     parser: vt100::Parser<Replies>,
     armed: VecDeque<(Sight, oneshot::Sender<Instant>)>,
     received: usize,
+    last_output: Instant,
 }
 
 impl Screen {
@@ -114,6 +123,7 @@ impl Screen {
     fn observe(&mut self, bytes: &[u8], at: Instant) -> Vec<u8> {
         self.parser.process(bytes);
         self.received += bytes.len();
+        self.last_output = at;
         while self
             .armed
             .front()
@@ -161,6 +171,7 @@ impl Terminal {
             parser: parser()?,
             armed: VecDeque::new(),
             received: 0,
+            last_output: Instant::now(),
         };
         let sightings = screen.arm(sights)?;
         let screen = Arc::new(Mutex::new(screen));
@@ -201,6 +212,20 @@ impl Terminal {
             .next()
             .await
             .map(drop)
+    }
+
+    pub async fn last_output_before_quiet(&self, quiet: Duration) -> Result<Instant> {
+        timeout(REPLAY_OUTPUT_DEADLINE, async {
+            loop {
+                let last = locked(&self.screen)?.last_output;
+                if last.elapsed() >= quiet {
+                    return Ok(last);
+                }
+                sleep_until((last + quiet).into()).await;
+            }
+        })
+        .await
+        .context("The CLI kept writing to the terminal")?
     }
 
     pub fn contents(&self) -> String {
@@ -297,6 +322,7 @@ mod tests {
             parser: parser().unwrap(),
             armed: VecDeque::new(),
             received: 0,
+            last_output: Instant::now(),
         };
         screen.observe(lines.join("\r\n").as_bytes(), Instant::now());
         screen
@@ -336,6 +362,39 @@ mod tests {
         let stopped = observed(&["• Interrupted", PLACEHOLDER]);
         assert!(Sight::Stopped.holds(stopped.parser.screen()));
         assert!(!Sight::Stopped.holds(observed(&["• Interrupted agent"]).parser.screen()));
+    }
+
+    #[test]
+    fn replayed_waits_for_the_history_status_to_clear() {
+        let sentence = "Stored long conversation is ready.";
+        for status in ["• Loading history", "• Connecting"] {
+            let replaying = observed(&[sentence, status, PLACEHOLDER]);
+            assert!(!Sight::ReplayFinished(sentence).holds(replaying.parser.screen()));
+        }
+        let replayed = observed(&[sentence, "› ", PLACEHOLDER]);
+        assert!(Sight::ReplayFinished(sentence).holds(replayed.parser.screen()));
+        assert!(!Sight::ReplayFinished(sentence).holds(observed(&[PLACEHOLDER]).parser.screen()));
+    }
+
+    #[tokio::test]
+    async fn settled_returns_the_last_write_once_output_stays_quiet() {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf a; sleep 0.2; printf b; sleep 0.2; printf c; exec sleep 5",
+        ]);
+        let (spawned, terminal, _) = Terminal::spawn(command, Vec::new()).unwrap();
+        let quiet = Duration::from_millis(500);
+        let last = terminal.last_output_before_quiet(quiet).await.unwrap();
+        let detected = Instant::now();
+        assert!(terminal.contents().contains("abc"));
+        assert!(
+            last - spawned >= Duration::from_millis(350),
+            "{:?}",
+            last - spawned
+        );
+        assert!(detected - last >= quiet);
+        terminal.kill().await;
     }
 
     #[tokio::test]

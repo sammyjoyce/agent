@@ -9,6 +9,7 @@ pub enum Role {
     Cli,
     Coordinator,
     Runtime,
+    Codex,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
