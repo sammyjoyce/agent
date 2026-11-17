@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use agent_cli::serialized_spawn::SerializedSpawn;
 use serde_json::{Value, json};
 
 const COORDINATOR: &str = "11111111-1111-4111-8111-111111111111";
@@ -148,7 +149,7 @@ impl World {
         let made = Command::new("node")
             .args(["--no-warnings", "-e", &script])
             .arg(self.state.join("session.sqlite"))
-            .output()
+            .output_serialized()
             .unwrap();
         assert!(made.status.success(), "{}", stderr(&made));
     }
@@ -213,13 +214,13 @@ impl World {
     fn serve_with(&self, environment: &[(&str, &str)]) -> Supervisor {
         let mut command = self.command();
         command.envs(environment.iter().copied());
-        let supervisor = Supervisor(Some(command.spawn().unwrap()));
+        let supervisor = Supervisor(Some(command.spawn_serialized().unwrap()));
         until("the coordinator socket", || self.socket().exists());
         supervisor
     }
 
     fn run(&self) -> Output {
-        Supervisor(Some(self.command().spawn().unwrap())).finish()
+        Supervisor(Some(self.command().spawn_serialized().unwrap())).finish()
     }
 
     fn socket(&self) -> PathBuf {
@@ -653,7 +654,7 @@ fn a_claim_helper_that_outlives_its_killed_coordinator_keeps_the_next_start_out_
     world.answer(json!({ "result": "claimed", "epoch": 4, "head": 0 }), "", 0);
     let unanswered = world.runtime.join("failover/unanswered");
     fs::write(&unanswered, "").unwrap();
-    let killed = Supervisor(Some(world.command().spawn().unwrap()));
+    let killed = Supervisor(Some(world.command().spawn_serialized().unwrap()));
     until("the first start's claim helper", || {
         world.helper_runs().len() == 1
     });

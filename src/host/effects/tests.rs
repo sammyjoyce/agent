@@ -5,6 +5,7 @@ use crate::{
     },
     protocol::{HostCommand, HostResult},
     runtime::effects::EffectsLock,
+    serialized_spawn::SerializedSpawn,
 };
 use std::{path::Path, sync::Arc};
 use tokio::{
@@ -247,7 +248,7 @@ async fn an_effect_that_outlives_its_connection_holds_the_effects_lock_until_it_
                 "--nocapture",
             ])
             .env(ALONE, "1")
-            .output()
+            .output_serialized()
             .unwrap();
         assert!(
             alone.status.success(),
