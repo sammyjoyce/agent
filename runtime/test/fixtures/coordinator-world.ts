@@ -126,8 +126,8 @@ export async function coordinatorWorld(t: WorldOwner, prepare: (homes: readonly 
       });
     } finally { channel.destroy(); }
   }
-  async function until(check: () => Promise<boolean>, message = "", diagnostic: () => string = () => ""): Promise<void> {
-    const deadline = Date.now() + 10_000;
+  async function until(check: () => Promise<boolean>, message = "", diagnostic: () => string = () => "", limit = 10_000): Promise<void> {
+    const deadline = Date.now() + limit;
     while (!await check()) { assert.ok(Date.now() < deadline, message + "\n" + diagnostic() + "\n" + children.map((process) => process.errors()).join("\n") +
       children.slice(-3).map((process) => process.output().slice(-2400)).join("\n")); await new Promise((resolve) => setTimeout(resolve, 20)); }
   }
