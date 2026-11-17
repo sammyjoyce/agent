@@ -100,14 +100,12 @@ final class ScopeInteractionTests: XCTestCase {
     let jobHeader = app.buttons["Details for Job: Morning review"]
     for _ in 0..<4 where !jobHeader.isHittable { app.swipeUp() }
     jobHeader.tap()
-    XCTAssertTrue(app.staticTexts["invented-job"].waitForExistence(timeout: 5))
+    reveal("invented-job")
     app.buttons["Done"].tap()
     let legacyHeader = app.buttons["Details for Update"]
     for _ in 0..<4 where !legacyHeader.isHittable { app.swipeUp() }
     legacyHeader.tap()
-    XCTAssertTrue(
-      app.staticTexts["Source and task details were not recorded for this message."]
-        .waitForExistence(timeout: 5))
+    reveal("Source and task details were not recorded for this message.")
     app.buttons["Done"].tap()
     let inputs = await peer.inputs()
     let attempts = await peer.submitAttempts()
