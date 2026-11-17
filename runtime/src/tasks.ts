@@ -1952,7 +1952,7 @@ export class TaskStore {
       }
       const task = await this.get(input.task_id);
       const failed = this.outcome(task, this.actor(task, input.agent_id).conversation_id, null, null,
-        active.mode === "job" && error instanceof TaskError ? error.message
+        active.mode === "job" && (error instanceof TaskError || error instanceof ModelTurnError) ? error.message
           : "Worker execution did not complete; inspect the retained task and its pending input");
       await this.session.commit(async (tx) => this.outcomes?.recordIn(tx, failed, false, attemptId), BACKGROUND_CONTEXT);
       throw error;
