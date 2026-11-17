@@ -31,6 +31,7 @@ use crate::{
         HistoryResponse, HistorySource, HistoryThread, PAGE_BYTES, excerpt,
     },
     protocol::HistoryRole,
+    runtime::effects::EffectGroup,
 };
 
 const ITEM_BYTES: usize = 128 * 1024;
@@ -1619,6 +1620,7 @@ struct TurnsParams<'a> {
 }
 
 struct Connection {
+    _recorded: EffectGroup,
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
@@ -1697,6 +1699,7 @@ impl Connection {
         let mut child = command
             .spawn()
             .context("Could not start the installed Codex history reader")?;
+        let recorded = EffectGroup::led_by(child.id());
         let input = child
             .stdin
             .take()
@@ -1708,6 +1711,7 @@ impl Connection {
                 .context("Codex history output is unavailable")?,
         );
         let mut connection = Self {
+            _recorded: recorded,
             child,
             input,
             output,
@@ -1995,6 +1999,7 @@ mod tests {
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {readFile} from 'node:fs/promises';
+import {join} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {BACKGROUND_CONTEXT} from '@earendil-works/chord/context';
 import {openNodeSqliteDatabase} from '@earendil-works/chord/sqlite/node';
@@ -2006,6 +2011,7 @@ const {HistoryStore,ImportedItemEntry}=await import(new URL('./history.js',runti
 const {transcript}=await import(new URL('./transcript.js',runtime));
 let serialized='';for await(const chunk of process.stdin)serialized+=chunk;
 const input=JSON.parse(serialized), {missing,available}=input;
+const expectedAtAssetRoot=available.assets.map(asset=>({...asset,path:join(input.asset_root,asset.sha256)}));
 const thread={id:'thread-a',title:'Inspect synthetic media',cwd:'/example/project',created_at:1,updated_at:2,
   forked_from_id:null,parent_thread_id:null,version:'native-thread-v1',version_reliable:true,archived:true};
 const batch=(item)=>({host_id:'source-host',thread,items:[item],next_cursor:null,
@@ -2030,7 +2036,7 @@ try{
   assert.equal(entries.flatMap(transcript).filter(message=>message.text===missing.text).length,1);
   const overlaid=await app.store.entry(conversation.id.toString(),original.id.toString());
   assert.equal(overlaid.data.item.version,missing.version);
-  assert.deepEqual(overlaid.data.item.assets,available.assets,'Recovered refs retain their actual incoming evidence version');
+  assert.deepEqual(overlaid.data.item.assets,expectedAtAssetRoot,'Recovered refs retain their actual incoming evidence version');
   assert.equal(createHash('sha256').update(await readFile(available.assets[0].path)).digest('hex'),available.assets[0].sha256);
   assert.deepEqual(await app.store.original(overlaid),missing.data);
   assert.equal((await app.session.commit(tx=>tx.scanTasks({},100),BACKGROUND_CONTEXT)).items.length,0);
@@ -2043,7 +2049,7 @@ try{
   const saved=(await reopened.entries({order:'ascending'},100,undefined,BACKGROUND_CONTEXT)).items;
   assert.deepEqual(saved.filter(ImportedItemEntry.is),before);
   assert.equal(saved.flatMap(transcript).filter(message=>message.text===missing.text).length,1);
-  assert.deepEqual((await app.store.entry(reopened.id.toString(),original.id.toString())).data.item.assets,available.assets);
+  assert.deepEqual((await app.store.entry(reopened.id.toString(),original.id.toString())).data.item.assets,expectedAtAssetRoot);
   const executions=(await app.session.commit(tx=>tx.scanTasks({},100),BACKGROUND_CONTEXT)).items.length;
   assert.equal(executions,0);
   process.stdout.write(JSON.stringify({message_entries:1,executions})+'\n');
@@ -3356,6 +3362,7 @@ import {SqliteStorage} from '@earendil-works/pi-durable/storage/sqlite';
 const runtime=pathToFileURL(process.argv[1]);
 const {HistoryStore,ImportedItemEntry}=await import(new URL('./history.js',runtime));
 const {HistoryImports}=await import(new URL('./importer.js',runtime));
+const {LocalFiles}=await import(new URL('./failover/retained-files.js',runtime));
 const {TaskStore}=await import(new URL('./tasks.js',runtime));
 const {ConversationModels}=await import(new URL('./models.js',runtime));
 const {Retrieval}=await import(new URL('./retrieval.js',runtime));
@@ -3374,7 +3381,7 @@ async function open(){
   {models,registry:createRegistry(),identity:{attribution:null}},BACKGROUND_CONTEXT);
  const store=new HistoryStore(session),tasks=new TaskStore(session,new ConversationModels(models));tasks.useHistory(store);
  const retrieval=new Retrieval(session,store,tasks,join(evidence.directory,'search.sqlite'));
- return {session,store,retrieval,importer:new HistoryImports(session,store,join(evidence.directory,'assets'))};
+ return {session,store,retrieval,importer:new HistoryImports(session,store,new LocalFiles(evidence.directory))};
 }
 let app=await open(),reads=0;
 const call=async command=>{

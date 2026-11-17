@@ -22,6 +22,7 @@ import { TaskStore, type HostCall } from "../src/tasks.js";
 import { Retrieval } from "../src/retrieval.js";
 import { SearchIndex } from "../src/search.js";
 import { history } from "../src/transcript.js";
+import { LocalFiles } from "../src/failover/retained-files.js";
 
 const thread: HistoryThread = { id: "source-thread", title: "Revision fixture", cwd: "/example", created_at: 1, updated_at: 10,
   forked_from_id: null, parent_thread_id: null, version: "thread-one", version_reliable: true, archived: true };
@@ -185,7 +186,7 @@ test("same-host same-second captures replace revisions through the native import
     return { type: "history", response: { type: "read", thread_id: thread.id,
       version: changedDuringRead ? "native-page-snapshot" : metadata.version, items: values, next_cursor: null, gaps: [], complete: true, source_exhausted: true } };
   };
-  const run = () => new HistoryImports(app.session, app.store, join(directory, "assets")).codex([node], [node.host_id], [node.host_id], call, () => {}, () => app.retrieval.sync(app.embed, true));
+  const run = () => new HistoryImports(app.session, app.store, new LocalFiles(directory)).codex([node], [node.host_id], [node.host_id], call, () => {}, () => app.retrieval.sync(app.embed, true));
   try {
     await run(); const record = await app.store.get({ source: "codex", thread_id: thread.id }); assert.ok(record); const id = record.conversation_id;
     await app.close(); app = await open(directory);
@@ -214,7 +215,7 @@ test("a provisional advertised snapshot yields to its own already-known native r
     assert.equal(request.type, "read"); reads += 1;
     return { type: "history", response: { type: "read", thread_id: thread.id, version: "known-native", items: [current], next_cursor: null, gaps: [], complete: true, source_exhausted: true } };
   };
-  const run = () => new HistoryImports(app.session, app.store, join(directory, "assets")).codex([node], [node.host_id], [node.host_id], call, () => {}, async () => {});
+  const run = () => new HistoryImports(app.session, app.store, new LocalFiles(directory)).codex([node], [node.host_id], [node.host_id], call, () => {}, async () => {});
   try {
     await run(); advertised = "provisional-inventory"; await run();
     assert.equal(reads, 2);
@@ -262,7 +263,7 @@ test("empty targeted retry pages retain their confirmed capture and new cursor a
     return { type: "history", response: { type: "read", thread_id: thread.id, version: thread.version, items: values, next_cursor: next,
       gaps: request.cursor === null ? [missing(first.id)] : stage === 0 ? [missing(second.id)] : [], complete: false, source_exhausted: next === null } };
   };
-  const run = () => new HistoryImports(app.session, app.store, join(directory, "assets")).codex([node], [node.host_id], [node.host_id], call, () => {}, async () => {});
+  const run = () => new HistoryImports(app.session, app.store, new LocalFiles(directory)).codex([node], [node.host_id], [node.host_id], call, () => {}, async () => {});
   try {
     await run(); const record = await app.store.get({ source: "codex", thread_id: thread.id }); assert.ok(record);
     await app.close(); app = await open(directory); stage = 1; reads.length = 0;

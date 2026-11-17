@@ -4,7 +4,7 @@ use std::{
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::Path,
     process::Stdio,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -23,9 +23,12 @@ use tokio::{
 };
 
 pub(crate) mod diagnostics;
+pub(crate) mod effects;
 pub mod lifecycle;
+mod owner;
 use crate::runtime::diagnostics::{Diagnostics, Event as DiagnosticEvent, HostTiming, Trace};
 use crate::runtime::lifecycle::RequestLifecycle;
+pub use owner::{OwnerClaim, OwnerFenced};
 
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
@@ -78,6 +81,22 @@ impl WriterLock {
             .context("Another agent process owns this state directory")?;
         Ok(Self(file))
     }
+
+    /// Lets the child of `command` keep this lock after exec. The state
+    /// directory then stays locked while that child lives, also when this
+    /// process is killed first.
+    pub(crate) fn inherit(&self, command: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt;
+        let lock_fd = self.0.as_raw_fd();
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(lock_fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
 }
 
 pub struct Runtime {
@@ -89,7 +108,12 @@ pub struct Runtime {
     service_diagnostics: Mutex<Diagnostics>,
     stopping: watch::Sender<bool>,
     coordinator_id: CoordinatorId,
+    owner_epoch: Option<crate::failover::OwnerEpoch>,
     restore_held: bool,
+    /// Shared with the actor. The state directory stays locked until the
+    /// service that owns this value has drained its effects and dropped it,
+    /// and until Pi is reaped, whichever is later.
+    _claim: Arc<OwnerClaim>,
 }
 
 enum CommandMessage {
@@ -128,13 +152,13 @@ struct Pending {
 }
 
 impl Runtime {
-    pub fn start(script: &Path, state: &Path) -> Result<Self> {
-        Self::start_with_notifications(script, state, None, StartRecord::BestEffort)
+    pub fn start(script: &Path, claim: OwnerClaim) -> Result<Self> {
+        Self::start_with_notifications(script, claim, None, StartRecord::BestEffort)
     }
 
     pub(crate) fn start_with_notifications(
         script: &Path,
-        state: &Path,
+        claim: OwnerClaim,
         apns: Option<&crate::notifications::ApnsConfig>,
         start_record: StartRecord,
     ) -> Result<Self> {
@@ -142,9 +166,10 @@ impl Runtime {
             script.is_file(),
             "Pi runtime is not built; build the runtime first"
         );
-        let guard = WriterLock::acquire(state)?;
-        let restore_held = crate::backup::restore_held(&guard, state);
-        let coordinator_id = CoordinatorId::load_or_mint(state)?;
+        let state = claim.state();
+        let restore_held = crate::backup::restore_held(claim.lock(), state);
+        let coordinator_id = claim.coordinator_id();
+        let owner_epoch = claim.epoch();
         let diagnostics = match start_record {
             StartRecord::BestEffort => Diagnostics::start(state),
             StartRecord::RequiredByDreams => {
@@ -161,7 +186,7 @@ impl Runtime {
                 diagnostics
             }
         };
-        let lock_fd = guard.0.as_raw_fd();
+        let lock_fd = claim.lock().0.as_raw_fd();
         let mut command = Command::new("node");
         command
             .arg("--no-warnings")
@@ -177,6 +202,10 @@ impl Runtime {
         if let Some(config) = apns.filter(|_| !restore_held) {
             config.validate()?;
             command.env("AGENT_APNS_CONFIG", serde_json::to_string(config)?);
+        }
+        command.env_remove("AGENT_FAILOVER");
+        if let Some(session) = claim.pi_session() {
+            command.env("AGENT_FAILOVER", serde_json::to_string(&session)?);
         }
         // Pi retains this open-file description after exec. Killing its Rust
         // supervisor cannot release ownership while the real writer survives.
@@ -204,6 +233,8 @@ impl Runtime {
         let notifications = notices.clone();
         let service_diagnostics = Mutex::new(diagnostics.fork());
         let (quiescing, _) = watch::channel(false);
+        let claim = Arc::new(claim);
+        let held = claim.clone();
         let actor = tokio::spawn(async move {
             let result = run_actor(
                 child,
@@ -213,7 +244,7 @@ impl Runtime {
                     commands: incoming,
                     shutdown: stopping,
                 },
-                guard,
+                claim,
                 notifications,
                 diagnostics,
             )
@@ -230,12 +261,18 @@ impl Runtime {
             service_diagnostics,
             stopping: quiescing,
             coordinator_id,
+            owner_epoch,
             restore_held,
+            _claim: held,
         })
     }
 
     pub fn coordinator_id(&self) -> CoordinatorId {
         self.coordinator_id
+    }
+
+    pub fn owner_epoch(&self) -> Option<crate::failover::OwnerEpoch> {
+        self.owner_epoch
     }
 
     /// Whether this store waits for `backup release`, read once under this
@@ -487,7 +524,7 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
     mut stdin: ChildStdin,
     output: R,
     control: ActorControl,
-    _writer_guard: WriterLock,
+    _owner: Arc<OwnerClaim>,
     notices: broadcast::Sender<RuntimeNotice>,
     mut diagnostics: Diagnostics,
 ) -> Result<()> {
@@ -661,7 +698,9 @@ async fn run_actor<R: AsyncBufRead + Unpin>(
             child.wait().await.context("Could not confirm Pi exit")
         }
     };
-    reaped?;
+    if reaped?.code() == Some(i32::from(crate::failover::OWNER_FENCED_EXIT)) {
+        return Err(OwnerFenced::Runtime.into());
+    }
     result
 }
 
@@ -788,7 +827,7 @@ setInterval(()=>{},1000);
             .unwrap();
             let runtime = crate::runtime::Runtime::start_with_notifications(
                 &script,
-                state.path(),
+                crate::runtime::OwnerClaim::acquire(state.path(), &script, None).unwrap(),
                 Some(&apns),
                 crate::runtime::StartRecord::BestEffort,
             )
@@ -816,7 +855,7 @@ setInterval(()=>{},1000);
     async fn native_duplex_backpressure_keeps_stdout_readable_during_a_partial_command_write() {
         use crate::{
             protocol::{RuntimeCommand, RuntimeEventKind},
-            runtime::Runtime,
+            runtime::{OwnerClaim, Runtime},
         };
         use std::sync::Arc;
         let state = tempfile::tempdir().unwrap();
@@ -851,7 +890,13 @@ process.stdin.on('data',chunk=>{
  }
 });
 "#).unwrap();
-        let runtime = Arc::new(Runtime::start(&script, state.path()).unwrap());
+        let runtime = Arc::new(
+            Runtime::start(
+                &script,
+                OwnerClaim::acquire(state.path(), &script, None).unwrap(),
+            )
+            .unwrap(),
+        );
         let mut first = runtime.request(RuntimeCommand::Status).await.unwrap();
         assert!(matches!(
             first.events.recv().await,
@@ -933,7 +978,7 @@ process.stdin.on('data',chunk=>{
     async fn canceled_partial_admission_finishes_its_frame_and_rejects_unowned_host_calls() {
         use crate::{
             protocol::{RuntimeCommand, RuntimeEventKind},
-            runtime::Runtime,
+            runtime::{OwnerClaim, Runtime},
         };
         use std::sync::Arc;
         let state = tempfile::tempdir().unwrap();
@@ -969,7 +1014,13 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
  }
 });
 "#).unwrap();
-        let runtime = Arc::new(Runtime::start(&script, state.path()).unwrap());
+        let runtime = Arc::new(
+            Runtime::start(
+                &script,
+                OwnerClaim::acquire(state.path(), &script, None).unwrap(),
+            )
+            .unwrap(),
+        );
         let mut first = runtime.request(RuntimeCommand::Status).await.unwrap();
         assert!(matches!(
             first.events.recv().await,
@@ -1043,7 +1094,7 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
     async fn shutdown_bypasses_a_saturated_queue_and_reaps_a_child_that_never_reads_again() {
         use crate::{
             protocol::{RuntimeCommand, RuntimeEventKind},
-            runtime::{CommandMessage, Runtime},
+            runtime::{CommandMessage, OwnerClaim, Runtime},
         };
         use tokio::sync::oneshot;
         let state = tempfile::tempdir().unwrap();
@@ -1061,7 +1112,11 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
  }
 });setInterval(()=>{},1000);
 "#).unwrap();
-        let runtime = Runtime::start(&script, state.path()).unwrap();
+        let runtime = Runtime::start(
+            &script,
+            OwnerClaim::acquire(state.path(), &script, None).unwrap(),
+        )
+        .unwrap();
         let mut first = runtime.request(RuntimeCommand::Status).await.unwrap();
         assert!(matches!(
             first.events.recv().await,
@@ -1190,7 +1245,7 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
     async fn native_runtime_logs_correlated_lifecycle_without_private_payloads() {
         use crate::protocol::{InputMode, RuntimeCommand, RuntimeEventKind};
         use crate::runtime::{
-            Runtime,
+            OwnerClaim, Runtime,
             diagnostics::{BrowserCause, BrowserOutcome, Event, Record},
         };
         let state = tempfile::tempdir().unwrap();
@@ -1227,7 +1282,11 @@ createInterface({input:process.stdin}).on('line',line=>{
  }
 });
 "#).unwrap();
-        let runtime = Runtime::start(&script, state.path()).unwrap();
+        let runtime = Runtime::start(
+            &script,
+            OwnerClaim::acquire(state.path(), &script, None).unwrap(),
+        )
+        .unwrap();
         let mut call = runtime
             .request(RuntimeCommand::Chat {
                 origin: None,
@@ -1474,7 +1533,7 @@ createInterface({input:process.stdin}).on('line',line=>{
     #[tokio::test]
     async fn unavailable_diagnostics_does_not_block_or_change_runtime_results() {
         use crate::protocol::{RuntimeCommand, RuntimeEventKind};
-        use crate::runtime::Runtime;
+        use crate::runtime::{OwnerClaim, Runtime};
         let state = tempfile::tempdir().unwrap();
         std::fs::write(
             state.path().join("diagnostics"),
@@ -1494,7 +1553,11 @@ createInterface({input:process.stdin}).on('line',line=>{
 "#,
         )
         .unwrap();
-        let runtime = Runtime::start(&script, state.path()).unwrap();
+        let runtime = Runtime::start(
+            &script,
+            OwnerClaim::acquire(state.path(), &script, None).unwrap(),
+        )
+        .unwrap();
         for _ in 0..3 {
             let mut call = runtime.request(RuntimeCommand::Status).await.unwrap();
             timeout(Duration::from_secs(3), async {
@@ -1519,7 +1582,7 @@ createInterface({input:process.stdin}).on('line',line=>{
 
     #[tokio::test]
     async fn a_runtime_that_requires_its_start_record_refuses_to_start_and_names_the_remedy() {
-        use crate::runtime::{Runtime, StartRecord};
+        use crate::runtime::{OwnerClaim, Runtime, StartRecord};
         let state = tempfile::tempdir().unwrap();
         std::fs::write(
             state.path().join("diagnostics"),
@@ -1530,7 +1593,7 @@ createInterface({input:process.stdin}).on('line',line=>{
         std::fs::write(&script, "process.stdin.resume();\n").unwrap();
         let Err(error) = Runtime::start_with_notifications(
             &script,
-            state.path(),
+            OwnerClaim::acquire(state.path(), &script, None).unwrap(),
             None,
             StartRecord::RequiredByDreams,
         ) else {

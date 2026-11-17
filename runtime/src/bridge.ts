@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { AttachmentStore, AttachmentError, validateInput } from "./attachments.js";
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { createRegistry, Harness, ROOT_CONVERSATION_ID, type Conversation, type Submission } from "@earendil-works/pi-durable";
+import { createRegistry, Harness, ROOT_CONVERSATION_ID, type Conversation, type Storage, type Submission } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { RuntimeRequest } from "./generated/RuntimeRequest.js";
 import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
@@ -21,6 +21,7 @@ import { ConversationViews } from "./conversation-views.js";
 import { Observation } from "./observation.js";
 import { Retrieval } from "./retrieval.js";
 import { FeedbackStore } from "./feedback.js";
+import { LocalFiles, ReplicatedFiles, type RetainedFiles } from "./failover/retained-files.js";
 import { FeedbackDispatcher } from "./feedback-dispatch.js";
 import { createGuidance } from "./guidance.js";
 import { createDreamsTools, createDreamsToolset, isDreamsTask } from "./dreams.js";
@@ -48,6 +49,7 @@ import { DiagnosticsTelemetry } from "./telemetry.js";
 import { conversationUsage } from "./usage.js";
 import { StartupDiagnostics } from "./startup-diagnostics.js";
 import { openConversationDatabase } from "./conversation-database.js";
+import { effectGate, exitFenced, openReplicatedOwnership, type Ownership } from "./failover/ownership.js";
 
 function notificationConfig(): ApnsConfig | undefined {
   const saved = process.env.AGENT_APNS_CONFIG;
@@ -66,6 +68,28 @@ function stateDirectory(): string {
   return directory;
 }
 const state = stateDirectory();
+const startup = new StartupDiagnostics(state);
+/** Aborted once the bridge has closed, so nothing that waits for the authority keeps the process alive. */
+const closed = new AbortController();
+const failoverSession = process.env.AGENT_FAILOVER;
+// A replicated owner catches up with the log here, before it reads a frame
+// and before Pi opens. A fenced one never gets past this line.
+const ownership: Ownership = failoverSession === undefined ? { kind: "local" }
+  : await startup.run("storage_open", () => openReplicatedOwnership({ session: failoverSession, stateDirectory: state, onFenced: exitFenced, signal: closed.signal }));
+function openStorage(): Promise<Storage> {
+  switch (ownership.kind) {
+    case "local": return startup.run("storage_open", async () => SqliteStorage.open(await openConversationDatabase(join(state, "session.sqlite"))));
+    case "replicated": return Promise.resolve(ownership.storage);
+    default: return ownership satisfies never;
+  }
+}
+function retainedFiles(): RetainedFiles {
+  switch (ownership.kind) {
+    case "local": return new LocalFiles(state);
+    case "replicated": return new ReplicatedFiles(ownership.log, { link: ownership.link, stateDirectory: state, signal: closed.signal });
+    default: return ownership satisfies never;
+  }
+}
 const auth = new ChatGptAuth(state);
 let activeLoginRequestId: number | undefined;
 // Admission bounds initialization, not the lifetime of an attached worker or
@@ -107,7 +131,7 @@ function writeEvent(id: number, event: RuntimeEventKind): void {
 }
 function failure(id: number, code: ErrorCode, message: string): void { emit(id, { type: "failure", code, message }); }
 const hostRequests = new HostRequests((id, call_id, command) => emit(id, { type: "host_call", call_id, command }),
-  (id, call_id) => emit(id, { type: "host_cancel", call_id }));
+  (id, call_id) => emit(id, { type: "host_cancel", call_id }), effectGate(ownership));
 const inference = new ConversationModels(undefined, auth);
 const models = inference.models;
 let backgroundOwner: number | undefined;
@@ -137,11 +161,7 @@ type Application = TriageApplication & { stopInputDelivery(): void; harness: Har
   histories: HistoryStore; catalog: ConversationCatalog; attachments: AttachmentStore; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler;
   telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics; discovery: ToolDiscovery; serviceExecution: ActorExecution; goals: GoalStore };
 async function openApplication(): Promise<Application> {
-  const startup = new StartupDiagnostics(state);
-  const storage = await startup.run("storage_open", async () => {
-    const database = await openConversationDatabase(join(state, "session.sqlite"));
-    return SqliteStorage.open(database);
-  });
+  const storage = await openStorage();
   const registry = createRegistry();
   const telemetry = await DiagnosticsTelemetry.open(state);
   let harness: Harness;
@@ -151,17 +171,18 @@ async function openApplication(): Promise<Application> {
   } catch (error) { await telemetry.close(); throw error; }
   const discovery = createToolDiscovery();
   try { return await startup.run("application_recovery", async () => {
-  const notifications = new Notifications(harness, registry, notificationConfig());
+  const notifications = new Notifications(harness, registry, notificationConfig(), undefined, effectGate(ownership));
   const tasks = new TaskStore(harness, inference);
   await startup.run("task_migration", () => tasks.prepare());
-  const attachments = new AttachmentStore(state); tasks.useAttachments(attachments);
+  const files = retainedFiles();
+  const attachments = new AttachmentStore(files); tasks.useAttachments(attachments);
   const environment = new CoordinatorEnvironment(harness); environment.useLiveGuidance(); tasks.useEnvironment(environment);
   const assets = join(state, "history", "assets");
   const histories = new HistoryStore(harness, assets); tasks.useHistory(histories);
   const catalog = new ConversationCatalog(harness, histories, tasks);
-  const imports = new HistoryImports(harness, histories, assets);
+  const imports = new HistoryImports(harness, histories, files);
   const retrieval = new Retrieval(harness, histories, tasks, join(state, "search.sqlite"));
-  const feedback = new FeedbackStore(state, tasks);
+  const feedback = new FeedbackStore(files, tasks);
   const repairs = new FeedbackDispatcher(feedback, tasks, environment);
   const executions = new Executions();
   await executions.prepareRecovery(harness);
@@ -1035,18 +1056,20 @@ try {
   for (const worker of workers.values()) worker.controller.abort();
   await Promise.allSettled(pending);
 } finally {
-  if (application !== undefined) {
-    const opened = await application.catch(() => undefined);
-    if (opened !== undefined) {
-      opened.notifications.close(); opened.stopInputDelivery();
-      try {
-        void opened.tasks.detachActors();
-        await opened.harness.close(BACKGROUND_CONTEXT);
-        await opened.tasks.detachActors();
-        await opened.discovery.close();
-        await opened.retrieval.close();
+  try {
+    if (application !== undefined) {
+      const opened = await application.catch(() => undefined);
+      if (opened !== undefined) {
+        opened.notifications.close(); opened.stopInputDelivery();
+        try {
+          void opened.tasks.detachActors();
+          await opened.harness.close(BACKGROUND_CONTEXT);
+          await opened.tasks.detachActors();
+          await opened.discovery.close();
+          await opened.retrieval.close();
+        }
+        finally { await opened.telemetry.close(); }
       }
-      finally { await opened.telemetry.close(); }
     }
-  }
+  } finally { closed.abort(); }
 }

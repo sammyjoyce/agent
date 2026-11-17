@@ -28,6 +28,8 @@ export interface AuthorityClientOptions {
   readonly token: string;
   /** Bounds each request, its body included. */
   readonly timeoutMs?: number;
+  /** An abort cuts every request in flight, which then rejects as `AuthorityUnreachable`. */
+  readonly signal?: AbortSignal;
 }
 
 /**
@@ -38,11 +40,13 @@ export class AuthorityClient implements AuthorityLink {
   private readonly base: string;
   private readonly token: string;
   private readonly timeoutMs: number;
+  private readonly signal: AbortSignal | undefined;
 
-  constructor({ url, coordinatorId, token, timeoutMs = 30_000 }: AuthorityClientOptions) {
+  constructor({ url, coordinatorId, token, timeoutMs = 30_000, signal }: AuthorityClientOptions) {
     this.base = `${url.replace(/\/+$/, "")}/v1/coordinators/${coordinatorId}`;
     this.token = token;
     this.timeoutMs = timeoutMs;
+    this.signal = signal;
   }
 
   command(command: AuthorityCommand): Promise<AuthorityReply> {
@@ -90,7 +94,8 @@ export class AuthorityClient implements AuthorityLink {
     let status: number, bytes: Uint8Array;
     try {
       const response = await fetch(`${this.base}/${path}`, {
-        method, body, redirect: "error", signal: AbortSignal.timeout(this.timeoutMs),
+        method, body, redirect: "error",
+        signal: this.signal === undefined ? AbortSignal.timeout(this.timeoutMs) : AbortSignal.any([this.signal, AbortSignal.timeout(this.timeoutMs)]),
         headers: { authorization: `Bearer ${this.token}` },
       });
       status = response.status;

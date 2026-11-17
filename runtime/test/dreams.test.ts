@@ -104,6 +104,32 @@ test("a Dreams task keeps its closed toolset on every scheduled turn, and its ou
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("a dreams_review that had no result when the coordinator stopped is reported as interrupted, and the review is not asked for again", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-dreams-")); let app = await openDreams(directory);
+  try {
+    let entered = () => {};
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    app.configureBackground((command: HostCommand, signal: AbortSignal) => {
+      let operation = command;
+      while (operation.type === "on_node") operation = operation.command;
+      if (operation.type !== "dreams") return app.call(command);
+      app.requests.push(operation.request); entered();
+      return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason as Error)));
+    });
+    app.scripted(() => fauxAssistantMessage(fauxToolCall("dreams_review", { page: 1 }), { stopReason: "toolUse" }));
+    const first = runScheduled(dreamsOccurrence, new AbortController().signal, app); first.catch(() => {});
+    await started;
+    await app.close(); app = await openDreams(directory);
+
+    let told = "";
+    app.scripted((context) => { told = JSON.stringify(context.messages.filter((message) => message.role === "toolResult")); return fauxAssistantMessage("Dreams saw the interrupted review."); });
+    const task = (await app.tasks.list()).find(isDreamsTask); assert.ok(task);
+    await runScheduled(dreamsOccurrence, new AbortController().signal, app, task.id); await app.settled();
+    assert.match(told, /dreams_review was interrupted/);
+    assert.deepEqual(app.requests, [], "The reopened coordinator asked its host for no review");
+  } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("a Dreams task keeps its scheduler source", { timeout: 20_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-dreams-")), app = await openDreams(directory);
   try {

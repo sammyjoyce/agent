@@ -41,7 +41,8 @@ export function decide(record: AuthorityRecord | undefined, command: AuthorityCo
     case "enroll":
       return state.kind === "active" && state.holder === command.holder ? accept(record) : refuse("enrolled");
     case "claim":
-      return state.kind === "active" && state.holder === command.holder ? move({ ...state, epoch: state.epoch + 1 }) : fenced();
+      if (state.kind !== "active" || state.holder !== command.holder) return fenced();
+      return command.expected_epoch === state.epoch ? move({ ...state, epoch: state.epoch + 1 }) : refuse("epoch_moved");
     case "append": {
       const { entry } = command;
       if (!owns(command.holder, entry.epoch)) return fenced();
