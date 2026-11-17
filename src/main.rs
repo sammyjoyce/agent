@@ -3162,6 +3162,28 @@ fn scrawl_watcher(client: ClientContext<'_>) -> Option<WatchGuard> {
     })))
 }
 
+/// How long a worker waits for one answer from its coordinator while it
+/// registers. The coordinator may take that long for the two metadata updates
+/// of a registration.
+const WORKER_REGISTRATION_LIMIT: Duration =
+    Duration::from_secs(2 * agent_cli::broker::CONTROL_LIMIT.as_secs());
+
+/// A worker reads its coordinator's address only when it dials, so a wait
+/// without an end would keep it from the address an operator moved to a new
+/// owner.
+async fn coordinator_answer<T>(exchange: impl Future<Output = Result<T>>) -> Result<T> {
+    match timeout(WORKER_REGISTRATION_LIMIT, exchange).await {
+        Ok(answer) => answer,
+        Err(_) => {
+            let limit = WORKER_REGISTRATION_LIMIT.as_secs();
+            service_notice(format_args!(
+                "The coordinator did not answer this worker's registration within {limit}s."
+            ));
+            bail!("The coordinator did not answer a registration within {limit}s")
+        }
+    }
+}
+
 async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> {
     let ClientContext {
         config,
@@ -3204,34 +3226,38 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
                 &daemon,
             )
             .await?;
-            let settings = environment(client).await?;
+            let settings = coordinator_answer(environment(client)).await?;
             configure_messages(&settings.sources).await;
-            let mut wire = connection(client, false).await?;
-            write_command(
-                &mut *wire.writer,
-                &RuntimeCommand::ConnectWorker { node: node.clone() },
-            )
+            let (reader, mut writer, child, link) = coordinator_answer(async {
+                let mut wire = connection(client, false).await?;
+                write_command(
+                    &mut *wire.writer,
+                    &RuntimeCommand::ConnectWorker { node: node.clone() },
+                )
+                .await?;
+                let mut reader = FrameReader::new(BufReader::new(wire.reader));
+                let frame = reader
+                    .next_frame()
+                    .await?
+                    .context("Coordinator closed the worker registration")?;
+                let RuntimeEventKind::WorkerReady {
+                    coordinator_id,
+                    owner_epoch,
+                    ..
+                } = decode_coordinator_event(&frame)?
+                else {
+                    bail!("Coordinator did not accept this worker");
+                };
+                let link = OwnerLink::new(coordinator_id, owner_epoch);
+                Ok((reader, wire.writer, wire.child, link))
+            })
             .await?;
-            let mut reader = FrameReader::new(BufReader::new(wire.reader));
-            let frame = reader
-                .next_frame()
-                .await?
-                .context("Coordinator closed the worker registration")?;
-            let RuntimeEventKind::WorkerReady {
-                coordinator_id,
-                owner_epoch,
-                ..
-            } = decode_coordinator_event(&frame)?
-            else {
-                bail!("Coordinator did not accept this worker");
-            };
-            let link = OwnerLink::new(coordinator_id, owner_epoch);
             if let Err(error) = floor.admit(link) {
                 service_notice(format_args!("{error:#}"));
-                let _ = close_connection(&mut *wire.writer, wire.child).await;
+                let _ = close_connection(&mut *writer, child).await;
                 return Err(error);
             }
-            Ok::<_, anyhow::Error>((node, reader, wire.writer, wire.child, link))
+            Ok::<_, anyhow::Error>((node, reader, writer, child, link))
         };
         let registered = tokio::select! {
             registered = register => registered,

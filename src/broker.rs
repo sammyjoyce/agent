@@ -504,8 +504,11 @@ pub(crate) async fn initialize(runtime: &Runtime, bootstrap: CoordinatorBootstra
     .context("Coordinator initialization failed")
 }
 
+/// How long the coordinator gives one metadata update. A worker's registration makes two.
+pub const CONTROL_LIMIT: Duration = Duration::from_secs(15);
+
 pub async fn control(runtime: &Runtime, command: RuntimeCommand) -> Result<()> {
-    control_until(runtime, command, Instant::now() + Duration::from_secs(15))
+    control_until(runtime, command, Instant::now() + CONTROL_LIMIT)
         .await
         .context("Coordinator metadata update failed")
 }
