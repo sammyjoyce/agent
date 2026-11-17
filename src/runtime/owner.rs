@@ -3,15 +3,16 @@
 use std::{
     fmt,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::{
     coordinator_id::CoordinatorId,
     failover::{
         AuthorityRefusal, AuthorityState, FailoverConfig, FailoverHelper, FailoverOperator,
-        FailoverReport, FailoverRequest, FailoverSession, HolderId, OwnerEpoch,
+        FailoverReport, FailoverRequest, FailoverSession, HolderId, LogPosition, OwnerEpoch,
     },
     runtime::{
         WriterLock,
@@ -44,10 +45,12 @@ impl OwnerClaim {
     /// Takes `writer.lock`, then the coordinator identity. With a `[failover]`
     /// section, asks the authority for the next epoch through the runtime's
     /// helper and never mints an identity. A state directory that holds no
-    /// log position is refused before any epoch is asked for.
+    /// log position is refused before any epoch is asked for. Without the
+    /// section, a state directory that holds a log position is refused.
     pub fn acquire(state: &Path, script: &Path, failover: Option<&FailoverConfig>) -> Result<Self> {
         let Some(failover) = failover else {
             let lock = WriterLock::acquire(state)?;
+            refuse_replicated_directory(state)?;
             // Only a replicated owner's release reads this lock, so a start
             // without failover never fails on it.
             let effects = EffectsLock::share(state)
@@ -157,6 +160,56 @@ impl OwnerClaim {
             }),
         }
     }
+}
+
+/// A state directory that holds a log position opens only under an epoch
+/// from the authority. A local start of one would commit what the log never
+/// gets, and a replaced owner would serve again beside the new one.
+fn refuse_replicated_directory(state: &Path) -> Result<()> {
+    let Some(position) = held_log_position(state)? else {
+        return Ok(());
+    };
+    bail!(
+        "{} is a replicated state directory: it holds its coordinator's failover log through position {}. A coordinator opens it only under an epoch from the failover authority, and this start has no [failover] section, so it asked for no epoch and opened nothing. Run it with the config file that holds this host's [failover] section",
+        state.display(),
+        position.get()
+    )
+}
+
+/// Prints the log position a session database holds, or `null` for one that
+/// was never enrolled or joined. `failover enroll` and `failover join` write
+/// that row, through the runtime's `ScopedDatabase.stampPosition`.
+const PRINT_LOG_POSITION: &str = r#"
+const { DatabaseSync } = require("node:sqlite");
+const database = new DatabaseSync(process.argv[1], { readOnly: true, timeout: 5000 });
+const stamped = database.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'beep_boop_failover'").get();
+const row = stamped && database.prepare("SELECT position FROM beep_boop_failover WHERE singleton = 1").get();
+process.stdout.write(JSON.stringify(row ? row.position : null));
+"#;
+
+/// The log position `state` holds. Rust links no SQLite, so Node reads it.
+/// The script is inline because this check runs on every start, whichever
+/// script stands in for Pi and whatever lies beside it.
+fn held_log_position(state: &Path) -> Result<Option<LogPosition>> {
+    let database = state.join("session.sqlite");
+    if !database.exists() {
+        return Ok(None);
+    }
+    let output = Command::new("node")
+        .args(["--no-warnings", "-e", PRINT_LOG_POSITION])
+        .arg(&database)
+        .stdin(Stdio::null())
+        .output()
+        .context("Could not start node to read the state directory's log position")?;
+    ensure!(
+        output.status.success(),
+        "Could not read whether {} is a replicated state directory ({}): {}",
+        state.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("{} holds an invalid log position", database.display()))
 }
 
 /// A sealed holder that restarts says by itself that it is stopped, so the

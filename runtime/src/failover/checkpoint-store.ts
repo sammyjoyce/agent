@@ -41,7 +41,7 @@ async function archiveFiles(root: string): Promise<string[]> {
  * of at most `partBytes`, then the manifest that names them. Returns the
  * manifest's SHA-256, which the checkpoint record carries.
  */
-export async function storeCheckpoint(store: BlobStore, archive: string, header: Pick<CheckpointManifest, "through" | "coordinator_id">,
+export async function storeCheckpoint(store: BlobStore, archive: string, header: Pick<CheckpointManifest, "through" | "pi_seq" | "coordinator_id">,
   partBytes: number = CHECKPOINT_PART_BYTES): Promise<{ manifest: string; files: number; bytes: number }> {
   if (!Number.isSafeInteger(partBytes) || partBytes < 1 || partBytes > CHECKPOINT_PART_BYTES) {
     throw new Error(`A checkpoint part holds from 1 to ${CHECKPOINT_PART_BYTES} bytes, not ${partBytes}`);
@@ -71,7 +71,7 @@ export async function storeCheckpoint(store: BlobStore, archive: string, header:
     files.push({ path, size, sha256: whole.digest("hex"), parts });
   }
   await uploads.finish();
-  const manifest: CheckpointManifest = { format: CHECKPOINT_FORMAT, through: header.through, coordinator_id: header.coordinator_id, files };
+  const manifest: CheckpointManifest = { format: CHECKPOINT_FORMAT, through: header.through, pi_seq: header.pi_seq, coordinator_id: header.coordinator_id, files };
   const bytes = Buffer.from(JSON.stringify(manifest), "utf8"), sha256 = sha256Hex(bytes);
   await store.putBlob(sha256, bytes);
   return { manifest: sha256, files: files.length, bytes: files.reduce((total, file) => total + file.size, 0) };
@@ -98,10 +98,11 @@ const only = (value: Record<string, unknown>, ...keys: string[]) => Object.keys(
 /** Parses a checkpoint manifest strictly: no unknown field, no path that leaves the archive, no file named twice. */
 export function parseCheckpointManifest(value: unknown): CheckpointManifest {
   const invalid = (problem: string): never => { throw new Error(`The checkpoint manifest ${problem}`); };
-  if (!object(value) || !only(value, "format", "through", "coordinator_id", "files")) return invalid("is not a manifest object");
-  const { format, through, coordinator_id, files } = value;
+  if (!object(value) || !only(value, "format", "through", "pi_seq", "coordinator_id", "files")) return invalid("is not a manifest object");
+  const { format, through, pi_seq, coordinator_id, files } = value;
   if (format !== CHECKPOINT_FORMAT) return invalid(`uses format ${String(format)}, and this build reads format ${CHECKPOINT_FORMAT}`);
   if (!counter(through)) return invalid("names no log position");
+  if (!counter(pi_seq)) return invalid("names no Pi sequence");
   if (typeof coordinator_id !== "string" || !isLowercaseUuid(coordinator_id)) return invalid("names no coordinator");
   if (!Array.isArray(files)) return invalid("lists no files");
   const paths = new Set<string>();
@@ -113,7 +114,7 @@ export function parseCheckpointManifest(value: unknown): CheckpointManifest {
     if (!counter(size) || !digest(sha256) || !Array.isArray(parts) || !parts.every(digest)) return invalid(`lists ${path} without a size, a SHA-256 and its parts`);
     return { path, size, sha256, parts };
   });
-  return { format, through, coordinator_id, files: parsed };
+  return { format, through, pi_seq, coordinator_id, files: parsed };
 }
 
 /**

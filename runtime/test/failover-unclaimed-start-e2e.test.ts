@@ -49,7 +49,7 @@ async function upload(state: string): Promise<string> {
 }
 
 const refusal = (position: number) =>
-  new RegExp(`is a replicated state directory: it holds the failover log of coordinator \\S+ through position ${position}\\..*\\[failover\\] section`, "s");
+  new RegExp(`is a replicated state directory: it holds its coordinator's failover log through position ${position}\\..*\\[failover\\] section`, "s");
 
 test("a replicated state directory opens only under a claim, whatever the config says", { timeout: 240_000 }, async (t) => {
   const world = await World.start(t);

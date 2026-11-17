@@ -116,6 +116,25 @@ impl World {
         }
     }
 
+    /// Makes the session database, stamped at `position` as `failover enroll`
+    /// and `failover join` stamp it, or with no stamp.
+    fn session_database(&self, position: Option<u64>) {
+        let stamp = position.map_or(String::new(), |position| {
+            format!(
+                "database.exec('CREATE TABLE beep_boop_failover (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), position INTEGER NOT NULL); INSERT INTO beep_boop_failover VALUES (1, {position})');"
+            )
+        });
+        let script = format!(
+            "const database = new (require('node:sqlite').DatabaseSync)(process.argv[1]); database.exec('CREATE TABLE entries (id INTEGER PRIMARY KEY)'); {stamp} database.close();"
+        );
+        let made = Command::new("node")
+            .args(["--no-warnings", "-e", &script])
+            .arg(self.state.join("session.sqlite"))
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{}", stderr(&made));
+    }
+
     fn with_coordinator_id(self) -> Self {
         fs::write(self.state.join("coordinator-id"), COORDINATOR).unwrap();
         self
@@ -277,6 +296,36 @@ fn a_coordinator_without_failover_mints_its_id_and_never_passes_a_failover_sessi
             .rex_calls()
             .is_some_and(|calls| calls.contains("config\u{1f}check"))
     });
+    drop(supervisor);
+}
+
+#[test]
+fn a_start_without_failover_refuses_a_directory_that_holds_a_log_position_before_sources_rex_pi_or_a_socket()
+ {
+    let world = World::new(Failover::Absent).with_coordinator_id();
+    world.session_database(Some(4));
+    let output = world.run();
+    let message = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{message}");
+    assert!(
+        message.contains("is a replicated state directory")
+            && message.contains("through position 4")
+            && message.contains("[failover] section"),
+        "{message}"
+    );
+    assert!(!world.socket().exists());
+    assert_eq!(world.bridge(), None);
+    assert_eq!(world.rex_calls(), None);
+    assert!(world.helper_runs().is_empty());
+}
+
+#[test]
+fn a_start_without_failover_serves_a_directory_whose_database_holds_no_log_position() {
+    let world = World::new(Failover::Absent);
+    world.session_database(None);
+    let supervisor = world.serve();
+    assert_eq!(world.bridge().unwrap(), json!({ "failover": null }));
+    assert!(world.helper_runs().is_empty());
     drop(supervisor);
 }
 

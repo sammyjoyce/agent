@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { fetchCheckpoint, parseCheckpointManifest, readCheckpointManifest, storeCheckpoint } from "../src/failover/checkpoint-store.js";
 import { sha256Hex } from "../src/failover/log-entry.js";
-import { CHECKPOINT_PART_BYTES } from "../src/generated/failover-operator.js";
+import { CHECKPOINT_FORMAT, CHECKPOINT_PART_BYTES } from "../src/generated/failover-operator.js";
 import { fingerprint } from "./fixtures/failover-hosts.js";
 import { MemoryAuthority } from "./fixtures/failover-memory-authority.js";
 
@@ -33,23 +33,24 @@ async function archive(t: TestContext): Promise<string> {
 
 test("a checkpoint round trips through parts that each fit one request", async (t) => {
   const store = new MemoryAuthority(), source = await archive(t), target = join(await directory(t), "fetched");
-  const stored = await storeCheckpoint(store, source, { through: 7, coordinator_id: COORDINATOR }, 100);
+  const header = { through: 7, pi_seq: 41, coordinator_id: COORDINATOR };
+  const stored = await storeCheckpoint(store, source, header, 100);
   assert.deepEqual({ files: stored.files, bytes: stored.bytes }, { files: 5, bytes: 17 + 36 + 0 + 300 + 250 });
   const manifest = await readCheckpointManifest(store, stored.manifest);
-  assert.deepEqual({ format: manifest.format, through: manifest.through, coordinator_id: manifest.coordinator_id }, { format: 1, through: 7, coordinator_id: COORDINATOR });
+  assert.deepEqual({ format: manifest.format, through: manifest.through, pi_seq: manifest.pi_seq, coordinator_id: manifest.coordinator_id }, { format: CHECKPOINT_FORMAT, ...header });
   assert.deepEqual(Object.fromEntries(manifest.files.map((file) => [file.path, file.parts.length])),
     { "manifest.json": 1, "data/coordinator-id": 1, "data/empty": 0, "data/session.sqlite": 3, "data/history/assets/ragged": 3 });
   for (const sha256 of manifest.files.flatMap((file) => file.parts)) assert.ok((store.blobs.get(sha256)?.byteLength ?? 0) <= 100);
 
   assert.deepEqual(await fetchCheckpoint(store, manifest, target), { files: 5, bytes: stored.bytes });
   assert.deepEqual(await fingerprint(target), await fingerprint(source));
-  assert.deepEqual(await storeCheckpoint(store, source, { through: 7, coordinator_id: COORDINATOR }, 100), stored, "storing the same archive again names the same manifest");
-  await assert.rejects(storeCheckpoint(store, source, { through: 7, coordinator_id: COORDINATOR }, CHECKPOINT_PART_BYTES + 1), /A checkpoint part holds from 1 to/);
+  assert.deepEqual(await storeCheckpoint(store, source, header, 100), stored, "storing the same archive again names the same manifest");
+  await assert.rejects(storeCheckpoint(store, source, header, CHECKPOINT_PART_BYTES + 1), /A checkpoint part holds from 1 to/);
 });
 
 test("a part or a file that does not match its hash is refused, and the file never gets its name", async (t) => {
   const store = new MemoryAuthority(), source = await archive(t);
-  const stored = await storeCheckpoint(store, source, { through: 0, coordinator_id: COORDINATOR }, 100);
+  const stored = await storeCheckpoint(store, source, { through: 0, pi_seq: 0, coordinator_id: COORDINATOR }, 100);
   const manifest = await readCheckpointManifest(store, stored.manifest);
   const database = manifest.files.find((file) => file.path === "data/session.sqlite");
   assert.ok(database);
@@ -63,7 +64,7 @@ test("a part or a file that does not match its hash is refused, and the file nev
 
   const swapped = { ...manifest, files: manifest.files.map((file) => file === database ? { ...file, parts: [second, first, ...file.parts.slice(2)] } : file) };
   const good = new MemoryAuthority();
-  await storeCheckpoint(good, source, { through: 0, coordinator_id: COORDINATOR }, 100);
+  await storeCheckpoint(good, source, { through: 0, pi_seq: 0, coordinator_id: COORDINATOR }, 100);
   await assert.rejects(fetchCheckpoint(good, swapped, join(await directory(t), "fetched")), /parts of data\/session\.sqlite do not add up to the file/);
 
   const bytes = Buffer.from("not the manifest");
@@ -74,12 +75,13 @@ test("a part or a file that does not match its hash is refused, and the file nev
 
 test("a checkpoint manifest is parsed strictly", () => {
   const file = { path: "data/session.sqlite", size: 3, sha256: "ab".repeat(32), parts: ["cd".repeat(32)] };
-  const manifest = { format: 1, through: 0, coordinator_id: COORDINATOR, files: [file] };
+  const manifest = { format: CHECKPOINT_FORMAT, through: 0, pi_seq: 0, coordinator_id: COORDINATOR, files: [file] };
   assert.deepEqual(parseCheckpointManifest(manifest), manifest);
   const refused: [string, unknown][] = [
-    ["another format", { ...manifest, format: 2 }],
+    ["another format", { ...manifest, format: CHECKPOINT_FORMAT + 1 }],
     ["an unknown field", { ...manifest, note: "invented" }],
-    ["a missing position", { format: 1, coordinator_id: COORDINATOR, files: [] }],
+    ["a missing position", { format: CHECKPOINT_FORMAT, pi_seq: 0, coordinator_id: COORDINATOR, files: [] }],
+    ["a missing Pi sequence", { format: CHECKPOINT_FORMAT, through: 0, coordinator_id: COORDINATOR, files: [] }],
     ["a path that leaves the archive", { ...manifest, files: [{ ...file, path: "data/../../auth.json" }] }],
     ["an absolute path", { ...manifest, files: [{ ...file, path: "/tmp/invented" }] }],
     ["a path named twice", { ...manifest, files: [file, file] }],

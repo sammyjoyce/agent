@@ -62,7 +62,11 @@ test("promotion moves ownership to a standby only on stop evidence", { timeout: 
   });
 
   await t.test("a wait that ends is no evidence, and the old host's release is", async () => {
-    const { coordinator, owner, standby, epoch, head } = await replicatedPair(world);
+    const { coordinator, owner, standby, epoch: before, head } = await replicatedPair(world);
+    const alive = owner.serve({ runtime: fenced });
+    await until(() => exists(join(owner.state, "agent.sock")), "the old owner serves, with a stand-in for Pi that never reads the seal");
+    const epoch = before + 1;
+    assert.deepEqual(await owner.authorityState(), { kind: "active", epoch, holder: OWNER, head }, "the old owner's start claimed the next epoch");
     const waited = await standby.failover("promote", "--replace-epoch", String(epoch), "--wait", "1");
     assert.notEqual(waited.code, 0);
     assert.match(waited.stderr, /gave no stop evidence within 1 seconds/);
@@ -72,8 +76,6 @@ test("promotion moves ownership to a standby only on stop evidence", { timeout: 
     assert.deepEqual(await owner.authorityState(), sealed, "the record stays sealed when the wait ends");
     assert.equal(await held(standby.state), true);
 
-    const alive = owner.serve({ failover: false, runtime: fenced });
-    await until(() => exists(join(owner.state, "agent.sock")), "a process of the old owner holds its writer lock");
     const locked = await owner.failover("release");
     assert.notEqual(locked.code, 0);
     assert.match(locked.stderr, /Another agent process owns this state directory/);
