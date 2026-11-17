@@ -353,11 +353,16 @@
       XCTAssertEqual(state.generations["Check the build"], 1)
       XCTAssertEqual(state.submits.map(\.origin), ["siri"])
 
+      // The phone also observes the coordinator on its own connection, so it can learn of the
+      // placement although the submit's reply was lost. It asks again only when it was not told.
       try await world.loseNextSubmitReply()
-      let saved = try await send("Rotate the Work logs", to: work)
-      XCTAssertEqual(saved.value, "saved")
-      let again = try await send("Rotate the Work logs", to: work)
-      XCTAssertTrue(["delivered", "alreadyDelivered"].contains(again.value), again.value)
+      var answers = [try await send("Rotate the Work logs", to: work).value]
+      XCTAssertTrue(["delivered", "saved"].contains(answers[0]), answers[0])
+      if answers[0] == "saved" {
+        answers.append(try await send("Rotate the Work logs", to: work).value)
+        XCTAssertTrue(["delivered", "alreadyDelivered"].contains(answers[1]), answers[1])
+      }
+      attach(answers, named: "rotate-answers")
       state = try await world.state(once: { $0.generations["Rotate the Work logs"] != nil })
       let rotations = state.submits.filter { $0.text == "Rotate the Work logs" }
       XCTAssertEqual(Set(rotations.map(\.inputId)).count, 1, "\(rotations)")
