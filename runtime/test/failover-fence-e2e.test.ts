@@ -49,7 +49,7 @@ async function linkedPair(world: FailoverWorld) {
 async function succeed(world: FailoverWorld): Promise<void> {
   await world.serve(world.standby);
   await world.direct(world.standby);
-  await world.online(world.standby, [world.worker.nodeId]);
+  await world.redirected(world.standby);
 }
 
 /**
@@ -150,7 +150,7 @@ test("an owner the authority no longer answers, or has replaced, starts no effec
   });
 
   await t.test("a paused old owner holding a worker link: the worker drops the link within its watch and serves the new owner", async (t) => {
-    const world = await failoverWorld(t, { watchSeconds: 1 }), { owner, standby, worker } = world;
+    const world = await failoverWorld(t, { watchSeconds: 1 }), { owner, standby } = world;
     const serving = await linkedPair(world);
     await world.script("fixture-old-link", [mark(world, "old-owner"), { text: "The old owner ran its command." }]);
     assert.deepEqual(answers(await world.send(owner, "fixture-old-link")), ["The old owner ran its command."]);
@@ -161,7 +161,7 @@ test("an owner the authority no longer answers, or has replaced, starts no effec
     await world.serve(standby);
     await world.direct(standby);
     await world.until(async () => await world.floor() === 4, "The watching worker must raise its floor to the new owner's epoch");
-    await world.online(standby, [worker.nodeId]);
+    await world.redirected(standby);
     await world.script("fixture-new-link", [mark(world, "new-owner"), { text: "The new owner ran its command." }]);
     assert.deepEqual(answers(await world.send(standby, "fixture-new-link")), ["The new owner ran its command."]);
     assert.deepEqual(await markers(world), ["old-owner", "new-owner"]);

@@ -51,7 +51,7 @@ async function overlap(t: TestContext, { tool, world: options, load, prepare, ef
   await world.promote({ replaceEpoch: 2, statement: STATEMENT });
   await world.serve(standby);
   await world.direct(standby);
-  await world.online(standby, [worker.nodeId]);
+  await world.redirected(standby);
   await world.until(async () => (await world.send(standby, key, { id: sent.id })).some((event) => event.type === "input_accepted" && event.work?.type === "completed"),
     "The new owner must finish the turn it recovered");
   const told = await world.lastAsked(key);

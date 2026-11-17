@@ -729,7 +729,10 @@ epoch it has served for each coordinator in a file outside every state
 directory. It refuses a lower epoch at registration and before each effect,
 also after a restart. A worker with a `[failover]` section reads the owner
 record on an interval and ends the link of a replaced owner, which cancels the
-effects that link started.
+effects that link started. The daemon then registers at its coordinator address
+again. It waits at most 30 seconds for each answer of a registration before it
+tries again, so an old owner that accepts the connection and does not answer
+cannot hold it.
 
 **Standby.** A standby is a state directory that never runs `serve`. `failover
 join` restores a checkpoint, and `failover follow` replays log entries through
