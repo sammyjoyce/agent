@@ -97,16 +97,31 @@ final class ScopeInteractionTests: XCTestCase {
     reveal("invented-original")
     app.buttons["Done"].tap()
     XCTAssertFalse(app.navigationBars["Notice details"].exists)
-    let jobHeader = app.buttons["Details for Job: Morning review"]
-    for _ in 0..<4 where !jobHeader.isHittable { app.swipeUp() }
-    jobHeader.tap()
+    // A header under the Latest button or the composer still reports hittable, and its tap lands
+    // on the cover. Scroll until the header is clear of both, then require the sheet.
+    func open(_ header: XCUIElement) {
+      let composer = app.textViews["Message the coordinator"]
+      let latest = app.buttons["latest-messages"]
+      func covered() -> Bool {
+        guard header.exists, header.isHittable else { return true }
+        let cover = latest.exists ? latest.frame.minY : composer.frame.minY
+        return header.frame.maxY > min(cover, composer.frame.minY)
+      }
+      for _ in 0..<4 where covered() { app.swipeUp() }
+      XCTAssertFalse(covered())
+      header.tap()
+      XCTAssertTrue(app.navigationBars["Notice details"].waitForExistence(timeout: 5))
+    }
+    func close() {
+      app.buttons["Done"].tap()
+      XCTAssertTrue(app.navigationBars["Notice details"].waitForNonExistence(timeout: 5))
+    }
+    open(app.buttons["Details for Job: Morning review"])
     reveal("invented-job")
-    app.buttons["Done"].tap()
-    let legacyHeader = app.buttons["Details for Update"]
-    for _ in 0..<4 where !legacyHeader.isHittable { app.swipeUp() }
-    legacyHeader.tap()
+    close()
+    open(app.buttons["Details for Update"])
     reveal("Source and task details were not recorded for this message.")
-    app.buttons["Done"].tap()
+    close()
     let inputs = await peer.inputs()
     let attempts = await peer.submitAttempts()
     let retries = await peer.retries()
