@@ -77,12 +77,18 @@ final class ComposerInteractionTests: XCTestCase {
     // This fixture has no dictation controller. Real held-mic coverage is selected separately
     // by the native runner from DictationInteractionTests' existing progressive-speech cases.
     let controls = [menu, app.buttons["Paste images"], send].filter { $0.exists }
+    // Keyboard avoidance and the recipient line move the whole inset in screen
+    // coordinates. Wrapping should keep each control's leading anchor and keep
+    // the row together; the draft-above-controls check is assertFullWidth.
+    try await eventually(description: "composer menu and send share a baseline") {
+      abs(menu.frame.minY - send.frame.minY) < 1
+    }
     var controlFrames = controls.map { $0.frame }
     func assertControlsStayPut() {
       for (control, frame) in zip(controls, controlFrames) {
         XCTAssertEqual(control.frame.minX, frame.minX, accuracy: 1, control.identifier)
-        XCTAssertEqual(control.frame.minY, frame.minY, accuracy: 1, control.identifier)
       }
+      XCTAssertEqual(menu.frame.minY, send.frame.minY, accuracy: 1, "control row")
     }
     // Hi fits even at accessibility sizes. Comparing to 44pt would incorrectly stack it.
     XCTAssertLessThan(composer.frame.minX, send.frame.minX)
@@ -128,6 +134,9 @@ final class ComposerInteractionTests: XCTestCase {
     composer.typeText("@Work ")
     XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3))
     try await Task.sleep(for: .milliseconds(300))
+    try await eventually(description: "composer menu and send share a baseline after the chip") {
+      abs(menu.frame.minY - send.frame.minY) < 1
+    }
     controlFrames = controls.map { $0.frame }
     composer.typeText(suffix)
     try await eventually { composer.frame.maxY <= menu.frame.minY + 1 }

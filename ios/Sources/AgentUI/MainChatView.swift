@@ -749,11 +749,12 @@ public struct MainChatView: View {
             }
           #endif
         }
-        .layoutValue(key: ComposerEditorLayoutKey.self, value: true)
         .disabled(!model.draftReady)
         // The field drops a rewrite made inside its own write, so the tag moves after it. Tags are
         // read from committed text alone, so one an input method composes moves once committed.
         .onChange(of: model.committed) { model.promoteTypedTag() }
+        // Mark the complete editor subview, not a view inside its modifiers.
+        .layoutValue(key: ComposerEditorLayoutKey.self, value: true)
         #if os(iOS)
           if let dictation, dictation.model != .unsupported {
             MicButton(dictation: dictation, target: dictationTarget)

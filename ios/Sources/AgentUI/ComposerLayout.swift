@@ -31,10 +31,12 @@ struct ComposerEditorLayoutKey: LayoutValueKey {
       let width = proposal.width ?? controlWidth + gaps + sizes[editor].width
       let inlineWidth = max(1, width - controlWidth - gaps)
       let inline = subviews[editor].sizeThatFits(.init(width: inlineWidth, height: nil))
-      let stacked = inline.height > singleLineHeight + 1
+      // A one-line editor can still measure ~44pt (control minimum / rounding) against
+      // a ~42pt font line. Stack only when it is taller than both.
+      let rowHeight = controls.map { sizes[$0].height }.max() ?? 0
+      let stacked = inline.height > max(singleLineHeight, rowHeight) + 1
       sizes[editor] = subviews[editor].sizeThatFits(
         .init(width: stacked ? width : inlineWidth, height: nil))
-      let rowHeight = controls.map { sizes[$0].height }.max() ?? 0
       let height =
         stacked
         ? sizes[editor].height + spacing + rowHeight : max(sizes[editor].height, rowHeight)
