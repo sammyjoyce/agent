@@ -52,6 +52,104 @@ final class ComposerInteractionTests: XCTestCase {
     XCTAssertTrue(app.staticTexts["To Work and Personal"].waitForExistence(timeout: 10))
     return (app, work, personal)
   }
+  func testWrappingDraftMovesAboveControlsWithoutSending() async throws {
+    try await exerciseWrappingDraft(largestText: false)
+  }
+
+  func testWrappingDraftUsesFullWidthAtLargestDynamicType() async throws {
+    try await exerciseWrappingDraft(largestText: true)
+  }
+
+  private func exerciseWrappingDraft(largestText: Bool) async throws {
+    let (app, work, personal) = try await launchWithWorkAndPersonal(largestText: largestText)
+    defer { app.terminate() }
+    let composer = app.textViews["Message the coordinator"]
+    let menu = app.buttons["composerMenu"]
+    let send = app.buttons["Send message"]
+    composer.tap()
+    XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
+    try await Task.sleep(for: .milliseconds(400))
+    XCTAssertTrue(composer.showsNoText)
+    XCTAssertGreaterThan(composer.frame.minX, menu.frame.maxX, "Empty stays inline")
+    XCTAssertGreaterThan(composer.frame.maxY, menu.frame.minY, "Empty stays beside controls")
+    composer.typeText("Hi")
+    try await eventually { composer.value as? String == "Hi" }
+    // This fixture has no dictation controller. Real held-mic coverage is selected separately
+    // by the native runner from DictationInteractionTests' existing progressive-speech cases.
+    let controls = [menu, app.buttons["Paste images"], send].filter { $0.exists }
+    var controlFrames = controls.map { $0.frame }
+    func assertControlsStayPut() {
+      for (control, frame) in zip(controls, controlFrames) {
+        XCTAssertEqual(control.frame.minX, frame.minX, accuracy: 1, control.identifier)
+        XCTAssertEqual(control.frame.minY, frame.minY, accuracy: 1, control.identifier)
+      }
+    }
+    // Hi fits even at accessibility sizes. Comparing to 44pt would incorrectly stack it.
+    XCTAssertLessThan(composer.frame.minX, send.frame.minX)
+    XCTAssertGreaterThan(composer.frame.minX, menu.frame.maxX, "Short stays inline")
+    XCTAssertGreaterThan(composer.frame.maxY, menu.frame.minY, "Short stays beside controls")
+    let ready = XCTAttachment(screenshot: app.screenshot())
+    ready.name = "composer-wrap-short-ready"
+    ready.lifetime = .keepAlways
+    add(ready)
+    print(
+      "composer-wrap[short-ready] field=\(composer.frame) menu=\(menu.frame) send=\(send.frame)")
+    let suffix = String(repeating: " invented wrapping words", count: 8)
+    composer.typeText(suffix)
+    try await eventually(description: "COMPOSER_WRAP_ABOVE_CONTROLS") {
+      composer.frame.maxY <= menu.frame.minY + 1
+    }
+    func assertFullWidth(_ name: String) {
+      assertControlsStayPut()
+      XCTAssertLessThanOrEqual(composer.frame.minX, menu.frame.minX + 1)
+      XCTAssertGreaterThanOrEqual(composer.frame.maxX, send.frame.maxX - 1)
+      XCTAssertLessThanOrEqual(composer.frame.maxY, menu.frame.minY + 1)
+      XCTAssertGreaterThanOrEqual(menu.frame.height, 44)
+      XCTAssertGreaterThanOrEqual(send.frame.height, 44)
+      let image = XCTAttachment(screenshot: app.screenshot())
+      image.name = name
+      image.lifetime = .keepAlways
+      add(image)
+      print("composer-wrap[\(name)] field=\(composer.frame) menu=\(menu.frame) send=\(send.frame)")
+    }
+    assertFullWidth("wrapping-full-width")
+    // No tap to recover focus: deletion must still reach the original editor/caret.
+    composer.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: suffix.count))
+    try await eventually { composer.value as? String == "Hi" }
+    try await eventually { composer.frame.minX > menu.frame.maxX }
+    assertControlsStayPut()
+    composer.typeText("\nX")
+    try await eventually { composer.value as? String == "Hi\nX" }
+    assertFullWidth("explicit-newline-full-width")
+    composer.typeText(XCUIKeyboardKey.delete.rawValue + XCUIKeyboardKey.delete.rawValue)
+    try await eventually { composer.value as? String == "Hi" }
+    // A typed recipient must survive a subsequent reflow, without sending.
+    composer.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: 2))
+    composer.typeText("@Work ")
+    XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3))
+    try await Task.sleep(for: .milliseconds(300))
+    controlFrames = controls.map { $0.frame }
+    composer.typeText(suffix)
+    try await eventually { composer.frame.maxY <= menu.frame.minY + 1 }
+    assertFullWidth("recipient-wrapping-full-width")
+    XCTAssertTrue(app.buttons["To Work"].exists)
+    XCTAssertEqual(app.staticTexts["recipientLine"].label, "To Work")
+    // Native clipboard paste replaces a selection while retaining the recipient and focus.
+    composer.typeKey("a", modifierFlags: .command)
+    UIPasteboard.general.string = "Pasted invented note\nSecond line"
+    composer.typeKey("v", modifierFlags: .command)
+    try await eventually { composer.value as? String == "Pasted invented note\nSecond line" }
+    assertFullWidth("pasted-newline-full-width")
+    composer.typeText("X")
+    XCTAssertEqual(composer.value as? String, "Pasted invented note\nSecond lineX")
+    XCTAssertTrue(app.buttons["To Work"].exists)
+    let toWork = await work.submits()
+    let toPersonal = await personal.submits()
+    XCTAssertEqual(toWork, [], "Wrapping and editing never submit")
+    XCTAssertEqual(toPersonal, [])
+    print("composer-wrap: messagesSubmitted=\(toWork.count + toPersonal.count)")
+  }
+
   /// Where the field draws its one line of text, in points from its leading edge: the leftmost and
   /// rightmost gray pixels in a screenshot that stand out from the field's background, in either
   /// appearance. A chip's name and the caret are colored, so neither counts.
