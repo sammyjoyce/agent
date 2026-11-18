@@ -77,18 +77,23 @@ final class ComposerInteractionTests: XCTestCase {
     // This fixture has no dictation controller. Real held-mic coverage is selected separately
     // by the native runner from DictationInteractionTests' existing progressive-speech cases.
     let controls = [menu, app.buttons["Paste images"], send].filter { $0.exists }
-    // Keyboard avoidance and the recipient line move the whole inset in screen
-    // coordinates. Wrapping should keep each control's leading anchor and keep
-    // the row together; the draft-above-controls check is assertFullWidth.
+    // The Simulator shows and hides its software keyboard as hardware key events arrive, which
+    // moves the whole composer on screen. Measure each control from the composer's bottom edge,
+    // so a control that jumps inside the composer still fails.
+    let surface = app.descendants(matching: .any).matching(identifier: "messageComposer").firstMatch
     try await eventually(description: "composer menu and send share a baseline") {
       abs(menu.frame.minY - send.frame.minY) < 1
     }
-    var controlFrames = controls.map { $0.frame }
+    func placement(_ control: XCUIElement) -> CGPoint {
+      CGPoint(x: control.frame.minX, y: surface.frame.maxY - control.frame.minY)
+    }
+    var controlPlacements = controls.map(placement)
     func assertControlsStayPut() {
-      for (control, frame) in zip(controls, controlFrames) {
-        XCTAssertEqual(control.frame.minX, frame.minX, accuracy: 1, control.identifier)
+      for (control, expected) in zip(controls, controlPlacements) {
+        let actual = placement(control)
+        XCTAssertEqual(actual.x, expected.x, accuracy: 1, control.identifier)
+        XCTAssertEqual(actual.y, expected.y, accuracy: 1, control.identifier)
       }
-      XCTAssertEqual(menu.frame.minY, send.frame.minY, accuracy: 1, "control row")
     }
     // Hi fits even at accessibility sizes. Comparing to 44pt would incorrectly stack it.
     XCTAssertLessThan(composer.frame.minX, send.frame.minX)
@@ -137,14 +142,23 @@ final class ComposerInteractionTests: XCTestCase {
     try await eventually(description: "composer menu and send share a baseline after the chip") {
       abs(menu.frame.minY - send.frame.minY) < 1
     }
-    controlFrames = controls.map { $0.frame }
+    controlPlacements = controls.map(placement)
     composer.typeText(suffix)
     try await eventually { composer.frame.maxY <= menu.frame.minY + 1 }
     assertFullWidth("recipient-wrapping-full-width")
-    XCTAssertTrue(app.buttons["To Work"].exists)
+    // At the largest size the draft passes its line limit and scrolls to the caret, and the field
+    // exposes the chip only while all of it shows. Scroll back to the chip before checking it.
+    if !app.buttons["To Work"].exists { composer.swipeDown() }
+    XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3))
     XCTAssertEqual(app.staticTexts["recipientLine"].label, "To Work")
     // Native clipboard paste replaces a selection while retaining the recipient and focus.
     composer.typeKey("a", modifierFlags: .command)
+    // The first hardware shortcut in a fresh Simulator can raise a passing "Keyboard Detected"
+    // alert. Let it go before the next key, or the next key's interruption check fails on it.
+    let keyboardAlert = XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.firstMatch
+    if keyboardAlert.waitForExistence(timeout: 2) {
+      XCTAssertTrue(keyboardAlert.waitForNonExistence(timeout: 10))
+    }
     UIPasteboard.general.string = "Pasted invented note\nSecond line"
     composer.typeKey("v", modifierFlags: .command)
     try await eventually { composer.value as? String == "Pasted invented note\nSecond line" }
