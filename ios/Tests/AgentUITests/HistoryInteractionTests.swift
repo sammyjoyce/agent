@@ -147,11 +147,11 @@ final class ComposerInteractionTests: XCTestCase {
     composer.typeText(suffix)
     try await eventually { composer.frame.maxY <= menu.frame.minY + 1 }
     assertFullWidth("recipient-wrapping-full-width")
-    // At the largest size the draft passes its line limit and scrolls to the caret, and the field
-    // exposes the chip only while all of it shows. Scroll back to the chip before checking it.
-    if !app.buttons["To Work"].exists { composer.swipeDown() }
-    XCTAssertTrue(app.buttons["To Work"].waitForExistence(timeout: 3))
-    XCTAssertEqual(app.staticTexts["recipientLine"].label, "To Work")
+    // At the largest size this draft passes its line limit and scrolls to the caret, and the field
+    // exposes the chip only while all of it shows. The chip is checked again after the paste
+    // below, where the draft is short at every size.
+    if !largestText { XCTAssertTrue(app.buttons["To Work"].exists) }
+    XCTAssertEqual(recipientLine.label, "To Work")
     // Native clipboard paste replaces a selection while retaining the recipient and focus.
     composer.typeKey("a", modifierFlags: .command)
     // The first hardware shortcut in a fresh Simulator can raise a passing "Keyboard Detected"
