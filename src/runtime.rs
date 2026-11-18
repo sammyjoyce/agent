@@ -1,3 +1,4 @@
+use crate::serialized_spawn::SerializedTokioSpawn;
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
@@ -217,7 +218,9 @@ impl Runtime {
                 Ok(())
             });
         }
-        let mut child = command.spawn().context("Could not start the Pi runtime")?;
+        let mut child = command
+            .spawn_serialized()
+            .context("Could not start the Pi runtime")?;
         let stdin = child
             .stdin
             .take()

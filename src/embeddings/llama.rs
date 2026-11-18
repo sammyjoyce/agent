@@ -1,3 +1,4 @@
+use crate::serialized_spawn::SerializedTokioSpawn;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -136,7 +137,7 @@ impl LlamaProvider {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true)
-            .spawn();
+            .spawn_serialized();
         let child = match child {
             Ok(child) => child,
             Err(error) => {

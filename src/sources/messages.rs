@@ -639,6 +639,7 @@ impl Source for MessagesSource {
 
 #[cfg(test)]
 mod tests {
+    use crate::serialized_spawn::SerializedSpawn;
     use crate::sources::{
         ReadOutput, Source, SourceCheckpoint, SourceCoverage,
         messages::{
@@ -1089,7 +1090,7 @@ mod tests {
             Command::new("sqlite3")
                 .arg(&database)
                 .arg(&sql)
-                .status()
+                .status_serialized()
                 .unwrap()
                 .success()
         );
@@ -1105,7 +1106,7 @@ mod tests {
                     .arg("--db")
                     .arg(&database)
                     .args(&argv[1..])
-                    .output()
+                    .output_serialized()
                     .unwrap();
                 assert!(
                     output.status.success(),
@@ -1146,7 +1147,7 @@ mod tests {
         let unread = Command::new("sqlite3")
             .arg(&database)
             .arg("SELECT COUNT(*) FROM message WHERE is_read=0")
-            .output()
+            .output_serialized()
             .unwrap();
         assert!(unread.status.success());
         assert_eq!(String::from_utf8(unread.stdout).unwrap().trim(), "28");
@@ -1154,7 +1155,7 @@ mod tests {
             Command::new("sqlite3")
                 .arg(&database)
                 .arg("UPDATE message SET is_read=1")
-                .status()
+                .status_serialized()
                 .unwrap()
                 .success()
         );
@@ -1163,7 +1164,7 @@ mod tests {
             Command::new("sqlite3")
                 .arg(&database)
                 .arg("UPDATE message SET text='A revised example' WHERE guid='message-1'")
-                .status()
+                .status_serialized()
                 .unwrap()
                 .success()
         );

@@ -519,6 +519,7 @@ pub fn verify(scenario: Scenario, outcome: &Outcome, requests: &[Request]) -> Re
 
 #[cfg(test)]
 mod tests {
+    use agent_cli::serialized_spawn::SerializedSpawn;
     use std::time::SystemTime;
 
     use super::*;
@@ -688,7 +689,7 @@ mod tests {
     fn a_tool_still_alive_when_interrupted_is_visible_fails_the_sample() {
         let mut tool = std::process::Command::new("sleep")
             .arg("30")
-            .spawn()
+            .spawn_serialized()
             .unwrap();
         let pid = i32::try_from(tool.id()).unwrap();
         assert!(ensure_reaped(pid).is_err());

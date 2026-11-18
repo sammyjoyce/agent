@@ -226,6 +226,7 @@ impl ContextStore {
 
 #[cfg(test)]
 mod tests {
+    use crate::serialized_spawn::SerializedSpawn;
     use crate::{context::ContextStore, protocol::HostResult};
     use std::{fs, os::unix::fs::symlink, process::Command};
 
@@ -269,7 +270,7 @@ mod tests {
             Command::new("git")
                 .args(["init", "--quiet"])
                 .current_dir(root)
-                .status()
+                .status_serialized()
                 .unwrap()
                 .success()
         );

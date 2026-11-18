@@ -1,6 +1,7 @@
 //! Native conversation usage and separate read-only Codex-account quota metadata.
 //! Protocol: https://learn.chatgpt.com/docs/app-server#6-rate-limits-chatgpt
 
+use crate::serialized_spawn::SerializedTokioSpawn;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::process::Stdio;
@@ -483,7 +484,7 @@ async fn read_owned(expected_email: Option<&str>) -> anyhow::Result<UsageSnapsho
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()
+        .spawn_serialized()
         .map_err(|_| UsageError::CodexUnavailable)?;
     let diagnostics = child
         .stderr

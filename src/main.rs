@@ -5,6 +5,7 @@ mod dreams_cli;
 mod mail;
 mod state;
 
+use agent_cli::serialized_spawn::{SerializedSpawn, SerializedTokioSpawn};
 use std::{
     collections::{HashMap, VecDeque},
     env,
@@ -3512,7 +3513,7 @@ async fn local_connection(
         });
     }
     let mut child = command
-        .spawn()
+        .spawn_serialized()
         .context("Could not start the local coordinator")?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -3610,7 +3611,7 @@ async fn connection(client: ClientContext<'_>, login: bool) -> Result<Wire> {
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
     let mut child = command
-        .spawn()
+        .spawn_serialized()
         .context("Could not start the coordinator SSH connection")?;
     let reader = child.stdout.take().context("SSH output is unavailable")?;
     let writer = child.stdin.take().context("SSH input is unavailable")?;
@@ -4028,7 +4029,7 @@ async fn request_presented(
                 );
                 let status = std::process::Command::new("open")
                     .args(["-a", "Google Chrome", &url])
-                    .status()
+                    .status_serialized()
                     .context("Could not open Chrome for ChatGPT sign-in")?;
                 ensure!(status.success(), "Chrome did not open");
                 eprintln!("Finish ChatGPT sign-in in Chrome.");
@@ -4468,6 +4469,7 @@ mod tests {
     use agent_cli::models::{ModelProvider, ModelSelection, Reasoning};
     use agent_cli::protocol::{ImportPhase, ImportProgress, SearchMode};
     use agent_cli::rex::RexClient;
+    use agent_cli::serialized_spawn::SerializedSpawn;
     use clap::Parser;
     use std::path::{Path, PathBuf};
 
@@ -4789,7 +4791,7 @@ esac
                 .env("REX_SESSION", "unrelated-session")
                 .env("REX_BLOCK", "unrelated-pane")
                 .env("REX_CLIENT", "unrelated-client")
-                .output()
+                .output_serialized()
                 .unwrap();
             assert!(
                 output.status.success(),
@@ -5795,7 +5797,7 @@ esac
                     if (item.valid) models.validate(item.selection);
                     else await assert.rejects(models.preflight(item.selection), /Reasoning .* unavailable/);
                 }
-            "#]).arg(models).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            "#]).arg(models).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn_serialized().unwrap();
         child
             .stdin
             .take()

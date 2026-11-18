@@ -2,6 +2,7 @@
 //! the fixture first on PATH.
 #![allow(dead_code)]
 
+use agent_cli::serialized_spawn::SerializedSpawn;
 use std::path::Path;
 
 pub const HOST: &str = "44444444-4444-4444-8444-444444444444";
@@ -35,7 +36,7 @@ pub fn run(test: &str, case: &str, envs: &[(&str, &str)]) {
         .env("AGENT_TEST_FAKE_REX", directory.path())
         .env("PATH", path)
         .envs(envs.iter().copied())
-        .output()
+        .output_serialized()
         .unwrap();
     assert!(
         output.status.success()

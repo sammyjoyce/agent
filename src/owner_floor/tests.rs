@@ -7,7 +7,7 @@ use std::{
 use super::{BelowFloor, OwnerFloor, OwnerLink};
 use crate::{
     coordinator_id::CoordinatorId, failover::OwnerEpoch, protocol::RuntimeEventKind,
-    runtime::decode_coordinator_event,
+    runtime::decode_coordinator_event, serialized_spawn::SerializedSpawn,
 };
 
 const FIRST: &str = "11111111-1111-4111-8111-111111111111";
@@ -199,7 +199,7 @@ fn concurrent_admits_from_two_processes_never_lower_the_floor() {
                 .env(CHILD_START, start.to_string())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .spawn()
+                .spawn_serialized()
                 .unwrap()
         })
         .collect();

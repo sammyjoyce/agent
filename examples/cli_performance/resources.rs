@@ -178,12 +178,13 @@ fn read(pid: i32) -> Result<Reading> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_cli::serialized_spawn::SerializedSpawn;
 
     #[test]
     fn a_busy_child_reports_its_cpu_time_and_resident_memory() {
         let mut child = std::process::Command::new("/bin/sh")
             .args(["-c", "while :; do :; done"])
-            .spawn()
+            .spawn_serialized()
             .unwrap();
         let pid = i32::try_from(child.id()).unwrap();
         let window = Window::open(&[(Role::Coordinator, pid)]).unwrap();

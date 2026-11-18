@@ -17,7 +17,10 @@ use super::{
     AUTHORITY_UNREACHABLE_EXIT, FailoverReport, FailoverRequest, FailoverSession, OperatorReport,
     OperatorRequest,
 };
-use crate::runtime::WriterLock;
+use crate::{
+    runtime::WriterLock,
+    serialized_spawn::{SerializedSpawn, SerializedTokioSpawn},
+};
 
 /// The authority did not answer the helper or the operator. The same request is safe to repeat.
 #[derive(Debug)]
@@ -95,7 +98,7 @@ impl<Request: Serialize, Report: DeserializeOwned> FailoverScript<Request, Repor
     ) -> Result<Report> {
         let mut command = tokio::process::Command::from(self.command(session, request)?);
         command.kill_on_drop(true);
-        let output = tokio::time::timeout(limit, command.output())
+        let output = tokio::time::timeout(limit, command.output_serialized())
             .await
             .with_context(|| format!("The {} did not answer in time", self.name))?
             .with_context(|| format!("Could not start the {}", self.name))?;
@@ -104,7 +107,7 @@ impl<Request: Serialize, Report: DeserializeOwned> FailoverScript<Request, Repor
 
     fn finish(&self, mut command: Command) -> Result<Report> {
         let output = command
-            .output()
+            .output_serialized()
             .with_context(|| format!("Could not start the {}", self.name))?;
         self.report(output)
     }

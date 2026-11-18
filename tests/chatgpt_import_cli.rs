@@ -5,6 +5,7 @@ use std::{
 };
 
 use agent_cli::history::chatgpt::ChatGptPackageSummary;
+use agent_cli::serialized_spawn::SerializedSpawn;
 use serde_json::{Value, json};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
@@ -81,7 +82,7 @@ fn run(home: &Path, state: &Path, arguments: &[&str]) -> Output {
         .arg("--state-dir")
         .arg(state)
         .args(arguments)
-        .output()
+        .output_serialized()
         .unwrap()
 }
 

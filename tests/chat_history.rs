@@ -1,3 +1,4 @@
+use agent_cli::serialized_spawn::SerializedTokioSpawn;
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -165,7 +166,7 @@ async fn repeated_control_c_detaches_while_admission_is_held_and_retains_its_ori
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     let mut output = child.stdout.take().unwrap();
@@ -347,7 +348,7 @@ async fn known_chief_history_renders_while_its_observer_readiness_is_held() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     let mut output = child.stdout.take().unwrap();
@@ -790,7 +791,7 @@ async fn observer_recovery(case: RecoveryCase) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     let mut output = child.stdout.take().unwrap();
@@ -1251,7 +1252,7 @@ async fn chief_startup(mode: ChiefStartup) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     let mut output = child.stdout.take().unwrap();
@@ -1528,7 +1529,7 @@ async fn coordinator_decode_failure_reports_safe_metadata_without_private_values
         .arg("--config")
         .arg(config)
         .args(["--no-tui", "history", "read", "saved"])
-        .output()
+        .output_serialized()
         .await
         .unwrap();
     server.await.unwrap();
@@ -1699,7 +1700,7 @@ async fn exact_resume_renders_history_without_fetching_fuzzy_catalog_pages() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     let mut output = child.stdout.take().unwrap();
     let mut bytes = Vec::new();
@@ -1876,7 +1877,7 @@ async fn main_history(older: bool) {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
-            .spawn()
+            .spawn_serialized()
             .unwrap();
         child
             .stdin

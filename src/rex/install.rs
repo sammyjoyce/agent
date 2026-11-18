@@ -346,6 +346,7 @@ impl Change {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
+    use crate::serialized_spawn::SerializedSpawn;
     use std::{fs, os::unix::fs::symlink, path::PathBuf};
 
     use crate::rex::{
@@ -460,7 +461,7 @@ mod tests {
                     ])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
-                    .status();
+                    .status_serialized();
             }
         }
         #[derive(Deserialize)]
@@ -509,7 +510,7 @@ mod tests {
             .arg("--state-dir")
             .arg(directory.path().join("state"))
             .arg("--json")
-            .output()
+            .output_serialized()
             .unwrap();
         assert!(
             started.status.success(),

@@ -422,6 +422,7 @@ async fn collect(client: &RexClient, expected: Uuid) -> Result<HostResult> {
 
 #[cfg(test)]
 mod tests {
+    use crate::serialized_spawn::SerializedSpawn;
     use crate::{
         executable_fixture::write_executable,
         protocol::HostResult,
@@ -446,7 +447,7 @@ mod tests {
             std::process::Command::new("sqlite3")
                 .arg(&database)
                 .arg(schema)
-                .status()
+                .status_serialized()
                 .unwrap()
                 .success()
         );
@@ -454,7 +455,7 @@ mod tests {
             .arg("--db")
             .arg(&database)
             .args(["read", "--json", "--limit=1", "--", "example-chat"])
-            .output()
+            .output_serialized()
             .unwrap();
         assert!(
             page.status.success(),
@@ -594,7 +595,7 @@ return {first=a.state,busy=b.state,retained=retained.state,second=c.state,first_
                 &serde_json::to_string(&inputs).unwrap(),
                 "--json",
             ])
-            .output()
+            .output_serialized()
             .unwrap();
         assert!(
             output.status.success(),
@@ -724,7 +725,7 @@ return {busy_during_cleanup=busy.state,successor=next.state,old_stopped=exists(r
                 &serde_json::to_string(&inputs).unwrap(),
                 "--json",
             ])
-            .output()
+            .output_serialized()
             .unwrap();
         assert!(
             output.status.success(),

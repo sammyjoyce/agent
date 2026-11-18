@@ -18,6 +18,7 @@ use crate::{
         WriterLock,
         effects::{EffectsLock, SurvivingEffects},
     },
+    serialized_spawn::SerializedSpawn,
 };
 
 /// Proof that this process may run a coordinator. `Runtime::start` requires
@@ -199,7 +200,7 @@ fn held_log_position(state: &Path) -> Result<Option<LogPosition>> {
         .args(["--no-warnings", "-e", PRINT_LOG_POSITION, "--"])
         .arg(&database)
         .stdin(Stdio::null())
-        .output()
+        .output_serialized()
         .context("Could not start node to read the state directory's log position")?;
     ensure!(
         output.status.success(),
