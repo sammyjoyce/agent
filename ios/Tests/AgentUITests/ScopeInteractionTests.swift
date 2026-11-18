@@ -60,6 +60,135 @@ final class ScopeInteractionTests: XCTestCase {
     return (app, work, personal)
   }
 
+  func testNoticeHeaderOpensReadOnlyRecordedDetailsAndDismissesAtLargeText() async throws {
+    let details = NoticeDetails(
+      sourceConversationId: "invented-conversation", sourceEntryId: "invented-original",
+      sources: [],
+      taskId: "invented-task", taskTitle: "Parcel decision")
+    let rows: [HistoryMessage] = [
+      .init(
+        continuation: false, entryId: "notice:1", finalChunk: true,
+        noticeDetails: details, role: .notice, text: "A misleading body is not provenance."),
+      .init(
+        continuation: false, entryId: "notice:2", finalChunk: true,
+        noticeOrigin: .init(jobId: "invented-job", title: "Morning review"),
+        role: .notice, text: "Another invented update."),
+      .init(
+        continuation: false, entryId: "notice:3", finalChunk: true,
+        role: .notice, text: "Legacy update."),
+    ]
+    let (app, peer, _) = try await launch(count: 1, largestText: true) { peer, _ in
+      let history = NativeEventHistory(messages: rows, nextCursor: nil, pageComplete: true)
+      await peer.history(initial: history, pages: [:], latest: history)
+    }
+    let taskHeader = app.buttons["Details for Task: Parcel decision"]
+    // A large-text transcript may initially follow its last row.
+    for _ in 0..<4 where !taskHeader.isHittable { app.swipeDown() }
+    XCTAssertTrue(taskHeader.waitForExistence(timeout: 5))
+    taskHeader.tap()
+    XCTAssertTrue(app.navigationBars["Notice details"].waitForExistence(timeout: 5))
+    XCTAssertTrue(app.staticTexts["Parcel decision"].exists)
+    func reveal(_ text: String) {
+      for _ in 0..<8 where !app.staticTexts[text].isHittable { app.swipeUp() }
+      XCTAssertTrue(app.staticTexts[text].isHittable)
+    }
+    reveal("invented-task")
+    reveal("invented-conversation")
+    reveal("invented-original")
+    app.buttons["Done"].tap()
+    XCTAssertFalse(app.navigationBars["Notice details"].exists)
+    // A header under the Latest button or the composer still reports hittable, and its tap lands
+    // on the cover. Scroll until the header is clear of both, then require the sheet.
+    func open(_ header: XCUIElement) {
+      let composer = app.textViews["Message the coordinator"]
+      let latest = app.buttons["latest-messages"]
+      func covered() -> Bool {
+        guard header.exists, header.isHittable else { return true }
+        let cover = latest.exists ? latest.frame.minY : composer.frame.minY
+        return header.frame.maxY > min(cover, composer.frame.minY)
+      }
+      for _ in 0..<4 where covered() { app.swipeUp() }
+      XCTAssertFalse(covered())
+      header.tap()
+      XCTAssertTrue(app.navigationBars["Notice details"].waitForExistence(timeout: 5))
+    }
+    func close() {
+      app.buttons["Done"].tap()
+      XCTAssertTrue(app.navigationBars["Notice details"].waitForNonExistence(timeout: 5))
+    }
+    open(app.buttons["Details for Job: Morning review"])
+    reveal("invented-job")
+    close()
+    open(app.buttons["Details for Update"])
+    reveal("Source and task details were not recorded for this message.")
+    close()
+    let inputs = await peer.inputs()
+    let attempts = await peer.submitAttempts()
+    let retries = await peer.retries()
+    XCTAssertTrue(inputs.isEmpty)
+    XCTAssertEqual(attempts, 0)
+    XCTAssertEqual(retries, 0)
+  }
+
+  func testSourceOnlyNoticeHeadersOpenExactCanonicalEvidenceWithoutTaskMetadata() async throws {
+    let origins = [
+      (
+        "google",
+        "Parcel decision with a deliberately long invented source title that wraps compactly in the chat header"
+      ),
+      ("github", "Review requested"),
+    ]
+    let rows: [HistoryMessage] = origins.enumerated().map { index, origin in
+      .init(
+        continuation: false, entryId: "source:\(index)", finalChunk: true,
+        noticeDetails: .init(
+          sourceConversationId: "invented-source-conversation", sourceEntryId: "original-\(index)",
+          sources: [
+            .init(
+              account: "invented-\(origin.0)-account", eventId: "event-\(index)",
+              eventVersion: "v1", provider: origin.0, threadId: "thread-\(index)", title: origin.1)
+          ]),
+        role: .notice, text: "Job Fake: body text must not determine this header.")
+    }
+    let (app, peer, _) = try await launch(count: 1) { peer, _ in
+      let history = NativeEventHistory(messages: rows, nextCursor: nil, pageComplete: true)
+      await peer.history(initial: history, pages: [:], latest: history)
+    }
+    for (index, origin) in origins.enumerated() {
+      let label = "Details for \(origin.0): \(origin.1)"
+      let header = app.buttons[label]
+      for _ in 0..<4 where !header.isHittable { app.swipeDown() }
+      XCTAssertTrue(header.waitForExistence(timeout: 5))
+      header.tap()
+      XCTAssertTrue(app.navigationBars["Notice details"].waitForExistence(timeout: 5))
+      func reveal(_ text: String) {
+        for _ in 0..<8 where !app.staticTexts[text].isHittable { app.swipeUp() }
+        XCTAssertTrue(app.staticTexts[text].isHittable)
+      }
+      reveal("invented-source-conversation")
+      reveal("original-\(index)")
+      reveal(origin.1)
+      reveal(origin.0)
+      reveal("invented-\(origin.0)-account")
+      reveal("thread-\(index)")
+      reveal("event-\(index)")
+      reveal("v1")
+      XCTAssertFalse(app.staticTexts["invented-task"].exists)
+      let capture = XCTAttachment(screenshot: app.screenshot())
+      capture.name = "Source-only \(origin.0) recorded details"
+      capture.lifetime = .keepAlways
+      add(capture)
+      app.buttons["Done"].tap()
+      XCTAssertFalse(app.navigationBars["Notice details"].exists)
+    }
+    let inputs = await peer.inputs()
+    let attempts = await peer.submitAttempts()
+    let retries = await peer.retries()
+    XCTAssertTrue(inputs.isEmpty)
+    XCTAssertEqual(attempts, 0)
+    XCTAssertEqual(retries, 0)
+  }
+
   private func wait(_ condition: () async -> Bool) async throws {
     let deadline = ContinuousClock.now + .seconds(10)
     while !(await condition()) {

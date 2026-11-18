@@ -1253,6 +1253,7 @@ struct ToolResult {
 struct Entry {
     id: u64,
     kind: String,
+    assistant: bool,
     user: bool,
     data: Value,
 }
@@ -1965,11 +1966,17 @@ impl Closed<'_> {
     fn notices(&self) -> Vec<Value> {
         let origin = Self::notice_origin(&NORTHWIND);
         let notice = |publisher: &str, task: Value, origin: Option<&Value>| {
+            let mut details = json!({ "source_conversation_id": publisher, "sources": [] });
+            if !task.is_null() {
+                details["task_id"] = task.clone();
+                details["task_title"] = json!(self.seeded.title);
+            }
             json!({
                 "conversation_id": MAIN_ROLE, "kind": "agent.user_notice",
                 "data": {
                     "source_conversation_id": publisher, "task_id": task, "text": ANY_TEXT,
                     "notice_origin": origin,
+                    "notice_details": details,
                 },
             })
         };
@@ -2017,6 +2024,80 @@ impl Closed<'_> {
                 let mut record = self.entry(conversation, entry);
                 match entry.kind.as_str() {
                     "agent.user_notice" => {
+                        let details = &entry.data["notice_details"];
+                        let source_id = entry.data["source_entry_id"].as_str().and_then(|id| {
+                            id.parse::<u64>()
+                                .ok()
+                                .filter(|parsed| *parsed > 0 && parsed.to_string() == id)
+                        });
+                        let publisher = entry.data["source_conversation_id"].as_str();
+                        // Identity scope is the real publisher assistant/tool entry.
+                        // Multiple nested notices may share it; no unique nested-call
+                        // identity is inferred from message text or adjacency.
+                        let actual_assistant =
+                            source_id.zip(publisher).is_some_and(|(id, publisher)| {
+                                self.saved.conversations.iter().any(|conversation| {
+                                    conversation.id == publisher
+                                        && conversation
+                                            .entries
+                                            .iter()
+                                            .any(|original| original.id == id && original.assistant)
+                                }) && self.saved.tool_results.iter().any(|result| {
+                                    result.conversation_id == publisher
+                                        && result.call_entry_id == Some(id)
+                                        && ["notify", "notify_user", "codemode"]
+                                            .contains(&result.tool.as_str())
+                                })
+                            });
+                        let allowed = [
+                            "source_conversation_id",
+                            "source_entry_id",
+                            "task_id",
+                            "task_title",
+                            "sources",
+                        ];
+                        let valid = actual_assistant
+                            && details.as_object().is_some_and(|fields| {
+                                fields.keys().all(|key| allowed.contains(&key.as_str()))
+                            })
+                            && details["source_entry_id"] == entry.data["source_entry_id"]
+                            && details["source_conversation_id"]
+                                == entry.data["source_conversation_id"]
+                            && (if entry.data["task_id"].is_null() {
+                                details.get("task_id").is_none()
+                                    && details.get("task_title").is_none()
+                            } else {
+                                details["task_id"] == entry.data["task_id"]
+                                    && details["task_title"] == self.seeded.title
+                            });
+                        if valid {
+                            forget(&mut record["data"]["notice_details"], &["source_entry_id"]);
+                        } else {
+                            record["data"]["notice_details"]["invalid_snapshot_binding"] =
+                                json!(true);
+                        }
+                        if let Some(sources) =
+                            record["data"]["notice_details"]["sources"].as_array_mut()
+                        {
+                            sources.retain(|source| {
+                                // Compare to independent admitted event records, including the
+                                // exact revision/title, before accounting for variable citations.
+                                let canonical = self.saved.events.iter().any(|admitted| {
+                                    let event = &admitted["event"];
+                                    about_northwind(event)
+                                        && *source
+                                            == json!({
+                                                "provider": event["source"]["provider"],
+                                                "account": event["source"]["account"],
+                                                "thread_id": event["source"]["thread_id"],
+                                                "title": event["title"],
+                                                "event_id": event["id"],
+                                                "event_version": event["version"],
+                                            })
+                                });
+                                !canonical
+                            });
+                        }
                         forget(&mut record["data"], &["source_entry_id"]);
                         if let Some(text) = record["data"].get_mut("text") {
                             any_text(text);
@@ -2400,11 +2481,188 @@ fn assert_oracles(scenario: &Scenario, checks: &[Oracle]) {
     );
 }
 
+// One real publication is read back once; each corruption is applied only to a
+// clone of its notice. Admitted events and original assistant/tool records stay
+// independent, so a forged notice cannot manufacture its own expected evidence.
+fn assert_notice_mutations(
+    scenario: &Scenario,
+    world: &World,
+    seeded: &TaskRecord,
+    decoy: &TaskRecord,
+    saved: &Readback,
+) {
+    let closed = |state: &Readback| {
+        Closed {
+            scenario,
+            world,
+            seeded,
+            decoy,
+            saved: state,
+        }
+        .notices()
+    };
+    assert!(
+        closed(saved).is_empty(),
+        "Unchanged legal publication must pass"
+    );
+    let (conversation, entry) = saved
+        .conversations
+        .iter()
+        .enumerate()
+        .find_map(|(ci, c)| {
+            c.entries
+                .iter()
+                .position(|entry| entry.kind == "agent.user_notice")
+                .map(|ei| (ci, ei))
+        })
+        .expect("The real fixture must publish a notice");
+    let data = &saved.conversations[conversation].entries[entry].data;
+    let sources = data["notice_details"]["sources"].as_array().unwrap();
+    let google = sources
+        .iter()
+        .position(|source| source["provider"] == "google")
+        .expect("Actual Google citation");
+    let outcome = sources
+        .iter()
+        .position(|source| source["provider"] == "task_outcomes")
+        .expect("Actual outcome citation");
+    let base = serde_json::to_value(saved).unwrap();
+    let prefix = format!("/conversations/{conversation}/entries/{entry}/data");
+    let mut cases: Vec<(String, String, Value)> = Vec::new();
+    for (provider, index) in [("google", google), ("outcome", outcome)] {
+        for field in [
+            "title",
+            "event_version",
+            "account",
+            "provider",
+            "thread_id",
+            "event_id",
+        ] {
+            cases.push((
+                format!("{provider} wrong {field}"),
+                format!("{prefix}/notice_details/sources/{index}/{field}"),
+                json!("invented-corruption"),
+            ));
+        }
+        cases.push((
+            format!("{provider} body substituted as title"),
+            format!("{prefix}/notice_details/sources/{index}/title"),
+            json!("Invented private body must not become provenance"),
+        ));
+    }
+    for (field, value) in [
+        ("source_entry_id", json!("999999999")),
+        ("source_conversation_id", json!("999999999")),
+        ("task_id", json!("invented-wrong-task")),
+        ("task_title", json!("invented-wrong-title")),
+    ] {
+        cases.push((
+            format!("nested wrong {field}"),
+            format!("{prefix}/notice_details/{field}"),
+            value,
+        ));
+    }
+    let mut checked = 0;
+    let rejects = |mutated: Value, name: &str| {
+        let state: Readback = serde_json::from_value(mutated).unwrap();
+        assert!(
+            !closed(&state).is_empty(),
+            "store.notices silently accepted {name}"
+        );
+        eprintln!("NOTICE_MUTATION_REJECTED {name}");
+    };
+    for (name, path, value) in cases {
+        let mut mutated = base.clone();
+        *mutated.pointer_mut(&path).unwrap() = value;
+        rejects(mutated, &name);
+        checked += 1;
+    }
+    for value in [json!("999999999"), Value::Null] {
+        let mut mutated = base.clone();
+        *mutated
+            .pointer_mut(&format!("{prefix}/source_entry_id"))
+            .unwrap() = value.clone();
+        *mutated
+            .pointer_mut(&format!("{prefix}/notice_details/source_entry_id"))
+            .unwrap() = value;
+        rejects(mutated, "both entry IDs forged equal");
+        checked += 1;
+    }
+    let mut mutated = base.clone();
+    mutated
+        .pointer_mut(&prefix)
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("source_entry_id");
+    mutated
+        .pointer_mut(&format!("{prefix}/notice_details"))
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("source_entry_id");
+    rejects(mutated, "both entry IDs missing");
+    checked += 1;
+    for suffix in [
+        "notice_details",
+        &format!("notice_details/sources/{google}"),
+    ] {
+        for value in [json!("Invented extra body"), Value::Null] {
+            let mut mutated = base.clone();
+            mutated
+                .pointer_mut(&format!("{prefix}/{suffix}"))
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("body".into(), value);
+            rejects(mutated, "unknown body field");
+            checked += 1;
+        }
+    }
+    let mut mutated = base.clone();
+    *mutated.pointer_mut(&format!("{prefix}/task_id")).unwrap() = Value::Null;
+    mutated
+        .pointer_mut(&format!("{prefix}/notice_details"))
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("task_id");
+    rejects(mutated, "null task with unbound title");
+    checked += 1;
+    eprintln!(
+        "NOTICE_MUTATIONS: legal readback passed; {checked} independent corruptions rejected"
+    );
+}
+
+#[tokio::test]
+async fn notice_oracle_rejects_corrupted_real_publication_snapshots() {
+    let _turn = SWITCHBOARD.lock().await;
+    let scenario = scenario("injected_instructions_in_confirmation");
+    let script = |at: &Attempt| {
+        at.books_then(outcome_triage_that(&format!(
+        "const evidence = JSON.parse(await tools.read_source_events({{ limit: 100 }}));         await tools.notify({{ keys: evidence.filter(record => record.event.source.thread_id === {:?} || record.event.source.thread_id === {:?}).map(record => record.key), task_id: {:?}, text: \"Invented legal update.\" }});",
+        NORTHWIND.thread, at.task.to_string(), at.task.to_string()
+    ), OWN_TASK))
+    };
+    let checks = run_with_notice_mutations(scenario, &script, Setup::Plain, false, true).await;
+    assert_oracles(scenario, &checks);
+}
+
 async fn run(
     scenario: &Scenario,
     script: &dyn Fn(&Attempt) -> Script,
     setup: Setup,
     crash: bool,
+) -> Vec<Oracle> {
+    run_with_notice_mutations(scenario, script, setup, crash, false).await
+}
+
+async fn run_with_notice_mutations(
+    scenario: &Scenario,
+    script: &dyn Fn(&Attempt) -> Script,
+    setup: Setup,
+    crash: bool,
+    verify_notice_mutations: bool,
 ) -> Vec<Oracle> {
     let world = World::new(scenario.seeded_ledger);
     let Seeded {
@@ -2486,7 +2744,11 @@ async fn run(
     }
     let drained = settle(&world, scenario.rounds.len()).await;
     coordinator.close().await;
-    checks.extend(oracles(scenario, &world, &task, &decoy, &readback(&world)));
+    let saved = readback(&world);
+    if verify_notice_mutations {
+        assert_notice_mutations(scenario, &world, &task, &decoy, &saved);
+    }
+    checks.extend(oracles(scenario, &world, &task, &decoy, &saved));
     checks.push(oracle(
         "scripted_steps_consumed",
         drained && world.drained(),

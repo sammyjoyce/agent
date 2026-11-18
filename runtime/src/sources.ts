@@ -579,12 +579,12 @@ export class SourceJournal {
     text: string, emit?: (task: string | null, text: string) => void): Promise<NoticePublication> {
     const records = await this.events({ keys, limit: 100 });
     if (new Set(keys).size !== records.length) throw new TaskError("Notification refers to unknown source events");
-    if (taskId !== null) await this.tasks.get(taskId);
+    const task = taskId === null ? undefined : await this.tasks.get(taskId);
     const conversation = await this.tasks.conversation(conversationId);
     const origin = await this.tasks.origin(conversation, callId);
     const lineage = await this.tasks.noticeOrigin(conversation, origin.id);
     const publication = await publishMainNotice(this.session, conversation, origin, taskId, records.map((record) => record.event.source),
-      { key: callId, text, events: records.map((record) => record.event), ...(lineage === undefined ? {} : { origin: lineage }) });
+      { key: callId, text, ...(task === undefined ? {} : { taskTitle: task.title }), events: records.map((record) => record.event), ...(lineage === undefined ? {} : { origin: lineage }) });
     if (publication === "published") emit?.(taskId, text);
     return publication;
   }

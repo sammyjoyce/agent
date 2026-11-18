@@ -799,6 +799,7 @@ mod tests {
         final_chunk: bool,
     ) -> HistoryMessage {
         HistoryMessage {
+            notice_details: None,
             notice_origin: None,
             presentation: None,
             entry_id: id.into(),
