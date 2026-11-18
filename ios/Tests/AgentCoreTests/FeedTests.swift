@@ -460,6 +460,7 @@ actor WorkRoute {
 @MainActor func withTwoFixtures(
   registration: NotificationRegistration? = nil, holdingWork gate: DialGate? = nil,
   holdingPersonal personalGate: DialGate? = nil, route: WorkRoute? = nil, draft: String? = nil,
+  spotlight: SpotlightFake? = nil,
   _ body: (Coordinators, FixtureCoordinator, FixtureCoordinator, URL) async throws -> Void
 ) async throws {
   let first = FixtureCoordinator()
@@ -486,7 +487,8 @@ actor WorkRoute {
       let personal = (address.port == 4002) != swapped || repointed
       return LineConnection(
         connection: NWConnection(to: personal ? secondPort : firstPort, using: .tcp))
-    }, persistence: draft.map { ComposerDraftStore(url: root.appending(path: $0)) })
+    }, persistence: draft.map { ComposerDraftStore(url: root.appending(path: $0)) },
+    spotlight: spotlight)
   await coordinators.setActive(true)
   do {
     try await body(coordinators, first, second, root)
