@@ -86,7 +86,7 @@ class FixtureHost {
       }
       case "write_file": this.files.set(command.path, command.content); return { type: "written" };
       case "exec": return { type: "process", exit_code: 0, stdout: "", stderr: "", truncated: false };
-      case "spawn_worker": return { type: "spawned", binding };
+      case "spawn_workspace_worker": return { type: "spawned", binding };
       case "resume_worker": return { type: "written" };
       case "inspect_worker": return { type: "worker_presence", presence: { state: "present", running: false } };
       default: throw new Error(`The fixture host does not run ${command.type}`);
@@ -427,16 +427,16 @@ test("main sets its goal in one new task, replays by request ID and keeps it acr
     assert.equal(task.title, objective); assert.equal(task.outcome, objective);
     assert.deepEqual(task.pending.map((input) => input.id), [`goal:${request}:1:0`]);
     assert.match(task.pending[0]?.content ?? "", /^Goal set with \/goal: Write the fixture summary/);
-    const spawned = host.calls.filter((command) => command.type === "spawn_worker");
+    const spawned = host.calls.filter((command) => command.type === "spawn_workspace_worker");
     assert.equal(spawned.length, 1);
-    assert.equal(spawned[0]?.type === "spawn_worker" ? spawned[0].host.host_id : undefined, nodeId);
+    assert.equal(spawned[0]?.type === "spawn_workspace_worker" ? spawned[0].host.host_id : undefined, nodeId);
 
     const replayed = await app.goal(MAIN, { type: "set", request_id: request, objective });
     assert.deepEqual(goalOf(replayed), goal);
     await assert.rejects(app.goal(MAIN, { type: "set", request_id: randomUUID(), objective: "Another goal" }), /already has an unfinished goal/);
     assert.deepEqual((await app.tasks.list()).map((saved) => saved.id), [request]);
     assert.equal((await app.tasks.get(request)).pending.length, 1);
-    assert.equal(host.count("spawn_worker"), 1);
+    assert.equal(host.count("spawn_workspace_worker"), 1);
 
     app = await fixture.reopen();
     assert.deepEqual(goalOf(await app.goal(MAIN, show)), goal);

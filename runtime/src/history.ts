@@ -7,26 +7,57 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { defineDocFamily, defineEntry, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Harness, type Tx } from "@earendil-works/pi-durable";
 import type { HistoryGap } from "./generated/HistoryGap.js";
 import type { HistoryAssetRef } from "./generated/HistoryAssetRef.js";
+import type { HistoryBranch } from "./generated/HistoryBranch.js";
 import type { HistoryImportBatch } from "./generated/HistoryImportBatch.js";
 import type { HistoryImportReceipt } from "./generated/HistoryImportReceipt.js";
 import type { HistoryItem } from "./generated/HistoryItem.js";
+import type { HistoryProvider } from "./generated/HistoryProvider.js";
+import type { HistoryRole } from "./generated/HistoryRole.js";
 import type { HistoryRetryPage } from "./generated/HistoryRetryPage.js";
 import type { HistoryThread } from "./generated/HistoryThread.js";
 import type { ImportedConversation } from "./generated/ImportedConversation.js";
 import type { ImportedConversationSummary } from "./generated/ImportedConversationSummary.js";
+import type { SourceRef } from "./generated/SourceRef.js";
 import { HistoryObservation, HistoryRevisions, REVISION_FORMAT, RevisionTracker, type CaptureState, type RevisionView, type SourceCapture, type SourceSnapshot } from "./history-revisions.js";
+import { field, string } from "./message-presentation.js";
+
+export type SourceThread = { readonly source: HistoryProvider; readonly thread_id: string };
+const HISTORY_SOURCES = {
+  codex: { account: "local" },
+  chatgpt: { account: "export" },
+} as const satisfies Record<HistoryProvider, { account: string }>;
+export function historyKey(source: HistoryProvider, ...values: string[]): string {
+  return createHash("sha256").update(JSON.stringify([source, ...values])).digest("hex");
+}
+export function importedThread(record: Pick<ImportedConversation, "source" | "thread">): SourceThread {
+  return { source: record.source, thread_id: record.thread.id };
+}
+export function entryThread(entry: { data: { source: HistoryProvider; thread_id: string } }): SourceThread {
+  return { source: entry.data.source, thread_id: entry.data.thread_id };
+}
+export function importedSourceRef(record: Pick<ImportedConversation, "source" | "thread">): SourceRef {
+  return { provider: record.source, account: HISTORY_SOURCES[record.source].account, thread_id: record.thread.id };
+}
+const CHATGPT_SEARCHABLE_ROLES: ReadonlySet<HistoryRole> = new Set(["user", "assistant", "commentary", "final"]);
+export function shownInConversation(item: { branch?: HistoryBranch }): boolean {
+  return item.branch === undefined || item.branch.state === "current";
+}
 
 type InertItem = Omit<HistoryItem, "data"> & { data: JsonValue };
-export const ImportedItemEntry = defineEntry<{ source: "codex"; thread_id: string; item: InertItem; observed_at?: number; snapshot?: SourceSnapshot }>("agent.history.item");
-export const ImportedThreadEntry = defineEntry<{ source: "codex"; thread: HistoryThread }>("agent.history.thread");
+export const ImportedItemEntry = defineEntry<{ source: HistoryProvider; thread_id: string; item: InertItem; observed_at?: number; snapshot?: SourceSnapshot }>("agent.history.item");
+export const ImportedThreadEntry = defineEntry<{ source: HistoryProvider; thread: HistoryThread }>("agent.history.thread");
 type ThreadState = { native_id: ConversationId | null; record: ImportedConversation | null; watermark: EntryId | null; evidence: string | null; snapshot?: SourceSnapshot; capture?: CaptureState };
 export type ImportCheckpoint = { version: string; next_cursor: string | null; complete: boolean; gaps: HistoryGap[]; updated_at: number;
   resume_cursor?: string | null;
   source_exhausted?: boolean; retry_pages?: HistoryRetryPage[]; snapshot?: SourceSnapshot; capture?: CaptureState };
 const Threads = defineDocFamily<ThreadState, null>({ kind: "agent.history.threads", scope: "session", family: true, version: 1,
   initial: () => ({ native_id: null, record: null, watermark: null, evidence: null }), checkpointWhen: () => true });
-const Reverse = defineDocFamily<{ thread_id: string | null }, null>({ kind: "agent.history.conversations", scope: "session", family: true, version: 1,
+type ReverseLink = { thread_id: string | null; source?: Exclude<HistoryProvider, "codex"> };
+const Reverse = defineDocFamily<ReverseLink, null>({ kind: "agent.history.conversations", scope: "session", family: true, version: 1,
   initial: () => ({ thread_id: null }), checkpointWhen: () => true });
+function reverseThread(link: Readonly<ReverseLink> | undefined): SourceThread | undefined {
+  return link?.thread_id === null || link?.thread_id === undefined ? undefined : { source: link.source ?? "codex", thread_id: link.thread_id };
+}
 const Checkpoints = defineDocFamily<{ checkpoint: ImportCheckpoint | null; captures?: { next: number; versions: Record<string, number>; confirmed?: Record<string, string> } }, null>({ kind: "agent.history.hosts", scope: "session", family: true, version: 1,
   initial: () => ({ checkpoint: null }), checkpointWhen: () => true });
 const RetainedAssets = defineDocFamily<{ assets: HistoryAssetRef[] }, null>({ kind: "agent.history.assets", scope: "session", family: true, version: 1,
@@ -39,7 +70,6 @@ type Cache = { native_id: ConversationId | null; watermark: EntryId | null; rece
   canonical: Map<string, string>; items: Map<string, Set<EntryId>>; entries: Map<string, EntryId>; revisions: RevisionTracker };
 export class HistoryError extends Error {}
 class OriginalUnavailable extends HistoryError {}
-function identity(...values: string[]): string { return createHash("sha256").update(JSON.stringify(["codex", ...values])).digest("hex"); }
 function receipt(item: HistoryItem): string { return JSON.stringify(["item", item.id, item.version]); }
 function captureOrder(previous: SourceSnapshot | undefined, state: CaptureState | undefined, incoming: SourceCapture | undefined): "older" | "own_provisional" | "comparable" | "unknown" {
   if (previous === undefined || incoming === undefined || previous.host_id !== incoming.snapshot.host_id) return "unknown";
@@ -50,7 +80,7 @@ function captureOrder(previous: SourceSnapshot | undefined, state: CaptureState 
 }
 function sameContext(left: InertItem, right: InertItem): boolean {
   return left.id === right.id && left.turn_id === right.turn_id && left.kind === right.kind && left.role === right.role &&
-    left.order === right.order && left.timestamp_ms === right.timestamp_ms;
+    left.order === right.order && left.timestamp_ms === right.timestamp_ms && isDeepStrictEqual(left.branch, right.branch);
 }
 function mergeAssets(left: readonly HistoryAssetRef[], right: readonly HistoryAssetRef[]): HistoryAssetRef[] {
   return [...new Map([...left, ...right].map((asset) => [JSON.stringify([asset.kind, asset.path]), asset])).values()];
@@ -98,33 +128,36 @@ export function importedText(entry: EntryRecord): string | undefined {
 
 /** Native data entries are the item/version ledger; no submissions or executions. */
 export class HistoryStore {
-  private cached: { thread_id: string; cache: Cache } | undefined;
+  private cached: { key: string; cache: Cache } | undefined;
   constructor(readonly session: Harness, private readonly assetRoot?: string) {}
-  async get(threadId: string): Promise<ImportedConversation | undefined> {
-    const state = await this.session.snapshot(Threads, identity(threadId), BACKGROUND_CONTEXT);
+  async get(thread: SourceThread): Promise<ImportedConversation | undefined> {
+    const state = await this.session.snapshot(Threads, historyKey(thread.source, thread.thread_id), BACKGROUND_CONTEXT);
     return state?.record === null || state?.record === undefined ? undefined : detached(state.record);
   }
-  async byConversation(id: string): Promise<ImportedConversation | undefined> {
-    const link = await this.session.snapshot(Reverse, id, BACKGROUND_CONTEXT);
-    return link?.thread_id === null || link?.thread_id === undefined ? undefined : this.get(link.thread_id);
+  private async linked(conversationId: string): Promise<SourceThread | undefined> {
+    return reverseThread(await this.session.snapshot(Reverse, conversationId, BACKGROUND_CONTEXT));
   }
-  async checkpoint(threadId: string, hostId: string): Promise<ImportCheckpoint | undefined> {
-    const state = await this.session.snapshot(Checkpoints, identity(threadId, hostId), BACKGROUND_CONTEXT);
+  async byConversation(id: string): Promise<ImportedConversation | undefined> {
+    const thread = await this.linked(id);
+    return thread === undefined ? undefined : this.get(thread);
+  }
+  async checkpoint(thread: SourceThread, origin: string): Promise<ImportCheckpoint | undefined> {
+    const state = await this.session.snapshot(Checkpoints, historyKey(thread.source, thread.thread_id, origin), BACKGROUND_CONTEXT);
     return state?.checkpoint === null || state?.checkpoint === undefined ? undefined : structuredClone(state.checkpoint);
   }
   /** Claim capture order before a source RPC; known snapshot replays keep their epoch. */
-  async capture(hostId: string, thread: HistoryThread, freshAttempt = false): Promise<SourceCapture | undefined> {
+  async capture(origin: string, source: HistoryProvider, thread: HistoryThread, freshAttempt = false): Promise<SourceCapture | undefined> {
     if (!thread.version_reliable) return undefined;
     return this.session.commit(async (tx) => {
-      const state = await tx.doc(Checkpoints, identity(thread.id, hostId), null);
+      const state = await tx.doc(Checkpoints, historyKey(source, thread.id, origin), null);
       if (state.captures === undefined) state.captures = { next: 0, versions: {} };
-      const clock = state.captures, key = identity("snapshot", thread.version);
+      const clock = state.captures, key = historyKey(source, "snapshot", thread.version);
       const known = clock.versions[key];
-      if (!freshAttempt && known !== undefined) return { thread_id: thread.id, attempt: known, phase: "advertised",
-        snapshot: { host_id: hostId, version: thread.version, sequence: known } };
+      if (!freshAttempt && known !== undefined) return { source, thread_id: thread.id, attempt: known, phase: "advertised",
+        snapshot: { host_id: origin, version: thread.version, sequence: known } };
       if (!Number.isSafeInteger(clock.next) || clock.next >= Number.MAX_SAFE_INTEGER) throw new HistoryError("History capture sequence is unavailable");
       const attempt = ++clock.next, sequence = known ?? attempt; clock.versions[key] = sequence;
-      return { thread_id: thread.id, attempt, phase: "advertised", snapshot: { host_id: hostId, version: thread.version, sequence } };
+      return { source, thread_id: thread.id, attempt, phase: "advertised", snapshot: { host_id: origin, version: thread.version, sequence } };
     }, BACKGROUND_CONTEXT);
   }
   /** A first page can reveal a newer native fingerprint than its inventory did. */
@@ -133,11 +166,11 @@ export class HistoryStore {
     if (capture.thread_id !== thread.id) throw new HistoryError("History capture belongs to another thread");
     if (capture.phase === "read") return capture.snapshot.version === thread.version ? capture : null;
     return this.session.commit(async (tx) => {
-      const state = await tx.doc(Checkpoints, identity(thread.id, capture.snapshot.host_id), null), clock = state.captures;
+      const state = await tx.doc(Checkpoints, historyKey(capture.source, thread.id, capture.snapshot.host_id), null), clock = state.captures;
       if (clock === undefined || capture.attempt > clock.next) throw new HistoryError("History capture is unavailable");
       const confirmation = clock.confirmed?.[capture.attempt.toString()];
       if (confirmation !== undefined && confirmation !== thread.version) return null;
-      const key = identity("snapshot", thread.version), known = clock.versions[key];
+      const key = historyKey(capture.source, "snapshot", thread.version), known = clock.versions[key];
       // An overlapping later capture makes an unadvertised version's order
       // unknowable. Retain the page without inventing a host epoch for it.
       if (known === undefined && capture.attempt < clock.next) return null;
@@ -149,23 +182,23 @@ export class HistoryStore {
     }, BACKGROUND_CONTEXT);
   }
   /** Bounded read. Legacy ledgers reconcile under the existing index owner. */
-  async revisionView(threadId: string): Promise<RevisionView> {
+  async revisionView(thread: SourceThread): Promise<RevisionView> {
     // Imports publish this certificate in the same commit as their source rows.
     // Its cutoff also excludes a later concurrent import from this read snapshot.
-    const projection = await this.session.snapshot(HistoryRevisions, identity(threadId), BACKGROUND_CONTEXT);
+    const projection = await this.session.snapshot(HistoryRevisions, historyKey(thread.source, thread.thread_id), BACKGROUND_CONTEXT);
     return { watermark: projection?.watermark ?? null, ready: projection?.format === REVISION_FORMAT && projection.watermark !== null,
       entries: projection?.entries ?? {} };
   }
   async prepareRevisions(conversationId: string): Promise<void> {
-    const link = await this.session.snapshot(Reverse, conversationId, BACKGROUND_CONTEXT);
-    if (link?.thread_id === undefined || link.thread_id === null) return;
-    const key = identity(link.thread_id);
+    const thread = await this.linked(conversationId);
+    if (thread === undefined) return;
+    const key = historyKey(thread.source, thread.thread_id);
     while (true) {
       const state = await this.session.snapshot(Threads, key, BACKGROUND_CONTEXT);
       if (state?.native_id === undefined || state.native_id === null) return;
       const projection = await this.session.snapshot(HistoryRevisions, key, BACKGROUND_CONTEXT);
       if (projection?.format === REVISION_FORMAT && projection.watermark === state.watermark) return;
-      const cache = await this.cache(link.thread_id, state), entries = cache.revisions.projection();
+      const cache = await this.cache(key, state), entries = cache.revisions.projection();
       if (await this.session.commit(async (tx) => {
         const current = await tx.doc(Threads, key, null);
         if (current.native_id !== state.native_id || current.watermark !== state.watermark) return false;
@@ -174,9 +207,9 @@ export class HistoryStore {
     }
   }
   /** Older native listings omitted lineage even when a read supplied the current version. */
-  async reconcileLineage(thread: HistoryThread): Promise<void> {
+  async reconcileLineage(source: HistoryProvider, thread: HistoryThread): Promise<void> {
     if (!thread.version_reliable) return;
-    const key = identity(thread.id), before = await this.session.snapshot(Threads, key, BACKGROUND_CONTEXT);
+    const key = historyKey(source, thread.id), before = await this.session.snapshot(Threads, key, BACKGROUND_CONTEXT);
     const previous = before?.record?.thread;
     if (before?.native_id === null || before?.native_id === undefined || previous === undefined ||
       !previous.version_reliable || previous.version !== thread.version || previous.updated_at > thread.updated_at ||
@@ -190,9 +223,9 @@ export class HistoryStore {
     }, BACKGROUND_CONTEXT);
   }
   async conversation(id: string): Promise<Conversation | undefined> {
-    const link = await this.session.snapshot(Reverse, id, BACKGROUND_CONTEXT);
-    if (link?.thread_id === null || link?.thread_id === undefined) return undefined;
-    const state = await this.session.snapshot(Threads, identity(link.thread_id), BACKGROUND_CONTEXT);
+    const thread = await this.linked(id);
+    if (thread === undefined) return undefined;
+    const state = await this.session.snapshot(Threads, historyKey(thread.source, thread.thread_id), BACKGROUND_CONTEXT);
     return state?.native_id === null || state?.native_id === undefined ? undefined : this.session.conversation(state.native_id, BACKGROUND_CONTEXT);
   }
   async entry(conversationId: string, id: string): Promise<EntryRecord> {
@@ -204,16 +237,35 @@ export class HistoryStore {
   }
   private async retainedAssets(entry: EntryRecord): Promise<HistoryAssetRef[]> {
     if (!ImportedItemEntry.is(entry)) return [];
-    const { thread_id, item } = entry.data;
-    const retained = await this.session.snapshot(RetainedAssets, identity(thread_id, item.id, item.version), BACKGROUND_CONTEXT);
-    return mergeAssets(item.assets, retained?.assets ?? []);
+    const { source, thread_id, item } = entry.data;
+    const retained = await this.session.snapshot(RetainedAssets, historyKey(source, thread_id, item.id, item.version), BACKGROUND_CONTEXT);
+    return mergeAssets(item.assets.map((asset) => this.liveAsset(asset)), (retained?.assets ?? []).map((asset) => this.liveAsset(asset)));
+  }
+  /**
+   * An entry records the absolute path its asset had where it was imported. A
+   * replayed log and a restored backup carry that path into another state
+   * directory, so the path is rebuilt from this asset root and the hash that
+   * names the retained file.
+   */
+  private liveAsset(asset: HistoryAssetRef): HistoryAssetRef {
+    return this.assetRoot === undefined || asset.sha256 === null ? asset : { ...asset, path: join(this.assetRoot, asset.sha256) };
   }
   async indexText(entry: EntryRecord): Promise<string | undefined> {
     if (!ImportedItemEntry.is(entry)) return importedText(entry);
-    const item = entry.data.item;
+    const { source, item } = entry.data;
+    switch (source) {
+      case "codex": return this.codexIndexText(entry, item);
+      case "chatgpt": return CHATGPT_SEARCHABLE_ROLES.has(item.role) ? this.originalText(entry, item, (original) => string(field(original, "text")) ?? "") : "";
+      default: { const unhandled: never = source; throw new HistoryError(`Unknown history source ${String(unhandled)}`); }
+    }
+  }
+  private async codexIndexText(entry: EntryRecord, item: InertItem): Promise<string> {
     if (item.kind === "imageGeneration") return "";
     if (item.role !== "user" && item.role !== "assistant") return item.text.slice(0, 32_000);
-    try { return body(await this.original(entry)) || item.text; }
+    return this.originalText(entry, item, body);
+  }
+  private async originalText(entry: EntryRecord, item: InertItem, text: (original: JsonValue) => string): Promise<string> {
+    try { return text(await this.original(entry)) || item.text; }
     catch (error) {
       if (error instanceof OriginalUnavailable) return "Bounded historical excerpt (full original unavailable):\n" + item.text;
       throw error;
@@ -237,9 +289,9 @@ export class HistoryStore {
     }
     return data;
   }
-  private async cache(threadId: string, state: Readonly<ThreadState> | undefined): Promise<Cache> {
+  private async cache(key: string, state: Readonly<ThreadState> | undefined): Promise<Cache> {
     const native_id = state?.native_id ?? null; const watermark = state?.watermark ?? null;
-    const current = this.cached?.thread_id === threadId && this.cached.cache.native_id === native_id ? this.cached.cache : undefined;
+    const current = this.cached?.key === key && this.cached.cache.native_id === native_id ? this.cached.cache : undefined;
     if (current !== undefined && current.watermark === watermark) return current;
     const receipts = new Set(current?.receipts), canonical = new Map(current?.canonical), items = new Map<string, Set<EntryId>>();
     const entries = new Map(current?.entries), revisions = current?.revisions ?? new RevisionTracker();
@@ -266,7 +318,7 @@ export class HistoryStore {
         cursor = page.next;
       } while (cursor !== undefined);
     }
-    const cache = { native_id, watermark, receipts, canonical, items, entries, revisions }; this.cached = { thread_id: threadId, cache }; return cache;
+    const cache = { native_id, watermark, receipts, canonical, items, entries, revisions }; this.cached = { key, cache }; return cache;
   }
   private async aliases(items: InertItem[], cache: Cache): Promise<Map<string, string>> {
     const aliases = new Map<string, string>(), prepared = new Map<string, { item: InertItem; canonical: string }[]>(), seen = new Set<string>();
@@ -309,39 +361,42 @@ export class HistoryStore {
     }
   }
   async import(batch: HistoryImportBatch, captured?: SourceCapture | null): Promise<HistoryImportReceipt> {
+    const source = batch.source ?? "codex";
+    if (!Object.hasOwn(HISTORY_SOURCES, source)) throw new HistoryError("Unknown history source");
     if (batch.thread.id.length === 0 || batch.thread.version.length === 0 || batch.host_id.length === 0) throw new HistoryError("History source identity is required");
     if (batch.complete && batch.next_cursor !== null) throw new HistoryError("Complete history cannot have an unread continuation");
     const items: InertItem[] = batch.items.map((item) => {
       if (item.id.length === 0 || item.version.length === 0 || !json(item.data)) throw new HistoryError("History item identity and JSON evidence are required");
       return { ...item, data: item.data };
     });
-    let capture = captured === undefined ? await this.capture(batch.host_id, batch.thread) : captured ?? undefined;
+    let capture = captured === undefined ? await this.capture(batch.host_id, source, batch.thread) : captured ?? undefined;
     if (capture?.phase === "advertised" && (batch.items.length > 0 || batch.complete)) capture = await this.rebindCapture(capture, batch.thread) ?? undefined;
     const snapshot = capture?.snapshot;
-    if (capture !== undefined && (capture.thread_id !== batch.thread.id || snapshot?.host_id !== batch.host_id || snapshot.version !== batch.thread.version)) {
+    if (capture !== undefined && (capture.source !== source || capture.thread_id !== batch.thread.id || snapshot?.host_id !== batch.host_id || snapshot.version !== batch.thread.version)) {
       throw new HistoryError("History capture does not match this source page");
     }
     await this.assets(items);
-    const key = identity(batch.thread.id);
+    const key = historyKey(source, batch.thread.id);
     while (true) {
       const before = await this.session.snapshot(Threads, key, BACKGROUND_CONTEXT);
-      const cache = await this.cache(batch.thread.id, before);
+      const cache = await this.cache(key, before);
       const expectedNative = cache.native_id, expectedWatermark = cache.watermark;
       const aliases = await this.aliases(items, cache);
       const result = await this.session.commit(async (tx) => {
         const state = await tx.doc(Threads, key, null);
         if (state.native_id !== expectedNative || state.watermark !== expectedWatermark) return undefined;
-        const host = await tx.doc(Checkpoints, identity(batch.thread.id, batch.host_id), null);
-        if (snapshot !== undefined && host.captures?.versions[identity("snapshot", snapshot.version)] !== snapshot.sequence) throw new HistoryError("History capture is unavailable");
+        const host = await tx.doc(Checkpoints, historyKey(source, batch.thread.id, batch.host_id), null);
+        if (snapshot !== undefined && host.captures?.versions[historyKey(source, "snapshot", snapshot.version)] !== snapshot.sequence) throw new HistoryError("History capture is unavailable");
         const native = state.native_id ?? (await tx.createConversation({ ownership: { kind: "ownerless" } })).id;
         state.native_id = native;
         const reverse = await tx.doc(Reverse, native.toString(), null); reverse.thread_id = batch.thread.id;
+        if (source !== "codex") reverse.source = source;
         const added: string[] = []; const keys: string[] = []; const canonical = new Map<string, string>();
         const appended: { id: string; entry: EntryId; item: InertItem }[] = [], observed: EntryId[] = [], incoming = new Map<string, EntryId>();
         let addedItems = 0; let existingItems = 0;
         const metadataKey = JSON.stringify(["thread", batch.thread.version]);
         if (!cache.receipts.has(metadataKey)) {
-          const entry = await tx.appendEntry(ImportedThreadEntry, native, { data: { source: "codex", thread: batch.thread } });
+          const entry = await tx.appendEntry(ImportedThreadEntry, native, { data: { source, thread: batch.thread } });
           state.watermark = entry.id; added.push(entry.id.toString()); keys.push(metadataKey);
         }
         const seen = new Set(cache.receipts);
@@ -356,7 +411,7 @@ export class HistoryStore {
             if (nativeEntry !== undefined) observed.push(nativeEntry);
             let changed = !seen.has(itemKey);
             if (item.assets.length > 0) {
-              const refs = await tx.doc(RetainedAssets, identity(batch.thread.id, item.id, version), null);
+              const refs = await tx.doc(RetainedAssets, historyKey(source, batch.thread.id, item.id, version), null);
               const assets = mergeAssets(refs.assets, item.assets);
               if (JSON.stringify(assets) !== JSON.stringify(refs.assets)) {
                 refs.assets = assets; changed = true;
@@ -372,10 +427,10 @@ export class HistoryStore {
             if (!seen.has(itemKey)) { keys.push(itemKey); seen.add(itemKey); canonical.set(itemKey, version); }
             continue;
           }
-          const entry = await tx.appendEntry(ImportedItemEntry, native, { data: { source: "codex", thread_id: batch.thread.id, item,
+          const entry = await tx.appendEntry(ImportedItemEntry, native, { data: { source, thread_id: batch.thread.id, item,
             ...(Number.isSafeInteger(batch.thread.updated_at) ? { observed_at: batch.thread.updated_at } : {}), ...(snapshot === undefined ? {} : { snapshot }) } });
           if (item.assets.length > 0) {
-            const refs = await tx.doc(RetainedAssets, identity(batch.thread.id, item.id, item.version), null);
+            const refs = await tx.doc(RetainedAssets, historyKey(source, batch.thread.id, item.id, item.version), null);
             refs.assets = mergeAssets(refs.assets, item.assets);
           }
           state.watermark = entry.id; added.push(entry.id.toString()); keys.push(itemKey); seen.add(itemKey); addedItems += 1;
@@ -402,7 +457,7 @@ export class HistoryStore {
         if (newer) {
           const complete = (sameVersion && batch.thread.version_reliable && previous?.thread.version_reliable && previous.complete) ||
             (batch.complete && batch.gaps.length === 0);
-          state.record = { source: "codex", thread: batch.thread, conversation_id: native.toString(), adopted_task_id: previous?.adopted_task_id ?? null,
+          state.record = { source, thread: batch.thread, conversation_id: native.toString(), adopted_task_id: previous?.adopted_task_id ?? null,
             complete, gaps: complete ? [] : batch.retry_pages === undefined ? gaps(sameVersion ? previous?.gaps ?? [] : [], batch.gaps) : structuredClone(batch.gaps) };
           if (snapshot === undefined) delete state.snapshot; else state.snapshot = snapshot;
           if (capture === undefined) delete state.capture; else state.capture = { attempt: capture.attempt, phase: capture.phase };
@@ -431,15 +486,15 @@ export class HistoryStore {
         cache.entries.set(receipt(item.item), item.entry);
       }
       cache.revisions.apply(result.plan); cache.revisions.metadata(batch.thread.updated_at);
-      cache.native_id = result.native; cache.watermark = result.watermark; this.cached = { thread_id: batch.thread.id, cache };
-      const conversation = await this.get(batch.thread.id);
+      cache.native_id = result.native; cache.watermark = result.watermark; this.cached = { key, cache };
+      const conversation = await this.get({ source, thread_id: batch.thread.id });
       if (conversation === undefined) throw new HistoryError("History mapping did not commit");
       return { conversation, added_items: result.addedItems, existing_items: result.existingItems, entry_ids: result.added, watermark: result.watermark?.toString() ?? null };
     }
   }
-  async adopt(threadId: string, taskId: string, evidence: string, create: (tx: Tx, native: ConversationId, record: ImportedConversation) => Promise<void>): Promise<string> {
+  async adopt(thread: SourceThread, taskId: string, evidence: string, create: (tx: Tx, native: ConversationId, record: ImportedConversation) => Promise<void>): Promise<string> {
     return this.session.commit(async (tx) => {
-      const state = await tx.doc(Threads, identity(threadId), null);
+      const state = await tx.doc(Threads, historyKey(thread.source, thread.thread_id), null);
       if (state.record === null || state.native_id === null) throw new HistoryError("Unknown imported conversation");
       if (state.record.adopted_task_id !== null) return state.record.adopted_task_id;
       await create(tx, state.native_id, detached(state.record));
@@ -448,9 +503,9 @@ export class HistoryStore {
     }, BACKGROUND_CONTEXT);
   }
   async evidence(conversationId: string): Promise<string> {
-    const link = await this.session.snapshot(Reverse, conversationId, BACKGROUND_CONTEXT);
-    if (link?.thread_id === null || link?.thread_id === undefined) return "";
-    const state = await this.session.snapshot(Threads, identity(link.thread_id), BACKGROUND_CONTEXT);
+    const thread = await this.linked(conversationId);
+    if (thread === undefined) return "";
+    const state = await this.session.snapshot(Threads, historyKey(thread.source, thread.thread_id), BACKGROUND_CONTEXT);
     return state?.evidence ?? "";
   }
   async *inventory(): AsyncIterable<{ conversation_id: string; watermark: string }> {

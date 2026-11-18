@@ -751,6 +751,7 @@ impl ResourceBackend for GitBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serialized_spawn::SerializedSpawn;
     use std::process::{Child, Command};
 
     struct Fixture {
@@ -765,7 +766,7 @@ mod tests {
             .current_dir(directory)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .output()
+            .output_serialized()
             .unwrap();
         assert!(
             output.status.success(),
@@ -1007,7 +1008,7 @@ mod tests {
             Command::new("sleep")
                 .arg("60")
                 .current_dir(&identity.top)
-                .spawn()
+                .spawn_serialized()
                 .unwrap(),
         );
         let reason = held_reason(

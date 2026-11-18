@@ -459,9 +459,78 @@ with the same sentences. Open Job has no phrase, because a phrase would make
 each refresh of the app's phrases read every coordinator's jobs. Add it in the
 Shortcuts app.
 
+**Send Message** sends one line to one saved coordinator after you confirm it.
+Say "Send a message to Work in Beep Boop", or add the action in the Shortcuts
+app. It runs without opening the app and leaves the composer, its draft and its
+chosen coordinator as they were. It declares
+`.requiresLocalDeviceAuthentication`, which Apple documents as requiring an
+unlock of the device that runs it. The confirmation names the coordinator
+first and ends with the message, after "The message reads:", so the text
+cannot change which coordinator the sentence names. The message sent is the
+message shown, trimmed of surrounding spaces.
+
+The action refuses before it asks, and saves nothing, when the message is
+blank, longer than 1,000 characters, more than one line, or holds a character
+the confirmation cannot show, such as a control, format or tag character.
+Ordinary emoji pass, but flags built from tag characters, such as England's,
+are refused. A message that starts with `/`, or is `?`, is a command the
+coordinator would run, and the action says "Beep Boop does not run commands
+from Siri." When the phone's protected data is unavailable, it says
+"Unlock your iPhone to send messages to Work. Nothing was sent."
+
+A confirmed message goes through the coordinator's saved outbox, as a
+composer send does, with the `siri` origin. A coordinator that does not list
+`siri` among the origins it accepts gets nothing, and the action says the
+coordinator needs an update. The action waits 8 seconds in all for the
+connection and the coordinator's answer, then says one of these:
+
+- "Sent to Work." The coordinator accepted or placed the message.
+- "Saved on this iPhone, but Work has not confirmed it. Ask again to retry
+  this copy." No answer came in time. The copy stays on this iPhone, and
+  nothing sends it again by itself. Asking again writes it again under its
+  original input ID, as **Check / retry** in the app does. Each time the app
+  connects to Work, it asks Work about that input ID. If Work has the copy,
+  its row in the app reads Sent, and asking again says Work already has it.
+- "Work did not accept the message." or "Work reported a problem: …" The
+  copy stays on this iPhone.
+- A sentence that ends "Nothing was sent." The phone saved nothing.
+
+Asking again for the same text to the same coordinator never makes a second
+copy by accident. A copy that Work has not confirmed is offered again under
+its own input ID, which the coordinator recognizes, so the agent answers it
+once. A copy that Work has accepted but not yet placed is not sent again. For
+an hour after Work places a copy, the confirmation says Work already has it
+and when it was sent. After that hour, the same text is a new message. The
+phone checks again when it saves the copy, and sends nothing if another copy
+appeared while you were confirming.
+
 The feed of one coordinator, Jobs and work, and a job's screen tell the system
 which coordinator or jobs they show, by identifier alone, so no message text
 is part of it.
+
+**Spotlight** finds each saved coordinator by name, and each scheduled job by
+title, with its coordinator and its run state, such as "Work, Interrupted".
+iOS hands a tap on a result to the app as a `CSSearchableItemActionType`
+activity that names the item. The app then opens that coordinator or job the
+way Open Coordinator and Open Job do, so the composer draft stays as it is. A
+job opens once its coordinator has listed it. A result whose coordinator or
+job is gone opens nothing, and a notice over the feed says why. Nothing else
+is indexed: no message, prompt, working directory, schedule, run time or
+output. The app writes one named index,
+`coordinators-and-jobs`, with the complete file protection class, so its
+contents should not be readable while the phone is locked. That is inferred
+from the protection class. No simulator enforces it, and it was not measured
+on a phone. It writes once the app is active, never from a launch the system
+starts in the background. Each launch's first activation clears the index,
+indexes the saved coordinators, and reads each paired coordinator's job list
+once, so a stop part way through a rename or removal leaves nothing stale past
+the next launch. After that, a rename updates the coordinator and its jobs, a
+removal deletes both, and each job list the app reads replaces that
+coordinator's jobs. A read that fails changes nothing. So a coordinator that
+has not answered since the launch has no jobs in Spotlight, and one that
+answered and then stops answering keeps the jobs it last listed until a later
+list replaces them or the app launches again. `SpotlightIndex` in
+`ios/Sources/AgentUI/Siri/` is the only writer.
 
 An intent holds a coordinator connected with a lease, so the Job picker and
 Retry Interrupted Run work with the app in the background. A leased
@@ -495,6 +564,22 @@ package test checks the retry's sentence, and the metadata check requires that
 the built app keeps the retry behind authentication and gives it no phrase. No
 test shows the authentication itself. On a fresh simulator the retry ran with
 the lock screen showing.
+
+App Intents Testing also confirms a confirmation by itself, so the
+out-of-process tests of Send Message check what follows it: the intent's
+value, what each fixture coordinator received, and the draft. A package test
+checks each sentence and each confirmation. `testShortcutsAsksBeforeItSends`
+runs the App Shortcut from the Shortcuts app, which shows the confirmation,
+and checks that Cancel sends nothing. It skips when the Shortcuts app does not
+reach the confirmation. `testSendMessageToAPrivateCoordinator`
+runs against the real service with a synthetic model, served by
+`runtime/test/fixtures/siri-world.ts`. It loses the reply to one message and
+checks that the message runs once. It asks again only when the first answer
+is "saved", and then checks that the retry reuses the input ID.
+`runtime/test/siri-send.test.ts` checks against the real coordinator runtime
+that a write repeated under one input ID starts one generation. The UI test
+runs only when the test runner's `TEST_RUNNER_AGENT_SIRI_WORLD` names that
+world's relay port, control port and coordinator ID, and is skipped otherwise.
 
 ## Validation
 

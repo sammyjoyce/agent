@@ -2461,7 +2461,8 @@
     "HistoryProvider": {
       "type": "string",
       "enum": [
-        "codex"
+        "codex",
+        "chatgpt"
       ]
     },
     "HistoryRequest": {
@@ -3124,6 +3125,45 @@
           ]
         },
         {
+          "description": "Distinct command so older hosts reject workspace routing before effects.",
+          "type": "object",
+          "properties": {
+            "allocation_id": {
+              "type": "string"
+            },
+            "host": {
+              "$ref": "#/$defs/WorkerHost"
+            },
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            },
+            "title": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "spawn_workspace_worker"
+            },
+            "workspace": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkerRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "host",
+            "task_id",
+            "allocation_id",
+            "title"
+          ]
+        },
+        {
           "type": "object",
           "properties": {
             "agent_id": {
@@ -3307,6 +3347,11 @@
         },
         "phase": {
           "$ref": "#/$defs/ImportPhase"
+        },
+        "source": {
+          "description": "Older coordinators report only Codex progress and omit this field.",
+          "$ref": "#/$defs/HistoryProvider",
+          "default": "codex"
         },
         "threads_imported": {
           "type": "integer",
@@ -5129,6 +5174,23 @@
           "properties": {
             "connection_id": {
               "type": "string"
+            },
+            "coordinator_id": {
+              "description": "Missing from coordinators older than owner floors.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "uuid"
+            },
+            "owner_epoch": {
+              "description": "The epoch the failover authority granted this coordinator start.\nAbsent for a coordinator without a `[failover]` section.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
             },
             "type": {
               "type": "string",

@@ -1,5 +1,6 @@
 //! Browser handles belong to one conversation, host and live connection.
 
+use crate::serialized_spawn::SerializedTokioSpawn;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -301,7 +302,7 @@ impl Process {
             // Closing stdin asks the helper to disconnect its MCP child. Chrome
             // is externally owned and must outlive this process.
             .kill_on_drop(false)
-            .spawn()
+            .spawn_serialized()
             .context("Could not start the browser runtime")?;
         let input = Arc::new(Mutex::new(Some(
             child.stdin.take().context("Browser runtime has no input")?,

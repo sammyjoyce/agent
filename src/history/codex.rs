@@ -3,6 +3,7 @@
 
 mod projection;
 
+use crate::serialized_spawn::SerializedTokioSpawn;
 use std::{
     collections::HashMap,
     os::unix::fs::PermissionsExt,
@@ -28,12 +29,12 @@ use tokio::{
 use crate::{
     history::{
         HistoryAssetKind, HistoryAssetRef, HistoryGap, HistoryGapCode, HistoryItem, HistoryRequest,
-        HistoryResponse, HistorySource, HistoryThread,
+        HistoryResponse, HistorySource, HistoryThread, PAGE_BYTES, excerpt,
     },
     protocol::HistoryRole,
+    runtime::effects::EffectGroup,
 };
 
-const PAGE_BYTES: usize = 500 * 1024;
 const ITEM_BYTES: usize = 128 * 1024;
 const NATIVE_BYTES: usize = 64 * 1024 * 1024;
 const INVENTORY_RPC_DEADLINE: Duration = Duration::from_secs(60);
@@ -830,6 +831,7 @@ impl CodexHistory {
                 timestamp_ms: entry.completed_at_ms.or(entry.started_at_ms),
                 data,
                 assets,
+                branch: None,
             }),
             gaps,
         ))
@@ -1292,19 +1294,6 @@ fn flatten(turns: Vec<NativeTurn>) -> Vec<NativeEntry> {
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
-fn excerpt(text: &str, maximum: usize) -> String {
-    let end = text
-        .char_indices()
-        .map(|(index, _)| index)
-        .take_while(|index| *index <= maximum)
-        .last()
-        .unwrap_or(0);
-    if text.len() <= maximum {
-        text.into()
-    } else {
-        text[..end].into()
-    }
-}
 fn bounded(response: HistoryResponse) -> Result<HistoryResponse> {
     ensure!(
         serde_json::to_vec(&response)?.len() <= PAGE_BYTES,
@@ -1632,6 +1621,7 @@ struct TurnsParams<'a> {
 }
 
 struct Connection {
+    _recorded: EffectGroup,
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
@@ -1708,8 +1698,9 @@ impl Connection {
             command.env("CODEX_HOME", home);
         }
         let mut child = command
-            .spawn()
+            .spawn_serialized()
             .context("Could not start the installed Codex history reader")?;
+        let recorded = EffectGroup::led_by(child.id());
         let input = child
             .stdin
             .take()
@@ -1721,6 +1712,7 @@ impl Connection {
                 .context("Codex history output is unavailable")?,
         );
         let mut connection = Self {
+            _recorded: recorded,
             child,
             input,
             output,
@@ -1853,6 +1845,7 @@ fn classify(error: &anyhow::Error) -> HistoryGapCode {
 
 #[cfg(test)]
 mod tests {
+    use crate::serialized_spawn::SerializedTokioSpawn;
     use std::{
         os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
@@ -2008,6 +2001,7 @@ mod tests {
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {readFile} from 'node:fs/promises';
+import {join} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {BACKGROUND_CONTEXT} from '@earendil-works/chord/context';
 import {openNodeSqliteDatabase} from '@earendil-works/chord/sqlite/node';
@@ -2019,6 +2013,7 @@ const {HistoryStore,ImportedItemEntry}=await import(new URL('./history.js',runti
 const {transcript}=await import(new URL('./transcript.js',runtime));
 let serialized='';for await(const chunk of process.stdin)serialized+=chunk;
 const input=JSON.parse(serialized), {missing,available}=input;
+const expectedAtAssetRoot=available.assets.map(asset=>({...asset,path:join(input.asset_root,asset.sha256)}));
 const thread={id:'thread-a',title:'Inspect synthetic media',cwd:'/example/project',created_at:1,updated_at:2,
   forked_from_id:null,parent_thread_id:null,version:'native-thread-v1',version_reliable:true,archived:true};
 const batch=(item)=>({host_id:'source-host',thread,items:[item],next_cursor:null,
@@ -2043,7 +2038,7 @@ try{
   assert.equal(entries.flatMap(transcript).filter(message=>message.text===missing.text).length,1);
   const overlaid=await app.store.entry(conversation.id.toString(),original.id.toString());
   assert.equal(overlaid.data.item.version,missing.version);
-  assert.deepEqual(overlaid.data.item.assets,available.assets,'Recovered refs retain their actual incoming evidence version');
+  assert.deepEqual(overlaid.data.item.assets,expectedAtAssetRoot,'Recovered refs retain their actual incoming evidence version');
   assert.equal(createHash('sha256').update(await readFile(available.assets[0].path)).digest('hex'),available.assets[0].sha256);
   assert.deepEqual(await app.store.original(overlaid),missing.data);
   assert.equal((await app.session.commit(tx=>tx.scanTasks({},100),BACKGROUND_CONTEXT)).items.length,0);
@@ -2056,14 +2051,14 @@ try{
   const saved=(await reopened.entries({order:'ascending'},100,undefined,BACKGROUND_CONTEXT)).items;
   assert.deepEqual(saved.filter(ImportedItemEntry.is),before);
   assert.equal(saved.flatMap(transcript).filter(message=>message.text===missing.text).length,1);
-  assert.deepEqual((await app.store.entry(reopened.id.toString(),original.id.toString())).data.item.assets,available.assets);
+  assert.deepEqual((await app.store.entry(reopened.id.toString(),original.id.toString())).data.item.assets,expectedAtAssetRoot);
   const executions=(await app.session.commit(tx=>tx.scanTasks({},100),BACKGROUND_CONTEXT)).items.length;
   assert.equal(executions,0);
   process.stdout.write(JSON.stringify({message_entries:1,executions})+'\n');
 }finally{await app.session.close(BACKGROUND_CONTEXT);}
 "#])
             .arg(&runtime).current_dir(runtime_root).stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn_serialized().unwrap();
         use tokio::io::AsyncWriteExt;
         child
             .stdin
@@ -3208,7 +3203,7 @@ try{
 }finally{await session.close(BACKGROUND_CONTEXT);}
 "#])
             .arg(&runtime).current_dir(runtime_root).stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn_serialized().unwrap();
         use tokio::io::AsyncWriteExt;
         child
             .stdin
@@ -3368,7 +3363,8 @@ import {createRegistry,Harness} from '@earendil-works/pi-durable';
 import {SqliteStorage} from '@earendil-works/pi-durable/storage/sqlite';
 const runtime=pathToFileURL(process.argv[1]);
 const {HistoryStore,ImportedItemEntry}=await import(new URL('./history.js',runtime));
-const {CodexImporter}=await import(new URL('./importer.js',runtime));
+const {HistoryImports}=await import(new URL('./importer.js',runtime));
+const {LocalFiles}=await import(new URL('./failover/retained-files.js',runtime));
 const {TaskStore}=await import(new URL('./tasks.js',runtime));
 const {ConversationModels}=await import(new URL('./models.js',runtime));
 const {Retrieval}=await import(new URL('./retrieval.js',runtime));
@@ -3387,7 +3383,7 @@ async function open(){
   {models,registry:createRegistry(),identity:{attribution:null}},BACKGROUND_CONTEXT);
  const store=new HistoryStore(session),tasks=new TaskStore(session,new ConversationModels(models));tasks.useHistory(store);
  const retrieval=new Retrieval(session,store,tasks,join(evidence.directory,'search.sqlite'));
- return {session,store,retrieval,importer:new CodexImporter(session,store,join(evidence.directory,'assets'))};
+ return {session,store,retrieval,importer:new HistoryImports(session,store,new LocalFiles(evidence.directory))};
 }
 let app=await open(),reads=0;
 const call=async command=>{
@@ -3398,7 +3394,7 @@ const call=async command=>{
  return {type:'history',response:{type:'read',thread_id:evidence.current.id,version:evidence.current.version,items:evidence.items,
   next_cursor:null,gaps:evidence.gaps,complete:false,source_exhausted:true}};
 };
-const run=()=>app.importer.run([host],[host.host_id],[],call,()=>{},()=>app.retrieval.sync(embed,true));
+const run=()=>app.importer.codex([host],[host.host_id],[],call,()=>{},()=>app.retrieval.sync(embed,true));
 try{
  const seeded=await app.store.import({host_id:host.host_id,thread:evidence.previous,items:evidence.items,next_cursor:null,gaps:[],complete:true,source_exhausted:true,retry_pages:[]});
  await app.retrieval.sync(embed,true);
@@ -3409,7 +3405,7 @@ try{
  const retained=(await conversation.entries({order:'ascending'},100,undefined,BACKGROUND_CONTEXT)).items.filter(ImportedItemEntry.is);
  assert.equal(retained.length,5);for(const entry of original)assert.deepEqual(retained.find(value=>value.id===entry.id),entry);
  for(const text of initialEmbedded)assert.equal(embedded.filter(value=>value===text).length,1,'Existing vectors must be reused');
- const checkpoint=await app.store.checkpoint(evidence.current.id,host.host_id);
+ const checkpoint=await app.store.checkpoint({source:'codex',thread_id:evidence.current.id},host.host_id);
  assert.equal(checkpoint.version,evidence.current.version);assert.notEqual(checkpoint.version,evidence.previous.version);
  assert.equal(checkpoint.complete,false);assert.deepEqual(checkpoint.gaps,evidence.gaps);
  assert.deepEqual((await conversation.context(BACKGROUND_CONTEXT)).messages,[]);
@@ -3424,7 +3420,7 @@ try{
 }finally{await app.retrieval.close();await app.session.close(BACKGROUND_CONTEXT);}
 "#])
             .arg(&runtime).current_dir(runtime_root).stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn_serialized().unwrap();
         child
             .stdin
             .take()
@@ -3662,7 +3658,7 @@ try{
 }finally{await app.session.close(BACKGROUND_CONTEXT);}
 "#])
             .arg(&runtime).current_dir(runtime_root).stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn_serialized().unwrap();
         child
             .stdin
             .take()
@@ -4293,7 +4289,7 @@ try{
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
-            .spawn()
+            .spawn_serialized()
             .unwrap();
         let mut input = child.stdin.take().unwrap();
         let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();

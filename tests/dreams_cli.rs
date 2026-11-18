@@ -1,3 +1,4 @@
+use agent_cli::serialized_spawn::SerializedSpawn;
 use std::{
     collections::BTreeSet,
     fs,
@@ -427,7 +428,7 @@ fn a_coordinator_admits_no_command_until_its_log_records_its_start() {
         .process_group(0)
         .stdout(Stdio::null())
         .stderr(fs::File::create(&stderr).unwrap())
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut admitted = 0;
@@ -546,7 +547,7 @@ fn with_dreams_a_coordinator_that_cannot_record_its_start_names_the_path_and_the
             .process_group(0)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_serialized()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         while server.try_wait().unwrap().is_none() && Instant::now() < deadline {
@@ -686,7 +687,7 @@ fn a_store_restored_from_a_backup_reviews_the_time_before_the_restore_as_a_gap()
             .args(["--json", "backup"])
             .args(args)
             .env("HOME", fixture.directory.path())
-            .output()
+            .output_serialized()
             .unwrap();
         assert!(
             output.status.success(),
@@ -1284,8 +1285,9 @@ impl Sealed {
             },
         ] {
             let (_owner, cancelled) = watch::channel(false);
-            let HostResult::Dreams { reply } = dreams.execute(request, cancelled).await else {
-                panic!("Dreams could not serve the request");
+            let result = dreams.execute(request, cancelled).await;
+            let HostResult::Dreams { reply } = result else {
+                panic!("Dreams could not serve the request: {result:?}");
             };
             assert!(
                 !reply.text.contains("rejected"),
@@ -1319,7 +1321,7 @@ fn hold_git_until_released(fixture: &Fixture, held: &str) -> HeldGit {
     let release = fixture.directory.path().join(format!("git-{held}-release"));
     let real_git = Command::new("/bin/sh")
         .args(["-c", "command -v git"])
-        .output()
+        .output_serialized()
         .unwrap();
     fixture.shadow_program(
         "git",
@@ -1355,7 +1357,7 @@ async fn apply_gives_git_the_bytes_it_verified_even_when_the_patch_file_changes_
         .command(&sealed.apply_arguments(), false)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);
     while !ready.exists() && Instant::now() < deadline {
@@ -1696,7 +1698,7 @@ async fn show_prints_only_the_evidence_it_verified_even_if_the_evidence_changes_
         .command(&["dreams", "show", &sealed.run], true)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);
     while !ready.exists() && Instant::now() < deadline {

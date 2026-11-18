@@ -1,3 +1,9 @@
 disallowed-methods = [
     { path = "agent_cli::rex::RexClient::for_process", reason = "Each process selects Rex once in main; borrow the Executor's or caller's client instead" },
+    { path = "std::process::Command::spawn", reason = "Start children through agent_cli::serialized_spawn, so a child started on another thread cannot inherit this one's pipes on macOS" },
+    { path = "std::process::Command::output", reason = "Start children through agent_cli::serialized_spawn, so a child started on another thread cannot inherit this one's pipes on macOS" },
+    { path = "std::process::Command::status", reason = "Start children through agent_cli::serialized_spawn, so a child started on another thread cannot inherit this one's pipes on macOS" },
+    { path = "tokio::process::Command::spawn", reason = "Start children through agent_cli::serialized_spawn, so a child started on another thread cannot inherit this one's pipes on macOS" },
+    { path = "tokio::process::Command::output", reason = "Start children through agent_cli::serialized_spawn, so a child started on another thread cannot inherit this one's pipes on macOS" },
+    { path = "tokio::process::Command::status", reason = "Start children through agent_cli::serialized_spawn, so a child started on another thread cannot inherit this one's pipes on macOS" },
 ]

@@ -11,7 +11,8 @@ reads only visible cells. A menu, an ANSI-stripped byte match, or text already
 scrolled offscreen does not satisfy a check. Each version runs its own Rust
 coordinator and TypeScript runtime on the same synthetic state: the chief's
 40-message history, a saved 5,000-message conversation, and 3,000 unrelated
-saved discussions, all in real Pi/SQLite storage.
+saved discussions, all in real Pi/SQLite storage. The contention scenarios add
+a search index of that state and an invented Codex history.
 
 ## Scenarios and gates
 
@@ -24,8 +25,12 @@ gate runs from one benchmark mark to a later one.
 | `chief_cold` | Fresh per sample | `conversation_visible` | CLI spawn | The chief's last stored sentence is visible. |
 | `chief` | Shared per version | `conversation_visible` | CLI spawn | The chief's last stored sentence is visible. |
 | `long_history` | Shared per version | `conversation_visible` | Spawn of `chat /resume <id>` | The long conversation's last sentence is visible. |
+| `scroll_history` | Shared per version | `scroll_to_oldest` | Ctrl+Home at the live bottom of the resumed long conversation | Its oldest message, message 0, is visible. |
+| `scroll_history` | Shared per version | `page_up` | PageUp inside the history view | Message 3, on the page above, is visible. |
 | `submit` | Fresh per sample | `admission` | Enter | The composer is empty and the prompt is a placed `›` line with no pending `sending…` state. |
 | `submit` | Fresh per sample | `first_activity` | Enter | The turn's reasoning summary is visible. |
+| `submit_during_search` | Fresh per sample | `admission`, `first_activity` | Enter | As `submit`, while history searches run. |
+| `submit_during_import` | Fresh per sample | `admission`, `first_activity` | Enter | As `submit`, while a Codex import runs. |
 | `steer` | Fresh per sample | `steer_admission` | Enter on a second prompt while the first turn streams | `Steering messages, waiting` is visible. |
 | `steer` | Fresh per sample | `steer_reply` | The same Enter | The steering turn's answer is visible and the turn is idle. |
 | `stop_stream` | Fresh per sample | `stop` | Esc while the reasoning stream is open | `• Interrupted` is visible and the turn is idle. |
@@ -37,6 +42,18 @@ fresh coordinator from the snapshot and prepares outside timing. It launches
 the CLI, waits for the chief, and settles one short turn. Each prompt is typed
 first, and Enter is pressed only once the composer shows the prompt, so Enter
 is a keystroke of its own. `/exit` ends every sample.
+
+`scroll_history` resumes the long conversation and prepares outside timing.
+It waits until the last sentence and the composer are visible with neither
+`• Connecting` nor `• Loading history` showing, then until the CLI has
+written nothing for 500 ms. Once replay ends,
+the CLI writes every replayed message into the terminal's native scrollback
+in batches over several frames, and no visible cell marks the end of that
+write. Ctrl+Home then opens the history view at the oldest message. An
+untimed PageDown moves to the page that shows message 12, and the timed
+PageUp returns to message 3. PageUp is timed inside the history view because
+the first PageUp from the live bottom redraws the same screen, as the limits
+below describe.
 
 ## Application delay
 
@@ -110,6 +127,35 @@ Every coordinator also has a `/bin/sh` Rex stand-in on its private `PATH`. It
 answers `whoami` and `hosts`, so the coordinator has a local node to run
 `exec`, and the CLI's identity check on each input starts no Node process.
 
+## Background loads
+
+`submit_during_search` and `submit_during_import` run the `submit` turns while
+a second client on the coordinator's socket sends the requests that
+`beep-boop history search` and `beep-boop import codex` send. The load starts
+after the prime turn settles, and the measured window opens only once the
+load is under way.
+
+For search, the seed builds `search/search.sqlite` with the runtime's own
+retrieval code from a copy of the session and 8-dimension vectors hashed
+from each text, so
+the index's checkpoints match the stored history. The session that the other
+scenarios read stays unchanged. Each search coordinator gets a copy of the
+index and the shell's sqlite-vec through `AGENT_SQLITE_VEC`. Four loops each
+send a keyword search for `previous task context remains readable` with a
+limit of 8, and send the next one when it finishes. The load is under way once
+a search returns the long conversation. Once activity is visible, the loops
+send no new search, and searches in flight finish.
+
+For import, the seed writes 200 invented legacy Codex rollouts. Each holds one
+user message and 50 answers as `agent_message` events, the lines that Codex
+reads from a legacy rollout. Each import coordinator gets its own copy as
+`~/.codex` and a `codex` on its private `PATH` that records its pid and runs
+the shell's `codex`. The import names no host, so it reads every node the
+coordinator knows. The Rex stand-in lists no other host, so that is the
+coordinator's own node. The load is
+under way once the import commits its first item. The sample does not wait for
+the import to finish, and closing the coordinator stops it.
+
 ## Correctness
 
 A sample fails, and the run with it, when any of these happen:
@@ -126,17 +172,27 @@ A sample fails, and the run with it, when any of these happen:
   `Interrupted` becomes visible.
 - Pi's token ledger for the chief changes by a total other than the sum of the
   responses that completed inside the measured window.
-- A launch scenario contacts the provider.
+- A launch or scroll scenario contacts the provider.
+- A background search fails or misses the long conversation, none finishes
+  before Enter, or between Enter and visible activity no search is
+  outstanding for more than 5 ms. A shorter gap is a loop sending its next
+  search after the runtime answered every loop at once.
+- The import fails, commits no item before Enter, or commits no new item after
+  activity is visible. The error then asks for a larger corpus.
+- The `codex` process still runs 2 s after its coordinator exits.
 
 The error includes the visible screen, the marks and the provider log.
 
 ## CPU, memory and tokens
 
 Each sample reports CPU time and memory for the CLI, the coordinator and the
-runtime, and Pi's token use. These are never gated. The benchmark reads each
-process only when the window opens and closes. The interactive window covers
-the measured steps. The launch window runs from before the spawn until the
-text is visible, so the CLI's CPU time covers its whole life.
+runtime, and Pi's token use. `submit_during_import` also reports the
+`codex app-server` that the import runs, as the `codex` role. The search
+loads run inside the benchmark process and are not read. These readings are
+never gated. The benchmark reads each process only when the window opens and
+closes. The interactive window covers the measured steps, and the scroll
+window covers its three keys. The launch window runs from before the spawn
+until the text is visible, so the CLI's CPU time covers its whole life.
 
 | Platform | CPU time | Resident | Peak |
 | --- | --- | --- | --- |
@@ -154,20 +210,27 @@ The provider reports synthetic usage, so the token counts are synthetic too:
 `output_tokens` adds the answer or `exec` argument bytes divided by 4, rounded
 up. Cached tokens are 0, and the total is input plus output. Pi records no
 usage for the stopped stream, so `stop_stream` reports a change of zero.
+Launch and scroll samples send no turns, and their `tokens` is `null`.
 
 ## Results
 
 `performance/results.json` uses schema 3. Its header names the terminal size,
 the corpus sizes, the allowances, each scenario's turns and gates, the usage
-formula, the kind of peak memory, and `synthetic: true`. Each sample keeps its gate spans and a
-timeline in milliseconds from the sample's start. The timeline holds the
+formula, the kind of peak memory, and `synthetic: true`. `search_corpus` is
+`null` unless a selected scenario searches, and `import_corpus` names the
+Codex rollouts and the answers in each. Each sample keeps its gate spans and a
+timeline in milliseconds from the sample's start. The sample records when its
+window opened, as `opened_epoch_ms` on the wall clock and `opened_at_ms` on
+the timeline, and the pid of every process it read. The timeline holds the
 marks, the provider's request, first chunk, completion and client close, and
 coordinator diagnostics receipts at their 1 ms resolution. Receipts only
 explain a sample. Each sample also keeps every provider request with its
-scripted and observed holds, the process readings, and the token change. The
-report ends with each comparison and the medians of CPU time, memory and
-tokens. A JSONL file keeps completed samples if a later sample fails, and a
-failure JSON records the error.
+scripted and observed holds, the process readings, and the token change. A
+contention sample keeps its load under `background`: every search's send and
+finish times, match count and reported gaps, or every import progress event
+with its phase and counts. The report ends with each comparison and the
+medians of CPU time, memory and tokens. A JSONL file keeps completed samples
+if a later sample fails, and a failure JSON records the error.
 
 ## Run the benchmark
 
@@ -177,7 +240,7 @@ Build both revisions' runtime and CLI, then compare:
 nix develop --command cargo build --release --bin beep-boop \
   --example terminal-fixture --example cli-performance
 nix develop --command npm --prefix runtime run build
-nix develop --command target/release/examples/cli-performance \
+nix develop .#ci --command target/release/examples/cli-performance \
   --baseline /path/to/base/target/release/beep-boop \
   --baseline-runtime /path/to/base/runtime/dist/src/bridge.js \
   --candidate target/release/beep-boop \
@@ -188,10 +251,12 @@ nix develop --command target/release/examples/cli-performance \
   --output performance/results.json
 ```
 
-Add `--scenario submit`, repeated as needed, to run a subset. `--samples`
-sets the measured pairs per scenario.
+The `ci` shell adds the `codex` that `submit_during_import` runs, beside the
+sqlite-vec that every development shell sets. Add `--scenario submit`,
+repeated as needed, to run a subset. `--samples` sets the measured pairs per
+scenario.
 
-## Prove that every gate can fail
+## Prove that the gates can fail
 
 Two runs on one build show the gates' range:
 
@@ -201,7 +266,12 @@ Two runs on one build show the gates' range:
 2. Run the same build on both sides with
    `--candidate-runtime runtime/dist/test/fixtures/slow-runtime.js`. That
    runtime delays every write to the coordinator by 500 ms, so every gate
-   reports `REGRESSION` and the benchmark exits with status 1.
+   that waits on the runtime reports `REGRESSION` and the benchmark exits
+   with status 1. Leave out `scroll_history`. Its keys never reach the
+   runtime, and with the slow runtime the replay outlasts the 20-second
+   deadline, so the sample fails before its first key. No fixture slows the
+   CLI itself. Showing that the scroll gates can fail needs a candidate CLI
+   patched to delay its Ctrl+Home and PageUp handling.
 
 ## Limits
 
@@ -218,13 +288,27 @@ Two runs on one build show the gates' range:
   inside it, as described under application delay.
 - Rex is a shell stand-in, and the model provider is a local script.
 - Token counts are synthetic.
-- Scrolling to older text in a long history, and foreground work during search
-  and import, are not measured yet.
+- The search load sends keyword searches only. No embedding runtime runs, so
+  dense retrieval and the import's indexing are not measured. Every search
+  reports that history changes await indexing, because the prime turn
+  changes the chief after the seed built the index.
+- The import is measured while it commits threads. Its discovery runs before
+  the window, and its indexing runs after it.
+- `scroll_history` measures scrolling after the replay and its scrollback
+  write end, not during them.
+- On Linux the scroll gates' medians are about 1 ms for Ctrl+Home and 0.3 ms
+  for PageUp. The 20 ms absolute allowance is far above both, so a scroll
+  key that slows by less than about 20 ms passes.
+- After the scrollback write, the first PageUp from the live bottom redraws an
+  identical screen, and only the second scrolls. The gates start from
+  Ctrl+Home and from inside the history view, so that first PageUp is not
+  measured.
 
 ## Add a scenario
 
 Add a variant to `Scenario` in `examples/cli_performance/scenario.rs`, its
-definition, and its arm in `drive`. Seed any retained data it needs in
+definition, and its arm in `drive`. A definition's `background` names any load
+that runs beside the measured steps. Seed any retained data it needs in
 `runtime/test/fixtures/performance.ts`. The paired sampling and regression
 gate apply to every gate of every variant. Keep text synthetic and test the
 real path the scenario is measuring.

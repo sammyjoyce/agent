@@ -1,3 +1,4 @@
+use agent_cli::serialized_spawn::SerializedTokioSpawn;
 use std::{
     collections::BTreeMap,
     fs,
@@ -18,9 +19,14 @@ use tokio::{
 
 use crate::{
     DEADLINE,
+    background::Background,
     provider::{Provider, Request, ToolFixture},
     scenario::Turn,
 };
+
+const CODEX_EXIT_AFTER_CLOSE: Duration = Duration::from_secs(2);
+pub const SEARCH_INDEX: &str = "search";
+pub const CODEX_CORPUS: &str = "codex";
 
 /// Answers the coordinator's local-node discovery and the CLI's per-input
 /// identity check without starting Node inside a timed interval.
@@ -45,20 +51,61 @@ const RECEIPTS: &[&str] = &[
     "interrupted",
 ];
 
-pub fn node() -> Result<PathBuf> {
+pub fn installed(program: &str) -> Result<PathBuf> {
     let paths = std::env::var_os("PATH").context("PATH is required")?;
-    let node = std::env::split_paths(&paths)
-        .map(|path| path.join("node"))
+    let found = std::env::split_paths(&paths)
+        .map(|path| path.join(program))
         .find(|path| path.is_file())
-        .context("Node is required")?;
-    Ok(fs::canonicalize(node)?)
+        .with_context(|| format!("{program} is required on PATH"))?;
+    Ok(fs::canonicalize(found)?)
+}
+
+fn copy_files(from: &Path, to: &Path) -> Result<()> {
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            fs::copy(entry.path(), to.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+fn quoted(path: &Path) -> Result<String> {
+    let text = path.to_str().context("A fixture path is not UTF-8")?;
+    ensure!(
+        !text.contains('\''),
+        "A fixture path contains a quote: {text}"
+    );
+    Ok(format!("'{text}'"))
+}
+
+fn pid_recording_codex(pid_file: &Path) -> Result<String> {
+    Ok(format!(
+        "#!/bin/sh\nprintf '%s' \"$$\" > {}\nexec {} \"$@\"\n",
+        quoted(pid_file)?,
+        quoted(&installed("codex")?)?
+    ))
 }
 
 pub fn isolated(command: &mut Command, directory: &Path) -> Result<()> {
     let bin = directory.join("bin");
     if !bin.exists() {
         fs::create_dir(&bin)?;
-        std::os::unix::fs::symlink(node()?, bin.join("node"))?;
+        std::os::unix::fs::symlink(installed("node")?, bin.join("node"))?;
         fs::write(bin.join("rex"), REX)?;
         fs::set_permissions(bin.join("rex"), fs::Permissions::from_mode(0o700))?;
     }
@@ -181,6 +228,7 @@ pub struct Closed {
 }
 
 pub struct Coordinator {
+    background: Background,
     child: Child,
     directory: tempfile::TempDir,
     provider: Provider,
@@ -193,16 +241,12 @@ impl Coordinator {
         runtime: &Path,
         snapshot: &Path,
         turns: &'static [Turn],
+        background: Background,
     ) -> Result<Self> {
         let directory = tempfile::tempdir()?;
         let path = directory.path();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-        for entry in fs::read_dir(snapshot)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                fs::copy(entry.path(), path.join(entry.file_name()))?;
-            }
-        }
+        copy_files(snapshot, path)?;
         fs::write(path.join("config.toml"), "")?;
         fs::write(path.join("AGENTS.md"), "")?;
         let mut command = Command::new(binary);
@@ -230,7 +274,20 @@ impl Coordinator {
                 format!("http://{}", listener.local_addr()?),
             )
             .env("AGENT_PERFORMANCE_RUNTIME_PID", path.join("runtime.pid"));
-        let child = command.spawn()?;
+        match background {
+            Background::None => {}
+            Background::Search => {
+                command.env("AGENT_SQLITE_VEC", sqlite_vec()?);
+                copy_files(&snapshot.join(SEARCH_INDEX), path)?;
+            }
+            Background::Import => {
+                copy_tree(&snapshot.join(CODEX_CORPUS), &path.join(".codex"))?;
+                let codex = path.join("bin/codex");
+                fs::write(&codex, pid_recording_codex(&path.join("codex.pid"))?)?;
+                fs::set_permissions(codex, fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        let child = command.spawn_serialized()?;
         let provider = Provider::start(
             listener,
             turns,
@@ -241,6 +298,7 @@ impl Coordinator {
             },
         );
         let mut coordinator = Self {
+            background,
             child,
             directory,
             provider,
@@ -273,6 +331,10 @@ impl Coordinator {
         Ok(coordinator)
     }
 
+    pub fn background(&self) -> Background {
+        self.background
+    }
+
     pub fn directory(&self) -> &Path {
         self.directory.path()
     }
@@ -293,6 +355,10 @@ impl Coordinator {
 
     pub fn tool_pid_file(&self) -> PathBuf {
         self.directory().join("tool.pid")
+    }
+
+    pub fn codex_pid_file(&self) -> PathBuf {
+        self.directory().join("codex.pid")
     }
 
     pub fn requests(&self) -> Result<Vec<Request>> {
@@ -331,6 +397,11 @@ impl Coordinator {
     }
 
     pub async fn close(mut self) -> Result<Closed> {
+        let codex_pid_file = self.codex_pid_file();
+        let codex = codex_pid_file
+            .exists()
+            .then(|| read_pid(&codex_pid_file))
+            .transpose()?;
         if let Some(pid) = self.child.id() {
             // Only this fixture-owned coordinator is signaled and reaped.
             ensure!(unsafe { libc::kill(i32::try_from(pid)?, libc::SIGTERM) } == 0);
@@ -346,11 +417,36 @@ impl Coordinator {
         let requests = provider.close()?;
         let stderr = fs::read_to_string(directory.path().join("coordinator.stderr"))?;
         ensure!(status.success(), "Synthetic coordinator failed: {stderr}");
+        if let Some(pid) = codex {
+            exits_within(pid, CODEX_EXIT_AFTER_CLOSE)
+                .await
+                .with_context(|| format!("The Codex app-server {pid} outlived its coordinator"))?;
+        }
         Ok(Closed {
             requests,
             receipts: receipts(&directory.path().join("diagnostics"))?,
         })
     }
+}
+
+pub fn sqlite_vec() -> Result<std::ffi::OsString> {
+    std::env::var_os("AGENT_SQLITE_VEC").context(
+        "Search contention needs sqlite-vec; set AGENT_SQLITE_VEC, as the Nix development shells do",
+    )
+}
+
+async fn exits_within(pid: i32, within: Duration) -> Result<()> {
+    let gone = || {
+        let alive = unsafe { libc::kill(pid, 0) };
+        alive != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    };
+    timeout(within, async {
+        while !gone() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("Process {pid} was still running after {within:?}"))
 }
 
 pub fn read_pid(path: &Path) -> Result<i32> {
@@ -415,4 +511,37 @@ fn receipts(directory: &Path) -> Result<Receipts> {
     receipts.kept = earliest.into_values().collect();
     receipts.kept.sort_by_key(|receipt| receipt.epoch_ms);
     Ok(receipts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_process_that_exits_passes_and_one_that_keeps_running_fails() {
+        let mut quick = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn_serialized()
+            .unwrap();
+        let quick_pid = i32::try_from(quick.id().unwrap()).unwrap();
+        quick.wait().await.unwrap();
+        assert!(
+            exits_within(quick_pid, Duration::from_secs(1))
+                .await
+                .is_ok()
+        );
+
+        let mut lingering = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 5"])
+            .kill_on_drop(true)
+            .spawn_serialized()
+            .unwrap();
+        let lingering_pid = i32::try_from(lingering.id().unwrap()).unwrap();
+        assert!(
+            exits_within(lingering_pid, Duration::from_millis(50))
+                .await
+                .is_err()
+        );
+        lingering.kill().await.unwrap();
+    }
 }

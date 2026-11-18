@@ -25,7 +25,9 @@ import { ApnsClient, notificationDeliveryKey, NotificationDeliveries, Notificati
 import { validEvent } from "../src/protocol.js";
 import { history, UserNoticeEntry } from "../src/transcript.js";
 import { annotateTranscript } from "../src/transcript_visibility.js";
+import type { OwnerGate } from "../src/failover/owner-gate.js";
 import { FakeClock } from "./fixtures/background-runtime.js";
+import { until as eventually } from "./fixtures/until.js";
 
 const first = "11111111-1111-4111-8111-111111111111", second = "22222222-2222-4222-8222-222222222222";
 const token = "01ab".repeat(24), replacement = "cd23".repeat(24);
@@ -52,15 +54,15 @@ async function until(session: Harness, signal: AbortSignal, condition: () => Pro
     signal.addEventListener("abort", abort, { once: true }); if (signal.aborted) abort(); else void check();
   });
 }
-async function app(directory: string, config: ApnsConfig, origin: string, beforeStart?: (session: Harness) => Promise<void>, clock?: FakeClock) {
+async function app(directory: string, config: ApnsConfig, origin: string, beforeStart?: (session: Harness) => Promise<void>, clock?: FakeClock, ownerGate?: OwnerGate) {
   const registry = createRegistry();
   const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
     { models: createModels(), registry, identity: { attribution: null }, ...(clock === undefined ? {} : { now: clock.now, setTimer: clock.setTimer }) }, BACKGROUND_CONTEXT);
   await session.root(BACKGROUND_CONTEXT); await beforeStart?.(session);
-  const notifications = new Notifications(session, registry, config, origin); await notifications.start();
+  const notifications = new Notifications(session, registry, config, origin, ownerGate); await notifications.start();
   return { session, notifications, registry };
 }
-async function fixture(t: TestContext, beforeStart?: (session: Harness) => Promise<void>, clock?: FakeClock) {
+async function fixture(t: TestContext, beforeStart?: (session: Harness) => Promise<void>, clock?: FakeClock, ownerGate?: OwnerGate) {
   const directory = await mkdtemp(join(tmpdir(), "agent-notifications-")); await chmod(directory, 0o700);
   const keys = generateKeyPairSync("ec", { namedCurve: "prime256v1" }), key = join(directory, "AuthKey.p8");
   await writeFile(key, keys.privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600 });
@@ -75,7 +77,7 @@ async function fixture(t: TestContext, beforeStart?: (session: Harness) => Promi
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address(); assert.ok(address !== null && typeof address === "object");
-  const origin = `http://127.0.0.1:${address.port}`, current = { value: await app(directory, config, origin, beforeStart, clock) };
+  const origin = `http://127.0.0.1:${address.port}`, current = { value: await app(directory, config, origin, beforeStart, clock, ownerGate) };
   t.after(async () => {
     current.value.notifications.close(); await current.value.session.close(BACKGROUND_CONTEXT);
     for (const session of sessions) session.destroy();
@@ -83,7 +85,7 @@ async function fixture(t: TestContext, beforeStart?: (session: Harness) => Promi
     await rm(directory, { recursive: true, force: true });
   });
   return { directory, config, origin, keys, requests, replies, current,
-    reopen: async (beforeStart?: (session: Harness) => Promise<void>) => { current.value.notifications.close(); await current.value.session.close(BACKGROUND_CONTEXT); current.value = await app(directory, config, origin, beforeStart, clock); },
+    reopen: async (beforeStart?: (session: Harness) => Promise<void>) => { current.value.notifications.close(); await current.value.session.close(BACKGROUND_CONTEXT); current.value = await app(directory, config, origin, beforeStart, clock, ownerGate); },
   };
 }
 async function append(session: Harness, kind = AssistantEntry.kind, text = "Private fixture response", stopReason: "stop" | "toolUse" = "stop"): Promise<EntryRecord> {
@@ -470,4 +472,65 @@ test("native presentation annotations suppress unseen and already queued entries
   const fresh = await append(app.session);
   await until(app.session, t.signal, async () => (await delivery(app.session, first, fresh))?.state === "accepted");
   assert.equal(f.requests.length, 1, "Restoring an old row must not replay its alert");
+});
+
+/** An owner gate a test opens or refuses by hand. It starts closed. */
+function ownerGate() {
+  const waiting: { open(): void; refuse(error: Error): void }[] = [];
+  let closed = true;
+  const gate: OwnerGate = {
+    fresh: (signal) => !closed ? Promise.resolve() : new Promise<void>((resolve, reject) => {
+      signal?.addEventListener("abort", () => reject(new Error("The wait at the gate was aborted")), { once: true });
+      waiting.push({ open: resolve, refuse: reject });
+    }),
+  };
+  return { gate, waiting, open() { closed = false; for (const waiter of waiting.splice(0)) waiter.open(); } };
+}
+
+test("a replicated owner's push waits at the owner gate after its attempt is saved, and reaches APNs once the gate opens", { timeout: 10_000 }, async (t) => {
+  const owner = ownerGate(), f = await fixture(t, undefined, undefined, owner.gate), app = f.current.value;
+  await app.notifications.request({ type: "register", installation_id: first, token });
+  const reply = await append(app.session); app.session.resume();
+  await eventually(() => owner.waiting.length === 1, "the push asks the owner gate");
+  assert.equal((await delivery(app.session, first, reply))?.state, "attempting", "the attempt is saved before the gate is asked");
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(f.requests.length, 0, "nothing reaches APNs while the gate is closed");
+  owner.open();
+  await until(app.session, t.signal, async () => (await delivery(app.session, first, reply))?.state === "accepted");
+  assert.equal(f.requests.length, 1);
+});
+
+test("an attempt the owner gate turns away is saved as never sent, and a later dispatcher sends it once", { timeout: 10_000 }, async (t) => {
+  const owner = ownerGate(), f = await fixture(t, undefined, undefined, owner.gate), app = f.current.value;
+  await app.notifications.request({ type: "register", installation_id: first, token });
+  const reply = await append(app.session); app.session.resume();
+  await eventually(() => owner.waiting.length === 1, "the push asks the owner gate");
+  owner.waiting[0]?.refuse(new Error("The authority's answer never came"));
+  await until(app.session, t.signal, async () => (await delivery(app.session, first, reply))?.state === "queued");
+  const unsent = await delivery(app.session, first, reply);
+  assert.equal(unsent?.attempts, 0, "a turned-away attempt is not counted");
+  assert.equal(f.requests.length, 0);
+  assert.equal((await app.session.snapshot(NotificationState, BACKGROUND_CONTEXT))?.active, null, "the dispatcher ended without a result");
+  owner.open();
+  const next = await append(app.session);
+  await until(app.session, t.signal, async () => (await delivery(app.session, first, next))?.state === "accepted" && (await delivery(app.session, first, reply))?.state === "accepted");
+  assert.equal(f.requests.length, 2, "each reply reaches APNs once");
+});
+
+// Pi takes no commit from a task while its Harness closes, so the saved attempt
+// outlives the wait. The next start reads it as it reads any attempt whose
+// outcome it cannot know: uncertain, and never sent again.
+test("a coordinator that closes while a push waits at the owner gate sends nothing, and after it reopens the attempt is uncertain and stays unsent", { timeout: 10_000 }, async (t) => {
+  const owner = ownerGate(), f = await fixture(t, undefined, undefined, owner.gate);
+  let app = f.current.value;
+  await app.notifications.request({ type: "register", installation_id: first, token });
+  const reply = await append(app.session); app.session.resume();
+  await eventually(() => owner.waiting.length === 1, "the push asks the owner gate");
+  await f.reopen(async () => { owner.open(); });
+  app = f.current.value; app.session.resume();
+  await until(app.session, t.signal, async () => (await delivery(app.session, first, reply))?.state === "uncertain");
+  const next = await append(app.session);
+  await until(app.session, t.signal, async () => (await delivery(app.session, first, next))?.state === "accepted");
+  assert.deepEqual(f.requests.map((request) => object(request.body) && object(request.body.agent) && request.body.agent.entry_id), [next.id.toString()],
+    "the reopened coordinator sends new replies and never the interrupted one");
 });

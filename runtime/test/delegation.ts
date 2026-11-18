@@ -89,7 +89,7 @@ export async function attachMainAndSpawnedWorkers(app: App, signal: AbortSignal)
     { signal, async ready() {}, answer(_id, text) { answers.push(text); }, idle() {} }).then(() => {}, (error: unknown) => { failures.push(error); }));
   };
   const effects: HostCall = async (command) => {
-    if (command.type === "spawn_worker") {
+    if (command.type === "spawn_workspace_worker") {
       attach(command.task_id, command.allocation_id, binding); return { type: "spawned", binding };
     }
     if (command.type === "spawn_subagent") {

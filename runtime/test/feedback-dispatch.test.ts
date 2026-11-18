@@ -20,6 +20,7 @@ import { TaskStore, type HostCall } from "../src/tasks.js";
 import { fixtureModel } from "./model.js";
 import { AttachmentStore } from "../src/attachments.js";
 import { SourceJournal } from "../src/sources.js";
+import { LocalFiles } from "../src/failover/retained-files.js";
 
 const coordinator: AgentNode = { host_id: "11111111-1111-4111-8111-111111111111", name: "coordinator", rex_server: null,
   coordinator: null, home_directory: "/home/coordinator", agent_program: "/example/bin/agent",
@@ -38,11 +39,11 @@ async function open(directory: string) {
   const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
     { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
   const tasks = new TaskStore(session, new ConversationModels(models));
-  const attachments = new AttachmentStore(directory); tasks.useAttachments(attachments);
+  const attachments = new AttachmentStore(new LocalFiles(directory)); tasks.useAttachments(attachments);
   const environment = new CoordinatorEnvironment(session); tasks.useEnvironment(environment);
   await environment.configure({ settings: { model: fixtureModel, instructions: "Use the existing checkout.", context_repositories: [], sources: [] }, node: coordinator });
   await environment.register(linux); environment.setConnected([coordinator.host_id, linux.host_id]);
-  const store = new FeedbackStore(directory, tasks);
+  const store = new FeedbackStore(new LocalFiles(directory), tasks);
   const sources = new SourceJournal(session, tasks);
   return { session, tasks, environment, store, sources, attachments, dispatcher: new FeedbackDispatcher(store, tasks, environment), faux };
 }
@@ -117,7 +118,7 @@ test("concurrent raw CLI feedback opens one initial repair folder and reuses it 
     const raw = { ...context, binding: null };
     const first = await app.store.capture("First report.", raw), second = await app.store.capture("Second report.", raw);
     const call: HostCall = async (command) => {
-      if (command.type === "spawn_worker") { assert.equal(command.parent, undefined); spawns += 1; return { type: "spawned", binding }; }
+      if (command.type === "spawn_workspace_worker") { assert.equal(command.workspace, null); spawns += 1; return { type: "spawned", binding }; }
       assert.equal(command.type, "resume_worker"); return { type: "written" };
     };
     const [left, right] = await Promise.all([app.dispatcher.dispatch(first, call), app.dispatcher.dispatch(second, call)]);

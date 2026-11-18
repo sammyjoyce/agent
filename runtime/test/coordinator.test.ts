@@ -136,8 +136,8 @@ test("real CLI, coordinator and worker retain main history across an offline lap
   const repaired = (await tasks()).find((task) => task.id === repair.id); assert.ok(repaired?.worker.state === "bound");
   assert.deepEqual(repaired.worker.binding, repairBinding);
   const windows = sessions(join(homes[1]!, "rex.json"));
-  assert.equal(new Set(windows.map((window) => window.session_id)).size, 2, "Feedback must not create a top-level Rex folder");
-  assert.equal(windows.filter((window) => window.session_id === original.binding.session_id).length, 2, "Repeated feedback must reuse its repair terminal");
+  assert.equal(new Set(windows.map((window) => window.session_id)).size, 1, "Feedback must not create a top-level Rex folder");
+  assert.equal(windows.filter((window) => window.session_id === original.binding.session_id).length, 3, "Shared task windows plus repeated feedback must reuse its repair terminal");
   await script("fixture-original-after-feedback", [{ text: "The original task remains usable after both feedback reports." }]);
   actor.child.stdin.write("fixture-original-after-feedback\n");
   await until(async () => events(actor.output()).some((event) => event.type === "answer" &&
@@ -256,7 +256,7 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     reopened.child.stdin.write("/exit\r"); assert.equal(await reopened.exited, 0, reopened.errors());
     const resumedTask: TaskRecord | undefined = (await tasks()).find((task) => task.id === old.id); assert.ok(resumedTask?.worker.state === "bound");
     assert.deepEqual(resumedTask.worker.binding, original.binding);
-    assert.equal(new Set(sessions(join(homes[1]!, "rex.json")).map((window) => window.session_id)).size, 2);
+    assert.equal(new Set(sessions(join(homes[1]!, "rex.json")).map((window) => window.session_id)).size, 1);
   }
   const stopPath = join(directory, "explicit-stop"), stopAnswer = "An explicitly stopped action must not finish.";
   await script("fixture-explicit-stop", [held(stopPath), { text: stopAnswer }]);

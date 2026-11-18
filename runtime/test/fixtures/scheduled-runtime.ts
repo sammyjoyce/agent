@@ -58,7 +58,7 @@ export async function openScheduled(directory: string, guidanceVersion = "origin
     if (command.type === "inspect_worker") return { type: "worker_presence", presence: { state: "present", running: false } };
     if (command.type === "resume_agent_worker") return { type: "spawned", binding: command.binding };
     if (command.type === "spawn_subagent") return { type: "spawned", binding: { ...binding, block_id: "block:55555555-5555-4555-8555-555555555555" } };
-    if (command.type === "spawn_worker" || command.type === "resume_worker") return { type: "spawned", binding };
+    if (command.type === "spawn_workspace_worker" || command.type === "resume_worker") return { type: "spawned", binding };
     if (command.type === "reload_guidance") return { type: "shared_guidance", global: { text: "FRESH_GLOBAL_POLICY", sources: [] },
       workflow_policy: "Current execution policy.", context_repositories: [], context_sources: [] };
     if (command.type === "project_guidance") return { type: "project_guidance", snapshot: { text: `FRESH_PROJECT_POLICY_${guidanceVersion}`, sources: [] } };

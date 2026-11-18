@@ -3,7 +3,7 @@ use std::{os::fd::AsRawFd, sync::Arc, time::Duration};
 use crate::{
     broker::Broker,
     protocol::{HostResult, RuntimeCommand},
-    runtime::Runtime,
+    runtime::{OwnerClaim, Runtime},
     service::handle,
 };
 use tokio::{
@@ -36,7 +36,13 @@ async fn reset_client_does_not_cancel_admitted_owned_work() {
         }
       });
     "#).unwrap();
-    let runtime = Arc::new(Runtime::start(&script, directory.path()).unwrap());
+    let runtime = Arc::new(
+        Runtime::start(
+            &script,
+            OwnerClaim::acquire(directory.path(), &script, None).unwrap(),
+        )
+        .unwrap(),
+    );
     let broker = Arc::new(
         Broker::new(
             None,

@@ -364,6 +364,7 @@ fn record_hold(
 
 #[cfg(test)]
 mod tests {
+    use agent_cli::serialized_spawn::SerializedSpawn;
     use std::{
         fs,
         io::{BufRead, BufReader, Write},
@@ -374,7 +375,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::coordinator::node;
+    use crate::coordinator::installed;
 
     const EXIT_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -404,10 +405,10 @@ exec sleep 60 >/dev/null"#;
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .process_group(0)
-                .spawn()
+                .spawn_serialized()
                 .unwrap();
             let call = ToolFixture {
-                node: node().unwrap(),
+                node: installed("node").unwrap(),
                 pid_file: pid_file.clone(),
                 owner: owner.id(),
             }

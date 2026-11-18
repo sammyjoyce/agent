@@ -1,5 +1,6 @@
 //! Real CLI/native producers -> Rust runtime transport -> Pi -> provider payload.
 //! Only provider responses and the execution host are synthetic.
+use agent_cli::serialized_spawn::SerializedTokioSpawn;
 use agent_cli::{
     instructions::GuidanceSnapshot,
     models::ModelSelection,
@@ -8,7 +9,7 @@ use agent_cli::{
         AgentNode, CoordinatorBootstrap, CoordinatorSettings, HostCommand, HostResult,
         RuntimeCommand, RuntimeEventKind, WorkerLaunch,
     },
-    runtime::{FrameReader, Runtime, RuntimeCall},
+    runtime::{FrameReader, OwnerClaim, Runtime, RuntimeCall},
 };
 use serde::Deserialize;
 use std::{
@@ -186,7 +187,13 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
     fs::create_dir(&fake_bin).unwrap();
     let rex = fake_bin.join("rex");
     write_executable(&rex, "#!/bin/sh\nexit 1\n");
-    let runtime = Arc::new(Runtime::start(&script, directory.path()).unwrap());
+    let runtime = Arc::new(
+        Runtime::start(
+            &script,
+            OwnerClaim::acquire(directory.path(), &script, None).unwrap(),
+        )
+        .unwrap(),
+    );
     let host = "11111111-1111-4111-8111-111111111111";
     collect(
         &runtime,
@@ -331,7 +338,7 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     let (id, call_id) = match timeout(Duration::from_secs(8), held).await {
         Ok(Ok(held)) => held,

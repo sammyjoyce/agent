@@ -4,9 +4,11 @@ use std::{
 };
 
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
+    Seed,
+    background::{Evidence, ImportPhase},
     coordinator::{Receipts, Tokens},
     gate::{
         self, ABSOLUTE_ALLOWANCE_MS, Comparison, Hold, HoldKind, Mark, Observation,
@@ -21,6 +23,18 @@ use crate::{
 
 const USAGE_FORMULA: &str = "input_tokens = ceil(request body bytes / 4); reasoning_tokens = ceil(reasoning bytes / 4); output_tokens = reasoning_tokens + ceil(answer or exec arguments bytes / 4); cached 0; total = input + output";
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct SearchCorpus {
+    conversations: u32,
+    chunks: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct ImportCorpus {
+    rollouts: u32,
+    items_per_rollout: u32,
+}
+
 #[derive(Serialize)]
 pub struct Sample {
     scenario: Scenario,
@@ -28,7 +42,10 @@ pub struct Sample {
     pair: u8,
     warmup: bool,
     spans: Vec<Span>,
+    opened_epoch_ms: f64,
+    opened_at_ms: f64,
     timeline: Vec<Moment>,
+    background: BackgroundReport,
     requests: Vec<RequestReport>,
     processes: Vec<Process>,
     tokens: Option<Tokens>,
@@ -59,6 +76,31 @@ enum Event {
         command: Option<String>,
         resolution_ms: u8,
     },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum BackgroundReport {
+    None,
+    Search { requests: Vec<SearchReport> },
+    Import { progress: Vec<ProgressReport> },
+}
+
+#[derive(Serialize)]
+struct SearchReport {
+    sent_ms: f64,
+    done_ms: f64,
+    matches: usize,
+    expected_found: bool,
+    gaps: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ProgressReport {
+    at_ms: f64,
+    phase: ImportPhase,
+    items_added: u32,
+    threads_imported: u32,
 }
 
 #[derive(Serialize)]
@@ -120,6 +162,8 @@ pub struct Report {
     terminal_columns: u16,
     long_history_messages: u32,
     unrelated_saved_conversations: u32,
+    search_corpus: Option<SearchCorpus>,
+    import_corpus: ImportCorpus,
     relative_allowance: f64,
     absolute_allowance_ms: f64,
     synthetic: bool,
@@ -183,10 +227,11 @@ impl Sample {
             }
         }
         let opened = outcome.opened;
-        let opened_ms = opened.wall.duration_since(UNIX_EPOCH)?.as_secs_f64() * 1000.0;
+        let opened_epoch_ms = opened.wall.duration_since(UNIX_EPOCH)?.as_secs_f64() * 1000.0;
+        let opened_at_ms = at(opened.monotonic);
         for receipt in receipts.kept {
             timeline.push(Moment {
-                at_ms: receipt.epoch_ms as f64 - opened_ms + at(opened.monotonic),
+                at_ms: receipt.epoch_ms as f64 - opened_epoch_ms + opened_at_ms,
                 event: Event::Receipt {
                     event: receipt.event,
                     input_id: receipt.input_id,
@@ -196,6 +241,32 @@ impl Sample {
             });
         }
         timeline.sort_by(|left, right| left.at_ms.total_cmp(&right.at_ms));
+        let background = match outcome.background {
+            Evidence::None => BackgroundReport::None,
+            Evidence::Search(requests) => BackgroundReport::Search {
+                requests: requests
+                    .into_iter()
+                    .map(|request| SearchReport {
+                        sent_ms: at(request.sent),
+                        done_ms: at(request.done),
+                        matches: request.matches,
+                        expected_found: request.expected_found,
+                        gaps: request.gaps,
+                    })
+                    .collect(),
+            },
+            Evidence::Import(progress) => BackgroundReport::Import {
+                progress: progress
+                    .into_iter()
+                    .map(|event| ProgressReport {
+                        at_ms: at(event.at),
+                        phase: event.phase,
+                        items_added: event.items_added,
+                        threads_imported: event.threads_imported,
+                    })
+                    .collect(),
+            },
+        };
         let requests = requests
             .iter()
             .map(|request| RequestReport {
@@ -231,7 +302,10 @@ impl Sample {
             pair,
             warmup: pair == 0,
             spans,
+            opened_epoch_ms,
+            opened_at_ms,
             timeline,
+            background,
             requests,
             processes: outcome.processes,
             tokens: outcome.tokens,
@@ -339,7 +413,7 @@ impl Report {
     }
 }
 
-pub fn build(scenarios: &[Scenario], samples: Vec<Sample>) -> Result<Report> {
+pub fn build(scenarios: &[Scenario], samples: Vec<Sample>, seed: &Seed) -> Result<Report> {
     let observations = samples
         .iter()
         .flat_map(|sample| {
@@ -360,6 +434,8 @@ pub fn build(scenarios: &[Scenario], samples: Vec<Sample>) -> Result<Report> {
         terminal_columns: terminal::COLUMNS,
         long_history_messages: 5_000,
         unrelated_saved_conversations: 3_000,
+        search_corpus: seed.search_corpus,
+        import_corpus: seed.import_corpus,
         relative_allowance: RELATIVE_ALLOWANCE,
         absolute_allowance_ms: ABSOLUTE_ALLOWANCE_MS,
         synthetic: true,

@@ -5,6 +5,7 @@ mod dreams_cli;
 mod mail;
 mod state;
 
+use agent_cli::serialized_spawn::{SerializedSpawn, SerializedTokioSpawn};
 use std::{
     collections::{HashMap, VecDeque},
     env,
@@ -12,7 +13,7 @@ use std::{
     io::{ErrorKind, IsTerminal},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitCode, Stdio},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -23,19 +24,25 @@ use agent_cli::{
     config::{self, ClientConfig},
     context::ContextStore,
     discovery,
+    failover::{OWNER_FENCED_EXIT, OwnerEpoch, commands},
     feedback::FeedbackContext,
+    history::{HistorySource, chatgpt::ChatGptHistory},
     host,
     host::effects::{Admission, Capacity, HostEffects},
     instructions, jobs,
     models::{ModelProvider, ModelSelection, Reasoning},
+    owner_floor::{OwnerFloor, OwnerLink, OwnerWatch},
     protocol::{
         AuthStatus, ConversationChange, ConversationSettings, CoordinatorBootstrap,
-        CoordinatorSettings, ImportPhase, InputMode, MainInputContext, RuntimeCommand,
-        RuntimeEventKind, SavedConversation, SearchMode, TaskId, TranscriptAnnotation,
-        TranscriptClassification, WorkerLaunch, WorkerRef,
+        CoordinatorSettings, HostDelivery, HostResult, ImportPhase, ImportProgress, InputMode,
+        MainInputContext, RuntimeCommand, RuntimeEventKind, SavedConversation, SearchMode, TaskId,
+        TranscriptAnnotation, TranscriptClassification, WorkerLaunch, WorkerRef,
     },
     rex::{BlockId, RexClient, SessionId},
-    runtime::{FrameReader, Wire, decode_coordinator_event, lifecycle::RequestLifecycle},
+    runtime::{
+        FrameReader, OwnerClaim, OwnerFenced, Wire, decode_coordinator_event,
+        lifecycle::RequestLifecycle,
+    },
     scrawl_feedback, service,
     tui::attachments::ComposerInput,
     tui::{Tui, TuiHandle, TuiInfo, TuiInput},
@@ -149,6 +156,12 @@ enum Action {
     Backup {
         #[command(subcommand)]
         command: BackupAction,
+    },
+    /// Replicate a coordinator: enroll its owner, keep a standby, and promote
+    /// the standby. Every command needs a [failover] section in the private config.
+    Failover {
+        #[command(subcommand)]
+        command: FailoverAction,
     },
     /// Run this machine's coordinator or registered worker service.
     Serve {
@@ -297,6 +310,19 @@ enum ImportAction {
         #[arg(long, value_name = "NAME_OR_ID", value_parser = clap::builder::NonEmptyStringValueParser::new())]
         embedding_host: Option<String>,
     },
+    /// Import a downloaded ChatGPT data export. The export is checked before anything is
+    /// saved; nothing in it runs, and system or custom instructions are never imported.
+    #[command(name = "chatgpt")]
+    ChatGpt {
+        /// The export: its ZIP, the first part of a split download, an extracted folder,
+        /// or a conversations JSON file.
+        #[arg(required = true, num_args = 1.., value_name = "EXPORT")]
+        paths: Vec<PathBuf>,
+        /// Check the export and report what would be imported, without contacting the
+        /// coordinator.
+        #[arg(long)]
+        check: bool,
+    },
     Status,
     /// Resume existing history indexing parked by the restart limit.
     RetryIndex,
@@ -350,6 +376,56 @@ enum BackupAction {
     /// Rebuild a state directory at TARGET, which must be absent or empty, from ARCHIVE.
     Restore { archive: PathBuf, target: PathBuf },
     /// Let a restored coordinator run background work again.
+    Release,
+}
+
+#[derive(Subcommand)]
+enum FailoverAction {
+    /// Print the authority's record and the log position this state directory holds.
+    Status {
+        /// The coordinator to ask about, when the state directory names none.
+        #[arg(long)]
+        coordinator_id: Option<agent_cli::coordinator_id::CoordinatorId>,
+    },
+    /// Make the stopped coordinator the first owner of its replicated state.
+    Enroll {
+        #[arg(long, hide = true)]
+        part_bytes: Option<u64>,
+    },
+    /// Store a new checkpoint from the stopped owner, which drops the log entries it covers.
+    Checkpoint {
+        #[arg(long, hide = true)]
+        part_bytes: Option<u64>,
+    },
+    /// Build a standby of COORDINATOR_ID in the state directory, which must be absent or empty.
+    Join {
+        coordinator_id: agent_cli::coordinator_id::CoordinatorId,
+        /// First rename the state directory that is there to <name>.replaced-<time>.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Apply new log entries and their files to a standby until interrupted.
+    Follow {
+        /// Return when the standby holds the whole log.
+        #[arg(long)]
+        once: bool,
+        /// Seconds between two reads of the log.
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
+        interval: u64,
+    },
+    /// Make this standby the owner in place of the owner at EPOCH.
+    Promote {
+        /// The owner epoch that `failover status` shows now.
+        #[arg(long, value_name = "EPOCH")]
+        replace_epoch: u64,
+        /// Your statement that the old owner is stopped, for a host that cannot be reached.
+        #[arg(long, value_name = "STATEMENT")]
+        old_owner_stopped: Option<String>,
+        /// Seconds to wait for the old owner's stop evidence.
+        #[arg(long, default_value_t = 60)]
+        wait: u64,
+    },
+    /// On the old owner's host: prove that no process of this state directory is alive.
     Release,
 }
 
@@ -479,7 +555,17 @@ fn task_message_sender() -> Result<Option<String>> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<ExitCode> {
+    match run().await {
+        Err(error) if error.downcast_ref::<OwnerFenced>().is_some() => {
+            eprintln!("Error: {error:?}");
+            Ok(ExitCode::from(OWNER_FENCED_EXIT))
+        }
+        result => result.map(|()| ExitCode::SUCCESS),
+    }
+}
+
+async fn run() -> Result<()> {
     let mut arguments = Arguments::parse();
     #[allow(clippy::disallowed_methods)]
     let rex = RexClient::for_process(arguments.rex_server.as_deref())?;
@@ -487,6 +573,7 @@ async fn main() -> Result<()> {
         prompt: None,
         selection: ModelArgs::default(),
     });
+    let mut chatgpt = None;
     match action {
         Action::MessagesRead { argv } => {
             let output = agent_cli::sources::messages_read::capture(&argv).await?;
@@ -528,6 +615,15 @@ async fn main() -> Result<()> {
                 );
             }
             return Ok(());
+        }
+        Action::Import {
+            command: ImportAction::ChatGpt { ref paths, check },
+        } => {
+            let source = check_chatgpt_export(paths.clone(), arguments.json, check).await?;
+            if check {
+                return Ok(());
+            }
+            chatgpt = Some(source);
         }
         Action::Init => {
             let path = arguments
@@ -643,6 +739,73 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
+        Action::Failover { command } => {
+            let script = runtime_script(arguments.runtime.clone());
+            let state = state::path(arguments.state_dir.clone())?;
+            let config = config::load(arguments.config.as_deref())?;
+            let failover = config.failover.as_ref().context(
+                "The failover commands need a [failover] section in the private config file",
+            )?;
+            let json = arguments.json;
+            match command {
+                FailoverAction::Status { coordinator_id } => print_receipt(
+                    json,
+                    &commands::status(&state, coordinator_id, &script, failover)?,
+                )?,
+                FailoverAction::Enroll { part_bytes } => print_receipt(
+                    json,
+                    &commands::enroll(&state, &script, failover, part_bytes)?,
+                )?,
+                FailoverAction::Checkpoint { part_bytes } => print_receipt(
+                    json,
+                    &commands::checkpoint(&state, &script, failover, part_bytes)?,
+                )?,
+                FailoverAction::Join {
+                    coordinator_id,
+                    replace,
+                } => print_receipt(
+                    json,
+                    &commands::join(&state, coordinator_id, replace, &script, failover)?,
+                )?,
+                FailoverAction::Follow { once, interval } => commands::follow(
+                    &state,
+                    &script,
+                    failover,
+                    (!once).then(|| Duration::from_secs(interval)),
+                    |followed| print_receipt(json, followed),
+                )?,
+                FailoverAction::Promote {
+                    replace_epoch,
+                    old_owner_stopped,
+                    wait,
+                } => {
+                    ensure!(
+                        old_owner_stopped
+                            .as_deref()
+                            .is_none_or(|statement| !statement.trim().is_empty()),
+                        "--old-owner-stopped needs your statement of why the old owner is stopped"
+                    );
+                    print_receipt(
+                        json,
+                        &commands::promote(
+                            &state,
+                            &script,
+                            failover,
+                            commands::Promotion {
+                                replace_epoch: OwnerEpoch::new(replace_epoch)?,
+                                old_owner_stopped,
+                                wait: Duration::from_secs(wait),
+                                apns_configured: config.apns.is_some(),
+                            },
+                        )?,
+                    )?
+                }
+                FailoverAction::Release => {
+                    print_receipt(json, &commands::release(&state, &script, failover)?)?
+                }
+            }
+            return Ok(());
+        }
         _ => {}
     }
     let directory = state::directory(arguments.state_dir.clone())?;
@@ -693,6 +856,8 @@ async fn main() -> Result<()> {
             );
             return worker_service(client, 300).await;
         }
+        // A host that does not own the coordinator must set up nothing, not even Messages.
+        let claim = OwnerClaim::acquire(&directory, &script, config.failover.as_ref())?;
         if !no_sources {
             configure_messages(&config.sources).await;
         }
@@ -746,7 +911,7 @@ async fn main() -> Result<()> {
         };
         return service::serve_configured(
             &script,
-            &directory,
+            claim,
             (!local_only).then_some(tailnet_port),
             policy,
             daemon,
@@ -789,6 +954,19 @@ async fn main() -> Result<()> {
             scrawl_feedback::watch(watcher, &dialer, service_notice).await;
         }
         return Ok(());
+    }
+    if let Some(source) = chatgpt {
+        let package = source.summary().clone();
+        return request_presented(
+            &arguments,
+            client,
+            RuntimeCommand::ImportChatGpt { package },
+            None,
+            PlainNoticeRoute::Direct,
+            Some(Arc::new(source)),
+        )
+        .await
+        .map(|_| ());
     }
     let command = match action {
         Action::Login => RuntimeCommand::Login,
@@ -875,6 +1053,9 @@ async fn main() -> Result<()> {
                 hosts,
                 embedding_host,
             },
+            ImportAction::ChatGpt { .. } => {
+                bail!("ChatGPT exports are checked locally before import")
+            }
             ImportAction::Status => RuntimeCommand::ImportStatus,
             ImportAction::RetryIndex => RuntimeCommand::RetryHistoryIndex,
         },
@@ -1146,6 +1327,7 @@ async fn main() -> Result<()> {
                             command,
                             None,
                             PlainNoticeRoute::Watch,
+                            None,
                         )
                         .await?;
                     }
@@ -2981,6 +3163,28 @@ fn scrawl_watcher(client: ClientContext<'_>) -> Option<WatchGuard> {
     })))
 }
 
+/// How long a worker waits for one answer from its coordinator while it
+/// registers. The coordinator may take that long for the two metadata updates
+/// of a registration.
+const WORKER_REGISTRATION_LIMIT: Duration =
+    Duration::from_secs(2 * agent_cli::broker::CONTROL_LIMIT.as_secs());
+
+/// A worker reads its coordinator's address only when it dials, so a wait
+/// without an end would keep it from the address an operator moved to a new
+/// owner.
+async fn coordinator_answer<T>(exchange: impl Future<Output = Result<T>>) -> Result<T> {
+    match timeout(WORKER_REGISTRATION_LIMIT, exchange).await {
+        Ok(answer) => answer,
+        Err(_) => {
+            let limit = WORKER_REGISTRATION_LIMIT.as_secs();
+            service_notice(format_args!(
+                "The coordinator did not answer this worker's registration within {limit}s."
+            ));
+            bail!("The coordinator did not answer a registration within {limit}s")
+        }
+    }
+}
+
 async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> {
     let ClientContext {
         config,
@@ -3000,6 +3204,12 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
         host::Executor::with_tailscale(directory, daemon.clone(), rex.clone())
             .with_browser(script, config.browser.clone()),
     );
+    let floor = OwnerFloor::for_user()?;
+    let watch = config
+        .failover
+        .as_ref()
+        .map(|failover| OwnerWatch::new(failover, script))
+        .transpose()?;
     let mut delay = 1;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -3017,33 +3227,44 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
                 &daemon,
             )
             .await?;
-            let settings = environment(client).await?;
+            let settings = coordinator_answer(environment(client)).await?;
             configure_messages(&settings.sources).await;
-            let mut wire = connection(client, false).await?;
-            write_command(
-                &mut *wire.writer,
-                &RuntimeCommand::ConnectWorker { node: node.clone() },
-            )
+            let (reader, mut writer, child, link) = coordinator_answer(async {
+                let mut wire = connection(client, false).await?;
+                write_command(
+                    &mut *wire.writer,
+                    &RuntimeCommand::ConnectWorker { node: node.clone() },
+                )
+                .await?;
+                let mut reader = FrameReader::new(BufReader::new(wire.reader));
+                let frame = reader
+                    .next_frame()
+                    .await?
+                    .context("Coordinator closed the worker registration")?;
+                let RuntimeEventKind::WorkerReady {
+                    coordinator_id,
+                    owner_epoch,
+                    ..
+                } = decode_coordinator_event(&frame)?
+                else {
+                    bail!("Coordinator did not accept this worker");
+                };
+                let link = OwnerLink::new(coordinator_id, owner_epoch);
+                Ok((reader, wire.writer, wire.child, link))
+            })
             .await?;
-            let mut reader = FrameReader::new(BufReader::new(wire.reader));
-            let frame = reader
-                .next_frame()
-                .await?
-                .context("Coordinator closed the worker registration")?;
-            ensure!(
-                matches!(
-                    decode_coordinator_event(&frame)?,
-                    RuntimeEventKind::WorkerReady { .. }
-                ),
-                "Coordinator did not accept this worker"
-            );
-            Ok::<_, anyhow::Error>((node, reader, wire.writer, wire.child))
+            if let Err(error) = floor.admit(link) {
+                service_notice(format_args!("{error:#}"));
+                let _ = close_connection(&mut *writer, child).await;
+                return Err(error);
+            }
+            Ok::<_, anyhow::Error>((node, reader, writer, child, link))
         };
         let registered = tokio::select! {
             registered = register => registered,
             signal = &mut shutdown => { signal?; return Ok(()); }
         };
-        if let Ok((node, mut reader, mut writer, child)) = registered {
+        if let Ok((node, mut reader, mut writer, child, link)) = registered {
             delay = 1;
             service_notice(format_args!("Worker connected as {}.", node.name));
             // Collection needs another connection while this one serves effects.
@@ -3079,11 +3300,22 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
                     sleep(Duration::from_secs(interval.into())).await;
                 }
             }));
+            let watched = async {
+                match &watch {
+                    Some(watch) => watch.ended(&floor, link).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(watched);
             let mut effects = HostEffects::new(Capacity::RegisteredWorker);
             let result = async {
                 loop {
                     tokio::select! {
                         signal = &mut shutdown => { signal?; return Ok::<_, anyhow::Error>(true); }
+                        error = &mut watched => {
+                            service_notice(format_args!("{error:#}"));
+                            return Err(error);
+                        }
                         completed = effects.next(), if !effects.is_empty() => {
                             let reply = completed?.context("Worker effect queue closed")?;
                             write_command(&mut *writer, &RuntimeCommand::HostReply { call_id: reply.call_id, result: reply.result }).await?;
@@ -3093,6 +3325,15 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
                             match decode_coordinator_event(&frame)? {
                                 RuntimeEventKind::HostCancel { call_id } => { effects.cancel(&call_id); }
                                 RuntimeEventKind::HostCall { call_id, command } => {
+                                    if let Err(error) = floor.check(link) {
+                                        service_notice(format_args!("{error:#}"));
+                                        let result = HostResult::Failed {
+                                            delivery: Some(HostDelivery::NotStarted),
+                                            message: format!("{error:#}; no command was started"),
+                                        };
+                                        write_command(&mut *writer, &RuntimeCommand::HostReply { call_id, result }).await?;
+                                        return Err(error);
+                                    }
                                     let executor = executor.clone();
                                     if let Admission::Rejected(reply) = effects.spawn(call_id, |cancelled| async move {
                                         executor.execute_cancelled(*command, cancelled).await
@@ -3272,7 +3513,7 @@ async fn local_connection(
         });
     }
     let mut child = command
-        .spawn()
+        .spawn_serialized()
         .context("Could not start the local coordinator")?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -3370,7 +3611,7 @@ async fn connection(client: ClientContext<'_>, login: bool) -> Result<Wire> {
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
     let mut child = command
-        .spawn()
+        .spawn_serialized()
         .context("Could not start the coordinator SSH connection")?;
     let reader = child.stdout.take().context("SSH output is unavailable")?;
     let writer = child.stdin.take().context("SSH input is unavailable")?;
@@ -3418,7 +3659,15 @@ async fn request(
     client: ClientContext<'_>,
     command: RuntimeCommand,
 ) -> Result<Option<String>> {
-    request_presented(arguments, client, command, None, PlainNoticeRoute::Direct).await
+    request_presented(
+        arguments,
+        client,
+        command,
+        None,
+        PlainNoticeRoute::Direct,
+        None,
+    )
+    .await
 }
 
 async fn request_with_ui(
@@ -3437,6 +3686,7 @@ async fn request_with_ui(
             session: Some(ui),
         }),
         PlainNoticeRoute::Direct,
+        None,
     )
     .await
 }
@@ -3447,6 +3697,7 @@ async fn request_presented(
     command: RuntimeCommand,
     mut presentation: Option<Presentation<'_>>,
     notices: PlainNoticeRoute,
+    history: Option<Arc<dyn HistorySource>>,
 ) -> Result<Option<String>> {
     let ClientContext {
         config,
@@ -3459,7 +3710,10 @@ async fn request_presented(
     let lifecycle = RequestLifecycle::for_command(&command)
         .context("Transport controls require an active request")?;
     let mut active_turn = lifecycle.allows(&RuntimeCommand::Interrupt);
-    let importing = matches!(command, RuntimeCommand::ImportCodex { .. });
+    let importing = matches!(
+        command,
+        RuntimeCommand::ImportCodex { .. } | RuntimeCommand::ImportChatGpt { .. }
+    );
     let mut ui_controls = presentation
         .as_ref()
         .is_some_and(|view| view.session.is_some());
@@ -3479,6 +3733,7 @@ async fn request_presented(
     let mut history_cursor = None;
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let mut feedback = tokio::task::JoinSet::new();
+    let mut reads = tokio::task::JoinSet::new();
     let mut thinking = false;
     let mut wire = connection(client, lifecycle == RequestLifecycle::Login).await?;
     let relay_needed = match (
@@ -3506,6 +3761,11 @@ async fn request_presented(
     loop {
         let frame = tokio::select! {
             frame = reader.next_frame() => frame?.context("Coordinator disconnected; saved work is retained")?,
+            read = reads.join_next(), if !reads.is_empty() => {
+                let (call_id, result) = read.context("Export reads stopped")??;
+                write_command(&mut *wire.writer, &RuntimeCommand::HostReply { call_id, result }).await?;
+                continue;
+            }
             target = async {
                 match callback.as_mut() {
                     Some(callback) => callback.next().await,
@@ -3580,7 +3840,7 @@ async fn request_presented(
                             let (task_id, agent_id) = history_target.clone().map_or((None, None), |(task, agent)| (Some(task), agent));
                             let next = Box::pin(request_presented(arguments, client,
                                 RuntimeCommand::ReadHistory { task_id, agent_id, cursor: Some(cursor) },
-                                Some(Presentation { handle: view.handle.clone(), session: None }), PlainNoticeRoute::Direct)).await?;
+                                Some(Presentation { handle: view.handle.clone(), session: None }), PlainNoticeRoute::Direct, None)).await?;
                             if lifecycle.is_worker() { history_cursor = next; } else if let Some(ui) = view.session.as_mut() { ui.history_cursor = next; }
                         } else { view.handle.event(RuntimeEventKind::Notice { task_id: None, text: "No older history.".into() })?; }
                     }
@@ -3735,7 +3995,18 @@ async fn request_presented(
             view.handle.event(event.clone())?;
         }
         match event {
-            RuntimeEventKind::HostCall { call_id, .. } => {
+            RuntimeEventKind::HostCall { call_id, command } => {
+                if let (Some(source), agent_cli::protocol::HostCommand::History { request }) = (&history, *command) {
+                    let source = source.clone();
+                    reads.spawn(async move {
+                        let result = match source.request(request).await {
+                            Ok(response) => agent_cli::protocol::HostResult::History { response },
+                            Err(error) => agent_cli::protocol::HostResult::Failed { message: error.to_string(), delivery: None },
+                        };
+                        (call_id, result)
+                    });
+                    continue;
+                }
                 write_command(&mut *wire.writer, &RuntimeCommand::HostReply { call_id, result: outdated_coordinator_effect() }).await?;
                 let notice = "Update the coordinator so this task's host runs its commands.";
                 match &presentation {
@@ -3758,7 +4029,7 @@ async fn request_presented(
                 );
                 let status = std::process::Command::new("open")
                     .args(["-a", "Google Chrome", &url])
-                    .status()
+                    .status_serialized()
                     .context("Could not open Chrome for ChatGPT sign-in")?;
                 ensure!(status.success(), "Chrome did not open");
                 eprintln!("Finish ChatGPT sign-in in Chrome.");
@@ -3944,16 +4215,7 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
         }
         RuntimeEventKind::Interrupted => println!("Interrupted."),
         RuntimeEventKind::ImportProgress { progress } => {
-            println!(
-                "{}: {} imported, {} unchanged, {} seen; {} items added, {} assets, {} gaps",
-                import_phase_name(&progress.phase),
-                progress.threads_imported,
-                progress.threads_unchanged,
-                progress.threads_seen,
-                progress.items_added,
-                progress.assets_saved,
-                progress.gap_count
-            );
+            println!("{}", import_progress_line(progress));
             if matches!(progress.phase, ImportPhase::Complete | ImportPhase::Partial) {
                 for gap in progress.gaps.iter().take(3) {
                     eprintln!("  {gap}");
@@ -4101,12 +4363,92 @@ fn import_phase(phase: &ImportPhase) -> u8 {
 }
 fn import_phase_name(phase: &ImportPhase) -> &'static str {
     match phase {
-        ImportPhase::Discovering => "Discovering",
-        ImportPhase::Importing => "Importing",
-        ImportPhase::Indexing => "Indexing",
-        ImportPhase::Complete => "Complete",
-        ImportPhase::Partial => "Partial",
+        ImportPhase::Discovering => "discovering",
+        ImportPhase::Importing => "importing",
+        ImportPhase::Indexing => "indexing",
+        ImportPhase::Complete => "complete",
+        ImportPhase::Partial => "partial",
     }
+}
+
+fn import_progress_line(progress: &ImportProgress) -> String {
+    format!(
+        "{} {}: {} imported, {} unchanged, {} seen; {} items added, {} assets, {} gaps",
+        progress.source.label(),
+        import_phase_name(&progress.phase),
+        progress.threads_imported,
+        progress.threads_unchanged,
+        progress.threads_seen,
+        progress.items_added,
+        progress.assets_saved,
+        progress.gap_count
+    )
+}
+
+async fn check_chatgpt_export(
+    paths: Vec<PathBuf>,
+    json: bool,
+    check: bool,
+) -> Result<ChatGptHistory> {
+    let source = tokio::task::spawn_blocking(move || {
+        ChatGptHistory::open(&paths, &mut |step| {
+            if !json {
+                eprintln!("{step}");
+            }
+        })
+    })
+    .await??;
+    let summary = source.summary();
+    if json && check {
+        println!("{}", serde_json::to_string(summary)?);
+        return Ok(source);
+    }
+    eprintln!(
+        "ChatGPT export {}: {} conversations ({} archived) in {} shards",
+        summary.digest.get(..8).unwrap_or(&summary.digest),
+        summary.conversations,
+        summary.archived,
+        summary.shards
+    );
+    eprintln!(
+        "  {} attachments, {} not in this export",
+        summary.attachments, summary.missing_attachments
+    );
+    eprintln!(
+        "  {} system, developer, custom-instruction and hidden messages and code outputs are left out",
+        summary.excluded_messages
+    );
+    if !summary.unsupported.is_empty() {
+        let total: u32 = summary.unsupported.iter().map(|kind| kind.count).sum();
+        let kinds: Vec<String> = summary
+            .unsupported
+            .iter()
+            .map(|kind| format!("{} × {}", kind.count, kind.content))
+            .collect();
+        eprintln!(
+            "  {total} entries are of a kind this import does not read: {}",
+            kinds.join(", ")
+        );
+    }
+    if summary.dropped_library_files > 0 {
+        eprintln!(
+            "  {} library files have no kept message in this export and are left out",
+            summary.dropped_library_files
+        );
+    }
+    if summary.unreferenced_files > 0 {
+        eprintln!(
+            "  {} files in this export are not named by any imported message and are left out",
+            summary.unreferenced_files
+        );
+    }
+    for note in &summary.notes {
+        eprintln!("  {note}");
+    }
+    for problem in &summary.problems {
+        eprintln!("  Not imported: {problem}");
+    }
+    Ok(source)
 }
 
 #[cfg(test)]
@@ -4125,10 +4467,11 @@ mod tests {
         local_service_command,
     };
     use agent_cli::models::{ModelProvider, ModelSelection, Reasoning};
-    use agent_cli::protocol::SearchMode;
+    use agent_cli::protocol::{ImportPhase, ImportProgress, SearchMode};
     use agent_cli::rex::RexClient;
+    use agent_cli::serialized_spawn::SerializedSpawn;
     use clap::Parser;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     fn personal_rex() -> RexClient {
         RexClient::for_process(None).unwrap()
@@ -4448,7 +4791,7 @@ esac
                 .env("REX_SESSION", "unrelated-session")
                 .env("REX_BLOCK", "unrelated-pane")
                 .env("REX_CLIENT", "unrelated-client")
-                .output()
+                .output_serialized()
                 .unwrap();
             assert!(
                 output.status.success(),
@@ -4738,6 +5081,50 @@ esac
         assert!(admission.sending().unwrap());
         assert_eq!(admission.input().unwrap(), input);
         assert_eq!(admission.id, id);
+    }
+
+    #[test]
+    fn import_chatgpt_parses_paths_and_check() {
+        let parsed =
+            Arguments::try_parse_from(["agent", "import", "chatgpt", "a.zip", "b.zip", "--check"])
+                .unwrap();
+        assert!(matches!(parsed.command, Some(Action::Import {
+            command: crate::ImportAction::ChatGpt { paths, check: true }
+        }) if paths == [PathBuf::from("a.zip"), PathBuf::from("b.zip")]));
+        let parsed = Arguments::try_parse_from(["agent", "import", "chatgpt", "export/"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Action::Import {
+                command: crate::ImportAction::ChatGpt { check: false, .. }
+            })
+        ));
+        assert!(Arguments::try_parse_from(["agent", "import", "chatgpt"]).is_err());
+        assert!(Arguments::try_parse_from(["agent", "import", "chatgpt", "--check"]).is_err());
+    }
+
+    #[test]
+    fn progress_lines_name_their_source() {
+        let progress = |source| ImportProgress {
+            source,
+            phase: ImportPhase::Complete,
+            host_id: None,
+            threads_seen: 3,
+            threads_imported: 2,
+            threads_unchanged: 1,
+            items_added: 9,
+            items_unchanged: 0,
+            assets_saved: 1,
+            gap_count: 0,
+            gaps: Vec::new(),
+        };
+        assert_eq!(
+            crate::import_progress_line(&progress(agent_cli::protocol::HistoryProvider::ChatGpt)),
+            "ChatGPT complete: 2 imported, 1 unchanged, 3 seen; 9 items added, 1 assets, 0 gaps"
+        );
+        assert_eq!(
+            crate::import_progress_line(&progress(agent_cli::protocol::HistoryProvider::Codex)),
+            "Codex complete: 2 imported, 1 unchanged, 3 seen; 9 items added, 1 assets, 0 gaps"
+        );
     }
 
     #[test]
@@ -5410,7 +5797,7 @@ esac
                     if (item.valid) models.validate(item.selection);
                     else await assert.rejects(models.preflight(item.selection), /Reasoning .* unavailable/);
                 }
-            "#]).arg(models).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            "#]).arg(models).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn_serialized().unwrap();
         child
             .stdin
             .take()

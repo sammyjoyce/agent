@@ -15,12 +15,14 @@ import type { HistoryItem } from "../src/generated/HistoryItem.js";
 import type { HistoryGap } from "../src/generated/HistoryGap.js";
 import type { RuntimeEvent } from "../src/generated/RuntimeEvent.js";
 import { HistoryStore, ImportedItemEntry } from "../src/history.js";
-import { CodexImporter } from "../src/importer.js";
+import { HistoryImports } from "../src/importer.js";
 import { ConversationModels, DEFAULT_MODEL } from "../src/models.js";
 import { Retrieval } from "../src/retrieval.js";
 import { TaskStore, type HostCall } from "../src/tasks.js";
 import { createAppTools, Executions } from "../src/tools.js";
 import { validEvent } from "../src/protocol.js";
+import { LocalFiles } from "../src/failover/retained-files.js";
+import { chatGptBatch } from "./fixtures/chatgpt-history.js";
 
 const space: EmbeddingSpace = { id: "synthetic-tool-search", model_revision: "fixture", model_digest: "fixture",
   dimensions: 3, pooling: "last", normalization: "l2", instruction_version: 1 };
@@ -109,15 +111,15 @@ test("search and task reads bound imported coverage while Pi retains every canon
     assert.deepEqual(await tasks.saved(chosen.conversation_id), receipt.conversation);
     const adopted = await tasks.adopt(chosen.conversation_id, { id: "11111111-1111-4111-8111-111111111111",
       outcome: "Continue the retained decision", evidence: "The original connector decision is retained", model: DEFAULT_MODEL });
-    assert.deepEqual((await history.get(source.thread.id))?.gaps, source.gaps);
+    assert.deepEqual((await history.get({ source: "codex", thread_id: source.thread.id }))?.gaps, source.gaps);
     await retrieval.close(); await session.close(BACKGROUND_CONTEXT); closed = true;
     const reopened = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
       { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
     try {
-      const retained = new HistoryStore(reopened), canonical = await retained.get(source.thread.id);
+      const retained = new HistoryStore(reopened), canonical = await retained.get({ source: "codex", thread_id: source.thread.id });
       assert.deepEqual(canonical?.gaps, source.gaps);
       assert.equal(canonical?.adopted_task_id, adopted.id);
-      assert.deepEqual((await retained.checkpoint(source.thread.id, source.host_id))?.gaps, source.gaps);
+      assert.deepEqual((await retained.checkpoint({ source: "codex", thread_id: source.thread.id }, source.host_id))?.gaps, source.gaps);
     } finally { await reopened.close(BACKGROUND_CONTEXT); }
   } finally {
     if (!closed) { await retrieval.close(); await session.close(BACKGROUND_CONTEXT); }
@@ -188,8 +190,8 @@ test("main and worker tools find older substantive context beside a newer shallo
     }
     assert.deepEqual(inspected, ["main", "worker"]);
     assert.equal((await tasks.list()).length, 1);
-    assert.equal((await history.get("older-substantive"))?.adopted_task_id, null);
-    assert.equal((await history.get("newer-shallow"))?.adopted_task_id, null);
+    assert.equal((await history.get({ source: "codex", thread_id: "older-substantive" }))?.adopted_task_id, null);
+    assert.equal((await history.get({ source: "codex", thread_id: "newer-shallow" }))?.adopted_task_id, null);
   } finally { await retrieval.close(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -202,7 +204,7 @@ test("main and worker search retain fresh matching tasks while an import fills t
   const history = new HistoryStore(session); const tasks = new TaskStore(session, new ConversationModels(models)); tasks.useHistory(history);
   const executions = new Executions(), tools = createAppTools(tasks, executions); registry.install(tools.main); registry.install(tools.worker);
   const retrieval = new Retrieval(session, history, tasks, join(directory, "search.sqlite"));
-  const importer = new CodexImporter(session, history, join(directory, "assets"));
+  const importer = new HistoryImports(session, history, new LocalFiles(directory));
   const node: AgentNode = { host_id: "fixture-source", name: "Desktop", rex_server: "https://desktop.example.test", coordinator: null,
     agent_program: "agent", home_directory: "/example/home", launch: { state_dir: null, runtime: null, config: null, instructions: null, model: null } };
   const query = "connector decisions";
@@ -224,7 +226,7 @@ test("main and worker search retain fresh matching tasks while an import fills t
     const old = await retrieval.search(query, [], 8, call, true); assert.equal(old.candidates.length, 8);
     const fresh = await tasks.create({ title: "Connector decisions", outcome: "Continue the connector decision audit", model: DEFAULT_MODEL });
     const unrelated = await tasks.create({ title: "Unrelated transport repair", outcome: "Fix a bicycle tire", model: DEFAULT_MODEL });
-    importing = importer.run([node], [node.host_id], [], call, () => {}, async () => { indexed(); await gate; });
+    importing = importer.codex([node], [node.host_id], [], call, () => {}, async () => { indexed(); await gate; });
     await began; assert.equal(importer.isRunning(), true);
     const root = await session.root(BACKGROUND_CONTEXT);
     for (const role of ["main", "worker"]) {
@@ -242,7 +244,7 @@ test("main and worker search retain fresh matching tasks while an import fills t
         assert.ok(found.matches.some((match: unknown) => match !== null && typeof match === "object" && "entry_ids" in match && Array.isArray(match.entry_ids) && match.entry_ids.length > 0),
           "Historical originals must remain available beside live task metadata");
         assert.ok(found.matches.every((match: unknown) => match !== null && typeof match === "object" && "title" in match && match.title !== "Unrelated transport repair"));
-        assert.ok("gaps" in found); assert.deepEqual(found.gaps, ["Codex history import and indexing are in progress"]);
+        assert.ok("gaps" in found); assert.deepEqual(found.gaps, ["History import and indexing are in progress"]);
         const exact = await invoke(session, conversation, { type: "toolCall", id: "exact-search-" + role, name: "search_tasks",
           arguments: { query, sources: [{ provider: "task_outcomes", account: "local", thread_id: unrelated.id }] } });
         assert.ok(exact !== null && typeof exact === "object" && "matches" in exact && Array.isArray(exact.matches));
@@ -346,4 +348,24 @@ test("semantic reads after reopen bypass an owned full catchup and retain increm
     if (!closed) { await app.retrieval.close(); await app.session.close(BACKGROUND_CONTEXT); }
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("chatgpt provenance refs are chatgpt/export and codex refs are unchanged", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-search-provenance-"));
+  const models = createModels();
+  const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+    { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  const history = new HistoryStore(session), tasks = new TaskStore(session, new ConversationModels(models)); tasks.useHistory(history);
+  try {
+    const shared = "00000000-0000-4000-8000-0000000000c1";
+    const codex = await history.import(batch(shared, 1, [item("note", "Codex note about deployment", 1)]));
+    const chatgpt = await history.import(chatGptBatch(shared, 2, [
+      { id: "prompt", parent: null, turn: "prompt", kind: "user:text", role: "user", text: "Plan a picnic for eight" }]));
+    const refs = async (conversation: string) => {
+      const found = new Set<string>(); for await (const record of tasks.records(conversation)) for (const ref of record.source_refs) found.add(ref);
+      return [...found];
+    };
+    assert.deepEqual(await refs(codex.conversation.conversation_id), [JSON.stringify(["codex", "local", shared])]);
+    assert.deepEqual(await refs(chatgpt.conversation.conversation_id), [JSON.stringify(["chatgpt", "export", shared])]);
+  } finally { await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

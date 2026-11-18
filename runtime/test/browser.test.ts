@@ -21,6 +21,7 @@ import type { RuntimeEvent } from "../src/generated/RuntimeEvent.js";
 import { DEFAULT_MODEL } from "../src/models.js";
 import { protocolLines, validEvent } from "../src/protocol.js";
 import { Executions, type Execution } from "../src/tools.js";
+import { LocalFiles } from "../src/failover/retained-files.js";
 
 const hostId = "11111111-1111-4111-8111-111111111111";
 const otherHostId = "22222222-2222-4222-8222-222222222222";
@@ -35,7 +36,7 @@ async function open(directory: string) {
   const registry = createRegistry();
   const session = await Harness.open(await SqliteStorage.open(database), { models, registry }, BACKGROUND_CONTEXT);
   const browsers = new BrowserStore(session), executions = new Executions();
-  const tools = createBrowserTools(browsers, executions, new AttachmentStore(directory)); registry.install(tools);
+  const tools = createBrowserTools(browsers, executions, new AttachmentStore(new LocalFiles(directory))); registry.install(tools);
   return { session, browsers, executions, tools, faux };
 }
 

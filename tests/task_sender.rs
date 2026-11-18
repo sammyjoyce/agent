@@ -1,4 +1,5 @@
 //! Real host execution and CLI serialization retain the calling conversation.
+use agent_cli::serialized_spawn::SerializedTokioSpawn;
 use agent_cli::{
     host::{ACTOR_CONVERSATION_ENV, Executor},
     protocol::{HostCommand, HostResult, InputMode, InputOrigin, RuntimeCommand, RuntimeEventKind},
@@ -28,7 +29,7 @@ async fn host_exec_and_real_tasks_send_preserve_explicit_actor_and_clear_inherit
                 .args(["--exact", TEST, "--nocapture"])
                 .env(CHILD, "true")
                 .env(ACTOR_CONVERSATION_ENV, "999")
-                .output(),
+                .output_serialized(),
         )
         .await
         .unwrap()
@@ -150,7 +151,7 @@ async fn tasks_send_rejects_noncanonical_actor_identity_before_delivery() {
                 ])
                 .env(ACTOR_CONVERSATION_ENV, invalid)
                 .stdin(Stdio::null())
-                .output(),
+                .output_serialized(),
         )
         .await
         .unwrap()

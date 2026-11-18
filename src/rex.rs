@@ -4,6 +4,7 @@
 pub mod install;
 pub mod source;
 
+use crate::serialized_spawn::SerializedTokioSpawn;
 use std::fmt;
 use std::path::Path;
 use std::process::Stdio;
@@ -503,6 +504,26 @@ impl RexClient {
         Ok(view)
     }
 
+    /// Dedicated workspace ownership is durable in the coordinator, not inferred
+    /// from this display label. Its first task gets a named window too.
+    pub async fn create_workspace_session(
+        &self,
+        title: &str,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+    ) -> Result<WorkerBinding, RexError> {
+        let mut request = CreateRequest::worker(title, program, args, cwd)?;
+        request.label = "Beep Boop".to_owned();
+        request.initial_windows[0].window_label = title.to_owned();
+        request.initial_windows[0].layout.block.label = title.to_owned();
+        let output = self
+            .api("session.create", &request)
+            .await
+            .map_err(|error| creation_failure(error, None))?;
+        decode_creation(&output)
+    }
+
     /// One native create attempt. Lost or malformed receipts never authorize a retry.
     pub async fn create_session(
         &self,
@@ -653,7 +674,9 @@ impl RexClient {
 
     async fn run(&self, args: Vec<String>) -> Result<Vec<u8>, CallFailure> {
         let mut command = self.command(&args);
-        let mut child = command.spawn().map_err(|_| CallFailure::Unavailable)?;
+        let mut child = command
+            .spawn_serialized()
+            .map_err(|_| CallFailure::Unavailable)?;
         let result = tokio::time::timeout(CALL_TIMEOUT, async {
             let stdout = child.stdout.take().ok_or(CallFailure::Failed)?;
             let stderr = child.stderr.take().ok_or(CallFailure::Failed)?;
@@ -993,6 +1016,7 @@ fn decode_creation(output: &[u8]) -> Result<WorkerBinding, RexError> {
 mod tests {
     use super::*;
     use crate::executable_fixture::write_executable;
+    use crate::serialized_spawn::SerializedSpawn;
     const SESSION: &str = "session:11111111-1111-4111-8111-111111111111";
     const WINDOW: &str = "window:22222222-2222-4222-8222-222222222222";
     const BLOCK: &str = "block:33333333-3333-4333-8333-333333333333";
@@ -1052,7 +1076,7 @@ printf '<pre>Current task view 🦀</pre>\n'
             .env("REX_SESSION", "unrelated-session")
             .env("REX_BLOCK", "unrelated-pane")
             .env("REX_CLIENT", "unrelated-client")
-            .output()
+            .output_serialized()
             .unwrap();
         assert!(
             output.status.success(),
@@ -1562,7 +1586,7 @@ printf '%s\n' "$value"
                 .env("PATH", &paths)
                 .env("AGENT_TEST_REX_PROCESS_FIXTURE", directory.path())
                 .env("AGENT_TEST_REX_PROCESS_CASE", case)
-                .output()
+                .output_serialized()
                 .unwrap();
             assert!(
                 result.status.success(),

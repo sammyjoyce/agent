@@ -32,10 +32,14 @@ public enum Microphone {
 /// The session is `.record` with mode `.measurement`, which keeps the system's own signal
 /// processing to a minimum, so the model hears audio closest to what it was trained on.
 final class Capture: Sendable {
-  let audio: AsyncStream<[Float]>
-  private let heard: AsyncStream<[Float]>.Continuation
+  let audio: AsyncThrowingStream<[Float], any Error>
+  private let heard: AsyncThrowingStream<[Float], any Error>.Continuation
   private let reporting: AsyncStream<Take.Event>.Continuation
   private let state: OSAllocatedUnfairLock<State>
+  /// A converter error halts capture on this queue, since `removeTap` inside the tap's block can
+  /// run that block again before it returns. The queued halt holds the capture strongly. A weak
+  /// reference could leave the last release, and the running engine with it, to the tap's block.
+  private let teardown = DispatchQueue(label: "ParakeetSpeech.Capture.teardown")
 
   private struct State {
     var engine: AVAudioEngine?
@@ -59,7 +63,7 @@ final class Capture: Sendable {
     engine: AVAudioEngine, converter: AVAudioConverter,
     reporting: AsyncStream<Take.Event>.Continuation
   ) {
-    (audio, heard) = AsyncStream.makeStream(of: [Float].self)
+    (audio, heard) = AsyncThrowingStream.makeStream(of: [Float].self)
     self.reporting = reporting
     state = OSAllocatedUnfairLock(uncheckedState: State(engine: engine, converter: converter))
   }
@@ -93,6 +97,7 @@ final class Capture: Sendable {
     do {
       engine.prepare()
       try engine.start()
+      capture.observe(engine)
     } catch {
       capture.stop()
       throw error
@@ -102,14 +107,17 @@ final class Capture: Sendable {
 
   var isRunning: Bool { state.withLockUnchecked { $0.engine != nil } }
 
+  /// Halts, then waits for any halt queued on `teardown`, so that halt cannot deactivate the shared
+  /// audio session after the next take activates it.
   func stop() {
     halt(interrupted: false)
+    teardown.sync {}
   }
 
   private func halt(interrupted: Bool) {
     let running = state.withLockUnchecked { state -> (AVAudioEngine, [any NSObjectProtocol])? in
       guard let engine = state.engine else { return nil }
-      let rest = Self.convert(nil, with: state.converter)
+      let rest = (try? Self.convert(nil, with: state.converter)) ?? []
       if !rest.isEmpty { heard.yield(rest) }
       heard.finish()
       defer {
@@ -130,7 +138,15 @@ final class Capture: Sendable {
   private func hear(_ buffer: AVAudioPCMBuffer) {
     let level = state.withLockUnchecked { state -> Float? in
       guard state.engine != nil else { return nil }
-      let samples = Self.convert(buffer, with: state.converter)
+      let samples: [Float]
+      do {
+        samples = try Self.convert(buffer, with: state.converter)
+      } catch {
+        // Under the lock, so a stop racing this buffer cannot end the audio cleanly first.
+        heard.finish(throwing: error)
+        teardown.async { self.halt(interrupted: false) }
+        return nil
+      }
       guard !samples.isEmpty else { return nil }
       heard.yield(samples)
       return state.level(samples)
@@ -139,7 +155,7 @@ final class Capture: Sendable {
   }
 
   private static func convert(_ buffer: AVAudioPCMBuffer?, with converter: AVAudioConverter)
-    -> [Float]
+    throws -> [Float]
   {
     let ratio = converter.outputFormat.sampleRate / converter.inputFormat.sampleRate
     let capacity = AVAudioFrameCount(Double(buffer?.frameLength ?? 0) * ratio) + 1_024
@@ -156,6 +172,7 @@ final class Capture: Sendable {
         input.pointee = .haveData
         return next
       }
+      if status == .error { throw ParakeetError.audioFormat }
       if let channel = output.floatChannelData {
         heard.append(
           contentsOf: UnsafeBufferPointer(start: channel[0], count: Int(output.frameLength)))
@@ -163,6 +180,28 @@ final class Capture: Sendable {
       guard status == .haveData else { break }
     }
     return heard
+  }
+
+  /// `AVAudioEngine` stops itself and posts `AVAudioEngineConfigurationChange` when the input's
+  /// channel count or sample rate changes. A notice while it still runs did not stop its audio, so
+  /// the take goes on.
+  private func engineChanged() {
+    guard let engine = state.withLockUnchecked({ $0.engine }), !engine.isRunning else { return }
+    halt(interrupted: true)
+  }
+
+  /// `AVAudioEngine` posts `AVAudioEngineConfigurationChange` on an internal queue, where releasing
+  /// the engine can deadlock. The handler queues the check on `teardown`, which `stop()` waits for.
+  /// It reaches the capture only through `check`, so the internal queue never holds the capture
+  /// strongly. The engine may stop itself before the observer is added, so the check runs here too.
+  private func observe(_ engine: AVAudioEngine) {
+    let check: @Sendable () -> Void = { [weak self] in self?.engineChanged() }
+    holdUntilHalt([
+      NotificationCenter.default.addObserver(
+        forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
+      ) { [teardown] _ in teardown.async(execute: check) }
+    ])
+    engineChanged()
   }
 
   private func observe() {
@@ -192,8 +231,18 @@ final class Capture: Sendable {
           self?.halt(interrupted: true)
         },
       ]
-      state.withLockUnchecked { $0.observers = observers }
+      holdUntilHalt(observers)
     #endif
+  }
+
+  private func holdUntilHalt(_ observers: [any NSObjectProtocol]) {
+    let halted = state.withLockUnchecked { state in
+      guard state.engine != nil else { return true }
+      state.observers += observers
+      return false
+    }
+    guard halted else { return }
+    for observer in observers { NotificationCenter.default.removeObserver(observer) }
   }
 
   private static func deactivate() {

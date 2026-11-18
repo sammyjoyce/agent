@@ -78,12 +78,25 @@ public final class AppNotifications: NSObject {
     get throws { try receiver().coordinators }
   }
 
+  /// False while the phone is locked and files it protects cannot be read or written.
+  var protectedDataAvailable: Bool {
+    #if os(iOS)
+      UIApplication.shared.isProtectedDataAvailable
+    #else
+      true
+    #endif
+  }
+
   func open(_ origin: AlertOrigin) {
     openRequest = OpenRequest(destination: .feed(notice: coordinators.show(opening: origin)))
   }
 
   func open(_ job: JobEntity) {
     openRequest = OpenRequest(destination: .job(job.id))
+  }
+
+  func showNotice(_ notice: String) {
+    openRequest = OpenRequest(destination: .feed(notice: notice))
   }
 
   func presents(_ origin: AlertOrigin?) -> Bool {
@@ -103,13 +116,22 @@ public final class AppNotifications: NSObject {
       caches: .cachesDirectory, transport: .tailnet,
       persistence: ComposerDraftStore(
         url: URL.applicationSupportDirectory.appending(path: "Agent/Composer/draft.json")),
-      sharedInbox: try? SharedDraftInbox.configured())
+      sharedInbox: try? SharedDraftInbox.configured(), spotlight: Self.appSpotlight)
     AppDependencyManager.shared.add(dependency: self)
+  }
+
+  private static var appSpotlight: (any SpotlightStore)? {
+    #if os(iOS)
+      CoreSpotlightStore()
+    #else
+      nil
+    #endif
   }
 
   init(
     defaults: UserDefaults, applicationSupport: URL, caches: URL, transport: CoordinatorTransport,
     persistence: ComposerDraftStore? = nil, sharedInbox: SharedDraftInbox? = nil,
+    spotlight: (any SpotlightStore)? = nil,
     permission: @escaping @MainActor () async throws -> Bool = AppNotifications.alertPermission
   ) {
     let registration = NotificationRegistration(
@@ -125,7 +147,8 @@ public final class AppNotifications: NSObject {
     self.registration = registration
     coordinators = Coordinators(
       registration: registration, defaults: defaults, applicationSupport: applicationSupport,
-      caches: caches, transport: transport, persistence: persistence, sharedInbox: sharedInbox)
+      caches: caches, transport: transport, persistence: persistence, sharedInbox: sharedInbox,
+      spotlight: spotlight)
     super.init()
   }
 

@@ -27,6 +27,7 @@ import { conversationSettings } from "../src/settings.js";
 import { TaskStore, type HostCall } from "../src/tasks.js";
 import { history } from "../src/transcript.js";
 import { fixtureModel } from "./model.js";
+import { chatGptBatch } from "./fixtures/chatgpt-history.js";
 
 const binding: WorkerRef = { host_id: "11111111-1111-4111-8111-111111111111", session_id: "session:22222222-2222-4222-8222-222222222222",
   window_id: "window:33333333-3333-4333-8333-333333333333", block_id: "block:44444444-4444-4444-8444-444444444444" };
@@ -346,7 +347,7 @@ test("imported views and settings are inert; actual input uses one normal Rex ac
       task_id: null, agent_id: null, change: { type: "set_reasoning", reasoning: "high" }, catalog: false });
     assert.deepEqual(await app.tasks.list(), [], "Changing an imported view's model must not adopt or execute it");
     let spawns = 0;
-    const call: HostCall = async (command) => { assert.equal(command.type, "spawn_worker"); if (command.type !== "spawn_worker") throw new Error("Unexpected host operation");
+    const call: HostCall = async (command) => { assert.equal(command.type, "spawn_workspace_worker"); if (command.type !== "spawn_workspace_worker") throw new Error("Unexpected host operation");
       assert.equal(command.host.cwd, "/example/project"); spawns += 1; return { type: "spawned", binding }; };
     const receipts: RuntimeEventKind[] = [];
     await app.views.input(input(saved.conversation_id, "first", "Continue this hardware work"), call, (event) => receipts.push(event));
@@ -483,7 +484,7 @@ test("active child steering reuses its actor and closed child or task folders re
     await app.views.input(input(child.conversation_id, "fourth", "Continue after closing the task folder"), async (command) => {
       const operation = local(command);
       if (operation.type === "inspect_worker") return { type: "worker_presence", presence: { state: "missing_session" } };
-      if (operation.type === "spawn_worker") { folders += 1; return { type: "spawned", binding: nextParent }; }
+      if (operation.type === "spawn_workspace_worker") { folders += 1; return { type: "spawned", binding: nextParent }; }
       assert.equal(operation.type, "spawn_subagent"); if (operation.type !== "spawn_subagent") throw new Error("Unexpected folder recovery");
       assert.equal(operation.parent.session_id, nextParent.session_id); panes += 1; return { type: "spawned", binding: nextChild };
     }, () => {});
@@ -517,7 +518,7 @@ test("a stale child missing-folder read cannot replace a parent folder confirmed
         if (inspected === 1) { entered(); await gate; return { type: "worker_presence", presence: { state: "missing_session" } }; }
         return { type: "worker_presence", presence: { state: "present", running: true } };
       }
-      if (operation.type === "spawn_worker") { folders += 1; return { type: "spawned", binding }; }
+      if (operation.type === "spawn_workspace_worker") { folders += 1; return { type: "spawned", binding }; }
       if (operation.type === "spawn_subagent") return { type: "spawned", binding: childBinding };
       throw new Error("Unexpected recovery operation");
     });
@@ -570,7 +571,7 @@ test("two missing child folders share parent recovery and retain both admitted i
         inspected += 1; if (inspected <= 2) { if (inspected === 2) bothEntered(); await inspections; }
         return { type: "worker_presence", presence: { state: "missing_session" } };
       }
-      if (operation.type === "spawn_worker") { folders += 1; creating(); await creation; return { type: "spawned", binding: next }; }
+      if (operation.type === "spawn_workspace_worker") { folders += 1; creating(); await creation; return { type: "spawned", binding: next }; }
       assert.equal(operation.type, "spawn_subagent"); if (operation.type !== "spawn_subagent") throw new Error("Unexpected recovery");
       assert.equal(operation.parent.session_id, next.session_id); panes += 1;
       return { type: "spawned", binding: { ...next, block_id: operation.agent_id } };
@@ -660,4 +661,33 @@ test("saved conversation transport origin survives outbox reopen, conflicting re
     app.faux.setResponses([origins([null]), origins([null, "ios"])]); await run(child.id);
     assert.equal(app.faux.state.callCount, 3, "Provenance adds no inference");
   } finally { app.views.close(); app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("continuing a chatgpt conversation uses the default host", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-chatgpt-continue-")), app = await open(directory);
+  const views: ReturnType<typeof observe>[] = [];
+  try {
+    const shared = "00000000-0000-4000-8000-0000000000c1";
+    await app.histories.import({ host_id: binding.host_id, thread: { id: shared, title: "Deployment notes", cwd: "/example/project",
+      created_at: 1, updated_at: 2, version: "codex-v1", version_reliable: true, archived: false, forked_from_id: null, parent_thread_id: null },
+      items: [{ id: "note", turn_id: "one", kind: "userMessage", role: "user", text: "Codex note about deployment", version: "one",
+        timestamp_ms: 1, order: 0, data: { type: "userMessage", text: "Codex note about deployment" }, assets: [] }], next_cursor: null, gaps: [], complete: true });
+    const saved = (await app.histories.import(chatGptBatch(shared, 10, [
+      { id: "prompt", parent: null, turn: "prompt", kind: "user:text", role: "user", text: "Plan a picnic for eight" }]))).conversation;
+    const view = observe(app, 1, saved.conversation_id); views.push(view);
+    await view.until(() => view.frames.some((event) => event.type === "conversation_ready"));
+    const ready = view.frames.find((event) => event.type === "conversation_ready");
+    assert.equal(ready?.type === "conversation_ready" ? ready.cwd : undefined, "/", "An export has no working directory to report");
+    await view.detach();
+    const spawned: [string | null | undefined, string][] = [];
+    const call: HostCall = async (command) => {
+      if (command.type !== "spawn_workspace_worker") throw new Error("Unexpected host operation");
+      spawned.push([command.host.host_id, command.host.cwd]); return { type: "spawned", binding };
+    };
+    await app.views.input(input(saved.conversation_id, "continue", "Continue the picnic plan"), call, () => {});
+    assert.deepEqual(spawned, [[binding.host_id, "/example/home"]],
+      "A Codex checkpoint for the same native ID never makes the ChatGPT conversation resume in that thread's directory");
+    assert.equal(app.faux.state.callCount, 0);
+  } finally { app.views.close(); await Promise.allSettled(views.map((view) => view.running)); app.catalog.close();
+    await app.harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

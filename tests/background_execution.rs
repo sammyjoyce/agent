@@ -12,7 +12,7 @@ use agent_cli::{
         RuntimeEventKind, TaskId, TaskRecord, WorkerLaunch,
     },
     rex::RexClient,
-    runtime::{Runtime, RuntimeCall},
+    runtime::{OwnerClaim, Runtime, RuntimeCall},
 };
 use serde::Serialize;
 use tokio::time::{sleep, timeout};
@@ -221,7 +221,13 @@ async fn stopping_one_background_actor_drains_its_real_process_and_preserves_the
         },
         background: None,
     };
-    let runtime = Arc::new(Runtime::start(&script, directory.path()).unwrap());
+    let runtime = Arc::new(
+        Runtime::start(
+            &script,
+            OwnerClaim::acquire(directory.path(), &script, None).unwrap(),
+        )
+        .unwrap(),
+    );
     collect(
         runtime
             .request(RuntimeCommand::ConfigureCoordinator {
@@ -415,7 +421,11 @@ async fn stopping_one_background_actor_drains_its_real_process_and_preserves_the
         .close()
         .await
         .unwrap();
-    let runtime = Runtime::start(&script, directory.path()).unwrap();
+    let runtime = Runtime::start(
+        &script,
+        OwnerClaim::acquire(directory.path(), &script, None).unwrap(),
+    )
+    .unwrap();
     let (reopened, history) = task(&runtime, &ids[0]).await;
     assert_eq!(reopened.conversation_id, alpha_task.conversation_id);
     assert!(history.contains("JOB_ALPHA") && history.contains("ALPHA_RECOVERY"));

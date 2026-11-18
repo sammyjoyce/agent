@@ -136,6 +136,7 @@ final class ChatModel {
       endAnsweredQuestion()
       followScope()
       pushFeedbackTarget()
+      indexSaved()
     }
   }
   /// The scope last asked for, as saved. Only `show(_:)` changes it.
@@ -167,8 +168,10 @@ final class ChatModel {
       endAnsweredQuestion()
       followScope()
       pushFeedbackTarget()
+      indexSaved()
     }
   }
+  private func indexSaved() { spotlight?.save(profiles.filter { removed[$0.id] == nil }) }
   /// What the composer holds. A draft changed in code replaces the field's text, composition
   /// included, so all of it is committed.
   var draft = "" {
@@ -316,6 +319,7 @@ final class ChatModel {
   var draftError: String?
   @ObservationIgnored private let persistence: ComposerDraftStore?
   @ObservationIgnored private let sharedInbox: SharedDraftInbox?
+  @ObservationIgnored let spotlight: SpotlightIndex?
   @ObservationIgnored private var persistentRevision: UInt64 = 0
   @ObservationIgnored private var composerID = UUID()
   @ObservationIgnored private var consumedTransfers: Set<UUID> = []
@@ -361,13 +365,14 @@ final class ChatModel {
     inspecting conversation: SavedConversation? = nil,
     draftStore: AttachmentStore? = nil, persistence: ComposerDraftStore? = nil,
     sharedInbox: SharedDraftInbox? = nil, registration: NotificationRegistration? = nil,
-    scope preference: ScopePreference = .memory,
+    scope preference: ScopePreference = .memory, spotlight: SpotlightIndex? = nil,
     admit: @escaping Admit = { deliver in await deliver() }
   ) {
     inspectedConversation = conversation
     self.draftStore = draftStore
     self.persistence = persistence
     self.sharedInbox = sharedInbox
+    self.spotlight = spotlight
     draftReady = persistence == nil
     self.registration = registration
     self.admit = admit
@@ -738,13 +743,13 @@ final class ChatModel {
 
   /// Holds lane `id` connected while `body` runs, whatever the scene is doing. The lane is dialed
   /// only if nothing else had it connecting, and it disconnects after `body` only if nothing else
-  /// wants it, before this returns. `body` runs once, and only after the lane's session itself
-  /// reported connected within `limit`. Otherwise `body` never runs, and this throws
+  /// wants it, before this returns. `body` runs once, on the lane's session, and only after that
+  /// session itself reported connected within `limit`. Otherwise `body` never runs, and this throws
   /// `LaneError.gone` or `.notPaired` for a lane without a session, `.outboxUnreadable` as soon
   /// as the session has dialed nothing because it could not read its saved outbox, `.unanswered`
   /// once `limit` passes, or `CancellationError` for a cancelled task.
   func withConnection<T>(
-    to id: ProfileID, within limit: Duration, _ body: () async throws -> T
+    to id: ProfileID, within limit: Duration, _ body: (CoordinatorSession) async throws -> T
   ) async throws -> T {
     try Task.checkCancellation()
     _ = try session(on: id)
@@ -753,8 +758,8 @@ final class ChatModel {
     let outcome: Result<T, any Error>
     do {
       await reconcile(id)
-      try await awaitConnection(id, until: deadline)
-      outcome = .success(try await body())
+      let session = try await awaitConnection(id, until: deadline)
+      outcome = .success(try await body(session))
     } catch {
       outcome = .failure(error)
     }
@@ -765,12 +770,12 @@ final class ChatModel {
     return try outcome.get()
   }
 
-  /// Returns once lane `id`'s session reports connected with no lifecycle call on the lane in
+  /// Returns lane `id`'s session once it reports connected with no lifecycle call on the lane in
   /// flight, since a redial closes the connection that a read before it saw. It asks the session,
   /// because `snapshots` is a copy that trails it. A session that dialed nothing for want of its
   /// outbox ends the wait at once, since nothing dials it again until the next `reconcile`.
   private func awaitConnection(_ id: ProfileID, until deadline: ContinuousClock.Instant)
-    async throws
+    async throws -> CoordinatorSession
   {
     while true {
       let session = try session(on: id)
@@ -779,7 +784,7 @@ final class ChatModel {
       try Task.checkCancellation()
       if told(session, on: id) == .outboxUnreadable { throw LaneError.outboxUnreadable(name(id)) }
       guard ContinuousClock.now < deadline else { throw LaneError.unanswered(name(id)) }
-      if connected, lifecycles[id]?.inFlight == nil { return }
+      if connected, lifecycles[id]?.inFlight == nil { return session }
       try await Task.sleep(for: .milliseconds(5))
     }
   }
@@ -872,7 +877,9 @@ final class ChatModel {
     for session in sessions { await session.retire() }
   }
   func jobs(_ id: String? = nil, lane: ProfileID) async throws -> NativeJobStatus {
-    try await onLane(lane) { try await $0.jobs(id) }
+    let status = try await onLane(lane) { try await $0.jobs(id) }
+    if case .list(let listing) = status { spotlight?.list(listing.jobs, of: lane) }
+    return status
   }
   func retryJob(_ id: String, lane: ProfileID) async throws -> ScheduledJobStatus {
     try await onLane(lane) { try await $0.retryJob(id) }

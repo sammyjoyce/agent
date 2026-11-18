@@ -401,7 +401,11 @@ impl Broker {
         let mut cancellations = tokio::task::JoinSet::new();
         let mut draining = false;
         let result: Result<()> = async {
-            crate::service::write_frame(&mut writer, &RuntimeEventKind::WorkerReady { connection_id: generation.to_string() }).await?;
+            crate::service::write_frame(&mut writer, &RuntimeEventKind::WorkerReady {
+                connection_id: generation.to_string(),
+                coordinator_id: Some(runtime.coordinator_id()),
+                owner_epoch: runtime.owner_epoch(),
+            }).await?;
             loop {
                 if draining && pending.is_empty() && incoming.is_empty() { return Ok(()); }
                 tokio::select! {
@@ -463,7 +467,9 @@ fn target(command: &HostCommand) -> Option<&str> {
         HostCommand::ResourceInspect { record }
         | HostCommand::ResourcePlanCleanup { record }
         | HostCommand::ResourceCollect { record, .. } => Some(&record.host_id),
-        HostCommand::SpawnWorker { host, .. } => host.host_id.as_deref(),
+        HostCommand::SpawnWorker { host, .. } | HostCommand::SpawnWorkspaceWorker { host, .. } => {
+            host.host_id.as_deref()
+        }
         HostCommand::SpawnSubagent { parent, .. } => Some(&parent.host_id),
         HostCommand::ResumeWorker { binding, .. }
         | HostCommand::ResumeAgentWorker { binding, .. }
@@ -498,8 +504,11 @@ pub(crate) async fn initialize(runtime: &Runtime, bootstrap: CoordinatorBootstra
     .context("Coordinator initialization failed")
 }
 
+/// How long the coordinator gives one metadata update. A worker's registration makes two.
+pub const CONTROL_LIMIT: Duration = Duration::from_secs(15);
+
 pub async fn control(runtime: &Runtime, command: RuntimeCommand) -> Result<()> {
-    control_until(runtime, command, Instant::now() + Duration::from_secs(15))
+    control_until(runtime, command, Instant::now() + CONTROL_LIMIT)
         .await
         .context("Coordinator metadata update failed")
 }
@@ -557,7 +566,7 @@ mod tests {
             AgentNode, HostCommand, HostResult, ImageMediaType, ImageRead, RuntimeCommand,
             RuntimeEventKind, WorkerLaunch,
         },
-        runtime::{FrameReader, Runtime},
+        runtime::{FrameReader, OwnerClaim, Runtime},
         service::write_frame,
     };
     use std::{fs, sync::Arc, time::Duration};
@@ -692,7 +701,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("fixture.mjs");
         fs::write(&script, FIXTURE).unwrap();
-        let runtime = Runtime::start(&script, directory.path()).unwrap();
+        let runtime = Runtime::start(
+            &script,
+            OwnerClaim::acquire(directory.path(), &script, None).unwrap(),
+        )
+        .unwrap();
         (directory, Arc::new(runtime))
     }
     fn effect(id: &str, command: HostCommand) -> HostCommand {

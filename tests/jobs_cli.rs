@@ -1,3 +1,4 @@
+use agent_cli::serialized_spawn::SerializedSpawn;
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
@@ -118,7 +119,7 @@ impl Fixture {
             .command_format(args, json)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_serialized()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
         while child.try_wait().unwrap().is_none() {

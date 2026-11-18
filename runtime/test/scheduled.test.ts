@@ -37,7 +37,7 @@ test("scheduled work uses the existing task actor, current guidance and exact na
     assert.equal(app.commands.filter((command) => command.type === "exec").length, 1);
     await runScheduled(scheduledOccurrence, new AbortController().signal, app);
     assert.equal((await app.tasks.list()).length, 1); assert.equal(app.faux.state.callCount, 2);
-    assert.equal(app.commands.filter((command) => command.type === "spawn_worker" || command.type === "resume_worker").length, 0);
+    assert.equal(app.commands.filter((command) => command.type === "spawn_workspace_worker" || command.type === "resume_worker").length, 0);
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -235,7 +235,7 @@ test("SIGKILL after scheduled input placement restores its actor without duplica
     assert.equal(recovered?.id, prior.id);
     const page = await conversation.entries({}, 100, undefined, BACKGROUND_CONTEXT);
     assert.equal(page.items.filter((entry) => entry.model?.some((message) => message.role === "user")).length, 1);
-    assert.equal(app.commands.filter((command) => command.type === "spawn_worker").length, 0);
+    assert.equal(app.commands.filter((command) => command.type === "spawn_workspace_worker").length, 0);
     assert.equal(app.commands.filter((command) => command.type === "resume_worker").length, 0);
     assert.equal(app.commands.filter((command) => command.type === "exec").length, 1,
       JSON.stringify(page.items.flatMap((entry) => entry.model?.filter((message) => message.role === "toolResult") ?? [])));
@@ -257,11 +257,11 @@ test("job migration preserves only a job-owned conversation independently of its
       job_id: job.id });
     await app.tasks.update(owned.id, (saved) => { saved.worker = { state: "bound", allocation_id: "old-allocation", host, binding }; });
     assert.equal(await openJobActor(job, app.tasks), owned.id);
-    assert.equal(app.commands.filter((command) => command.type === "spawn_worker").length, 1);
+    assert.equal(app.commands.filter((command) => command.type === "spawn_workspace_worker").length, 1);
     app.faux.setResponses([fauxAssistantMessage("Continued the original job conversation.")]);
     await runScheduled(scheduledOccurrence, new AbortController().signal, app, owned.id);
     assert.equal((await app.tasks.get(owned.id)).conversation_id, owned.conversation_id);
-    assert.equal(app.commands.filter((command) => command.type === "spawn_worker").length, 1);
+    assert.equal(app.commands.filter((command) => command.type === "spawn_workspace_worker").length, 1);
     assert.equal(app.commands.filter((command) => command.type === "resume_worker" || command.type === "inspect_worker").length, 0);
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
 });

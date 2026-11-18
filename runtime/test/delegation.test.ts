@@ -38,7 +38,8 @@ async function open(directory: string) {
   const release = executions.bind(root.id.toString(), { cwd: host.cwd, hosts: [host], model: fixtureModel,
     search: async () => found, async call(command) {
       effects.push(command);
-      if (command.type === "spawn_worker") return { type: "spawned", binding: { ...binding, session_id: `session:${randomUUID()}` } };
+      if (command.type === "on_node") return { type: "worker_presence", presence: { state: "present", running: true } };
+      if (command.type === "spawn_workspace_worker") return { type: "spawned", binding: { ...binding, session_id: command.workspace?.session_id ?? `session:${randomUUID()}` } };
       assert.equal(command.type, "resume_worker"); return { type: "written" };
     } });
   await tasks.inference.configure(root, fixtureModel, { extensions: [tools.main] });
@@ -93,7 +94,7 @@ test("same-effort continuation reuses its binding while a justified separate out
       tool({ task_id: old.id, input: "Continue the same broader cleanup; use child terminals for subwork." }, "reuse-existing"),
       tool({ title: "Independent calendar repair", outcome: "Repair calendar sync", input: "Repair calendar sync", new_task: true,
         new_task_reason: "Calendar synchronization is a separate outcome from device playbook cleanup." }, "separate-calendar"), fauxAssistantMessage("Cleanup continued and the separate calendar repair started.")]);
-    assert.deepEqual(app.effects.map((command) => command.type), ["resume_worker", "spawn_worker"]);
+    assert.deepEqual(app.effects.map((command) => command.type), ["resume_worker", "on_node", "spawn_workspace_worker"]);
     assert.equal((await app.tasks.list()).length, 2);
     const continued = await app.tasks.get(old.id); assert.ok(continued.worker.state === "bound");
     assert.deepEqual(continued.worker.binding, binding); assert.equal(continued.conversation_id, old.conversation_id);
@@ -108,7 +109,7 @@ test("same-effort continuation reuses its binding while a justified separate out
       entries[0]?.data.candidates.map(({ conversation_id, task_id }) => ({ conversation_id, task_id })));
     assert.ok(created.candidates.every((candidate) => Number.isFinite(candidate.score) && candidate.score > 0));
     const separate = await app.tasks.get(created.selection.task_id); assert.ok(separate.worker.state === "bound");
-    assert.notEqual(separate.worker.binding.session_id, binding.session_id);
+    assert.equal(separate.worker.binding.session_id, binding.session_id, "Separate task conversations share the coordinator workspace");
   } finally { await app.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -125,7 +126,7 @@ test("adoption and later continuation record the same imported conversation with
       tool({ conversation_id: saved.conversation.conversation_id, input: "Continue that same quote." }, "continue-quote"), fauxAssistantMessage("The historical quote is the active task.")]);
     const [task] = await app.tasks.list(); assert.ok(task); assert.equal((await app.tasks.list()).length, 1);
     assert.equal(task.conversation_id, saved.conversation.conversation_id);
-    assert.deepEqual(app.effects.map((command) => command.type), ["spawn_worker", "resume_worker"]);
+    assert.deepEqual(app.effects.map((command) => command.type), ["spawn_workspace_worker", "resume_worker"]);
     assert.deepEqual((await app.decisions()).map((entry) => entry.data.selection), [
       { kind: "adopt", task_id: task.id, conversation_id: task.conversation_id }, { kind: "reuse", task_id: task.id, conversation_id: task.conversation_id },
     ]);

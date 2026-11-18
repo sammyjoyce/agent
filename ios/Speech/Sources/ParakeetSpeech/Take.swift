@@ -13,8 +13,8 @@ public final class Take: Sendable {
     case level(Float)
     /// The whole transcript so far. Later audio can still change it, so each replaces the last.
     case partial(String)
-    /// A call, Siri, losing the input or a media-services reset stopped capture. What was heard is
-    /// kept, and `finish` still returns its words.
+    /// A call, Siri, a lost input, an input format change, or a media-services reset stopped
+    /// capture. What was heard is kept, and `finish` still returns its words.
     case interrupted
   }
 
@@ -104,14 +104,14 @@ public final class Take: Sendable {
   }
 
   private static func transcribe(
-    _ audio: AsyncStream<[Float]>, with model: Task<Recognizer, any Error>,
+    _ audio: AsyncThrowingStream<[Float], any Error>, with model: Task<Recognizer, any Error>,
     reporting: AsyncStream<Event>.Continuation
   ) async throws -> String {
     let recognizer = try await model.value
     try Task.checkCancellation()
     try await recognizer.reset()
     var shown = ""
-    for await samples in audio {
+    for try await samples in audio {
       try Task.checkCancellation()
       let heard = try await recognizer.feed(samples)
       guard heard != shown else { continue }

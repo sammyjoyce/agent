@@ -489,6 +489,7 @@ impl Dreams {
 
 #[cfg(test)]
 mod tests {
+    use crate::serialized_spawn::SerializedSpawn;
     use std::{
         fs,
         os::unix::fs::{PermissionsExt, symlink},
@@ -528,7 +529,7 @@ mod tests {
             .args(arguments)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .output()
+            .output_serialized()
             .unwrap();
         assert!(
             output.status.success(),

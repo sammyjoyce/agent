@@ -173,6 +173,7 @@ fn parse(bytes: &[u8]) -> Option<Response> {
 #[cfg(test)]
 mod tests {
     use crate::callback::{CallbackRelay, parse};
+    use crate::serialized_spawn::SerializedSpawn;
     use std::{io::ErrorKind, net::SocketAddr, time::Duration};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -197,7 +198,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", name, "--nocapture", "--test-threads=1"])
             .env("AGENT_CALLBACK_TEST_PROCESS", name)
-            .output()
+            .output_serialized()
             .unwrap();
         assert!(
             output.status.success(),

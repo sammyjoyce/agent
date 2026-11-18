@@ -80,7 +80,7 @@ test("public delegation after SQLite reopen retains unknown sessions and resumes
       }
       const resumed = await app.tasks.get(task.id); assert.ok(resumed.worker.state === "bound");
       assert.deepEqual(resumed.worker.binding, replacement); assert.equal(spawns, 1); assert.equal(resumes, 2);
-      assert.equal(commands.some((command) => command.type === "spawn_worker"), false);
+      assert.equal(commands.some((command) => command.type === "spawn_workspace_worker"), false);
       assert.equal((await app.tasks.list()).length, 1);
       assert.equal(resumed.pending.length, 3, "Original work and both public-tool updates remain owned by the same task");
     } finally { unbind(); }
@@ -233,9 +233,9 @@ test("a bound task whose session did not survive a Rex restart reopens in the sa
       sent.push(command.type);
       if (command.type === "resume_worker") return notStarted;
       if (command.type === "on_node") return { type: "worker_presence", presence: { state: "missing_session" } };
-      assert.equal(command.type, "spawn_worker"); return { type: "spawned", binding: reopened };
+      assert.equal(command.type, "spawn_workspace_worker"); return { type: "spawned", binding: reopened };
     });
-    assert.deepEqual(sent, ["resume_worker", "on_node", "spawn_worker"]);
+    assert.deepEqual(sent, ["resume_worker", "on_node", "on_node", "spawn_workspace_worker"]);
     assert.ok(resumed.worker.state === "bound"); assert.deepEqual(resumed.worker.binding, reopened);
     assert.notEqual(resumed.worker.allocation_id, original.worker.allocation_id);
     assert.equal(resumed.id, task.id); assert.equal(resumed.conversation_id, task.conversation_id);
@@ -246,7 +246,7 @@ test("a bound task whose session did not survive a Rex restart reopens in the sa
     assert.deepEqual(entries.items.filter(Decision.is).map((entry) => [entry.data.operation, entry.data.previous.state, entry.data.current.state, entry.data.result.type]), [
       ["create", "unassigned", "allocating", "pending"], ["create", "allocating", "bound", "spawned"],
       ...failedResume, ...failedResume, ...failedResume,
-      ["reopen", "bound", "allocating", "pending"], ["create", "allocating", "bound", "spawned"],
+      ["reopen", "unassigned", "allocating", "pending"], ["create", "allocating", "bound", "spawned"],
     ]);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
@@ -263,7 +263,7 @@ test("an older missing-session observation cannot replace a newer confirmed runn
     const gate = new Promise<void>((resolve) => { release = resolve; });
     slow = app.tasks.dispatch(task.id, host, async (command): Promise<HostResult> => {
       if (command.type === "on_node") { entered(); await gate; return { type: "worker_presence", presence: { state: "missing_session" } }; }
-      assert.equal(command.type, "spawn_worker"); spawns += 1;
+      assert.equal(command.type, "spawn_workspace_worker"); spawns += 1;
       return { type: "spawned", binding: { ...binding, session_id: "session:55555555-5555-4555-8555-555555555555" } };
     });
     void slow.catch(() => {}); await started;

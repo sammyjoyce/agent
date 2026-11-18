@@ -1,4 +1,3 @@
-import { setTimeout as sleep } from "node:timers/promises";
 import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import type { Seq, Storage, StorageWrite } from "@earendil-works/pi-durable";
 import type { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
@@ -6,13 +5,10 @@ import type { AuthorityState } from "../generated/AuthorityState.js";
 import type { BatchBody } from "../generated/BatchBody.js";
 import type { FileRecord } from "../generated/FileRecord.js";
 import type { LogEntry } from "../generated/LogEntry.js";
-import { AuthorityUnreachable, type AuthorityLink } from "./authority-link.js";
+import { repeatUntilAnswered, type AuthorityLink } from "./authority-link.js";
 import { INLINE_BATCH_LIMIT_BYTES, logEntryDigest, parseBatch, sha256Hex, versions } from "./log-entry.js";
 import type { ScopedDatabase } from "./scoped-database.js";
-import { followLog, publishFiles, replicatedFilePath, type LogFollower } from "./standby.js";
-
-const FIRST_RETRY_MS = 50;
-const RETRY_CAP_MS = 5_000;
+import { followLog, publishFiles, removePaths, replicatedFilePath, type LogFollower } from "./standby.js";
 
 /**
  * The authority no longer takes this holder for the owner. The process must
@@ -43,6 +39,8 @@ export interface LogWriter {
   readonly head: number;
   /** Logs a file-only entry, then gives each file its final name. */
   appendFiles(files: readonly StagedFile[]): Promise<void>;
+  /** Logs an entry that removes each path, a file or a whole tree, then removes it here. */
+  removeFiles(paths: readonly string[]): Promise<void>;
   /** Holds files for the entry of the next Pi batch, which names them ahead of the batch that references them. */
   carry(files: readonly StagedFile[]): void;
 }
@@ -50,6 +48,18 @@ export interface LogWriter {
 export interface ReplicatedStorageOptions extends LogFollower {
   readonly holder: string;
   readonly epoch: number;
+  /**
+   * Called where a refusal is read from the authority's answer, before the
+   * `OwnerFenced` is thrown. Pi turns a rejected commit into a failed Session
+   * and keeps the process alive, so the throw alone can be swallowed.
+   */
+  readonly onFenced: (error: OwnerFenced) => void;
+}
+
+function fenced(options: Pick<ReplicatedStorageOptions, "onFenced">, reason: OwnerFenced["reason"], state: AuthorityState | null): OwnerFenced {
+  const error = new OwnerFenced(reason, state);
+  options.onFenced(error);
+  return error;
 }
 
 /**
@@ -66,7 +76,7 @@ export async function openReplicatedStorage(options: ReplicatedStorageOptions): 
     const record = await link.record();
     if (record === undefined) throw new Error("This coordinator is not enrolled with the authority");
     const { state } = record;
-    if (state.kind !== "active" || state.holder !== holder || state.epoch !== epoch) throw new OwnerFenced(state.kind === "active" ? "fenced" : "sealed", state);
+    if (state.kind !== "active" || state.holder !== holder || state.epoch !== epoch) throw fenced(options, state.kind === "active" ? "fenced" : "sealed", state);
     inner = await database.openStorage();
   } catch (error) {
     await database.close().catch(() => {});
@@ -107,8 +117,16 @@ class OwnerLog implements LogWriter {
 
   appendFiles(files: readonly StagedFile[]): Promise<void> {
     return this.#serialized(async () => {
-      const at = await this.#append(files, null);
+      const at = await this.#append({ files, removed: [], batch: null });
       await this.#options.database.applyWithoutBatch(at, () => this.#publish(files));
+      this.#head = at;
+    });
+  }
+
+  removeFiles(paths: readonly string[]): Promise<void> {
+    return this.#serialized(async () => {
+      const at = await this.#append({ files: [], removed: paths, batch: null });
+      await this.#options.database.applyWithoutBatch(at, () => removePaths(this.#options.stateDirectory, paths));
       this.#head = at;
     });
   }
@@ -119,7 +137,7 @@ class OwnerLog implements LogWriter {
     const logged = parseBatch(json, this.#head + 1);
     const piSeq = await database.dryRun(() => this.#storage.commit(logged, context));
     const files = this.#carried.splice(0);
-    const at = await this.#append(files, { piSeq, json });
+    const at = await this.#append({ files, removed: [], batch: { piSeq, json } });
     const committed = await database.apply(at, piSeq, { publish: () => this.#publish(files), commit: () => this.#storage.commit(logged, context) });
     this.#head = at;
     return committed;
@@ -131,14 +149,17 @@ class OwnerLog implements LogWriter {
     return result;
   }
 
-  async #append(files: readonly StagedFile[], batch: { readonly piSeq: number; readonly json: string } | null): Promise<number> {
-    const { link, holder, epoch } = this.#options;
-    const body = { at: this.#head + 1, epoch, versions: await versions(), files: files.map(({ record }) => record),
+  async #append({ files, removed, batch }: { readonly files: readonly StagedFile[]; readonly removed: readonly string[];
+    readonly batch: { readonly piSeq: number; readonly json: string } | null }): Promise<number> {
+    const { link, holder, epoch, signal } = this.#options;
+    const body = { at: this.#head + 1, epoch, versions: await versions(), files: files.map(({ record }) => record), removed: [...removed],
       batch: batch === null ? null : { pi_seq: batch.piSeq, body: await this.#batchBody(batch.json) } };
     const entry: LogEntry = { ...body, digest: logEntryDigest(body) };
-    const reply = await this.#repeatUntilAnswered(() => link.command({ op: "append", holder, entry }));
+    // The authority takes a repeated append from the current owner as the same
+    // append, so a repeat after a lost exchange is safe.
+    const reply = await repeatUntilAnswered(() => link.command({ op: "append", holder, entry }), signal);
     if (reply.result === "accepted") return entry.at;
-    if (reply.reason === "sealed" || reply.reason === "fenced") throw new OwnerFenced(reply.reason, reply.state);
+    if (reply.reason === "sealed" || reply.reason === "fenced") throw fenced(this.#options, reply.reason, reply.state);
     throw new Error(`The authority refused log entry ${entry.at} as ${reply.reason}: this owner's head is ${this.#head}, and the authority's is ${reply.state?.head ?? "unknown"}`);
   }
 
@@ -146,26 +167,11 @@ class OwnerLog implements LogWriter {
     const bytes = Buffer.from(json, "utf8");
     if (bytes.byteLength <= INLINE_BATCH_LIMIT_BYTES) return { kind: "inline", json };
     const sha256 = sha256Hex(bytes);
-    await this.#repeatUntilAnswered(() => this.#options.link.putBlob(sha256, bytes));
+    await repeatUntilAnswered(() => this.#options.link.putBlob(sha256, bytes), this.#options.signal);
     return { kind: "blob", sha256, size: bytes.byteLength };
   }
 
   #publish(files: readonly StagedFile[]): Promise<void> {
     return publishFiles(files.map(({ record, staged }) => ({ synced: staged, path: replicatedFilePath(this.#options.stateDirectory, record) })));
-  }
-
-  async #repeatUntilAnswered<T>(exchange: () => Promise<T>): Promise<T> {
-    const { signal } = this.#options;
-    for (let wait = FIRST_RETRY_MS; ; wait = Math.min(wait * 2, RETRY_CAP_MS)) {
-      try {
-        return await exchange();
-      } catch (error) {
-        if (!(error instanceof AuthorityUnreachable)) throw error;
-        if (signal?.aborted) throw new Error("Stopped waiting for the authority, which was unreachable", { cause: error });
-      }
-      await sleep(wait, undefined, signal === undefined ? {} : { signal }).catch((error: unknown) => {
-        throw new Error("Stopped waiting for the authority, which was unreachable", { cause: error });
-      });
-    }
   }
 }

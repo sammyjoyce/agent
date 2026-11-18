@@ -21,11 +21,14 @@ import type { HostResult } from "../src/generated/HostResult.js";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
 import { ATTACHMENT_CHUNK_BYTES } from "../src/generated/attachment-limits.js";
+import { chatGptBatch } from "./fixtures/chatgpt-history.js";
 import { node, openScheduled, scheduledOccurrence } from "./fixtures/scheduled-runtime.js";
+import { LocalFiles } from "../src/failover/retained-files.js";
 
 type Server = { child: ChildProcessWithoutNullStreams; closed: Promise<number | null>; errors(): string };
 type Run = { code: number | null; stdout: string; stderr: string };
-type Seeded = { taskId: string; agentId: string; scheduledTaskId: string; importedConversation: string; attachment: AttachmentRef;
+type Seeded = { taskId: string; agentId: string; scheduledTaskId: string; importedConversation: string; chatGptConversation: string;
+  chatGptFile: { sha256: string; bytes: Buffer }; attachment: AttachmentRef;
   attachmentBytes: Buffer; feedbackId: string; fullOriginal: string; inputIds: string[] };
 
 const STEER_ID = "a1111111-1111-4111-8111-111111111111";
@@ -69,7 +72,7 @@ async function seed(state: string): Promise<Seeded> {
     await runScheduled(scheduledOccurrence, new AbortController().signal, app);
     const scheduledTask = (await app.tasks.list())[0]; assert.ok(scheduledTask, "the scheduled occurrence owns a task");
 
-    const attachments = new AttachmentStore(state); app.tasks.useAttachments(attachments);
+    const attachments = new AttachmentStore(new LocalFiles(state)); app.tasks.useAttachments(attachments);
     const attachmentBytes = Buffer.from("Invented ledger line one.\nInvented ledger line two.\n".repeat(4000));
     let attachment: AttachmentRef | null = null;
     for (let offset = 0; offset < attachmentBytes.length; offset += ATTACHMENT_CHUNK_BYTES) {
@@ -94,13 +97,27 @@ async function seed(state: string): Promise<Seeded> {
       version: "v1", order: 0, timestamp_ms: 1, data: null,
       assets: [{ path: join(assets, coldSha), item_id: "invented-item", version: "v1", kind: "cold_evidence", media_type: "application/json",
         sha256: coldSha, size: cold.length }] };
-    const imported = await new HistoryStore(app.session, assets).import({ host_id: node.host_id,
+    const history = new HistoryStore(app.session, assets);
+    const imported = await history.import({ host_id: node.host_id,
       thread: { id: "invented-thread", title: "Invented imported thread", cwd: "/workspace/example", created_at: 1, updated_at: 2,
         forked_from_id: null, parent_thread_id: null, version: "thread-v1", version_reliable: true, archived: false },
       items: [item], next_cursor: null, complete: true, gaps: [] });
+    const picnic = [{ id: "six", parent: null, turn: "six", kind: "user:text", role: "user", text: "Plan a picnic for six" },
+      { id: "six-reply", parent: "six", turn: "six", kind: "assistant:text", role: "assistant", text: "A plan for six." }] as const;
+    const chatGptBytes = Buffer.from("An invented file attached to a ChatGPT message."), chatGptSha = sha256(chatGptBytes);
+    await writeFile(join(assets, chatGptSha), chatGptBytes, { mode: 0o600 });
+    const edited = chatGptBatch("invented-chatgpt-conversation", 3, [
+      ...picnic.map((entry) => ({ ...entry, state: "alternate" as const })),
+      { id: "eight", parent: null, turn: "eight", kind: "user:text", role: "user", text: "Plan a picnic for eight", alternates: 1 },
+      { id: "eight-reply", parent: "eight", turn: "eight", kind: "assistant:text", role: "assistant", text: "A plan for eight." }]);
+    const carrier = edited.items.find((entry) => entry.id === "eight")!;
+    carrier.assets = [{ path: join(assets, chatGptSha), item_id: carrier.id, version: carrier.version, kind: "local_media", media_type: "text/plain",
+      sha256: chatGptSha, size: chatGptBytes.length }];
+    await history.import(chatGptBatch("invented-chatgpt-conversation", 2, picnic));
+    const chatGpt = await history.import(edited);
     const large = randomBytes(16 * 1024 * 1024); await writeFile(join(assets, sha256(large)), large, { mode: 0o600 });
 
-    const feedback = new FeedbackStore(state, app.tasks);
+    const feedback = new FeedbackStore(new LocalFiles(state), app.tasks);
     const bundle = await feedback.capture("Invented feedback about the ledger task.", { attachments: [attachment], origin_host_id: node.host_id,
       cwd: "/workspace/example", conversation_id: null, task_id: task.id, agent_id: null, model: null, binding: null, draft: "",
       queued_inputs: [], client_errors: [] });
@@ -114,7 +131,7 @@ async function seed(state: string): Promise<Seeded> {
     await app.tasks.update(finished.id, (saved) => { saved.state = { state: "resolved", evidence: "Invented verified completion" }; });
 
     return { taskId: task.id, agentId: agent.id, scheduledTaskId: scheduledTask.id, importedConversation: imported.conversation.conversation_id,
-      attachment, attachmentBytes, feedbackId: bundle.id, fullOriginal, inputIds: [STEER_ID, FOLLOW_UP_ID, AGENT_INPUT_ID] };
+      chatGptConversation: chatGpt.conversation.conversation_id, chatGptFile: { sha256: chatGptSha, bytes: chatGptBytes }, attachment, attachmentBytes, feedbackId: bundle.id, fullOriginal, inputIds: [STEER_ID, FOLLOW_UP_ID, AGENT_INPUT_ID] };
   } finally { await app.close(); }
 }
 
@@ -219,9 +236,10 @@ test("an offline backup restores into a new directory that the production coordi
     }
     const agent = await request(state, { type: "read_history", task_id: seeded.taskId, agent_id: seeded.agentId, cursor: null });
     const imported = await request(state, { type: "read_conversation", conversation_id: seeded.importedConversation, cursor: null });
+    const chatGpt = await request(state, { type: "read_conversation", conversation_id: seeded.chatGptConversation, cursor: null });
     const feedback = await request(state, { type: "read_feedback", id: seeded.feedbackId });
     const attachment = await download(state, seeded.attachment.id);
-    return { tasks, agent, imported, feedback, attachment: sha256(attachment) };
+    return { tasks, agent, imported, chatGpt, feedback, attachment: sha256(attachment) };
   }
 
   try {
@@ -245,6 +263,9 @@ test("an offline backup restores into a new directory that the production coordi
     assert.equal(baseline.attachment, sha256(seeded.attachmentBytes));
     const importedText = baseline.imported.flatMap((event) => event.type === "history" ? event.messages.map((message) => message.text) : []).join("");
     assert.ok(importedText.includes("zirconium connector") && !importedText.includes("Bounded excerpt only."), "the original store renders its retained cold original");
+    const chatGptShown = baseline.chatGpt.flatMap((event) => event.type === "history" ? event.messages.map((message) => `${message.role}: ${message.text}`) : []);
+    assert.deepEqual(chatGptShown, ["notice: 1 other version of this message is retained as evidence and not shown.", "user: Plan a picnic for eight",
+      "assistant: A plan for eight."], "the original store shows the ChatGPT conversation's selected branch and counts the retained one");
     const coordinatorId = await readFile(join(original, "coordinator-id"), "utf8");
 
     refused(await cli(["--state-dir", original, "backup", "create", archive]), /Another agent process owns this state directory/, "backup of a live coordinator");
@@ -391,6 +412,8 @@ test("an offline backup restores into a new directory that the production coordi
     server = await start(restored, jobConfig); await ready(server, restored);
     const restoredRead = await readBack(restored, seeded);
     assert.deepEqual(restoredRead, baseline, "the restored store reads identical history, receipts, assets, attachments and feedback");
+    assert.deepEqual(await readFile(join(restored, "history", "assets", seeded.chatGptFile.sha256)), seeded.chatGptFile.bytes,
+      "a file retained by a ChatGPT import is restored with its bytes");
     await delay(2_000);
     const held = await request(restored, { type: "list_jobs" });
     assert.ok(held[0]?.type === "scheduled_jobs");

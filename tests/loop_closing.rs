@@ -1,6 +1,7 @@
 #[path = "fixtures/executable.rs"]
 mod executable_fixture;
 
+use agent_cli::serialized_spawn::SerializedSpawn;
 use std::{
     fs,
     ops::RangeInclusive,
@@ -21,7 +22,7 @@ use agent_cli::{
         TaskState, WorkerLaunch,
     },
     rex::RexClient,
-    runtime::{Runtime, RuntimeCall},
+    runtime::{OwnerClaim, Runtime, RuntimeCall},
     sources::{SourceConfig, SourceCoverage},
 };
 use executable_fixture::write_executable;
@@ -940,7 +941,8 @@ impl Coordinator {
             },
             background: None,
         };
-        let runtime = Arc::new(Runtime::start(&script, &world.state).unwrap());
+        let claim = OwnerClaim::acquire(&world.state, &script, None).unwrap();
+        let runtime = Arc::new(Runtime::start(&script, claim).unwrap());
         for command in [
             RuntimeCommand::ConfigureCoordinator {
                 bootstrap: bootstrap.clone(),
@@ -1376,7 +1378,7 @@ fn readback(world: &World) -> Readback {
         .arg("--no-warnings")
         .arg(fixture)
         .arg(&world.state)
-        .output()
+        .output_serialized()
         .unwrap();
     assert!(
         output.status.success(),

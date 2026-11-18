@@ -1,10 +1,12 @@
 use std::{
+    collections::HashSet,
     fs,
     future::{Future, pending},
     io,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use crate::{
@@ -22,9 +24,14 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::runtime::{FrameReader, Runtime, ShutdownSignal, StartRecord};
+use crate::runtime::{
+    FrameReader, OwnerClaim, OwnerFenced, Runtime, ShutdownSignal, StartRecord,
+    effects::SurvivingEffects,
+};
 
 const SOCKET_NAME: &str = "agent.sock";
+/// How long a fenced owner waits for the authority to take its stop evidence.
+const RELEASE_LIMIT: Duration = Duration::from_secs(30);
 
 pub async fn connect(state: &Path) -> io::Result<UnixStream> {
     UnixStream::connect(state.join(SOCKET_NAME)).await
@@ -55,7 +62,7 @@ pub async fn relay(stream: UnixStream) -> Result<()> {
 
 pub async fn serve_configured(
     script: &Path,
-    state: &Path,
+    claim: OwnerClaim,
     port: Option<u16>,
     policy: crate::tailnet::PeerPolicy,
     daemon: crate::tailnet::Daemon,
@@ -64,7 +71,7 @@ pub async fn serve_configured(
 ) -> Result<()> {
     serve_with_transport(
         script,
-        state,
+        claim,
         port,
         policy,
         daemon,
@@ -100,7 +107,7 @@ async fn serve_until(
 ) -> Result<()> {
     serve_with_transport(
         script,
-        state,
+        OwnerClaim::acquire(state, script, None)?,
         None,
         crate::tailnet::PeerPolicy::new(&[], &[])?,
         crate::tailnet::Daemon::default(),
@@ -111,10 +118,57 @@ async fn serve_until(
     .await
 }
 
+/// Runs the coordinator, then posts a fenced owner's stop evidence.
 #[allow(clippy::too_many_arguments)]
 async fn serve_with_transport(
     script: &Path,
-    state: &Path,
+    claim: OwnerClaim,
+    port: Option<u16>,
+    policy: crate::tailnet::PeerPolicy,
+    daemon: crate::tailnet::Daemon,
+    rex: crate::rex::RexClient,
+    bootstrap: Option<CoordinatorBootstrap>,
+    shutdown: impl Future<Output = Result<ShutdownReason>>,
+) -> Result<()> {
+    let session = claim.pi_session();
+    let state = claim.state().to_owned();
+    let served = serve_owner(
+        script, claim, port, policy, daemon, rex, bootstrap, shutdown,
+    )
+    .await;
+    if let (Err(error), Some(session)) = (&served, session)
+        && let Some(OwnerFenced::Runtime) = error.downcast_ref()
+        && let Some(epoch) = session.epoch
+    {
+        match crate::failover::commands::post_released(
+            script,
+            &state,
+            &session,
+            epoch,
+            RELEASE_LIMIT,
+        )
+        .await
+        {
+            Ok(true) => eprintln!(
+                "Told the failover authority that this coordinator stopped its effects at epoch {}",
+                epoch.get()
+            ),
+            Ok(false) => {}
+            Err(error) if error.is::<SurvivingEffects>() => eprintln!(
+                "Did not tell the failover authority that this coordinator stopped. {error:#}"
+            ),
+            Err(error) => eprintln!(
+                "Could not tell the failover authority that this coordinator stopped: {error:#}. Run `beep-boop failover release` on this host"
+            ),
+        }
+    }
+    served
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_owner(
+    script: &Path,
+    claim: OwnerClaim,
     port: Option<u16>,
     policy: crate::tailnet::PeerPolicy,
     daemon: crate::tailnet::Daemon,
@@ -123,7 +177,7 @@ async fn serve_with_transport(
     shutdown: impl Future<Output = Result<ShutdownReason>>,
 ) -> Result<()> {
     tokio::pin!(shutdown);
-    // Claim the writer before deciding an old socket is stale.
+    let state = &claim.state().to_owned();
     let background = bootstrap
         .as_ref()
         .and_then(|value| value.background.clone());
@@ -135,7 +189,7 @@ async fn serve_with_transport(
         .transpose()?;
     let owner = Runtime::start_with_notifications(
         script,
-        state,
+        claim,
         config.as_ref().and_then(|config| config.apns.as_ref()),
         StartRecord::for_config(config.as_ref()),
     )?;
@@ -459,6 +513,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     let mut call = runtime.request(command).await?;
     let mut input_closed = false;
     let mut output_closed = false;
+    let mut client_reads = HashSet::new();
     let mut effects = HostEffects::new(Capacity::Unbounded);
     let result: Result<()> = async {
         loop {
@@ -471,17 +526,24 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                 event = call.events.recv() => {
                     let event = event.context("Coordinator closed before completing the request")?;
                     if let RuntimeEventKind::HostCall { call_id, command } = &event {
-                        if !lifecycle.owns_host_effects() {
+                        if lifecycle.serves_client_history(command) {
+                            if input_closed {
+                                runtime.reply(call.request_id, call_id.clone(), client_history_lost()).await?;
+                                continue;
+                            }
+                            client_reads.insert(call_id.clone());
+                        } else if !lifecycle.owns_host_effects() {
                             runtime.reply(call.request_id, call_id.clone(), terminal_effect_refused()).await?;
                             continue;
+                        } else {
+                            let broker = broker.clone(); let command = (**command).clone(); let call_id = call_id.clone();
+                            if let Admission::Rejected(reply) = effects.spawn(call_id, |cancelled| async move {
+                                broker.execute_cancelled(command, cancelled).await
+                            })? {
+                                runtime.reply(call.request_id, reply.call_id, reply.result).await?;
+                            }
+                            continue;
                         }
-                        let broker = broker.clone(); let command = (**command).clone(); let call_id = call_id.clone();
-                        if let Admission::Rejected(reply) = effects.spawn(call_id, |cancelled| async move {
-                            broker.execute_cancelled(command, cancelled).await
-                        })? {
-                            runtime.reply(call.request_id, reply.call_id, reply.result).await?;
-                        }
-                        continue;
                     }
                     if let RuntimeEventKind::HostCancel { call_id } = &event {
                         effects.cancel(call_id);
@@ -501,6 +563,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                         if lifecycle.is_worker() || lifecycle.is_view() { return Err(error); }
                         input_closed = true;
                         output_closed = true;
+                        release_client_reads(&runtime, call.request_id, &mut client_reads).await?;
                     }
                     if done { return Ok(()); }
                 }
@@ -513,6 +576,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                             // real result, as with EOF or a failed output write.
                             input_closed = true;
                             output_closed = true;
+                            release_client_reads(&runtime, call.request_id, &mut client_reads).await?;
                             continue;
                         }
                         Err(error) => return Err(error),
@@ -523,11 +587,15 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                         if lifecycle.allows(&RuntimeCommand::DetachWorker) {
                             runtime.worker_control(call.request_id, lifecycle.disconnect_command().context("Missing worker detach control")?).await?;
                         }
+                        release_client_reads(&runtime, call.request_id, &mut client_reads).await?;
                         continue;
                     };
                     let control: RuntimeCommand = serde_json::from_slice(&bytes)
                         .context("Client sent an invalid control")?;
                     match control {
+                        RuntimeCommand::HostReply { call_id, result } if client_reads.remove(&call_id) => {
+                            runtime.reply(call.request_id, call_id, result).await?;
+                        }
                         command if lifecycle.allows(&command) => {
                             match command {
                                 RuntimeCommand::OAuthCallback { target } => runtime.callback(call.request_id, target).await?,
@@ -585,6 +653,27 @@ async fn identify<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         "An identified connection must carry native requests"
     );
     Ok(Some(next))
+}
+
+async fn release_client_reads(
+    runtime: &Runtime,
+    request_id: u32,
+    client_reads: &mut HashSet<String>,
+) -> Result<()> {
+    for call_id in client_reads.drain() {
+        runtime
+            .reply(request_id, call_id, client_history_lost())
+            .await?;
+    }
+    Ok(())
+}
+
+fn client_history_lost() -> crate::protocol::HostResult {
+    crate::protocol::HostResult::Failed {
+        delivery: Some(crate::protocol::HostDelivery::OutcomeUncertain),
+        message: "The client serving this import disconnected; run the import again to resume."
+            .into(),
+    }
 }
 
 fn terminal_effect_refused() -> crate::protocol::HostResult {
@@ -651,7 +740,7 @@ mod tests {
     mod scrawl_feedback;
     mod startup;
     use crate::protocol::{AuthStatus, HostResult, InputMode, RuntimeCommand, RuntimeEventKind};
-    use crate::runtime::{FrameReader, Runtime, ShutdownSignal};
+    use crate::runtime::{FrameReader, OwnerClaim, Runtime, ShutdownSignal};
     use crate::service::{
         SOCKET_NAME, ShutdownReason, SocketOwner, authenticated, connect, serve_until, write_frame,
     };
@@ -671,6 +760,7 @@ mod tests {
       import { appendFileSync, existsSync, renameSync, writeFileSync } from 'node:fs';
       import { join } from 'node:path';
       const uploads = new Map();
+      const histories = new Map();
       const emit = (id,event) => process.stdout.write(JSON.stringify({version:1,id,event})+'\n');
       const finish = id => { emit(id,{type:'auth_status',status:{state:'signed_out'}}); emit(id,{type:'done'}); };
       const publish = (name, value) => {
@@ -714,6 +804,19 @@ mod tests {
         } else if(command.type==='run_task'||command.type==='logout') {
           emit(id,{type:'host_call',call_id:'11111111-1111-4111-8111-111111111111',command:{
             type:'exec',program:'node',args:['--eval','process.stdout.write("synthetic\\n")'],cwd:'/',timeout_seconds:60}});
+        } else if(command.type==='import_chatgpt') {
+          if(command.package.parts[0]==='mixed.zip') for (const [call,delay] of [[1,0],[2,10000]])
+            emit(id,{type:'host_call',call_id:'exec-'+call,command:{type:'exec',program:'node',cwd:'/',timeout_seconds:60,
+              args:['--eval','setTimeout(()=>process.stdout.write("synthetic\\n"),'+delay+')']}});
+          for (const call of [1,2]) emit(id,{type:'host_call',call_id:'history-'+call,
+            command:{type:'history',request:{type:'list',archived:false,cursor:null}}});
+        } else if(command.type==='host_reply'&&command.call_id.startsWith('history-')) {
+          publish(command.call_id+'.json',JSON.stringify(command.result));
+          histories.set(id,(histories.get(id)??0)+1);
+          if(histories.get(id)===1) emit(id,{type:'notice',task_id:null,text:'Invented history progress'});
+          else { emit(id,{type:'done'}); }
+        } else if(command.type==='host_reply'&&command.call_id.startsWith('exec-')) {
+          publish(command.call_id+'.json',JSON.stringify(command.result));
         } else if(command.type==='host_reply') {
           publish('reply.json',JSON.stringify(command.result)); finish(id);
         } else if(command.type==='attachment'&&command.request.type==='upload') {
@@ -1361,6 +1464,231 @@ mod tests {
         service.stop().await;
     }
 
+    fn chatgpt_import(part: &str) -> RuntimeCommand {
+        RuntimeCommand::ImportChatGpt {
+            package: crate::history::chatgpt::ChatGptPackageSummary {
+                digest: "0".repeat(64),
+                parts: vec![part.into()],
+                conversations: 1,
+                archived: 0,
+                shards: 1,
+                attachments: 0,
+                missing_attachments: 0,
+                excluded_messages: 0,
+                unsupported: Vec::new(),
+                dropped_library_files: 0,
+                unreferenced_files: 0,
+                notes: Vec::new(),
+                problems: Vec::new(),
+            },
+        }
+    }
+
+    async fn delegated_history_calls<R: AsyncRead + Unpin>(reader: &mut FrameReader<BufReader<R>>) {
+        for expected in ["history-1", "history-2"] {
+            let event: RuntimeEventKind =
+                serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
+            assert!(
+                matches!(&event, RuntimeEventKind::HostCall { call_id, .. } if call_id == expected),
+                "{event:?}"
+            );
+        }
+    }
+
+    async fn disconnected_reply(directory: &std::path::Path, call: &str) {
+        let path = directory.join(format!("{call}.json"));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "{call} was not failed promptly");
+            sleep(Duration::from_millis(5)).await;
+        }
+        let reply = fs::read_to_string(path).unwrap();
+        assert!(reply.contains("disconnected"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn history_client_eof_fails_outstanding_reads_promptly() {
+        let service = Running::start().await;
+        let mut client = service.client().await;
+        write_frame(&mut client, &chatgpt_import("export.zip"))
+            .await
+            .unwrap();
+        let (reader, mut writer) = client.into_split();
+        let mut reader = FrameReader::new(BufReader::new(reader));
+        delegated_history_calls(&mut reader).await;
+        writer.shutdown().await.unwrap();
+        for call in ["history-1", "history-2"] {
+            disconnected_reply(service.directory.path(), call).await;
+        }
+        drop(reader);
+        service.stop().await;
+    }
+
+    #[tokio::test]
+    async fn history_client_read_error_fails_outstanding_reads_promptly() {
+        let service = Running::start().await;
+        let mut client = service.client().await;
+        write_frame(&mut client, &chatgpt_import("export.zip"))
+            .await
+            .unwrap();
+        let (reader, mut writer) = client.into_split();
+        let mut reader = FrameReader::new(BufReader::new(reader));
+        delegated_history_calls(&mut reader).await;
+        writer.write_all(br#"{"type":"host_reply","#).await.unwrap();
+        writer.shutdown().await.unwrap();
+        for call in ["history-1", "history-2"] {
+            disconnected_reply(service.directory.path(), call).await;
+        }
+        drop(reader);
+        service.stop().await;
+    }
+
+    /// A client whose output side fails while its input stays open, which a socket cannot
+    /// produce on demand.
+    struct FailingOutput {
+        inner: tokio::io::DuplexStream,
+        failed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl AsyncRead for FailingOutput {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(context, buffer)
+        }
+    }
+
+    impl AsyncWrite for FailingOutput {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+            buffer: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.failed.load(std::sync::atomic::Ordering::SeqCst) {
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+            }
+            std::pin::Pin::new(&mut self.inner).poll_write(context, buffer)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(context)
+        }
+    }
+
+    #[tokio::test]
+    async fn history_client_output_failure_fails_outstanding_reads_promptly() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("fixture.mjs");
+        fs::write(&script, FIXTURE).unwrap();
+        let runtime = Arc::new(
+            Runtime::start(
+                &script,
+                OwnerClaim::acquire(directory.path(), &script, None).unwrap(),
+            )
+            .unwrap(),
+        );
+        let broker = Arc::new(
+            crate::broker::Broker::with_tailscale(
+                None,
+                directory.path(),
+                crate::tailnet::Daemon::default(),
+                crate::rex::RexClient::for_process(None).unwrap(),
+            )
+            .unwrap(),
+        );
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handled = tokio::spawn(crate::service::handle(
+            FailingOutput {
+                inner: server,
+                failed: failed.clone(),
+            },
+            runtime.clone(),
+            broker,
+        ));
+        let (reader, mut writer) = tokio::io::split(client);
+        write_frame(&mut writer, &chatgpt_import("export.zip"))
+            .await
+            .unwrap();
+        let mut reader = FrameReader::new(BufReader::new(reader));
+        delegated_history_calls(&mut reader).await;
+        failed.store(true, std::sync::atomic::Ordering::SeqCst);
+        write_frame(
+            &mut writer,
+            &RuntimeCommand::HostReply {
+                call_id: "history-1".into(),
+                result: HostResult::Failed {
+                    delivery: None,
+                    message: "Invented first reply".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        disconnected_reply(directory.path(), "history-2").await;
+        timeout(Duration::from_secs(5), handled)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop((reader, writer));
+        Arc::try_unwrap(runtime)
+            .ok()
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_client_is_sent_only_reads_and_cannot_answer_the_services_calls() {
+        let service = Running::start().await;
+        let mut client = service.client().await;
+        write_frame(&mut client, &chatgpt_import("mixed.zip"))
+            .await
+            .unwrap();
+        let (reader, mut writer) = client.into_split();
+        let mut reader = FrameReader::new(BufReader::new(reader));
+        delegated_history_calls(&mut reader).await;
+        let executed = service.wait_for("exec-1.json").await;
+        let result: HostResult = serde_json::from_slice(&fs::read(&executed).unwrap()).unwrap();
+        assert!(
+            matches!(&result, HostResult::Process { exit_code: 0, stdout, .. } if stdout == "synthetic\n"),
+            "{result:?}"
+        );
+        write_frame(
+            &mut writer,
+            &RuntimeCommand::HostReply {
+                call_id: "exec-2".into(),
+                result: HostResult::Failed {
+                    delivery: None,
+                    message: "Invented forged reply".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let running = fs::read_to_string(service.wait_for("exec-2.json").await).unwrap();
+        assert!(!running.contains("Invented forged reply"), "{running}");
+        for call in ["history-1", "history-2"] {
+            disconnected_reply(service.directory.path(), call).await;
+        }
+        drop((reader, writer));
+        service.stop().await;
+    }
+
     #[tokio::test]
     async fn half_closed_input_still_receives_the_requested_result() {
         let service = Running::start().await;
@@ -1756,7 +2084,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("fixture.mjs");
         fs::write(&script, FIXTURE).unwrap();
-        let runtime = Arc::new(Runtime::start(&script, directory.path()).unwrap());
+        let runtime = Arc::new(
+            Runtime::start(
+                &script,
+                OwnerClaim::acquire(directory.path(), &script, None).unwrap(),
+            )
+            .unwrap(),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut denied_client = TcpStream::connect(listener.local_addr().unwrap())
             .await

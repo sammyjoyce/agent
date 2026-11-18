@@ -5,7 +5,8 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AgentDoc, ROOT_CONVERSATION_ID, type Conversation, type Harness } from "@earendil-works/pi-durable";
 import type { ConversationCatalog } from "./catalog.js";
 import type { CoordinatorEnvironment } from "./environment.js";
-import type { HistoryStore } from "./history.js";
+import { importedThread, type HistoryStore } from "./history.js";
+import type { ImportedConversation } from "./generated/ImportedConversation.js";
 import type { SourceJournal } from "./sources.js";
 import { inspectMainWork, reconcileMainInput } from "./main_observation.js";
 import type { ConversationModels } from "./models.js";
@@ -72,7 +73,7 @@ export class ConversationViews {
         { includeFinal: true, working(value) { working = value; publish({ type: "conversation_state", working }); } });
       if (view.closed) return;
       view.snapshot({ type: "conversation_ready", conversation: summary, model,
-        cwd: native?.cwd ?? imported?.thread.cwd ?? "/", working });
+        cwd: native?.cwd ?? (imported?.thread.cwd || "/"), working });
       const receiptWork = inputIds.length === 0 ? undefined : await inspectMainWork(app.harness, conversation);
       for (const input_id of inputIds) {
         if (view.closed) return;
@@ -97,12 +98,12 @@ export class ConversationViews {
       }
     }
   }
-  private async host(app: ConversationServices, task: TaskRecord, threadId?: string, cwd = "/"): Promise<WorkerHost> {
+  private async host(app: ConversationServices, task: TaskRecord, imported?: ImportedConversation, cwd = "/"): Promise<WorkerHost> {
     if (app.tasks.isBackgroundTask(task)) return app.tasks.workerHost(task.id);
     if (task.worker.state !== "unassigned") return app.tasks.workerHost(task.id);
     const available = await app.environment.environment();
-    const origins = threadId === undefined ? [] : (await Promise.all(available.nodes.map(async (node) =>
-      await app.histories.checkpoint(threadId, node.host_id) === undefined ? undefined : node.host_id))).filter((id) => id !== undefined);
+    const origins = imported === undefined ? [] : (await Promise.all(available.nodes.map(async (node) =>
+      await app.histories.checkpoint(importedThread(imported), node.host_id) === undefined ? undefined : node.host_id))).filter((id) => id !== undefined);
     const hosts = await app.environment.hosts(cwd, null, []);
     const selected = hosts.find((host) => host.host_id !== null && host.host_id !== undefined && origins.includes(host.host_id))
       ?? await app.environment.defaultHost(hosts);
@@ -130,7 +131,7 @@ export class ConversationViews {
     if (summary.agent_id === null) {
       await app.tasks.enqueue(task.id, command.input, command.input_id, undefined, command.mode, command.attachments, command.origin, sender);
       emit({ type: "input_accepted", input_id: command.input_id });
-      const dispatched = await app.tasks.dispatch(task.id, await this.host(app, task, imported?.thread.id, imported?.thread.cwd), call);
+      const dispatched = await app.tasks.dispatch(task.id, await this.host(app, task, imported, imported?.thread.cwd), call);
       if (!app.tasks.isBackgroundTask(dispatched) && dispatched.worker.state !== "bound") throw new TaskError("Session allocation is unconfirmed; its saved input is retained.");
     } else {
       const dispatched = await app.tasks.continueAgent(task.id, summary.agent_id, command.input, command.input_id, call, command.mode,

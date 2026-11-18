@@ -1,5 +1,6 @@
 //! Tailscale transport with explicit peer trust. Never bind a wildcard or ordinary LAN address.
 
+use crate::serialized_spawn::SerializedTokioSpawn;
 use std::{
     collections::BTreeSet,
     io,
@@ -428,7 +429,7 @@ async fn invoke<T: DeserializeOwned>(daemon: &Daemon, args: &[&str]) -> Result<T
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
-        .spawn()
+        .spawn_serialized()
         .context("Tailscale CLI is unavailable")?;
     let result = timeout(Duration::from_secs(8), async {
         let mut bytes = Vec::new();
@@ -845,6 +846,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn listener_restarts_after_an_active_close_without_sharing_a_live_port() {
+        use crate::serialized_spawn::SerializedSpawn;
         use crate::tailnet::listen_on;
         use std::io::ErrorKind;
         use tokio::{
@@ -862,7 +864,7 @@ mod tests {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", name, "--nocapture", "--test-threads=1"])
                 .env("AGENT_TAILNET_LIFECYCLE_TEST", name)
-                .output()
+                .output_serialized()
                 .unwrap();
             assert!(
                 output.status.success(),

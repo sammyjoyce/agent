@@ -22,8 +22,8 @@ test("an admitted job executes its host tool and saves its native answer without
       },
     ]);
     running = runScheduled(scheduledOccurrence, controller.signal, app);
-    await pump(() => app.faux.state.callCount > 0 || app.commands.some((command) => command.type === "spawn_worker"));
-    assert.equal(app.commands.some((command) => command.type === "spawn_worker"), false,
+    await pump(() => app.faux.state.callCount > 0 || app.commands.some((command) => command.type === "spawn_workspace_worker"));
+    assert.equal(app.commands.some((command) => command.type === "spawn_workspace_worker"), false,
       "A scheduled job must execute without creating a Rex session or waiting for run_task to attach");
     await running;
     const task = (await app.tasks.list())[0]; assert.ok(task);

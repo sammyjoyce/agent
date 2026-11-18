@@ -58,7 +58,7 @@ public final class Coordinators {
   init(
     registration: NotificationRegistration?, defaults: UserDefaults, applicationSupport: URL,
     caches: URL, transport: CoordinatorTransport, persistence: ComposerDraftStore? = nil,
-    sharedInbox: SharedDraftInbox? = nil
+    sharedInbox: SharedDraftInbox? = nil, spotlight: (any SpotlightStore)? = nil
   ) {
     self.registration = registration
     self.applicationSupport = applicationSupport
@@ -67,7 +67,8 @@ public final class Coordinators {
     chat = ChatModel(
       draftStore: AttachmentStore(directory: applicationSupport.appending(path: "Agent/Drafts")),
       persistence: persistence, sharedInbox: sharedInbox, registration: registration,
-      scope: ScopePreference(defaults: defaults))
+      scope: ScopePreference(defaults: defaults),
+      spotlight: spotlight.map { SpotlightIndex(store: $0) })
     do {
       let stored = try Self.migrate(
         defaults: defaults, applicationSupport: applicationSupport, caches: caches)
@@ -90,11 +91,13 @@ public final class Coordinators {
       for task in Array(pairing.values) + Array(withdrawing.values) { task.cancel() }
       pairing = [:]
       withdrawing = [:]
+      chat.spotlight?.deactivate()
     }
     await chat.setActive(active)
     guard chat.demand.sceneActive else { return }
     for profile in profiles where profile.pin == nil { retryPairing(profile.id) }
     for withdrawal in withdrawals { retry(withdrawal) }
+    chat.spotlight?.activate(listing: self)
   }
 
   /// For App Intents: holds coordinator `id` connected while `body` runs, with the scene in the
@@ -103,7 +106,7 @@ public final class Coordinators {
     to id: ProfileID, within limit: Duration = ConnectionLease.connectionWait,
     _ body: () async throws -> T
   ) async throws -> T {
-    try await chat.withConnection(to: id, within: limit, body)
+    try await chat.withConnection(to: id, within: limit) { _ in try await body() }
   }
 
   func route(_ origin: AlertOrigin) -> ProfileID? {

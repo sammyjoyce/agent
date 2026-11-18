@@ -133,7 +133,7 @@ class EvalHost {
           return { type: "process", exit_code: result.code, stdout: result.stdout, stderr: result.stderr, truncated: false };
         }
         case "browser": return { type: "browser", response: this.browser(command.request.session_id, command.request.action) };
-        case "spawn_worker": return { type: "spawned", binding: { host_id: HOST_ID, session_id: `session:${randomUUID()}`,
+        case "spawn_workspace_worker": return { type: "spawned", binding: { host_id: HOST_ID, session_id: `session:${randomUUID()}`,
           window_id: `window:${randomUUID()}`, block_id: `block:${randomUUID()}` } };
         default: return { type: "failed", message: `${command.type} is unavailable on this isolated evaluation host` };
       }
@@ -221,7 +221,7 @@ const scenarios: Scenario[] = [
     await writeFile(join(world.workspace, "CHANGELOG.md"), "# Pebble changelog\n\n## 2.4.0\n- Add `pebble sync --dry-run`.\n- Fix duplicate project names on import.\n\n## 2.3.1\n- Fix a crash when the config directory is missing.\n");
     const answer = await askMain(world, "Have a worker draft release notes for Pebble 2.4 from CHANGELOG.md in this project. Start it as a new task on the eval host; do not draft them yourself.");
     const task = (await world.app.tasks.list()).find((candidate) => /release notes/iu.test(candidate.title + " " + candidate.outcome));
-    return { success: task !== undefined && world.host.commands.includes("spawn_worker"), detail: `task=${task?.title ?? "none"}; answer=${answer.slice(0, 160)}` };
+    return { success: task !== undefined && world.host.commands.includes("spawn_workspace_worker"), detail: `task=${task?.title ?? "none"}; answer=${answer.slice(0, 160)}` };
   } },
   { name: "file-edit", role: "worker", async run(world) {
     const config = join(world.workspace, "config", "limits.toml");

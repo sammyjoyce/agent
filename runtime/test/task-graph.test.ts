@@ -89,7 +89,7 @@ test("the task graph request joins live generations and tool calls with main, ta
   try {
     send(serviceRequestId, { type: "run_background", settings: { poll_interval_seconds: 3600, sources: false, jobs: null } });
     send(1, chat("fixture-graph-main: start the board review", "first-input"));
-    const spawned = await hostCall(1, "spawn_worker"); reply(spawned, { type: "spawned", binding });
+    const spawned = await hostCall(1, "spawn_workspace_worker"); reply(spawned, { type: "spawned", binding });
     assert.equal((await event(1, (event) => event.type === "done")).type, "done", errors);
     attach(2, spawned.command.task_id, spawned.command.allocation_id, binding);
     const subagent = await hostCall(serviceRequestId, "spawn_subagent");
@@ -98,7 +98,9 @@ test("the task graph request joins live generations and tool calls with main, ta
     attach(3, subagent.command.task_id, subagent.command.allocation_id, agentBinding, subagent.command.agent_id);
     await hostCall(serviceRequestId, "exec", 0); await hostCall(serviceRequestId, "exec", 1);
     send(4, chat("fixture-graph-second: start the connector audit", "second-input"));
-    await hostCall(4, "spawn_worker");
+    const inspected = await hostCall(4, "inspect_worker");
+    reply(inspected, { type: "worker_presence", presence: { state: "present", running: true } });
+    await hostCall(4, "spawn_workspace_worker");
 
     send(5, { type: "read_task_graph" });
     const response = await event(5, (event) => event.type === "task_graph");

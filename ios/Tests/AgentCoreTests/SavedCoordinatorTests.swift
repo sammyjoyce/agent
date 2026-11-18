@@ -3664,6 +3664,14 @@ func aBindingTheShippedBuildMadeAfterALaunchStoppedOutlivesThatLaunchsRecord(
   }
 }
 
+@MainActor private func sendAgainWhileTheComposerGetsTheDraftBack(_ chat: ChatModel) async throws {
+  let deadline = ContinuousClock.now + .seconds(30)
+  repeat {
+    _ = try await settles { chat.canSend }
+    await chat.send()
+  } while !chat.draft.isEmpty && ContinuousClock.now < deadline
+}
+
 /// Restores each held note that has an owner and sends it once the composer can, one at a time,
 /// and returns the name Restore addressed each to, by the note's text.
 @MainActor private func restoreAndSendEachOwnedNote(
@@ -3680,8 +3688,7 @@ func aBindingTheShippedBuildMadeAfterALaunchStoppedOutlivesThatLaunchsRecord(
     await chat.restoreHeld(note)
     addressed[note.item.text] = chat.destination.chip.map(chat.name) ?? "nobody"
     guard !chat.draft.isEmpty else { continue }
-    _ = try await settles { chat.canSend }
-    await chat.send()
+    try await sendAgainWhileTheComposerGetsTheDraftBack(chat)
     _ = try await settles { await sent() > before }
   }
   return addressed

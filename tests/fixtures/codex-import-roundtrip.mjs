@@ -13,7 +13,8 @@ import {createModels} from '@earendil-works/pi-ai';
 import {createRegistry,Harness} from '@earendil-works/pi-durable';
 import {SqliteStorage} from '@earendil-works/pi-durable/storage/sqlite';
 const runtime=pathToFileURL(process.argv[1]),home=process.argv[2],id=process.argv[3];
-const {CodexImporter}=await import(new URL('./importer.js',runtime));
+const {HistoryImports}=await import(new URL('./importer.js',runtime));
+const {LocalFiles}=await import(new URL('./failover/retained-files.js',runtime));
 const {HistoryStore,ImportedItemEntry}=await import(new URL('./history.js',runtime));
 const input=createInterface({input:process.stdin}),pending=[];
 input.on('line',line=>pending.shift()(JSON.parse(line)));
@@ -59,13 +60,13 @@ async function append(updates){await appendFile(path,updates.map(([index,text])=
 async function open(){
  const session=await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(home,'consumer.sqlite'))),
   {models:createModels(),registry:createRegistry(),identity:{attribution:null}},BACKGROUND_CONTEXT);
- const store=new HistoryStore(session,join(home,'assets'));
- return {session,store,importer:new CodexImporter(session,store,join(home,'assets'))};
+ const store=new HistoryStore(session,join(home,'history','assets'));
+ return {session,store,importer:new HistoryImports(session,store,new LocalFiles(home))};
 }
 let app=await open(),transferred=0,readCalls=0,failAt=Infinity,oldRevision=false;
 async function run(){
  transferred=0;readCalls=0;
- return app.importer.run([host],[host.host_id],[],async command=>{
+ return app.importer.codex([host],[host.host_id],[],async command=>{
   assert.equal(command.type,'on_node');assert.equal(command.command.type,'history');
   const operation=command.command.request;
   if(operation.type==='read'){
@@ -81,7 +82,7 @@ async function run(){
  },()=>{},async()=>{});
 }
 async function entries(){
- const mapping=await app.store.get(id);assert.ok(mapping);
+ const mapping=await app.store.get({source:'codex',thread_id:id});assert.ok(mapping);
  const conversation=await app.store.conversation(mapping.conversation_id);assert.ok(conversation);
  let cursor,items=[];
  do{const page=await conversation.entries({order:'ascending'},100,cursor,BACKGROUND_CONTEXT);items.push(...page.items.filter(ImportedItemEntry.is));cursor=page.next}while(cursor!==undefined);
@@ -105,7 +106,7 @@ try{
  await reopen();
  await append(Array.from({length:55},(_,index)=>[81+index,`Later ${index}`]));
  failAt=2;assert.equal((await run()).phase,'partial');assert.equal(transferred,25);
- const partial=await app.store.checkpoint(id,host.host_id);assert.ok(partial.next_cursor);assert.ok(partial.resume_cursor);
+ const partial=await app.store.checkpoint({source:'codex',thread_id:id},host.host_id);assert.ok(partial.next_cursor);assert.ok(partial.resume_cursor);
  await reopen();await append([[136,'Appended during interrupted catch-up']]);
  failAt=Infinity;assert.equal((await run()).phase,'complete');
  assert.equal(transferred,31,'Resume the committed change position even when another message changes the source version');
@@ -113,7 +114,7 @@ try{
  oldRevision=true;
  // Force a read without changing native evidence; an older reader checkpoint
  // must invalidate once and preserve every already-retained item identity.
- const saved=await app.store.checkpoint(id,host.host_id),mapping=await app.store.get(id);
+ const saved=await app.store.checkpoint({source:'codex',thread_id:id},host.host_id),mapping=await app.store.get({source:'codex',thread_id:id});
  await app.store.import({host_id:host.host_id,thread:mapping.thread,items:[],next_cursor:null,resume_cursor:saved.resume_cursor,
   gaps:[],complete:false,source_exhausted:false,retry_pages:[]});
  // A complete same-version ledger resists downgrade. Change the test's inventory

@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { AttachmentStore, AttachmentError, validateInput } from "./attachments.js";
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { createRegistry, Harness, ROOT_CONVERSATION_ID, type Conversation, type Submission } from "@earendil-works/pi-durable";
+import { createRegistry, Harness, ROOT_CONVERSATION_ID, type Conversation, type Storage, type Submission } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { RuntimeRequest } from "./generated/RuntimeRequest.js";
 import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
@@ -15,12 +15,13 @@ import { validRequest, validEvent, validApnsConfig, errorEvent, invalidHostReply
 import { TaskError, TaskStore, type ActorExecution, type HostCall } from "./tasks.js";
 import { readTaskGraph } from "./task-graph.js";
 import { HistoryStore } from "./history.js";
-import { CodexImporter } from "./importer.js";
+import { HistoryImports } from "./importer.js";
 import { ConversationCatalog } from "./catalog.js";
 import { ConversationViews } from "./conversation-views.js";
 import { Observation } from "./observation.js";
 import { Retrieval } from "./retrieval.js";
 import { FeedbackStore } from "./feedback.js";
+import { LocalFiles, ReplicatedFiles, type RetainedFiles } from "./failover/retained-files.js";
 import { FeedbackDispatcher } from "./feedback-dispatch.js";
 import { createGuidance } from "./guidance.js";
 import { createDreamsTools, createDreamsToolset, isDreamsTask } from "./dreams.js";
@@ -48,6 +49,7 @@ import { DiagnosticsTelemetry } from "./telemetry.js";
 import { conversationUsage } from "./usage.js";
 import { StartupDiagnostics } from "./startup-diagnostics.js";
 import { openConversationDatabase } from "./conversation-database.js";
+import { effectGate, exitFenced, openReplicatedOwnership, type Ownership } from "./failover/ownership.js";
 
 function notificationConfig(): ApnsConfig | undefined {
   const saved = process.env.AGENT_APNS_CONFIG;
@@ -66,6 +68,28 @@ function stateDirectory(): string {
   return directory;
 }
 const state = stateDirectory();
+const startup = new StartupDiagnostics(state);
+/** Aborted once the bridge has closed, so nothing that waits for the authority keeps the process alive. */
+const closed = new AbortController();
+const failoverSession = process.env.AGENT_FAILOVER;
+// A replicated owner catches up with the log here, before it reads a frame
+// and before Pi opens. A fenced one never gets past this line.
+const ownership: Ownership = failoverSession === undefined ? { kind: "local" }
+  : await startup.run("storage_open", () => openReplicatedOwnership({ session: failoverSession, stateDirectory: state, onFenced: exitFenced, signal: closed.signal }));
+function openStorage(): Promise<Storage> {
+  switch (ownership.kind) {
+    case "local": return startup.run("storage_open", async () => SqliteStorage.open(await openConversationDatabase(join(state, "session.sqlite"))));
+    case "replicated": return Promise.resolve(ownership.storage);
+    default: return ownership satisfies never;
+  }
+}
+function retainedFiles(): RetainedFiles {
+  switch (ownership.kind) {
+    case "local": return new LocalFiles(state);
+    case "replicated": return new ReplicatedFiles(ownership.log, { link: ownership.link, stateDirectory: state, signal: closed.signal });
+    default: return ownership satisfies never;
+  }
+}
 const auth = new ChatGptAuth(state);
 let activeLoginRequestId: number | undefined;
 // Admission bounds initialization, not the lifetime of an attached worker or
@@ -107,7 +131,7 @@ function writeEvent(id: number, event: RuntimeEventKind): void {
 }
 function failure(id: number, code: ErrorCode, message: string): void { emit(id, { type: "failure", code, message }); }
 const hostRequests = new HostRequests((id, call_id, command) => emit(id, { type: "host_call", call_id, command }),
-  (id, call_id) => emit(id, { type: "host_cancel", call_id }));
+  (id, call_id) => emit(id, { type: "host_cancel", call_id }), effectGate(ownership));
 const inference = new ConversationModels(undefined, auth);
 const models = inference.models;
 let backgroundOwner: number | undefined;
@@ -137,11 +161,7 @@ type Application = TriageApplication & { stopInputDelivery(): void; harness: Har
   histories: HistoryStore; catalog: ConversationCatalog; attachments: AttachmentStore; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler;
   telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics; discovery: ToolDiscovery; serviceExecution: ActorExecution; goals: GoalStore };
 async function openApplication(): Promise<Application> {
-  const startup = new StartupDiagnostics(state);
-  const storage = await startup.run("storage_open", async () => {
-    const database = await openConversationDatabase(join(state, "session.sqlite"));
-    return SqliteStorage.open(database);
-  });
+  const storage = await openStorage();
   const registry = createRegistry();
   const telemetry = await DiagnosticsTelemetry.open(state);
   let harness: Harness;
@@ -151,17 +171,18 @@ async function openApplication(): Promise<Application> {
   } catch (error) { await telemetry.close(); throw error; }
   const discovery = createToolDiscovery();
   try { return await startup.run("application_recovery", async () => {
-  const notifications = new Notifications(harness, registry, notificationConfig());
+  const notifications = new Notifications(harness, registry, notificationConfig(), undefined, effectGate(ownership));
   const tasks = new TaskStore(harness, inference);
   await startup.run("task_migration", () => tasks.prepare());
-  const attachments = new AttachmentStore(state); tasks.useAttachments(attachments);
+  const files = retainedFiles();
+  const attachments = new AttachmentStore(files); tasks.useAttachments(attachments);
   const environment = new CoordinatorEnvironment(harness); environment.useLiveGuidance(); tasks.useEnvironment(environment);
   const assets = join(state, "history", "assets");
   const histories = new HistoryStore(harness, assets); tasks.useHistory(histories);
   const catalog = new ConversationCatalog(harness, histories, tasks);
-  const importer = new CodexImporter(harness, histories, assets);
+  const imports = new HistoryImports(harness, histories, files);
   const retrieval = new Retrieval(harness, histories, tasks, join(state, "search.sqlite"));
-  const feedback = new FeedbackStore(state, tasks);
+  const feedback = new FeedbackStore(files, tasks);
   const repairs = new FeedbackDispatcher(feedback, tasks, environment);
   const executions = new Executions();
   await executions.prepareRecovery(harness);
@@ -198,7 +219,7 @@ async function openApplication(): Promise<Application> {
       for (const observer of mainObservers.values()) observer.publish(event);
     }
   });
-  const core = { stopInputDelivery, harness, tasks, environment, executions, sources, resources, histories, catalog, importer, retrieval, attachments, feedback, repairs, notifications, telemetry };
+  const core = { stopInputDelivery, harness, tasks, environment, executions, sources, resources, histories, catalog, imports, retrieval, attachments, feedback, repairs, notifications, telemetry };
   const background = new BackgroundScheduler(harness, registry, tasks, {
     ready: waitForBackground,
     async plan(cadence, after, now, signal) {
@@ -265,7 +286,7 @@ async function openApplication(): Promise<Application> {
       project: () => backgroundCall(host.host_id === null ? { type: "project_guidance", cwd: host.cwd }
         : { type: "on_node", host_id: host.host_id, command: { type: "project_guidance", cwd: host.cwd } }, scope()),
       search: (query, refs, limit, mode = "semantic") => retrieval.search(query, refs, limit,
-        (operation) => backgroundCall(operation, scope()), importer.isRunning(), mode),
+        (operation) => backgroundCall(operation, scope()), imports.isRunning(), mode),
       call: (operation) => backgroundCall(environment.route(operation, host), scope()),
     }),
   };
@@ -320,10 +341,10 @@ const ending = new Set<number>();
 
 function searchFor(application: Awaited<ReturnType<typeof openApplication>>, id: number) {
   return (query: string, refs: string[], limit: number, mode: SearchMode = "semantic") => application.retrieval.search(query, refs, limit,
-    (command) => hostRequests.call(id, command), application.importer.isRunning(), mode);
+    (command) => hostRequests.call(id, command), application.imports.isRunning(), mode);
 }
 type TriageApplication = { sources: SourceJournal; environment: CoordinatorEnvironment; executions: Executions;
-  toolsets: Toolsets; retrieval: Retrieval; importer: CodexImporter };
+  toolsets: Toolsets; retrieval: Retrieval; imports: HistoryImports };
 async function triageSources(application: TriageApplication, id: number, command: Extract<RuntimeCommand, { type: "triage_sources" }>, signal?: AbortSignal): Promise<void> {
   const { sources, environment, executions, toolsets } = application;
   signal?.throwIfAborted();
@@ -331,7 +352,7 @@ async function triageSources(application: TriageApplication, id: number, command
   const hosts = await environment.hosts(command.cwd, null, command.hosts);
   const default_host = await environment.defaultHost(hosts);
   const search = (query: string, refs: string[], limit: number, mode: SearchMode = "semantic") => application.retrieval.search(query, refs, limit,
-    (operation) => hostRequests.call(id, operation, signal), application.importer.isRunning(), mode);
+    (operation) => hostRequests.call(id, operation, signal), application.imports.isRunning(), mode);
   await sources.triage({ ...command, hosts }, (conversation, model) => executions.bind(conversation.id.toString(), {
     model, cwd: command.cwd, hosts, default_host, connectedHosts: () => environment.hosts(command.cwd, null, command.hosts),
     role: "triage", search, call: (operation) => hostRequests.call(id, environment.route(operation, default_host), signal),
@@ -579,12 +600,21 @@ async function handle(request: RuntimeRequest): Promise<void> {
           // locally; returned vectors still undergo normal index validation.
           return result.type === "failed" ? call(operation) : result;
         };
-        await application.importer.run(available.nodes, available.online_host_ids, command.hosts,
+        await application.imports.codex(available.nodes, available.online_host_ids, command.hosts,
           call, (progress) => emit(id, { type: "import_progress", progress }),
           () => application.retrieval.sync(indexCall, true));
         break;
       }
-      case "import_status": emit(id, { type: "import_progress", progress: await (await app()).importer.status() }); break;
+      case "import_chatgpt": {
+        const application = await app();
+        const call: HostCall = (operation) => hostRequests.call(id, operation);
+        await application.imports.chatgpt(command.package, call, (progress) => emit(id, { type: "import_progress", progress }),
+          () => application.retrieval.sync(call, true));
+        break;
+      }
+      case "import_status":
+        for (const progress of await (await app()).imports.statuses()) emit(id, { type: "import_progress", progress });
+        break;
       case "retry_history_index": emit(id, { type: "job_status", status: await (await app()).background.retryHistoryIndex() }); break;
       case "notifications": emit(id, { type: "notifications", status: await (await app()).notifications.request(command.request) }); break;
       case "task_input": {
@@ -1026,18 +1056,20 @@ try {
   for (const worker of workers.values()) worker.controller.abort();
   await Promise.allSettled(pending);
 } finally {
-  if (application !== undefined) {
-    const opened = await application.catch(() => undefined);
-    if (opened !== undefined) {
-      opened.notifications.close(); opened.stopInputDelivery();
-      try {
-        void opened.tasks.detachActors();
-        await opened.harness.close(BACKGROUND_CONTEXT);
-        await opened.tasks.detachActors();
-        await opened.discovery.close();
-        await opened.retrieval.close();
+  try {
+    if (application !== undefined) {
+      const opened = await application.catch(() => undefined);
+      if (opened !== undefined) {
+        opened.notifications.close(); opened.stopInputDelivery();
+        try {
+          void opened.tasks.detachActors();
+          await opened.harness.close(BACKGROUND_CONTEXT);
+          await opened.tasks.detachActors();
+          await opened.discovery.close();
+          await opened.retrieval.close();
+        }
+        finally { await opened.telemetry.close(); }
       }
-      finally { await opened.telemetry.close(); }
     }
-  }
+  } finally { closed.abort(); }
 }

@@ -1,4 +1,5 @@
 //! Effects run on the attached CLI's machine, never an implicit fallback host.
+use crate::serialized_spawn::SerializedTokioSpawn;
 use std::{
     future::Future,
     path::{Path, PathBuf},
@@ -24,6 +25,7 @@ use crate::{
         BlockId, HostId, RexClient, RexError, RexIdentity, SessionId, WindowId, WorkerBinding,
         WorkerResume,
     },
+    runtime::effects::EffectGroup,
 };
 use uuid::Uuid;
 
@@ -473,6 +475,25 @@ async fn execute_inner(rex: &RexClient, command: HostCommand) -> Result<HostResu
                 &allocation_id,
                 &title,
                 parent.as_ref(),
+                None,
+            )
+            .await
+        }
+        HostCommand::SpawnWorkspaceWorker {
+            host,
+            workspace,
+            task_id,
+            allocation_id,
+            title,
+        } => {
+            spawn_worker(
+                rex,
+                &host,
+                &task_id,
+                &allocation_id,
+                &title,
+                None,
+                Some(workspace.as_ref()),
             )
             .await
         }
@@ -733,6 +754,7 @@ async fn spawn_worker(
     allocation_id: &str,
     title: &str,
     parent: Option<&ExecutionBinding>,
+    workspace: Option<Option<&crate::protocol::WorkerRef>>,
 ) -> Result<HostResult> {
     let checked = async {
         let expected = host.host_id.as_deref().map(HostId::parse).transpose()?;
@@ -741,25 +763,37 @@ async fn spawn_worker(
             expected.is_none_or(|id| id == identity.host_id),
             "Worker host differs from this node's native Rex identity"
         );
-        let origin = match parent {
-            Some(parent) => {
-                ensure!(
-                    identity.host_id == parent.host_id,
-                    "The feedback terminal must use its originating host"
-                );
-                // The origin pane is on the personal Rex, which a private client cannot reach.
-                if client.is_private() {
-                    None
-                } else {
-                    let native = &parent.native;
-                    client
-                        .inspect_session(&native.session_id)
-                        .await?
-                        .verify_binding(native, &identity.host_id)?;
-                    Some(native.session_id.clone())
-                }
+        let origin = if let Some(Some(workspace)) = workspace {
+            let owned = ExecutionBinding::try_from(workspace)?;
+            ensure!(owned.host_id == identity.host_id, "Workspace host changed");
+            let view = client.inspect_session(&owned.native.session_id).await?;
+            if owned.rex_instance_id != Some(identity.instance_id) {
+                // Rex restoration is accepted only with positive proof of the
+                // exact previously owned pane under the current native host.
+                view.verify_binding(&owned.native, &identity.host_id)?;
             }
-            None => None,
+            Some(owned.native.session_id)
+        } else {
+            match parent {
+                Some(parent) => {
+                    ensure!(
+                        identity.host_id == parent.host_id,
+                        "The feedback terminal must use its originating host"
+                    );
+                    // The origin pane is on the personal Rex, which a private client cannot reach.
+                    if client.is_private() {
+                        None
+                    } else {
+                        let native = &parent.native;
+                        client
+                            .inspect_session(&native.session_id)
+                            .await?
+                            .verify_binding(native, &identity.host_id)?;
+                        Some(native.session_id.clone())
+                    }
+                }
+                None => None,
+            }
         };
         Ok((identity, origin))
     }
@@ -779,6 +813,11 @@ async fn spawn_worker(
                     &args,
                     Path::new(&host.cwd),
                 )
+                .await
+        }
+        None if workspace.is_some() => {
+            client
+                .create_workspace_session(title, &host.agent_program, &args, Path::new(&host.cwd))
                 .await
         }
         None => {
@@ -986,13 +1025,14 @@ pub(crate) async fn run_process_ending(
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true)
-        .spawn()
+        .spawn_serialized()
         .map_err(|error| {
             ProcessFailure::NotStarted(
                 anyhow::Error::new(error)
                     .context(format!("Could not start command {program:?} in {cwd:?}")),
             )
         })?;
+    let _recorded = EffectGroup::led_by(child.id());
     let result = async {
         let mut group = ProcessGroup(
             child
@@ -1803,6 +1843,52 @@ mod tests {
         assert_eq!(stdout, literal);
         assert_eq!(stderr, "diagnostic");
         assert!(!truncated);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn captured_output_closes_when_its_command_exits_while_other_commands_start() {
+        async fn capture(program: &str, args: &[&str]) -> Result<i32, String> {
+            let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+            run_process(
+                ProcessRequest::new(
+                    program,
+                    &args,
+                    std::path::Path::new("/"),
+                    Duration::from_secs(30),
+                    1024,
+                )
+                .unwrap(),
+            )
+            .await
+            .map(|output| output.exit_code)
+            .map_err(|failure| format!("{program}: {failure:?}"))
+        }
+        let window = Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let mut commands = Vec::new();
+        for _ in 0..16 {
+            commands.push(tokio::spawn(async move {
+                while started.elapsed() < window {
+                    capture("true", &[]).await?;
+                }
+                Ok(0)
+            }));
+        }
+        while started.elapsed() < window {
+            commands.push(tokio::spawn(capture("sleep", &["4"])));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut failures = Vec::new();
+        for command in commands {
+            if let Err(failure) = command.await.unwrap() {
+                failures.push(failure);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} captures failed: {failures:?}",
+            failures.len()
+        );
     }
 
     #[tokio::test]
