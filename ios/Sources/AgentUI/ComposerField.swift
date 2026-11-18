@@ -16,6 +16,31 @@
     }
     static let inset = UIEdgeInsets(top: 11, left: 2, bottom: 11, right: 2)
     static let maximumLines: CGFloat = 6
+
+    /// Match the editor's actual body font at its environment's content size, not the controls'
+    /// fixed 44pt targets (a single line is taller than those at accessibility sizes).
+    static func singleLineHeight(at size: DynamicTypeSize) -> CGFloat {
+      let category: UIContentSizeCategory
+      switch size {
+      case .xSmall: category = .extraSmall
+      case .small: category = .small
+      case .medium: category = .medium
+      case .large: category = .large
+      case .xLarge: category = .extraLarge
+      case .xxLarge: category = .extraExtraLarge
+      case .xxxLarge: category = .extraExtraExtraLarge
+      case .accessibility1: category = .accessibilityMedium
+      case .accessibility2: category = .accessibilityLarge
+      case .accessibility3: category = .accessibilityExtraLarge
+      case .accessibility4: category = .accessibilityExtraExtraLarge
+      case .accessibility5: category = .accessibilityExtraExtraExtraLarge
+      @unknown default: category = .large
+      }
+      let traits = UITraitCollection(preferredContentSizeCategory: category)
+      let font = UIFont.preferredFont(forTextStyle: .body, compatibleWith: traits)
+      return font.lineHeight + inset.top + inset.bottom
+    }
+
     let text: String
     let placeholder: String
     let chip: Chip?
@@ -123,12 +148,10 @@
       -> CGSize?
     {
       guard let width = proposal.width, width.isFinite else { return nil }
-      box.fitChip(width: width)
       let view = box.draft
-      let fitting = view.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude)).height
+      let fitting = box.fittingHeight(width: width)
       let limit =
         (view.font?.lineHeight ?? 0) * Self.maximumLines + Self.inset.top + Self.inset.bottom
-      view.isScrollEnabled = fitting > limit
       return CGSize(width: width, height: min(fitting, limit))
     }
 
@@ -172,14 +195,41 @@
       }
       required init?(coder: NSCoder) { return nil }
 
+      /// A scratch copy of the draft for measuring at a width the draft is not laid out at.
+      private let probe: UITextView = {
+        let view = UITextView(frame: .zero, textContainer: nil)
+        view.isScrollEnabled = false
+        return view
+      }()
+
+      /// The draft's height at `width`, with the chip fitted to that width. ComposerLayout measures
+      /// the editor at its inline and its full width in every pass. Fitting the live draft's chip
+      /// to each probe moved its lines and asked for another pass, so layout never settled.
+      func fittingHeight(width: CGFloat) -> CGFloat {
+        let size = CGSize(width: width, height: .greatestFiniteMagnitude)
+        let room = chipFit(width: width)?.room ?? .none
+        guard room != draft.chipRoom else { return draft.sizeThatFits(size).height }
+        probe.font = draft.font
+        probe.textContainer.lineFragmentPadding = draft.textContainer.lineFragmentPadding
+        probe.attributedText = draft.attributedText
+        DraftView.apply(room, to: probe)
+        return probe.sizeThatFits(size).height
+      }
+
       /// Sizes the chip to one line of the draft. A chip that leaves a third of the line beside it
       /// shares the first line with the draft. A wider one takes the first line, truncating a name
       /// too long for it, and the draft starts under it.
       func fitChip(width: CGFloat) {
-        guard let chip, let font = draft.font else {
+        guard let fit = chipFit(width: width) else {
           draft.chipRoom = .none
           return
         }
+        button.bounds.size = fit.size
+        draft.chipRoom = fit.room
+      }
+
+      private func chipFit(width: CGFloat) -> (size: CGSize, room: DraftView.ChipRoom)? {
+        guard let chip, let font = draft.font else { return nil }
         if titleSize != font.pointSize {
           titleSize = font.pointSize
           var configuration = UIButton.Configuration.plain()
@@ -200,18 +250,30 @@
         let line = width - ComposerField.inset.left - ComposerField.inset.right
         let natural = button.intrinsicContentSize.width
         if natural + 4 <= line * 2 / 3 {
-          button.bounds.size = CGSize(width: natural, height: font.lineHeight)
-          draft.chipRoom = .beside(natural + 4)
-        } else {
-          button.bounds.size = CGSize(width: min(natural, line), height: font.lineHeight)
-          draft.chipRoom = .above(font.lineHeight)
+          return (CGSize(width: natural, height: font.lineHeight), .beside(natural + 4))
         }
+        return (CGSize(width: min(natural, line), height: font.lineHeight), .above(font.lineHeight))
       }
 
       override func layoutSubviews() {
         super.layoutSubviews()
         draft.frame = bounds
         fitChip(width: bounds.width)
+        // Layout probes both the hypothetical compact width and the placed width. A probe must
+        // not toggle scrolling (which can reset contentOffset); only the real bounds decide it.
+        let fitting = draft.sizeThatFits(
+          CGSize(width: bounds.width, height: .greatestFiniteMagnitude)
+        ).height
+        let limit =
+          (draft.font?.lineHeight ?? 0) * ComposerField.maximumLines
+          + ComposerField.inset.top + ComposerField.inset.bottom
+        let scrolling = fitting > limit
+        if draft.isScrollEnabled != scrolling {
+          draft.isScrollEnabled = scrolling
+          if scrolling && draft.isFirstResponder {
+            draft.scrollRangeToVisible(draft.selectedRange)
+          }
+        }
         button.frame.origin = CGPoint(
           x: ComposerField.inset.left, y: ComposerField.inset.top - draft.contentOffset.y)
         // VoiceOver reads the recipient, then the draft. It reaches the chip only while all of
@@ -314,19 +376,7 @@
       var chipRoom = ChipRoom.none {
         didSet {
           guard chipRoom != oldValue else { return }
-          textContainerInset = ComposerField.inset
-          textContainer.exclusionPaths = []
-          switch chipRoom {
-          case .none: break
-          case .beside(let indent):
-            // Any line fragment this rect touches starts after it. Half a line touches only
-            // the first. TextKit ignores a rect that leaves the line no room, hence `above`.
-            let line = font?.lineHeight ?? 0
-            textContainer.exclusionPaths = [
-              UIBezierPath(rect: CGRect(x: 0, y: 0, width: indent, height: line / 2))
-            ]
-          case .above(let height): textContainerInset.top += height
-          }
+          Self.apply(chipRoom, to: self)
           // TextKit moves the lines for the new room but keeps drawing them where they were until
           // the text changes, so taps and the caret would miss what is drawn.
           if let layout = textLayoutManager {
@@ -334,6 +384,23 @@
             layout.textViewportLayoutController.layoutViewport()
           }
           setNeedsLayout()
+        }
+      }
+
+      /// Leaves the chip's room in `view`'s first line or above it.
+      static func apply(_ room: ChipRoom, to view: UITextView) {
+        view.textContainerInset = ComposerField.inset
+        view.textContainer.exclusionPaths = []
+        switch room {
+        case .none: break
+        case .beside(let indent):
+          // Any line fragment this rect touches starts after it. Half a line touches only
+          // the first. TextKit ignores a rect that leaves the line no room, hence `above`.
+          let line = view.font?.lineHeight ?? 0
+          view.textContainer.exclusionPaths = [
+            UIBezierPath(rect: CGRect(x: 0, y: 0, width: indent, height: line / 2))
+          ]
+        case .above(let height): view.textContainerInset.top += height
         }
       }
 
