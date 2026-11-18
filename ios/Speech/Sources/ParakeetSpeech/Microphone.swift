@@ -97,6 +97,7 @@ final class Capture: Sendable {
     do {
       engine.prepare()
       try engine.start()
+      capture.observe(engine)
     } catch {
       capture.stop()
       throw error
@@ -106,8 +107,8 @@ final class Capture: Sendable {
 
   var isRunning: Bool { state.withLockUnchecked { $0.engine != nil } }
 
-  /// Halts, then waits for any halt a converter error queued, so that halt cannot deactivate the
-  /// shared audio session after the next take activates it.
+  /// Halts, then waits for any halt queued on `teardown`, so that halt cannot deactivate the shared
+  /// audio session after the next take activates it.
   func stop() {
     halt(interrupted: false)
     teardown.sync {}
@@ -181,6 +182,28 @@ final class Capture: Sendable {
     return heard
   }
 
+  /// `AVAudioEngine` stops itself and posts `AVAudioEngineConfigurationChange` when the input's
+  /// channel count or sample rate changes. A notice while it still runs did not stop its audio, so
+  /// the take goes on.
+  private func engineChanged() {
+    guard let engine = state.withLockUnchecked({ $0.engine }), !engine.isRunning else { return }
+    halt(interrupted: true)
+  }
+
+  /// `AVAudioEngine` posts `AVAudioEngineConfigurationChange` on an internal queue, where releasing
+  /// the engine can deadlock. The handler queues the check on `teardown`, which `stop()` waits for.
+  /// It reaches the capture only through `check`, so the internal queue never holds the capture
+  /// strongly. The engine may stop itself before the observer is added, so the check runs here too.
+  private func observe(_ engine: AVAudioEngine) {
+    let check: @Sendable () -> Void = { [weak self] in self?.engineChanged() }
+    holdUntilHalt([
+      NotificationCenter.default.addObserver(
+        forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
+      ) { [teardown] _ in teardown.async(execute: check) }
+    ])
+    engineChanged()
+  }
+
   private func observe() {
     #if os(iOS)
       let center = NotificationCenter.default
@@ -208,8 +231,18 @@ final class Capture: Sendable {
           self?.halt(interrupted: true)
         },
       ]
-      state.withLockUnchecked { $0.observers = observers }
+      holdUntilHalt(observers)
     #endif
+  }
+
+  private func holdUntilHalt(_ observers: [any NSObjectProtocol]) {
+    let halted = state.withLockUnchecked { state in
+      guard state.engine != nil else { return true }
+      state.observers += observers
+      return false
+    }
+    guard halted else { return }
+    for observer in observers { NotificationCenter.default.removeObserver(observer) }
   }
 
   private static func deactivate() {
