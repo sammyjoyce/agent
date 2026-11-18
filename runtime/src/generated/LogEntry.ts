@@ -4,14 +4,20 @@ import type { LogPosition } from "./LogPosition.js";
 import type { LoggedBatch } from "./LoggedBatch.js";
 import type { OwnerEpoch } from "./OwnerEpoch.js";
 import type { Sha256Hex } from "./Sha256Hex.js";
+import type { StatePath } from "./StatePath.js";
 import type { Versions } from "./Versions.js";
 
 /**
- * One replication log entry: the files a commit needs, then the commit. A
- * file-only entry has no batch.
+ * One replication log entry: the files a commit needs, the paths the owner
+ * removed, then the commit. An entry that only names or removes files has no batch.
  */
 export type LogEntry = { at: LogPosition, epoch: OwnerEpoch,
 /**
  * SHA-256 over every other field, which tells a repeat from a conflict.
  */
-digest: Sha256Hex, versions: Versions, files: Array<FileRecord>, batch: LoggedBatch | null, };
+digest: Sha256Hex, versions: Versions, files: Array<FileRecord>,
+/**
+ * Each path is a file or a whole directory tree. A standby removes them
+ * after it gives this entry's files their names.
+ */
+removed: Array<StatePath>, batch: LoggedBatch | null, };

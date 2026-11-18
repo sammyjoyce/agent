@@ -1,24 +1,30 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, type TestContext } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { SqliteDatabase } from "@earendil-works/chord/sqlite";
 import { createModels, fauxProvider } from "@earendil-works/pi-ai";
 import { createRegistry, Harness, type Registry, type Storage, type StorageWrite } from "@earendil-works/pi-durable";
+import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { openConversationDatabase } from "../../src/conversation-database.js";
 import { AuthorityClient } from "../../src/failover/authority-client.js";
 import type { AuthorityLink } from "../../src/failover/authority-link.js";
 import { commandHolder } from "../../src/failover/authority-wire.js";
 import { sha256Hex } from "../../src/failover/log-entry.js";
-import { openReplicatedStorage, type StagedFile } from "../../src/failover/replicated-storage.js";
+import { openReplicatedStorage, type OwnerFenced, type StagedFile } from "../../src/failover/replicated-storage.js";
+import { ReplicatedFiles } from "../../src/failover/retained-files.js";
 import { ScopedDatabase } from "../../src/failover/scoped-database.js";
 import { applyLog } from "../../src/failover/standby.js";
 import type { AuthorityCommand } from "../../src/generated/AuthorityCommand.js";
+import type { AuthorityReply } from "../../src/generated/AuthorityReply.js";
 import type { AuthorityState } from "../../src/generated/AuthorityState.js";
+import type { FileRecord } from "../../src/generated/FileRecord.js";
 import type { LogEntry } from "../../src/generated/LogEntry.js";
+import type { RuntimeEventKind } from "../../src/generated/RuntimeEventKind.js";
+import { REPLICATED_FILE_ROOTS } from "../../src/generated/replicated-file-roots.js";
 import { fixtureModel } from "../model.js";
 import { manifest, manifestBytes } from "./failover-authority-cells.js";
 import { MemoryAuthority } from "./failover-memory-authority.js";
@@ -92,13 +98,36 @@ export async function stateDirectory(t: TestContext): Promise<string> {
 
 export const sessionPath = (directory: string) => join(directory, "session.sqlite");
 
+export async function filesUnder(directory: string): Promise<string[]> {
+  const entries = await readdir(directory, { recursive: true, withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  });
+  return entries.filter((entry) => entry.isFile()).map((entry) => relative(directory, join(entry.parentPath, entry.name))).sort();
+}
+
+export async function retainedFiles(directory: string): Promise<Record<string, string>> {
+  const paths = (await filesUnder(directory)).filter((path) => REPLICATED_FILE_ROOTS.some((root) => path.startsWith(`${root}/`)));
+  return Object.fromEntries(await Promise.all(paths.map(async (path) => [path, sha256Hex(await readFile(join(directory, path)))] as const)));
+}
+
+/** A coordinator start by `holder`: reads the epoch and claims the next one, as the helper does. Returns the authority's reply. */
+export async function claimStart(link: AuthorityLink, holder: string): Promise<AuthorityReply> {
+  const record = await link.record();
+  if (record === undefined) throw new Error("A start can only be claimed for an enrolled coordinator");
+  return link.command({ op: "claim", holder, expected_epoch: record.state.epoch });
+}
+
 export async function enroll(link: AuthorityLink, holder = OWNER): Promise<number> {
   await link.putBlob(manifest, manifestBytes);
   return (await accepted(link, { op: "enroll", holder, checkpoint: { through: 0, manifest } })).epoch;
 }
 
+/** A read-only connection that waits for a lock, because a test reads a database that another process may be opening or closing. */
+const reader = (directory: string) => new DatabaseSync(sessionPath(directory), { readOnly: true, timeout: 5_000 });
+
 export function tables(directory: string): Record<string, string[]> {
-  const database = new DatabaseSync(sessionPath(directory), { readOnly: true });
+  const database = reader(directory);
   try {
     const names = database.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all();
     return Object.fromEntries(names.map(({ name }) =>
@@ -124,16 +153,25 @@ export interface OwnerOptions {
   readonly holder?: string;
   readonly epoch: number;
   readonly signal?: AbortSignal;
+  readonly onFenced?: (error: OwnerFenced) => void;
   readonly registry?: Registry;
   readonly tokensPerSecond?: number;
+  readonly observe?: (database: SqliteDatabase) => SqliteDatabase;
 }
 
 export async function openOwner(directory: string, link: AuthorityLink, options: OwnerOptions) {
-  const database = await openScoped(directory);
-  const { storage, log } = await openReplicatedStorage({ database, link, holder: options.holder ?? OWNER, epoch: options.epoch,
-    stateDirectory: directory, ...(options.signal === undefined ? {} : { signal: options.signal }) });
-  try { return { database, storage, log, ...await openPi(storage, options) }; }
+  const database = await openScoped(directory, options.observe);
+  const opened = { database, link, holder: options.holder ?? OWNER, epoch: options.epoch, stateDirectory: directory,
+    onFenced: options.onFenced ?? (() => {}), ...(options.signal === undefined ? {} : { signal: options.signal }) };
+  const { storage, log } = await openReplicatedStorage(opened);
+  try { return { database, storage, log, files: new ReplicatedFiles(log, opened), ...await openPi(storage, options) }; }
   catch (error) { await storage.close(BACKGROUND_CONTEXT).catch(() => {}); throw error; }
+}
+
+/** Commits as a coordinator without the commit barrier does. */
+export async function commitOutsideTheLog(directory: string, text: string): Promise<void> {
+  const { harness, root } = await openPi(await SqliteStorage.open(await openConversationDatabase(sessionPath(directory))));
+  try { await root.submit(note(text, `request-${text}`), BACKGROUND_CONTEXT); } finally { await harness.close(BACKGROUND_CONTEXT); }
 }
 
 export async function stage(directory: string, link: AuthorityLink, path: string, bytes: Uint8Array): Promise<StagedFile> {
@@ -174,6 +212,16 @@ export async function logEntries(link: AuthorityLink): Promise<LogEntry[]> {
   }
 }
 
+/** The files the log names and no later entry removed, by path. */
+export async function loggedFiles(link: AuthorityLink): Promise<Map<string, FileRecord>> {
+  const named = new Map<string, FileRecord>();
+  for (const entry of await logEntries(link)) {
+    for (const file of entry.files) named.set(file.path, file);
+    for (const removed of entry.removed) for (const path of named.keys()) if (path === removed || path.startsWith(`${removed}/`)) named.delete(path);
+  }
+  return named;
+}
+
 export async function logBatches(link: AuthorityLink): Promise<StorageWrite[][]> {
   const batches: StorageWrite[][] = [];
   for (const { batch } of await logEntries(link)) {
@@ -185,6 +233,16 @@ export async function logBatches(link: AuthorityLink): Promise<StorageWrite[][]>
   return batches;
 }
 
+/** How many submissions the log holds for the input with this id. Each one is an admission of it. */
+export async function loggedInputs(link: AuthorityLink, inputId: string): Promise<number> {
+  const writes = (await logBatches(link)).flat();
+  return new Set(writes.flatMap((write) => write.type === "submission" && write.value.requestId === inputId ? [write.value.id] : [])).size;
+}
+
+/** The receipts that say an input was accepted. A later receipt with `work` reports its progress. */
+export const admissions = (events: readonly RuntimeEventKind[], inputId: string) =>
+  events.filter((event) => event.type === "input_accepted" && event.input_id === inputId && event.work === undefined).length;
+
 export const note = (data: string, requestId: string) => ({ type: "write", entry: { kind: "app.note", data }, requestId }) as const;
 
 const noteData = (entries: readonly { kind?: unknown; data?: unknown }[]) => entries.flatMap((entry) => entry.kind === "app.note" ? [String(entry.data)] : []);
@@ -194,7 +252,7 @@ export async function loggedNotes(link: AuthorityLink): Promise<string[]> {
 }
 
 export function localNotes(directory: string): string[] {
-  const database = new DatabaseSync(sessionPath(directory), { readOnly: true });
+  const database = reader(directory);
   try { return noteData(database.prepare("SELECT record FROM entries ORDER BY rowid").all().map((row) => JSON.parse(String(row.record)))); }
   finally { database.close(); }
 }

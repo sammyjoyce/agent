@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { EntryRecord } from "@earendil-works/pi-durable";
@@ -9,6 +9,7 @@ import type { FeedbackEntry } from "./generated/FeedbackEntry.js";
 import type { FeedbackEvidence } from "./generated/FeedbackEvidence.js";
 import { DelegationDecisionEntry } from "./delegation.js";
 import { AllocationDecisionEntry } from "./allocation.js";
+import type { RetainedFiles } from "./failover/retained-files.js";
 import { TaskStore } from "./tasks.js";
 
 const SAFE_DECISIONS = new Set(["search_tasks", "delegate_task", "spawn_agent", "continue_agent", "record_task", "report_result", "read_agents", "wait_agents"]);
@@ -38,15 +39,6 @@ class Capture {
     if (end < bytes.length) this.truncated = true;
     return bytes.subarray(0, end).toString("utf8");
   }
-}
-
-async function privateWrite(path: string, content: string): Promise<void> {
-  const temporary = `${path}.${randomUUID()}.tmp`;
-  try {
-    const file = await open(temporary, "wx", 0o600);
-    try { await file.writeFile(content); await file.sync(); } finally { await file.close(); }
-    await rename(temporary, path);
-  } catch (error) { await rm(temporary, { force: true }); throw error; }
 }
 
 function diagnostic(entry: EntryRecord, capture: Capture): FeedbackEntry {
@@ -113,7 +105,7 @@ function diagnostic(entry: EntryRecord, capture: Capture): FeedbackEntry {
 export class FeedbackStore {
   private readonly directory: string;
   private readonly capturing = new Map<string, Promise<FeedbackBundle>>();
-  constructor(state: string, private readonly tasks: TaskStore) { this.directory = join(state, "feedback"); }
+  constructor(private readonly files: RetainedFiles, private readonly tasks: TaskStore) { this.directory = join(files.stateDirectory, "feedback"); }
 
   async capture(description: string, input: FeedbackContext, inputId?: string): Promise<FeedbackBundle> {
     if (inputId === undefined) return this.captureNew(description, input);
@@ -158,9 +150,8 @@ export class FeedbackStore {
       omissions: ["System instructions, auth/config/environment stores, hidden thinking and media bytes are excluded.",
         "Execution/file/unknown tool payloads are omitted; canonical entry and call IDs remain available.",
         "Known credential forms are redacted; private conversation prose may still contain sensitive user data."] };
-    await mkdir(this.directory, { recursive: true, mode: 0o700 }); await chmod(this.directory, 0o700);
-    await privateWrite(this.path(bundle.id), JSON.stringify(bundle));
-    await privateWrite(join(this.directory, "latest"), bundle.id);
+    await this.files.write([{ path: `feedback/${bundle.id}.json`, bytes: Buffer.from(JSON.stringify(bundle)) },
+      { path: "feedback/latest", bytes: Buffer.from(bundle.id) }]);
     return bundle;
   }
 

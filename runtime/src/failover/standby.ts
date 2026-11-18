@@ -70,13 +70,16 @@ export async function followLog(follower: LogFollower, storage: SqliteStorage): 
 
 async function applyEntry({ database, link, stateDirectory }: LogFollower, storage: SqliteStorage, installed: Versions, entry: LogEntry): Promise<void> {
   const { digest, ...digested } = entry;
-  const { at, versions: written, files, batch } = entry;
+  const { at, versions: written, files, removed, batch } = entry;
   if (written.pi_durable !== installed.pi_durable || written.chord !== installed.chord) {
     throw new Error(`Log entry ${at} was written by Pi Durable ${written.pi_durable} and Chord ${written.chord}, and this host runs Pi Durable ${installed.pi_durable} and Chord ${installed.chord}`);
   }
   if (logEntryDigest(digested) !== digest) throw new Error(`Log entry ${at} does not match its digest`);
   const pending = await downloadFiles(link, stateDirectory, files);
-  const publish = () => publishFiles(pending);
+  const publish = async () => {
+    await publishFiles(pending);
+    await removePaths(stateDirectory, removed);
+  };
   try {
     if (batch === null) return await database.applyWithoutBatch(at, publish);
     const writes = parseBatch(await batchJson(link, at, batch.body), at);
@@ -100,7 +103,7 @@ async function batchJson(link: AuthorityLink, at: number, body: BatchBody): Prom
 }
 
 /** The path of a replicated file under a state directory. Refuses a record whose path leaves it. */
-export function replicatedFilePath(stateDirectory: string, file: FileRecord): string {
+export function replicatedFilePath(stateDirectory: string, file: Pick<FileRecord, "path">): string {
   const path = join(stateDirectory, file.path), inside = relative(stateDirectory, path);
   if (inside === "" || inside.startsWith("..") || isAbsolute(inside)) throw new Error(`The replicated file path ${file.path} leaves the state directory`);
   return path;
@@ -129,11 +132,7 @@ async function downloadFiles(link: AuthorityLink, stateDirectory: string, files:
       if (present !== undefined && matches(present, file)) continue;
       const bytes = await link.getBlob(file.sha256);
       if (!matches(bytes, file)) throw new Error(`The blob for ${file.path} does not match its record`);
-      await makeDirectory(dirname(path));
-      const synced = join(dirname(path), `.${randomUUID()}.tmp`);
-      pending.push({ synced, path });
-      const handle = await open(synced, "wx", 0o600);
-      try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
+      pending.push({ synced: await writeTemporary(dirname(path), bytes), path });
     }
     return pending;
   } catch (error) {
@@ -155,7 +154,45 @@ export async function publishFiles(files: readonly PendingFile[]): Promise<void>
   }
 }
 
-async function makeDirectory(directory: string): Promise<void> {
+/**
+ * Removes each path a log entry removed, a file or a whole tree, in a way that
+ * survives a crash. A path that is already gone needs nothing, so a repeat
+ * after a crash ends the same.
+ */
+export async function removePaths(stateDirectory: string, paths: readonly string[]): Promise<void> {
+  for (const removed of paths) {
+    const path = replicatedFilePath(stateDirectory, { path: removed });
+    await rm(path, { recursive: true, force: true });
+    await syncDirectory(dirname(path)).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+    });
+  }
+}
+
+/** A name no replicated file takes, so a file under it is one a crash left before its log entry named it. */
+export function isTemporaryName(name: string): boolean {
+  return name.startsWith(".") || name.endsWith(".tmp");
+}
+
+export function temporaryPath(directory: string): string {
+  return join(directory, `.${randomUUID()}.tmp`);
+}
+
+export async function writeTemporary(directory: string, bytes: Uint8Array): Promise<string> {
+  await makeDirectory(directory);
+  const path = temporaryPath(directory);
+  try {
+    const handle = await open(path, "wx", 0o600);
+    try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
+    return path;
+  } catch (error) {
+    await rm(path, { force: true });
+    throw error;
+  }
+}
+
+/** Creates a private directory and syncs each parent it had to create an entry in. */
+export async function makeDirectory(directory: string): Promise<void> {
   const created = await mkdir(directory, { recursive: true, mode: 0o700 });
   if (created === undefined) return;
   for (let made = directory; ; made = dirname(made)) {

@@ -6,6 +6,7 @@ use std::{
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use crate::{
@@ -23,9 +24,14 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::runtime::{FrameReader, Runtime, ShutdownSignal, StartRecord};
+use crate::runtime::{
+    FrameReader, OwnerClaim, OwnerFenced, Runtime, ShutdownSignal, StartRecord,
+    effects::SurvivingEffects,
+};
 
 const SOCKET_NAME: &str = "agent.sock";
+/// How long a fenced owner waits for the authority to take its stop evidence.
+const RELEASE_LIMIT: Duration = Duration::from_secs(30);
 
 pub async fn connect(state: &Path) -> io::Result<UnixStream> {
     UnixStream::connect(state.join(SOCKET_NAME)).await
@@ -56,7 +62,7 @@ pub async fn relay(stream: UnixStream) -> Result<()> {
 
 pub async fn serve_configured(
     script: &Path,
-    state: &Path,
+    claim: OwnerClaim,
     port: Option<u16>,
     policy: crate::tailnet::PeerPolicy,
     daemon: crate::tailnet::Daemon,
@@ -65,7 +71,7 @@ pub async fn serve_configured(
 ) -> Result<()> {
     serve_with_transport(
         script,
-        state,
+        claim,
         port,
         policy,
         daemon,
@@ -101,7 +107,7 @@ async fn serve_until(
 ) -> Result<()> {
     serve_with_transport(
         script,
-        state,
+        OwnerClaim::acquire(state, script, None)?,
         None,
         crate::tailnet::PeerPolicy::new(&[], &[])?,
         crate::tailnet::Daemon::default(),
@@ -112,10 +118,57 @@ async fn serve_until(
     .await
 }
 
+/// Runs the coordinator, then posts a fenced owner's stop evidence.
 #[allow(clippy::too_many_arguments)]
 async fn serve_with_transport(
     script: &Path,
-    state: &Path,
+    claim: OwnerClaim,
+    port: Option<u16>,
+    policy: crate::tailnet::PeerPolicy,
+    daemon: crate::tailnet::Daemon,
+    rex: crate::rex::RexClient,
+    bootstrap: Option<CoordinatorBootstrap>,
+    shutdown: impl Future<Output = Result<ShutdownReason>>,
+) -> Result<()> {
+    let session = claim.pi_session();
+    let state = claim.state().to_owned();
+    let served = serve_owner(
+        script, claim, port, policy, daemon, rex, bootstrap, shutdown,
+    )
+    .await;
+    if let (Err(error), Some(session)) = (&served, session)
+        && let Some(OwnerFenced::Runtime) = error.downcast_ref()
+        && let Some(epoch) = session.epoch
+    {
+        match crate::failover::commands::post_released(
+            script,
+            &state,
+            &session,
+            epoch,
+            RELEASE_LIMIT,
+        )
+        .await
+        {
+            Ok(true) => eprintln!(
+                "Told the failover authority that this coordinator stopped its effects at epoch {}",
+                epoch.get()
+            ),
+            Ok(false) => {}
+            Err(error) if error.is::<SurvivingEffects>() => eprintln!(
+                "Did not tell the failover authority that this coordinator stopped. {error:#}"
+            ),
+            Err(error) => eprintln!(
+                "Could not tell the failover authority that this coordinator stopped: {error:#}. Run `beep-boop failover release` on this host"
+            ),
+        }
+    }
+    served
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_owner(
+    script: &Path,
+    claim: OwnerClaim,
     port: Option<u16>,
     policy: crate::tailnet::PeerPolicy,
     daemon: crate::tailnet::Daemon,
@@ -124,7 +177,7 @@ async fn serve_with_transport(
     shutdown: impl Future<Output = Result<ShutdownReason>>,
 ) -> Result<()> {
     tokio::pin!(shutdown);
-    // Claim the writer before deciding an old socket is stale.
+    let state = &claim.state().to_owned();
     let background = bootstrap
         .as_ref()
         .and_then(|value| value.background.clone());
@@ -136,7 +189,7 @@ async fn serve_with_transport(
         .transpose()?;
     let owner = Runtime::start_with_notifications(
         script,
-        state,
+        claim,
         config.as_ref().and_then(|config| config.apns.as_ref()),
         StartRecord::for_config(config.as_ref()),
     )?;
@@ -687,7 +740,7 @@ mod tests {
     mod scrawl_feedback;
     mod startup;
     use crate::protocol::{AuthStatus, HostResult, InputMode, RuntimeCommand, RuntimeEventKind};
-    use crate::runtime::{FrameReader, Runtime, ShutdownSignal};
+    use crate::runtime::{FrameReader, OwnerClaim, Runtime, ShutdownSignal};
     use crate::service::{
         SOCKET_NAME, ShutdownReason, SocketOwner, authenticated, connect, serve_until, write_frame,
     };
@@ -1539,7 +1592,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("fixture.mjs");
         fs::write(&script, FIXTURE).unwrap();
-        let runtime = Arc::new(Runtime::start(&script, directory.path()).unwrap());
+        let runtime = Arc::new(
+            Runtime::start(
+                &script,
+                OwnerClaim::acquire(directory.path(), &script, None).unwrap(),
+            )
+            .unwrap(),
+        );
         let broker = Arc::new(
             crate::broker::Broker::with_tailscale(
                 None,
@@ -2025,7 +2084,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("fixture.mjs");
         fs::write(&script, FIXTURE).unwrap();
-        let runtime = Arc::new(Runtime::start(&script, directory.path()).unwrap());
+        let runtime = Arc::new(
+            Runtime::start(
+                &script,
+                OwnerClaim::acquire(directory.path(), &script, None).unwrap(),
+            )
+            .unwrap(),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut denied_client = TcpStream::connect(listener.local_addr().unwrap())
             .await

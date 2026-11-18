@@ -4,7 +4,7 @@ use crate::{
         AgentNode, CoordinatorBootstrap, CoordinatorSettings, RuntimeCommand, RuntimeEventKind,
         WorkerLaunch,
     },
-    runtime::{FrameReader, Runtime, ShutdownSignal},
+    runtime::{FrameReader, OwnerClaim, ShutdownSignal},
     service::{SOCKET_NAME, ShutdownReason, connect, serve_with_transport, write_frame},
 };
 use std::{fs, path::PathBuf, time::Duration};
@@ -64,7 +64,7 @@ await import(pathToFileURL({}).href);
         let task = tokio::spawn(async move {
             serve_with_transport(
                 &runtime_script,
-                &state,
+                OwnerClaim::acquire(&state, &runtime_script, None)?,
                 None,
                 crate::tailnet::PeerPolicy::new(&[], &[]).unwrap(),
                 crate::tailnet::Daemon::default(),
@@ -189,7 +189,7 @@ async fn configured(stream: UnixStream) -> Vec<AgentNode> {
 async fn initialization_waits_for_real_pi_beyond_the_metadata_deadline() {
     let mut service = Starting::held(INSTRUCTIONS.into()).await;
     assert!(!service.directory.path().join(SOCKET_NAME).exists());
-    assert!(Runtime::start(&service.script, service.directory.path()).is_err());
+    assert!(OwnerClaim::acquire(service.directory.path(), &service.script, None).is_err());
     // Ordinary metadata times out while this real child still holds startup.
     sleep(Duration::from_secs(17)).await;
     service.signal(libc::SIGUSR2);
@@ -203,7 +203,7 @@ async fn shutdown_during_initialization_reaps_pi_without_binding_a_listener() {
     // request admission rather than only waiting for a coordinator reply.
     let mut service = Starting::held("p".repeat(2 * 1024 * 1024)).await;
     assert!(!service.directory.path().join(SOCKET_NAME).exists());
-    assert!(Runtime::start(&service.script, service.directory.path()).is_err());
+    assert!(OwnerClaim::acquire(service.directory.path(), &service.script, None).is_err());
     service.stop.take().unwrap().send(()).unwrap();
     let stopped = timeout(Duration::from_secs(8), &mut service.task).await;
     if stopped.is_err() {

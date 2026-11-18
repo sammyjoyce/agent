@@ -12,7 +12,7 @@ use std::{
     io::{ErrorKind, IsTerminal},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitCode, Stdio},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -23,20 +23,25 @@ use agent_cli::{
     config::{self, ClientConfig},
     context::ContextStore,
     discovery,
+    failover::{OWNER_FENCED_EXIT, OwnerEpoch, commands},
     feedback::FeedbackContext,
     history::{HistorySource, chatgpt::ChatGptHistory},
     host,
     host::effects::{Admission, Capacity, HostEffects},
     instructions, jobs,
     models::{ModelProvider, ModelSelection, Reasoning},
+    owner_floor::{OwnerFloor, OwnerLink, OwnerWatch},
     protocol::{
         AuthStatus, ConversationChange, ConversationSettings, CoordinatorBootstrap,
-        CoordinatorSettings, ImportPhase, ImportProgress, InputMode, MainInputContext,
-        RuntimeCommand, RuntimeEventKind, SavedConversation, SearchMode, TaskId,
+        CoordinatorSettings, HostDelivery, HostResult, ImportPhase, ImportProgress, InputMode,
+        MainInputContext, RuntimeCommand, RuntimeEventKind, SavedConversation, SearchMode, TaskId,
         TranscriptAnnotation, TranscriptClassification, WorkerLaunch, WorkerRef,
     },
     rex::{BlockId, RexClient, SessionId},
-    runtime::{FrameReader, Wire, decode_coordinator_event, lifecycle::RequestLifecycle},
+    runtime::{
+        FrameReader, OwnerClaim, OwnerFenced, Wire, decode_coordinator_event,
+        lifecycle::RequestLifecycle,
+    },
     scrawl_feedback, service,
     tui::attachments::ComposerInput,
     tui::{Tui, TuiHandle, TuiInfo, TuiInput},
@@ -150,6 +155,12 @@ enum Action {
     Backup {
         #[command(subcommand)]
         command: BackupAction,
+    },
+    /// Replicate a coordinator: enroll its owner, keep a standby, and promote
+    /// the standby. Every command needs a [failover] section in the private config.
+    Failover {
+        #[command(subcommand)]
+        command: FailoverAction,
     },
     /// Run this machine's coordinator or registered worker service.
     Serve {
@@ -368,6 +379,56 @@ enum BackupAction {
 }
 
 #[derive(Subcommand)]
+enum FailoverAction {
+    /// Print the authority's record and the log position this state directory holds.
+    Status {
+        /// The coordinator to ask about, when the state directory names none.
+        #[arg(long)]
+        coordinator_id: Option<agent_cli::coordinator_id::CoordinatorId>,
+    },
+    /// Make the stopped coordinator the first owner of its replicated state.
+    Enroll {
+        #[arg(long, hide = true)]
+        part_bytes: Option<u64>,
+    },
+    /// Store a new checkpoint from the stopped owner, which drops the log entries it covers.
+    Checkpoint {
+        #[arg(long, hide = true)]
+        part_bytes: Option<u64>,
+    },
+    /// Build a standby of COORDINATOR_ID in the state directory, which must be absent or empty.
+    Join {
+        coordinator_id: agent_cli::coordinator_id::CoordinatorId,
+        /// First rename the state directory that is there to <name>.replaced-<time>.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Apply new log entries and their files to a standby until interrupted.
+    Follow {
+        /// Return when the standby holds the whole log.
+        #[arg(long)]
+        once: bool,
+        /// Seconds between two reads of the log.
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
+        interval: u64,
+    },
+    /// Make this standby the owner in place of the owner at EPOCH.
+    Promote {
+        /// The owner epoch that `failover status` shows now.
+        #[arg(long, value_name = "EPOCH")]
+        replace_epoch: u64,
+        /// Your statement that the old owner is stopped, for a host that cannot be reached.
+        #[arg(long, value_name = "STATEMENT")]
+        old_owner_stopped: Option<String>,
+        /// Seconds to wait for the old owner's stop evidence.
+        #[arg(long, default_value_t = 60)]
+        wait: u64,
+    },
+    /// On the old owner's host: prove that no process of this state directory is alive.
+    Release,
+}
+
+#[derive(Subcommand)]
 enum ConfigAction {
     Apply { settings: PathBuf },
 }
@@ -493,7 +554,17 @@ fn task_message_sender() -> Result<Option<String>> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<ExitCode> {
+    match run().await {
+        Err(error) if error.downcast_ref::<OwnerFenced>().is_some() => {
+            eprintln!("Error: {error:?}");
+            Ok(ExitCode::from(OWNER_FENCED_EXIT))
+        }
+        result => result.map(|()| ExitCode::SUCCESS),
+    }
+}
+
+async fn run() -> Result<()> {
     let mut arguments = Arguments::parse();
     #[allow(clippy::disallowed_methods)]
     let rex = RexClient::for_process(arguments.rex_server.as_deref())?;
@@ -667,6 +738,73 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
+        Action::Failover { command } => {
+            let script = runtime_script(arguments.runtime.clone());
+            let state = state::path(arguments.state_dir.clone())?;
+            let config = config::load(arguments.config.as_deref())?;
+            let failover = config.failover.as_ref().context(
+                "The failover commands need a [failover] section in the private config file",
+            )?;
+            let json = arguments.json;
+            match command {
+                FailoverAction::Status { coordinator_id } => print_receipt(
+                    json,
+                    &commands::status(&state, coordinator_id, &script, failover)?,
+                )?,
+                FailoverAction::Enroll { part_bytes } => print_receipt(
+                    json,
+                    &commands::enroll(&state, &script, failover, part_bytes)?,
+                )?,
+                FailoverAction::Checkpoint { part_bytes } => print_receipt(
+                    json,
+                    &commands::checkpoint(&state, &script, failover, part_bytes)?,
+                )?,
+                FailoverAction::Join {
+                    coordinator_id,
+                    replace,
+                } => print_receipt(
+                    json,
+                    &commands::join(&state, coordinator_id, replace, &script, failover)?,
+                )?,
+                FailoverAction::Follow { once, interval } => commands::follow(
+                    &state,
+                    &script,
+                    failover,
+                    (!once).then(|| Duration::from_secs(interval)),
+                    |followed| print_receipt(json, followed),
+                )?,
+                FailoverAction::Promote {
+                    replace_epoch,
+                    old_owner_stopped,
+                    wait,
+                } => {
+                    ensure!(
+                        old_owner_stopped
+                            .as_deref()
+                            .is_none_or(|statement| !statement.trim().is_empty()),
+                        "--old-owner-stopped needs your statement of why the old owner is stopped"
+                    );
+                    print_receipt(
+                        json,
+                        &commands::promote(
+                            &state,
+                            &script,
+                            failover,
+                            commands::Promotion {
+                                replace_epoch: OwnerEpoch::new(replace_epoch)?,
+                                old_owner_stopped,
+                                wait: Duration::from_secs(wait),
+                                apns_configured: config.apns.is_some(),
+                            },
+                        )?,
+                    )?
+                }
+                FailoverAction::Release => {
+                    print_receipt(json, &commands::release(&state, &script, failover)?)?
+                }
+            }
+            return Ok(());
+        }
         _ => {}
     }
     let directory = state::directory(arguments.state_dir.clone())?;
@@ -717,6 +855,8 @@ async fn main() -> Result<()> {
             );
             return worker_service(client, 300).await;
         }
+        // A host that does not own the coordinator must set up nothing, not even Messages.
+        let claim = OwnerClaim::acquire(&directory, &script, config.failover.as_ref())?;
         if !no_sources {
             configure_messages(&config.sources).await;
         }
@@ -770,7 +910,7 @@ async fn main() -> Result<()> {
         };
         return service::serve_configured(
             &script,
-            &directory,
+            claim,
             (!local_only).then_some(tailnet_port),
             policy,
             daemon,
@@ -3022,6 +3162,28 @@ fn scrawl_watcher(client: ClientContext<'_>) -> Option<WatchGuard> {
     })))
 }
 
+/// How long a worker waits for one answer from its coordinator while it
+/// registers. The coordinator may take that long for the two metadata updates
+/// of a registration.
+const WORKER_REGISTRATION_LIMIT: Duration =
+    Duration::from_secs(2 * agent_cli::broker::CONTROL_LIMIT.as_secs());
+
+/// A worker reads its coordinator's address only when it dials, so a wait
+/// without an end would keep it from the address an operator moved to a new
+/// owner.
+async fn coordinator_answer<T>(exchange: impl Future<Output = Result<T>>) -> Result<T> {
+    match timeout(WORKER_REGISTRATION_LIMIT, exchange).await {
+        Ok(answer) => answer,
+        Err(_) => {
+            let limit = WORKER_REGISTRATION_LIMIT.as_secs();
+            service_notice(format_args!(
+                "The coordinator did not answer this worker's registration within {limit}s."
+            ));
+            bail!("The coordinator did not answer a registration within {limit}s")
+        }
+    }
+}
+
 async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> {
     let ClientContext {
         config,
@@ -3041,6 +3203,12 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
         host::Executor::with_tailscale(directory, daemon.clone(), rex.clone())
             .with_browser(script, config.browser.clone()),
     );
+    let floor = OwnerFloor::for_user()?;
+    let watch = config
+        .failover
+        .as_ref()
+        .map(|failover| OwnerWatch::new(failover, script))
+        .transpose()?;
     let mut delay = 1;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -3058,33 +3226,44 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
                 &daemon,
             )
             .await?;
-            let settings = environment(client).await?;
+            let settings = coordinator_answer(environment(client)).await?;
             configure_messages(&settings.sources).await;
-            let mut wire = connection(client, false).await?;
-            write_command(
-                &mut *wire.writer,
-                &RuntimeCommand::ConnectWorker { node: node.clone() },
-            )
+            let (reader, mut writer, child, link) = coordinator_answer(async {
+                let mut wire = connection(client, false).await?;
+                write_command(
+                    &mut *wire.writer,
+                    &RuntimeCommand::ConnectWorker { node: node.clone() },
+                )
+                .await?;
+                let mut reader = FrameReader::new(BufReader::new(wire.reader));
+                let frame = reader
+                    .next_frame()
+                    .await?
+                    .context("Coordinator closed the worker registration")?;
+                let RuntimeEventKind::WorkerReady {
+                    coordinator_id,
+                    owner_epoch,
+                    ..
+                } = decode_coordinator_event(&frame)?
+                else {
+                    bail!("Coordinator did not accept this worker");
+                };
+                let link = OwnerLink::new(coordinator_id, owner_epoch);
+                Ok((reader, wire.writer, wire.child, link))
+            })
             .await?;
-            let mut reader = FrameReader::new(BufReader::new(wire.reader));
-            let frame = reader
-                .next_frame()
-                .await?
-                .context("Coordinator closed the worker registration")?;
-            ensure!(
-                matches!(
-                    decode_coordinator_event(&frame)?,
-                    RuntimeEventKind::WorkerReady { .. }
-                ),
-                "Coordinator did not accept this worker"
-            );
-            Ok::<_, anyhow::Error>((node, reader, wire.writer, wire.child))
+            if let Err(error) = floor.admit(link) {
+                service_notice(format_args!("{error:#}"));
+                let _ = close_connection(&mut *writer, child).await;
+                return Err(error);
+            }
+            Ok::<_, anyhow::Error>((node, reader, writer, child, link))
         };
         let registered = tokio::select! {
             registered = register => registered,
             signal = &mut shutdown => { signal?; return Ok(()); }
         };
-        if let Ok((node, mut reader, mut writer, child)) = registered {
+        if let Ok((node, mut reader, mut writer, child, link)) = registered {
             delay = 1;
             service_notice(format_args!("Worker connected as {}.", node.name));
             // Collection needs another connection while this one serves effects.
@@ -3120,11 +3299,22 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
                     sleep(Duration::from_secs(interval.into())).await;
                 }
             }));
+            let watched = async {
+                match &watch {
+                    Some(watch) => watch.ended(&floor, link).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(watched);
             let mut effects = HostEffects::new(Capacity::RegisteredWorker);
             let result = async {
                 loop {
                     tokio::select! {
                         signal = &mut shutdown => { signal?; return Ok::<_, anyhow::Error>(true); }
+                        error = &mut watched => {
+                            service_notice(format_args!("{error:#}"));
+                            return Err(error);
+                        }
                         completed = effects.next(), if !effects.is_empty() => {
                             let reply = completed?.context("Worker effect queue closed")?;
                             write_command(&mut *writer, &RuntimeCommand::HostReply { call_id: reply.call_id, result: reply.result }).await?;
@@ -3134,6 +3324,15 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
                             match decode_coordinator_event(&frame)? {
                                 RuntimeEventKind::HostCancel { call_id } => { effects.cancel(&call_id); }
                                 RuntimeEventKind::HostCall { call_id, command } => {
+                                    if let Err(error) = floor.check(link) {
+                                        service_notice(format_args!("{error:#}"));
+                                        let result = HostResult::Failed {
+                                            delivery: Some(HostDelivery::NotStarted),
+                                            message: format!("{error:#}; no command was started"),
+                                        };
+                                        write_command(&mut *writer, &RuntimeCommand::HostReply { call_id, result }).await?;
+                                        return Err(error);
+                                    }
                                     let executor = executor.clone();
                                     if let Admission::Rejected(reply) = effects.spawn(call_id, |cancelled| async move {
                                         executor.execute_cancelled(*command, cancelled).await
