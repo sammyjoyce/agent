@@ -199,10 +199,12 @@ recovery; [history](history.md) describes import and retrieval.
   native chat clients.
 - [ ] Bring the iPhone app's actions and content to Siri and Shortcuts through
   App Intents. **Open Coordinator**, **Open Job**, **Retry Interrupted Run**,
-  **Send Message**, reading jobs, and onscreen coordinators and jobs ship, with
-  a build check that the app carries its intents metadata and phrases. Send
-  Message asks before it sends, sends one confirmed copy through the outbox,
-  and never runs a command. Spotlight follows.
+  **Send Message**, reading jobs, onscreen coordinators and jobs, and
+  coordinators and jobs in Spotlight ship, with a build check that the app
+  carries its intents metadata and phrases. Send Message asks before it sends,
+  sends one confirmed copy through the outbox, and never runs a command. These
+  checks on a real iPhone remain: Siri by voice, and Send Message and the
+  Spotlight index on a locked phone.
 - [ ] A macOS menu bar app that shows Beep Boop's status on the Mac, including
   whether the service is running and its installed and running versions.
 - [ ] Typed read and write access to Apple Notes, Reminders, Mail and Messages
@@ -319,8 +321,22 @@ recovery; [history](history.md) describes import and retrieval.
   directory. Background work, task turns and automatic worktree collection stay
   held until `backup release`. See
   [backups and restore](setup.md#backups-and-restore).
-- [ ] Replicated coordinator state and failover, retaining one active owner so
-  additional coordinators do not duplicate work or external effects.
+- [x] Replicated coordinator state and failover, retaining one active owner so
+  additional coordinators do not duplicate work or external effects. A
+  coordinator with a `[failover]` section writes every commit and retained file
+  to a log on a Cloudflare Durable Object before local disk, a standby replays
+  that log, and `beep-boop failover promote` moves ownership to it under an
+  epoch that only the authority grants. The authority refuses every append and
+  every effect approval from any other epoch, so a coordinator without the
+  current epoch commits nothing, accepts no input and gets no new effect
+  approved. A coordinator opens a replicated state directory only under that
+  epoch. After a wrong statement that the old host is stopped, an effect
+  approved before the seal can still be dispatched once; promotion reports it
+  and does not repeat it. Promotion is an operator command, and nothing takes
+  over by itself. See
+  [failover](setup.md#failover), and
+  [cross-host recovery](architecture.md#cross-host-recovery) for what the stop
+  evidence does not prove.
 
 ## Upstream reuse follow-ups
 

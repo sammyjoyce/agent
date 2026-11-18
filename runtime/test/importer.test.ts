@@ -26,6 +26,7 @@ import { SearchIndex } from "../src/search.js";
 import { TaskStore, type HostCall } from "../src/tasks.js";
 import { HostRequests } from "../src/tools.js";
 import { transcript } from "../src/transcript.js";
+import { LocalFiles } from "../src/failover/retained-files.js";
 
 function node(host_id: string): AgentNode {
   return { host_id, name: host_id, rex_server: null, agent_program: "/example/agent", home_directory: "/example/home", coordinator: null,
@@ -58,8 +59,8 @@ async function open(directory: string) {
   const models = createModels();
   const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
     { models, registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
-  const assets = join(directory, "assets"), histories = new HistoryStore(session, assets);
-  const importer = new HistoryImports(session, histories, assets);
+  const assets = join(directory, "history", "assets"), histories = new HistoryStore(session, assets);
+  const importer = new HistoryImports(session, histories, new LocalFiles(directory));
   let indexes = 0;
   return { session, histories, importer, assets, models, indexCount: () => indexes,
     run: (producer: Producer, nodes = [coordinator]) => importer.codex(nodes, nodes.map((node) => node.host_id), [], native(producer), () => {}, async () => { indexes += 1; }) };

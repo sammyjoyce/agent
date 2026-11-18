@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { HostRequests } from "../src/tools.js";
+import type { OwnerGate } from "../src/failover/owner-gate.js";
 import type { HostCommand } from "../src/generated/HostCommand.js";
 
 test("interrupt fences new host calls until owned effects settle and the next turn resumes", async () => {
@@ -63,4 +64,75 @@ test("interrupt immediately releases embedding callers but preserves independent
     requests.finish(7); requests.finish(8);
     await rejected;
   }
+});
+
+function ownerGate() {
+  const waiting: { open(): void; refuse(error: Error): void; signal: AbortSignal | undefined }[] = [];
+  const gate: OwnerGate = {
+    fresh: (signal) => new Promise<void>((resolve, reject) => {
+      signal?.addEventListener("abort", () => reject(new Error("The wait at the gate was aborted")), { once: true });
+      waiting.push({ open: resolve, refuse: reject, signal });
+    }),
+  };
+  return { gate, waiting };
+}
+
+test("a replicated owner emits a host call only after the owner gate opens for it", async () => {
+  const calls: string[] = [], { gate, waiting } = ownerGate();
+  const requests = new HostRequests((_request, call) => calls.push(call), () => {}, gate);
+  const operation: HostCommand = { type: "exec", program: "/bin/true", args: [], cwd: "/", timeout_seconds: 5 };
+  const pending = requests.call(7, operation);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(waiting.length, 1, "the call asks the gate once");
+  assert.deepEqual(calls, [], "nothing is emitted while the gate is closed");
+  waiting[0]?.open();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(calls.length, 1);
+  assert.equal(requests.reply(7, calls[0] ?? "", { type: "written" }), true);
+  assert.deepEqual(await pending, { type: "written" });
+});
+
+test("a call that ends while it waits at the owner gate never emits a frame", async () => {
+  const calls: string[] = [], cancelled: string[] = [], { gate, waiting } = ownerGate();
+  const requests = new HostRequests((_request, call) => calls.push(call), (_request, call) => cancelled.push(call), gate);
+  const operation: HostCommand = { type: "exec", program: "/bin/true", args: [], cwd: "/", timeout_seconds: 5 };
+  const stop = new AbortController();
+  const aborted = requests.call(7, operation, stop.signal);
+  const interrupted = requests.call(8, operation);
+  const ended = requests.call(9, operation);
+  const refused = requests.call(10, operation);
+  const fence = new Error("The authority refused this owner");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(waiting.length, 4);
+  stop.abort();
+  requests.cancelRequest(8);
+  requests.finish(9);
+  waiting[3]?.refuse(fence);
+  await assert.rejects(aborted, /stopped before the host operation started/);
+  await assert.rejects(interrupted, /interrupted before the host operation started/);
+  await assert.rejects(ended, /request ended before the host operation/);
+  await assert.rejects(refused, (error) => error === fence, "the gate's refusal reaches the caller unchanged");
+  assert.ok(waiting.slice(0, 3).every((waiter) => waiter.signal?.aborted), "each ended call leaves the gate");
+  for (const waiter of waiting) waiter.open();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, [], "a late opening emits nothing for a call that ended");
+  assert.deepEqual(cancelled, [], "a call that never started has nothing to cancel");
+  requests.resumeRequest(8);
+  const next = requests.call(8, operation);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  waiting[4]?.open();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(calls.length, 1, "the request works again after the interrupt is resumed");
+  requests.reply(8, calls[0] ?? "", { type: "written" }); await next;
+});
+
+test("calls that wait at the owner gate count toward the pending limit", async () => {
+  const { gate, waiting } = ownerGate();
+  const requests = new HostRequests(() => {}, () => {}, gate);
+  const operation: HostCommand = { type: "exec", program: "/bin/true", args: [], cwd: "/", timeout_seconds: 5 };
+  const held = Array.from({ length: 128 }, () => requests.call(7, operation));
+  await assert.rejects(requests.call(7, operation), /Too many pending host operations/);
+  assert.equal(waiting.length, 128);
+  requests.finish(7);
+  await Promise.allSettled(held);
 });

@@ -1,8 +1,10 @@
 import { decide, type AuthorityWrite } from "./authority-core.js";
-import { COMMAND_BODY_LIMIT_BYTES, commandBlobs, commandHolder, isLowercaseUuid, isSha256Hex, parseAuthorityCommand, parseAuthorityCredentials, type AuthorityCredential } from "./authority-wire.js";
+import { COMMAND_BODY_LIMIT_BYTES, commandBlobs, commandHolder, isBatchJson, isLowercaseUuid, isSha256Hex, logEntryCanonical, parseAuthorityCommand, parseAuthorityCredentials,
+  type AuthorityCredential } from "./authority-wire.js";
 import type { AuthorityCommand } from "../generated/AuthorityCommand.js";
 import type { AuthorityRecord } from "../generated/AuthorityRecord.js";
 import type { AuthorityReply } from "../generated/AuthorityReply.js";
+import type { LogEntry } from "../generated/LogEntry.js";
 
 type SqlValue = string | number | null;
 interface SqlCursor extends Iterable<Record<string, SqlValue>> {
@@ -135,10 +137,28 @@ async function readCommand(request: Request): Promise<AuthorityCommand> {
   } catch {
     throw new Refusal(400, "The command body is not UTF-8 JSON.");
   }
+  let command: AuthorityCommand;
   try {
-    return parseAuthorityCommand(value);
+    command = parseAuthorityCommand(value);
   } catch (error) {
     throw new Refusal(400, error instanceof Error ? error.message : String(error));
+  }
+  if (command.op === "append") await refuseUnappliable(command.entry);
+  return command;
+}
+
+/**
+ * A standby checks an entry's digest and parses its inline batch before it
+ * applies it. An entry that fails either check could never be applied, and no
+ * promotion could then reach the head, so the log never takes one. A batch in
+ * the blob store is checked only by its hash, when it is stored.
+ */
+async function refuseUnappliable(entry: LogEntry): Promise<void> {
+  if (await sha256Hex(new TextEncoder().encode(logEntryCanonical(entry))) !== entry.digest) {
+    throw new Refusal(422, "The digest of the log entry does not match its fields.");
+  }
+  if (entry.batch?.body.kind === "inline" && !isBatchJson(entry.batch.body.json)) {
+    throw new Refusal(422, "The inline batch of the log entry is not a JSON list of writes.");
   }
 }
 

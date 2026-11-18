@@ -1,4 +1,5 @@
 //! Effects run on the attached CLI's machine, never an implicit fallback host.
+use crate::serialized_spawn::SerializedTokioSpawn;
 use std::{
     future::Future,
     path::{Path, PathBuf},
@@ -24,6 +25,7 @@ use crate::{
         BlockId, HostId, RexClient, RexError, RexIdentity, SessionId, WindowId, WorkerBinding,
         WorkerResume,
     },
+    runtime::effects::EffectGroup,
 };
 use uuid::Uuid;
 
@@ -1023,13 +1025,14 @@ pub(crate) async fn run_process_ending(
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true)
-        .spawn()
+        .spawn_serialized()
         .map_err(|error| {
             ProcessFailure::NotStarted(
                 anyhow::Error::new(error)
                     .context(format!("Could not start command {program:?} in {cwd:?}")),
             )
         })?;
+    let _recorded = EffectGroup::led_by(child.id());
     let result = async {
         let mut group = ProcessGroup(
             child
@@ -1840,6 +1843,52 @@ mod tests {
         assert_eq!(stdout, literal);
         assert_eq!(stderr, "diagnostic");
         assert!(!truncated);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn captured_output_closes_when_its_command_exits_while_other_commands_start() {
+        async fn capture(program: &str, args: &[&str]) -> Result<i32, String> {
+            let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+            run_process(
+                ProcessRequest::new(
+                    program,
+                    &args,
+                    std::path::Path::new("/"),
+                    Duration::from_secs(30),
+                    1024,
+                )
+                .unwrap(),
+            )
+            .await
+            .map(|output| output.exit_code)
+            .map_err(|failure| format!("{program}: {failure:?}"))
+        }
+        let window = Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let mut commands = Vec::new();
+        for _ in 0..16 {
+            commands.push(tokio::spawn(async move {
+                while started.elapsed() < window {
+                    capture("true", &[]).await?;
+                }
+                Ok(0)
+            }));
+        }
+        while started.elapsed() < window {
+            commands.push(tokio::spawn(capture("sleep", &["4"])));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut failures = Vec::new();
+        for command in commands {
+            if let Err(failure) = command.await.unwrap() {
+                failures.push(failure);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} captures failed: {failures:?}",
+            failures.len()
+        );
     }
 
     #[tokio::test]

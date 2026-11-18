@@ -1441,6 +1441,7 @@ struct MessageRow: View {
   let badges: [ProfileID: CoordinatorBadge]
   let implied: ProfileID?
   @State private var expanded = false
+  @State private var showingNoticeDetails = false
   @Environment(\.dynamicTypeSize) private var typeSize
 
   init(
@@ -1553,8 +1554,21 @@ struct MessageRow: View {
   private var content: some View {
     VStack(alignment: .leading, spacing: 8) {
       if showsHeader {
-        Label(title, systemImage: symbol).font(.caption.weight(.semibold)).foregroundStyle(
-          .secondary)
+        Button {
+          showingNoticeDetails = true
+        } label: {
+          Label(title, systemImage: symbol)
+            .font(.caption.weight(.semibold))
+            .lineLimit(typeSize.isAccessibilitySize ? nil : 2)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(minHeight: 44, alignment: .leading)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Details for " + title)
+        .accessibilityHint("Shows recorded source information. Does not start any work.")
+        .sheet(isPresented: $showingNoticeDetails) {
+          NoticeDetailsView(row: model.row)
+        }
       }
       if model.row.tool != nil || model.row.role == .thinking
         || (model.row.role == .tool && model.row.presentation != nil)
@@ -1598,7 +1612,7 @@ struct MessageRow: View {
     case .assistant, .final: "Beep Boop"
     case .commentary: "Update"
     case .partialAnswer: "Partial answer"
-    case .notice: model.row.provenanceLabel ?? "Notice"
+    case .notice: model.row.provenanceLabel ?? "Update"
     case .thinking: "Reasoning"
     case .tool: "Tool"
     }
@@ -1717,5 +1731,66 @@ struct RichMessage: View {
       }
     }
     .frame(maxWidth: .infinity, alignment: .leading).multilineTextAlignment(.leading)
+  }
+}
+
+// Pure snapshot inspection: no session, transport, or worker actions.
+private struct NoticeDetailsView: View {
+  let row: ChatRow
+  @Environment(\.dismiss) private var dismiss
+
+  var body: some View {
+    NavigationStack {
+      List {
+        Section("Publication") {
+          value("Source", row.provenanceLabel ?? "Unknown — not recorded")
+          value("Notice entry", row.entryID)
+        }
+        if let job = row.noticeOrigin {
+          Section("Scheduled job") {
+            value("Title", job.title)
+            value("Job ID", job.jobId)
+          }
+        }
+        if let details = row.noticeDetails {
+          Section("Task and original entry") {
+            value("Task title", details.taskTitle)
+            value("Task ID", details.taskId)
+            value("Conversation ID", details.sourceConversationId)
+            value("Entry ID", details.sourceEntryId)
+          }
+          ForEach(Array(details.sources.enumerated()), id: \.offset) { _, source in
+            Section("Recorded source") {
+              value("Title", source.title)
+              value("Provider", source.provider)
+              value("Account", source.account)
+              value("Thread ID", source.threadId)
+              value("Event ID", source.eventId)
+              value("Version", source.eventVersion)
+            }
+          }
+          if details.sources.isEmpty {
+            Text("External source details were not recorded.")
+          }
+        } else {
+          Text("Source and task details were not recorded for this message.")
+        }
+      }
+      .textSelection(.enabled)
+      .navigationTitle("Notice details")
+      .toolbar {
+        ToolbarItem(placement: .confirmationAction) {
+          Button("Done") { dismiss() }
+        }
+      }
+    }
+  }
+
+  private func value(_ label: String, _ value: String?) -> some View {
+    VStack(alignment: .leading, spacing: 4) {
+      Text(label).font(.caption).foregroundStyle(.secondary)
+      Text(value.flatMap { $0.isEmpty ? nil : $0 } ?? "Not recorded")
+        .fixedSize(horizontal: false, vertical: true)
+    }
   }
 }

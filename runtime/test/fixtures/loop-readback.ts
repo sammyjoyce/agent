@@ -37,7 +37,7 @@ try {
   for (const { id } of await app.database.all<{ id: number }>("SELECT id FROM conversations ORDER BY id")) {
     const issued = new Map<string, number>(), listed: unknown[] = [];
     for (const entry of await entries(String(id))) {
-      listed.push({ id: entry.id, kind: entry.kind, user: entry.model?.some((message) => message.role === "user") ?? false,
+      listed.push({ id: entry.id, kind: entry.kind, assistant: entry.model?.some((message) => message.role === "assistant") ?? false, user: entry.model?.some((message) => message.role === "user") ?? false,
         data: entry.kind === "agent.notice_context" ? cited(entry) : entry.kind.startsWith("agent.") ? entry.data ?? null : null });
       for (const message of entry.model ?? []) {
         if (message.role === "assistant") for (const part of message.content) if (part.type === "toolCall") issued.set(part.id, entry.id);

@@ -1,3 +1,4 @@
+use agent_cli::serialized_spawn::SerializedTokioSpawn;
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -117,6 +118,7 @@ async fn repeated_control_c_detaches_while_admission_is_held_and_retains_its_ori
                             }
                             RuntimeCommand::ReadConversation { conversation_id, cursor: None } => vec![RuntimeEventKind::History {
                                 conversation_id, messages: vec![HistoryMessage {
+                                    notice_details: None,
                                     notice_origin: None,
                                     entry_id: "saved-answer".into(), role: HistoryRole::Final,
                                     text: "The saved chief transcript is ready.".into(), continuation: false,
@@ -165,7 +167,7 @@ async fn repeated_control_c_detaches_while_admission_is_held_and_retains_its_ori
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     let mut output = child.stdout.take().unwrap();
@@ -302,6 +304,7 @@ async fn known_chief_history_renders_while_its_observer_readiness_is_held() {
                             }
                             RuntimeCommand::ReadConversation { conversation_id, cursor: None } => {
                                 let mut messages = vec![HistoryMessage {
+                                    notice_details: None,
                                     notice_origin: None,
                                     entry_id: "saved-answer".into(), role: HistoryRole::Final,
                                     text: "Saved conversation text can appear before observation is ready.".into(), continuation: false,
@@ -309,6 +312,7 @@ async fn known_chief_history_renders_while_its_observer_readiness_is_held() {
                                 }];
                                 if reads.fetch_add(1, Ordering::SeqCst) > 0 {
                                     messages.push(HistoryMessage {
+                                        notice_details: None,
                                         notice_origin: None,
                                         entry_id: "answer-during-attach".into(), role: HistoryRole::Final,
                                         text: "The entry committed during attachment remains visible.".into(), continuation: false,
@@ -347,7 +351,7 @@ async fn known_chief_history_renders_while_its_observer_readiness_is_held() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     let mut output = child.stdout.take().unwrap();
@@ -619,6 +623,7 @@ async fn recovery_connection(
                 drop(known);
                 receipts.push(RuntimeEventKind::Message {
                     message: HistoryMessage {
+                        notice_details: None,
                         notice_origin: None,
                         presentation: None,
                         entry_id: "recovered-answer".into(),
@@ -662,6 +667,7 @@ async fn recovery_connection(
                 .iter()
                 .filter(|input| input.placed)
                 .map(|input| HistoryMessage {
+                    notice_details: None,
                     notice_origin: None,
                     presentation: None,
                     entry_id: format!("native-{}", input.id),
@@ -790,7 +796,7 @@ async fn observer_recovery(case: RecoveryCase) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     let mut output = child.stdout.take().unwrap();
@@ -1170,6 +1176,7 @@ async fn chief_startup(mode: ChiefStartup) {
                         vec![RuntimeEventKind::History {
                             conversation_id,
                             messages: vec![HistoryMessage {
+                                notice_details: None,
                                 notice_origin: None,
                                 presentation: None,
                                 attachments: None,
@@ -1251,7 +1258,7 @@ async fn chief_startup(mode: ChiefStartup) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     let mut output = child.stdout.take().unwrap();
@@ -1528,7 +1535,7 @@ async fn coordinator_decode_failure_reports_safe_metadata_without_private_values
         .arg("--config")
         .arg(config)
         .args(["--no-tui", "history", "read", "saved"])
-        .output()
+        .output_serialized()
         .await
         .unwrap();
     server.await.unwrap();
@@ -1656,6 +1663,7 @@ async fn exact_resume_renders_history_without_fetching_fuzzy_catalog_pages() {
                         vec![RuntimeEventKind::History {
                             conversation_id,
                             messages: vec![HistoryMessage {
+                                notice_details: None,
                                 notice_origin: None,
                                 presentation: None,
                                 attachments: None,
@@ -1699,7 +1707,7 @@ async fn exact_resume_renders_history_without_fetching_fuzzy_catalog_pages() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     let mut output = child.stdout.take().unwrap();
     let mut bytes = Vec::new();
@@ -1811,6 +1819,7 @@ async fn main_history(older: bool) {
                             conversation_id: "persisted-main".into(),
                             messages: vec![
                                 HistoryMessage {
+                                    notice_details: None,
                                     notice_origin: None,
                                     presentation: None,
                                     attachments: None,
@@ -1827,6 +1836,7 @@ async fn main_history(older: bool) {
                                     tool: None,
                                 },
                                 HistoryMessage {
+                                    notice_details: None,
                                     notice_origin: None,
                                     presentation: None,
                                     attachments: None,
@@ -1876,7 +1886,7 @@ async fn main_history(older: bool) {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
-            .spawn()
+            .spawn_serialized()
             .unwrap();
         child
             .stdin

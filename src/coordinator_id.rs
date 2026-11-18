@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 
 /// Persistent identity of one coordinator state directory, so a phone can tell
 /// two coordinators apart and notice when fresh state replaced the one it knew.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
 #[serde(transparent)]
 pub struct CoordinatorId(uuid::Uuid);
 

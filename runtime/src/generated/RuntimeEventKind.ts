@@ -6,6 +6,7 @@ import type { AuthStatus } from "./AuthStatus.js";
 import type { BackgroundStatus } from "./BackgroundStatus.js";
 import type { ConversationSettings } from "./ConversationSettings.js";
 import type { ConversationUsage } from "./ConversationUsage.js";
+import type { CoordinatorId } from "./CoordinatorId.js";
 import type { CoordinatorSettings } from "./CoordinatorSettings.js";
 import type { ErrorCode } from "./ErrorCode.js";
 import type { FeedbackBundle } from "./FeedbackBundle.js";
@@ -20,6 +21,7 @@ import type { JobSyncReport } from "./JobSyncReport.js";
 import type { ModelActivity } from "./ModelActivity.js";
 import type { ModelSelection } from "./ModelSelection.js";
 import type { NotificationStatus } from "./NotificationStatus.js";
+import type { OwnerEpoch } from "./OwnerEpoch.js";
 import type { ResourceRecord } from "./ResourceRecord.js";
 import type { SavedConversation } from "./SavedConversation.js";
 import type { SavedMatch } from "./SavedMatch.js";
@@ -32,7 +34,16 @@ import type { ToolDetails } from "./ToolDetails.js";
 import type { TranscriptAnnotation } from "./TranscriptAnnotation.js";
 import type { UsageAvailability } from "./UsageAvailability.js";
 
-export type RuntimeEventKind = { "type": "conversation_usage", usage: ConversationUsage, } | { "type": "attachment", response: AttachmentResponse, } | { "type": "job_run", run: JobRunReceipt, } | { "type": "jobs_synced", report: JobSyncReport, } | { "type": "job_status", status: BackgroundStatus, } | { "type": "scheduled_jobs", jobs: Array<ScheduledJobStatus>, } | { "type": "scheduled_job", job: ScheduledJobStatus, } | { "type": "usage", usage: UsageAvailability, } | { "type": "feedback_ready", receipt: FeedbackReceipt, input_id?: string, } | { "type": "feedback", bundle: FeedbackBundle, } | { "type": "import_progress", progress: ImportProgress, } | { "type": "saved_matches", matches: Array<SavedMatch>, gaps: Array<string>, } | { "type": "conversations", items: Array<SavedConversation>, next_cursor: string | null, } | { "type": "configured" } | { "type": "notifications", status: NotificationStatus, } | { "type": "transcript_annotated", conversation_id: string, entries: Array<TranscriptAnnotation>, } | { "type": "node_registered", host_id: string, } | { "type": "worker_ready", connection_id: string, } | { "type": "environment", settings: CoordinatorSettings, nodes: Array<AgentNode>, online_host_ids: Array<string>, unavailable_host_ids?: Array<string> | null, } | { "type": "resources", resources: Array<ResourceRecord>, } | { "type": "sources", sources: Array<SourceState>, } | { "type": "source_admitted", new_events: number, checkpoint_advanced: boolean, state: SourceState, } | { "type": "notice", task_id: TaskId | null, text: string, } | { "type": "host_call", call_id: string, command: HostCommand, } | { "type": "tasks", tasks: Array<TaskRecord>, } | { "type": "task", task: TaskRecord, history: string, } | { "type": "task_graph", graph: TaskGraphSnapshot, } | { "type": "authorization_url", url: string, } | { "type": "auth_status", status: AuthStatus, } | { "type": "conversation_settings", settings: ConversationSettings, } | { "type": "goal", status: GoalStatus, } | { "type": "main_ready",
+export type RuntimeEventKind = { "type": "conversation_usage", usage: ConversationUsage, } | { "type": "attachment", response: AttachmentResponse, } | { "type": "job_run", run: JobRunReceipt, } | { "type": "jobs_synced", report: JobSyncReport, } | { "type": "job_status", status: BackgroundStatus, } | { "type": "scheduled_jobs", jobs: Array<ScheduledJobStatus>, } | { "type": "scheduled_job", job: ScheduledJobStatus, } | { "type": "usage", usage: UsageAvailability, } | { "type": "feedback_ready", receipt: FeedbackReceipt, input_id?: string, } | { "type": "feedback", bundle: FeedbackBundle, } | { "type": "import_progress", progress: ImportProgress, } | { "type": "saved_matches", matches: Array<SavedMatch>, gaps: Array<string>, } | { "type": "conversations", items: Array<SavedConversation>, next_cursor: string | null, } | { "type": "configured" } | { "type": "notifications", status: NotificationStatus, } | { "type": "transcript_annotated", conversation_id: string, entries: Array<TranscriptAnnotation>, } | { "type": "node_registered", host_id: string, } | { "type": "worker_ready", connection_id: string,
+/**
+ * Missing from coordinators older than owner floors.
+ */
+coordinator_id?: CoordinatorId,
+/**
+ * The epoch the failover authority granted this coordinator start.
+ * Absent for a coordinator without a `[failover]` section.
+ */
+owner_epoch?: OwnerEpoch, } | { "type": "environment", settings: CoordinatorSettings, nodes: Array<AgentNode>, online_host_ids: Array<string>, unavailable_host_ids?: Array<string> | null, } | { "type": "resources", resources: Array<ResourceRecord>, } | { "type": "sources", sources: Array<SourceState>, } | { "type": "source_admitted", new_events: number, checkpoint_advanced: boolean, state: SourceState, } | { "type": "notice", task_id: TaskId | null, text: string, } | { "type": "host_call", call_id: string, command: HostCommand, } | { "type": "tasks", tasks: Array<TaskRecord>, } | { "type": "task", task: TaskRecord, history: string, } | { "type": "task_graph", graph: TaskGraphSnapshot, } | { "type": "authorization_url", url: string, } | { "type": "auth_status", status: AuthStatus, } | { "type": "conversation_settings", settings: ConversationSettings, } | { "type": "goal", status: GoalStatus, } | { "type": "main_ready",
 /**
  * Advertised by the runtime that persists and projects transport provenance.
  */

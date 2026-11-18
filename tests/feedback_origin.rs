@@ -3,6 +3,7 @@
 #[path = "fixtures/fake_rex.rs"]
 mod fake_rex;
 
+use agent_cli::serialized_spawn::SerializedTokioSpawn;
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Stdio, time::Duration};
 
 use agent_cli::{
@@ -144,7 +145,7 @@ async fn terminal_feedback_reports_the_pane_from_the_rex_server_that_owns_the_te
         });
         let output = timeout(
             Duration::from_secs(30),
-            cli(directory.path(), rex_server, DECOY, &["chat", DESCRIPTION]).output(),
+            cli(directory.path(), rex_server, DECOY, &["chat", DESCRIPTION]).output_serialized(),
         )
         .await
         .unwrap()
@@ -215,7 +216,7 @@ async fn worker_feedback_reports_its_pane_on_the_private_rex_server_that_started
         &["run-task", TASK, "--allocation-id", "allocation-root"],
     )
     .stdin(Stdio::piped())
-    .spawn()
+    .spawn_serialized()
     .unwrap();
     let mut stdin = worker.stdin.take().unwrap();
     stdin

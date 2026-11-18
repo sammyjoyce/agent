@@ -46,6 +46,8 @@ PARAMETERS = {"SendMessageIntent": {"message": STRING, "coordinator": "Coordinat
 IN_BACKGROUND = {"SendMessageIntent"}
 OPENS = {"OpenCoordinatorIntent": "CoordinatorEntity", "OpenJobIntent": "JobEntity"}
 OPEN_ENTITY = "com.apple.link.systemProtocol.OpenEntity"
+INDEXED = {"CoordinatorEntity", "JobEntity"}
+INDEXED_ENTITY = "com.apple.appintents.entity.Indexed"
 
 
 def metadata_path(argument: str) -> Path:
@@ -83,6 +85,15 @@ def problems(metadata: dict) -> list[str]:
         missing = expected - listed
         if entity in entities and missing:
             found.append(f"{entity} is missing properties: {', '.join(sorted(missing))}")
+    for entity, record in entities.items():
+        indexed = INDEXED_ENTITY in (record.get("systemProtocolMetadata") or [])
+        if entity in INDEXED and not indexed:
+            found.append(f"{entity} is not indexed in Spotlight")
+        if indexed and entity not in INDEXED:
+            found.append(f"{entity} is indexed in Spotlight, where only coordinators and jobs go")
+        for p in record.get("properties") or []:
+            if p.get("spotlightAttributeKey"):
+                found.append(f"{entity}.{p.get('identifier')} names a Spotlight attribute")
     shortcuts = metadata.get("autoShortcuts") or []
     if not shortcuts:
         found.append("autoShortcuts is empty, so the app ships no phrase")
@@ -152,6 +163,7 @@ def main() -> int:
     print(
         f"intents metadata ok actions={len(ACTIONS)} entities={len(ENTITIES)}"
         f" properties={properties} enums={len(ENUMS)} shortcuts={len(metadata['autoShortcuts'])}"
+        f" indexed={len(INDEXED)}"
     )
     return 0
 

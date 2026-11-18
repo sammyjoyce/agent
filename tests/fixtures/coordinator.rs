@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use agent_cli::serialized_spawn::SerializedSpawn;
 use std::{
     fs,
     os::unix::net::UnixStream,
@@ -58,7 +59,7 @@ impl Coordinator<'_> {
             .command(&["serve", "--local-only", "--no-sources"], true)
             .stdout(Stdio::null())
             .stderr(fs::File::create(&stderr).unwrap())
-            .spawn()
+            .spawn_serialized()
             .unwrap();
         let mut server = Server(Some(child));
         let deadline = Instant::now() + COORDINATOR_READY_TIMEOUT;

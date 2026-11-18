@@ -29,8 +29,9 @@ function commands(world: World, callers: readonly string[]): AuthorityCommand[] 
   const epochs = [epoch - 1, epoch, epoch + 1].filter((value) => value >= 0);
   const result: AuthorityCommand[] = [];
   for (const caller of callers) {
-    result.push({ op: "enroll", holder: caller, checkpoint: { through: 0, manifest } }, { op: "claim", holder: caller });
+    result.push({ op: "enroll", holder: caller, checkpoint: { through: 0, manifest } });
     for (const value of epochs) {
+      result.push({ op: "claim", holder: caller, expected_epoch: value });
       for (const at of [head - 1, head, head + 1, head + 2]) {
         if (at >= 1) for (const digest of digests) result.push({ op: "append", holder: caller, entry: entry(value, at, digest) });
       }
@@ -92,7 +93,7 @@ function reachable(start: World, callers: readonly string[], bound: { readonly e
           assert.ok(attested || released, "the old owner was taken to be stopped without evidence");
         }
       }
-      if (command.op !== "claim" && command.op !== "append") {
+      if (command.op !== "append") {
         assert.equal(key(step(next, command).world), key(next), `a repeat of ${command.op} moved the authority again`);
       }
       if (after.epoch > bound.epoch || after.head > bound.head || seen.has(key(next))) continue;

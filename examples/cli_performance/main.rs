@@ -9,6 +9,7 @@ mod scenario;
 mod session;
 mod terminal;
 
+use agent_cli::serialized_spawn::SerializedTokioSpawn;
 use std::{
     collections::BTreeMap, fs, io::Write, os::unix::fs::PermissionsExt, path::PathBuf,
     time::Duration,
@@ -129,7 +130,7 @@ async fn run(mut options: Arguments) -> Result<()> {
     if searches {
         command.env("AGENT_SQLITE_VEC", sqlite_vec()?);
     }
-    let seeded = timeout(Duration::from_secs(180), command.output())
+    let seeded = timeout(Duration::from_secs(180), command.output_serialized())
         .await
         .context("Synthetic history seeding did not finish")??;
     ensure!(

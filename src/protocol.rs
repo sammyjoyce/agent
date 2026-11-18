@@ -1622,6 +1622,17 @@ pub enum RuntimeEventKind {
     },
     WorkerReady {
         connection_id: String,
+        /// Missing from coordinators older than owner floors.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "Option<Uuid>")]
+        #[ts(optional)]
+        coordinator_id: Option<crate::coordinator_id::CoordinatorId>,
+        /// The epoch the failover authority granted this coordinator start.
+        /// Absent for a coordinator without a `[failover]` section.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "Option<u64>")]
+        #[ts(optional)]
+        owner_epoch: Option<crate::failover::OwnerEpoch>,
     },
     Environment {
         settings: CoordinatorSettings,
@@ -1762,8 +1773,41 @@ pub struct NoticeOrigin {
     pub title: String,
 }
 
+/// Publication-time evidence, independent of scheduled-job lineage. Never inferred from text.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+pub struct NoticeDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub task_title: Option<String>,
+    pub source_conversation_id: String,
+    pub source_entry_id: String,
+    #[serde(default)]
+    pub sources: Vec<NoticeSource>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+pub struct NoticeSource {
+    pub provider: String,
+    pub account: String,
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub event_version: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct HistoryMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub notice_details: Option<Box<NoticeDetails>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub notice_origin: Option<NoticeOrigin>,
@@ -2385,6 +2429,7 @@ mod tests {
         assert!(legacy.tool.is_none());
         assert!(!legacy.final_chunk);
         let message = HistoryMessage {
+            notice_details: None,
             notice_origin: None,
             presentation: None,
             attachments: None,

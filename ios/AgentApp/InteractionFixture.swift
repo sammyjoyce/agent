@@ -77,7 +77,7 @@
             },
             persistence: ComposerDraftStore(
               url: support.appending(path: "Agent/Composer/draft.json")),
-            sharedInbox: try? SharedDraftInbox.configured())
+            sharedInbox: try? SharedDraftInbox.configured(), spotlight: CoreSpotlightStore())
         } catch { return nil }
       }
     }

@@ -31,6 +31,7 @@ import type { TaskRecord } from "../src/generated/TaskRecord.js";
 import type { WorkerHost } from "../src/generated/WorkerHost.js";
 import type { WorkerRef } from "../src/generated/WorkerRef.js";
 import { fixtureModel } from "./model.js";
+import { LocalFiles } from "../src/failover/retained-files.js";
 
 const host: WorkerHost = { host_id: "11111111-1111-4111-8111-111111111111", name: "fixture", rex_server: null,
   coordinator: null, cwd: "/workspace/example", agent_program: "/example/agent" };
@@ -105,7 +106,7 @@ async function open(directory: string, guidanceText = "CURRENT_PROFILE_GUIDANCE"
   const discovery = createToolDiscovery();
   const goals = new GoalStore(session, tasks, new CoordinatorEnvironment(session));
   const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance: createGuidance(executions), tools, sourceTools,
-    resourceTools: createResourceTools(resources, tasks, executions), browserTools: createBrowserTools(new BrowserStore(session), executions, new AttachmentStore(directory)),
+    resourceTools: createResourceTools(resources, tasks, executions), browserTools: createBrowserTools(new BrowserStore(session), executions, new AttachmentStore(new LocalFiles(directory))),
     jobTools: createJobTools(background, executions), goalTools: createGoalTools(goals, executions) }),
   { responsePolicy: createMainResponsePolicy(session), inputOrigins: createInputOrigins(session) }),
   surfaces, discovery);

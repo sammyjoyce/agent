@@ -1,5 +1,6 @@
 //! Executable fixtures for tests that share a process with other tests.
 
+use agent_cli::serialized_spawn::SerializedSpawn;
 use std::{
     fs,
     io::Write,
@@ -19,7 +20,7 @@ pub fn write_executable(path: &Path, content: &str) {
         .arg(path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     writer
         .stdin

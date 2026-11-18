@@ -14,6 +14,7 @@ import {createRegistry,Harness} from '@earendil-works/pi-durable';
 import {SqliteStorage} from '@earendil-works/pi-durable/storage/sqlite';
 const runtime=pathToFileURL(process.argv[1]),home=process.argv[2],id=process.argv[3];
 const {HistoryImports}=await import(new URL('./importer.js',runtime));
+const {LocalFiles}=await import(new URL('./failover/retained-files.js',runtime));
 const {HistoryStore,ImportedItemEntry}=await import(new URL('./history.js',runtime));
 const input=createInterface({input:process.stdin}),pending=[];
 input.on('line',line=>pending.shift()(JSON.parse(line)));
@@ -59,8 +60,8 @@ async function append(updates){await appendFile(path,updates.map(([index,text])=
 async function open(){
  const session=await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(home,'consumer.sqlite'))),
   {models:createModels(),registry:createRegistry(),identity:{attribution:null}},BACKGROUND_CONTEXT);
- const store=new HistoryStore(session,join(home,'assets'));
- return {session,store,importer:new HistoryImports(session,store,join(home,'assets'))};
+ const store=new HistoryStore(session,join(home,'history','assets'));
+ return {session,store,importer:new HistoryImports(session,store,new LocalFiles(home))};
 }
 let app=await open(),transferred=0,readCalls=0,failAt=Infinity,oldRevision=false;
 async function run(){

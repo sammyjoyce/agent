@@ -1,3 +1,4 @@
+use agent_cli::serialized_spawn::SerializedTokioSpawn;
 use std::{
     collections::VecDeque,
     num::NonZeroU16,
@@ -176,7 +177,7 @@ impl Terminal {
         let sightings = screen.arm(sights)?;
         let screen = Arc::new(Mutex::new(screen));
         let spawned = Instant::now();
-        let mut child = command.spawn()?;
+        let mut child = command.spawn_serialized()?;
         let input = Arc::new(tokio::sync::Mutex::new(
             child.stdin.take().context("Missing terminal input")?,
         ));

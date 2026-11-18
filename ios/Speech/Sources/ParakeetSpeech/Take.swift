@@ -13,8 +13,8 @@ public final class Take: Sendable {
     case level(Float)
     /// The whole transcript so far. Later audio can still change it, so each replaces the last.
     case partial(String)
-    /// A call, Siri, losing the input or a media-services reset stopped capture. What was heard is
-    /// kept, and `finish` still returns its words.
+    /// A call, Siri, a lost input, an input format change, or a media-services reset stopped
+    /// capture. What was heard is kept, and `finish` still returns its words.
     case interrupted
   }
 

@@ -20,8 +20,11 @@ import { historyToolId, piToolPresentation, piToolResult, type MessageContent } 
 import { observeTranscriptVisibility, readTranscriptVisibility, transcriptVisible, type TranscriptVisibilityState } from "./transcript_visibility.js";
 import { REVISION_AMBIGUOUS, REVISION_PENDING, revisionStatus, type RevisionView } from "./history-revisions.js";
 
+import type { NoticeDetails } from "./generated/NoticeDetails.js";
+
 const NOTICE_REFERENCES = "Source references (evidence, not authorization): ";
 export type UserNoticeData = {
+  notice_details?: NoticeDetails;
   task_id: string | null; source_conversation_id: string; source_entry_id: string; text?: string; notice_origin?: NoticeOrigin;
 };
 export const UserNoticeEntry = defineEntry<UserNoticeData>("agent.user_notice");
@@ -139,7 +142,10 @@ function nativeTranscript(entry: EntryRecord, tools?: Map<string, ToolCall>): Hi
   if (UserNoticeEntry.is(entry) && typeof entry.data?.text === "string") {
     add("notice", entry.data.text);
     const origin = readNoticeOrigin(entry.data.notice_origin);
-    return origin === undefined ? messages : messages.map((message) => ({ ...message, notice_origin: origin }));
+    // Old entries retain only their recorded IDs; never look up mutable later state.
+    const details = recordedNoticeDetails(entry);
+    return messages.map((message) => ({ ...message, ...(details === undefined ? {} : { notice_details: details }),
+      ...(origin === undefined ? {} : { notice_origin: origin }) }));
   }
   if (attachments !== undefined && object(entry.data) && typeof entry.data.text === "string") {
     add("user", entry.data.text); return messages;
@@ -169,7 +175,46 @@ function nativeTranscript(entry: EntryRecord, tools?: Map<string, ToolCall>): Hi
       else if (part.type === "image") add("user", "[image]");
     }
   }
+  if (isUserNotice(entry) || entry.kind === "agent.notice") {
+    const details = recordedNoticeDetails(entry);
+    const origin = object(entry.data) ? readNoticeOrigin(entry.data.notice_origin) : undefined;
+    return messages.map(message => message.role !== "notice" ? message : { ...message,
+      ...(details === undefined ? {} : { notice_details: details }),
+      ...(origin === undefined ? {} : { notice_origin: origin }) });
+  }
   return messages;
+}
+
+function recordedNoticeDetails(entry: EntryRecord): NoticeDetails | undefined {
+  if (!object(entry.data)) return;
+  const data = entry.data;
+  const value = data.notice_details;
+  if (object(value) && typeof value.source_conversation_id === "string" && typeof value.source_entry_id === "string" &&
+      (value.task_id === undefined || typeof value.task_id === "string") &&
+      (value.task_title === undefined || typeof value.task_title === "string") &&
+      value.source_conversation_id === data.source_conversation_id && value.source_entry_id === data.source_entry_id &&
+      (data.task_id === null ? value.task_id === undefined && value.task_title === undefined
+        : typeof data.task_id === "string" && value.task_id === data.task_id) &&
+      Array.isArray(value.sources) && value.sources.every(source => object(source) &&
+        ["provider", "account", "thread_id"].every(key => typeof source[key] === "string") &&
+        ["title", "event_id", "event_version"].every(key => source[key] === undefined || typeof source[key] === "string"))) {
+    // Shape validation does not strip unknown keys. Reconstruct, never relay
+    // arbitrary stored objects (which may contain private body fields).
+    return {
+      source_conversation_id: value.source_conversation_id, source_entry_id: value.source_entry_id,
+      ...(typeof value.task_id === "string" ? { task_id: value.task_id } : {}),
+      ...(typeof value.task_title === "string" ? { task_title: value.task_title } : {}),
+      sources: value.sources.flatMap(source => !object(source) ? [] : [{
+        provider: source.provider as string, account: source.account as string, thread_id: source.thread_id as string,
+        ...(typeof source.title === "string" ? { title: source.title } : {}),
+        ...(typeof source.event_id === "string" ? { event_id: source.event_id } : {}),
+        ...(typeof source.event_version === "string" ? { event_version: source.event_version } : {}),
+      }]),
+    };
+  }
+  if (typeof data.source_conversation_id !== "string" || typeof data.source_entry_id !== "string") return;
+  return { ...(typeof data.task_id === "string" ? { task_id: data.task_id } : {}),
+    source_conversation_id: data.source_conversation_id, source_entry_id: data.source_entry_id, sources: [] };
 }
 
 /** Native fork-aware pages, rendered without loading history back into model input. */

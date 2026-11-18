@@ -2404,6 +2404,16 @@
           "type": "boolean",
           "default": false
         },
+        "notice_details": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NoticeDetails"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "notice_origin": {
           "anyOf": [
             {
@@ -4430,6 +4440,41 @@
         "head"
       ]
     },
+    "NoticeDetails": {
+      "description": "Publication-time evidence, independent of scheduled-job lineage. Never inferred from text.",
+      "type": "object",
+      "properties": {
+        "source_conversation_id": {
+          "type": "string"
+        },
+        "source_entry_id": {
+          "type": "string"
+        },
+        "sources": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/NoticeSource"
+          }
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task_title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "source_conversation_id",
+        "source_entry_id"
+      ]
+    },
     "NoticeOrigin": {
       "description": "Immutable scheduled-run lineage copied onto the published notice.",
       "type": "object",
@@ -4444,6 +4489,43 @@
       "required": [
         "job_id",
         "title"
+      ]
+    },
+    "NoticeSource": {
+      "type": "object",
+      "properties": {
+        "account": {
+          "type": "string"
+        },
+        "event_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "event_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": "string"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "provider",
+        "account",
+        "thread_id"
       ]
     },
     "NotificationStatus": {
@@ -5092,6 +5174,23 @@
           "properties": {
             "connection_id": {
               "type": "string"
+            },
+            "coordinator_id": {
+              "description": "Missing from coordinators older than owner floors.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "uuid"
+            },
+            "owner_epoch": {
+              "description": "The epoch the failover authority granted this coordinator start.\nAbsent for a coordinator without a `[failover]` section.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
             },
             "type": {
               "type": "string",

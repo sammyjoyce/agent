@@ -4,6 +4,8 @@ use crate::{
         effects::{Admission, Capacity, HostEffects},
     },
     protocol::{HostCommand, HostResult},
+    runtime::effects::EffectsLock,
+    serialized_spawn::SerializedSpawn,
 };
 use std::{path::Path, sync::Arc};
 use tokio::{
@@ -229,4 +231,61 @@ async fn duplicate_ids_reject_before_replacing_cancellation_or_starting_another_
         std::fs::read_to_string(directory.path().join("original")).unwrap(),
         "original"
     );
+}
+
+const ALONE: &str = "AGENT_TEST_EFFECT_SHARE_ALONE";
+
+#[tokio::test]
+async fn an_effect_that_outlives_its_connection_holds_the_effects_lock_until_it_ends() {
+    // The coordinator's share is one per process, and every child process
+    // inherits it. So the check runs in a process of its own, where no other
+    // test takes a share or starts a child.
+    if std::env::var_os(ALONE).is_none() {
+        let alone = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "host::effects::tests::an_effect_that_outlives_its_connection_holds_the_effects_lock_until_it_ends",
+                "--nocapture",
+            ])
+            .env(ALONE, "1")
+            .output_serialized()
+            .unwrap();
+        assert!(
+            alone.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&alone.stdout),
+            String::from_utf8_lossy(&alone.stderr)
+        );
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let coordinator = EffectsLock::share(state.path()).unwrap();
+    let mut effects = HostEffects::new(Capacity::Unbounded);
+    let (finish, finished) = oneshot::channel::<()>();
+    let admission = effects
+        .spawn("call".into(), |_| async move {
+            let _ = finished.await;
+            HostResult::Written
+        })
+        .unwrap();
+    assert!(matches!(admission, Admission::Started));
+    drop(effects);
+    drop(coordinator);
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(state.path().join("effects.lock"))
+        .unwrap();
+    assert!(
+        fs2::FileExt::try_lock_exclusive(&lock).is_err(),
+        "An effect that outlived its connection and its coordinator's claim must hold effects.lock"
+    );
+    finish.send(()).unwrap();
+    timeout(Duration::from_secs(10), async {
+        while fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("effects.lock must be free once the effect has ended");
 }

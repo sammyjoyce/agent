@@ -1,3 +1,4 @@
+use agent_cli::serialized_spawn::SerializedTokioSpawn;
 use std::{
     collections::BTreeMap,
     fs,
@@ -286,7 +287,7 @@ impl Coordinator {
                 fs::set_permissions(codex, fs::Permissions::from_mode(0o700))?;
             }
         }
-        let child = command.spawn()?;
+        let child = command.spawn_serialized()?;
         let provider = Provider::start(
             listener,
             turns,
@@ -520,7 +521,7 @@ mod tests {
     async fn a_process_that_exits_passes_and_one_that_keeps_running_fails() {
         let mut quick = Command::new("/bin/sh")
             .args(["-c", "exit 0"])
-            .spawn()
+            .spawn_serialized()
             .unwrap();
         let quick_pid = i32::try_from(quick.id().unwrap()).unwrap();
         quick.wait().await.unwrap();
@@ -533,7 +534,7 @@ mod tests {
         let mut lingering = Command::new("/bin/sh")
             .args(["-c", "exec sleep 5"])
             .kill_on_drop(true)
-            .spawn()
+            .spawn_serialized()
             .unwrap();
         let lingering_pid = i32::try_from(lingering.id().unwrap()).unwrap();
         assert!(
