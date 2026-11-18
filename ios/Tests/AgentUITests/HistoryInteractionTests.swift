@@ -78,14 +78,15 @@ final class ComposerInteractionTests: XCTestCase {
     // by the native runner from DictationInteractionTests' existing progressive-speech cases.
     let controls = [menu, app.buttons["Paste images"], send].filter { $0.exists }
     // The Simulator shows and hides its software keyboard as hardware key events arrive, which
-    // moves the whole composer on screen. Measure each control from the composer's bottom edge,
-    // so a control that jumps inside the composer still fails.
-    let surface = app.descendants(matching: .any).matching(identifier: "messageComposer").firstMatch
+    // moves the whole composer on screen, and the composer's own frame gains the home indicator
+    // inset while the keyboard is down. Measure each control from the recipient line under the
+    // controls instead, so a control that jumps inside the composer still fails.
+    let recipientLine = app.staticTexts["recipientLine"]
     try await eventually(description: "composer menu and send share a baseline") {
       abs(menu.frame.minY - send.frame.minY) < 1
     }
     func placement(_ control: XCUIElement) -> CGPoint {
-      CGPoint(x: control.frame.minX, y: surface.frame.maxY - control.frame.minY)
+      CGPoint(x: control.frame.minX, y: recipientLine.frame.minY - control.frame.minY)
     }
     var controlPlacements = controls.map(placement)
     func assertControlsStayPut() {
