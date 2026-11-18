@@ -88,12 +88,24 @@ final class ComposerInteractionTests: XCTestCase {
     func placement(_ control: XCUIElement) -> CGPoint {
       CGPoint(x: control.frame.minX, y: recipientLine.frame.minY - control.frame.minY)
     }
-    var controlPlacements = controls.map(placement)
-    func assertControlsStayPut() {
-      for (control, expected) in zip(controls, controlPlacements) {
-        let actual = placement(control)
-        XCTAssertEqual(actual.x, expected.x, accuracy: 1, control.identifier)
-        XCTAssertEqual(actual.y, expected.y, accuracy: 1, control.identifier)
+    func near(_ a: [CGPoint], _ b: [CGPoint]) -> Bool {
+      zip(a, b).allSatisfy { abs($0.x - $1.x) < 1 && abs($0.y - $1.y) < 1 }
+    }
+    // Each frame is a separate query, so a reading taken while the keyboard moves the composer
+    // mixes two positions. Take the placements once two readings agree.
+    func settledPlacements() async throws -> [CGPoint] {
+      var last = controls.map(placement)
+      try await eventually(description: "composer controls settle") {
+        let now = controls.map(placement)
+        defer { last = now }
+        return near(now, last)
+      }
+      return last
+    }
+    var controlPlacements = try await settledPlacements()
+    func assertControlsStayPut() async throws {
+      try await eventually(description: "composer controls stay put") {
+        near(controls.map(placement), controlPlacements)
       }
     }
     // Hi fits even at accessibility sizes. Comparing to 44pt would incorrectly stack it.
@@ -111,8 +123,8 @@ final class ComposerInteractionTests: XCTestCase {
     try await eventually(description: "COMPOSER_WRAP_ABOVE_CONTROLS") {
       composer.frame.maxY <= menu.frame.minY + 1
     }
-    func assertFullWidth(_ name: String) {
-      assertControlsStayPut()
+    func assertFullWidth(_ name: String) async throws {
+      try await assertControlsStayPut()
       XCTAssertLessThanOrEqual(composer.frame.minX, menu.frame.minX + 1)
       XCTAssertGreaterThanOrEqual(composer.frame.maxX, send.frame.maxX - 1)
       XCTAssertLessThanOrEqual(composer.frame.maxY, menu.frame.minY + 1)
@@ -124,15 +136,15 @@ final class ComposerInteractionTests: XCTestCase {
       add(image)
       print("composer-wrap[\(name)] field=\(composer.frame) menu=\(menu.frame) send=\(send.frame)")
     }
-    assertFullWidth("wrapping-full-width")
+    try await assertFullWidth("wrapping-full-width")
     // No tap to recover focus: deletion must still reach the original editor/caret.
     composer.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: suffix.count))
     try await eventually { composer.value as? String == "Hi" }
     try await eventually { composer.frame.minX > menu.frame.maxX }
-    assertControlsStayPut()
+    try await assertControlsStayPut()
     composer.typeText("\nX")
     try await eventually { composer.value as? String == "Hi\nX" }
-    assertFullWidth("explicit-newline-full-width")
+    try await assertFullWidth("explicit-newline-full-width")
     composer.typeText(XCUIKeyboardKey.delete.rawValue + XCUIKeyboardKey.delete.rawValue)
     try await eventually { composer.value as? String == "Hi" }
     // A typed recipient must survive a subsequent reflow, without sending.
@@ -143,10 +155,10 @@ final class ComposerInteractionTests: XCTestCase {
     try await eventually(description: "composer menu and send share a baseline after the chip") {
       abs(menu.frame.minY - send.frame.minY) < 1
     }
-    controlPlacements = controls.map(placement)
+    controlPlacements = try await settledPlacements()
     composer.typeText(suffix)
     try await eventually { composer.frame.maxY <= menu.frame.minY + 1 }
-    assertFullWidth("recipient-wrapping-full-width")
+    try await assertFullWidth("recipient-wrapping-full-width")
     // At the largest size this draft passes its line limit and scrolls to the caret, and the field
     // exposes the chip only while all of it shows. The chip is checked again after the paste
     // below, where the draft is short at every size.
@@ -163,7 +175,7 @@ final class ComposerInteractionTests: XCTestCase {
     UIPasteboard.general.string = "Pasted invented note\nSecond line"
     composer.typeKey("v", modifierFlags: .command)
     try await eventually { composer.value as? String == "Pasted invented note\nSecond line" }
-    assertFullWidth("pasted-newline-full-width")
+    try await assertFullWidth("pasted-newline-full-width")
     composer.typeText("X")
     XCTAssertEqual(composer.value as? String, "Pasted invented note\nSecond lineX")
     XCTAssertTrue(app.buttons["To Work"].exists)
