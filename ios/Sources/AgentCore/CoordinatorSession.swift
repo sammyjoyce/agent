@@ -255,6 +255,9 @@ public actor CoordinatorSession {
   private let inspectedConversation: SavedConversation?
   private let stamps: StampSource
   private var ledger: Ledger
+  /// true while the saved ledger exists but could not be read, as after a launch while the iPhone
+  /// was locked. Nothing replaces it until a read succeeds.
+  private var ledgerUnread = false
   /// Each visible row's receive stamp, kept by row ID so a row that changes key keeps it.
   private var rowStamps: [String: TimeInterval] = [:]
   private struct WeakSession { weak var session: CoordinatorSession? }
@@ -297,12 +300,13 @@ public actor CoordinatorSession {
     previews = AttachmentStore(directory: directory.previews)
     self.stamps = stamps
     // Loaded before any session connects, so every saved stamp seeds the shared source. A
-    // missing or unreadable ledger only loses receive order and send records, so it never
-    // blocks the session. An inspection leaves the ledger to the profile's own session.
+    // missing or corrupt ledger only loses receive order and send records, and one that cannot
+    // be read yet is kept and folded in once it can be, so neither blocks the session. An
+    // inspection leaves the ledger to the profile's own session.
     if conversation == nil {
-      ledger =
-        (try? JSONDecoder().decode(Ledger.self, from: Data(contentsOf: directory.ledger)))
-        ?? Ledger()
+      let saved = Self.readLedger(directory.ledger)
+      ledger = saved ?? Ledger()
+      ledgerUnread = saved == nil
     } else {
       ledger = Ledger()
     }
@@ -1742,12 +1746,36 @@ public actor CoordinatorSession {
   }
 
   @discardableResult private func saveLedger() -> Bool {
-    guard !retired, inspectedConversation == nil else { return false }
+    guard !retired, inspectedConversation == nil, !ledgerUnread || rereadLedger() else {
+      return false
+    }
     ledger.prune(keeping: transcript.unpreparedRows)
     do {
       try writePrivately(JSONEncoder().encode(ledger), to: directory.ledger)
       return true
     } catch { return false }
+  }
+  /// Folds in the ledger an earlier launch saved, once it can be read. Its stamps and sends win
+  /// over what this launch recorded without it.
+  private func rereadLedger() -> Bool {
+    guard let saved = Self.readLedger(directory.ledger) else { return false }
+    ledger.entries.merge(saved.entries) { _, saved in saved }
+    ledger.sends.merge(saved.sends) { _, saved in saved }
+    if let newest = saved.entries.values.map(\.receivedAt).max() { stamps.seed(newest) }
+    ledgerUnread = false
+    return true
+  }
+  /// The saved ledger, empty when there is none or it is corrupt, or nil when it cannot be read.
+  private nonisolated static func readLedger(_ url: URL) -> Ledger? {
+    let data: Data
+    do {
+      data = try Data(contentsOf: url)
+    } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+      return Ledger()
+    } catch {
+      return nil
+    }
+    return (try? JSONDecoder().decode(Ledger.self, from: data)) ?? Ledger()
   }
   private func schedulePublish() {
     guard flush == nil else { return }
