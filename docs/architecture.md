@@ -531,10 +531,13 @@ tool receipts stay internal. Explicit notifications use `agent.user_notice`
 with a durable publication identity. Legacy `agent.notice` entries remain
 readable but are not eligible for push delivery.
 Display-only writes make new notices visible while main is busy. A separate
-hidden entry adds their model context at Pi's normal boundary, preserving reset
-and compaction ordering. Each projection has a stable request ID; replay fills
-an interrupted projection without duplicating the visible notice. A notice
-queued behind a reset is reported as queued until its display write completes.
+hidden entry adds their model context once main has no run. Pi places a busy
+conversation's queued writes after a tool round, and a context that then ends
+in the notice's assistant message ends the run unanswered, so a durable
+`agent.notice_context.place` task holds notices in order while main works.
+Each projection has a stable request ID; replay fills an interrupted
+projection without duplicating the visible notice. A notice queued behind a
+reset is reported as queued until its display write completes.
 
 Task outcomes are a built-in source, admitted in the same transaction as task
 changes. They retain conversation, entry and tool-call provenance. Unfinished

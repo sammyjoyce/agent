@@ -13,6 +13,7 @@ import type { SourceState } from "./generated/SourceState.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
 import type { TaskOutcome } from "./generated/TaskOutcome.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
+import { NoticeContextPlacement } from "./notice_context.js";
 import { publishMainNotice, sourceReference, TaskError, TaskStore, type NoticePublication } from "./tasks.js";
 import { Executions } from "./tools.js";
 import { PartitionedRecords } from "./partitioned-records.js";
@@ -618,7 +619,7 @@ export function createSourceTools(journal: SourceJournal, executions: Executions
       const publication = await journal.notify(id, api.callId, [], task?.id ?? null, text);
       return output(publication === "published" ? "Published to the main chat." : "Queued for the main chat; not yet delivered.");
     } });
-  const main = defineExtension({ name: "source-tools", tools: [read, notifyUser,
+  const main = defineExtension({ name: "source-tools", tasks: [NoticeContextPlacement], tools: [read, notifyUser,
     defineTool({ name: "link_source_events", description: "Account for source events by linking them to an existing durable task.",
       parameters: Type.Object({ keys: Type.Array(Type.String(), { minItems: 1 }), task_id: Type.String() }),
       async execute(args, api) {
