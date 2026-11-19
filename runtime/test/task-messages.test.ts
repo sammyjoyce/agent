@@ -9,6 +9,7 @@ import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { AgentDoc, AssistantEntry, createRegistry, defineExtension, GenerationTask, Harness, hook, InboxDoc, LiveDoc,
   ToolResultEntry, ToolTask, UserEntry, type Conversation, type GenerationCheckpoint } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { commitWrites } from "@earendil-works/pi-durable/testing";
 import { openConversationDatabase } from "../src/conversation-database.js";
 import { CoordinatorEnvironment } from "../src/environment.js";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
@@ -99,13 +100,13 @@ test("peer messages retain their sender through native steering and reopening wi
       const assistant = await tx.appendEntry(AssistantEntry, conversation!.id, { model: [] });
       const generation = await tx.createTask(GenerationTask, {}, { ownership: { kind: "conversation" } });
       const live = await tx.doc(LiveDoc, conversation!.id);
-      live.run = { taskId: generation, inputs: [submission.id] }; live.tools = [];
+      live.run = { taskId: generation, inputs: [submission.id], turns: 0 }; live.tools = [];
       return { generation, assistant: assistant.id };
     }, BACKGROUND_CONTEXT);
     const record = await app.session.getTask(native.generation, BACKGROUND_CONTEXT); assert.ok(record);
     const deadline = clock.value + 3_600_000;
     const checkpoint: GenerationCheckpoint = { phase: "tools", assistant: native.assistant, tools: [], pending: [] };
-    await app.storage.commit([{ type: "task", value: { ...record, state: { status: "sleeping", until: deadline, checkpoint } } }], BACKGROUND_CONTEXT);
+    await commitWrites(app.storage, [{ type: "task", value: { ...record, state: { status: "sleeping", until: deadline, checkpoint } } }], BACKGROUND_CONTEXT);
     await app.session.close(BACKGROUND_CONTEXT); app = await open(directory, clock);
     app.registry.install(boundary);
     conversation = await app.tasks.conversation(owner.conversation_id);

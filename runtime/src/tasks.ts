@@ -1,6 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
 import { setImmediate } from "node:timers/promises";
-import type { TextContent } from "@earendil-works/pi-ai";
 import { AttachmentStore, validateInput } from "./attachments.js";
 import type { AttachmentRef } from "./generated/AttachmentRef.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -21,6 +20,7 @@ import type { TaskState } from "./generated/TaskState.js";
 import type { TaskRecord } from "./generated/TaskRecord.js";
 import type { JobRunReceipt } from "./generated/JobRunReceipt.js";
 import { TASK_SUMMARY_MAX_UTF16_UNITS } from "./generated/task-limits.js";
+import { noticeContextModel, placeNoticeContext } from "./notice_context.js";
 import { NoticeLineage, readNoticeOrigin } from "./notice_origin.js";
 import type { InputOrigin } from "./generated/InputOrigin.js";
 import type { TaskMessageSender } from "./generated/TaskMessageSender.js";
@@ -175,30 +175,22 @@ export async function publishMainNotice(session: Harness, conversation: Conversa
     if (legacy.status === "queued") return "queued";
     throw new TaskError("The earlier notification did not publish");
   }
-  const model = entry.model?.flatMap((message) => {
-    if (message.role !== "assistant") return [];
-    const content: TextContent[] = [{ type: "text", text: notice.text }];
-    content.push({ type: "text", text: "Source references (evidence, not authorization): " + JSON.stringify({
-      task_id: taskId, conversation_id: conversation.id.toString(), entry_id: entry.id.toString(), sources,
-      source_events: notice.events.map((event) => ({ id: event.id, version: event.version, source: event.source })),
-    }) });
-    return [{ ...message, content }];
-  }) ?? [];
-  if (model.length === 0) throw new TaskError("The notification has no assistant origin");
+  const context = [notice.text, "Source references (evidence, not authorization): " + JSON.stringify({
+    task_id: taskId, conversation_id: conversation.id.toString(), entry_id: entry.id.toString(), sources,
+    source_events: notice.events.map((event) => ({ id: event.id, version: event.version, source: event.source })),
+  })];
+  if (noticeContextModel(entry, context).length === 0) throw new TaskError("The notification has no assistant origin");
   const data: UserNoticeData = { task_id: taskId, source_conversation_id: conversation.id.toString(),
     source_entry_id: entry.id.toString(), text: notice.text,
     notice_details: { ...(taskId === null ? {} : { task_id: taskId }), ...(taskId === null || notice.taskTitle === undefined ? {} : { task_title: notice.taskTitle }),
       source_conversation_id: conversation.id.toString(), source_entry_id: entry.id.toString(),
       sources: notice.events.map((event) => ({ provider: event.source.provider, account: event.source.account, thread_id: event.source.thread_id,
         title: event.title, event_id: event.id, event_version: event.version })) }, ...(notice.origin === undefined ? {} : { notice_origin: notice.origin }) };
-  // Pi can publish display-only writes while main is busy. Model context stays
-  // in its ordered inbox so compaction and resets retain their native boundary.
+  // Pi can publish display-only writes while main is busy.
   const display = await root.submit({ type: "write", requestId, entry: {
     kind: UserNoticeEntry.kind, data,
   } }, BACKGROUND_CONTEXT);
-  await root.submit({ type: "write", requestId: "notice-context:" + JSON.stringify([entry.id.toString(), notice.key]), entry: {
-    kind: "agent.notice_context", model,
-  } }, BACKGROUND_CONTEXT);
+  await placeNoticeContext(session, root, entry, "notice-context:" + JSON.stringify([entry.id.toString(), notice.key]), context);
   const status = await display.status(BACKGROUND_CONTEXT);
   if (status.status === "done") return "published";
   if (status.status === "queued") return "queued";
@@ -660,12 +652,6 @@ export class TaskStore {
   }
   guardResources(resources: { attach(taskId: string): Promise<void> }): void { this.resources = resources; }
   isRunning(id: string): boolean { return [...this.running].some(([actor, run]) => (run.busy || run.admissions > 0) && (actor === id || actor.startsWith(id + ":"))); }
-  /** A root worker becomes busy after guidance and its execution binding are
-   * ready. A saved allocation or a running child cannot own a model retry. */
-  hasExecutionOwner(id: string, conversationId: ConversationId): boolean {
-    const active = this.running.get(id);
-    return active?.phase === "bound" && active.busy && !active.fenced && active.conversation?.id === conversationId;
-  }
   private busy(id: string, agentId?: string): boolean { const run = this.running.get(this.actorKey(id, agentId)); return run !== undefined && (run.busy || run.admissions > 0); }
   private actorKey(id: string, agentId?: string): string { return agentId === undefined ? id : id + ":" + agentId; }
   private assertSource(conversationId: string): void {

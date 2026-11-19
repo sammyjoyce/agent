@@ -16,6 +16,7 @@ import { SourceJournal, createSourceTools } from "../src/sources.js";
 import { publishMainNotice, TaskStore } from "../src/tasks.js";
 import { Executions } from "../src/tools.js";
 import { isUserNotice } from "../src/transcript.js";
+import { pump } from "./fixtures/background-runtime.js";
 import { fixtureModel } from "./model.js";
 
 const binding: WorkerRef = { host_id: "11111111-1111-4111-8111-111111111111",
@@ -37,6 +38,10 @@ async function open(directory: string) {
 }
 async function notices(conversation: Conversation) {
   return (await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items.filter(isUserNotice);
+}
+async function modelNotices(conversation: Conversation, text: string): Promise<number> {
+  return (await conversation.context(BACKGROUND_CONTEXT)).messages.filter((message) => message.role === "assistant" &&
+    message.content.some((part) => part.type === "text" && part.text === text)).length;
 }
 
 const cases: { child: boolean; main: "idle" | "busy" | "reset" }[] = [
@@ -120,9 +125,8 @@ for (const { child, main } of cases) test(`a running ${child ? "child" : "worker
     assert.equal((await notices(root)).length, 1, "Replaying the same native call must not append a second notice");
     assert.deepEqual(live, [entry.id.toString()]);
     releaseMain(); await mainExecution; mainExecution = undefined;
-    assert.equal((await root.context(BACKGROUND_CONTEXT)).messages.filter((message) => message.role === "assistant" &&
-      message.content.some((part) => part.type === "text" && part.text === text)).length, 1,
-    "The main model must retain exactly one copy of the notice");
+    await pump(async () => await modelNotices(root, text) > 0);
+    assert.equal(await modelNotices(root, text), 1, "The main model must retain exactly one copy of the notice");
     release(); await execution; execution = undefined;
     assert.equal((await notices(root)).length, 1, "The eventual worker final must not republish the update");
     stop(); await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
@@ -164,8 +168,8 @@ for (const legacy of [false, true]) test(`${legacy ? "legacy queued" : "visible"
       data: { task_id: null, source_conversation_id: source.id.toString(), source_entry_id: origin.id.toString() },
       model: [fauxAssistantMessage(notice.text)] } }, BACKGROUND_CONTEXT);
     assert.equal(await publishMainNotice(app.session, source, origin, null, [], notice), legacy ? "queued" : "published");
-    const queuedId = legacy ? requestId : "notice-context:" + JSON.stringify([origin.id.toString(), notice.key]);
-    assert.equal((await root.commit((tx) => tx.submissionByRequest(root.id, queuedId), BACKGROUND_CONTEXT))?.status, "queued");
+    if (legacy) assert.equal((await root.commit((tx) => tx.submissionByRequest(root.id, requestId), BACKGROUND_CONTEXT))?.status, "queued");
+    else assert.equal(await modelNotices(root, notice.text), 0, "Main's model must see the notice only after its run");
     assert.equal((await notices(root)).length, legacy ? 0 : 1);
     await app.session.close(BACKGROUND_CONTEXT); release(); await execution.catch(() => {}); execution = undefined;
     app = await open(directory); app.faux.setResponses([fauxAssistantMessage("Main completed after reopen.")]);
@@ -173,13 +177,44 @@ for (const legacy of [false, true]) test(`${legacy ? "legacy queued" : "visible"
     source = await app.tasks.conversation(source.id.toString());
     await publishMainNotice(app.session, source, origin, null, [], notice);
     await root.waitForIdle(BACKGROUND_CONTEXT);
+    await pump(async () => await modelNotices(root, notice.text) > 0);
     assert.equal((await notices(root)).length, 1, "A legacy queued write must not acquire a second visible projection");
-    assert.equal((await root.context(BACKGROUND_CONTEXT)).messages.filter((message) => message.role === "assistant" &&
-      message.content.some((part) => part.type === "text" && part.text === notice.text)).length, 1);
+    assert.equal(await modelNotices(root, notice.text), 1);
     const calls = app.faux.state.callCount;
     assert.equal(await publishMainNotice(app.session, source, origin, null, [], notice), "published");
     assert.equal((await notices(root)).length, 1);
     assert.equal(app.faux.state.callCount, calls, "Replaying publication must not start another model turn");
+  } finally { release(); await execution?.catch(() => {}); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("notices published while main is busy reach its model once each, in publication order, after its run", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-notice-order-")), app = await open(directory);
+  let release = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let execution: Promise<unknown> | undefined;
+  try {
+    const root = await app.session.root(BACKGROUND_CONTEXT);
+    await root.configure({ model: { provider: "openai", modelId: "fixture" } }, BACKGROUND_CONTEXT);
+    let started = () => {};
+    const running = new Promise<void>((resolve) => { started = resolve; });
+    app.faux.setResponses([async () => { started(); await held; return fauxAssistantMessage("Main completed."); }]);
+    execution = (await root.submit({ type: "input", content: "Continue main work." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+    await running;
+    const source = await app.session.createConversation({ ownership: { kind: "ownerless" } }, BACKGROUND_CONTEXT);
+    const published: string[] = [];
+    for (const [key, text] of [["first-notice", "The first verified result is ready."], ["second-notice", "The second verified result is ready."]] as const) {
+      const origin = await source.commit((tx) => tx.appendEntry(source.id, { kind: "pi.assistant", model: [fauxAssistantMessage(text)] }), BACKGROUND_CONTEXT);
+      assert.equal(await publishMainNotice(app.session, source, origin, null, [], { key, text, events: [] }), "published");
+      published.push(text);
+    }
+    assert.equal((await notices(root)).length, 2, "Both notices are visible while main is busy");
+    for (const text of published) assert.equal(await modelNotices(root, text), 0, "Main's model must see a notice only after its run");
+    release(); await execution; execution = undefined;
+    await pump(async () => (await Promise.all(published.map((text) => modelNotices(root, text)))).every((count) => count > 0));
+    const seen = (await root.context(BACKGROUND_CONTEXT)).messages.flatMap((message) => message.role !== "assistant" ? [] :
+      message.content.flatMap((part) => part.type === "text" && published.includes(part.text) ? [part.text] : []));
+    assert.deepEqual(seen, published, "Main's model must see each notice once, in publication order");
+    assert.equal(app.faux.state.callCount, 1, "Placing notice context must not start another model turn");
   } finally { release(); await execution?.catch(() => {}); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -190,24 +225,23 @@ test("reopen completes a missing model projection without repeating the visible 
     const notice = { key: "interrupted-notice", text: "A useful result is ready.", events: [] };
     const origin = await source.commit((tx) => tx.appendEntry(source.id, { kind: "pi.assistant",
       model: [fauxAssistantMessage(notice.text)] }), BACKGROUND_CONTEXT);
-    const original = app.session;
-    const getRoot = original.root.bind(original), rootBeforeClose = await getRoot(BACKGROUND_CONTEXT);
-    const submit = rootBeforeClose.submit.bind(rootBeforeClose);
-    original.root = async () => rootBeforeClose;
-    rootBeforeClose.submit = async (draft, context) => {
-      const receipt = await submit(draft, context);
-      if (draft.type === "write" && draft.entry.kind === "agent.user_notice") await original.close(BACKGROUND_CONTEXT);
-      return receipt;
+    const original = app.session, commit = original.commit.bind(original);
+    let displayed = false;
+    const observed = original.observeCommits({ advance(publication) {
+      if (publication.changes.some((change) => change.type === "entry" && isUserNotice(change.value))) displayed = true;
+    }, end() {} });
+    original.commit = async (change, context, options) => {
+      if (displayed) await original.close(BACKGROUND_CONTEXT);
+      return commit(change, context, options);
     };
     try { await assert.rejects(publishMainNotice(original, source, origin, null, [], notice), /closed|closing/i); }
-    finally { original.root = getRoot; rootBeforeClose.submit = submit; }
+    finally { observed.detach(); original.commit = commit; }
     app = await open(directory); source = await app.tasks.conversation(source.id.toString());
     await Promise.all([publishMainNotice(app.session, source, origin, null, [], notice),
       publishMainNotice(app.session, source, origin, null, [], notice)]);
     const root = await app.session.root(BACKGROUND_CONTEXT);
     assert.equal((await notices(root)).length, 1);
-    assert.equal((await root.context(BACKGROUND_CONTEXT)).messages.filter((message) => message.role === "assistant" &&
-      message.content.some((part) => part.type === "text" && part.text === notice.text)).length, 1);
+    assert.equal(await modelNotices(root, notice.text), 1);
     assert.equal(app.faux.state.callCount, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });

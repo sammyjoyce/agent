@@ -134,6 +134,7 @@ export class ScopedDatabase implements SqliteDatabase {
 
   exec(sql: string): Promise<void> { return this.#inner.exec(sql).catch(refuseUnlogged); }
   run(sql: string, ...params: SqliteValue[]): Promise<void> { return this.#inner.run(sql, ...params).catch(refuseUnlogged); }
+  runCounted(sql: string, ...params: SqliteValue[]): Promise<number> { return this.#inner.runCounted(sql, ...params).catch(refuseUnlogged); }
   get<T extends object>(sql: string, ...params: SqliteValue[]): Promise<T | undefined> { return this.#inner.get<T>(sql, ...params).catch(refuseUnlogged); }
   all<T extends object>(sql: string, ...params: SqliteValue[]): Promise<T[]> { return this.#inner.all<T>(sql, ...params).catch(refuseUnlogged); }
   close(): Promise<void> { return this.#inner.close(); }

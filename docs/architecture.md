@@ -459,10 +459,11 @@ An unfinished initial scan is catching up; a later scan is refreshing. Typed
 progress reports the frozen scan window and provider-specific units without
 claiming completion from a successful page. Missing older completion data stays
 unknown.
-Source review reclaims parked native work only after binding its execution
-context. Pi handles tool recovery: interrupted unsafe effects are recorded as
-interrupted, not replayed. Existing submissions and source decisions remain
-authoritative.
+Source review checks its run only after binding its execution context, and
+refuses one that waits on a task this runtime cannot run. Pi handles tool
+recovery: interrupted unsafe effects are recorded as interrupted, not replayed,
+and a call cut off at the restart limit ends with an error result. Existing
+submissions and source decisions remain authoritative.
 Admit events durably before advancing a cursor. Partial reads never
 pretend to be complete, and repeated event versions do not create duplicate
 work. New batches rotate across provider/account streams and alternate oldest
@@ -530,10 +531,13 @@ tool receipts stay internal. Explicit notifications use `agent.user_notice`
 with a durable publication identity. Legacy `agent.notice` entries remain
 readable but are not eligible for push delivery.
 Display-only writes make new notices visible while main is busy. A separate
-hidden entry adds their model context at Pi's normal boundary, preserving reset
-and compaction ordering. Each projection has a stable request ID; replay fills
-an interrupted projection without duplicating the visible notice. A notice
-queued behind a reset is reported as queued until its display write completes.
+hidden entry adds their model context once main has no run. Pi places a busy
+conversation's queued writes after a tool round, and a context that then ends
+in the notice's assistant message ends the run unanswered, so a durable
+`agent.notice_context.place` task holds notices in order while main works.
+Each projection has a stable request ID; replay fills an interrupted
+projection without duplicating the visible notice. A notice queued behind a
+reset is reported as queued until its display write completes.
 
 Task outcomes are a built-in source, admitted in the same transaction as task
 changes. They retain conversation, entry and tool-call provenance. Unfinished
@@ -681,11 +685,13 @@ An unanswered input retains its native status. A successful recovery can link
 settles after the linked recovery inputs finish and execution is idle, even
 while the task waits for external work.
 
-Explicit job recovery uses Pi's retry operation on the existing parked native
-timer, background task or current root model generation. Model recovery requires
-the owning worker's configured execution context; another actor or generation
-cannot grant a retry. Recovery preserves admitted occurrences, queued inputs and
-timers. Native job and conversation inspection use the same runtime records
+Pi ends a task that crashes cut off at its restart limit. The trigger or lane
+that still names an ended background task holds its work, and explicit job
+recovery starts that timer or work again as a new native task with the same
+input. A replacement timer plans from its trigger's saved cursor, so it catches
+up the occurrences it missed. A root model generation that Pi ends there settles
+its inputs unanswered, which the reconciliation above handles. Recovery
+preserves admitted occurrences, queued inputs and timers. Native job and conversation inspection use the same runtime records
 and history projection as the CLI; inspection detaches without aborting work.
 
 ### Cross-host recovery
@@ -713,7 +719,11 @@ check. It does not read a batch that is in the blob store.
 
 **Commits go to the log first.** For each Pi commit the coordinator runs the
 batch in a transaction that it rolls back, appends the batch to the log, and
-only then commits it locally. A retained file takes its final name only after a
+only then commits it locally. Pi can pass several commits in one storage call.
+Each of them is a log entry of its own, appended and committed in order, so a
+standby applies the same commits one by one. When Pi's checks refuse one of
+them, it and the commits after it reach neither the log nor the disk, and the
+ones before it stay. A retained file takes its final name only after a
 log entry names it. So local disk never holds a commit or a file that the log
 lacks, and every acknowledgement a client receives is true on a standby that
 has applied the log. An append that the authority refuses because the epoch is
@@ -737,7 +747,11 @@ cannot hold it.
 **Standby.** A standby is a state directory that never runs `serve`. `failover
 join` restores a checkpoint, and `failover follow` replays log entries through
 Pi's own storage commit, each at its own log position and Pi sequence. It never
-opens a Harness, so it schedules nothing and emits nothing.
+opens a Harness, so it schedules nothing and emits nothing. Each entry names the
+Pi Durable and Chord releases that wrote it. A standby replays the entries of
+its own releases, and those of an older pair when a test showed that its Pi
+commits their batches to the rows the older Pi wrote. Pi Durable 1.5.2 replays
+the entries of 1.4.0. A standby refuses every other entry and stops there.
 
 **A replicated directory never opens without its claim.** A state directory
 that holds a log position, an owner's or a standby's, opens for a coordinator

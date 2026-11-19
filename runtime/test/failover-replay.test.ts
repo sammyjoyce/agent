@@ -262,7 +262,7 @@ for (const [name, connect] of Object.entries(authorities)) {
 
     let stopped = false;
     const stopsAfterRename = (database: SqliteDatabase): SqliteDatabase => ({ exec: (sql) => database.exec(sql), run: (sql, ...params) => database.run(sql, ...params),
-      get: (sql, ...params) => database.get(sql, ...params), all: (sql, ...params) => database.all(sql, ...params), close: () => database.close(),
+      runCounted: (sql, ...params) => database.runCounted(sql, ...params), get: (sql, ...params) => database.get(sql, ...params), all: (sql, ...params) => database.all(sql, ...params), close: () => database.close(),
       transaction: (callback) => database.transaction(async (transaction) => {
         const value = await callback(transaction);
         if (!stopped && existsSync(path)) { stopped = true; throw new Error("Invented: the process stopped before the transaction committed"); }
@@ -280,9 +280,10 @@ for (const [name, connect] of Object.entries(authorities)) {
     assert.deepEqual(tables(standby), tables(directory));
   });
 
-  test(`${name}: an entry written by another Pi Durable or Chord is refused and the position does not move`, async (t) => {
-    for (const [stamped, expected] of [[{ pi_durable: "9.9.9" }, /Pi Durable 9\.9\.9 and Chord 1\.4\.0, and this host runs Pi Durable 1\.4\.0 and Chord 1\.4\.0/],
-      [{ chord: "9.9.9" }, /Pi Durable 1\.4\.0 and Chord 9\.9\.9, and this host runs/]] as const) {
+  test(`${name}: an entry written by a Pi Durable or Chord this host does not replay is refused and the position does not move`, async (t) => {
+    for (const [stamped, expected] of [[{ pi_durable: "9.9.9" }, /Pi Durable 9\.9\.9 and Chord 1\.5\.2, and this host runs Pi Durable 1\.5\.2 and Chord 1\.5\.2/],
+      [{ chord: "9.9.9" }, /Pi Durable 1\.5\.2 and Chord 9\.9\.9, and this host runs/],
+      [{ pi_durable: "1.4.0" }, /Pi Durable 1\.4\.0 and Chord 1\.5\.2, and this host runs/]] as const) {
       const link = await connect(), epoch = await enroll(link), directory = await stateDirectory(t), standby = await stateDirectory(t);
       const owner = await openOwner(directory, link, { epoch });
       await owner.root.submit(note("first", "request-1"), context);

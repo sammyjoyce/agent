@@ -1,5 +1,5 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { ROOT_CONVERSATION_ID, type Cursor, type EntryRecord, type Harness } from "@earendil-works/pi-durable";
+import { ROOT_CONVERSATION_ID, type CommitObservation, type Cursor, type EntryRecord, type Harness } from "@earendil-works/pi-durable";
 import type { SavedConversation } from "./generated/SavedConversation.js";
 import type { HistoryThread } from "./generated/HistoryThread.js";
 import type { TaskStore } from "./tasks.js";
@@ -46,10 +46,10 @@ export class ConversationCatalog {
   private rootUpdatedAt: number | null = null;
   private ready = false;
   private loading: Promise<void> | undefined;
-  private readonly unsubscribe: () => void;
+  private readonly commits: CommitObservation;
   private readonly unsubscribeClose: () => void;
   constructor(private readonly session: Harness, private readonly histories: HistoryStore, private readonly tasks: TaskStore) {
-    this.unsubscribe = session.subscribeCommits((publication) => {
+    this.commits = session.observeCommits({ advance: (publication) => {
       for (const change of publication.changes) {
         if (change.type === "conversation" && change.value.id === ROOT_CONVERSATION_ID) this.root = true;
         if (change.type !== "entry") continue;
@@ -57,10 +57,10 @@ export class ConversationCatalog {
           this.root = true; this.rootUpdatedAt = latest(this.rootUpdatedAt, messageTime(change.value));
         } else if (ImportedThreadEntry.is(change.value)) this.retain(change.value.conversationId.toString(), change.value.data.thread);
       }
-    });
+    }, end() {} });
     this.unsubscribeClose = session.subscribeClose(() => this.close());
   }
-  close(): void { this.unsubscribe(); this.unsubscribeClose(); }
+  close(): void { this.commits.detach(); this.unsubscribeClose(); }
   private retain(id: string, thread: HistoryThread, seeding = false): void {
     const item = imported(id, thread), previous = this.imported.get(id), updated_at = item.updated_at;
     if (previous !== undefined && previous.updated_at !== null &&

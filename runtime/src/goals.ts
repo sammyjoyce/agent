@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { Type } from "typebox";
-import { copyJson } from "@earendil-works/chord";
+import { copyJson } from "@earendil-works/chord/json";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { defineDoc, defineDocFamily, defineEntry, defineExtension, defineTool, GenerationTask, LiveDoc, ROOT_CONVERSATION_ID,
   type ConversationId, type Extension, type Harness, type TaskId as NativeTaskId, type Tx } from "@earendil-works/pi-durable";

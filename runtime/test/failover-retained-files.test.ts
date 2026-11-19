@@ -143,7 +143,8 @@ class Crash {
 
   /** Wraps the owner's raw database, so the end of the transaction that applies a file entry, after its renames and before its commit, is a step. */
   readonly observe = (database: SqliteDatabase): SqliteDatabase => ({
-    exec: (sql) => database.exec(sql), run: (sql, ...params) => database.run(sql, ...params), get: (sql, ...params) => database.get(sql, ...params),
+    exec: (sql) => database.exec(sql), run: (sql, ...params) => database.run(sql, ...params), runCounted: (sql, ...params) => database.runCounted(sql, ...params),
+    get: (sql, ...params) => database.get(sql, ...params),
     all: (sql, ...params) => database.all(sql, ...params), close: () => database.close(),
     transaction: (callback) => database.transaction(async (transaction) => {
       const value = await callback(transaction);

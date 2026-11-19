@@ -1,0 +1,108 @@
+{
+ "beep_boop_failover": [
+  "{\"singleton\":1,\"position\":37}"
+ ],
+ "conversations": [
+  "{\"id\":1,\"owner_conversation_id\":null,\"owner_task_id\":null,\"record\":\"{\\\"id\\\":1}\"}",
+  "{\"id\":18,\"owner_conversation_id\":null,\"owner_task_id\":null,\"record\":\"{\\\"id\\\":18,\\\"parent\\\":{\\\"conversationId\\\":1,\\\"at\\\":17}}\"}"
+ ],
+ "document_revisions": [
+  "{\"document_id\":3,\"seq\":1,\"kind\":\"base\",\"version\":1,\"content\":\"{\\\"items\\\":[]}\"}",
+  "{\"document_id\":5,\"seq\":1,\"kind\":\"base\",\"version\":1,\"content\":\"{\\\"sessionId\\\":\\\"01a1f1f3-02ef-7539-9cab-368497140f4d\\\"}\"}",
+  "{\"document_id\":6,\"seq\":1,\"kind\":\"base\",\"version\":1,\"content\":\"{\\\"model\\\":{\\\"provider\\\":\\\"openai\\\",\\\"modelId\\\":\\\"fixture\\\"}}\"}",
+  "{\"document_id\":16,\"seq\":20,\"kind\":\"base\",\"version\":1,\"content\":\"{\\\"count\\\":1}\"}",
+  "{\"document_id\":16,\"seq\":21,\"kind\":\"delta\",\"version\":1,\"content\":\"[[\\\"s\\\",[\\\"count\\\"],2]]\"}",
+  "{\"document_id\":19,\"seq\":22,\"kind\":\"base\",\"version\":1,\"content\":\"{\\\"model\\\":{\\\"provider\\\":\\\"openai\\\",\\\"modelId\\\":\\\"fixture\\\"}}\"}",
+  "{\"document_id\":20,\"seq\":22,\"kind\":\"base\",\"version\":1,\"content\":\"{\\\"count\\\":1}\"}",
+  "{\"document_id\":21,\"seq\":22,\"kind\":\"base\",\"version\":1,\"content\":\"{}\"}",
+  "{\"document_id\":22,\"seq\":22,\"kind\":\"base\",\"version\":1,\"content\":\"{\\\"items\\\":[]}\"}",
+  "{\"document_id\":23,\"seq\":22,\"kind\":\"base\",\"version\":1,\"content\":\"{\\\"models\\\":{},\\\"tools\\\":{}}\"}",
+  "{\"document_id\":24,\"seq\":22,\"kind\":\"base\",\"version\":1,\"content\":\"{\\\"sessionId\\\":\\\"01a1f1f3-0554-7539-9cab-3687a0c2acb5\\\"}\"}",
+  "{\"document_id\":27,\"seq\":26,\"kind\":\"base\",\"version\":1,\"content\":\"{\\\"name\\\":\\\"south\\\",\\\"rows\\\":2}\"}",
+  "{\"document_id\":2,\"seq\":32,\"kind\":\"base\",\"version\":1,\"content\":\"{\\\"run\\\":{\\\"taskId\\\":32,\\\"inputs\\\":[31]},\\\"tools\\\":[{\\\"callId\\\":\\\"tool:1795060598156:uvw0b7jux3\\\",\\\"name\\\":\\\"hold\\\",\\\"taskId\\\":34,\\\"status\\\":\\\"pending\\\"}]}\"}",
+  "{\"document_id\":4,\"seq\":32,\"kind\":\"base\",\"version\":1,\"content\":\"{\\\"models\\\":{\\\"openai/fixture\\\":{\\\"input\\\":370,\\\"output\\\":238,\\\"cacheRead\\\":234,\\\"cacheWrite\\\":372,\\\"totalTokens\\\":1214,\\\"cost\\\":{\\\"input\\\":0,\\\"output\\\":0,\\\"cacheRead\\\":0,\\\"cacheWrite\\\":0,\\\"total\\\":0}}},\\\"tools\\\":{}}\"}",
+  "{\"document_id\":2,\"seq\":34,\"kind\":\"delta\",\"version\":1,\"content\":\"[[\\\"s\\\",[\\\"tools\\\",0,\\\"status\\\"],\\\"running\\\"]]\"}"
+ ],
+ "documents": [
+  "{\"id\":2,\"kind\":\"\\\"pi.live\\\"\",\"family\":0,\"key_value\":\"\\\"\\\"\",\"scope_kind\":\"conversation\",\"owner_id\":1,\"created_at\":1,\"retired_at\":null,\"record\":\"{\\\"id\\\":2,\\\"kind\\\":\\\"pi.live\\\",\\\"scope\\\":{\\\"kind\\\":\\\"conversation\\\",\\\"conversationId\\\":1},\\\"history\\\":\\\"latest\\\",\\\"fork\\\":\\\"initial\\\",\\\"createdAt\\\":1}\"}",
+  "{\"id\":3,\"kind\":\"\\\"pi.inbox\\\"\",\"family\":0,\"key_value\":\"\\\"\\\"\",\"scope_kind\":\"conversation\",\"owner_id\":1,\"created_at\":1,\"retired_at\":null,\"record\":\"{\\\"id\\\":3,\\\"kind\\\":\\\"pi.inbox\\\",\\\"scope\\\":{\\\"kind\\\":\\\"conversation\\\",\\\"conversationId\\\":1},\\\"history\\\":\\\"latest\\\",\\\"fork\\\":\\\"initial\\\",\\\"createdAt\\\":1}\"}",
+  "{\"id\":4,\"kind\":\"\\\"pi.usage\\\"\",\"family\":0,\"key_value\":\"\\\"\\\"\",\"scope_kind\":\"conversation\",\"owner_id\":1,\"created_at\":1,\"retired_at\":null,\"record\":\"{\\\"id\\\":4,\\\"kind\\\":\\\"pi.usage\\\",\\\"scope\\\":{\\\"kind\\\":\\\"conversation\\\",\\\"conversationId\\\":1},\\\"history\\\":\\\"latest\\\",\\\"fork\\\":\\\"initial\\\",\\\"createdAt\\\":1}\"}",
+  "{\"id\":5,\"kind\":\"\\\"pi.provider\\\"\",\"family\":0,\"key_value\":\"\\\"\\\"\",\"scope_kind\":\"conversation\",\"owner_id\":1,\"created_at\":1,\"retired_at\":null,\"record\":\"{\\\"id\\\":5,\\\"kind\\\":\\\"pi.provider\\\",\\\"scope\\\":{\\\"kind\\\":\\\"conversation\\\",\\\"conversationId\\\":1},\\\"history\\\":\\\"latest\\\",\\\"fork\\\":\\\"initial\\\",\\\"createdAt\\\":1}\"}",
+  "{\"id\":6,\"kind\":\"\\\"pi.agent\\\"\",\"family\":0,\"key_value\":\"\\\"\\\"\",\"scope_kind\":\"conversation\",\"owner_id\":1,\"created_at\":1,\"retired_at\":null,\"record\":\"{\\\"id\\\":6,\\\"kind\\\":\\\"pi.agent\\\",\\\"scope\\\":{\\\"kind\\\":\\\"conversation\\\",\\\"conversationId\\\":1},\\\"history\\\":\\\"rewindable\\\",\\\"fork\\\":\\\"asOf\\\",\\\"createdAt\\\":1}\"}",
+  "{\"id\":16,\"kind\":\"\\\"fixture.ledger\\\"\",\"family\":0,\"key_value\":\"\\\"\\\"\",\"scope_kind\":\"conversation\",\"owner_id\":1,\"created_at\":20,\"retired_at\":null,\"record\":\"{\\\"id\\\":16,\\\"kind\\\":\\\"fixture.ledger\\\",\\\"scope\\\":{\\\"kind\\\":\\\"conversation\\\",\\\"conversationId\\\":1},\\\"history\\\":\\\"rewindable\\\",\\\"fork\\\":\\\"asOf\\\",\\\"createdAt\\\":20}\"}",
+  "{\"id\":19,\"kind\":\"\\\"pi.agent\\\"\",\"family\":0,\"key_value\":\"\\\"\\\"\",\"scope_kind\":\"conversation\",\"owner_id\":18,\"created_at\":22,\"retired_at\":null,\"record\":\"{\\\"id\\\":19,\\\"kind\\\":\\\"pi.agent\\\",\\\"scope\\\":{\\\"kind\\\":\\\"conversation\\\",\\\"conversationId\\\":18},\\\"history\\\":\\\"rewindable\\\",\\\"fork\\\":\\\"asOf\\\",\\\"createdAt\\\":22}\"}",
+  "{\"id\":20,\"kind\":\"\\\"fixture.ledger\\\"\",\"family\":0,\"key_value\":\"\\\"\\\"\",\"scope_kind\":\"conversation\",\"owner_id\":18,\"created_at\":22,\"retired_at\":23,\"record\":\"{\\\"id\\\":20,\\\"kind\\\":\\\"fixture.ledger\\\",\\\"scope\\\":{\\\"kind\\\":\\\"conversation\\\",\\\"conversationId\\\":18},\\\"history\\\":\\\"rewindable\\\",\\\"fork\\\":\\\"asOf\\\",\\\"createdAt\\\":22,\\\"retiredAt\\\":23}\"}",
+  "{\"id\":21,\"kind\":\"\\\"pi.live\\\"\",\"family\":0,\"key_value\":\"\\\"\\\"\",\"scope_kind\":\"conversation\",\"owner_id\":18,\"created_at\":22,\"retired_at\":null,\"record\":\"{\\\"id\\\":21,\\\"kind\\\":\\\"pi.live\\\",\\\"scope\\\":{\\\"kind\\\":\\\"conversation\\\",\\\"conversationId\\\":18},\\\"history\\\":\\\"latest\\\",\\\"fork\\\":\\\"initial\\\",\\\"createdAt\\\":22}\"}",
+  "{\"id\":22,\"kind\":\"\\\"pi.inbox\\\"\",\"family\":0,\"key_value\":\"\\\"\\\"\",\"scope_kind\":\"conversation\",\"owner_id\":18,\"created_at\":22,\"retired_at\":null,\"record\":\"{\\\"id\\\":22,\\\"kind\\\":\\\"pi.inbox\\\",\\\"scope\\\":{\\\"kind\\\":\\\"conversation\\\",\\\"conversationId\\\":18},\\\"history\\\":\\\"latest\\\",\\\"fork\\\":\\\"initial\\\",\\\"createdAt\\\":22}\"}",
+  "{\"id\":23,\"kind\":\"\\\"pi.usage\\\"\",\"family\":0,\"key_value\":\"\\\"\\\"\",\"scope_kind\":\"conversation\",\"owner_id\":18,\"created_at\":22,\"retired_at\":null,\"record\":\"{\\\"id\\\":23,\\\"kind\\\":\\\"pi.usage\\\",\\\"scope\\\":{\\\"kind\\\":\\\"conversation\\\",\\\"conversationId\\\":18},\\\"history\\\":\\\"latest\\\",\\\"fork\\\":\\\"initial\\\",\\\"createdAt\\\":22}\"}",
+  "{\"id\":24,\"kind\":\"\\\"pi.provider\\\"\",\"family\":0,\"key_value\":\"\\\"\\\"\",\"scope_kind\":\"conversation\",\"owner_id\":18,\"created_at\":22,\"retired_at\":null,\"record\":\"{\\\"id\\\":24,\\\"kind\\\":\\\"pi.provider\\\",\\\"scope\\\":{\\\"kind\\\":\\\"conversation\\\",\\\"conversationId\\\":18},\\\"history\\\":\\\"latest\\\",\\\"fork\\\":\\\"initial\\\",\\\"createdAt\\\":22}\"}",
+  "{\"id\":25,\"kind\":\"\\\"fixture.tally\\\"\",\"family\":0,\"key_value\":\"\\\"\\\"\",\"scope_kind\":\"session\",\"owner_id\":0,\"created_at\":24,\"retired_at\":26,\"record\":\"{\\\"id\\\":25,\\\"kind\\\":\\\"fixture.tally\\\",\\\"scope\\\":{\\\"kind\\\":\\\"session\\\"},\\\"createdAt\\\":24,\\\"retiredAt\\\":26}\"}",
+  "{\"id\":26,\"kind\":\"\\\"fixture.plot\\\"\",\"family\":1,\"key_value\":\"\\\"north\\\"\",\"scope_kind\":\"session\",\"owner_id\":0,\"created_at\":24,\"retired_at\":26,\"record\":\"{\\\"id\\\":26,\\\"kind\\\":\\\"fixture.plot\\\",\\\"key\\\":\\\"north\\\",\\\"scope\\\":{\\\"kind\\\":\\\"session\\\"},\\\"createdAt\\\":24,\\\"retiredAt\\\":26}\"}",
+  "{\"id\":27,\"kind\":\"\\\"fixture.plot\\\"\",\"family\":1,\"key_value\":\"\\\"south\\\"\",\"scope_kind\":\"session\",\"owner_id\":0,\"created_at\":25,\"retired_at\":null,\"record\":\"{\\\"id\\\":27,\\\"kind\\\":\\\"fixture.plot\\\",\\\"key\\\":\\\"south\\\",\\\"scope\\\":{\\\"kind\\\":\\\"session\\\"},\\\"createdAt\\\":25}\"}"
+ ],
+ "durable_metadata": [
+  "{\"singleton\":1,\"next_id\":\"35\",\"next_seq\":36}"
+ ],
+ "durable_schema": [
+  "{\"singleton\":1,\"version\":2}"
+ ],
+ "entries": [
+  "{\"id\":7,\"conversation_id\":1,\"head\":null,\"commit_seq\":2,\"record\":\"{\\\"model\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"Plan the garden.\\\",\\\"timestamp\\\":1795060597494}],\\\"kind\\\":\\\"pi.user\\\",\\\"id\\\":7,\\\"conversationId\\\":1}\"}",
+  "{\"id\":10,\"conversation_id\":1,\"head\":null,\"commit_seq\":4,\"record\":\"{\\\"model\\\":[{\\\"role\\\":\\\"system\\\",\\\"content\\\":\\\"\\\",\\\"toolsAdded\\\":[{\\\"name\\\":\\\"note\\\",\\\"description\\\":\\\"Write an invented note, one line at a time\\\",\\\"parameters\\\":{\\\"type\\\":\\\"object\\\",\\\"required\\\":[\\\"text\\\",\\\"lines\\\"],\\\"properties\\\":{\\\"text\\\":{\\\"type\\\":\\\"string\\\"},\\\"lines\\\":{\\\"type\\\":\\\"number\\\"}}}},{\\\"name\\\":\\\"hold\\\",\\\"description\\\":\\\"Wait until the coordinator stops\\\",\\\"parameters\\\":{\\\"type\\\":\\\"object\\\",\\\"properties\\\":{}}}],\\\"timestamp\\\":1795060597505}],\\\"kind\\\":\\\"pi.system\\\",\\\"id\\\":10,\\\"conversationId\\\":1,\\\"byTaskId\\\":9}\"}",
+  "{\"id\":11,\"conversation_id\":1,\"head\":null,\"commit_seq\":6,\"record\":\"{\\\"model\\\":[{\\\"role\\\":\\\"assistant\\\",\\\"content\\\":[{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"I will write that down first.\\\"},{\\\"type\\\":\\\"toolCall\\\",\\\"id\\\":\\\"tool:1795060597494:b6isudcvnwe\\\",\\\"name\\\":\\\"note\\\",\\\"arguments\\\":{\\\"text\\\":\\\"invented note\\\",\\\"lines\\\":6}}],\\\"api\\\":\\\"faux:1795060597485:guxh2408g08\\\",\\\"provider\\\":\\\"openai\\\",\\\"model\\\":\\\"fixture\\\",\\\"usage\\\":{\\\"input\\\":89,\\\"output\\\":18,\\\"cacheRead\\\":0,\\\"cacheWrite\\\":89,\\\"totalTokens\\\":196,\\\"cost\\\":{\\\"input\\\":0,\\\"output\\\":0,\\\"cacheRead\\\":0,\\\"cacheWrite\\\":0,\\\"total\\\":0}},\\\"stopReason\\\":\\\"toolUse\\\",\\\"timestamp\\\":1795060597494}],\\\"kind\\\":\\\"pi.assistant\\\",\\\"id\\\":11,\\\"conversationId\\\":1,\\\"byTaskId\\\":9}\"}",
+  "{\"id\":13,\"conversation_id\":1,\"head\":null,\"commit_seq\":10,\"record\":\"{\\\"model\\\":[{\\\"role\\\":\\\"toolResult\\\",\\\"toolCallId\\\":\\\"tool:1795060597494:b6isudcvnwe\\\",\\\"toolName\\\":\\\"note\\\",\\\"content\\\":[{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"invented note line 0\\\\ninvented note line 1\\\\ninvented note line 2\\\\ninvented note line 3\\\\ninvented note line 4\\\\ninvented note line 5\\\\n\\\"}],\\\"isError\\\":false,\\\"durationMs\\\":73,\\\"timestamp\\\":1795060597635}],\\\"data\\\":{\\\"diagnostics\\\":[]},\\\"kind\\\":\\\"pi.tool-result\\\",\\\"id\\\":13,\\\"conversationId\\\":1,\\\"byTaskId\\\":12}\"}",
+  "{\"id\":15,\"conversation_id\":1,\"head\":null,\"commit_seq\":19,\"record\":\"{\\\"model\\\":[{\\\"role\\\":\\\"assistant\\\",\\\"content\\\":[{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"Sentence 0 of an invented answer about a garden plan. Sentence 1 of an invented answer about a garden plan. Sentence 2 of an invented answer about a garden plan. Sentence 3 of an invented answer about a garden plan. Sentence 4 of an invented answer about a garden plan. Sentence 5 of an invented answer about a garden plan. Sentence 6 of an invented answer about a garden plan. Sentence 7 of an invented answer about a garden plan. Sentence 8 of an invented answer about a garden plan. Sentence 9 of an invented answer about a garden plan. Sentence 10 of an invented answer about a garden plan. Sentence 11 of an invented answer about a garden plan. Sentence 12 of an invented answer about a garden plan. Sentence 13 of an invented answer about a garden plan. Sentence 14 of an invented answer about a garden plan. Sentence 15 of an invented answer about a garden plan.\\\"}],\\\"api\\\":\\\"faux:1795060597485:guxh2408g08\\\",\\\"provider\\\":\\\"openai\\\",\\\"model\\\":\\\"fixture\\\",\\\"usage\\\":{\\\"input\\\":56,\\\"output\\\":218,\\\"cacheRead\\\":89,\\\"cacheWrite\\\":57,\\\"totalTokens\\\":420,\\\"cost\\\":{\\\"input\\\":0,\\\"output\\\":0,\\\"cacheRead\\\":0,\\\"cacheWrite\\\":0,\\\"total\\\":0}},\\\"stopReason\\\":\\\"stop\\\",\\\"timestamp\\\":1795060597494}],\\\"kind\\\":\\\"pi.assistant\\\",\\\"id\\\":15,\\\"conversationId\\\":1,\\\"byTaskId\\\":14}\"}",
+  "{\"id\":17,\"conversation_id\":1,\"head\":null,\"commit_seq\":20,\"record\":\"{\\\"kind\\\":\\\"app.note\\\",\\\"data\\\":\\\"the ledger says one\\\",\\\"id\\\":17,\\\"conversationId\\\":1}\"}",
+  "{\"id\":28,\"conversation_id\":1,\"head\":null,\"commit_seq\":27,\"record\":\"{\\\"kind\\\":\\\"app.note\\\",\\\"data\\\":\\\"the sketch is attached\\\",\\\"id\\\":28,\\\"conversationId\\\":1}\"}",
+  "{\"id\":30,\"conversation_id\":1,\"head\":null,\"commit_seq\":28,\"record\":\"{\\\"model\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"Hold the gate.\\\",\\\"timestamp\\\":1795060598156}],\\\"kind\\\":\\\"pi.user\\\",\\\"id\\\":30,\\\"conversationId\\\":1}\"}",
+  "{\"id\":33,\"conversation_id\":1,\"head\":null,\"commit_seq\":32,\"record\":\"{\\\"model\\\":[{\\\"role\\\":\\\"assistant\\\",\\\"content\\\":[{\\\"type\\\":\\\"toolCall\\\",\\\"id\\\":\\\"tool:1795060598156:uvw0b7jux3\\\",\\\"name\\\":\\\"hold\\\",\\\"arguments\\\":{}}],\\\"api\\\":\\\"faux:1795060597485:guxh2408g08\\\",\\\"provider\\\":\\\"openai\\\",\\\"model\\\":\\\"fixture\\\",\\\"usage\\\":{\\\"input\\\":225,\\\"output\\\":2,\\\"cacheRead\\\":145,\\\"cacheWrite\\\":226,\\\"totalTokens\\\":598,\\\"cost\\\":{\\\"input\\\":0,\\\"output\\\":0,\\\"cacheRead\\\":0,\\\"cacheWrite\\\":0,\\\"total\\\":0}},\\\"stopReason\\\":\\\"toolUse\\\",\\\"timestamp\\\":1795060598156}],\\\"kind\\\":\\\"pi.assistant\\\",\\\"id\\\":33,\\\"conversationId\\\":1,\\\"byTaskId\\\":32}\"}"
+ ],
+ "record_ids": [
+  "{\"id\":1,\"record_type\":\"conversation\"}",
+  "{\"id\":2,\"record_type\":\"document\"}",
+  "{\"id\":3,\"record_type\":\"document\"}",
+  "{\"id\":4,\"record_type\":\"document\"}",
+  "{\"id\":5,\"record_type\":\"document\"}",
+  "{\"id\":6,\"record_type\":\"document\"}",
+  "{\"id\":7,\"record_type\":\"entry\"}",
+  "{\"id\":8,\"record_type\":\"submission\"}",
+  "{\"id\":9,\"record_type\":\"task\"}",
+  "{\"id\":10,\"record_type\":\"entry\"}",
+  "{\"id\":11,\"record_type\":\"entry\"}",
+  "{\"id\":12,\"record_type\":\"task\"}",
+  "{\"id\":13,\"record_type\":\"entry\"}",
+  "{\"id\":14,\"record_type\":\"task\"}",
+  "{\"id\":15,\"record_type\":\"entry\"}",
+  "{\"id\":16,\"record_type\":\"document\"}",
+  "{\"id\":17,\"record_type\":\"entry\"}",
+  "{\"id\":18,\"record_type\":\"conversation\"}",
+  "{\"id\":19,\"record_type\":\"document\"}",
+  "{\"id\":20,\"record_type\":\"document\"}",
+  "{\"id\":21,\"record_type\":\"document\"}",
+  "{\"id\":22,\"record_type\":\"document\"}",
+  "{\"id\":23,\"record_type\":\"document\"}",
+  "{\"id\":24,\"record_type\":\"document\"}",
+  "{\"id\":25,\"record_type\":\"document\"}",
+  "{\"id\":26,\"record_type\":\"document\"}",
+  "{\"id\":27,\"record_type\":\"document\"}",
+  "{\"id\":28,\"record_type\":\"entry\"}",
+  "{\"id\":29,\"record_type\":\"submission\"}",
+  "{\"id\":30,\"record_type\":\"entry\"}",
+  "{\"id\":31,\"record_type\":\"submission\"}",
+  "{\"id\":32,\"record_type\":\"task\"}",
+  "{\"id\":33,\"record_type\":\"entry\"}",
+  "{\"id\":34,\"record_type\":\"task\"}"
+ ],
+ "submissions": [
+  "{\"id\":8,\"conversation_id\":1,\"request_id\":\"\\\"request-garden\\\"\",\"status\":\"done\",\"record\":\"{\\\"conversationId\\\":1,\\\"requestId\\\":\\\"request-garden\\\",\\\"type\\\":\\\"input\\\",\\\"status\\\":\\\"done\\\",\\\"entry\\\":7,\\\"id\\\":8,\\\"answer\\\":15}\"}",
+  "{\"id\":29,\"conversation_id\":1,\"request_id\":\"\\\"request-sketch\\\"\",\"status\":\"done\",\"record\":\"{\\\"conversationId\\\":1,\\\"requestId\\\":\\\"request-sketch\\\",\\\"type\\\":\\\"write\\\",\\\"status\\\":\\\"done\\\",\\\"entry\\\":28,\\\"id\\\":29}\"}",
+  "{\"id\":31,\"conversation_id\":1,\"request_id\":\"\\\"request-hold\\\"\",\"status\":\"placed\",\"record\":\"{\\\"conversationId\\\":1,\\\"requestId\\\":\\\"request-hold\\\",\\\"type\\\":\\\"input\\\",\\\"status\\\":\\\"placed\\\",\\\"entry\\\":30,\\\"id\\\":31}\"}"
+ ],
+ "tasks": [
+  "{\"id\":9,\"conversation_id\":1,\"kind\":\"\\\"pi.generation\\\"\",\"status\":\"terminal\",\"abort_requested\":0,\"background\":0,\"record\":\"{\\\"id\\\":9,\\\"conversationId\\\":1,\\\"kind\\\":\\\"pi.generation\\\",\\\"version\\\":1,\\\"input\\\":{},\\\"background\\\":false,\\\"abortRequested\\\":false,\\\"state\\\":{\\\"status\\\":\\\"terminal\\\",\\\"outcome\\\":{\\\"status\\\":\\\"completed\\\",\\\"result\\\":{\\\"entryId\\\":11}}},\\\"startedAt\\\":1795060597500,\\\"endedAt\\\":1795060597645}\"}",
+  "{\"id\":12,\"conversation_id\":1,\"kind\":\"\\\"pi.tool\\\"\",\"status\":\"terminal\",\"abort_requested\":0,\"background\":0,\"record\":\"{\\\"id\\\":12,\\\"conversationId\\\":1,\\\"kind\\\":\\\"pi.tool\\\",\\\"version\\\":2,\\\"input\\\":{\\\"kind\\\":\\\"model\\\",\\\"assistant\\\":11,\\\"callId\\\":\\\"tool:1795060597494:b6isudcvnwe\\\"},\\\"owner\\\":9,\\\"background\\\":false,\\\"abortRequested\\\":false,\\\"state\\\":{\\\"status\\\":\\\"terminal\\\",\\\"outcome\\\":{\\\"status\\\":\\\"completed\\\",\\\"result\\\":{\\\"kind\\\":\\\"model\\\",\\\"entryId\\\":13}}},\\\"startedAt\\\":1795060597551,\\\"endedAt\\\":1795060597635}\"}",
+  "{\"id\":14,\"conversation_id\":1,\"kind\":\"\\\"pi.generation\\\"\",\"status\":\"terminal\",\"abort_requested\":0,\"background\":0,\"record\":\"{\\\"id\\\":14,\\\"conversationId\\\":1,\\\"kind\\\":\\\"pi.generation\\\",\\\"version\\\":1,\\\"input\\\":{},\\\"background\\\":false,\\\"abortRequested\\\":false,\\\"state\\\":{\\\"status\\\":\\\"terminal\\\",\\\"outcome\\\":{\\\"status\\\":\\\"completed\\\",\\\"result\\\":{\\\"entryId\\\":15}}},\\\"startedAt\\\":1795060597650,\\\"endedAt\\\":1795060598080}\"}",
+  "{\"id\":32,\"conversation_id\":1,\"kind\":\"\\\"pi.generation\\\"\",\"status\":\"waiting\",\"abort_requested\":0,\"background\":0,\"record\":\"{\\\"id\\\":32,\\\"conversationId\\\":1,\\\"kind\\\":\\\"pi.generation\\\",\\\"version\\\":1,\\\"input\\\":{},\\\"background\\\":false,\\\"abortRequested\\\":false,\\\"state\\\":{\\\"status\\\":\\\"waiting\\\",\\\"checkpoint\\\":{\\\"phase\\\":\\\"tools\\\",\\\"assistant\\\":33,\\\"tools\\\":[34],\\\"pending\\\":[]},\\\"on\\\":[34],\\\"policy\\\":\\\"allSettled\\\"},\\\"startedAt\\\":1795060598163}\"}",
+  "{\"id\":34,\"conversation_id\":1,\"kind\":\"\\\"pi.tool\\\"\",\"status\":\"pending\",\"abort_requested\":0,\"background\":0,\"record\":\"{\\\"id\\\":34,\\\"conversationId\\\":1,\\\"kind\\\":\\\"pi.tool\\\",\\\"version\\\":2,\\\"input\\\":{\\\"kind\\\":\\\"model\\\",\\\"assistant\\\":33,\\\"callId\\\":\\\"tool:1795060598156:uvw0b7jux3\\\"},\\\"owner\\\":32,\\\"background\\\":false,\\\"abortRequested\\\":false,\\\"state\\\":{\\\"status\\\":\\\"pending\\\",\\\"checkpoint\\\":{\\\"phase\\\":\\\"execute\\\",\\\"arguments\\\":{},\\\"replay\\\":\\\"unsafe\\\"}},\\\"startedAt\\\":1795060598189}\"}"
+ ]
+}

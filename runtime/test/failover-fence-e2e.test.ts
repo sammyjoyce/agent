@@ -137,9 +137,13 @@ test("an owner the authority no longer answers, or has replaced, starts no effec
     const promoted = await world.promote({ replaceEpoch: 2, statement: STATEMENT });
     assert.deepEqual(promoted.unfinished_tools.map(({ replay_safe }) => replay_safe), [false], `the promotion reports the call the old epoch started: ${JSON.stringify(promoted)}`);
 
+    // A command the resumed owner sends, such as a commit Pi deferred or its owner check, would fence it ahead of its dispatch.
+    const afterResume = latch();
+    owner.proxy.inject({ fault: { kind: "hold", release: afterResume.released }, match: commands() });
     approval.release();
     world.resume(owner);
     await world.until(async () => (await markers(world)).length === 1, "The approval the old owner held releases its one host call");
+    afterResume.release();
     assert.equal(await serving.exited, OWNER_FENCED_EXIT, serving.errors().slice(-2000));
 
     await succeed(world);

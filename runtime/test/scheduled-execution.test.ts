@@ -14,7 +14,7 @@ import { LiveDoc } from "@earendil-works/pi-durable";
 import { runScheduled } from "../src/scheduled.js";
 import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
 import { pump } from "./fixtures/background-runtime.js";
-import { binding, node, openScheduled, scheduledOccurrence } from "./fixtures/scheduled-runtime.js";
+import { binding, CRASH_RETRY, node, openScheduled, scheduledOccurrence } from "./fixtures/scheduled-runtime.js";
 import { fixtureModel } from "./model.js";
 import { runAdmitted } from "./fixtures/run-admitted.js";
 
@@ -198,7 +198,7 @@ for (const shutdown of ["SIGKILL", "graceful"]) for (const phase of ["child", "c
       if (shutdown === "SIGKILL") childProcess.kill("SIGKILL"); else childProcess.stdin.end();
       const exit = await exited; if (shutdown === "graceful") assert.equal(exit, 0, stderr);
       lines.close();
-      app = await openScheduled(directory, "restored");
+      app = await openScheduled(directory, "restored", undefined, [], CRASH_RETRY);
       const task = (await app.tasks.list())[0]; assert.ok(task);
       const actor = phase === "child" ? task.agents[0] : task; assert.ok(actor);
       const conversation = await app.tasks.conversation(actor.conversation_id);

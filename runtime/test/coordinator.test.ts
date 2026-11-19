@@ -101,6 +101,9 @@ test("real CLI, coordinator and worker retain main history across an offline lap
     event.conversation_id === old.conversation_id && event.text === "The original task accepted input while feedback admission was held."),
   "The original worker must keep processing input while feedback admission waits");
   assert.equal(reports().length, 0, "Processing the original task must not depend on receiving the feedback receipt");
+  // The repair asks the model as soon as its window launches, before its terminal attaches, so its answer waits for that terminal.
+  const repairAttached = join(directory, "repair-attached");
+  await script("fixture-feedback-first", [{ text: "The feedback repair is verified and remains in the existing folder.", after: repairAttached }]);
   await rm(feedbackGate);
   await until(async () => reports().length === 1);
   const firstReport = reports()[0]; assert.ok(firstReport);
@@ -115,9 +118,10 @@ test("real CLI, coordinator and worker retain main history across an offline lap
   assert.equal(repair.worker.binding.session_id, original.binding.session_id); assert.notEqual(repair.worker.binding.window_id, original.binding.window_id);
   const repairLaunch = sessions(join(homes[1]!, "rex.json")).find((window) => window.block_id === repairBinding.block_id); assert.ok(repairLaunch);
   assert.equal(repairLaunch.label, "Beep Boop feedback");
-  await script("fixture-feedback-first", [{ text: "The feedback repair is verified and remains in the existing folder." }]);
   const repairActor = start(1, repairLaunch.command.slice(1), undefined,
     { REX_SESSION: repairLaunch.session_id, REX_BLOCK: repairLaunch.block_id }, true);
+  await until(async () => events(repairActor.output()).some((event) => event.type === "task_ready"), "The repair terminal must attach to its task");
+  await writeFile(repairAttached, "");
   await until(async () => events(repairActor.output()).some((event) => event.type === "worker_idle"));
   const repairFinal = "The feedback repair is verified and remains in the existing folder.";
   assert.equal(events(repairActor.output()).filter((event) => event.type === "answer" && event.text === repairFinal).length, 1);
