@@ -14,7 +14,7 @@ import { openJobActor, runScheduled } from "../src/scheduled.js";
 import type { ScheduledOccurrence } from "../src/generated/ScheduledOccurrence.js";
 import { createAppTools } from "../src/tools.js";
 import { DAY, FakeClock, exampleJob, planned, pump } from "./fixtures/background-runtime.js";
-import { binding, openScheduled, scheduledOccurrence } from "./fixtures/scheduled-runtime.js";
+import { binding, CRASH_RETRY, openScheduled, scheduledOccurrence } from "./fixtures/scheduled-runtime.js";
 import { runAdmitted } from "./fixtures/run-admitted.js";
 
 test("scheduled work uses the existing task actor, current guidance and exact native input", { timeout: 10_000 }, async () => {
@@ -216,7 +216,7 @@ test("SIGKILL after scheduled input placement restores its actor without duplica
     const signal = await lines[Symbol.asyncIterator]().next();
     assert.equal(signal.value, "PLACED", stderr);
     const closed = new Promise<void>((resolve) => child.once("close", () => resolve())); child.kill("SIGKILL"); await closed; lines.close();
-    app = await openScheduled(directory, "restored");
+    app = await openScheduled(directory, "restored", undefined, [], CRASH_RETRY);
     const tasks = await app.tasks.list(); assert.equal(tasks.length, 1);
     const original = tasks[0]; assert.ok(original); assert.deepEqual(original.pending, []);
     const originalConversation = await app.tasks.conversation(original.conversation_id);
