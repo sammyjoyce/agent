@@ -112,7 +112,6 @@ globalThis.fetch = async (input, options) => {
   ];
   const headers = { "content-type": "text/event-stream" };
   if (chunks === undefined) return new Response(events.map((event) => "data: " + JSON.stringify(event) + "\n\n").join(""), { headers });
-  // A streamed step sends each text delta interval_ms after the one before, as a model streams its answer.
   const interval = Number(step.interval_ms), encoder = new TextEncoder();
   return new Response(new ReadableStream({ async start(controller) {
     for (const event of events) {

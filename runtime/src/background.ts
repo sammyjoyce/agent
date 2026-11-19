@@ -61,8 +61,6 @@ function terminal(): NextTaskState<BackgroundCheckpoint, null> {
   return { status: "terminal", outcome: { status: "completed", result: null } };
 }
 function failure(error: unknown): string { return error instanceof Error ? error.message : "Background execution failed"; }
-/** Pi ends a task that crashes cut off `restartLimit` times in a row. The trigger
- * or lane that names it holds its work until an explicit retry replaces it. */
 function restartLimited(record: TaskRecord<JsonValue, JsonValue, JsonValue> | undefined): record is TaskRecord<BackgroundTaskInput, JsonValue, JsonValue> {
   if (record?.kind !== "agent.background" || record.state.status !== "terminal" || record.state.outcome.status !== "faulted") return false;
   const detail = record.state.outcome.error.detail;
@@ -100,7 +98,6 @@ export class BackgroundScheduler {
           await callbacks.ready?.(runtime.signal);
           runtime.signal.throwIfAborted();
           const input = task.input, observedAt = runtime.now();
-          // A timer that replaced one Pi ended at its restart limit plans from its trigger's saved cursor.
           const cursor = task.state.checkpoint.cursor ?? (await this.session.snapshot(State, context))?.triggers
             .find((trigger) => same(trigger.key, input.key) && trigger.generation === input.generation)?.cursor ?? null;
           let plan: OccurrencePlan;
@@ -338,8 +335,6 @@ export class BackgroundScheduler {
   private createTimerIn(tx: Tx, input: Extract<BackgroundTaskInput, { type: "trigger" }>): Promise<NativeTaskId<null>> {
     return tx.createTask(this.task, input, { ownership: { kind: "conversation" }, conversationId: ROOT_CONVERSATION_ID, background: true });
   }
-  /** Start the timers and lane work Pi ended at its restart limit again, from
-   * the same input. A timer keeps its trigger's cursor and catches up from it. */
   private async replaceRestartLimitedIn(tx: Tx, triggers: readonly Trigger[], lane: Lane | undefined): Promise<boolean> {
     let replaced = false;
     for (const trigger of triggers) {
@@ -430,7 +425,6 @@ export class BackgroundScheduler {
     for (const task of inspection.tasks) if (task.record.kind === "agent.background" && task.state.kind === "blocked") {
       blocked.set(task.record.id, task.state);
     }
-    // Live tasks are all in the inspection. Only an ended task still named by a trigger or lane needs a read.
     const live = new Set(inspection.tasks.map(task => task.record.id)), ended = new Set<NativeTaskId>();
     for (const id of new Set([...(state?.triggers ?? []).map(trigger => trigger.task), ...(state?.lanes ?? []).map(lane => lane.active)])) {
       if (id !== null && !live.has(id) && restartLimited(await this.session.getTask(id, BACKGROUND_CONTEXT))) ended.add(id);

@@ -12,7 +12,6 @@ const context = BACKGROUND_CONTEXT;
 const fixture = new URL("../../test/fixtures/failover-log-1.4.0/", import.meta.url);
 const fixtureJson = async (name: string): Promise<unknown> => JSON.parse(await readFile(new URL(name, fixture), "utf8"));
 
-/** Appends the log a Pi Durable 1.4.0 owner wrote, byte for byte, with the blobs it names. */
 async function writtenBy140(link: TestAuthority): Promise<LogEntry[]> {
   const entries = (await readFile(new URL("log.jsonl", fixture), "utf8")).trim().split("\n").map((line) => JSON.parse(line) as LogEntry);
   for (const name of await readdir(new URL("blobs/", fixture))) await link.putBlob(name, await readFile(new URL(`blobs/${name}`, fixture)));

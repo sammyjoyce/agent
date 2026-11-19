@@ -33,8 +33,7 @@ async function open(directory: string) {
   const session = await Harness.open(storage, { models: builtinModels(), registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
   const tasks = new TaskStore(session), sources = new SourceJournal(session, tasks, new Executions());
   const scheduler = new BackgroundScheduler(session, registry, tasks, {
-    // Calendar calculation is outside this regression. Pi owns the model run,
-    // its restart limit and the durable input the production job consumer settles.
+    // Calendar calculation is outside this regression.
     plan: async (_cadence, _after, now) => ({ due: null, next: now + 3_600_000 }),
     refreshSources: async () => {}, triageSources: async () => {}, collectResources: async () => {}, indexHistory: async () => {},
     runJob: (occurrence, signal, actorId) => runScheduled(occurrence, signal, { session, tasks, sources }, actorId),
@@ -47,7 +46,6 @@ test("job inspection leaves an actor without a current native run untouched", as
   try {
     await app.scheduler.syncJobs([job]);
     const receipt = await app.scheduler.runJob({ type: "run_job", job_id: job.id, schedule_id: null, request_id: "not-admitted" });
-    // Without an execution service the job's admitted input waits for its actor.
     await pump(async () => /execution is unavailable/.test((await app.scheduler.getJob(job.id)).schedules[0]?.error ?? ""));
     const actor = await app.tasks.get(receipt.task_id), conversation = await app.tasks.conversation(actor.conversation_id);
     const before = await app.session.snapshot(LiveDoc, conversation.id, BACKGROUND_CONTEXT);
@@ -79,8 +77,7 @@ for (const legacy of [false, true]) test(`a job run Pi ends at its restart limit
       return generation;
     }, BACKGROUND_CONTEXT);
     const generation = await placed(conversation, "manual:retained"), otherGeneration = await placed(other, "manual:other");
-    // Persist genuine native crash records while the Harness is paused: this
-    // job's run was cut off at Pi's restart limit, the other's sleeps until its retry.
+    // Persist genuine native crash records while the Harness is paused.
     for (const id of [generation, otherGeneration]) {
       const record = await app.session.getTask(id, BACKGROUND_CONTEXT); assert.ok(record);
       await commitWrites(app.storage, [{ type: "task", value: id === generation

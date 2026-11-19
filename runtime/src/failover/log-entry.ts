@@ -29,7 +29,6 @@ export function parseBatch(json: string, at: number): StorageWrite[] {
   return writes as StorageWrite[];
 }
 
-/** What Pi's storage did with one batch committed on its own: stored it at `seq`, or refused it by Pi's own checks. */
 export type BatchOutcome = { readonly kind: "stored"; readonly seq: Seq } | { readonly kind: "refused"; readonly reason: unknown };
 
 /**

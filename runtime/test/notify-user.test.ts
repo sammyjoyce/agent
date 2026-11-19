@@ -230,7 +230,6 @@ test("reopen completes a missing model projection without repeating the visible 
     const observed = original.observeCommits({ advance(publication) {
       if (publication.changes.some((change) => change.type === "entry" && isUserNotice(change.value))) displayed = true;
     }, end() {} });
-    // The process stops once the visible notice is stored, before its model context.
     original.commit = async (change, context, options) => {
       if (displayed) await original.close(BACKGROUND_CONTEXT);
       return commit(change, context, options);

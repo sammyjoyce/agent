@@ -12,7 +12,6 @@ const HeldNoticeContexts = defineDoc<State>({ kind: "agent.notice_context.held",
 
 function settled(): NextTaskState<Checkpoint, null> { return { status: "terminal", outcome: { status: "completed", result: null } }; }
 
-/** What main's model sees of a notice: the origin's assistant messages, saying `text`. */
 export function noticeContextModel(origin: EntryRecord | undefined, text: readonly string[]): NonNullable<EntryRecord["model"]> {
   return origin?.model?.flatMap((message) => message.role !== "assistant" ? []
     : [{ ...message, content: text.map((part) => ({ type: "text" as const, text: part })) }]) ?? [];
@@ -22,7 +21,6 @@ function admitIn(tx: Tx, root: Pick<Conversation, "submit">, requestId: string, 
   return root.submit(tx, { type: "write", requestId, entry: { kind: "agent.notice_context", model } });
 }
 
-/** Places held notice contexts in order, each once main has no run. */
 export const NoticeContextPlacement = defineTask<null, Checkpoint, null>({
   name: "agent.notice_context.place", version: 1, initial: () => ({ phase: "place", placed: null }),
   phases: {

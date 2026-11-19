@@ -259,7 +259,6 @@ test("reclaiming the input a restart-limited run left queued owns it without ano
     peer = bridge(directory);
     peer.send(1, { type: "set_connected_nodes", host_ids: [host] }); await peer.done(1);
     peer.send(2, { type: "main_input", input_id: "queued", input: "Do not replace the original saved input", mode: "steer" });
-    // The owner reports the reclaimed input again once it retains every saved input.
     const receipts = () => peer?.events(2).filter((event) => event.type === "input_accepted" && event.input_id === "queued") ?? [];
     await peer.wait(2, () => receipts().length === 2 || peer?.events(2).some((event) => event.type === "done") === true);
     assert.deepEqual(receipts(), [1, 2].map(() => ({ type: "input_accepted", input_id: "queued", work: { type: "queued" } })),

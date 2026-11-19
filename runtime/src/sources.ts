@@ -59,8 +59,6 @@ function sameEvent(left: SourceEvent, right: SourceEvent): boolean {
     left.source.thread_id === right.source.thread_id && left.title === right.title && left.text === right.text;
 }
 
-/** A triage run that waits on a task this runtime cannot run never finishes.
- * Pi owns tool recovery: unsafe interrupted effects settle without being replayed. */
 async function requireRunnableSourceRun(session: Harness, conversation: Conversation): Promise<void> {
   const run = (await session.snapshot(LiveDoc, conversation.id, BACKGROUND_CONTEXT))?.run;
   if (run === undefined) return;

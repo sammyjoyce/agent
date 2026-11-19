@@ -168,7 +168,6 @@ export async function openOwner(directory: string, link: AuthorityLink, options:
   catch (error) { await storage.close(BACKGROUND_CONTEXT).catch(() => {}); throw error; }
 }
 
-/** Stores `batches` in one call, as Pi's Session does: the result, and the sequence each stored batch received, in order. */
 export async function commitGroup(storage: Storage, batches: readonly (readonly StorageWrite[])[]): Promise<CommitResult & { readonly seqs: readonly Seq[] }> {
   const seqs: Seq[] = [];
   const result = await storage.commit(batches, (index, seq) => {
