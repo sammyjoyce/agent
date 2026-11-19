@@ -1,7 +1,7 @@
 import { taskMessageSender } from "./task-messages.js";
 import { validEvent } from "./protocol.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { JsonValue } from "@earendil-works/chord";
+import type { JsonValue } from "@earendil-works/chord/json";
 import type { AssistantMessage, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
 import { AssistantEntry, CompactionEntry, defineDocFamily, defineEntry, LiveDoc, ROOT_CONVERSATION_ID, type Conversation, type Cursor, type DocumentWatch, type EntryId, type EntryRecord,
   type DocumentReader, type Harness, type JsonObject, type LiveState } from "@earendil-works/pi-durable";
