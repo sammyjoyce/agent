@@ -133,6 +133,9 @@ recovery; [history](history.md) describes import and retrieval.
 
 ## Inputs and automation
 
+- [ ] **Sidechats** (inspired by Meta’s Muse): open a side conversation from a
+  message to explore a follow-up without interrupting the main chat. Return to
+  that message when done; bring an answer back only if you choose.
 - [x] Ship `/goal` for persistent objectives, visible progress, pause/resume and
   completion tied to a verified outcome. A goal completes only when the runtime
   itself finds the required text in a file on the task's host.
