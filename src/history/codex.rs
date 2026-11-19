@@ -1858,6 +1858,7 @@ mod tests {
     use serde_json::Value;
 
     use crate::{
+        TEST_HANG_LIMIT,
         history::{
             HistoryGapCode, HistoryRequest, HistoryResponse, HistorySource,
             codex::{CodexHistory, NativeEntry, NativeThread, PAGE_BYTES, ReadCursor, digest},
@@ -2076,7 +2077,7 @@ try{
             )
             .await
             .unwrap();
-        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+        let output = tokio::time::timeout(TEST_HANG_LIMIT, child.wait_with_output())
             .await
             .unwrap()
             .unwrap();
@@ -2159,7 +2160,7 @@ try{
         let source = fixture(directory.path(), &provider_fixture(vec![]));
         std::fs::write(directory.path().join("block"), b"block").unwrap();
         let control = async {
-            let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            let pid = tokio::time::timeout(TEST_HANG_LIMIT, async {
                 loop {
                     if let Ok(calls) = std::fs::read_to_string(directory.path().join("calls"))
                         && let Some(call) = calls
@@ -2904,7 +2905,7 @@ try{
                     .await
             })
         };
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_HANG_LIMIT, async {
             loop {
                 if std::fs::read_to_string(directory.path().join("calls"))
                     .is_ok_and(|calls| calls.contains("thread/list"))
@@ -3014,7 +3015,7 @@ try{
             ),
         );
         let control = async {
-            let blocked_pid = tokio::time::timeout(Duration::from_secs(5), async {
+            let blocked_pid = tokio::time::timeout(TEST_HANG_LIMIT, async {
                 loop {
                     if let Ok(calls) = std::fs::read_to_string(directory.path().join("calls")) {
                         for call in calls
@@ -3218,7 +3219,7 @@ try{
             )
             .await
             .unwrap();
-        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+        let output = tokio::time::timeout(TEST_HANG_LIMIT, child.wait_with_output())
             .await
             .unwrap()
             .unwrap();
@@ -3674,7 +3675,7 @@ try{
             )
             .await
             .unwrap();
-        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+        let output = tokio::time::timeout(TEST_HANG_LIMIT, child.wait_with_output())
             .await
             .unwrap()
             .unwrap();

@@ -172,6 +172,7 @@ fn parse(bytes: &[u8]) -> Option<Response> {
 
 #[cfg(test)]
 mod tests {
+    use crate::TEST_HANG_LIMIT;
     use crate::callback::{CallbackRelay, parse};
     use crate::serialized_spawn::SerializedSpawn;
     use std::{io::ErrorKind, net::SocketAddr, time::Duration};
@@ -211,7 +212,7 @@ mod tests {
 
     async fn response_and_close(stream: &mut TcpStream) -> String {
         let mut response = String::new();
-        timeout(Duration::from_secs(1), stream.read_to_string(&mut response))
+        timeout(TEST_HANG_LIMIT, stream.read_to_string(&mut response))
             .await
             .unwrap()
             .unwrap();
@@ -220,7 +221,7 @@ mod tests {
     }
 
     async fn assert_listener_closed(address: SocketAddr) {
-        let error = timeout(Duration::from_secs(1), TcpStream::connect(address))
+        let error = timeout(TEST_HANG_LIMIT, TcpStream::connect(address))
             .await
             .unwrap()
             .unwrap_err();
@@ -231,7 +232,7 @@ mod tests {
         let mut browser = TcpStream::connect(address).await.unwrap();
         browser.write_all(format!("GET /auth/callback?code={code}&state=expected HTTP/1.1\r\nHost:127.0.0.1:1455\r\n\r\n").as_bytes())
             .await.unwrap();
-        let target = timeout(Duration::from_secs(1), relay.next())
+        let target = timeout(TEST_HANG_LIMIT, relay.next())
             .await
             .unwrap()
             .unwrap();
@@ -285,7 +286,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            timeout(Duration::from_secs(1), relay.next())
+            timeout(TEST_HANG_LIMIT, relay.next())
                 .await
                 .unwrap()
                 .unwrap(),

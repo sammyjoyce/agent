@@ -799,6 +799,7 @@ impl<R: AsyncBufRead + Unpin> FrameReader<R> {
 
 #[cfg(test)]
 mod tests {
+    use crate::TEST_HANG_LIMIT;
     use crate::runtime::{FrameReader, MAX_FRAME_BYTES};
     use std::time::Duration;
     use tokio::io::{AsyncWriteExt, BufReader};
@@ -836,7 +837,7 @@ setInterval(()=>{},1000);
             )
             .unwrap();
             let reported = state.path().join("apns");
-            let seen = timeout(Duration::from_secs(10), async {
+            let seen = timeout(TEST_HANG_LIMIT, async {
                 loop {
                     if let Ok(text) = std::fs::read_to_string(&reported)
                         && !text.is_empty()
@@ -921,13 +922,13 @@ process.stdin.on('data',chunk=>{
                 })
                 .await
         });
-        let observed = timeout(Duration::from_secs(2), first.events.recv()).await;
+        let observed = timeout(TEST_HANG_LIMIT, first.events.recv()).await;
         if observed.is_err() {
             submission.abort();
         }
         let following = if observed.is_ok() {
             let mut call = runtime.request(RuntimeCommand::Status).await.unwrap();
-            Some(timeout(Duration::from_secs(3), async {
+            Some(timeout(TEST_HANG_LIMIT, async {
                 assert!(matches!(call.events.recv().await, Some(RuntimeEventKind::Configured)));
                 let call_id = match call.events.recv().await { Some(RuntimeEventKind::HostCall { call_id, .. }) => call_id,
                     _ => panic!("The native owner did not request its host result") };
@@ -943,7 +944,7 @@ process.stdin.on('data',chunk=>{
         let submitted = submission.await;
         let completed = match submitted {
             Ok(Ok(mut call)) => Some(
-                timeout(Duration::from_secs(2), async {
+                timeout(TEST_HANG_LIMIT, async {
                     (call.events.recv().await, call.events.recv().await)
                 })
                 .await,
@@ -1046,7 +1047,7 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
                 .await
         });
         assert!(
-            matches!(timeout(Duration::from_secs(2), first.events.recv()).await.unwrap(),
+            matches!(timeout(TEST_HANG_LIMIT, first.events.recv()).await.unwrap(),
             Some(RuntimeEventKind::Notice { text, .. }) if text == "partial command is waiting")
         );
         let log = state.path().join("diagnostics/runtime.jsonl");
@@ -1074,7 +1075,7 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
         assert!(matches!(submission.await, Err(error) if error.is_cancelled()));
         std::fs::write(state.path().join("release"), "Complete the same frame").unwrap();
         let mut release_observed = false;
-        let completed = timeout(Duration::from_secs(2), async {
+        let completed = timeout(TEST_HANG_LIMIT, async {
             assert!(matches!(first.events.recv().await,
                 Some(RuntimeEventKind::Notice { text, .. }) if text == "release marker consumed"));
             release_observed = true;
@@ -1146,9 +1147,7 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
             .await
             .unwrap();
         assert!(matches!(
-            timeout(Duration::from_secs(2), first.events.recv())
-                .await
-                .unwrap(),
+            timeout(TEST_HANG_LIMIT, first.events.recv()).await.unwrap(),
             Some(RuntimeEventKind::Notice { .. })
         ));
         assert!(
@@ -1186,7 +1185,7 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
             .unwrap()
             .parse()
             .unwrap();
-        timeout(Duration::from_secs(6), runtime.close())
+        timeout(TEST_HANG_LIMIT, runtime.close())
             .await
             .unwrap()
             .unwrap();
@@ -1305,7 +1304,7 @@ createInterface({input:process.stdin}).on('line',line=>{
             .await
             .unwrap();
         let request_id = call.request_id;
-        timeout(Duration::from_secs(3), async {
+        timeout(TEST_HANG_LIMIT, async {
             loop {
                 match call.events.recv().await.unwrap() {
                     RuntimeEventKind::HostCall { call_id, command } => {
@@ -1384,14 +1383,14 @@ createInterface({input:process.stdin}).on('line',line=>{
             .await
             .unwrap();
         let history_request = history.request_id;
-        timeout(Duration::from_secs(3), async {
+        timeout(TEST_HANG_LIMIT, async {
             while !matches!(history.events.recv().await.unwrap(), RuntimeEventKind::Done) {}
         })
         .await
         .unwrap();
         runtime.close().await.unwrap();
         let path = state.path().join("diagnostics/runtime.jsonl");
-        let (text, records) = timeout(Duration::from_secs(3), async {
+        let (text, records) = timeout(TEST_HANG_LIMIT, async {
             loop {
                 let text = std::fs::read_to_string(&path).unwrap_or_default();
                 let complete = text.rsplit_once('\n').map_or("", |(complete, _)| complete);
@@ -1563,7 +1562,7 @@ createInterface({input:process.stdin}).on('line',line=>{
         .unwrap();
         for _ in 0..3 {
             let mut call = runtime.request(RuntimeCommand::Status).await.unwrap();
-            timeout(Duration::from_secs(3), async {
+            timeout(TEST_HANG_LIMIT, async {
                 assert!(matches!(
                     call.events.recv().await,
                     Some(RuntimeEventKind::Configured)

@@ -739,6 +739,7 @@ mod tests {
     mod ownership;
     mod scrawl_feedback;
     mod startup;
+    use crate::TEST_HANG_LIMIT;
     use crate::protocol::{AuthStatus, HostResult, InputMode, RuntimeCommand, RuntimeEventKind};
     use crate::runtime::{FrameReader, OwnerClaim, Runtime, ShutdownSignal};
     use crate::service::{
@@ -1002,7 +1003,7 @@ mod tests {
         }
 
         async fn client(&self) -> UnixStream {
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + TEST_HANG_LIMIT;
             loop {
                 match connect(self.directory.path()).await {
                     Ok(stream) => return stream,
@@ -1016,7 +1017,7 @@ mod tests {
 
         async fn stop(self) {
             self.stop.send(()).unwrap();
-            timeout(Duration::from_secs(5), self.task)
+            timeout(TEST_HANG_LIMIT, self.task)
                 .await
                 .unwrap()
                 .unwrap()
@@ -1026,7 +1027,7 @@ mod tests {
 
         async fn wait_for(&self, filename: &str) -> PathBuf {
             let path = self.directory.path().join(filename);
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + TEST_HANG_LIMIT;
             while !path.exists() {
                 assert!(
                     Instant::now() < deadline,
@@ -1054,7 +1055,7 @@ mod tests {
             let mut reader = FrameReader::new(BufReader::new(socket));
             let mut sources = 0;
             loop {
-                let bytes = timeout(Duration::from_secs(3), reader.next_frame())
+                let bytes = timeout(TEST_HANG_LIMIT, reader.next_frame())
                     .await
                     .unwrap()
                     .unwrap()
@@ -1263,13 +1264,13 @@ mod tests {
                 task,
             } = service;
             stop.send(()).unwrap();
-            timeout(Duration::from_secs(5), task)
+            timeout(TEST_HANG_LIMIT, task)
                 .await
                 .unwrap()
                 .unwrap()
                 .unwrap();
             let after = now();
-            let records = timeout(Duration::from_secs(3), async {
+            let records = timeout(TEST_HANG_LIMIT, async {
                 loop {
                     let text =
                         fs::read_to_string(directory.path().join("diagnostics/runtime.jsonl"))
@@ -1352,7 +1353,7 @@ mod tests {
             stream.shutdown().await.unwrap();
         }
         let mut bytes = Vec::new();
-        timeout(Duration::from_secs(3), stream.read_to_end(&mut bytes))
+        timeout(TEST_HANG_LIMIT, stream.read_to_end(&mut bytes))
             .await
             .unwrap()
             .unwrap();
@@ -1430,7 +1431,7 @@ mod tests {
         write_frame(&mut slow, &RuntimeCommand::Login)
             .await
             .unwrap();
-        let completed = timeout(Duration::from_secs(10), async {
+        let completed = timeout(TEST_HANG_LIMIT, async {
             service.wait_for("login-id").await;
             let first = service.client().await;
             let second = service.client().await;
@@ -1497,7 +1498,7 @@ mod tests {
 
     async fn disconnected_reply(directory: &std::path::Path, call: &str) {
         let path = directory.join(format!("{call}.json"));
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + TEST_HANG_LIMIT;
         while !path.exists() {
             assert!(Instant::now() < deadline, "{call} was not failed promptly");
             sleep(Duration::from_millis(5)).await;
@@ -1638,7 +1639,7 @@ mod tests {
         .await
         .unwrap();
         disconnected_reply(directory.path(), "history-2").await;
-        timeout(Duration::from_secs(5), handled)
+        timeout(TEST_HANG_LIMIT, handled)
             .await
             .unwrap()
             .unwrap()
@@ -1741,7 +1742,7 @@ mod tests {
         );
         reader.next_frame().await.unwrap().unwrap();
         writer.shutdown().await.unwrap();
-        let done = timeout(Duration::from_secs(1), reader.next_frame())
+        let done = timeout(TEST_HANG_LIMIT, reader.next_frame())
             .await
             .unwrap()
             .unwrap()
@@ -1855,7 +1856,7 @@ mod tests {
             .unwrap();
         let (client_read, client_write) = client.into_split();
         let mut client_read = FrameReader::new(BufReader::new(client_read));
-        let (from_worker, first) = timeout(Duration::from_secs(3), async {
+        let (from_worker, first) = timeout(TEST_HANG_LIMIT, async {
             tokio::select! {
                 frame = worker_read.next_frame() => (true, frame),
                 frame = client_read.next_frame() => (false, frame),
@@ -1978,7 +1979,7 @@ mod tests {
         let mut reader = FrameReader::new(BufReader::new(client));
         let mut frames = Vec::new();
         loop {
-            let frame = timeout(Duration::from_secs(3), reader.next_frame())
+            let frame = timeout(TEST_HANG_LIMIT, reader.next_frame())
                 .await
                 .unwrap()
                 .unwrap()
@@ -2033,7 +2034,7 @@ mod tests {
         } = service;
         drop(stop);
         assert!(
-            timeout(Duration::from_secs(3), task)
+            timeout(TEST_HANG_LIMIT, task)
                 .await
                 .unwrap()
                 .unwrap()
@@ -2056,7 +2057,7 @@ mod tests {
             .await
             .unwrap();
         let mut worker = FrameReader::new(BufReader::new(worker));
-        let frame = timeout(Duration::from_secs(3), watcher.next_frame())
+        let frame = timeout(TEST_HANG_LIMIT, watcher.next_frame())
             .await
             .unwrap()
             .unwrap()
@@ -2177,7 +2178,7 @@ mod tests {
             #[serde(other)]
             Other,
         }
-        timeout(Duration::from_secs(2), async {
+        timeout(TEST_HANG_LIMIT, async {
             loop {
                 let saved = fs::read_to_string(directory.path().join("diagnostics/runtime.jsonl")).unwrap_or_default();
                 if saved.lines().any(|line| matches!(serde_json::from_str::<Receipt>(line).unwrap(), Receipt::PeerRejected { peer, reason } if peer == denied_peer && reason == "Rejected synthetic peer")) { break; }

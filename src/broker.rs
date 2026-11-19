@@ -560,6 +560,7 @@ fn unavailable() -> HostResult {
 mod tests {
     mod delivery;
     use crate::{
+        TEST_HANG_LIMIT,
         broker::Broker,
         models::ModelSelection,
         protocol::{
@@ -681,16 +682,13 @@ mod tests {
         }
         async fn close(self) {
             drop((self.reader, self.writer));
-            let _ = timeout(Duration::from_secs(2), self.task)
-                .await
-                .unwrap()
-                .unwrap();
+            let _ = timeout(TEST_HANG_LIMIT, self.task).await.unwrap().unwrap();
         }
     }
     async fn event(
         reader: &mut FrameReader<BufReader<ReadHalf<DuplexStream>>>,
     ) -> RuntimeEventKind {
-        let frame = timeout(Duration::from_secs(2), reader.next_frame())
+        let frame = timeout(TEST_HANG_LIMIT, reader.next_frame())
             .await
             .unwrap()
             .unwrap()
@@ -867,9 +865,7 @@ mod tests {
                 },
             },
         ] {
-            let result = match timeout(Duration::from_secs(2), broker.execute(browser(action)))
-                .await
-            {
+            let result = match timeout(TEST_HANG_LIMIT, broker.execute(browser(action))).await {
                 Ok(result) => result,
                 Err(_) => {
                     worker.close().await;
@@ -1089,7 +1085,7 @@ mod tests {
                 },
             },
         };
-        let refused = timeout(Duration::from_secs(2), broker.execute(screenshot(legacy)))
+        let refused = timeout(TEST_HANG_LIMIT, broker.execute(screenshot(legacy)))
             .await
             .expect("An old worker's screenshot must fail before reaching its effect stream");
         assert!(
@@ -1248,7 +1244,7 @@ mod tests {
         ));
         let mut new = Worker::connect(broker.clone(), runtime.clone(), id).await;
         assert!(
-            matches!(timeout(Duration::from_secs(2),first).await.unwrap().unwrap(),HostResult::Failed { message, .. } if message.contains("not replayed"))
+            matches!(timeout(TEST_HANG_LIMIT,first).await.unwrap().unwrap(),HostResult::Failed { message, .. } if message.contains("not replayed"))
         );
         old.close().await;
         let next = {
@@ -1475,7 +1471,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            timeout(Duration::from_secs(2), task)
+            timeout(TEST_HANG_LIMIT, task)
                 .await
                 .unwrap()
                 .unwrap()

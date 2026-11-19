@@ -1,6 +1,7 @@
 use std::{os::fd::AsRawFd, sync::Arc, time::Duration};
 
 use crate::{
+    TEST_HANG_LIMIT,
     broker::Broker,
     protocol::{HostResult, RuntimeCommand},
     runtime::{OwnerClaim, Runtime},
@@ -62,7 +63,7 @@ async fn reset_client_does_not_cancel_admitted_owned_work() {
         let mut command = serde_json::to_vec(&RuntimeCommand::Logout).unwrap();
         command.push(b'\n');
         client.write_all(&command).await.unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_LIMIT;
         while !directory.path().join("started").exists() {
             assert!(Instant::now() < deadline);
             sleep(Duration::from_millis(10)).await;
@@ -89,7 +90,7 @@ async fn reset_client_does_not_cancel_admitted_owned_work() {
         // expose a zero-byte receipt while writeFileSync is still publishing it.
         (&mut handler).await
     };
-    let observed = timeout(Duration::from_secs(8), observe).await;
+    let observed = timeout(TEST_HANG_LIMIT, observe).await;
     if observed.is_err() {
         handler.abort();
         let _ = handler.await;

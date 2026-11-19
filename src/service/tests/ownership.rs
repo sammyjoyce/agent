@@ -1,5 +1,6 @@
 use super::{Running, ShutdownReason, attached_command, write_frame};
 use crate::{
+    TEST_HANG_LIMIT,
     protocol::{HostResult, RuntimeCommand, RuntimeEventKind},
     runtime::FrameReader,
 };
@@ -35,7 +36,7 @@ impl WriteGate {
     }
 
     async fn started(&mut self) {
-        timeout(Duration::from_secs(5), async {
+        timeout(TEST_HANG_LIMIT, async {
             while self.bytes.is_empty() {
                 self.read_available();
                 sleep(Duration::from_millis(5)).await;
@@ -114,7 +115,7 @@ async fn noninteractive_worker_interrupt_reaches_its_own_request() {
     write_frame(&mut writer, &RuntimeCommand::Interrupt)
         .await
         .unwrap();
-    let completed = timeout(Duration::from_secs(1), async {
+    let completed = timeout(TEST_HANG_LIMIT, async {
         loop {
             let event: RuntimeEventKind =
                 serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
@@ -174,7 +175,7 @@ async fn a_client_host_reply_is_rejected_and_cannot_answer_an_effect_the_service
     .await
     .unwrap();
     let mut rest = Vec::new();
-    timeout(Duration::from_secs(3), reader.read_to_end(&mut rest))
+    timeout(TEST_HANG_LIMIT, reader.read_to_end(&mut rest))
         .await
         .expect("The service must close a client that sends a host reply")
         .unwrap();
@@ -252,7 +253,7 @@ async fn observers_cannot_submit_input_through_their_connection() {
     .await
     .unwrap();
     let mut bytes = Vec::new();
-    timeout(Duration::from_secs(3), reader.read_to_end(&mut bytes))
+    timeout(TEST_HANG_LIMIT, reader.read_to_end(&mut bytes))
         .await
         .unwrap()
         .unwrap();
@@ -287,7 +288,7 @@ async fn shutdown_waits_for_an_inflight_write_and_records_its_real_receipt() {
     let completed = match early {
         Ok(result) => result,
         Err(_) => tokio::select! {
-            result = timeout(Duration::from_secs(5), task) => result.unwrap(),
+            result = timeout(TEST_HANG_LIMIT, task) => result.unwrap(),
             () = gate.collect() => unreachable!(),
         },
     };
@@ -330,7 +331,7 @@ async fn ordinary_requests_preserve_more_than_32_concurrent_effects() {
     gate.started().await;
     let mut reader = FrameReader::new(BufReader::new(client));
     tokio::select! {
-        result = timeout(Duration::from_secs(10), async {
+        result = timeout(TEST_HANG_LIMIT, async {
             loop {
                 let event: RuntimeEventKind = serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
                 if matches!(event, RuntimeEventKind::Done) { return; }
