@@ -7,7 +7,7 @@ import type { JsonObject } from "@earendil-works/pi-ai";
 import type { FailoverSession } from "../../src/generated/FailoverSession.js";
 
 export type ModelStep = { text: string } | { tool: string; args: JsonObject; commentary?: string } |
-  { code: string; commentary?: string } | { hold_and_write_pid: string };
+  { code: string; commentary?: string } | { hold_and_write_pid: string } | { stream: string[]; interval_ms: number };
 export type ModelQueue = Record<string, ModelStep[]>;
 type ResponseItem = { id: string; type: "message"; role: "assistant"; status: "completed"; phase?: "commentary";
   content: [{ type: "output_text"; text: string; annotations: [] }] } |
@@ -66,7 +66,9 @@ globalThis.fetch = async (input, options) => {
   const declared = new Map([...(Array.isArray(body.tools) ? body.tools : []), ...updates].flatMap((tool: unknown) =>
     object(tool) && typeof tool.name === "string" ? [[tool.name, tool.type] as const] : []));
   const codemode = declared.get("codemode");
-  if (typeof step.text === "string") item = { id, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: step.text, annotations: [] }] };
+  const chunks = Array.isArray(step.stream) ? step.stream.map((chunk: unknown) => { assert.equal(typeof chunk, "string"); return String(chunk); }) : undefined;
+  const answer = chunks?.join("") ?? step.text;
+  if (typeof answer === "string") item = { id, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: answer, annotations: [] }] };
   else if (typeof step.code === "string") {
     assert.ok(codemode !== undefined, "A scripted program needs the codemode tool");
     item = codemodeCall(id, step.code, codemode);
@@ -86,7 +88,7 @@ globalThis.fetch = async (input, options) => {
         ...(item.type === "message" ? { content: [] } : item.type === "custom_tool_call" ? { input: "" } : { arguments: "" }) } },
       ...(item.type === "message" ? [
         { type: "response.content_part.added", item_id: item.id, output_index, content_index: 0, part: { type: "output_text", text: "", annotations: [] } },
-        { type: "response.output_text.delta", item_id: item.id, output_index, content_index: 0, delta: item.content[0].text },
+        ...(chunks ?? [item.content[0].text]).map((delta) => ({ type: "response.output_text.delta", item_id: item.id, output_index, content_index: 0, delta })),
         { type: "response.output_text.done", item_id: item.id, output_index, content_index: 0, text: item.content[0].text },
       ] : item.type === "custom_tool_call" ? [
         { type: "response.custom_tool_call_input.delta", item_id: item.id, output_index, delta: item.input },
@@ -101,6 +103,16 @@ globalThis.fetch = async (input, options) => {
       input_tokens: 1, output_tokens: 1, total_tokens: 2, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 },
     } } },
   ];
-  return new Response(events.map((event) => "data: " + JSON.stringify(event) + "\n\n").join(""), { headers: { "content-type": "text/event-stream" } });
+  const headers = { "content-type": "text/event-stream" };
+  if (chunks === undefined) return new Response(events.map((event) => "data: " + JSON.stringify(event) + "\n\n").join(""), { headers });
+  // A streamed step sends each text delta interval_ms after the one before, as a model streams its answer.
+  const interval = Number(step.interval_ms), encoder = new TextEncoder();
+  return new Response(new ReadableStream({ async start(controller) {
+    for (const event of events) {
+      if (event.type === "response.output_text.delta") await new Promise((resolve) => setTimeout(resolve, interval));
+      controller.enqueue(encoder.encode("data: " + JSON.stringify(event) + "\n\n"));
+    }
+    controller.close();
+  } }), { headers });
 };
 await import("../../src/bridge.js");
