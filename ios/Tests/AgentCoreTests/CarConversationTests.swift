@@ -95,6 +95,7 @@ private func takes(_ takes: [String]) -> ScriptedSpeech.Script {
 @MainActor private func withCar(
   _ script: ScriptedSpeech.Script, carplay: Bool = true, timings: CarTimings = .quick,
   protectedDataAvailable: @escaping @MainActor () -> Bool = { true },
+  engine wrap: (SpeechEngine) -> SpeechEngine = { $0 },
   _ body: (CarRig) async throws -> Void
 ) async throws {
   try await withTwoFixtures { coordinators, workPeer, _, _ in
@@ -103,7 +104,7 @@ private func takes(_ takes: [String]) -> ScriptedSpeech.Script {
     let (work, _) = try await addWorkAndPersonal(coordinators)
     await coordinators.setActive(false)
     let speech = ScriptedSpeech(script)
-    let engine = speech.engine
+    let engine = wrap(speech.engine)
     let spoken = SpokenLines()
     let car = CarConversation(
       coordinators: coordinators, engine: engine, speaker: spoken.speaker,
@@ -244,6 +245,76 @@ func cancelEndsATakeAtOnceWhileItsWordsAreStillComing() async throws {
     try await eventually("the phone's words land") { phone.take == nil }
     #expect(rig.spoken.lines == ["Talking to Work."])
     #expect(await rig.submitted().isEmpty)
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func sendConfirmsWhileTheConfirmationWordsAreStillComing() async throws {
+  try await withCar(takes([deploy, "Perhaps.", ""])) { rig in
+    await rig.peer.answerEachSubmit(finished)
+    rig.spoken.holding = "Send to"
+    rig.car.begin(with: rig.work)
+    try await eventually("the read-back") { rig.spoken.lines.count == 2 }
+    rig.speech.hold()
+    defer { rig.speech.release() }
+    rig.spoken.holding = nil
+    try await eventually("the confirmation's words are coming") {
+      rig.car.phase == .confirming && rig.speech.heldFinishes == 1
+    }
+    rig.car.perform(.send, in: .confirming)
+    rig.speech.release()
+    try await rig.ended(saying: 3)
+    #expect(await rig.submitted().map(\.text) == [deploy])
+    #expect(rig.spoken.lines.last == finished)
+  }
+}
+
+/// Holds the second take's finish with its capture still open, as Parakeet listens 200 ms more
+/// before it stops capture.
+@MainActor private final class ConfirmationTail {
+  private var finishes = 0
+  private var waiting: CheckedContinuation<Void, Never>?
+  var isWaiting: Bool { waiting != nil }
+
+  func wrap(_ engine: SpeechEngine) -> SpeechEngine {
+    SpeechEngine(
+      model: engine.model, install: engine.install, prewarm: engine.prewarm, remove: engine.remove,
+      diskUsage: engine.diskUsage, onCellular: engine.onCellular, permission: engine.permission,
+      requestPermission: engine.requestPermission,
+      record: {
+        let recording = try await engine.record()
+        return Recording(
+          events: recording.events, finish: { try await self.finish(recording) },
+          cancel: recording.cancel)
+      })
+  }
+
+  func release() {
+    waiting?.resume()
+    waiting = nil
+  }
+
+  private func finish(_ recording: Recording) async throws -> String {
+    finishes += 1
+    if finishes == 2 { await withCheckedContinuation { waiting = $0 } }
+    return try await recording.finish()
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func anInterruptionWhileTheConfirmationWordsAreComingSendsNothing() async throws {
+  let tail = ConfirmationTail()
+  try await withCar(takes([deploy, "Yes.", ""]), engine: tail.wrap) { rig in
+    await rig.peer.answerEachSubmit(finished)
+    rig.car.begin(with: rig.work)
+    defer { tail.release() }
+    try await eventually("the confirmation's words are coming") { tail.isWaiting }
+    rig.speech.interrupt()
+    try await rig.ended(saying: 2)
+    tail.release()
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(await rig.submitted().isEmpty)
+    #expect(rig.spoken.lines == ["Talking to Work.", "Send to Work: \(deploy)?"])
   }
 }
 

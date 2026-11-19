@@ -326,16 +326,26 @@ public final class CarConversation {
   }
 
   /// The take's words once `finish` returns them. Ending the conversation abandons them at once,
-  /// since `finish` can wait for a model that is still compiling.
+  /// since `finish` can wait for a model that is still compiling. Send and an interruption count
+  /// while the words are coming, as they do while listening.
   private func transcription(of recording: Recording, in step: inout Step) async throws -> Heard {
     let inbox = step.inbox
     Task { inbox.yield(.transcribed(try? await recording.finish())) }
     while let signal = await step.signals.next(isolation: #isolation) {
-      guard case .transcribed(let words) = signal else { continue }
-      guard let heard = words?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+      switch signal {
+      case .transcribed(let words):
+        guard let heard = words?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+          return .interrupted
+        }
+        return heard.isEmpty ? .silence : .words(heard)
+      case .press(.send):
+        recording.cancel()
+        return .pressed
+      case .heard(.interrupted):
+        recording.cancel()
         return .interrupted
+      case .press, .heard, .captureEnded, .tick, .spoken: continue
       }
-      return heard.isEmpty ? .silence : .words(heard)
     }
     recording.cancel()
     throw CancellationError()
