@@ -3,7 +3,7 @@ import test from "node:test";
 import { decide } from "../src/failover/authority-core.js";
 import type { AuthorityCommand } from "../src/generated/AuthorityCommand.js";
 import type { AuthorityRecord } from "../src/generated/AuthorityRecord.js";
-import { cellCheckpoint, cellCommand, cellLog, cells, cellStates, digests, entry, holders, manifest, scriptedSequences, tarantula, type Outcome, type Script } from "./fixtures/failover-authority-cells.js";
+import { cellCheckpoint, cellCommand, cellLog, cells, cellStates, digests, entry, holders, manifest, scriptedSequences, primaryHolder, type Outcome, type Script } from "./fixtures/failover-authority-cells.js";
 
 interface World {
   readonly record: AuthorityRecord | undefined;
@@ -128,7 +128,7 @@ test("every state, operation and caller cell gives its documented answer", () =>
   const operations = new Set<string>(["enroll", "claim", "append", "confirm", "checkpoint", "promote", "release", "activate"] satisfies AuthorityCommand["op"][]);
   assert.deepEqual(new Set(Object.keys(cells).map((name) => name.split(" ")[0])), operations, "the table misses an operation");
   for (const [name, [none, ...enrolled]] of Object.entries(cells)) {
-    assert.equal(outcome(undefined, name, tarantula), none, `${name} before enrollment`);
+    assert.equal(outcome(undefined, name, primaryHolder), none, `${name} before enrollment`);
     cellStates.forEach((state, index) => {
       assert.deepEqual(holders.map((caller) => outcome({ state, checkpoint: cellCheckpoint }, name, caller)), enrolled[index],
         `${name} on ${state.kind} by the old owner, the candidate and a third holder`);

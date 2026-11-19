@@ -10,7 +10,7 @@ import { commandHolder } from "../src/failover/authority-wire.js";
 import type { AuthorityCommand } from "../src/generated/AuthorityCommand.js";
 import type { AuthorityReply } from "../src/generated/AuthorityReply.js";
 import type { LogEntry } from "../src/generated/LogEntry.js";
-import { cellCheckpoint, cellCommand, cellLog, cells, cellStates, digested, digests, entry, holders, manifest, manifestBytes, orion, scriptedSequences, tarantula,
+import { cellCheckpoint, cellCommand, cellLog, cells, cellStates, digested, digests, entry, holders, manifest, manifestBytes, standbyHolder, scriptedSequences, primaryHolder,
   type Outcome, type Script } from "./fixtures/failover-authority-cells.js";
 import { startAuthority } from "./fixtures/failover-workerd.js";
 
@@ -18,11 +18,11 @@ const coordinatorIds = Array.from({ length: 140 }, (_, index) => `00000000-0000-
 const readOnlyCoordinator = coordinatorIds[0]!;
 const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 const outcome = (reply: AuthorityReply): Outcome => reply.result === "accepted" ? "accepted" : reply.reason;
-const enroll: AuthorityCommand = { op: "enroll", holder: tarantula, checkpoint: { through: 0, manifest } };
-/** An append by tarantula. `content` picks one of several entries for the position, and the other fields replace the entry's own. */
+const enroll: AuthorityCommand = { op: "enroll", holder: primaryHolder, checkpoint: { through: 0, manifest } };
+/** An append by primaryHolder. `content` picks one of several entries for the position, and the other fields replace the entry's own. */
 function append(at: number, change: Partial<Omit<LogEntry, "digest">> & { content?: string } = {}, epoch = 1): Extract<AuthorityCommand, { op: "append" }> {
   const { content = digests[0], ...fields } = change;
-  return { op: "append", holder: tarantula, entry: digested({ ...entry(epoch, at, content), ...fields }) };
+  return { op: "append", holder: primaryHolder, entry: digested({ ...entry(epoch, at, content), ...fields }) };
 }
 const batchOf = (bytes: number) => JSON.stringify(["x".repeat(bytes - 4)]);
 const status = (expected: number, type: typeof AuthorityRejected | typeof AuthorityDenied) => (error: unknown) =>
@@ -36,7 +36,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
   let used = 1;
   const token = (coordinator: string, holder: string | null) =>
     authority.credentials.find((credential) => credential.coordinator === coordinator && credential.holder === holder)!.token;
-  const link = (coordinator: string, holder: string | null = tarantula) =>
+  const link = (coordinator: string, holder: string | null = primaryHolder) =>
     new AuthorityClient({ url: authority.url, coordinatorId: coordinator, token: token(coordinator, holder) });
   const bare = () => coordinatorIds[used++] ?? assert.fail("the test ran out of coordinator ids");
   const fresh = async () => {
@@ -64,14 +64,14 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
 
   await t.test("every cell of the rules' table gives the same answer through HTTP", async () => {
     const active: Script = [
-      [{ op: "enroll", holder: tarantula, checkpoint: cellCheckpoint }, "accepted"],
-      [{ op: "claim", holder: tarantula, expected_epoch: 1 }, "accepted"],
-      [{ op: "claim", holder: tarantula, expected_epoch: 2 }, "accepted"],
+      [{ op: "enroll", holder: primaryHolder, checkpoint: cellCheckpoint }, "accepted"],
+      [{ op: "claim", holder: primaryHolder, expected_epoch: 1 }, "accepted"],
+      [{ op: "claim", holder: primaryHolder, expected_epoch: 2 }, "accepted"],
       [append(1, { content: digests[0] }, 3), "accepted"],
       [append(2, { content: digests[1] }, 3), "accepted"],
     ];
-    const sealed: Script = [...active, [{ op: "promote", candidate: orion, expected_epoch: 3, attestation: null }, "accepted"]];
-    const vacant: Script = [...sealed, [{ op: "release", holder: tarantula, epoch: 3, evidence: "released" }, "accepted"]];
+    const sealed: Script = [...active, [{ op: "promote", candidate: standbyHolder, expected_epoch: 3, attestation: null }, "accepted"]];
+    const vacant: Script = [...sealed, [{ op: "release", holder: primaryHolder, epoch: 3, evidence: "released" }, "accepted"]];
     const setups = [active, sealed, vacant];
     const answer = async (setup: Script | undefined, name: string, caller: string) => {
       const coordinator = await fresh();
@@ -86,7 +86,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
     const observed: Record<string, unknown> = {};
     for (const name of Object.keys(cells)) {
       observed[name] = [
-        await answer(undefined, name, tarantula),
+        await answer(undefined, name, primaryHolder),
         ...await Promise.all(setups.map((setup) => Promise.all(holders.map((caller) => answer(setup, name, caller))))),
       ];
     }
@@ -132,7 +132,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
     await play(coordinator, [[enroll, "accepted"], [append(1), "accepted"]]);
     const before = await link(coordinator).log(0, 64);
     const repeat = await link(coordinator).command(append(1));
-    assert.deepEqual(repeat, { result: "accepted", state: { kind: "active", epoch: 1, holder: tarantula, head: 1 } });
+    assert.deepEqual(repeat, { result: "accepted", state: { kind: "active", epoch: 1, holder: primaryHolder, head: 1 } });
     assert.deepEqual(await link(coordinator).log(0, 64), before);
     assert.equal(outcome(await link(coordinator).command(append(1, { content: digests[1] }))), "conflict");
   });
@@ -147,11 +147,11 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
       digested({ ...sound.entry, batch: { pi_seq: 1, body: { kind: "inline", json: '{"a":"list is what a standby applies"}' } } }),
     ];
     for (const entry of unappliable) {
-      await assert.rejects(link(coordinator).command({ op: "append", holder: tarantula, entry }), status(422, AuthorityRejected), JSON.stringify(entry.batch));
+      await assert.rejects(link(coordinator).command({ op: "append", holder: primaryHolder, entry }), status(422, AuthorityRejected), JSON.stringify(entry.batch));
     }
     assert.equal(await head(coordinator), 0, "the log took none of them");
-    await play(coordinator, [[sound, "accepted"], [{ op: "promote", candidate: orion, expected_epoch: 1, attestation: "Invented: the old host is powered off" }, "accepted"],
-      [{ op: "activate", candidate: orion, applied: 1 }, "accepted"]]);
+    await play(coordinator, [[sound, "accepted"], [{ op: "promote", candidate: standbyHolder, expected_epoch: 1, attestation: "Invented: the old host is powered off" }, "accepted"],
+      [{ op: "activate", candidate: standbyHolder, applied: 1 }, "accepted"]]);
   });
 
   await t.test("an append naming a missing blob is refused until the blob is stored", async () => {
@@ -178,7 +178,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
     await play(coordinator, [[enroll, "accepted"], [append(1), "accepted"], [append(2), "accepted"]]);
 
     const later = Buffer.from("invented backup manifest through entry 2");
-    const checkpoint: AuthorityCommand = { op: "checkpoint", holder: tarantula, epoch: 1, record: { through: 2, manifest: sha256(later) } };
+    const checkpoint: AuthorityCommand = { op: "checkpoint", holder: primaryHolder, epoch: 1, record: { through: 2, manifest: sha256(later) } };
     const before = await link(coordinator).log(0, 64);
     await play(coordinator, [[checkpoint, "missing_blob"]]);
     assert.deepEqual(await link(coordinator).log(0, 64), before, "the record, the head and the log entries are unchanged");
@@ -199,7 +199,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
     await assert.rejects(link(coordinator).putBlob(claimed, Buffer.from("invented substitute")), status(422, AuthorityRejected));
     await assert.rejects(link(coordinator).getBlob(claimed), status(404, AuthorityRejected));
     const probe = (sha: string) => fetch(`${authority.url}/v1/coordinators/${coordinator}/blobs/${sha}`,
-      { method: "HEAD", headers: { authorization: `Bearer ${token(coordinator, tarantula)}` } });
+      { method: "HEAD", headers: { authorization: `Bearer ${token(coordinator, primaryHolder)}` } });
     assert.equal((await probe(sha256(large))).status, 200);
     assert.equal((await probe(claimed)).status, 404);
   });
@@ -223,11 +223,11 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
     await link(first).putBlob(sha256(bytes), bytes);
     assert.equal(await link(second).record(), undefined);
     await assert.rejects(link(second).getBlob(sha256(bytes)), status(404, AuthorityRejected));
-    await play(second, [[{ op: "enroll", holder: orion, checkpoint: { through: 0, manifest } }, "accepted"]]);
-    assert.deepEqual(await link(first).record(), { state: { kind: "active", epoch: 1, holder: tarantula, head: 1 }, checkpoint: { through: 0, manifest } });
-    const borrowed = new AuthorityClient({ url: authority.url, coordinatorId: second, token: token(first, tarantula) });
+    await play(second, [[{ op: "enroll", holder: standbyHolder, checkpoint: { through: 0, manifest } }, "accepted"]]);
+    assert.deepEqual(await link(first).record(), { state: { kind: "active", epoch: 1, holder: primaryHolder, head: 1 }, checkpoint: { through: 0, manifest } });
+    const borrowed = new AuthorityClient({ url: authority.url, coordinatorId: second, token: token(first, primaryHolder) });
     await assert.rejects(borrowed.record(), status(401, AuthorityDenied));
-    await assert.rejects(borrowed.command({ op: "claim", holder: tarantula, expected_epoch: 1 }), status(401, AuthorityDenied));
+    await assert.rejects(borrowed.command({ op: "claim", holder: primaryHolder, expected_epoch: 1 }), status(401, AuthorityDenied));
   });
 
   await t.test("credentials: tokens are checked, holders run only their own commands, and read-only reads only the record", async () => {
@@ -240,16 +240,16 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
 
     await link(coordinator).putBlob(manifest, manifestBytes);
     await play(coordinator, [[enroll, "accepted"]]);
-    await assert.rejects(link(coordinator, tarantula).command({ op: "claim", holder: orion, expected_epoch: 1 }), status(403, AuthorityDenied));
-    await assert.rejects(link(coordinator, tarantula).command({ op: "activate", candidate: orion, applied: 0 }), status(403, AuthorityDenied));
+    await assert.rejects(link(coordinator, primaryHolder).command({ op: "claim", holder: standbyHolder, expected_epoch: 1 }), status(403, AuthorityDenied));
+    await assert.rejects(link(coordinator, primaryHolder).command({ op: "activate", candidate: standbyHolder, applied: 0 }), status(403, AuthorityDenied));
 
     const reader = link(coordinator, null);
     assert.deepEqual(await reader.record(), await link(coordinator).record());
     await assert.rejects(reader.log(0, 64), status(403, AuthorityDenied));
-    await assert.rejects(reader.command({ op: "confirm", holder: tarantula, epoch: 1 }), status(403, AuthorityDenied));
+    await assert.rejects(reader.command({ op: "confirm", holder: primaryHolder, epoch: 1 }), status(403, AuthorityDenied));
     await assert.rejects(reader.getBlob(digests[0]), status(403, AuthorityDenied));
     await assert.rejects(reader.putBlob(sha256(Buffer.from("x")), Buffer.from("x")), status(403, AuthorityDenied));
-    assert.equal(outcome(await link(coordinator).command({ op: "confirm", holder: tarantula, epoch: 1 })), "accepted");
+    assert.equal(outcome(await link(coordinator).command({ op: "confirm", holder: primaryHolder, epoch: 1 })), "accepted");
   });
 
   await t.test("following the log page by page returns every entry once, in order, in bounded pages", async () => {
@@ -271,7 +271,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
 
   await t.test("malformed requests are refused with 400 and a sentence", async () => {
     const coordinator = await fresh();
-    const authorization = { authorization: `Bearer ${token(coordinator, tarantula)}` };
+    const authorization = { authorization: `Bearer ${token(coordinator, primaryHolder)}` };
     const refusal = async (path: string, init: RequestInit = {}) => {
       const response = await fetch(`${authority.url}${path}`, { ...init, headers: { ...authorization, ...init.headers } });
       assert.equal(response.status, 400, path);
@@ -288,7 +288,7 @@ test("the authority Worker on local workerd", { timeout: 180_000 }, async (t) =>
     await refusal(`${base}/log?after=0&limit=0`);
     await refusal(`${base}/log?after=0&limit=5&extra=1`);
     await refusal(`${base}/commands`, { method: "POST", body: "{ not json" });
-    assert.match(await refusal(`${base}/commands`, { method: "POST", body: JSON.stringify({ op: "claim", holder: tarantula, expected_epoch: 1, extra: 1 }) }), /extra/);
+    assert.match(await refusal(`${base}/commands`, { method: "POST", body: JSON.stringify({ op: "claim", holder: primaryHolder, expected_epoch: 1, extra: 1 }) }), /extra/);
   });
 
   await t.test("the record, the log and a blob survive a restart of workerd", async () => {
