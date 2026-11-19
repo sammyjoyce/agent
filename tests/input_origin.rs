@@ -12,9 +12,7 @@ use agent_cli::{
     runtime::{FrameReader, OwnerClaim, Runtime, RuntimeCall},
 };
 use serde::Deserialize;
-use std::{
-    fs, os::unix::fs::PermissionsExt, path::Path, process::Stdio, sync::Arc, time::Duration,
-};
+use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Stdio, sync::Arc};
 use tokio::{
     io::{AsyncWriteExt, BufReader},
     net::UnixListener,
@@ -26,6 +24,9 @@ use tokio::{
 #[path = "fixtures/executable.rs"]
 mod executable_fixture;
 use executable_fixture::write_executable;
+#[path = "fixtures/hang_limit.rs"]
+mod hang_limit;
+use hang_limit::TEST_HANG_LIMIT;
 
 #[derive(Deserialize)]
 struct Capture {
@@ -131,10 +132,7 @@ fn cli_diagnostics(output: &std::process::Output) -> String {
     )
 }
 async fn collect(runtime: &Runtime, mut call: RuntimeCall) {
-    while let Some(event) = timeout(Duration::from_secs(8), call.events.recv())
-        .await
-        .unwrap()
-    {
+    while let Some(event) = timeout(TEST_HANG_LIMIT, call.events.recv()).await.unwrap() {
         match event {
             RuntimeEventKind::HostCall { call_id, command } => runtime
                 .reply(call.request_id, call_id, result(&command))
@@ -250,7 +248,7 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
     let mut observer = runtime.request(*observe).await.unwrap();
     let mut accepted = None;
     loop {
-        let event = timeout(Duration::from_secs(8), observer.events.recv())
+        let event = timeout(TEST_HANG_LIMIT, observer.events.recv())
             .await
             .unwrap()
             .unwrap();
@@ -288,10 +286,7 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
         assert!(matches!(command, RuntimeCommand::Chat { .. }));
         let mut call = owner.request(command).await.unwrap();
         let mut entered = Some(entered);
-        while let Some(event) = timeout(Duration::from_secs(8), call.events.recv())
-            .await
-            .unwrap()
-        {
+        while let Some(event) = timeout(TEST_HANG_LIMIT, call.events.recv()).await.unwrap() {
             if let RuntimeEventKind::HostCall { call_id, command } = &event {
                 if execution(command) {
                     entered
@@ -340,21 +335,21 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
         .kill_on_drop(true)
         .spawn_serialized()
         .unwrap();
-    let (id, call_id) = match timeout(Duration::from_secs(8), held).await {
+    let (id, call_id) = match timeout(TEST_HANG_LIMIT, held).await {
         Ok(Ok(held)) => held,
         failed => {
             let status = cli.try_wait().unwrap();
             if status.is_none() {
                 cli.kill().await.unwrap();
             }
-            let output = timeout(Duration::from_secs(8), cli.wait_with_output()).await;
+            let output = timeout(TEST_HANG_LIMIT, cli.wait_with_output()).await;
             relay.abort();
             let relay_result = relay.await;
             runtime.detach(observer.request_id).await;
             let shutdown = Arc::try_unwrap(runtime).ok().unwrap().close().await;
             let output = output.unwrap().unwrap();
             panic!(
-                "CLI did not reach its initial host execution within 8s: {failed:?}; \
+                "CLI did not reach its initial host execution: {failed:?}; \
                  exit_before_cleanup={status:?}; {}; relay={relay_result:?}; runtime={shutdown:?}",
                 cli_diagnostics(&output),
             );
@@ -363,7 +358,7 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
     // Consume the genuine native commentary before admitting the later steer.
     // Its visible acknowledgment cannot satisfy that not-yet-existing input.
     let commentary = loop {
-        let event = timeout(Duration::from_secs(8), observer.events.recv())
+        let event = timeout(TEST_HANG_LIMIT, observer.events.recv())
             .await
             .unwrap()
             .unwrap();
@@ -408,7 +403,7 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
         )
         .await
         .unwrap();
-    let output = timeout(Duration::from_secs(8), cli.wait_with_output())
+    let output = timeout(TEST_HANG_LIMIT, cli.wait_with_output())
         .await
         .unwrap()
         .unwrap();
@@ -416,7 +411,7 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
     relay.await.unwrap();
     let mut native_events = Vec::new();
     loop {
-        let event = timeout(Duration::from_secs(8), observer.events.recv())
+        let event = timeout(TEST_HANG_LIMIT, observer.events.recv())
             .await
             .unwrap()
             .unwrap();

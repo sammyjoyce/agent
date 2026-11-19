@@ -2,8 +2,11 @@
 mod executable_fixture;
 #[path = "fixtures/fake_rex.rs"]
 mod fake_rex;
+#[path = "fixtures/hang_limit.rs"]
+mod hang_limit;
 
 use agent_cli::serialized_spawn::SerializedTokioSpawn;
+use hang_limit::TEST_HANG_LIMIT;
 use std::{
     fs,
     hash::{BuildHasher, Hasher, RandomState},
@@ -137,7 +140,7 @@ fn job(id: &str, prompt: &str, directory: &Path, model: ModelSelection) -> Sched
 async fn collect(mut call: RuntimeCall) -> Vec<RuntimeEventKind> {
     let mut events = Vec::new();
     loop {
-        let event = timeout(Duration::from_secs(8), call.events.recv())
+        let event = timeout(TEST_HANG_LIMIT, call.events.recv())
             .await
             .expect("The runtime request did not finish")
             .expect("The runtime request closed without its terminal event");
@@ -235,7 +238,7 @@ impl Coordinator {
             )
             .await
         });
-        timeout(Duration::from_secs(8), async {
+        timeout(TEST_HANG_LIMIT, async {
             loop {
                 let events =
                     collect(runtime.request(RuntimeCommand::ListJobs).await.unwrap()).await;
@@ -311,7 +314,7 @@ impl Coordinator {
     async fn close(self) {
         self.background.abort();
         let _ = self.background.await;
-        timeout(Duration::from_secs(8), async {
+        timeout(TEST_HANG_LIMIT, async {
             while Arc::strong_count(&self.runtime) > 1 {
                 sleep(Duration::from_millis(10)).await;
             }
@@ -483,7 +486,7 @@ async fn read_file_sends_host_images_natively_and_keeps_text_reads() {
         job("vision", "JOB_VISION", files, ModelSelection::default()),
         job("blind", "JOB_BLIND", files, text_only),
     ];
-    let limit = Duration::from_secs(20);
+    let limit = TEST_HANG_LIMIT;
     let coordinator = Coordinator::open(files, "coordinator-runtime.js", &environment, &jobs).await;
     let vision_task = coordinator.run("vision").await;
     let blind_task = coordinator.run("blind").await;
@@ -580,7 +583,7 @@ impl Attached {
     }
 
     async fn next(&mut self) -> RuntimeCommand {
-        let frame = timeout(Duration::from_secs(10), self.frames.next_frame())
+        let frame = timeout(TEST_HANG_LIMIT, self.frames.next_frame())
             .await
             .expect("The registered worker went quiet")
             .unwrap()
@@ -756,7 +759,7 @@ async fn a_registered_worker_serves_image_reads_from_its_own_host() {
         .kill_on_drop(true)
         .spawn_serialized()
         .unwrap();
-    let served = timeout(Duration::from_secs(30), served_reads).await;
+    let served = timeout(TEST_HANG_LIMIT, served_reads).await;
     worker.start_kill().unwrap();
     let output = worker.wait_with_output().await.unwrap();
     let Ok(Ok((received, chunks, text))) = served else {

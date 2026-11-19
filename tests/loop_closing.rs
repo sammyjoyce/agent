@@ -1,7 +1,10 @@
 #[path = "fixtures/executable.rs"]
 mod executable_fixture;
+#[path = "fixtures/hang_limit.rs"]
+mod hang_limit;
 
 use agent_cli::serialized_spawn::SerializedSpawn;
+use hang_limit::TEST_HANG_LIMIT;
 use std::{
     fs,
     ops::RangeInclusive,
@@ -836,7 +839,7 @@ fn reply_script(scenario: &Scenario, attempt: &Attempt) -> Script {
 async fn collect(mut call: RuntimeCall) -> Vec<RuntimeEventKind> {
     let mut events = Vec::new();
     loop {
-        let event = timeout(Duration::from_secs(8), call.events.recv())
+        let event = timeout(TEST_HANG_LIMIT, call.events.recv())
             .await
             .expect("The runtime request did not finish")
             .expect("The runtime request closed without its terminal event");
@@ -850,12 +853,12 @@ async fn collect(mut call: RuntimeCall) -> Vec<RuntimeEventKind> {
     }
 }
 
-async fn eventually<T, F, Fut>(limit: Duration, what: &str, mut probe: F) -> T
+async fn eventually<T, F, Fut>(what: &str, mut probe: F) -> T
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Option<T>>,
 {
-    timeout(limit, async {
+    timeout(TEST_HANG_LIMIT, async {
         loop {
             if let Some(value) = probe().await {
                 return value;
@@ -982,7 +985,7 @@ impl Coordinator {
             runtime,
             background,
         };
-        eventually(Duration::from_secs(8), "the job is applied", || async {
+        eventually("the job is applied", || async {
             coordinator
                 .request(RuntimeCommand::ListJobs)
                 .await
@@ -1045,7 +1048,6 @@ impl Coordinator {
         self.background.abort();
         let _ = self.background.await;
         eventually(
-            Duration::from_secs(8),
             "the stopped background owner releases its runtime",
             || async { (Arc::strong_count(&self.runtime) == 1).then_some(()) },
         )
@@ -1128,7 +1130,6 @@ async fn seed_job(
         })
         .unwrap();
     eventually(
-        Duration::from_secs(20),
         "the seeded task waits on its supplier and its outcome is triaged",
         || async {
             let task = coordinator.task(&id).await;
@@ -1144,7 +1145,7 @@ async fn seed_job(
 const REPLAY_POLLS: usize = 2;
 
 async fn settle(world: &World, rounds: usize) -> bool {
-    let drained = timeout(Duration::from_secs(20), async {
+    let drained = timeout(TEST_HANG_LIMIT, async {
         while !world.drained() {
             sleep(Duration::from_millis(20)).await;
         }
@@ -1152,11 +1153,9 @@ async fn settle(world: &World, rounds: usize) -> bool {
     .await
     .is_ok();
     let polls = (world.served() + REPLAY_POLLS).max(rounds + 1);
-    eventually(
-        Duration::from_secs(15),
-        "every round was served and the feed replayed",
-        || async { (world.served() >= polls).then_some(()) },
-    )
+    eventually("every round was served and the feed replayed", || async {
+        (world.served() >= polls).then_some(())
+    })
     .await;
     drained
 }
@@ -1182,19 +1181,15 @@ async fn outage_oracles(
             .lines()
             .count()
     };
-    eventually(
-        Duration::from_secs(10),
-        "the first failing poll starts",
-        || async { (world.served() >= 1).then_some(()) },
-    )
+    eventually("the first failing poll starts", || async {
+        (world.served() >= 1).then_some(())
+    })
     .await;
     let before = coordinator.mail_state().await;
     let requested = recorded();
-    eventually(
-        Duration::from_secs(10),
-        "the last failing poll starts",
-        || async { (world.served() >= failing).then_some(()) },
-    )
+    eventually("the last failing poll starts", || async {
+        (world.served() >= failing).then_some(())
+    })
     .await;
     let during = coordinator.mail_state().await;
     let task = coordinator.task(task).await;
@@ -2687,19 +2682,13 @@ async fn run_with_notice_mutations(
     }));
     world.serve_rounds(scenario.rounds);
     if let Setup::InputDuringOutage(input) = setup {
-        eventually(
-            Duration::from_secs(10),
-            "the mail source reads unavailable",
-            || async {
-                coordinator
-                    .mail_state()
-                    .await
-                    .is_some_and(|state| {
-                        matches!(state.coverage, SourceCoverage::Unavailable { .. })
-                    })
-                    .then_some(())
-            },
-        )
+        eventually("the mail source reads unavailable", || async {
+            coordinator
+                .mail_state()
+                .await
+                .is_some_and(|state| matches!(state.coverage, SourceCoverage::Unavailable { .. }))
+                .then_some(())
+        })
         .await;
         coordinator
             .request(RuntimeCommand::TaskInput {
@@ -2711,18 +2700,15 @@ async fn run_with_notice_mutations(
                 mode: InputMode::FollowUp,
             })
             .await;
-        eventually(
-            Duration::from_secs(10),
-            "the input sent during the outage is answered",
-            || async { (world.remaining(input) == 0).then_some(()) },
-        )
+        eventually("the input sent during the outage is answered", || async {
+            (world.remaining(input) == 0).then_some(())
+        })
         .await;
     }
     let mut checks =
         outage_oracles(scenario, &world, &coordinator, &task.id, &world.requests()).await;
     if crash {
         let pid = eventually(
-            Duration::from_secs(30),
             "the resumed worker reaches its action and routing has finished",
             || async {
                 let pid = fs::read_to_string(&marker).ok()?.parse::<i32>().ok()?;
@@ -2731,7 +2717,6 @@ async fn run_with_notice_mutations(
         )
         .await;
         eventually(
-            Duration::from_secs(10),
             "the routing turn has committed its final answer",
             || async { (!coordinator.triaging().await).then_some(()) },
         )
@@ -3970,7 +3955,7 @@ async fn settle_live(
         .iter()
         .position(|round| matches!(round, Feed::Mail(_)))
         .unwrap();
-    eventually(Duration::from_secs(60), "the reply is served", || async {
+    eventually("the reply is served", || async {
         (world.served() >= first_mail).then_some(())
     })
     .await;
