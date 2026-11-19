@@ -227,10 +227,17 @@ actor FixtureCoordinator {
   func retain(_ data: Data, id: String) { files[id] = data }
   func count() -> Int { submissions.count }
   private var placesEachSubmit = false
+  private var answer: String?
   /// From now on places each submit on its own socket once it is accepted, then ends that socket,
   /// as an idle coordinator does, so its completion and answer can reach the phone only on the
   /// observer.
   func placeEachSubmit() { placesEachSubmit = true }
+  /// Places each submit as `placeEachSubmit` does, then tells the observer that its work completed
+  /// with an answer entry of its own, and that entry's `text`.
+  func answerEachSubmit(_ text: String) {
+    placesEachSubmit = true
+    answer = text
+  }
   private var busy = false
   /// Submits the busy turn has not placed, each with the socket still waiting for it.
   private var unplaced: [(input: String, socket: NWConnection?)] = []
@@ -508,6 +515,14 @@ actor FixtureCoordinator {
             on: socket)
           // The phone may close the socket as soon as its input is placed.
           try? await emit(.done, on: socket)
+          if let answer, let observer {
+            let entry = "answer-\(request.inputId)"
+            try await emit(
+              .accepted(
+                .init(inputId: request.inputId, work: .completed(.init(answerEntryId: entry)))),
+              on: observer)
+            try await emit(.answer(.init(entryId: entry, text: answer)), on: observer)
+          }
           return
         }
         if busy {
