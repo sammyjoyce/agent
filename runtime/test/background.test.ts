@@ -428,22 +428,27 @@ for (const boundary of boundaries) {
   });
 }
 
-test("repeated interrupted restarts expose Pi parking without replacing the durable timer", { timeout: 20_000 }, async () => {
+test("a timer Pi ends at its restart limit stays parked until a job retry catches up from its cursor", { timeout: 20_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-background-parked-"));
   let app: Awaited<ReturnType<typeof openBackground>> | undefined;
   try {
     for (let restart = 0; restart < 5; restart += 1) await killAt(directory, "before");
     app = await openBackground(directory, new FakeClock(START + DAY));
     await app.scheduler.start({ poll_interval_seconds: 60, sources: true, jobs: [exampleJob()] });
-    const job = await app.scheduler.getJob("example-review");
-    assert.match(job.schedules[0]?.error ?? "", /parked after repeated interrupted restarts/);
+    const current = app, error = async () => (await current.scheduler.getJob("example-review")).schedules[0]?.error ?? null;
+    await pump(async () => /parked after repeated interrupted restarts/.test(await error() ?? ""));
     assert.equal((await app.receipts())?.jobs.length ?? 0, 0);
     assert.deepEqual(await app.scheduler.syncJobs([exampleJob()]), { added: 0, updated: 0, removed: 0, unchanged: 1 });
-    assert.match((await app.scheduler.getJob("example-review")).schedules[0]?.error ?? "", /parked/);
+    assert.match(await error() ?? "", /parked/);
+    await app.scheduler.retryJob("example-review");
+    await pump(async () => (await current.receipts())?.jobs.length === 1);
+    assert.equal((await app.receipts())?.jobs[0]?.scheduled_at, START + DAY, "The replacement timer must catch up the occurrence it missed");
+    await pump(async () => await error() === null);
+    await assert.rejects(app.scheduler.retryJob("example-review"), /parked/);
   } finally { await app?.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
-test("parked job retry resumes its exact native work once while another job stays running", { timeout: 20_000 }, async () => {
+test("job retry restarts the exact work Pi ended at its restart limit once while another job stays running", { timeout: 20_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-background-retry-")), held = gate();
   let app: Awaited<ReturnType<typeof openBackground>> | undefined;
   let started = () => {}; const running = new Promise<void>(resolve => { started = resolve; });
@@ -467,22 +472,27 @@ test("parked job retry resumes its exact native work once while another job stay
     await app.scheduler.start({ poll_interval_seconds: 60, sources: true, jobs: [exampleJob(), other] });
     await app.scheduler.runJob({ type: "run_job", job_id: other.id, schedule_id: null, request_id: "normal-running-job" });
     await running;
-    const before = await app.scheduler.getJob("example-review"), inspection = await app.session.inspect(BACKGROUND_CONTEXT);
-    const parked = inspection.tasks.find(task => matches(task.record.input, "example-review") && task.state.kind === "blocked" && task.state.reason === "restart_limit");
-    const normal = inspection.tasks.find(task => matches(task.record.input, other.id));
-    assert.ok(parked); assert.ok(normal); assert.equal(normal.record.state.status, "running");
-    assert.ok(retryable(app.scheduler), "Parked jobs need an explicit retry of their retained native task");
+    const current = app;
+    const jobTasks = async () => (await current.session.commit(tx => tx.scanTasks({}, 100), BACKGROUND_CONTEXT)).items
+      .filter(task => matches(task.input, "example-review"));
+    await pump(async () => (await jobTasks()).some(task => task.state.status === "terminal"));
+    const [parked, ...others] = await jobTasks();
+    assert.ok(parked?.state.status === "terminal" && parked.state.outcome.status === "faulted"); assert.deepEqual(others, []);
+    const before = await app.scheduler.getJob("example-review");
+    assert.deepEqual(before.last_run?.state, { status: "blocked", message: "restart_limit" });
+    assert.match(before.schedules[0]?.error ?? "", /parked after repeated interrupted restarts/);
+    const normal = (await app.session.inspect(BACKGROUND_CONTEXT)).tasks.find(task => matches(task.record.input, other.id));
+    assert.ok(normal); assert.equal(normal.record.state.status, "running");
+    assert.ok(retryable(app.scheduler), "Jobs Pi ended need an explicit retry of their retained native input");
     await assert.rejects(app.scheduler.retryJob("missing"), /Unknown scheduled job/);
     await assert.rejects(app.scheduler.retryJob(other.id), /parked/);
     const resumed = await app.scheduler.retryJob("example-review");
     assert.equal(resumed.job.id, "example-review");
-    const current = app;
-    await pump(async () => (await current.session.getTask(parked.record.id, BACKGROUND_CONTEXT))?.state.status === "terminal");
-    const after = await app.session.getTask(parked.record.id, BACKGROUND_CONTEXT); assert.ok(after);
-    assert.deepEqual(after.input, parked.record.input, "The captured occurrence and request identity must survive retry");
-    assert.equal(after.id, parked.record.id);
-    assert.equal(after.state.status, "terminal");
-    if (after.state.status === "terminal") assert.equal(after.state.outcome.status, "completed");
+    await pump(async () => (await jobTasks()).length === 2 && (await jobTasks()).every(task => task.state.status === "terminal"));
+    const after = (await jobTasks()).find(task => task.id !== parked.id); assert.ok(after);
+    assert.deepEqual(after.input, parked.input, "The captured occurrence and request identity must survive retry");
+    assert.ok(after.state.status === "terminal"); assert.equal(after.state.outcome.status, "completed");
+    assert.deepEqual(await app.session.getTask(parked.id, BACKGROUND_CONTEXT), parked, "Pi's record of the ended work is retained");
     assert.deepEqual(await app.session.getTask(normal.record.id, BACKGROUND_CONTEXT), normal.record,
       "Retrying another job cannot reset or replace normal running work");
     const status = await app.scheduler.getJob("example-review");

@@ -846,13 +846,14 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn listener_restarts_after_an_active_close_without_sharing_a_live_port() {
+        use crate::TEST_HANG_LIMIT;
         use crate::serialized_spawn::SerializedSpawn;
         use crate::tailnet::listen_on;
         use std::io::ErrorKind;
         use tokio::{
             io::{AsyncReadExt, AsyncWriteExt},
             net::TcpStream,
-            time::{Duration, timeout},
+            time::timeout,
         };
         let current = std::thread::current();
         let name = current.name().unwrap();
@@ -874,7 +875,7 @@ mod tests {
             );
             return;
         }
-        timeout(Duration::from_secs(5), async {
+        timeout(TEST_HANG_LIMIT, async {
             let mut listener = listen_on(Ipv4Addr::LOCALHOST, 0).unwrap();
             let address = listener.local_addr().unwrap();
             for _ in 0..2 {

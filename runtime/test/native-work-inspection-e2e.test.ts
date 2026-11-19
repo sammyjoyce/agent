@@ -11,6 +11,7 @@ import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { createRegistry, GenerationTask, Harness, LiveDoc, UserEntry, type TaskId } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { commitWrites } from "@earendil-works/pi-durable/testing";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
 import type { SavedConversation } from "../src/generated/SavedConversation.js";
@@ -69,12 +70,12 @@ test("native job and saved-work inspection uses the production coordinator witho
           status: "placed", entry: entry.id });
         const generation = await tx.createTask(GenerationTask, {}, { ownership: { kind: "conversation" } });
         const live = await tx.doc(LiveDoc, conversation.id);
-        live.run = { taskId: generation, inputs: [input.id] }; live.generation = { attempt: 1 };
+        live.run = { taskId: generation, inputs: [input.id], turns: 0 }; live.generation = { attempt: 1 };
         return generation;
       }, BACKGROUND_CONTEXT);
       const record = await seeded.harness.getTask(generation, BACKGROUND_CONTEXT); assert.ok(record);
       const until = Date.now() + 3_600_000;
-      await seeded.storage.commit([{ type: "task", value: { ...record, state: { status: "sleeping", until,
+      await commitWrites(seeded.storage, [{ type: "task", value: { ...record, state: { status: "sleeping", until,
         checkpoint: { phase: "retry", attempt: 1, until } } } }], BACKGROUND_CONTEXT);
       generationIDs.push(generation);
     }

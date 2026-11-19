@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import type { JsonValue } from "@earendil-works/chord/json";
 import { defineDoc, defineEntry, defineTask, LiveDoc, ROOT_CONVERSATION_ID, type Harness, type Registry,
-  type HarnessInspection, type NextTaskState, type Task, type TaskId as NativeTaskId, type TaskInspection, type Tx } from "@earendil-works/pi-durable";
+  type HarnessInspection, type NextTaskState, type Task, type TaskId as NativeTaskId, type TaskInspection, type TaskRecord, type Tx } from "@earendil-works/pi-durable";
 import type { BackgroundCadence } from "./generated/BackgroundCadence.js";
 import type { BackgroundCheckpoint } from "./generated/BackgroundCheckpoint.js";
 import type { BackgroundSettings } from "./generated/BackgroundSettings.js";
@@ -9,6 +10,7 @@ import type { BackgroundStatus } from "./generated/BackgroundStatus.js";
 import type { BackgroundTaskInput } from "./generated/BackgroundTaskInput.js";
 import type { BackgroundTriggerKey } from "./generated/BackgroundTriggerKey.js";
 import type { BackgroundWork } from "./generated/BackgroundWork.js";
+import type { InputBlockReason } from "./generated/InputBlockReason.js";
 import type { OccurrencePlan } from "./generated/OccurrencePlan.js";
 import type { ScheduledJob } from "./generated/ScheduledJob.js";
 import type { ScheduledOccurrence } from "./generated/ScheduledOccurrence.js";
@@ -59,9 +61,10 @@ function terminal(): NextTaskState<BackgroundCheckpoint, null> {
   return { status: "terminal", outcome: { status: "completed", result: null } };
 }
 function failure(error: unknown): string { return error instanceof Error ? error.message : "Background execution failed"; }
-function parkedBackgroundTasks(inspection: HarnessInspection, candidates: ReadonlySet<NativeTaskId>): TaskInspection[] {
-  return inspection.tasks.filter(task => candidates.has(task.record.id) && task.record.kind === "agent.background" &&
-    task.state.kind === "blocked" && task.state.reason === "restart_limit");
+function restartLimited(record: TaskRecord<JsonValue, JsonValue, JsonValue> | undefined): record is TaskRecord<BackgroundTaskInput, JsonValue, JsonValue> {
+  if (record?.kind !== "agent.background" || record.state.status !== "terminal" || record.state.outcome.status !== "faulted") return false;
+  const detail = record.state.outcome.error.detail;
+  return typeof detail === "object" && detail !== null && !Array.isArray(detail) && detail.reason === "restart_limit";
 }
 function occurrenceId(value: BackgroundTriggerKey, scheduledAt: number): string {
   // A configuration revision diagnoses a run, but never creates a second occurrence.
@@ -94,7 +97,9 @@ export class BackgroundScheduler {
           if (task.input.type !== "trigger") throw new Error("Background timer has execution input");
           await callbacks.ready?.(runtime.signal);
           runtime.signal.throwIfAborted();
-          const input = task.input, cursor = task.state.checkpoint.cursor, observedAt = runtime.now();
+          const input = task.input, observedAt = runtime.now();
+          const cursor = task.state.checkpoint.cursor ?? (await this.session.snapshot(State, context))?.triggers
+            .find((trigger) => same(trigger.key, input.key) && trigger.generation === input.generation)?.cursor ?? null;
           let plan: OccurrencePlan;
           try { plan = await callbacks.plan(input.cadence, cursor, observedAt, runtime.signal); }
           catch (error) {
@@ -323,11 +328,27 @@ export class BackgroundScheduler {
     const old = previous?.task ?? null;
     const saved: Trigger = { key, generation: (previous?.generation ?? 0) + 1, revision,
       task: null, cursor: null, last: previous?.last ?? null, next: null, enabled: true, error: null, error_scope: null };
-    saved.task = await tx.createTask(this.task, { type: "trigger", key, generation: saved.generation, cadence, job }, {
-      ownership: { kind: "conversation" }, conversationId: ROOT_CONVERSATION_ID, background: true,
-    });
+    saved.task = await this.createTimerIn(tx, { type: "trigger", key, generation: saved.generation, cadence, job });
     if (previous === undefined) state.triggers.push(saved); else Object.assign(previous, saved);
     return old;
+  }
+  private createTimerIn(tx: Tx, input: Extract<BackgroundTaskInput, { type: "trigger" }>): Promise<NativeTaskId<null>> {
+    return tx.createTask(this.task, input, { ownership: { kind: "conversation" }, conversationId: ROOT_CONVERSATION_ID, background: true });
+  }
+  private async replaceRestartLimitedIn(tx: Tx, triggers: readonly Trigger[], lane: Lane | undefined): Promise<boolean> {
+    let replaced = false;
+    for (const trigger of triggers) {
+      const timer = trigger.task === null ? undefined : await tx.task(trigger.task);
+      if (!restartLimited(timer) || timer.input.type !== "trigger") continue;
+      trigger.task = await this.createTimerIn(tx, timer.input);
+      replaced = true;
+    }
+    const work = lane?.active === null || lane?.active === undefined ? undefined : await tx.task(lane.active);
+    if (lane !== undefined && restartLimited(work) && work.input.type === "work") {
+      lane.active = await this.createWorkIn(tx, { key: work.input.key, work: work.input.work });
+      replaced = true;
+    }
+    return replaced;
   }
   private async builtins(settings: BackgroundSettings): Promise<void> {
     const old = await this.session.commit(async (tx) => {
@@ -404,22 +425,25 @@ export class BackgroundScheduler {
     for (const task of inspection.tasks) if (task.record.kind === "agent.background" && task.state.kind === "blocked") {
       blocked.set(task.record.id, task.state);
     }
+    const live = new Set(inspection.tasks.map(task => task.record.id)), ended = new Set<NativeTaskId>();
+    for (const id of new Set([...(state?.triggers ?? []).map(trigger => trigger.task), ...(state?.lanes ?? []).map(lane => lane.active)])) {
+      if (id !== null && !live.has(id) && restartLimited(await this.session.getTask(id, BACKGROUND_CONTEXT))) ended.add(id);
+    }
     const errors = new Map<string, string>();
     for (const trigger of state?.triggers ?? []) {
       const lane = state?.lanes.find((item) => item.id === laneId(trigger.key));
-      const error = trigger.task === null ? undefined : blocked.get(trigger.task);
-      const workError = lane?.active === null || lane?.active === undefined ? undefined : blocked.get(lane.active);
-      const paused = workError ?? error;
+      const named = [lane?.active ?? null, trigger.task].flatMap(id => id === null ? [] : [id]);
+      const paused = named.map(id => blocked.get(id)).find(reason => reason !== undefined);
       // Keep the saved attempt's diagnostic, but do not publish it as current
       // while that exact work is executing. Job lanes are shared by schedules.
       const executing = lane?.active !== null && lane?.active !== undefined && running.has(lane.active) &&
         (trigger.key.type === "builtin" || lane.last_run?.task === lane.active && lane.last_run.schedule_id === trigger.key.schedule_id);
       let message = trigger.error_scope === "work" && executing ? null : trigger.error;
-      if (paused !== undefined) {
-        if (paused.reason !== "restart_limit") message = `Background work is blocked by its native task definition (${paused.reason})`;
-        else if (trigger.key.type === "builtin" && trigger.key.name === "history") {
-          message = "History indexing is paused after repeated interruptions. Resume with beep-boop import retry-index.";
-        } else message = "Background work is parked after repeated interrupted restarts; inspect its native task before retrying";
+      if (paused !== undefined) message = `Background work is blocked by its native task definition (${paused.reason})`;
+      else if (named.some(id => ended.has(id))) {
+        message = trigger.key.type === "builtin" && trigger.key.name === "history"
+          ? "History indexing is paused after repeated interruptions. Resume with beep-boop import retry-index."
+          : "Background work is parked after repeated interrupted restarts; inspect its native task before retrying";
       }
       if (message !== null && message !== undefined) errors.set(key(trigger.key), message);
     }
@@ -438,9 +462,8 @@ export class BackgroundScheduler {
     }) };
     });
   }
-  /** The current root generation must own, or block, this lane's admitted
-   * input. A saved actor alone does not authorize retrying other work. */
-  private async actorGeneration(id: string, lane: Lane | undefined, inspection: HarnessInspection): Promise<{ generation: TaskInspection; schedule_id: string; actor_id: string } | undefined> {
+  /** The current root generation must own, or block, this lane's admitted input. */
+  private async actorGeneration(id: string, lane: Lane | undefined, inspection: HarnessInspection): Promise<{ generation: TaskInspection; schedule_id: string } | undefined> {
     if (lane?.active === null || lane?.active === undefined) return;
     const input = inspection.tasks.find(task => task.record.id === lane.active && task.record.kind === "agent.background")?.record.input;
     if (input === null || typeof input !== "object" || Array.isArray(input) || input.type !== "work") return;
@@ -468,7 +491,7 @@ export class BackgroundScheduler {
     }, BACKGROUND_CONTEXT);
     const generation = inspection.tasks.find(task => task.record.id === current && task.record.conversationId === conversation.id &&
       task.record.kind === "pi.generation" && task.record.owner === undefined && !task.record.background);
-    return generation === undefined ? undefined : { generation, schedule_id: key.schedule_id, actor_id: actorId };
+    return generation === undefined ? undefined : { generation, schedule_id: key.schedule_id };
   }
   async getJob(id: string): Promise<ScheduledJobStatus> {
     const inspection = await this.session.inspect(BACKGROUND_CONTEXT);
@@ -480,8 +503,7 @@ export class BackgroundScheduler {
     const actorWork = await this.actorGeneration(id, lane, inspection);
     const blocked = actorWork?.generation.state.kind === "blocked" ? actorWork.generation.state.reason : undefined;
     if (blocked !== undefined) {
-      const message = blocked === "restart_limit" ? "Job model generation is parked after repeated interrupted restarts; retry the interrupted run"
-        : `Job model generation is blocked by its native task definition (${blocked})`;
+      const message = `Job model generation is blocked by its native task definition (${blocked})`;
       job = { ...job, schedules: job.schedules.map(schedule => schedule.schedule_id === actorWork?.schedule_id ? { ...schedule, error: message } : schedule) };
     }
     // Older state has no reference; never invent execution times from an
@@ -494,7 +516,7 @@ export class BackgroundScheduler {
     let execution: JobExecutionState;
     if (blocked !== undefined && lane?.active === reference.task) execution = { status: "blocked", message: blocked };
     else if (live?.state.kind === "blocked") execution = { status: "blocked", message: live.state.reason };
-    else if (live?.state.kind === "ready" || record.state.status === "pending") execution = { status: "queued" };
+    else if (live?.state.kind === "pending" || record.state.status === "pending") execution = { status: "queued" };
     else switch (record.state.status) {
       case "running": execution = { status: "running" }; break;
       case "waiting":
@@ -506,6 +528,7 @@ export class BackgroundScheduler {
         execution = outcome.status === "completed" ? { status: "completed" }
           : outcome.status === "failed" ? { status: "failed", message: outcome.error.message }
           : outcome.status === "orphaned" ? { status: "blocked", message: outcome.reason ?? "Task definition unavailable" }
+          : restartLimited(record) ? { status: "blocked", message: "restart_limit" satisfies InputBlockReason }
           : { status: "stopped" };
         break;
       }
@@ -531,41 +554,29 @@ export class BackgroundScheduler {
       output_truncated: characters.length > 16000 };
     return { ...job, last_run };
   }
-  /** Retry only this applied job's interrupted native timer/work or current
-   * root model generation, retaining the occurrence, checkpoint and input. */
+  /** Retry only this applied job's timers and work that Pi ended at its
+   * restart limit, retaining the occurrence, cursor and input. A job's model
+   * run that ended there settles its input unanswered, which the job reconciles. */
   async retryJob(id: string): Promise<ScheduledJobStatus> {
-    const state = await this.session.snapshot(State, BACKGROUND_CONTEXT);
-    if (!state?.jobs.some(job => job.id === id)) throw new TaskError("Unknown scheduled job");
-    const candidates = new Set<NativeTaskId>();
-    for (const trigger of state.triggers) {
-      if (trigger.enabled && trigger.key.type === "job" && trigger.key.job_id === id && trigger.task !== null) candidates.add(trigger.task);
-    }
-    const lane = state.lanes.find(lane => lane.id === JSON.stringify(["job", id])), active = lane?.active;
-    if (active !== null && active !== undefined) candidates.add(active);
-    const inspection = await this.session.inspect(BACKGROUND_CONTEXT);
-    const parked = parkedBackgroundTasks(inspection, candidates);
-    const actorWork = await this.actorGeneration(id, lane, inspection);
-    if (actorWork?.generation.state.kind === "blocked" && actorWork.generation.state.reason === "restart_limit") {
-      if (this.tasks.hasExecutionOwner(actorWork.actor_id, actorWork.generation.record.conversationId)) parked.push(actorWork.generation);
-      else if (parked.length === 0) throw new TaskError("The job's existing worker must attach before its model generation can be retried");
-    }
-    if (parked.length === 0) throw new TaskError("This job has no parked interrupted run or timer to retry");
-    for (const task of parked) await this.session.retryTask(task.record.id, BACKGROUND_CONTEXT);
+    const replaced = await this.session.commit(async (tx) => {
+      const state = await tx.doc(State);
+      if (!state.jobs.some(job => job.id === id)) throw new TaskError("Unknown scheduled job");
+      return this.replaceRestartLimitedIn(tx, state.triggers.filter(trigger => trigger.enabled && trigger.key.type === "job" && trigger.key.job_id === id),
+        state.lanes.find(lane => lane.id === JSON.stringify(["job", id])));
+    }, BACKGROUND_CONTEXT);
+    if (!replaced) throw new TaskError("This job has no parked interrupted run or timer to retry");
     return this.getJob(id);
   }
   /** Explicit recovery preserves the existing history lane and its queued
    * passes. Startup must keep Pi's crash-loop protection intact. */
   async retryHistoryIndex(): Promise<BackgroundStatus> {
-    const state = await this.session.snapshot(State, BACKGROUND_CONTEXT);
-    const trigger = state?.triggers.find(trigger => trigger.enabled && trigger.key.type === "builtin" && trigger.key.name === "history");
-    if (state === undefined || trigger === undefined) throw new TaskError("No enabled history indexing timer exists");
-    const candidates = new Set<NativeTaskId>();
-    if (trigger.task !== null) candidates.add(trigger.task);
-    const active = state.lanes.find(lane => lane.id === laneId(trigger.key))?.active;
-    if (active !== null && active !== undefined) candidates.add(active);
-    const parked = parkedBackgroundTasks(await this.session.inspect(BACKGROUND_CONTEXT), candidates);
-    if (parked.length === 0) throw new TaskError("History indexing has no parked interrupted work or timer to retry");
-    for (const task of parked) await this.session.retryTask(task.record.id, BACKGROUND_CONTEXT);
+    const replaced = await this.session.commit(async (tx) => {
+      const state = await tx.doc(State);
+      const trigger = state.triggers.find(trigger => trigger.enabled && trigger.key.type === "builtin" && trigger.key.name === "history");
+      if (trigger === undefined) throw new TaskError("No enabled history indexing timer exists");
+      return this.replaceRestartLimitedIn(tx, [trigger], state.lanes.find(lane => lane.id === laneId(trigger.key)));
+    }, BACKGROUND_CONTEXT);
+    if (!replaced) throw new TaskError("History indexing has no parked interrupted work or timer to retry");
     return this.status();
   }
 }

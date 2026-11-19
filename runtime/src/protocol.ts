@@ -6,7 +6,7 @@ import type { RuntimeRequest } from "./generated/RuntimeRequest.js";
 import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import type { ApnsConfig } from "./generated/ApnsConfig.js";
-import { ModelTurnError } from "./models.js";
+import type { ModelProvider } from "./generated/ModelProvider.js";
 import { AuthError } from "./auth.js";
 import { ModelsError } from "@earendil-works/pi-ai/utils/models-error";
 
@@ -42,8 +42,10 @@ async function schema(name: string): Promise<object> {
   return value;
 }
 
+ajv.addSchema(await schema("event"), "event");
 export const validRequest = ajv.compile<RuntimeRequest>(await schema("request"));
-export const validEvent = ajv.compile<RuntimeEvent>(await schema("event"));
+export const validEvent = ajv.compile<RuntimeEvent>({ $ref: "event" });
+export const validProvider = ajv.compile<ModelProvider>({ $ref: "event#/$defs/ModelProvider" });
 export const validApnsConfig = ajv.compile<ApnsConfig>(await schema("apns"));
 
 /** JSON frames end at LF, never Unicode line/paragraph separators inside strings. */
@@ -83,6 +85,9 @@ export function invalidHostReply(value: unknown, version: number): HostReply | u
     result: { type: "failed", message: "Invalid host reply; schema validation failed" + (details.length === 0 ? "." : ": " + details) } } };
   return validRequest(reply) ? reply : undefined;
 }
+
+/** The message reaches clients verbatim, so it must be a safe summary. */
+export class ModelTurnError extends Error {}
 
 export function errorEvent(error: unknown): Extract<RuntimeEventKind, { type: "failure" }> {
   if (error instanceof ModelTurnError) return { type: "failure", code: /authentication/u.test(error.message) ? "authentication_failed" : "provider_unavailable", message: error.message };

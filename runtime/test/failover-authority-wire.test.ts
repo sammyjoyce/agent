@@ -7,22 +7,22 @@ import type { AuthorityRefusal } from "../src/generated/AuthorityRefusal.js";
 import type { AuthorityReply } from "../src/generated/AuthorityReply.js";
 import type { AuthorityState } from "../src/generated/AuthorityState.js";
 import type { LogPage } from "../src/generated/LogPage.js";
-import { digests, entry, manifest, orion, tarantula } from "./fixtures/failover-authority-cells.js";
+import { digests, entry, manifest, standbyHolder, primaryHolder } from "./fixtures/failover-authority-cells.js";
 
 const file = { path: "attachments/a1/content", sha256: digests[1], size: 12 };
 const wellFormed: readonly AuthorityCommand[] = [
-  { op: "enroll", holder: tarantula, checkpoint: { through: 0, manifest } },
-  { op: "claim", holder: tarantula, expected_epoch: 1 },
-  { op: "append", holder: tarantula, entry: entry(1, 1, digests[0]) },
-  { op: "append", holder: tarantula, entry: { ...entry(1, 2, digests[0]), batch: null, removed: ["attachments/a1", "feedback/latest"], files: [file, { ...file, path: "history/assets/ab/cd.png" }, { ...file, path: "feedback/latest" }] } },
-  { op: "append", holder: tarantula, entry: { ...entry(1, 3, digests[0]), files: [file], batch: { pi_seq: 9_007_199_254_740_991, body: { kind: "blob", sha256: digests[1], size: 9_007_199_254_740_991 } } } },
-  { op: "confirm", holder: tarantula, epoch: 9_007_199_254_740_991 },
-  { op: "promote", candidate: orion, expected_epoch: 1, attestation: null },
-  { op: "promote", candidate: orion, expected_epoch: 1, attestation: "the old host is powered off" },
-  { op: "release", holder: tarantula, epoch: 1, evidence: "released" },
-  { op: "release", holder: tarantula, epoch: 1, evidence: "lock_held" },
-  { op: "activate", candidate: orion, applied: 0 },
-  { op: "checkpoint", holder: tarantula, epoch: 1, record: { through: 2, manifest } },
+  { op: "enroll", holder: primaryHolder, checkpoint: { through: 0, manifest } },
+  { op: "claim", holder: primaryHolder, expected_epoch: 1 },
+  { op: "append", holder: primaryHolder, entry: entry(1, 1, digests[0]) },
+  { op: "append", holder: primaryHolder, entry: { ...entry(1, 2, digests[0]), batch: null, removed: ["attachments/a1", "feedback/latest"], files: [file, { ...file, path: "history/assets/ab/cd.png" }, { ...file, path: "feedback/latest" }] } },
+  { op: "append", holder: primaryHolder, entry: { ...entry(1, 3, digests[0]), files: [file], batch: { pi_seq: 9_007_199_254_740_991, body: { kind: "blob", sha256: digests[1], size: 9_007_199_254_740_991 } } } },
+  { op: "confirm", holder: primaryHolder, epoch: 9_007_199_254_740_991 },
+  { op: "promote", candidate: standbyHolder, expected_epoch: 1, attestation: null },
+  { op: "promote", candidate: standbyHolder, expected_epoch: 1, attestation: "the old host is powered off" },
+  { op: "release", holder: primaryHolder, epoch: 1, evidence: "released" },
+  { op: "release", holder: primaryHolder, epoch: 1, evidence: "lock_held" },
+  { op: "activate", candidate: standbyHolder, applied: 0 },
+  { op: "checkpoint", holder: primaryHolder, epoch: 1, record: { through: 2, manifest } },
 ];
 
 test("every well-formed command is accepted unchanged", () => {
@@ -33,12 +33,12 @@ test("every well-formed command is accepted unchanged", () => {
   }
 });
 
-const claim = { op: "claim", holder: tarantula, expected_epoch: 1 };
-const append = { op: "append", holder: tarantula, entry: entry(1, 1, digests[0]) };
+const claim = { op: "claim", holder: primaryHolder, expected_epoch: 1 };
+const append = { op: "append", holder: primaryHolder, entry: entry(1, 1, digests[0]) };
 const withEntry = (change: Record<string, unknown>) => ({ ...append, entry: { ...append.entry, ...change } });
 const withFile = (change: Record<string, unknown>) => withEntry({ files: [{ ...file, ...change }] });
 const withBatch = (change: Record<string, unknown>) => withEntry({ batch: { ...append.entry.batch, ...change } });
-const promote = { op: "promote", candidate: orion, expected_epoch: 1, attestation: null };
+const promote = { op: "promote", candidate: standbyHolder, expected_epoch: 1, attestation: null };
 const without = <T extends object>(value: T, field: keyof T) => Object.fromEntries(Object.entries(value).filter(([key]) => key !== field));
 
 type Malformed = readonly (readonly [field: string, value: unknown])[];
@@ -57,35 +57,35 @@ const malformed: Malformed = [
   ["command", null],
   ["command", [claim]],
   ["command", "claim"],
-  ["op", { holder: tarantula }],
+  ["op", { holder: primaryHolder }],
   ["op", { ...claim, op: "seize" }],
   ["op", { ...claim, op: 1 }],
   ["extra", { ...claim, extra: 1 }],
-  ["__proto__", JSON.parse(`{"op":"claim","holder":"${tarantula}","expected_epoch":1,"__proto__":{}}`)],
+  ["__proto__", JSON.parse(`{"op":"claim","holder":"${primaryHolder}","expected_epoch":1,"__proto__":{}}`)],
   ["holder", { op: "claim" }],
-  ["holder", { op: "claim", holder: "tarantula" }],
+  ["holder", { op: "claim", holder: "primary-holder" }],
   ["holder", { op: "claim", holder: "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE" }],
-  ["holder", { op: "claim", holder: `{${tarantula}}` }],
-  ["expected_epoch", { op: "claim", holder: tarantula }],
-  ["expected_epoch", { op: "claim", holder: tarantula, expected_epoch: -1 }],
+  ["holder", { op: "claim", holder: `{${primaryHolder}}` }],
+  ["expected_epoch", { op: "claim", holder: primaryHolder }],
+  ["expected_epoch", { op: "claim", holder: primaryHolder, expected_epoch: -1 }],
   ["candidate", { op: "activate", candidate: 7, applied: 0 }],
-  ["applied", { op: "activate", candidate: orion, applied: null }],
-  ["epoch", { op: "confirm", holder: tarantula, epoch: -1 }],
-  ["epoch", { op: "confirm", holder: tarantula, epoch: 9_007_199_254_740_992 }],
-  ["epoch", { op: "confirm", holder: tarantula, epoch: 1.5 }],
-  ["epoch", { op: "confirm", holder: tarantula, epoch: "1" }],
+  ["applied", { op: "activate", candidate: standbyHolder, applied: null }],
+  ["epoch", { op: "confirm", holder: primaryHolder, epoch: -1 }],
+  ["epoch", { op: "confirm", holder: primaryHolder, epoch: 9_007_199_254_740_992 }],
+  ["epoch", { op: "confirm", holder: primaryHolder, epoch: 1.5 }],
+  ["epoch", { op: "confirm", holder: primaryHolder, epoch: "1" }],
   ["expected_epoch", without(promote, "expected_epoch")],
   ["attestation", without(promote, "attestation")],
   ["attestation", { ...promote, attestation: "" }],
   ["attestation", { ...promote, attestation: " \n\t" }],
   ["attestation", { ...promote, attestation: 1 }],
-  ["evidence", { op: "release", holder: tarantula, epoch: 1, evidence: "operator_attested" }],
-  ["evidence", { op: "release", holder: tarantula, epoch: 1, evidence: { kind: "released" } }],
-  ["checkpoint", { op: "enroll", holder: tarantula }],
-  ["checkpoint.manifest", { op: "enroll", holder: tarantula, checkpoint: { through: 0, manifest: manifest.toUpperCase() } }],
-  ["checkpoint.size", { op: "enroll", holder: tarantula, checkpoint: { through: 0, manifest, size: 1 } }],
-  ["record.through", { op: "checkpoint", holder: tarantula, epoch: 1, record: { through: 2 ** 53, manifest } }],
-  ["entry", { op: "append", holder: tarantula, entry: [] }],
+  ["evidence", { op: "release", holder: primaryHolder, epoch: 1, evidence: "operator_attested" }],
+  ["evidence", { op: "release", holder: primaryHolder, epoch: 1, evidence: { kind: "released" } }],
+  ["checkpoint", { op: "enroll", holder: primaryHolder }],
+  ["checkpoint.manifest", { op: "enroll", holder: primaryHolder, checkpoint: { through: 0, manifest: manifest.toUpperCase() } }],
+  ["checkpoint.size", { op: "enroll", holder: primaryHolder, checkpoint: { through: 0, manifest, size: 1 } }],
+  ["record.through", { op: "checkpoint", holder: primaryHolder, epoch: 1, record: { through: 2 ** 53, manifest } }],
+  ["entry", { op: "append", holder: primaryHolder, entry: [] }],
   ["entry.at", { ...append, entry: without(append.entry, "at") }],
   ["entry.head", withEntry({ head: 1 })],
   ["entry.digest", withEntry({ digest: "a".repeat(63) })],
@@ -120,9 +120,9 @@ test("a malformed command is refused with a message that names the bad field", (
   assertRefusedNamingField(parseAuthorityCommand, malformed);
 });
 
-const active: AuthorityState = { kind: "active", epoch: 3, holder: tarantula, head: 2 };
-const sealed: AuthorityState = { kind: "sealed", epoch: 3, holder: tarantula, candidate: orion, head: 2 };
-const vacant: AuthorityState = { kind: "vacant", epoch: 3, candidate: orion, evidence: { kind: "operator_attested", statement: "the old host is powered off" }, head: 2 };
+const active: AuthorityState = { kind: "active", epoch: 3, holder: primaryHolder, head: 2 };
+const sealed: AuthorityState = { kind: "sealed", epoch: 3, holder: primaryHolder, candidate: standbyHolder, head: 2 };
+const vacant: AuthorityState = { kind: "vacant", epoch: 3, candidate: standbyHolder, evidence: { kind: "operator_attested", statement: "the old host is powered off" }, head: 2 };
 const states: readonly AuthorityState[] = [active, sealed, vacant,
   { ...vacant, evidence: { kind: "released" } }, { ...vacant, evidence: { kind: "lock_held" } }];
 const refusals = Object.keys({ not_enrolled: 0, enrolled: 0, sealed: 0, fenced: 0, gap: 0, conflict: 0, missing_blob: 0, epoch_moved: 0, already_owner: 0,
@@ -164,7 +164,7 @@ const malformedReplies: Malformed = [
   ["state.epoch", accepted({ ...active, epoch: "3" })],
   ["state.holder", accepted({ ...active, holder: "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE" })],
   ["state.head", accepted(without(active, "head"))],
-  ["state.candidate", accepted({ ...active, candidate: orion })],
+  ["state.candidate", accepted({ ...active, candidate: standbyHolder })],
   ["state.candidate", accepted(without(sealed, "candidate"))],
   ["state.evidence", accepted(without(vacant, "evidence"))],
   ["state.evidence.kind", accepted({ ...vacant, evidence: { kind: "timed_out" } })],
@@ -193,7 +193,7 @@ const malformedPages: Malformed = [
   ["record", { entries: [] }],
   ["entries", { record }],
   ["entries", { record, entries: {} }],
-  ["record.state.holder", { record: { ...record, state: { ...active, holder: "tarantula" } }, entries: [] }],
+  ["record.state.holder", { record: { ...record, state: { ...active, holder: "primary-holder" } }, entries: [] }],
   ["entries[0].digest", { record, entries: [{ ...entry(1, 1, digests[0]), digest: "a".repeat(63) }] }],
   ["entries[1].batch.pi_seq", { record, entries: [entry(1, 1, digests[0]), { ...entry(1, 2, digests[1]), batch: { body: { kind: "inline", json: "[]" } } }] }],
   ["entries[0].files[0].size", { record, entries: [{ ...entry(1, 1, digests[0]), files: [{ ...file, size: 2 ** 53 }] }] }],

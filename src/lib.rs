@@ -46,3 +46,10 @@ pub mod notifications;
 #[cfg(test)]
 #[path = "../tests/fixtures/executable.rs"]
 mod executable_fixture;
+
+#[cfg(test)]
+#[path = "../tests/fixtures/hang_limit.rs"]
+mod hang_limit;
+
+#[cfg(test)]
+pub(crate) use hang_limit::TEST_HANG_LIMIT;

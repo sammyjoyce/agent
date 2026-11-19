@@ -9,6 +9,7 @@ import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { AgentDoc, createRegistry, GenerationTask, Harness, InboxDoc, LiveDoc, UserEntry,
   type GenerationCheckpoint } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { commitWrites } from "@earendil-works/pi-durable/testing";
 import { ConversationCatalog } from "../src/catalog.js";
 import { openConversationDatabase } from "../src/conversation-database.js";
 import { ConversationViews } from "../src/conversation-views.js";
@@ -79,13 +80,13 @@ for (const boundaryHeld of [false, true]) {
         requestId: current.id, status: "placed", entry: entry.id });
       const generation = await tx.createTask(GenerationTask, {}, { ownership: { kind: "conversation" } });
       const live = await tx.doc(LiveDoc, conversation.id);
-      live.run = { taskId: generation, inputs: [submission.id] }; live.generation = { attempt: 1 };
+      live.run = { taskId: generation, inputs: [submission.id], turns: 0 }; live.generation = { attempt: 1 };
       return { generation, submission: submission.id };
     }, BACKGROUND_CONTEXT);
     const record = await app.harness.getTask(native.generation, BACKGROUND_CONTEXT); assert.ok(record);
     const deadline = Date.now() + 3_600_000;
-    const checkpoint: GenerationCheckpoint = { phase: "retry", attempt: 1, until: deadline };
-    await app.storage.commit([{ type: "task", value: { ...record, state: { status: "sleeping", until: deadline, checkpoint } } }], BACKGROUND_CONTEXT);
+    const checkpoint = { phase: "retry", attempt: 1, until: deadline } satisfies GenerationCheckpoint;
+    await commitWrites(app.storage, [{ type: "task", value: { ...record, state: { status: "sleeping", until: deadline, checkpoint } } }], BACKGROUND_CONTEXT);
     app.views.close(); app.catalog.close(); await app.harness.close(BACKGROUND_CONTEXT);
     app = await open(directory); conversation = await app.tasks.conversation(task.conversation_id);
     const controller = new AbortController(), executions = new Executions();

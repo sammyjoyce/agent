@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import type { StorageWrite } from "@earendil-works/pi-durable";
+import type { Context } from "@earendil-works/chord/context";
+import type { Seq, Storage, StorageWrite } from "@earendil-works/pi-durable";
 import type { LogEntry } from "../generated/LogEntry.js";
 import type { Versions } from "../generated/Versions.js";
 import { COMMAND_BODY_LIMIT_BYTES, logEntryCanonical } from "./authority-wire.js";
@@ -26,6 +27,46 @@ export function parseBatch(json: string, at: number): StorageWrite[] {
   const writes: unknown = JSON.parse(json);
   if (!Array.isArray(writes)) throw new Error(`The batch of log entry ${at} is not a list of writes`);
   return writes as StorageWrite[];
+}
+
+export type BatchOutcome = { readonly kind: "stored"; readonly seq: Seq } | { readonly kind: "refused"; readonly reason: unknown };
+
+/**
+ * Commits one batch through Pi's storage as a commit of its own, the way every
+ * log entry is applied. A failure of the database rejects.
+ */
+export async function commitBatch(storage: Storage, writes: readonly StorageWrite[], context: Context): Promise<BatchOutcome> {
+  let stored: Seq | undefined;
+  const { refused } = await storage.commit([writes], (_index, seq) => { stored = seq; }, context);
+  return stored === undefined ? { kind: "refused", reason: refused } : { kind: "stored", seq: stored };
+}
+
+/** Commits the batch of the log entry at `at`, which Pi must store. */
+export async function commitLoggedBatch(storage: Storage, writes: readonly StorageWrite[], at: number, context: Context): Promise<Seq> {
+  const outcome = await commitBatch(storage, writes, context);
+  switch (outcome.kind) {
+    case "stored": return outcome.seq;
+    case "refused": throw new Error(`Pi Durable refused the batch of log entry ${at}`, { cause: outcome.reason });
+    default: return outcome satisfies never;
+  }
+}
+
+type PiVersions = Pick<Versions, "pi_durable" | "chord">;
+
+/**
+ * Older Pi Durable and Chord releases whose log entries a release replays.
+ * Their batches commit through the reader's Pi to the rows their own Pi wrote,
+ * as failover-replay-1.4.0.test.ts checks against a log that 1.4.0 wrote.
+ */
+const REPLAYED_WRITERS: readonly { readonly reader: PiVersions; readonly writer: PiVersions }[] = [
+  { reader: { pi_durable: "1.5.2", chord: "1.5.2" }, writer: { pi_durable: "1.4.0", chord: "1.4.0" } },
+];
+
+const samePi = (left: PiVersions, right: PiVersions) => left.pi_durable === right.pi_durable && left.chord === right.chord;
+
+/** Whether a host running `installed` can replay the batch of an entry that `written` logged. */
+export function replays(installed: Versions, written: Versions): boolean {
+  return samePi(installed, written) || REPLAYED_WRITERS.some(({ reader, writer }) => samePi(reader, installed) && samePi(writer, written));
 }
 
 let installed: Promise<Versions> | undefined;

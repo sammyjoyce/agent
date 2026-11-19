@@ -224,7 +224,7 @@ mod tests {
             ])
             .arg(&pid_file);
         assert!(
-            run(command, Duration::from_millis(200))
+            run(command, Duration::from_secs(5))
                 .await
                 .unwrap_err()
                 .to_string()

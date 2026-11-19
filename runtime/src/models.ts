@@ -11,13 +11,11 @@ import type { WorkerHost } from "./generated/WorkerHost.js";
 import type { ConversationChange } from "./generated/ConversationChange.js";
 import type { ModelOption } from "./generated/ModelOption.js";
 import { withWebSearch } from "./web-search.js";
+import { validProvider } from "./protocol.js";
 
-/** Keep application provider IDs aligned with the pinned upstream registry. */
-export const PROVIDERS: readonly ModelProvider[] = getBuiltinProviders();
+const WIRE_PROVIDERS: readonly ModelProvider[] = getBuiltinProviders().filter((id) => validProvider(id));
 export const DEFAULT_MODEL: ModelSelection = { provider: "openai", model_id: "gpt-6.1-sol", reasoning: "xhigh", fast: false };
 export class ModelError extends Error {}
-/** A failed inference is not an invalid user request. Only safe summaries cross the protocol. */
-export class ModelTurnError extends Error {}
 /** Allowlisted diagnostic categories, never raw provider bodies or credentials. */
 export function subscriptionSharingLimit(error: string): boolean {
   return /\bsubscription_sharing_usage_limit_exceeded\b/u.test(error) ||
@@ -91,7 +89,7 @@ export async function modelFailureMessage(conversation: Conversation, fallback: 
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
-function provider(value: unknown): value is ModelProvider { return PROVIDERS.some((id) => id === value); }
+function provider(value: unknown): value is ModelProvider { return WIRE_PROVIDERS.some((id) => id === value); }
 function reasoning(value: unknown): value is Reasoning { return MODEL_THINKING_LEVELS.some((level) => level === value); }
 function supportsFast(model: Model<Api>): boolean { return model.provider === "openai" && model.api === "openai-responses"; }
 

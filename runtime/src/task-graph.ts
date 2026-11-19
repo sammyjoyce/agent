@@ -25,8 +25,8 @@ function graphState(state: NativeState): TaskGraphState {
 }
 
 async function liveFrame(tasks: TaskStore): Promise<NativeNode[]> {
-  const attached = await tasks.session.taskGraph(BACKGROUND_CONTEXT);
-  try { return Object.values(attached.value.tasks); } finally { attached.dispose(); }
+  const observed = await tasks.session.observeTaskGraph({ advance() {}, end() {} }, BACKGROUND_CONTEXT);
+  try { return Object.values(observed.value.tasks); } finally { observed.detach(); }
 }
 
 function shallowestFirst(live: readonly NativeNode[], limit: number): NativeNode[] {

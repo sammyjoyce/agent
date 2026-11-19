@@ -1,10 +1,11 @@
 import { taskMessageSender } from "./task-messages.js";
 import { validEvent } from "./protocol.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { JsonValue } from "@earendil-works/chord";
+import type { JsonValue } from "@earendil-works/chord/json";
 import type { AssistantMessage, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
-import { AssistantEntry, CompactionEntry, defineDocFamily, defineEntry, LiveDoc, ROOT_CONVERSATION_ID, type Conversation, type Cursor, type DocumentWatch, type EntryId, type EntryRecord,
-  type DocumentReader, type Harness, type JsonObject, type LiveState } from "@earendil-works/pi-durable";
+import type { Op } from "@earendil-works/chord/delta";
+import { AssistantEntry, CompactionEntry, defineDocFamily, defineEntry, LiveDoc, ROOT_CONVERSATION_ID, type Conversation, type ConversationView, type Cursor, type EntryId, type EntryRecord,
+  type DocumentReader, type Harness, type LiveState, type Observation } from "@earendil-works/pi-durable";
 import { readNoticeOrigin } from "./notice_origin.js";
 import type { NoticeOrigin } from "./generated/NoticeOrigin.js";
 import type { HistoryBranch } from "./generated/HistoryBranch.js";
@@ -341,6 +342,26 @@ export async function toolDetails(conversation: Conversation, value: string, cal
     status: result === undefined ? "running" : result.isError ? "failed" : "finished", input, output };
 }
 
+/** Activity reads no history: a view of one entry is the least Pi loads. */
+const ACTIVITY_WINDOW = { min: 1, max: 1 };
+/** Pi's view keeps LiveDoc's value under its kind. */
+function liveState(view: ConversationView): Readonly<LiveState> | null {
+  return (view.docs[LiveDoc.definition.kind] as Readonly<LiveState> | undefined) ?? null;
+}
+function isEntryRecord(value: unknown): value is EntryRecord {
+  return object(value) && entryId(value.id) && typeof value.conversationId === "number" && typeof value.kind === "string";
+}
+/**
+ * The entries one commit appended. Pi's view adds them to `entries` in one
+ * splice before it trims its window, so the window's size loses none.
+ */
+function appendedEntries(ops: readonly Op[]): EntryRecord[] {
+  return ops.flatMap((op) => op[0] === "p" && op[1].length === 1 && op[1][0] === "entries" && op[3] === 0 ? op[4].map((value) => {
+    if (!isEntryRecord(value)) throw new Error("Pi's conversation view appended something other than an entry");
+    return value;
+  }) : []);
+}
+
 /** Forward live state and new native entries without mounting historical model context. */
 export async function activity(session: Harness, conversation: Conversation, emit: (event: ModelActivity) => void,
   message?: (message: HistoryMessage) => void, text?: (delta: string) => void,
@@ -407,90 +428,44 @@ export async function activity(session: Harness, conversation: Conversation, emi
     return idle;
   };
 
-  type Frame = { entries: EntryRecord[]; expected?: JsonObject | null };
-  const pending: Frame[] = [];
-  let watch: DocumentWatch<LiveState> | undefined, acquiring: Promise<void> | undefined;
-  let ready = false, stopped = false, failure: unknown, cutoff = 0;
-  const drain = () => {
-    if (!ready || stopped) return;
-    while (pending[0]?.expected === undefined) {
-      const frame = pending.shift(); if (frame === undefined) break;
-      for (const entry of frame.entries) if (entry.id > cutoff) committed(entry);
-    }
-  };
-  const accept = (value: Readonly<LiveState> | null, initial = false) => {
-    if (stopped) return;
-    // Pinned Pi 1.4 publishes the same immutable value to commit subscribers
-    // and typed document watches. Joining those identities keeps final thinking
-    // ahead of its canonical entry without decoding or casting Pi's state.
-    const index = pending.findIndex((frame) => frame.expected === value);
-    if (index < 0) { if (initial && live(value)) observer?.working(false); return; }
-    for (const frame of pending.splice(0, index + 1)) {
-      const idle = frame.expected === value && live(value);
-      for (const entry of frame.entries) if (entry.id > cutoff) committed(entry);
-      // Pi's answer and endRun share a commit. Canonical identity must reach
-      // the renderer before idle releases its unbound reasoning preview.
-      if (idle) observer?.working(false);
-    }
-    drain();
-  };
-  let unsubscribe = () => {}, unsubscribeClose = () => {};
+  let stopped = false, ready = false, scheduled = false, failure: unknown;
+  let observation: Observation<ConversationView> | undefined, unsubscribeClose = () => {};
+  const pending: { live: Readonly<LiveState> | null; ops: readonly Op[] }[] = [];
   const close = async () => {
     if (stopped) return;
-    stopped = true; unsubscribe(); unsubscribeClose(); visibility.close(); pending.length = 0; tools.clear();
-    const owned = watch, loading = acquiring; watch = undefined;
-    await owned?.stop();
-    await loading?.catch(() => {});
+    stopped = true; observation?.detach(); unsubscribeClose(); visibility.close(); pending.length = 0; tools.clear();
     compaction(false);
   };
   const failed = (error: unknown) => { failure = error; void close(); };
-  const acquire = (): Promise<void> => {
-    if (acquiring !== undefined) return acquiring;
-    const operation = (async () => {
-      const owned = await session.watchDoc(LiveDoc, conversation.id, BACKGROUND_CONTEXT);
-      if (stopped) { await owned?.stop(); return; }
-      watch = owned;
-      if (owned === undefined) {
-        // Creation and retirement may both precede acquisition. Canonical
-        // entries remain available even when that transient incarnation is gone.
-        accept(null, true); drain(); return;
+  // Pi calls views as it publishes a commit, and commit observers such as
+  // input receipts a microtask later. Applying each commit in a later
+  // microtask keeps an input's placement ahead of its canonical entry.
+  const apply = () => {
+    scheduled = false;
+    if (!ready || stopped) return;
+    try {
+      for (const commit of pending.splice(0)) {
+        const idle = commit.live !== previous && live(commit.live);
+        for (const entry of appendedEntries(commit.ops)) committed(entry);
+        // Pi's answer and endRun share a commit. Canonical identity must reach
+        // the renderer before idle releases its unbound reasoning preview.
+        if (idle) observer?.working(false);
       }
-      accept(owned.value, true);
-      owned.start(async (value) => {
-        accept(value);
-        if (value === null && watch === owned) {
-          watch = undefined;
-          queueMicrotask(() => { if (!stopped) void acquire().catch(failed); });
-        }
-      });
-      void owned.closed.then((result) => { if (result.reason === "listener_error") failed(result.error); });
-    })();
-    acquiring = operation;
-    void operation.finally(() => {
-      if (acquiring === operation) acquiring = undefined;
-      if (!stopped && watch === undefined && pending.some((frame) => frame.expected !== undefined && frame.expected !== null)) {
-        queueMicrotask(() => { if (!stopped) void acquire().catch(failed); });
-      }
-    }).catch(() => {});
-    return operation;
+    } catch (error) { failed(error); }
   };
-  unsubscribe = session.subscribeCommits((publication) => {
-    const entries = publication.changes.flatMap((change) => change.type === "entry" && change.value.conversationId === conversation.id ? [change.value] : []);
-    const changed = publication.changes.find((change) => change.type === "document" && change.record.kind === LiveDoc.definition.kind && change.conversationId === conversation.id);
-    if (entries.length === 0 && changed === undefined) return;
-    if (pending.length >= 512) { failed(new Error("Activity observation fell behind; reconnect to recover saved history.")); return; }
-    const expected = changed?.type === "document" && (changed.ops.length > 0 || changed.value === null || changed.record.createdAt === publication.seq) ? changed.value : undefined;
-    pending.push({ entries, ...(expected === undefined ? {} : { expected }) });
-    drain();
-    if (watch === undefined && acquiring === undefined && expected !== undefined && expected !== null) {
-      queueMicrotask(() => { if (!stopped) void acquire().catch(failed); });
-    }
-  });
   unsubscribeClose = session.subscribeClose(() => { void close(); });
   try {
-    // One bounded native tail, not the active transcript/model-context mount.
-    cutoff = (await conversation.entries({ order: "descending" }, 1, undefined, BACKGROUND_CONTEXT)).items[0]?.id ?? 0;
-    await acquire(); ready = true; drain();
+    observation = await session.observeConversation(conversation.id, {
+      advance(call) {
+        if (stopped || call.kind !== "value") return;
+        if (pending.length >= 512) { failed(new Error("Activity observation fell behind; reconnect to recover saved history.")); return; }
+        pending.push({ live: liveState(call.value), ops: call.ops });
+        if (!scheduled) { scheduled = true; queueMicrotask(apply); }
+      },
+      end(ended) { if (ended.kind === "listener_error") failed(ended.error); else void close(); },
+    }, BACKGROUND_CONTEXT, ACTIVITY_WINDOW);
+    if (stopped) observation.detach();
+    else { live(liveState(observation.value)); ready = true; apply(); }
     if (failure !== undefined) throw failure;
   } catch (error) { await close(); throw error; }
   return async () => { await close(); if (failure !== undefined) throw failure; };

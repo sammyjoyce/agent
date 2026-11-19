@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
-import { createRegistry, Harness, defineExtension, defineTool, watchEvents, type AgentEvent } from "@earendil-works/pi-durable";
+import { createRegistry, Harness, defineExtension, defineTool, LiveDoc, type LiveState } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { activity, history, isUserNotice, transcript } from "../src/transcript.js";
@@ -287,15 +287,18 @@ test("native thinking updates and final snapshots render each block once while p
   const tools = defineExtension({ name: "fixture-check", tools: [defineTool({ name: "check", description: "Run a synthetic check", parameters: Type.Object({}),
     async execute() { return { output: [{ type: "text", text: "Checked" }] }; } })] }); registry.install(tools);
   const session = await Harness.open(storage, { models, registry, identity: { attribution: null }, settings: { progress: { partialIntervalMs: 0 } } }, BACKGROUND_CONTEXT);
-  const events: AgentEvent[] = []; const thinking: string[] = [];
+  const thinking: string[] = [];
   let stop: (() => Promise<void>) | undefined; let stopNative: (() => Promise<unknown>) | undefined;
   try {
     const root = await session.root(BACKGROUND_CONTEXT);
     await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [tools] }, BACKGROUND_CONTEXT);
-    let interleaved = false;
-    const native = await watchEvents(session, root.id, BACKGROUND_CONTEXT); native.start(async (batch) => {
-      events.push(...batch);
-      if (!interleaved && batch.some((event) => event.type === "message_update" && event.changes.some((change) => change.type === "text_delta"))) {
+    let interleaved = false, streamed = false, answered = false;
+    const native = await root.watch(BACKGROUND_CONTEXT); native.start(async (call) => {
+      if (call.kind !== "value") return;
+      const live = call.value.docs[LiveDoc.definition.kind] as Readonly<LiveState> | undefined;
+      const streaming = live?.generation?.message?.content.some((part) => part.type === "text" && part.text.length > 0) ?? false;
+      streamed ||= streaming; answered ||= call.value.entries.some((entry) => entry.kind === "pi.assistant");
+      if (!interleaved && streaming) {
         interleaved = true;
         await root.commit((tx) => tx.appendEntry(root.id, { kind: "fixture.concurrent", model: [
           { role: "user", content: "Concurrent stored message while the assistant streams", timestamp: 1 },
@@ -310,8 +313,8 @@ test("native thinking updates and final snapshots render each block once while p
     ]);
     await (await root.submit({ type: "input", content: "Check and finish" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
     await root.waitForIdle(BACKGROUND_CONTEXT); await stop?.(); stop = undefined; await stopNative?.(); stopNative = undefined;
-    assert.ok(events.some((event) => event.type === "message_update"), "Exercise actual native streamed updates");
-    assert.ok(events.some((event) => event.type === "message_end"), "Exercise actual native final snapshots");
+    assert.ok(streamed, "Exercise actual native streamed updates");
+    assert.ok(answered, "Exercise actual native final snapshots");
     assert.equal(interleaved, true, "Exercise an unrelated native message_start during the same assistant's progress");
     assert.equal(thinking.join(""), summary.repeat(3));
     assert.equal(faux.state.callCount, 2);

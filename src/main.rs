@@ -4460,11 +4460,18 @@ mod executable_fixture;
 mod fake_rex;
 
 #[cfg(test)]
+#[path = "../tests/fixtures/hang_limit.rs"]
+mod hang_limit;
+
+#[cfg(test)]
+use hang_limit::TEST_HANG_LIMIT;
+
+#[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use crate::{
-        Action, Arguments, ModelArgs, executable_fixture::write_executable, fake_rex,
-        local_service_command,
+        Action, Arguments, ModelArgs, TEST_HANG_LIMIT, executable_fixture::write_executable,
+        fake_rex, local_service_command,
     };
     use agent_cli::models::{ModelProvider, ModelSelection, Reasoning};
     use agent_cli::protocol::{ImportPhase, ImportProgress, SearchMode};
@@ -4569,7 +4576,7 @@ mod tests {
                     matches!(details, ToolDetails::Unavailable { call_id } if call_id == request.call_id)
                 );
             }
-            tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            tokio::time::timeout(TEST_HANG_LIMIT, server)
                 .await
                 .unwrap()
                 .unwrap();
@@ -4620,7 +4627,7 @@ mod tests {
             )
             .await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), command_received)
+        tokio::time::timeout(TEST_HANG_LIMIT, command_received)
             .await
             .unwrap()
             .unwrap();
@@ -4633,7 +4640,7 @@ mod tests {
                 .unwrap_err()
                 .is_cancelled()
         );
-        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        tokio::time::timeout(TEST_HANG_LIMIT, server)
             .await
             .unwrap()
             .unwrap();

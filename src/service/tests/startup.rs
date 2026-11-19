@@ -1,10 +1,12 @@
 use crate::{
+    TEST_HANG_LIMIT,
     models::ModelSelection,
     protocol::{
         AgentNode, CoordinatorBootstrap, CoordinatorSettings, RuntimeCommand, RuntimeEventKind,
         WorkerLaunch,
     },
     runtime::{FrameReader, OwnerClaim, ShutdownSignal},
+    serialized_spawn::while_no_child_starts,
     service::{SOCKET_NAME, ShutdownReason, connect, serve_with_transport, write_frame},
 };
 use std::{fs, path::PathBuf, time::Duration};
@@ -86,7 +88,7 @@ await import(pathToFileURL({}).href);
             )
             .await
         });
-        let pid = timeout(Duration::from_secs(5), async {
+        let pid = timeout(TEST_HANG_LIMIT, async {
             loop {
                 if let Ok(pid) = fs::read_to_string(directory.path().join("held.pid")) {
                     break pid.parse().unwrap();
@@ -110,7 +112,7 @@ await import(pathToFileURL({}).href);
     }
 
     async fn client(&mut self) -> UnixStream {
-        timeout(Duration::from_secs(10), async {
+        timeout(TEST_HANG_LIMIT, async {
             loop {
                 if let Ok(stream) = connect(self.directory.path()).await {
                     return stream;
@@ -130,7 +132,7 @@ await import(pathToFileURL({}).href);
 
     async fn stop(mut self) {
         self.stop.take().unwrap().send(()).unwrap();
-        timeout(Duration::from_secs(8), self.task)
+        timeout(TEST_HANG_LIMIT, self.task)
             .await
             .unwrap()
             .unwrap()
@@ -152,7 +154,7 @@ fn assert_reaped_and_unlocked(directory: &tempfile::TempDir, pid: libc::pid_t) {
         .write(true)
         .open(directory.path().join("writer.lock"))
         .unwrap();
-    fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+    while_no_child_starts(|| fs2::FileExt::try_lock_exclusive(&lock)).unwrap();
 }
 
 async fn configured(stream: UnixStream) -> Vec<AgentNode> {
@@ -165,7 +167,7 @@ async fn configured(stream: UnixStream) -> Vec<AgentNode> {
     .unwrap();
     let mut reader = FrameReader::new(BufReader::new(reader));
     let event: RuntimeEventKind = serde_json::from_slice(
-        &timeout(Duration::from_secs(5), reader.next_frame())
+        &timeout(TEST_HANG_LIMIT, reader.next_frame())
             .await
             .unwrap()
             .unwrap()
@@ -205,11 +207,11 @@ async fn shutdown_during_initialization_reaps_pi_without_binding_a_listener() {
     assert!(!service.directory.path().join(SOCKET_NAME).exists());
     assert!(OwnerClaim::acquire(service.directory.path(), &service.script, None).is_err());
     service.stop.take().unwrap().send(()).unwrap();
-    let stopped = timeout(Duration::from_secs(8), &mut service.task).await;
+    let stopped = timeout(TEST_HANG_LIMIT, &mut service.task).await;
     if stopped.is_err() {
         // Let the baseline finish cleanly before reporting its missed shutdown.
         service.signal(libc::SIGUSR2);
-        let _ = timeout(Duration::from_secs(10), &mut service.task).await;
+        let _ = timeout(TEST_HANG_LIMIT, &mut service.task).await;
     }
     stopped
         .expect("Shutdown waited for Pi initialization")
@@ -252,7 +254,7 @@ async fn ordinary_worker_metadata_still_times_out_when_real_pi_stalls() {
     let mut response = Vec::new();
     let closed = timeout(Duration::from_secs(20), worker.read_to_end(&mut response)).await;
     service.signal(libc::SIGCONT);
-    let registered = timeout(Duration::from_secs(5), async {
+    let registered = timeout(TEST_HANG_LIMIT, async {
         loop {
             let nodes = configured(service.client().await).await;
             if nodes

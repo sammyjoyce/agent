@@ -17,6 +17,10 @@ use agent_cli::{
 use serde::Serialize;
 use tokio::time::{sleep, timeout};
 
+#[path = "fixtures/hang_limit.rs"]
+mod hang_limit;
+use hang_limit::TEST_HANG_LIMIT;
+
 #[derive(Serialize)]
 struct CommandArguments {
     program: String,
@@ -46,7 +50,7 @@ impl Drop for BackgroundOwner {
 async fn collect(mut call: RuntimeCall) -> Vec<RuntimeEventKind> {
     let mut events = Vec::new();
     loop {
-        let event = timeout(Duration::from_secs(8), call.events.recv())
+        let event = timeout(TEST_HANG_LIMIT, call.events.recv())
             .await
             .expect("The runtime request did not finish")
             .expect("The runtime request closed without its terminal event");
@@ -104,7 +108,7 @@ fn job(id: &str, prompt: &str, directory: &Path) -> ScheduledJob {
 }
 
 async fn started(path: &Path) -> i32 {
-    timeout(Duration::from_secs(8), async {
+    timeout(TEST_HANG_LIMIT, async {
         loop {
             if let Ok(value) = fs::read_to_string(path)
                 && value.ends_with('\n')
@@ -269,7 +273,7 @@ async fn stopping_one_background_actor_drains_its_real_process_and_preserves_the
         )
         .await
     }));
-    timeout(Duration::from_secs(8), async {
+    timeout(TEST_HANG_LIMIT, async {
         loop {
             let events = collect(runtime.request(RuntimeCommand::ListJobs).await.unwrap()).await;
             if events.iter().any(|event| {
@@ -322,7 +326,7 @@ async fn stopping_one_background_actor_drains_its_real_process_and_preserves_the
         })
         .await
         .unwrap();
-    timeout(Duration::from_secs(8), async {
+    timeout(TEST_HANG_LIMIT, async {
         loop {
             if matches!(
                 view.events.recv().await,
@@ -363,7 +367,7 @@ async fn stopping_one_background_actor_drains_its_real_process_and_preserves_the
     assert_eq!(unsafe { libc::kill(beta_process, 0) }, 0);
     assert!(!completed_beta.exists());
     fs::write(&release_beta, "release").unwrap();
-    timeout(Duration::from_secs(8), async {
+    timeout(TEST_HANG_LIMIT, async {
         loop {
             if task(&runtime, &ids[1]).await.0.summary
                 == "Beta completed with its real host receipt."
@@ -394,7 +398,7 @@ async fn stopping_one_background_actor_drains_its_real_process_and_preserves_the
             .unwrap(),
     )
     .await;
-    timeout(Duration::from_secs(8), async {
+    timeout(TEST_HANG_LIMIT, async {
         loop {
             if task(&runtime, &ids[0]).await.0.summary
                 == "The same saved alpha conversation continued."
@@ -408,7 +412,7 @@ async fn stopping_one_background_actor_drains_its_real_process_and_preserves_the
     .unwrap();
     runtime.detach(view.request_id).await;
     background.0.abort();
-    timeout(Duration::from_secs(8), async {
+    timeout(TEST_HANG_LIMIT, async {
         while Arc::strong_count(&runtime) > 1 {
             sleep(Duration::from_millis(10)).await;
         }

@@ -34,16 +34,16 @@ function summaryMessage(text: string): NonNullable<NonNullable<LiveState["genera
     stopReason: message.stopReason, timestamp: message.timestamp, content: [{ type: "thinking", thinking: text }] };
 }
 
-function heldWatch(session: Harness) {
+function heldAttachment(session: Harness) {
   const entered = gate(), release = gate();
   let held = true;
-  session.watchDoc = new Proxy(session.watchDoc, {
+  session.observeConversation = new Proxy(session.observeConversation, {
     apply(target, owner, args: unknown[]) {
       const result: unknown = Reflect.apply(target, owner, args);
       assert.ok(result instanceof Promise);
-      return result.then(async (watch: unknown) => {
+      return result.then(async (observation: unknown) => {
         if (held) { held = false; entered.resolve(); await release.promise; }
-        return watch;
+        return observation;
       });
     },
   });
@@ -64,14 +64,14 @@ test("activity reconnect reads one native tail regardless of retained root size"
       stop = await activity(app.session, app.root, () => {}, (message) => messages.push(message), undefined, { includeFinal: true, working() {} });
       await stop(); stop = undefined;
     }
-    assert.deepEqual(scans, [1, 1], "Presentation must not hydrate every active entry on attach or reconnect");
+    assert.deepEqual(scans, [2, 2], "Presentation must not hydrate every active entry on attach or reconnect");
     assert.deepEqual(messages, [], "Old native entries belong to paged history, never the live subscription");
   } finally { await stop?.(); await app.close(); }
 });
 
-test("native coalesced LiveDoc delivery orders final thinking before new canonical entries without replay", { timeout: 10_000 }, async () => {
+test("commits made while the view attaches order final thinking before new canonical entries without replay", { timeout: 10_000 }, async () => {
   const app = await fixture(); let stop: (() => Promise<void>) | undefined;
-  const held = heldWatch(app.session);
+  const held = heldAttachment(app.session);
   try {
     await app.root.commit(async (tx) => { await tx.doc(LiveDoc, app.root.id); }, BACKGROUND_CONTEXT);
     const thinking: string[] = [], visible: HistoryMessage[] = [], order: string[] = [];
@@ -134,18 +134,22 @@ test("an absent LiveDoc can be created, retired and recreated while an observati
   } finally { await stop?.(); await app.close(); }
 });
 
-test("LiveDoc acquisition failure releases entry, visibility and close subscriptions", async () => {
+test("a failed view attachment releases the visibility and close subscriptions", async () => {
   const app = await fixture();
   try {
-    const original = app.session.subscribeCommits.bind(app.session); let subscriptions = 0;
-    app.session.subscribeCommits = (listener) => {
-      const stop = original(listener); subscriptions += 1;
-      return () => { subscriptions -= 1; stop(); };
+    const observeCommits = app.session.observeCommits.bind(app.session), subscribeClose = app.session.subscribeClose.bind(app.session);
+    let observers = 0;
+    app.session.observeCommits = (observer) => {
+      const observation = observeCommits(observer); observers += 1;
+      return { detach() { observers -= 1; observation.detach(); } };
     };
-    const existing = subscriptions;
-    app.session.watchDoc = new Proxy(app.session.watchDoc, { apply() { return Promise.reject(new Error("fixture acquisition failed")); } });
-    await assert.rejects(activity(app.session, app.root, () => {}), /fixture acquisition failed/);
-    assert.equal(subscriptions, existing, "A failed native acquisition must leave no entry or visibility listener");
+    app.session.subscribeClose = (listener) => {
+      const stop = subscribeClose(listener); observers += 1;
+      return () => { observers -= 1; stop(); };
+    };
+    app.session.observeConversation = () => Promise.reject(new Error("fixture attachment failed"));
+    await assert.rejects(activity(app.session, app.root, () => {}), /fixture attachment failed/);
+    assert.equal(observers, 0, "A failed attachment must leave no visibility or close listener");
   } finally { await app.close(); }
 });
 
@@ -218,8 +222,8 @@ test("a typed notice committed during native streaming leaves the response and r
   } finally { await publishing; await stop?.(); await app.close(); }
 });
 
-test("activity bounds pending native commits during delayed acquisition", { timeout: 10_000 }, async () => {
-  const app = await fixture(); const held = heldWatch(app.session);
+test("activity bounds the commits it holds while the view attaches", { timeout: 10_000 }, async () => {
+  const app = await fixture(); const held = heldAttachment(app.session);
   try {
     const starting = activity(app.session, app.root, () => {});
     await held.entered;

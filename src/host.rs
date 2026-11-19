@@ -1120,6 +1120,7 @@ mod tests {
     use tokio::{net::TcpStream, sync::oneshot, time::timeout};
 
     use crate::{
+        TEST_HANG_LIMIT,
         host::{Executor, ProcessOutput, ProcessRequest, run_process, run_process_until},
         protocol::{HostCommand, HostDelivery, HostResult, WorkerPresence, WorkerRef, WorkerState},
         rex::{RexClient, fake_rex},
@@ -1804,7 +1805,7 @@ mod tests {
                 .await
         });
         cancel.send(true).unwrap();
-        let result = timeout(Duration::from_secs(2), operation)
+        let result = timeout(TEST_HANG_LIMIT, operation)
             .await
             .expect("Cancellation must not wait for the held embedding provider")
             .unwrap();
@@ -1828,7 +1829,7 @@ mod tests {
                 literal.into(),
             ],
             std::path::Path::new("/"),
-            Duration::from_secs(5),
+            TEST_HANG_LIMIT,
             1024).unwrap(),
         )
         .await
@@ -1937,7 +1938,7 @@ setInterval(() => {}, 1000);
             )
             .await
         });
-        let fixture: Fixture = timeout(Duration::from_secs(5), async {
+        let fixture: Fixture = timeout(TEST_HANG_LIMIT, async {
             loop {
                 if let Ok(contents) = tokio::fs::read(&marker).await
                     && let Ok(fixture) = serde_json::from_slice(&contents)
@@ -1955,7 +1956,7 @@ setInterval(() => {}, 1000);
                 .is_ok()
         );
         stop.send(()).unwrap();
-        let result = timeout(Duration::from_secs(5), running)
+        let result = timeout(TEST_HANG_LIMIT, running)
             .await
             .expect("Cancellation must complete cleanup")
             .unwrap()
@@ -1981,7 +1982,7 @@ setInterval(() => {}, 1000);
         );
         // Reaping the direct child does not wait for its orphaned descendant.
         // Group SIGKILL can still be completing socket teardown on another CPU.
-        timeout(Duration::from_secs(5), async {
+        timeout(TEST_HANG_LIMIT, async {
             while TcpStream::connect(("127.0.0.1", fixture.port))
                 .await
                 .is_ok()

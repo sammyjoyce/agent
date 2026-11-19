@@ -9,9 +9,9 @@ import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import type { ErrorCode } from "./generated/ErrorCode.js";
 import { CoordinatorEnvironment, EnvironmentError } from "./environment.js";
-import { ConversationModels, ModelError, ModelTurnError, modelFailureMessage } from "./models.js";
+import { ConversationModels, ModelError, modelFailureMessage } from "./models.js";
 import { ChatGptAuth } from "./auth.js";
-import { validRequest, validEvent, validApnsConfig, errorEvent, invalidHostReply, protocolLines } from "./protocol.js";
+import { validRequest, validEvent, validApnsConfig, errorEvent, invalidHostReply, protocolLines, ModelTurnError } from "./protocol.js";
 import { TaskError, TaskStore, type ActorExecution, type HostCall } from "./tasks.js";
 import { readTaskGraph } from "./task-graph.js";
 import { HistoryStore } from "./history.js";
@@ -37,7 +37,7 @@ import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { conversationSettings } from "./settings.js";
 import { createInputOrigins, INPUT_ORIGIN_CAPABILITIES } from "./input_origin.js";
 import { watchInputDelivery } from "./input_delivery.js";
-import { inspectMainWork, reconcileMainInput, recoverMainGeneration, watchMainNotices } from "./main_observation.js";
+import { inspectMainWork, reconcileMainInput, watchMainNotices } from "./main_observation.js";
 import { createMainResponsePolicy, MAIN_RESPONSE_INSTRUCTIONS, mainResponse } from "./main_response.js";
 import { BackgroundScheduler } from "./background.js";
 import { openJobActor, runScheduled } from "./scheduled.js";
@@ -805,10 +805,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
           // Native work outlives its transport owner. Publish a blocked run only
           // after history makes the observer ready, so it stays connected.
           const work = await inspectMainWork(application.harness, root);
-          if (work.type === "blocked") failure(id, "invalid_request", work.recovery === "message"
-            ? "Main conversation paused after repeated restarts. Send a message to resume."
-            : work.recovery === "inspect_outcome" ? "Main conversation paused while owned work is parked. Inspect its prior outcome before retrying it."
-              : "Main conversation paused. Worker/runtime update required before it can resume.");
+          if (work.type === "blocked") failure(id, "invalid_request", "Main conversation paused. Worker/runtime update required before it can resume.");
           else if (work.type === "idle" && mainTurns.size === 0) emit(id, { type: "worker_idle" });
           await observer.finished;
         } finally {
@@ -884,7 +881,6 @@ async function handle(request: RuntimeRequest): Promise<void> {
             // One owner must retain every saved root input. Completing the
             // selected input can hand Pi directly to an older queued follow-up.
             await retainMainInputs(harness, root, turn);
-            await recoverMainGeneration(harness, root);
             let submission = reclaimedInput;
             if (submission === undefined) {
               const prepared = await application.attachments.input(command.input, command.attachments, executions.get(root.id.toString()).call, command.origin);
