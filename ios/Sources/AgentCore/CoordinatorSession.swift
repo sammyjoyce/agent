@@ -722,11 +722,13 @@ public actor CoordinatorSession {
   }
 
   /// Writes a queued input again under its original ID. One the coordinator accepted is observed by
-  /// that ID until placed, never written again. Returns the exchange that writes it, or nil when
-  /// none started.
+  /// that ID until placed, never written again. One whose origin this connection does not accept
+  /// stays queued and unwritten, since a coordinator refuses an origin it does not list. Returns the
+  /// exchange that writes it, or nil when none started.
   @discardableResult public func retry(_ inputID: String) -> UUID? {
     guard !retired, actions.count < 32, snapshot.connection == .connected,
-      let item = pending.first(where: { $0.request.inputId == inputID }), item.accepted != true
+      let item = pending.first(where: { $0.request.inputId == inputID }), item.accepted != true,
+      item.request.origin.map(accepts) ?? true
     else { return nil }
     unsent[inputID] = nil
     transcript.delivery(inputID, .sending)
