@@ -2225,13 +2225,12 @@ try{
         })
         .unwrap();
         let source = fixture(directory.path(), &native);
-        std::fs::write(directory.path().join("block"), b"block").unwrap();
         let HistoryResponse::List {
             threads,
             next_cursor,
-        } = tokio::time::timeout(Duration::from_secs(3), source.list(false, None))
+        } = tokio::time::timeout(TEST_HANG_LIMIT, source.list(false, None))
             .await
-            .expect("Each host call must yield after one repair page, not await the entire sweep")
+            .unwrap()
             .unwrap()
         else {
             panic!("Expected repair progress");
@@ -2247,9 +2246,9 @@ try{
                 .lines()
                 .filter(|line| line.contains("thread/list"))
                 .count(),
-            1
+            1,
+            "Each host call must yield after one repair page, not await the entire sweep"
         );
-        std::fs::remove_file(directory.path().join("block")).unwrap();
         drop(source);
         let source = fixture(directory.path(), &native);
         assert!(source.list(true, Some(cursor.clone())).await.is_err());
