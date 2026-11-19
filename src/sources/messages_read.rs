@@ -164,6 +164,12 @@ mod tests {
         program.to_str().unwrap().to_owned()
     }
 
+    fn shell_producer(directory: &Path, script: &str) -> String {
+        let program = directory.join("messages");
+        write_executable(&program, &format!("#!/bin/sh\n{script}\n"));
+        program.to_str().unwrap().to_owned()
+    }
+
     async fn run(request: &FixtureRequest<'_>) -> ProcessCapture {
         let output = capture(&["--request".into(), serde_json::to_string(request).unwrap()])
             .await
@@ -222,10 +228,7 @@ mod tests {
             assert_eq!(result.stderr.len(), limit);
             assert_eq!(result.truncated, truncated);
         }
-        producer(
-            directory.path(),
-            "process.stdout.write('started'); setInterval(() => {}, 1000);",
-        );
+        shell_producer(directory.path(), "printf started\nexec sleep 600");
         let started = std::time::Instant::now();
         let result = run(&FixtureRequest {
             argv: vec![program, "doctor".into()],
