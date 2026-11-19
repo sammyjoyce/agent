@@ -16,8 +16,6 @@ import { withWebSearch } from "./web-search.js";
 export const PROVIDERS: readonly ModelProvider[] = getBuiltinProviders();
 export const DEFAULT_MODEL: ModelSelection = { provider: "openai", model_id: "gpt-6.1-sol", reasoning: "xhigh", fast: false };
 export class ModelError extends Error {}
-/** A failed inference is not an invalid user request. Only safe summaries cross the protocol. */
-export class ModelTurnError extends Error {}
 /** Allowlisted diagnostic categories, never raw provider bodies or credentials. */
 export function subscriptionSharingLimit(error: string): boolean {
   return /\bsubscription_sharing_usage_limit_exceeded\b/u.test(error) ||
