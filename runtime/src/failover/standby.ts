@@ -8,7 +8,7 @@ import type { FileRecord } from "../generated/FileRecord.js";
 import type { LogEntry } from "../generated/LogEntry.js";
 import type { Versions } from "../generated/Versions.js";
 import type { AuthorityLink } from "./authority-link.js";
-import { logEntryDigest, parseBatch, sha256Hex, versions } from "./log-entry.js";
+import { commitLoggedBatch, logEntryDigest, parseBatch, sha256Hex, versions } from "./log-entry.js";
 import type { ScopedDatabase } from "./scoped-database.js";
 
 const LOG_PAGE_ENTRIES = 32;
@@ -83,7 +83,7 @@ async function applyEntry({ database, link, stateDirectory }: LogFollower, stora
   try {
     if (batch === null) return await database.applyWithoutBatch(at, publish);
     const writes = parseBatch(await batchJson(link, at, batch.body), at);
-    await database.apply(at, batch.pi_seq, { publish, commit: () => storage.commit(writes, BACKGROUND_CONTEXT) });
+    await database.apply(at, batch.pi_seq, { publish, commit: () => commitLoggedBatch(storage, writes, at, BACKGROUND_CONTEXT) });
   } catch (error) {
     await removeFiles(pending);
     throw error;

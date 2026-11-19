@@ -713,7 +713,11 @@ check. It does not read a batch that is in the blob store.
 
 **Commits go to the log first.** For each Pi commit the coordinator runs the
 batch in a transaction that it rolls back, appends the batch to the log, and
-only then commits it locally. A retained file takes its final name only after a
+only then commits it locally. Pi can pass several commits in one storage call.
+Each of them is a log entry of its own, appended and committed in order, so a
+standby applies the same commits one by one. When Pi's checks refuse one of
+them, it and the commits after it reach neither the log nor the disk, and the
+ones before it stay. A retained file takes its final name only after a
 log entry names it. So local disk never holds a commit or a file that the log
 lacks, and every acknowledgement a client receives is true on a standby that
 has applied the log. An append that the authority refuses because the epoch is

@@ -1,12 +1,12 @@
 import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
-import type { Seq, Storage, StorageWrite } from "@earendil-works/pi-durable";
+import type { CommitResult, Seq, Storage, StorageWrite } from "@earendil-works/pi-durable";
 import type { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { AuthorityState } from "../generated/AuthorityState.js";
 import type { BatchBody } from "../generated/BatchBody.js";
 import type { FileRecord } from "../generated/FileRecord.js";
 import type { LogEntry } from "../generated/LogEntry.js";
 import { repeatUntilAnswered, type AuthorityLink } from "./authority-link.js";
-import { INLINE_BATCH_LIMIT_BYTES, logEntryDigest, parseBatch, sha256Hex, versions } from "./log-entry.js";
+import { commitBatch, commitLoggedBatch, INLINE_BATCH_LIMIT_BYTES, logEntryDigest, parseBatch, sha256Hex, versions } from "./log-entry.js";
 import type { ScopedDatabase } from "./scoped-database.js";
 import { followLog, publishFiles, removePaths, replicatedFilePath, type LogFollower } from "./standby.js";
 
@@ -63,11 +63,12 @@ function fenced(options: Pick<ReplicatedStorageOptions, "onFenced">, reason: Own
 }
 
 /**
- * Opens the owner's storage. Every Pi commit is dry run locally, appended to
- * the log, and only then committed locally, so local disk never holds a commit
- * the log lacks. Entries the log holds and this directory lacks are applied
- * before this returns, which is before Pi opens. Takes ownership of
- * `database`. An abort of `signal` ends a wait for an unreachable authority.
+ * Opens the owner's storage. Pi stores a group of commits in one call, and
+ * each commit in it is dry run locally, appended to the log as an entry of its
+ * own, and only then committed locally, so local disk never holds a commit the
+ * log lacks. Entries the log holds and this directory lacks are applied before
+ * this returns, which is before Pi opens. Takes ownership of `database`. An
+ * abort of `signal` ends a wait for an unreachable authority.
  */
 export async function openReplicatedStorage(options: ReplicatedStorageOptions): Promise<{ storage: Storage; log: LogWriter }> {
   const { database, link, holder, epoch } = options;
@@ -131,17 +132,29 @@ class OwnerLog implements LogWriter {
     });
   }
 
-  readonly commit = (writes: readonly StorageWrite[], context: Context): Promise<Seq> => this.#serialized(async () => {
-    const { database } = this.#options;
-    const json = JSON.stringify(writes);
-    const logged = parseBatch(json, this.#head + 1);
-    const piSeq = await database.dryRun(() => this.#storage.commit(logged, context));
-    const files = this.#carried.splice(0);
-    const at = await this.#append({ files, removed: [], batch: { piSeq, json } });
-    const committed = await database.apply(at, piSeq, { publish: () => this.#publish(files), commit: () => this.#storage.commit(logged, context) });
-    this.#head = at;
-    return committed;
-  });
+  /**
+   * A standby applies each entry as a commit of its own, so the owner commits
+   * each batch of the group as one too. The first batch Pi refuses ends the
+   * group before it reaches the log, and the ones before it stay stored.
+   */
+  readonly commit = (batches: readonly (readonly StorageWrite[])[], receive: (index: number, seq: Seq) => void, context: Context): Promise<CommitResult> =>
+    this.#serialized(async () => {
+      const { database } = this.#options;
+      const stored: Seq[] = [];
+      let refused: { readonly reason: unknown } | undefined;
+      for (const writes of batches) {
+        const json = JSON.stringify(writes);
+        const logged = parseBatch(json, this.#head + 1);
+        const predicted = await database.dryRun(() => commitBatch(this.#storage, logged, context));
+        if (predicted.kind === "refused") { refused = predicted; break; }
+        const files = this.#carried.splice(0);
+        const at = await this.#append({ files, removed: [], batch: { piSeq: predicted.seq, json } });
+        stored.push(await database.apply(at, predicted.seq, { publish: () => this.#publish(files), commit: () => commitLoggedBatch(this.#storage, logged, at, context) }));
+        this.#head = at;
+      }
+      for (const [index, seq] of stored.entries()) receive(index, seq);
+      return refused === undefined ? { stored: stored.length } : { stored: stored.length, refused: refused.reason };
+    });
 
   #serialized<T>(step: () => Promise<T>): Promise<T> {
     const result = this.#serialUntilFirstFailure.then(step);

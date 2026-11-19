@@ -7,7 +7,7 @@ import { after, type TestContext } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { SqliteDatabase } from "@earendil-works/chord/sqlite";
 import { createModels, fauxProvider } from "@earendil-works/pi-ai";
-import { createRegistry, Harness, type Registry, type Storage, type StorageWrite } from "@earendil-works/pi-durable";
+import { createRegistry, Harness, type CommitResult, type Registry, type Seq, type Storage, type StorageWrite } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { openConversationDatabase } from "../../src/conversation-database.js";
 import { AuthorityClient } from "../../src/failover/authority-client.js";
@@ -166,6 +166,16 @@ export async function openOwner(directory: string, link: AuthorityLink, options:
   const { storage, log } = await openReplicatedStorage(opened);
   try { return { database, storage, log, files: new ReplicatedFiles(log, opened), ...await openPi(storage, options) }; }
   catch (error) { await storage.close(BACKGROUND_CONTEXT).catch(() => {}); throw error; }
+}
+
+/** Stores `batches` in one call, as Pi's Session does: the result, and the sequence each stored batch received, in order. */
+export async function commitGroup(storage: Storage, batches: readonly (readonly StorageWrite[])[]): Promise<CommitResult & { readonly seqs: readonly Seq[] }> {
+  const seqs: Seq[] = [];
+  const result = await storage.commit(batches, (index, seq) => {
+    if (index !== seqs.length) throw new Error(`Storage received batch ${index} out of order`);
+    seqs.push(seq);
+  }, BACKGROUND_CONTEXT);
+  return { ...result, seqs };
 }
 
 /** Commits as a coordinator without the commit barrier does. */

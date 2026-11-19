@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { ROOT_CONVERSATION_ID, type StorageWrite } from "@earendil-works/pi-durable";
+import { defineDoc, ROOT_CONVERSATION_ID, type Storage, type StorageWrite } from "@earendil-works/pi-durable";
 import { AuthorityDenied } from "../src/failover/authority-client.js";
 import { AuthorityUnreachable } from "../src/failover/authority-link.js";
 import { INLINE_BATCH_LIMIT_BYTES, sha256Hex } from "../src/failover/log-entry.js";
-import { OwnerFenced } from "../src/failover/replicated-storage.js";
+import { openReplicatedStorage, OwnerFenced } from "../src/failover/replicated-storage.js";
 import { UnloggedWrite } from "../src/failover/scoped-database.js";
-import { authorities, enroll, follow, localNotes, logBatches, logEntries, loggedNotes, note, openOwner, OWNER, replaceOwner, STANDBY,
+import { authorities, commitGroup, enroll, follow, localNotes, logBatches, logEntries, loggedNotes, note, openOwner, openPi, openScoped, OWNER, replaceOwner, STANDBY,
   stateDirectory, tables, takeBack } from "./fixtures/failover-state.js";
 import { until } from "./fixtures/until.js";
 
@@ -224,7 +225,9 @@ for (const [name, connect] of Object.entries(authorities)) {
     const reused = (await logBatches(link)).flat().find((write) => write.type === "entry");
     assert.ok(reused);
     const head = owner.log.head, before = tables(directory);
-    await assert.rejects(owner.storage.commit([reused], context), /already belongs to entry/);
+    const { stored, refused } = await commitGroup(owner.storage, [[reused]]);
+    assert.equal(stored, 0);
+    assert.match(String(refused), /already belongs to entry/);
     assert.equal((await link.record())?.state.head, head);
     assert.equal(owner.log.head, head);
     assert.deepEqual(tables(directory), before);
@@ -239,7 +242,9 @@ for (const [name, connect] of Object.entries(authorities)) {
     assert.ok(reused?.type === "entry");
     const fresh: StorageWrite = { type: "entry", value: { ...reused.value, id: await owner.storage.mintId() } };
     const head = owner.log.head, before = tables(directory);
-    await assert.rejects(owner.storage.commit(Object.assign([fresh], { toJSON: () => [reused] }), context), /already belongs to entry/);
+    const { stored, refused } = await commitGroup(owner.storage, [Object.assign([fresh], { toJSON: () => [reused] })]);
+    assert.equal(stored, 0);
+    assert.match(String(refused), /already belongs to entry/);
     assert.equal((await link.record())?.state.head, head, "the log did not move");
     assert.equal(owner.log.head, head);
     assert.deepEqual(tables(directory), before);
@@ -253,7 +258,7 @@ for (const [name, connect] of Object.entries(authorities)) {
     assert.ok(logged);
     let serialized = 0;
     const unstable = { toJSON: () => `serialized ${serialized += 1} times` } as unknown as string;
-    await owner.storage.commit([{ type: "entry", value: { ...logged.value, id: await owner.storage.mintId(), data: unstable } }], context);
+    await commitGroup(owner.storage, [[{ type: "entry", value: { ...logged.value, id: await owner.storage.mintId(), data: unstable } }]]);
     await owner.harness.close(context);
     await follow(standby, link);
     assert.deepEqual(tables(standby), tables(directory));
@@ -263,11 +268,95 @@ for (const [name, connect] of Object.entries(authorities)) {
     const link = await connect(), epoch = await enroll(link), directory = await stateDirectory(t), standby = await stateDirectory(t);
     const owner = await openOwner(directory, link, { epoch });
     const head = owner.log.head;
-    const first = await owner.storage.commit([], context);
-    assert.equal(await owner.storage.commit([], context), first + 1);
+    const { seqs: [first] } = await commitGroup(owner.storage, [[]]);
+    assert.ok(first !== undefined);
+    assert.deepEqual((await commitGroup(owner.storage, [[]])).seqs, [first + 1]);
     assert.equal(owner.log.head, head + 2);
     await owner.harness.close(context);
     assert.equal(await follow(standby, link), head + 2);
+    assert.deepEqual(tables(standby), tables(directory));
+  });
+
+  test(`${name}: a group of commits is one log entry per batch, each at its own Pi sequence, and a standby replays it`, async (t) => {
+    const link = await connect(), epoch = await enroll(link), directory = await stateDirectory(t), standby = await stateDirectory(t);
+    const owner = await openOwner(directory, link, { epoch });
+    await owner.root.submit(note("first", "request-1"), context);
+    const template = (await logBatches(link)).flat().find((write) => write.type === "entry" && write.value.kind === "app.note");
+    assert.ok(template?.type === "entry");
+    const fresh = async (data: string): Promise<StorageWrite[]> => [{ type: "entry", value: { ...template.value, id: await owner.storage.mintId(), data } }];
+    const head = owner.log.head;
+    const group = await commitGroup(owner.storage, [await fresh("group 1"), await fresh("group 2"), await fresh("group 3")]);
+    assert.equal(group.stored, 3);
+    assert.equal(group.refused, undefined);
+    const [firstSeq] = group.seqs;
+    assert.ok(firstSeq !== undefined);
+    assert.deepEqual(group.seqs, [firstSeq, firstSeq + 1, firstSeq + 2]);
+    const entries = (await logEntries(link)).filter((entry) => entry.at > head);
+    assert.deepEqual(entries.map((entry) => [entry.at, entry.batch?.pi_seq]), group.seqs.map((seq, index) => [head + 1 + index, seq]));
+    assert.deepEqual(localNotes(directory), ["first", "group 1", "group 2", "group 3"]);
+    await owner.harness.close(context);
+    assert.equal(await follow(standby, link), (await link.record())?.state.head);
+    assert.deepEqual(tables(standby), tables(directory));
+  });
+
+  test(`${name}: the first batch Pi refuses ends its group, and only the batches before it reach the log and the disk`, async (t) => {
+    const link = await connect(), epoch = await enroll(link), directory = await stateDirectory(t), standby = await stateDirectory(t);
+    const owner = await openOwner(directory, link, { epoch });
+    await owner.root.submit(note("first", "request-1"), context);
+    const reused = (await logBatches(link)).flat().find((write) => write.type === "entry" && write.value.kind === "app.note");
+    assert.ok(reused?.type === "entry");
+    const fresh = async (data: string): Promise<StorageWrite[]> => [{ type: "entry", value: { ...reused.value, id: await owner.storage.mintId(), data } }];
+    const head = owner.log.head;
+    const group = await commitGroup(owner.storage, [await fresh("before the refusal"), [reused], await fresh("after the refusal")]);
+    assert.equal(group.stored, 1);
+    assert.equal(group.seqs.length, 1);
+    assert.match(String(group.refused), /already belongs to entry/);
+    assert.equal(owner.log.head, head + 1);
+    assert.equal((await link.record())?.state.head, head + 1);
+    assert.deepEqual(await loggedNotes(link), ["first", "before the refusal"]);
+    assert.deepEqual(localNotes(directory), ["first", "before the refusal"]);
+    await owner.root.submit(note("second", "request-2"), context);
+    assert.deepEqual(localNotes(directory), ["first", "before the refusal", "second"], "the barrier commits after a refused group");
+    await owner.harness.close(context);
+    assert.equal(await follow(standby, link), (await link.record())?.state.head);
+    assert.deepEqual(tables(standby), tables(directory));
+  });
+
+  test(`${name}: Pi's group commits from independent jobs pass the barrier one log entry per commit, and a standby replays them`, async (t) => {
+    const link = await connect(), epoch = await enroll(link), directory = await stateDirectory(t), standby = await stateDirectory(t);
+    const { storage, log } = await openReplicatedStorage({ database: await openScoped(directory), link, holder: OWNER, epoch, stateDirectory: directory, onFenced: () => {} });
+    const groups: number[] = [];
+    const counted: Storage = new Proxy(storage, {
+      get(target, name) {
+        if (name === "commit") return (...[batches, receive, commitContext]: Parameters<Storage["commit"]>) => {
+          groups.push(batches.length);
+          return target.commit(batches, receive, commitContext);
+        };
+        const value: unknown = Reflect.get(target, name, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const { harness } = await openPi(counted);
+    const counters = Array.from({ length: 6 }, (_, index) =>
+      defineDoc<{ count: number }>({ kind: `fixture.counter-${index}`, scope: "session", version: 1, initial: () => ({ count: 0 }), checkpointWhen: () => false }));
+    let held = false;
+    link.beforeCommand = async (command) => {
+      if (command.op !== "append" || held) return;
+      held = true;
+      await sleep(50);
+    };
+    const head = log.head;
+    groups.length = 0;
+    await Promise.all(counters.map((counter) => harness.commit(async (tx) => { (await tx.doc(counter)).count += 1; }, context)));
+    assert.ok(groups.some((size) => size > 1), `Pi grouped commits that arrived while one was stored: ${JSON.stringify(groups)}`);
+    const entries = (await logEntries(link)).filter((entry) => entry.at > head);
+    assert.equal(entries.length, groups.reduce((sum, size) => sum + size, 0), "one log entry per commit");
+    const sequences = entries.map((entry) => entry.batch?.pi_seq);
+    const [firstSeq] = sequences;
+    assert.ok(firstSeq !== undefined);
+    assert.deepEqual(sequences, entries.map((_, index) => firstSeq + index));
+    await harness.close(context);
+    assert.equal(await follow(standby, link), (await link.record())?.state.head);
     assert.deepEqual(tables(standby), tables(directory));
   });
 

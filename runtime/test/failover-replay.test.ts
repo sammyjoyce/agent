@@ -262,7 +262,7 @@ for (const [name, connect] of Object.entries(authorities)) {
 
     let stopped = false;
     const stopsAfterRename = (database: SqliteDatabase): SqliteDatabase => ({ exec: (sql) => database.exec(sql), run: (sql, ...params) => database.run(sql, ...params),
-      get: (sql, ...params) => database.get(sql, ...params), all: (sql, ...params) => database.all(sql, ...params), close: () => database.close(),
+      runCounted: (sql, ...params) => database.runCounted(sql, ...params), get: (sql, ...params) => database.get(sql, ...params), all: (sql, ...params) => database.all(sql, ...params), close: () => database.close(),
       transaction: (callback) => database.transaction(async (transaction) => {
         const value = await callback(transaction);
         if (!stopped && existsSync(path)) { stopped = true; throw new Error("Invented: the process stopped before the transaction committed"); }

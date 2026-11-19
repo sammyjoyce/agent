@@ -7,6 +7,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { defineDoc, type TaskId } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { commitWrites } from "@earendil-works/pi-durable/testing";
 import type { BackgroundStatus } from "../src/generated/BackgroundStatus.js";
 import type { BackgroundTriggerKey } from "../src/generated/BackgroundTriggerKey.js";
 import type { BackgroundWork } from "../src/generated/BackgroundWork.js";
@@ -26,7 +27,7 @@ async function park(directory: string, ids: TaskId<null>[]): Promise<void> {
   const storage = await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite")));
   try {
     const records = await Promise.all(ids.map(id => storage.task(id, BACKGROUND_CONTEXT)));
-    await storage.commit(records.map(record => {
+    await commitWrites(storage, records.map(record => {
       assert.ok(record?.state.status === "running" || record?.state.status === "pending" || record?.state.status === "sleeping");
       return { type: "task", value: { ...record, restarts: 5, state: { status: "pending", checkpoint: record.state.checkpoint } } };
     }), BACKGROUND_CONTEXT);

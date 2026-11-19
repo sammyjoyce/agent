@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import type { StorageWrite } from "@earendil-works/pi-durable";
+import type { Context } from "@earendil-works/chord/context";
+import type { Seq, Storage, StorageWrite } from "@earendil-works/pi-durable";
 import type { LogEntry } from "../generated/LogEntry.js";
 import type { Versions } from "../generated/Versions.js";
 import { COMMAND_BODY_LIMIT_BYTES, logEntryCanonical } from "./authority-wire.js";
@@ -26,6 +27,29 @@ export function parseBatch(json: string, at: number): StorageWrite[] {
   const writes: unknown = JSON.parse(json);
   if (!Array.isArray(writes)) throw new Error(`The batch of log entry ${at} is not a list of writes`);
   return writes as StorageWrite[];
+}
+
+/** What Pi's storage did with one batch committed on its own: stored it at `seq`, or refused it by Pi's own checks. */
+export type BatchOutcome = { readonly kind: "stored"; readonly seq: Seq } | { readonly kind: "refused"; readonly reason: unknown };
+
+/**
+ * Commits one batch through Pi's storage as a commit of its own, the way every
+ * log entry is applied. A failure of the database rejects.
+ */
+export async function commitBatch(storage: Storage, writes: readonly StorageWrite[], context: Context): Promise<BatchOutcome> {
+  let stored: Seq | undefined;
+  const { refused } = await storage.commit([writes], (_index, seq) => { stored = seq; }, context);
+  return stored === undefined ? { kind: "refused", reason: refused } : { kind: "stored", seq: stored };
+}
+
+/** Commits the batch of the log entry at `at`, which Pi must store. */
+export async function commitLoggedBatch(storage: Storage, writes: readonly StorageWrite[], at: number, context: Context): Promise<Seq> {
+  const outcome = await commitBatch(storage, writes, context);
+  switch (outcome.kind) {
+    case "stored": return outcome.seq;
+    case "refused": throw new Error(`Pi Durable refused the batch of log entry ${at}`, { cause: outcome.reason });
+    default: return outcome satisfies never;
+  }
 }
 
 let installed: Promise<Versions> | undefined;
