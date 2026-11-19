@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import http2 from "node:http2";
 import { syncBuiltinESMExports } from "node:module";
 import type { JsonObject } from "@earendil-works/pi-ai";
 import type { FailoverSession } from "../../src/generated/FailoverSession.js";
 
-export type ModelStep = { text: string } | { tool: string; args: JsonObject; commentary?: string } |
+/** A `text` step with `after` answers once the file `after` exists. */
+export type ModelStep = { text: string; after?: string } | { tool: string; args: JsonObject; commentary?: string } |
   { code: string; commentary?: string } | { hold_and_write_pid: string } | { stream: string[]; interval_ms: number };
 export type ModelQueue = Record<string, ModelStep[]>;
 type ResponseItem = { id: string; type: "message"; role: "assistant"; status: "completed"; phase?: "commentary";
@@ -59,6 +60,12 @@ globalThis.fetch = async (input, options) => {
     writeFileSync(step.hold_and_write_pid, String(process.pid));
     const signal = options?.signal;
     return new Promise<Response>((_resolve, reject) => signal?.addEventListener("abort", () => reject(signal.reason), { once: true }));
+  }
+  if (typeof step.after === "string") {
+    while (!existsSync(step.after)) {
+      options?.signal?.throwIfAborted();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
   }
   const id = randomUUID();
   let item: ResponseItem;
