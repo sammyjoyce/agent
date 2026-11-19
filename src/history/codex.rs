@@ -2995,7 +2995,7 @@ try{
             .unwrap();
         assert_eq!(unsafe { libc::kill(reader_pid as i32, libc::SIGSTOP) }, 0);
         let resume_after = INVENTORY_RPC_DEADLINE + Duration::from_secs(1);
-        let observation_deadline = resume_after + Duration::from_secs(4);
+        let observation_deadline = resume_after + TEST_HANG_LIMIT;
         let listing = tokio::time::timeout(
             observation_deadline,
             blocked.request(HistoryRequest::List {
