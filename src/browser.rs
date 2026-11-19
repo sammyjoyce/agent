@@ -683,6 +683,7 @@ mod tests {
     };
     use uuid::Uuid;
 
+    use crate::TEST_HANG_LIMIT;
     use crate::browser::{
         BrowserAction, BrowserCapture, BrowserConfig, BrowserHost, BrowserRequest, BrowserResponse,
         BrowserTab, MAX_SCREENSHOT_BYTES,
@@ -771,7 +772,7 @@ input.on('close', () => { writeFileSync(join(directory, 'closed'), 'closed'); })
     }
 
     async fn wait_for(path: &Path) {
-        timeout(Duration::from_secs(3), async {
+        timeout(TEST_HANG_LIMIT, async {
             while !path.exists() {
                 sleep(Duration::from_millis(10)).await;
             }
@@ -838,7 +839,7 @@ input.on('close', () => { writeFileSync(join(directory, 'closed'), 'closed'); })
                 )
                 .await
         });
-        timeout(Duration::from_secs(3), async {
+        timeout(TEST_HANG_LIMIT, async {
             while !host
                 .sessions
                 .lock()
@@ -850,7 +851,7 @@ input.on('close', () => { writeFileSync(join(directory, 'closed'), 'closed'); })
         })
         .await
         .unwrap();
-        let reads = timeout(Duration::from_secs(3), async {
+        let reads = timeout(TEST_HANG_LIMIT, async {
             let status = host
                 .execute(
                     request(
@@ -881,7 +882,7 @@ input.on('close', () => { writeFileSync(join(directory, 'closed'), 'closed'); })
         })
         .await;
         stop_queued.send(true).unwrap();
-        let cancelled_reply = timeout(Duration::from_secs(3), &mut queued).await;
+        let cancelled_reply = timeout(TEST_HANG_LIMIT, &mut queued).await;
         fs::write(directory.path().join("continue"), "continue")
             .await
             .unwrap();
@@ -1169,7 +1170,7 @@ input.on('close', () => { writeFileSync(join(directory, 'closed'), 'closed'); })
             .unwrap();
         drop(host);
         wait_for(&directory.path().join("closed")).await;
-        timeout(Duration::from_secs(3), async {
+        timeout(TEST_HANG_LIMIT, async {
             while unsafe { libc::kill(pid, 0) } == 0 {
                 sleep(Duration::from_millis(10)).await;
             }

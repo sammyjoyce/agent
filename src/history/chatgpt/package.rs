@@ -1024,11 +1024,12 @@ fn digest(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::ffi::OsStrExt, path::Path, time::Duration};
+    use std::{os::unix::ffi::OsStrExt, path::Path};
 
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::TEST_HANG_LIMIT;
     use crate::history::chatgpt::fixture::{self, Conversation, Export, Forge};
 
     fn open_with(paths: &[PathBuf], limits: Limits) -> Result<Package, PackageError> {
@@ -1499,7 +1500,7 @@ mod tests {
             let _ = sender.send(open(&root).err().map(unsafe_reason));
         });
         assert_eq!(
-            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            receiver.recv_timeout(TEST_HANG_LIMIT).unwrap(),
             Some(UnsafeReason::SpecialFile)
         );
     }

@@ -500,6 +500,7 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::{
+        TEST_HANG_LIMIT,
         dreams::{
             ContentDigest, Dreams, DreamsAbstainReason, DreamsCheckFile, DreamsFileEdit,
             DreamsPolicy, DreamsPolicyFile, DreamsReply, DreamsRequest, DreamsTaskSummary, Outcome,
@@ -1034,7 +1035,7 @@ mod tests {
                 .count()
         };
         let mut seen = 0;
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::time::timeout(TEST_HANG_LIMIT, async {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 if written() > 0 && written() == seen {
@@ -1067,7 +1068,7 @@ mod tests {
                     .unwrap()
                     .contains("request_received")
             };
-            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::time::timeout(TEST_HANG_LIMIT, async {
                 while !draining() {
                     tokio::task::yield_now().await;
                 }

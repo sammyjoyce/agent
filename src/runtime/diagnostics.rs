@@ -1311,6 +1311,7 @@ impl Writer {
 
 #[cfg(test)]
 mod tests {
+    use crate::TEST_HANG_LIMIT;
     use crate::protocol::{InputMode, MainInputContext, RuntimeCommand, RuntimeRequest};
     use crate::runtime::diagnostics::{
         Diagnostics, Event, Record, RetentionPolicy, RetentionWatermark, Trace, WATERMARK_BYTES,
@@ -1940,7 +1941,7 @@ mod tests {
                 .filter(|record| matches!(record.event, Event::Heartbeat))
                 .count()
         };
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_HANG_LIMIT, async {
             while !directory.join("runtime.jsonl").exists() || heartbeats() < 2 {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -1953,7 +1954,7 @@ mod tests {
             .write(true)
             .open(directory.join("writer.lock"))
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_HANG_LIMIT, async {
             while fs2::FileExt::try_lock_exclusive(&lock).is_err() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -1987,7 +1988,7 @@ mod tests {
     }
 
     async fn reported_drops(directory: &std::path::Path) -> u64 {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::time::timeout(TEST_HANG_LIMIT, async {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 let reported: u64 = receipts(directory)
@@ -2072,7 +2073,7 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let log = overflowed(state.path(), std::time::Duration::from_secs(3_600), 300);
         let directory = state.path().join("diagnostics");
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::time::timeout(TEST_HANG_LIMIT, async {
             while receipts(&directory).len() < 256 {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }

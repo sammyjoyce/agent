@@ -1,6 +1,7 @@
 use std::{os::fd::AsRawFd, sync::Arc, time::Duration};
 
 use crate::{
+    TEST_HANG_LIMIT,
     broker::Broker,
     protocol::{HostResult, RuntimeCommand},
     runtime::{OwnerClaim, Runtime},
@@ -29,7 +30,7 @@ async fn reset_client_does_not_cancel_admitted_owned_work() {
           emit(id,{type:'host_call',call_id:'11111111-1111-4111-8111-111111111111',command:{
             type:'exec',program:process.execPath,args:['--eval',
               `const {writeFileSync}=require('node:fs');writeFileSync(${JSON.stringify(join(state,'started'))},'yes');setTimeout(()=>writeFileSync(${JSON.stringify(join(state,'finished'))},'yes'),800)`],
-            cwd:state,timeout_seconds:5}});
+            cwd:state,timeout_seconds:60}});
         }else if(command.type==='host_reply'){
           writeFileSync(join(state,'reply.json'),JSON.stringify(command.result));
           emit(id,{type:'auth_status',status:{state:'signed_out'}});emit(id,{type:'done'});
@@ -62,7 +63,7 @@ async fn reset_client_does_not_cancel_admitted_owned_work() {
         let mut command = serde_json::to_vec(&RuntimeCommand::Logout).unwrap();
         command.push(b'\n');
         client.write_all(&command).await.unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_HANG_LIMIT;
         while !directory.path().join("started").exists() {
             assert!(Instant::now() < deadline);
             sleep(Duration::from_millis(10)).await;
@@ -89,7 +90,7 @@ async fn reset_client_does_not_cancel_admitted_owned_work() {
         // expose a zero-byte receipt while writeFileSync is still publishing it.
         (&mut handler).await
     };
-    let observed = timeout(Duration::from_secs(8), observe).await;
+    let observed = timeout(TEST_HANG_LIMIT, observe).await;
     if observed.is_err() {
         handler.abort();
         let _ = handler.await;

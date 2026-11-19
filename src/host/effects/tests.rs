@@ -1,4 +1,5 @@
 use crate::{
+    TEST_HANG_LIMIT,
     host::{
         Executor,
         effects::{Admission, Capacity, HostEffects},
@@ -14,7 +15,7 @@ use tokio::{
 };
 
 async fn wait_for(path: &Path) {
-    timeout(Duration::from_secs(5), async {
+    timeout(TEST_HANG_LIMIT, async {
         while !path.exists() {
             sleep(Duration::from_millis(5)).await;
         }
@@ -115,10 +116,7 @@ async fn dropping_an_owner_retains_an_admitted_write_until_its_actual_result() {
     drop(effects);
     release.send(()).unwrap();
     assert!(matches!(
-        timeout(Duration::from_secs(5), recorded)
-            .await
-            .unwrap()
-            .unwrap(),
+        timeout(TEST_HANG_LIMIT, recorded).await.unwrap().unwrap(),
         HostResult::Written
     ));
     assert_eq!(std::fs::read_to_string(output).unwrap(), "complete");
@@ -157,7 +155,7 @@ async fn cancel_reaps_a_running_process_and_releases_its_call_identity() {
     wait_for(&started).await;
     assert!(!effects.cancel("missing"));
     assert!(effects.cancel("process"));
-    let reply = timeout(Duration::from_secs(5), effects.next())
+    let reply = timeout(TEST_HANG_LIMIT, effects.next())
         .await
         .unwrap()
         .unwrap()
@@ -281,7 +279,7 @@ async fn an_effect_that_outlives_its_connection_holds_the_effects_lock_until_it_
         "An effect that outlived its connection and its coordinator's claim must hold effects.lock"
     );
     finish.send(()).unwrap();
-    timeout(Duration::from_secs(10), async {
+    timeout(TEST_HANG_LIMIT, async {
         while fs2::FileExt::try_lock_exclusive(&lock).is_err() {
             sleep(Duration::from_millis(10)).await;
         }

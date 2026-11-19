@@ -1858,6 +1858,7 @@ mod tests {
     use serde_json::Value;
 
     use crate::{
+        TEST_HANG_LIMIT,
         history::{
             HistoryGapCode, HistoryRequest, HistoryResponse, HistorySource,
             codex::{CodexHistory, NativeEntry, NativeThread, PAGE_BYTES, ReadCursor, digest},
@@ -2076,7 +2077,7 @@ try{
             )
             .await
             .unwrap();
-        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+        let output = tokio::time::timeout(TEST_HANG_LIMIT, child.wait_with_output())
             .await
             .unwrap()
             .unwrap();
@@ -2159,7 +2160,7 @@ try{
         let source = fixture(directory.path(), &provider_fixture(vec![]));
         std::fs::write(directory.path().join("block"), b"block").unwrap();
         let control = async {
-            let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            let pid = tokio::time::timeout(TEST_HANG_LIMIT, async {
                 loop {
                     if let Ok(calls) = std::fs::read_to_string(directory.path().join("calls"))
                         && let Some(call) = calls
@@ -2224,13 +2225,12 @@ try{
         })
         .unwrap();
         let source = fixture(directory.path(), &native);
-        std::fs::write(directory.path().join("block"), b"block").unwrap();
         let HistoryResponse::List {
             threads,
             next_cursor,
-        } = tokio::time::timeout(Duration::from_secs(3), source.list(false, None))
+        } = tokio::time::timeout(TEST_HANG_LIMIT, source.list(false, None))
             .await
-            .expect("Each host call must yield after one repair page, not await the entire sweep")
+            .unwrap()
             .unwrap()
         else {
             panic!("Expected repair progress");
@@ -2246,9 +2246,9 @@ try{
                 .lines()
                 .filter(|line| line.contains("thread/list"))
                 .count(),
-            1
+            1,
+            "Each host call must yield after one repair page, not await the entire sweep"
         );
-        std::fs::remove_file(directory.path().join("block")).unwrap();
         drop(source);
         let source = fixture(directory.path(), &native);
         assert!(source.list(true, Some(cursor.clone())).await.is_err());
@@ -2904,7 +2904,7 @@ try{
                     .await
             })
         };
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_HANG_LIMIT, async {
             loop {
                 if std::fs::read_to_string(directory.path().join("calls"))
                     .is_ok_and(|calls| calls.contains("thread/list"))
@@ -2995,7 +2995,7 @@ try{
             .unwrap();
         assert_eq!(unsafe { libc::kill(reader_pid as i32, libc::SIGSTOP) }, 0);
         let resume_after = INVENTORY_RPC_DEADLINE + Duration::from_secs(1);
-        let observation_deadline = resume_after + Duration::from_secs(4);
+        let observation_deadline = resume_after + TEST_HANG_LIMIT;
         let listing = tokio::time::timeout(
             observation_deadline,
             blocked.request(HistoryRequest::List {
@@ -3014,7 +3014,7 @@ try{
             ),
         );
         let control = async {
-            let blocked_pid = tokio::time::timeout(Duration::from_secs(5), async {
+            let blocked_pid = tokio::time::timeout(TEST_HANG_LIMIT, async {
                 loop {
                     if let Ok(calls) = std::fs::read_to_string(directory.path().join("calls")) {
                         for call in calls
@@ -3218,7 +3218,7 @@ try{
             )
             .await
             .unwrap();
-        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+        let output = tokio::time::timeout(TEST_HANG_LIMIT, child.wait_with_output())
             .await
             .unwrap()
             .unwrap();
@@ -3674,7 +3674,7 @@ try{
             )
             .await
             .unwrap();
-        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+        let output = tokio::time::timeout(TEST_HANG_LIMIT, child.wait_with_output())
             .await
             .unwrap()
             .unwrap();

@@ -20,6 +20,15 @@ fn start_alone<T>(start: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
     start()
 }
 
+/// Runs `check` while no child is starting. A starting child holds a copy of
+/// every descriptor in this process until its exec, so a lock that this
+/// process has released can still look held while another thread starts one.
+#[cfg(test)]
+pub(crate) fn while_no_child_starts<T>(check: impl FnOnce() -> T) -> T {
+    let _alone = CHILD_START.lock().unwrap_or_else(PoisonError::into_inner);
+    check()
+}
+
 pub trait SerializedSpawn {
     fn spawn_serialized(&mut self) -> io::Result<std::process::Child>;
 
