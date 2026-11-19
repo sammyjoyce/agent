@@ -1819,6 +1819,8 @@ public actor CoordinatorSession {
     ledger.sends.merge(saved.sends) { _, saved in saved }
     if let newest = saved.entries.values.map(\.receivedAt).max() { stamps.seed(newest) }
     ledgerUnread = false
+    stampRows()
+    schedulePublish()
     return true
   }
   /// The saved ledger, empty when there is none or it is corrupt, or nil when it cannot be read.
