@@ -108,6 +108,9 @@ public final class AppNotifications: NSObject {
     return !chat.scope.shows(routed)
   }
 
+  /// The app's delegate, for the CarPlay scene, which UIKit creates with no way to reach it.
+  public private(set) static weak var current: AppNotifications?
+
   public override convenience init() { self.init(defaults: .standard) }
 
   public convenience init(defaults: UserDefaults) {
@@ -118,6 +121,7 @@ public final class AppNotifications: NSObject {
         url: URL.applicationSupportDirectory.appending(path: "Agent/Composer/draft.json")),
       sharedInbox: try? SharedDraftInbox.configured(), spotlight: Self.appSpotlight)
     AppDependencyManager.shared.add(dependency: self)
+    Self.current = self
   }
 
   private static var appSpotlight: (any SpotlightStore)? {

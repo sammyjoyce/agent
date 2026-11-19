@@ -88,14 +88,17 @@ public final class CarConversation {
     }
   }
 
-  /// Starts a conversation with `coordinator` once any running one has ended.
-  public func begin(with coordinator: CarCoordinator) {
+  /// Starts a conversation with `coordinator` once any running one has ended. The task ends with
+  /// that conversation.
+  @discardableResult public func begin(with coordinator: CarCoordinator) -> Task<Void, Never> {
     let previous = run
     previous?.cancel()
-    run = Task {
+    let next = Task {
       await previous?.value
       await converse(with: coordinator)
     }
+    run = next
+    return next
   }
 
   /// A press of a button made for `shown`. Done and Send do nothing once the conversation has left

@@ -581,6 +581,91 @@ that a write repeated under one input ID starts one generation. The UI test
 runs only when the test runner's `TEST_RUNNER_AGENT_SIRI_WORLD` names that
 world's relay port, control port and coordinator ID, and is skipped otherwise.
 
+### CarPlay
+
+In CarPlay, Beep Boop holds a hands-free conversation with one paired
+coordinator, as a voice-based conversational app. The car screen opens on a
+list with one row per paired coordinator, such as "Talk to Work". Nothing
+listens until a row is chosen. With no paired coordinator, the list has one
+row that cannot be chosen, "No coordinator is paired".
+
+Choosing a row opens a voice screen. Once it shows, the car says "Talking to
+Work." and listens. A take ends by itself once 1.4 seconds pass with no voice
+and no new words, after 7 seconds without a word, or after 45 seconds.
+**Done** ends it sooner. The car reads the message back, "Send to Work: …?",
+and listens for the answer. Yes, or **Send** on the screen, sends it. No says
+"Not sent. Go ahead." and listens again. Anything else, or silence, says "Not
+sent." and ends the conversation. Only a whole short answer counts, so "yes,
+but rename it" is not a yes.
+
+A confirmed message goes through the coordinator's saved outbox with the
+`carplay` origin, as Send Message does with `siri`. The coordinator must list
+`carplay` among the origins it accepts. The car waits 8 seconds for Work to
+take the message and 60 seconds for its answer, then reads aloud that
+message's own answer and no other. Code blocks and tables are named, not read,
+a bare web address reads as "a link", and a long answer stops at a sentence
+end with "The rest is in the chat." An answer that comes later is in the chat.
+The car then listens for the next message. Silence, a goodbye such as "that's
+all", **Cancel**, **Stop**, Back, an audio interruption, or leaving Beep Boop
+on the car screen ends the conversation. So does an outcome that the next
+message would meet too, such as a lost connection or a copy Work has not
+confirmed, once the car has said it.
+
+The car screen never shows a message or an answer. Its voice screen shows
+fixed words and the coordinator's name. No sentence asks the driver to pick
+up, unlock, open or tap the iPhone, or to download or allow anything. An
+answer is the coordinator's own words, read as they are. Its model is told
+that a `carplay` reply is read aloud to a driver who cannot look at or touch
+the iPhone, so the reply should not ask them to. The car never downloads the
+dictation model and never asks for the microphone, so set up dictation on the
+iPhone first. Before the first take it checks that the iPhone is unlocked,
+that the model is on this iPhone and works here, and that Beep Boop may use
+the microphone. When one fails, it says why and changes nothing. A model an
+update left stale goes on, since its first take prepares it. Files Beep Boop
+saves cannot be read while the iPhone is locked, so the car checks again
+before each take and each send, and says "Beep Boop can't send messages while
+iPhone is locked." The car holds the microphone for the whole conversation.
+Phone dictation does not start until it ends, and a car conversation that
+starts while the phone dictates says "The microphone is busy." The car's voice
+is the system voice, which lowers other audio while it speaks.
+
+CarPlay shows Beep Boop only when the app is signed with the
+`com.apple.developer.carplay-voice-based-conversation` entitlement, which
+Apple grants on request. Ordinary builds leave it out and keep automatic
+signing, so Xcode Cloud, simulator builds, unsigned builds and the share
+extension are unchanged. To run it in a car:
+
+1. Accept the CarPlay Entitlement Addendum and request the entitlement at
+   https://developer.apple.com/contact/carplay.
+2. Once Apple grants it, enable it on the App ID and make a development
+   provisioning profile for the app by hand.
+3. Create `ios/CarPlay.local.xcconfig`, which Git ignores, or pass the same
+   settings to `xcodebuild`:
+
+   ```
+   AGENT_CARPLAY = YES
+   AGENT_CARPLAY_PROFILE = <profile name>
+   ```
+
+   Choose the team as for a direct development install. A device build then
+   signs the app by hand with that profile and
+   `AgentApp/AgentCarPlay.entitlements`. The share extension still signs
+   automatically.
+4. Run the app on the iPhone, download the dictation model and allow the
+   microphone.
+5. Connect the iPhone by USB, open DeviceHub, and choose **Device → CarPlay
+   Simulator**. From iOS 27, CarPlay development needs a physical iPhone.
+
+`check.sh host` checks that the CarPlay entitlements differ from the app's
+only by the CarPlay key, that only a device build with `AGENT_CARPLAY=YES`
+asks for them, and that the Debug and Release builds declare the CarPlay
+scene. Package tests hold whole conversations with loopback coordinators and
+scripted speech, and a hosted test builds the real car templates. Nothing has
+run on a CarPlay screen yet. Only a car or the CarPlay Simulator can show the
+screens, the car's microphone and speakers, how takes end in a moving car,
+audio interruptions, how the voice screen limits rapid state changes, and a
+launch on a locked iPhone.
+
 ## Validation
 
 ```sh

@@ -3,6 +3,7 @@
 /runtime/node_modules/
 /runtime/dist/
 /local/
+/ios/CarPlay.local.xcconfig
 /.env*
 !/.env.example
 *.log
