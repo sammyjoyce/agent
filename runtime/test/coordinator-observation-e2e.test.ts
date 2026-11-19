@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { createModels } from "@earendil-works/pi-ai";
-import { createRegistry, GenerationTask, Harness, LiveDoc, UserEntry } from "@earendil-works/pi-durable";
+import { createRegistry, GenerationTask, Harness, InboxDoc, LiveDoc, UserEntry } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { commitWrites } from "@earendil-works/pi-durable/testing";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
@@ -73,10 +73,16 @@ test("production coordinator reconciles saved input before history across a real
           const generation = await tx.createTask(GenerationTask, {}, { ownership: { kind: "conversation" } });
           const live = await tx.doc(LiveDoc, conversation.id);
           live.run = { taskId: generation, inputs: [submission_id], turns: 0 }; live.generation = { attempt: 1 };
+          // Store what Pi admits while busy. Submitting would start scheduling,
+          // which can end this seeded run before the inputs queue behind it.
+          const inbox = await tx.doc(InboxDoc, conversation.id);
+          for (const [requestId, mode, content] of [[steerInput, "steer", "Keep the unplaced steer"],
+            [queuedInput, "followUp", "Keep the unplaced follow-up"]] as const) {
+            const { id } = await tx.createSubmission({ type: "input", conversationId: conversation.id, requestId, status: "queued" });
+            inbox.items.push({ id, mode, content });
+          }
           return { generation, entry_id: entry_id.toString() };
         }, BACKGROUND_CONTEXT);
-        await conversation.submit({ type: "input", requestId: steerInput, content: "Keep the unplaced steer", whenBusy: "steer" }, BACKGROUND_CONTEXT);
-        await conversation.submit({ type: "input", requestId: queuedInput, content: "Keep the unplaced follow-up", whenBusy: "followUp" }, BACKGROUND_CONTEXT);
         const record = await harness.getTask(generation, BACKGROUND_CONTEXT); assert.ok(record);
         // A real persisted Pi retry holds this generation without a provider or
         // replacement execution service. The production interrupt must settle it.
