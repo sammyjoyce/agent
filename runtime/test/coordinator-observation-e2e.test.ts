@@ -11,6 +11,7 @@ import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { createModels } from "@earendil-works/pi-ai";
 import { createRegistry, GenerationTask, Harness, LiveDoc, UserEntry } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { commitWrites } from "@earendil-works/pi-durable/testing";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
 import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
 import { protocolLines, validEvent } from "../src/protocol.js";
@@ -71,7 +72,7 @@ test("production coordinator reconciles saved input before history across a real
           }
           const generation = await tx.createTask(GenerationTask, {}, { ownership: { kind: "conversation" } });
           const live = await tx.doc(LiveDoc, conversation.id);
-          live.run = { taskId: generation, inputs: [submission_id] }; live.generation = { attempt: 1 };
+          live.run = { taskId: generation, inputs: [submission_id], turns: 0 }; live.generation = { attempt: 1 };
           return { generation, entry_id: entry_id.toString() };
         }, BACKGROUND_CONTEXT);
         await conversation.submit({ type: "input", requestId: steerInput, content: "Keep the unplaced steer", whenBusy: "steer" }, BACKGROUND_CONTEXT);
@@ -79,7 +80,7 @@ test("production coordinator reconciles saved input before history across a real
         const record = await harness.getTask(generation, BACKGROUND_CONTEXT); assert.ok(record);
         // A real persisted Pi retry holds this generation without a provider or
         // replacement execution service. The production interrupt must settle it.
-        await storage.commit([{ type: "task", value: { ...record, state: { status: "pending",
+        await commitWrites(storage, [{ type: "task", value: { ...record, state: { status: "pending",
           checkpoint: { phase: "retry", attempt: 1, until: Date.now() + 3_600_000 } } } }], BACKGROUND_CONTEXT);
         stopProbes.push({ conversation_id: conversation.id.toString(), entry_id, input_id: stoppedInput,
           steer_id: steerInput, queued_id: queuedInput, root: conversation.id === root.id });
