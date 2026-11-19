@@ -729,8 +729,12 @@ mod tests {
                 r#""input_origins":true,"accepted_input_origins":["cli","ios","siri"],"#,
             ),
             (
-                r#""input_origins":true,"accepted_input_origins":["watch","siri","cli","ios","siri"],"#,
-                r#""input_origins":true,"accepted_input_origins":["cli","ios","siri"],"#,
+                r#""input_origins":true,"accepted_input_origins":["cli","ios","siri","carplay"],"#,
+                r#""input_origins":true,"accepted_input_origins":["cli","ios","siri","carplay"],"#,
+            ),
+            (
+                r#""input_origins":true,"accepted_input_origins":["watch","carplay","siri","cli","ios","siri"],"#,
+                r#""input_origins":true,"accepted_input_origins":["cli","ios","siri","carplay"],"#,
             ),
             (
                 r#""input_origins":true,"accepted_input_origins":["cli"],"#,
@@ -761,6 +765,7 @@ mod tests {
             ))
         };
         assert!(submit("siri").is_ok());
+        assert!(submit("carplay").is_ok());
         assert!(submit("watch").is_err());
     }
 

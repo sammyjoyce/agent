@@ -292,7 +292,8 @@ pub struct SavedConversation {
 
 /// Trusted direct-input transport metadata, never inferred from text or host.
 /// Omission is unknown, including legacy clients and non-human work.
-/// `siri` is Siri or a Shortcuts action relayed by the iPhone app. A client sends a value
+/// `siri` is Siri or a Shortcuts action relayed by the iPhone app. `carplay` is the iPhone app's
+/// CarPlay voice conversation, whose reply is read aloud to the driver. A client sends a value
 /// only when the coordinator lists it in `AcceptedInputOrigins`.
 #[derive(
     Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, JsonSchema, TS,
@@ -302,6 +303,7 @@ pub enum InputOrigin {
     Cli,
     Ios,
     Siri,
+    Carplay,
 }
 
 /// The origins a coordinator accepts in a submit's `origin`. Decoding drops names this build

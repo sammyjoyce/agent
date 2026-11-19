@@ -86,11 +86,11 @@ func aCoordinatorThatListsNoOriginsNeverAcceptsSiri(advertised: Bool?) async thr
 }
 
 @Test func eachInputOriginHasItsOwnRowLabel() {
-  let labels = [InputOrigin.cli, .ios, .siri].map {
+  let labels = [InputOrigin.cli, .ios, .siri, .carplay].map {
     ChatRow(id: $0.rawValue, role: .user, text: "Invented message", inputOrigin: $0)
       .provenanceLabel
   }
-  #expect(labels == ["CLI", "iOS", "Siri"])
+  #expect(labels == ["CLI", "iOS", "Siri", "CarPlay"])
 }
 
 @Test(.timeLimit(.minutes(1)))
