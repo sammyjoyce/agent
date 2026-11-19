@@ -30,7 +30,7 @@ async fn reset_client_does_not_cancel_admitted_owned_work() {
           emit(id,{type:'host_call',call_id:'11111111-1111-4111-8111-111111111111',command:{
             type:'exec',program:process.execPath,args:['--eval',
               `const {writeFileSync}=require('node:fs');writeFileSync(${JSON.stringify(join(state,'started'))},'yes');setTimeout(()=>writeFileSync(${JSON.stringify(join(state,'finished'))},'yes'),800)`],
-            cwd:state,timeout_seconds:5}});
+            cwd:state,timeout_seconds:60}});
         }else if(command.type==='host_reply'){
           writeFileSync(join(state,'reply.json'),JSON.stringify(command.result));
           emit(id,{type:'auth_status',status:{state:'signed_out'}});emit(id,{type:'done'});

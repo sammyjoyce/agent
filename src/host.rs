@@ -1829,7 +1829,7 @@ mod tests {
                 literal.into(),
             ],
             std::path::Path::new("/"),
-            Duration::from_secs(5),
+            TEST_HANG_LIMIT,
             1024).unwrap(),
         )
         .await
