@@ -59,6 +59,7 @@ model_providers! {
     QwenTokenPlan => "qwen-token-plan",
     QwenTokenPlanCn => "qwen-token-plan-cn",
     QwenTokenPlanIndividual => "qwen-token-plan-individual",
+    QwenTokenPlanIndividualCn => "qwen-token-plan-individual-cn",
     Xiaomi => "xiaomi",
     XiaomiTokenPlanCn => "xiaomi-token-plan-cn",
     XiaomiTokenPlanAms => "xiaomi-token-plan-ams",
@@ -176,7 +177,7 @@ mod tests {
 
     #[test]
     fn provider_cli_and_wire_names_roundtrip_the_same_exact_values() {
-        assert_eq!(ModelProvider::value_variants().len(), 42);
+        assert_eq!(ModelProvider::value_variants().len(), 43);
         for provider in ModelProvider::value_variants() {
             let encoded = serde_json::to_string(provider).unwrap();
             assert_eq!(
