@@ -6,6 +6,7 @@ use crate::{
         WorkerLaunch,
     },
     runtime::{FrameReader, OwnerClaim, ShutdownSignal},
+    serialized_spawn::while_no_child_starts,
     service::{SOCKET_NAME, ShutdownReason, connect, serve_with_transport, write_frame},
 };
 use std::{fs, path::PathBuf, time::Duration};
@@ -153,7 +154,7 @@ fn assert_reaped_and_unlocked(directory: &tempfile::TempDir, pid: libc::pid_t) {
         .write(true)
         .open(directory.path().join("writer.lock"))
         .unwrap();
-    fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+    while_no_child_starts(|| fs2::FileExt::try_lock_exclusive(&lock)).unwrap();
 }
 
 async fn configured(stream: UnixStream) -> Vec<AgentNode> {
