@@ -639,9 +639,11 @@ public actor CoordinatorSession {
   /// and waits for the answer its completion names. A refusal saves nothing. Once saved, the copy
   /// stays in the outbox until the coordinator places it, and this never writes it again. The
   /// wait ends when the observer drops, since a reconnect cannot replay an answer it missed.
+  /// A turn canceled before this runs saves nothing.
   public func converse(
     _ message: SiriMessage, inputID: String, limits: VoiceTurnLimits = .car
-  ) async -> VoiceReply {
+  ) async throws(CancellationError) -> VoiceReply {
+    guard !Task.isCancelled else { throw CancellationError() }
     guard !retired, inspectedConversation == nil else { return .notSent(.removed) }
     guard snapshot.connection == .connected else { return .notSent(.unanswered) }
     guard accepts(.carplay) else { return .notSent(.notAdvertised) }

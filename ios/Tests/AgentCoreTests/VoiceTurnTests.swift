@@ -46,11 +46,11 @@ private func withCarPeer(
 }
 
 private func ask(_ session: CoordinatorSession, limits: VoiceTurnLimits = .car) throws -> (
-  inputID: String, reply: Task<VoiceReply, Never>
+  inputID: String, reply: Task<VoiceReply, any Error>
 ) {
   let inputID = UUID().uuidString
   let message = try SiriMessage(parsing: question)
-  return (inputID, Task { await session.converse(message, inputID: inputID, limits: limits) })
+  return (inputID, Task { try await session.converse(message, inputID: inputID, limits: limits) })
 }
 
 private func completion(_ inputID: String, answer entryID: String) -> NativeEvent {
@@ -79,7 +79,7 @@ func theCarReadsOnlyTheAnswerItsInputsCompletionNames(_ arrival: Arrival) async 
     for event in arrival == .answerFirst ? Array(own.reversed()) : own {
       try await fixture.emitOnObserver(event)
     }
-    #expect(await reply.value == .answered(finished))
+    #expect(try await reply.value == .answered(finished))
     #expect(await fixture.count() == 1)
   }
 }
@@ -94,7 +94,7 @@ func aCompletionWhoseAnswerNeverArrivesReadsNoOtherAnswer() async throws {
     try await eventually("Work got the input") { await fixture.count() == 1 }
     try await fixture.emitOnObserver(completion(inputID, answer: "car-entry"))
     try await fixture.emitOnObserver(answer("other-entry", "An invented reply to another input"))
-    #expect(await reply.value == .noReadableReply)
+    #expect(try await reply.value == .noReadableReply)
   }
 }
 
@@ -112,7 +112,7 @@ func otherInputsAnswersDoNotPushOutTheAnswerThisInputsCompletionNames() async th
         answer("other-\(index)", "An invented reply to another input."))
     }
     try await fixture.emitOnObserver(completion(inputID, answer: "car-entry"))
-    #expect(await reply.value == .answered(finished))
+    #expect(try await reply.value == .answered(finished))
   }
 }
 
@@ -125,7 +125,7 @@ func workThatEndsWithoutAnAnswerIsStopped(_ work: InputWorkState) async throws {
     let (inputID, reply) = try ask(session)
     try await eventually("Work got the input") { await fixture.count() == 1 }
     try await fixture.emitOnObserver(.accepted(.init(inputId: inputID, work: work)))
-    #expect(await reply.value == .stopped)
+    #expect(try await reply.value == .stopped)
   }
 }
 
@@ -136,7 +136,7 @@ func aDeliveredInputWithNoCompletionInTimeIsStillWorking() async throws {
     let limits = VoiceTurnLimits(
       delivery: .seconds(8), answer: .milliseconds(500), answerText: .seconds(3))
     let (_, reply) = try ask(session, limits: limits)
-    #expect(await reply.value == .stillWorking)
+    #expect(try await reply.value == .stillWorking)
     #expect(await fixture.count() == 1)
   }
 }
@@ -153,9 +153,9 @@ func theOutboxHoldsTheCarCopyBeforeWorkHearsItAndNothingWritesItAgain() async th
     let saved = try #require(try queuedRequests(directory.outbox).first)
     #expect(saved == written)
     #expect(saved.origin == .carplay && saved.mode == .steer && saved.text == question)
-    let again = await session.converse(try SiriMessage(parsing: question), inputID: inputID)
+    let again = try await session.converse(try SiriMessage(parsing: question), inputID: inputID)
     #expect(again == .notSent(.busy))
-    #expect(await reply.value == .unconfirmed)
+    #expect(try await reply.value == .unconfirmed)
     #expect(try queuedRequests(directory.outbox).map(\.inputId) == [inputID])
     await fixture.releaseSubmitReply()
     try await eventually("Work placed it") { try queuedRequests(directory.outbox).isEmpty }
@@ -173,7 +173,7 @@ func aDroppedObserverEndsTheWaitAndTheInputIsNotWrittenAgain() async throws {
       return try queuedRequests(directory.outbox).isEmpty
     }
     await fixture.dropObserver()
-    #expect(await reply.value == .lostConnection(delivered: true))
+    #expect(try await reply.value == .lostConnection(delivered: true))
     try await eventually("the observer came back") { await observes(fixture) == 2 }
     #expect(await fixture.count() == 1, "Nothing was written again")
   }
@@ -182,10 +182,25 @@ func aDroppedObserverEndsTheWaitAndTheInputIsNotWrittenAgain() async throws {
 @Test(.timeLimit(.minutes(1)))
 func aCoordinatorThatDoesNotTakeCarplayGetsNothing() async throws {
   try await withCarPeer(carplay: false) { session, fixture, directory in
-    let reply = await session.converse(
+    let reply = try await session.converse(
       try SiriMessage(parsing: question), inputID: UUID().uuidString)
     #expect(reply == .notSent(.notAdvertised))
     #expect(!FileManager.default.fileExists(atPath: directory.outbox.path))
+    #expect(await fixture.count() == 0)
+  }
+}
+
+@Test(.timeLimit(.minutes(1)))
+func aTurnCanceledBeforeTheSessionRunsItSavesAndSendsNothing() async throws {
+  try await withCarPeer { session, fixture, directory in
+    let message = try SiriMessage(parsing: question)
+    let turn = Task {
+      withUnsafeCurrentTask { $0?.cancel() }
+      return try await session.converse(message, inputID: UUID().uuidString)
+    }
+    await #expect(throws: CancellationError.self) { try await turn.value }
+    #expect(!FileManager.default.fileExists(atPath: directory.outbox.path))
+    try await Task.sleep(for: .milliseconds(200))
     #expect(await fixture.count() == 0)
   }
 }
@@ -195,10 +210,10 @@ func aRefusalAndAFailedWriteAreTheirOwnReplies() async throws {
   try await withCarPeer { session, fixture, _ in
     let message = try SiriMessage(parsing: question)
     await fixture.rejectSubmits()
-    #expect(await session.converse(message, inputID: UUID().uuidString) == .rejected)
+    #expect(try await session.converse(message, inputID: UUID().uuidString) == .rejected)
     await fixture.rejectSubmits(false)
     await fixture.failSubmits("Invented: the execution host is offline")
-    #expect(await session.converse(message, inputID: UUID().uuidString) == .failed)
+    #expect(try await session.converse(message, inputID: UUID().uuidString) == .failed)
   }
 }
 

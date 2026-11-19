@@ -195,7 +195,7 @@ public final class CarConversation {
       switch try await confirm(message, to: name) {
       case .yes where protectedDataAvailable():
         enter(.working)
-        reply = await send(message, on: session)
+        reply = try await send(message, on: session)
       case .yes, .locked: reply = .notSent(.locked)
       case .no:
         enter(.speaking)
@@ -239,8 +239,11 @@ public final class CarConversation {
 
   /// Sends `message` and waits for its reply. A message the locked iPhone could not save says so,
   /// as Send Message does.
-  private func send(_ message: SiriMessage, on session: CoordinatorSession) async -> VoiceReply {
-    let reply = await session.converse(message, inputID: UUID().uuidString, limits: timings.turn)
+  private func send(_ message: SiriMessage, on session: CoordinatorSession) async throws
+    -> VoiceReply
+  {
+    let reply = try await session.converse(
+      message, inputID: UUID().uuidString, limits: timings.turn)
     let unsaved = reply == .notSent(.outboxNotSaved) || reply == .notSent(.outboxUnreadable)
     return unsaved && !protectedDataAvailable() ? .notSent(.locked) : reply
   }
