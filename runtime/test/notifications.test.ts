@@ -41,7 +41,7 @@ function gate() {
 async function until(session: Harness, signal: AbortSignal, condition: () => Promise<boolean>): Promise<void> {
   return new Promise((resolve, reject) => {
     let running = false, again = false, finished = false;
-    const cleanup = () => { finished = true; stop(); signal.removeEventListener("abort", abort); };
+    const cleanup = () => { finished = true; commits.detach(); signal.removeEventListener("abort", abort); };
     const abort = () => { cleanup(); reject(new Error("Notification proof did not reach its durable boundary")); };
     async function check(): Promise<void> {
       again = true; if (running || finished) return; running = true;
@@ -50,7 +50,7 @@ async function until(session: Harness, signal: AbortSignal, condition: () => Pro
       } catch (error) { cleanup(); reject(error); }
       finally { running = false; }
     }
-    const stop = session.subscribeCommits(() => queueMicrotask(() => { void check(); }));
+    const commits = session.observeCommits({ advance: () => queueMicrotask(() => { void check(); }), end() {} });
     signal.addEventListener("abort", abort, { once: true }); if (signal.aborted) abort(); else void check();
   });
 }

@@ -1,5 +1,5 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { Harness } from "@earendil-works/pi-durable";
+import type { CommitObservation, Harness } from "@earendil-works/pi-durable";
 import type { HostCall, TaskStore } from "./tasks.js";
 import type { HistoryStore } from "./history.js";
 import { SearchIndex, type Embed, type SearchResult } from "./search.js";
@@ -10,20 +10,20 @@ export class Retrieval {
   private index: SearchIndex | undefined;
   private ready = false;
   private readonly dirty = new Map<string, string>();
-  private readonly unsubscribe: () => void;
+  private readonly commits: CommitObservation;
   private syncing = Promise.resolve();
   private pendingSyncs = 0;
   private closing: Promise<void> | undefined;
   constructor(session: Harness, private readonly histories: HistoryStore, private readonly tasks: TaskStore, private readonly path: string) {
-    this.unsubscribe = session.subscribeCommits((publication) => {
+    this.commits = session.observeCommits({ advance: (publication) => {
       for (const change of publication.changes) if (change.type === "entry") {
         this.dirty.set(change.value.conversationId.toString(), change.value.id.toString());
       }
-    });
+    }, end() {} });
   }
   close(): Promise<void> {
     if (this.closing !== undefined) return this.closing;
-    this.unsubscribe(); this.dirty.clear();
+    this.commits.detach(); this.dirty.clear();
     // Retire the workers before draining callbacks. Queued callbacks observe
     // closure before opening an index; active effects keep their real owner.
     const queued = this.syncing;

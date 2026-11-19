@@ -240,11 +240,12 @@ export class SourceJournal {
         if (dirty && !closed) void refresh().catch((error: unknown) => { if (!closed) failed(error); });
       });
     };
-    const stop = this.session.subscribeCommits((publication) => {
+    const commits = this.session.observeCommits({ advance: (publication) => {
       if (!publication.changes.some((change) => change.type === "document" && change.record.kind === Control.definition.kind)) return;
       dirty = true;
       if (pending === undefined) void refresh().catch((error: unknown) => { if (!closed) failed(error); });
-    });
+    }, end() {} });
+    const stop = () => commits.detach();
     try { await refresh(); } catch (error) { closed = true; stop(); throw error; }
     return async () => { closed = true; stop(); await pending; };
   }

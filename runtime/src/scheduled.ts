@@ -60,7 +60,7 @@ export async function runScheduled(occurrence: ScheduledOccurrence, signal: Abor
     await tasks.enqueueScheduled(id, occurrencePrompt(occurrence), occurrence);
   }
   let failure: unknown, revision = 0, wake: (() => void) | undefined;
-  const stop = session.subscribeCommits(() => { revision += 1; wake?.(); });
+  const commits = session.observeCommits({ advance: () => { revision += 1; wake?.(); }, end() {} });
   const aborted = () => wake?.(); signal.addEventListener("abort", aborted);
   try {
     const previousOutcome = (await sources.events({ provider: "task_outcomes", thread_id: id, limit: 1 }))[0]?.key;
@@ -85,5 +85,5 @@ export async function runScheduled(occurrence: ScheduledOccurrence, signal: Abor
       await new Promise<void>((resolve) => { wake = resolve; if (revision !== observed || signal.aborted) resolve(); });
       wake = undefined;
     }
-  } finally { stop(); signal.removeEventListener("abort", aborted); }
+  } finally { commits.detach(); signal.removeEventListener("abort", aborted); }
 }
