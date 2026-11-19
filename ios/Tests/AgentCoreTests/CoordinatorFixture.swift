@@ -189,6 +189,10 @@ actor FixtureCoordinator {
   func emitOnObserver(_ event: NativeEvent) async throws {
     try await emit(event, on: #require(observer))
   }
+  func dropObserver() {
+    observer?.cancel()
+    observer = nil
+  }
   private var submissions: [NativeRequestSubmit] = []
   private var files: [String: Data] = [:]
   private var uploads = 0
@@ -222,6 +226,11 @@ actor FixtureCoordinator {
   func uploaded(_ id: String) -> Data? { files[id] }
   func retain(_ data: Data, id: String) { files[id] = data }
   func count() -> Int { submissions.count }
+  private var placesEachSubmit = false
+  /// From now on places each submit on its own socket once it is accepted, then ends that socket,
+  /// as an idle coordinator does, so its completion and answer can reach the phone only on the
+  /// observer.
+  func placeEachSubmit() { placesEachSubmit = true }
   private var busy = false
   /// Submits the busy turn has not placed, each with the socket still waiting for it.
   private var unplaced: [(input: String, socket: NWConnection?)] = []
@@ -492,6 +501,14 @@ actor FixtureCoordinator {
         }
         if !dropInputAcknowledgements {
           try await emit(.accepted(.init(inputId: request.inputId)), on: socket)
+        }
+        if placesEachSubmit {
+          try await emit(
+            .placed(.init(entryId: "placed-\(request.inputId)", inputId: request.inputId)),
+            on: socket)
+          // The phone may close the socket as soon as its input is placed.
+          try? await emit(.done, on: socket)
+          return
         }
         if busy {
           unplaced.append((request.inputId, socket))

@@ -230,6 +230,8 @@ public actor CoordinatorSession {
   /// Siri sends waiting for the coordinator's first word, by input ID, each with the exchange that
   /// writes it once one does.
   private var siriWaits: [String: (answer: SiriAnswer, action: UUID)] = [:]
+  /// Car turns waiting on their input, by input ID, each with the exchange that writes it.
+  private var voiceTickets: [String: (ticket: VoiceTicket, action: UUID)] = [:]
   private enum Unsent { case staged, waiting }
   /// Durable inputs this session staged that have not left the phone. A staged one can be
   /// unstaged, as can an inherited one no session has written. A started one waits for this lane to
@@ -422,6 +424,7 @@ public actor CoordinatorSession {
     let ownedConnections = Array(actionConnections.values) + [connection].compactMap { $0 }
     actionConnections = [:]
     connection = nil
+    tellEveryVoice(.connectionLost)
     resetCapabilities()
     snapshot.connection = .disconnected
     snapshot.busy = false
@@ -630,6 +633,42 @@ public actor CoordinatorSession {
   private func answerSiri(_ inputID: String, _ result: SiriSendResult, from action: UUID? = nil) {
     guard let wait = siriWaits[inputID], action == nil || wait.action == action else { return }
     wait.answer.settle(result)
+  }
+
+  /// Saves `message` as a new `carplay` input under `inputID`, writes it as Check / retry does,
+  /// and waits for the answer its completion names. A refusal saves nothing. Once saved, the copy
+  /// stays in the outbox until the coordinator places it, and this never writes it again. The
+  /// wait ends when the observer drops, since a reconnect cannot replay an answer it missed.
+  public func converse(
+    _ message: SiriMessage, inputID: String, limits: VoiceTurnLimits = .car
+  ) async -> VoiceReply {
+    guard !retired, inspectedConversation == nil else { return .notSent(.removed) }
+    guard snapshot.connection == .connected else { return .notSent(.unanswered) }
+    guard accepts(.carplay) else { return .notSent(.notAdvertised) }
+    guard actions.count < 32, voiceTickets[inputID] == nil else { return .notSent(.busy) }
+    let request = NativeRequestSubmit(
+      attachments: nil, inputId: inputID, mode: .steer, origin: .carplay, text: message.text)
+    do throws(OutboxAdmission) {
+      try admit(request, sendID: UUID().uuidString, recipients: [profile])
+    } catch {
+      publish()
+      return .notSent(error == .full ? .outboxFull : .outboxNotSaved)
+    }
+    let start = ContinuousClock.now
+    guard let action = retry(inputID) else { return .unconfirmed }
+    let ticket = VoiceTicket()
+    voiceTickets[inputID] = (ticket, action)
+    defer { if voiceTickets[inputID]?.ticket === ticket { voiceTickets[inputID] = nil } }
+    return await ticket.reply(limits: limits, from: start)
+  }
+  /// Tells a waiting car turn about its input. With `action`, only the exchange that writes it
+  /// may tell.
+  private func tellVoice(_ inputID: String, _ word: InputWord, from action: UUID? = nil) {
+    guard let wait = voiceTickets[inputID], action == nil || wait.action == action else { return }
+    wait.ticket.hear(word)
+  }
+  private func tellEveryVoice(_ word: InputWord) {
+    for wait in voiceTickets.values { wait.ticket.hear(word) }
   }
 
   /// Sends a staged input on this coordinator's own verified socket. While this lane is not
@@ -1013,6 +1052,7 @@ public actor CoordinatorSession {
         let outdated = !answered && endedByPeer && error as? ConnectionError == .closed
         let error = outdated ? ConnectionError.outdatedCoordinator : error
         connection = nil
+        tellEveryVoice(.connectionLost)
         for item in pending where unsent[item.request.inputId] == nil {
           transcript.delivery(item.request.inputId, unanswered(item))
         }
@@ -1102,7 +1142,10 @@ public actor CoordinatorSession {
       markNeverLeft(unwritten.filter { $0.action == id }.compactMap(\.started))
       unwritten.removeAll { $0.action == id }
       transcript.abandonHistory(id)
-      if let inputID { answerSiri(inputID, .saved, from: id) }
+      if let inputID {
+        answerSiri(inputID, .saved, from: id)
+        tellVoice(inputID, .unconfirmed, from: id)
+      }
     }
     do {
       let stream = try await dialer.open()
@@ -1147,7 +1190,10 @@ public actor CoordinatorSession {
           if let inputID, let item = pending.first(where: { $0.request.inputId == inputID }) {
             transcript.delivery(inputID, unanswered(item))
           }
-          if let inputID { answerSiri(inputID, .failed(failure.message), from: id) }
+          if let inputID {
+            answerSiri(inputID, .failed(failure.message), from: id)
+            tellVoice(inputID, .failed, from: id)
+          }
         default: consume(event, historyRequestID: id)
         }
         schedulePublish()
@@ -1586,7 +1632,9 @@ public actor CoordinatorSession {
         }
       }
     case .message(let value): transcript.message(value.message)
-    case .answer(let value): transcript.answer(value)
+    case .answer(let value):
+      transcript.answer(value)
+      if let entryID = value.entryId { tellEveryVoice(.answer(entryID: entryID, text: value.text)) }
     case .textDelta(let value):
       snapshot.error = nil
       snapshot.busy = true
@@ -1601,8 +1649,11 @@ public actor CoordinatorSession {
       }
       transcript.delivery(value.inputId, .saved)
       answerSiri(value.inputId, .delivered)
+      tellVoice(value.inputId, .delivered)
+      if let word = InputWord(value.work) { tellVoice(value.inputId, word) }
     case .placed(let value):
       answerSiri(value.inputId, .delivered)
+      tellVoice(value.inputId, .delivered)
       mark(value.inputId, refused: false, accepted: true)
       // Placement confirms transcript storage, not that the work finished.
       transcript.work(value.inputId, nil)
@@ -1616,6 +1667,7 @@ public actor CoordinatorSession {
       settle(value.inputId, entryID: nil)
     case .rejected(let value):
       answerSiri(value.inputId, .rejected)
+      tellVoice(value.inputId, .rejected)
       transcript.work(value.inputId, nil)
       if mark(value.inputId, refused: true) == .withdrawn {
         // The user already sent its copy, so this refusal needs nothing more.
