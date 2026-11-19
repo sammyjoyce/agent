@@ -109,8 +109,9 @@ Drafts and queued inputs stay in place; saved input IDs reconcile delivery.
 The phone persists coordinator acknowledgements, so returning to the app does
 not turn a saved message into an uncertain send. Delivery and processing are
 separate: work can be queued, running, completed, stopped or blocked. Completed
-work is normal; blocked work explains the required recovery. Sending a message
-can resume a parked main generation. Reconnecting alone never retries work.
+work is normal; blocked work explains the required recovery. A main run that
+Pi ends after repeated restarts leaves its input stopped, and the next message
+starts a new run. Reconnecting alone never retries work.
 An unconfirmed write is never resent automatically. Exiting during an outage
 saves pending input under the local state directory.
 
@@ -337,8 +338,9 @@ registered host. An unavailable source is reported as partial coverage, not
 silently skipped. [History](history.md) describes storage and retrieval.
 
 Use `beep-boop jobs status` to inspect background work and retained errors.
-If history indexing is parked after interrupted restarts, use
-`beep-boop import retry-index` to resume its checkpoint and staged vectors.
+If Pi ends history indexing after interrupted restarts, use
+`beep-boop import retry-index` to start it again from its checkpoint and staged
+vectors.
 
 A CLI-only client uses the same `beep-boop init --coordinator ...` command and
 skips the service. The [native iPhone client](../ios/README.md) connects to the
@@ -412,11 +414,12 @@ An active retry shows its current running state. Its previous work failure
 remains saved but is not advertised as current while that exact work executes.
 Planner failures, backoff and blocked work remain visible.
 
-`retry` resumes an existing execution parked after Pi's restart limit. It keeps
-the same task, occurrence and checkpoints, and does not admit another run or
-move recurring timers. A parked model generation resumes with current guidance
-and tools when its execution host is connected. Unknown jobs and jobs
-without a parked execution are rejected. Use `run` for a separate new pass.
+`retry` restarts a timer or execution that Pi ended at its restart limit and
+the job still holds. It keeps the same occurrence, input and timer cursor, and
+does not admit another run or move recurring timers. A job's model run that Pi
+ends there settles its input unanswered, and the job reconciles it like any
+unanswered turn. Unknown jobs and jobs without held work are rejected. Use
+`run` for a separate new pass.
 
 On iOS, Connection → Jobs and work lists applied jobs and saved conversations.
 A job's detail shows its schedules, execution state, retained timing, errors and

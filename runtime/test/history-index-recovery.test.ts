@@ -23,7 +23,7 @@ const settings = { poll_interval_seconds: 60, sources: false, jobs: [exampleJob(
 const retryable = (value: object): value is { retryHistoryIndex(): Promise<BackgroundStatus> } =>
   "retryHistoryIndex" in value && typeof value.retryHistoryIndex === "function";
 
-async function park(directory: string, ids: TaskId<null>[]): Promise<void> {
+async function cutOff(directory: string, ids: TaskId<null>[]): Promise<void> {
   const storage = await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite")));
   try {
     const records = await Promise.all(ids.map(id => storage.task(id, BACKGROUND_CONTEXT)));
@@ -45,7 +45,7 @@ function gate() {
   }) };
 }
 
-test("explicit history recovery resumes the same parked native work and retains its queued pass and healthy timer", async () => {
+test("explicit history recovery restarts the work Pi ended at its restart limit and retains its queued pass and healthy timer", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-history-index-retry-")), clock = new FakeClock();
   const held = gate(), otherHeld = gate(), resumed = gate();
   let initialCalls = 0, otherCalls = 0, resumedCalls = 0;
@@ -70,24 +70,32 @@ test("explicit history recovery resumes the same parked native work and retains 
     await app.session.close(BACKGROUND_CONTEXT);
     // Restore actual Pi crash records while the owning Harness is closed.
     // The lane, checkpoint and queued pass remain the production records.
-    await park(directory, [history, other]);
+    await cutOff(directory, [history, other]);
     app = await openBackground(directory, clock, {
       indexHistory: async signal => { resumedCalls += 1; await resumed.wait(signal); },
-      runJob: async () => { assert.fail("History recovery must leave another parked job untouched"); },
+      runJob: async () => { assert.fail("History recovery must leave another ended job untouched"); },
     });
     await app.scheduler.start(settings);
-    const before = await app.session.getTask(history, BACKGROUND_CONTEXT); assert.ok(before);
+    const current = app;
+    const ended = async (id: TaskId<null>) => {
+      const record = await current.session.getTask(id, BACKGROUND_CONTEXT);
+      return record?.state.status === "terminal" && record.state.outcome.status === "faulted" ? record : undefined;
+    };
+    await pump(async () => await ended(history) !== undefined && await ended(other) !== undefined);
+    const before = await ended(history); assert.ok(before);
     const timerBefore = await app.session.getTask(timer, BACKGROUND_CONTEXT), otherBefore = await app.session.getTask(other, BACKGROUND_CONTEXT);
-    assert.equal((await app.session.inspect(BACKGROUND_CONTEXT)).tasks.find(task => task.record.id === history)?.state.kind, "blocked");
     assert.equal(resumedCalls, 0, "Startup must not reset the crash-loop budget");
-    assert.ok(retryable(app.scheduler), "Parked native history work needs an explicit retry API");
+    assert.match((await app.scheduler.status()).errors.find(error => error.key.type === "builtin" && error.key.name === "history")?.message ?? "",
+      /paused after repeated interruptions.*retry-index/u);
+    assert.ok(retryable(app.scheduler), "History work Pi ended needs an explicit retry API");
     const result = await app.scheduler.retryHistoryIndex();
     await pump(() => resumedCalls === 1);
-    const running = await app.session.getTask(history, BACKGROUND_CONTEXT); assert.ok(running?.state.status === "running");
-    assert.equal(running.id, before.id); assert.equal(running.restarts ?? 0, 0);
-    assert.deepEqual(running.input, before.input); assert.deepEqual(running.state.checkpoint, before.state.checkpoint);
     const active = (await app.session.snapshot(State, BACKGROUND_CONTEXT))?.lanes.find(lane => lane.id === historyLane);
-    assert.equal(active?.active, history); assert.deepEqual(active?.pending, queued);
+    assert.ok(active?.active !== null && active?.active !== undefined && active.active !== history);
+    const replacement = active.active, running = await app.session.getTask(replacement, BACKGROUND_CONTEXT);
+    assert.ok(running?.state.status === "running");
+    assert.deepEqual(running.input, before.input); assert.deepEqual(active.pending, queued);
+    assert.deepEqual(await app.session.getTask(history, BACKGROUND_CONTEXT), before, "Pi's record of the ended work is retained");
     assert.deepEqual(await app.session.getTask(timer, BACKGROUND_CONTEXT), timerBefore);
     assert.deepEqual(await app.session.getTask(other, BACKGROUND_CONTEXT), otherBefore);
     assert.equal(result.errors.some(error => error.key.type === "builtin" && error.key.name === "history"), false);
@@ -95,7 +103,7 @@ test("explicit history recovery resumes the same parked native work and retains 
     resumed.release();
     await pump(async () => resumedCalls === 2 && (await app.session.snapshot(State, BACKGROUND_CONTEXT))?.lanes
       .find(lane => lane.id === historyLane)?.active === null);
-    const settled = await app.session.getTask(history, BACKGROUND_CONTEXT); assert.ok(settled?.state.status === "terminal");
+    const settled = await app.session.getTask(replacement, BACKGROUND_CONTEXT); assert.ok(settled?.state.status === "terminal");
     assert.equal(settled.state.outcome.status, "completed");
     assert.deepEqual(await app.session.getTask(other, BACKGROUND_CONTEXT), otherBefore);
     assert.deepEqual(await app.session.getTask(timer, BACKGROUND_CONTEXT), timerBefore);
@@ -107,7 +115,7 @@ test("explicit history recovery resumes the same parked native work and retains 
   }
 });
 
-test("explicit history recovery resumes an enabled parked timer without admitting another index pass", async () => {
+test("explicit history recovery restarts a timer Pi ended from its saved cursor without admitting another index pass", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-history-timer-retry-")), clock = new FakeClock();
   let app = await openBackground(directory, clock), calls = 0;
   try {
@@ -117,17 +125,25 @@ test("explicit history recovery resumes an enabled parked timer without admittin
     const state = await app.session.snapshot(State, BACKGROUND_CONTEXT); assert.ok(state);
     const timer = state.triggers.find(trigger => trigger.key.type === "builtin" && trigger.key.name === "history")?.task;
     assert.ok(timer !== null && timer !== undefined);
-    await app.session.close(BACKGROUND_CONTEXT); await park(directory, [timer]);
+    const sleeping = await app.session.getTask(timer, BACKGROUND_CONTEXT); assert.ok(sleeping?.state.status === "sleeping");
+    await app.session.close(BACKGROUND_CONTEXT); await cutOff(directory, [timer]);
     app = await openBackground(directory, clock, { indexHistory: async () => { calls += 1; } });
     await app.scheduler.start(settings);
-    assert.equal((await app.session.inspect(BACKGROUND_CONTEXT)).tasks.find(task => task.record.id === timer)?.state.kind, "blocked");
-    const before = await app.session.getTask(timer, BACKGROUND_CONTEXT); assert.ok(before);
+    const current = app;
+    await pump(async () => (await current.session.getTask(timer, BACKGROUND_CONTEXT))?.state.status === "terminal");
+    assert.match((await app.scheduler.status()).errors.find(error => error.key.type === "builtin" && error.key.name === "history")?.message ?? "",
+      /paused after repeated interruptions/u);
     assert.ok(retryable(app.scheduler)); await app.scheduler.retryHistoryIndex();
-    await pump(async () => (await app.session.getTask(timer, BACKGROUND_CONTEXT))?.state.status === "sleeping");
-    const after = await app.session.getTask(timer, BACKGROUND_CONTEXT); assert.ok(after?.state.status === "sleeping");
-    assert.equal(after.id, before.id); assert.equal(after.restarts ?? 0, 0);
-    assert.deepEqual(after.input, before.input); assert.deepEqual(after.state.checkpoint, before.state.checkpoint);
-    assert.deepEqual(await app.session.snapshot(State, BACKGROUND_CONTEXT), state); assert.equal(calls, 0);
+    const replacement = (await app.session.snapshot(State, BACKGROUND_CONTEXT))?.triggers
+      .find(trigger => trigger.key.type === "builtin" && trigger.key.name === "history")?.task;
+    assert.ok(replacement !== null && replacement !== undefined && replacement !== timer);
+    await pump(async () => (await current.session.getTask(replacement, BACKGROUND_CONTEXT))?.state.status === "sleeping");
+    const after = await app.session.getTask(replacement, BACKGROUND_CONTEXT); assert.ok(after?.state.status === "sleeping");
+    assert.deepEqual(after.input, sleeping.input);
+    assert.deepEqual(after.state, sleeping.state, "The replacement must plan from the ended timer's cursor and sleep until its deadline");
+    assert.deepEqual(await app.session.snapshot(State, BACKGROUND_CONTEXT), { ...state,
+      triggers: state.triggers.map(trigger => trigger.task === timer ? { ...trigger, task: replacement } : trigger) });
+    assert.equal(calls, 0);
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -150,7 +166,7 @@ test("history recovery refuses absent, healthy and disabled native timers withou
       const state = await tx.doc(State), trigger = state.triggers.find(trigger => trigger.task === timer); assert.ok(trigger);
       trigger.enabled = false;
     }, BACKGROUND_CONTEXT);
-    await app.session.close(BACKGROUND_CONTEXT); await park(directory, [timer]);
+    await app.session.close(BACKGROUND_CONTEXT); await cutOff(directory, [timer]);
     app = await openBackground(directory, clock); assert.ok(retryable(app.scheduler));
     const disabled = await app.session.getTask(timer, BACKGROUND_CONTEXT);
     await assert.rejects(app.scheduler.retryHistoryIndex(), /history|History/);

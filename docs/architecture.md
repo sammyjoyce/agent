@@ -459,10 +459,11 @@ An unfinished initial scan is catching up; a later scan is refreshing. Typed
 progress reports the frozen scan window and provider-specific units without
 claiming completion from a successful page. Missing older completion data stays
 unknown.
-Source review reclaims parked native work only after binding its execution
-context. Pi handles tool recovery: interrupted unsafe effects are recorded as
-interrupted, not replayed. Existing submissions and source decisions remain
-authoritative.
+Source review checks its run only after binding its execution context, and
+refuses one that waits on a task this runtime cannot run. Pi handles tool
+recovery: interrupted unsafe effects are recorded as interrupted, not replayed,
+and a call cut off at the restart limit ends with an error result. Existing
+submissions and source decisions remain authoritative.
 Admit events durably before advancing a cursor. Partial reads never
 pretend to be complete, and repeated event versions do not create duplicate
 work. New batches rotate across provider/account streams and alternate oldest
@@ -681,11 +682,13 @@ An unanswered input retains its native status. A successful recovery can link
 settles after the linked recovery inputs finish and execution is idle, even
 while the task waits for external work.
 
-Explicit job recovery uses Pi's retry operation on the existing parked native
-timer, background task or current root model generation. Model recovery requires
-the owning worker's configured execution context; another actor or generation
-cannot grant a retry. Recovery preserves admitted occurrences, queued inputs and
-timers. Native job and conversation inspection use the same runtime records
+Pi ends a task that crashes cut off at its restart limit. The trigger or lane
+that still names an ended background task holds its work, and explicit job
+recovery starts that timer or work again as a new native task with the same
+input. A replacement timer plans from its trigger's saved cursor, so it catches
+up the occurrences it missed. A root model generation that Pi ends there settles
+its inputs unanswered, which the reconciliation above handles. Recovery
+preserves admitted occurrences, queued inputs and timers. Native job and conversation inspection use the same runtime records
 and history projection as the CLI; inspection detaches without aborting work.
 
 ### Cross-host recovery
