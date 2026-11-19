@@ -8,7 +8,7 @@ import type { FileRecord } from "../generated/FileRecord.js";
 import type { LogEntry } from "../generated/LogEntry.js";
 import type { Versions } from "../generated/Versions.js";
 import type { AuthorityLink } from "./authority-link.js";
-import { commitLoggedBatch, logEntryDigest, parseBatch, sha256Hex, versions } from "./log-entry.js";
+import { commitLoggedBatch, logEntryDigest, parseBatch, replays, sha256Hex, versions } from "./log-entry.js";
 import type { ScopedDatabase } from "./scoped-database.js";
 
 const LOG_PAGE_ENTRIES = 32;
@@ -71,7 +71,7 @@ export async function followLog(follower: LogFollower, storage: SqliteStorage): 
 async function applyEntry({ database, link, stateDirectory }: LogFollower, storage: SqliteStorage, installed: Versions, entry: LogEntry): Promise<void> {
   const { digest, ...digested } = entry;
   const { at, versions: written, files, removed, batch } = entry;
-  if (written.pi_durable !== installed.pi_durable || written.chord !== installed.chord) {
+  if (!replays(installed, written)) {
     throw new Error(`Log entry ${at} was written by Pi Durable ${written.pi_durable} and Chord ${written.chord}, and this host runs Pi Durable ${installed.pi_durable} and Chord ${installed.chord}`);
   }
   if (logEntryDigest(digested) !== digest) throw new Error(`Log entry ${at} does not match its digest`);

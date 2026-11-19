@@ -52,6 +52,24 @@ export async function commitLoggedBatch(storage: Storage, writes: readonly Stora
   }
 }
 
+type PiVersions = Pick<Versions, "pi_durable" | "chord">;
+
+/**
+ * Older Pi Durable and Chord releases whose log entries a release replays.
+ * Their batches commit through the reader's Pi to the rows their own Pi wrote,
+ * as failover-replay-1.4.0.test.ts checks against a log that 1.4.0 wrote.
+ */
+const REPLAYED_WRITERS: readonly { readonly reader: PiVersions; readonly writer: PiVersions }[] = [
+  { reader: { pi_durable: "1.5.2", chord: "1.5.2" }, writer: { pi_durable: "1.4.0", chord: "1.4.0" } },
+];
+
+const samePi = (left: PiVersions, right: PiVersions) => left.pi_durable === right.pi_durable && left.chord === right.chord;
+
+/** Whether a host running `installed` can replay the batch of an entry that `written` logged. */
+export function replays(installed: Versions, written: Versions): boolean {
+  return samePi(installed, written) || REPLAYED_WRITERS.some(({ reader, writer }) => samePi(reader, installed) && samePi(writer, written));
+}
+
 let installed: Promise<Versions> | undefined;
 
 /** The application, Pi Durable and Chord versions this process runs, which stamp every log entry it writes. */
