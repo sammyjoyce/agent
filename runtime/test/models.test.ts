@@ -12,7 +12,7 @@ import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { AgentDoc, createRegistry, defineDoc, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { AuthError, ChatGptAuth } from "../src/auth.js";
-import { ConversationModels, DEFAULT_MODEL, ModelError, PROVIDERS } from "../src/models.js";
+import { ConversationModels, DEFAULT_MODEL, ModelError } from "../src/models.js";
 import { TaskStore } from "../src/tasks.js";
 import { createAppTools, Executions } from "../src/tools.js";
 import { validEvent } from "../src/protocol.js";
@@ -45,10 +45,23 @@ function fauxModels() {
   return { models, first, second };
 }
 
-test("typed providers cover the actual upstream registry and explicit unsupported settings fail before inference", () => {
-  const native = builtinModels(); const inference = new ConversationModels(native);
-  assert.deepEqual([...PROVIDERS].sort(), native.getProviders().map((provider) => provider.id).sort());
-  assert.equal(new Set(PROVIDERS).size, 43);
+test("the catalog offers every wire provider Pi serves and never one installed clients cannot decode", async () => {
+  const schema: { $defs: { ModelProvider: { enum: string[] } } } =
+    JSON.parse(await readFile(new URL("../../src/generated/event.schema.json", import.meta.url), "utf8"));
+  const wire = new Set(schema.$defs.ModelProvider.enum);
+  const native = builtinModels();
+  for (const id of wire) assert.notEqual(native.getProvider(id), undefined, `Pi no longer serves wire provider ${id}`);
+  native.setProvider(fauxProvider({ provider: "example-unreleased", models: [{ id: "fixture" }] }).provider);
+  const offered = new Set(native.getModels().map((model) => model.provider));
+  assert.ok([...offered].some((id) => !wire.has(id)), "Pi must offer a provider outside the wire enum for this test to filter");
+  const catalog = new ConversationModels(native).catalog();
+  assert.deepEqual(new Set(catalog.map((option) => option.provider)), new Set([...offered].filter((id) => wire.has(id))));
+  assert.ok(validEvent({ version: 1, id: 1, event: { type: "conversation_settings", settings: {
+    conversation_id: "example", task_id: null, agent_id: null, model: DEFAULT_MODEL, catalog } } }));
+});
+
+test("explicit unsupported settings fail before inference", () => {
+  const inference = new ConversationModels(builtinModels());
   assert.throws(() => inference.validate({ ...DEFAULT_MODEL, reasoning: "minimal" }), ModelError);
   assert.throws(() => inference.validate({ ...DEFAULT_MODEL, model_id: "missing-model" }), ModelError);
   assert.throws(() => inference.validate({ provider: "anthropic", model_id: "claude-opus-4-6", reasoning: null, fast: true }), ModelError);

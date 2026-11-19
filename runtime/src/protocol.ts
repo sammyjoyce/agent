@@ -6,6 +6,7 @@ import type { RuntimeRequest } from "./generated/RuntimeRequest.js";
 import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import type { ApnsConfig } from "./generated/ApnsConfig.js";
+import type { ModelProvider } from "./generated/ModelProvider.js";
 import { AuthError } from "./auth.js";
 import { ModelsError } from "@earendil-works/pi-ai/utils/models-error";
 
@@ -41,8 +42,10 @@ async function schema(name: string): Promise<object> {
   return value;
 }
 
+ajv.addSchema(await schema("event"), "event");
 export const validRequest = ajv.compile<RuntimeRequest>(await schema("request"));
-export const validEvent = ajv.compile<RuntimeEvent>(await schema("event"));
+export const validEvent = ajv.compile<RuntimeEvent>({ $ref: "event" });
+export const validProvider = ajv.compile<ModelProvider>({ $ref: "event#/$defs/ModelProvider" });
 export const validApnsConfig = ajv.compile<ApnsConfig>(await schema("apns"));
 
 /** JSON frames end at LF, never Unicode line/paragraph separators inside strings. */
