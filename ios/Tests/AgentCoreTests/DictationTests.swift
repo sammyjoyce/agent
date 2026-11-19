@@ -237,6 +237,37 @@ func anInterruptionAfterAHeldReleaseKeepsTheWords() async throws {
   }
 }
 
+@MainActor @Test(.timeLimit(.minutes(1)))
+func aCaptureThatEndsOnItsOwnKeepsTheWordsAndFreesTheMicrophone() async throws {
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let (events, heard) = AsyncStream.makeStream(of: RecordingEvent.self)
+  let scripted = ScriptedSpeech().engine
+  let engine = SpeechEngine(
+    model: scripted.model, install: scripted.install, prewarm: scripted.prewarm,
+    remove: scripted.remove, diskUsage: scripted.diskUsage, onCellular: scripted.onCellular,
+    permission: scripted.permission, requestPermission: scripted.requestPermission,
+    record: {
+      Recording(events: events, finish: { "Invented words before the capture stopped" }, cancel: {})
+    })
+  let chat = ChatModel(draftStore: AttachmentStore(directory: root.appending(path: "Drafts")))
+  let dictation = Dictation(engine: engine)
+  dictation.setForeground(true)
+  try await until("the model is read") { dictation.model != .checking }
+  try await withConnectedCoordinator(chat) { fixture, _ in
+    dictation.mic(.activated, in: DictationTarget(chat: chat))
+    try await listening(dictation, .toggled)
+    heard.yield(.level(0.9))
+    heard.finish()
+    try await until("the take ends") { dictation.take == nil }
+    #expect(chat.draft == "Invented words before the capture stopped")
+    #expect(dictation.notice == .interrupted)
+    #expect(engine.microphone.take(.car), "The car can take the microphone")
+    engine.microphone.release(.car)
+    #expect(await submitted(fixture).isEmpty, "A capture that stops never sends")
+  }
+}
+
 @MainActor @Test(.timeLimit(.minutes(1)), arguments: ["slid off", "cancelled by the system"])
 func aHeldTakeThatDoesNotEndOnTheMicKeepsItsWords(_ ending: String) async throws {
   try await withDictation(holdDelay: .milliseconds(10)) { dictation, _, chat, fixture, directory in

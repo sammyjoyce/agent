@@ -624,6 +624,9 @@ public final class Dictation {
       case .interrupted: keep(notice: .interrupted)
       }
     }
+    // Capture can also end on its own, as when its converter fails, and the take then ends as if
+    // interrupted. Otherwise it holds the microphone until the next tap.
+    if self.take?.id == id, case .listening? = self.take?.stage { keep(notice: .interrupted) }
   }
 
   private func regesture(_ next: Gesture) {
