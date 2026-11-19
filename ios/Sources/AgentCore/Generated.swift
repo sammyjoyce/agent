@@ -1015,7 +1015,6 @@ public enum ModelProvider: String, Codable, Sendable, Equatable {
     case `qwenTokenPlan` = "qwen-token-plan"
     case `qwenTokenPlanCn` = "qwen-token-plan-cn"
     case `qwenTokenPlanIndividual` = "qwen-token-plan-individual"
-    case `qwenTokenPlanIndividualCn` = "qwen-token-plan-individual-cn"
     case `xiaomi` = "xiaomi"
     case `xiaomiTokenPlanCn` = "xiaomi-token-plan-cn"
     case `xiaomiTokenPlanAms` = "xiaomi-token-plan-ams"
