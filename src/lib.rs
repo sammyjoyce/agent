@@ -48,4 +48,8 @@ pub mod notifications;
 mod executable_fixture;
 
 #[cfg(test)]
-pub(crate) const TEST_HANG_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+#[path = "../tests/fixtures/hang_limit.rs"]
+mod hang_limit;
+
+#[cfg(test)]
+pub(crate) use hang_limit::TEST_HANG_LIMIT;
