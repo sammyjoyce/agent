@@ -373,7 +373,7 @@ none a blocker. See [issue #52](https://github.com/sammyjoyce/agent/issues/52).
 
 ## Reuse upstream
 
-Verified against Pi Durable 1.4.0 and Beep Boop's current source. Source
+Verified against Pi Durable 1.5.2 and Beep Boop's current source. Source
 integration and deployment are tracked separately above.
 
 | Upstream capability | Status | Application use and remaining work |
