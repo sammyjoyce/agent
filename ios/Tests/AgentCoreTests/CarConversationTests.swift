@@ -176,6 +176,7 @@ func aTakeWhosePartialClearsStillReadsBackTheWordsItHeard() async throws {
   try await withCar(script, timings: timings) { rig in
     rig.spoken.holding = "Send to"
     rig.car.begin(with: rig.work)
+    try await eventually("the take opened") { rig.speech.recordings == 1 }
     try await eventually("the take ended") {
       rig.spoken.lines.count == 2 || rig.car.phase == .idle
     }
