@@ -21,6 +21,10 @@ struct Endpointer {
       trailingQuiet: .milliseconds(900), noWords: .seconds(5), longest: .seconds(6))
   }
 
+  /// How far a partial can trail the voice it transcribes. Parakeet decodes chunks of 13 frames
+  /// with 13 more to their right, so words show about two seconds after they are said.
+  static let partialLag: Duration = .milliseconds(2100)
+
   enum Verdict: Equatable {
     /// The take is over and keeps the words it heard.
     case finish
@@ -58,9 +62,14 @@ struct Endpointer {
     return verdict(at: now)
   }
 
+  /// A take never ends as silence while words for the voice it heard may still be coming, since
+  /// `finish` decodes everything heard.
   func verdict(at now: ContinuousClock.Instant) -> Verdict? {
-    if now >= start + policy.longest { return heardWords ? .finish : .silence }
-    guard heardWords else { return now >= start + policy.noWords ? .silence : nil }
+    let wordsMayCome = heardWords || now < lastVoice + Self.partialLag
+    if now >= start + policy.longest { return wordsMayCome ? .finish : .silence }
+    guard heardWords else {
+      return now >= start + policy.noWords && !wordsMayCome ? .silence : nil
+    }
     return now >= max(lastVoice, lastChange) + policy.trailingQuiet ? .finish : nil
   }
 }

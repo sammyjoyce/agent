@@ -31,6 +31,33 @@ import Testing
   #expect(verdict([(1000, .partial("Water")), (1100, .interrupted)]) == .interrupted)
 }
 
+@Test func voiceWhoseWordsMayStillBeComingIsNotSilence() {
+  let start = ContinuousClock.now
+  func verdict(_ policy: Endpointer.Policy, _ events: [(at: Int, event: RecordingEvent?)])
+    -> Endpointer.Verdict?
+  {
+    var endpointer = Endpointer(policy, startedAt: start)
+    for (at, event) in events {
+      let now = start + .milliseconds(at)
+      if let verdict = event.map({ endpointer.hear($0, at: now) }) ?? endpointer.verdict(at: now) {
+        return verdict
+      }
+    }
+    return nil
+  }
+  let lateYes: [(at: Int, event: RecordingEvent?)] = [
+    (3400, .level(0.9)), (3900, .level(0.9)), (5000, nil), (5500, .partial("Yes")), (6000, nil),
+  ]
+  #expect(verdict(.confirmation, lateYes) == .finish, "A yes said late is not silence")
+  #expect(verdict(.message, [(6000, .level(0.9)), (8099, nil)]) == nil)
+  #expect(verdict(.message, [(6000, .level(0.9)), (8100, nil)]) == .silence)
+  #expect(
+    verdict(.message, [(5600, .level(0.9)), (7000, .level(0.9)), (7600, .partial("Water"))])
+      == nil, "A message started late is still being heard")
+  #expect(verdict(.message, [(44_000, .level(0.9)), (45_000, nil)]) == .finish)
+  #expect(verdict(.message, [(1000, .level(0.9)), (45_000, nil)]) == .silence)
+}
+
 @Test func wordsStayHeardWhenALaterPartialClearsThem() {
   let start = ContinuousClock.now
   var endpointer = Endpointer(.message, startedAt: start)
