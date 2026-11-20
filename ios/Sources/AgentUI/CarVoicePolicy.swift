@@ -62,10 +62,12 @@ struct Endpointer {
     return verdict(at: now)
   }
 
-  /// A take never ends as silence while words for the voice it heard may still be coming, since
-  /// `finish` decodes everything heard.
+  /// A take never ends as silence while words for voice it heard before its no-words limit may
+  /// still be coming, since `finish` decodes everything heard. Sound after the limit is too late,
+  /// so steady noise cannot hold a take open.
   func verdict(at now: ContinuousClock.Instant) -> Verdict? {
-    let wordsMayCome = heardWords || now < lastVoice + Self.partialLag
+    let wordsMayCome =
+      heardWords || now < min(lastVoice, start + policy.noWords) + Self.partialLag
     if now >= start + policy.longest { return wordsMayCome ? .finish : .silence }
     guard heardWords else {
       return now >= start + policy.noWords && !wordsMayCome ? .silence : nil

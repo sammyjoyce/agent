@@ -54,8 +54,16 @@ import Testing
   #expect(
     verdict(.message, [(5600, .level(0.9)), (7000, .level(0.9)), (7600, .partial("Water"))])
       == nil, "A message started late is still being heard")
-  #expect(verdict(.message, [(44_000, .level(0.9)), (45_000, nil)]) == .finish)
+  #expect(
+    verdict(.message, [(44_000, .level(0.9)), (45_000, nil)]) == .silence,
+    "Sound after the limit is too late")
   #expect(verdict(.message, [(1000, .level(0.9)), (45_000, nil)]) == .silence)
+  var noisy = Endpointer(.message, startedAt: start)
+  let ended = stride(from: 0, through: 45_000, by: 100).first { at in
+    noisy.hear(.level(0.9), at: start + .milliseconds(at)) != nil
+  }
+  #expect(ended == 9100, "Steady noise with no words cannot hold a take open")
+  #expect(noisy.verdict(at: start + .milliseconds(9100)) == .silence)
 }
 
 @Test func wordsStayHeardWhenALaterPartialClearsThem() {
