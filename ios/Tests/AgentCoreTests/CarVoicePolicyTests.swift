@@ -66,6 +66,24 @@ import Testing
   #expect(noisy.verdict(at: start + .milliseconds(9100)) == .silence)
 }
 
+@Test func noHeardVoiceIsSilenceEvenBeforePartialLag() {
+  let start = ContinuousClock.now
+  let short = Endpointer.Policy(
+    trailingQuiet: .milliseconds(500), noWords: .seconds(1), longest: .seconds(2))
+  let silent = Endpointer(short, startedAt: start)
+  #expect(silent.verdict(at: start + .milliseconds(1000)) == .silence)
+  #expect(silent.verdict(at: start + .milliseconds(2000)) == .silence)
+
+  var quietNoise = Endpointer(short, startedAt: start)
+  #expect(quietNoise.hear(.level(0.2), at: start + .milliseconds(500)) == nil)
+  #expect(quietNoise.verdict(at: start + .milliseconds(1000)) == .silence)
+
+  var loudVoice = Endpointer(short, startedAt: start)
+  #expect(loudVoice.hear(.level(0.9), at: start + .milliseconds(500)) == nil)
+  #expect(loudVoice.verdict(at: start + .milliseconds(1000)) == nil)
+  #expect(loudVoice.verdict(at: start + .milliseconds(2000)) == .finish)
+}
+
 @Test func wordsStayHeardWhenALaterPartialClearsThem() {
   let start = ContinuousClock.now
   var endpointer = Endpointer(.message, startedAt: start)

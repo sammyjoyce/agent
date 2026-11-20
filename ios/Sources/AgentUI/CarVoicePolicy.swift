@@ -38,13 +38,12 @@ struct Endpointer {
   /// Stays true once any partial had words, even if a later one clears them, since the take's
   /// text comes from `finish`, not from the last partial.
   private var heardWords = false
-  private var lastVoice: ContinuousClock.Instant
+  private var lastVoice: ContinuousClock.Instant?
   private var lastChange: ContinuousClock.Instant
 
   init(_ policy: Policy, startedAt start: ContinuousClock.Instant) {
     self.policy = policy
     self.start = start
-    lastVoice = start
     lastChange = start
   }
 
@@ -66,13 +65,14 @@ struct Endpointer {
   /// still be coming, since `finish` decodes everything heard. Sound after the limit is too late,
   /// so steady noise cannot hold a take open.
   func verdict(at now: ContinuousClock.Instant) -> Verdict? {
-    let wordsMayCome =
-      heardWords || now < min(lastVoice, start + policy.noWords) + Self.partialLag
+    let voiceRecent =
+      lastVoice.map { now < min($0, start + policy.noWords) + Self.partialLag } ?? false
+    let wordsMayCome = heardWords || voiceRecent
     if now >= start + policy.longest { return wordsMayCome ? .finish : .silence }
     guard heardWords else {
       return now >= start + policy.noWords && !wordsMayCome ? .silence : nil
     }
-    return now >= max(lastVoice, lastChange) + policy.trailingQuiet ? .finish : nil
+    return now >= max(lastVoice ?? start, lastChange) + policy.trailingQuiet ? .finish : nil
   }
 }
 
