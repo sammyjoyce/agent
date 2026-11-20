@@ -374,6 +374,114 @@ none a blocker. See [issue #52](https://github.com/sammyjoyce/agent/issues/52).
   `libglib-2.0` on NixOS hosts, and the gate must pass the browser fixture's
   `GITHUB_ENV` on.
 
+## Issues
+
+Real-device iPhone UI issues audited through macOS iPhone Mirroring on a
+physical iPhone 16 Pro (`iPhone17,1`, iOS `27.3` build `24C5037i`, Beep Boop iOS
+`0.1` build `416`, iPhone Mirroring `2.1` build `128.2` on macOS `27.3` build
+`26C5035r`). Private screenshots, walkthrough clips and action logs are retained
+outside this repository under their evidence identifiers; all examples below use
+invented names and placeholder text. Entries distinguish **OBSERVED** defects
+from **USER-REPORTED NOT REPRODUCED** and **UNTESTED / BLOCKED** coverage gaps
+after the phone left mirroring (`iPhone in Use`) before repeat and cold-relaunch
+trials completed. Deduplicated against existing roadmap items and open GitHub
+issues (including `#71` and `#95`).
+
+- [ ] **`UI-001` — Background/foreground reconnect drops reasoning summaries from an expanded activity group and shifts the open tool card**
+  - **Status**: `OBSERVED`
+  - **Severity**: High
+  - **Build**: Beep Boop iOS `0.1` (build `416`), iOS `27.3` (`24C5037i`), iPhone 16 Pro (`iPhone17,1`)
+  - **Steps**:
+    1. Open a single-coordinator feed (`Work`) containing a completed activity group with multiple tool calls and reasoning summaries (e.g., `5 tool calls · 4 summaries`).
+    2. Expand the activity group and expand its first shell tool call so a reasoning summary row sits directly above the expanded `Shell` card.
+    3. Background Beep Boop to the Home Screen and leave it backgrounded until it suspends and disconnects (`Disconnected` visible in the App Switcher snapshot).
+    4. Foreground Beep Boop from the App Switcher and wait for automatic reconnect (`Connecting` → connected) to settle, then observe without touching the screen for >8 seconds and again after scrolling 15 minutes later.
+  - **Expected**: Reconnect restores the complete activity group (`5 tool calls · 4 summaries`), keeps the reasoning summary above the expanded tool call, and keeps the expanded `Shell` card anchored at its prior vertical position.
+  - **Actual**: During `Connecting`, the group header drops all summaries (`5 tool calls`) and the first reasoning summary disappears. Once reconnect settles—and persistently 15 minutes later after scrolling—the header remains `5 tool calls · 2 summaries`, two of four summaries never return, and the open `Shell` card shifts upward by ~1 row height (~30–35 pt). *(Control: coordinator scope, group/card expanded state, general scroll neighborhood and tool-row count survived without duplicates.)*
+  - **Repro frequency**: 1/1 observed trial on build `416` (repeat trials and cold-relaunch persistence check blocked when phone left mirroring).
+  - **Evidence**: `EVID-20261120-A1`
+  - **Acceptance check**: With an expanded activity group containing N summaries and an open child tool card, background Beep Boop until it disconnects, foreground it, and verify all N summaries remain in both the group header and expanded body with zero vertical jump of the open tool card after reconnect completes.
+
+- [ ] **`UI-002` — Expanding the active streaming activity group at the live tail stalls follow-tail, clips streaming rows behind the composer and delays `Latest`**
+  - **Status**: `OBSERVED`
+  - **Severity**: Medium-High
+  - **Build**: Beep Boop iOS `0.1` (build `416`), iOS `27.3` (`24C5037i`), iPhone 16 Pro (`iPhone17,1`)
+  - **Steps**:
+    1. Sit at the live tail of an actively streaming conversation (`Working...` visible above the composer, no `Latest` pill).
+    2. Tap the collapsed active activity disclosure (`3 tool calls · 2 summaries >`) to expand it while the run continues.
+    3. Do not scroll manually; observe across a 10-second burst (16 frames) as a 4th tool call starts (`1 running · 4 tool calls · 2 summaries`) and completes, and again ~2 minutes later after a 5th call and additional summaries append.
+  - **Expected**: Expanding the live activity group either keeps follow-tail engaged so newly appended tool rows and `Working...` stay cleanly above the composer, or immediately transitions to manual-reading mode with `↓ Latest` visible and no row clipped mid-line under the composer edge.
+  - **Actual**: Immediately on expansion, `Working...` is pushed downward and half-clipped behind the composer with no `↓ Latest` pill shown. When the 4th tool call streams in and completes across the 10-second burst, follow-tail does not advance: `Working...` moves below the composer and the 4th tool row is half-clipped behind the composer, still with no `↓ Latest` pill. Only after further rows append later (`5 tool calls · 4 summaries`) does `↓ Latest` appear.
+  - **Repro frequency**: 1/1 observed live-streaming trial on build `416` (16 consecutive frames over 10 seconds plus follow-up observation).
+  - **Evidence**: `EVID-20261120-B1`
+  - **Acceptance check**: At the live tail of an actively streaming turn, expand the active activity group and verify that either newly appended tool rows and `Working...` stay fully visible above the composer, or `↓ Latest` appears immediately without clipping active rows mid-line under the composer.
+
+- [ ] **`UI-003` — Floating `↓ Latest` pill overlaps readable text inside expanded `Shell` tool cards and activity rows**
+  - **Status**: `OBSERVED`
+  - **Severity**: Low-Medium
+  - **Build**: Beep Boop iOS `0.1` (build `416`), iOS `27.3` (`24C5037i`), iPhone 16 Pro (`iPhone17,1`)
+  - **Steps**:
+    1. Scroll above the live tail (or expand an activity group / `Shell` card while newer rows exist below) so the floating `↓ Latest` pill is displayed.
+    2. Inspect the bottom-right text of visible activity rows and expanded `Shell` card output lines.
+  - **Expected**: The `↓ Latest` jump button does not obscure readable text or disclosure chevrons inside activity rows or expanded `Shell` cards.
+  - **Actual**: The opaque `↓ Latest` pill floats directly on top of bottom-right transcript content, covering activity row suffixes/chevrons and the right side of the bottom two visible lines inside an expanded `Shell` card across multiple scroll positions.
+  - **Repro frequency**: 2/2 distinct expanded layouts (over collapsed activity rows and over an expanded `Shell` card) across multiple scroll offsets and after reconnect.
+  - **Evidence**: `EVID-20261120-B2`
+  - **Acceptance check**: Scroll above the live tail with both collapsed activity rows and an expanded `Shell` card in view and verify the `↓ Latest` control remains legible without obscuring code lines or row disclosure controls.
+
+- [ ] **`UI-004` — Consecutive reasoning summaries concatenate inline with literal `****` markdown delimiters**
+  - **Status**: `OBSERVED`
+  - **Severity**: Low-Medium
+  - **Build**: Beep Boop iOS `0.1` (build `416`), iOS `27.3` (`24C5037i`), iPhone 16 Pro (`iPhone17,1`)
+  - **Steps**:
+    1. Stream a multi-step turn that emits consecutive bolded reasoning summaries into one activity group.
+    2. Expand the activity group and inspect the summary entries.
+  - **Expected**: Each reasoning summary renders as its own separated line or block with clean formatting and no raw markdown tokens.
+  - **Actual**: Two adjacent summaries are concatenated into a single line with literal `****` rendered between them (e.g., `Inspecting report status****Reviewing message text`), persisting across the entire 10-second burst and subsequent captures.
+  - **Repro frequency**: 1/1 multi-summary streaming turn observed on build `416`.
+  - **Evidence**: `EVID-20261120-O1`
+  - **Acceptance check**: Stream two back-to-back bolded reasoning summaries into an activity group and verify they render as distinct lines/blocks with zero literal `*` markdown delimiters visible.
+
+- [ ] **`UI-005` — `Disconnected` / `Connecting` status bar collides with the top visible transcript line during background/foreground transitions**
+  - **Status**: `OBSERVED`
+  - **Severity**: Low
+  - **Build**: Beep Boop iOS `0.1` (build `416`), iOS `27.3` (`24C5037i`), iPhone 16 Pro (`iPhone17,1`)
+  - **Steps**:
+    1. Scroll mid-conversation so a message line sits immediately below the top header bar.
+    2. Background Beep Boop until it disconnects, inspect the App Switcher snapshot, and foreground Beep Boop to observe the `Disconnected` → `Connecting` → connected transition.
+  - **Expected**: Connection status banners reserve dedicated vertical layout space above the transcript viewport without overlapping visible message text or spinners.
+  - **Actual**: `Disconnected` / `Try again` sits flush against the top visible line in the background snapshot, and during foreground `Connecting` the activity spinner aligns beside/overlaps the right edge of the top transcript line before the feed shifts as the status row clears.
+  - **Repro frequency**: 1/1 observed background→foreground reconnect on build `416`.
+  - **Evidence**: `EVID-20261120-A2`
+  - **Acceptance check**: Trigger disconnect and foreground reconnect while scrolled mid-conversation and verify status banners inset cleanly above transcript text with no text/spinner collision.
+
+- [ ] **`UI-006` — Close/reopen cold relaunch and in-app conversation navigation away/back remain unverified**
+  - **Status**: `UNTESTED / BLOCKED` (reported Focus A scope; partial coverage in `UI-001` and `UI-005`)
+  - **Severity**: Medium (pending reproduction)
+  - **Build**: Beep Boop iOS `0.1` (build `416`), iOS `27.3` (`24C5037i`), iPhone 16 Pro (`iPhone17,1`)
+  - **Steps**:
+    1. Verify composer is empty and idle, record active coordinator scope, scroll offset, expanded activity/tool state and visible message history.
+    2. Test: (a) switching coordinator scope (`Work` ↔ `All coordinators` ↔ second coordinator), (b) opening `Connection → Jobs and work` conversations and navigating back, and (c) closing Beep Boop from the App Switcher and cold-relaunching.
+    3. Repeat 2–3 times per transition.
+  - **Expected**: Active conversation scope, history completeness (no missing/duplicated rows), and expected scroll/expansion restoration behave consistently across navigation away/back and cold relaunch.
+  - **Actual**: Not yet executed on build `416` because iPhone Mirroring ended with `iPhone in Use — Lock your iPhone to connect` when the user took the physical phone before these transitions ran. (The coordinator picker menu itself opened cleanly.)
+  - **Repro frequency**: Untested (0 trials; blocked by `iPhone in Use`).
+  - **Evidence**: `EVID-20261120-BLOCK`
+  - **Acceptance check**: Complete 2–3 trials each of coordinator switching, `Jobs and work` navigation away/back, and cold app relaunch on a real iPhone via iPhone Mirroring; confirm no missing history, duplicate rows, unexpected scope resets or scroll loss.
+
+- [ ] **`UI-007` — Unexpected viewport jump while reading expanded tool-call details during active streaming**
+  - **Status**: `USER-REPORTED NOT REPRODUCED / PARTIALLY BLOCKED` (reported Focus B scope; related live-tail defect captured in `UI-002`)
+  - **Severity**: High (if reproduced; pending remaining live-tail/keyboard/collapse trials)
+  - **Build**: Beep Boop iOS `0.1` (build `416`), iOS `27.3` (`24C5037i`), iPhone 16 Pro (`iPhone17,1`)
+  - **Steps**:
+    1. Open an actively streaming conversation with tool calls and expand a child tool-call detail card (`Shell` card) to read its output while new tool calls and assistant text stream in.
+    2. Test from both (a) off-tail (`↓ Latest` visible) and (b) live-tail (follow-tail active), plus toggling keyboard open/dismiss and collapsing/re-expanding neighboring rows mid-stream.
+  - **Expected**: Reading an expanded tool-call detail stays anchored in place while new events append below, and collapsing/expanding or toggling the keyboard does not unexpectedly jump the viewport away from the inspected row.
+  - **Actual**: In one off-tail control trial (`↓ Latest` already visible), expanding a `Shell` card and waiting while the turn finished and appended a new reply below produced **no** unexpected jump (0/1). Live-tail child-card expansion during rapid multi-chunk streaming, inner-card vs outer-feed scrolling during streaming, collapse/expand row anchoring, and keyboard open/dismiss interactions were blocked when the phone left mirroring (`iPhone in Use`).
+  - **Repro frequency**: 0/1 in off-tail control trial; remaining live-tail, collapse/expand and keyboard scenarios untested (blocked by `iPhone in Use`).
+  - **Evidence**: `EVID-20261120-B3`, `EVID-20261120-BLOCK`
+  - **Acceptance check**: Against an actively streaming read-only job feed or harmless test coordinator, verify zero unexpected viewport jumps when expanding/reading a tool-call detail card from both live-tail and scrolled-up states while text and tool events stream continuously, and across collapse/expand and keyboard toggle interactions.
+
 ## Reuse upstream
 
 Verified against Pi Durable 1.5.2 and Beep Boop's current source. Source
