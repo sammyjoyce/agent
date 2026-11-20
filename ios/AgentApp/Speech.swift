@@ -58,31 +58,36 @@ private final class SystemVoice: NSObject, AVSpeechSynthesizerDelegate {
       .playback, mode: .spokenAudio, options: [.duckOthers, .interruptSpokenAudioAndMixWithOthers])
     try session.setActive(true)
     defer { try? session.setActive(false, options: .notifyOthersOnDeactivation) }
+    let utterance = AVSpeechUtterance(string: sentence)
+    utterance.prefersAssistiveTechnologySettings = true
+    let id = ObjectIdentifier(utterance)
     let interruption = NotificationCenter.default.addObserver(
       forName: AVAudioSession.interruptionNotification, object: session, queue: .main
     ) { notification in
       let type = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
       guard type == AVAudioSession.InterruptionType.began.rawValue else { return }
-      MainActor.assumeIsolated { self.stop() }
+      MainActor.assumeIsolated { self.cancel(id) }
     }
     defer { NotificationCenter.default.removeObserver(interruption) }
-    let utterance = AVSpeechUtterance(string: sentence)
-    utterance.prefersAssistiveTechnologySettings = true
     try await withTaskCancellationHandler {
       try await withCheckedThrowingContinuation { (said: CheckedContinuation<Void, any Error>) in
         if Task.isCancelled {
           said.resume(throwing: CancellationError())
         } else {
-          saying[ObjectIdentifier(utterance)] = said
+          saying[id] = said
           synthesizer.speak(utterance)
         }
       }
     } onCancel: {
-      Task { @MainActor in self.stop() }
+      Task { @MainActor in self.cancel(id) }
     }
   }
 
-  private func stop() { synthesizer.stopSpeaking(at: .immediate) }
+  private func cancel(_ id: ObjectIdentifier) {
+    guard let pending = saying.removeValue(forKey: id) else { return }
+    synthesizer.stopSpeaking(at: .immediate)
+    pending.resume(throwing: CancellationError())
+  }
 
   nonisolated func speechSynthesizer(
     _ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance
