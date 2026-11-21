@@ -440,6 +440,61 @@ recovery; [history](history.md) describes import and retrieval.
   [cross-host recovery](architecture.md#cross-host-recovery) for what the stop
   evidence does not prove.
 
+## Rex integration
+
+Opportunities reviewed against Superlogical's Oct 21–Nov 21, 2026 updates, Rex
+`0.1.0-preview.21` (control API revision 18) and current Rex documentation. Keep
+existing `rex_instance_id` restart fencing in `src/rex.rs`: `block.close` still
+has no conditional precondition and native agent-session restore is not shipped
+yet.
+
+- [ ] Emit the Program Status Protocol (`OSC 7501`) from the TUI alongside
+  `WindowTitle` in `src/tui/inline.rs`, using `app=beep-boop` and the same
+  control-character/bidi sanitization as `terminal_title`. Map active turns and
+  goals to `working` (with concise `msg` and bounded `progress` where known),
+  authentication failures and future typed owner-waiting states to `blocked`
+  (`auth`, `question`, `permission`), completed turns/goals to `done`, failures
+  to `error`, idle/cancelled runs to `idle`, and clean detach to `clear`. Use
+  hierarchical child record IDs (`id=...`) to surface active child agents and
+  delegates in Rex's Activity Mode, tab indicators, Dock badge, `Go to Anything`
+  and future Rex mobile push notifications.
+- [ ] Query `server.apple.privacy_status` (local Unix socket only, no TCC
+  prompt) during `beep-boop rex install` (`src/rex/install.rs`) and Messages
+  source diagnostics to verify `full_disk_access` is `granted` and report
+  `responsible_path` when missing. Gate on `server.version` / graceful
+  `method_not_found` handling for non-macOS hosts and older Rex servers.
+- [ ] Verify remote file drag-and-drop and clipboard image paste from Rex
+  clients (`com.superlogical.terminal.upload_begin`) against `dropped_files` in
+  `src/tui/attachments.rs`, covering shell quoting, batch spacing, trailing
+  newlines and uploaded temp-file lifetime between drop and Send.
+- [ ] Emit `OSC 8` hyperlinks for web-search sources and clean absolute file
+  paths for local artifacts (browser screenshots, Dreams diffs, edited files) in
+  completed TUI scrollback rows so Rex Quick Look (`⇧⌘+Click`, `⌘Y`, and remote
+  `com.superlogical.terminal.download_begin`) previews them natively.
+- [ ] Support Rex's SSH transport (`ssh://` endpoints from `rex hosts` and
+  `rex server install ssh://<address>`) alongside Tailscale in node discovery
+  (`src/discovery.rs`) and worker setup docs so Linux VMs without Tailscale can
+  join as Rex-backed worker hosts.
+- [ ] Add an optional Rex Lua action module using `rex.ui.pick` / `rex.ui.input`
+  (also callable via `rex do`) and `client.perform` (`session.select`) so Rex's
+  command palette and connected clients can pick active or waiting Beep Boop
+  tasks across devices and jump straight to their Rex window, or send a quick
+  prompt to main chat. Keep it separate from core execution and durable
+  chat/iOS approvals because `client.perform` requires Remote Control enabled
+  and `rex.ui` needs an attached Rex app.
+- [ ] Tighten feedback terminal capture in `src/rex.rs` (`capture_terminal`)
+  with `--trim` and/or `com.superlogical.terminal.format` (`max_bytes` +
+  `blob_read`) so large styled captures degrade cleanly.
+- [ ] Evaluate secondary Rex capabilities and upstream roadmap items as they
+  mature: clickable localhost URLs / `rex forward open` for remote worker dev
+  servers; floating/minimized panes (`session.new_layer`,
+  `session.set_layer_state`) as an optional host for Sidechats or Active work
+  while keeping primary task agents in named tabs; bounded/opt-in Kitty
+  graphics thumbnails in TUI scrollback (size-capped due to remote head-of-line
+  blocking); headless macOS and Windows Rex servers; new terminal protocol
+  proposals from Superlogical; and the upcoming Rex Block SDK (`--block-dir` +
+  `data.connect`) before investing in a standalone macOS desktop GUI.
+
 ## Upstream reuse follow-ups
 
 Verifiers found these while qualifying the upstream reuse rows below and judged
