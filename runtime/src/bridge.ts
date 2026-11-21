@@ -181,6 +181,7 @@ type Application = TriageApplication & { stopInputDelivery(): void; harness: Har
 async function openApplication(): Promise<Application> {
   const storage = await openStorage();
   const registry = createRegistry();
+  inference.register(registry);
   const telemetry = await DiagnosticsTelemetry.open(state);
   let harness: Harness;
   try {

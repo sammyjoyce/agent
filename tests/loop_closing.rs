@@ -1443,8 +1443,9 @@ const DECOY_ROLE: &str = "decoy";
 const TRIAGE_ROLE: &str = "triage";
 const MAIN_ROLE: &str = "main";
 const ANY_NUMBER: RangeInclusive<usize> = 0..=usize::MAX;
-const KNOWN_DOCUMENTS: [&str; 33] = [
+const KNOWN_DOCUMENTS: [&str; 34] = [
     "agent.background",
+    "agent.compaction.parts",
     "agent.delegation.receipts",
     "agent.environment",
     "agent.goal",
