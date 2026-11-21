@@ -1256,6 +1256,7 @@ struct Entry {
 #[derive(Debug, Deserialize, Serialize)]
 struct Conversation {
     id: String,
+    triage: bool,
     entries: Vec<Entry>,
 }
 
@@ -1628,19 +1629,16 @@ impl Closed<'_> {
             .standing()
             .into_iter()
             .find(|(_, _, task)| task.conversation_id == id);
-        let mut others = self.saved.conversations.iter().filter(|saved| {
-            saved.id != self.saved.root
-                && self
-                    .standing()
-                    .iter()
-                    .all(|(_, _, task)| task.conversation_id != saved.id)
-        });
-        let triage = others.next().filter(|_| others.next().is_none());
+        let triage = self
+            .saved
+            .conversations
+            .iter()
+            .any(|saved| saved.id == id && saved.triage);
         if id == self.saved.root {
             MAIN_ROLE
         } else if let Some((_, role, _)) = task {
             role
-        } else if triage.is_some_and(|triage| triage.id == id) {
+        } else if triage {
             TRIAGE_ROLE
         } else {
             id
@@ -2256,6 +2254,7 @@ impl Closed<'_> {
             .map(|saved| self.conversation_role(&saved.id))
             .collect();
         conversations.sort_unstable();
+        conversations.dedup();
         let mut out: Vec<Value> = self
             .saved
             .documents
