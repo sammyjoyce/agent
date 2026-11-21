@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { defineDocFamily, ROOT_CONVERSATION_ID, type Cursor, type EntryRecord } from "@earendil-works/pi-durable";
+import { defineDoc, defineDocFamily, ROOT_CONVERSATION_ID, type Cursor, type EntryRecord } from "@earendil-works/pi-durable";
 import { CodemodeStoreDoc } from "@earendil-works/pi-durable/codemode";
 import type { Goal } from "../../src/generated/Goal.js";
 import { ResourceStore } from "../../src/resources.js";
@@ -8,6 +8,13 @@ import { openStateStorage } from "./state-storage.js";
 
 const GoalSlots = defineDocFamily<{ goal: Goal | null }, null>({ kind: "agent.goal", scope: "session", family: true, version: 1,
   initial: () => ({ goal: null }), checkpointWhen: () => true });
+const SourceControl = defineDoc<{ conversation_id: string | null }>({ kind: "agent.source.control", scope: "session", version: 1,
+  initial: () => ({ conversation_id: null }), checkpointWhen: () => true });
+const triagePrompt = "Continue this admitted source work; do not repeat completed actions.\n";
+const isTriageInput = (entry: EntryRecord): boolean => entry.kind === "pi.user" && (entry.model ?? []).some((message) =>
+  message.role === "user" && (typeof message.content === "string"
+    ? message.content.startsWith(triagePrompt)
+    : message.content.some((part) => part.type === "text" && part.text.startsWith(triagePrompt))));
 const directory = process.argv[2];
 if (directory === undefined) throw new Error("Name a closed coordinator state directory");
 const app = await openStateStorage(join(directory, "session.sqlite"));
@@ -33,10 +40,11 @@ try {
     }
     return null;
   };
+  const latestTriage = (await app.session.snapshot(SourceControl, BACKGROUND_CONTEXT))?.conversation_id ?? null;
   const tool_results: unknown[] = [], conversations: unknown[] = [], codemode_stores: unknown[] = [];
   for (const { id } of await app.database.all<{ id: number }>("SELECT id FROM conversations ORDER BY id")) {
-    const issued = new Map<string, number>(), listed: unknown[] = [];
-    for (const entry of await entries(String(id))) {
+    const issued = new Map<string, number>(), listed: unknown[] = [], rawEntries = await entries(String(id));
+    for (const entry of rawEntries) {
       listed.push({ id: entry.id, kind: entry.kind, assistant: entry.model?.some((message) => message.role === "assistant") ?? false, user: entry.model?.some((message) => message.role === "user") ?? false,
         data: entry.kind === "agent.notice_context" ? cited(entry) : entry.kind.startsWith("agent.") ? entry.data ?? null : null });
       for (const message of entry.model ?? []) {
@@ -46,7 +54,10 @@ try {
           text: message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n") });
       }
     }
-    conversations.push({ id: String(id), entries: listed });
+    const userEntries = rawEntries.filter((entry) => entry.kind === "pi.user");
+    const triage = id !== ROOT_CONVERSATION_ID && (await app.tasks.findOwner(String(id))) === undefined &&
+      (String(id) === latestTriage || (userEntries.length > 0 && userEntries.every(isTriageInput)));
+    conversations.push({ id: String(id), triage, entries: listed });
     const saved = await app.session.snapshot(CodemodeStoreDoc, (await app.tasks.conversation(String(id))).id, BACKGROUND_CONTEXT);
     if (saved !== undefined) codemode_stores.push({ conversation_id: String(id), values: saved.values });
   }
