@@ -209,13 +209,7 @@ final class Capture: Sendable {
       let center = NotificationCenter.default
       let session = AVAudioSession.sharedInstance()
       let observers = [
-        center.addObserver(
-          forName: AVAudioSession.interruptionNotification, object: session, queue: nil
-        ) { [weak self] note in
-          let type = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
-          guard type == AVAudioSession.InterruptionType.began.rawValue else { return }
-          self?.halt(interrupted: true)
-        },
+        observeInterruption(of: session, in: center),
         center.addObserver(
           forName: AVAudioSession.routeChangeNotification, object: session, queue: nil
         ) { [weak self] note in
@@ -234,6 +228,31 @@ final class Capture: Sendable {
       holdUntilHalt(observers)
     #endif
   }
+
+  #if os(iOS)
+    private func observeInterruption(
+      of session: AVAudioSession, in center: NotificationCenter
+    ) -> any NSObjectProtocol {
+      if #available(iOS 27.0, *) {
+        return center.addObserver(
+          forName: AVAudioSession.didBecomeInactiveNotification, object: session, queue: nil
+        ) { [weak self] note in
+          let context =
+            note.userInfo?[AVAudioSession.deactivationContextKey]
+            as? AVAudioSession.DeactivationContext
+          guard context?.source == .system else { return }
+          self?.halt(interrupted: true)
+        }
+      }
+      return center.addObserver(
+        forName: AVAudioSession.interruptionNotification, object: session, queue: nil
+      ) { [weak self] note in
+        let type = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+        guard type == AVAudioSession.InterruptionType.began.rawValue else { return }
+        self?.halt(interrupted: true)
+      }
+    }
+  #endif
 
   private func holdUntilHalt(_ observers: [any NSObjectProtocol]) {
     let halted = state.withLockUnchecked { state in

@@ -55,19 +55,13 @@ private final class SystemVoice: NSObject, AVSpeechSynthesizerDelegate {
   func say(_ sentence: String) async throws {
     let session = AVAudioSession.sharedInstance()
     try session.setCategory(
-      .playback, mode: .spokenAudio, options: [.duckOthers, .interruptSpokenAudioAndMixWithOthers])
+      .playback, mode: .voicePrompt, options: [.duckOthers, .interruptSpokenAudioAndMixWithOthers])
     try session.setActive(true)
     defer { try? session.setActive(false, options: .notifyOthersOnDeactivation) }
     let utterance = AVSpeechUtterance(string: sentence)
     utterance.prefersAssistiveTechnologySettings = true
     let id = ObjectIdentifier(utterance)
-    let interruption = NotificationCenter.default.addObserver(
-      forName: AVAudioSession.interruptionNotification, object: session, queue: .main
-    ) { notification in
-      let type = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
-      guard type == AVAudioSession.InterruptionType.began.rawValue else { return }
-      MainActor.assumeIsolated { self.cancel(id) }
-    }
+    let interruption = observeInterruption(of: session, cancelling: id)
     defer { NotificationCenter.default.removeObserver(interruption) }
     try await withTaskCancellationHandler {
       try await withCheckedThrowingContinuation { (said: CheckedContinuation<Void, any Error>) in
@@ -80,6 +74,30 @@ private final class SystemVoice: NSObject, AVSpeechSynthesizerDelegate {
       }
     } onCancel: {
       Task { @MainActor in self.cancel(id) }
+    }
+  }
+
+  private func observeInterruption(
+    of session: AVAudioSession, cancelling id: ObjectIdentifier
+  ) -> any NSObjectProtocol {
+    let center = NotificationCenter.default
+    if #available(iOS 27.0, *) {
+      return center.addObserver(
+        forName: AVAudioSession.didBecomeInactiveNotification, object: session, queue: .main
+      ) { notification in
+        let context =
+          notification.userInfo?[AVAudioSession.deactivationContextKey]
+          as? AVAudioSession.DeactivationContext
+        guard context?.source == .system else { return }
+        MainActor.assumeIsolated { self.cancel(id) }
+      }
+    }
+    return center.addObserver(
+      forName: AVAudioSession.interruptionNotification, object: session, queue: .main
+    ) { notification in
+      let type = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+      guard type == AVAudioSession.InterruptionType.began.rawValue else { return }
+      MainActor.assumeIsolated { self.cancel(id) }
     }
   }
 
