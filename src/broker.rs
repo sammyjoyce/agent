@@ -286,13 +286,31 @@ impl Broker {
     pub async fn execute_cancelled(
         &self,
         command: HostCommand,
-        cancelled: watch::Receiver<bool>,
+        mut cancelled: watch::Receiver<bool>,
     ) -> HostResult {
         let result =
             match command {
-                HostCommand::Background { request } => crate::background::execute(request)
-                    .await
-                    .map(|response| HostResult::Background { response }),
+                HostCommand::Background { request } => {
+                    // Background requests are read-only. Drop the read on
+                    // cancellation so its owned process-group guards stop
+                    // source helpers and descendants instead of detaching them.
+                    tokio::select! {
+                        biased;
+                        () = async {
+                            loop {
+                                if *cancelled.borrow_and_update() {
+                                    return;
+                                }
+                                if cancelled.changed().await.is_err() {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
+                        } => Err(anyhow::anyhow!("Background read was cancelled")),
+                        response = crate::background::execute(request) => {
+                            response.map(|response| HostResult::Background { response })
+                        }
+                    }
+                }
                 HostCommand::Dreams { request } => {
                     return match &self.dreams {
                         Some(dreams) => dreams.execute(request, cancelled).await,
@@ -559,6 +577,7 @@ fn unavailable() -> HostResult {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     mod delivery;
+    mod source_cancellation;
     use crate::{
         TEST_HANG_LIMIT,
         broker::Broker,
