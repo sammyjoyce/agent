@@ -239,6 +239,82 @@ recovery; [history](history.md) describes import and retrieval.
   knows which message the reply is about. Today a message's menu offers only
   **Copy message**, **Select text** and **Share text**, and an input cannot
   name an earlier message.
+- [ ] Show **Active work** in the main chat, a read-only view of the tasks and
+  scheduled jobs that are running or waiting now. The view opens over the
+  conversation, so nothing leaves the main chat. Today `beep-boop tasks graph`
+  prints live work as one snapshot outside chat, and no chat command lists
+  tasks. The iPhone app's **Jobs and work** page lists each job's next run and
+  each saved conversation's last update, with no running or waiting state.
+  Throwaway prototypes compared eight layouts. They are kept outside this
+  repository, and the names in the sketch are invented.
+
+  ```text
+  2 running · 2 waiting         1 needs you  v     the strip, under the title
+
+  Active work                               x     the sheet, over the chat
+  Running
+    Fix login redirect                    12m
+    desktop · exec
+    Update dependencies                    3m
+    laptop · exec
+  Waiting
+    Board review                        1h 8m
+    desktop · needs your reply
+    Fix CI on main                        26m
+    server · on GitHub checks
+  ```
+
+  - **Strip.** The strip is one line under the iPhone chat's title. It gives
+    the count of running work, the count of waiting work, and the count that
+    waits on the owner. When all three counts are zero the strip is absent, so
+    an idle chat looks as it does today.
+  - **Sheet.** A tap on the strip opens the list as a sheet over the chat, and
+    a swipe down returns to the conversation. The sheet has two groups,
+    **Running** and **Waiting**. Work that waits on the owner comes first in
+    **Waiting** and carries the only colored mark. When a snapshot reports
+    `omitted` live tasks, the sheet says how many it left out, as `tasks graph`
+    does.
+  - **Row.** Each row has a status mark, the title, where the work runs, what
+    the work does now, and for how long. A task names its host, and a scheduled
+    job says **Job**. A running row names its current tool. A waiting row says
+    what it waits on.
+  - **Read-only.** No control in the view starts, stops, retries or answers
+    anything. Scheduled runs that have not started stay on **Jobs and work**.
+  - **Terminal UI.** The terminal shows the same two groups in a full-screen
+    panel, with each running row's live tool calls and agents indented under
+    it, as `tasks graph` prints them. The footer carries the counts beside the
+    model and the path. The panel is prototyped, and the footer counts are not.
+  - **What the build needs first.** The data for the view has gaps today.
+    - The iPhone cannot read tasks or the task graph. For work,
+      `NativeRequest` offers `Jobs`, `Conversations` and `Inspect`, and the
+      generated Swift types have no `TaskRecord` or `TaskGraphSnapshot`. Add a
+      native request, and a `Ready` flag beside `work_inspection` so that the
+      strip stays hidden when the coordinator lacks the request.
+    - `ReadTaskGraph` returns one snapshot. The strip needs the live task graph
+      watch under [Upstream reuse follow-ups](#upstream-reuse-follow-ups), or
+      it has to poll.
+    - No typed field says that work waits on the owner. `TaskState::Waiting`
+      carries `actor` as free text that the model writes.
+    - A task has no start time. `TaskRecord` has `updated_at` only, and
+      `JobExecution` already has `started_at`.
+    - The task graph carries a tool's name and not its arguments, so a row can
+      say `exec` and cannot say which command.
+  - **Set aside.** The comparison set four other layouts aside. A separate
+    page leaves the main chat. Groups by machine spread the work that waits on
+    the owner across the list. A timeline needs each run's start and end for
+    the past hour, and `ScheduledJobStatus` keeps `last_run` only. A panel that
+    opens in place either drops the host and the current tool with one-line
+    rows, or covers most of the chat with two-line rows.
+  - **Open, for the owner.** These choices remain. The strip can sit under the
+    title, as the sketch has it, or above the composer. An open task with no
+    live work can be listed or left out. A row can open its conversation in
+    the existing read-only inspection view, or open nothing.
+  - **Acceptance check.** On a real iPhone, against a coordinator with running
+    and waiting work, the strip's counts equal the sheet's rows, and a state
+    change updates both without a refresh. With no active work, the strip is
+    absent. Against a coordinator without the native request, the strip is
+    absent and the chat is unchanged. No control in the sheet changes a task
+    or a job.
 
 ## Retrieval, learning and proof
 
@@ -367,6 +443,8 @@ none a blocker. See [issue #52](https://github.com/sammyjoyce/agent/issues/52).
   breaking the bridge.
 - [ ] Print JSON errors when a `--json` CLI request fails.
 - [ ] A live task graph watch, plus task graph views in the TUI and iOS app.
+  **Active work** under [Inputs and automation](#inputs-and-automation)
+  specifies those views.
 - [ ] Make waits in `runtime/test/native-main.test.ts` cancellation-aware, so a
   missing event fails at its timeout instead of hanging. Trunk hangs the same
   way.
