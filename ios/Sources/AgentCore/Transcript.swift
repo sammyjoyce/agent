@@ -571,6 +571,7 @@ extension InputOrigin {
     case .cli: "CLI"
     case .ios: "iOS"
     case .siri: "Siri"
+    case .carplay: "CarPlay"
     }
   }
 }

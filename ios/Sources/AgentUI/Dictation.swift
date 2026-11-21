@@ -48,6 +48,24 @@ public struct Recording: Sendable {
   }
 }
 
+/// Who holds the microphone. One engine's takes share one recognizer and one audio session, so a
+/// phone take and a car conversation never overlap.
+final class MicrophoneClaim: Sendable {
+  enum Holder: Sendable { case phone, car }
+  private let holder = Mutex<Holder?>(nil)
+
+  /// False while it is held, even by `who`.
+  func take(_ who: Holder) -> Bool {
+    holder.withLock { holder in
+      guard holder == nil else { return false }
+      holder = who
+      return true
+    }
+  }
+
+  func release(_ who: Holder) { holder.withLock { if $0 == who { $0 = nil } } }
+}
+
 /// What dictation needs from a speech engine.
 public struct SpeechEngine: Sendable {
   /// Reads files only, never the network.
@@ -68,6 +86,7 @@ public struct SpeechEngine: Sendable {
   /// Starts capture at once and starts loading the model beside it. Throws when the audio session
   /// cannot be taken, as during a call.
   let record: @Sendable () async throws -> Recording
+  let microphone = MicrophoneClaim()
 
   public init(
     model: @escaping @Sendable () async -> SpeechModel,
@@ -136,6 +155,7 @@ final class ScriptedSpeech: Sendable {
     var script: Script
     var takes = 0
     var installs = 0
+    var cancellations = 0
     var holding = false
     var failing = false
     var held: [CheckedContinuation<Void, Never>] = []
@@ -149,6 +169,9 @@ final class ScriptedSpeech: Sendable {
 
   var recordings: Int { state.withLock { $0.takes } }
   var installs: Int { state.withLock { $0.installs } }
+  var cancellations: Int { state.withLock { $0.cancellations } }
+  /// Finishes waiting for `release`.
+  var heldFinishes: Int { state.withLock { $0.held.count } }
 
   func hold() { state.withLock { $0.holding = true } }
   func release() {
@@ -253,7 +276,10 @@ final class ScriptedSpeech: Sendable {
         if state.withLock({ $0.failing }) { throw ScriptedFailure() }
         return words
       },
-      cancel: stop)
+      cancel: { [self] in
+        state.withLock { $0.cancellations += 1 }
+        stop()
+      })
   }
 }
 
@@ -549,6 +575,10 @@ public final class Dictation {
       return
     case .granted: break
     }
+    guard engine.microphone.take(.phone) else {
+      notice = .microphoneUnavailable
+      return
+    }
     notice = nil
     let reservation = target.reserve()
     target.chat.promoteTypedTag()
@@ -594,6 +624,9 @@ public final class Dictation {
       case .interrupted: keep(notice: .interrupted)
       }
     }
+    // Capture can also end on its own, as when its converter fails, and the take then ends as if
+    // interrupted. Otherwise it holds the microphone until the next tap.
+    if self.take?.id == id, case .listening? = self.take?.stage { keep(notice: .interrupted) }
   }
 
   private func regesture(_ next: Gesture) {
@@ -639,6 +672,7 @@ public final class Dictation {
   private func land(_ id: UUID, _ result: Result<String, any Error>) {
     guard let take, take.id == id, case .transcribing(let landing) = take.stage else { return }
     self.take = nil
+    engine.microphone.release(.phone)
     let target = take.target
     let words: String
     do {
@@ -673,6 +707,7 @@ public final class Dictation {
   private func end(_ id: UUID, notice: DictationNotice) {
     guard let take, take.id == id else { return }
     self.take = nil
+    engine.microphone.release(.phone)
     level = 0
     cancelTimers()
     take.target.unlock()

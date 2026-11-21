@@ -57,6 +57,36 @@ func retryingALegacyOutboxNeverInventsAnOriginEvenAfterCapabilityIsAdvertised() 
   }
 }
 
+@Test(.timeLimit(.minutes(1)), arguments: [InputOrigin.ios, .siri, .carplay])
+func retryWritesAQueuedInputOnlyToACoordinatorThatAcceptsItsOrigin(_ origin: InputOrigin)
+  async throws
+{
+  try await withCoordinator { session, fixture, outbox in
+    let queued = NativeRequestSubmit(
+      inputId: UUID().uuidString, mode: .steer, origin: origin, text: "An invented queued message")
+    let item = OutboxItem(
+      request: queued, sendID: UUID().uuidString, recipients: [session.profile],
+      queuedAt: Date().timeIntervalSince1970)
+    try writePrivately(JSONEncoder().encode([item]), to: outbox)
+    await fixture.advertiseInputOrigins(origin == .ios ? nil : true)
+    await session.connect()
+    for await update in session.updates where update.connection == .connected { break }
+    #expect(await session.retry(queued.inputId) == nil)
+    #expect(try queuedRequests(outbox) == [queued])
+    await session.disconnect()
+    await fixture.advertiseInputOrigins(true)
+    await fixture.advertiseAcceptedInputOrigins([origin.rawValue])
+    await session.connect()
+    for await update in session.updates where update.connection == .connected { break }
+    #expect(await session.retry(queued.inputId) != nil)
+    for await written in fixture.observedInputs {
+      #expect(written == queued)
+      break
+    }
+    #expect(await fixture.count() == 1, "Only the coordinator that accepts the origin got it")
+  }
+}
+
 @Test(.timeLimit(.minutes(1)))
 func aCoordinatorThatListsSiriAcceptsItAndAnUnknownListedOriginIsSkipped() async throws {
   try await withCoordinator { session, fixture, outbox in
@@ -86,11 +116,11 @@ func aCoordinatorThatListsNoOriginsNeverAcceptsSiri(advertised: Bool?) async thr
 }
 
 @Test func eachInputOriginHasItsOwnRowLabel() {
-  let labels = [InputOrigin.cli, .ios, .siri].map {
+  let labels = [InputOrigin.cli, .ios, .siri, .carplay].map {
     ChatRow(id: $0.rawValue, role: .user, text: "Invented message", inputOrigin: $0)
       .provenanceLabel
   }
-  #expect(labels == ["CLI", "iOS", "Siri"])
+  #expect(labels == ["CLI", "iOS", "Siri", "CarPlay"])
 }
 
 @Test(.timeLimit(.minutes(1)))

@@ -30,6 +30,7 @@ if [[ "$phase" == all || "$phase" == host ]]; then
     "$native_dir/PhoneAcceptance/PhoneAcceptance.xcodeproj/project.pbxproj" \
     "$native_dir/AgentApp/PrivacyInfo.xcprivacy" "$native_dir/TestFlightExport.plist" \
     "$native_dir/AgentApp/Info.plist" "$native_dir/AgentApp/Agent.entitlements" \
+    "$native_dir/AgentApp/AgentCarPlay.entitlements" \
     "$native_dir/ShareExtension/Info.plist" "$native_dir/ShareExtension/Share.entitlements"
 
   # Rust's exporter owns Generated.swift and its formatting.
@@ -114,6 +115,71 @@ SWIFT
     python3 "$native_dir/scripts/check-intents-metadata.py" \
       "$run_dir/app/Build/Products/$configuration-iphonesimulator/Agent.app"
   done
+  carplay_profile='Invented CarPlay Profile'
+  show_signing() {
+    local sdk=$1
+    shift
+    xcodebuild -project "$native_dir/Agent.xcodeproj" -target Agent -target AgentShare \
+      -sdk "$sdk" -showBuildSettings -json "$@"
+  }
+  for sdk in iphoneos iphonesimulator; do
+    show_signing "$sdk" > "$run_dir/signing-default-$sdk.json"
+    show_signing "$sdk" AGENT_CARPLAY=YES AGENT_CARPLAY_PROFILE="$carplay_profile" \
+      > "$run_dir/signing-YES-$sdk.json"
+  done
+  python3 - "$run_dir" "$native_dir" "$carplay_profile" <<'PY'
+import json
+import plistlib
+import sys
+from pathlib import Path
+
+run_dir, native_dir, profile = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+carplay = "com.apple.developer.carplay-voice-based-conversation"
+app = plistlib.loads((native_dir / "AgentApp/Agent.entitlements").read_bytes())
+car = plistlib.loads((native_dir / "AgentApp/AgentCarPlay.entitlements").read_bytes())
+if carplay in app or car != {**app, carplay: True}:
+    sys.exit("AgentCarPlay.entitlements must be Agent.entitlements and the CarPlay key")
+
+ordinary = {
+    "Agent": ("AgentApp/Agent.entitlements", "Automatic", ""),
+    "AgentShare": ("ShareExtension/Share.entitlements", "Automatic", ""),
+}
+opted_in = {**ordinary, "Agent": ("AgentApp/AgentCarPlay.entitlements", "Manual", profile)}
+expected = {
+    ("default", "iphoneos"): ordinary,
+    ("default", "iphonesimulator"): ordinary,
+    ("YES", "iphoneos"): opted_in,
+    ("YES", "iphonesimulator"): ordinary,
+}
+if (native_dir / "CarPlay.local.xcconfig").exists():
+    print("CarPlay.local.xcconfig is present, so default signing was not checked")
+    expected = {key: targets for key, targets in expected.items() if key[0] == "YES"}
+keys = ("CODE_SIGN_ENTITLEMENTS", "CODE_SIGN_STYLE", "PROVISIONING_PROFILE_SPECIFIER")
+for (carplay_setting, sdk), targets in expected.items():
+    shown = json.loads((run_dir / f"signing-{carplay_setting}-{sdk}.json").read_text())
+    for target, want in targets.items():
+        found = [entry["buildSettings"] for entry in shown if entry["target"] == target]
+        got = tuple(found[0].get(key, "") for key in keys) if found else None
+        if got != want:
+            sys.exit(f"{target} with AGENT_CARPLAY {carplay_setting} on {sdk}: {got}, want {want}")
+print("CarPlay signing: only the app's device build with AGENT_CARPLAY=YES asks for CarPlay")
+
+role = "CPTemplateApplicationSceneSessionRoleApplication"
+for configuration in ("Debug", "Release"):
+    app_dir = run_dir / f"app/Build/Products/{configuration}-iphonesimulator/Agent.app"
+    manifest = plistlib.loads((app_dir / "Info.plist").read_bytes()).get(
+        "UIApplicationSceneManifest", {})
+    scenes = manifest.get("UISceneConfigurations", {})
+    if (
+        manifest.get("UIApplicationSupportsMultipleScenes") is not True
+        or list(scenes) != [role]
+        or [(scene.get("UISceneClassName"), scene.get("UISceneDelegateClassName"))
+            for scene in scenes[role]]
+        != [("CPTemplateApplicationScene", "Agent.CarPlayScene")]
+    ):
+        sys.exit(f"The {configuration} build does not declare its CarPlay scene: {manifest}")
+    print(f"The {configuration} build declares Agent.CarPlayScene and multiple scenes")
+PY
 fi
 if [[ "$phase" == host ]]; then
   exit 0

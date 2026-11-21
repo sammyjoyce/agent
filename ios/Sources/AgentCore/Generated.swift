@@ -426,6 +426,7 @@ public enum InputOrigin: String, Codable, Sendable, Equatable {
     case `cli` = "cli"
     case `ios` = "ios"
     case `siri` = "siri"
+    case `carplay` = "carplay"
 }
 
 public struct InputWorkStateCompleted: Codable, Sendable, Equatable {

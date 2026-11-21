@@ -238,6 +238,88 @@ func aPlacementStaysQueuedUntilItsRecordIsSaved() async throws {
   }
 }
 
+/// A launch while the iPhone is locked cannot read the ledger an earlier launch saved. Nothing it
+/// records replaces that ledger, and once it can be read its saved stamps and sends win.
+@Test(.timeLimit(.minutes(1)))
+func aLedgerThatCannotBeReadIsKeptUntilItCanBeMerged() async throws {
+  try await withProfile { fixture, directory, launch in
+    let receivedAt = 1_762_100_000.25
+    let earlier = Ledger(
+      entries: ["kept": .init(receivedAt: receivedAt, sendID: "S0")],
+      sends: [
+        "S0": .init(
+          inputID: "11111111-1111-4111-8111-111111111111", entryID: "kept",
+          recipients: [directory.profile], queuedAt: receivedAt)
+      ])
+    try writePrivately(JSONEncoder().encode(earlier), to: directory.ledger)
+    let path = directory.ledger.path
+    let savedFile = {
+      try FileManager.default.attributesOfItem(atPath: path)[.systemFileNumber] as? Int
+    }
+    let original = try savedFile()
+    try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: path)
+    defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path) }
+    await fixture.replyToHistory(
+      initial: .init(messages: [reply("kept", "Sent before the lock")], pageComplete: true),
+      pages: [:])
+
+    let session = try await launch()
+    await session.connect()
+    _ = try await until(session) {
+      $0.connection == .connected && $0.rows.contains { $0.entryID == "kept" }
+    }
+    try await fixture.liveMessage(reply("live", "An invented reply while locked"))
+    _ = try await until(session) { $0.rows.contains { $0.entryID == "live" } }
+    #expect(await session.submit("Invented: water the ferns"))
+    _ = try await until(session) {
+      $0.connection == .connected && $0.rows.contains { $0.entryID?.hasPrefix("placed-") == true }
+    }
+    #expect(try queuedRequests(directory.outbox).map(\.text) == ["Invented: water the ferns"])
+    #expect(try savedFile() == original, "Nothing replaced the unread ledger")
+
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+    await session.connect()
+    try await eventually("the placement recorded") {
+      try queuedRequests(directory.outbox).isEmpty
+    }
+    let merged = try savedLedger(directory)
+    #expect(merged.entries["kept"] == earlier.entries["kept"])
+    #expect(merged.sends["S0"] == earlier.sends["S0"])
+    #expect(merged.entries["live"] != nil)
+    let placed = try #require(merged.sends.first { $0.key != "S0" }?.value)
+    #expect(merged.entries[try #require(placed.entryID)]?.sendID != nil)
+    #expect(await fixture.count() == 1, "Reconciling again never resends")
+  }
+}
+
+@Test(.timeLimit(.minutes(1)))
+func theRowsShowTheSavedStampsAsSoonAsTheLedgerCanBeRead() async throws {
+  try await withProfile { fixture, directory, launch in
+    let receivedAt = 1_762_100_000.25
+    let earlier = Ledger(entries: ["kept": .init(receivedAt: receivedAt)], sends: [:])
+    try writePrivately(JSONEncoder().encode(earlier), to: directory.ledger)
+    let path = directory.ledger.path
+    try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: path)
+    defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path) }
+    await fixture.replyToHistory(
+      initial: .init(messages: [reply("kept", "Sent before the lock")], pageComplete: true),
+      pages: [:])
+
+    let session = try await launch()
+    await session.connect()
+    _ = try await until(session) {
+      $0.connection == .connected && $0.rows.contains { $0.entryID == "kept" }
+    }
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+    try await fixture.liveMessage(reply("live", "An invented reply after the unlock"))
+    let shown = try await until(session) { $0.rows.contains { $0.entryID == "live" } }
+    #expect(try savedLedger(directory).entries["kept"]?.receivedAt == receivedAt)
+    #expect(
+      shown.rows.first { $0.entryID == "kept" }?.receivedAt
+        == Date(timeIntervalSince1970: receivedAt))
+  }
+}
+
 /// A restored item, which its coordinator refused, is discarded once its copy was sent instead. The
 /// ledger keeps that the item was withdrawn, after the outbox lets it go and across a relaunch, so
 /// its Send reads not sent here.

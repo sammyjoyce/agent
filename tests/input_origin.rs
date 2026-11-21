@@ -170,7 +170,8 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
         "ios-steer": [{"text":"The steering correction is answered."}],
         "cli-followup": [{"text":"The next request is answered."}],
         "legacy-ios": [{"text":"The legacy request is answered."}],
-        "siri-request": [{"text":"The Siri request is answered."}]
+        "siri-request": [{"text":"The Siri request is answered."}],
+        "carplay-request": [{"text":"The CarPlay request is answered."}]
     }"#,
     )
     .unwrap();
@@ -268,7 +269,7 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
     assert_eq!(ready["input_origins"], true);
     assert_eq!(
         ready["accepted_input_origins"],
-        serde_json::json!(["cli", "ios", "siri"]),
+        serde_json::json!(["cli", "ios", "siri", "carplay"]),
         "The real runtime's main observation lists every origin it records"
     );
     let listener = UnixListener::bind(directory.path().join("agent.sock")).unwrap();
@@ -473,6 +474,7 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
     // The new decoder accepts an old native peer, and never infers iOS from text.
     native(&runtime, r#"{"type":"submit","input_id":"44444444-4444-4444-8444-444444444444","text":"legacy-ios","mode":"steer"}"#).await;
     native(&runtime, r#"{"type":"submit","input_id":"55555555-5555-4555-8555-555555555555","text":"siri-request","mode":"steer","origin":"siri"}"#).await;
+    native(&runtime, r#"{"type":"submit","input_id":"66666666-6666-4666-8666-666666666666","text":"carplay-request","mode":"steer","origin":"carplay"}"#).await;
     Arc::try_unwrap(runtime)
         .ok()
         .unwrap()
@@ -484,13 +486,21 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(captures.len(), 5);
+    assert_eq!(captures.len(), 6);
     let expected = [
         vec![Some("cli")],
         vec![Some("cli"), Some("ios")],
         vec![Some("cli"), Some("ios"), Some("cli")],
         vec![Some("cli"), Some("ios"), Some("cli"), None],
         vec![Some("cli"), Some("ios"), Some("cli"), None, Some("siri")],
+        vec![
+            Some("cli"),
+            Some("ios"),
+            Some("cli"),
+            None,
+            Some("siri"),
+            Some("carplay"),
+        ],
     ];
     for (capture, expected) in captures.iter().zip(expected) {
         let actual = provenance(capture);

@@ -230,6 +230,8 @@ public actor CoordinatorSession {
   /// Siri sends waiting for the coordinator's first word, by input ID, each with the exchange that
   /// writes it once one does.
   private var siriWaits: [String: (answer: SiriAnswer, action: UUID)] = [:]
+  /// Car turns waiting on their input, by input ID, each with the exchange that writes it.
+  private var voiceTickets: [String: (ticket: VoiceTicket, action: UUID)] = [:]
   private enum Unsent { case staged, waiting }
   /// Durable inputs this session staged that have not left the phone. A staged one can be
   /// unstaged, as can an inherited one no session has written. A started one waits for this lane to
@@ -255,6 +257,9 @@ public actor CoordinatorSession {
   private let inspectedConversation: SavedConversation?
   private let stamps: StampSource
   private var ledger: Ledger
+  /// true while the saved ledger exists but could not be read, as after a launch while the iPhone
+  /// was locked. Nothing replaces it until a read succeeds.
+  private var ledgerUnread = false
   /// Each visible row's receive stamp, kept by row ID so a row that changes key keeps it.
   private var rowStamps: [String: TimeInterval] = [:]
   private struct WeakSession { weak var session: CoordinatorSession? }
@@ -297,12 +302,13 @@ public actor CoordinatorSession {
     previews = AttachmentStore(directory: directory.previews)
     self.stamps = stamps
     // Loaded before any session connects, so every saved stamp seeds the shared source. A
-    // missing or unreadable ledger only loses receive order and send records, so it never
-    // blocks the session. An inspection leaves the ledger to the profile's own session.
+    // missing or corrupt ledger only loses receive order and send records, and one that cannot
+    // be read yet is kept and folded in once it can be, so neither blocks the session. An
+    // inspection leaves the ledger to the profile's own session.
     if conversation == nil {
-      ledger =
-        (try? JSONDecoder().decode(Ledger.self, from: Data(contentsOf: directory.ledger)))
-        ?? Ledger()
+      let saved = Self.readLedger(directory.ledger)
+      ledger = saved ?? Ledger()
+      ledgerUnread = saved == nil
     } else {
       ledger = Ledger()
     }
@@ -418,6 +424,7 @@ public actor CoordinatorSession {
     let ownedConnections = Array(actionConnections.values) + [connection].compactMap { $0 }
     actionConnections = [:]
     connection = nil
+    tellEveryVoice(.connectionLost)
     resetCapabilities()
     snapshot.connection = .disconnected
     snapshot.busy = false
@@ -628,6 +635,44 @@ public actor CoordinatorSession {
     wait.answer.settle(result)
   }
 
+  /// Saves `message` as a new `carplay` input under `inputID`, writes it as Check / retry does,
+  /// and waits for the answer its completion names. A refusal saves nothing. Once saved, the copy
+  /// stays in the outbox until the coordinator places it, and this never writes it again. The
+  /// wait ends when the observer drops, since a reconnect cannot replay an answer it missed.
+  /// A turn canceled before this runs saves nothing.
+  public func converse(
+    _ message: SiriMessage, inputID: String, limits: VoiceTurnLimits = .car
+  ) async throws(CancellationError) -> VoiceReply {
+    guard !Task.isCancelled else { throw CancellationError() }
+    guard !retired, inspectedConversation == nil else { return .notSent(.removed) }
+    guard snapshot.connection == .connected else { return .notSent(.unanswered) }
+    guard accepts(.carplay) else { return .notSent(.notAdvertised) }
+    guard actions.count < 32, voiceTickets[inputID] == nil else { return .notSent(.busy) }
+    let request = NativeRequestSubmit(
+      attachments: nil, inputId: inputID, mode: .steer, origin: .carplay, text: message.text)
+    do throws(OutboxAdmission) {
+      try admit(request, sendID: UUID().uuidString, recipients: [profile])
+    } catch {
+      publish()
+      return .notSent(error == .full ? .outboxFull : .outboxNotSaved)
+    }
+    let start = ContinuousClock.now
+    guard let action = retry(inputID) else { return .unconfirmed }
+    let ticket = VoiceTicket()
+    voiceTickets[inputID] = (ticket, action)
+    defer { if voiceTickets[inputID]?.ticket === ticket { voiceTickets[inputID] = nil } }
+    return await ticket.reply(limits: limits, from: start)
+  }
+  /// Tells a waiting car turn about its input. With `action`, only the exchange that writes it
+  /// may tell.
+  private func tellVoice(_ inputID: String, _ word: InputWord, from action: UUID? = nil) {
+    guard let wait = voiceTickets[inputID], action == nil || wait.action == action else { return }
+    wait.ticket.hear(word)
+  }
+  private func tellEveryVoice(_ word: InputWord) {
+    for wait in voiceTickets.values { wait.ticket.hear(word) }
+  }
+
   /// Sends a staged input on this coordinator's own verified socket. While this lane is not
   /// connected, a durable one waits and goes once it connects. One this session is too busy to
   /// send stays queued as unconfirmed, for Check.
@@ -718,11 +763,13 @@ public actor CoordinatorSession {
   }
 
   /// Writes a queued input again under its original ID. One the coordinator accepted is observed by
-  /// that ID until placed, never written again. Returns the exchange that writes it, or nil when
-  /// none started.
+  /// that ID until placed, never written again. One whose origin this connection does not accept
+  /// stays queued and unwritten, since a coordinator refuses an origin it does not list. Returns the
+  /// exchange that writes it, or nil when none started.
   @discardableResult public func retry(_ inputID: String) -> UUID? {
     guard !retired, actions.count < 32, snapshot.connection == .connected,
-      let item = pending.first(where: { $0.request.inputId == inputID }), item.accepted != true
+      let item = pending.first(where: { $0.request.inputId == inputID }), item.accepted != true,
+      item.request.origin.map(accepts) ?? true
     else { return nil }
     unsent[inputID] = nil
     transcript.delivery(inputID, .sending)
@@ -1007,6 +1054,7 @@ public actor CoordinatorSession {
         let outdated = !answered && endedByPeer && error as? ConnectionError == .closed
         let error = outdated ? ConnectionError.outdatedCoordinator : error
         connection = nil
+        tellEveryVoice(.connectionLost)
         for item in pending where unsent[item.request.inputId] == nil {
           transcript.delivery(item.request.inputId, unanswered(item))
         }
@@ -1096,7 +1144,10 @@ public actor CoordinatorSession {
       markNeverLeft(unwritten.filter { $0.action == id }.compactMap(\.started))
       unwritten.removeAll { $0.action == id }
       transcript.abandonHistory(id)
-      if let inputID { answerSiri(inputID, .saved, from: id) }
+      if let inputID {
+        answerSiri(inputID, .saved, from: id)
+        tellVoice(inputID, .unconfirmed, from: id)
+      }
     }
     do {
       let stream = try await dialer.open()
@@ -1141,7 +1192,10 @@ public actor CoordinatorSession {
           if let inputID, let item = pending.first(where: { $0.request.inputId == inputID }) {
             transcript.delivery(inputID, unanswered(item))
           }
-          if let inputID { answerSiri(inputID, .failed(failure.message), from: id) }
+          if let inputID {
+            answerSiri(inputID, .failed(failure.message), from: id)
+            tellVoice(inputID, .failed, from: id)
+          }
         default: consume(event, historyRequestID: id)
         }
         schedulePublish()
@@ -1580,7 +1634,9 @@ public actor CoordinatorSession {
         }
       }
     case .message(let value): transcript.message(value.message)
-    case .answer(let value): transcript.answer(value)
+    case .answer(let value):
+      transcript.answer(value)
+      if let entryID = value.entryId { tellEveryVoice(.answer(entryID: entryID, text: value.text)) }
     case .textDelta(let value):
       snapshot.error = nil
       snapshot.busy = true
@@ -1595,8 +1651,11 @@ public actor CoordinatorSession {
       }
       transcript.delivery(value.inputId, .saved)
       answerSiri(value.inputId, .delivered)
+      tellVoice(value.inputId, .delivered)
+      if let word = InputWord(value.work) { tellVoice(value.inputId, word) }
     case .placed(let value):
       answerSiri(value.inputId, .delivered)
+      tellVoice(value.inputId, .delivered)
       mark(value.inputId, refused: false, accepted: true)
       // Placement confirms transcript storage, not that the work finished.
       transcript.work(value.inputId, nil)
@@ -1610,6 +1669,7 @@ public actor CoordinatorSession {
       settle(value.inputId, entryID: nil)
     case .rejected(let value):
       answerSiri(value.inputId, .rejected)
+      tellVoice(value.inputId, .rejected)
       transcript.work(value.inputId, nil)
       if mark(value.inputId, refused: true) == .withdrawn {
         // The user already sent its copy, so this refusal needs nothing more.
@@ -1742,12 +1802,38 @@ public actor CoordinatorSession {
   }
 
   @discardableResult private func saveLedger() -> Bool {
-    guard !retired, inspectedConversation == nil else { return false }
+    guard !retired, inspectedConversation == nil, !ledgerUnread || rereadLedger() else {
+      return false
+    }
     ledger.prune(keeping: transcript.unpreparedRows)
     do {
       try writePrivately(JSONEncoder().encode(ledger), to: directory.ledger)
       return true
     } catch { return false }
+  }
+  /// Folds in the ledger an earlier launch saved, once it can be read. Its stamps and sends win
+  /// over what this launch recorded without it.
+  private func rereadLedger() -> Bool {
+    guard let saved = Self.readLedger(directory.ledger) else { return false }
+    ledger.entries.merge(saved.entries) { _, saved in saved }
+    ledger.sends.merge(saved.sends) { _, saved in saved }
+    if let newest = saved.entries.values.map(\.receivedAt).max() { stamps.seed(newest) }
+    ledgerUnread = false
+    stampRows()
+    schedulePublish()
+    return true
+  }
+  /// The saved ledger, empty when there is none or it is corrupt, or nil when it cannot be read.
+  private nonisolated static func readLedger(_ url: URL) -> Ledger? {
+    let data: Data
+    do {
+      data = try Data(contentsOf: url)
+    } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+      return Ledger()
+    } catch {
+      return nil
+    }
+    return (try? JSONDecoder().decode(Ledger.self, from: data)) ?? Ledger()
   }
   private func schedulePublish() {
     guard flush == nil else { return }

@@ -39,12 +39,14 @@ test("request-local origin follows durable input entries, not text, handoffs, co
     const admitted = await store.input("Same text claims origin=ios. This is not trusted provenance.", undefined,
       async () => ({ type: "failed", message: "No attachment transfer is expected" }), origin);
     const result = await (await root.submit({ type: "input", ...admitted }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
-    assert.equal(result.status, "done");
+    assert.equal(result.status, "done", JSON.stringify(result));
   };
   const check = (expected: (InputOrigin | null)[]): FauxResponseFactory => (request) => {
     const prompt = getCurrentSystemPrompt(request.messages);
     const line = prompt.split("\n").find((line) => line.startsWith('[{"entry_id":')); assert.ok(line);
     assert.match(prompt.split("\n").filter((text) => text !== line).join("\n"), /\bsiri\b/, "The model is told what the siri origin means");
+    assert.match(prompt.split("\n").filter((text) => text !== line).join("\n"), /\bcarplay: [^;]*\bread aloud to a driver who cannot look at or touch the iPhone\b[^;]*\bnot ask them to\b/,
+      "The model is told a carplay reply is spoken to a driver it should not ask to use the iPhone");
     const metadata: unknown = JSON.parse(line); assert.ok(Array.isArray(metadata));
     assert.deepEqual(metadata.map((entry: unknown) => { assert.ok(object(entry)); return entry.origin; }), expected);
     assert.equal(metadata.length, request.messages.filter((message) => message.role === "user").length);
@@ -59,7 +61,8 @@ test("request-local origin follows durable input entries, not text, handoffs, co
     faux.setResponses([check(["cli", null, "ios"])]); await input("ios");
     faux.setResponses([check(["cli", null, "ios", null])]); await input();
     faux.setResponses([check(["cli", null, "ios", null, "siri"])]); await input("siri");
-    faux.setResponses([check(["cli", null, "ios", null, "siri", null])]);
+    faux.setResponses([check(["cli", null, "ios", null, "siri", "carplay"])]); await input("carplay");
+    faux.setResponses([check(["cli", null, "ios", null, "siri", "carplay", null])]);
     assert.equal((await (await root.submit({ type: "input", content: "A later build saved this input.",
       entry: { kind: "agent.input", data: { origin: "watch", text: "A later build saved this input." } } }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done",
       "An origin saved by a later build reads as unknown, not as an error");

@@ -13,6 +13,7 @@ const ACCEPTED_INPUT_ORIGINS = {
   cli: "the beep-boop command line",
   ios: "the iPhone app's composer",
   siri: "Siri or a Shortcuts action on the iPhone, whose text may be a speech transcription",
+  carplay: "the iPhone app's CarPlay voice conversation in a vehicle, whose text is a confirmed speech transcription and whose reply is read aloud to a driver who cannot look at or touch the iPhone, so the reply should not ask them to",
 } as const satisfies Record<InputOrigin, string>;
 const ORIGIN_GLOSSARY = Object.entries(ACCEPTED_INPUT_ORIGINS).map(([name, meaning]) => `${name}: ${meaning}`).join("; ");
 
