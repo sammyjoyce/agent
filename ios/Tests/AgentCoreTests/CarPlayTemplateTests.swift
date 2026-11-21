@@ -28,7 +28,7 @@
   }
 
   @available(iOS 26.4, *)
-  @MainActor @Test func eachVoiceStateShowsFixedWordsTheNameAndItsOwnButtons() {
+  @MainActor @Test func eachVoiceStateShowsFixedWordsTheNameAndItsOwnButtons() throws {
     let traits = UITraitCollection {
       $0.displayScale = 3
       $0.userInterfaceStyle = .dark
@@ -50,11 +50,16 @@
       ])
     for state in states {
       #expect(state.actionButtons.count <= CPVoiceControlState.maximumActionButtonCount)
-      #expect(state.image?.configuration?.traitCollection?.displayScale == 3)
-      #expect(state.image?.configuration?.traitCollection?.userInterfaceStyle == .dark)
+      let image = try #require(state.image)
+      #expect(max(image.size.width, image.size.height) >= 72)
+      #expect(image.size.width <= 150 && image.size.height <= 150)
+      #expect(image.configuration?.traitCollection?.displayScale == 3)
+      #expect(image.configuration?.traitCollection?.userInterfaceStyle == .dark)
       for button in state.actionButtons {
-        #expect(button.image?.configuration?.traitCollection?.displayScale == 3)
-        #expect(button.image?.configuration?.traitCollection?.userInterfaceStyle == .dark)
+        let icon = try #require(button.image)
+        #expect(max(icon.size.width, icon.size.height) < 40)
+        #expect(icon.configuration?.traitCollection?.displayScale == 3)
+        #expect(icon.configuration?.traitCollection?.userInterfaceStyle == .dark)
       }
     }
   }

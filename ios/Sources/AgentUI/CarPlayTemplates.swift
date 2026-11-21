@@ -108,7 +108,7 @@
           identifier: phase.rawValue, titleVariants: titles,
           image: UIImage(
             systemName: symbol,
-            withConfiguration: base.applying(UIImage.SymbolConfiguration(pointSize: 72))),
+            withConfiguration: UIImage.SymbolConfiguration(pointSize: 72).applying(base)),
           repeats: false)
         state.actionButtons = buttons.map { button in
           let press = CPButton(
