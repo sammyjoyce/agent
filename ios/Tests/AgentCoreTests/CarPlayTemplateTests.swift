@@ -28,8 +28,12 @@
   }
 
   @available(iOS 26.4, *)
-  @MainActor @Test func eachVoiceStateShowsFixedWordsTheNameAndItsOwnButtons() {
-    let template = CarScreen.voiceTemplate(for: "Work") { _, _ in }
+  @MainActor @Test func eachVoiceStateShowsFixedWordsTheNameAndItsOwnButtons() throws {
+    let traits = UITraitCollection {
+      $0.displayScale = 3
+      $0.userInterfaceStyle = .dark
+    }
+    let template = CarScreen.voiceTemplate(for: "Work", traits: traits) { _, _ in }
     let states = template.voiceControlStates
     #expect(states.map(\.identifier) == ["working", "listening", "confirming", "speaking"])
     #expect(
@@ -46,6 +50,17 @@
       ])
     for state in states {
       #expect(state.actionButtons.count <= CPVoiceControlState.maximumActionButtonCount)
+      let image = try #require(state.image)
+      #expect(max(image.size.width, image.size.height) >= 72)
+      #expect(image.size.width <= 150 && image.size.height <= 150)
+      #expect(image.configuration?.traitCollection?.displayScale == 3)
+      #expect(image.configuration?.traitCollection?.userInterfaceStyle == .dark)
+      for button in state.actionButtons {
+        let icon = try #require(button.image)
+        #expect(max(icon.size.width, icon.size.height) < 40)
+        #expect(icon.configuration?.traitCollection?.displayScale == 3)
+        #expect(icon.configuration?.traitCollection?.userInterfaceStyle == .dark)
+      }
     }
   }
 

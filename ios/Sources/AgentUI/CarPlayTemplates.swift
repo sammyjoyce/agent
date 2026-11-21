@@ -19,7 +19,7 @@
       self.conversation = conversation
       super.init()
       interface.delegate = self
-      interface.setRootTemplate(list, animated: false, completion: nil)
+      interface.setRootTemplate(list, animated: false) { _, _ in }
       showChoices()
     }
 
@@ -45,7 +45,9 @@
     /// Pushes the voice template, and starts the conversation only once it shows.
     private func talk(to coordinator: CarCoordinator) {
       guard voice == nil, let conversation else { return }
-      let voice = Self.voiceTemplate(for: coordinator.name) { conversation.perform($0, in: $1) }
+      let voice = Self.voiceTemplate(
+        for: coordinator.name, traits: interface.carTraitCollection
+      ) { conversation.perform($0, in: $1) }
       self.voice = voice
       Task {
         let pushed = (try? await interface.pushTemplate(voice, animated: true)) == true
@@ -94,8 +96,10 @@
     /// One state for each phase but idle. Working comes first because the template shows its
     /// first state as it appears, and the conversation connects before it speaks.
     static func voiceTemplate(
-      for name: String, perform: @escaping @MainActor (CarAction, CarPhase) -> Void
+      for name: String, traits: UITraitCollection = UITraitCollection(),
+      perform: @escaping @MainActor (CarAction, CarPhase) -> Void
     ) -> CPVoiceControlTemplate {
+      let base = traits.imageConfiguration
       func state(
         _ phase: CarPhase, _ titles: [String], _ symbol: String,
         _ buttons: [(title: String, symbol: String, action: CarAction)]
@@ -103,10 +107,13 @@
         let state = CPVoiceControlState(
           identifier: phase.rawValue, titleVariants: titles,
           image: UIImage(
-            systemName: symbol, withConfiguration: UIImage.SymbolConfiguration(pointSize: 72)),
+            systemName: symbol,
+            withConfiguration: UIImage.SymbolConfiguration(pointSize: 72).applying(base)),
           repeats: false)
         state.actionButtons = buttons.map { button in
-          let press = CPButton(image: UIImage(systemName: button.symbol) ?? UIImage()) { _ in
+          let press = CPButton(
+            image: UIImage(systemName: button.symbol, withConfiguration: base) ?? UIImage()
+          ) { _ in
             perform(button.action, phase)
           }
           press.title = button.title
