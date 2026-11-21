@@ -22,18 +22,41 @@ export function subscriptionSharingLimit(error: string): boolean {
   return /\bsubscription_sharing_usage_limit_exceeded\b/u.test(error) ||
     /\bChatGPT user has reached (?:their |the )?Subscription Sharing usage limit\b/iu.test(error);
 }
-export function providerFailureMessage(error: string): string | undefined {
+
+const PROVIDER_FAILURE_MESSAGES: Record<string, string> = {
+  subscription_sharing_usage_limit_exceeded:
+    "The upstream app subscription-sharing usage limit was reached. Saved history is retained; changing local credentials does not reset this limit.",
+  authentication_error:
+    "The model provider rejected authentication (401/authentication_error). Saved history and credentials are retained.",
+  rate_limit_error:
+    "The model provider rate limit was reached (429/rate_limit_error). Saved history is retained.",
+  context_length_exceeded:
+    "The model provider rejected the context size (context_length_exceeded). Saved history is retained; this does not imply stored history is corrupt.",
+};
+
+function retainedCompactionError(error: string): string | undefined {
   // Pi's blocking-compaction task adds these exact wrappers. Its Responses
   // serializer formats bare HTTP bodies as "OpenAI API error (status): body".
   // Read only an anchored transport status, never status-like digits in a body.
   const request = error.replace(/^Compaction failed: /u, "").replace(/^Summarization failed: /u, "");
   const match = /^(?:OpenAI API error \((\d{3})\):|(\d{3})(?=[:\s]|$))/u.exec(request);
   const status = match?.[1] ?? match?.[2];
-  if (subscriptionSharingLimit(error)) return "The upstream app subscription-sharing usage limit was reached. Saved history is retained; changing local credentials does not reset this limit.";
-  if (status === "401" || /\bauthentication_error\b|\binvalid x-api-key\b|\binvalid_api_key\b/u.test(error)) return "The model provider rejected authentication (401/authentication_error). Saved history and credentials are retained.";
-  if (status === "429" || /\brate_limit_error\b|\brate_limit_exceeded\b/u.test(error)) return "The model provider rate limit was reached (429/rate_limit_error). Saved history is retained.";
-  if (/\bcontext_length_exceeded\b|\bprompt is too long\b|\bmaximum context length\b/u.test(error)) return "The model provider rejected the context size (context_length_exceeded). Saved history is retained; this does not imply stored history is corrupt.";
+  if (subscriptionSharingLimit(error)) return "subscription_sharing_usage_limit_exceeded";
+  if (status === "401" || /\bauthentication_error\b|\binvalid x-api-key\b|\binvalid_api_key\b/u.test(error)) {
+    return "authentication_error";
+  }
+  if (status === "429" || /\brate_limit_error\b|\brate_limit_exceeded\b/u.test(error)) {
+    return "rate_limit_error";
+  }
+  if (/\bcontext_length_exceeded\b|\bprompt is too long\b|\bmaximum context length\b/u.test(error)) {
+    return "context_length_exceeded";
+  }
   return undefined;
+}
+
+export function providerFailureMessage(error: string): string | undefined {
+  const category = retainedCompactionError(error);
+  return category === undefined ? undefined : PROVIDER_FAILURE_MESSAGES[category];
 }
 
 const SHARING_LIMIT_MESSAGE = 'ChatGPT plan usage reached a limit for this app. In Settings → Usage → App limits (https://chatgpt.com/settings/usage), review the app limit and enable "Allow other apps to use credits after reaching your usage limit" to use available credits. Its conversation is retained.';
@@ -135,7 +158,8 @@ export class ConversationModels {
   private readonly catalogRefreshes = new Map<ModelProvider, Promise<void>>();
   private bindSession: ((session: Harness) => void) | undefined;
   private readonly session = new Promise<Harness>((resolve) => { this.bindSession = resolve; });
-  private readonly compaction = createCompaction(this.session);
+  private readonly compactionFailures = new Map<string, string>();
+  private readonly compaction = createCompaction(this.session, this.compactionFailures, retainedCompactionError);
   private compactionGuarded = false;
   constructor(readonly models: MutableModels = builtinModels(), auth?: ChatGptAuth, registry?: Registry) {
     for (const id of ["openai", "openai-codex"]) {
@@ -182,7 +206,7 @@ export class ConversationModels {
     registry.install(this.compaction);
     if (!this.compactionGuarded) {
       this.compactionGuarded = true;
-      guardCompactionRequests(this.models);
+      guardCompactionRequests(this.models, this.compactionFailures);
     }
   }
   bind(session: Harness): void { this.bindSession?.(session); this.bindSession = undefined; }

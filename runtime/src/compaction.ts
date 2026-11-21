@@ -50,21 +50,29 @@ function truncated(text: string): boolean {
 
 /** Pi can fall back from a beforeCompact failure to its ordinary summary.
  * Preserve native failure handling without sending that oversized fallback. */
-export function guardCompactionRequests(models: MutableModels): void {
+export function guardCompactionRequests(models: MutableModels, failures?: Map<string, string>): void {
   const complete = models.completeSimple.bind(models);
   models.completeSimple = async (model, context, options) => {
     const [system, user] = context.messages;
     const systemText = system?.role === "system" ? getSystemMessageText(system) : "";
     const userText = user?.role !== "user" ? "" : typeof user.content === "string" ? user.content
       : user.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n");
-    if (context.messages.length === 2 && user?.role === "user" &&
-        systemText.startsWith("You are a context summarization assistant.") &&
-        (Buffer.byteLength(systemText) + Buffer.byteLength(userText) + (options?.maxTokens ?? 0) + 1024 > model.contextWindow ||
-          truncated(userText))) {
-      return { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(),
-        stopReason: "error", errorMessage: "Compaction source exceeds the request budget; its source and completed fragments are retained.",
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    const isFallbackSummary = context.messages.length === 2 && user?.role === "user" &&
+      systemText.startsWith("You are a context summarization assistant.");
+    if (isFallbackSummary) {
+      const sessionId = options?.sessionId;
+      const retained = sessionId === undefined ? undefined : failures?.get(sessionId);
+      if (sessionId !== undefined && retained !== undefined) failures?.delete(sessionId);
+      const oversized = Buffer.byteLength(systemText) + Buffer.byteLength(userText) + (options?.maxTokens ?? 0) + 1024 > model.contextWindow;
+      if (retained !== undefined || oversized || truncated(userText)) {
+        return { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(),
+          stopReason: "error",
+          errorMessage: retained !== undefined
+            ? `Compaction source out of budget after ${retained}; its source and completed fragments are retained.`
+            : "Compaction source exceeds the request budget; its source and completed fragments are retained.",
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+      }
     }
     return complete(model, context, options);
   };
@@ -72,9 +80,15 @@ export function guardCompactionRequests(models: MutableModels): void {
 
 /** Pi still selects the range and owns summary placement and generation wakeup.
  * Only prefixes too large for one conservative request use this reduction. */
-export function createCompaction(session: Promise<Harness>): Extension {
+export function createCompaction(
+  session: Promise<Harness>,
+  failures?: Map<string, string>,
+  classifyError?: (error: string) => string | undefined,
+): Extension {
   return defineExtension({ name: "bounded_compaction", hooks: [hook(CompactionTask, {
     async beforeCompact(compaction, api, context: Context) {
+      const existingProvider = await api.snapshot(ProviderDoc, api.conversationId, context);
+      if (existingProvider !== undefined) failures?.delete(existingProvider.sessionId);
       const agent = await api.snapshot(AgentDoc, api.conversationId, context);
       const model = agent?.model === undefined ? undefined : api.models.getModel(agent.model.provider, agent.model.modelId);
       if (model === undefined) return undefined;
@@ -90,8 +104,10 @@ export function createCompaction(session: Promise<Harness>): Extension {
       // Quoted native truncation markers also use the full-source path; they
       // must not be mistaken for a lossy fallback on an otherwise small input.
       if (Buffer.byteLength(source) <= limit && !largeResult && !truncated(source)) return undefined;
-      const provider = await api.snapshot(ProviderDoc, api.conversationId, context);
       const harness = await session;
+      const sessionId = existingProvider?.sessionId ??
+        (await harness.commit((tx) => tx.doc(ProviderDoc, api.conversationId), context)).sessionId;
+      failures?.delete(sessionId);
       for (;;) {
         const parts = chunks(source, limit), summaries: string[] = [];
         for (const part of parts) {
@@ -104,7 +120,7 @@ export function createCompaction(session: Promise<Harness>): Extension {
             { role: "user", content: part, timestamp: 0 },
           ] }, { maxTokens: output, toolChoice: "none", cacheRetention: "none", telemetry: context.telemetry,
             ...(getSupportedThinkingLevels(model).includes("low") ? { reasoning: "low" } : {}),
-            ...(provider === undefined ? {} : { sessionId: provider.sessionId }),
+            sessionId,
             ...(context.abortSignal === undefined ? {} : { signal: context.abortSignal }) });
           context.abortSignal?.throwIfAborted();
           const text = message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n").trim();
@@ -123,11 +139,21 @@ export function createCompaction(session: Promise<Harness>): Extension {
             else addUsage(total, usage);
             return saved.text;
           }, context);
-          if (!complete || retained === null) throw new Error("A bounded checkpoint did not complete; its source and finished fragments are retained");
+          if (!complete || retained === null) {
+            const category = message.stopReason === "error" && message.errorMessage !== undefined
+              ? classifyError?.(message.errorMessage)
+              : undefined;
+            if (category !== undefined) failures?.set(sessionId, category);
+            else failures?.delete(sessionId);
+            throw new Error("A bounded checkpoint did not complete; its source and finished fragments are retained");
+          }
           summaries.push(retained);
         }
         const summary = summaries.join("\n\n");
-        if (parts.length === 1) return { summary };
+        if (parts.length === 1) {
+          failures?.delete(sessionId);
+          return { summary };
+        }
         if (Buffer.byteLength(summary) >= Buffer.byteLength(source)) throw new Error("Checkpoint reduction did not shrink; source is retained");
         source = summary;
       }
