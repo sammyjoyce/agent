@@ -43,8 +43,8 @@ function counting(database: SqliteDatabase) {
 
 test("the dry-run contract was written for the installed Pi Durable and Chord", async () => {
   const installed = await versions();
-  assert.equal(installed.pi_durable, "1.5.2", "Pi Durable changed: reread SqliteStorage.commit and rerun this file before trusting the barrier");
-  assert.equal(installed.chord, "1.5.2", "Chord changed: reread its transaction contract before trusting the barrier");
+  assert.equal(installed.pi_durable, "1.6.0", "Pi Durable changed: reread SqliteStorage.commit and rerun this file before trusting the barrier");
+  assert.equal(installed.chord, "1.6.0", "Chord changed: reread its transaction contract before trusting the barrier");
   assert.equal(installed.application, "0.1.0");
 });
 

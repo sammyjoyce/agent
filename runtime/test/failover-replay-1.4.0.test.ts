@@ -4,6 +4,7 @@ import { test } from "node:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { openReplicatedStorage } from "../src/failover/replicated-storage.js";
+import { logEntryDigest } from "../src/failover/log-entry.js";
 import { appliedPosition, lastPiSequence } from "../src/failover/state-directory.js";
 import type { LogEntry } from "../src/generated/LogEntry.js";
 import { authorities, enroll, follow, logEntries, openPi, openScoped, OWNER, retainedFiles, stateDirectory, tables, type TestAuthority } from "./fixtures/failover-state.js";
@@ -20,7 +21,7 @@ async function writtenBy140(link: TestAuthority): Promise<LogEntry[]> {
 }
 
 for (const [name, connect] of Object.entries(authorities)) {
-  test(`${name}: a log that Pi Durable 1.4.0 wrote replays on 1.5.2 to the tables its owner wrote, and an owner continues it`, async (t) => {
+  test(`${name}: a log that Pi Durable 1.4.0 wrote replays on 1.6.0 to the tables its owner wrote, and an owner continues it`, async (t) => {
     const link = await connect(), epoch = await enroll(link);
     const written = await writtenBy140(link);
     assert.ok(written.every((entry) => entry.versions.pi_durable === "1.4.0" && entry.versions.chord === "1.4.0"));
@@ -42,15 +43,62 @@ for (const [name, connect] of Object.entries(authorities)) {
     await harness.close(context);
 
     const continued = (await logEntries(link)).slice(written.length);
-    assert.ok(continued.length > 0 && continued.every((entry) => entry.versions.pi_durable === "1.5.2"), "the owner continued the log on Pi Durable 1.5.2");
+    assert.ok(continued.length > 0 && continued.every((entry) => entry.versions.pi_durable === "1.6.0"), "the owner continued the log on Pi Durable 1.6.0");
     const head = (await link.record())?.state.head;
     assert.equal(await follow(upgraded, link), head);
-    assert.deepEqual(tables(upgraded), tables(directory), "a standby that replayed the 1.4.0 entries follows the 1.5.2 ones");
+    assert.deepEqual(tables(upgraded), tables(directory), "a standby that replayed the 1.4.0 entries follows the 1.6.0 ones");
     const joined = await stateDirectory(t);
     assert.equal(await follow(joined, link), head);
     assert.deepEqual(tables(joined), tables(directory), "a standby replays the whole mixed log");
     assert.equal(appliedPosition(joined), head);
     assert.equal(lastPiSequence(joined), (await logEntries(link)).findLast((entry) => entry.batch !== null)?.batch?.pi_seq,
       "promotion finds the Pi sequence of the last logged batch");
+  });
+
+  test(`${name}: a mixed 1.4.0 and 1.5.2 log replays on 1.6.0 and continues on 1.6.0`, async (t) => {
+    const seed = await connect(), seedEpoch = await enroll(seed);
+    const written = await writtenBy140(seed);
+    const seedDirectory = await stateDirectory(t);
+    const seeded = await openReplicatedStorage({ database: await openScoped(seedDirectory), link: seed, holder: OWNER, epoch: seedEpoch, stateDirectory: seedDirectory, onFenced: () => {} });
+    const seedPi = await openPi(seeded.storage);
+    seedPi.faux.setResponses(Array.from({ length: 3 }, () => fauxAssistantMessage("Invented: prune the vines at dusk.")));
+    await (await seedPi.root.submit({ type: "input", content: "Prune the vines.", requestId: "request-prune" }, context)).wait(context);
+    await seedPi.harness.close(context);
+    const seedEntries = await logEntries(seed);
+    const middle152 = seedEntries.slice(written.length).map(({ digest: _, ...rest }) => {
+      const entry = { ...rest, versions: { application: "0.1.0", pi_durable: "1.5.2", chord: "1.5.2" } };
+      return { ...entry, digest: logEntryDigest(entry) };
+    });
+    assert.ok(middle152.length > 0);
+
+    const link = await connect(), epoch = await enroll(link);
+    await writtenBy140(link);
+    for (const entry of middle152) {
+      for (const file of entry.files) await link.putBlob(file.sha256, await seed.getBlob(file.sha256));
+      if (entry.batch?.body.kind === "blob") await link.putBlob(entry.batch.body.sha256, await seed.getBlob(entry.batch.body.sha256));
+      assert.equal((await link.command({ op: "append", holder: OWNER, entry })).result, "accepted");
+    }
+
+    const upgraded = await stateDirectory(t);
+    assert.equal(await follow(upgraded, link), seedEntries.length);
+    assert.deepEqual(tables(upgraded), tables(seedDirectory), "a 1.6.0 standby replays both 1.4.0 and 1.5.2 entries");
+
+    const directory = await stateDirectory(t);
+    const { storage, log } = await openReplicatedStorage({ database: await openScoped(directory), link, holder: OWNER, epoch, stateDirectory: directory, onFenced: () => {} });
+    assert.equal(log.head, seedEntries.length, "the 1.6.0 owner caught up with 1.4.0 and 1.5.2 entries before Pi opened");
+    const { harness, root, faux } = await openPi(storage);
+    faux.setResponses(Array.from({ length: 3 }, () => fauxAssistantMessage("Invented: mulch the beds before frost.")));
+    await (await root.submit({ type: "input", content: "Mulch the beds.", requestId: "request-mulch" }, context)).wait(context);
+    await harness.close(context);
+
+    const continued = (await logEntries(link)).slice(seedEntries.length);
+    assert.ok(continued.length > 0 && continued.every((entry) => entry.versions.pi_durable === "1.6.0"), "the owner continued the log on Pi Durable 1.6.0");
+    const head = (await link.record())?.state.head;
+    assert.equal(await follow(upgraded, link), head);
+    assert.deepEqual(tables(upgraded), tables(directory));
+    const joined = await stateDirectory(t);
+    assert.equal(await follow(joined, link), head);
+    assert.deepEqual(tables(joined), tables(directory), "a standby replays the whole 1.4.0, 1.5.2, and 1.6.0 log");
+    assert.equal(appliedPosition(joined), head);
   });
 }

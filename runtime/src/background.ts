@@ -521,7 +521,7 @@ export class BackgroundScheduler {
       case "running": execution = { status: "running" }; break;
       case "waiting":
       case "completing": execution = { status: "waiting" }; break;
-      case "sleeping": execution = { status: "retrying", at: record.state.until,
+      case "sleeping": execution = record.state.until === undefined ? { status: "waiting" } : { status: "retrying", at: record.state.until,
         message: lane?.active === reference.task && trigger?.error_scope === "work" ? trigger.error : null }; break;
       case "terminal": {
         const outcome = record.state.outcome;
