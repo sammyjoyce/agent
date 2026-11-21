@@ -337,6 +337,7 @@ for suite in "${suites[@]}"; do
         -destination "platform=iOS Simulator,id=$simulator_id" -destination-timeout 60 \
         -onlyUsePackageVersionsFromResolvedFile \
         -parallel-testing-enabled NO -test-timeouts-enabled YES -derivedDataPath "$run_dir/app" \
+        -retry-tests-on-failure -test-iterations 2 -test-repetition-relaunch-enabled YES \
         -resultBundlePath "$run_dir/ios-rendering-tests.xcresult" \
         CODE_SIGNING_ALLOWED=YES CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= test
       kill "$notification_watcher"

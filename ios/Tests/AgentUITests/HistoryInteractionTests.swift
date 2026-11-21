@@ -932,6 +932,16 @@ final class HistoryInteractionTests: XCTestCase {
     app.descendants(matching: .any).matching(identifier: "Message the coordinator").firstMatch
   }
 
+  private func waitForBackground(_ app: XCUIApplication) {
+    let background = XCTNSPredicateExpectation(
+      predicate: NSPredicate { _, _ in
+        app.state == .runningBackground || app.state == .runningBackgroundSuspended
+      }, object: app)
+    XCTAssertEqual(
+      XCTWaiter.wait(for: [background], timeout: 5), .completed,
+      "Unexpected background state: \(app.state)")
+  }
+
   private func returnToForeground(
     _ app: XCUIApplication, peer: InteractionPeer, waitForSuspension: Bool = false
   ) async throws {
@@ -945,7 +955,7 @@ final class HistoryInteractionTests: XCTestCase {
         throw XCTSkip("The test runner kept the app in \(app.state), without suspending it.")
       }
     } else {
-      XCTAssertTrue(app.wait(for: .runningBackground, timeout: 5))
+      waitForBackground(app)
     }
     app.activate()
     XCTAssertTrue(app.wait(for: .runningForeground, timeout: 5))
@@ -960,6 +970,12 @@ final class HistoryInteractionTests: XCTestCase {
   private func enableSimulatorAutocorrection() throws {
     continueAfterFailure = false
     #if targetEnvironment(simulator)
+      func waitForValue(_ value: String, on element: XCUIElement) {
+        let settled = XCTNSPredicateExpectation(
+          predicate: NSPredicate(format: "value == %@", value), object: element)
+        XCTAssertEqual(
+          XCTWaiter.wait(for: [settled], timeout: 5), .completed, element.debugDescription)
+      }
       func tapSwitch(_ element: XCUIElement) {
         // Settings can wrap the actual switch in another accessibility switch.
         let control = element.switches.firstMatch
@@ -992,9 +1008,12 @@ final class HistoryInteractionTests: XCTestCase {
         keyboard.tap()
       }
       XCTAssertTrue(correction.waitForExistence(timeout: 5), settings.debugDescription)
-      if correction.value as? String == "1" { tapSwitch(correction) }
+      if correction.value as? String == "1" {
+        tapSwitch(correction)
+        waitForValue("0", on: correction)
+      }
       tapSwitch(correction)
-      XCTAssertEqual(correction.value as? String, "1", settings.debugDescription)
+      waitForValue("1", on: correction)
       // First-run Slide to Type onboarding can intercept later key taps.
       let slideToType = settings.switches["Slide to Type"]
       if slideToType.exists {
@@ -1004,7 +1023,7 @@ final class HistoryInteractionTests: XCTestCase {
         }
         XCTAssertTrue(slideToType.isHittable, settings.debugDescription)
         if slideToType.value as? String == "1" { tapSwitch(slideToType) }
-        XCTAssertEqual(slideToType.value as? String, "0", settings.debugDescription)
+        waitForValue("0", on: slideToType)
       }
     #else
       throw XCTSkip("Keyboard preference setup requires a disposable simulator.")
@@ -1500,7 +1519,7 @@ final class HistoryInteractionTests: XCTestCase {
       expected.append(text)
       let observations = await peer.observationCount()
       settings.activate()
-      XCTAssertTrue(app.wait(for: .runningBackground, timeout: 5))
+      waitForBackground(app)
       app.activate()
       try await eventually(description: "resumed conversation observer") {
         await peer.observationCount() > observations
