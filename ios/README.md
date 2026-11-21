@@ -508,6 +508,17 @@ The feed of one coordinator, Jobs and work, and a job's screen tell the system
 which coordinator or jobs they show, by identifier alone, so no message text
 is part of it.
 
+When built with the iOS 27.3 SDK, **Open Coordinator** and **Send Message** also
+conform to `ToolIntent` so Siri can invoke them on iOS 27.3+, while **Open Job**
+and **Retry Interrupted Run** stay outside `ToolIntent` because resolving
+`JobEntity` dials every paired coordinator and retrying mutates remote job state
+without an interactive confirmation dialog. On the same SDK, `CoordinatorEntity`
+and `JobEntity` set `authenticationPolicy = .requiresLocalDeviceAuthentication`
+as defense in depth alongside complete file/Spotlight protection and each
+intent's own `authenticationPolicy`, keeping every declared entity property
+visible (`IntentVisibility.default`) because private coordinator fields remain
+off the entities.
+
 **Spotlight** finds each saved coordinator by name, and each scheduled job by
 title, with its coordinator and its run state, such as "Work, Interrupted".
 iOS hands a tap on a result to the app as a `CSSearchableItemActionType`

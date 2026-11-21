@@ -1,3 +1,4 @@
+import AppIntents
 import Foundation
 import Testing
 
@@ -404,5 +405,26 @@ struct SiriCoordinatorEntityTests {
     #expect(try #require(fixture.notifications.openRequest).destination == tapDestination)
     #expect(chat.draft == "An invented Work draft")
     #expect(chat.destination == destination)
+  }
+
+  @Test func intentAndEntityPoliciesMatchSdkCapabilities() {
+    #expect(SendMessageIntent.authenticationPolicy == .requiresLocalDeviceAuthentication)
+    #expect(RetryInterruptedRunIntent.authenticationPolicy == .requiresAuthentication)
+
+    #if AGENT_IOS_27_3_SDK
+      if #available(iOS 27.3, macOS 27.3, *) {
+        func isTool<I: AppIntent>(_ type: I.Type) -> Bool { type is any ToolIntent.Type }
+        func entityPolicy<E: AppEntity>(_ type: E.Type) -> IntentAuthenticationPolicy {
+          type.authenticationPolicy
+        }
+
+        #expect(isTool(OpenCoordinatorIntent.self))
+        #expect(isTool(SendMessageIntent.self))
+        #expect(!isTool(OpenJobIntent.self))
+        #expect(!isTool(RetryInterruptedRunIntent.self))
+        #expect(entityPolicy(CoordinatorEntity.self) == .requiresLocalDeviceAuthentication)
+        #expect(entityPolicy(JobEntity.self) == .requiresLocalDeviceAuthentication)
+      }
+    #endif
   }
 }

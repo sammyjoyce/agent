@@ -6,15 +6,21 @@ entity. Every shortcut must hold a phrase that is not empty. One of Open Coordin
 must name ${target} and ${applicationName}, and one of Send Message's must name ${coordinator}
 and ${applicationName}. No other action has a phrase. Open Job has none, because a phrase on its
 job would make each refresh of the app's phrases read every coordinator's jobs. Send Message
-takes exactly a message and one saved coordinator, and runs without opening the app.
+takes exactly a message and one saved coordinator, and runs without opening the app. On iOS 27.3 SDK
+builds (or when `--sdk-27-3` is passed), it also verifies `ToolIntent` conformance on Open
+Coordinator and Send Message only, plus `.requiresLocalDeviceAuthentication` and Siri-visible
+metadata on Coordinator and Job entities and their properties.
 
 A shortcuts provider in the wrong target still builds, and only the extracted metadata shows that
 the app ships no phrase.
 
-Usage: check-intents-metadata.py <Agent.app | extract.actionsdata>
+Usage: check-intents-metadata.py [--sdk-27-3 | --no-sdk-27-3] <Agent.app | extract.actionsdata>
 """
 
+import argparse
 import json
+import plistlib
+import re
 import sys
 from pathlib import Path
 
@@ -24,10 +30,13 @@ ACTIONS = {
     "RetryInterruptedRunIntent",
     "SendMessageIntent",
 }
+TOOLS = {"OpenCoordinatorIntent", "SendMessageIntent"}
+TOOL_INTENT = "com.apple.link.systemProtocol.ToolIntent"
 ENTITIES = {
     "CoordinatorEntity": {"name"},
     "JobEntity": {"title", "coordinator", "schedule", "state", "lastRun", "nextRun"},
 }
+AUTHENTICATED_ENTITIES = {"CoordinatorEntity": 2, "JobEntity": 2}
 ENUMS = {"JobRunState"}
 QUERIES = {"CoordinatorQuery", "JobQuery"}
 # Each action a phrase runs, and what one of its phrases must name.
@@ -57,6 +66,22 @@ def metadata_path(argument: str) -> Path:
     return path
 
 
+def app_uses_sdk_27_3(argument: str) -> bool:
+    path = Path(argument)
+    plist_path = path / "Info.plist" if path.is_dir() else path.parent.parent / "Info.plist"
+    try:
+        info = plistlib.loads(plist_path.read_bytes())
+    except (OSError, plistlib.InvalidFileException, ValueError) as error:
+        raise ValueError(f"cannot read {plist_path}: {error}") from error
+    sdk = str(info.get("DTSDKName") or "")
+    match = re.search(r"(\d+)(?:\.(\d+))?", sdk)
+    if not match:
+        raise ValueError(f"missing or unparseable DTSDKName {sdk!r} in {plist_path}")
+    major = int(match.group(1))
+    minor = int(match.group(2) or 0)
+    return (major, minor) >= (27, 3)
+
+
 def value_type(value: dict) -> str | None:
     if "entity" in value:
         return (value["entity"].get("wrapper") or {}).get("typeName")
@@ -65,7 +90,7 @@ def value_type(value: dict) -> str | None:
     return None
 
 
-def problems(metadata: dict) -> list[str]:
+def problems(metadata: dict, *, expect_27_3: bool = False) -> list[str]:
     found = []
     shipped = {kind: set(metadata.get(kind) or {}) for kind in ("actions", "entities", "queries")}
     shipped["enums"] = {enum.get("identifier") for enum in metadata.get("enums") or []}
@@ -131,40 +156,114 @@ def problems(metadata: dict) -> list[str]:
     for action, entity in OPENS.items():
         if action not in actions:
             continue
-        metadata = actions[action]
+        action_metadata = actions[action]
         targets = [
             ((p.get("valueType") or {}).get("entity") or {}).get("wrapper", {}).get("typeName")
-            for p in metadata.get("parameters") or []
+            for p in action_metadata.get("parameters") or []
             if p.get("name") == "target"
         ]
-        if OPEN_ENTITY not in (metadata.get("systemProtocols") or []) or targets != [entity]:
+        if OPEN_ENTITY not in (action_metadata.get("systemProtocols") or []) or targets != [entity]:
             found.append(f"{action} is not the open intent for {entity}: targets {targets}")
-        if metadata.get("openAppWhenRun") is not True:
+        if action_metadata.get("openAppWhenRun") is not True:
             found.append(f"{action} does not open the app")
+    tools = {
+        name for name, action in actions.items() if TOOL_INTENT in (action.get("systemProtocols") or [])
+    }
+    if expect_27_3:
+        missing_tools = TOOLS - tools
+        if missing_tools:
+            found.append(f"missing ToolIntent conformance: {', '.join(sorted(missing_tools))}")
+        unexpected_tools = tools - TOOLS
+        if unexpected_tools:
+            found.append(f"unexpected ToolIntent conformance: {', '.join(sorted(unexpected_tools))}")
+        for entity, policy in AUTHENTICATED_ENTITIES.items():
+            if entity not in entities:
+                continue
+            record = entities[entity]
+            entity_policy = record.get("authenticationPolicy")
+            if entity_policy != policy:
+                found.append(f"{entity} does not {POLICIES[policy]}")
+            entity_vis = record.get("visibilityMetadata") or {}
+            if entity_vis.get("isDiscoverable") is not True or entity_vis.get("assistantOnly") is True:
+                found.append(f"{entity} is hidden from Siri and Shortcuts")
+            for prop in record.get("properties") or []:
+                prop_name = prop.get("identifier")
+                eff_policy = (
+                    prop.get("authenticationPolicy")
+                    if prop.get("authenticationPolicy") is not None
+                    else entity_policy
+                )
+                if eff_policy != policy:
+                    found.append(f"{entity}.{prop_name} does not {POLICIES[policy]}")
+                vis = (
+                    prop["visibilityMetadata"]
+                    if prop.get("visibilityMetadata") is not None
+                    else entity_vis
+                )
+                if vis.get("isDiscoverable") is not True or vis.get("assistantOnly") is True:
+                    found.append(f"{entity}.{prop_name} is hidden from Siri and Shortcuts")
+    else:
+        if tools:
+            found.append(f"unexpected ToolIntent conformance on pre-27.3 build: {', '.join(sorted(tools))}")
+        for entity in AUTHENTICATED_ENTITIES:
+            if entity not in entities:
+                continue
+            record = entities[entity]
+            if record.get("authenticationPolicy") not in (None, 0):
+                found.append(f"{entity} sets 27.3 authenticationPolicy on pre-27.3 build")
+            for prop in record.get("properties") or []:
+                if prop.get("authenticationPolicy") not in (None, 0):
+                    found.append(
+                        f"{entity}.{prop.get('identifier')} sets 27.3 authenticationPolicy"
+                        " on pre-27.3 build"
+                    )
     return found
 
 
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(usage=__doc__.strip().splitlines()[-1])
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--sdk-27-3", action="store_true", dest="sdk_27_3")
+    group.add_argument("--no-sdk-27-3", action="store_false", dest="sdk_27_3")
+    parser.set_defaults(sdk_27_3=None)
+    parser.add_argument("target")
+    return parser.parse_args(argv)
+
+
 def main() -> int:
-    if len(sys.argv) != 2:
-        print(__doc__.strip().splitlines()[-1], file=sys.stderr)
-        return 2
-    path = metadata_path(sys.argv[1])
+    args = parse_args(sys.argv[1:])
+    path = metadata_path(args.target)
+    if args.sdk_27_3 is None:
+        try:
+            expect_27_3 = app_uses_sdk_27_3(args.target)
+        except ValueError as error:
+            print(
+                f"cannot determine SDK version ({error}); pass an Agent.app bundle or"
+                " --sdk-27-3 / --no-sdk-27-3",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        expect_27_3 = args.sdk_27_3
     try:
         metadata = json.loads(path.read_text())
     except (OSError, ValueError) as error:
         print(f"intents metadata unreadable at {path}: {error}", file=sys.stderr)
         return 1
-    found = problems(metadata)
+    found = problems(metadata, expect_27_3=expect_27_3)
     if found:
         for problem in found:
             print(f"intents metadata check failed: {problem}", file=sys.stderr)
         return 1
     properties = sum(map(len, ENTITIES.values()))
-    print(
+    summary = (
         f"intents metadata ok actions={len(ACTIONS)} entities={len(ENTITIES)}"
         f" properties={properties} enums={len(ENUMS)} shortcuts={len(metadata['autoShortcuts'])}"
         f" indexed={len(INDEXED)}"
     )
+    if expect_27_3:
+        summary += f" tools={len(TOOLS)} authenticated_entities={len(AUTHENTICATED_ENTITIES)}"
+    print(summary)
     return 0
 
 

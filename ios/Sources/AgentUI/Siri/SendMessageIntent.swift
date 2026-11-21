@@ -10,10 +10,13 @@ public struct SendMessageIntent: AppIntent {
     .requiresLocalDeviceAuthentication
   public static let openAppWhenRun = false
 
-  @Parameter(title: "Message", requestValueDialog: "What's the message?")
+  @Parameter(
+    title: "Message",
+    description: "The single-line message to send, without a leading slash command.",
+    requestValueDialog: "What's the message?")
   public var message: String
 
-  @Parameter(title: "Coordinator")
+  @Parameter(title: "Coordinator", description: "The saved coordinator to receive the message.")
   public var coordinator: CoordinatorEntity
 
   @Dependency private var notifications: AppNotifications
