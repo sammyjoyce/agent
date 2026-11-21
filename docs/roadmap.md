@@ -315,6 +315,29 @@ recovery; [history](history.md) describes import and retrieval.
     absent. Against a coordinator without the native request, the strip is
     absent and the chat is unchanged. No control in the sheet changes a task
     or a job.
+- [ ] An iOS interface for **[Dreams](setup.md#dreams)** to browse runs,
+  inspect sealed proposals and approve them from the iPhone app. List runs
+  newest first with each run's window, coverage, outcome and current proposal
+  status (`pending`, `applied`, `stale`, `target_dirty`, `target_locked`,
+  `patch_changed` or `policy_changed`). Opening a run shows its coverage gaps,
+  before and after check results, quoted model rationale or abstention note,
+  bounded cited evidence and the patch, escaping control and Unicode format
+  characters so the diff read on the phone matches the bytes `apply` commits.
+  Approving a pending proposal requires explicit confirmation and sends that
+  run's exact sealed `outcome_sha256`, running the same coordinator-side hash,
+  policy, base, clean-worktree and single-apply checks as
+  `beep-boop dreams apply`. Today `dreams list`, `show` and `apply` exist only
+  in the CLI reading the coordinator's state directory on the coordinator host.
+  `NativeRequest` has no Dreams requests, `NativeEvent::Ready` has no Dreams
+  capability flag beside `work_inspection` and `conversation_settings` (so
+  coordinators without `[dreams]` or older coordinators keep the entry hidden),
+  and the generated Swift bindings have no Dreams types. Native Dreams reads
+  and apply stay on the authenticated coordinator boundary outside Pi's runtime
+  and tool surface, preserving the invariant that no model or conversation tool
+  can approve or apply a proposal. Open for the owner: whether Dreams lives
+  under coordinator controls beside **Jobs and work** or also surfaces a notice
+  when a nightly run has a pending proposal, and whether to ship read-only
+  inspection before remote apply.
 
 ## Retrieval, learning and proof
 
