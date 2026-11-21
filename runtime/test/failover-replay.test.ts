@@ -281,9 +281,10 @@ for (const [name, connect] of Object.entries(authorities)) {
   });
 
   test(`${name}: an entry written by a Pi Durable or Chord this host does not replay is refused and the position does not move`, async (t) => {
-    for (const [stamped, expected] of [[{ pi_durable: "9.9.9" }, /Pi Durable 9\.9\.9 and Chord 1\.5\.2, and this host runs Pi Durable 1\.5\.2 and Chord 1\.5\.2/],
-      [{ chord: "9.9.9" }, /Pi Durable 1\.5\.2 and Chord 9\.9\.9, and this host runs/],
-      [{ pi_durable: "1.4.0" }, /Pi Durable 1\.4\.0 and Chord 1\.5\.2, and this host runs/]] as const) {
+    for (const [stamped, expected] of [[{ pi_durable: "9.9.9" }, /Pi Durable 9\.9\.9 and Chord 1\.6\.0, and this host runs Pi Durable 1\.6\.0 and Chord 1\.6\.0/],
+      [{ chord: "9.9.9" }, /Pi Durable 1\.6\.0 and Chord 9\.9\.9, and this host runs/],
+      [{ pi_durable: "1.4.0" }, /Pi Durable 1\.4\.0 and Chord 1\.6\.0, and this host runs/],
+      [{ pi_durable: "1.5.2" }, /Pi Durable 1\.5\.2 and Chord 1\.6\.0, and this host runs/]] as const) {
       const link = await connect(), epoch = await enroll(link), directory = await stateDirectory(t), standby = await stateDirectory(t);
       const owner = await openOwner(directory, link, { epoch });
       await owner.root.submit(note("first", "request-1"), context);

@@ -56,10 +56,12 @@ type PiVersions = Pick<Versions, "pi_durable" | "chord">;
 /**
  * Older Pi Durable and Chord releases whose log entries a release replays.
  * Their batches commit through the reader's Pi to the rows their own Pi wrote,
- * as failover-replay-1.4.0.test.ts checks against a log that 1.4.0 wrote.
+ * as failover-replay-1.4.0.test.ts checks against logs that 1.4.0 and 1.5.2 wrote.
  */
 const REPLAYED_WRITERS: readonly { readonly reader: PiVersions; readonly writer: PiVersions }[] = [
   { reader: { pi_durable: "1.5.2", chord: "1.5.2" }, writer: { pi_durable: "1.4.0", chord: "1.4.0" } },
+  { reader: { pi_durable: "1.6.0", chord: "1.6.0" }, writer: { pi_durable: "1.4.0", chord: "1.4.0" } },
+  { reader: { pi_durable: "1.6.0", chord: "1.6.0" }, writer: { pi_durable: "1.5.2", chord: "1.5.2" } },
 ];
 
 const samePi = (left: PiVersions, right: PiVersions) => left.pi_durable === right.pi_durable && left.chord === right.chord;

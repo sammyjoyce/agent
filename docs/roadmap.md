@@ -484,7 +484,7 @@ issues (including `#71` and `#95`).
 
 ## Reuse upstream
 
-Verified against Pi Durable 1.5.2 and Beep Boop's current source. Source
+Verified against Pi Durable 1.6.0 and Beep Boop's current source. Source
 integration and deployment are tracked separately above.
 
 | Upstream capability | Status | Application use and remaining work |

@@ -1072,7 +1072,7 @@ the old state directory under a new name.
 Upgrade the standby before the owner, or together with it. A standby refuses
 an entry that a newer Pi Durable wrote and stops following until it runs that
 release too. A newer standby replays the entries of the releases it was tested
-against, so a standby on Pi Durable 1.5.2 follows a log that 1.4.0 began.
+against, so a standby on Pi Durable 1.6.0 follows a log that 1.4.0 or 1.5.2 began.
 
 ### Keep the log short
 

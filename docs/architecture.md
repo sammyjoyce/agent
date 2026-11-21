@@ -750,8 +750,8 @@ Pi's own storage commit, each at its own log position and Pi sequence. It never
 opens a Harness, so it schedules nothing and emits nothing. Each entry names the
 Pi Durable and Chord releases that wrote it. A standby replays the entries of
 its own releases, and those of an older pair when a test showed that its Pi
-commits their batches to the rows the older Pi wrote. Pi Durable 1.5.2 replays
-the entries of 1.4.0. A standby refuses every other entry and stops there.
+commits their batches to the rows the older Pi wrote. Pi Durable 1.6.0 replays
+the entries of 1.4.0 and 1.5.2. A standby refuses every other entry and stops there.
 
 **A replicated directory never opens without its claim.** A state directory
 that holds a log position, an owner's or a standby's, opens for a coordinator

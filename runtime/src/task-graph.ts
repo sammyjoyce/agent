@@ -12,13 +12,20 @@ import { TaskError, type TaskStore } from "./tasks.js";
 export const TASK_GRAPH_NODE_LIMIT = 500;
 export const TASK_GRAPH_BYTE_LIMIT = 1024 * 1024;
 
-const joinPolicies: Record<JoinPolicy, TaskGraphJoinPolicy> = { failFast: "fail_fast", allSettled: "all_settled" };
+function joinPolicy(policy: JoinPolicy): TaskGraphJoinPolicy {
+  switch (policy) {
+    case "failFast": return "fail_fast";
+    case "allSettled": return "all_settled";
+    case "any": throw new Error("Unsupported Pi join policy: any");
+    default: { const unsupported: never = policy; throw new Error("Unsupported Pi join policy: " + JSON.stringify(unsupported)); }
+  }
+}
 
 function graphState(state: NativeState): TaskGraphState {
   switch (state.status) {
     case "pending": case "running": return { status: state.status, phase: state.phase };
-    case "waiting": return { status: "waiting", phase: state.phase, on: [...state.on], policy: joinPolicies[state.policy] };
-    case "sleeping": return { status: "sleeping", phase: state.phase, until: state.until };
+    case "waiting": return { status: "waiting", phase: state.phase, on: [...state.on], policy: joinPolicy(state.policy) };
+    case "sleeping": return state.until === undefined ? { status: "waiting", phase: state.phase, on: [], policy: "all_settled" } : { status: "sleeping", phase: state.phase, until: state.until };
     case "completing": return { status: "completing", outcome: state.outcome };
     default: { const unsupported: never = state; throw new Error("Unsupported Pi task state: " + JSON.stringify(unsupported)); }
   }
