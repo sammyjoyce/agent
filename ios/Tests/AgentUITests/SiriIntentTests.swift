@@ -408,13 +408,14 @@
       var scrolls = 0
       let deadline = ContinuousClock.now + .seconds(90)
       while ContinuousClock.now < deadline {
-        let texts = hosts.flatMap { $0.staticTexts.allElementsBoundByIndex }.map(\.label)
-        let buttons = hosts.flatMap { $0.buttons.allElementsBoundByIndex }.map(\.label)
+        let snapshots = hosts.compactMap { try? $0.snapshot() }
+        let texts = snapshots.flatMap { labels(of: .staticText, in: $0) }
+        let buttons = snapshots.flatMap { labels(of: .button, in: $0) }
         log.append("texts \(texts)\nbuttons \(buttons)")
         switch step {
         case .tile:
           for label in ["Continue", "Not Now", "OK", "Get Started"] {
-            let button = shortcuts.buttons[label]
+            let button = shortcuts.buttons[label].firstMatch
             if button.exists && button.isHittable {
               button.tap()
               log.append("dismissed \(label)")
@@ -423,12 +424,12 @@
           // The folder shows one tile per coordinator, a Send button with the name beside it.
           let tile = nearest(
             labeled(shortcuts.buttons, "Send"),
-            to: labeled(shortcuts.staticTexts, coordinator).map(\.frame))
+            to: labeled(shortcuts.staticTexts, coordinator).compactMap { try? $0.snapshot().frame })
           let folder = shortcuts.buttons["Beep Boop"].firstMatch
-          let library = shortcuts.buttons["Library"]
-          if let tile, tile.isHittable {
+          let library = shortcuts.buttons["Library"].firstMatch
+          if let tile, tile.element.exists && tile.element.isHittable {
             log.append("tapped the Send tile of \(coordinator) at \(tile.frame)")
-            tile.tap()
+            tile.element.tap()
             step = .message
           } else if folder.exists && folder.isHittable {
             folder.tap()
@@ -450,7 +451,9 @@
           step = .confirmation
           log.append("typed the message")
           for done in ["Done", "Continue", "Next"] {
-            let button = hosts.map { $0.buttons[done] }.first { $0.exists && $0.isHittable }
+            let predicate = NSPredicate(format: "label == %@", done)
+            let button = hosts.map { $0.buttons.matching(predicate).firstMatch }
+              .first { $0.exists && $0.isHittable }
             if let button {
               button.tap()
               log.append("tapped \(done)")
@@ -462,13 +465,13 @@
           for host in hosts {
             let asked = host.staticTexts[sentence].firstMatch
             // The tiles keep their Send buttons under the confirmation, which has its own.
-            guard asked.exists,
-              let choice = nearest(labeled(host.buttons, answer), to: [asked.frame]),
-              choice.isHittable
+            guard asked.exists, let askedFrame = try? asked.snapshot().frame,
+              let choice = nearest(labeled(host.buttons, answer), to: [askedFrame]),
+              choice.element.exists && choice.element.isHittable
             else { continue }
             capture("shortcuts-confirmation-\(answer.lowercased())", XCUIScreen.main)
             log.append("tapped \(answer) at \(choice.frame)")
-            choice.tap()
+            choice.element.tap()
             return
           }
         }
@@ -482,12 +485,26 @@
       throw NoShortcutsConfirmation()
     }
 
-    private func nearest(_ elements: [XCUIElement], to frames: [CGRect]) -> XCUIElement? {
-      let gaps = elements.flatMap { element in
-        let frame = element.frame
-        return frames.map { (hypot($0.midX - frame.midX, $0.midY - frame.midY), element) }
+    private func labels(
+      of type: XCUIElement.ElementType, in snapshot: any XCUIElementSnapshot
+    ) -> [String] {
+      var result: [String] = []
+      var stack: [any XCUIElementSnapshot] = [snapshot]
+      while let node = stack.popLast() {
+        if node.elementType == type { result.append(node.label) }
+        stack.append(contentsOf: node.children.reversed())
       }
-      return gaps.min { $0.0 < $1.0 }?.1
+      return result
+    }
+
+    private func nearest(
+      _ elements: [XCUIElement], to frames: [CGRect]
+    ) -> (element: XCUIElement, frame: CGRect)? {
+      let gaps = elements.flatMap { element -> [(Double, XCUIElement, CGRect)] in
+        guard let frame = try? element.snapshot().frame else { return [] }
+        return frames.map { (hypot($0.midX - frame.midX, $0.midY - frame.midY), element, frame) }
+      }
+      return gaps.min { $0.0 < $1.0 }.map { ($0.1, $0.2) }
     }
 
     private func attach(_ lines: [String], named name: String) {
