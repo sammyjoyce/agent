@@ -478,10 +478,9 @@ public struct MainChatView: View {
       .defaultScrollAnchor(followsLatest ? .bottom : nil, for: .sizeChanges)
       .scrollPosition(
         id: Binding(
-          // Keep the observed row binding stable when leaving the live tail. Switching from nil
-          // to an already-visible ID makes SwiftUI align that row's top, jumping across a tall
-          // message and stranding subsequent downward drags at the start of the transcript.
-          get: { visibleItem },
+          // Following the latest, code scrolls without updating this binding, so a row here would
+          // be out of date. Opening the picker reapplies it and would scroll back to that row.
+          get: { followsLatest ? nil : visibleItem },
           set: { item in
             // Structural controls have no transcript row ID. Keep the real
             // reading anchor when a paging control temporarily leads.
