@@ -447,10 +447,11 @@ decide then which task and terminal the fork gets.
 
 Background sources implement a transport-neutral Rust trait in
 `sources/mod.rs`, with sibling CLI adapters for mail, calendars, GitHub,
-Messages and Slack, plus a REST API adapter for Home Assistant state changes.
-CLIs own authentication and refresh, and every adapter returns the same
-normalized events, checkpoint and coverage. The coordinator rediscovers
-configured accounts and
+Messages and Slack, plus HTTP API adapters for Home Assistant state changes and
+Up bank transactions. CLIs own authentication and refresh. The HTTP adapters
+read a bearer token from a configured credential command on each poll. Every
+adapter returns the same normalized events, checkpoint and coverage. The
+coordinator rediscovers configured accounts and
 polls bounded pages, with separate cursors and coverage per account.
 Main-chat clients show unavailable or partial coverage as current status,
 outside conversation history. Repeated polls do not repeat notices; a healthy
@@ -616,11 +617,13 @@ The [roadmap](roadmap.md) tracks the implementation and evaluation checklist.
 
 ### Integrations and scheduling
 
-Home Assistant can use its API for repairs, failures and state changes. Later
-sources may include MyChart notifications and Ramp activity through their
-existing CLIs. These are optional feeds; domain workflows such as Poshmark
-offers continue through ordinary mail intake. API credentials stay in the
-configured private credential provider.
+Home Assistant state changes and Up bank transactions are current opt-in
+sources. See [HTTP sources](setup.md#http-sources). Home Assistant repairs and
+failures are not read yet. They need its WebSocket API. Later sources may
+include MyChart notifications and Ramp activity through their existing CLIs.
+These are optional feeds; domain workflows such as Poshmark offers continue
+through ordinary mail intake. API credentials stay in the configured private
+credential provider.
 
 Reuse supported APIs and configured CLIs before adding an adapter. Existing
 coding-agent plugins are not automatically portable to this runtime. Chrome

@@ -716,6 +716,8 @@ internal task outcomes remain available.
 | `github` | Switchboard GitHub namespaces and `gh` |
 | `slack` | Configured read-only CLI command |
 | `messages` | Switchboard Messages namespaces, or local macOS `messages` |
+| `home_assistant` | `curl` and a credential command. See [HTTP sources](#http-sources). |
+| `up` | `curl` and a credential command. See [HTTP sources](#http-sources). |
 
 Omitting `namespaces` discovers all configured accounts for that provider. An
 explicit selection never falls back to another account. Slack additionally needs
@@ -831,6 +833,124 @@ another sender's receipt, a heartbeat or the writer's last line at shutdown. No 
 audit interval at an unbounded event rate. The writer also records a
 `heartbeat` receipt every five minutes, so an interval with no receipt at all
 means that nothing was written, not that nothing happened.
+
+### HTTP sources
+
+The `home_assistant` and `up` sources read an HTTP API with a bearer token. They
+need no provider CLI. A poll runs your `credential_command` and then `curl`, so
+`curl` must be on the service's PATH. Without it, the source reports
+`could not run curl; check that curl is on the service PATH.`
+
+`curl` gets the token and the request address on standard input. Its process
+arguments are the same for every request, so other local processes see no
+token, host or path. `curl` does not read the service user's `.curlrc` and does
+not follow a redirect.
+
+#### Credential command
+
+`credential_command` is a program and its arguments, as a list. Beep Boop runs
+it without a shell, in `/`, with the service's environment.
+
+- The command must exit with status 0.
+- The token is the command's standard output, with the white space around it
+  removed. The token must not be empty. It must not hold a control character, a
+  double quote or a backslash.
+- Error output is not part of the token. No output of the command appears in a
+  status message or in a log.
+- The command runs before each page that a source reads, and Beep Boop does not
+  store the token between pages. Home Assistant reads one page per poll. An Up
+  scan reads three pages or more, so it runs the command three times or more.
+- The command must finish within 15 minutes and print less than 2 MiB.
+
+If the command breaks a rule, the source reports
+`credentials are unavailable; check credential_command.` and keeps its
+checkpoint.
+
+#### Home Assistant
+
+```toml
+[[sources]]
+provider = "home_assistant"
+account = "home"
+url = "http://homeassistant.example.test:8123"
+credential_command = ["/usr/local/bin/example-secrets", "read", "home-assistant-token"]
+entities = ["binary_sensor.example_leak", "light.example_*"]
+```
+
+- `account` is a label that you choose. Clients show it.
+- `url` is the base address of your Home Assistant server. The source accepts
+  `http` and `https`. With `http`, the token crosses your network in clear text.
+- The token is a Home Assistant long-lived access token.
+- `entities` is required. An entry is an exact entity ID, or a prefix that ends
+  in `*`. The source ignores every other entity.
+
+The source reads `GET /api/states` once per poll.
+
+- The first poll reports each listed entity once, as an initial observation. A
+  wide pattern such as `sensor.*` sends many events when you turn the source on.
+- After the first poll, a change of an entity's state or of its `last_changed`
+  time is one event. A change of attributes alone is not an event.
+
+Known limits:
+
+- The source sees the state at each poll. A state that an entity enters and
+  leaves between two polls is not reported.
+- Repairs and failed automations are not read. They need the Home Assistant
+  WebSocket API.
+
+#### Up
+
+```toml
+[[sources]]
+provider = "up"
+account = "everyday"
+credential_command = ["/usr/local/bin/example-secrets", "read", "up-token"]
+```
+
+- `account` is a label that you choose. Clients show it, so do not use an
+  account number.
+- The token is an Up personal access token. Generate it in the Up app under
+  **Data sharing**. Up allows one token at a time. If you generate a token for
+  another tool, this source reports `Up rejected the token` until your
+  credential provider holds the new token.
+- `url` is optional. It must be `https`, or `http` on a loopback host. The
+  default is `https://api.up.com.au/api/v1`.
+
+The source sends `GET` requests only. It reads the transactions of every
+account that the token's holder has.
+
+- The first poll reads the last seven days.
+- Each new transaction is one event. A change of status, such as held to
+  settled, is a new version of the same event. Source review decides what
+  reaches the main conversation, and it sends the event text, with merchant
+  names and amounts, to the model.
+- A held transaction that Up deletes is reported once as `hold removed`. Up
+  does not say whether the merchant released the hold or whether Up settled it
+  as a separate transaction. A separate transaction is a separate event.
+- A scan is at least three requests: an identity check, the recent transactions
+  and the held transactions. Each further page of 100 transactions is one more
+  request. So is each held transaction that left Up's list.
+- A new scan starts five minutes or more after the last scan finished, whatever
+  `poll_interval_seconds` is. Between scans a poll sends no request, so the last
+  check that `beep-boop sources` shows can be up to five minutes newer than the
+  last request.
+
+Known limits:
+
+- A transaction that appears and disappears between two scans is not seen.
+- A held transaction that was created more than seven days before the first
+  poll is neither reported nor followed.
+- The source follows at most 512 held transactions. With more, it reports
+  partial coverage and stops until Up lists fewer.
+- A change of category, tags or note is not an event.
+- The checkpoint belongs to one Up customer and one `account` label. To read
+  another customer's transactions, use another label. Otherwise the source
+  reports `Up checkpoint belongs to another account or configuration`.
+- `beep-boop sources --json` prints checkpoints. The Up checkpoint holds the
+  ID, the description and the amount of each held transaction that the source
+  follows.
+- Up publishes no rate limit. After an HTTP 429 the source reports
+  `Up rate limit reached` and sends one request per poll until Up answers.
 
 ### Scrawl feedback
 
