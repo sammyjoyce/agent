@@ -1547,6 +1547,78 @@ final class HistoryInteractionTests: XCTestCase {
     XCTAssertEqual(composer.value as? String, "Alpha")
   }
 
+  func testPasteImagesClipboardVariantsAndUnsentSafety() async throws {
+    UIPasteboard.general.items = []
+    defer { UIPasteboard.general.items = [] }
+    let peer = InteractionPeer()
+    let app = try await launchMessages([
+      .init(continuation: false, entryId: "1", finalChunk: true, role: .final, text: "Ready")
+    ], peer: peer)
+    let composer = editor(app)
+    XCTAssertTrue(composer.waitForExistence(timeout: 5))
+    let note = "Invented paste audit note."
+    composer.tap()
+    composer.typeText(note)
+    let paste = app.buttons["Paste images"]
+    XCTAssertTrue(paste.waitForExistence(timeout: 3))
+    let menu = app.buttons["composerMenu"]
+    XCTAssertLessThan(menu.frame.midX, paste.frame.midX)
+    XCTAssertLessThan(paste.frame.midX, composer.frame.midX)
+
+    func evidence(_ name: String) {
+      let screenshot = XCTAttachment(screenshot: app.screenshot())
+      screenshot.name = "paste-audit-" + name
+      screenshot.lifetime = .keepAlways
+      add(screenshot)
+      let tree = XCTAttachment(string: app.debugDescription)
+      tree.name = "paste-audit-tree-" + name
+      tree.lifetime = .keepAlways
+      add(tree)
+    }
+
+    XCTAssertTrue(paste.wait(for: \.isEnabled, toEqual: false, timeout: 5))
+    evidence("empty-disabled")
+    UIPasteboard.general.string = "Invented text-only clipboard"
+    XCTAssertTrue(paste.wait(for: \.isEnabled, toEqual: false, timeout: 5))
+    evidence("text-disabled")
+    XCTAssertEqual(composer.value as? String, note)
+    XCTAssertFalse(app.staticTexts["Unsent attachments"].exists)
+
+    let renderer = UIGraphicsImageRenderer(size: CGSize(width: 32, height: 24))
+    let image = renderer.image { context in
+      UIColor.systemTeal.setFill()
+      context.fill(CGRect(x: 0, y: 0, width: 32, height: 24))
+    }
+    for (format, bytes) in [
+      ("public.png", try XCTUnwrap(image.pngData())),
+      ("public.jpeg", try XCTUnwrap(image.jpegData(compressionQuality: 0.9)))
+    ] {
+      UIPasteboard.general.setData(bytes, forPasteboardType: format)
+      XCTAssertTrue(paste.wait(for: \.isEnabled, toEqual: true, timeout: 5))
+      evidence(format + "-enabled")
+      paste.tap()
+      let remove = app.buttons["Remove Image.jpg"]
+      XCTAssertTrue(remove.waitForExistence(timeout: 5))
+      XCTAssertTrue(app.staticTexts["Unsent attachments"].exists)
+      XCTAssertEqual(composer.value as? String, note)
+      XCTAssertTrue(app.buttons["Send message"].isEnabled)
+      for _ in 0..<10 {
+        let attempts = await peer.submitAttempts()
+        XCTAssertEqual(attempts, 0, "Pasting must never submit")
+        try await Task.sleep(for: .milliseconds(100))
+      }
+      XCTAssertFalse(app.staticTexts["Sending"].exists)
+      XCTAssertFalse(app.staticTexts["Sent"].exists)
+      evidence(format + "-unsent")
+      remove.tap()
+      XCTAssertTrue(remove.waitForNonExistence(timeout: 3))
+      XCTAssertFalse(app.staticTexts["Unsent attachments"].exists)
+      XCTAssertEqual(composer.value as? String, note)
+      print("PASTE_AUDIT \(format): enabled; staged Image.jpg; draft preserved; submitAttempts=0; removed")
+    }
+    print("PASTE_AUDIT empty/text: disabled; control ordered menu < Paste images < draft")
+  }
+
   func testPasteImagesKeepsTheNoteAndCreatesOnlyRemovableUnsentAttachments() async throws {
     let app = try await launchMessages([
       .init(continuation: false, entryId: "1", finalChunk: true, role: .final, text: "Ready")
