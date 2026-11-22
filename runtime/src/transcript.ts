@@ -17,7 +17,8 @@ import type { ToolDetails } from "./generated/ToolDetails.js";
 import type { ToolDetailContent } from "./generated/ToolDetailContent.js";
 import { entryThread, HistoryError, HistoryStore, ImportedItemEntry, ImportedThreadEntry, isHistoryEntry, shownInConversation } from "./history.js";
 import { importedAdapter } from "./imported-history.js";
-import { historyToolId, piToolPresentation, piToolResult, type MessageContent } from "./message-presentation.js";
+import { codemodeNestedCalls, historyToolId, piToolPresentation, piToolResult, piToolResults, type MessageContent } from "./message-presentation.js";
+import { formatTaskTransferNotice, TaskTransferEntry } from "./allocation.js";
 import { observeTranscriptVisibility, readTranscriptVisibility, transcriptVisible, type TranscriptVisibilityState } from "./transcript_visibility.js";
 import { REVISION_AMBIGUOUS, REVISION_PENDING, revisionStatus, type RevisionView } from "./history-revisions.js";
 
@@ -151,6 +152,9 @@ function nativeTranscript(entry: EntryRecord, tools?: Map<string, ToolCall>): Hi
   if (attachments !== undefined && object(entry.data) && typeof entry.data.text === "string") {
     add("user", entry.data.text); return messages;
   }
+  if (TaskTransferEntry.is(entry)) {
+    return messageRows(entry, { role: "notice", text: formatTaskTransferNotice(entry.data) });
+  }
   if (ImportedItemEntry.is(entry)) {
     const { source, item } = entry.data;
     return shownInConversation(item) ? importedRows(entry, item, importedAdapter(source).display(item, item.data, entry.id.toString()), false) : [];
@@ -159,7 +163,9 @@ function nativeTranscript(entry: EntryRecord, tools?: Map<string, ToolCall>): Hi
   for (const message of entry.model ?? []) {
     if (message.role === "system") continue;
     if (message.role === "toolResult") {
-      messages.push(...messageRows(entry, piToolResult(message, entry.conversationId.toString(), tools?.get(message.toolCallId))));
+      for (const item of piToolResults(message, entry.conversationId.toString(), tools?.get(message.toolCallId))) {
+        messages.push(...messageRows(entry, item));
+      }
       tools?.delete(message.toolCallId); continue;
     }
     const role: HistoryRole = message.role !== "assistant" ? message.role : (isUserNotice(entry) || entry.kind === "agent.notice") ? "notice"
@@ -317,6 +323,32 @@ export async function toolDetails(conversation: Conversation, value: string, cal
     if (detail.truncated && output.type === "text") output.truncated = true;
     return { type: "available", call_id: callId, name: canonical.tool.name, status: canonical.tool.status,
       input: detail.input === null ? { type: "unavailable", reason: "not_recorded" } : detailText(detail.input), output };
+  }
+  const nestedMatch = /^(.+)\/c(\d+)$/u.exec(callId);
+  if (nestedMatch !== null) {
+    const [, parentId, indexText] = nestedMatch;
+    const nestedId = Number(indexText);
+    if (parentId === undefined || !Number.isSafeInteger(nestedId)) return { type: "unavailable", call_id: callId };
+    let parentResult = toolParts(selected, parentId).result;
+    if (parentResult === undefined) {
+      const page = await conversation.entries({ minEntryId: id, order: "ascending" }, TOOL_DETAIL_ENTRIES, undefined, BACKGROUND_CONTEXT);
+      for (const entry of page.items) { parentResult = toolParts(entry, parentId).result; if (parentResult !== undefined) break; }
+    }
+    const nested = parentResult?.toolName === "codemode"
+      ? codemodeNestedCalls(parentResult.details).find((item) => item.id === nestedId)
+      : undefined;
+    if (nested === undefined) return { type: "unavailable", call_id: callId };
+    let formattedInput = nested.args;
+    try { formattedInput = JSON.stringify(JSON.parse(nested.args), null, 2); } catch {}
+    return {
+      type: "available",
+      call_id: callId,
+      name: nested.name,
+      status: nested.status === "ok" ? "finished" : nested.status === "running" ? "running" : "failed",
+      input: detailText(formattedInput),
+      output: nested.error !== undefined ? detailText(nested.error)
+        : { type: "unavailable", reason: nested.status === "running" ? "pending" : "not_recorded" },
+    };
   }
   let { call, result } = toolParts(selected, callId);
   if (call === undefined && result === undefined) return { type: "unavailable", call_id: callId };

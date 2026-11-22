@@ -731,6 +731,12 @@ async function handle(request: RuntimeRequest): Promise<void> {
         emit(id, { type: "task", task, history: await tasks.history(command.task_id) });
         break;
       }
+      case "transfer_task": {
+        const { tasks } = await app();
+        const task = await tasks.transferTask(command.task_id, command.host, (operation) => hostRequests.call(id, operation), command.cwd);
+        emit(id, { type: "task", task, history: await tasks.history(command.task_id) });
+        break;
+      }
       case "source_states": emit(id, { type: "sources", sources: await (await app()).sources.states() }); break;
       case "ingest_source": {
         const result = await (await app()).sources.admit(command.batch, command.expected_checkpoint);

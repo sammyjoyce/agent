@@ -217,7 +217,8 @@
         "resume",
         "reconcile",
         "revoke",
-        "reopen"
+        "reopen",
+        "transfer"
       ]
     },
     "AllocationResult": {

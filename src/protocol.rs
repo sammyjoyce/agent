@@ -640,6 +640,14 @@ pub enum RuntimeCommand {
         #[ts(optional)]
         agent_id: Option<String>,
     },
+    /// Transfer an offline host's bound or pending task to another online host.
+    TransferTask {
+        task_id: TaskId,
+        host: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        cwd: Option<String>,
+    },
     RunTask {
         task_id: TaskId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -803,6 +811,7 @@ pub enum AllocationOperation {
     Reconcile,
     Revoke,
     Reopen,
+    Transfer,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]

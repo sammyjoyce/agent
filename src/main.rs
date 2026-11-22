@@ -298,6 +298,16 @@ enum TasksAction {
         #[arg(long)]
         agent_id: Option<String>,
     },
+    /// Transfer an offline host's task to another online machine while preserving lineage.
+    Transfer {
+        task_id: TaskId,
+        /// Target online host name or Rex host ID.
+        #[arg(long, value_name = "NAME_OR_ID", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        host: String,
+        /// Working directory override on the target host (defaults to the host's configured home directory).
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        cwd: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1146,6 +1156,9 @@ async fn run(mut arguments: Arguments) -> Result<()> {
                 allocation_id,
                 agent_id,
             },
+            TasksAction::Transfer { task_id, host, cwd } => {
+                RuntimeCommand::TransferTask { task_id, host, cwd }
+            }
         },
         Action::Import { command } => match command {
             ImportAction::Codex {
@@ -4825,6 +4838,46 @@ mod tests {
         assert_eq!(
             RequestLifecycle::for_command(&RuntimeCommand::ReadTaskGraph),
             Some(RequestLifecycle::Once)
+        );
+    }
+
+    #[test]
+    fn tasks_transfer_parses_typed_target_host_and_optional_cwd() {
+        use crate::TasksAction;
+        use agent_cli::{protocol::RuntimeCommand, runtime::lifecycle::RequestLifecycle};
+        let task_id = "11111111-1111-4111-8111-111111111111";
+        let parsed = Arguments::try_parse_from([
+            "agent",
+            "--json",
+            "tasks",
+            "transfer",
+            task_id,
+            "--host",
+            "linux-vm",
+            "--cwd",
+            "/srv/work",
+        ])
+        .unwrap();
+        assert!(parsed.json);
+        assert!(matches!(
+            parsed.command,
+            Some(Action::Tasks {
+                command: TasksAction::Transfer { .. }
+            })
+        ));
+        let command = RuntimeCommand::TransferTask {
+            task_id: task_id.parse().unwrap(),
+            host: "linux-vm".into(),
+            cwd: Some("/srv/work".into()),
+        };
+        assert_eq!(
+            RequestLifecycle::for_command(&command),
+            Some(RequestLifecycle::Once)
+        );
+        assert!(
+            serde_json::to_string(&command)
+                .unwrap()
+                .contains("transfer_task")
         );
     }
 

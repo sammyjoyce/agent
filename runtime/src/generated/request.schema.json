@@ -4351,6 +4351,33 @@
           ]
         },
         {
+          "description": "Transfer an offline host's bound or pending task to another online host.",
+          "type": "object",
+          "properties": {
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "task_id": {
+              "$ref": "#/$defs/TaskId"
+            },
+            "type": {
+              "type": "string",
+              "const": "transfer_task"
+            }
+          },
+          "required": [
+            "type",
+            "task_id",
+            "host"
+          ]
+        },
+        {
           "type": "object",
           "properties": {
             "agent_id": {
