@@ -344,5 +344,25 @@ mod tests {
             .unwrap();
         let plain_bytes = String::from_utf8(plain_captured.0.lock().unwrap().clone()).unwrap();
         assert!(!plain_bytes.contains("\x1b]8;;"), "{plain_bytes:?}");
+
+        let dev_captured = SharedBuf::default();
+        let mut dev_backend = ScrollbackBackend::new(dev_captured.clone());
+        dev_backend.set_osc8(true);
+        let dev_text = "Dev: http://localhost:5173/app and http://127.0.0.1:8080/healthz";
+        let dev_width = dev_text.chars().count() as u16;
+        let mut dev_buf = Buffer::empty(Rect::new(0, 0, dev_width, 1));
+        dev_buf.set_string(0, 0, dev_text, Style::default());
+        dev_backend
+            .draw((0..dev_width).map(|x| (x, 0, &dev_buf[(x, 0)])))
+            .unwrap();
+        let dev_bytes = String::from_utf8(dev_captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            dev_bytes.contains("\x1b]8;;http://localhost:5173/app\x1b\\"),
+            "{dev_bytes:?}"
+        );
+        assert!(
+            dev_bytes.contains("\x1b]8;;http://127.0.0.1:8080/healthz\x1b\\"),
+            "{dev_bytes:?}"
+        );
     }
 }
