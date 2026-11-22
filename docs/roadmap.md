@@ -345,11 +345,15 @@ restore is not shipped yet.
   Sidechats or Active work while keeping task agents in named tabs; size-capped
   opt-in Kitty graphics thumbnails in TUI scrollback; headless macOS and Windows
   Rex servers; and new Superlogical terminal protocol proposals before investing
-  in a standalone macOS desktop GUI.
+  in a standalone macOS desktop GUI. *(OSC 8 localhost links are shipped in
+  `src/tui/scrollback_links.rs` and the secondary protocol schemas are documented
+  in [rex-exploration](rex-exploration.md); GUI Sidechat overlay hosting,
+  scrollback Kitty thumbnail rendering, and Windows server verification remain
+  open.)*
 
 ### Protocol, Block SDK and iOS client exploration
 
-- [ ] **Direct `rex.control.v1` WebSocket client (`GET /api/control`).** Explore
+- [x] **Direct `rex.control.v1` WebSocket client (`GET /api/control`).** Explore
   speaking Rex's control protocol directly from iOS (`ios/Sources/AgentCore`,
   `ios/Sources/AgentUI`) and Rust (`src/rex.rs`) instead of shelling out to the
   CLI, covering `hello`/`welcome` negotiation (`api_revision`,
@@ -360,23 +364,25 @@ restore is not shipped yet.
   QUIC ALPN), and undocumented session/client events (`session_moved`,
   `client_call_requested`, `client_perform_requested`, `client_performed`,
   `client_prompt_requested`, `client_prompt_ended`,
-  `client_script_events_dropped`).
-- [ ] **Direct `GET /api/data` framing and `rex.data.bytes.v1`.** Explore Rex's
+  `client_script_events_dropped`). *(Explored against live `rex` API rev 19; see
+  [rex-exploration](rex-exploration.md).)*
+- [x] **Direct `GET /api/data` framing and `rex.data.bytes.v1`.** Explore Rex's
   binary `/api/data` WebSocket handshake (`HELLO` 17 B, `RESUME` 25 B, `WELCOME`
   32 B with 60 s reconnect token and 64-bit channel nonce, `REJECT` 2 B reasons
   `0x01`–`0x07`, documented on server `/llms.txt`) and `rex.data.bytes.v1` in
   the iOS client to stream remote file downloads (`download_begin` with
   `if_none_match`/`version`, `download:<uuid>`), uploads (`upload_begin`,
   `upload:<uuid>`) and tunneled TCP connections (`conn:<name>`) directly between
-  iOS and execution hosts.
-- [ ] **Live iOS terminal streaming (`rex.data.terminal.v1`) vs. snapshot
+  iOS and execution hosts. *(Explored via live `data.connect` schema; see
+  [rex-exploration](rex-exploration.md).)*
+- [x] **Live iOS terminal streaming (`rex.data.terminal.v1`) vs. snapshot
   reads.** Compare full `rex.data.terminal.v1` streaming (Ghostty snapshot
   header plus APC `ESC _ rex1;<nonce>;<json> ESC \` frames for `resize`, `theme`
   and `child_exited`, with byte-exact `RESUME` recovery) against on-demand
   `com.superlogical.terminal.format` (`max_bytes` + `blob_read`) reads so iOS
   can inspect live Rex panes without requiring an embedded Ghostty renderer
-  upfront.
-- [ ] **Out-of-process Rex Block SDK (`--block-dir` / `--block-plugin-reload`).**
+  upfront. *(Compared & documented in [rex-exploration](rex-exploration.md).)*
+- [x] **Out-of-process Rex Block SDK (`--block-dir` / `--block-plugin-reload`).**
   Explore an experimental Beep Boop block creator using Rex's server plugin
   machinery (`rex-block-*` discovery, `REX_BLOCKSERVER_INFO_FD` handshake, the
   7-RPC `blockserver` lifecycle—`creator.list`, `block.create`, `block.method`,
@@ -386,15 +392,17 @@ restore is not shipped yet.
   `com.superlogical.terminal` and `com.superlogical.onboarding`, custom blocks
   would render first in Beep Boop's iOS client while tracking upstream Rex's
   public Block SDK; treat `Rex.app` `rex.server.*` UserDefaults as local
-  prototyping hooks only.
-- [ ] **Built-in non-terminal blocks (`tunnel` and `onboarding`).** Explore
+  prototyping hooks only. *(Evaluated via live `block_creator.list`; see
+  [rex-exploration](rex-exploration.md).)*
+- [x] **Built-in non-terminal blocks (`tunnel` and `onboarding`).** Explore
   `com.superlogical.tunnel` (rev 14; detached `dial`/`listen` flavors, `info`,
   `connection_requested` event, `rex.data.bytes.v1` transport) for on-demand TCP
   tunnels from iOS and workers without shelling out to `rex forward`, and study
   `com.superlogical.onboarding` (rev 7; `state`/`set_step`, generation-stamped
   `step_changed`, zero data stream) as the reference pattern for stateful
-  non-terminal blocks.
-- [ ] **Extended `com.superlogical.terminal` methods and events.** Explore
+  non-terminal blocks. *(Evaluated and documented in
+  [rex-exploration](rex-exploration.md).)*
+- [x] **Extended `com.superlogical.terminal` methods and events.** Explore
   server-documented terminal APIs across the coordinator, TUI and iOS client:
   `ports` (rev 15) and `ports_changed` (rev 16) to surface live worker
   dev-server ports in Active work / iOS alongside `tunnel`; `list_dir` for
@@ -403,7 +411,8 @@ restore is not shipped yet.
   reads; and `modes` (rev 3), `input_mode`, `process`, `program_status`, `size`,
   `size_changed`, `url_clicked`, `clear`, `resize` and `set_theme` for richer
   pane inspection (alternate screen, no-echo prompts, process ancestry and URL
-  handoff).
+  handoff). *(Evaluated and documented in
+  [rex-exploration](rex-exploration.md).)*
 - [ ] **Focus history (`focus_history.reverse`) and macOS `Rex.app` surfaces.**
   Explore control API rev 19 `focus_history.reverse` for jumping across recent
   task panes, tabs and sessions from workflows and iOS, plus `Rex.app`'s
@@ -414,7 +423,10 @@ restore is not shipped yet.
   Shortcuts and local tooling. Keep `rex __internal` subcommands (`dial-stdio`,
   `autostart-status`, `tcc-preflight`, `ssh-tunnel`, `askpass`, `session-start`,
   `skill`) off direct dependencies and track upstream `rex block new` / `rex
-  block stream` implementation.
+  block stream` implementation. *(`focus_history.reverse` and `rex block
+  new`/`stream` schemas documented in [rex-exploration](rex-exploration.md);
+  `Rex.app` AppleScript/`Rex.sdef` and Shortcuts App Intents require an
+  installed `Rex.app` bundle to verify.)*
 
 ## Host integrations and automation
 
@@ -440,7 +452,9 @@ and configured CLIs first, Chrome tools second, and desktop computer use last.
   - **Prerequisites and open owner decisions.** Implement the four guarantees
     `macctl` currently lacks ([#31](https://github.com/sammyjoyce/agent/issues/31)),
     and decide per-send approval rules, triage write permissions and the
-    design's remaining policy questions.
+    design's remaining policy questions. *(Deferred until `macos/macctl/`,
+    typed per-app operations, runtime tools, and owner approval policies land
+    together.)*
 
 ### Desktop computer use fallback
 
@@ -455,7 +469,9 @@ and configured CLIs first, Chrome tools second, and desktop computer use last.
   requires the Accessibility grant.
   - **Open decisions and constraints.** Decide whether to invoke `agent-desktop`
     directly or build on its design, and bound private desktop content exposure
-    across accessibility snapshots, screenshots and clipboard reads.
+    across accessibility snapshots, screenshots and clipboard reads. *(Deferred
+    until `agent-desktop` runtime tools, Accessibility grants, and privacy
+    defaults land together.)*
 
 ## History, sources and multi-host
 
@@ -466,7 +482,8 @@ portability.
   Support resumable, idempotent ingestion with attachment coverage matching
   Codex and ChatGPT imports. Grok Bot currently documents per-call transcripts
   and per-message downloads rather than an account-wide export, so the import
-  source remains open.
+  source remains open. *(Checked `docs.x.ai/grok-bot/overview`: per-call transcript
+  export and recording download remain the only documented UI exports.)*
 - [ ] **Optional domain event sources.** Add opt-in API or CLI adapters where
   workflows outgrow ordinary mail intake—such as Home Assistant repairs and
   state changes via its API, or MyChart and Ramp activity via existing CLIs—with
