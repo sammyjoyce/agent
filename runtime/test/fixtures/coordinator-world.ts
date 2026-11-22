@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, open, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { delimiter, join } from "node:path";
@@ -164,7 +165,7 @@ export async function coordinatorWorld(t: WorldOwner, prepare: (homes: readonly 
 
 export async function pidsMatching(text: string): Promise<number[]> {
   // procps leaves piped width undefined; -w twice is unlimited on procps and macOS.
-  const { stdout } = await promisify(execFile)("/bin/ps", ["-A", "-ww", "-o", "pid=,args="], { maxBuffer: 64 * 1024 * 1024 });
+  const { stdout } = await promisify(execFile)(existsSync("/bin/ps") ? "/bin/ps" : "ps", ["-A", "-ww", "-o", "pid=,args="], { maxBuffer: 64 * 1024 * 1024 });
   return stdout.split("\n").flatMap((line) => {
     const match = /^\s*(\d+)\s(.*)$/.exec(line);
     return match !== null && match[2]!.includes(text) && Number(match[1]) !== process.pid ? [Number(match[1])] : [];

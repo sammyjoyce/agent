@@ -47,7 +47,7 @@ test("runtime EOF closes an attached native main observation", { timeout: 15_000
   }
 });
 
-test("native main observation survives idle, correlates notices, streams text and rejects stopped queued input on reconnect", { timeout: 15_000 }, async () => {
+test("native main observation survives idle, correlates notices, streams text and rejects stopped queued input on reconnect", { timeout: 15_000 }, async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "agent-native-main-")), queue = join(directory, "responses.json");
   await writeFile(queue, JSON.stringify({
     "publish-native": [{ tool: "tool_search", args: { query: "notify" } }, { tool: "notify", args: { keys: [], text: "A useful durable notice." } },
@@ -63,9 +63,19 @@ test("native main observation survives idle, correlates notices, streams text an
   let errors = "", held: { request: number; call: string } | undefined, feedbackSpawns = 0;
   child.stderr.setEncoding("utf8").on("data", (text: string) => { errors += text; });
   const send = (id: number, command: RuntimeCommand) => child.stdin.write(JSON.stringify({ version: 1, id, command }) + "\n");
-  const wait = (id: number, predicate: (event: RuntimeEventKind) => boolean): Promise<RuntimeEventKind> => new Promise((resolve) => {
-    const check = () => { const frame = frames.find((frame) => frame.id === id && predicate(frame.event)); if (frame !== undefined) { changes.delete(check); resolve(frame.event); } };
-    changes.add(check); check();
+  const wait = (id: number, predicate: (event: RuntimeEventKind) => boolean): Promise<RuntimeEventKind> => new Promise((resolve, reject) => {
+    function cleanup(): void { changes.delete(check); t.signal.removeEventListener("abort", stopped); child.off("close", stopped); }
+    function stopped(): void {
+      cleanup();
+      reject(new Error(`Bridge stopped before request ${id} matched: ${JSON.stringify(frames.slice(-12).map((frame) => ({ id: frame.id, event: frame.event })))}\n${errors}`));
+    }
+    function check(): void {
+      const frame = frames.find((frame) => frame.id === id && predicate(frame.event));
+      if (frame === undefined) return;
+      cleanup(); resolve(frame.event);
+    }
+    changes.add(check); t.signal.addEventListener("abort", stopped, { once: true }); child.once("close", stopped);
+    if (t.signal.aborted || child.exitCode !== null || child.signalCode !== null) stopped(); else check();
   });
   const done = (id: number) => wait(id, (event) => event.type === "done");
   const events = (id: number) => frames.filter((frame) => frame.id === id).map((frame) => frame.event);

@@ -118,9 +118,18 @@
     });
     devShells = eachSystem (system: let
       pkgs = import nixpkgs {inherit system;};
+      browserLibraries = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (with pkgs; [
+        glib nspr nss at-spi2-core dbus cups expat libxcb libxkbcommon
+        alsa-lib libdrm libgbm cairo pango systemdLibs fontconfig freetype stdenv.cc.cc.lib
+        libx11 libxext libxcomposite libxdamage libxfixes libxrandr
+      ]);
       tools = {
-        packages = with pkgs; [cargo rustc rustfmt clippy nodejs_26 pkg-config git lsof actionlint unzip wrangler];
+        packages = with pkgs; [cargo rustc rustfmt clippy nodejs_26 pkg-config git lsof actionlint unzip wrangler]
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.procps];
         AGENT_SQLITE_VEC = "${pkgs.sqlite-vec}/lib/vec0${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
+        shellHook = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+          export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath browserLibraries}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        '';
       };
     in {
       default = pkgs.mkShell (tools

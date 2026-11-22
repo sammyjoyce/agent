@@ -206,3 +206,53 @@ test("the task graph shows sleeping, blocked and background work, keeps an idle 
       "An oversized snapshot must fail its own request, not overflow the runtime frame");
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
+
+test("bridge rejects an oversized task-graph request without breaking subsequent commands", { timeout: 30_000 }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-task-graph-bridge-"));
+  const oversized = await open(directory);
+  const abort = async () => {};
+  const held = defineTask<null, { phase: "run" }, null>({ name: "fixture.held", version: 1, initial: () => ({ phase: "run" }), abort,
+    phases: { run: async () => new Promise<never>(() => {}) } });
+  oversized.registry.install({ name: "fixture", tasks: [held] });
+  try {
+    const verbose = await oversized.tasks.create({ title: "Oversized title ".repeat(TASK_GRAPH_BYTE_LIMIT / 14), outcome: "Overflow graph snapshot" });
+    const conversation = await oversized.tasks.conversation(verbose.conversation_id);
+    await oversized.session.commit((tx) => tx.createTask(held, null, { ownership: { kind: "conversation" }, conversationId: conversation.id }), BACKGROUND_CONTEXT);
+  } finally { await oversized.session.close(BACKGROUND_CONTEXT); }
+
+  const child = spawn(process.execPath, ["--no-warnings", fileURLToPath(new URL("../src/bridge.js", import.meta.url)), directory],
+    { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, OPENAI_API_KEY: "" } });
+  const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+  const lines = createInterface({ input: child.stdout });
+  const frames: RuntimeEvent[] = []; const listeners = new Set<() => void>(); let errors = "";
+  child.stderr.setEncoding("utf8").on("data", (chunk: string) => { errors += chunk; });
+  lines.on("line", (line) => {
+    const frame: unknown = JSON.parse(line); assert.ok(validEvent(frame)); frames.push(frame);
+    for (const notify of listeners) notify();
+  });
+  const send = (id: number, command: RuntimeCommand) => child.stdin.write(JSON.stringify({ version: 1, id, command }) + "\n");
+  const collect = (id: number): Promise<RuntimeEventKind[]> => new Promise((resolve, reject) => {
+    function cleanup(): void { listeners.delete(check); t.signal.removeEventListener("abort", aborted); child.off("close", aborted); }
+    function aborted(): void { cleanup(); reject(new Error("Bridge ended before request " + id + ": " + errors)); }
+    function check(): void {
+      const own = frames.filter((frame) => frame.id === id).map((frame) => frame.event);
+      if (!own.some((event) => event.type === "done")) return;
+      cleanup(); resolve(own);
+    }
+    listeners.add(check); t.signal.addEventListener("abort", aborted, { once: true }); child.once("close", aborted);
+    if (t.signal.aborted || child.exitCode !== null || child.signalCode !== null) aborted(); else check();
+  });
+  try {
+    send(1, { type: "read_task_graph" });
+    const oversizedReply = await collect(1);
+    assert.deepEqual(oversizedReply.map((event) => event.type), ["failure", "done"]);
+    const failure = oversizedReply[0];
+    assert.ok(failure?.type === "failure");
+    assert.equal(failure.code, "invalid_request");
+    assert.match(failure.message, /task graph is too large to send/u);
+
+    send(2, { type: "list_tasks" });
+    const followUp = await collect(2);
+    assert.deepEqual(followUp.map((event) => event.type), ["tasks", "done"]);
+  } finally { lines.close(); child.stdin.end(); child.kill("SIGKILL"); await closed; await rm(directory, { recursive: true, force: true }); }
+});

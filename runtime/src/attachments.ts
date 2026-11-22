@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { open, readFile, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { InputEntry, UserInput } from "@earendil-works/pi-durable";
-import { DEFAULT_IMAGE_LIMITS } from "@earendil-works/pi-durable/tools";
+import { DEFAULT_IMAGE_LIMITS, type ImageLimits } from "@earendil-works/pi-durable/tools";
 import type { InputOrigin } from "./generated/InputOrigin.js";
 import type { AttachmentRef } from "./generated/AttachmentRef.js";
 import type { AttachmentRequest } from "./generated/AttachmentRequest.js";
@@ -223,7 +223,7 @@ export class AttachmentStore {
     }
     throw new AttachmentError("Attachment transfer did not complete");
   }
-  async input(text: string, refs: readonly AttachmentRef[] | undefined, call: HostCall, origin?: InputOrigin): Promise<{ content: UserInput; entry?: InputEntry }> {
+  async input(text: string, refs: readonly AttachmentRef[] | undefined, call: HostCall, origin?: InputOrigin, limits: ImageLimits = DEFAULT_IMAGE_LIMITS): Promise<{ content: UserInput; entry?: InputEntry }> {
     if (refs === undefined || refs.length === 0) return { content: text, ...(origin === undefined ? {} : {
       entry: { kind: "agent.input", data: { origin, text } },
     }) };
@@ -232,7 +232,7 @@ export class AttachmentStore {
       const path = await this.materialize(ref, call);
       content.push({ type: "text", text: `Attached file ${JSON.stringify(ref.name)} (attachment ID ${ref.id}, SHA-256 ${ref.sha256}): ${JSON.stringify(path)} on this execution host. If the cache path expires, use read_attachment with this attachment ID.` });
       if (ref.media_type.startsWith("image/")) {
-        const prepared = await prepareImage(await readFile(join(this.folder(ref.id), "content")), ref.media_type, DEFAULT_IMAGE_LIMITS);
+        const prepared = await prepareImage(await readFile(join(this.folder(ref.id), "content")), ref.media_type, limits);
         if (prepared === undefined) {
           if (["image/png", "image/jpeg", "image/gif", "image/webp"].includes(ref.media_type)) throw new AttachmentError("This image could not be prepared for the model; convert it to PNG or JPEG");
           content.push({ type: "text", text: `The original ${ref.media_type} file is available at the attachment path above; native image conversion was unavailable. Use file tools to inspect or convert the original.` });

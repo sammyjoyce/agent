@@ -408,7 +408,8 @@ function submitInput(id: number, command: Extract<RuntimeCommand, { type: "submi
         interrupts.delete(id); interrupted.delete(id); hostRequests.resumeRequest(id);
       }
       const application = await app();
-      const prepared = await application.attachments.input(command.input, command.attachments, application.executions.get(main.conversation.id.toString()).call, command.origin);
+      const prepared = await application.attachments.input(command.input, command.attachments, application.executions.get(main.conversation.id.toString()).call, command.origin,
+        application.tasks.inference.imageLimits(application.executions.model(main.conversation.id.toString())));
       const conversation = main.conversation;
       const submission = await application.attachments.admit(command.attachments, () => {
         if (!main.accepting || interrupted.has(id) || interrupts.get(id) !== undefined) return undefined;
@@ -902,7 +903,8 @@ async function handle(request: RuntimeRequest): Promise<void> {
             await retainMainInputs(harness, root, turn);
             let submission = reclaimedInput;
             if (submission === undefined) {
-              const prepared = await application.attachments.input(command.input, command.attachments, executions.get(root.id.toString()).call, command.origin);
+              const prepared = await application.attachments.input(command.input, command.attachments, executions.get(root.id.toString()).call, command.origin,
+                application.tasks.inference.imageLimits(selected));
               submission = await application.attachments.admit(command.attachments, () => {
                 if (interrupted.has(id)) return undefined;
                 submissionAttempted = true;
