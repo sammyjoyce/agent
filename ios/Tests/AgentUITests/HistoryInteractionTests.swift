@@ -742,6 +742,87 @@ final class ComposerInteractionTests: XCTestCase {
     try await assertTheFeedHoldsTheNewestReply(
       newest, after: "The picker after new replies", above: picker)
   }
+
+  func testSimulatorScopeSwitchingJobsNavigationAndLiveShellAnchoringDuringStream() async throws {
+    let shellOutput = "Live stream shell output stays readable"
+    let details = ToolDetails.available(
+      .init(
+        callId: "anchor-shell",
+        input: .text(.init(text: #"{"program":"printf","args":["anchor"]}"#, truncated: false)),
+        name: "exec",
+        output: .text(
+          .init(
+            text:
+              #"{"type":"process","exit_code":0,"stdout":"Live stream shell output stays readable","stderr":"","truncated":false}"#,
+            truncated: false)),
+        status: .finished))
+    var workHistory = (1...6).map { index in
+      HistoryMessage(
+        continuation: false, entryId: "w-\(index)", finalChunk: true, role: .final,
+        text: "Work entry \(index)")
+    }
+    workHistory.insert(
+      HistoryMessage(
+        continuation: false, entryId: "w-shell", finalChunk: true,
+        presentation: .command(.init(command: "printf anchor", durationMs: 3, exitCode: 0)),
+        role: .tool, text: shellOutput,
+        tool: .init(callId: "anchor-shell", name: "exec", status: .finished)),
+      at: 0)
+    workHistory.insert(
+      HistoryMessage(
+        continuation: false, entryId: "w-neighbor", finalChunk: true,
+        presentation: .command(.init(command: "echo neighbor", durationMs: 2, exitCode: 0)),
+        role: .tool, text: "Neighbor output",
+        tool: .init(callId: "neighbor-tool", name: "exec", status: .finished)),
+      at: 1)
+    let (app, work, _) = try await launchWithWorkAndPersonal(workHistory: workHistory)
+    await work.toolDetails(["anchor-shell": details])
+    defer { app.terminate() }
+
+    let scopeMenu = app.buttons["All coordinators"]
+    XCTAssertTrue(scopeMenu.waitForExistence(timeout: 5), app.debugDescription)
+    scopeMenu.tap()
+    let workOption = app.buttons["Work"]
+    XCTAssertTrue(workOption.waitForExistence(timeout: 5), app.debugDescription)
+    workOption.tap()
+    await work.serve(jobs: [])
+    app.buttons["Connection"].tap()
+    XCTAssertTrue(app.navigationBars["Connection"].waitForExistence(timeout: 5))
+    app.buttons["dismissConnection"].tap()
+
+    let transcript = app.scrollViews["transcript"]
+    transcript.swipeDown()
+    let shellGroup = app.buttons.matching(
+      NSPredicate(
+        format: "identifier BEGINSWITH 'activity:' AND identifier ENDSWITH '/tool:anchor-shell'")
+    ).firstMatch
+    XCTAssertTrue(shellGroup.waitForExistence(timeout: 5))
+    shellGroup.tap()
+    let shellItem = app.buttons.matching(
+      NSPredicate(
+        format:
+          "identifier BEGINSWITH 'activity-item:' AND identifier ENDSWITH '/tool:anchor-shell'")
+    ).firstMatch
+    XCTAssertTrue(shellItem.waitForExistence(timeout: 3))
+    shellItem.tap()
+    let textEl = app.staticTexts[shellOutput]
+    XCTAssertTrue(textEl.waitForExistence(timeout: 5))
+    let anchoredY = textEl.frame.minY
+    try await work.beginReply("Rapid trailing token update. ")
+    let streamingCheckDeadline = ContinuousClock.now + .seconds(3)
+    while !app.staticTexts["Rapid trailing token update. "].exists
+      && ContinuousClock.now < streamingCheckDeadline
+    {
+      try await Task.sleep(for: .milliseconds(25))
+    }
+    XCTAssertLessThanOrEqual(abs(textEl.frame.minY - anchoredY), 2.0)
+    let composer = app.descendants(matching: .any).matching(identifier: "Message the coordinator")
+      .firstMatch
+    composer.tap()
+    XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
+    transcript.swipeDown()
+    XCTAssertTrue(textEl.exists)
+  }
 }
 
 @MainActor
@@ -904,13 +985,16 @@ final class HistoryInteractionTests: XCTestCase {
   private func launchMessages(
     _ messages: [HistoryMessage], toolDetails: [String: ToolDetails] = [:],
     appearance: String? = nil, commands: [SlashCommand] = [],
-    peer: InteractionPeer = InteractionPeer()
+    peer: InteractionPeer = InteractionPeer(),
+    preserveHistory: Bool = false
   ) async throws -> XCUIApplication {
     continueAfterFailure = false
     executionTimeAllowance = 600
     addTeardownBlock { await peer.stop() }
-    let history = NativeEventHistory(messages: messages, nextCursor: nil, pageComplete: true)
-    await peer.history(initial: history, pages: [:], latest: history)
+    if !preserveHistory {
+      let history = NativeEventHistory(messages: messages, nextCursor: nil, pageComplete: true)
+      await peer.history(initial: history, pages: [:], latest: history)
+    }
     await peer.toolDetails(toolDetails)
     await peer.commands(commands)
     let app = XCUIApplication()
@@ -2386,6 +2470,326 @@ final class HistoryInteractionTests: XCTestCase {
     tail.name = "latest-reloads-current-conversation"
     tail.lifetime = .keepAlways
     add(tail)
+  }
+
+  func testConsecutiveBoldReasoningSummariesRenderWithoutDelimiters() async throws {
+    let app = try await launchMessages([
+      .init(
+        continuation: false, entryId: "thinking-merge", finalChunk: true, role: .thinking,
+        text: "**Inspecting report status****Reviewing message text**"),
+      .init(
+        continuation: false, entryId: "tool-1", finalChunk: true,
+        presentation: .command(.init(command: "echo ok", durationMs: 4, exitCode: 0)),
+        role: .tool, text: "ok", tool: .init(callId: "c1", name: "exec", status: .finished)),
+    ])
+    let group = feedButton("activity", row: "entry:thinking-merge:0", app: app)
+    XCTAssertTrue(group.waitForExistence(timeout: 5), app.debugDescription)
+    group.tap()
+    XCTAssertTrue(app.staticTexts["Inspecting report status"].waitForExistence(timeout: 3))
+    XCTAssertTrue(app.staticTexts["Reviewing message text"].exists)
+    XCTAssertEqual(
+      app.staticTexts.matching(NSPredicate(format: "label CONTAINS '****'")).count, 0)
+  }
+
+  func testReconnectRetainsAllReasoningSummariesAndOpenShellCardPosition() async throws {
+    struct Output: Encodable {
+      let type = "process"
+      let exitCode = 0
+      enum CodingKeys: String, CodingKey {
+        case type, stdout, stderr, truncated
+        case exitCode = "exit_code"
+      }
+      let stdout = "Shell card stays anchored during reconnect"
+      let stderr = ""
+      let truncated = false
+    }
+    let output = Output()
+    let details = ToolDetails.available(
+      .init(
+        callId: "c5",
+        input: .text(.init(text: #"{"program":"printf","args":["anchored"]}"#, truncated: false)),
+        name: "exec",
+        output: .text(
+          .init(
+            text: String(decoding: try JSONEncoder().encode(output), as: UTF8.self),
+            truncated: false)),
+        status: .finished))
+    let peer = InteractionPeer()
+    let initialWithEarlierPage = NativeEventHistory(
+      messages: [
+        .init(
+          continuation: false, entryId: "100", finalChunk: true, role: .final, text: "Earlier setup"
+        )
+      ], nextCursor: "99", pageComplete: true)
+    await peer.history(initial: initialWithEarlierPage, pages: [:], latest: initialWithEarlierPage)
+    let app = try await launchMessages(
+      [], toolDetails: ["c5": details], peer: peer, preserveHistory: true)
+    try await eventually { await peer.observationCount() > 0 }
+
+    let steps = [
+      ("Summary 1", "c1", "101", "102"),
+      ("Summary 2", "c2", "103", "104"),
+      ("Summary 3", "c3", "120", "121"),
+      ("Summary 4", "c4", "124", "125"),
+    ]
+    for (summary, callID, assistantID, resultID) in steps {
+      try await peer.publish(.activity(.init(activity: .thinking(.init(text: "**\(summary)**")))))
+      try await peer.publish(
+        .activity(.init(activity: .toolStarted(.init(callId: callID, name: "exec")))))
+      try await peer.publish(
+        .message(
+          .init(
+            message: .init(
+              continuation: false, entryId: assistantID, finalChunk: true, role: .tool, text: "",
+              tool: .init(callId: callID, name: "exec", status: .running)))))
+      try await peer.publish(
+        .message(
+          .init(
+            message: .init(
+              continuation: false, entryId: resultID, finalChunk: true, role: .tool,
+              text: "Output \(callID)",
+              tool: .init(callId: callID, name: "exec", status: .finished)))))
+    }
+    try await peer.publish(
+      .activity(.init(activity: .toolStarted(.init(callId: "c5", name: "exec")))))
+    try await peer.publish(
+      .message(
+        .init(
+          message: .init(
+            continuation: false, entryId: "126", finalChunk: true, role: .tool, text: "",
+            tool: .init(callId: "c5", name: "exec", status: .running)))))
+    try await peer.publish(
+      .message(
+        .init(
+          message: .init(
+            continuation: false, entryId: "127", finalChunk: true,
+            presentation: .command(.init(command: "printf anchored", durationMs: 8, exitCode: 0)),
+            role: .tool, text: output.stdout,
+            tool: .init(callId: "c5", name: "exec", status: .finished)))))
+    try await peer.publish(.idle)
+
+    let groupPredicate = NSPredicate(
+      format: "identifier BEGINSWITH 'activity:' AND label CONTAINS '5 tool calls'")
+    let group = app.buttons.matching(groupPredicate).firstMatch
+    XCTAssertTrue(group.waitForExistence(timeout: 5), app.debugDescription)
+    XCTAssertTrue(group.label.contains("4 summaries"), group.label)
+    group.tap()
+
+    let shellRow = feedButton("activity-item", row: "tool:c5", app: app)
+    XCTAssertTrue(shellRow.waitForExistence(timeout: 3))
+    shellRow.tap()
+    XCTAssertTrue(app.staticTexts["Success"].waitForExistence(timeout: 5))
+    let shellText = app.staticTexts[output.stdout]
+    XCTAssertTrue(shellText.waitForExistence(timeout: 5))
+    let transcript = app.scrollViews["transcript"]
+    let topEdge = max(transcript.frame.minY, app.navigationBars.firstMatch.frame.maxY)
+    let beforeY = shellText.frame.minY
+    let beforeRelativeY = shellText.frame.minY - topEdge
+
+    let boundedPage = NativeEventHistory(
+      messages: [
+        .init(
+          continuation: false, entryId: "120", finalChunk: true, role: .thinking,
+          text: "**Summary 3**"),
+        .init(
+          continuation: false, entryId: "121", finalChunk: true, role: .tool, text: "Output c3",
+          tool: .init(callId: "c3", name: "exec", status: .finished)),
+        .init(
+          continuation: false, entryId: "124", finalChunk: true, role: .thinking,
+          text: "**Summary 4**"),
+        .init(
+          continuation: false, entryId: "125", finalChunk: true, role: .tool, text: "Output c4",
+          tool: .init(callId: "c4", name: "exec", status: .finished)),
+        .init(
+          continuation: false, entryId: "127", finalChunk: true,
+          presentation: .command(.init(command: "printf anchored", durationMs: 8, exitCode: 0)),
+          role: .tool, text: output.stdout,
+          tool: .init(callId: "c5", name: "exec", status: .finished)),
+      ], nextCursor: "119", pageComplete: true)
+    await peer.updateHistory(initial: boundedPage, latest: boundedPage)
+    await peer.holdObservations()
+    await peer.dropObserver()
+
+    try await eventually(description: "reconnecting banner appears") {
+      app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] 'connecting'")).firstMatch
+        .exists
+    }
+    XCTAssertTrue(group.label.contains("4 summaries"), "During Connecting: \(group.label)")
+    let duringTopEdge = max(transcript.frame.minY, app.navigationBars.firstMatch.frame.maxY)
+    let duringRelativeY = shellText.frame.minY - duringTopEdge
+    XCTAssertLessThanOrEqual(
+      abs(duringRelativeY - beforeRelativeY), 2.0,
+      "beforeY=\(beforeY) topEdge=\(topEdge) duringY=\(shellText.frame.minY) duringTop=\(duringTopEdge)"
+    )
+
+    await peer.releaseObservations()
+    try await eventually(description: "reconnection finishes and reconnecting banner clears") {
+      let count = await peer.observationCount()
+      let banner = app.staticTexts.matching(
+        NSPredicate(format: "label CONTAINS[c] 'connecting'")
+      ).firstMatch
+      return count >= 2 && !banner.exists
+    }
+    XCTAssertTrue(group.label.contains("5 tool calls"), group.label)
+    XCTAssertTrue(group.label.contains("4 summaries"), group.label)
+    XCTAssertLessThanOrEqual(abs(shellText.frame.minY - beforeY), 2.0)
+  }
+
+  func testExpandingLiveActivityGroupAtTailKeepsWorkingVisibleAboveComposer() async throws {
+    let initial = (1...12).map { index in
+      HistoryMessage(
+        continuation: false, entryId: "msg-\(index)", finalChunk: true, role: .final,
+        text: "Earlier response number \(index) fills the transcript above the active tail.")
+    }
+    let peer = InteractionPeer()
+    let app = try await launchMessages(initial, peer: peer)
+    try await eventually { await peer.observationCount() > 0 }
+
+    try await peer.publish(
+      .ready(.init(conversationId: "fixture-root", model: "fixture/model", working: true)))
+    try await peer.publish(.activity(.init(activity: .thinking(.init(text: "**Live tail step**")))))
+    try await peer.publish(
+      .activity(.init(activity: .toolStarted(.init(callId: "live-1", name: "exec")))))
+    try await peer.publish(
+      .message(
+        .init(
+          message: .init(
+            continuation: false, entryId: "200", finalChunk: true, role: .tool, text: "",
+            tool: .init(callId: "live-1", name: "exec", status: .running)))))
+
+    let working = app.staticTexts["Beep Boop is working"]
+    XCTAssertTrue(working.waitForExistence(timeout: 5))
+    let group = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'activity:'"))
+      .firstMatch
+    XCTAssertTrue(group.waitForExistence(timeout: 5))
+    group.tap()
+
+    try await peer.publish(
+      .activity(.init(activity: .toolStarted(.init(callId: "live-2", name: "exec")))))
+    try await peer.publish(
+      .message(
+        .init(
+          message: .init(
+            continuation: false, entryId: "201", finalChunk: true, role: .tool, text: "",
+            tool: .init(callId: "live-2", name: "exec", status: .running)))))
+
+    let composer = app.descendants(matching: .any).matching(identifier: "messageComposer")
+      .firstMatch
+    let expandedItem = app.buttons.matching(
+      NSPredicate(format: "identifier BEGINSWITH 'activity-item:'")
+    ).firstMatch
+    XCTAssertTrue(expandedItem.waitForExistence(timeout: 5))
+    try await eventually(description: "Working indicator remains visible above composer") {
+      guard working.exists else { return false }
+      return working.frame.maxY <= composer.frame.minY + 1
+    }
+    let latest = app.buttons["latest-messages"]
+    XCTAssertFalse(latest.exists, "Expanding a live tail group should keep following the tail")
+  }
+
+  func testLatestButtonDoesNotOverlapShellOutputOrDisclosureControls() async throws {
+    struct Output: Encodable {
+      let type = "process"
+      let exitCode = 0
+      enum CodingKeys: String, CodingKey {
+        case type, stdout, stderr, truncated
+        case exitCode = "exit_code"
+      }
+      let stdout = "Line one of shell output\nLine two of shell output"
+      let stderr = ""
+      let truncated = false
+    }
+    let output = Output()
+    let details = ToolDetails.available(
+      .init(
+        callId: "shell-overlap",
+        input: .text(.init(text: #"{"program":"printf","args":["test"]}"#, truncated: false)),
+        name: "exec",
+        output: .text(
+          .init(
+            text: String(decoding: try JSONEncoder().encode(output), as: UTF8.self),
+            truncated: false)),
+        status: .finished))
+    var messages = [
+      HistoryMessage(
+        continuation: false, entryId: "e-shell", finalChunk: true,
+        presentation: .command(.init(command: "printf test", durationMs: 5, exitCode: 0)),
+        role: .tool, text: output.stdout,
+        tool: .init(callId: "shell-overlap", name: "exec", status: .finished)),
+      HistoryMessage(
+        continuation: false, entryId: "e-between", finalChunk: true, role: .final,
+        text: "Separator between shell card and collapsed disclosure group."),
+      HistoryMessage(
+        continuation: false, entryId: "e-collapsed", finalChunk: true,
+        presentation: .command(.init(command: "echo collapsed", durationMs: 2, exitCode: 0)),
+        role: .tool, text: "done",
+        tool: .init(callId: "collapsed-call", name: "exec", status: .finished)),
+    ]
+    for index in 1...14 {
+      messages.append(
+        HistoryMessage(
+          continuation: false, entryId: "tail-\(index)", finalChunk: true, role: .final,
+          text: "Tail filler message \(index) that scrolls the shell card up off the bottom."))
+    }
+    let app = try await launchMessages(messages, toolDetails: ["shell-overlap": details])
+    let transcript = app.scrollViews["transcript"]
+    XCTAssertTrue(transcript.waitForExistence(timeout: 5))
+    for _ in 0..<6
+    where !app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'activity:'")).firstMatch
+      .exists
+    {
+      transcript.swipeDown()
+    }
+    let firstGroup = feedButton("activity", row: "tool:shell-overlap", app: app)
+    XCTAssertTrue(firstGroup.waitForExistence(timeout: 5))
+    firstGroup.tap()
+    let shellItem = feedButton("activity-item", row: "tool:shell-overlap", app: app)
+    XCTAssertTrue(shellItem.waitForExistence(timeout: 3))
+    shellItem.tap()
+    let shellText = app.staticTexts[output.stdout]
+    XCTAssertTrue(shellText.waitForExistence(timeout: 5))
+    let latest = app.buttons["latest-messages"]
+    XCTAssertTrue(latest.waitForExistence(timeout: 5))
+    XCTAssertFalse(latest.frame.intersects(shellText.frame), "Latest pill overlapped shell output")
+    let collapsedGroup = feedButton("activity", row: "tool:collapsed-call", app: app)
+    XCTAssertTrue(collapsedGroup.waitForExistence(timeout: 5), app.debugDescription)
+    XCTAssertFalse(
+      latest.frame.intersects(collapsedGroup.frame), "Latest pill overlapped disclosure row")
+  }
+
+  func testConnectionBannersStayClearOfScrolledTranscriptTopLine() async throws {
+    let messages = (1...24).map { index in
+      HistoryMessage(
+        continuation: false, entryId: "banner-\(index)", finalChunk: true, role: .final,
+        text: "Scrolled transcript entry \(index) used to verify banner separation cleanly.")
+    }
+    let peer = InteractionPeer()
+    let app = try await launchMessages(messages, peer: peer)
+    let transcript = app.scrollViews["transcript"]
+    XCTAssertTrue(transcript.waitForExistence(timeout: 5))
+    transcript.swipeDown()
+    await peer.holdObservations()
+    await peer.dropObserver()
+    let banner = app.otherElements["connectionStatusBanner"]
+    let bannerText = app.staticTexts.matching(
+      NSPredicate(format: "label CONTAINS[c] 'connecting' OR label CONTAINS[c] 'disconnected'")
+    ).firstMatch
+    XCTAssertTrue(bannerText.waitForExistence(timeout: 5))
+    let bannerFrame = banner.exists ? banner.frame : bannerText.frame
+    let transcriptFrame = transcript.frame
+    XCTAssertGreaterThanOrEqual(transcriptFrame.minY, bannerFrame.maxY - 1)
+    let completelyVisibleTop = app.staticTexts.matching(
+      NSPredicate(format: "label BEGINSWITH 'Scrolled transcript entry '")
+    ).allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame).filter {
+      !$0.isEmpty && $0.minY >= transcriptFrame.minY - 1
+    }.min { $0.minY < $1.minY }
+    let topRow = try XCTUnwrap(
+      completelyVisibleTop,
+      "Expected at least one completely visible transcript row below banner")
+    XCTAssertGreaterThanOrEqual(
+      topRow.minY, bannerFrame.maxY - 1,
+      "Top visible transcript row \(topRow) collided with banner \(bannerFrame)")
+    await peer.releaseObservations()
   }
 }
 

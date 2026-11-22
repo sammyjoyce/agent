@@ -14,6 +14,93 @@ public enum RichBlock: Sendable, Equatable {
 
 /// Foundation owns Markdown syntax; the session actor owns ordered snapshots.
 public enum RichText {
+  /// Separates adjacent bolded reasoning headings (`**First****Second**` ->
+  /// `**First**\n\n**Second**`) while preserving inline bold, code spans, fences,
+  /// and standalone thematic breaks.
+  public static func separateReasoningSummaries(_ text: String) -> String {
+    guard text.contains("****") else { return text }
+    var output = ""
+    output.reserveCapacity(text.utf8.count + 16)
+    let scalars = Array(text.unicodeScalars)
+    let count = scalars.count
+    var index = 0
+    var inlineBackticks = 0
+    var fenceBackticks = 0
+    var lineStart = true
+
+    while index < count {
+      let scalar = scalars[index]
+      if fenceBackticks > 0 {
+        if lineStart {
+          var spaces = index
+          while spaces < count && scalars[spaces] == " " { spaces += 1 }
+          var ticks = spaces
+          while ticks < count && scalars[ticks] == "`" { ticks += 1 }
+          if ticks - spaces >= fenceBackticks {
+            var tail = ticks
+            while tail < count && (scalars[tail] == " " || scalars[tail] == "\t") { tail += 1 }
+            if tail == count || scalars[tail] == "\n" { fenceBackticks = 0 }
+          }
+        }
+        output.unicodeScalars.append(scalar)
+        lineStart = scalar == "\n"
+        index += 1
+        continue
+      }
+
+      if scalar == "`" {
+        var end = index
+        while end < count && scalars[end] == "`" { end += 1 }
+        let run = end - index
+        if inlineBackticks == 0 {
+          if lineStart && run >= 3 {
+            var cursor = end
+            var hasBacktick = false
+            while cursor < count && scalars[cursor] != "\n" {
+              if scalars[cursor] == "`" { hasBacktick = true }
+              cursor += 1
+            }
+            if !hasBacktick { fenceBackticks = run }
+          } else {
+            inlineBackticks = run
+          }
+        } else if run == inlineBackticks {
+          inlineBackticks = 0
+        }
+        for cursor in index..<end { output.unicodeScalars.append(scalars[cursor]) }
+        lineStart = false
+        index = end
+        continue
+      }
+
+      if inlineBackticks == 0 && scalar == "*" {
+        var end = index
+        while end < count && scalars[end] == "*" { end += 1 }
+        if end - index == 4, index > 0, end < count {
+          let before = scalars[index - 1]
+          let after = scalars[end]
+          let wordBefore = !CharacterSet.whitespacesAndNewlines.contains(before) && before != "*"
+          let wordAfter = !CharacterSet.whitespacesAndNewlines.contains(after) && after != "*"
+          if wordBefore && wordAfter {
+            output.append("**\n\n**")
+            lineStart = false
+            index = end
+            continue
+          }
+        }
+        for cursor in index..<end { output.unicodeScalars.append(scalars[cursor]) }
+        lineStart = false
+        index = end
+        continue
+      }
+
+      output.unicodeScalars.append(scalar)
+      lineStart = scalar == "\n"
+      index += 1
+    }
+    return output
+  }
+
   static func prepare(_ texts: [String]) -> [[RichBlock]] {
     guard texts.count > 1 else { return texts.map(parse) }
     let workers = min(4, ProcessInfo.processInfo.activeProcessorCount, texts.count)

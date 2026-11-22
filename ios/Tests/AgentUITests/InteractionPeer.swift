@@ -41,6 +41,8 @@ actor InteractionPeer {
   private var requests: [String] = []
   private var held: Set<String> = []
   private var releases: [String: CheckedContinuation<Void, Never>] = [:]
+  private var holdingObservations = false
+  private var heldObservations: [CheckedContinuation<Void, Never>] = []
   private var rejecting = false
   private var announced: [SlashCommand] = []
   private var origins: [String]?
@@ -87,6 +89,20 @@ actor InteractionPeer {
   func announce(_ commands: [SlashCommand]) { announced = commands }
   /// Closes the app's observation, as a dropped network does.
   func dropObserver() { observer?.cancel() }
+  func holdObservations() { holdingObservations = true }
+  func releaseObservations() {
+    holdingObservations = false
+    for continuation in heldObservations { continuation.resume() }
+    heldObservations = []
+  }
+  func setWorking(_ value: Bool) { working = value }
+  func updateHistory(initial: NativeEventHistory, latest: NativeEventHistory) {
+    self.initial = initial
+    self.latest = latest
+  }
+  func publish(_ event: NativeEvent) async throws {
+    try await emit(event, to: XCTUnwrap(observer))
+  }
   func placeLastSubmit() async throws {
     let input = try XCTUnwrap(submitted.last)
     try await emit(
@@ -128,6 +144,7 @@ actor InteractionPeer {
   func stop() {
     for continuation in releases.values { continuation.resume() }
     releases = [:]
+    releaseObservations()
     releaseSubmits()
     listener?.cancel()
     listener = nil
@@ -153,6 +170,7 @@ actor InteractionPeer {
       switch request {
       case .observe(let observe):
         observations += 1
+        if holdingObservations { await withCheckedContinuation { heldObservations.append($0) } }
         observer = socket
         if !announced.isEmpty {
           try await emit(.commands(.init(commands: announced)), to: socket)

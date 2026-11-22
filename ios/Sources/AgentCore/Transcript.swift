@@ -1,5 +1,21 @@
 import Foundation
 
+extension HistoryRole {
+  var isAssistantText: Bool {
+    switch self {
+    case .assistant, .final, .partialAnswer, .commentary: true
+    case .user, .notice, .thinking, .tool: false
+    }
+  }
+
+  var carriesAnswer: Bool {
+    switch self {
+    case .assistant, .final, .commentary: true
+    case .thinking, .tool, .user, .notice, .partialAnswer: false
+    }
+  }
+}
+
 public enum Delivery: String, Sendable, Equatable {
   case sending = "Sending"
   // A coordinator receipt, never merely a local outbox write.
@@ -138,8 +154,9 @@ struct Transcript: Sendable {
     }
     finishResponse()
     thinkingID = nil
-    storage.removeAll { $0.id.hasPrefix("thinking:") }
-    dirtyRows = dirtyRows.filter { !$0.hasPrefix("thinking:") }
+    storage.removeAll { $0.id.hasPrefix("thinking:") && $0.entryID == nil }
+    let remaining = Set(storage.map(\.id))
+    dirtyRows.formIntersection(remaining)
   }
   mutating func pending(_ request: NativeRequestSubmit, delivery: Delivery) {
     if storage.contains(where: { $0.inputID == request.inputId }) {
@@ -239,15 +256,33 @@ struct Transcript: Sendable {
     let loadedIDs = Set(loaded.storage.compactMap(\.entryID))
     historicalEntries.formUnion(loadedIDs)
     dirtyRows.formUnion(loaded.dirtyRows)
-    // Reuse a correlated input's stable row identity at its canonical position.
-    // Multiple user blocks can belong to one entry; only one inherits the input ID.
+    // Reuse a correlated input's or live thinking row's stable row identity at its canonical position.
+    // Multiple user/thinking blocks can belong to one entry; only one inherits each existing ID.
     var correlatedInputs: Set<String> = []
+    var correlatedThinking: Set<String> = []
     let incoming = loaded.storage.map { row in
       if row.role == .user,
         let input = storage.first(where: { $0.inputID != nil && $0.entryID == row.entryID }),
         correlatedInputs.insert(input.id).inserted
       {
         return input
+      }
+      if row.role == .thinking,
+        let existing = storage.first(where: {
+          $0.role == .thinking && $0.entryID == row.entryID
+            && !correlatedThinking.contains($0.id)
+        }),
+        correlatedThinking.insert(existing.id).inserted
+      {
+        var updated = existing
+        updated.entryID = row.entryID
+        updated.positionID = row.positionID ?? existing.positionID
+        if updated.text != row.text || updated.blocks.isEmpty {
+          updated.text = row.text
+          updated.blocks = []
+          dirtyRows.insert(updated.id)
+        }
+        return updated
       }
       // Calls and results have different entry IDs but share one tool row ID.
       // An older call must not replace its newer result or duplicate that row.
@@ -378,7 +413,10 @@ struct Transcript: Sendable {
       }
       )
     {
-      storage[index].text = boundedText(storage[index].text + message.text)
+      let combined = storage[index].text + message.text
+      let normalized =
+        message.role == .thinking ? RichText.separateReasoningSummaries(combined) : combined
+      storage[index].text = boundedText(normalized)
       storage[index].presentation = message.presentation ?? storage[index].presentation
       storage[index].noticeOrigin = message.noticeOrigin ?? storage[index].noticeOrigin
       storage[index].noticeDetails = message.noticeDetails ?? storage[index].noticeDetails
@@ -390,14 +428,24 @@ struct Transcript: Sendable {
     } else {
       let segment = segmentCounts[message.entryId, default: 0]
       segmentCounts[message.entryId] = segment + 1
+      let body =
+        message.role == .thinking
+        ? RichText.separateReasoningSummaries(message.text) : message.text
       append(
         ChatRow(
           id: "entry:\(message.entryId):\(segment)", entryID: message.entryId, role: message.role,
-          text: boundedText(message.text), presentation: message.presentation,
+          text: boundedText(body), presentation: message.presentation,
           attachments: message.attachments ?? [], noticeOrigin: message.noticeOrigin,
           noticeDetails: message.noticeDetails))
     }
-    if !historical { bound() }
+    if !historical {
+      if message.role.isAssistantText
+        || (message.role == .tool && message.tool?.status == .running)
+      {
+        bindPendingThinking(to: message.entryId)
+      }
+      bound()
+    }
   }
   mutating func answer(_ answer: NativeEventAnswer) {
     finishResponse()
@@ -412,8 +460,25 @@ struct Transcript: Sendable {
       ChatRow(
         id: "entry:\(entry):\(segment)", entryID: answer.entryId, role: .final,
         text: boundedText(answer.text)))
+    if let entryId = answer.entryId {
+      bindPendingThinking(to: entryId)
+    }
     thinkingID = nil
     bound()
+  }
+  private mutating func bindPendingThinking(to entryID: String) {
+    for index in storage.indices.reversed() {
+      let row = storage[index]
+      if row.role == .thinking {
+        if row.entryID == nil {
+          storage[index].entryID = entryID
+        } else if row.entryID != entryID {
+          break
+        }
+      } else if let existing = row.entryID, existing != entryID {
+        break
+      }
+    }
   }
   private func hasVisibleAnswer(_ entryID: String) -> Bool {
     storage.contains {
@@ -425,12 +490,16 @@ struct Transcript: Sendable {
     switch activity {
     case .thinking(let value):
       if let id = thinkingID, let index = storage.firstIndex(where: { $0.id == id }) {
-        storage[index].text = boundedText(storage[index].text + value.text)
+        storage[index].text = boundedText(
+          RichText.separateReasoningSummaries(storage[index].text + value.text))
         dirtyRows.insert(id)
       } else {
         let id = "thinking:\(UUID().uuidString)"
         thinkingID = id
-        append(ChatRow(id: id, role: .thinking, text: boundedText(value.text)))
+        append(
+          ChatRow(
+            id: id, role: .thinking,
+            text: boundedText(RichText.separateReasoningSummaries(value.text))))
       }
     case .toolStarted(let tool):
       thinkingID = nil
@@ -554,15 +623,6 @@ private struct NativeEntryID: Sendable, Equatable, Comparable {
   }
 
   static func < (left: Self, right: Self) -> Bool { left.value < right.value }
-}
-
-extension HistoryRole {
-  var carriesAnswer: Bool {
-    switch self {
-    case .assistant, .final, .commentary: true
-    case .thinking, .tool, .user, .notice, .partialAnswer: false
-    }
-  }
 }
 
 extension InputOrigin {

@@ -156,6 +156,7 @@ struct ActivityGroupView: View {
   @Binding var expansion: ActivityExpansion
   let details: ToolDetailsLoader
   var onExpand: () -> Void = {}
+  var onExpandGroup: (() -> Void)? = nil
   var preview: (AttachmentRef) -> Void = { _ in }
   @State private var queue = ActivityDetailQueue()
 
@@ -168,7 +169,7 @@ struct ActivityGroupView: View {
           expansion.groups.remove(group.id)
         } else {
           expansion.groups.insert(group.id)
-          onExpand()
+          (onExpandGroup ?? onExpand)()
         }
       } label: {
         HStack(spacing: 8) {

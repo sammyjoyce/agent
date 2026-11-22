@@ -162,4 +162,27 @@ import Testing
         .divider,
       ])
   }
+
+  @Test func consecutiveBoldReasoningSummariesSeparateCleanlyWithoutDroppingInlineBold() {
+    let separated = RichText.separateReasoningSummaries(
+      "**Inspecting report status****Reviewing message text**")
+    #expect(separated == "**Inspecting report status**\n\n**Reviewing message text**")
+    let blocks = RichText.parse(separated)
+    #expect(blocks.count == 2)
+    if case .prose(let first) = blocks.first, case .prose(let second) = blocks.last {
+      #expect(String(first.characters) == "Inspecting report status")
+      #expect(String(second.characters) == "Reviewing message text")
+      #expect(!String(first.characters).contains("*"))
+      #expect(!String(second.characters).contains("*"))
+    } else {
+      Issue.record("Expected two separate prose blocks: \(blocks)")
+    }
+
+    let inline = RichText.separateReasoningSummaries("**Inspecting** the **report** carefully")
+    #expect(inline == "**Inspecting** the **report** carefully")
+
+    let fenced = RichText.separateReasoningSummaries(
+      "`keep****inline`\n\n```text\nkeep****fenced\n```\n\n****")
+    #expect(fenced == "`keep****inline`\n\n```text\nkeep****fenced\n```\n\n****")
+  }
 }
