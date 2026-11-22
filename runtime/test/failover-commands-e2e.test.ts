@@ -138,7 +138,20 @@ test("the failover commands enroll an owner and keep a standby of it", { timeout
       const run = await owner.failover(...command), label = command.join(" ");
       assert.equal(run.code, 1, `${label}: ${run.stderr}`);
       assert.match(run.stderr, /The fault proxy refused this request/, label);
-      assert.equal(run.stdout, "", `${label} prints no receipt`);
+      const lines = run.stdout.trim().split("\n");
+      assert.equal(lines.length, 1, `${label} emits one JSON failure line`);
+      const failure = JSON.parse(lines[0]!) as {
+        type?: string;
+        code?: string;
+        message?: string;
+        record?: unknown;
+        checkpoint?: unknown;
+      };
+      assert.equal(failure.type, "failure", `${label} emits a JSON failure event`);
+      assert.equal(typeof failure.code, "string", `${label} emits an error code`);
+      assert.match(failure.message ?? "", /The fault proxy refused this request/, label);
+      assert.equal(failure.record, undefined, `${label} prints no receipt`);
+      assert.equal(failure.checkpoint, undefined, `${label} prints no checkpoint receipt`);
     }
     proxy.heal();
     assert.equal(await owner.record(), undefined, "nothing reached the authority");
