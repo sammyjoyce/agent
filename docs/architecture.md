@@ -447,9 +447,9 @@ decide then which task and terminal the fork gets.
 
 Background sources implement a transport-neutral Rust trait in
 `sources/mod.rs`, with sibling CLI adapters for mail, calendars, GitHub,
-Messages, Slack, MyChart and Ramp, plus a REST API adapter for Home Assistant
-state changes. CLIs own authentication and refresh, and every adapter returns
-the same normalized events, checkpoint and coverage. The coordinator rediscovers
+Messages and Slack, plus a REST API adapter for Home Assistant state changes.
+CLIs own authentication and refresh, and every adapter returns the same
+normalized events, checkpoint and coverage. The coordinator rediscovers
 configured accounts and
 polls bounded pages, with separate cursors and coverage per account.
 Main-chat clients show unavailable or partial coverage as current status,

@@ -295,7 +295,17 @@ mod tests {
     };
 
     use super::*;
-    use crate::sources::cli_feed::write_test_helper;
+
+    fn write_test_helper(dir: &std::path::Path, name: &str, body: &str) -> Vec<String> {
+        let script = dir.join(name);
+        std::fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        vec![script.to_string_lossy().into_owned()]
+    }
 
     #[test]
     fn rejects_empty_entities_allowlist() {

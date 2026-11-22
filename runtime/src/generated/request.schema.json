@@ -4836,64 +4836,6 @@
             "credential_command",
             "entities"
           ]
-        },
-        {
-          "description": "Opt-in MyChart notifications/results through a configured read-only CLI.",
-          "type": "object",
-          "properties": {
-            "account": {
-              "type": "string"
-            },
-            "command": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            },
-            "enabled": {
-              "type": "boolean",
-              "default": true
-            },
-            "provider": {
-              "type": "string",
-              "const": "mychart"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "provider",
-            "command",
-            "account"
-          ]
-        },
-        {
-          "description": "Opt-in Ramp expense/reimbursement/approval activity through a configured CLI.",
-          "type": "object",
-          "properties": {
-            "account": {
-              "type": "string"
-            },
-            "command": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            },
-            "enabled": {
-              "type": "boolean",
-              "default": true
-            },
-            "provider": {
-              "type": "string",
-              "const": "ramp"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "provider",
-            "command",
-            "account"
-          ]
         }
       ]
     },

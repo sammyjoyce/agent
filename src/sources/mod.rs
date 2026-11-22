@@ -2,14 +2,11 @@
 //! them only after admitting every returned event into its durable inbox.
 
 pub mod calendar;
-pub mod cli_feed;
 pub mod github;
 pub mod google;
 pub mod home_assistant;
 pub mod messages;
 pub mod messages_read;
-pub mod mychart;
-pub mod ramp;
 pub mod slack;
 
 use std::{
@@ -287,21 +284,6 @@ pub enum SourceConfig {
         credential_command: Vec<String>,
         entities: Vec<String>,
     },
-    /// Opt-in MyChart notifications/results through a configured read-only CLI.
-    #[serde(rename = "mychart")]
-    MyChart {
-        #[serde(default = "source_enabled")]
-        enabled: bool,
-        command: Vec<String>,
-        account: String,
-    },
-    /// Opt-in Ramp expense/reimbursement/approval activity through a configured CLI.
-    Ramp {
-        #[serde(default = "source_enabled")]
-        enabled: bool,
-        command: Vec<String>,
-        account: String,
-    },
 }
 
 fn source_enabled() -> bool {
@@ -316,9 +298,7 @@ impl SourceConfig {
             | Self::GoogleCalendar { enabled, .. }
             | Self::Messages { enabled, .. }
             | Self::Slack { enabled, .. }
-            | Self::HomeAssistant { enabled, .. }
-            | Self::MyChart { enabled, .. }
-            | Self::Ramp { enabled, .. } => *enabled,
+            | Self::HomeAssistant { enabled, .. } => *enabled,
         }
     }
 
@@ -357,18 +337,6 @@ impl SourceConfig {
                     credential_command.clone(),
                     entities.clone(),
                 )?;
-                Ok(())
-            }
-            Self::MyChart {
-                command, account, ..
-            } => {
-                mychart::new(command.clone(), account.clone())?;
-                Ok(())
-            }
-            Self::Ramp {
-                command, account, ..
-            } => {
-                ramp::new(command.clone(), account.clone())?;
                 Ok(())
             }
         }
@@ -537,30 +505,6 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                         account: account.clone(),
                     },
                     "Home Assistant source configuration is invalid; coverage is unknown",
-                )),
-            },
-            SourceConfig::MyChart {
-                command, account, ..
-            } => match mychart::new(command.clone(), account.clone()) {
-                Ok(source) => sources.push(Box::new(source)),
-                Err(_) => failures.push(SourceBatch::unavailable(
-                    SourceKey {
-                        provider: "mychart".into(),
-                        account: account.clone(),
-                    },
-                    "MyChart source configuration is invalid; coverage is unknown",
-                )),
-            },
-            SourceConfig::Ramp {
-                command, account, ..
-            } => match ramp::new(command.clone(), account.clone()) {
-                Ok(source) => sources.push(Box::new(source)),
-                Err(_) => failures.push(SourceBatch::unavailable(
-                    SourceKey {
-                        provider: "ramp".into(),
-                        account: account.clone(),
-                    },
-                    "Ramp source configuration is invalid; coverage is unknown",
                 )),
             },
         }
@@ -799,16 +743,6 @@ mod tests {
                 url: String::new(),
                 credential_command: Vec::new(),
                 entities: Vec::new(),
-            },
-            SourceConfig::MyChart {
-                enabled: false,
-                command: Vec::new(),
-                account: String::new(),
-            },
-            SourceConfig::Ramp {
-                enabled: false,
-                command: Vec::new(),
-                account: String::new(),
             },
         ];
         let catalog = configured(&sources).await;
