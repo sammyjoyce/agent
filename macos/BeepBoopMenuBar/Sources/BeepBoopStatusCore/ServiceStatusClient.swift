@@ -153,7 +153,7 @@ public struct ServiceStatusClient: Sendable {
     }
     if let runningPath = service.executablePath,
       !runningPath.isEmpty,
-      installed.resolvedPath != runningPath
+      !pathsNameSameInstall(installed.resolvedPath, runningPath)
     {
       return .binaryReplaced(
         version: service.version,
@@ -162,6 +162,15 @@ public struct ServiceStatusClient: Sendable {
       )
     }
     return .upToDate(version: service.version)
+  }
+
+  /// An install may start its program through a wrapper script in the same folder, so the two
+  /// file names can differ. An upgrade puts the program in another folder.
+  static func pathsNameSameInstall(_ first: String, _ second: String) -> Bool {
+    func folder(_ path: String) -> String {
+      URL(fileURLWithPath: path).resolvingSymlinksInPath().deletingLastPathComponent().path
+    }
+    return folder(first) == folder(second)
   }
 
   public func inspectInstalledBinary(

@@ -444,7 +444,7 @@ and configured CLIs first, Chrome tools second, and desktop computer use last.
   menu bar app showing Beep Boop's status on that Mac, including whether the
   local service is running and its installed versus running versions. *(`macos/BeepBoopMenuBar/`
   queries `NativeRequest::ServiceStatus` over `agent.sock` and compares installed
-  `beep-boop --version` and resolved executable path against the running service.)*
+  `beep-boop --version` and the folder of the resolved executable against the running service.)*
 
 ### Apple Notes, Reminders, Mail and Messages (`macctl`)
 
