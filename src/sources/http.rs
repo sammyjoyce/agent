@@ -3,7 +3,7 @@
 //! The token and the whole request address reach `curl` on standard input, so
 //! the process arguments are the same for every request of every source. A
 //! request can only go to the configured base address, and `curl` follows no
-//! redirect, so the token reaches no other server.
+//! redirect and uses no proxy, so the token reaches no other server.
 
 use std::fmt::{self, Write as _};
 
@@ -57,14 +57,17 @@ impl HttpApi {
         rule: UrlRule,
     ) -> Result<Self> {
         let base = url.trim().trim_end_matches('/').to_owned();
-        let quotable = !base.chars().any(breaks_curl_quoting);
+        ensure!(
+            !base.chars().any(breaks_curl_quoting),
+            "{label} URL must not contain white space, a control character, a double quote or a backslash"
+        );
         match rule {
             UrlRule::AnyHttp => ensure!(
-                quotable && (base.starts_with("http://") || base.starts_with("https://")),
+                base.starts_with("http://") || base.starts_with("https://"),
                 "{label} URL must be an http:// or https:// base URL"
             ),
             UrlRule::HttpsOrLoopback => ensure!(
-                quotable && is_https_or_loopback(&base),
+                is_https_or_loopback(&base),
                 "{label} URL must be https, or http on a loopback host"
             ),
         }
@@ -275,7 +278,9 @@ impl Session<'_> {
 ///
 /// `-q` comes first, so curl does not read the service user's own config file.
 /// The command has no `-L`, so curl follows no redirect. `globoff` makes curl
-/// send brackets and braces in the address as they are.
+/// send brackets and braces in the address as they are. `noproxy = "*"` makes
+/// curl ignore every proxy variable in the service environment, so a proxy
+/// never receives the token or answers in the place of the service.
 fn curl_invocation(api: &HttpApi, target: &Target, token: &BearerToken) -> (Vec<String>, String) {
     let argv = vec![
         api.curl.clone(),
@@ -289,7 +294,7 @@ fn curl_invocation(api: &HttpApi, target: &Target, token: &BearerToken) -> (Vec<
         "-".into(),
     ];
     let stdin = format!(
-        "globoff\nheader = \"Authorization: Bearer {}\"\nurl = \"{}{}\"\n",
+        "globoff\nnoproxy = \"*\"\nheader = \"Authorization: Bearer {}\"\nurl = \"{}{}\"\n",
         token.0, api.base, target.0
     );
     (argv, stdin)
@@ -677,7 +682,7 @@ mod tests {
         );
         assert_eq!(
             stdin,
-            "globoff\nheader = \"Authorization: Bearer example-token\"\nurl = \"https://api.example.test/v1/transactions/example-transaction-1?filter[since]=2026-11-15T00%3A00%3A00Z\"\n"
+            "globoff\nnoproxy = \"*\"\nheader = \"Authorization: Bearer example-token\"\nurl = \"https://api.example.test/v1/transactions/example-transaction-1?filter[since]=2026-11-15T00%3A00%3A00Z\"\n"
         );
     }
 
@@ -772,17 +777,29 @@ mod tests {
 
     #[test]
     fn an_address_that_would_break_the_curl_config_is_refused() {
-        for refused in [
-            "http://home.example.test:8123/\"",
-            "http://home.example.test:8123/\\",
-            "http://home.example.test:8123/a b",
-            "ftp://home.example.test",
+        for (refused, message) in [
+            (
+                "http://home.example.test:8123/\"",
+                "Example URL must not contain white space, a control character, a double quote or a backslash",
+            ),
+            (
+                "http://home.example.test:8123/\\",
+                "Example URL must not contain white space, a control character, a double quote or a backslash",
+            ),
+            (
+                "http://home.example.test:8123/a b",
+                "Example URL must not contain white space, a control character, a double quote or a backslash",
+            ),
+            (
+                "ftp://home.example.test",
+                "Example URL must be an http:// or https:// base URL",
+            ),
         ] {
             assert_eq!(
                 HttpApi::new("Example", refused, vec!["true".into()], UrlRule::AnyHttp)
                     .unwrap_err()
                     .to_string(),
-                "Example URL must be an http:// or https:// base URL",
+                message,
                 "{refused}"
             );
         }
