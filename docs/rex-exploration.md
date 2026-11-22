@@ -27,7 +27,7 @@ covering secondary surfaces, direct control/data framing, and block plugins.
      Kitty-graphics terminals (`ghostty`, `kitty`, `wezterm`, `rex`) when scrollback thumbnail
      rendering is implemented.
 
-4. **Headless Servers & Terminfo (`rex server`)**
+4. **Headless Servers (`rex server`)**
    - `rex server` exposes `run`, `start`, `status`, `logs`, `tailscale`, `stop`, `install`, and
      `uninstall` subcommands. Default local servers bind a peer-credential Unix socket; remote
      Tailscale access is opt-in.
@@ -46,8 +46,8 @@ covering secondary surfaces, direct control/data framing, and block plugins.
      (`rex.data.terminal.v1` or `rex.data.bytes.v1`), returning `REJECT 0x01` if already
      redeemed/expired or `0x07` on subprotocol mismatch, and closing unsupported streams with
      WebSocket close `1008`.
-   - Applies uniformly across `download_begin`, `upload_begin`, and `com.superlogical.tunnel`
-     streams.
+   - The handshake and the reject reasons are shared by every data stream. `download_begin`
+     and `upload_begin` return their own tickets.
 
 3. **Live iOS Terminal Streaming (`rex.data.terminal.v1`) vs. Snapshot Reads**
    - `com.superlogical.terminal.format` (`max_bytes` + `com.superlogical.terminal.blob_read`)
@@ -77,5 +77,4 @@ covering secondary surfaces, direct control/data framing, and block plugins.
      `not_session_id`, `not_window_id`, and returns `{ reversed, cursor, session_id, window_id,
      block_id }`.
    - `rex block new` and `rex block stream` ship in the `rex` CLI.
-   - `Rex.app` AppleScript (`Rex.sdef`) and macOS Shortcuts App Intents require an installed
-     `Rex.app` bundle to verify interactively.
+   - `Rex.app` AppleScript (`Rex.sdef`) and macOS Shortcuts App Intents were not verified.

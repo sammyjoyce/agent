@@ -353,7 +353,7 @@ restore is not shipped yet.
 
 ### Protocol, Block SDK and iOS client exploration
 
-- [x] **Direct `rex.control.v1` WebSocket client (`GET /api/control`).** Explore
+- [ ] **Direct `rex.control.v1` WebSocket client (`GET /api/control`).** Explore
   speaking Rex's control protocol directly from iOS (`ios/Sources/AgentCore`,
   `ios/Sources/AgentUI`) and Rust (`src/rex.rs`) instead of shelling out to the
   CLI, covering `hello`/`welcome` negotiation (`api_revision`,
@@ -364,8 +364,10 @@ restore is not shipped yet.
   QUIC ALPN), and undocumented session/client events (`session_moved`,
   `client_call_requested`, `client_perform_requested`, `client_performed`,
   `client_prompt_requested`, `client_prompt_ended`,
-  `client_script_events_dropped`). *(Explored against live `rex` API rev 19; see
-  [rex-exploration](rex-exploration.md).)*
+  `client_script_events_dropped`). *(First pass against live `rex` API rev 19 in
+  [rex-exploration](rex-exploration.md), which records `session.bootstrap` and
+  `session.own_block` only; negotiation, transports and the listed events
+  remain open.)*
 - [x] **Direct `GET /api/data` framing and `rex.data.bytes.v1`.** Explore Rex's
   binary `/api/data` WebSocket handshake (`HELLO` 17 B, `RESUME` 25 B, `WELCOME`
   32 B with 60 s reconnect token and 64-bit channel nonce, `REJECT` 2 B reasons
@@ -382,7 +384,7 @@ restore is not shipped yet.
   `com.superlogical.terminal.format` (`max_bytes` + `blob_read`) reads so iOS
   can inspect live Rex panes without requiring an embedded Ghostty renderer
   upfront. *(Compared & documented in [rex-exploration](rex-exploration.md).)*
-- [x] **Out-of-process Rex Block SDK (`--block-dir` / `--block-plugin-reload`).**
+- [ ] **Out-of-process Rex Block SDK (`--block-dir` / `--block-plugin-reload`).**
   Explore an experimental Beep Boop block creator using Rex's server plugin
   machinery (`rex-block-*` discovery, `REX_BLOCKSERVER_INFO_FD` handshake, the
   7-RPC `blockserver` lifecycle—`creator.list`, `block.create`, `block.method`,
@@ -392,8 +394,10 @@ restore is not shipped yet.
   `com.superlogical.terminal` and `com.superlogical.onboarding`, custom blocks
   would render first in Beep Boop's iOS client while tracking upstream Rex's
   public Block SDK; treat `Rex.app` `rex.server.*` UserDefaults as local
-  prototyping hooks only. *(Evaluated via live `block_creator.list`; see
-  [rex-exploration](rex-exploration.md).)*
+  prototyping hooks only. *(First pass in
+  [rex-exploration](rex-exploration.md), which records the built-in creators
+  from live `block_creator.list` only; plugin discovery, the handshake and the
+  lifecycle calls remain open.)*
 - [x] **Built-in non-terminal blocks (`tunnel` and `onboarding`).** Explore
   `com.superlogical.tunnel` (rev 14; detached `dial`/`listen` flavors, `info`,
   `connection_requested` event, `rex.data.bytes.v1` transport) for on-demand TCP
@@ -402,7 +406,7 @@ restore is not shipped yet.
   `step_changed`, zero data stream) as the reference pattern for stateful
   non-terminal blocks. *(Evaluated and documented in
   [rex-exploration](rex-exploration.md).)*
-- [x] **Extended `com.superlogical.terminal` methods and events.** Explore
+- [ ] **Extended `com.superlogical.terminal` methods and events.** Explore
   server-documented terminal APIs across the coordinator, TUI and iOS client:
   `ports` (rev 15) and `ports_changed` (rev 16) to surface live worker
   dev-server ports in Active work / iOS alongside `tunnel`; `list_dir` for
@@ -411,8 +415,8 @@ restore is not shipped yet.
   reads; and `modes` (rev 3), `input_mode`, `process`, `program_status`, `size`,
   `size_changed`, `url_clicked`, `clear`, `resize` and `set_theme` for richer
   pane inspection (alternate screen, no-echo prompts, process ancestry and URL
-  handoff). *(Evaluated and documented in
-  [rex-exploration](rex-exploration.md).)*
+  handoff). *(First pass in [rex-exploration](rex-exploration.md), which
+  records the methods; the events remain open.)*
 - [ ] **Focus history (`focus_history.reverse`) and macOS `Rex.app` surfaces.**
   Explore control API rev 19 `focus_history.reverse` for jumping across recent
   task panes, tabs and sessions from workflows and iOS, plus `Rex.app`'s
@@ -425,8 +429,8 @@ restore is not shipped yet.
   `skill`) off direct dependencies and track upstream `rex block new` / `rex
   block stream` implementation. *(`focus_history.reverse` and `rex block
   new`/`stream` schemas documented in [rex-exploration](rex-exploration.md);
-  `Rex.app` AppleScript/`Rex.sdef` and Shortcuts App Intents require an
-  installed `Rex.app` bundle to verify.)*
+  `Rex.app` AppleScript/`Rex.sdef` and Shortcuts App Intents remain
+  unverified.)*
 
 ## Host integrations and automation
 
@@ -482,7 +486,7 @@ portability.
   Support resumable, idempotent ingestion with attachment coverage matching
   Codex and ChatGPT imports. Grok Bot currently documents per-call transcripts
   and per-message downloads rather than an account-wide export, so the import
-  source remains open. *(Checked `docs.x.ai/grok-bot/overview`: per-call transcript
+  source remains open. *(Checked `docs.x.ai/grok-bot/chat-and-collaboration`: per-call transcript
   export and recording download remain the only documented UI exports.)*
 - [ ] **Optional domain event sources.** Add opt-in API or CLI adapters where
   workflows outgrow ordinary mail intake—such as Home Assistant repairs and
