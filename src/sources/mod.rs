@@ -5,6 +5,7 @@ pub mod calendar;
 pub mod github;
 pub mod google;
 pub mod home_assistant;
+pub(crate) mod http;
 pub mod messages;
 pub mod messages_read;
 pub mod slack;

@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -12,15 +12,15 @@ use crate::{
     protocol::SourceRef,
     sources::{
         Source, SourceBatch, SourceCheckpoint, SourceCoverage, SourceEvent, SourceKey,
-        parse_timestamp_ms, read_command, read_command_with_stdin,
+        http::{HttpApi, HttpFailure, Target},
+        parse_timestamp_ms,
     },
 };
 
 #[derive(Debug)]
 pub struct HomeAssistantSource {
     account: String,
-    base_url: String,
-    credential_command: Vec<String>,
+    api: HttpApi,
     entities: Vec<String>,
 }
 
@@ -54,20 +54,7 @@ impl HomeAssistantSource {
             !account.trim().is_empty() && !account.chars().any(char::is_control),
             "Home Assistant source needs an explicit account"
         );
-        let trimmed_url = url.trim().trim_end_matches('/').to_owned();
-        ensure!(
-            (trimmed_url.starts_with("http://") || trimmed_url.starts_with("https://"))
-                && !trimmed_url.chars().any(char::is_control)
-                && !trimmed_url.chars().any(char::is_whitespace),
-            "Home Assistant URL must be an http:// or https:// base URL"
-        );
-        ensure!(
-            credential_command
-                .first()
-                .is_some_and(|program| !program.is_empty())
-                && credential_command.iter().all(|part| !part.contains('\0')),
-            "Home Assistant source needs a credential_command"
-        );
+        let api = HttpApi::new("Home Assistant", &url, credential_command)?;
         ensure!(
             !entities.is_empty()
                 && entities
@@ -78,57 +65,24 @@ impl HomeAssistantSource {
         );
         Ok(Self {
             account,
-            base_url: trimmed_url,
-            credential_command,
+            api,
             entities,
         })
     }
 
-    async fn read_token(&self) -> Result<String> {
-        let output = read_command(&self.credential_command).await?;
-        ensure!(
-            output.exit_code == 0 && !output.truncated,
-            "Home Assistant credential helper failed"
-        );
-        let token = output.stdout.trim().to_owned();
-        ensure!(
-            !token.is_empty()
-                && !token.chars().any(char::is_control)
-                && !token.contains('"')
-                && !token.contains('\\'),
-            "Home Assistant credential helper returned an unusable token"
-        );
-        Ok(token)
+    async fn read_states(&self) -> Result<Vec<HaState>, HttpFailure> {
+        self.api
+            .open()
+            .await?
+            .get(&Target::fixed("/api/states"))
+            .await?
+            .json()
     }
 
-    async fn get_json(&self, path: &str, token: &str) -> Result<(u16, String)> {
-        let endpoint = format!("{}{}", self.base_url, path);
-        let config_stdin = format!("header = \"Authorization: Bearer {token}\"\n");
-        let argv = vec![
-            "curl".into(),
-            "-sS".into(),
-            "-w".into(),
-            "\n%{http_code}".into(),
-            "--max-time".into(),
-            "20".into(),
-            "-K".into(),
-            "-".into(),
-            endpoint,
-        ];
-        let output = read_command_with_stdin(&argv, config_stdin.as_bytes()).await?;
-        ensure!(
-            output.exit_code == 0 && !output.truncated,
-            "Home Assistant API request failed (exit {})",
-            output.exit_code
-        );
-        let Some((body, code)) = output.stdout.rsplit_once('\n') else {
-            bail!("Home Assistant HTTP response missing status code");
-        };
-        let status: u16 = code
-            .trim()
-            .parse()
-            .context("Invalid HTTP status from Home Assistant")?;
-        Ok((status, body.to_owned()))
+    #[cfg(test)]
+    fn with_curl(mut self, program: String) -> Self {
+        self.api = self.api.with_curl(program);
+        self
     }
 
     fn matches_entity(&self, entity_id: &str) -> bool {
@@ -236,6 +190,24 @@ fn event_version(fingerprint: &str, title: &str, text: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn unavailable_text(failure: HttpFailure) -> String {
+    match failure {
+        HttpFailure::Credential => {
+            "Home Assistant credentials are unavailable; check credential_command.".into()
+        }
+        HttpFailure::NotRun => {
+            "Home Assistant could not run curl; check that curl is on the service PATH.".into()
+        }
+        HttpFailure::TimedOut | HttpFailure::Unreachable | HttpFailure::Oversized => {
+            "Home Assistant API is unreachable; checkpoint retained.".into()
+        }
+        HttpFailure::Status(code) => {
+            format!("Home Assistant API returned HTTP {code}; checkpoint retained.")
+        }
+        HttpFailure::Unreadable => "Home Assistant returned an invalid /api/states payload.".into(),
+    }
+}
+
 #[async_trait::async_trait]
 impl Source for HomeAssistantSource {
     fn key(&self) -> SourceKey {
@@ -260,36 +232,9 @@ impl Source for HomeAssistantSource {
             previous.account == self.account,
             "Home Assistant checkpoint belongs to another account"
         );
-        let token = match self.read_token().await {
-            Ok(token) => token,
-            Err(_) => {
-                return Ok(SourceBatch::unavailable(
-                    key,
-                    "Home Assistant credentials are unavailable; check credential_command.",
-                ));
-            }
-        };
-
-        let (states_code, states_body) = match self.get_json("/api/states", &token).await {
-            Ok(response) => response,
-            Err(_) => {
-                return Ok(SourceBatch::unavailable(
-                    key,
-                    "Home Assistant API is unreachable; checkpoint retained.",
-                ));
-            }
-        };
-        if !(200..300).contains(&states_code) {
-            return Ok(SourceBatch::unavailable(
-                key,
-                format!("Home Assistant API returned HTTP {states_code}; checkpoint retained."),
-            ));
-        }
-        let Ok(states) = serde_json::from_str::<Vec<HaState>>(&states_body) else {
-            return Ok(SourceBatch::unavailable(
-                key,
-                "Home Assistant returned an invalid /api/states payload.",
-            ));
+        let states = match self.read_states().await {
+            Ok(states) => states,
+            Err(failure) => return Ok(SourceBatch::unavailable(key, unavailable_text(failure))),
         };
 
         let (events, next) = self.diff_states(states, &previous, checkpoint.is_none());
@@ -316,6 +261,10 @@ mod tests {
     };
 
     use super::*;
+    use crate::sources::{
+        http::testing::{Canned, FakeApi, credential_script, curl_shim, shim_runs},
+        read_command,
+    };
 
     fn write_test_helper(dir: &std::path::Path, name: &str, body: &str) -> Vec<String> {
         let script = dir.join(name);
@@ -727,5 +676,108 @@ mod tests {
         assert!(bad_json.checkpoint.is_none());
 
         server.abort();
+    }
+
+    fn demo_leak_off() -> serde_json::Value {
+        serde_json::json!([{
+            "entity_id": LEAK,
+            "state": "off",
+            "attributes": { "friendly_name": "Demo Leak" },
+            "last_changed": "2026-11-22T01:00:00Z"
+        }])
+    }
+
+    fn unavailable(message: &str) -> SourceCoverage {
+        SourceCoverage::Unavailable {
+            message: message.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_curl_is_named_and_a_dead_server_is_unreachable() {
+        let server = FakeApi::start(|_| Canned::json(200, demo_leak_off())).await;
+        let dir = tempfile::tempdir().unwrap();
+        let command = credential_script(dir.path(), "example-ha-token");
+
+        let without_curl = HomeAssistantSource::new(
+            "home-example".into(),
+            server.url.clone(),
+            command.clone(),
+            vec![LEAK.into()],
+        )
+        .unwrap()
+        .with_curl("/nonexistent/example-curl".into());
+        let batch = without_curl.poll(None).await.unwrap();
+        assert_eq!(
+            batch.coverage,
+            unavailable(
+                "Home Assistant could not run curl; check that curl is on the service PATH."
+            )
+        );
+        assert!(batch.checkpoint.is_none());
+        assert!(server.seen().is_empty());
+
+        let dead_server = HomeAssistantSource::new(
+            "home-example".into(),
+            FakeApi::dead_url(),
+            command,
+            vec![LEAK.into()],
+        )
+        .unwrap();
+        assert_eq!(
+            dead_server.poll(None).await.unwrap().coverage,
+            unavailable("Home Assistant API is unreachable; checkpoint retained.")
+        );
+    }
+
+    #[tokio::test]
+    async fn curl_gets_no_address_or_token_as_an_argument_and_does_not_read_its_own_config_file() {
+        let server = FakeApi::start(|_| Canned::json(200, demo_leak_off())).await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".curlrc"),
+            "header = \"X-Example-Curlrc: read\"\n",
+        )
+        .unwrap();
+        let address = server.url.trim_start_matches("http://");
+        let shim = curl_shim(dir.path(), &["example-ha-token", address, "/api/states"]);
+        let source = HomeAssistantSource::new(
+            "home-example".into(),
+            server.url.clone(),
+            credential_script(dir.path(), "example-ha-token"),
+            vec![LEAK.into()],
+        )
+        .unwrap()
+        .with_curl(shim);
+
+        let batch = source.poll(None).await.unwrap();
+
+        assert_eq!(batch.coverage, SourceCoverage::Complete);
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(
+            shim_runs(dir.path()),
+            1,
+            "the request went through the shim"
+        );
+        let polled = &server.seen()[0];
+        assert_eq!(polled.target, "/api/states");
+        assert_eq!(polled.bearer.as_deref(), Some("example-ha-token"));
+        assert_eq!(polled.header("X-Example-Curlrc"), None);
+
+        let without_q = read_command(&[
+            "sh".into(),
+            "-c".into(),
+            "CURL_HOME=\"$0\" exec curl -sS \"$1\"".into(),
+            dir.path().to_string_lossy().into_owned(),
+            format!("{}/control", server.url),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(without_q.exit_code, 0);
+        assert_eq!(
+            server.seen()[1].header("X-Example-Curlrc"),
+            Some("read"),
+            "without -q the same curl reads the file, so the check above can fail"
+        );
     }
 }
