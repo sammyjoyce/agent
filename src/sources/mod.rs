@@ -2,6 +2,7 @@
 //! them only after admitting every returned event into its durable inbox.
 
 pub mod calendar;
+pub(crate) mod feed;
 pub mod github;
 pub mod google;
 pub mod home_assistant;
@@ -9,6 +10,7 @@ pub(crate) mod http;
 pub mod messages;
 pub mod messages_read;
 pub mod slack;
+pub mod up;
 
 use std::{
     fmt::Debug,
@@ -285,6 +287,18 @@ pub enum SourceConfig {
         credential_command: Vec<String>,
         entities: Vec<String>,
     },
+    /// Up bank transactions from the Up API, with a personal access token
+    /// from `credential_command`. Read-only: the source sends GET requests only.
+    Up {
+        #[serde(default = "source_enabled")]
+        enabled: bool,
+        /// A label the owner chooses. Clients show it, so it must not be an account number.
+        account: String,
+        credential_command: Vec<String>,
+        /// API base address. Omitted means `https://api.up.com.au/api/v1`.
+        /// Must be https, or http on a loopback host.
+        url: Option<String>,
+    },
 }
 
 fn source_enabled() -> bool {
@@ -299,7 +313,8 @@ impl SourceConfig {
             | Self::GoogleCalendar { enabled, .. }
             | Self::Messages { enabled, .. }
             | Self::Slack { enabled, .. }
-            | Self::HomeAssistant { enabled, .. } => *enabled,
+            | Self::HomeAssistant { enabled, .. }
+            | Self::Up { enabled, .. } => *enabled,
         }
     }
 
@@ -338,6 +353,15 @@ impl SourceConfig {
                     credential_command.clone(),
                     entities.clone(),
                 )?;
+                Ok(())
+            }
+            Self::Up {
+                account,
+                credential_command,
+                url,
+                ..
+            } => {
+                up::UpSource::new(account.clone(), url.clone(), credential_command.clone())?;
                 Ok(())
             }
         }
@@ -508,6 +532,23 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                     "Home Assistant source configuration is invalid; coverage is unknown",
                 )),
             },
+            SourceConfig::Up {
+                account,
+                credential_command,
+                url,
+                ..
+            } => {
+                match up::UpSource::new(account.clone(), url.clone(), credential_command.clone()) {
+                    Ok(source) => sources.push(Box::new(source)),
+                    Err(_) => failures.push(SourceBatch::unavailable(
+                        SourceKey {
+                            provider: "up".into(),
+                            account: account.clone(),
+                        },
+                        "Up source configuration is invalid; coverage is unknown",
+                    )),
+                }
+            }
         }
     }
     SourceCatalog { sources, failures }
@@ -744,6 +785,12 @@ mod tests {
                 url: String::new(),
                 credential_command: Vec::new(),
                 entities: Vec::new(),
+            },
+            SourceConfig::Up {
+                enabled: false,
+                account: String::new(),
+                credential_command: Vec::new(),
+                url: Some("http://bank.example.test".into()),
             },
         ];
         let catalog = configured(&sources).await;

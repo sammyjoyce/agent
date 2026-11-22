@@ -5,10 +5,11 @@
 //! request can only go to the configured base address, and `curl` follows no
 //! redirect, so the token reaches no other server.
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 use anyhow::{Result, ensure};
 use serde::de::DeserializeOwned;
+use sha2::{Digest, Sha256};
 
 use crate::{
     host::ProcessFailure,
@@ -16,6 +17,18 @@ use crate::{
 };
 
 pub(crate) const REQUEST_SECONDS: u32 = 20;
+/// A longer link from a service is refused, so a checkpoint that stores one stays bounded.
+const MAX_TARGET_BYTES: usize = 2048;
+
+/// Which base addresses a source accepts.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum UrlRule {
+    /// Any http or https address. Home Assistant runs on a home network.
+    AnyHttp,
+    /// https, or http on 127.0.0.1, [::1] or localhost, so a bank token never
+    /// crosses a network in clear text.
+    HttpsOrLoopback,
+}
 
 /// A validated API base address and the command that prints its token.
 pub(crate) struct HttpApi {
@@ -41,13 +54,20 @@ impl HttpApi {
         label: &'static str,
         url: &str,
         credential_command: Vec<String>,
+        rule: UrlRule,
     ) -> Result<Self> {
         let base = url.trim().trim_end_matches('/').to_owned();
-        ensure!(
-            (base.starts_with("http://") || base.starts_with("https://"))
-                && !base.chars().any(breaks_curl_quoting),
-            "{label} URL must be an http:// or https:// base URL"
-        );
+        let quotable = !base.chars().any(breaks_curl_quoting);
+        match rule {
+            UrlRule::AnyHttp => ensure!(
+                quotable && (base.starts_with("http://") || base.starts_with("https://")),
+                "{label} URL must be an http:// or https:// base URL"
+            ),
+            UrlRule::HttpsOrLoopback => ensure!(
+                quotable && is_https_or_loopback(&base),
+                "{label} URL must be https, or http on a loopback host"
+            ),
+        }
         ensure!(
             credential_command
                 .first()
@@ -85,6 +105,16 @@ impl HttpApi {
         })
     }
 
+    /// The part of `link` after the base address, when `link` points inside this API.
+    pub(crate) fn target_of(&self, link: &str) -> Option<Target> {
+        Target::try_from(link.strip_prefix(self.base.as_str())?.to_owned()).ok()
+    }
+
+    /// A short hash of the base address, for a checkpoint that must not move to another server.
+    pub(crate) fn fingerprint(&self) -> String {
+        hex::encode(&Sha256::digest(self.base.as_bytes())[..8])
+    }
+
     #[cfg(test)]
     pub(crate) fn with_max_time(mut self, seconds: u32) -> Self {
         self.max_time = seconds;
@@ -103,14 +133,99 @@ fn breaks_curl_quoting(character: char) -> bool {
     character.is_control() || character.is_whitespace() || matches!(character, '"' | '\\')
 }
 
-/// A path under the base address. Only a `Target` can be requested.
+/// User info, a query and a fragment are refused, so the text before the first
+/// path segment is exactly the host that receives the token.
+fn is_https_or_loopback(base: &str) -> bool {
+    let Some((scheme, rest)) = base.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.contains('@') || rest.contains(['?', '#']) {
+        return false;
+    }
+    let (host, port) = match authority.rfind(':') {
+        Some(colon) if !authority[colon..].contains(']') => {
+            (&authority[..colon], &authority[colon + 1..])
+        }
+        _ => (authority, ""),
+    };
+    if host.is_empty() || !port.chars().all(|digit| digit.is_ascii_digit()) {
+        return false;
+    }
+    match scheme {
+        "https" => true,
+        "http" => matches!(
+            host.to_ascii_lowercase().as_str(),
+            "127.0.0.1" | "[::1]" | "localhost"
+        ),
+        _ => false,
+    }
+}
+
+/// A path and query under the base address. Only a `Target` can be requested.
+///
+/// It starts with '/' and holds no white space, control character, '"' or
+/// '\'. The curl config quotes it, so these rules are what stops a link from a
+/// service from adding a curl option.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Target(String);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct UnsafeTarget;
 
 impl Target {
     /// A path written in the source code, such as "/api/states".
     pub(crate) fn fixed(path: &'static str) -> Self {
         Self(path.to_owned())
+    }
+
+    /// Appends one percent-encoded path segment, such as an id from the service.
+    pub(crate) fn segment(mut self, value: &str) -> Self {
+        self.0.push('/');
+        push_percent_encoded(&mut self.0, value);
+        self
+    }
+
+    /// Appends `name=value`. The name stays literal, so `filter[since]` keeps its brackets.
+    pub(crate) fn query(mut self, name: &'static str, value: &str) -> Self {
+        self.0.push(if self.0.contains('?') { '&' } else { '?' });
+        self.0.push_str(name);
+        self.0.push('=');
+        push_percent_encoded(&mut self.0, value);
+        self
+    }
+
+    pub(crate) fn path(&self) -> &str {
+        self.0.split('?').next().unwrap_or_default()
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for Target {
+    type Error = UnsafeTarget;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let safe = value.starts_with('/')
+            && value.len() <= MAX_TARGET_BYTES
+            && !value.chars().any(breaks_curl_quoting);
+        if safe {
+            Ok(Self(value))
+        } else {
+            Err(UnsafeTarget)
+        }
+    }
+}
+
+fn push_percent_encoded(target: &mut String, value: &str) {
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            target.push(char::from(byte));
+        } else {
+            let _ = write!(target, "%{byte:02X}");
+        }
     }
 }
 
@@ -194,6 +309,12 @@ impl Reply {
         }
         serde_json::from_str(&self.body).map_err(|_| HttpFailure::Unreadable)
     }
+
+    /// The body as `T` whatever the status, for a source that must tell a
+    /// documented error body from any other answer with the same status.
+    pub(crate) fn body_as<T: DeserializeOwned>(&self) -> Option<T> {
+        serde_json::from_str(&self.body).ok()
+    }
 }
 
 /// Everything that can go wrong with one request. No variant carries text from
@@ -238,7 +359,7 @@ pub(crate) mod testing {
     /// What the fake server received.
     #[derive(Clone, Debug)]
     pub(crate) struct Seen {
-        /// Path and query as sent, such as "/api/states".
+        /// Path and query as sent, such as "/transactions?filter[status]=HELD&page[size]=100".
         pub(crate) target: String,
         /// The value after "Authorization: Bearer ", when present.
         pub(crate) bearer: Option<String>,
@@ -250,12 +371,49 @@ pub(crate) mod testing {
             self.target.split('?').next().unwrap_or_default()
         }
 
+        pub(crate) fn query(&self, name: &str) -> Option<String> {
+            query_of(&self.target, name)
+        }
+
         pub(crate) fn header(&self, name: &str) -> Option<&str> {
             self.headers
                 .iter()
                 .find(|(key, _)| key.eq_ignore_ascii_case(name))
                 .map(|(_, value)| value.as_str())
         }
+    }
+
+    /// The decoded value of one query parameter of a request target.
+    pub(crate) fn query_of(target: &str, name: &str) -> Option<String> {
+        let (_, query) = target.split_once('?')?;
+        query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .find(|(key, _)| percent_decoded(key) == name)
+            .map(|(_, value)| percent_decoded(value))
+    }
+
+    fn percent_decoded(value: &str) -> String {
+        let bytes = value.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            let escaped = (bytes[index] == b'%')
+                .then(|| value.get(index + 1..index + 3))
+                .flatten()
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+            match escaped {
+                Some(byte) => {
+                    decoded.push(byte);
+                    index += 3;
+                }
+                None => {
+                    decoded.push(bytes[index]);
+                    index += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&decoded).into_owned()
     }
 
     pub(crate) struct Canned {
@@ -298,7 +456,7 @@ pub(crate) mod testing {
     /// A loopback HTTP server. The handler is the whole script of the test. It
     /// usually closes over shared state that the test edits between polls.
     pub(crate) struct FakeApi {
-        /// "http://127.0.0.1:<port>".
+        /// "http://127.0.0.1:<port>", which both `UrlRule`s accept.
         pub(crate) url: String,
         seen: Arc<Mutex<Vec<Seen>>>,
         server: JoinHandle<()>,
@@ -452,17 +610,16 @@ mod tests {
     };
 
     fn api(url: &str, credential_command: Vec<String>) -> HttpApi {
-        HttpApi::new("Example", url, credential_command).unwrap()
+        HttpApi::new("Example", url, credential_command, UrlRule::HttpsOrLoopback).unwrap()
     }
 
     #[test]
     fn curl_invocation_keeps_the_token_and_the_address_out_of_process_arguments() {
         let api = api("https://api.example.test/v1", vec!["true".into()]);
-        let (argv, stdin) = curl_invocation(
-            &api,
-            &Target::fixed("/api/states"),
-            &BearerToken("example-token".into()),
-        );
+        let target = Target::fixed("/transactions")
+            .segment("example-transaction-1")
+            .query("filter[since]", "2026-11-15T00:00:00Z");
+        let (argv, stdin) = curl_invocation(&api, &target, &BearerToken("example-token".into()));
 
         assert_eq!(
             argv,
@@ -480,8 +637,97 @@ mod tests {
         );
         assert_eq!(
             stdin,
-            "globoff\nheader = \"Authorization: Bearer example-token\"\nurl = \"https://api.example.test/v1/api/states\"\n"
+            "globoff\nheader = \"Authorization: Bearer example-token\"\nurl = \"https://api.example.test/v1/transactions/example-transaction-1?filter[since]=2026-11-15T00%3A00%3A00Z\"\n"
         );
+    }
+
+    #[test]
+    fn target_rejects_quotes_backslashes_control_characters_and_long_values() {
+        for unsafe_target in [
+            "transactions".to_owned(),
+            "/a\"\nurl = \"https://other.example.test".to_owned(),
+            "/a\\".to_owned(),
+            "/a b".to_owned(),
+            "/a\tb".to_owned(),
+            format!("/{}", "a".repeat(MAX_TARGET_BYTES)),
+        ] {
+            assert_eq!(Target::try_from(unsafe_target), Err(UnsafeTarget));
+        }
+        assert_eq!(
+            Target::try_from("/transactions?page[after]=abc%3D".to_owned())
+                .unwrap()
+                .path(),
+            "/transactions"
+        );
+        assert_eq!(
+            Target::fixed("/transactions")
+                .segment("a\"b/c d")
+                .query("page[size]", "1&x=\\")
+                .as_str(),
+            "/transactions/a%22b%2Fc%20d?page[size]=1%26x%3D%5C"
+        );
+    }
+
+    #[test]
+    fn target_of_refuses_a_link_to_another_host_scheme_or_port() {
+        let api = api("https://api.example.test/v1/", vec!["true".into()]);
+        assert_eq!(
+            api.target_of("https://api.example.test/v1/transactions?page[after]=abc")
+                .unwrap()
+                .as_str(),
+            "/transactions?page[after]=abc"
+        );
+        for foreign in [
+            "https://other.example.test/v1/transactions",
+            "http://api.example.test/v1/transactions",
+            "https://api.example.test:8443/v1/transactions",
+            "https://api.example.test/v1.other.example.test/transactions",
+            "https://api.example.test/v2/transactions",
+            "/v1/transactions",
+        ] {
+            assert_eq!(api.target_of(foreign), None, "{foreign}");
+        }
+    }
+
+    #[test]
+    fn https_or_loopback_refuses_plain_http_to_another_host() {
+        for accepted in [
+            "https://api.example.test/v1",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080/api",
+            "http://localhost",
+        ] {
+            HttpApi::new(
+                "Example",
+                accepted,
+                vec!["true".into()],
+                UrlRule::HttpsOrLoopback,
+            )
+            .unwrap();
+        }
+        for refused in [
+            "http://api.example.test/v1",
+            "http://127.0.0.1@api.example.test/v1",
+            "http://127.0.0.1.example.test",
+            "http://localhost:port",
+            "https://api.example.test/v1?next=",
+            "ftp://127.0.0.1",
+            "https://",
+            "api.example.test",
+        ] {
+            let error = HttpApi::new(
+                "Example",
+                refused,
+                vec!["true".into()],
+                UrlRule::HttpsOrLoopback,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Example URL must be https, or http on a loopback host",
+                "{refused}"
+            );
+        }
     }
 
     #[test]
@@ -493,17 +739,29 @@ mod tests {
             "ftp://home.example.test",
         ] {
             assert_eq!(
-                HttpApi::new("Example", refused, vec!["true".into()])
+                HttpApi::new("Example", refused, vec!["true".into()], UrlRule::AnyHttp)
                     .unwrap_err()
                     .to_string(),
                 "Example URL must be an http:// or https:// base URL",
                 "{refused}"
             );
         }
+        HttpApi::new(
+            "Example",
+            "http://home.example.test:8123",
+            vec!["true".into()],
+            UrlRule::AnyHttp,
+        )
+        .unwrap();
         assert_eq!(
-            HttpApi::new("Example", "https://api.example.test", Vec::new())
-                .unwrap_err()
-                .to_string(),
+            HttpApi::new(
+                "Example",
+                "https://api.example.test",
+                Vec::new(),
+                UrlRule::AnyHttp
+            )
+            .unwrap_err()
+            .to_string(),
             "Example source needs a credential_command"
         );
     }
@@ -519,7 +777,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_request_reaches_the_server_with_the_bearer_token() {
+    async fn a_request_reaches_the_server_with_the_bearer_token_and_literal_brackets() {
         let server = FakeApi::start(|_| Canned::json(200, json!({ "ok": true }))).await;
         let dir = tempfile::tempdir().unwrap();
         let api = api(&server.url, credential_script(dir.path(), "example-token"));
@@ -528,17 +786,29 @@ mod tests {
             .open()
             .await
             .unwrap()
-            .get(&Target::fixed("/api/states"))
+            .get(
+                &Target::fixed("/transactions")
+                    .query("filter[since]", "2026-11-15T00:00:00Z")
+                    .query("page[size]", "100"),
+            )
             .await
             .unwrap();
 
+        assert_eq!(reply.status, 200);
         assert_eq!(
             reply.json::<serde_json::Value>().unwrap(),
             json!({ "ok": true })
         );
         let seen = server.seen();
         assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].target, "/api/states");
+        assert_eq!(
+            seen[0].target,
+            "/transactions?filter[since]=2026-11-15T00%3A00%3A00Z&page[size]=100"
+        );
+        assert_eq!(
+            seen[0].query("filter[since]").as_deref(),
+            Some("2026-11-15T00:00:00Z")
+        );
         assert_eq!(seen[0].bearer.as_deref(), Some("example-token"));
     }
 
@@ -627,7 +897,7 @@ mod tests {
             .open()
             .await
             .unwrap()
-            .get(&Target::fixed("/api/states"))
+            .get(&Target::fixed("/transactions"))
             .await
             .unwrap();
 

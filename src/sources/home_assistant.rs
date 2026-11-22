@@ -12,7 +12,7 @@ use crate::{
     protocol::SourceRef,
     sources::{
         Source, SourceBatch, SourceCheckpoint, SourceCoverage, SourceEvent, SourceKey,
-        http::{HttpApi, HttpFailure, Target},
+        http::{HttpApi, HttpFailure, Target, UrlRule},
         parse_timestamp_ms,
     },
 };
@@ -54,7 +54,7 @@ impl HomeAssistantSource {
             !account.trim().is_empty() && !account.chars().any(char::is_control),
             "Home Assistant source needs an explicit account"
         );
-        let api = HttpApi::new("Home Assistant", &url, credential_command)?;
+        let api = HttpApi::new("Home Assistant", &url, credential_command, UrlRule::AnyHttp)?;
         ensure!(
             !entities.is_empty()
                 && entities
