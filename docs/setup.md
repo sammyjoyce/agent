@@ -55,6 +55,22 @@ Rex host labels and endpoints are reused when present in its shared host
 inventory; a machine can also announce its own native Rex metadata. There is
 no second host list to maintain in agent settings.
 
+### Linux VM workers over SSH (without Tailscale)
+
+On Linux worker VMs that reach Rex over SSH rather than Tailscale:
+
+```sh
+rex server install --yes --label worker-vm ssh://worker.example.invalid
+rex hosts add worker-vm ssh://worker.example.invalid
+```
+
+Non-interactive SSH authentication (`ssh-agent` and an already accepted
+`known_hosts` entry from running `ssh worker.example.invalid` once) must succeed
+without terminal prompts. A worker started with
+`beep-boop --rex-server ssh://worker.example.invalid serve` or registered with an
+`ssh://` entry in `rex hosts` announces that SSH endpoint during node discovery
+when Tailscale HTTPS is absent.
+
 Use `beep-boop chat` from any directory in another terminal. It always reaches
 the configured coordinator. Caller project information accompanies the request;
 shared context and conversation storage stay on the coordinator.

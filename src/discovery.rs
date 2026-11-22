@@ -38,8 +38,11 @@ pub async fn local_node(
         })
         .or(native_name)
         .unwrap_or_else(|| "local".into());
-    // Apps reach a node's Rex at this address, so a private server never announces one.
-    let endpoint = if rex.is_private() {
+    // Apps reach a node's Rex at its SSH or Tailscale/peer address, whereas a
+    // local-only private Unix server never announces an address.
+    let endpoint = if let Some(ssh) = rex.ssh_endpoint() {
+        Some(ssh.to_owned())
+    } else if rex.is_private() {
         None
     } else {
         identity
@@ -48,7 +51,7 @@ pub async fn local_node(
             .and_then(|tailnet| tailnet.https.as_ref())
             .filter(|https| https.state == "available")
             .and_then(|https| https.url.clone())
-            .or_else(|| peer.and_then(|peer| peer.endpoints.as_ref()?.first().cloned()))
+            .or_else(|| select_peer_endpoint(peer.and_then(|peer| peer.endpoints.as_deref())))
     };
     let node = AgentNode {
         host_id: identity.host_id.to_string(),
@@ -71,6 +74,15 @@ pub async fn local_node(
     };
     validate_node(&node)?;
     Ok(node)
+}
+
+fn select_peer_endpoint(endpoints: Option<&[String]>) -> Option<String> {
+    let endpoints = endpoints?;
+    endpoints
+        .iter()
+        .find(|endpoint| !endpoint.starts_with("unix://") && !endpoint.trim().is_empty())
+        .cloned()
+        .or_else(|| endpoints.first().cloned())
 }
 
 pub fn validate_node(node: &AgentNode) -> Result<()> {
@@ -125,9 +137,13 @@ mod tests {
             }
             return;
         };
-        let rex = RexClient::for_process(
-            (case == "private").then_some("unix:///run/user/1000/rex-agent/server.sock"),
-        )
+        let rex = RexClient::for_process(if case == "private" {
+            Some("unix:///run/user/1000/rex-agent/server.sock")
+        } else if case == "ssh-explicit" {
+            Some("ssh://alice@worker.example.invalid")
+        } else {
+            None
+        })
         .unwrap();
         let daemon =
             crate::tailnet::Daemon::new(Some(std::path::Path::new("/nonexistent/tailscaled.sock")))
@@ -145,6 +161,20 @@ mod tests {
             assert_eq!(node.rex_server, None);
             assert_eq!(node.name, "fixture-node");
             assert_eq!(fake_rex::methods(), ["whoami"]);
+        } else if case == "ssh-peer" {
+            assert_eq!(
+                node.rex_server.as_deref(),
+                Some("ssh://worker.example.invalid:2222")
+            );
+            assert_eq!(node.name, "fixture-peer");
+            assert_eq!(fake_rex::methods(), ["whoami", "hosts"]);
+        } else if case == "ssh-explicit" {
+            assert_eq!(
+                node.rex_server.as_deref(),
+                Some("ssh://alice@worker.example.invalid")
+            );
+            assert_eq!(node.name, "local");
+            assert_eq!(fake_rex::methods(), ["whoami"]);
         } else {
             assert_eq!(
                 node.rex_server.as_deref(),
@@ -152,6 +182,35 @@ mod tests {
             );
             assert_eq!(node.name, "fixture-peer");
             assert_eq!(fake_rex::methods(), ["whoami", "hosts"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_workers_without_tailscale_discover_ssh_endpoints() {
+        const TEST: &str =
+            "discovery::tests::a_private_node_announces_no_rex_address_and_reads_no_peer_inventory";
+        for (case, envs) in [
+            (
+                "ssh-peer",
+                &[
+                    ("AGENT_TEST_FAKE_REX_NO_TAILSCALE", "1"),
+                    ("AGENT_TEST_FAKE_REX_SSH_PEER", "1"),
+                ][..],
+            ),
+            (
+                "ssh-explicit",
+                &[
+                    ("AGENT_TEST_FAKE_REX_NO_TAILSCALE", "1"),
+                    (
+                        "AGENT_TEST_FAKE_REX_EXPLICIT_SSH",
+                        "ssh://alice@worker.example.invalid",
+                    ),
+                ][..],
+            ),
+        ] {
+            if fake_rex::case().is_none() {
+                fake_rex::run(TEST, case, envs);
+            }
         }
     }
 }

@@ -213,21 +213,144 @@ enum RexRoute {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct LocalRexEndpoint(String);
+enum EndpointKind {
+    Unix,
+    Ssh,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalRexEndpoint {
+    raw: String,
+    kind: EndpointKind,
+}
 
 impl LocalRexEndpoint {
     fn parse(input: &str) -> anyhow::Result<Self> {
-        let path = input.strip_prefix("unix://").map(Path::new);
-        anyhow::ensure!(
-            path.is_some_and(|path| path.is_absolute() && path.file_name().is_some())
-                && !input.contains(['\0', '?', '#']),
-            "--rex-server must be unix:// followed by an absolute socket path, not {input:?}"
+        if let Some(rest) = input.strip_prefix("unix://") {
+            let path = Path::new(rest);
+            anyhow::ensure!(
+                path.is_absolute()
+                    && path.file_name().is_some()
+                    && !input.contains(['\0', '?', '#']),
+                "--rex-server must be unix:// followed by an absolute socket path, not {input:?}"
+            );
+            return Ok(Self {
+                raw: input.to_owned(),
+                kind: EndpointKind::Unix,
+            });
+        }
+        if let Some(rest) = input.strip_prefix("ssh://") {
+            anyhow::ensure!(
+                valid_ssh_authority(rest),
+                "--rex-server ssh:// endpoint must be ssh://[user@]host[:port], not {input:?}"
+            );
+            return Ok(Self {
+                raw: input.to_owned(),
+                kind: EndpointKind::Ssh,
+            });
+        }
+        anyhow::bail!(
+            "--rex-server must be unix:///... or ssh://[user@]host[:port], not {input:?}"
         );
-        Ok(Self(input.to_owned()))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.raw
     }
 }
 
-fn personal_messages() -> RexClient {
+fn valid_ssh_authority(authority: &str) -> bool {
+    if authority.is_empty()
+        || authority.len() > 320
+        || authority
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | '\\'))
+    {
+        return false;
+    }
+    let host_port = if let Some((user, rest)) = authority.split_once('@') {
+        if user.is_empty()
+            || user.len() > 64
+            || user.starts_with('-')
+            || !user
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'+'))
+        {
+            return false;
+        }
+        rest
+    } else {
+        authority
+    };
+    if host_port.is_empty() || host_port.contains('@') {
+        return false;
+    }
+    let host = if let Some(bracketed) = host_port.strip_prefix('[') {
+        let Some((ipv6, suffix)) = bracketed.split_once(']') else {
+            return false;
+        };
+        if ipv6.is_empty()
+            || !ipv6
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+        {
+            return false;
+        }
+        if !suffix.is_empty() {
+            let Some(port) = suffix.strip_prefix(':') else {
+                return false;
+            };
+            if port.parse::<u16>().ok().filter(|p| *p > 0).is_none() {
+                return false;
+            }
+        }
+        return true;
+    } else if let Some((host, port)) = host_port.rsplit_once(':') {
+        if host.contains(':') || port.parse::<u16>().ok().filter(|p| *p > 0).is_none() {
+            return false;
+        }
+        host
+    } else {
+        host_port
+    };
+    !host.is_empty()
+        && !host.starts_with('-')
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApplePrivacyPreflight {
+    Granted,
+    Missing {
+        status: String,
+        responsible_path: Option<String>,
+    },
+    NotApplicable,
+    UnsupportedServer,
+}
+
+impl ApplePrivacyPreflight {
+    pub fn warning_message(&self) -> Option<String> {
+        let Self::Missing {
+            status,
+            responsible_path,
+        } = self
+        else {
+            return None;
+        };
+        let target = responsible_path
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+            .unwrap_or("Rex");
+        Some(format!(
+            "Rex Full Disk Access is {status}. Grant Full Disk Access to {target} in macOS System Settings -> Privacy & Security -> Full Disk Access so Messages reads succeed."
+        ))
+    }
+}
+
+pub(crate) fn personal_messages() -> RexClient {
     RexClient {
         route: RexRoute::Personal,
     }
@@ -331,10 +454,28 @@ impl RexClient {
         matches!(self.route, RexRoute::Private(_))
     }
 
+    pub fn ssh_endpoint(&self) -> Option<&str> {
+        match &self.route {
+            RexRoute::Private(endpoint) if endpoint.kind == EndpointKind::Ssh => {
+                Some(endpoint.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn is_local_unix_socket(&self) -> bool {
+        match &self.route {
+            RexRoute::Personal => true,
+            RexRoute::Private(endpoint) => endpoint.kind == EndpointKind::Unix,
+        }
+    }
+
     pub fn rex_server_args(&self) -> Vec<String> {
         match &self.route {
             RexRoute::Personal => Vec::new(),
-            RexRoute::Private(endpoint) => vec!["--rex-server".into(), endpoint.0.clone()],
+            RexRoute::Private(endpoint) => {
+                vec!["--rex-server".into(), endpoint.as_str().to_owned()]
+            }
         }
     }
 
@@ -375,14 +516,185 @@ impl RexClient {
         decode(&output)
     }
 
-    /// Capture only the explicitly owned terminal, never the client's focused pane.
-    pub async fn capture_terminal(
+    /// Preflight macOS Full Disk Access without triggering a TCC prompt.
+    /// Queries only over a local Unix socket and skips non-macOS or older servers.
+    pub async fn full_disk_access_preflight(&self) -> Result<ApplePrivacyPreflight, RexError> {
+        #[derive(Deserialize)]
+        struct ServerVersion {
+            platform: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct ApplePrivacyStatus {
+            #[serde(default)]
+            services: Vec<ApplePrivacyService>,
+            responsible_path: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct ApplePrivacyService {
+            service: String,
+            status: String,
+        }
+
+        if !self.is_local_unix_socket() {
+            return Ok(ApplePrivacyPreflight::NotApplicable);
+        }
+        let version: ServerVersion = match self.api("server.version", &Empty {}).await {
+            Ok(bytes) => decode(&bytes)?,
+            Err(CallFailure::MethodNotFound | CallFailure::Forbidden) => {
+                return Ok(ApplePrivacyPreflight::UnsupportedServer);
+            }
+            Err(error) => return Err(read_failure(error)),
+        };
+        if !version
+            .platform
+            .as_deref()
+            .is_some_and(|platform| platform.starts_with("darwin"))
+        {
+            return Ok(ApplePrivacyPreflight::NotApplicable);
+        }
+        let privacy: ApplePrivacyStatus =
+            match self.api("server.apple.privacy_status", &Empty {}).await {
+                Ok(bytes) => decode(&bytes)?,
+                Err(CallFailure::MethodNotFound | CallFailure::Forbidden) => {
+                    return Ok(ApplePrivacyPreflight::UnsupportedServer);
+                }
+                Err(error) => return Err(read_failure(error)),
+            };
+        let Some(fda) = privacy
+            .services
+            .into_iter()
+            .find(|service| service.service == "full_disk_access")
+        else {
+            return Ok(ApplePrivacyPreflight::NotApplicable);
+        };
+        if fda.status == "granted" {
+            Ok(ApplePrivacyPreflight::Granted)
+        } else {
+            Ok(ApplePrivacyPreflight::Missing {
+                status: fda.status,
+                responsible_path: privacy.responsible_path,
+            })
+        }
+    }
+
+    async fn format_capture(
         &self,
         session: &SessionId,
         block: &BlockId,
-    ) -> Result<TerminalCapture, RexError> {
-        let arguments = |format: &str| {
-            vec![
+        format: &str,
+    ) -> Result<String, CallFailure> {
+        #[derive(Serialize)]
+        struct FormatRequest<'a> {
+            session_id: &'a SessionId,
+            block_id: &'a BlockId,
+            args: FormatArgs<'a>,
+        }
+        #[derive(Serialize)]
+        struct FormatArgs<'a> {
+            format: &'a str,
+            trim: bool,
+            max_bytes: usize,
+        }
+        #[derive(Deserialize)]
+        struct FormatReply {
+            #[serde(default)]
+            content: String,
+            id: Option<u64>,
+            eof: Option<bool>,
+            total: Option<usize>,
+        }
+        #[derive(Serialize)]
+        struct BlobRequest<'a> {
+            session_id: &'a SessionId,
+            block_id: &'a BlockId,
+            args: BlobArgs,
+        }
+        #[derive(Serialize)]
+        struct BlobArgs {
+            id: u64,
+            offset: usize,
+            max_bytes: usize,
+        }
+        #[derive(Deserialize)]
+        struct BlobReply {
+            data: String,
+            eof: bool,
+        }
+
+        const CHUNK_BYTES: usize = 256 * 1024;
+        let max_total = usize::try_from(MAX_OUTPUT_BYTES).unwrap_or(usize::MAX);
+        let reply: FormatReply = serde_json::from_slice(
+            &self
+                .api(
+                    "com.superlogical.terminal.format",
+                    &FormatRequest {
+                        session_id: session,
+                        block_id: block,
+                        args: FormatArgs {
+                            format,
+                            trim: true,
+                            max_bytes: CHUNK_BYTES,
+                        },
+                    },
+                )
+                .await?,
+        )
+        .map_err(|_| CallFailure::Failed)?;
+        if reply.total.is_some_and(|total| total > max_total) {
+            return Err(CallFailure::OutputTooLarge);
+        }
+        let mut out = reply.content;
+        if out.len() > max_total {
+            return Err(CallFailure::OutputTooLarge);
+        }
+        let mut done = reply.eof.unwrap_or(reply.id.is_none());
+        if !done && let Some(id) = reply.id {
+            while !done && out.len() < max_total {
+                let remaining = max_total - out.len();
+                let chunk: BlobReply = serde_json::from_slice(
+                    &self
+                        .api(
+                            "com.superlogical.terminal.blob_read",
+                            &BlobRequest {
+                                session_id: session,
+                                block_id: block,
+                                args: BlobArgs {
+                                    id,
+                                    offset: out.len(),
+                                    max_bytes: remaining.min(CHUNK_BYTES),
+                                },
+                            },
+                        )
+                        .await?,
+                )
+                .map_err(|_| CallFailure::Failed)?;
+                if chunk.data.is_empty() {
+                    break;
+                }
+                if chunk.data.len() > remaining {
+                    return Err(CallFailure::OutputTooLarge);
+                }
+                out.push_str(&chunk.data);
+                done = chunk.eof;
+            }
+            if !done {
+                return Err(CallFailure::OutputTooLarge);
+            }
+        }
+        if out.is_empty() {
+            return Err(CallFailure::Failed);
+        }
+        Ok(out)
+    }
+
+    async fn cli_capture(
+        &self,
+        session: &SessionId,
+        block: &BlockId,
+        format: &str,
+    ) -> Result<String, CallFailure> {
+        let output = self
+            .run(vec![
                 "capture".to_owned(),
                 "--session".to_owned(),
                 session.to_string(),
@@ -390,27 +702,51 @@ impl RexClient {
                 block.to_string(),
                 "--format".to_owned(),
                 format.to_owned(),
-            ]
-        };
-        let decode = |output| {
-            let text = String::from_utf8(output).map_err(|_| RexError::InvalidResponse)?;
-            if text.is_empty() {
-                return Err(RexError::InvalidResponse);
+                "--trim".to_owned(),
+            ])
+            .await?;
+        let text = String::from_utf8(output).map_err(|_| CallFailure::Failed)?;
+        if text.is_empty() {
+            return Err(CallFailure::Failed);
+        }
+        Ok(text)
+    }
+
+    async fn capture_terminal_via(
+        &self,
+        session: &SessionId,
+        block: &BlockId,
+        path: CapturePath,
+    ) -> Result<TerminalCapture, CallFailure> {
+        let capture = |format| async move {
+            match path {
+                CapturePath::Rpc => self.format_capture(session, block, format).await,
+                CapturePath::Cli => self.cli_capture(session, block, format).await,
             }
-            Ok(text)
         };
-        match self.run(arguments("html")).await {
-            Ok(output) => decode(output).map(TerminalCapture::Html),
-            // Styling can exceed this client's output bound while the same
-            // pane's text still fits. Other failures must not select a pane
-            // implicitly or cause another export attempt.
-            Err(CallFailure::OutputTooLarge) => self
-                .run(arguments("text"))
+        match capture("html").await {
+            Ok(html) => Ok(TerminalCapture::Html(html)),
+            // Styling can exceed our byte bound while trimmed text still fits.
+            Err(CallFailure::OutputTooLarge) => capture("text").await.map(TerminalCapture::Text),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Capture only the explicitly owned terminal, never the client's focused pane.
+    pub async fn capture_terminal(
+        &self,
+        session: &SessionId,
+        block: &BlockId,
+    ) -> Result<TerminalCapture, RexError> {
+        match self
+            .capture_terminal_via(session, block, CapturePath::Rpc)
+            .await
+        {
+            Err(CallFailure::MethodNotFound) => self
+                .capture_terminal_via(session, block, CapturePath::Cli)
                 .await
-                .map_err(read_failure)
-                .and_then(decode)
-                .map(TerminalCapture::Text),
-            Err(error) => Err(read_failure(error)),
+                .map_err(read_failure),
+            other => other.map_err(read_failure),
         }
     }
 
@@ -657,7 +993,7 @@ impl RexClient {
         if let RexRoute::Private(endpoint) = &self.route {
             command
                 .arg("--server")
-                .arg(&endpoint.0)
+                .arg(endpoint.as_str())
                 .env_remove("REX_SERVER");
         }
         command
@@ -690,7 +1026,7 @@ impl RexClient {
                 return Err(CallFailure::OutputTooLarge);
             }
             if error.len() as u64 > MAX_ERROR_BYTES {
-                return Err(CallFailure::Failed);
+                return Err(classify_common_error(&error).unwrap_or(CallFailure::Failed));
             }
             if !status.success() {
                 if status.code() == Some(4)
@@ -712,7 +1048,7 @@ impl RexClient {
                 }) {
                     return Err(CallFailure::SessionNotFound);
                 }
-                return Err(CallFailure::Failed);
+                return Err(classify_common_error(&error).unwrap_or(CallFailure::Failed));
             }
             Ok(bytes)
         })
@@ -759,11 +1095,31 @@ async fn bounded_output(
     input.take(limit + 1).read_to_end(&mut bytes).await?;
     Ok(bytes)
 }
+#[derive(Clone, Copy)]
+enum CapturePath {
+    Rpc,
+    Cli,
+}
+fn classify_common_error(error: &[u8]) -> Option<CallFailure> {
+    let text = std::str::from_utf8(error).ok()?;
+    let trimmed = text.trim_end();
+    if trimmed.ends_with("(status=404 code=method_not_found)")
+        || trimmed.ends_with("code=method_not_found)")
+    {
+        Some(CallFailure::MethodNotFound)
+    } else if text.contains("(status=403 ") {
+        Some(CallFailure::Forbidden)
+    } else {
+        None
+    }
+}
 #[derive(Debug)]
 enum CallFailure {
     Unavailable,
     InvalidInput,
     Failed,
+    MethodNotFound,
+    Forbidden,
     OutputTooLarge,
     SessionNotFound,
     ServerDown { location: String },
@@ -773,7 +1129,9 @@ fn read_failure(error: CallFailure) -> RexError {
         CallFailure::Unavailable => RexError::Unavailable,
         CallFailure::ServerDown { location } => RexError::ServerDown { location },
         CallFailure::InvalidInput => RexError::InvalidInput,
-        CallFailure::Failed => RexError::ReadFailed,
+        CallFailure::Failed | CallFailure::MethodNotFound | CallFailure::Forbidden => {
+            RexError::ReadFailed
+        }
         CallFailure::OutputTooLarge => RexError::OutputTooLarge,
         CallFailure::SessionNotFound => RexError::SessionNotFound,
     }
@@ -1059,6 +1417,12 @@ mod tests {
             r#"#!/bin/sh
 set -eu
 [ -z "${REX_SESSION-}" ] && [ -z "${REX_BLOCK-}" ] && [ -z "${REX_CLIENT-}" ]
+for arg in "$@"; do
+  if [ "$arg" = "com.superlogical.terminal.format" ]; then
+    printf 'Error: stream response "control-1" failed: netapi: no handler for method "com.superlogical.terminal.format" (status=404 code=method_not_found)\n' >&2
+    exit 3
+  fi
+done
 printf '%s\n' "$@" > "$AGENT_TEST_REX_CAPTURE_ARGS"
 printf '<pre>Current task view 🦀</pre>\n'
 "#,
@@ -1096,9 +1460,198 @@ printf '<pre>Current task view 🦀</pre>\n'
                 "--block",
                 BLOCK,
                 "--format",
-                "html"
+                "html",
+                "--trim"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_capture_uses_format_blob_read_and_degrades_large_html_to_bounded_text() {
+        const CHILD: &str = "AGENT_TEST_REX_FORMAT_CAPTURE_CHILD";
+        const MODE: &str = "AGENT_TEST_REX_FORMAT_MODE";
+        const TEST: &str = "rex::tests::terminal_capture_uses_format_blob_read_and_degrades_large_html_to_bounded_text";
+        if let Ok(mode) = std::env::var(MODE) {
+            let _ = std::env::var_os(CHILD);
+            let client = RexClient::for_process(None).unwrap();
+            let output = client
+                .capture_terminal(
+                    &SessionId::parse(SESSION).unwrap(),
+                    &BlockId::parse(BLOCK).unwrap(),
+                )
+                .await
+                .unwrap();
+            if mode == "chunked-html" {
+                assert_eq!(
+                    output,
+                    TerminalCapture::Html("<pre>part-1 part-2</pre>".into())
+                );
+            } else {
+                assert_eq!(output, TerminalCapture::Text("plain trimmed tail\n".into()));
+            }
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("rex");
+        write_executable(
+            &program,
+            r#"#!/bin/sh
+set -eu
+method=""
+payload=""
+prev=""
+for arg do
+  if [ -n "$method" ]; then payload=$arg; break; fi
+  case "$prev:$arg" in
+    call:*) method=$arg ;;
+  esac
+  prev=$arg
+done
+case "$method" in
+  com.superlogical.terminal.format)
+    case "$payload" in
+      *'"trim":true'*) ;;
+      *) exit 2 ;;
+    esac
+    if [ "$AGENT_TEST_REX_CASE_MODE" = "chunked-html" ]; then
+      printf '{"content":"<pre>part-1 ","id":7,"eof":false,"total":20}\n'
+    else
+      case "$payload" in
+        *'"format":"html"'*)
+          printf 'Error: output exceeded limit (status=413 code=too_large)\n' >&2
+          exit 3 ;;
+        *'"format":"text"'*)
+          printf '{"content":"plain trimmed tail\\n","eof":true}\n' ;;
+      esac
+    fi ;;
+  com.superlogical.terminal.blob_read)
+    case "$payload" in
+      *'"id":7'*'"offset":12'*)
+        printf '{"id":7,"data":"part-2</pre>","total":20,"eof":true}\n' ;;
+      *) exit 2 ;;
+    esac ;;
+  *) exit 2 ;;
+esac
+"#,
+        );
+        let path = std::env::join_paths(std::iter::once(directory.path().to_owned()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
+        .unwrap();
+        for mode in ["chunked-html", "html-too-large"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env(MODE, mode)
+                .env("AGENT_TEST_REX_CASE_MODE", mode)
+                .env("PATH", &path)
+                .output_serialized()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn full_disk_access_preflight_gates_platform_transport_and_legacy_servers() {
+        const MODE: &str = "AGENT_TEST_REX_PRIVACY_MODE";
+        const TEST: &str =
+            "rex::tests::full_disk_access_preflight_gates_platform_transport_and_legacy_servers";
+        if let Ok(mode) = std::env::var(MODE) {
+            if mode == "ssh" {
+                let ssh = RexClient::for_process(Some("ssh://worker.example.invalid")).unwrap();
+                assert_eq!(
+                    ssh.full_disk_access_preflight().await.unwrap(),
+                    ApplePrivacyPreflight::NotApplicable
+                );
+                return;
+            }
+            let client = RexClient::for_process(None).unwrap();
+            let result = client.full_disk_access_preflight().await.unwrap();
+            match mode.as_str() {
+                "linux" => assert_eq!(result, ApplePrivacyPreflight::NotApplicable),
+                "legacy" => assert_eq!(result, ApplePrivacyPreflight::UnsupportedServer),
+                "darwin-granted" => {
+                    assert_eq!(result, ApplePrivacyPreflight::Granted);
+                    assert_eq!(result.warning_message(), None);
+                }
+                "darwin-denied" => {
+                    assert_eq!(
+                        result,
+                        ApplePrivacyPreflight::Missing {
+                            status: "denied".into(),
+                            responsible_path: Some(
+                                "/Applications/Rex.app/Contents/MacOS/Rex".into()
+                            ),
+                        }
+                    );
+                    let msg = result.warning_message().unwrap();
+                    assert!(msg.contains("denied"), "{msg}");
+                    assert!(
+                        msg.contains("/Applications/Rex.app/Contents/MacOS/Rex"),
+                        "{msg}"
+                    );
+                }
+                other => panic!("unexpected mode {other}"),
+            }
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("rex");
+        write_executable(
+            &program,
+            r#"#!/bin/sh
+set -eu
+method=""
+prev=""
+for arg do
+  case "$prev:$arg" in
+    call:*) method=$arg; break ;;
+  esac
+  prev=$arg
+done
+case "$AGENT_TEST_REX_PRIVACY_CASE:$method" in
+  ssh:*) exit 2 ;;
+  linux:server.version)
+    printf '{"rex_version":"0.1.0","platform":"linux_amd64"}\n' ;;
+  linux:server.apple.privacy_status)
+    exit 2 ;;
+  legacy:server.version)
+    printf 'Error: stream response "control-1" failed: netapi: no handler for method "server.version" (status=404 code=method_not_found)\n' >&2
+    exit 3 ;;
+  darwin-granted:server.version|darwin-denied:server.version)
+    printf '{"rex_version":"0.1.0","platform":"darwin_arm64"}\n' ;;
+  darwin-granted:server.apple.privacy_status)
+    printf '{"services":[{"service":"full_disk_access","status":"granted"}],"responsible_path":"/Applications/Rex.app"}\n' ;;
+  darwin-denied:server.apple.privacy_status)
+    printf '{"services":[{"service":"full_disk_access","status":"denied"}],"responsible_path":"/Applications/Rex.app/Contents/MacOS/Rex"}\n' ;;
+  *) exit 2 ;;
+esac
+"#,
+        );
+        let path = std::env::join_paths(std::iter::once(directory.path().to_owned()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
+        .unwrap();
+        for mode in ["ssh", "linux", "legacy", "darwin-granted", "darwin-denied"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(MODE, mode)
+                .env("AGENT_TEST_REX_PRIVACY_CASE", mode)
+                .env("PATH", &path)
+                .output_serialized()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[tokio::test]
@@ -1392,6 +1945,40 @@ printf '<pre>Current task view 🦀</pre>\n'
             );
         }
         assert!(!RexClient::for_process(None).unwrap().is_private());
+    }
+
+    #[test]
+    fn ssh_rex_endpoints_are_validated_without_shell_interpolation() {
+        for (input, accepted) in [
+            ("ssh://worker.example.invalid", true),
+            ("ssh://alice@worker.example.invalid", true),
+            ("ssh://alice@worker.example.invalid:2222", true),
+            ("ssh://[::1]:2222", true),
+            ("ssh://", false),
+            ("ssh://-oProxyCommand=bad", false),
+            ("ssh://-alice@worker.example.invalid", false),
+            ("ssh://alice@-worker.example.invalid", false),
+            ("ssh://worker.example.invalid/path", false),
+            ("ssh://worker.example.invalid?x=1", false),
+            ("ssh://worker.example.invalid#frag", false),
+            ("ssh://alice@bob@worker.example.invalid", false),
+            ("ssh://worker.example.invalid:0", false),
+            ("ssh://worker.example.invalid:notaport", false),
+            ("ssh://worker example.invalid", false),
+        ] {
+            assert_eq!(
+                LocalRexEndpoint::parse(input).is_ok(),
+                accepted,
+                "{input:?}"
+            );
+            let client = RexClient::for_process(Some(input));
+            assert_eq!(client.is_ok(), accepted, "{input:?}");
+            if accepted {
+                let client = client.unwrap();
+                assert_eq!(client.ssh_endpoint(), Some(input));
+                assert!(!client.is_local_unix_socket());
+            }
+        }
     }
 
     #[tokio::test]

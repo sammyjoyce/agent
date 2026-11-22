@@ -15,6 +15,7 @@ for argument do
   if [ -n "$method" ]; then payload=$argument; break; fi
   case "$previous:$argument" in
     --server:unix://*) socket=${argument#unix://}; server=$argument ;;
+    --server:ssh://*) server=$argument ;;
     call:*) method=$argument ;;
     *:whoami | *:hosts) method=$argument; break ;;
   esac
@@ -56,9 +57,17 @@ if [ "${AGENT_TEST_FAKE_REX_RESTART_AFTER-}" = "$method" ]; then
 fi
 case "$method" in
   whoami)
-    printf '{"host_id":"%s","instance_id":"%s","rex_version":"fixture","tailscale":{"dns_name":"fixture-node.example.ts.net","https":{"state":"available","url":"https://fixture-node.example.ts.net"}}}\n' "$host" "$instance" ;;
+    if [ "${AGENT_TEST_FAKE_REX_NO_TAILSCALE-}" = "1" ]; then
+      printf '{"host_id":"%s","instance_id":"%s","rex_version":"fixture"}\n' "$host" "$instance"
+    else
+      printf '{"host_id":"%s","instance_id":"%s","rex_version":"fixture","tailscale":{"dns_name":"fixture-node.example.ts.net","https":{"state":"available","url":"https://fixture-node.example.ts.net"}}}\n' "$host" "$instance"
+    fi ;;
   hosts)
-    printf '{"hosts":[{"host_id":"%s","label":"fixture-peer","endpoints":["https://peer.example.invalid"]}]}\n' "$host" ;;
+    if [ "${AGENT_TEST_FAKE_REX_SSH_PEER-}" = "1" ]; then
+      printf '{"hosts":[{"host_id":"%s","label":"fixture-peer","endpoints":["unix:///run/user/1000/rex.sock","ssh://worker.example.invalid:2222"]}]}\n' "$host"
+    else
+      printf '{"hosts":[{"host_id":"%s","label":"fixture-peer","endpoints":["https://peer.example.invalid"]}]}\n' "$host"
+    fi ;;
   session.create)
     printf '{"session_id":"%s","initial_windows":[{"window_id":"%s","block_ids":["%s"],"revision":1}]}\n' "$created" "$created_window" "$created_block" ;;
   session.new_window)
@@ -81,6 +90,8 @@ case "$method" in
       *"${AGENT_TEST_FAKE_REX_RUNNING:-<none>}"*) printf '{"child":{"pid":4242},"foreground":null,"last_exit":null}\n' ;;
       *) printf '{"child":null,"foreground":null,"last_exit":{"exit_code":0}}\n' ;;
     esac ;;
+  com.superlogical.terminal.format)
+    printf '{"content":"<pre>Current task view 🦀</pre>\\n","eof":true}\n' ;;
   block.close) : > "$root/closed"; printf '{}\n' ;;
   *) printf 'Unexpected fixture method %s\n' "$method" >&2; exit 1 ;;
 esac

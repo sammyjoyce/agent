@@ -386,6 +386,14 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                             .map(|source| Box::new(source) as Box<dyn Source>),
                     ),
                     Err(error) => {
+                        let mut message = discovery_failure(
+                            &error,
+                            "Messages account discovery failed; coverage is unknown",
+                        );
+                        if let Some(warning) = messages::full_disk_access_diagnostic().await {
+                            message.push(' ');
+                            message.push_str(&warning);
+                        }
                         for account in namespaces
                             .clone()
                             .unwrap_or_else(|| vec![DISCOVERY_ACCOUNT.into()])
@@ -395,10 +403,7 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                                     provider: "messages".into(),
                                     account,
                                 },
-                                discovery_failure(
-                                    &error,
-                                    "Messages account discovery failed; coverage is unknown",
-                                ),
+                                message.clone(),
                             ));
                         }
                     }
