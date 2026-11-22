@@ -554,19 +554,103 @@ fn task_message_sender() -> Result<Option<String>> {
     Ok(Some(value))
 }
 
+fn wants_json_flag() -> bool {
+    std::env::args_os()
+        .skip(1)
+        .take_while(|argument| argument != "--")
+        .any(|argument| argument == "--json")
+}
+
+fn json_error(error: &anyhow::Error) -> (agent_cli::protocol::ErrorCode, String) {
+    use agent_cli::protocol::ErrorCode;
+    if let Some(failure) = error.downcast_ref::<CoordinatorFailure>() {
+        return (failure.code.clone(), failure.message.clone());
+    }
+    if error.downcast_ref::<OwnerFenced>().is_some() || chat_view::ViewError::is_transport(error) {
+        return (ErrorCode::CoordinatorUnavailable, format!("{error:#}"));
+    }
+    if let Some(rex_error) = error.downcast_ref::<agent_cli::rex::RexError>() {
+        let code = match rex_error {
+            agent_cli::rex::RexError::InvalidInput | agent_cli::rex::RexError::InvalidId => {
+                ErrorCode::InvalidRequest
+            }
+            agent_cli::rex::RexError::Unavailable | agent_cli::rex::RexError::ServerDown { .. } => {
+                ErrorCode::CoordinatorUnavailable
+            }
+            _ => ErrorCode::Internal,
+        };
+        return (code, format!("{error:#}"));
+    }
+    if error.chain().any(|cause| {
+        cause.is::<agent_cli::history::chatgpt::PackageError>() || cause.is::<toml::de::Error>()
+    }) {
+        return (ErrorCode::InvalidRequest, format!("{error:#}"));
+    }
+    (ErrorCode::Internal, format!("{error:#}"))
+}
+
+fn emit_failure_or_stderr(
+    code: agent_cli::protocol::ErrorCode,
+    message: impl Into<String>,
+    stderr_line: &str,
+    json: bool,
+) {
+    if json {
+        let _ = display(
+            &RuntimeEventKind::Failure {
+                code,
+                message: message.into(),
+            },
+            true,
+        );
+    }
+    eprintln!("{stderr_line}");
+}
+
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
-    match run().await {
+    let arguments = match Arguments::try_parse() {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            if !matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) && wants_json_flag()
+            {
+                let _ = display(
+                    &RuntimeEventKind::Failure {
+                        code: agent_cli::protocol::ErrorCode::InvalidRequest,
+                        message: error.render().to_string().trim().to_owned(),
+                    },
+                    true,
+                );
+            }
+            error.exit();
+        }
+    };
+    let json = arguments.json;
+    match run(arguments).await {
+        Ok(()) => Ok(ExitCode::SUCCESS),
         Err(error) if error.downcast_ref::<OwnerFenced>().is_some() => {
-            eprintln!("Error: {error:?}");
+            emit_failure_or_stderr(
+                agent_cli::protocol::ErrorCode::CoordinatorUnavailable,
+                error.to_string(),
+                &format!("Error: {error:?}"),
+                json,
+            );
             Ok(ExitCode::from(OWNER_FENCED_EXIT))
         }
-        result => result.map(|()| ExitCode::SUCCESS),
+        Err(error) => {
+            if json {
+                let (code, message) = json_error(&error);
+                let _ = display(&RuntimeEventKind::Failure { code, message }, true);
+            }
+            Err(error)
+        }
     }
 }
 
-async fn run() -> Result<()> {
-    let mut arguments = Arguments::parse();
+async fn run(mut arguments: Arguments) -> Result<()> {
     #[allow(clippy::disallowed_methods)]
     let rex = RexClient::for_process(arguments.rex_server.as_deref())?;
     let action = arguments.command.take().unwrap_or(Action::Chat {
@@ -1229,7 +1313,13 @@ async fn run() -> Result<()> {
                     if let Some(command) = local {
                         match command {
                             Err(error) => {
-                                eprintln!("{error}");
+                                let text = error.to_string();
+                                emit_failure_or_stderr(
+                                    agent_cli::protocol::ErrorCode::InvalidRequest,
+                                    &text,
+                                    &text,
+                                    arguments.json,
+                                );
                                 continue;
                             }
                             Ok(ChatCommand::Help) => {
@@ -1248,7 +1338,13 @@ async fn run() -> Result<()> {
                                 )
                                 .await
                                 {
-                                    eprintln!("Local command failed: {error}");
+                                    let (code, message) = json_error(&error);
+                                    emit_failure_or_stderr(
+                                        code,
+                                        message,
+                                        &format!("Local command failed: {error}"),
+                                        arguments.json,
+                                    );
                                 }
                                 continue;
                             }
@@ -1294,7 +1390,15 @@ async fn run() -> Result<()> {
                                         }
                                     }
                                 }
-                                Err(error) => eprintln!("Feedback could not start: {error}"),
+                                Err(error) => {
+                                    let (code, message) = json_error(&error);
+                                    emit_failure_or_stderr(
+                                        code,
+                                        message,
+                                        &format!("Feedback could not start: {error}"),
+                                        json,
+                                    );
+                                }
                             }
                         });
                         continue;
@@ -3755,12 +3859,22 @@ async fn request_presented(
     let result = async {
     write_command(&mut *wire.writer, &command).await?;
     let mut reader = FrameReader::new(BufReader::new(wire.reader));
-    let mut failure = None;
+    let mut failure = None::<CoordinatorFailure>;
     let mut outcome = false;
     let mut progress_key = None;
     loop {
         let frame = tokio::select! {
-            frame = reader.next_frame() => frame?.context("Coordinator disconnected; saved work is retained")?,
+            frame = reader.next_frame() => match frame.map_err(chat_view::ViewError::read)? {
+                Some(frame) => frame,
+                None => {
+                    if let Some(failure) = failure.take() {
+                        return Err(failure.into());
+                    }
+                    return Err(chat_view::ViewError::transport(anyhow::anyhow!(
+                        "Coordinator disconnected; saved work is retained"
+                    )));
+                }
+            },
             read = reads.join_next(), if !reads.is_empty() => {
                 let (call_id, result) = read.context("Export reads stopped")??;
                 write_command(&mut *wire.writer, &RuntimeCommand::HostReply { call_id, result }).await?;
@@ -3864,7 +3978,16 @@ async fn request_presented(
                 } else if let Some(line) = line {
                     if let Some(command) = ChatCommand::parse(&line) {
                         match command {
-                            Err(error) => { eprintln!("{error}"); continue; }
+                            Err(error) => {
+                                let text = error.to_string();
+                                emit_failure_or_stderr(
+                                    agent_cli::protocol::ErrorCode::InvalidRequest,
+                                    &text,
+                                    &text,
+                                    arguments.json,
+                                );
+                                continue;
+                            }
                             Ok(ChatCommand::Help) => { println!("{}", agent_cli::tui::help_text()); continue; }
                             Ok(ChatCommand::Exit) => {
                                 write_command(&mut *wire.writer, &RuntimeCommand::DetachWorker).await?;
@@ -3874,7 +3997,15 @@ async fn request_presented(
                             Ok(ChatCommand::History | ChatCommand::Feedback { .. }) => {}
                             Ok(command) => {
                                 let cwd = feedback_settings.as_ref().map(|(_, cwd)| Path::new(cwd)).unwrap_or_else(|| Path::new("."));
-                                if let Err(error) = local_command_plain(client, &command, history_target.clone(), cwd, arguments.json).await { eprintln!("Local command failed: {error}"); }
+                                if let Err(error) = local_command_plain(client, &command, history_target.clone(), cwd, arguments.json).await {
+                                    let (code, message) = json_error(&error);
+                                    emit_failure_or_stderr(
+                                        code,
+                                        message,
+                                        &format!("Local command failed: {error}"),
+                                        arguments.json,
+                                    );
+                                }
                                 continue;
                             }
                         }
@@ -3903,7 +4034,15 @@ async fn request_presented(
                             }.await;
                             match captured {
                                 Ok(events) => for event in events { if let Err(error) = display(&event, json) { eprintln!("Feedback receipt could not be displayed: {error}"); } },
-                                Err(error) => eprintln!("Feedback could not start: {error}"),
+                                Err(error) => {
+                                    let (code, message) = json_error(&error);
+                                    emit_failure_or_stderr(
+                                        code,
+                                        message,
+                                        &format!("Feedback could not start: {error}"),
+                                        json,
+                                    );
+                                }
                             }
                             });
                         }
@@ -4034,14 +4173,14 @@ async fn request_presented(
                 ensure!(status.success(), "Chrome did not open");
                 eprintln!("Finish ChatGPT sign-in in Chrome.");
             }
-            RuntimeEventKind::Failure { message, .. } => {
+            RuntimeEventKind::Failure { code, message } => {
                 if let Some(ui) = presentation
                     .as_mut()
                     .and_then(|view| view.session.as_deref_mut())
                 {
                     ui.failure_shown = true;
                 }
-                failure = Some(message);
+                failure = Some(CoordinatorFailure { code, message });
             }
             RuntimeEventKind::Done => {
                 if (lifecycle == RequestLifecycle::Chat || lifecycle.is_view()) && let Some(view) = &presentation && view.session.as_ref().is_none_or(|ui|ui.selected.is_none()) { view.handle.working(false)?; }
@@ -4164,10 +4303,13 @@ async fn request_presented(
                     progress_key = Some(key);
                 }
                 if importing && matches!(progress.phase, ImportPhase::Partial) {
-                    failure = Some(format!(
-                        "History import is partial ({} gaps); committed history and checkpoints are retained",
-                        progress.gap_count
-                    ));
+                    failure = Some(CoordinatorFailure {
+                        code: agent_cli::protocol::ErrorCode::StorageUnavailable,
+                        message: format!(
+                            "History import is partial ({} gaps); committed history and checkpoints are retained",
+                            progress.gap_count
+                        ),
+                    });
                 }
             }
             other => {
@@ -4183,7 +4325,7 @@ async fn request_presented(
         }
     }
     if let Some(failure) = failure {
-        bail!("{failure}");
+        return Err(failure.into());
     }
     ensure!(outcome || lifecycle.is_view(), "Coordinator completed without a result");
     Ok(history_cursor)

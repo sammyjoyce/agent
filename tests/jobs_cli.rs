@@ -718,18 +718,29 @@ fn real_cli_reconciles_files_preserves_builtins_and_reopens_durable_deadlines() 
     assert_ne!(updated.schedules[0].next_at, original.schedules[0].next_at);
     assert!(updated.job.prompt.contains("updated evidence"));
 
+    fn failure_message(output: &Output) -> String {
+        assert!(!output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout
+            .lines()
+            .rfind(|line| !line.trim().is_empty())
+            .expect("failed --json CLI command must emit JSON failure on stdout");
+        match serde_json::from_str::<RuntimeEventKind>(line).expect("JSON failure event") {
+            RuntimeEventKind::Failure { message, .. } => message,
+            other => panic!("unexpected JSON event: {other:?}"),
+        }
+    }
+
     let duplicate = fixture.jobs.join("copied.toml");
     fs::write(&duplicate, &edited).unwrap();
     let output = fixture.cli(&["jobs", "sync"]);
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Duplicate scheduled job ID"));
+    assert!(failure_message(&output).contains("Duplicate scheduled job ID"));
     assert_eq!(fixture.get().job.revision, updated.job.revision);
     fs::remove_file(&duplicate).unwrap();
     let (_, schedule) = edited.split_once("[[schedules]]").unwrap();
     fs::write(&file, format!("{edited}\n[[schedules]]{schedule}")).unwrap();
     let output = fixture.cli(&["jobs", "sync"]);
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Duplicate schedule ID"));
+    assert!(failure_message(&output).contains("Duplicate schedule ID"));
     assert_eq!(fixture.get().job.revision, updated.job.revision);
     fs::write(&file, &edited).unwrap();
 
@@ -817,10 +828,11 @@ fn remote_sync_rejects_client_paths_before_connecting() {
         !fixture.directory.path().join("external-calls").exists(),
         "Remote sync must reject client paths before contacting the coordinator"
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let event: RuntimeEventKind = serde_json::from_str(stdout.trim()).unwrap();
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("Run jobs sync on the coordinator"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        matches!(&event, RuntimeEventKind::Failure { message, .. } if message.contains("Run jobs sync on the coordinator")),
+        "{event:?}"
     );
 }
 
@@ -839,12 +851,11 @@ fn retry_jobs_reaches_the_coordinator_without_launching_unparked_work() {
     for (id, reason) in [(JOB_ID, "parked"), ("missing", "unknown scheduled job")] {
         let output = fixture.cli(&["jobs", "retry", id]);
         assert!(!output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let event: RuntimeEventKind = serde_json::from_str(stdout.trim()).unwrap();
         assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .to_lowercase()
-                .contains(reason),
-            "Retry must report the coordinator's recovery decision: {}",
-            String::from_utf8_lossy(&output.stderr)
+            matches!(&event, RuntimeEventKind::Failure { message, .. } if message.to_lowercase().contains(reason)),
+            "Retry must report the coordinator's recovery decision: {event:?}"
         );
         assert!(fixture.tasks().is_empty(), "Retry must not admit a new run");
         assert_eq!(fixture.status().triggers, triggers);
@@ -874,12 +885,11 @@ fn history_index_recovery_reports_native_state_without_starting_an_import() {
     assert!(String::from_utf8_lossy(&plain.stdout).contains("Background work:"));
     let output = fixture.cli(&["import", "retry-index"]);
     assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let event: RuntimeEventKind = serde_json::from_str(stdout.trim()).unwrap();
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .to_lowercase()
-            .contains("parked"),
-        "Recovery must reach the coordinator's native-state guard: {}",
-        String::from_utf8_lossy(&output.stderr)
+        matches!(&event, RuntimeEventKind::Failure { message, .. } if message.to_lowercase().contains("parked")),
+        "Recovery must reach the coordinator's native-state guard: {event:?}"
     );
     assert!(fixture.tasks().is_empty());
     assert_eq!(fixture.status().triggers, before.triggers);
