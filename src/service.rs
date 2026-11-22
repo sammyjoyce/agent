@@ -1,3 +1,5 @@
+mod boundary;
+
 use std::{
     collections::HashSet,
     fs,
@@ -461,6 +463,9 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                         .await?;
                     return Ok(());
                 }
+                crate::native::Operation::Service(service_request) => {
+                    return boundary::handle(&mut writer, &runtime, &broker, service_request).await;
+                }
             }
         }
         command => command,
@@ -740,6 +745,7 @@ mod tests {
     mod scrawl_feedback;
     mod startup;
     use crate::TEST_HANG_LIMIT;
+    use crate::native::{NativeEvent, NativeRequest};
     use crate::protocol::{AuthStatus, HostResult, InputMode, RuntimeCommand, RuntimeEventKind};
     use crate::runtime::{FrameReader, OwnerClaim, Runtime, ShutdownSignal};
     use crate::service::{
@@ -2290,5 +2296,121 @@ mod tests {
         drop(owner);
         drop(listener);
         assert_eq!(fs::read_to_string(path).unwrap(), "replacement");
+    }
+
+    struct BoundaryService {
+        state: PathBuf,
+        stop: oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<Result<()>>,
+    }
+
+    impl BoundaryService {
+        async fn start(state: PathBuf) -> Self {
+            fs::create_dir_all(&state).unwrap();
+            let script = state.join("fixture.mjs");
+            fs::write(
+                &script,
+                "import readline from 'node:readline';\nconst rl = readline.createInterface({ input: process.stdin });\nrl.on('line', (line) => {\n  const req = JSON.parse(line);\n  if (req.command.type === 'configure_coordinator' || req.command.type === 'set_connected_nodes' || req.command.type === 'run_background') {\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'done' } }) + '\\n');\n  } else if (req.command.type === 'observe_main') {\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'main_ready', conversation_id: '1', cwd: '/', model: { provider: 'openai', model_id: 'fixture', reasoning: null, fast: false } } }) + '\\n');\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'worker_idle' } }) + '\\n');\n  } else {\n    process.stderr.write('UNEXPECTED_RUNTIME_COMMAND:' + req.command.type + '\\n');\n  }\n});\n",
+            )
+            .unwrap();
+            let (stop, stopped) = oneshot::channel::<()>();
+            let state_for_task = state.clone();
+            let task = tokio::spawn(async move {
+                super::serve_with_transport(
+                    &script,
+                    OwnerClaim::acquire(&state_for_task, &script, None).unwrap(),
+                    None,
+                    crate::tailnet::PeerPolicy::new(&[], &[]).unwrap(),
+                    crate::tailnet::Daemon::default(),
+                    crate::rex::RexClient::for_process(None).unwrap(),
+                    None,
+                    async {
+                        let _ = stopped.await;
+                        Ok(ShutdownReason::Requested)
+                    },
+                )
+                .await
+            });
+            Self { state, stop, task }
+        }
+
+        async fn connect(&self) -> UnixStream {
+            let deadline = Instant::now() + TEST_HANG_LIMIT;
+            loop {
+                match connect(&self.state).await {
+                    Ok(stream) => return stream,
+                    Err(_) => {
+                        assert!(Instant::now() < deadline);
+                        sleep(Duration::from_millis(5)).await;
+                    }
+                }
+            }
+        }
+
+        async fn request_events(&self, request: NativeRequest) -> Vec<NativeEvent> {
+            let stream = self.connect().await;
+            let (r, mut w) = stream.into_split();
+            write_frame(&mut w, &RuntimeCommand::Native { request })
+                .await
+                .unwrap();
+            let mut reader = FrameReader::new(BufReader::new(r));
+            let mut events = Vec::new();
+            loop {
+                let Some(frame) = timeout(TEST_HANG_LIMIT, reader.next_frame())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                else {
+                    break;
+                };
+                let event: NativeEvent = serde_json::from_slice(&frame).unwrap();
+                let done = matches!(event, NativeEvent::Done);
+                events.push(event);
+                if done {
+                    break;
+                }
+            }
+            events
+        }
+
+        async fn shutdown(self) {
+            let _ = self.stop.send(());
+            let _ = self.task.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn service_status_reports_running_coordinator_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let service = BoundaryService::start(state.clone()).await;
+
+        let events = service.request_events(NativeRequest::ServiceStatus).await;
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            NativeEvent::ServiceStatus {
+                coordinator_id,
+                pid,
+                version,
+                executable_path,
+                state_dir,
+            } => {
+                assert_eq!(coordinator_id, &runtime_coordinator_id(&state));
+                assert_eq!(*pid, std::process::id());
+                assert_eq!(version, env!("CARGO_PKG_VERSION"));
+                assert!(executable_path.is_some());
+                assert_eq!(state_dir, &state.to_string_lossy());
+            }
+            other => panic!("Expected ServiceStatus event, got {other:?}"),
+        }
+        assert!(matches!(events[1], NativeEvent::Done));
+
+        service.shutdown().await;
+    }
+
+    fn runtime_coordinator_id(state: &std::path::Path) -> String {
+        crate::coordinator_id::CoordinatorId::load_or_mint(state)
+            .unwrap()
+            .to_string()
     }
 }

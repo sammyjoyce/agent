@@ -2627,6 +2627,20 @@
           ]
         },
         {
+          "description": "Coordinator service-boundary running status and version comparison. Never forwarded to Pi.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "service_status"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
           "type": "object",
           "properties": {
             "type": {

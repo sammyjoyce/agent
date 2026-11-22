@@ -537,4 +537,6 @@
 {"type":"notifications","status":{"configured":true,"registered":false}}
 {"type":"notifications","status":{"configured":false,"registered":true}}
 {"type":"done"}
+{"type":"service_status","coordinator_id":"example","pid":1,"version":"example","executable_path":"example","state_dir":"example"}
+{"type":"service_status","coordinator_id":"example","pid":1,"version":"example","state_dir":"example"}
 {"type":"identity","coordinator_id":"example"}

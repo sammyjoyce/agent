@@ -1691,7 +1691,8 @@ public actor CoordinatorSession {
       snapshot.busy = false
       transcript.idle()
     // `VerifiedConnection` fails a socket that repeats `identity`, so it never arrives here.
-    case .attachment, .toolDetails, .conversations, .notifications, .disconnect, .done, .identity:
+    case .attachment, .toolDetails, .conversations, .notifications, .serviceStatus, .disconnect,
+      .done, .identity:
       break
     }
     switch event {
