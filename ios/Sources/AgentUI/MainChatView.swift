@@ -16,6 +16,7 @@ public struct MainChatView: View {
   private let notifications: AppNotifications?
   private let relatedWork: [SavedConversation]
   private let inspectRelated: ((SavedConversation) -> Void)?
+  var prototypeBack: (() -> Void)? = nil
   @Environment(\.dismiss) private var dismiss
   @State private var settings = false
   @FocusState private var composerFocused: Bool
@@ -65,10 +66,16 @@ public struct MainChatView: View {
     _followsLatest = State(initialValue: initialScrollTarget == nil)
   }
   public var body: some View {
-    NavigationStack {
+    NavigationStack { chat }
+    .preferredColorScheme(appearance.colorScheme)
+  }
+  private var chat: some View {
       VStack(spacing: 0) {
+        prototypeBar
         if model.multiple {
-          ForEach(model.profiles) { profile in laneStatus(profile) }
+          ForEach(model.profiles.filter { model.scope == nil || $0.id == model.scope }) {
+            profile in laneStatus(profile)
+          }
         } else if let status = connectionStatus {
           HStack(spacing: 8) {
             ProgressView().controlSize(.mini)
@@ -153,7 +160,32 @@ public struct MainChatView: View {
         .toolbarBackground(.visible, for: .navigationBar)
       #endif
       .toolbar {
+        if let prototypeBack {
+          ToolbarItem(placement: .topBarLeading) {
+            Button(action: prototypeBack) {
+              HStack(spacing: 4) {
+                Image(systemName: "chevron.left").fontWeight(.semibold)
+                if model.hiddenUnseen > 0 {
+                  Text("\(model.hiddenUnseen)").font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white).padding(.horizontal, 7).padding(.vertical, 1)
+                    .background(.blue, in: Capsule())
+                }
+              }
+            }.tint(.primary)
+          }
+        }
         ToolbarItem(placement: .principal) {
+          if model.prototypeVariant == "v1" && model.multiple {
+            titleMenu
+          } else if model.scoped || model.prototypeVariant == "v4" {
+            VStack(spacing: 1) {
+              Text(model.scope.map(model.name) ?? "All coordinators").font(.headline)
+              Text(
+                model.scope.map { model.snapshotModel($0) }
+                  ?? joinedNames(model.profiles.map(\.name.description))
+              ).font(.caption).foregroundStyle(.primary.opacity(0.65)).lineLimit(1)
+            }
+          } else {
           VStack(spacing: 1) {
             Text(model.inspectedConversation?.title ?? "Beep Boop").font(.headline).lineLimit(1)
             Text(
@@ -163,6 +195,7 @@ public struct MainChatView: View {
             )
             .font(.caption).foregroundStyle(.primary.opacity(0.65)).lineLimit(1)
           }.accessibilityElement(children: .combine)
+          }
         }
         ToolbarItem(placement: .primaryAction) {
           if inspecting {
@@ -246,8 +279,6 @@ public struct MainChatView: View {
           followsLatest = true
         }
       }
-    }
-    .preferredColorScheme(appearance.colorScheme)
   }
   private var mainVisible: Bool { scenePhase == .active && !settings && !sourceDetails }
   private var inspecting: Bool { model.inspectedConversation != nil }
@@ -277,7 +308,7 @@ public struct MainChatView: View {
   /// Each coordinator's name and color, with two or more saved. Empty otherwise, which keeps
   /// the one-coordinator feed as it was.
   private var badges: [ProfileID: CoordinatorBadge] {
-    guard model.multiple else { return [:] }
+    guard model.multiple, !model.scoped else { return [:] }
     return Dictionary(
       model.profiles.enumerated().map { index, profile in
         (
@@ -339,7 +370,7 @@ public struct MainChatView: View {
   }
   private var transcript: some View {
     let items = model.transcriptItems
-    let starts = model.multiple ? TranscriptItem.runStarts(items) : []
+    let starts = model.multiple && !model.scoped ? TranscriptItem.runStarts(items) : []
     let badges = badges
     return ScrollViewReader { scroll in
       ScrollView {
@@ -438,6 +469,13 @@ public struct MainChatView: View {
         if let initialScrollTarget {
           await Task.yield()
           scroll.scrollTo(initialScrollTarget, anchor: .top)
+        }
+      }
+      .task(id: model.scope) {
+        for _ in 0..<5 {
+          try? await Task.sleep(for: .milliseconds(400))
+          followsLatest = true
+          scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
         }
       }
       .task(id: historyRequest) {
@@ -663,7 +701,9 @@ public struct MainChatView: View {
       .overlay {
         RoundedRectangle(cornerRadius: 26).strokeBorder(.primary.opacity(0.12), lineWidth: 0.5)
       }
-      if model.addressesByName {
+      if model.prototypeVariant == "v5" && model.multiple {
+        composerScope
+      } else if model.addressesByName, !model.scoped || model.blockedForPrototype {
         // With the picker open the tag is still being typed, which is not an error.
         let blocked =
           if case .blocked = model.addressing, model.pickerMatches.isEmpty { true } else { false }
@@ -676,7 +716,8 @@ public struct MainChatView: View {
     .padding(.horizontal, 12).padding(.vertical, 8).background(.background)
   }
   private var placeholder: String {
-    model.mode == .steer ? "Message Beep Boop" : "Queue a follow-up"
+    if model.scoped, let scope = model.scope { return "Message \(model.name(scope))" }
+    return model.mode == .steer ? "Message Beep Boop" : "Queue a follow-up"
   }
   #if os(iOS)
     /// The draft with the chip on its first line, like a word typed there.
@@ -1361,5 +1402,210 @@ struct RichMessage: View {
       }
     }
     .frame(maxWidth: .infinity, alignment: .leading).multilineTextAlignment(.leading)
+  }
+}
+
+// PROTOTYPE: the switcher variants. Throwaway.
+extension MainChatView {
+  func withPrototypeBack(_ back: @escaping () -> Void) -> Self {
+    var copy = self
+    copy.prototypeBack = back
+    return copy
+  }
+  func prototypeColor(_ id: ProfileID) -> Color {
+    let index = model.profiles.firstIndex { $0.id == id } ?? 0
+    return colorScheme == .dark
+      ? coordinatorPalette[index % 4].dark : coordinatorPalette[index % 4].light
+  }
+  private func dot(_ id: ProfileID, size: CGFloat = 8) -> some View {
+    Circle().fill(prototypeColor(id)).frame(width: size, height: size)
+  }
+  private func countBadge(_ count: Int, color: Color) -> some View {
+    Text("\(count)").font(.caption2.weight(.bold)).monospacedDigit()
+      .foregroundStyle(.white).padding(.horizontal, 6).padding(.vertical, 1)
+      .background(color, in: Capsule())
+  }
+  private var hiddenWithNews: [ProfileID] {
+    model.profiles.map(\.id).filter { $0 != model.scope && model.unseen($0) > 0 }
+  }
+  private var scopeBinding: Binding<ProfileID?> {
+    Binding(get: { model.scope }, set: { model.scope = $0 })
+  }
+
+  @ViewBuilder var prototypeBar: some View {
+    if model.multiple {
+      switch model.prototypeVariant {
+      case "v2": scopeBar
+      case "v3": filterPills
+      default: EmptyView()
+      }
+    }
+  }
+
+  // V1
+  var titleMenu: some View {
+    Menu {
+      scopeToggle(nil, title: "All coordinators", count: 0)
+      Divider()
+      ForEach(model.profiles) { profile in
+        scopeToggle(profile.id, title: profile.name.description, count: model.unseen(profile.id))
+      }
+    } label: {
+      VStack(spacing: 1) {
+        HStack(spacing: 4) {
+          if let scope = model.scope { dot(scope) }
+          Text(model.scope.map(model.name) ?? "All coordinators").font(.headline)
+          Image(systemName: "chevron.down").font(.caption.weight(.bold))
+            .foregroundStyle(.secondary)
+        }
+        if let other = hiddenWithNews.first {
+          HStack(spacing: 4) {
+            dot(other, size: 6)
+            Text("\(model.name(other)) · \(model.unseen(other)) new")
+              .foregroundStyle(prototypeColor(other))
+          }.font(.caption.weight(.semibold))
+        } else {
+          Text(
+            model.scope.map { model.snapshotModel($0) }
+              ?? joinedNames(model.profiles.map(\.name.description))
+          ).font(.caption).foregroundStyle(.primary.opacity(0.65))
+        }
+      }
+      .foregroundStyle(.primary).lineLimit(1)
+    }
+    .accessibilityIdentifier("scopeMenu")
+  }
+
+  @ViewBuilder private func scopeToggle(_ id: ProfileID?, title: String, count: Int)
+    -> some View
+  {
+    let icon =
+      id.map {
+        AnyView(
+          Image(
+            uiImage: UIImage(systemName: "circle.fill")!.withTintColor(
+              UIColor(prototypeColor($0)), renderingMode: .alwaysOriginal)))
+      } ?? AnyView(Image(systemName: "square.stack"))
+    // A menu draws a checkmark for a Toggle but a subtitle only for a Button. The current scope
+    // never has new replies, so it takes the Toggle.
+    if model.scope == id {
+      Toggle(isOn: .constant(true)) {
+        Text(title)
+        icon
+      }
+    } else {
+      Button {
+        model.scope = id
+      } label: {
+        Text(title)
+        if count > 0 { Text("\(count) new \(count == 1 ? "reply" : "replies")") }
+        icon
+      }
+    }
+  }
+
+  // V2
+  var scopeBar: some View {
+    let ids: [ProfileID?] = [nil] + model.profiles.map { .some($0.id) }
+    return Picker("Show", selection: scopeBinding) {
+      Text("All").tag(ProfileID?.none)
+      ForEach(model.profiles) { Text($0.name.description).tag(ProfileID?.some($0.id)) }
+    }
+    .pickerStyle(.segmented)
+    .overlay {
+      GeometryReader { geometry in
+        let width = geometry.size.width / CGFloat(ids.count)
+        ForEach(Array(ids.enumerated()), id: \.offset) { index, id in
+          if let id, id != model.scope, model.unseen(id) > 0 {
+            countBadge(model.unseen(id), color: prototypeColor(id))
+              .position(x: width * CGFloat(index + 1) - 14, y: 2)
+          }
+        }
+      }.allowsHitTesting(false)
+    }
+    .padding(.horizontal, 16).padding(.top, 6).padding(.bottom, 8)
+    .accessibilityIdentifier("scopeBar")
+  }
+
+  // V3
+  var filterPills: some View {
+    ScrollView(.horizontal, showsIndicators: false) {
+      HStack(spacing: 8) {
+        pill(nil, title: "All", count: model.scope == nil ? 0 : model.hiddenUnseen)
+        ForEach(model.profiles) { profile in
+          pill(profile.id, title: profile.name.description, count: model.unseen(profile.id))
+        }
+      }
+      .padding(.horizontal, 16).padding(.vertical, 8)
+    }
+    .accessibilityIdentifier("filterPills")
+  }
+  private func pill(_ id: ProfileID?, title: String, count: Int) -> some View {
+    let selected = model.scope == id
+    let tint = id.map(prototypeColor) ?? .primary
+    return Button {
+      model.scope = id
+    } label: {
+      HStack(spacing: 6) {
+        if let id {
+          Circle().fill(selected ? Color.white : prototypeColor(id)).frame(width: 8, height: 8)
+        }
+        Text(title).font(.subheadline.weight(.semibold))
+        if count > 0, !selected {
+          countBadge(count, color: tint)
+        }
+      }
+      .padding(.horizontal, 14).frame(height: 34)
+      .foregroundStyle(
+        selected ? AnyShapeStyle(id == nil ? Color(uiColor: .systemBackground) : .white)
+          : AnyShapeStyle(.primary)
+      )
+      .background(
+        selected ? AnyShapeStyle(tint) : AnyShapeStyle(Color.primary.opacity(0.07)),
+        in: Capsule())
+    }
+    .buttonStyle(.plain)
+    .accessibilityLabel(title)
+  }
+
+  // V5
+  var composerScope: some View {
+    HStack(spacing: 8) {
+      Menu {
+        scopeToggle(nil, title: "Work and Personal", count: 0)
+        Divider()
+        ForEach(model.profiles) { profile in
+          scopeToggle(profile.id, title: profile.name.description, count: model.unseen(profile.id))
+        }
+      } label: {
+        HStack(spacing: 4) {
+          if let scope = model.scope {
+            dot(scope, size: 7)
+            Text("To \(model.name(scope))").foregroundStyle(prototypeColor(scope))
+          } else {
+            Text(model.recipientLine).foregroundStyle(Color(uiColor: .secondaryLabel))
+          }
+          Image(systemName: "chevron.up.chevron.down").font(.caption2.weight(.bold))
+            .foregroundStyle(Color(uiColor: .secondaryLabel))
+        }
+        .font(.footnote.weight(.semibold))
+      }
+      .accessibilityIdentifier("composerScope")
+      Spacer(minLength: 8)
+      ForEach(hiddenWithNews, id: \.self) { other in
+        Button {
+          model.scope = other
+        } label: {
+          HStack(spacing: 4) {
+            dot(other, size: 6)
+            Text("\(model.name(other)) · \(model.unseen(other)) new")
+          }
+          .font(.footnote.weight(.semibold)).foregroundStyle(prototypeColor(other))
+          .padding(.horizontal, 10).padding(.vertical, 4)
+          .background(prototypeColor(other).opacity(0.12), in: Capsule())
+        }.buttonStyle(.plain)
+      }
+    }
+    .padding(.horizontal, 12)
   }
 }

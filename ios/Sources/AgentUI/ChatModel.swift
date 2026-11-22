@@ -65,6 +65,27 @@ final class ChatModel {
     didSet { transcriptItems = TranscriptItem.grouped(rows, preserving: transcriptItems) }
   }
   private(set) var transcriptItems: [TranscriptItem] = []
+  // PROTOTYPE: the coordinator the screen shows, or nil for the combined feed.
+  var scope: ProfileID? { didSet { if scope != oldValue { prototypeSeen(scope); refresh() } } }
+  var prototypeVariant = ""
+  var prototypePaired = false
+  var prototypeUnseen: [ProfileID: Int] = [:]
+  func prototypeSeen(_ id: ProfileID?) {
+    if let id { prototypeUnseen[id] = nil } else { prototypeUnseen = [:] }
+  }
+  func unseen(_ id: ProfileID) -> Int { prototypeUnseen[id] ?? 0 }
+  var hiddenUnseen: Int {
+    guard scope != nil else { return 0 }
+    return prototypeUnseen.filter { $0.key != scope }.values.reduce(0, +)
+  }
+  var scoped: Bool { scope != nil && multiple }
+  var blockedForPrototype: Bool { if case .blocked = addressing { true } else { false } }
+  func latestRow(_ id: ProfileID?) -> ChatRow? {
+    let lanes = id.map { [$0] } ?? self.lanes.map(\.id)
+    return lanes.compactMap { snapshots[$0]?.rows.last { $0.role == .final || $0.role == .user } }
+      .max { ($0.receivedAt ?? .distantPast) < ($1.receivedAt ?? .distantPast) }
+  }
+  func snapshotModel(_ id: ProfileID) -> String { snapshots[id]?.model ?? model }
   /// The feed's aggregate: the best state any lane is in. One coordinator's own state is its
   /// snapshot's.
   var connection: ConnectionState = .disconnected
@@ -418,13 +439,15 @@ final class ChatModel {
   /// The chip the composer draws: the recipient while the composer names recipients. With one
   /// coordinator saved and none removed none is drawn, as on `main`, though a restored draft keeps
   /// its recipient, so it stays its source's when another coordinator is added.
-  var shownChip: ProfileID? { addressesByName ? recipient : nil }
+  var shownChip: ProfileID? { addressesByName && !scoped ? recipient : nil }
 
   func name(_ id: ProfileID) -> String {
     profiles.first { $0.id == id }?.name.description ?? removed[id] ?? "Coordinator"
   }
 
-  func paired(_ id: ProfileID) -> Bool { lanes.first { $0.id == id }?.session != nil }
+  func paired(_ id: ProfileID) -> Bool {
+    prototypePaired || lanes.first { $0.id == id }?.session != nil
+  }
 
   func laneEpoch(_ id: ProfileID) -> Int { laneEpochs[id] ?? 0 }
 
@@ -626,9 +649,9 @@ final class ChatModel {
     // A restored message's text is never a tag, whatever its chip (DESIGN-REVIEW A2).
     return Addressing.parse(
       text, hasAttachments: hasAttachments, chip: chip, literal: restoredFrom != nil,
-      among: lanes.filter { removed[$0.id] == nil }.map {
+      among: lanes.filter { removed[$0.id] == nil && (scope == nil || $0.id == scope) }.map {
         .init(
-          id: $0.id, name: name($0.id), paired: $0.session != nil, connected: connected($0.id))
+          id: $0.id, name: name($0.id), paired: paired($0.id), connected: connected($0.id))
       }, removed: removed)
   }
 
@@ -643,7 +666,7 @@ final class ChatModel {
   /// Saved coordinators matching an `@` still being typed in the committed text, for the picker
   /// above the composer. A restored draft offers none, since choosing one replaces the draft.
   var pickerMatches: [CoordinatorProfile] {
-    guard addressesByName, recipient == nil, restoredFrom == nil, committed.first == "@",
+    guard addressesByName, !scoped, recipient == nil, restoredFrom == nil, committed.first == "@",
       !committed.contains(where: \.isWhitespace)
     else { return [] }
     let typed = committed.dropFirst().lowercased()
@@ -669,7 +692,7 @@ final class ChatModel {
   /// draft's text is literal for good, so no tag in it ever becomes the chip, and none does while
   /// an input method is still composing the draft.
   func promoteTypedTag() {
-    guard addressesByName, recipient == nil, restoredFrom == nil, committed == draft,
+    guard addressesByName, !scoped, recipient == nil, restoredFrom == nil, committed == draft,
       draft.first == "@"
     else { return }
     let word = draft.dropFirst().prefix { !$0.isWhitespace }
@@ -1107,7 +1130,7 @@ final class ChatModel {
 
   /// Rebuilds the feed and the composer's view of the coordinators from every lane's state.
   private func refresh() {
-    let states = lanes.compactMap { lane in
+    let states = lanes.filter { scope == nil || $0.id == scope }.compactMap { lane in
       snapshots[lane.id].map { (id: lane.id, snapshot: $0) }
     }
     let existing = Dictionary(
