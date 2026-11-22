@@ -1917,16 +1917,17 @@ mod tests {
         assert!(up.dir.path().join("refused").exists());
     }
 
-    /// The part of the runtime's source journal that a poll depends on: a
-    /// checkpoint moves only for `More` and `Complete`, and an event is new
-    /// when its id and version are.
+    /// A model of the runtime's source journal, with the two rules a poll
+    /// depends on: a checkpoint moves only for `More` and `Complete`, and an
+    /// event is new when its id and version are. `tests/source_refresh.rs`
+    /// runs the same scan against the real journal.
     #[derive(Default)]
-    struct Journal {
+    struct JournalModel {
         states: Vec<SourceState>,
         admitted: BTreeMap<(String, String), (String, String)>,
     }
 
-    impl Journal {
+    impl JournalModel {
         fn admit(&mut self, batch: SourceBatch) -> usize {
             let mut new_events = 0;
             for event in &batch.events {
@@ -1962,7 +1963,7 @@ mod tests {
     /// One refresh round: pages until the poll entry point returns no cursor.
     async fn refresh(
         config: &[SourceConfig],
-        journal: &mut Journal,
+        journal: &mut JournalModel,
     ) -> Vec<(SourceCoverage, usize)> {
         let mut cursor = None;
         let mut pages = Vec::new();
@@ -2036,7 +2037,7 @@ mod tests {
             credential_command: credential_script(up.dir.path(), TOKEN),
             url: Some(up.api.url.clone()),
         }];
-        let mut journal = Journal::default();
+        let mut journal = JournalModel::default();
 
         let fail_once = AtomicBool::new(true);
         up.script(move |seen| {
