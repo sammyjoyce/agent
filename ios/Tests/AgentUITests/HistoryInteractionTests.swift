@@ -535,6 +535,70 @@ final class ComposerInteractionTests: XCTestCase {
 
 @MainActor
 final class HistoryInteractionTests: XCTestCase {
+  private func drag(_ transcript: XCUIElement, down: Bool) {
+    let start = transcript.coordinate(
+      withNormalizedOffset: CGVector(dx: 0.5, dy: down ? 0.3 : 0.65))
+    let end = transcript.coordinate(
+      withNormalizedOffset: CGVector(dx: 0.5, dy: down ? 0.65 : 0.3))
+    start.press(forDuration: 0.05, thenDragTo: end)
+  }
+  func testLongSingleNoticeRemainsDraggableThroughKeyboardAndRevision() async throws {
+    continueAfterFailure = true
+    let peer = InteractionPeer()
+    addTeardownBlock { await peer.stop() }
+    let paragraphs = (0..<32).map {
+      "Scroll checkpoint \($0). This invented notice explains a separate observation in enough detail to wrap across several lines on a phone."
+    }
+    let history = NativeEventHistory(
+      messages: [
+        .init(
+          continuation: false, entryId: "long-notice", finalChunk: true,
+          role: .notice, text: paragraphs.joined(separator: "\n\n"))
+      ], nextCursor: nil, pageComplete: true)
+    await peer.history(initial: history, pages: [:], latest: history)
+    let app = XCUIApplication()
+    app.launchEnvironment["AGENT_INTERACTION_PORT"] = String(try await peer.start())
+    app.launchEnvironment["AGENT_INTERACTION_COORDINATOR"] = peer.coordinator.uuidString
+    app.launchArguments += ["-notificationsEnabled", "NO"]
+    app.launch()
+    defer { app.terminate() }
+    let transcript = app.scrollViews["transcript"]
+    XCTAssertTrue(transcript.waitForExistence(timeout: 10))
+    let marker = app.staticTexts.matching(
+      NSPredicate(format: "label BEGINSWITH %@", "Scroll checkpoint 16.")
+    ).firstMatch
+    XCTAssertTrue(marker.waitForExistence(timeout: 5))
+    let composer = app.textViews["Message the coordinator"]
+    composer.tap()
+    XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
+    drag(transcript, down: true)  // The first downward drag may only dismiss the keyboard.
+    XCTAssertTrue(app.keyboards.firstMatch.waitForNonExistence(timeout: 5))
+    for index in 0..<3 {
+      let before = marker.frame.minY
+      drag(transcript, down: true)
+      let after = marker.frame.minY
+      print("LONG_SCROLL down \(index): \(before) -> \(after)")
+      XCTAssertGreaterThan(after - before, 60, "A tall single row stopped moving downward")
+    }
+    let reading = marker.frame.minY
+    let incoming = "An invented live revision arrives outside the reading viewport."
+    try await peer.beginReply(incoming)
+    let working = app.buttons["Stop response"]
+    XCTAssertTrue(working.waitForExistence(timeout: 5))
+    XCTAssertEqual(marker.frame.minY, reading, accuracy: 3, "Streaming displaced the reader")
+    try await peer.reply(incoming)
+    XCTAssertTrue(working.waitForNonExistence(timeout: 5))
+    XCTAssertEqual(
+      marker.frame.minY, reading, accuracy: 3, "Completing output displaced the reader")
+    for index in 0..<3 {
+      let before = marker.frame.minY
+      drag(transcript, down: false)
+      let after = marker.frame.minY
+      print("LONG_SCROLL up \(index): \(before) -> \(after)")
+      XCTAssertGreaterThan(before - after, 60, "A tall single row stopped moving upward")
+    }
+  }
+
   func testRunKeepsDraftAndCoordinatorsAcrossRelaunch() async throws {
     continueAfterFailure = false
     executionTimeAllowance = 120
