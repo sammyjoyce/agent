@@ -1840,6 +1840,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_429_after_a_good_identity_check_ends_the_poll_after_two_requests_on_a_listing_and_up_to_five_on_lookups()
+     {
+        let limit = "Up rate limit reached; this poll stopped. Checkpoint retained.";
+        let rows: Vec<Row> = (1..=4)
+            .map(|number| {
+                held(
+                    &format!("example-hold-{number}"),
+                    "Example Hotel",
+                    "-1.00",
+                    NOW - number * HOUR,
+                )
+            })
+            .collect();
+        let up = Harness::start(rows).await;
+        let (_, saved) = up.scan(None, NOW).await;
+
+        up.script(|seen| {
+            (seen.path() == "/transactions").then(|| up_error(429, "Too Many Requests"))
+        });
+        for attempt in 0..2 {
+            let mark = up.targets().len();
+            let limited = up.poll(Some(&saved), NOW + SPACING + attempt).await;
+            assert_eq!(limited.coverage, unavailable(limit));
+            assert!(limited.checkpoint.is_none());
+            let requested = up.targets_since(mark);
+            assert_eq!(requested.len(), 2, "{requested:?}");
+            assert_eq!(requested[0], "/util/ping");
+        }
+
+        up.world().script = None;
+        up.world().rows.clear();
+        let lookups = up.poll_to_lookups(&saved, NOW + SPACING).await;
+        up.script(|seen| {
+            (seen.path() == "/transactions/example-hold-1")
+                .then(|| up_error(429, "Too Many Requests"))
+        });
+        for attempt in 0..2 {
+            let mark = up.targets().len();
+            let limited = up.poll(Some(&lookups), NOW + SPACING + attempt).await;
+            assert_eq!(limited.coverage, partial(limit));
+            assert!(limited.checkpoint.is_none());
+            assert_eq!(
+                up.targets_since(mark),
+                [
+                    "/util/ping",
+                    "/transactions/example-hold-4",
+                    "/transactions/example-hold-3",
+                    "/transactions/example-hold-2",
+                    "/transactions/example-hold-1",
+                ],
+                "the identity check, and the lookups up to the one that Up refuses"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_timeout_reports_its_fixed_text() {
         let up = Harness::start(Vec::new()).await;
         up.script(|_| Some(Canned::hang()));
@@ -2544,6 +2600,169 @@ mod tests {
                 "the next scan reads the transaction again with an equal version"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn at_the_cap_a_hold_that_leaves_during_a_scan_keeps_its_place_until_a_new_label_reads_again()
+     {
+        let rows: Vec<Row> = (0..MAX_HOLDS as u64)
+            .map(|number| {
+                held(
+                    &format!("example-hold-{number:03}"),
+                    "Example Hotel",
+                    "-1.00",
+                    NOW - DAY - number,
+                )
+            })
+            .collect();
+        let up = Harness::start(rows).await;
+        up.world().page_size = 600;
+        let recent = up.poll(None, NOW).await;
+        assert_eq!(recent.coverage, SourceCoverage::More);
+
+        up.world().delete("example-hold-000");
+        up.world().delete("example-hold-001");
+        up.world()
+            .rows
+            .push(held("example-hold-new", "Example Motel", "-2.00", NOW));
+        let stopped_with = |held_at_up: usize, batch: SourceBatch, requested: Vec<String>| {
+            assert_eq!(
+                batch.coverage,
+                partial(TOO_MANY_HOLDS),
+                "Up lists {held_at_up} held transactions"
+            );
+            assert!(batch.checkpoint.is_none());
+            assert_eq!(batch.events.len(), held_at_up);
+            assert!(titles(&batch.events).contains(&"Example Motel: -2.00 AUD (held)"));
+            assert!(removals(&batch.events).is_empty());
+            assert_eq!(
+                requested,
+                [
+                    "/util/ping",
+                    "/transactions?filter[status]=HELD&page[size]=100"
+                ],
+                "the poll reads the held list again, and no new transaction"
+            );
+        };
+        let mark = up.targets().len();
+        let stopped = up.poll(recent.checkpoint.as_ref(), NOW + 1).await;
+        stopped_with(511, stopped, up.targets_since(mark));
+
+        up.world().rows.truncate(449);
+        up.world()
+            .rows
+            .push(held("example-hold-new", "Example Motel", "-2.00", NOW));
+        let mark = up.targets().len();
+        let stopped = up.poll(recent.checkpoint.as_ref(), NOW + 2).await;
+        stopped_with(450, stopped, up.targets_since(mark));
+
+        let new_label = || {
+            UpSource::new(
+                "everyday-2".into(),
+                Some(up.api.url.clone()),
+                credential_script(up.dir.path(), TOKEN),
+            )
+            .unwrap()
+        };
+        let mark = up.targets().len();
+        let (events, _) = up.scan_with(&new_label, None, NOW + 3).await;
+        assert_eq!(
+            up.since_requested_after(mark),
+            feed::utc(NOW + 3 - 7 * DAY),
+            "a new label starts a fresh seven-day read"
+        );
+        assert_eq!(versions(&events).len(), 450);
+        assert!(
+            removals(&events).is_empty(),
+            "the holds that left under the old label are not reported under the new one"
+        );
+
+        up.world().settle("example-hold-new", "-2.00", NOW + 3);
+        let (_, saved) = up.scan(recent.checkpoint.as_ref(), NOW + 4).await;
+        let (events, _) = up.scan(Some(&saved), NOW + 4 + SPACING).await;
+        assert_eq!(
+            removals(&events).len(),
+            MAX_HOLDS - 449,
+            "under the old label the scan ends when Up lists no hold that it has not counted, and the next scan reports the holds that left"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_daily_reread_finds_a_settlement_listed_thirteen_days_after_its_creation_time_and_misses_one_listed_later()
+     {
+        let up = Harness::start(Vec::new()).await;
+        let (_, saved) = up.scan(None, NOW).await;
+        let reread = NOW + 30 * DAY;
+        let (_, saved) = up.scan(Some(&saved), reread).await;
+
+        let listed = reread + SPACING;
+        up.world().rows.push(settled(
+            "example-transaction-1",
+            "Example Hotel",
+            "-180.00",
+            listed - 13 * DAY,
+        ));
+        let (same_scan, saved) = up.scan(Some(&saved), listed).await;
+        assert!(same_scan.is_empty());
+
+        let listed_later = reread + 6 * HOUR;
+        up.world().rows.push(settled(
+            "example-transaction-2",
+            "Example Motel",
+            "-90.00",
+            listed_later - 13 * DAY - 18 * HOUR,
+        ));
+        let (same_scan, saved) = up.scan(Some(&saved), listed_later).await;
+        assert!(same_scan.is_empty());
+
+        let (next_reread, saved) = up.scan(Some(&saved), reread + DAY).await;
+        assert_eq!(
+            titles(&next_reread),
+            ["Example Hotel: -180.00 AUD (settled)"],
+            "the reread a day later reaches 14 days back, which is 13 days before the last reread"
+        );
+        let (reread_after, _) = up.scan(Some(&saved), reread + 2 * DAY).await;
+        assert!(
+            reread_after.is_empty(),
+            "a settlement listed 13 days and 18 hours after its creation time is never read"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clock_that_ran_ahead_for_longer_than_the_reread_hides_new_transactions_and_one_from_before_the_reread_stays_missing()
+     {
+        const AHEAD: u64 = 30 * DAY;
+        let up = Harness::start(Vec::new()).await;
+        let (_, saved) = up.scan(None, NOW).await;
+        let (_, mut saved) = up.scan(Some(&saved), NOW + DAY + AHEAD).await;
+
+        for (id, description, created) in [
+            ("example-transaction-1", "Example Cafe", NOW + 2 * DAY),
+            ("example-transaction-2", "Example Books", NOW + 7 * DAY),
+        ] {
+            up.world()
+                .rows
+                .push(settled(id, description, "-5.00", created));
+            let (hidden, next) = up.scan(Some(&saved), created + HOUR + AHEAD).await;
+            assert!(
+                hidden.is_empty(),
+                "under the clock that runs ahead, the source asks from a time that has not come"
+            );
+            saved = next;
+        }
+
+        let corrected = NOW + 20 * DAY;
+        let mark = up.targets().len();
+        let (events, _) = up.scan(Some(&saved), corrected).await;
+        assert_eq!(
+            up.since_requested_after(mark),
+            feed::utc(corrected - 14 * DAY)
+        );
+        assert_eq!(
+            titles(&events),
+            ["Example Books: -5.00 AUD (settled)"],
+            "the transaction from 18 days before the clock was corrected is missing"
+        );
     }
 
     #[tokio::test]
