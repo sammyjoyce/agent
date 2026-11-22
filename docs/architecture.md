@@ -625,8 +625,8 @@ Reuse supported APIs and configured CLIs before adding an adapter. Existing
 coding-agent plugins are not automatically portable to this runtime. Chrome
 tools are the UI fallback after those. Desktop computer use is the final
 fallback after Chrome tools, for a desktop app that no API, CLI or Chrome tool
-reaches. The [roadmap](roadmap.md#inputs-and-automation) tracks computer use
-as planned work.
+reaches. The [roadmap](roadmap.md#desktop-computer-use-fallback) tracks computer
+use as planned work.
 
 For Chrome tools, Rust owns the host and helper lifetime. A TypeScript helper
 pairs the official Playwright extension through Pi's MCP client and connects

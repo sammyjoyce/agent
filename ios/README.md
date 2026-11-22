@@ -779,7 +779,7 @@ synthetic external model responses and host effects, never real accounts.
 Native UI checks exercise copy/partial-selection, clipboard-image drafts and
 actual appearance. Release acceptance also requires protected CI, a matching
 coordinator and signed build/source readback. Current acceptance is tracked in
-the [roadmap](../docs/roadmap.md#finish-the-current-pass).
+the [roadmap](../docs/roadmap.md#stabilization-and-acceptance).
 
 ## Phone acceptance
 

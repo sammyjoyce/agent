@@ -1,252 +1,194 @@
 # Roadmap
 
-Remaining work. The [architecture](architecture.md) describes ownership and
-recovery; [history](history.md) describes import and retrieval.
+Beep Boop routes user messages, incoming events and scheduled follow-ups through
+one main conversation: find related work, continue the existing task, and close
+the loop quietly unless a result or decision is needed. This roadmap tracks what
+ships today and what remains across stabilization, conversation UX, Rex
+integration, host automation and history coverage.
 
-## Finish the current pass
+Companion docs cover how shipped systems work: [architecture](architecture.md)
+(ownership, execution and failover), [history](history.md) (import and hybrid
+retrieval), [setup](setup.md) (services, trust, scheduled jobs and Dreams), and
+[performance](performance.md) (benchmarks and evaluations).
 
-- [x] Finish Codex catch-up and vector indexing, reconcile available text against
-  source checkpoints, and verify real searches. Missing media stays explicit
-  coverage gaps; importing and searching open no Rex sessions.
-- [x] Import changes to completed Codex conversations from validated change
-  watermarks, preserving earlier edits, source lineage and retention upgrades.
-- [x] Finish live search latency validation, including time outside the index
-  query while background work runs.
-- [x] Verify a real incoming supplier version reaches its original imported
-  task conversation and completes the existing worker's native submission.
-- [x] Verify chat admission, steering, interruption, reopening and scrolling
-  against a large live corpus while background work runs. Live checks passed
-  with over a million retained entries, including pending-input recovery after
-  stop and bounded main-history reopen.
-- [x] Recover main-chat admission after coordinator restart, preserving steer
-  and queue modes. Independent workers and control requests remain responsive
-  while another worker's host effect is held. Ready observers and workers do
-  not consume startup capacity; the real bridge regression covers 64 observers,
-  bounded initialization, replies at capacity, recovery and detach cleanup.
-- [x] Derive request lifecycle and valid controls from the Rust command type;
-  share host-effect ownership and the CLI's client context across transports.
-  Shutdown drains issued writes before releasing the runtime. Regression tests
-  cover worker interruption, read-only observers, effect capacity and receipts.
-- [x] Retain attachments before Pi admission without filesystem work on the
-  shared commit queue; retention failures admit no input.
-- [x] Carry native invocation cancellation through background host effects,
-  preserving issued receipts and isolating unrelated execution lanes. Restored
-  phases wait for their transport while notification recovery proceeds.
-- [x] Preserve typed storage, provider and native failures, plus host-delivery
-  certainty. Reconnect reconciles uncertain inputs without resending them.
-- [x] Coalesce source-status reads and make retrieval close terminal for queued
-  indexing, lazy opens and late embedding replies.
-- [x] Partition retained task and source bodies in native Pi documents, with
-  resumable migration, bounded read/write regressions and real SQL-plan and
-  growth benchmarks. Legacy records remain intact. Initialization has its own
-  bounded budget and remains cancellable before listeners bind.
-  Retained-history scans yield between pages so concurrent clients stay
-  responsive during exhaustive reads.
-- [x] Use narrow process results and validate native execution bindings before
-  host effects while retaining process limits and cleanup ownership.
-- [x] Share Rust/Swift tool-merge traces across live, restored and sparse updates,
-  preserving known names, terminal states and retained output.
-- [x] Prepare the runtime once in CI and gate signed-cache publication on
-  qualified package closures from trusted main runs. Preserve qualified compiler
-  caches across publishing failures.
-- [x] Share bounded snapshot-to-live observation for main and saved chats,
-  preserving event order and suppressing publications throughout view cleanup.
-  Overflow reports recovery without retaining an unbounded history buffer.
-- [x] Test native outbox recovery against the production coordinator and Pi
-  storage across reconnects and server restarts, without fake peers. CI runs
-  the wire test on both platforms and the Swift client on macOS.
-- [x] Persist acknowledged sends across iOS suspension and app restart.
-  Delivery and processing have separate states; completed work is normal,
-  blocked work is visible, and explicit continuation can recover a parked
-  main generation without duplicating its saved inputs.
-- [x] Clear the iOS composer immediately on Send while retaining its backup
-  until outbox admission. Preserve newer typing and restore local rejections;
-  connection changes cannot resurrect saved text. Native tests keep the
-  keyboard active through consecutive sends and use production persistence.
-  Cold recovery uses admission identities to preserve newer notes and files
-  after failed saves, queue retirement and storage relocation.
-  Simulator checks retain production startup and composer/outbox state across
-  relaunch.
-  The native text view copies and clears its buffer in the Send event, before
-  asynchronous admission work. Native checks cover marked text, consecutive
-  sends, foreground recovery and active responses. The replacement is available
-  in TestFlight. A [phone acceptance](../ios/README.md#phone-acceptance) run on
-  an installed build showed the placeholder and the keyboard in the first
-  composer capture after every Send. It covered consecutive sends, an active
-  response across Home and an app switch, a long multiline draft, identical
-  newer typing and a relaunch with a newer draft. A started control that never
-  left the phone comes back to the live composer ahead of newer typing, and
-  `ChatModel` tests drive a failed dial, a disconnect and an address edit
-  before any recipient writes it
-  ([#34](https://github.com/sammyjoyce/agent/issues/34)).
-- [x] Return a control's text, such as `/status`, to the live iOS composer when
-  no recipient of its Send wrote it, as crash recovery already does, and keep
-  newer typing. A control that any recipient wrote does not come back. A
-  `ChatModel` test drives a dial that fails after the start. See
-  [issue #34](https://github.com/sammyjoyce/agent/issues/34).
-- [x] Use shared typed cells for live and imported messages, with Codex-style
-  terminal formatting and retained command output on reopen.
-- [x] Retain the live tail and older reading position through native rotation.
-  Expanded tool cards show retained output once without losing truncated text.
-- [x] Pin and activate scheduled-chat reuse, recovery and shared worktree
-  controls through Global Nix. Background, CLI and main-agent collection have
-  passed live checks, preserving active and dirty work.
-- [x] Run scheduled tasks and their child agents without Rex terminals, retaining
-  conversation identity, host tools, live views, steering and isolated stop.
-- [x] Verify failed scheduled occurrences settle after recovery on their
-  existing tasks, clearing scheduler errors while preserving unresolved work.
-- [x] Verify parked scheduled model generations recover live on the existing
-  actor, preserving queued occurrences and native submission identities.
-- [x] Verify parked history indexing resumes its retained native work and
-  staged batches without re-importing conversations.
-- [x] Verify current source events reach triage beside historical backlogs.
-  Deployed per-account old/new selection and separate polling/triage lanes
-  passed live checks with older mail pending. Interrupted source claims
-  settled; restart and retry regression tests pass. Provider-time ordering
-  covers later historical backfills and immutable legacy rereads.
-- [x] Surface failed source checks in CLI and native clients without adding
-  repeated history notices. Retain typed helper failures and accept mail
-  without a Subject header.
-- [x] Recover missed shipment and spam work after source-storage failure.
-  Verify source-bound shipment registration and carrier refresh, plus the spam
-  proposal's main-chat publication and accepted phone delivery.
-- [x] Verify autonomous handoff under the revised source instructions, including
-  existing tasks with stale restrictions, without manual continuation.
-  A fresh shipping notice resumed the existing task and its source investigation.
-- [x] Verify chat reuse and native worktree inventory display live. Reopening
-  retained the task, conversation and allocation; `/worktrees` displayed real
-  inventory with ready, held and removed states.
-- [x] Release the qualified native copy, selection, clipboard-image and input
-  updates. Signed private TestFlight build 106 matches the deployed coordinator's
-  production source; native UI, host and simulator CI checks pass.
-- [x] Show native input and scheduled-notice provenance and main-conversation
-  model settings; retain unsent drafts across reopen. Native consumer and UI
-  checks pass, including the matched production-coordinator restart check.
-- [x] Provision and ship an iOS Share target backed by the shared-draft queue.
-  Signed private TestFlight build 106 includes matching host and extension App
-  Groups; native UI checks verify the unsent-draft handoff.
-- [x] Verify native rendering against the original visual references.
-  Typed action rows and the shared Shell card passed native rendering,
-  copy/selection and Light/Dark checks. Unknown shell intent remains explicit.
-- [x] Ship private lifecycle logs, `/machines`, local usage-reset times and
-  countdowns, and the remaining viewport correction.
+## Shipped foundation
 
-## Inputs and automation
+Built on [Pi Durable](https://github.com/earendil-works/pi/tree/main/packages/durable)
+and [Pi telemetry](https://github.com/earendil-works/pi/tree/main/packages/telemetry)
+1.6.0; upstream interfaces remain experimental and are verified at each pinned
+upgrade.
 
-- [ ] **Sidechats** (inspired by Meta’s Muse): open a side conversation from a
-  message to explore a follow-up without interrupting the main chat. Return to
-  that message when done; bring an answer back only if you choose.
-- [x] Ship `/goal` for persistent objectives, visible progress, pause/resume and
-  completion tied to a verified outcome. A goal completes only when the runtime
-  itself finds the required text in a file on the task's host.
-- [x] Ship hosted web search and page retrieval with source links for supported
-  OpenAI models. The existing ChatGPT login has passed an isolated search,
-  open-page and find-in-page check. Other providers need their own integration.
-- [x] Ship Chrome control in the selected host's existing profile with normal
-  Playwright code and private 1Password CLI reads. Both macOS deployments
-  passed fresh password/TOTP sign-in with 1Password enabled, authenticated
-  access, independent connections without browser approval clicks, and owned
-  tab cleanup after the Beep Boop service restarted.
-- [x] Reuse existing signed-in user tabs with exclusive control and preserved
-  drafts; return explicit browser-script results without automatic page dumps.
-- [ ] Complete unattended Chrome lifecycle acceptance across OS reboots,
-  ordinary browser relaunch and interruption recovery with autofill enabled.
-  A disposable macOS guest with installed Chrome, the extension and
-  saved-password autofill passed OS reboot, relaunch, and helper and service
-  interruption. Chrome for Testing on a disposable profile passed relaunch and
-  interruption. See `docs/chrome-acceptance.md`. A reboot of an existing
-  deployment host remains.
-- [x] Deliver browser screenshot attachments.
-- [x] A phone client for the main conversation, using the same submission,
-  steering and queueing path as the CLI. The native iPhone app fulfills the
-  planned WhatsApp/iMessage client use case. System appearance is the default,
-  with saved Light/Dark overrides and native keyboard dismissal.
-- [x] Enable iPhone alerts for completed main-chat replies and explicit
-  `notify_user` notices, including mid-job requests. On a real phone, a
-  development-signed build had alerts on and was registered with the
-  coordinator. A [phone acceptance](../ios/README.md#phone-acceptance) run
-  showed a completed reply as an alert with the app in the background and
-  after it was terminated, and a mid-job notice while its job still ran. Each
-  alert matched an accepted durable delivery. TestFlight builds need the
-  production APNs environment. See [notification setup](notifications.md).
-- [x] Direct coordination between task sessions through their durable inboxes:
-  sender identity, admission receipts, steering or queueing, and shared history.
-- [x] Voice input through a transcription provider interface. The iPhone
-  composer transcribes on the device with Parakeet behind `SpeechEngine`. Tap
-  the mic to transcribe into the draft, or hold it to send through the same
-  Send. Dictation transcribes on the phone and never uploads its audio. A held
-  take passed a real-phone recheck.
-- [x] File/photo attachments on iOS and dragged files in the terminal, retained
-  with the conversation and delivered to Pi on the selected execution host.
-- [x] Paste clipboard images into removable, unsent iOS attachments while
-  preserving the note. Native UI checks cover import, removal and no automatic
-  send.
-- [x] Copy complete native messages or select a text range, including activity
-  summaries and tool output. Native copy/paste and partial selection are
-  verified against the actual composer.
-- [x] Retain typed CLI/iOS input origins and scheduled-notice lineage. Missing
-  legacy origins remain unknown. Native acknowledgement/history checks keep
-  sent inputs before their replies without duplicate echoes or retry badges.
-- [x] Scheduled jobs through the existing coordinator background process and
-  task follow-through path. Reuse durable timers; persist occurrence identities
-  so restarts and retries cannot run a job twice.
-- [x] Reuse each scheduled job's task and Pi conversation across timer and
-  manual runs, preserving each admitted run's prompt, model and identity.
-- [x] Release CLI account diagnostics and scheduled-run timing, outcome and
-  exact reply inspection. Keep unavailable historical timing explicit.
-- [x] Release native scheduled-job diagnostics, retained-run recovery and
-  read-only navigation into live job and sub-agent conversations. Signed build
-  106 and the deployed coordinator share these contracts. Live retry preserved
-  the parked task, and source readback separates progress from completed scans.
-- [x] Shared worktree inventory through the CLI and `/worktrees`, including
-  native chat clients.
-- [ ] Bring the iPhone app's actions and content to Siri and Shortcuts through
-  App Intents. **Open Coordinator**, **Open Job**, **Retry Interrupted Run**,
-  **Send Message**, reading jobs, onscreen coordinators and jobs, and
-  coordinators and jobs in Spotlight ship, with a build check that the app
-  carries its intents metadata and phrases. Send Message asks before it sends,
-  sends one confirmed copy through the outbox, and never runs a command. These
-  checks on a real iPhone remain: Siri by voice, and Send Message and the
-  Spotlight index on a locked phone.
-- [ ] A macOS menu bar app that shows Beep Boop's status on the Mac, including
-  whether the service is running and its installed and running versions.
-- [ ] Typed read and write access to Apple Notes, Reminders, Mail and Messages
-  through macctl, a signed Swift daemon whose source moves into `macos/macctl/`.
-  `HostCommand::Apple` reaches only the configured Mac that owns the data, and
-  that Mac's tiers decide which `apple_read`, `apple_change` and `apple_send`
-  methods exist. Each write commits an operation record before dispatch; an
-  unknown outcome blocks further writes to that app until it is settled. macctl
-  first needs four guarantees it lacks today. Per-send approval, triage writes
-  and the design's other open questions are the owner's decisions. See the
-  [design](https://github.com/sammyjoyce/agent/issues/31).
-- [ ] Computer use for desktop apps on the selected host, based on or using
-  [agent-desktop](https://github.com/vercel-labs/agent-desktop). Computer use
-  is the final fallback, after supported APIs, configured CLIs and Chrome
-  tools, as the [architecture](architecture.md#integrations-and-scheduling)
-  orders them. agent-desktop reads an app's accessibility tree as JSON with a
-  ref for each element, acts on a ref, then reads the tree again to check the
-  result. It needs no screenshots or pixel matching and has no model inside,
-  so the loop stays in Pi. It ships under Apache-2.0 as a CLI, an MCP server
-  and a C library for macOS, Windows and Linux. Ref actions do not move the
-  pointer or take focus unless `--headed` is set, and macOS needs the
-  Accessibility grant. Whether to run agent-desktop or build on its design is
-  open. Snapshots, screenshots and clipboard reads can hold private desktop
-  content.
-- [ ] Reply to a specific message in the iPhone app, as Apple Messages does.
-  Choose **Reply** on a message, and the composer shows that message above the
-  draft until you send or cancel. The sent input names the message it answers,
-  so the transcript shows that message quoted with the reply and the model
-  knows which message the reply is about. Today a message's menu offers only
-  **Copy message**, **Select text** and **Share text**, and an input cannot
-  name an earlier message.
-- [ ] Show **Active work** in the main chat, a read-only view of the tasks and
-  scheduled jobs that are running or waiting now. The view opens over the
-  conversation, so nothing leaves the main chat. Today `beep-boop tasks graph`
-  prints live work as one snapshot outside chat, and no chat command lists
-  tasks. The iPhone app's **Jobs and work** page lists each job's next run and
-  each saved conversation's last update, with no running or waiting state.
-  Throwaway prototypes compared eight layouts. They are kept outside this
-  repository, and the names in the sketch are invented.
+- **Coordinator, durability and recovery.** One Rust supervisor and narrow
+  TypeScript adapter over Pi SQLite own the main conversation, typed protocol
+  schemas, steering/queueing/abort/compaction, attachment retention and bounded
+  snapshot-to-live observation. Checksummed [backups and restore](setup.md#backups-and-restore)
+  and opt-in epoch-fenced [failover](setup.md#failover) (Cloudflare Durable
+  Object log + R2 blobs + operator-promoted standby) preserve single-writer
+  ownership without duplicating external effects.
+- **Terminal and iPhone clients.** The Ratatui TUI (`--no-tui` and `--json`
+  supported) and the [iPhone app](../ios/README.md) (distributed via private
+  TestFlight) share submission, steering, queueing, `/status`, `/machines`,
+  `/worktrees` and read-only job/task inspection. iOS includes APNs main-chat
+  and mid-job `notify_user` [alerts](notifications.md), crash-safe composer and
+  outbox recovery, a Share extension, on-device Parakeet dictation behind
+  `SpeechEngine`, Scrawl `/feedback` recordings, Siri/Shortcuts App Intents,
+  Spotlight indexing and a CarPlay hands-free voice loop.
+- **Tasks, scheduling and browser fallback.** Interactive tasks run in named Rex
+  sessions with daemon-owned host effects that survive terminal exits and Rex
+  restarts. Headless [scheduled jobs](setup.md#scheduled-jobs) and child agents
+  run on Pi's durable sleeps without Rex terminals, reusing each job's task and
+  conversation across timer and manual runs. Tasks coordinate directly via
+  `message_task`, track host-verified file outcomes via `/goal`, and clean up
+  merged worktrees on a guarded five-minute sweep. Main defers rare tools behind
+  `tool_search`, while triage, worker and child-agent roles batch calls in
+  `codemode` scripts (~30% lower suite token use on the
+  [tool discovery eval](performance.md#tool-discovery)). Supported OpenAI models
+  have hosted web search, and signed-in Chrome automation via Playwright +
+  1Password CLI serves as the browser fallback.
+- **Sources, retrieval and reviewed learning.** Gmail and Calendar (`gws`),
+  GitHub (`gh`), Slack and macOS `messages` pollers feed backlog-safe triage
+  lanes verified by deterministic and live [loop-closing evaluations](architecture.md#validation).
+  Incremental Codex and `chatgpt` imports feed a rebuildable SQLite FTS +
+  binary-shortlist/exact-reranked vector index (2.9 s median reader latency at
+  1.35M chunks) with `read_file` native image support and Photon preparation.
+  Nightly log review and confined [Dreams](setup.md#dreams) runs propose at most
+  one tested guidance diff per run, applied only when a human approves its exact
+  `outcome_sha256`.
+
+## Stabilization and acceptance
+
+Finish physical-hardware and real-archive proofs for shipped code, fix observed
+iPhone transcript defects, and close remaining runtime and evaluation gaps.
+
+### Device and live-data acceptance
+
+- [ ] **Siri, Shortcuts and Spotlight on a locked iPhone.** **Open
+  Coordinator**, **Open Job**, **Retry Interrupted Run**, confirmed single-line
+  **Send Message** (`siri` outbox origin; refuses `/` and `?` commands),
+  onscreen entity reporting, `ToolIntent` / local-device authentication policies
+  and the complete-protection `coordinators-and-jobs` Spotlight index ship with
+  automated checks ([details](../ios/README.md#siri-and-shortcuts)). Verify Siri
+  by voice, **Send Message** and Spotlight lock-screen protection on a physical
+  locked iPhone.
+- [ ] **CarPlay in-vehicle verification.** The CarPlay scene, voice loop
+  (`carplay` outbox origin, readback confirmation, concise spoken reply, lock
+  and microphone prechecks) and entitlement build gates ship
+  ([details](../ios/README.md#carplay)). Once the
+  `com.apple.developer.carplay-voice-based-conversation` entitlement is
+  provisioned, verify templates, car microphone/speakers, end-of-speech timing
+  in motion, audio interruptions, rapid state throttling and locked-phone launch
+  in a car or CarPlay Simulator.
+- [ ] **Chrome lifecycle reboot on a deployment host.** Disposable Tart macOS
+  guests (installed Chrome, Web Store extension, saved-password autofill, Rex
+  and LaunchAgent) pass `relaunch`, `kill_helper`, `kill_service` and
+  `os_reboot`, and local Chrome for Testing passes `relaunch`, `kill_helper` and
+  `kill_service` ([Chrome lifecycle acceptance](chrome-acceptance.md)). Run the
+  `os_reboot` leg on an existing deployment host using its default Chrome data
+  root and macOS login reopen.
+- [ ] **Real ChatGPT export verification.** `beep-boop import chatgpt` validates
+  and imports invented single- and multi-part exports end to end across
+  interruption, reruns and edited branches ([ChatGPT exports](history.md#chatgpt-exports)).
+  Run `--check` and full import against a real account export and record its
+  counts, digests, coverage gaps and unsupported content.
+
+### iPhone transcript and reconnect polish
+
+Real-device UI audit findings from macOS iPhone Mirroring on iPhone 16 Pro
+(`iPhone17,1`, iOS `27.3`, Beep Boop `0.1` build `416`; deduplicated against
+`#71` and `#95`). Examples use invented text; private captures are retained
+outside this repository by evidence ID.
+
+- [ ] **`UI-001` (High, observed, `EVID-20261120-A1`) — Reconnect drops
+  reasoning summaries and shifts open tool cards.** After background disconnect
+  and foreground reconnect, an expanded activity group (`5 tool calls · 4
+  summaries` with an open `Shell` card) drops all summaries while `Connecting`
+  and settles permanently with missing summaries (`5 tool calls · 2 summaries`),
+  shifting the open `Shell` card upward by ~1 row (~30–35 pt). *Acceptance:*
+  Across background disconnect and foreground reconnect, an expanded group
+  retains all N summaries in its header and body with zero vertical jump of an
+  open child tool card.
+- [ ] **`UI-002` (Medium-High, observed, `EVID-20261120-B1`) — Expanding the
+  live activity group stalls follow-tail and clips rows.** Expanding the active
+  activity disclosure at the live tail pushes `Working...` and newly streamed
+  tool rows half-clipped behind the composer without advancing follow-tail, and
+  delays showing `↓ Latest` until several more items append. *Acceptance:*
+  Expanding the active group at the live tail either keeps new tool rows and
+  `Working...` fully visible above the composer or immediately enters manual
+  reading with `↓ Latest` shown and no mid-line clipping.
+- [ ] **`UI-003` (Low-Medium, observed, `EVID-20261120-B2`) — Floating
+  `↓ Latest` pill obscures transcript content.** When scrolled above the tail,
+  the opaque `↓ Latest` pill covers bottom-right disclosure chevrons on
+  collapsed activity rows and the right side of the bottom two lines inside an
+  expanded `Shell` card. *Acceptance:* `↓ Latest` remains legible above the tail
+  without overlapping `Shell` output text or row disclosure controls.
+- [ ] **`UI-004` (Low-Medium, observed, `EVID-20261120-O1`) — Consecutive
+  reasoning summaries concatenate with literal `****`.** Back-to-back bolded
+  reasoning summaries in one activity group render inline on a single line with
+  raw `****` delimiters (e.g., `Inspecting report status****Reviewing message
+  text`). *Acceptance:* Consecutive bolded summaries render as distinct lines or
+  blocks with no visible `*` delimiters.
+- [ ] **`UI-005` (Low, observed, `EVID-20261120-A2`) — Connection banners
+  collide with the top transcript line.** When scrolled mid-conversation,
+  `Disconnected` / `Try again` and foreground `Connecting` (plus its spinner)
+  sit flush against or overlap the top visible message line before shifting the
+  feed on clear. *Acceptance:* Connection status banners reserve dedicated
+  vertical space above the transcript with no text or spinner collision.
+- [ ] **`UI-006` and `UI-007` (Blocked device trials, `EVID-20261120-B3`,
+  `EVID-20261120-BLOCK`) — Cold relaunch, scope switching and live-stream detail
+  anchoring.** Complete the physical-iPhone checks interrupted when mirroring
+  ended (`iPhone in Use`): (1) 2–3 trials each of switching coordinator scope
+  (`Work` ↔ `All coordinators` ↔ second coordinator), navigating into
+  `Connection → Jobs and work` and back, and cold app relaunch (`UI-006`); and
+  (2) reading an expanded `Shell` card during rapid live-tail streaming,
+  neighboring collapse/expand and keyboard toggle without unexpected viewport
+  jumps (`UI-007`; off-tail control passed 1/1).
+
+### Runtime, CLI and evaluation hardening
+
+Follow-ups from the live loop-closing eval
+([#72](https://github.com/sammyjoyce/agent/issues/72)) and upstream Pi reuse
+qualification ([#52](https://github.com/sammyjoyce/agent/issues/52)).
+
+- [ ] **Silence outcome triage on user-handled threads
+  ([#72](https://github.com/sammyjoyce/agent/issues/72)).** On the 7-case live
+  loop-closing eval (`gpt-6.1-sol`, 6/7 passing), when a thread was already
+  handled by the user, the resumed worker resolved the task without booking and
+  outcome triage still posted a needless main-chat completion notice. Keep
+  outcome triage quiet when the user already handled the exchange.
+- [ ] **Model-aware image attachment limits.** Prepare attached images with the
+  active conversation model's image limits rather than fixed defaults (`#52`).
+- [ ] **Cross-host and cancellation image-read coverage.** Add end-to-end
+  `read_file` image tests for triage and child-agent routes across two machines,
+  and for cancelling a slow transfer (`#52`).
+- [ ] **Shrink the worker `codemode` prompt budget.** Reduce inline schema weight
+  in the worker role's `codemode` prompt section using tool namespaces or a
+  smaller inline budget (`#52`).
+- [ ] **Semantic `child-agent` oracle and full-suite requalification.** Replace
+  the wording-based `child-agent` check in the tool discovery eval (which still
+  accepts post-sentence denials or phrases like "ruled out", "excluded",
+  "instead of" and "discarded theory") with a meaning check, then rerun the full
+  nine-scenario confirmation at `low` and default reasoning while retaining
+  every answer (`#52`).
+- [ ] **Bridge, CLI and CI test hygiene (`#52`).**
+  - Add a bridge-level regression test proving an oversized task-graph request
+    fails cleanly without breaking the bridge.
+  - Emit structured JSON error objects when a `--json` CLI command fails.
+  - Make event waits in `runtime/test/native-main.test.ts` cancellation-aware so
+    missing events fail at timeout instead of hanging.
+  - Restore Linux real-browser CI coverage by supplying `libglib-2.0` for pinned
+    Chromium on NixOS hosts and forwarding the browser fixture's `GITHUB_ENV`.
+
+## Conversation and visibility
+
+Make background execution, nightly proposals, message-targeted replies and
+branching conversations legible directly from the main chat.
+
+### Active work in the main chat
+
+- [ ] **Read-only live work strip, sheet and TUI panel.** Show tasks and
+  scheduled jobs that are running or waiting now without leaving the main
+  conversation (replacing ad-hoc `beep-boop tasks graph` snapshots outside chat,
+  while **Jobs and work** continues to list next runs and saved conversations).
 
   ```text
   2 running · 2 waiting         1 needs you  v     the strip, under the title
@@ -264,499 +206,273 @@ recovery; [history](history.md) describes import and retrieval.
     server · on GitHub checks
   ```
 
-  - **Strip.** The strip is one line under the iPhone chat's title. It gives
-    the count of running work, the count of waiting work, and the count that
-    waits on the owner. When all three counts are zero the strip is absent, so
-    an idle chat looks as it does today.
-  - **Sheet.** A tap on the strip opens the list as a sheet over the chat, and
-    a swipe down returns to the conversation. The sheet has two groups,
-    **Running** and **Waiting**. Work that waits on the owner comes first in
-    **Waiting** and carries the only colored mark. When a snapshot reports
-    `omitted` live tasks, the sheet says how many it left out, as `tasks graph`
-    does.
-  - **Row.** Each row has a status mark, the title, where the work runs, what
-    the work does now, and for how long. A task names its host, and a scheduled
-    job says **Job**. A running row names its current tool. A waiting row says
-    what it waits on.
-  - **Read-only.** No control in the view starts, stops, retries or answers
-    anything. Scheduled runs that have not started stay on **Jobs and work**.
-  - **Terminal UI.** The terminal shows the same two groups in a full-screen
-    panel, with each running row's live tool calls and agents indented under
-    it, as `tasks graph` prints them. The footer carries the counts beside the
-    model and the path. The panel is prototyped, and the footer counts are not.
-  - **What the build needs first.** The data for the view has gaps today.
-    - The iPhone cannot read tasks or the task graph. For work,
-      `NativeRequest` offers `Jobs`, `Conversations` and `Inspect`, and the
-      generated Swift types have no `TaskRecord` or `TaskGraphSnapshot`. Add a
-      native request, and a `Ready` flag beside `work_inspection` so that the
-      strip stays hidden when the coordinator lacks the request.
-    - `ReadTaskGraph` returns one snapshot. The strip needs the live task graph
-      watch under [Upstream reuse follow-ups](#upstream-reuse-follow-ups), or
-      it has to poll.
-    - No typed field says that work waits on the owner. `TaskState::Waiting`
-      carries `actor` as free text that the model writes.
-    - A task has no start time. `TaskRecord` has `updated_at` only, and
-      `JobExecution` already has `started_at`.
-    - The task graph carries a tool's name and not its arguments, so a row can
-      say `exec` and cannot say which command.
-  - **Set aside.** The comparison set four other layouts aside. A separate
-    page leaves the main chat. Groups by machine spread the work that waits on
-    the owner across the list. A timeline needs each run's start and end for
-    the past hour, and `ScheduledJobStatus` keeps `last_run` only. A panel that
-    opens in place either drops the host and the current tool with one-line
-    rows, or covers most of the chat with two-line rows.
-  - **Open, for the owner.** These choices remain. The strip can sit under the
-    title, as the sketch has it, or above the composer. An open task with no
-    live work can be listed or left out. A row can open its conversation in
-    the existing read-only inspection view, or open nothing.
-  - **Acceptance check.** On a real iPhone, against a coordinator with running
-    and waiting work, the strip's counts equal the sheet's rows, and a state
-    change updates both without a refresh. With no active work, the strip is
-    absent. Against a coordinator without the native request, the strip is
-    absent and the chat is unchanged. No control in the sheet changes a task
-    or a job.
-- [ ] An iOS interface for **[Dreams](setup.md#dreams)** to browse runs,
-  inspect sealed proposals and approve them from the iPhone app. List runs
-  newest first with each run's window, coverage, outcome and current proposal
-  status (`pending`, `applied`, `stale`, `target_dirty`, `target_locked`,
-  `patch_changed` or `policy_changed`). Opening a run shows its coverage gaps,
-  before and after check results, quoted model rationale or abstention note,
-  bounded cited evidence and the patch, escaping control and Unicode format
-  characters so the diff read on the phone matches the bytes `apply` commits.
-  Approving a pending proposal requires explicit confirmation and sends that
-  run's exact sealed `outcome_sha256`, running the same coordinator-side hash,
-  policy, base, clean-worktree and single-apply checks as
-  `beep-boop dreams apply`. Today `dreams list`, `show` and `apply` exist only
-  in the CLI reading the coordinator's state directory on the coordinator host.
-  `NativeRequest` has no Dreams requests, `NativeEvent::Ready` has no Dreams
-  capability flag beside `work_inspection` and `conversation_settings` (so
-  coordinators without `[dreams]` or older coordinators keep the entry hidden),
-  and the generated Swift bindings have no Dreams types. Native Dreams reads
-  and apply stay on the authenticated coordinator boundary outside Pi's runtime
-  and tool surface, preserving the invariant that no model or conversation tool
-  can approve or apply a proposal. Open for the owner: whether Dreams lives
-  under coordinator controls beside **Jobs and work** or also surfaces a notice
-  when a nightly run has a pending proposal, and whether to ship read-only
-  inspection before remote apply.
+  - **iPhone strip and sheet.** One line under the chat title shows counts of
+    running work, waiting work and work waiting on the owner; when all three are
+    zero, the strip is hidden. Tapping opens a read-only sheet (**Running** and
+    **Waiting**; swipe down to return). Work waiting on the owner sorts first in
+    **Waiting** with the only colored mark, and `omitted` task counts are shown
+    as in `tasks graph`. Each two-line row shows status mark, title, host (or
+    **Job**), current tool or wait reason, and elapsed duration. No control
+    starts, stops, retries or answers work; unstarted jobs stay on **Jobs and
+    work**.
+  - **Terminal UI.** Full-screen panel with the same two groups and live tool
+    calls and child agents indented under running rows (panel prototyped), plus
+    live counts in the footer beside model and path (not yet prototyped).
+  - **Layouts set aside.** Separate page (leaves main chat), grouping by host
+    (scatters owner-blocked work), past-hour timeline (`ScheduledJobStatus`
+    keeps `last_run` only), and inline expanding panel (drops host/tool at one
+    line or covers the chat at two).
+  - **Prerequisites.**
+    1. Add `NativeRequest` task-graph reads, generated Swift `TaskRecord` /
+       `TaskGraphSnapshot` types, and a `NativeEvent::Ready` capability flag
+       beside `work_inspection` so older coordinators keep the strip hidden.
+    2. Add a live task-graph watch ([#52](https://github.com/sammyjoyce/agent/issues/52))
+       so clients subscribe instead of polling single `ReadTaskGraph` snapshots.
+    3. Add a typed waiting-on-owner state (`TaskState::Waiting` currently stores
+       model-written free-text `actor`).
+    4. Record task `started_at` (`TaskRecord` currently has `updated_at` only;
+       `JobExecution` already has `started_at`).
+    5. Carry bounded tool-argument context in the task graph if rows should show
+       more than bare tool names such as `exec`.
+  - **Open owner decisions.** Strip placement (under chat title vs. above
+    composer); whether open tasks with no live activity appear or stay omitted;
+    whether tapping a row opens read-only conversation inspection or does
+    nothing.
+  - **Acceptance.** On a real iPhone against a coordinator with running and
+    waiting work, strip counts match sheet rows and update live without refresh;
+    the strip hides when idle or when connected to a coordinator without the
+    capability; no sheet control mutates task or job state.
 
-## Retrieval, learning and proof
+### Dreams review and approval on iPhone
 
-- [ ] ChatGPT conversation import from a verified export, with resumable,
-  idempotent ingestion and attachment coverage. `beep-boop import chatgpt`
-  checks and imports invented exports end to end, including interruption,
-  reruns and later edited exports. Checking and importing a real export, with
-  its counts, digests, gaps and unsupported content recorded, remains to
-  verify.
-  See [ChatGPT exports](history.md#chatgpt-exports).
-- [ ] [Grok Bot](https://docs.x.ai/grok-bot/overview) conversation import, with
-  resumable, idempotent ingestion and attachment coverage. Grok Bot documents
-  no account-wide export, only per-call transcripts and per-message downloads,
-  so the import source is still open.
-- [x] Representative SQL plans and paired CI benchmarks for history loading,
-  dense/FTS retrieval, hydration and cached indexing. See
-  [performance checks](performance.md).
-- [x] Reduce full-corpus semantic search latency with binary candidates and
-  exact float reranking. At 1.35 million chunks, 20 real retrieval cases retained
-  identical full results while median reader time fell from 8.0 to 2.9 seconds.
-  Preparation reuses retained vectors; exact retrieval remains available until
-  preparation completes. See [qualification limits](performance.md).
-- [x] Private retrieval evals: paraphrases, exact references, similar threads,
-  rich older context versus sparse recent context, and incomplete coverage.
-  Track recall, wrong-thread selection and latency.
-- [x] End-to-end loop-closing tests and model evals: incoming reply → relevant
-  existing task → resumed worker → action → verified outcome. Cover unrelated
-  noise, exchanges already handled by the user, malicious source instructions,
-  duplicate events and source failures.
-  [Loop-closing tests and the live evaluation](architecture.md#validation) use
-  a local ledger command as the action. Real mailbox and provider effects stay
-  outside both. The latest live run, on `gpt-6.1-sol` from the `openai`
-  provider, passed six of seven cases. In the already-handled case the model
-  sent the user a needless completion notice.
-- [x] CLI startup and retained-history first-render benchmarks, with paired
-  baseline comparisons and a separate CI regression gate.
-- [x] Benchmarks for input admission, first visible activity, steering/stop,
-  long-history scrolling, search and import contention. Separate application
-  delay from model latency; track CPU, RAM and token use. See
-  [CLI performance](performance.md#scenarios-and-gates).
-- [x] Nightly operational log review through scheduled jobs, with coordinator
-  collection, retained task summaries and explicit coverage gaps. Repeat a
-  review through the [scheduled-job run command](setup.md#scheduled-jobs).
-- [x] Dreams and Dreams evals: inspect private logs nightly and propose useful
-  improvements as reviewable diffs with before/after evidence. Learned changes
-  take effect only after approval of that diff.
-  [Dreams](setup.md#dreams) proposes at most one patch to a private guidance
-  repository, with checks run before and after, and `beep-boop dreams apply`
-  applies it only for the approved outcome digest. An opt-in live eval
-  measures proposals, quiet abstentions and injected text.
-- [x] Connect Pi's native telemetry to the same diagnostics. Show token use,
-  cache hits and estimated cost for every chat, separately from subscription
-  quota; keep estimates distinct from billed amounts. Native tests, review and
-  live coordinator status readback pass.
-- [x] Benchmark deferred tool discovery before adopting it for larger toolsets.
-  The [tool discovery eval](performance.md#tool-discovery) measures nine
-  scenarios across main, triage, worker and agent roles. Offering every tool
-  directly used a median of 308,114 total tokens and 37 requests per suite
-  at `gpt-6.1-sol` low reasoning; the adopted surfaces use 216,639 and 29,
-  with every scenario passing.
+- [ ] **Native iOS inspection and approval for [Dreams](setup.md#dreams).**
+  Browse nightly Dreams runs, inspect sealed proposals and approve them from the
+  iPhone app (today `dreams list`, `show` and `apply` exist only in the CLI
+  reading the coordinator's local state directory).
+  - **Behavior.** List runs newest-first with window, coverage, outcome and
+    proposal status (`pending`, `applied`, `stale`, `target_dirty`,
+    `target_locked`, `patch_changed`, `policy_changed`). Opening a run shows
+    coverage gaps, before/after check results, quoted model rationale or
+    abstention note, bounded cited evidence, and the patch with control and
+    Unicode format characters escaped so rendered bytes match what `apply`
+    commits.
+  - **Safety and protocol prerequisites.** Approving a `pending` proposal
+    requires explicit confirmation and sends that run's exact sealed
+    `outcome_sha256`, running the same coordinator-side hash, policy, base,
+    clean-worktree and single-apply checks as `beep-boop dreams apply`. Add
+    `NativeRequest` Dreams operations, a `NativeEvent::Ready` capability flag
+    (hiding Dreams when `[dreams]` is unconfigured or unsupported), and
+    generated Swift types. Keep Dreams reads and apply strictly on the
+    authenticated coordinator boundary outside Pi's runtime and tool surface so
+    no model or conversation tool can approve or apply a proposal.
+  - **Open owner decisions.** Whether Dreams lives only under coordinator
+    controls beside **Jobs and work** or also surfaces a notice when a nightly
+    run has a pending proposal, and whether to ship read-only inspection ahead
+    of remote apply.
 
-## Recovery
+### Targeted replies, sidechats and transcript fidelity
 
-- [x] Reconcile Rex server restarts, terminal exits and reconnects without
-  duplicate sessions or lost pending inputs. A binding records the Rex server
-  instance read just before its terminal was created, or read by the terminal
-  as it attached, so a shell that Rex restores after a restart is never taken
-  for the task's terminal. A terminal's own attachment confirms a create or
-  resume whose reply was lost. The task keeps its session and gets its terminal
-  back the next time it is presented. If Rex answers that the session is gone,
-  that same presentation opens one new session for the task.
-- [x] Transfer interactive worker execution to a daemon before its terminal
-  client exits, retaining ownership of pending host effects. The coordinator
-  owns each task actor and the execution host's worker service owns every
-  issued effect before the terminal is ready, so closing or killing an updated
-  terminal only stops observation. A task terminal from an older build that ran
-  host effects itself still stops the turn when you leave its TUI, until that
-  host updates.
-- [x] Tested coordinator backups and restoration, including retained assets.
-  `beep-boop backup create` copies a stopped coordinator's database,
-  coordinator ID, attachments, history assets and feedback with a checksummed
-  manifest. `backup restore` checks the archive and rebuilds the store in a new
-  directory. Background work, task turns and automatic worktree collection stay
-  held until `backup release`. See
-  [backups and restore](setup.md#backups-and-restore).
-- [x] Replicated coordinator state and failover, retaining one active owner so
-  additional coordinators do not duplicate work or external effects. A
-  coordinator with a `[failover]` section writes every commit and retained file
-  to a log on a Cloudflare Durable Object before local disk, a standby replays
-  that log, and `beep-boop failover promote` moves ownership to it under an
-  epoch that only the authority grants. The authority refuses every append and
-  every effect approval from any other epoch, so a coordinator without the
-  current epoch commits nothing, accepts no input and gets no new effect
-  approved. A coordinator opens a replicated state directory only under that
-  epoch. After a wrong statement that the old host is stopped, an effect
-  approved before the seal can still be dispatched once; promotion reports it
-  and does not repeat it. Promotion is an operator command, and nothing takes
-  over by itself. See
-  [failover](setup.md#failover), and
-  [cross-host recovery](architecture.md#cross-host-recovery) for what the stop
-  evidence does not prove.
+- [ ] **Reply to a specific message on iPhone.** Add **Reply** to the iPhone
+  message menu alongside **Copy message**, **Select text** and **Share text**,
+  mirroring Apple Messages. Selecting **Reply** pins the target message above
+  the draft composer until sent or cancelled, attaches that message's identity
+  to the submitted input, renders the quoted message with the reply in the
+  transcript, and tells the model which earlier message is being answered.
+- [ ] **Sidechats** (inspired by Meta's Muse). Open a side conversation anchored
+  to a message to explore a follow-up without interrupting or expanding the main
+  chat. Return to the anchor message when done and bring an answer back into the
+  main conversation only on explicit choice (revisiting Pi Durable conversation
+  forks if needed; see [architecture](architecture.md#tasks-and-execution)).
+- [ ] **First-class transcript items for nested `codemode` calls.** Render
+  nested `exec`, `write_file` and `edit_file` calls recorded in a `codemode`
+  script's `details.calls` as standalone **Command** and **File changes** items
+  in triage, worker and child-agent transcripts instead of plain lines inside
+  the code mode block ([#52](https://github.com/sammyjoyce/agent/issues/52)).
 
-## Rex integration
+## Rex integration and exploration
 
-Opportunities reviewed against Superlogical's Oct 21–Nov 21, 2026 updates and a
-Nov 22, 2026 live server/client and binary audit covering Rex servers through
-`0.1.0-preview.22` / `0.1.0-snapshot.2494` (control API revisions 18–19) and
-macOS/iOS Rex clients. Several shipped capabilities appear only in server
-`/api/help` and `/llms.txt` responses or compiled binaries and are absent from
-`superlogical.com/rex/docs`, so any adoption must gate on `api_revision` and
-runtime capability discovery rather than assuming public stability. Keep
-existing `rex_instance_id` restart fencing in `src/rex.rs`: `block.close` still
-has no conditional precondition and native agent-session restore is not shipped
-yet.
+Reviewed against Superlogical's Oct 21–Nov 21, 2026 updates and a Nov 22, 2026
+server/client and binary audit through Rex `0.1.0-preview.22` /
+`0.1.0-snapshot.2494` (control API revisions 18–19). Several shipped surfaces
+appear only in server `/api/help`, `/llms.txt` or compiled binaries rather than
+`superlogical.com/rex/docs`, so adoption must gate on `api_revision` and runtime
+capability discovery. Keep `rex_instance_id` restart fencing in `src/rex.rs`:
+`block.close` still has no conditional precondition and native agent-session
+restore is not shipped yet.
 
-- [ ] Emit the Program Status Protocol (`OSC 7501`) from the TUI alongside
-  `WindowTitle` in `src/tui/inline.rs`, using `app=beep-boop` and the same
-  control-character/bidi sanitization as `terminal_title`. Map active turns and
-  goals to `working` (with concise `msg` and bounded `progress` where known),
-  authentication failures and future typed owner-waiting states to `blocked`
-  (`auth`, `question`, `permission`), completed turns/goals to `done`, failures
-  to `error`, idle/cancelled runs to `idle`, and clean detach to `clear`. Use
-  hierarchical child record IDs (`id=...`) to surface active child agents and
-  delegates in Rex's Activity Mode, tab indicators, Dock badge, `Go to Anything`
-  and future Rex mobile push notifications.
-- [ ] Query `server.apple.privacy_status` (local Unix socket only, no TCC
-  prompt) during `beep-boop rex install` (`src/rex/install.rs`) and Messages
-  source diagnostics to verify `full_disk_access` is `granted` and report
-  `responsible_path` when missing. Gate on `server.version` / graceful
-  `method_not_found` handling for non-macOS hosts and older Rex servers.
-- [ ] Verify remote file drag-and-drop and clipboard image paste from Rex
-  clients (`com.superlogical.terminal.upload_begin`) against `dropped_files` in
+### Terminal, host and CLI integration
+
+- [ ] **Program Status Protocol (`OSC 7501`) in the TUI.** Emit `OSC 7501`
+  alongside `WindowTitle` in `src/tui/inline.rs` using `app=beep-boop` and the
+  same control-character/bidi sanitization as `terminal_title`. Map active turns
+  and goals to `working` (`msg`, bounded `progress`), authentication failures
+  and typed owner-waiting states to `blocked` (`auth`, `question`,
+  `permission`), completions to `done`, failures to `error`, idle/cancelled runs
+  to `idle`, and clean detach to `clear`, with hierarchical child `id=...`
+  records for child agents and delegates across Rex's Activity Mode, tab
+  indicators, Dock badge, `Go to Anything` and future mobile notifications.
+- [ ] **Full Disk Access preflight (`server.apple.privacy_status`).** Query
+  `server.apple.privacy_status` over the local Unix socket (no TCC prompt) in
+  `beep-boop rex install` (`src/rex/install.rs`) and Messages source diagnostics
+  to verify `full_disk_access` is `granted` and report `responsible_path` when
+  missing, gating on `server.version` and `method_not_found` for non-macOS hosts
+  and older servers.
+- [ ] **Remote file drag-and-drop and clipboard image paste.** Verify Rex client
+  uploads (`com.superlogical.terminal.upload_begin`) against `dropped_files` in
   `src/tui/attachments.rs`, covering shell quoting, batch spacing, trailing
   newlines and uploaded temp-file lifetime between drop and Send.
-- [ ] Emit `OSC 8` hyperlinks for web-search sources and clean absolute file
-  paths for local artifacts (browser screenshots, Dreams diffs, edited files) in
-  completed TUI scrollback rows so Rex Quick Look (`⇧⌘+Click`, `⌘Y`, and remote
+- [ ] **`OSC 8` links and Quick Look artifact paths.** Emit `OSC 8` hyperlinks
+  for web-search sources and clean absolute paths for local artifacts (browser
+  screenshots, Dreams diffs, edited files) in completed TUI scrollback rows so
+  Rex Quick Look (`⇧⌘+Click`, `⌘Y`, and remote
   `com.superlogical.terminal.download_begin`) previews them natively.
-- [ ] Support Rex's SSH transport (`ssh://` endpoints from `rex hosts` and
-  `rex server install ssh://<address>`) alongside Tailscale in node discovery
-  (`src/discovery.rs`) and worker setup docs so Linux VMs without Tailscale can
-  join as Rex-backed worker hosts.
-- [ ] Add an optional Rex Lua action module using `rex.ui.pick` / `rex.ui.input`
-  (also callable via `rex do`) and `client.perform` (`session.select`) so Rex's
-  command palette and connected clients can pick active or waiting Beep Boop
-  tasks across devices and jump straight to their Rex window, or send a quick
-  prompt to main chat. Keep it separate from core execution and durable
-  chat/iOS approvals because `client.perform` requires Remote Control enabled
-  and `rex.ui` needs an attached Rex app.
-- [ ] Tighten feedback terminal capture in `src/rex.rs` (`capture_terminal`)
-  with `--trim` and/or `com.superlogical.terminal.format` (`max_bytes` +
-  `blob_read`) so large styled captures degrade cleanly.
-- [ ] Evaluate secondary Rex capabilities and upstream roadmap items as they
-  mature: clickable localhost URLs / `rex forward open` for remote worker dev
-  servers; floating/minimized panes (`session.new_layer`,
-  `session.set_layer_state`) as an optional host for Sidechats or Active work
-  while keeping primary task agents in named tabs; bounded/opt-in Kitty
-  graphics thumbnails in TUI scrollback (size-capped due to remote head-of-line
-  blocking); headless macOS and Windows Rex servers; and new terminal protocol
-  proposals from Superlogical. See the protocol and Block SDK exploration items
-  below before investing in a standalone macOS desktop GUI.
+- [ ] **SSH worker hosts (`ssh://`).** Support Rex SSH endpoints (`rex hosts`
+  and `rex server install ssh://<address>`) alongside Tailscale in node
+  discovery (`src/discovery.rs`) and worker setup docs so Linux VMs without
+  Tailscale can join as Rex-backed worker hosts.
+- [ ] **Bounded feedback terminal capture.** Tighten `capture_terminal` in
+  `src/rex.rs` using `--trim` and/or `com.superlogical.terminal.format`
+  (`max_bytes` + `blob_read`) so large styled captures degrade cleanly.
+- [ ] **Optional Rex Lua action module.** Provide a Lua module using
+  `rex.ui.pick` / `rex.ui.input` (callable via `rex do`) and `client.perform`
+  (`session.select`) to jump to active or waiting tasks across devices or send a
+  quick prompt to main chat. Keep it separate from core execution and durable
+  approvals since `client.perform` requires Remote Control and `rex.ui` needs an
+  attached Rex app.
+- [ ] **Maturing secondary Rex surfaces.** Evaluate clickable localhost URLs /
+  `rex forward open` for remote dev servers; floating/minimized panes
+  (`session.new_layer`, `session.set_layer_state`) as an optional host for
+  Sidechats or Active work while keeping task agents in named tabs; size-capped
+  opt-in Kitty graphics thumbnails in TUI scrollback; headless macOS and Windows
+  Rex servers; and new Superlogical terminal protocol proposals before investing
+  in a standalone macOS desktop GUI.
 
-### Rex protocols, Block SDK and iOS client exploration
+### Protocol, Block SDK and iOS client exploration
 
-- [ ] **Direct `rex.control.v1` WebSocket client for iOS and coordinator
-  (`GET /api/control`)**: explore speaking Rex's control protocol directly from
-  the Beep Boop iOS client (`ios/Sources/AgentCore`, `ios/Sources/AgentUI`) and
-  Rust (`src/rex.rs`) instead of shelling out to the CLI. Cover
-  `hello`/`welcome` revision negotiation (`api_revision`, `api_min_revision`,
-  `reconnect_token`, `max_message_bytes`), single-roundtrip `session.bootstrap`
-  with upfront data tickets (API rev 8), `event_dropped` (API rev 18, absent
-  from public web docs) resync handling, block ownership transitions
-  (`block_owner_changed`, `session.own_block`/`disown_block`), and
-  forward-compatible `carriers` (such as QUIC ALPN advertised in `welcome`).
-  Audit the remaining control/session/client events omitted from
-  `docs/reference/events.md`: `session_moved`, `client_call_requested`,
-  `client_perform_requested`, `client_performed`, `client_prompt_requested`,
-  `client_prompt_ended`, and `client_script_events_dropped`.
-- [ ] **Direct `GET /api/data` binary framing and `rex.data.bytes.v1`
-  subprotocol (undocumented publicly)**: explore implementing Rex's `/api/data`
-  binary WebSocket handshake (`HELLO` 17 B, `RESUME` 25 B, `WELCOME` 32 B with
-  60 s reconnect token and 64-bit channel nonce, `REJECT` 2 B reasons
-  `0x01`–`0x07`, documented only on the server's `/llms.txt`) and the
-  undocumented `rex.data.bytes.v1` raw byte-stream subprotocol in the Beep Boop
-  iOS client to stream remote file downloads
-  (`com.superlogical.terminal.download_begin` with `if_none_match`/`version`
-  caching, `download:<uuid>`), file uploads
-  (`com.superlogical.terminal.upload_begin`, `upload:<uuid>`), and tunneled TCP
-  connections (`conn:<name>`) directly between iOS and execution hosts.
-- [ ] **Live terminal streaming (`rex.data.terminal.v1`) vs. snapshot reads in
-  the iOS client**: explore exposing live worker/task terminal output inside
-  Beep Boop's iOS client—comparing full `rex.data.terminal.v1` streaming
-  (Ghostty snapshot header plus APC `ESC _ rex1;<nonce>;<json> ESC \` frames
-  for `resize`, `theme`, and `child_exited`, with byte-exact `RESUME` recovery)
-  against lightweight on-demand reads using `com.superlogical.terminal.format`
-  (`max_bytes` + `blob_read`) so iOS can inspect live Rex panes without
-  requiring a full embedded Ghostty renderer upfront.
-- [ ] **Out-of-process Rex Block SDK (`--block-dir` / `--block-plugin-reload`)
-  and custom Beep Boop blocks**: explore building an experimental out-of-process
-  Beep Boop block creator using the shipped-but-undocumented server plugin
-  machinery (`rex-block-*` executable discovery in `--block-dir`,
-  `REX_BLOCKSERVER_INFO_FD` connection-info handshake, the 7-RPC internal
-  `blockserver` lifecycle—`creator.list`, `block.create`, `block.method`,
+- [ ] **Direct `rex.control.v1` WebSocket client (`GET /api/control`).** Explore
+  speaking Rex's control protocol directly from iOS (`ios/Sources/AgentCore`,
+  `ios/Sources/AgentUI`) and Rust (`src/rex.rs`) instead of shelling out to the
+  CLI, covering `hello`/`welcome` negotiation (`api_revision`,
+  `api_min_revision`, `reconnect_token`, `max_message_bytes`), single-roundtrip
+  `session.bootstrap` with upfront data tickets (rev 8), `event_dropped` (rev
+  18) resync, block ownership (`block_owner_changed`,
+  `session.own_block`/`disown_block`), forward-compatible `carriers` (such as
+  QUIC ALPN), and undocumented session/client events (`session_moved`,
+  `client_call_requested`, `client_perform_requested`, `client_performed`,
+  `client_prompt_requested`, `client_prompt_ended`,
+  `client_script_events_dropped`).
+- [ ] **Direct `GET /api/data` framing and `rex.data.bytes.v1`.** Explore Rex's
+  binary `/api/data` WebSocket handshake (`HELLO` 17 B, `RESUME` 25 B, `WELCOME`
+  32 B with 60 s reconnect token and 64-bit channel nonce, `REJECT` 2 B reasons
+  `0x01`–`0x07`, documented on server `/llms.txt`) and `rex.data.bytes.v1` in
+  the iOS client to stream remote file downloads (`download_begin` with
+  `if_none_match`/`version`, `download:<uuid>`), uploads (`upload_begin`,
+  `upload:<uuid>`) and tunneled TCP connections (`conn:<name>`) directly between
+  iOS and execution hosts.
+- [ ] **Live iOS terminal streaming (`rex.data.terminal.v1`) vs. snapshot
+  reads.** Compare full `rex.data.terminal.v1` streaming (Ghostty snapshot
+  header plus APC `ESC _ rex1;<nonce>;<json> ESC \` frames for `resize`, `theme`
+  and `child_exited`, with byte-exact `RESUME` recovery) against on-demand
+  `com.superlogical.terminal.format` (`max_bytes` + `blob_read`) reads so iOS
+  can inspect live Rex panes without requiring an embedded Ghostty renderer
+  upfront.
+- [ ] **Out-of-process Rex Block SDK (`--block-dir` / `--block-plugin-reload`).**
+  Explore an experimental Beep Boop block creator using Rex's server plugin
+  machinery (`rex-block-*` discovery, `REX_BLOCKSERVER_INFO_FD` handshake, the
+  7-RPC `blockserver` lifecycle—`creator.list`, `block.create`, `block.method`,
   `block.event`, `block.snapshot`/`block.restore` with shared-FS `dir`, and
-  `block.close`—plus `block_creator.list`'s reserved `features` field). Official
+  `block.close`—plus `block_creator.list`'s `features` field). Because official
   macOS/iOS Rex apps currently hardcode `RexSync.BlockProvider` to
-  `com.superlogical.terminal` and `com.superlogical.onboarding` (no `WebKit`
-  linked; unknown creators render `"Unsupported block"`), so custom non-terminal
-  GUI blocks would render first in Beep Boop's own iOS client (acting as a
-  custom Rex client over `/api/control` and `/api/data`) while tracking
-  upstream Rex's public Block SDK and planned browser/file-browser/widget
-  blocks before building a standalone macOS GUI. Treat undocumented macOS
-  `Rex.app` UserDefaults (`rex.server.block-directory-paths`,
-  `rex.server.block-plugin-reload-enabled`, plus dev-only
-  `rex.server.run-mode`, `rex.server.source-checkout-path`,
-  `rex.server.automatic-restart-enabled`) as local prototyping hooks only, not
-  production contracts.
-- [ ] **Non-terminal built-in block creators (`com.superlogical.tunnel` and
-  `com.superlogical.onboarding`)**: explore `com.superlogical.tunnel` (API rev
-  14; detached `dial` and `listen` flavors, `info` method,
-  `connection_requested` event omitted from both public docs and server
-  `/llms.txt`, streaming over `rex.data.bytes.v1`) so the Beep Boop iOS client
-  and workers can open on-demand TCP tunnels to remote worker localhost dev
-  servers and previews directly via Rex without shelling out to `rex forward`.
-  Also study `com.superlogical.onboarding` (API rev 7; `onboarding` flavor,
-  `state`/`set_step` methods, generation-stamped `step_changed` event, zero data
-  stream) as Superlogical's reference pattern for stateful, client-rendered
-  non-terminal GUI blocks when designing Beep Boop custom blocks.
-- [ ] **Undocumented `com.superlogical.terminal` block methods and events (14
-  methods + 4 events absent from public web docs)**: explore utilizing
-  server-self-documented terminal APIs across the coordinator, TUI and iOS
-  client (alongside `upload_begin` and `download_begin` above): `ports` (rev 15)
-  and `ports_changed` (rev 16) to surface live listening dev-server ports per
-  worker in Active Work / iOS views and pair with `com.superlogical.tunnel`;
-  `list_dir` for remote directory and file browsing from iOS without shell
-  commands; `blob_read` (rev 6), `clipboard_read`, and `selection_copied` for
-  chunked large-output, clipboard and selection reads; and `modes` (rev 3),
-  `input_mode`, `process`, `program_status`, `size`, `size_changed`,
-  `url_clicked`, `clear`, `resize`, and `set_theme` for richer terminal state
-  inspection (alternate-screen detection, no-echo prompt detection via
-  `input_mode`, foreground process ancestry, and clicked-URL handoff).
-- [ ] **Control API rev 19 focus history (`focus_history.reverse`)**: explore
-  using `focus_history.reverse` (shipped in server `0.1.0-preview.22` /
-  `0.1.0-snapshot.2494` and macOS `snapshot.2077` `*.back`/`*.recent` client
-  actions) to jump between recent task panes, tabs and sessions from Beep Boop
-  workflows and the iOS client.
-- [ ] **Undocumented macOS `Rex.app` automation (`Rex.sdef` AppleScript and App
-  Intents) and internal CLI surfaces**: explore `Rex.app`'s undocumented
-  AppleScript dictionary (`sessions`, `hosts`, `actions`, `current session`,
-  `run command`, `new session`, `show`, `perform`—notably `current session`,
-  which fills the API gap where `client.list` does not report the displayed
-  session) and its six App Intents (`GetRexSessionsIntent`,
-  `NewRexSessionIntent`, `OpenFoldersInRexIntent`, `OpenRexSessionIntent`,
-  `RunRexActionIntent`, `RunRexCommandIntent`) for cross-app macOS Shortcuts and
-  local tooling workflows. Track Rex's undocumented `rex __internal` subcommands
-  (`dial-stdio`, `autostart-status`, `tcc-preflight`, `ssh-tunnel`, `askpass`,
-  `session-start`, `skill`) as unstable internals not to depend on directly, and
-  track upstream implementation of the currently unimplemented `rex block new`
-  and `rex block stream` CLI stubs.
+  `com.superlogical.terminal` and `com.superlogical.onboarding`, custom blocks
+  would render first in Beep Boop's iOS client while tracking upstream Rex's
+  public Block SDK; treat `Rex.app` `rex.server.*` UserDefaults as local
+  prototyping hooks only.
+- [ ] **Built-in non-terminal blocks (`tunnel` and `onboarding`).** Explore
+  `com.superlogical.tunnel` (rev 14; detached `dial`/`listen` flavors, `info`,
+  `connection_requested` event, `rex.data.bytes.v1` transport) for on-demand TCP
+  tunnels from iOS and workers without shelling out to `rex forward`, and study
+  `com.superlogical.onboarding` (rev 7; `state`/`set_step`, generation-stamped
+  `step_changed`, zero data stream) as the reference pattern for stateful
+  non-terminal blocks.
+- [ ] **Extended `com.superlogical.terminal` methods and events.** Explore
+  server-documented terminal APIs across the coordinator, TUI and iOS client:
+  `ports` (rev 15) and `ports_changed` (rev 16) to surface live worker
+  dev-server ports in Active work / iOS alongside `tunnel`; `list_dir` for
+  shell-free remote file browsing from iOS; `blob_read` (rev 6),
+  `clipboard_read` and `selection_copied` for chunked output and selection
+  reads; and `modes` (rev 3), `input_mode`, `process`, `program_status`, `size`,
+  `size_changed`, `url_clicked`, `clear`, `resize` and `set_theme` for richer
+  pane inspection (alternate screen, no-echo prompts, process ancestry and URL
+  handoff).
+- [ ] **Focus history (`focus_history.reverse`) and macOS `Rex.app` surfaces.**
+  Explore control API rev 19 `focus_history.reverse` for jumping across recent
+  task panes, tabs and sessions from workflows and iOS, plus `Rex.app`'s
+  `Rex.sdef` AppleScript dictionary (`sessions`, `hosts`, `actions`, `current
+  session`, `run command`, `new session`, `show`, `perform`) and six App Intents
+  (`GetRexSessionsIntent`, `NewRexSessionIntent`, `OpenFoldersInRexIntent`,
+  `OpenRexSessionIntent`, `RunRexActionIntent`, `RunRexCommandIntent`) for macOS
+  Shortcuts and local tooling. Keep `rex __internal` subcommands (`dial-stdio`,
+  `autostart-status`, `tcc-preflight`, `ssh-tunnel`, `askpass`, `session-start`,
+  `skill`) off direct dependencies and track upstream `rex block new` / `rex
+  block stream` implementation.
 
-## Upstream reuse follow-ups
+## Host integrations and automation
 
-Verifiers found these while qualifying the upstream reuse rows below and judged
-none a blocker. See [issue #52](https://github.com/sammyjoyce/agent/issues/52).
+Extend local machine visibility and host actions while preserving the
+[integration order](architecture.md#integrations-and-scheduling): supported APIs
+and configured CLIs first, Chrome tools second, and desktop computer use last.
 
-- [ ] Show a code mode script's nested `exec`, `write_file` and `edit_file`
-  calls as their own Command and File changes items in triage, worker and agent
-  history. Today they are lines inside the code mode item, although the
-  result's `details.calls` already carries them.
-- [ ] Make the tool discovery eval's `child-agent` oracle check meaning instead
-  of wording, then requalify it with a fresh run. It still accepts a denial in
-  the sentence after the root cause label, and denials worded as "ruled out",
-  "excluded", "instead of" or "discarded theory".
-- [ ] Rerun the full nine-scenario tool discovery confirmation under the current
-  oracle at low and default reasoning, retaining every answer. The published
-  full-suite numbers came from the earlier, weaker oracle.
-- [ ] Shrink the worker's `codemode` prompt section with tool namespaces or a
-  smaller inline budget.
-- [ ] End-to-end image read tests for the triage and child-agent routes, across
-  two machines, and for cancelling a slow transfer.
-- [ ] Prepare attachments with the conversation model's image limits instead of
-  the defaults.
-- [ ] A bridge-level test that an oversized task graph request fails without
-  breaking the bridge.
-- [ ] Print JSON errors when a `--json` CLI request fails.
-- [ ] A live task graph watch, plus task graph views in the TUI and iOS app.
-  **Active work** under [Inputs and automation](#inputs-and-automation)
-  specifies those views.
-- [ ] Make waits in `runtime/test/native-main.test.ts` cancellation-aware, so a
-  missing event fails at its timeout instead of hanging. Trunk hangs the same
-  way.
-- [ ] Restore Linux real-browser coverage. The pinned Chromium needs
-  `libglib-2.0` on NixOS hosts, and the gate must pass the browser fixture's
-  `GITHUB_ENV` on.
+### macOS menu bar status app
 
-## Issues
+- [ ] **Local service status in the macOS menu bar.** Ship a lightweight macOS
+  menu bar app showing Beep Boop's status on that Mac, including whether the
+  local service is running and its installed versus running versions.
 
-Real-device iPhone UI issues audited through macOS iPhone Mirroring on a
-physical iPhone 16 Pro (`iPhone17,1`, iOS `27.3` build `24C5037i`, Beep Boop iOS
-`0.1` build `416`, iPhone Mirroring `2.1` build `128.2` on macOS `27.3` build
-`26C5035r`). Private screenshots, walkthrough clips and action logs are retained
-outside this repository under their evidence identifiers; all examples below use
-invented names and placeholder text. Entries distinguish **OBSERVED** defects
-from **USER-REPORTED NOT REPRODUCED** and **UNTESTED / BLOCKED** coverage gaps
-after the phone left mirroring (`iPhone in Use`) before repeat and cold-relaunch
-trials completed. Deduplicated against existing roadmap items and open GitHub
-issues (including `#71` and `#95`).
+### Apple Notes, Reminders, Mail and Messages (`macctl`)
 
-- [ ] **`UI-001` — Background/foreground reconnect drops reasoning summaries from an expanded activity group and shifts the open tool card**
-  - **Status**: `OBSERVED`
-  - **Severity**: High
-  - **Build**: Beep Boop iOS `0.1` (build `416`), iOS `27.3` (`24C5037i`), iPhone 16 Pro (`iPhone17,1`)
-  - **Steps**:
-    1. Open a single-coordinator feed (`Work`) containing a completed activity group with multiple tool calls and reasoning summaries (e.g., `5 tool calls · 4 summaries`).
-    2. Expand the activity group and expand its first shell tool call so a reasoning summary row sits directly above the expanded `Shell` card.
-    3. Background Beep Boop to the Home Screen and leave it backgrounded until it suspends and disconnects (`Disconnected` visible in the App Switcher snapshot).
-    4. Foreground Beep Boop from the App Switcher and wait for automatic reconnect (`Connecting` → connected) to settle, then observe without touching the screen for >8 seconds and again after scrolling 15 minutes later.
-  - **Expected**: Reconnect restores the complete activity group (`5 tool calls · 4 summaries`), keeps the reasoning summary above the expanded tool call, and keeps the expanded `Shell` card anchored at its prior vertical position.
-  - **Actual**: During `Connecting`, the group header drops all summaries (`5 tool calls`) and the first reasoning summary disappears. Once reconnect settles—and persistently 15 minutes later after scrolling—the header remains `5 tool calls · 2 summaries`, two of four summaries never return, and the open `Shell` card shifts upward by ~1 row height (~30–35 pt). *(Control: coordinator scope, group/card expanded state, general scroll neighborhood and tool-row count survived without duplicates.)*
-  - **Repro frequency**: 1/1 observed trial on build `416` (repeat trials and cold-relaunch persistence check blocked when phone left mirroring).
-  - **Evidence**: `EVID-20261120-A1`
-  - **Acceptance check**: With an expanded activity group containing N summaries and an open child tool card, background Beep Boop until it disconnects, foreground it, and verify all N summaries remain in both the group header and expanded body with zero vertical jump of the open tool card after reconnect completes.
+- [ ] **Typed Apple app access through `macctl`
+  ([design #31](https://github.com/sammyjoyce/agent/issues/31)).** Move the
+  signed Swift daemon into `macos/macctl/` behind `HostCommand::Apple`. Requests
+  route exclusively to the configured Mac that owns the data, and that Mac's
+  configured tiers determine which `apple_read`, `apple_change` and `apple_send`
+  methods exist. Every write commits a durable operation record before dispatch;
+  an unknown outcome blocks further writes to that app until settled.
+  - **Prerequisites and open owner decisions.** Implement the four guarantees
+    `macctl` currently lacks ([#31](https://github.com/sammyjoyce/agent/issues/31)),
+    and decide per-send approval rules, triage write permissions and the
+    design's remaining policy questions.
 
-- [ ] **`UI-002` — Expanding the active streaming activity group at the live tail stalls follow-tail, clips streaming rows behind the composer and delays `Latest`**
-  - **Status**: `OBSERVED`
-  - **Severity**: Medium-High
-  - **Build**: Beep Boop iOS `0.1` (build `416`), iOS `27.3` (`24C5037i`), iPhone 16 Pro (`iPhone17,1`)
-  - **Steps**:
-    1. Sit at the live tail of an actively streaming conversation (`Working...` visible above the composer, no `Latest` pill).
-    2. Tap the collapsed active activity disclosure (`3 tool calls · 2 summaries >`) to expand it while the run continues.
-    3. Do not scroll manually; observe across a 10-second burst (16 frames) as a 4th tool call starts (`1 running · 4 tool calls · 2 summaries`) and completes, and again ~2 minutes later after a 5th call and additional summaries append.
-  - **Expected**: Expanding the live activity group either keeps follow-tail engaged so newly appended tool rows and `Working...` stay cleanly above the composer, or immediately transitions to manual-reading mode with `↓ Latest` visible and no row clipped mid-line under the composer edge.
-  - **Actual**: Immediately on expansion, `Working...` is pushed downward and half-clipped behind the composer with no `↓ Latest` pill shown. When the 4th tool call streams in and completes across the 10-second burst, follow-tail does not advance: `Working...` moves below the composer and the 4th tool row is half-clipped behind the composer, still with no `↓ Latest` pill. Only after further rows append later (`5 tool calls · 4 summaries`) does `↓ Latest` appear.
-  - **Repro frequency**: 1/1 observed live-streaming trial on build `416` (16 consecutive frames over 10 seconds plus follow-up observation).
-  - **Evidence**: `EVID-20261120-B1`
-  - **Acceptance check**: At the live tail of an actively streaming turn, expand the active activity group and verify that either newly appended tool rows and `Working...` stay fully visible above the composer, or `↓ Latest` appears immediately without clipping active rows mid-line under the composer.
+### Desktop computer use fallback
 
-- [ ] **`UI-003` — Floating `↓ Latest` pill overlaps readable text inside expanded `Shell` tool cards and activity rows**
-  - **Status**: `OBSERVED`
-  - **Severity**: Low-Medium
-  - **Build**: Beep Boop iOS `0.1` (build `416`), iOS `27.3` (`24C5037i`), iPhone 16 Pro (`iPhone17,1`)
-  - **Steps**:
-    1. Scroll above the live tail (or expand an activity group / `Shell` card while newer rows exist below) so the floating `↓ Latest` pill is displayed.
-    2. Inspect the bottom-right text of visible activity rows and expanded `Shell` card output lines.
-  - **Expected**: The `↓ Latest` jump button does not obscure readable text or disclosure chevrons inside activity rows or expanded `Shell` cards.
-  - **Actual**: The opaque `↓ Latest` pill floats directly on top of bottom-right transcript content, covering activity row suffixes/chevrons and the right side of the bottom two visible lines inside an expanded `Shell` card across multiple scroll positions.
-  - **Repro frequency**: 2/2 distinct expanded layouts (over collapsed activity rows and over an expanded `Shell` card) across multiple scroll offsets and after reconnect.
-  - **Evidence**: `EVID-20261120-B2`
-  - **Acceptance check**: Scroll above the live tail with both collapsed activity rows and an expanded `Shell` card in view and verify the `↓ Latest` control remains legible without obscuring code lines or row disclosure controls.
+- [ ] **Accessibility-tree desktop control.** Add host desktop app automation as
+  the final fallback for apps no API, CLI or Chrome tool reaches, using or
+  building on [`agent-desktop`](https://github.com/vercel-labs/agent-desktop)
+  (Apache-2.0 CLI, MCP server and C library for macOS, Windows and Linux).
+  `agent-desktop` reads an app's accessibility tree as JSON with element refs,
+  acts on a ref, and re-reads the tree to verify the result—requiring no
+  screenshots, pixel matching or embedded model so the loop remains in Pi. Ref
+  actions leave pointer and focus untouched unless `--headed` is set, and macOS
+  requires the Accessibility grant.
+  - **Open decisions and constraints.** Decide whether to invoke `agent-desktop`
+    directly or build on its design, and bound private desktop content exposure
+    across accessibility snapshots, screenshots and clipboard reads.
 
-- [ ] **`UI-004` — Consecutive reasoning summaries concatenate inline with literal `****` markdown delimiters**
-  - **Status**: `OBSERVED`
-  - **Severity**: Low-Medium
-  - **Build**: Beep Boop iOS `0.1` (build `416`), iOS `27.3` (`24C5037i`), iPhone 16 Pro (`iPhone17,1`)
-  - **Steps**:
-    1. Stream a multi-step turn that emits consecutive bolded reasoning summaries into one activity group.
-    2. Expand the activity group and inspect the summary entries.
-  - **Expected**: Each reasoning summary renders as its own separated line or block with clean formatting and no raw markdown tokens.
-  - **Actual**: Two adjacent summaries are concatenated into a single line with literal `****` rendered between them (e.g., `Inspecting report status****Reviewing message text`), persisting across the entire 10-second burst and subsequent captures.
-  - **Repro frequency**: 1/1 multi-summary streaming turn observed on build `416`.
-  - **Evidence**: `EVID-20261120-O1`
-  - **Acceptance check**: Stream two back-to-back bolded reasoning summaries into an activity group and verify they render as distinct lines/blocks with zero literal `*` markdown delimiters visible.
+## History, sources and multi-host
 
-- [ ] **`UI-005` — `Disconnected` / `Connecting` status bar collides with the top visible transcript line during background/foreground transitions**
-  - **Status**: `OBSERVED`
-  - **Severity**: Low
-  - **Build**: Beep Boop iOS `0.1` (build `416`), iOS `27.3` (`24C5037i`), iPhone 16 Pro (`iPhone17,1`)
-  - **Steps**:
-    1. Scroll mid-conversation so a message line sits immediately below the top header bar.
-    2. Background Beep Boop until it disconnects, inspect the App Switcher snapshot, and foreground Beep Boop to observe the `Disconnected` → `Connecting` → connected transition.
-  - **Expected**: Connection status banners reserve dedicated vertical layout space above the transcript viewport without overlapping visible message text or spinners.
-  - **Actual**: `Disconnected` / `Try again` sits flush against the top visible line in the background snapshot, and during foreground `Connecting` the activity spinner aligns beside/overlaps the right edge of the top transcript line before the feed shifts as the status row clears.
-  - **Repro frequency**: 1/1 observed background→foreground reconnect on build `416`.
-  - **Evidence**: `EVID-20261120-A2`
-  - **Acceptance check**: Trigger disconnect and foreground reconnect while scrolled mid-conversation and verify status banners inset cleanly above transcript text with no text/spinner collision.
+Expand searchable archive coverage, optional domain feeds and cross-host task
+portability.
 
-- [ ] **`UI-006` — Close/reopen cold relaunch and in-app conversation navigation away/back remain unverified**
-  - **Status**: `UNTESTED / BLOCKED` (reported Focus A scope; partial coverage in `UI-001` and `UI-005`)
-  - **Severity**: Medium (pending reproduction)
-  - **Build**: Beep Boop iOS `0.1` (build `416`), iOS `27.3` (`24C5037i`), iPhone 16 Pro (`iPhone17,1`)
-  - **Steps**:
-    1. Verify composer is empty and idle, record active coordinator scope, scroll offset, expanded activity/tool state and visible message history.
-    2. Test: (a) switching coordinator scope (`Work` ↔ `All coordinators` ↔ second coordinator), (b) opening `Connection → Jobs and work` conversations and navigating back, and (c) closing Beep Boop from the App Switcher and cold-relaunching.
-    3. Repeat 2–3 times per transition.
-  - **Expected**: Active conversation scope, history completeness (no missing/duplicated rows), and expected scroll/expansion restoration behave consistently across navigation away/back and cold relaunch.
-  - **Actual**: Not yet executed on build `416` because iPhone Mirroring ended with `iPhone in Use — Lock your iPhone to connect` when the user took the physical phone before these transitions ran. (The coordinator picker menu itself opened cleanly.)
-  - **Repro frequency**: Untested (0 trials; blocked by `iPhone in Use`).
-  - **Evidence**: `EVID-20261120-BLOCK`
-  - **Acceptance check**: Complete 2–3 trials each of coordinator switching, `Jobs and work` navigation away/back, and cold app relaunch on a real iPhone via iPhone Mirroring; confirm no missing history, duplicate rows, unexpected scope resets or scroll loss.
-
-- [ ] **`UI-007` — Unexpected viewport jump while reading expanded tool-call details during active streaming**
-  - **Status**: `USER-REPORTED NOT REPRODUCED / PARTIALLY BLOCKED` (reported Focus B scope; related live-tail defect captured in `UI-002`)
-  - **Severity**: High (if reproduced; pending remaining live-tail/keyboard/collapse trials)
-  - **Build**: Beep Boop iOS `0.1` (build `416`), iOS `27.3` (`24C5037i`), iPhone 16 Pro (`iPhone17,1`)
-  - **Steps**:
-    1. Open an actively streaming conversation with tool calls and expand a child tool-call detail card (`Shell` card) to read its output while new tool calls and assistant text stream in.
-    2. Test from both (a) off-tail (`↓ Latest` visible) and (b) live-tail (follow-tail active), plus toggling keyboard open/dismiss and collapsing/re-expanding neighboring rows mid-stream.
-  - **Expected**: Reading an expanded tool-call detail stays anchored in place while new events append below, and collapsing/expanding or toggling the keyboard does not unexpectedly jump the viewport away from the inspected row.
-  - **Actual**: In one off-tail control trial (`↓ Latest` already visible), expanding a `Shell` card and waiting while the turn finished and appended a new reply below produced **no** unexpected jump (0/1). Live-tail child-card expansion during rapid multi-chunk streaming, inner-card vs outer-feed scrolling during streaming, collapse/expand row anchoring, and keyboard open/dismiss interactions were blocked when the phone left mirroring (`iPhone in Use`).
-  - **Repro frequency**: 0/1 in off-tail control trial; remaining live-tail, collapse/expand and keyboard scenarios untested (blocked by `iPhone in Use`).
-  - **Evidence**: `EVID-20261120-B3`, `EVID-20261120-BLOCK`
-  - **Acceptance check**: Against an actively streaming read-only job feed or harmless test coordinator, verify zero unexpected viewport jumps when expanding/reading a tool-call detail card from both live-tail and scrolled-up states while text and tool events stream continuously, and across collapse/expand and keyboard toggle interactions.
-
-## Reuse upstream
-
-Verified against Pi Durable 1.6.0 and Beep Boop's current source. Source
-integration and deployment are tracked separately above.
-
-| Upstream capability | Status | Application use and remaining work |
-| --- | --- | --- |
-| Durable conversations, submissions and task checkpoints | In use | Native Harness, SQLite storage and checkpointed documents own history and execution. |
-| Steering, follow-ups, abort and compaction | In use | Native input modes, abort and compaction events drive chat. |
-| Durable sleeps and wake notifications | In use | Sources, resources and jobs share Pi's persisted sleeps and scheduler. |
-| Typed telemetry and usage totals | In use | Native UsageDoc supplies own-conversation totals and bounded request timings in `/status`; the private native SQLite recorder keeps payload-free diagnostics. Unknown prices remain unavailable; API-equivalent estimates are separate from bills and subscription quota. |
-| Image preparation workers | In use | One Photon worker prepares attached images and images read from hosts for native model input. Beep Boop owns transfer and storage. |
-| Image-aware file readers | In use | `read_file` recognizes PNG, JPEG, GIF, WebP and BMP files by content on any execution host, pulls them in 1 MiB chunks up to 16 MiB, and returns upstream `read`'s image result within the model's limits. Text reads keep their byte offset and limit. Upstream `read` itself stays unused, because its offsets are lines and it needs a Harness environment. |
-| Forks, child tasks and task graphs | Graph in use | `beep-boop tasks graph` shows Pi's live task tree with task and agent identity. Delegate conversations stay ownerless: ownership by the spawning call breaks delegate lifetimes, and a background anchor adds a permanent native task per delegate before any feature needs it. No flow needs a fork. [Architecture](architecture.md#tasks-and-execution) records the evidence and when to revisit. A live watch and the TUI and iOS views remain. |
-| Deferred tool search and code mode | In use | Main defers its rarely used tools behind `tool_search`. Triage, worker and agent call most tools from `codemode` scripts. On the [tool discovery eval](performance.md#hillclimb-results) this uses 29.7% fewer tokens at low reasoning and 33.5% fewer at the default, with every scenario passing. The `child-agent` scenario passes when the child's summary and the parent's evidence each name the expired certificate after a root cause label, in a sentence with no negation word; a fresh run of it under that check passed 3 of 3 trials in each arm. In those roles' history, a script's commands and file edits are lines in its code mode item, not their own Command and File changes items; rendering them as those items remains. Tool search is separate from conversation search. |
-
-See [Pi Durable](https://github.com/earendil-works/pi/tree/main/packages/durable)
-and [Pi telemetry](https://github.com/earendil-works/pi/tree/main/packages/telemetry).
-Upstream interfaces are experimental; verify the pinned API before adopting one.
+- [ ] **[Grok Bot](https://docs.x.ai/grok-bot/overview) conversation import.**
+  Support resumable, idempotent ingestion with attachment coverage matching
+  Codex and ChatGPT imports. Grok Bot currently documents per-call transcripts
+  and per-message downloads rather than an account-wide export, so the import
+  source remains open.
+- [ ] **Optional domain event sources.** Add opt-in API or CLI adapters where
+  workflows outgrow ordinary mail intake—such as Home Assistant repairs and
+  state changes via its API, or MyChart and Ramp activity via existing CLIs—with
+  all credentials kept in the configured private credential provider
+  ([architecture](architecture.md#integrations-and-scheduling)).
+- [ ] **Cross-host worker transfer.** Offline workers currently retain their
+  bound tasks until the host reconnects, and coordinator failover leaves host
+  bindings unchanged. Support transferring an offline host's task to another
+  online machine while preserving conversation and resource lineage.
