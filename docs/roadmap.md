@@ -442,8 +442,13 @@ recovery; [history](history.md) describes import and retrieval.
 
 ## Rex integration
 
-Opportunities reviewed against Superlogical's Oct 21–Nov 21, 2026 updates, Rex
-`0.1.0-preview.21` (control API revision 18) and current Rex documentation. Keep
+Opportunities reviewed against Superlogical's Oct 21–Nov 21, 2026 updates and a
+Nov 22, 2026 live server/client and binary audit covering Rex servers through
+`0.1.0-preview.22` / `0.1.0-snapshot.2494` (control API revisions 18–19) and
+macOS/iOS Rex clients. Several shipped capabilities appear only in server
+`/api/help` and `/llms.txt` responses or compiled binaries and are absent from
+`superlogical.com/rex/docs`, so any adoption must gate on `api_revision` and
+runtime capability discovery rather than assuming public stability. Keep
 existing `rex_instance_id` restart fencing in `src/rex.rs`: `block.close` still
 has no conditional precondition and native agent-session restore is not shipped
 yet.
@@ -491,9 +496,107 @@ yet.
   `session.set_layer_state`) as an optional host for Sidechats or Active work
   while keeping primary task agents in named tabs; bounded/opt-in Kitty
   graphics thumbnails in TUI scrollback (size-capped due to remote head-of-line
-  blocking); headless macOS and Windows Rex servers; new terminal protocol
-  proposals from Superlogical; and the upcoming Rex Block SDK (`--block-dir` +
-  `data.connect`) before investing in a standalone macOS desktop GUI.
+  blocking); headless macOS and Windows Rex servers; and new terminal protocol
+  proposals from Superlogical. See the protocol and Block SDK exploration items
+  below before investing in a standalone macOS desktop GUI.
+
+### Rex protocols, Block SDK and iOS client exploration
+
+- [ ] **Direct `rex.control.v1` WebSocket client for iOS and coordinator
+  (`GET /api/control`)**: explore speaking Rex's control protocol directly from
+  the Beep Boop iOS client (`ios/Sources/AgentCore`, `ios/Sources/AgentUI`) and
+  Rust (`src/rex.rs`) instead of shelling out to the CLI. Cover
+  `hello`/`welcome` revision negotiation (`api_revision`, `api_min_revision`,
+  `reconnect_token`, `max_message_bytes`), single-roundtrip `session.bootstrap`
+  with upfront data tickets (API rev 8), `event_dropped` (API rev 18, absent
+  from public web docs) resync handling, block ownership transitions
+  (`block_owner_changed`, `session.own_block`/`disown_block`), and
+  forward-compatible `carriers` (such as QUIC ALPN advertised in `welcome`).
+  Audit the remaining control/session/client events omitted from
+  `docs/reference/events.md`: `session_moved`, `client_call_requested`,
+  `client_perform_requested`, `client_performed`, `client_prompt_requested`,
+  `client_prompt_ended`, and `client_script_events_dropped`.
+- [ ] **Direct `GET /api/data` binary framing and `rex.data.bytes.v1`
+  subprotocol (undocumented publicly)**: explore implementing Rex's `/api/data`
+  binary WebSocket handshake (`HELLO` 17 B, `RESUME` 25 B, `WELCOME` 32 B with
+  60 s reconnect token and 64-bit channel nonce, `REJECT` 2 B reasons
+  `0x01`–`0x07`, documented only on the server's `/llms.txt`) and the
+  undocumented `rex.data.bytes.v1` raw byte-stream subprotocol in the Beep Boop
+  iOS client to stream remote file downloads
+  (`com.superlogical.terminal.download_begin` with `if_none_match`/`version`
+  caching, `download:<uuid>`), file uploads
+  (`com.superlogical.terminal.upload_begin`, `upload:<uuid>`), and tunneled TCP
+  connections (`conn:<name>`) directly between iOS and execution hosts.
+- [ ] **Live terminal streaming (`rex.data.terminal.v1`) vs. snapshot reads in
+  the iOS client**: explore exposing live worker/task terminal output inside
+  Beep Boop's iOS client—comparing full `rex.data.terminal.v1` streaming
+  (Ghostty snapshot header plus APC `ESC _ rex1;<nonce>;<json> ESC \` frames
+  for `resize`, `theme`, and `child_exited`, with byte-exact `RESUME` recovery)
+  against lightweight on-demand reads using `com.superlogical.terminal.format`
+  (`max_bytes` + `blob_read`) so iOS can inspect live Rex panes without
+  requiring a full embedded Ghostty renderer upfront.
+- [ ] **Out-of-process Rex Block SDK (`--block-dir` / `--block-plugin-reload`)
+  and custom Beep Boop blocks**: explore building an experimental out-of-process
+  Beep Boop block creator using the shipped-but-undocumented server plugin
+  machinery (`rex-block-*` executable discovery in `--block-dir`,
+  `REX_BLOCKSERVER_INFO_FD` connection-info handshake, the 7-RPC internal
+  `blockserver` lifecycle—`creator.list`, `block.create`, `block.method`,
+  `block.event`, `block.snapshot`/`block.restore` with shared-FS `dir`, and
+  `block.close`—plus `block_creator.list`'s reserved `features` field). Official
+  macOS/iOS Rex apps currently hardcode `RexSync.BlockProvider` to
+  `com.superlogical.terminal` and `com.superlogical.onboarding` (no `WebKit`
+  linked; unknown creators render `"Unsupported block"`), so custom non-terminal
+  GUI blocks would render first in Beep Boop's own iOS client (acting as a
+  custom Rex client over `/api/control` and `/api/data`) while tracking
+  upstream Rex's public Block SDK and planned browser/file-browser/widget
+  blocks before building a standalone macOS GUI. Treat undocumented macOS
+  `Rex.app` UserDefaults (`rex.server.block-directory-paths`,
+  `rex.server.block-plugin-reload-enabled`, plus dev-only
+  `rex.server.run-mode`, `rex.server.source-checkout-path`,
+  `rex.server.automatic-restart-enabled`) as local prototyping hooks only, not
+  production contracts.
+- [ ] **Non-terminal built-in block creators (`com.superlogical.tunnel` and
+  `com.superlogical.onboarding`)**: explore `com.superlogical.tunnel` (API rev
+  14; detached `dial` and `listen` flavors, `info` method,
+  `connection_requested` event omitted from both public docs and server
+  `/llms.txt`, streaming over `rex.data.bytes.v1`) so the Beep Boop iOS client
+  and workers can open on-demand TCP tunnels to remote worker localhost dev
+  servers and previews directly via Rex without shelling out to `rex forward`.
+  Also study `com.superlogical.onboarding` (API rev 7; `onboarding` flavor,
+  `state`/`set_step` methods, generation-stamped `step_changed` event, zero data
+  stream) as Superlogical's reference pattern for stateful, client-rendered
+  non-terminal GUI blocks when designing Beep Boop custom blocks.
+- [ ] **Undocumented `com.superlogical.terminal` block methods and events (14
+  methods + 4 events absent from public web docs)**: explore utilizing
+  server-self-documented terminal APIs across the coordinator, TUI and iOS
+  client (alongside `upload_begin` and `download_begin` above): `ports` (rev 15)
+  and `ports_changed` (rev 16) to surface live listening dev-server ports per
+  worker in Active Work / iOS views and pair with `com.superlogical.tunnel`;
+  `list_dir` for remote directory and file browsing from iOS without shell
+  commands; `blob_read` (rev 6), `clipboard_read`, and `selection_copied` for
+  chunked large-output, clipboard and selection reads; and `modes` (rev 3),
+  `input_mode`, `process`, `program_status`, `size`, `size_changed`,
+  `url_clicked`, `clear`, `resize`, and `set_theme` for richer terminal state
+  inspection (alternate-screen detection, no-echo prompt detection via
+  `input_mode`, foreground process ancestry, and clicked-URL handoff).
+- [ ] **Control API rev 19 focus history (`focus_history.reverse`)**: explore
+  using `focus_history.reverse` (shipped in server `0.1.0-preview.22` /
+  `0.1.0-snapshot.2494` and macOS `snapshot.2077` `*.back`/`*.recent` client
+  actions) to jump between recent task panes, tabs and sessions from Beep Boop
+  workflows and the iOS client.
+- [ ] **Undocumented macOS `Rex.app` automation (`Rex.sdef` AppleScript and App
+  Intents) and internal CLI surfaces**: explore `Rex.app`'s undocumented
+  AppleScript dictionary (`sessions`, `hosts`, `actions`, `current session`,
+  `run command`, `new session`, `show`, `perform`—notably `current session`,
+  which fills the API gap where `client.list` does not report the displayed
+  session) and its six App Intents (`GetRexSessionsIntent`,
+  `NewRexSessionIntent`, `OpenFoldersInRexIntent`, `OpenRexSessionIntent`,
+  `RunRexActionIntent`, `RunRexCommandIntent`) for cross-app macOS Shortcuts and
+  local tooling workflows. Track Rex's undocumented `rex __internal` subcommands
+  (`dial-stdio`, `autostart-status`, `tcc-preflight`, `ssh-tunnel`, `askpass`,
+  `session-start`, `skill`) as unstable internals not to depend on directly, and
+  track upstream implementation of the currently unimplemented `rex block new`
+  and `rex block stream` CLI stubs.
 
 ## Upstream reuse follow-ups
 
