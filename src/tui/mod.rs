@@ -6,6 +6,8 @@ mod conversations;
 mod inline;
 mod markdown;
 mod pending;
+mod program_status;
+mod scrollback_links;
 mod shell;
 mod transcript;
 
@@ -407,6 +409,7 @@ struct Message {
     notice_details: Option<Box<crate::protocol::NoticeDetails>>,
     tool_name: String,
     body_entry: Option<String>,
+    base_dir: Option<String>,
 }
 
 #[derive(Clone)]
@@ -604,10 +607,17 @@ impl Message {
             notice_details: None,
             tool_name: String::new(),
             body_entry: None,
+            base_dir: None,
         }
     }
     fn with_output(mut self, output: CellOutput) -> Self {
         self.output = output;
+        self
+    }
+    fn with_base_dir(mut self, cwd: &str) -> Self {
+        if !cwd.is_empty() {
+            self.base_dir = Some(cwd.to_owned());
+        }
         self
     }
     fn notice_label(&self) -> Option<String> {
@@ -662,6 +672,7 @@ impl Message {
             notice_title: notice_label.as_deref(),
             tool_name: &self.tool_name,
             attachments: &self.attachments,
+            cwd: self.base_dir.as_deref(),
         };
         self.rendered.get_or_insert_with(|| cells::render(content))
     }
@@ -678,6 +689,14 @@ struct LayoutWork {
     measured_messages: usize,
     painted_rows: usize,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChildAgentStatus {
+    id: String,
+    title: Option<String>,
+    state: program_status::ProgramState,
+    msg: Option<String>,
+}
+
 struct State {
     info: TuiInfo,
     messages: Vec<Message>,
@@ -705,6 +724,12 @@ struct State {
     worker: bool,
     observation: Option<ObservationState>,
     source_warning: Option<String>,
+    child_agents: std::collections::BTreeMap<String, ChildAgentStatus>,
+    last_failure: Option<(ErrorCode, String)>,
+    last_completion: Option<String>,
+    auth_pending: bool,
+    goal_status: Option<crate::protocol::GoalStatus>,
+    waiting_on: Option<(program_status::BlockedKind, String)>,
     history_offset: Option<usize>,
     history_entry: Option<HistoryEntry>,
     loading_history: Option<HistoryLoad>,
@@ -758,6 +783,12 @@ impl State {
             worker: false,
             observation: None,
             source_warning: None,
+            child_agents: std::collections::BTreeMap::new(),
+            last_failure: None,
+            last_completion: None,
+            auth_pending: false,
+            goal_status: None,
+            waiting_on: None,
             history_offset: Some(0),
             history_entry: None,
             loading_history: None,
@@ -778,7 +809,8 @@ impl State {
     fn push(&mut self, role: Role, text: String) {
         self.finish_thinking();
         self.invalidate(self.messages.len());
-        self.messages.push(Message::new(None, role, text));
+        self.messages
+            .push(Message::new(None, role, text).with_base_dir(&self.info.cwd));
         self.changed = true;
     }
     fn error_context(&self, detail: String) -> String {
@@ -808,6 +840,12 @@ impl State {
     fn working(&mut self, working: bool) {
         if working && !self.working {
             self.working_started = Some(Instant::now());
+        }
+        if working {
+            self.last_failure = None;
+            self.last_completion = None;
+            self.auth_pending = false;
+            self.waiting_on = None;
         }
         if !working {
             self.working_started = None;
@@ -944,7 +982,9 @@ impl State {
                 let index = *offset;
                 self.messages.insert(
                     index,
-                    Message::new(Some(message.entry_id), role, message.text).with_output(output),
+                    Message::new(Some(message.entry_id), role, message.text)
+                        .with_output(output)
+                        .with_base_dir(&self.info.cwd),
                 );
                 *offset += 1;
                 self.invalidate(index);
@@ -959,8 +999,11 @@ impl State {
             self.invalidate(index);
         } else {
             self.invalidate(self.messages.len());
-            self.messages
-                .push(Message::new(Some(message.entry_id), role, message.text).with_output(output));
+            self.messages.push(
+                Message::new(Some(message.entry_id), role, message.text)
+                    .with_output(output)
+                    .with_base_dir(&self.info.cwd),
+            );
         }
         if !attachments.is_empty()
             && let Some(index) = self
@@ -994,6 +1037,10 @@ impl State {
             self.messages[index].presentation = presentation;
             self.messages[index].rendered = None;
             self.invalidate(index);
+            if !historical {
+                let presentation = self.messages[index].presentation.clone();
+                self.record_child_presentation(presentation.as_deref());
+            }
         }
         self.changed = true;
     }
@@ -1061,6 +1108,7 @@ impl State {
         let pending = std::mem::take(&mut self.unbound_thinking);
         self.thinking = None;
         self.compacting = false;
+        self.child_agents.clear();
         for index in (0..self.messages.len()).rev() {
             if self.messages[index].id.is_none()
                 && matches!(self.messages[index].kind, MessageKind::Thinking(id) if pending.contains(&id))
@@ -1173,7 +1221,8 @@ impl State {
                 self.messages[index].id = Some(entry_id);
             }
         } else {
-            let mut message = Message::new(Some(entry_id), Role::Tool, label);
+            let mut message =
+                Message::new(Some(entry_id), Role::Tool, label).with_base_dir(&self.info.cwd);
             message.body_entry = message.id.clone();
             message.output = if historical && self.loading_history.is_some() {
                 CellOutput::Retained
@@ -1218,6 +1267,10 @@ impl State {
             if !name.trim().is_empty() && (!stale || message.tool_name.trim().is_empty()) { message.tool_name = name; }
             message.rendered = None;
             if terminal && !matches!(message.output, CellOutput::Printed | CellOutput::Retained) { message.output = CellOutput::Ready; }
+            if !historical {
+                let presentation = message.presentation.clone();
+                self.record_child_presentation(presentation.as_deref());
+            }
         }
         self.history_changed |= historical;
     }
@@ -1248,7 +1301,8 @@ impl State {
             }
             RuntimeEventKind::ConversationReady { conversation, model, cwd, working } => {
                 self.reset_observed_activity();
-                self.info = TuiInfo { title: conversation.title, model: Some(model), cwd };
+                self.info = TuiInfo { title: conversation.title, model: Some(model), cwd: cwd.clone() };
+                self.set_cwd(cwd);
                 self.worker = false;
                 self.output.banner.ready();
                 self.working(working);
@@ -1297,7 +1351,13 @@ impl State {
                 if let Some(entry_id) = &entry_id { self.bind_thinking(entry_id); }
                 self.finish_thinking();
                 self.working(false);
+                self.auth_pending = false;
+                self.last_failure = None;
+                self.waiting_on = None;
                 if text.trim().is_empty() { return; }
+                self.last_completion = Some(
+                    first_non_empty_line(&text).unwrap_or_else(|| "Completed".into()),
+                );
                 if entry_id.as_ref().is_none_or(|id| !self.messages.iter().any(|message| message.id.as_ref() == Some(id)
                     && matches!(message.role, Role::Agent | Role::PartialAnswer | Role::Commentary) && !message.text.trim().is_empty())) {
                     // A repaired native answer can arrive after the next input.
@@ -1339,6 +1399,10 @@ impl State {
                 ModelActivity::Compaction { active, failed } => {
                     self.compacting = active;
                     if failed {
+                        self.last_failure = Some((
+                            ErrorCode::Internal,
+                            "Context compaction failed".into(),
+                        ));
                         self.push(
                             Role::Failure,
                             "Context compaction failed. Saved history is retained.".into(),
@@ -1354,18 +1418,49 @@ impl State {
                 self.info.title = title;
                 self.worker = true;
                 self.history_offset = Some(0);
+                self.child_agents.clear();
             }
             RuntimeEventKind::ConversationSettings { settings } => self.info.model = Some(settings.model),
             RuntimeEventKind::MainReady { model, cwd, .. } => {
                 self.output.banner.ready();
                 self.info.model = Some(model);
-                self.info.cwd = cwd;
+                self.set_cwd(cwd);
                 self.working(true);
             }
-            RuntimeEventKind::WorkerIdle => self.working(false),
+            RuntimeEventKind::AuthorizationUrl { .. } => {
+                self.auth_pending = true;
+                self.last_failure = None;
+                self.last_completion = None;
+                self.waiting_on = None;
+            }
+            RuntimeEventKind::AuthStatus { status } => match status {
+                crate::protocol::AuthStatus::Connected { .. } => self.auth_pending = false,
+                crate::protocol::AuthStatus::NeedsSignIn { .. } => self.auth_pending = true,
+                crate::protocol::AuthStatus::SignedOut => {}
+            },
+            RuntimeEventKind::Goal { status } => self.update_goal_status(status),
+            RuntimeEventKind::Task { task, .. } => self.update_task_status(&task),
+            RuntimeEventKind::WorkerIdle => {
+                if self.working
+                    && self.last_failure.is_none()
+                    && self.waiting_on.is_none()
+                    && !self.auth_pending
+                    && self.last_completion.is_none()
+                {
+                    self.last_completion = Some("Done".into());
+                }
+                self.working(false);
+            }
             RuntimeEventKind::Interrupted => {
                 self.finish_thinking();
                 self.working(false);
+                self.auth_pending = false;
+                self.last_failure = None;
+                self.last_completion = None;
+                self.waiting_on = None;
+                self.child_agents.retain(|_, agent| {
+                    !matches!(agent.state, program_status::ProgramState::Working)
+                });
                 self.push(Role::Notice, "Interrupted".into());
             }
             RuntimeEventKind::Notice { text, .. } if !self.worker => self.push(Role::Notice, text),
@@ -1375,12 +1470,15 @@ impl State {
             }
             RuntimeEventKind::Failure { code, message } => {
                 self.compacting = false;
+                self.last_completion = None;
                 let recovery = if matches!(&code, ErrorCode::AuthenticationRequired | ErrorCode::AuthenticationFailed) {
+                    self.auth_pending = true;
                     self.info.model.as_ref().map_or_else(String::new, |model| {
                         if model.provider == ModelProvider::OpenAiCodex { "\n\nRun `beep-boop login` to reconnect ChatGPT.".into() }
                         else { format!("\n\nCheck the configured authentication for `{}`.", model.provider.as_str()) }
                     })
                 } else { String::new() };
+                self.last_failure = Some((code.clone(), message.clone()));
                 let label = match code {
                     ErrorCode::CoordinatorUnavailable => "Coordinator connection lost",
                     ErrorCode::InvalidRequest => "Code: invalid_request",
@@ -1439,6 +1537,8 @@ impl State {
                 }
             }
             RuntimeEventKind::InputRejected { input_id, message } => {
+                self.last_completion = None;
+                self.last_failure = Some((ErrorCode::InvalidRequest, message.clone()));
                 let pending = self.messages.iter().position(|message| matches!(&message.kind, MessageKind::Input { input_id: id, .. } if id == &input_id));
                 let receipt = pending.map_or_else(|| "No local delivery receipt is available for this input.".into(), |index| {
                     let saved = &self.messages[index];
@@ -2424,8 +2524,316 @@ fn terminal_title(info: &TuiInfo) -> String {
         .map(|name| name.to_string_lossy())
         .unwrap_or_else(|| info.cwd.as_str().into());
     let title = format!("{} | {}", info.title, directory);
-    title.chars().filter(|ch| !ch.is_control() && !matches!(ch, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}'))
-        .collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect()
+    program_status::sanitize_single_line(&title, 160)
+}
+
+fn first_non_empty_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn blocked_kind_for_actor(actor: &str) -> Option<(program_status::BlockedKind, String)> {
+    let normalized = actor.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.contains("auth") || normalized.contains("login") || normalized.contains("signin")
+    {
+        return Some((
+            program_status::BlockedKind::Auth,
+            format!("Waiting for authentication ({})", actor.trim()),
+        ));
+    }
+    if normalized.contains("perm") || normalized.contains("approv") || normalized.contains("grant")
+    {
+        return Some((
+            program_status::BlockedKind::Permission,
+            format!("Waiting for permission ({})", actor.trim()),
+        ));
+    }
+    if matches!(
+        normalized.as_str(),
+        "user" | "owner" | "human" | "operator" | "question"
+    ) {
+        return Some((
+            program_status::BlockedKind::Question,
+            format!("Waiting on {}", actor.trim()),
+        ));
+    }
+    None
+}
+
+impl State {
+    fn set_cwd(&mut self, cwd: String) {
+        self.info.cwd = cwd.clone();
+        if cwd.is_empty() {
+            return;
+        }
+        for (index, message) in self.messages.iter_mut().enumerate() {
+            if message.base_dir.is_none() && message.output != CellOutput::Printed {
+                message.base_dir = Some(cwd.clone());
+                message.rendered = None;
+                self.dirty_from = Some(self.dirty_from.map_or(index, |dirty| dirty.min(index)));
+            }
+        }
+    }
+
+    fn update_task_status(&mut self, task: &crate::protocol::TaskRecord) {
+        match &task.state {
+            crate::protocol::TaskState::Waiting { actor, next_check } => {
+                self.waiting_on = blocked_kind_for_actor(actor).map(|(kind, mut msg)| {
+                    if let Some(next) = next_check {
+                        msg.push_str(&format!(" · next check {next}"));
+                    }
+                    (kind, msg)
+                });
+            }
+            crate::protocol::TaskState::Open | crate::protocol::TaskState::Resolved { .. } => {
+                self.waiting_on = None;
+                if matches!(task.state, crate::protocol::TaskState::Resolved { .. })
+                    && !self.working
+                    && self.last_failure.is_none()
+                    && !self.auth_pending
+                {
+                    self.last_completion = Some(if task.title.trim().is_empty() {
+                        "Resolved".into()
+                    } else {
+                        task.title.clone()
+                    });
+                }
+            }
+        }
+        for agent in &task.agents {
+            let Some(id) = program_status::sanitize_record_id(&["agent", &agent.id]) else {
+                continue;
+            };
+            let title = (!agent.title.trim().is_empty()).then(|| agent.title.clone());
+            let (state, msg) = match &agent.state {
+                crate::protocol::TaskAgentState::Open => (
+                    program_status::ProgramState::Working,
+                    Some("Working".to_owned()),
+                ),
+                crate::protocol::TaskAgentState::Done => (
+                    program_status::ProgramState::Done,
+                    Some("Completed".to_owned()),
+                ),
+                crate::protocol::TaskAgentState::Failed { reason } => (
+                    program_status::ProgramState::Error,
+                    Some(if reason.trim().is_empty() {
+                        "Failed".to_owned()
+                    } else {
+                        reason.clone()
+                    }),
+                ),
+            };
+            self.child_agents.insert(
+                agent.id.clone(),
+                ChildAgentStatus {
+                    id,
+                    title,
+                    state,
+                    msg,
+                },
+            );
+        }
+    }
+
+    fn update_goal_status(&mut self, status: crate::protocol::GoalStatus) {
+        if let Some(view) = &status.goal {
+            self.update_task_status(&view.task);
+            match &view.goal.state {
+                crate::protocol::GoalState::Active => {
+                    self.last_completion = None;
+                    if matches!(view.task.state, crate::protocol::TaskState::Open) {
+                        self.waiting_on = None;
+                    }
+                }
+                crate::protocol::GoalState::Paused { reason } => {
+                    self.waiting_on.get_or_insert_with(|| {
+                        (
+                            program_status::BlockedKind::Question,
+                            match reason {
+                                crate::protocol::GoalPause::BudgetExhausted => {
+                                    "Goal paused: budget exhausted".into()
+                                }
+                                crate::protocol::GoalPause::Requested => {
+                                    "Goal paused: waiting on /goal resume".into()
+                                }
+                                crate::protocol::GoalPause::Interrupted => "Goal paused".into(),
+                            },
+                        )
+                    });
+                }
+                crate::protocol::GoalState::Complete { .. } => {
+                    self.waiting_on = None;
+                    self.last_completion = Some(view.goal.objective.clone());
+                }
+            }
+        } else {
+            self.waiting_on = None;
+        }
+        self.goal_status = Some(status);
+    }
+
+    fn set_child_agent_status(
+        &mut self,
+        raw_id: &str,
+        title: Option<String>,
+        status: Option<(program_status::ProgramState, &str)>,
+    ) {
+        let Some((state, msg)) = status else {
+            self.child_agents.remove(raw_id);
+            return;
+        };
+        let Some(id) = program_status::sanitize_record_id(&["agent", raw_id]) else {
+            return;
+        };
+        self.child_agents.insert(
+            raw_id.to_owned(),
+            ChildAgentStatus {
+                id,
+                title,
+                state,
+                msg: Some(msg.to_owned()),
+            },
+        );
+    }
+
+    fn record_child_presentation(
+        &mut self,
+        presentation: Option<&crate::protocol::MessagePresentation>,
+    ) {
+        use crate::protocol::{AgentActivityState, AgentState, MessagePresentation};
+        use program_status::ProgramState;
+        match presentation {
+            Some(MessagePresentation::AgentCoordination { agents, .. }) => {
+                for agent in agents {
+                    let title = agent
+                        .name
+                        .clone()
+                        .filter(|name| !name.trim().is_empty())
+                        .or_else(|| Some("Child agent".into()));
+                    let status = match agent.state.as_ref() {
+                        Some(AgentState::Pending) => Some((ProgramState::Working, "Pending")),
+                        Some(AgentState::Running) => Some((ProgramState::Working, "Working")),
+                        Some(AgentState::Completed) => Some((ProgramState::Done, "Completed")),
+                        Some(AgentState::Failed) => Some((ProgramState::Error, "Failed")),
+                        Some(
+                            AgentState::Interrupted | AgentState::Shutdown | AgentState::NotFound,
+                        ) => None,
+                        None => continue,
+                    };
+                    self.set_child_agent_status(&agent.thread_id, title, status);
+                }
+            }
+            Some(MessagePresentation::AgentActivity {
+                agent_path,
+                agent_thread_id,
+                state,
+            }) => {
+                let title = (!agent_path.trim().is_empty()).then(|| agent_path.clone());
+                let status = match state {
+                    Some(AgentActivityState::Started | AgentActivityState::Interacted) => {
+                        Some((ProgramState::Working, "Working"))
+                    }
+                    Some(AgentActivityState::Completed) => Some((ProgramState::Done, "Completed")),
+                    Some(AgentActivityState::Interrupted) => None,
+                    None => return,
+                };
+                self.set_child_agent_status(agent_thread_id, title, status);
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn program_status_reports(&self) -> Vec<program_status::ProgramStatusReport> {
+        use program_status::{BlockedKind, ProgramState, ProgramStatusReport};
+        let active_goal = self
+            .goal_status
+            .as_ref()
+            .and_then(|status| status.goal.as_deref())
+            .filter(|view| matches!(view.goal.state, crate::protocol::GoalState::Active));
+        let goal_progress = active_goal.and_then(|view| {
+            let budget = view.goal.activation.budget;
+            (budget > 0).then(|| {
+                let done = view.goal.activation.continuations.min(budget);
+                u8::try_from((done * 100) / budget).unwrap_or(100)
+            })
+        });
+        let (state, progress, msg) = if self.auth_pending
+            || matches!(
+                &self.last_failure,
+                Some((
+                    ErrorCode::AuthenticationRequired | ErrorCode::AuthenticationFailed,
+                    _
+                ))
+            ) {
+            (
+                ProgramState::Blocked(BlockedKind::Auth),
+                None,
+                self.last_failure
+                    .as_ref()
+                    .map(|(_, text)| text.clone())
+                    .or_else(|| Some("Authentication required".into())),
+            )
+        } else if let Some((kind, reason)) = &self.waiting_on {
+            (
+                ProgramState::Blocked(*kind),
+                goal_progress,
+                Some(reason.clone()),
+            )
+        } else if let Some((_, failure)) = &self.last_failure {
+            (ProgramState::Error, None, Some(failure.clone()))
+        } else if self.working || self.compacting || self.interrupting || active_goal.is_some() {
+            let detail = if self.interrupting {
+                "Interrupting".to_owned()
+            } else if self.compacting {
+                "Compacting context".to_owned()
+            } else if let Some(view) = active_goal {
+                view.goal.objective.clone()
+            } else {
+                self.messages
+                    .iter()
+                    .rev()
+                    .find_map(|message| match &message.kind {
+                        MessageKind::Tool {
+                            status: ToolStatus::Running,
+                            ..
+                        } if !message.tool_name.trim().is_empty() => {
+                            Some(message.tool_name.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "Working".into())
+            };
+            (ProgramState::Working, goal_progress, Some(detail))
+        } else if let Some(completion) = &self.last_completion {
+            (ProgramState::Done, None, Some(completion.clone()))
+        } else {
+            (ProgramState::Idle, None, Some(self.status().to_owned()))
+        };
+
+        let mut reports = Vec::with_capacity(1 + self.child_agents.len());
+        reports.push(ProgramStatusReport {
+            id: None,
+            state,
+            progress,
+            title: Some(terminal_title(&self.info)),
+            msg,
+        });
+        for child in self.child_agents.values() {
+            reports.push(ProgramStatusReport {
+                id: Some(child.id.clone()),
+                state: child.state,
+                progress: None,
+                title: child.title.clone(),
+                msg: child.msg.clone(),
+            });
+        }
+        reports
+    }
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -5908,5 +6316,289 @@ mod tests {
                 .unwrap();
             assert_eq!(cells[0].fg, color);
         }
+    }
+
+    #[test]
+    fn file_changes_and_media_resolve_absolute_artifact_paths_for_quick_look() {
+        use crate::protocol::{
+            FileChangePresentation, FileOperation, MediaOperation, MessagePresentation,
+            ToolHistory, ToolStatus,
+        };
+        let mut view = state();
+        view.event(RuntimeEventKind::Message {
+            message: HistoryMessage {
+                notice_details: None,
+                notice_origin: None,
+                entry_id: "media-entry".into(),
+                role: HistoryRole::Tool,
+                text: String::new(),
+                continuation: false,
+                final_chunk: true,
+                presentation: Some(Box::new(MessagePresentation::Media {
+                    operation: MediaOperation::View,
+                    status: None,
+                    path: Some("captures/screen shot.png".into()),
+                })),
+                attachments: None,
+                tool: Some(ToolHistory {
+                    call_id: "media-call".into(),
+                    name: "view_image".into(),
+                    status: ToolStatus::Finished,
+                }),
+            },
+        });
+        view.event(RuntimeEventKind::Message {
+            message: HistoryMessage {
+                notice_details: None,
+                notice_origin: None,
+                entry_id: "diff-entry".into(),
+                role: HistoryRole::Tool,
+                text: "+hello\n".into(),
+                continuation: false,
+                final_chunk: true,
+                presentation: Some(Box::new(MessagePresentation::FileChanges {
+                    changes: vec![
+                        FileChangePresentation {
+                            path: "src/lib.rs".into(),
+                            operation: Some(FileOperation::Update),
+                        },
+                        FileChangePresentation {
+                            path: "README.md".into(),
+                            operation: Some(FileOperation::Update),
+                        },
+                    ],
+                })),
+                attachments: None,
+                tool: Some(ToolHistory {
+                    call_id: "diff-call".into(),
+                    name: "edit".into(),
+                    status: ToolStatus::Finished,
+                }),
+            },
+        });
+        let text = rendered(&mut view, 120, 24);
+        assert!(
+            text.contains("/workspace/example/captures/screen shot.png"),
+            "{text}"
+        );
+        assert!(text.contains("Updated src/lib.rs, README.md"), "{text}");
+        assert!(text.contains("└ /workspace/example/src/lib.rs"), "{text}");
+        assert!(text.contains("└ /workspace/example/README.md"), "{text}");
+    }
+
+    #[test]
+    fn osc_7501_reports_working_goal_blocked_done_error_idle_and_children() {
+        use crate::protocol::{
+            AgentAction, AgentActivityState, AgentState, AgentStatePresentation, Goal,
+            GoalActivation, GoalCheck, GoalPause, GoalState, GoalStatus, GoalView,
+            MessagePresentation, TaskId, TaskRecord, TaskState, ToolHistory, ToolStatus,
+            WorkerState,
+        };
+        use crate::tui::program_status::{BlockedKind, ProgramState};
+
+        let mut view = state();
+        let reports = view.program_status_reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].state, ProgramState::Idle);
+        assert_eq!(reports[0].title.as_deref(), Some("Main agent | example"));
+
+        view.working(true);
+        let working = view.program_status_reports();
+        assert_eq!(working[0].state, ProgramState::Working);
+
+        let task_id = TaskId::new();
+        view.event(RuntimeEventKind::Goal {
+            status: GoalStatus {
+                conversation_id: "main".into(),
+                goal: Some(Box::new(GoalView {
+                    goal: Goal {
+                        id: "goal-1".into(),
+                        task_id: task_id.clone(),
+                        objective: "Ship native integration".into(),
+                        activation: GoalActivation {
+                            number: 1,
+                            request_id: "req-1".into(),
+                            continuations: 1,
+                            budget: 4,
+                            check: Some(GoalCheck::FileContains {
+                                path: "docs/roadmap.md".into(),
+                                text: "[x]".into(),
+                            }),
+                        },
+                        state: GoalState::Active,
+                        last_rejection: None,
+                        created_at: 0,
+                        updated_at: 0,
+                    },
+                    task: TaskRecord {
+                        id: task_id.clone(),
+                        conversation_id: "task-conv".into(),
+                        title: "Goal task".into(),
+                        outcome: String::new(),
+                        summary: String::new(),
+                        model: None,
+                        scheduled_run: None,
+                        state: TaskState::Open,
+                        worker: WorkerState::Unassigned,
+                        sources: vec![],
+                        pending: vec![],
+                        agents: vec![],
+                        updated_at: 0,
+                    },
+                })),
+            },
+        });
+        let goal_working = view.program_status_reports();
+        assert_eq!(goal_working[0].state, ProgramState::Working);
+        assert_eq!(goal_working[0].progress, Some(25));
+        assert_eq!(
+            goal_working[0].msg.as_deref(),
+            Some("Ship native integration")
+        );
+
+        view.event(RuntimeEventKind::Goal {
+            status: GoalStatus {
+                conversation_id: "main".into(),
+                goal: Some(Box::new(GoalView {
+                    goal: Goal {
+                        id: "goal-1".into(),
+                        task_id: task_id.clone(),
+                        objective: "Ship native integration".into(),
+                        activation: GoalActivation {
+                            number: 1,
+                            request_id: "req-1".into(),
+                            continuations: 4,
+                            budget: 4,
+                            check: None,
+                        },
+                        state: GoalState::Paused {
+                            reason: GoalPause::BudgetExhausted,
+                        },
+                        last_rejection: None,
+                        created_at: 0,
+                        updated_at: 0,
+                    },
+                    task: TaskRecord {
+                        id: task_id,
+                        conversation_id: "task-conv".into(),
+                        title: "Goal task".into(),
+                        outcome: String::new(),
+                        summary: String::new(),
+                        model: None,
+                        scheduled_run: None,
+                        state: TaskState::Waiting {
+                            actor: "user".into(),
+                            next_check: None,
+                        },
+                        worker: WorkerState::Unassigned,
+                        sources: vec![],
+                        pending: vec![],
+                        agents: vec![],
+                        updated_at: 0,
+                    },
+                })),
+            },
+        });
+        let waiting_user = view.program_status_reports();
+        assert_eq!(
+            waiting_user[0].state,
+            ProgramState::Blocked(BlockedKind::Question)
+        );
+
+        view.event(RuntimeEventKind::AuthorizationUrl {
+            url: "https://auth.openai.com/example".into(),
+        });
+        assert_eq!(
+            view.program_status_reports()[0].state,
+            ProgramState::Blocked(BlockedKind::Auth)
+        );
+
+        view.event(RuntimeEventKind::Failure {
+            code: crate::protocol::ErrorCode::ProviderUnavailable,
+            message: "Upstream timeout".into(),
+        });
+        assert_eq!(
+            view.program_status_reports()[0].state,
+            ProgramState::Blocked(BlockedKind::Auth)
+        );
+
+        view.event(RuntimeEventKind::Interrupted);
+        assert_eq!(view.program_status_reports()[0].state, ProgramState::Idle);
+
+        view.event(RuntimeEventKind::Failure {
+            code: crate::protocol::ErrorCode::ProviderUnavailable,
+            message: "Upstream timeout".into(),
+        });
+        assert_eq!(view.program_status_reports()[0].state, ProgramState::Error);
+
+        view.event(RuntimeEventKind::Answer {
+            conversation_id: "main".into(),
+            text: "Done cleanly\nExtra detail".into(),
+            entry_id: Some("ans-1".into()),
+        });
+        let done = view.program_status_reports();
+        assert_eq!(done[0].state, ProgramState::Done);
+        assert_eq!(done[0].msg.as_deref(), Some("Done cleanly"));
+
+        view.event(RuntimeEventKind::Message {
+            message: HistoryMessage {
+                notice_details: None,
+                notice_origin: None,
+                entry_id: "coord-1".into(),
+                role: HistoryRole::Tool,
+                text: String::new(),
+                continuation: false,
+                final_chunk: true,
+                presentation: Some(Box::new(MessagePresentation::AgentCoordination {
+                    action: Some(AgentAction::List),
+                    sender_thread_id: None,
+                    receiver_thread_ids: vec![],
+                    agents: vec![AgentStatePresentation {
+                        thread_id: "child:1".into(),
+                        name: Some("Audit worker".into()),
+                        state: Some(AgentState::Running),
+                    }],
+                })),
+                attachments: None,
+                tool: Some(ToolHistory {
+                    call_id: "c1".into(),
+                    name: "list_agents".into(),
+                    status: ToolStatus::Finished,
+                }),
+            },
+        });
+        view.event(RuntimeEventKind::Message {
+            message: HistoryMessage {
+                notice_details: None,
+                notice_origin: None,
+                entry_id: "act-1".into(),
+                role: HistoryRole::Tool,
+                text: String::new(),
+                continuation: false,
+                final_chunk: true,
+                presentation: Some(Box::new(MessagePresentation::AgentActivity {
+                    agent_path: "Subagent".into(),
+                    agent_thread_id: "child-2".into(),
+                    state: Some(AgentActivityState::Completed),
+                })),
+                attachments: None,
+                tool: Some(ToolHistory {
+                    call_id: "c2".into(),
+                    name: "agent".into(),
+                    status: ToolStatus::Finished,
+                }),
+            },
+        });
+        let with_children = view.program_status_reports();
+        assert_eq!(with_children.len(), 3);
+        assert_eq!(with_children[1].id.as_deref(), Some("agent/child-2"));
+        assert_eq!(with_children[1].state, ProgramState::Done);
+        assert_eq!(with_children[2].id.as_deref(), Some("agent/child_1"));
+        assert_eq!(with_children[2].state, ProgramState::Working);
+
+        view.event(RuntimeEventKind::Interrupted);
+        let cleared = view.program_status_reports();
+        assert_eq!(cleared.len(), 2);
+        assert_eq!(cleared[0].state, ProgramState::Idle);
     }
 }

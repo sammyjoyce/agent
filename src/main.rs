@@ -2669,7 +2669,7 @@ async fn prepare_attachments(client: ClientContext<'_>, input: &mut ComposerInpu
         child,
     )));
     while let Some(file) = input.files.first().cloned() {
-        let attachment = upload_file(&file.path, |request| {
+        let attachment = upload_file(file.upload_path(), |request| {
             let transfer = transfer.clone();
             async move {
                 let mut owned = transfer.lock().await;

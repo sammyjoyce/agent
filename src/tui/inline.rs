@@ -1,7 +1,12 @@
 //! Normal terminal scrollback owns completed output. Only mutable cells and the
 //! composer remain in the inline viewport; native selection never needs mouse capture.
 
-use crate::tui::{State, TerminalModes, WindowTitle, activity, terminal_title};
+use crate::tui::{
+    State, TerminalModes, WindowTitle, activity,
+    program_status::{Osc7501Command, ProgramStatusReport},
+    scrollback_links::{Osc8Guard, ScrollbackBackend, ScrollbackLinks},
+    terminal_title,
+};
 use anyhow::{Context, Result};
 use crossterm::{
     cursor::{MoveTo, Show},
@@ -14,13 +19,16 @@ use crossterm::{
 };
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
-    backend::{Backend, CrosstermBackend},
+    backend::Backend,
     layout::{Position, Size},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::Widget,
 };
-use std::{collections::HashSet, io::Stdout};
+use std::{
+    collections::{BTreeMap, HashSet},
+    io::{Stdout, Write},
+};
 
 const BANNER_ROWS: u16 = 4;
 const OUTPUT_CELLS_PER_FRAME: usize = 32;
@@ -90,10 +98,11 @@ fn fresh_inline<B: Backend>(mut backend: B) -> std::result::Result<Terminal<B>, 
 }
 
 pub(super) struct Screen {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: Terminal<ScrollbackBackend<Stdout>>,
     height: u16,
     size: Size,
     title: String,
+    program_status: BTreeMap<Option<String>, String>,
     _modes: TerminalModes,
 }
 
@@ -111,13 +120,14 @@ impl Screen {
             ),
             DisableMouseCapture
         )?;
-        let terminal = fresh_inline(CrosstermBackend::new(output))?;
+        let terminal = fresh_inline(ScrollbackBackend::new(output))?;
         let size = terminal.size()?;
         Ok(Self {
             terminal,
             height: 6,
             size,
             title: String::new(),
+            program_status: BTreeMap::new(),
             _modes: modes,
         })
     }
@@ -139,13 +149,25 @@ impl Screen {
             execute!(std::io::stdout(), WindowTitle(&title))?;
             self.title = title;
         }
+        sync_program_status(
+            &mut std::io::stdout(),
+            &mut self.program_status,
+            &state.program_status_reports(),
+        )?;
         self.terminal.draw(|frame| state.draw(frame))?;
         state.changed |= state.has_native_output();
         Ok(())
     }
 
     pub(super) fn reset(&mut self) -> Result<()> {
-        self.terminal = fresh_inline(CrosstermBackend::new(std::io::stdout()))?;
+        if !self.program_status.is_empty() {
+            execute!(
+                std::io::stdout(),
+                Osc7501Command(ProgramStatusReport::clear_all_sequence())
+            )?;
+            self.program_status.clear();
+        }
+        self.terminal = fresh_inline(ScrollbackBackend::new(std::io::stdout()))?;
         self.height = 6;
         self.size = self.terminal.size()?;
         self.title.clear();
@@ -154,7 +176,7 @@ impl Screen {
 
     fn reframe(&mut self, size: Size, height: u16) -> Result<()> {
         reframe_inline(&mut self.terminal, size, height, |_| {
-            CrosstermBackend::new(std::io::stdout())
+            ScrollbackBackend::new(std::io::stdout())
         })?;
         self.size = size;
         self.height = height;
@@ -222,9 +244,35 @@ impl Drop for TerminalModes {
             DisableBracketedPaste,
             PopKeyboardEnhancementFlags,
             WindowTitle(""),
+            Osc7501Command(ProgramStatusReport::clear_all_sequence()),
             Show
         );
     }
+}
+
+fn sync_program_status(
+    output: &mut impl Write,
+    previous: &mut BTreeMap<Option<String>, String>,
+    reports: &[ProgramStatusReport],
+) -> std::io::Result<()> {
+    let mut next = BTreeMap::new();
+    for report in reports {
+        let encoded = report.encode();
+        next.insert(report.id.clone(), encoded);
+    }
+    for removed in previous.keys() {
+        if !next.contains_key(removed) {
+            let seq = ProgramStatusReport::clear(removed.as_deref()).encode();
+            execute!(output, Osc7501Command(&seq))?;
+        }
+    }
+    for (id, seq) in &next {
+        if previous.get(id) != Some(seq) {
+            execute!(output, Osc7501Command(seq))?;
+        }
+    }
+    *previous = next;
+    Ok(())
 }
 
 impl State {
@@ -260,7 +308,7 @@ impl State {
             .min(size.height.saturating_sub(minimum));
         size.height.saturating_sub(after_insert)
     }
-    pub(super) fn flush_output<B: Backend>(
+    pub(super) fn flush_output<B: Backend + ScrollbackLinks>(
         &mut self,
         terminal: &mut Terminal<B>,
         ending: bool,
@@ -319,14 +367,17 @@ impl State {
                     }
                     let cached = message.cached();
                     let rows = cached.layout(width);
+                    terminal.backend_mut().set_osc8(true);
+                    let guard = Osc8Guard(terminal);
                     for top in (0..rows).step_by(256) {
                         let height = u16::try_from((rows - top).min(256)).unwrap_or(256);
                         // A failed write can have emitted a prefix. Returning
                         // ends this renderer; it must never retry that prefix.
-                        terminal.insert_before(height, |buffer| {
+                        guard.0.insert_before(height, |buffer| {
                             cached.draw_buffer(buffer, top);
                         })?;
                     }
+                    drop(guard);
                     message.output = CellOutput::Printed;
                     emitted += 1;
                 }
@@ -2151,5 +2202,51 @@ mod tests {
         assert_eq!(rendered.matches("Current reasoning prefix").count(), 1);
         assert!(rendered.contains("Current reasoning prefix and suffix"));
         assert!(!state.compacting);
+    }
+
+    #[test]
+    fn osc_7501_sync_diffs_updates_and_clears_removed_children() {
+        use super::sync_program_status;
+        use crate::tui::program_status::{ProgramState, ProgramStatusReport};
+        use std::collections::BTreeMap;
+
+        let mut osc7501_out = Vec::<u8>::new();
+        let mut prev = BTreeMap::new();
+        sync_program_status(
+            &mut osc7501_out,
+            &mut prev,
+            &[
+                ProgramStatusReport {
+                    id: None,
+                    state: ProgramState::Working,
+                    progress: Some(50),
+                    title: Some("Main".into()),
+                    msg: Some("Building".into()),
+                },
+                ProgramStatusReport {
+                    id: Some("agent/c1".into()),
+                    state: ProgramState::Working,
+                    progress: None,
+                    title: Some("Child".into()),
+                    msg: Some("Running".into()),
+                },
+            ],
+        )
+        .unwrap();
+        sync_program_status(
+            &mut osc7501_out,
+            &mut prev,
+            &[ProgramStatusReport {
+                id: None,
+                state: ProgramState::Done,
+                progress: None,
+                title: Some("Main".into()),
+                msg: Some("Finished".into()),
+            }],
+        )
+        .unwrap();
+        let osc7501_str = String::from_utf8(osc7501_out).unwrap();
+        assert!(osc7501_str.contains("\x1b]7501;state=clear:id=agent/c1\x1b\\"));
+        assert!(osc7501_str.contains("state=done:app=beep-boop"));
     }
 }
