@@ -967,14 +967,21 @@ account that the token's holder has.
   page. If Up refuses a link again in the same scan, the source reports
   `Up refused a saved page link for the second time in one scan` and tries the
   same page at each poll.
-- The source compares the times in its checkpoint with the clock. If a saved
-  time is more than five minutes ahead of the clock, the source sends no request
-  and reports
-  `Up checkpoint holds a time more than five minutes ahead of this computer's clock; check the clock.`
-  The message goes on to say what follows. The source keeps the checkpoint and
-  continues from it when the clock is right again. If the clock was ahead when
-  the source first ran, the checkpoint stays ahead. Then change `account` to
-  start a fresh seven-day read.
+- The source compares the times in its checkpoint with the clock. A saved time
+  that is more than five minutes ahead of the clock was saved under a clock that
+  showed another time. The source does not wait for the clock to reach that
+  time, and it reports no error. The same poll starts a new scan from the time
+  that the clock shows now.
+  - The new scan reads the last 14 days again, but nothing from before the
+    first poll's seven days.
+  - The first poll's seven days then start no later than seven days before the
+    time that the clock shows. If the clock was ahead when the source first
+    ran, the first scan after you correct the clock reads the seven days before
+    the present. If the clock moved back, the source can deliver older
+    transactions than before.
+  - A scan that the source had not finished is dropped. The source still
+    follows every held transaction that it followed before.
+  - A transaction that the source reads again is not a new event.
 
 Known limits:
 
@@ -982,14 +989,39 @@ Known limits:
 - A held transaction that was created more than seven days before the first
   poll is neither reported nor followed.
 - A settlement that Up lists as a new transaction with an old creation time is
-  found by the daily reread, so it can arrive up to a day late. It is not seen
-  at all when Up lists it more than 14 days after that creation time, or when
-  that creation time is before the first poll's seven days.
+  found by the daily reread, so it can arrive up to a day late. The reread
+  reaches back 14 days, and the next reread can be a day away. So count on the
+  reread only when Up lists the transaction within 13 days of that creation
+  time, and while the coordinator runs. The source can miss a transaction that
+  Up lists between 13 and 14 days after that creation time. It does not see a
+  transaction that Up lists later, or whose creation time is before the first
+  poll's seven days.
+- A clock that is more than a day ahead can hide new transactions, because the
+  source then asks Up for transactions from a time that has not come. When the
+  clock is right again, the source reads the last 14 days. If the clock was
+  ahead for more than 14 days, a transaction from before those 14 days can be
+  missing.
 - The form of Up's 404 answer for a deleted transaction comes from Up's
   documentation. It has not been checked against a real account.
-- The source follows at most 512 held transactions. With more, it reports
-  partial coverage and stops until Up lists fewer. A held transaction that left
-  Up does not count.
+- The source follows at most 512 held transactions. When one scan lists more,
+  the source reports partial coverage with
+  `Up lists more held transactions than the 512 this source follows`
+  and does not finish that scan. Each poll then reads the same page again. The
+  transactions on that page are still delivered as events. The source reads
+  no other new transaction and reports no `hold removed` until the scan
+  finishes.
+  - A held transaction that left Up before the scan started does not count. A
+    held transaction that leaves Up during the scan keeps its place until the
+    scan finishes. So at 512 held transactions the message can appear while Up
+    lists fewer than 512, and it can stay after Up's list gets shorter.
+  - The scan finishes when Up lists no held transaction that the scan has not
+    counted, for example when the newest held transaction settles. The next
+    scan reports the held transactions that left.
+  - To end the stop yourself, change `account`. A new label starts a fresh
+    seven-day read, and it helps only when Up lists 512 held transactions or
+    fewer. The transactions of the last seven days arrive again as new events.
+    The source reports no `hold removed` for a held transaction that left Up
+    under the old label.
 - Up documents a UUID as the ID of a transaction. The source accepts an ID of 1
   to 128 letters, digits, hyphens and underscores. A page with any other ID is
   reported as `Up sent a response this source cannot read`, and nothing from
@@ -997,12 +1029,23 @@ Known limits:
 - A change of category, tags or note is not an event.
 - The checkpoint belongs to one Up customer and one `account` label. To read
   another customer's transactions, use another label. Otherwise the source
-  reports `Up checkpoint belongs to another account or configuration`.
+  reports
+  `Up checkpoint belongs to another account or configuration; change the account label to start a fresh seven-day read.`
+  The source reports the same message for a checkpoint that it cannot read,
+  such as a checkpoint that a build from before the daily reread wrote. The
+  message does not name that cause. In both cases the source reads no
+  transaction and keeps the checkpoint. A checkpoint that the source cannot
+  read stays that way, so change `account` to start a fresh seven-day read.
 - `beep-boop sources --json` prints checkpoints. The Up checkpoint holds the
   ID, the description and the amount of each held transaction that the source
   follows.
-- Up publishes no rate limit. After an HTTP 429 the source reports
-  `Up rate limit reached` and sends one request per poll until Up answers.
+- Up publishes no rate limit. At an HTTP 429 the source reports
+  `Up rate limit reached`, ends that poll and keeps its checkpoint. It does not
+  wait longer before the next poll. Each later poll starts with the identity
+  check and then repeats the request that Up refused. So a poll sends one
+  request while Up refuses the identity check, two while Up refuses a list of
+  transactions, and up to five while Up refuses a lookup of a held transaction
+  that left Up's list.
 
 ### Scrawl feedback
 
