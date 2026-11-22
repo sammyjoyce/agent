@@ -436,7 +436,10 @@ enum ConfigAction {
 
 #[derive(Subcommand)]
 enum RexAction {
+    /// Install the headless Messages reader module in the local Rex server.
     Install,
+    /// Install optional interactive Rex UI actions (task picker and quick main-chat prompt).
+    InstallActions,
 }
 
 #[derive(Subcommand)]
@@ -676,6 +679,18 @@ async fn run(mut arguments: Arguments) -> Result<()> {
                 if let Some(warning) = &installed.full_disk_access_warning {
                     eprintln!("Warning: {warning}");
                 }
+            }
+            return Ok(());
+        }
+        Action::Rex {
+            command: RexAction::InstallActions,
+        } => {
+            let installed =
+                agent_cli::rex::install::install_actions(agent_cli::rex::actions::MODULE).await?;
+            if arguments.json {
+                println!("{}", serde_json::to_string(&installed)?);
+            } else {
+                println!("Optional Rex UI actions configured");
             }
             return Ok(());
         }

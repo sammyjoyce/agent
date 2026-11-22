@@ -1,6 +1,7 @@
 //! Typed Rex CLI boundary. No automatic mutation retries.
 //! Native schemas are discovered per server with `rex api describe`.
 
+pub mod actions;
 pub mod install;
 pub mod source;
 

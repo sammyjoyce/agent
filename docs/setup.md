@@ -748,6 +748,17 @@ Setup can also be run explicitly:
 beep-boop rex install
 ```
 
+Optional interactive Rex UI actions (task picker via `rex.ui.pick` and quick
+main-chat prompt via `rex.ui.input` / `client.perform`) can be installed
+separately with:
+
+```sh
+beep-boop rex install-actions
+```
+
+These UI actions require an attached Rex app with Remote Control enabled and stay
+independent of headless core execution and durable approvals.
+
 If Rex configuration is managed elsewhere, include `require('agent_messages')`
 through that owner. The command reports any setup failure and preserves the
 existing configuration; other sources and chat can continue.

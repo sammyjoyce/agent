@@ -14,9 +14,42 @@ use sha2::{Digest, Sha256};
 
 use crate::rex::{RexClient, personal_messages, read_failure};
 
-const BEGIN: &[u8] = b"-- BEGIN agent Messages (managed by agent rex install)";
-const END: &[u8] = b"-- END agent Messages";
-const LOADER: &[u8] = b"\n-- BEGIN agent Messages (managed by agent rex install)\nrequire('agent_messages')\n-- END agent Messages\n";
+struct ModuleSpec<'a> {
+    module_name: &'a str,
+    label: &'a str,
+    begin: &'a [u8],
+    end: &'a [u8],
+    loader: &'a [u8],
+    identity_action: &'a str,
+    expected_actions: &'a [&'a str],
+    preflight_privacy: bool,
+}
+
+const MESSAGES_SPEC: ModuleSpec<'static> = ModuleSpec {
+    module_name: "agent_messages",
+    label: "Messages",
+    begin: b"-- BEGIN agent Messages (managed by agent rex install)",
+    end: b"-- END agent Messages",
+    loader: b"\n-- BEGIN agent Messages (managed by agent rex install)\nrequire('agent_messages')\n-- END agent Messages\n",
+    identity_action: "agent_messages_identity",
+    expected_actions: &[
+        "agent_messages_start",
+        "agent_messages_read",
+        "agent_messages_cancel",
+    ],
+    preflight_privacy: true,
+};
+
+const ACTIONS_SPEC: ModuleSpec<'static> = ModuleSpec {
+    module_name: "agent_actions",
+    label: "Actions",
+    begin: b"-- BEGIN agent Actions (managed by agent rex install-actions)",
+    end: b"-- END agent Actions",
+    loader: b"\n-- BEGIN agent Actions (managed by agent rex install-actions)\nrequire('agent_actions')\n-- END agent Actions\n",
+    identity_action: "agent_actions_identity",
+    expected_actions: &["agent_jump_to_task", "agent_quick_prompt"],
+    preflight_privacy: false,
+};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct InstallOutcome {
@@ -34,6 +67,21 @@ pub async fn install(module_source: &str) -> Result<InstallOutcome> {
         dirs::home_dir(),
     )?;
     install_at(&config_path, module_source, &personal_messages()).await
+}
+
+pub async fn install_actions(module_source: &str) -> Result<InstallOutcome> {
+    let config_path = config_path(
+        env::var_os("REX_CONFIG").map(PathBuf::from),
+        env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        dirs::home_dir(),
+    )?;
+    install_spec_at(
+        &config_path,
+        module_source,
+        &ACTIONS_SPEC,
+        &personal_messages(),
+    )
+    .await
 }
 
 fn config_path(
@@ -58,28 +106,40 @@ async fn install_at(
     module_source: &str,
     client: &RexClient,
 ) -> Result<InstallOutcome> {
+    install_spec_at(config_path, module_source, &MESSAGES_SPEC, client).await
+}
+
+async fn install_spec_at(
+    config_path: &Path,
+    module_source: &str,
+    spec: &ModuleSpec<'_>,
+    client: &RexClient,
+) -> Result<InstallOutcome> {
     let identity = hex::encode(Sha256::digest(module_source.as_bytes()));
     let module_source = format!(
-        "{module_source}\nrex.action {{\n  name = 'agent_messages_identity',\n  title = 'Beep Boop: Messages module identity',\n  run = function() return {{ sha256 = '{identity}' }} end,\n}}\n"
+        "{module_source}\nrex.action {{\n  name = '{}',\n  title = 'Beep Boop: {} module identity',\n  run = function() return {{ sha256 = '{identity}' }} end,\n}}\n",
+        spec.identity_action, spec.label,
     );
     let directory = config_path
         .parent()
         .context("Rex config has no directory")?;
-    let module_path = directory.join("agent_messages.lua");
+    let module_file = format!("{}.lua", spec.module_name);
+    let module_path = directory.join(&module_file);
     ensure!(
         config_path != module_path,
-        "REX_CONFIG cannot be agent_messages.lua"
+        "REX_CONFIG cannot be {module_file}"
     );
-    let config = snapshot(config_path)?;
-    let module = snapshot(&module_path)?;
+    let config = snapshot(config_path, spec.module_name)?;
+    let module = snapshot(&module_path, spec.module_name)?;
     let original = config
         .as_ref()
         .map_or(&[][..], |file| file.bytes.as_slice());
-    let has_loader = count(original, LOADER) != 0;
+    let has_loader = count(original, spec.loader) != 0;
     ensure!(
-        count(original, BEGIN) == usize::from(has_loader)
-            && count(original, END) == usize::from(has_loader),
-        "The managed Rex Messages loader was edited or duplicated; review {} before installing",
+        count(original, spec.begin) == usize::from(has_loader)
+            && count(original, spec.end) == usize::from(has_loader),
+        "The managed Rex {} loader was edited or duplicated; review {} before installing",
+        spec.label,
         config_path.display()
     );
     ensure!(
@@ -95,19 +155,24 @@ async fn install_at(
         && module
             .as_ref()
             .is_some_and(|file| file.bytes == module_source.as_bytes())
-        && verify_actions(client, &identity).await.is_ok()
+        && verify_actions(client, &identity, spec).await.is_ok()
     {
+        let full_disk_access_warning = if spec.preflight_privacy {
+            privacy_warning(client).await
+        } else {
+            None
+        };
         return Ok(InstallOutcome {
             changed: false,
             config_path: config_path.into(),
             module_path,
-            full_disk_access_warning: privacy_warning(client).await,
+            full_disk_access_warning,
         });
     }
     fs::create_dir_all(directory).context("Could not create the Rex configuration directory")?;
     let mut desired = original.to_vec();
     if !has_loader {
-        desired.extend_from_slice(LOADER);
+        desired.extend_from_slice(spec.loader);
     }
     let mut changes = Vec::new();
     let result = async {
@@ -115,7 +180,12 @@ async fn install_at(
             .as_ref()
             .is_none_or(|file| file.bytes != module_source.as_bytes())
         {
-            changes.push(replace(&module_path, &module, module_source.as_bytes())?);
+            changes.push(replace(
+                &module_path,
+                &module,
+                module_source.as_bytes(),
+                spec.module_name,
+            )?);
         }
         // A same-directory candidate retains Rex's native sibling-module lookup.
         // Its module is restored if validation or the final reload fails.
@@ -137,16 +207,16 @@ async fn install_at(
                 "Rex rejected the candidate configuration; inspect it with rex config check",
             )?;
         if !has_loader {
-            changes.push(replace(config_path, &config, &desired)?);
+            changes.push(replace(config_path, &config, &desired, spec.module_name)?);
         } else {
             ensure!(
-                snapshot(config_path)? == config,
+                snapshot(config_path, spec.module_name)? == config,
                 "Rex config changed during installation"
             );
         }
         for change in &changes {
             ensure!(
-                snapshot(&change.path)? == change.installed,
+                snapshot(&change.path, spec.module_name)? == change.installed,
                 "Rex config changed during installation"
             );
         }
@@ -157,14 +227,14 @@ async fn install_at(
             .context(
                 "Rex could not reload its local configuration; ensure the local server is running",
             )?;
-        verify_actions(client, &identity).await?;
+        verify_actions(client, &identity, spec).await?;
         Ok(())
     }
     .await;
     if let Err(error) = result {
         let mut conflicts = Vec::new();
         for change in changes.iter().rev() {
-            if let Err(rollback) = change.restore() {
+            if let Err(rollback) = change.restore(spec.module_name) {
                 conflicts.push(rollback.to_string());
             }
         }
@@ -176,11 +246,16 @@ async fn install_at(
             conflicts.join("; ")
         )));
     }
+    let full_disk_access_warning = if spec.preflight_privacy {
+        privacy_warning(client).await
+    } else {
+        None
+    };
     Ok(InstallOutcome {
         changed: true,
         config_path: config_path.into(),
         module_path,
-        full_disk_access_warning: privacy_warning(client).await,
+        full_disk_access_warning,
     })
 }
 
@@ -192,7 +267,11 @@ async fn privacy_warning(client: &RexClient) -> Option<String> {
         .and_then(|status| status.warning_message())
 }
 
-async fn verify_actions(client: &RexClient, expected_identity: &str) -> Result<()> {
+async fn verify_actions(
+    client: &RexClient,
+    expected_identity: &str,
+    spec: &ModuleSpec<'_>,
+) -> Result<()> {
     #[derive(Deserialize)]
     struct Catalog {
         actions: Vec<Action>,
@@ -209,33 +288,41 @@ async fn verify_actions(client: &RexClient, expected_identity: &str) -> Result<(
         .run(vec!["actions".into(), "--json".into()])
         .await
         .map_err(read_failure)
-        .context("Could not verify the local Rex Messages actions")?;
+        .with_context(|| format!("Could not verify the local Rex {} actions", spec.label))?;
     let catalog: Catalog =
         serde_json::from_slice(&output).context("Rex returned an invalid action catalog")?;
-    for expected in [
-        "agent_messages_start",
-        "agent_messages_read",
-        "agent_messages_cancel",
-    ] {
+    for expected in spec.expected_actions {
         ensure!(
-            catalog.actions.iter().any(|action| action.name == expected),
-            "Rex did not load the Messages actions; its running server may use another config file. Add require('agent_messages') in that file and run rex config reload"
+            catalog
+                .actions
+                .iter()
+                .any(|action| action.name == *expected),
+            "Rex did not load the {} actions; its running server may use another config file. Add require('{}') in that file and run rex config reload",
+            spec.label,
+            spec.module_name
         );
     }
     let output = client
         .run(vec![
             "do".into(),
-            "agent_messages_identity".into(),
+            spec.identity_action.into(),
             "--json".into(),
         ])
         .await
         .map_err(read_failure)
-        .context("Could not verify the loaded Rex Messages module identity")?;
+        .with_context(|| {
+            format!(
+                "Could not verify the loaded Rex {} module identity",
+                spec.label
+            )
+        })?;
     let identity: Identity = serde_json::from_slice(&output)
-        .context("Rex returned an invalid Messages module identity")?;
+        .with_context(|| format!("Rex returned an invalid {} module identity", spec.label))?;
     ensure!(
         identity.sha256 == expected_identity,
-        "Rex loaded another Messages module; its running server may use another config file. Add require('agent_messages') in that file and run rex config reload"
+        "Rex loaded another {} module; its running server may use another config file. Add require('{}') in that file and run rex config reload",
+        spec.label,
+        spec.module_name
     );
     Ok(())
 }
@@ -256,11 +343,11 @@ struct Snapshot {
     mode: u32,
 }
 
-fn snapshot(path: &Path) -> Result<Option<Snapshot>> {
+fn snapshot(path: &Path, module_name: &str) -> Result<Option<Snapshot>> {
     if let Some(existing) = path.ancestors().find(|ancestor| ancestor.exists()) {
         ensure!(
             !fs::canonicalize(existing)?.starts_with("/nix/store"),
-            "{} is managed by Nix; add require('agent_messages') in its owning configuration instead",
+            "{} is managed by Nix; add require('{module_name}') in its owning configuration instead",
             path.display()
         );
     }
@@ -271,7 +358,7 @@ fn snapshot(path: &Path) -> Result<Option<Snapshot>> {
     };
     ensure!(
         metadata.is_file(),
-        "{} is managed or is not a regular file; add require('agent_messages') in its owning configuration instead",
+        "{} is managed or is not a regular file; add require('{module_name}') in its owning configuration instead",
         path.display()
     );
     Ok(Some(Snapshot {
@@ -316,7 +403,12 @@ struct Change {
     installed: Option<Snapshot>,
 }
 
-fn replace(path: &Path, previous: &Option<Snapshot>, bytes: &[u8]) -> Result<Change> {
+fn replace(
+    path: &Path,
+    previous: &Option<Snapshot>,
+    bytes: &[u8],
+    module_name: &str,
+) -> Result<Change> {
     let directory = path.parent().context("Rex config has no directory")?;
     let candidate = temporary(
         directory,
@@ -324,12 +416,12 @@ fn replace(path: &Path, previous: &Option<Snapshot>, bytes: &[u8]) -> Result<Cha
         previous.as_ref().map_or(0o600, |file| file.mode),
     )?;
     ensure!(
-        snapshot(path)? == *previous,
+        snapshot(path, module_name)? == *previous,
         "Rex configuration changed while preparing installation"
     );
     // Record the inode being installed, rather than claiming a later user edit
     // if the destination changes immediately after the rename.
-    let installed = snapshot(&candidate.path)?;
+    let installed = snapshot(&candidate.path, module_name)?;
     fs::rename(&candidate.path, path).context("Could not replace Rex configuration")?;
     Ok(Change {
         path: path.into(),
@@ -339,15 +431,15 @@ fn replace(path: &Path, previous: &Option<Snapshot>, bytes: &[u8]) -> Result<Cha
 }
 
 impl Change {
-    fn restore(&self) -> Result<()> {
+    fn restore(&self, module_name: &str) -> Result<()> {
         ensure!(
-            snapshot(&self.path)? == self.installed,
+            snapshot(&self.path, module_name)? == self.installed,
             "{} changed; left untouched",
             self.path.display()
         );
         match &self.previous {
             Some(previous) => {
-                replace(&self.path, &self.installed, &previous.bytes)?;
+                replace(&self.path, &self.installed, &previous.bytes, module_name)?;
             }
             None => fs::remove_file(&self.path)?,
         }
@@ -363,7 +455,7 @@ mod tests {
 
     use crate::rex::{
         RexClient,
-        install::{config_path, install_at, replace, snapshot},
+        install::{ACTIONS_SPEC, config_path, install_at, install_spec_at, replace, snapshot},
         personal_messages,
     };
 
@@ -414,10 +506,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("init.lua");
         fs::write(&path, "original\n").unwrap();
-        let previous = snapshot(&path).unwrap();
-        let change = replace(&path, &previous, b"installed\n").unwrap();
+        let previous = snapshot(&path, "agent_messages").unwrap();
+        let change = replace(&path, &previous, b"installed\n", "agent_messages").unwrap();
         fs::write(&path, "user edit\n").unwrap();
-        assert!(change.restore().is_err());
+        assert!(change.restore("agent_messages").is_err());
         assert_eq!(fs::read(&path).unwrap(), b"user edit\n");
     }
 
@@ -567,15 +659,15 @@ mod tests {
                 .unwrap()
                 .preserved
         );
-        let config_before = snapshot(&path).unwrap();
-        let module_before = snapshot(&installed.module_path).unwrap();
+        let config_before = snapshot(&path, "agent_messages").unwrap();
+        let module_before = snapshot(&installed.module_path, "agent_messages").unwrap();
         let generation_before = generation(&client).await;
         let repeated = install_at(&path, include_str!("source.lua"), &client)
             .await
             .unwrap();
         assert!(!repeated.changed);
-        assert!(snapshot(&path).unwrap() == config_before);
-        assert!(snapshot(&installed.module_path).unwrap() == module_before);
+        assert!(snapshot(&path, "agent_messages").unwrap() == config_before);
+        assert!(snapshot(&installed.module_path, "agent_messages").unwrap() == module_before);
         assert_eq!(generation(&client).await, generation_before);
 
         // An interrupted setup can leave current bytes on disk while Rex still
@@ -594,12 +686,12 @@ mod tests {
             .await
             .unwrap();
         fs::write(&installed.module_path, current_module).unwrap();
-        let interrupted_module = snapshot(&installed.module_path).unwrap();
+        let interrupted_module = snapshot(&installed.module_path, "agent_messages").unwrap();
         let interrupted_generation = generation(&client).await;
         let recovered = install_at(&path, &newer_source, &client).await.unwrap();
         assert!(recovered.changed);
-        assert!(snapshot(&path).unwrap() == config_before);
-        assert!(snapshot(&installed.module_path).unwrap() == interrupted_module);
+        assert!(snapshot(&path, "agent_messages").unwrap() == config_before);
+        assert!(snapshot(&installed.module_path, "agent_messages").unwrap() == interrupted_module);
         assert_eq!(generation(&client).await, interrupted_generation + 1);
         let current_generation = generation(&client).await;
         assert!(
@@ -608,9 +700,22 @@ mod tests {
                 .unwrap()
                 .changed
         );
-        assert!(snapshot(&path).unwrap() == config_before);
-        assert!(snapshot(&installed.module_path).unwrap() == interrupted_module);
+        assert!(snapshot(&path, "agent_messages").unwrap() == config_before);
+        assert!(snapshot(&installed.module_path, "agent_messages").unwrap() == interrupted_module);
         assert_eq!(generation(&client).await, current_generation);
+
+        let actions_installed =
+            install_spec_at(&path, crate::rex::actions::MODULE, &ACTIONS_SPEC, &client)
+                .await
+                .unwrap();
+        assert!(actions_installed.changed);
+        assert!(actions_installed.module_path.ends_with("agent_actions.lua"));
+        assert!(actions_installed.full_disk_access_warning.is_none());
+        let actions_repeated =
+            install_spec_at(&path, crate::rex::actions::MODULE, &ACTIONS_SPEC, &client)
+                .await
+                .unwrap();
+        assert!(!actions_repeated.changed);
         drop(server);
     }
 }
