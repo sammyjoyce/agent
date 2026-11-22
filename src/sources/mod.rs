@@ -306,6 +306,24 @@ fn source_enabled() -> bool {
 }
 
 impl SourceConfig {
+    /// The `provider` value of every variant. It comes from the JSON schema,
+    /// so a new variant is listed without an edit here.
+    pub fn providers() -> Result<Vec<String>> {
+        let schema = serde_json::to_value(schemars::schema_for!(Self))?;
+        schema["oneOf"]
+            .as_array()
+            .context("The source schema lists no variants")?
+            .iter()
+            .map(|variant| {
+                variant
+                    .pointer("/properties/provider/const")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .context("A source variant has no provider value")
+            })
+            .collect()
+    }
+
     pub fn enabled(&self) -> bool {
         match self {
             Self::Google { enabled, .. }
@@ -752,6 +770,19 @@ mod tests {
         let source = read_command(&command).await.unwrap();
         assert!(source.truncated);
         assert_eq!(source.stdout.len(), MAX_FRAME_BYTES / 2);
+    }
+
+    #[test]
+    fn every_configurable_provider_has_a_display_name() {
+        let providers = SourceConfig::providers().unwrap();
+        assert!(providers.contains(&"up".to_owned()));
+        for provider in providers {
+            assert_ne!(
+                crate::tui::source_display_name(&provider),
+                "Other source",
+                "{provider} needs a name in tui::source_display_name"
+            );
+        }
     }
 
     #[tokio::test]

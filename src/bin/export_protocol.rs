@@ -179,6 +179,10 @@ fn main() -> Result<()> {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ios/Tests/AgentCoreTests/Fixtures");
     fs::create_dir_all(&fixtures)?;
     validate_tool_merge_traces(&fixtures)?;
+    fs::write(
+        fixtures.join("source-providers.json"),
+        serde_json::to_string_pretty(&agent_cli::sources::SourceConfig::providers()?)? + "\n",
+    )?;
     let schema = serde_json::to_value(schema_for!(agent_cli::native::NativeEvent))?;
     let events = swift::samples(&schema, &schema)?
         .into_iter()
