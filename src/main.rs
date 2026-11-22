@@ -565,6 +565,7 @@ async fn main() -> Result<ExitCode> {
 }
 
 async fn run() -> Result<()> {
+    agent_cli::phase("main");
     let mut arguments = Arguments::parse();
     #[allow(clippy::disallowed_methods)]
     let rex = RexClient::for_process(arguments.rex_server.as_deref())?;
@@ -856,7 +857,9 @@ async fn run() -> Result<()> {
             return worker_service(client, 300).await;
         }
         // A host that does not own the coordinator must set up nothing, not even Messages.
+        agent_cli::phase("config");
         let claim = OwnerClaim::acquire(&directory, &script, config.failover.as_ref())?;
+        agent_cli::phase("claim");
         if !no_sources {
             configure_messages(&config.sources).await;
         }
@@ -894,6 +897,7 @@ async fn run() -> Result<()> {
                 None
             }
         };
+        agent_cli::phase("rex");
         let bootstrap = CoordinatorBootstrap {
             settings: CoordinatorSettings {
                 model: config.model.clone(),

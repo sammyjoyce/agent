@@ -43,3 +43,12 @@ pub mod notifications;
 #[cfg(test)]
 #[path = "../tests/fixtures/executable.rs"]
 mod executable_fixture;
+
+/// Scratch measurement only: prints a start phase and its wall-clock time.
+pub fn phase(name: &str) {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    eprintln!("[phase] {name} {ms}");
+}

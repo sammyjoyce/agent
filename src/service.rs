@@ -193,6 +193,7 @@ async fn serve_owner(
         config.as_ref().and_then(|config| config.apns.as_ref()),
         StartRecord::for_config(config.as_ref()),
     )?;
+    crate::phase("pi-spawned");
     let background = if owner.restore_held() {
         eprintln!("{}", crate::backup::hold_notice(state));
         None
@@ -223,6 +224,7 @@ async fn serve_owner(
             return Err(error);
         }
     }
+    crate::phase("pi-initialized");
     let (listener, socket) = match SocketOwner::bind(state.join(SOCKET_NAME)) {
         Ok(bound) => bound,
         Err(error) => {
@@ -230,6 +232,7 @@ async fn serve_owner(
             return Err(error);
         }
     };
+    crate::phase("bound");
     let owner = Arc::new(owner);
     let tailnet = match port {
         Some(port) => match crate::tailnet::listen(port, &daemon).await {
