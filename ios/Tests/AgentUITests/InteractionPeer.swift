@@ -181,6 +181,15 @@ actor InteractionPeer {
         settingRequests.append(request)
         var settings = try XCTUnwrap(settingsValue)
         switch request.change {
+        case .setModel(let value):
+          let option = try XCTUnwrap(
+            settings.configured.catalog.first {
+              $0.provider == value.provider && $0.modelId == value.modelId
+            }, "The UI must send a catalog-backed provider/model pair")
+          let saved = settings.configured.model
+          settings.configured.model = .init(
+            fast: saved.fast && option.fast, modelId: option.modelId, provider: option.provider,
+            reasoning: saved.reasoning.flatMap { option.reasoning.contains($0) ? $0 : nil })
         case .setReasoning(let value): settings.configured.model.reasoning = value.reasoning
         case .setFast(let value): settings.configured.model.fast = value.mode == .on
         case .none: break

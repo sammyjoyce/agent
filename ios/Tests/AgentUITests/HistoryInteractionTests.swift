@@ -2005,6 +2005,121 @@ final class HistoryInteractionTests: XCTestCase {
     XCTAssertTrue(text("mail-primary").exists)
   }
 
+  func testConversationSettingsFilterModelsByProviderAndRoundTripMissingSelections() async throws {
+    continueAfterFailure = false
+    executionTimeAllowance = 90
+    let peer = InteractionPeer()
+    addTeardownBlock { await peer.stop() }
+    let history = NativeEventHistory(messages: [], nextCursor: nil, pageComplete: true)
+    await peer.history(initial: history, pages: [:], latest: history)
+    func option(_ provider: ModelProvider, _ id: String, _ name: String) -> ModelOption {
+      .init(fast: false, modelId: id, name: name, provider: provider, reasoning: [.low])
+    }
+    await peer.settings(
+      .init(
+        configured: .init(
+          catalog: [
+            option(.google, "zeta", "Zeta model"),
+            option(.google, "alpha", "Alpha model"),
+            option(.openai, "shared", "Shared OpenAI model"),
+            option(.openai, "only-openai", "OpenAI only model"),
+            option(.anthropic, "shared", "Shared Anthropic model"),
+            option(.anthropic, "only-anthropic", "Anthropic only model"),
+          ], conversationId: "fixture-root",
+          model: .init(fast: false, modelId: "retired-model", provider: .azure)),
+        effective: nil))
+    let app = XCUIApplication()
+    app.launchEnvironment["AGENT_INTERACTION_PORT"] = String(try await peer.start())
+    app.launchEnvironment["AGENT_INTERACTION_COORDINATOR"] = peer.coordinator.uuidString
+    app.launchArguments += ["-notificationsEnabled", "NO"]
+    app.launch()
+    defer { app.terminate() }
+    app.buttons["Connection"].tap()
+    app.buttons["Conversation settings"].tap()
+    let provider = app.buttons["conversationProviderPicker"]
+    let model = app.buttons["conversationModelPicker"]
+    XCTAssertTrue(provider.waitForExistence(timeout: 5), app.debugDescription)
+
+    // A saved pair missing from the catalog remains visible; opening its menus writes nothing.
+    model.tap()
+    XCTAssertTrue(action("retired-model", app: app).waitForExistence(timeout: 3))
+    XCTAssertFalse(action("Alpha model", app: app).exists)
+    app.navigationBars.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+    provider.tap()
+    XCTAssertTrue(action("azure", app: app).waitForExistence(timeout: 3))
+    // Two Google models still produce one provider entry.
+    XCTAssertEqual(
+      app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", "google")).count,
+      1)
+    action("google", app: app).tap()
+
+    func expectPair(_ selectedProvider: ModelProvider, _ id: String) async throws {
+      try await eventually(description: "atomic provider/model control") {
+        await peer.settingsControls().last?.change
+          == .setModel(.init(modelId: id, provider: selectedProvider))
+      }
+      let enabled = XCTNSPredicateExpectation(
+        predicate: NSPredicate(format: "enabled == true"), object: provider)
+      XCTAssertEqual(XCTWaiter.wait(for: [enabled], timeout: 3), .completed)
+    }
+    // Catalog order is deliberately reversed: fallback is stable model-ID order.
+    try await expectPair(.google, "alpha")
+    model.tap()
+    XCTAssertTrue(action("Alpha model", app: app).waitForExistence(timeout: 3))
+    XCTAssertTrue(action("Zeta model", app: app).exists)
+    XCTAssertFalse(action("Shared OpenAI model", app: app).exists)
+    XCTAssertFalse(action("Alpha model · google", app: app).exists)
+    action("Zeta model", app: app).tap()
+    try await expectPair(.google, "zeta")
+
+    provider.tap()
+    action("openai", app: app).tap()
+    try await expectPair(.openai, "only-openai")
+    model.tap()
+    XCTAssertTrue(action("Shared OpenAI model", app: app).waitForExistence(timeout: 3))
+    XCTAssertFalse(action("Shared Anthropic model", app: app).exists)
+    action("Shared OpenAI model", app: app).tap()
+    try await expectPair(.openai, "shared")
+    provider.tap()
+    action("anthropic", app: app).tap()
+    // The same model ID belongs to two providers; retain the ID, never the old provider.
+    try await expectPair(.anthropic, "shared")
+    model.tap()
+    XCTAssertTrue(action("Shared Anthropic model", app: app).waitForExistence(timeout: 3))
+    XCTAssertTrue(action("Anthropic only model", app: app).exists)
+    XCTAssertFalse(action("Shared OpenAI model", app: app).exists)
+    action("Shared Anthropic model", app: app).tap()
+
+    // Re-read the fixture over the actual settings protocol, not just the local picker binding.
+    let beforeRefresh = await peer.settingsControls().count
+    app.buttons["Refresh"].tap()
+    try await eventually(description: "fresh settings read") {
+      let requests = await peer.settingsControls()
+      return requests.count > beforeRefresh && requests.last?.change == nil
+    }
+    XCTAssertTrue(
+      app.staticTexts.matching(
+        NSPredicate(
+          format: "label == %@", "Configured, anthropic/shared · Provider default · Fast off")
+      )
+      .firstMatch.waitForExistence(timeout: 3), app.debugDescription)
+    model.tap()
+    XCTAssertTrue(action("Shared Anthropic model", app: app).waitForExistence(timeout: 3))
+    action("Shared Anthropic model", app: app).tap()
+    let changes = await peer.settingsControls().compactMap(\.change)
+    XCTAssertEqual(
+      changes,
+      [
+        .setModel(.init(modelId: "alpha", provider: .google)),
+        .setModel(.init(modelId: "zeta", provider: .google)),
+        .setModel(.init(modelId: "only-openai", provider: .openai)),
+        .setModel(.init(modelId: "shared", provider: .openai)),
+        .setModel(.init(modelId: "shared", provider: .anthropic)),
+      ])
+    let inputs = await peer.inputs()
+    XCTAssertTrue(inputs.isEmpty)
+  }
+
   func testConversationSettingsPreserveTheDraftAndUseOnlyAdvertisedMainControls() async throws {
     continueAfterFailure = false
     executionTimeAllowance = 90

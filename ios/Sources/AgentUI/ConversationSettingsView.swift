@@ -27,23 +27,55 @@ struct ConversationSettingsView: View {
         }
         Section {
           Picker(
-            "Model",
+            "Provider",
             selection: Binding(
-              get: { key(settings.configured.model) },
+              get: { settings.configured.model.provider.rawValue },
               set: { value in
-                guard let option = settings.configured.catalog.first(where: { key($0) == value })
+                guard value != settings.configured.model.provider.rawValue,
+                  let provider = ModelProvider(rawValue: value)
+                else { return }
+                let options = models(settings, provider: provider)
+                // Keep the model ID when both providers offer it; otherwise use the first
+                // catalog model in stable ID order. Send the pair as one server change.
+                guard
+                  let option = options.first(where: {
+                    $0.modelId == settings.configured.model.modelId
+                  }) ?? options.first
                 else { return }
                 change(.setModel(.init(modelId: option.modelId, provider: option.provider)))
               }
             )
           ) {
-            if !settings.configured.catalog.contains(where: {
-              key($0) == key(settings.configured.model)
-            }) {
-              Text(settings.configured.model.modelId).tag(key(settings.configured.model))
+            ForEach(providers(settings), id: \.rawValue) { provider in
+              Text(provider.rawValue).tag(provider.rawValue)
+                .disabled(models(settings, provider: provider).isEmpty)
             }
-            ForEach(settings.configured.catalog, id: \.settingsKey) { option in
-              Text("\(option.name) · \(option.provider.rawValue)").tag(key(option))
+          }
+          .pickerStyle(.menu).accessibilityIdentifier("conversationProviderPicker")
+          Picker(
+            "Model",
+            selection: Binding(
+              get: { settings.configured.model.modelId },
+              set: { value in
+                guard value != settings.configured.model.modelId,
+                  let option = models(settings, provider: settings.configured.model.provider)
+                    .first(where: { $0.modelId == value })
+                else { return }
+                change(.setModel(.init(modelId: option.modelId, provider: option.provider)))
+              }
+            )
+          ) {
+            if !models(settings, provider: settings.configured.model.provider).contains(where: {
+              $0.modelId == settings.configured.model.modelId
+            }) {
+              Text(settings.configured.model.modelId).tag(settings.configured.model.modelId)
+                .disabled(true)
+            }
+            ForEach(
+              models(settings, provider: settings.configured.model.provider), id: \.settingsKey
+            ) {
+              option in
+              Text(option.name).tag(option.modelId)
             }
           }
           .pickerStyle(.menu).accessibilityIdentifier("conversationModelPicker")
@@ -116,6 +148,19 @@ struct ConversationSettingsView: View {
   }
   private func change(_ change: ConversationChange) {
     Task { await run(change) }
+  }
+  private func providers(_ settings: NativeSettingsSnapshot) -> [ModelProvider] {
+    let names = Set(
+      settings.configured.catalog.map { $0.provider.rawValue }
+        + [settings.configured.model.provider.rawValue])
+    return names.sorted().compactMap(ModelProvider.init(rawValue:))
+  }
+  private func models(_ settings: NativeSettingsSnapshot, provider: ModelProvider) -> [ModelOption]
+  {
+    var seen = Set<String>()
+    return settings.configured.catalog
+      .filter { $0.provider == provider && seen.insert($0.modelId).inserted }
+      .sorted { $0.modelId < $1.modelId }
   }
   private func key(_ selection: ModelSelection) -> String {
     "\(selection.provider.rawValue)/\(selection.modelId)"
