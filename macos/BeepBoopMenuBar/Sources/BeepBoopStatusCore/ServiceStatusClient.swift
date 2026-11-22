@@ -274,6 +274,14 @@ public struct ServiceStatusClient: Sendable {
     }
     defer { Darwin.close(fd) }
 
+    var noSigpipe: Int32 = 1
+    guard
+      setsockopt(
+        fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, socklen_t(MemoryLayout<Int32>.size)) == 0
+    else {
+      return .stopped(reason: "Could not disable SIGPIPE on the service socket")
+    }
+
     var tv = timeval(tv_sec: Self.socketTimeoutSeconds, tv_usec: 0)
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
