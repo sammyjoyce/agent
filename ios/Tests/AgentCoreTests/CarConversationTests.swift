@@ -374,3 +374,99 @@ func anAudioInterruptionEndsTheConversationWithoutAWord(_ interruption: Interrup
     #expect(await rig.submitted().isEmpty)
   }
 }
+
+// MARK: adversary probes (land round)
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func probeSendPressedWhileTheConfirmationIsTranscribed() async throws {
+  try await withCar(takes([deploy, "Maybe later."])) { rig in
+    await rig.peer.answerEachSubmit(finished)
+    rig.spoken.holding = "Send to"
+    rig.car.begin(with: rig.work)
+    try await eventually("the read-back") {
+      rig.spoken.lines.count == 2 && rig.car.phase == .confirming
+    }
+    // The message take has finished, so only the confirmation take's words are held.
+    rig.speech.hold()
+    rig.spoken.holding = nil
+    try await eventually("the confirmation take waits for its words") {
+      rig.speech.heldFinishes == 1
+    }
+    let shown = rig.car.phase
+    rig.car.perform(.send, in: .confirming)
+    try await Task.sleep(for: .milliseconds(100))
+    rig.speech.release()
+    try await eventually("the outcome is said") { rig.spoken.lines.count >= 3 }
+    try await Task.sleep(for: .milliseconds(300))
+    print(
+      "PROBE send-during-transcription phase when Send was pressed:", shown, "lines:",
+      rig.spoken.lines, "submitted:", await rig.submitted().map(\.text))
+    #expect(shown == .confirming)
+    #expect(rig.spoken.lines.dropFirst(2).first == finished, "Send on the confirming screen sends")
+    #expect(await rig.submitted().map(\.text) == [deploy])
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func probeAStaleModelWhoseFirstWordsComeAfterTheSilenceLimit() async throws {
+  var script = takes([deploy, "Yes.", ""])
+  script.model = .stale
+  // The first partial comes 3 s into the take, as when the take's audio waits for a compile.
+  script.stepMilliseconds = 3_000
+  try await withCar(script, timings: .quick) { rig in
+    await rig.peer.answerEachSubmit(finished)
+    rig.car.begin(with: rig.work)
+    try await eventually("the take opened") { rig.speech.recordings >= 1 }
+    try await eventually("a read-back, or the end", within: .seconds(20)) {
+      rig.spoken.lines.count >= 2 || rig.car.phase == .idle
+    }
+    print(
+      "PROBE stale-model lines:", rig.spoken.lines, "recordings:", rig.speech.recordings,
+      "cancelled takes:", rig.speech.cancellations, "phase:", rig.car.phase)
+    #expect(
+      rig.spoken.lines.dropFirst().first == "Send to Work: \(deploy)?",
+      "The take's words are read back once the model has them")
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func probeTwoBeginsAtOnceHoldOneConversationAndReleaseTheMicrophone() async throws {
+  try await withCar(takes([deploy, "Yes.", ""])) { rig in
+    await rig.peer.answerEachSubmit(finished)
+    rig.car.begin(with: rig.work)
+    rig.car.begin(with: rig.work)
+    try await eventually("idle after the answer", within: .seconds(20)) {
+      rig.spoken.lines.contains(finished) && rig.car.phase == .idle
+    }
+    print("PROBE two-begins lines:", rig.spoken.lines, "sent:", await rig.submitted().map(\.text))
+    #expect(rig.spoken.lines.filter { $0 == "Talking to Work." }.count == 1)
+    #expect(await rig.submitted().map(\.text) == [deploy])
+    #expect(rig.engine.microphone.take(.phone), "The car released the microphone")
+    rig.engine.microphone.release(.phone)
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(2)))
+func probeAStaleModelThatCompilesForFifteenSecondsUnderTheCarsOwnTimings() async throws {
+  var script = takes([deploy, "Yes.", ""])
+  script.model = .stale
+  // ~/handoff/ios-dictation/arena/design.md measured the compile after an app update at 15 to
+  // 19 s on the iPhone. A take's audio waits for it, so no partial comes sooner.
+  script.stepMilliseconds = 15_000
+  try await withCar(script, timings: .car) { rig in
+    await rig.peer.answerEachSubmit(finished)
+    let start = ContinuousClock.now
+    rig.car.begin(with: rig.work)
+    try await eventually("the take opened") { rig.speech.recordings >= 1 }
+    try await eventually("a read-back, or the end", within: .seconds(40)) {
+      rig.spoken.lines.count >= 2 || rig.car.phase == .idle
+    }
+    print(
+      "PROBE stale-model car timings: ended after", ContinuousClock.now - start, "lines:",
+      rig.spoken.lines, "recordings:", rig.speech.recordings, "cancelled takes:",
+      rig.speech.cancellations, "phase:", rig.car.phase)
+    #expect(
+      rig.spoken.lines.dropFirst().first == "Send to Work: \(deploy)?",
+      "A stale model goes on, since its first take prepares it")
+  }
+}

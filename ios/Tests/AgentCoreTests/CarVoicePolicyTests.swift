@@ -167,3 +167,64 @@ import Testing
   for reply in goesOn { #expect(reply.continuesConversation, "\(reply)") }
   for reply in stops { #expect(!reply.continuesConversation, "\(reply)") }
 }
+
+// MARK: adversary probes (land round)
+
+@Test func probeWhatTheCarSaysForOddReplies() {
+  let cases: [(String, String)] = [
+    ("autolink", "See <https://example.com/invented-token> for the invented report."),
+    ("inline code url", "Run `curl https://example.com/invented-token` first."),
+    ("image", "![invented chart](https://example.com/chart.png) shows the trend."),
+    ("bare domain", "The invented log is at example.com/invented-token/logs."),
+    ("other schemes", "Fetch ftp://example.com/invented.tar or file:///Users/invented/secret.txt."),
+    ("tilde fence", "Done.\n\n~~~sh\ndeploy --all --token invented\n~~~\n\nThat was it."),
+    ("indented code", "Done.\n\n    deploy --all --token invented\n\nThat was it."),
+    ("pipe-less table", "Service | State\n--- | ---\napi | ok\n\nAll good."),
+    ("html", "<details><summary>More</summary>Hidden invented text</details>"),
+    ("only code", "```\ninvented\n```"),
+    ("url in parens", "It is done (see https://example.com/a_(b))."),
+    ("link text is url", "[https://example.com/invented](https://example.com/invented) has it."),
+    ("emoji and math", "Done ✅. Cost is $3.50 & 2 < 3."),
+    ("nested list code", "- Step one:\n  ```\n  invented\n  ```\n- Step two"),
+    ("no spaces long", String(repeating: "無", count: 700)),
+    ("one long sentence", String(repeating: "invented word ", count: 60)),
+    ("empty after strip", "---"),
+    ("whitespace link", "[ ](https://example.com/invented)"),
+  ]
+  for (name, markdown) in cases {
+    print("PROBE spoken[\(name)]:", SpokenReply.speech(from: markdown).debugDescription)
+    print("PROBE reply[\(name)]:", CarSentence.reply(.answered(markdown), from: "Work").debugDescription)
+  }
+}
+
+@Test func probeAnswerSpokenLateAfterTheReadBackIsSilence() {
+  // Parakeet's streaming window is 13 + 13 frames of 80 ms, so a word's partial trails it by
+  // one to two seconds (ios/README.md: "about two seconds behind you").
+  let start = ContinuousClock.now
+  func verdicts(_ policy: Endpointer.Policy, voiceFrom: Int, voiceTo: Int, partialAt: Int)
+    -> [(Int, Endpointer.Verdict)]
+  {
+    var endpointer = Endpointer(policy, startedAt: start)
+    var found: [(Int, Endpointer.Verdict)] = []
+    for at in stride(from: 0, through: 10_000, by: 100) {
+      let now = start + .milliseconds(at)
+      var verdict: Endpointer.Verdict?
+      if at >= voiceFrom && at <= voiceTo { verdict = endpointer.hear(.level(0.9), at: now) }
+      if at == partialAt { verdict = endpointer.hear(.partial("Yes"), at: now) ?? verdict }
+      verdict = verdict ?? endpointer.verdict(at: now)
+      if let verdict {
+        found.append((at, verdict))
+        break
+      }
+    }
+    return found
+  }
+  // "Yes" said 3.4 s to 3.9 s after the read-back, its partial due 1.6 s later at 5.5 s.
+  let confirmation = verdicts(.confirmation, voiceFrom: 3_400, voiceTo: 3_900, partialAt: 5_500)
+  print("PROBE late-yes confirmation verdict:", confirmation)
+  // A message started 5.6 s after "Talking to Work.", still being spoken at 7 s.
+  let message = verdicts(.message, voiceFrom: 5_600, voiceTo: 9_000, partialAt: 7_600)
+  print("PROBE late-start message verdict:", message)
+  #expect(confirmation.first?.1 != .silence, "A yes the microphone heard is not silence")
+  #expect(message.first?.1 != .silence, "A message being spoken is not silence")
+}

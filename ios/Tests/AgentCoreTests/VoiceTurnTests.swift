@@ -254,3 +254,20 @@ func aRefusalAndAFailedWriteAreTheirOwnReplies() async throws {
   #expect(reply(afterAnswersFrom: 63) == .answered(finished))
   #expect(reply(afterAnswersFrom: 64) == nil, "The oldest entry's answer was dropped")
 }
+
+// MARK: adversary probes (land round)
+
+@Test(.timeLimit(.minutes(1)))
+func probeSaveTheOutboxAnUnconfirmedCarTurnLeavesBehind() async throws {
+  try await withCarPeer { session, fixture, directory in
+    await fixture.holdNextSubmitReply()
+    let limits = VoiceTurnLimits(
+      delivery: .milliseconds(300), answer: .seconds(60), answerText: .seconds(3))
+    let (_, reply) = try ask(session, limits: limits)
+    #expect(await reply.value == .unconfirmed)
+    let saved = try Data(contentsOf: directory.outbox)
+    try saved.write(to: URL(fileURLWithPath: "/Users/sammy/.pi/agent/pstack/subagents/a43ff86edd5b/worktree/.adversary/head-outbox.json"))
+    print("PROBE head outbox:", String(decoding: saved, as: UTF8.self))
+    await fixture.releaseSubmitReply()
+  }
+}
