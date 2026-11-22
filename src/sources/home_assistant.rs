@@ -147,9 +147,16 @@ impl HomeAssistantSource {
         previous: &Checkpoint,
         initial: bool,
     ) -> (Vec<SourceEvent>, Checkpoint) {
+        // An allowlisted entity that is absent from this response keeps its
+        // fingerprint, so its return in another state is still a change.
         let mut next = Checkpoint {
             account: self.account.clone(),
-            states: BTreeMap::new(),
+            states: previous
+                .states
+                .iter()
+                .filter(|(entity_id, _)| self.matches_entity(entity_id))
+                .map(|(entity_id, fingerprint)| (entity_id.clone(), fingerprint.clone()))
+                .collect(),
         };
         let mut events = Vec::new();
 
@@ -172,24 +179,26 @@ impl HomeAssistantSource {
                     .or(item.last_updated.as_deref())
                     .and_then(parse_timestamp_ms);
                 let short_fp = fingerprint.get(..16).unwrap_or(&fingerprint);
+                let title = format!("{friendly}: {}", item.state);
+                let text = format!(
+                    "Entity {} changed to '{}'{}.",
+                    item.entity_id,
+                    item.state,
+                    prior
+                        .map(|_| " (state transition)")
+                        .unwrap_or(" (initial observation)")
+                );
                 events.push(SourceEvent {
                     id: format!("state:{}:{short_fp}", item.entity_id),
-                    version: fingerprint.clone(),
+                    version: event_version(&fingerprint, &title, &text),
                     legacy_version: None,
                     source: SourceRef {
                         provider: "home_assistant".into(),
                         account: self.account.clone(),
                         thread_id: format!("entity:{}", item.entity_id),
                     },
-                    title: format!("{friendly}: {}", item.state),
-                    text: format!(
-                        "Entity {} changed to '{}'{}.",
-                        item.entity_id,
-                        item.state,
-                        prior
-                            .map(|_| " (state transition)")
-                            .unwrap_or(" (initial observation)")
-                    ),
+                    title,
+                    text,
                     occurred_at,
                 });
             }
@@ -212,6 +221,18 @@ fn state_fingerprint(state: &HaState) -> String {
     hasher.update(state.state.as_bytes());
     hasher.update(b":");
     hasher.update(changed.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// The runtime rejects a page that repeats an id and a version with another
+/// title or text, so the version covers both. Each field carries its length,
+/// so two different sets of fields cannot hash the same bytes.
+fn event_version(fingerprint: &str, title: &str, text: &str) -> String {
+    let mut hasher = Sha256::new();
+    for field in [fingerprint, title, text] {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
     hex::encode(hasher.finalize())
 }
 
