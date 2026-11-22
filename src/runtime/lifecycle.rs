@@ -91,6 +91,7 @@ impl RequestLifecycle {
             | RuntimeCommand::ReadConversation { .. }
             | RuntimeCommand::OpenConversation { .. }
             | RuntimeCommand::RevokeAllocation { .. }
+            | RuntimeCommand::TransferTask { .. }
             | RuntimeCommand::Goal { .. } => Self::Once,
         })
     }

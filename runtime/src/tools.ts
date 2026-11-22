@@ -372,6 +372,12 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
     defineTool({ name: "revoke_allocation", description: "Cancel one exact unresolved new allocation with no known Rex session. Preserves input and history; known sessions must be reconciled.",
       parameters: Type.Object({ task_id: Type.String(), allocation_id: Type.String(), agent_id: Type.Optional(Type.String()) }),
       async execute(args) { return output(await tasks.revokeAllocation(args.task_id, args.allocation_id, args.agent_id)); } }),
+    defineTool({ name: "transfer_task", description: "Transfer an offline host's task to another connected worker host while preserving conversation and resource lineage.",
+      parameters: Type.Object({ task_id: Type.String({ minLength: 1 }), host: Type.String({ minLength: 1 }), cwd: Type.Optional(Type.String({ minLength: 1 })) }),
+      async execute(args, api) {
+        const execution = executions.get(api.conversationId.toString());
+        return output(await tasks.transferTask(args.task_id, args.host, execution.call, args.cwd));
+      } }),
     defineTool({ name: "delegate_task", description: "Continue existing work by task_id or conversation_id. Steers active work by default; use mode:follow_up for an independent later turn. A separate outcome needs new_task:true and new_task_reason when related work exists.",
       parameters: Type.Object({ task_id: Type.Optional(Type.String()), conversation_id: Type.Optional(Type.String()), input: Type.String({ maxLength: 65536 }), attachments: attachmentIds,
         mode: Type.Optional(Type.Enum(inputModes)),

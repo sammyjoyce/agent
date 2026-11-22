@@ -149,27 +149,27 @@ Follow-ups from the live loop-closing eval
 ([#72](https://github.com/sammyjoyce/agent/issues/72)) and upstream Pi reuse
 qualification ([#52](https://github.com/sammyjoyce/agent/issues/52)).
 
-- [ ] **Silence outcome triage on user-handled threads
+- [x] **Silence outcome triage on user-handled threads
   ([#72](https://github.com/sammyjoyce/agent/issues/72)).** On the 7-case live
   loop-closing eval (`gpt-6.1-sol`, 6/7 passing), when a thread was already
   handled by the user, the resumed worker resolved the task without booking and
   outcome triage still posted a needless main-chat completion notice. Keep
   outcome triage quiet when the user already handled the exchange.
-- [ ] **Model-aware image attachment limits.** Prepare attached images with the
+- [x] **Model-aware image attachment limits.** Prepare attached images with the
   active conversation model's image limits rather than fixed defaults (`#52`).
-- [ ] **Cross-host and cancellation image-read coverage.** Add end-to-end
+- [x] **Cross-host and cancellation image-read coverage.** Add end-to-end
   `read_file` image tests for triage and child-agent routes across two machines,
   and for cancelling a slow transfer (`#52`).
-- [ ] **Shrink the worker `codemode` prompt budget.** Reduce inline schema weight
+- [x] **Shrink the worker `codemode` prompt budget.** Reduce inline schema weight
   in the worker role's `codemode` prompt section using tool namespaces or a
   smaller inline budget (`#52`).
-- [ ] **Semantic `child-agent` oracle and full-suite requalification.** Replace
+- [x] **Semantic `child-agent` oracle and full-suite requalification.** Replace
   the wording-based `child-agent` check in the tool discovery eval (which still
   accepts post-sentence denials or phrases like "ruled out", "excluded",
   "instead of" and "discarded theory") with a meaning check, then rerun the full
   nine-scenario confirmation at `low` and default reasoning while retaining
   every answer (`#52`).
-- [ ] **Bridge, CLI and CI test hygiene (`#52`).**
+- [x] **Bridge, CLI and CI test hygiene (`#52`).**
   - Add a bridge-level regression test proving an oversized task-graph request
     fails cleanly without breaking the bridge.
   - Emit structured JSON error objects when a `--json` CLI command fails.
@@ -283,7 +283,7 @@ branching conversations legible directly from the main chat.
   chat. Return to the anchor message when done and bring an answer back into the
   main conversation only on explicit choice (revisiting Pi Durable conversation
   forks if needed; see [architecture](architecture.md#tasks-and-execution)).
-- [ ] **First-class transcript items for nested `codemode` calls.** Render
+- [x] **First-class transcript items for nested `codemode` calls.** Render
   nested `exec`, `write_file` and `edit_file` calls recorded in a `codemode`
   script's `details.calls` as standalone **Command** and **File changes** items
   in triage, worker and child-agent transcripts instead of plain lines inside
@@ -302,7 +302,7 @@ restore is not shipped yet.
 
 ### Terminal, host and CLI integration
 
-- [ ] **Program Status Protocol (`OSC 7501`) in the TUI.** Emit `OSC 7501`
+- [x] **Program Status Protocol (`OSC 7501`) in the TUI.** Emit `OSC 7501`
   alongside `WindowTitle` in `src/tui/inline.rs` using `app=beep-boop` and the
   same control-character/bidi sanitization as `terminal_title`. Map active turns
   and goals to `working` (`msg`, bounded `progress`), authentication failures
@@ -311,29 +311,29 @@ restore is not shipped yet.
   to `idle`, and clean detach to `clear`, with hierarchical child `id=...`
   records for child agents and delegates across Rex's Activity Mode, tab
   indicators, Dock badge, `Go to Anything` and future mobile notifications.
-- [ ] **Full Disk Access preflight (`server.apple.privacy_status`).** Query
+- [x] **Full Disk Access preflight (`server.apple.privacy_status`).** Query
   `server.apple.privacy_status` over the local Unix socket (no TCC prompt) in
   `beep-boop rex install` (`src/rex/install.rs`) and Messages source diagnostics
   to verify `full_disk_access` is `granted` and report `responsible_path` when
   missing, gating on `server.version` and `method_not_found` for non-macOS hosts
   and older servers.
-- [ ] **Remote file drag-and-drop and clipboard image paste.** Verify Rex client
+- [x] **Remote file drag-and-drop and clipboard image paste.** Verify Rex client
   uploads (`com.superlogical.terminal.upload_begin`) against `dropped_files` in
   `src/tui/attachments.rs`, covering shell quoting, batch spacing, trailing
   newlines and uploaded temp-file lifetime between drop and Send.
-- [ ] **`OSC 8` links and Quick Look artifact paths.** Emit `OSC 8` hyperlinks
+- [x] **`OSC 8` links and Quick Look artifact paths.** Emit `OSC 8` hyperlinks
   for web-search sources and clean absolute paths for local artifacts (browser
   screenshots, Dreams diffs, edited files) in completed TUI scrollback rows so
   Rex Quick Look (`⇧⌘+Click`, `⌘Y`, and remote
   `com.superlogical.terminal.download_begin`) previews them natively.
-- [ ] **SSH worker hosts (`ssh://`).** Support Rex SSH endpoints (`rex hosts`
+- [x] **SSH worker hosts (`ssh://`).** Support Rex SSH endpoints (`rex hosts`
   and `rex server install ssh://<address>`) alongside Tailscale in node
   discovery (`src/discovery.rs`) and worker setup docs so Linux VMs without
   Tailscale can join as Rex-backed worker hosts.
-- [ ] **Bounded feedback terminal capture.** Tighten `capture_terminal` in
+- [x] **Bounded feedback terminal capture.** Tighten `capture_terminal` in
   `src/rex.rs` using `--trim` and/or `com.superlogical.terminal.format`
   (`max_bytes` + `blob_read`) so large styled captures degrade cleanly.
-- [ ] **Optional Rex Lua action module.** Provide a Lua module using
+- [x] **Optional Rex Lua action module.** Provide a Lua module using
   `rex.ui.pick` / `rex.ui.input` (callable via `rex do`) and `client.perform`
   (`session.select`) to jump to active or waiting tasks across devices or send a
   quick prompt to main chat. Keep it separate from core execution and durable
@@ -472,7 +472,7 @@ portability.
   state changes via its API, or MyChart and Ramp activity via existing CLIs—with
   all credentials kept in the configured private credential provider
   ([architecture](architecture.md#integrations-and-scheduling)).
-- [ ] **Cross-host worker transfer.** Offline workers currently retain their
+- [x] **Cross-host worker transfer.** Offline workers currently retain their
   bound tasks until the host reconnects, and coordinator failover leaves host
   bindings unchanged. Support transferring an offline host's task to another
   online machine while preserving conversation and resource lineage.

@@ -309,7 +309,8 @@ pub fn held_after_restore(command: &RuntimeCommand) -> Option<&'static str> {
         | RuntimeCommand::SearchHistory { .. }
         | RuntimeCommand::ReadConversation { .. }
         | RuntimeCommand::OpenConversation { .. }
-        | RuntimeCommand::RevokeAllocation { .. } => None,
+        | RuntimeCommand::RevokeAllocation { .. }
+        | RuntimeCommand::TransferTask { .. } => None,
     }
 }
 

@@ -38,7 +38,7 @@ const host: WorkerHost = { host_id: "11111111-1111-4111-8111-111111111111", name
 const binding: WorkerRef = { host_id: "11111111-1111-4111-8111-111111111111",
   session_id: "session:22222222-2222-4222-8222-222222222222", window_id: "window:33333333-3333-4333-8333-333333333333",
   block_id: "block:44444444-4444-4444-8444-444444444444" };
-const taskNames = ["search_tasks", "read_task", "revoke_allocation", "delegate_task", "record_task", "continue_agent", "spawn_agent", "read_agents", "wait_agents", "report_result"];
+const taskNames = ["search_tasks", "read_task", "revoke_allocation", "transfer_task", "delegate_task", "record_task", "continue_agent", "spawn_agent", "read_agents", "wait_agents", "report_result"];
 const sourceDecisions = ["link_source_events", "dismiss_source_events", "notify"];
 const ADOPTED_SURFACES: Record<ToolRole, readonly string[]> = {
   main: ["exec", "read_attachment", "read_file", "write_file", "edit_file", "search_tasks", "read_task", "delegate_task", "record_task",
@@ -60,7 +60,7 @@ function offered(app: App, input: Context, role: ToolRole): void {
   assert.equal(names.includes("complete_goal"), role === "worker", `${role} offers complete_goal directly only as the worker`);
   const owned = [...new Set(app.toolsets[role].flatMap((extension) => extension.tools ?? []).map((tool) => tool.name))];
   const expected = role === "main" || role === "triage"
-    ? ["search_tasks", "read_task", "revoke_allocation", "delegate_task", "record_task"]
+    ? ["search_tasks", "read_task", "revoke_allocation", "transfer_task", "delegate_task", "record_task"]
     : role === "worker" ? ["record_task", "search_tasks", "read_task", "continue_agent", "spawn_agent", "read_agents", "wait_agents"]
     : ["search_tasks", "read_task", "read_agents", "report_result"];
   assert.deepEqual(owned.filter((name) => taskNames.includes(name)).sort(), expected.sort());

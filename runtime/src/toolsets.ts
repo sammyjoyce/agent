@@ -54,9 +54,9 @@ export const CONTEXT_TOOLS: readonly string[] = ["read_context", "search_context
 const CHILD_DEFERRED: readonly string[] = [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "allocate_worktree", "read_resources", "read_source_events", "notify_user"];
 export const WORKER_CODEMODE_INLINE_BUDGET = 350;
 export const TOOL_SURFACES = {
-  main: { deferred: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "read_resources", "collect_worktrees", "revoke_allocation",
+  main: { deferred: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "read_resources", "collect_worktrees", "revoke_allocation", "transfer_task",
     "read_source_events", "notify_user", "notify", "link_source_events", "dismiss_source_events"] },
-  triage: { deferred: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "revoke_allocation"], codemode: { keepDirect: ["record_task"] } },
+  triage: { deferred: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "revoke_allocation", "transfer_task"], codemode: { keepDirect: ["record_task"] } },
   worker: { deferred: CHILD_DEFERRED, codemode: { keepDirect: ["record_task", "complete_goal"], inlineBudget: WORKER_CODEMODE_INLINE_BUDGET } },
   agent: { deferred: CHILD_DEFERRED, codemode: { keepDirect: [] } },
 } as const satisfies Record<ToolRole, ToolSurface>;

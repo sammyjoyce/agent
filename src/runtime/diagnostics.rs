@@ -374,7 +374,7 @@ impl Trace {
                 trace.task_id = Some(task_id.to_string());
                 trace.agent_id = agent_id.as_deref().and_then(token);
             }
-            RuntimeCommand::ReadTask { task_id } => {
+            RuntimeCommand::ReadTask { task_id } | RuntimeCommand::TransferTask { task_id, .. } => {
                 trace.task_id = Some(task_id.to_string());
             }
             RuntimeCommand::Goal {

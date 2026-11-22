@@ -818,9 +818,12 @@ coordinator cannot start, and nobody can promote. There is no switch to detach
 from the authority, because a detached owner plus a later promotion is two
 owners. Removing the `[failover]` section is not one: that start is refused.
 
-Automatic takeover is not planned. Host transfer of a task's execution is
-separate from coordinator promotion: a bound task stays on its execution host,
-and to that host a promotion looks like a coordinator restart. The [history
+Automatic takeover is not planned. Explicit transfer of an offline host's task to
+another online host uses `beep-boop tasks transfer` or the main agent's
+`transfer_task` tool while preserving conversation, child-agent and worktree
+resource lineage. Host transfer of a task's execution is separate from
+coordinator promotion: a bound task stays on its execution host, and to that
+host a promotion looks like a coordinator restart. The [history
 implementation](history.md) covers inert Codex import, hybrid retrieval and
 same-host reopening.
 
