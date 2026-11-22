@@ -367,20 +367,7 @@ fn validate(config: &mut ClientConfig) -> Result<()> {
         validate_coordinator(coordinator)?;
     }
     for source in &config.sources {
-        if let SourceConfig::GitHub {
-            owner_filter: Some(filter),
-            ..
-        } = source
-        {
-            filter.validate()?;
-        }
-        if source.enabled()
-            && let SourceConfig::Slack {
-                command, account, ..
-            } = source
-        {
-            crate::sources::slack::SlackSource::new(command.clone(), account.clone())?;
-        }
+        source.validate()?;
     }
     Ok(())
 }

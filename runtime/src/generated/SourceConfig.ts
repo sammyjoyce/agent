@@ -5,4 +5,4 @@ export type SourceConfig = { "provider": "google", enabled: boolean, namespaces:
 /**
  * Exact repository owner partition; omitted preserves unfiltered intake.
  */
-owner_filter: GitHubOwnerFilter | null, } | { "provider": "google_calendar", enabled: boolean, namespaces: Array<string> | null, } | { "provider": "messages", enabled: boolean, namespaces: Array<string> | null, } | { "provider": "slack", enabled: boolean, command: Array<string>, account: string, };
+owner_filter: GitHubOwnerFilter | null, } | { "provider": "google_calendar", enabled: boolean, namespaces: Array<string> | null, } | { "provider": "messages", enabled: boolean, namespaces: Array<string> | null, } | { "provider": "slack", enabled: boolean, command: Array<string>, account: string, } | { "provider": "home_assistant", enabled: boolean, account: string, url: string, credential_command: Array<string>, entities: Array<string>, } | { "provider": "mychart", enabled: boolean, command: Array<string>, account: string, } | { "provider": "ramp", enabled: boolean, command: Array<string>, account: string, };
