@@ -5,7 +5,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use agent_cli::{
@@ -305,7 +305,6 @@ async fn local_helper_can_run_while_its_script_is_open_for_writing() {
 const UP_TOKEN: &str = "example-up-token";
 const SECOND_UP_TOKEN: &str = "example-second-up-token";
 const UP_FOREIGN: &str = "Up checkpoint belongs to another account or configuration; change the account label to start a fresh seven-day read.";
-const UP_CLOCK: &str = "Up checkpoint holds a time more than five minutes ahead of this computer's clock; check the clock. The source continues from this checkpoint when the clock is right. To start a fresh seven-day read instead, change the account label.";
 
 /// An invented Up account on a loopback address. It has one held and two
 /// settled transactions and lists them one per page, newest first. A second
@@ -816,84 +815,55 @@ async fn a_token_for_another_up_customer_after_a_restart_reads_no_transaction_in
 }
 
 #[tokio::test]
-async fn an_up_checkpoint_with_a_time_in_the_future_stops_the_real_poll_path_and_is_never_complete()
-{
-    let up = FakeUp::start().await;
-    up.second_page_fails.store(false, Ordering::Relaxed);
-    let setup = UpSetup::new(&up);
-    let runtime = start_runtime(&setup.state);
-    let mut rounds = 0;
-    while refresh_into_journal(&runtime, &setup.config)
-        .await
-        .last()
-        .map(|page| &page.coverage)
-        != Some(&SourceCoverage::Complete)
-    {
-        rounds += 1;
-        assert!(rounds < 4, "The first scan did not complete");
-    }
-
-    let ahead = save_as_written_by_a_clock_ahead(&runtime, 30 * 86_400).await;
-    let requests_before = up.requests().len();
-    for _ in 0..2 {
-        assert_eq!(
-            refresh_into_journal(&runtime, &setup.config).await,
-            [page(up_unavailable(UP_CLOCK), 0, 0, false)],
-            "a window that starts in the future holds no current transaction"
-        );
-    }
-    assert_eq!(up.requests().len(), requests_before, "no request is made");
-    assert_eq!(up_checkpoint(&runtime).await, ahead);
-    runtime.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn a_clock_behind_an_up_checkpoint_stops_the_real_poll_path_and_the_scan_resumes_at_its_saved_page_when_the_clock_is_right()
+async fn a_clock_behind_an_up_checkpoint_restarts_the_scan_in_flight_through_the_real_poll_path_and_the_journal_admits_its_first_page_once()
  {
-    /// Seconds between the stop and the time the clock is right again.
-    const WAIT: u64 = 12;
     let up = FakeUp::start().await;
     let setup = UpSetup::new(&up);
     let runtime = start_runtime(&setup.state);
     let first_round = refresh_into_journal(&runtime, &setup.config).await;
     assert_eq!(
-        first_round.last().map(|page| &page.coverage),
-        Some(&up_unavailable(
-            "Up API returned HTTP 503; checkpoint retained."
-        )),
+        first_round,
+        [
+            page(SourceCoverage::More, 1, 1, true),
+            page(
+                up_unavailable("Up API returned HTTP 503; checkpoint retained."),
+                0,
+                0,
+                false
+            ),
+        ],
         "the scan stops with its second page saved"
     );
     up.second_page_fails.store(false, Ordering::Relaxed);
 
-    let ahead = save_as_written_by_a_clock_ahead(&runtime, 300 + WAIT).await;
+    save_as_written_by_a_clock_ahead(&runtime, 3_600).await;
     let requests_before = up.requests().len();
     assert_eq!(
-        refresh_into_journal(&runtime, &setup.config).await,
-        [page(up_unavailable(UP_CLOCK), 0, 0, false)]
-    );
-    assert_eq!(up.requests().len(), requests_before, "no request is made");
-    assert_eq!(up_checkpoint(&runtime).await, ahead);
-
-    tokio::time::sleep(Duration::from_secs(WAIT + 1)).await;
-    let resumed = refresh_into_journal(&runtime, &setup.config).await;
-    assert_eq!(resumed[0], page(SourceCoverage::More, 1, 1, true));
-    assert_eq!(
-        resumed.last().map(|page| &page.coverage),
-        Some(&SourceCoverage::Complete)
+        refresh_until_complete(&runtime, &setup.config).await,
+        [
+            page(SourceCoverage::More, 1, 0, true),
+            page(SourceCoverage::More, 1, 1, true),
+            page(SourceCoverage::More, 1, 1, true),
+            page(SourceCoverage::Complete, 1, 0, true),
+        ],
+        "the first page is read again and the journal admits its transaction once"
     );
     let transactions: Vec<String> = up.requests()[requests_before..]
         .iter()
         .filter(|target| target.starts_with("/transactions"))
         .cloned()
         .collect();
+    assert!(
+        transactions[0].starts_with("/transactions?filter[since]="),
+        "the scan starts again at its first page, in the same poll: {transactions:?}"
+    );
     assert_eq!(
-        transactions,
+        transactions[1..],
         [
             "/transactions?page[after]=1&page[size]=1",
             "/transactions?page[after]=2&page[size]=1",
             "/transactions?filter[status]=HELD&page[size]=100",
-        ],
-        "the scan continues at the page of the kept checkpoint"
+        ]
     );
     runtime.close().await.unwrap();
 }

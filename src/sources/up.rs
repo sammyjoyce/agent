@@ -775,7 +775,6 @@ mod tests {
     const SPACING: u64 = 300;
     const TOKEN: &str = "example-up-token";
     const SECOND_TOKEN: &str = "example-second-up-token";
-    const CLOCK: &str = "Up checkpoint holds a time more than five minutes ahead of this computer's clock; check the clock. The source continues from this checkpoint when the clock is right. To start a fresh seven-day read instead, change the account label.";
     const REFUSED_AGAIN: &str =
         "Up refused a saved page link for the second time in one scan; checkpoint retained.";
     const UNREADABLE: &str = "Up sent a response this source cannot read; checkpoint retained.";
@@ -2455,36 +2454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_first_scan_under_a_clock_that_ran_ahead_is_a_visible_stop_after_the_clock_is_corrected()
-     {
-        let up = Harness::start(Vec::new()).await;
-        let (_, saved) = up.scan(None, NOW + 14 * DAY).await;
-        up.world().rows.push(settled(
-            "example-transaction-1",
-            "Example Cafe",
-            "-12.50",
-            NOW - HOUR,
-        ));
-        let mark = up.targets().len();
-
-        for attempt in 0..2 {
-            let stopped = up.poll(Some(&saved), NOW + attempt * SPACING).await;
-            assert_eq!(
-                stopped.coverage,
-                unavailable(CLOCK),
-                "a current transaction is outside a window that starts in the future"
-            );
-            assert!(stopped.checkpoint.is_none());
-            assert!(stopped.events.is_empty());
-        }
-        assert!(
-            up.targets_since(mark).is_empty(),
-            "no request is made while the clock is behind the checkpoint"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_clock_that_moves_backward_stops_the_poll_and_the_scan_continues_at_its_saved_page_when_the_clock_returns()
+    async fn a_clock_that_moves_backward_restarts_the_scan_and_the_new_scan_continues_at_its_saved_page_when_the_clock_returns()
      {
         let up = Harness::start(vec![
             settled("example-transaction-1", "Example Cafe", "-5.00", NOW - HOUR),
@@ -2499,17 +2469,24 @@ mod tests {
         up.world().page_size = 1;
         let first = up.poll_to_listing(None, NOW).await;
         assert_eq!(first.coverage, SourceCoverage::More);
-        let mark = up.targets().len();
 
-        for moved_back in [HOUR, 30 * DAY] {
-            let stopped = up.poll(first.checkpoint.as_ref(), NOW - moved_back).await;
-            assert_eq!(stopped.coverage, unavailable(CLOCK));
-            assert!(stopped.checkpoint.is_none(), "the checkpoint is kept");
-            assert!(stopped.events.is_empty());
+        let mut restarted = None;
+        for moved_back in [30 * DAY, HOUR] {
+            let mark = up.targets().len();
+            let again = up.poll(first.checkpoint.as_ref(), NOW - moved_back).await;
+            assert_eq!(again.coverage, SourceCoverage::More);
+            assert_eq!(
+                content(&again.events),
+                content(&first.events),
+                "the first page is read again"
+            );
+            let requested = up.targets_since(mark);
+            assert_eq!(requested.len(), 2, "the poll reads Up: {requested:?}");
+            assert!(!requested[1].contains("page[after]"));
+            restarted = again.checkpoint;
         }
-        assert!(up.targets_since(mark).is_empty());
 
-        let resumed = up.poll(first.checkpoint.as_ref(), NOW + 60).await;
+        let resumed = up.poll(restarted.as_ref(), NOW + 60).await;
         assert_eq!(resumed.coverage, SourceCoverage::More);
         assert_eq!(
             titles(&resumed.events),
@@ -2517,7 +2494,7 @@ mod tests {
         );
         assert!(
             up.targets().last().unwrap().contains("page[after]=1"),
-            "the scan continues from the same checkpoint"
+            "the scan that started under the clock that moved back continues at its saved page"
         );
     }
 

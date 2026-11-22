@@ -2,8 +2,8 @@
 //!
 //! Three things live here, each with one owner:
 //!   `FeedCheckpoint`: the window, its first seven days, paging, resume,
-//!   restart, overlap, the daily reread, the spacing of scans and the check
-//!   of the clock against the saved times.
+//!   restart, overlap, the daily reread, the spacing of scans and the rewind
+//!   when the clock is behind the saved times.
 //!   `FeedItem`: the only way to build an event. It derives the version from the text.
 //!   `FeedFailure`: the only way to build a failure batch. It owns every fixed sentence.
 //!
@@ -32,8 +32,9 @@ const OVERLAP_SECONDS: u64 = 86_400;
 /// A finished scan is followed by this much rest, which bounds the requests of an idle feed.
 const SCAN_SPACING_SECONDS: u64 = 300;
 /// A saved time that is this far ahead of the clock was written under another
-/// clock. A lower bound in the future would exclude current items, so the feed
-/// stops and does not report coverage.
+/// clock. A lower bound in the future would exclude current items, and a wait
+/// for the clock to reach it would leave a gap as long as the wait. So the feed
+/// starts again from the current clock and reads its reread window.
 const CLOCK_TOLERANCE_SECONDS: u64 = 300;
 /// One scan in this period reads the source's whole reread window again. It
 /// finds an item that the service lists late with an old creation time.
@@ -69,7 +70,8 @@ struct Saved<P, S> {
     scope: String,
     /// What the service says about whose data the token reads, as a hash.
     owner: Option<String>,
-    /// Unix seconds. Set once, on the first poll, to now minus seven days.
+    /// Unix seconds. Set on the first poll to now minus seven days. It moves
+    /// only when the clock is behind the checkpoint, and then only earlier.
     /// The feed never asks for, and never delivers, an item created before it.
     origin: u64,
     /// Unix seconds when the last scan that read the whole reread window began.
@@ -193,6 +195,9 @@ where
     /// of the new scan from `kept` and the default lower bound. Once a day the
     /// new scan reads the last `reread_seconds` again. The result is never
     /// before the first poll's seven days.
+    ///
+    /// A saved time more than `CLOCK_TOLERANCE_SECONDS` ahead of `now` drops
+    /// the scan in flight and starts one that reads the last `reread_seconds`.
     pub(crate) fn load(
         saved: Option<&SourceCheckpoint>,
         key: &SourceKey,
@@ -225,11 +230,19 @@ where
             Window::Scanning(scan) => scan.since.max(scan.started_at),
         }
         .max(saved.origin);
-        if latest > now.saturating_add(CLOCK_TOLERANCE_SECONDS) {
-            return Err(FeedFailure::ClockBehind);
-        }
+        let clock_is_behind = latest > now.saturating_add(CLOCK_TOLERANCE_SECONDS);
+        let mut origin = saved.origin;
         let mut reread_at = saved.reread_at;
         let scan = match saved.window {
+            // The saved times say nothing about what was read under this
+            // clock, so the window comes from the clock alone. An origin
+            // written by a clock that ran ahead would hide the seven days.
+            _ if clock_is_behind => {
+                origin = origin.min(now.saturating_sub(FIRST_LOOKBACK_SECONDS));
+                reread_at = now;
+                let (since, state) = begin(&saved.kept, now.saturating_sub(reread_seconds));
+                Scan::first_page(now, since.max(origin), 0, state)
+            }
             Window::Scanning(scan) if scan.pages >= MAX_SCAN_PAGES => {
                 return Err(FeedFailure::Endless);
             }
@@ -262,7 +275,7 @@ where
             account: saved.account,
             scope: saved.scope,
             owner: saved.owner,
-            origin: saved.origin,
+            origin,
             reread_at,
             scan,
             kept: saved.kept,
@@ -495,8 +508,6 @@ pub(crate) enum FeedFailure {
     Http(HttpFailure),
     /// The saved checkpoint does not parse, or has another account, scope or owner.
     ForeignCheckpoint,
-    /// The saved checkpoint holds a time that the clock has not reached.
-    ClockBehind,
     /// A cursor or page link that is too long, malformed, or outside the API.
     BadCursor,
     /// The scan used `MAX_SCAN_PAGES` poll calls.
@@ -552,9 +563,6 @@ impl FeedFailure {
             }
             Self::ForeignCheckpoint => format!(
                 "{label} checkpoint belongs to another account or configuration; change the account label to start a fresh seven-day read."
-            ),
-            Self::ClockBehind => format!(
-                "{label} checkpoint holds a time more than five minutes ahead of this computer's clock; check the clock. The source continues from this checkpoint when the clock is right. To start a fresh seven-day read instead, change the account label."
             ),
             Self::BadCursor => {
                 format!(
@@ -766,47 +774,52 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_time_more_than_five_minutes_ahead_of_the_clock_stops_the_feed_with_fixed_text() {
-        let clock = "Example checkpoint holds a time more than five minutes ahead of this computer's clock; check the clock. The source continues from this checkpoint when the clock is right. To start a fresh seven-day read instead, change the account label.";
-        let outcome = |saved: &SourceCheckpoint, now: u64| match Checkpoint::load(
-            Some(saved),
-            &key(),
-            "scope-a",
-            now,
-            REREAD,
-            |_, since| (since, None),
-        ) {
-            Ok(Turn::Scan(_)) => "scan".to_owned(),
-            Ok(Turn::Rest(_)) => "rest".to_owned(),
-            Err(failure) => failure.message("Example"),
-        };
-
+    fn a_saved_time_more_than_five_minutes_ahead_of_the_clock_rewinds_the_feed_in_the_same_poll() {
         let paging = saved_after(scanning(None, NOW), Step::Next(None), NOW)
             .checkpoint
             .unwrap();
         assert_eq!(
-            outcome(&paging, NOW - 301),
-            clock,
-            "the scan start is ahead"
+            scanning(Some(&paging), NOW - 301).scan.started_at,
+            NOW - 301,
+            "the scan start is ahead, so a new scan starts"
         );
-        assert_eq!(outcome(&paging, NOW - 300), "scan");
+        assert_eq!(
+            scanning(Some(&paging), NOW - 300).scan.started_at,
+            NOW,
+            "five minutes are tolerated, and the scan in flight continues"
+        );
 
         let resting = saved_after(scanning(None, NOW), Step::Done { floor: None }, NOW)
             .checkpoint
             .unwrap();
+        let since_at = |now: u64| scanning(Some(&resting), now).scan.since;
         let lower_bound = NOW - OVERLAP_SECONDS;
         assert_eq!(
-            outcome(&resting, lower_bound - 301),
-            clock,
-            "the lower bound is ahead"
+            since_at(lower_bound - 301),
+            lower_bound - 301 - 7 * DAY,
+            "the lower bound is ahead, so the feed reads the seven days before the clock"
         );
-        assert_eq!(outcome(&resting, lower_bound - 300), "scan");
         assert_eq!(
-            outcome(&resting, NOW - 8 * 86_400),
-            clock,
-            "the origin is ahead, and the feed does not report complete coverage"
+            since_at(lower_bound - 300),
+            NOW - 7 * DAY,
+            "five minutes are tolerated, and the origin stays"
         );
-        assert_eq!(outcome(&resting, NOW + 1), "rest");
+        assert_eq!(
+            since_at(NOW - 8 * DAY),
+            NOW - 15 * DAY,
+            "the origin is ahead, and the feed reads and does not rest"
+        );
+        assert!(matches!(
+            Checkpoint::load(
+                Some(&resting),
+                &key(),
+                "scope-a",
+                NOW + 1,
+                REREAD,
+                |_, since| { (since, None) }
+            ),
+            Ok(Turn::Rest(_))
+        ));
     }
 
     #[test]
