@@ -775,11 +775,11 @@ mod tests {
     #[tokio::test]
     async fn legacy_worker_rejects_child_resume_before_forwarding_and_still_handles_parent_resume()
     {
-        let (_directory, runtime) = runtime().await;
+        let (directory, runtime) = runtime().await;
         let broker = Arc::new(
             Broker::new(
                 None,
-                std::path::Path::new("/tmp"),
+                directory.path(),
                 crate::rex::RexClient::for_process(None).unwrap(),
             )
             .unwrap(),
@@ -873,11 +873,11 @@ mod tests {
 
     #[tokio::test]
     async fn browser_capable_legacy_worker_rejects_new_tab_actions_and_keeps_ordinary_calls() {
-        let (_directory, runtime) = runtime().await;
+        let (directory, runtime) = runtime().await;
         let broker = Arc::new(
             Broker::new(
                 None,
-                std::path::Path::new("/tmp"),
+                directory.path(),
                 crate::rex::RexClient::for_process(None).unwrap(),
             )
             .unwrap(),
@@ -993,11 +993,11 @@ mod tests {
 
     #[tokio::test]
     async fn negotiated_user_tab_support_forwards_both_actions_to_the_same_worker() {
-        let (_directory, runtime) = runtime().await;
+        let (directory, runtime) = runtime().await;
         let broker = Arc::new(
             Broker::new(
                 None,
-                std::path::Path::new("/tmp"),
+                directory.path(),
                 crate::rex::RexClient::for_process(None).unwrap(),
             )
             .unwrap(),
@@ -1088,11 +1088,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_screenshot_reaches_only_a_worker_that_negotiated_it() {
-        let (_directory, runtime) = runtime().await;
+        let (directory, runtime) = runtime().await;
         let broker = Arc::new(
             Broker::new(
                 None,
-                std::path::Path::new("/tmp"),
+                directory.path(),
                 crate::rex::RexClient::for_process(None).unwrap(),
             )
             .unwrap(),
@@ -1195,11 +1195,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_peer_answers_an_image_read_with_a_chunk_and_keeps_its_connection() {
-        let (_directory, runtime) = runtime().await;
+        let (directory, runtime) = runtime().await;
         let broker = Arc::new(
             Broker::new(
                 None,
-                std::path::Path::new("/tmp"),
+                directory.path(),
                 crate::rex::RexClient::for_process(None).unwrap(),
             )
             .unwrap(),
@@ -1262,11 +1262,11 @@ mod tests {
 
     #[tokio::test]
     async fn replacement_connections_own_new_effects_and_old_cleanup_cannot_remove_them() {
-        let (_directory, runtime) = runtime().await;
+        let (directory, runtime) = runtime().await;
         let broker = Arc::new(
             Broker::new(
                 None,
-                std::path::Path::new("/tmp"),
+                directory.path(),
                 crate::rex::RexClient::for_process(None).unwrap(),
             )
             .unwrap(),
@@ -1340,7 +1340,7 @@ mod tests {
         let broker = Arc::new(
             Broker::new(
                 None,
-                std::path::Path::new("/tmp"),
+                directory.path(),
                 crate::rex::RexClient::for_process(None).unwrap(),
             )
             .unwrap(),
@@ -1399,7 +1399,7 @@ mod tests {
         let broker = Arc::new(
             Broker::new(
                 None,
-                std::path::Path::new("/tmp"),
+                directory.path(),
                 crate::rex::RexClient::for_process(None).unwrap(),
             )
             .unwrap(),
@@ -1492,11 +1492,11 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_worker_replies_cannot_complete_another_connections_effects() {
-        let (_directory, runtime) = runtime().await;
+        let (directory, runtime) = runtime().await;
         let broker = Arc::new(
             Broker::new(
                 None,
-                std::path::Path::new("/tmp"),
+                directory.path(),
                 crate::rex::RexClient::for_process(None).unwrap(),
             )
             .unwrap(),

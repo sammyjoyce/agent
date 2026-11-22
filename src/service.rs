@@ -2124,6 +2124,7 @@ mod tests {
         let (server, peer) = listener.accept().await.unwrap();
         let denied_peer = peer;
         let rejected_runtime = runtime.clone();
+        let rejected_state = directory.path().to_owned();
         let rejected = tokio::spawn(async move {
             authenticated(
                 server,
@@ -2131,7 +2132,7 @@ mod tests {
                 Arc::new(
                     crate::broker::Broker::new(
                         None,
-                        std::path::Path::new("/tmp"),
+                        &rejected_state,
                         crate::rex::RexClient::for_process(None).unwrap(),
                     )
                     .unwrap(),
@@ -2155,6 +2156,7 @@ mod tests {
             .unwrap();
         let (server, peer) = listener.accept().await.unwrap();
         let options = socket2::SockRef::from(&server).try_clone().unwrap();
+        let allowed_state = directory.path().to_owned();
         let allowed_runtime = runtime.clone();
         let allowed = tokio::spawn(async move {
             authenticated(
@@ -2163,7 +2165,7 @@ mod tests {
                 Arc::new(
                     crate::broker::Broker::new(
                         None,
-                        std::path::Path::new("/tmp"),
+                        &allowed_state,
                         crate::rex::RexClient::for_process(None).unwrap(),
                     )
                     .unwrap(),
