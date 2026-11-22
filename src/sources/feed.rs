@@ -98,6 +98,8 @@ pub(crate) struct Scan<S> {
     /// The lower bound sent to the service for every page of this scan.
     pub(crate) since: u64,
     pages: u32,
+    /// True after `Step::Restart`. A source restarts a scan once.
+    restarted: bool,
     /// Where the next request continues. `None` asks for a first page.
     pub(crate) cursor: Option<Cursor>,
     pub(crate) state: S,
@@ -298,6 +300,7 @@ where
             started_at,
             since,
             pages,
+            restarted,
             state,
             ..
         } = self.scan;
@@ -307,6 +310,7 @@ where
                     started_at,
                     since,
                     pages: pages + 1,
+                    restarted,
                     cursor,
                     state,
                 }),
@@ -315,7 +319,10 @@ where
             // The page count carries over, so a cursor that the service
             // refuses every time ends as `Endless` and not as a loop.
             Step::Restart => (
-                Window::Scanning(Scan::first_page(now, since, pages + 1, S::default())),
+                Window::Scanning(Scan {
+                    restarted: true,
+                    ..Scan::first_page(now, since, pages + 1, S::default())
+                }),
                 SourceCoverage::More,
             ),
             Step::Done { floor } => (
@@ -357,9 +364,15 @@ impl<S> Scan<S> {
             started_at,
             since,
             pages,
+            restarted: false,
             cursor: None,
             state,
         }
+    }
+
+    /// True when this scan already started again after a refused cursor.
+    pub(crate) fn restarted(&self) -> bool {
+        self.restarted
     }
 }
 
@@ -841,6 +854,25 @@ mod tests {
             month + DAY - OVERLAP_SECONDS,
             "a reread that took several polls is not repeated"
         );
+    }
+
+    #[test]
+    fn a_second_restart_is_visible_to_the_source() {
+        let cursor = || Step::Next(Some(Cursor::try_from("page-2".to_owned()).unwrap()));
+        let paged = saved_after(scanning(None, NOW), cursor(), NOW);
+        let paging = scanning(paged.checkpoint.as_ref(), NOW);
+        assert!(!paging.scan.restarted());
+        let restarted = saved_after(paging, Step::Restart, NOW);
+        let again = saved_after(scanning(restarted.checkpoint.as_ref(), NOW), cursor(), NOW);
+        assert!(scanning(again.checkpoint.as_ref(), NOW).scan.restarted());
+
+        let done = saved_after(
+            scanning(again.checkpoint.as_ref(), NOW),
+            Step::Done { floor: None },
+            NOW,
+        );
+        let next = scanning(done.checkpoint.as_ref(), NOW + SCAN_SPACING_SECONDS);
+        assert!(!next.scan.restarted(), "the next scan may restart once");
     }
 
     #[test]

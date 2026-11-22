@@ -4,9 +4,11 @@
 //! created since the source was turned on minus seven days, and the change
 //! from held to settled, or the removal, of up to 512 held transactions.
 //!
-//! One scan is four steps. A `poll` call makes one request, or up to four lookups:
+//! One scan is three steps. A `poll` call reads the token once, asks Up whose
+//! data that token reads, and then makes one listing request or up to four
+//! lookups with the same token:
 //!
-//!   Ping      GET /util/ping                                          whose data the token reads
+//!   Ping      GET /util/ping                                          before each step below
 //!   Recent    GET /transactions?filter[since]=<since>&page[size]=100  new transactions
 //!   Held      GET /transactions?filter[status]=HELD&page[size]=100    every current hold
 //!   Departed  GET /transactions/{id}                                  each hold that left the Held listing
@@ -25,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::sources::{
     Source, SourceBatch, SourceCheckpoint, SourceEvent, SourceKey,
     feed::{self, Cursor, FeedCheckpoint, FeedFailure, FeedItem, Step, Stop, Turn},
-    http::{HttpApi, HttpFailure, Session, Target, UrlRule},
+    http::{HttpApi, HttpFailure, Reply, Session, Target, UrlRule},
     now_seconds, parse_timestamp_ms,
 };
 
@@ -38,6 +40,8 @@ const TRANSACTIONS: &str = "/transactions";
 const MAX_HOLDS: usize = 512;
 const TOO_MANY_HOLDS: &str =
     "Up lists more held transactions than the 512 this source follows; checkpoint retained.";
+const REFUSED_AGAIN: &str =
+    "Up refused a saved page link for the second time in one scan; checkpoint retained.";
 /// Lookups in one `poll` call. The runtime allows four calls a round.
 const LOOKUPS_PER_POLL: usize = 4;
 /// How far back a removed hold can pull the next window.
@@ -47,6 +51,10 @@ const MAX_REACH_BACK_SECONDS: u64 = 60 * 86_400;
 /// scan that followed the removal of the hold.
 const REREAD_SECONDS: u64 = 14 * 86_400;
 const MAX_ID_BYTES: usize = 128;
+const MAX_SUMMARY_CHARS: usize = 160;
+
+/// The time after the last response of a `poll` call.
+type Clock<'a> = &'a (dyn Fn() -> u64 + Sync);
 
 #[derive(Debug)]
 pub struct UpSource {
@@ -70,60 +78,69 @@ impl UpSource {
         Ok(Self { account, api })
     }
 
+    #[cfg(test)]
     async fn poll_at(&self, saved: Option<&SourceCheckpoint>, now: u64) -> SourceBatch {
-        feed::settle(LABEL, self.key(), self.step(saved, now).await)
+        feed::settle(LABEL, self.key(), self.step(saved, now, &|| now).await)
     }
 
-    /// One request, or up to `LOOKUPS_PER_POLL` lookups.
-    async fn step(&self, saved: Option<&SourceCheckpoint>, now: u64) -> Result<SourceBatch, Stop> {
+    /// The identity check, and then one request or up to `LOOKUPS_PER_POLL` lookups.
+    async fn step(
+        &self,
+        saved: Option<&SourceCheckpoint>,
+        now: u64,
+        clock: Clock<'_>,
+    ) -> Result<SourceBatch, Stop> {
         let key = self.key();
         let scope = feed::scope(&[&self.api.fingerprint()]);
-        let begin = |_: &Holds, since: u64| (since, UpScan::default());
+        let begin = |_: &Followed, since: u64| (since, UpScan::default());
         let loaded = Checkpoint::load(saved, &key, &scope, now, REREAD_SECONDS, begin)?;
         let mut checkpoint = match loaded {
             Turn::Rest(batch) => return Ok(batch),
             Turn::Scan(checkpoint) => checkpoint,
         };
+        // The credential command runs for every `poll` call and can print the
+        // token of another customer at any of them. So every call asks whose
+        // token it holds before it reads a transaction with that token. Only
+        // a hash of the customer id is kept.
         let session = self.api.open().await?;
+        let ping: Ping = session.get(&Target::fixed("/util/ping")).await?.json()?;
+        if ping.meta.id.is_empty() {
+            return Err(HttpFailure::Unreadable.into());
+        }
+        checkpoint.bind_owner(feed::scope(&[&self.account, &ping.meta.id]))?;
         match checkpoint.scan.state.phase {
-            Phase::Ping => {
-                let ping: Ping = session.get(&Target::fixed("/util/ping")).await?.json()?;
-                if ping.meta.id.is_empty() {
-                    return Err(HttpFailure::Unreadable.into());
-                }
-                // Only this hash of the customer id is kept. A swapped token
-                // would otherwise make every followed hold look removed.
-                checkpoint.bind_owner(feed::scope(&[&self.account, &ping.meta.id]))?;
-                checkpoint.scan.state.phase = Phase::Recent;
-                checkpoint.advance(key, Vec::new(), Step::Next(None), now)
-            }
             Phase::Recent => {
                 let since = feed::utc(checkpoint.scan.since);
                 let first = Target::fixed(TRANSACTIONS).query("filter[since]", &since);
-                self.list_page(&session, checkpoint, first, key, now).await
+                self.list_page(&session, checkpoint, first, key, clock)
+                    .await
             }
             // No lower bound here. If `filter[since]` compares `settledAt`,
             // this listing is the only place a new hold appears.
             Phase::Held => {
                 let first = Target::fixed(TRANSACTIONS).query("filter[status]", "HELD");
-                self.list_page(&session, checkpoint, first, key, now).await
+                self.list_page(&session, checkpoint, first, key, clock)
+                    .await
             }
             Phase::Departed => {
                 let mut events = Vec::new();
-                for (id, hold) in take_departed(&mut checkpoint, LOOKUPS_PER_POLL) {
-                    match look_up(&session, &id).await {
-                        Ok(found) => events.push(resolve(&mut checkpoint, id, hold, found, &key)),
+                for (id, hold) in checkpoint.kept.unseen.take_oldest(LOOKUPS_PER_POLL) {
+                    let found = match look_up(&session, &id).await {
+                        Ok(found) => found,
                         Err(failure) => return Err(Stop::after(events, failure)),
+                    };
+                    let resolved = resolve(&mut checkpoint, id, hold, found, &key);
+                    events.push(resolved.event);
+                    if !resolved.within_cap {
+                        return Err(Stop::after(events, FeedFailure::Fixed(TOO_MANY_HOLDS)));
                     }
                 }
-                let step = if has_departed(&checkpoint) {
-                    Step::Next(None)
+                let step = if checkpoint.kept.unseen.is_empty() {
+                    finish(&mut checkpoint)
                 } else {
-                    Step::Done {
-                        floor: checkpoint.scan.state.reach_back,
-                    }
+                    Step::Next(None)
                 };
-                checkpoint.advance(key, events, step, now)
+                checkpoint.advance(key, events, step, clock())
             }
         }
     }
@@ -134,15 +151,23 @@ impl UpSource {
         mut checkpoint: Checkpoint,
         first: Target,
         key: SourceKey,
-        now: u64,
+        clock: Clock<'_>,
     ) -> Result<SourceBatch, Stop> {
         let target = match &checkpoint.scan.cursor {
             Some(cursor) => saved_page(cursor)?,
             None => first.query("page[size]", feed::PAGE_SIZE),
         };
         let reply = session.get(&target).await?;
-        if feed::cursor_refused(checkpoint.scan.cursor.is_some(), reply.status) {
-            return checkpoint.advance(key, Vec::new(), Step::Restart, now);
+        // Only Up's own error body is a refusal. The same status with another
+        // body proves nothing about the cursor, and is an ordinary failure.
+        let refused = feed::cursor_refused(checkpoint.scan.cursor.is_some(), reply.status)
+            && is_up_error(&reply);
+        if refused {
+            return if checkpoint.scan.restarted() {
+                Err(FeedFailure::Fixed(REFUSED_AGAIN).into())
+            } else {
+                checkpoint.advance(key, Vec::new(), Step::Restart, clock())
+            };
         }
         let page: Page = reply.json()?;
         let listed = list(&mut checkpoint, &page.data, &key);
@@ -150,7 +175,7 @@ impl UpSource {
             return Err(Stop::after(listed.events, failure));
         }
         match after_listing(&mut checkpoint, page.links.next.as_deref(), &self.api) {
-            Ok(step) => checkpoint.advance(key, listed.events, step, now),
+            Ok(step) => checkpoint.advance(key, listed.events, step, clock()),
             Err(failure) => Err(Stop::after(listed.events, failure)),
         }
     }
@@ -178,14 +203,91 @@ impl Source for UpSource {
     }
 
     async fn poll(&self, checkpoint: Option<&SourceCheckpoint>) -> Result<SourceBatch> {
-        Ok(self.poll_at(checkpoint, now_seconds()?).await)
+        let now = now_seconds()?;
+        // The spacing of scans counts from the end of a scan, so the time is
+        // read again after the last response.
+        let after_response = || now_seconds().unwrap_or(now);
+        let step = self.step(checkpoint, now, &after_response).await;
+        Ok(feed::settle(LABEL, self.key(), step))
     }
 }
 
-type Checkpoint = FeedCheckpoint<Holds, UpScan>;
+type Checkpoint = FeedCheckpoint<Followed, UpScan>;
 
-/// Kept between scans: the transactions last seen as HELD, by transaction id.
-type Holds = BTreeMap<String, Hold>;
+/// The transactions last seen as HELD.
+///
+/// The two sets are separate so that the cap counts what Up lists now. A hold
+/// that left Up stays in `unseen` until its lookup, and takes no room from a
+/// new hold. Both sets live outside the scan state, so a restarted scan
+/// forgets neither.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Followed {
+    /// Followed since an earlier scan, and not returned yet by the scan in
+    /// flight. Between scans, every followed hold is here.
+    unseen: Holds,
+    /// Returned as HELD by the scan in flight. Empty between scans.
+    seen: Holds,
+}
+
+/// Holds by transaction id. Never more than `MAX_HOLDS`, with every summary
+/// within its bound, also when it is read from a checkpoint.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(try_from = "BTreeMap<TransactionId, Hold>")]
+struct Holds(BTreeMap<TransactionId, Hold>);
+
+impl TryFrom<BTreeMap<TransactionId, Hold>> for Holds {
+    type Error = &'static str;
+
+    fn try_from(holds: BTreeMap<TransactionId, Hold>) -> Result<Self, Self::Error> {
+        let bounded = holds.len() <= MAX_HOLDS
+            && holds.values().all(|hold| {
+                hold.summary.chars().count() <= MAX_SUMMARY_CHARS
+                    && !hold.summary.chars().any(char::is_control)
+            });
+        if bounded {
+            Ok(Self(holds))
+        } else {
+            Err("holds outside their bounds")
+        }
+    }
+}
+
+impl Holds {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn remove(&mut self, id: &TransactionId) {
+        self.0.remove(id);
+    }
+
+    /// Adds or replaces a hold. Returns false, and changes nothing, when the
+    /// hold is new and the set is full.
+    #[must_use]
+    fn follow(&mut self, id: TransactionId, hold: Hold) -> bool {
+        if self.0.len() >= MAX_HOLDS && !self.0.contains_key(&id) {
+            return false;
+        }
+        self.0.insert(id, hold);
+        true
+    }
+
+    /// Takes out up to `limit` holds, oldest first.
+    fn take_oldest(&mut self, limit: usize) -> Vec<(TransactionId, Hold)> {
+        let mut oldest: Vec<(u64, TransactionId)> = self
+            .0
+            .iter()
+            .map(|(id, hold)| (hold.created_at, id.clone()))
+            .collect();
+        oldest.sort();
+        oldest
+            .into_iter()
+            .take(limit)
+            .filter_map(|(_, id)| self.0.remove_entry(&id))
+            .collect()
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -195,9 +297,42 @@ struct Hold {
     /// "Example Cafe: -12.50 AUD". A removed hold has no body to read, so its
     /// event text comes from here.
     summary: String,
-    /// `started_at` of the scan whose Held listing last returned this id.
-    /// A hold has departed when this is not the current scan's `started_at`.
-    listed_in: u64,
+}
+
+/// A transaction id: 1 to 128 ASCII letters, digits, hyphens and underscores.
+/// Up documents UUIDs. An id is one segment of a request path and a key of the
+/// checkpoint, so no other text is accepted from Up or from a checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+struct TransactionId(String);
+
+impl TransactionId {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for TransactionId {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let accepted = !value.is_empty()
+            && value.len() <= MAX_ID_BYTES
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+        if accepted {
+            Ok(Self(value))
+        } else {
+            Err("unusable transaction id")
+        }
+    }
+}
+
+impl From<TransactionId> for String {
+    fn from(id: TransactionId) -> Self {
+        id.0
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -212,7 +347,6 @@ struct UpScan {
 #[serde(rename_all = "snake_case")]
 enum Phase {
     #[default]
-    Ping,
     Recent,
     Held,
     Departed,
@@ -249,7 +383,9 @@ struct One {
 }
 
 /// Up's documented error body. Another body with the same status can come
-/// from a proxy or a retired route, and proves nothing about a transaction.
+/// from a proxy or a retired route, and proves nothing about a transaction or
+/// a cursor. Up documents no text for a title or a detail, so only their type
+/// is checked.
 #[derive(Deserialize)]
 struct ErrorBody {
     errors: Vec<ErrorObject>,
@@ -264,14 +400,16 @@ struct ErrorObject {
     _detail: String,
 }
 
-impl ErrorBody {
-    fn is_not_found(&self) -> bool {
-        !self.errors.is_empty() && self.errors.iter().all(|error| error.status == "404")
-    }
+/// True when the body is Up's error body and every entry names the status of the reply.
+fn is_up_error(reply: &Reply) -> bool {
+    let status = reply.status.to_string();
+    reply.body_as::<ErrorBody>().is_some_and(|body| {
+        !body.errors.is_empty() && body.errors.iter().all(|error| error.status == status)
+    })
 }
 
 struct Transaction {
-    id: String,
+    id: TransactionId,
     status: Status,
     created_at: u64,
     settled_at: Option<u64>,
@@ -317,10 +455,19 @@ impl std::fmt::Display for Money {
     }
 }
 
-/// `None` without an id, a status or a creation time. A wrong shape in any
-/// other field reads as absent. Category, tags and note are not read, because
-/// the owner edits them and an edit is not an event.
-fn parse(raw: &serde_json::Value) -> Option<Transaction> {
+/// Why an item is not a `Transaction`.
+#[derive(Debug)]
+enum Unread {
+    /// No id, status or creation time. The other items of the page are delivered.
+    Malformed,
+    /// An id that is not a `TransactionId`. Nothing from its page is delivered.
+    UnsafeId,
+}
+
+/// A wrong shape in a field other than the id, the status and the creation
+/// time reads as absent. Category, tags and note are not read, because the
+/// owner edits them and an edit is not an event.
+fn parse(raw: &serde_json::Value) -> Result<Transaction, Unread> {
     let text = |pointer: &str| raw.pointer(pointer).and_then(serde_json::Value::as_str);
     let shown = |pointer: &str, max: usize| {
         text(pointer)
@@ -333,18 +480,24 @@ fn parse(raw: &serde_json::Value) -> Option<Transaction> {
             currency: shown(&format!("{pointer}/currencyCode"), 8)?,
         })
     };
-    let id = text("/id").filter(|id| {
-        !id.is_empty() && id.len() <= MAX_ID_BYTES && !id.chars().any(char::is_control)
-    })?;
-    let status = match shown("/attributes/status", 40)?.as_str() {
+    let id = TransactionId::try_from(text("/id").ok_or(Unread::Malformed)?.to_owned())
+        .map_err(|_| Unread::UnsafeId)?;
+    let status = match shown("/attributes/status", 40)
+        .ok_or(Unread::Malformed)?
+        .as_str()
+    {
         "HELD" => Status::Held,
         "SETTLED" => Status::Settled,
         other => Status::Other(other.to_owned()),
     };
-    Some(Transaction {
-        id: id.to_owned(),
+    let created_at = text("/attributes/createdAt")
+        .and_then(parse_timestamp_ms)
+        .ok_or(Unread::Malformed)?
+        / 1000;
+    Ok(Transaction {
+        id,
         status,
-        created_at: parse_timestamp_ms(text("/attributes/createdAt")?)? / 1000,
+        created_at,
         settled_at: text("/attributes/settledAt")
             .and_then(parse_timestamp_ms)
             .map(|milliseconds| milliseconds / 1000),
@@ -378,45 +531,39 @@ struct Listed {
 /// event, because the runtime ignores a repeat. A held item is followed, and
 /// an item with another status is no longer followed.
 fn list(checkpoint: &mut Checkpoint, items: &[serde_json::Value], key: &SourceKey) -> Listed {
-    let held_listing = checkpoint.scan.state.phase == Phase::Held;
-    let started_at = checkpoint.scan.started_at;
-    let mut events = Vec::new();
+    let mut transactions = Vec::new();
     let mut malformed = 0;
-    let mut too_many_holds = false;
     for raw in items {
-        let Some(transaction) = parse(raw) else {
-            malformed += 1;
-            continue;
-        };
+        match parse(raw) {
+            Ok(transaction) => transactions.push(transaction),
+            Err(Unread::Malformed) => malformed += 1,
+            Err(Unread::UnsafeId) => {
+                return Listed {
+                    events: Vec::new(),
+                    failure: Some(HttpFailure::Unreadable.into()),
+                };
+            }
+        }
+    }
+    let mut events = Vec::new();
+    let mut too_many_holds = false;
+    for transaction in transactions {
         if !checkpoint.covers(transaction.created_at) {
             continue;
         }
         events.push(describe(&transaction).into_event(key));
+        checkpoint.kept.unseen.remove(&transaction.id);
         if transaction.status != Status::Held {
-            checkpoint.kept.remove(&transaction.id);
+            checkpoint.kept.seen.remove(&transaction.id);
             continue;
         }
-        let listed_before = checkpoint
-            .kept
-            .get(&transaction.id)
-            .map(|hold| hold.listed_in);
-        if listed_before.is_none() && checkpoint.kept.len() >= MAX_HOLDS {
-            too_many_holds = true;
-            continue;
-        }
-        let listed_in = if held_listing {
-            started_at
-        } else {
-            listed_before.unwrap_or(0)
+        let hold = Hold {
+            created_at: transaction.created_at,
+            summary: summarize(&transaction),
         };
-        checkpoint.kept.insert(
-            transaction.id.clone(),
-            Hold {
-                created_at: transaction.created_at,
-                summary: summarize(&transaction),
-                listed_in,
-            },
-        );
+        if !checkpoint.kept.seen.follow(transaction.id, hold) {
+            too_many_holds = true;
+        }
     }
     let failure = if malformed > 0 {
         Some(FeedFailure::Malformed { count: malformed })
@@ -444,60 +591,40 @@ fn after_listing(
             Cursor::try_from(target.as_str().to_owned()).map_err(|_| FeedFailure::BadCursor)?;
         return Ok(Step::Next(Some(cursor)));
     }
-    let departed = has_departed(checkpoint);
-    let state = &mut checkpoint.scan.state;
-    Ok(match state.phase {
+    let departed = !checkpoint.kept.unseen.is_empty();
+    Ok(match checkpoint.scan.state.phase {
         Phase::Recent => {
-            state.phase = Phase::Held;
+            checkpoint.scan.state.phase = Phase::Held;
             Step::Next(None)
         }
         _ if departed => {
-            state.phase = Phase::Departed;
+            checkpoint.scan.state.phase = Phase::Departed;
             Step::Next(None)
         }
-        _ => Step::Done {
-            floor: state.reach_back,
-        },
+        _ => finish(checkpoint),
     })
 }
 
-fn has_departed(checkpoint: &Checkpoint) -> bool {
-    let started_at = checkpoint.scan.started_at;
-    checkpoint
-        .kept
-        .values()
-        .any(|hold| hold.listed_in != started_at)
-}
-
-/// Takes out up to `limit` holds that the Held listing of this scan did not
-/// return, oldest first. `resolve` puts back the ones that are still held.
-fn take_departed(checkpoint: &mut Checkpoint, limit: usize) -> Vec<(String, Hold)> {
-    let started_at = checkpoint.scan.started_at;
-    let mut departed: Vec<(u64, String)> = checkpoint
-        .kept
-        .iter()
-        .filter(|(_, hold)| hold.listed_in != started_at)
-        .map(|(id, hold)| (hold.created_at, id.clone()))
-        .collect();
-    departed.sort();
-    departed
-        .into_iter()
-        .take(limit)
-        .filter_map(|(_, id)| checkpoint.kept.remove_entry(&id))
-        .collect()
+/// Ends the scan. Both listings are read and every hold that left them is
+/// looked up, so the holds this scan saw are the followed holds.
+fn finish(checkpoint: &mut Checkpoint) -> Step {
+    checkpoint.kept.unseen = std::mem::take(&mut checkpoint.kept.seen);
+    Step::Done {
+        floor: checkpoint.scan.state.reach_back,
+    }
 }
 
 /// The current state of one transaction. `None` when Up answers 404 with its
 /// documented error body, which means that the transaction no longer exists.
-async fn look_up(session: &Session<'_>, id: &str) -> Result<Option<Transaction>, FeedFailure> {
+async fn look_up(
+    session: &Session<'_>,
+    id: &TransactionId,
+) -> Result<Option<Transaction>, FeedFailure> {
     let reply = session
-        .get(&Target::fixed(TRANSACTIONS).segment(id))
+        .get(&Target::fixed(TRANSACTIONS).segment(id.as_str()))
         .await?;
     if reply.status == 404 {
-        let documented = reply
-            .body_as::<ErrorBody>()
-            .is_some_and(|body| body.is_not_found());
-        return if documented {
+        return if is_up_error(&reply) {
             Ok(None)
         } else {
             Err(HttpFailure::Status(404).into())
@@ -505,9 +632,15 @@ async fn look_up(session: &Session<'_>, id: &str) -> Result<Option<Transaction>,
     }
     let one: One = reply.json()?;
     match parse(&one.data) {
-        Some(transaction) if transaction.id == id => Ok(Some(transaction)),
+        Ok(transaction) if transaction.id == *id => Ok(Some(transaction)),
         _ => Err(FeedFailure::Malformed { count: 1 }),
     }
+}
+
+struct Resolved {
+    event: SourceEvent,
+    /// False when the hold is still held and the scan already saw `MAX_HOLDS` others.
+    within_cap: bool,
 }
 
 /// Settles one departed hold and returns its event.
@@ -521,34 +654,38 @@ async fn look_up(session: &Session<'_>, id: &str) -> Result<Option<Transaction>,
 /// for the same checkpoint builds an equal event.
 fn resolve(
     checkpoint: &mut Checkpoint,
-    id: String,
+    id: TransactionId,
     hold: Hold,
     found: Option<Transaction>,
     key: &SourceKey,
-) -> SourceEvent {
-    let started_at = checkpoint.scan.started_at;
+) -> Resolved {
     match found {
         Some(transaction) => {
+            let event = describe(&transaction).into_event(key);
             // Still held: the listing changed while this scan read it.
-            if transaction.status == Status::Held {
-                checkpoint.kept.insert(
+            let within_cap = transaction.status != Status::Held
+                || checkpoint.kept.seen.follow(
                     id,
                     Hold {
                         created_at: transaction.created_at,
                         summary: summarize(&transaction),
-                        listed_in: started_at,
                     },
                 );
-            }
-            describe(&transaction).into_event(key)
+            Resolved { event, within_cap }
         }
         None => {
-            let floor = hold
-                .created_at
-                .max(started_at.saturating_sub(MAX_REACH_BACK_SECONDS));
+            let floor = hold.created_at.max(
+                checkpoint
+                    .scan
+                    .started_at
+                    .saturating_sub(MAX_REACH_BACK_SECONDS),
+            );
             let state = &mut checkpoint.scan.state;
             state.reach_back = Some(state.reach_back.map_or(floor, |earlier| earlier.min(floor)));
-            describe_removed(id, &hold).into_event(key)
+            Resolved {
+                event: describe_removed(id, &hold).into_event(key),
+                within_cap: true,
+            }
         }
     }
 }
@@ -585,7 +722,7 @@ fn describe(transaction: &Transaction) -> FeedItem {
         lines.push(format!("Settled: {}", feed::utc(settled_at)));
     }
     FeedItem {
-        id: transaction.id.clone(),
+        id: transaction.id.as_str().to_owned(),
         title: format!("{} ({status})", summarize(transaction)),
         text: lines.join("\n"),
         occurred_at: Some(transaction.created_at.saturating_mul(1000)),
@@ -597,13 +734,13 @@ fn summarize(transaction: &Transaction) -> String {
         Some(amount) => format!("{}: {amount}", transaction.description),
         None => transaction.description.clone(),
     };
-    feed::clip(&summary, 160)
+    feed::clip(&summary, MAX_SUMMARY_CHARS)
 }
 
 /// The text does not say "refunded" or "settled", because Up does not say which happened.
-fn describe_removed(id: String, hold: &Hold) -> FeedItem {
+fn describe_removed(id: TransactionId, hold: &Hold) -> FeedItem {
     FeedItem {
-        id,
+        id: id.into(),
         title: format!("{} (hold removed)", hold.summary),
         text: "Status: hold removed\nUp no longer lists this held transaction. Up removes a hold when the merchant releases it, or when Up replaces it with a separate settled transaction.".into(),
         occurred_at: None,
@@ -1031,10 +1168,7 @@ mod tests {
         ])
         .await;
 
-        let ping = up.poll(None, NOW).await;
-        assert_eq!(ping.coverage, SourceCoverage::More);
-        assert!(ping.events.is_empty());
-        let recent = up.poll(ping.checkpoint.as_ref(), NOW).await;
+        let recent = up.poll(None, NOW).await;
         assert_eq!(recent.coverage, SourceCoverage::More);
         assert_eq!(
             titles(&recent.events),
@@ -1070,9 +1204,10 @@ mod tests {
                     "/transactions?filter[since]={}&page[size]=100",
                     feed::utc(NOW - 7 * DAY).replace(':', "%3A")
                 ),
+                "/util/ping".to_owned(),
                 "/transactions?filter[status]=HELD&page[size]=100".to_owned(),
             ],
-            "an idle scan is three requests"
+            "an idle scan is four requests: the identity check before each listing"
         );
         assert!(
             up.api
@@ -1131,7 +1266,7 @@ mod tests {
         assert!(third.is_empty());
         assert_eq!(
             up.targets_since(mark).len(),
-            3,
+            4,
             "a settled transaction is no longer followed"
         );
     }
@@ -1163,7 +1298,7 @@ mod tests {
         let (third, _) = up.scan(Some(&saved), later + SPACING).await;
         assert!(third.is_empty(), "the removal is reported once");
         let requested = up.targets_since(mark);
-        assert_eq!(requested.len(), 3, "a removed hold is not looked up again");
+        assert_eq!(requested.len(), 4, "a removed hold is not looked up again");
         assert_eq!(
             since_of(&requested[1]),
             feed::utc(NOW - 4 * DAY),
@@ -1267,7 +1402,7 @@ mod tests {
         assert_ne!(second[0].version, first[1].version);
         assert_eq!(
             up.targets_since(mark).len(),
-            3,
+            4,
             "the window listed the settlement, so no lookup is needed"
         );
     }
@@ -1288,7 +1423,7 @@ mod tests {
         let mark = up.targets().len();
         let (second, _) = up.scan(Some(&saved), NOW + SPACING).await;
         assert!(second.is_empty());
-        assert_eq!(up.targets_since(mark).len(), 3, "nothing is looked up");
+        assert_eq!(up.targets_since(mark).len(), 4, "nothing is looked up");
     }
 
     #[tokio::test]
@@ -1306,8 +1441,7 @@ mod tests {
         let up = Harness::start(rows).await;
         up.world().page_size = 2;
 
-        let ping = up.poll(None, NOW).await;
-        let first = up.poll(ping.checkpoint.as_ref(), NOW).await;
+        let first = up.poll(None, NOW).await;
         assert_eq!(first.coverage, SourceCoverage::More);
         assert_eq!(first.events.len(), 2);
 
@@ -1384,7 +1518,7 @@ mod tests {
 
         let mut saved = None;
         let mut delivered = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..2 {
             let adapter = up.source();
             let batch = adapter.poll_at(saved.as_ref(), NOW).await;
             drop(adapter);
@@ -1401,7 +1535,7 @@ mod tests {
             ]
         );
         let requested = up.api.seen();
-        assert_eq!(requested[2].query("page[after]").as_deref(), Some("1"));
+        assert_eq!(requested[3].query("page[after]").as_deref(), Some("1"));
     }
 
     #[tokio::test]
@@ -1473,8 +1607,7 @@ mod tests {
         up.world().delete("example-transaction-2");
 
         let later = NOW + 2 * DAY;
-        let ping = up.poll(Some(&saved), later).await;
-        let recent = up.poll(ping.checkpoint.as_ref(), later).await;
+        let recent = up.poll(Some(&saved), later).await;
         let holds = up.poll(recent.checkpoint.as_ref(), later).await;
         assert_eq!(holds.coverage, SourceCoverage::More);
 
@@ -1584,9 +1717,8 @@ mod tests {
         let up = Harness::start(rows).await;
         up.world().page_size = 600;
 
-        let ping = up.poll(None, NOW).await;
         for attempt in 0..2 {
-            let stopped = up.poll(ping.checkpoint.as_ref(), NOW + attempt).await;
+            let stopped = up.poll(None, NOW + attempt).await;
             assert_eq!(stopped.coverage, partial(TOO_MANY_HOLDS));
             assert!(stopped.checkpoint.is_none());
             assert_eq!(
@@ -1597,7 +1729,7 @@ mod tests {
         }
 
         up.world().delete("example-hold-000");
-        let (_, saved) = up.scan(ping.checkpoint.as_ref(), NOW).await;
+        let (_, saved) = up.scan(None, NOW).await;
         up.world().delete(&oldest);
         let (events, _) = up.scan(Some(&saved), NOW + SPACING).await;
         let removed: Vec<&SourceEvent> = events
@@ -1627,15 +1759,12 @@ mod tests {
 
         up.script(|seen| (seen.path() == "/util/ping").then(|| up_error(404, "Not Found")));
         assert_eq!(up.poll(Some(&saved), later).await.coverage, not_found);
-        up.world().script = None;
-        let ping = up.poll(Some(&saved), later).await;
-
         up.script(|seen| (seen.path() == "/transactions").then(|| up_error(404, "Not Found")));
-        let listing = up.poll(ping.checkpoint.as_ref(), later).await;
+        let listing = up.poll(Some(&saved), later).await;
         assert_eq!(listing.coverage, not_found);
         assert!(listing.events.is_empty());
         up.world().script = None;
-        let recent = up.poll(ping.checkpoint.as_ref(), later).await;
+        let recent = up.poll(Some(&saved), later).await;
         let holds = up.poll(recent.checkpoint.as_ref(), later).await;
         assert_eq!(holds.coverage, SourceCoverage::More);
 
@@ -1789,7 +1918,7 @@ mod tests {
 
         let (events, _) = up.scan(Some(&saved), NOW + SPACING).await;
         assert_eq!(titles(&events), ["Example Cafe: -12.50 AUD (settled)"]);
-        assert_eq!(up.targets_since(mark).len(), 3);
+        assert_eq!(up.targets_since(mark).len(), 4);
     }
 
     #[tokio::test]
@@ -1805,8 +1934,7 @@ mod tests {
         ])
         .await;
         up.world().page_size = 1;
-        let ping = up.poll(None, NOW).await;
-        let first = up.poll(ping.checkpoint.as_ref(), NOW).await;
+        let first = up.poll(None, NOW).await;
         assert_eq!(first.events.len(), 1);
 
         up.script(|seen| {
@@ -1837,7 +1965,6 @@ mod tests {
     #[tokio::test]
     async fn a_page_link_to_another_host_or_path_is_not_followed() {
         let up = Harness::start(Vec::new()).await;
-        let ping = up.poll(None, NOW).await;
         let row = settled("example-transaction-1", "Example Cafe", "-5.00", NOW - HOUR);
         let own_address = up.api.url.clone();
 
@@ -1852,7 +1979,7 @@ mod tests {
             up.script(move |seen| {
                 (seen.path() == "/transactions").then(|| Canned::json(200, page.clone()))
             });
-            let refused = up.poll(ping.checkpoint.as_ref(), NOW).await;
+            let refused = up.poll(None, NOW).await;
             assert_eq!(
                 refused.coverage,
                 partial("Up sent a page link this source will not follow; checkpoint retained.")
@@ -1869,7 +1996,6 @@ mod tests {
     #[tokio::test]
     async fn an_item_without_an_id_makes_the_page_partial_and_keeps_the_checkpoint() {
         let up = Harness::start(Vec::new()).await;
-        let ping = up.poll(None, NOW).await;
         let good = settled("example-transaction-1", "Example Cafe", "-5.00", NOW - HOUR).json();
         let mut without_id = good.clone();
         without_id.as_object_mut().unwrap().remove("id");
@@ -1880,7 +2006,7 @@ mod tests {
             (seen.path() == "/transactions").then(|| Canned::json(200, page.clone()))
         });
 
-        let stopped = up.poll(ping.checkpoint.as_ref(), NOW).await;
+        let stopped = up.poll(None, NOW).await;
 
         assert_eq!(
             stopped.coverage,
@@ -1896,13 +2022,12 @@ mod tests {
     #[tokio::test]
     async fn a_listing_without_a_next_link_field_is_not_read_as_its_last_page() {
         let up = Harness::start(Vec::new()).await;
-        let ping = up.poll(None, NOW).await;
         up.script(|seen| {
             (seen.path() == "/transactions")
                 .then(|| Canned::json(200, json!({ "data": [], "links": {} })))
         });
 
-        let unreadable = up.poll(ping.checkpoint.as_ref(), NOW).await;
+        let unreadable = up.poll(None, NOW).await;
 
         assert_eq!(
             unreadable.coverage,
@@ -2618,6 +2743,50 @@ mod tests {
         assert_eq!(read.coverage, SourceCoverage::More, "512 holds are read");
     }
 
+    #[tokio::test]
+    async fn a_checkpoint_in_the_format_before_the_daily_reread_is_refused_and_not_misread() {
+        let up = Harness::start(Vec::new()).await;
+        let scope = feed::scope(&[&up.source().api.fingerprint()]);
+        let owner = feed::scope(&["everyday", "example-customer-1"]);
+        let head = format!(
+            r#"{{"account":"everyday","scope":"{scope}","owner":"{owner}","origin":1794395200,"#
+        );
+        let old_format = [
+            r#""window":{"scanning":{"started_at":1795000000,"since":1794395200,"pages":1,"cursor":null,"state":{"phase":"recent","reach_back":null}}},"kept":{}}"#,
+            r#""window":{"scanning":{"started_at":1795000000,"since":1794395200,"pages":2,"cursor":"/transactions?page[after]=1&page[size]=1&filter[since]=2026-11-11T11%3A06%3A40Z","state":{"phase":"recent","reach_back":null}}},"kept":{}}"#,
+            r#""window":{"resting":{"since":1794913600,"not_before":1795000300}},"kept":{"example-transaction-1":{"created_at":1794740800,"summary":"Example Hotel: -200.00 AUD","listed_in":1795000000}}}"#,
+        ];
+        let no_credential = UpSource::new(
+            "everyday".into(),
+            Some(up.api.url.clone()),
+            failing_credential_script(up.dir.path()),
+        )
+        .unwrap();
+        for rest in old_format {
+            let saved = SourceCheckpoint {
+                value: format!("{head}{rest}"),
+            };
+            let refused = no_credential.poll_at(Some(&saved), NOW + SPACING).await;
+            assert_eq!(refused.coverage, unavailable(FOREIGN), "{rest}");
+            assert!(refused.checkpoint.is_none());
+        }
+        assert!(up.targets().is_empty(), "no request is made");
+
+        let same_state_in_the_current_format = SourceCheckpoint {
+            value: format!(
+                r#"{head}"reread_at":1795000000,"window":{{"resting":{{"since":1794913600,"not_before":1795000300}}}},"kept":{{"unseen":{{"example-transaction-1":{{"created_at":1794740800,"summary":"Example Hotel: -200.00 AUD"}}}},"seen":{{}}}}}}"#
+            ),
+        };
+        let (events, _) = up
+            .scan(Some(&same_state_in_the_current_format), NOW + SPACING)
+            .await;
+        assert_eq!(
+            removals(&events),
+            ["example-transaction-1"],
+            "the refusal above comes from the format, and from nothing else in the checkpoint"
+        );
+    }
+
     #[test]
     fn an_address_with_a_quote_is_refused_with_a_message_that_names_the_cause() {
         let error = UpSource::new(
@@ -2764,14 +2933,13 @@ mod tests {
         assert_eq!(
             first_round,
             [
-                (SourceCoverage::More, 0),
                 (SourceCoverage::More, 1),
                 (
                     unavailable("Up API returned HTTP 503; checkpoint retained."),
                     0
                 ),
             ],
-            "the ping, the first page, and the failure that ends the round"
+            "the first page, and the failure that ends the round"
         );
 
         let mark = up.targets().len();
@@ -2787,7 +2955,7 @@ mod tests {
         );
         let requested = up.targets_since(mark);
         assert!(
-            requested[0].contains("page[after]=1&"),
+            requested[1].contains("page[after]=1&"),
             "the scan resumes at the saved page: {requested:?}"
         );
         assert_eq!(journal.admitted.len(), 3);

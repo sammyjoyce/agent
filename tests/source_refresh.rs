@@ -920,11 +920,10 @@ async fn up_pages_enter_the_real_source_journal_once_and_a_failed_scan_resumes_a
     assert_eq!(
         refresh_into_journal(&runtime, &config).await,
         [
-            page(SourceCoverage::More, 0, 0, true),
             page(SourceCoverage::More, 1, 1, true),
             page(failed.clone(), 0, 0, false),
         ],
-        "the identity check, the first page, and the failure that ends the round"
+        "the first page, and the failure that ends the round"
     );
     runtime.close().await.unwrap();
 
@@ -950,11 +949,14 @@ async fn up_pages_enter_the_real_source_journal_once_and_a_failed_scan_resumes_a
     assert_eq!(
         up.requests()[requests_before..],
         [
+            "/util/ping",
             "/transactions?page[after]=1&page[size]=1",
+            "/util/ping",
             "/transactions?page[after]=2&page[size]=1",
+            "/util/ping",
             "/transactions?filter[status]=HELD&page[size]=100",
         ],
-        "the scan resumes at the page the journal saved before the failure and the restart"
+        "the scan resumes at the page the journal saved before the failure and the restart, and checks the customer before each page"
     );
     runtime.close().await.unwrap();
 }
