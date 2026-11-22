@@ -158,8 +158,15 @@ impl Dreams {
         }
     }
 
-    fn decided(run: &RunId, outcome: &Outcome) -> DreamsReply {
-        Self::reply(run, true, outcome.sealed_line(run))
+    fn decided(&self, run: &RunId, outcome: &Outcome) -> DreamsReply {
+        let mut text = outcome.sealed_line(run);
+        if let Outcome::Proposed(proposal) = outcome {
+            text.push_str(&format!(
+                "\nPatch file: {}",
+                self.store.patch_path(run, proposal.attempt).display()
+            ));
+        }
+        Self::reply(run, true, text)
     }
 
     fn reviewed(&self, run: &RunId) -> Result<std::result::Result<RunView, DreamsReply>> {
@@ -317,7 +324,7 @@ impl Dreams {
             Err(reply) => return Ok(reply),
         };
         if let Some(outcome) = &view.outcome {
-            return Ok(Self::decided(&run, outcome));
+            return Ok(self.decided(&run, outcome));
         }
         let gaps = view.review.coverage.gaps().count();
         if reason == DreamsAbstainReason::Quiet && gaps > 0 {
@@ -337,7 +344,7 @@ impl Dreams {
                 note: UntrustedText::bounded(note, MAX_NOTE_CHARS),
             }),
         )?;
-        Ok(Self::decided(&run, &outcome))
+        Ok(self.decided(&run, &outcome))
     }
 
     async fn propose(
@@ -354,16 +361,13 @@ impl Dreams {
             Err(reply) => return Ok(reply),
         };
         if let Some(outcome) = &view.outcome {
-            return Ok(Self::decided(&run, outcome));
+            return Ok(self.decided(&run, outcome));
         }
         let exhausted = Outcome::Abstained(Abstention::AttemptsExhausted {
             attempts: MAX_ATTEMPTS,
         });
         let Some((attempt, directory)) = self.store.allocate_attempt(&run)? else {
-            return Ok(Self::decided(
-                &run,
-                &self.store.seal_outcome(&view, &exhausted)?,
-            ));
+            return Ok(self.decided(&run, &self.store.seal_outcome(&view, &exhausted)?));
         };
         let draft = Draft {
             edits,
@@ -379,7 +383,7 @@ impl Dreams {
                 let outcome = self
                     .store
                     .seal_outcome(&view, &Outcome::Proposed(Box::new(proposal)))?;
-                return Ok(Self::decided(&run, &outcome));
+                return Ok(self.decided(&run, &outcome));
             }
             Err(AttemptError::HostFailed(error)) => return Err(error),
             Err(AttemptError::ModelRejected(rejection)) => rejection,

@@ -22,6 +22,7 @@ pub(super) struct Content<'a> {
     pub(super) notice_title: Option<&'a str>,
     pub(super) tool_name: &'a str,
     pub(super) attachments: &'a [AttachmentLabel],
+    pub(super) cwd: Option<&'a str>,
 }
 
 pub(super) fn render(message: Content<'_>) -> CachedText {
@@ -411,12 +412,31 @@ fn tool(message: &Content<'_>, title: Line<'static>, status: ToolStatus) -> Cach
             lines.push(Line::styled("  … more agents (ctrl+t to expand)", dim()));
         }
     }
+    if let Some(MessagePresentation::FileChanges { changes }) = message.presentation {
+        let mut seen = Vec::with_capacity(changes.len());
+        for change in changes {
+            let resolved = resolve_artifact_path(message.cwd, &change.path);
+            if !resolved.is_empty() && !seen.contains(&resolved) {
+                lines.push(Line::styled(format!("└ {resolved}"), dim()));
+                seen.push(resolved);
+            }
+        }
+    }
     if let Some(MessagePresentation::Media {
-        status: Some(state),
+        status: state,
+        path,
         ..
     }) = message.presentation
     {
-        lines.push(Line::styled(format!("└ {}", markdown::plain(state)), dim()));
+        if let Some(state) = state {
+            lines.push(Line::styled(format!("└ {}", markdown::plain(state)), dim()));
+        }
+        if let Some(path) = path {
+            let resolved = resolve_artifact_path(message.cwd, path);
+            if !resolved.is_empty() {
+                lines.push(Line::styled(format!("└ {resolved}"), dim()));
+            }
+        }
     }
     let body_start = lines.len();
     for (index, line) in message.text.lines().take(6).enumerate() {
@@ -468,6 +488,43 @@ fn tool(message: &Content<'_>, title: Line<'static>, status: ToolStatus) -> Cach
     }
     lines.push(Line::default());
     CachedText::tool_preview(lines, marker(status), body_start..body_end, notice)
+}
+
+fn resolve_artifact_path(cwd: Option<&str>, raw: &str) -> String {
+    let cleaned = markdown::plain(raw);
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let path = std::path::Path::new(trimmed);
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(dir) = cwd
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty() && std::path::Path::new(dir).is_absolute())
+    {
+        std::path::Path::new(dir).join(path)
+    } else {
+        return trimmed.to_owned();
+    };
+    normalize_path(&joined)
+}
+
+fn normalize_path(path: &std::path::Path) -> String {
+    use std::path::{Component, PathBuf};
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized.display().to_string()
 }
 
 #[cfg(test)]
@@ -699,6 +756,42 @@ mod tests {
         assert_eq!(
             state.messages[0].text, body,
             "The preview must not alter retained tool output"
+        );
+    }
+
+    #[test]
+    fn file_changes_and_media_emit_clean_standalone_absolute_artifact_paths() {
+        use crate::protocol::FileChangePresentation;
+        let (_, files_text) = draw(
+            MessagePresentation::FileChanges {
+                changes: vec![
+                    FileChangePresentation {
+                        path: "src/./main.rs".into(),
+                        operation: None,
+                    },
+                    FileChangePresentation {
+                        path: "docs/../README.md".into(),
+                        operation: None,
+                    },
+                ],
+            },
+            Some(ToolStatus::Finished),
+            "+line",
+            100,
+        );
+        assert!(
+            files_text.contains("└ /example/src/main.rs"),
+            "{files_text}"
+        );
+        assert!(files_text.contains("└ /example/README.md"), "{files_text}");
+
+        assert_eq!(
+            super::resolve_artifact_path(Some("/workspace/app"), "src/./tui/../main.rs"),
+            "/workspace/app/src/main.rs"
+        );
+        assert_eq!(
+            super::resolve_artifact_path(Some("/workspace/app"), "/tmp/screen shot.png"),
+            "/tmp/screen shot.png"
         );
     }
 }

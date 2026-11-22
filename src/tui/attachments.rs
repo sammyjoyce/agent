@@ -2,18 +2,45 @@
 use crate::attachments::{AttachmentRef, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{
+    io::{Read, Write},
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug)]
+struct RetainedAttachment {
+    path: PathBuf,
+}
+
+impl Drop for RetainedAttachment {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ComposerFile {
     pub path: PathBuf,
     pub name: String,
     pub size_bytes: u32,
+    #[serde(skip)]
+    retained: Option<Arc<RetainedAttachment>>,
 }
+
+impl PartialEq for ComposerFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.name == other.name && self.size_bytes == other.size_bytes
+    }
+}
+
+impl Eq for ComposerFile {}
 
 impl ComposerFile {
     pub fn read_metadata(path: PathBuf) -> Result<Self> {
-        let metadata = path.metadata().context("Could not inspect attachment")?;
+        let mut source = std::fs::File::open(&path).context("Could not inspect attachment")?;
+        let metadata = source.metadata().context("Could not inspect attachment")?;
         ensure!(metadata.is_file(), "Attachments must be regular files");
         ensure!(
             metadata.len() <= u64::from(MAX_ATTACHMENT_BYTES),
@@ -28,11 +55,42 @@ impl ComposerFile {
             !name.chars().any(char::is_control),
             "Attachment filenames cannot contain control characters"
         );
+        // Keep a private copy between drop/capture and Send so transient files
+        // created by terminal upload helpers remain readable until upload.
+        let staged_path =
+            std::env::temp_dir().join(format!("beep-boop-staged-{}", uuid::Uuid::new_v4()));
+        let mut staged = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&staged_path)
+            .context("Could not stage attachment")?;
+        let guardian = Arc::new(RetainedAttachment { path: staged_path });
+        let mut limited = (&mut source).take(u64::from(MAX_ATTACHMENT_BYTES) + 1);
+        let copied =
+            std::io::copy(&mut limited, &mut staged).context("Could not copy attachment")?;
+        ensure!(
+            copied <= u64::from(MAX_ATTACHMENT_BYTES),
+            "Attachments must be at most 16 MiB"
+        );
+        staged
+            .flush()
+            .context("Could not flush staged attachment")?;
         Ok(Self {
             path,
             name,
-            size_bytes: u32::try_from(metadata.len())?,
+            size_bytes: u32::try_from(copied)?,
+            retained: Some(guardian),
         })
+    }
+
+    pub fn upload_path(&self) -> &Path {
+        self.retained
+            .as_ref()
+            .map(|file| file.path.as_path())
+            .filter(|path| path.is_file())
+            .unwrap_or(&self.path)
     }
 }
 
@@ -234,5 +292,45 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" ");
         assert!(dropped_files(&too_many, directory.path()).is_err());
+    }
+
+    #[test]
+    fn rex_upload_batch_handles_quoting_spacing_trailing_newlines_and_parens() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("screen shot (1).png");
+        let second = directory.path().join("café 'notes' & \"draft\".txt");
+        std::fs::write(&first, b"\x89PNG\r\n").unwrap();
+        std::fs::write(&second, b"notes").unwrap();
+        let paste = format!(
+            "  '{}'   '{}'\r\n",
+            first.display(),
+            second.display().to_string().replace('\'', "'\\''"),
+        );
+        let files = dropped_files(&paste, directory.path()).unwrap().unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, first);
+        assert_eq!(files[0].name, "screen shot (1).png");
+        assert_eq!(files[1].path, second);
+        assert_eq!(files[1].name, "café 'notes' & \"draft\".txt");
+    }
+
+    #[test]
+    fn dropped_file_remains_uploadable_after_source_temp_file_is_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let transient = directory.path().join("rex-upload-transient.png");
+        let bytes = b"\x89PNG\r\n\x1a\nrex-upload";
+        std::fs::write(&transient, bytes).unwrap();
+        let paste = format!("'{}'\n", transient.display());
+        let files = dropped_files(&paste, directory.path()).unwrap().unwrap();
+        assert_eq!(files.len(), 1);
+        std::fs::remove_file(&transient).unwrap();
+        assert!(!transient.exists());
+        assert_eq!(std::fs::read(files[0].upload_path()).unwrap(), bytes);
+
+        // Deserialized drafts without a live retained copy fall back to the recorded path.
+        let json = serde_json::to_string(&files[0]).unwrap();
+        let restored: super::ComposerFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, files[0]);
+        assert_eq!(restored.upload_path(), transient.as_path());
     }
 }

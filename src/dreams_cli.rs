@@ -433,6 +433,8 @@ struct RunReport<'a> {
     outcome_sha256: Option<&'a ContentDigest>,
     status: Option<&'a ProposalStatus>,
     patch: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    patch_path: Option<&'a Path>,
     apply: Option<String>,
     attempts_used: u8,
 }
@@ -551,6 +553,12 @@ fn render(report: &RunReport) -> String {
                 proposal.patch_sha256,
                 proposal.files.join(", ")
             ));
+            if let Some(path) = report.patch_path {
+                lines.push(format!(
+                    "Patch file: {}",
+                    escape_controls(&path.display().to_string())
+                ));
+            }
             if let Some(status) = report.status {
                 lines.push(format!("Status: {}", status.explain()));
             }
@@ -824,6 +832,12 @@ pub async fn run(
                 .with_context(|| format!("Unknown Dreams run {run}"))?;
             let (status, patch) = status_of(&store, policy.as_ref(), &view).await?.unzip();
             let patch = patch.map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+            let patch_path = match &view.outcome {
+                Some(Outcome::Proposed(proposal)) => {
+                    Some(store.patch_path(&view.id, proposal.attempt))
+                }
+                _ => None,
+            };
             let sealed = view.outcome.clone().map(|outcome| SealedOutcome {
                 review_sha256: view.review_sha256.clone(),
                 outcome,
@@ -836,6 +850,7 @@ pub async fn run(
                 outcome_sha256: view.outcome_sha256.as_ref(),
                 status: status.as_ref(),
                 patch: patch.as_deref(),
+                patch_path: patch_path.as_deref(),
                 apply: apply_command(&view),
                 attempts_used: view.attempts_used,
             };
@@ -998,6 +1013,7 @@ mod tests {
             review_sha256: view.review_sha256.clone(),
             outcome,
         });
+        let patch_path = store.patch_path(&view.id, proposal.attempt);
         let shown = render(&RunReport {
             run: &view.id,
             review: &view.review,
@@ -1006,9 +1022,14 @@ mod tests {
             outcome_sha256: view.outcome_sha256.as_ref(),
             status: Some(&status),
             patch: Some("+new\n"),
+            patch_path: Some(&patch_path),
             apply: apply_command(&view),
             attempts_used: view.attempts_used,
         });
+        assert!(
+            shown.contains(&format!("Patch file: {}", patch_path.display())),
+            "{shown}"
+        );
         assert!(
             shown.contains("an interrupted apply left proposed content"),
             "{shown}"
