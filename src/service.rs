@@ -949,6 +949,7 @@ mod tests {
                 origin_host_id: None,
                 cwd: "/".into(),
                 hosts: vec![],
+                reply_to: None,
             },
         )
         .await
@@ -1221,6 +1222,7 @@ mod tests {
                     text: "/help".into(),
                     mode: InputMode::Steer,
                     attachments: None,
+                    reply_to: None,
                 },
             },
         )
@@ -1290,6 +1292,7 @@ mod tests {
                     origin_host_id: None,
                     cwd: "/".into(),
                     hosts: vec![],
+                    reply_to: None,
                 },
             )
             .await

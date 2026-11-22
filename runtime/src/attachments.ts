@@ -5,6 +5,7 @@ import type { InputEntry, UserInput } from "@earendil-works/pi-durable";
 import { DEFAULT_IMAGE_LIMITS, type ImageLimits } from "@earendil-works/pi-durable/tools";
 import type { InputOrigin } from "./generated/InputOrigin.js";
 import type { AttachmentRef } from "./generated/AttachmentRef.js";
+import type { ReplyReference } from "./generated/ReplyReference.js";
 import type { AttachmentRequest } from "./generated/AttachmentRequest.js";
 import type { AttachmentResponse } from "./generated/AttachmentResponse.js";
 import { beginUpload, writeChunk } from "./attachment-upload.js";
@@ -36,10 +37,21 @@ function decode(value: unknown): Metadata {
 function requireId(id: string): void {
   if (!UUID.test(id) || id === "00000000-0000-0000-0000-000000000000") throw new AttachmentError("Invalid attachment ID");
 }
+import { formatReplyContext } from "./message-presentation.js";
+
 function same(left: AttachmentRef, right: AttachmentRef): boolean {
   return left.id === right.id && left.name === right.name && left.media_type === right.media_type &&
     left.size_bytes === right.size_bytes && left.sha256 === right.sha256;
 }
+
+export type PrepareInputOptions = {
+  text: string;
+  attachments?: readonly AttachmentRef[];
+  call: HostCall;
+  origin?: InputOrigin;
+  limits?: ImageLimits;
+  replyTo?: ReplyReference;
+};
 
 /** Originals are immutable, bounded and private. Staged orphans expire; admitted refs follow durable history. */
 export class AttachmentStore {
@@ -223,11 +235,24 @@ export class AttachmentStore {
     }
     throw new AttachmentError("Attachment transfer did not complete");
   }
-  async input(text: string, refs: readonly AttachmentRef[] | undefined, call: HostCall, origin?: InputOrigin, limits: ImageLimits = DEFAULT_IMAGE_LIMITS): Promise<{ content: UserInput; entry?: InputEntry }> {
-    if (refs === undefined || refs.length === 0) return { content: text, ...(origin === undefined ? {} : {
-      entry: { kind: "agent.input", data: { origin, text } },
-    }) };
-    const canonical = await this.resolve(refs), content: Exclude<UserInput, string> = [{ type: "text", text }];
+  async input(options: PrepareInputOptions): Promise<{ content: UserInput; entry?: InputEntry }> {
+    const { text, attachments: refs, call, origin, limits = DEFAULT_IMAGE_LIMITS, replyTo } = options;
+    const modelText = replyTo === undefined ? text : `${formatReplyContext(replyTo)}${text}`;
+    if (refs === undefined || refs.length === 0) {
+      if (origin === undefined && replyTo === undefined) return { content: modelText };
+      return {
+        content: modelText,
+        entry: {
+          kind: "agent.input",
+          data: {
+            text,
+            ...(origin === undefined ? {} : { origin }),
+            ...(replyTo === undefined ? {} : { reply_to: replyTo }),
+          },
+        },
+      };
+    }
+    const canonical = await this.resolve(refs), content: Exclude<UserInput, string> = [{ type: "text", text: modelText }];
     for (const ref of canonical) {
       const path = await this.materialize(ref, call);
       content.push({ type: "text", text: `Attached file ${JSON.stringify(ref.name)} (attachment ID ${ref.id}, SHA-256 ${ref.sha256}): ${JSON.stringify(path)} on this execution host. If the cache path expires, use read_attachment with this attachment ID.` });
@@ -239,6 +264,17 @@ export class AttachmentStore {
         } else content.push({ type: "image", data: prepared.data, mimeType: prepared.mimeType });
       }
     }
-    return { content, entry: { kind: "agent.input", data: { attachments: canonical, text, ...(origin === undefined ? {} : { origin }) } } };
+    return {
+      content,
+      entry: {
+        kind: "agent.input",
+        data: {
+          attachments: canonical,
+          text,
+          ...(origin === undefined ? {} : { origin }),
+          ...(replyTo === undefined ? {} : { reply_to: replyTo }),
+        },
+      },
+    };
   }
 }

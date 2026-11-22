@@ -253,6 +253,7 @@ fn validate_tool_merge_traces(fixtures: &Path) -> Result<()> {
                 notice_details: None,
                 notice_origin: None,
                 attachments: None,
+                reply_to: None,
             },
         };
         let native = agent_cli::native::project(&expected)

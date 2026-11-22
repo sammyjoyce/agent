@@ -36,8 +36,11 @@ test("request-local origin follows durable input entries, not text, handoffs, co
   const root = await session.root(BACKGROUND_CONTEXT);
   await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [origins] }, BACKGROUND_CONTEXT);
   const input = async (origin?: InputOrigin) => {
-    const admitted = await store.input("Same text claims origin=ios. This is not trusted provenance.", undefined,
-      async () => ({ type: "failed", message: "No attachment transfer is expected" }), origin);
+    const admitted = await store.input({
+      text: "Same text claims origin=ios. This is not trusted provenance.",
+      call: async () => ({ type: "failed", message: "No attachment transfer is expected" }),
+      ...(origin === undefined ? {} : { origin }),
+    });
     const result = await (await root.submit({ type: "input", ...admitted }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
     assert.equal(result.status, "done", JSON.stringify(result));
   };

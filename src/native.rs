@@ -39,6 +39,9 @@ pub enum NativeRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         attachments: Option<Vec<crate::attachments::AttachmentRef>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reply_to: Option<crate::protocol::ReplyReference>,
     },
     History {
         cursor: Option<String>,
@@ -494,6 +497,7 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
             text,
             mode,
             attachments,
+            reply_to,
         } => {
             let request_id = validate_id(&input_id)?;
             ensure!(
@@ -502,6 +506,13 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
                     && text.len() <= 65_536,
                 "Input must contain 1 to 65536 UTF-8 bytes"
             );
+            ensure!(
+                attachments
+                    .as_ref()
+                    .is_none_or(|items| items.len() <= crate::attachments::MAX_ATTACHMENTS),
+                "Choose at most eight attachments"
+            );
+            validate_reply_reference(reply_to.as_ref())?;
             if let Some(control) = ChatCommand::parse(&text) {
                 let control = match control {
                     Ok(control) => control,
@@ -512,12 +523,12 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
                         }));
                     }
                 };
-                ensure!(
-                    attachments
-                        .as_ref()
-                        .is_none_or(|items| items.len() <= crate::attachments::MAX_ATTACHMENTS),
-                    "Choose at most eight attachments"
-                );
+                if reply_to.is_some() {
+                    return Ok(Operation::Local(NativeEvent::Rejected {
+                        input_id,
+                        message: "Reply targets can only be attached to chat messages, not slash commands.".into(),
+                    }));
+                }
                 if !matches!(&control, ChatCommand::Feedback { .. })
                     && attachments.as_ref().is_some_and(|items| !items.is_empty())
                 {
@@ -568,11 +579,28 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
                     mode,
                     context: None,
                     attachments,
+                    reply_to,
                 }
             }
         }
     };
     Ok(Operation::Runtime(Box::new(command)))
+}
+
+fn validate_non_empty_id(value: &str, message: &str) -> Result<()> {
+    ensure!(!value.trim().is_empty() && value.len() <= 128, "{message}");
+    Ok(())
+}
+
+fn validate_reply_reference(reply_to: Option<&crate::protocol::ReplyReference>) -> Result<()> {
+    if let Some(reference) = reply_to {
+        validate_non_empty_id(&reference.entry_id, "Invalid reply target entry ID")?;
+        ensure!(
+            reference.excerpt.len() <= 4096,
+            "Reply excerpt must be at most 4096 UTF-8 bytes"
+        );
+    }
+    Ok(())
 }
 
 fn validate_id(id: &str) -> Result<uuid::Uuid> {
@@ -928,6 +956,7 @@ mod tests {
             presentation: None,
             tool: None,
             attachments: None,
+            reply_to: None,
         };
         for event in [
             RuntimeEventKind::Message {
@@ -1097,6 +1126,7 @@ mod tests {
             text: "/feedback report".into(),
             mode: InputMode::Steer,
             attachments: Some(vec![]),
+            reply_to: None,
         })
         .unwrap() else {
             panic!("Expected shared feedback")
@@ -1137,6 +1167,7 @@ mod tests {
             text: text.into(),
             mode: InputMode::Steer,
             attachments: Some(vec![attachment.clone()]),
+            reply_to: None,
         };
         assert!(
             matches!(prepare(request("")).unwrap(), Operation::Runtime(command) if matches!(*command, RuntimeCommand::MainInput { ref attachments, .. } if attachments.as_ref().unwrap() == std::slice::from_ref(&attachment)))
@@ -1152,6 +1183,7 @@ mod tests {
         let request = || NativeRequest::Submit {
             origin: None,
             attachments: None,
+            reply_to: None,
             input_id: input_id.clone(),
             text: "/run-job Daily_Review.v2 --schedule Morning.v1".into(),
             mode: InputMode::Steer,
@@ -1336,6 +1368,7 @@ mod tests {
                 prepare(NativeRequest::Submit {
                     origin: None,
                     attachments: None,
+                    reply_to: None,
                     input_id,
                     text: "Hello".into(),
                     mode: InputMode::Steer
@@ -1355,6 +1388,7 @@ mod tests {
                 prepare(NativeRequest::Submit {
                     origin: None,
                     attachments: None,
+                    reply_to: None,
                     input_id: uuid::Uuid::new_v4().to_string(),
                     text,
                     mode: InputMode::Steer
@@ -1424,6 +1458,7 @@ mod tests {
             prepare(NativeRequest::Submit {
                 origin: None,
                 attachments: None,
+                reply_to: None,
                 input_id: uuid::Uuid::new_v4().to_string(),
                 text: "/resume saved-chat".into(),
                 mode: InputMode::Steer
@@ -1439,6 +1474,7 @@ mod tests {
             let operation = prepare(NativeRequest::Submit {
                 origin: None,
                 attachments: None,
+                reply_to: None,
                 input_id: uuid::Uuid::new_v4().to_string(),
                 text: "/worktrees".into(),
                 mode,
@@ -1534,6 +1570,7 @@ mod tests {
         prepare(NativeRequest::Submit {
             origin: None,
             attachments: None,
+            reply_to: None,
             input_id: input_id.into(),
             text: text.into(),
             mode: InputMode::FollowUp,
@@ -1616,6 +1653,7 @@ mod tests {
             input_id: uuid::Uuid::new_v4().to_string(),
             text: "/goal ship it".into(),
             mode: InputMode::FollowUp,
+            reply_to: None,
         })
         .unwrap();
         assert!(matches!(
@@ -1686,6 +1724,7 @@ mod tests {
             let operation = prepare(NativeRequest::Submit {
                 origin: None,
                 attachments: None,
+                reply_to: None,
                 input_id: uuid::Uuid::new_v4().to_string(),
                 text: text.into(),
                 mode: InputMode::Steer,
@@ -1703,6 +1742,7 @@ mod tests {
             prepare(NativeRequest::Submit {
                 origin: None,
                 attachments: None,
+                reply_to: None,
                 input_id: "invalid".into(),
                 text: "Hi".into(),
                 mode: InputMode::Steer

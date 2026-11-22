@@ -519,10 +519,11 @@ public struct HistoryMessage: Codable, Sendable, Equatable {
     public var `noticeDetails`: NoticeDetails?
     public var `noticeOrigin`: NoticeOrigin?
     public var `presentation`: MessagePresentation?
+    public var `replyTo`: ReplyReference?
     public var `role`: HistoryRole
     public var `text`: String
     public var `tool`: ToolHistory?
-    public init(`attachments`: [AttachmentRef]? = nil, `continuation`: Bool, `entryId`: String, `finalChunk`: Bool, `noticeDetails`: NoticeDetails? = nil, `noticeOrigin`: NoticeOrigin? = nil, `presentation`: MessagePresentation? = nil, `role`: HistoryRole, `text`: String, `tool`: ToolHistory? = nil) {
+    public init(`attachments`: [AttachmentRef]? = nil, `continuation`: Bool, `entryId`: String, `finalChunk`: Bool, `noticeDetails`: NoticeDetails? = nil, `noticeOrigin`: NoticeOrigin? = nil, `presentation`: MessagePresentation? = nil, `replyTo`: ReplyReference? = nil, `role`: HistoryRole, `text`: String, `tool`: ToolHistory? = nil) {
         self.`attachments` = `attachments`
         self.`continuation` = `continuation`
         self.`entryId` = `entryId`
@@ -530,6 +531,7 @@ public struct HistoryMessage: Codable, Sendable, Equatable {
         self.`noticeDetails` = `noticeDetails`
         self.`noticeOrigin` = `noticeOrigin`
         self.`presentation` = `presentation`
+        self.`replyTo` = `replyTo`
         self.`role` = `role`
         self.`text` = `text`
         self.`tool` = `tool`
@@ -542,6 +544,7 @@ public struct HistoryMessage: Codable, Sendable, Equatable {
         case `noticeDetails` = "notice_details"
         case `noticeOrigin` = "notice_origin"
         case `presentation` = "presentation"
+        case `replyTo` = "reply_to"
         case `role` = "role"
         case `text` = "text"
         case `tool` = "tool"
@@ -1755,12 +1758,14 @@ public struct NativeRequestSubmit: Codable, Sendable, Equatable {
     public var `inputId`: String
     public var `mode`: InputMode
     public var `origin`: InputOrigin?
+    public var `replyTo`: ReplyReference?
     public var `text`: String
-    public init(`attachments`: [AttachmentRef]? = nil, `inputId`: String, `mode`: InputMode, `origin`: InputOrigin? = nil, `text`: String) {
+    public init(`attachments`: [AttachmentRef]? = nil, `inputId`: String, `mode`: InputMode, `origin`: InputOrigin? = nil, `replyTo`: ReplyReference? = nil, `text`: String) {
         self.`attachments` = `attachments`
         self.`inputId` = `inputId`
         self.`mode` = `mode`
         self.`origin` = `origin`
+        self.`replyTo` = `replyTo`
         self.`text` = `text`
     }
     enum CodingKeys: String, CodingKey {
@@ -1768,6 +1773,7 @@ public struct NativeRequestSubmit: Codable, Sendable, Equatable {
         case `inputId` = "input_id"
         case `mode` = "mode"
         case `origin` = "origin"
+        case `replyTo` = "reply_to"
         case `text` = "text"
     }
 }
@@ -2165,6 +2171,22 @@ public enum Reasoning: String, Codable, Sendable, Equatable {
 }
 
 public typealias Recurrence = String
+
+public struct ReplyReference: Codable, Sendable, Equatable {
+    public var `entryId`: String
+    public var `excerpt`: String
+    public var `role`: HistoryRole
+    public init(`entryId`: String, `excerpt`: String, `role`: HistoryRole) {
+        self.`entryId` = `entryId`
+        self.`excerpt` = `excerpt`
+        self.`role` = `role`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `entryId` = "entry_id"
+        case `excerpt` = "excerpt"
+        case `role` = "role"
+    }
+}
 
 public enum ReviewStage: String, Codable, Sendable, Equatable {
     case `started` = "started"

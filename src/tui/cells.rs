@@ -560,6 +560,7 @@ mod tests {
                 final_chunk: true,
                 presentation: Some(Box::new(presentation)),
                 attachments: None,
+                reply_to: None,
                 tool: status.map(|status| ToolHistory {
                     call_id: "call".into(),
                     name: "exec".into(),

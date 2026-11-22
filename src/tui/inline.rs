@@ -859,6 +859,7 @@ mod tests {
             continuation,
             final_chunk,
             attachments: None,
+            reply_to: None,
             tool: None,
         }
     }

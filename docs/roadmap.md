@@ -285,7 +285,7 @@ branching conversations legible directly from the main chat.
 
 ### Targeted replies, sidechats and transcript fidelity
 
-- [ ] **Reply to a specific message on iPhone.** Add **Reply** to the iPhone
+- [x] **Reply to a specific message on iPhone.** Add **Reply** to the iPhone
   message menu alongside **Copy message**, **Select text** and **Share text**,
   mirroring Apple Messages. Selecting **Reply** pins the target message above
   the draft composer until sent or cancelled, attaches that message's identity

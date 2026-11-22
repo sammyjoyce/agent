@@ -440,15 +440,21 @@ public actor CoordinatorSession {
   /// Stages and starts at once, addressed to this coordinator alone.
   @discardableResult public func submit(
     _ text: String, mode: InputMode = .steer, files: [LocalAttachment] = [],
-    composer: ComposerInputIdentity? = nil
+    composer: ComposerInputIdentity? = nil, replyTo: ReplyReference? = nil
   ) async -> Bool {
     guard
       let staged = await stage(
         text, mode: mode, files: files, sendID: UUID().uuidString, recipients: [profile],
-        composer: composer)
+        composer: composer, replyTo: replyTo)
     else { return false }
     start(staged)
     return true
+  }
+
+  /// Shared rule for composer inputs that run local or server controls instead of chat messages.
+  public nonisolated static func isControlInput(_ text: String) -> Bool {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.hasPrefix("/") || trimmed == "?"
   }
 
   /// Validates the input, copies `files` into this coordinator's outbox and saves the item
@@ -456,7 +462,8 @@ public actor CoordinatorSession {
   /// snapshot's error, when this coordinator cannot take it.
   public func stage(
     _ text: String, mode: InputMode = .steer, files: [LocalAttachment] = [], sendID: String,
-    recipients: [ProfileID], composer: ComposerInputIdentity? = nil
+    recipients: [ProfileID], composer: ComposerInputIdentity? = nil,
+    replyTo: ReplyReference? = nil
   ) async -> StagedInput? {
     guard !retired, inspectedConversation == nil, actions.count < 32,
       snapshot.connection == .connected,
@@ -475,9 +482,7 @@ public actor CoordinatorSession {
       return nil
     }
     let feedback = text.split(whereSeparator: \.isWhitespace).first == "/feedback"
-    let control =
-      text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/")
-      || text.trimmingCharacters(in: .whitespacesAndNewlines) == "?"
+    let control = Self.isControlInput(text)
     guard files.isEmpty || !control || feedback else {
       snapshot.error = "Files can be sent with messages or /feedback."
       publish()
@@ -504,7 +509,8 @@ public actor CoordinatorSession {
     }
     let request = NativeRequestSubmit(
       attachments: files.isEmpty && !feedback ? nil : files.map(\.reference),
-      inputId: UUID().uuidString, mode: mode, origin: accepts(.ios) ? .ios : nil, text: text)
+      inputId: UUID().uuidString, mode: mode, origin: accepts(.ios) ? .ios : nil,
+      replyTo: (!control || feedback) ? replyTo : nil, text: text)
     let previousComposers = composerInputs
     if let composer { composerInputs[composer.composerID.uuidString] = composer.inputID.uuidString }
     guard !control || feedback else {

@@ -2435,6 +2435,16 @@
             }
           ]
         },
+        "reply_to": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReplyReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "role": {
           "$ref": "#/$defs/HistoryRole"
         },
@@ -4660,6 +4670,25 @@
     "Recurrence": {
       "description": "Canonical DTSTART/RRULE properties, with an explicit timezone and anchor.",
       "type": "string"
+    },
+    "ReplyReference": {
+      "type": "object",
+      "properties": {
+        "entry_id": {
+          "type": "string"
+        },
+        "excerpt": {
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/HistoryRole"
+        }
+      },
+      "required": [
+        "entry_id",
+        "role",
+        "excerpt"
+      ]
     },
     "RequestTiming": {
       "type": "object",

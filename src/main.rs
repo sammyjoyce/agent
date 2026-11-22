@@ -2023,6 +2023,7 @@ fn selected_input(
                     attachments: (!input.attachments.is_empty()).then_some(input.attachments),
                     mode: admission.mode,
                     context: Some(context),
+                    reply_to: None,
                 },
                 token,
                 sender.clone(),
@@ -3553,6 +3554,7 @@ async fn chat_command(
             .map(|identity| identity.host_id.to_string()),
         cwd: cwd.to_string_lossy().into_owned(),
         hosts: Vec::new(),
+        reply_to: None,
     })
 }
 

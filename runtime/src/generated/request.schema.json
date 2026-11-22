@@ -2409,6 +2409,16 @@
                 }
               ]
             },
+            "reply_to": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReplyReference"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "text": {
               "type": "string"
             },
@@ -2916,6 +2926,25 @@
     "Recurrence": {
       "description": "Canonical DTSTART/RRULE properties, with an explicit timezone and anchor.",
       "type": "string"
+    },
+    "ReplyReference": {
+      "type": "object",
+      "properties": {
+        "entry_id": {
+          "type": "string"
+        },
+        "excerpt": {
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/HistoryRole"
+        }
+      },
+      "required": [
+        "entry_id",
+        "role",
+        "excerpt"
+      ]
     },
     "ResourceRecord": {
       "type": "object",
@@ -3597,6 +3626,16 @@
                 }
               ]
             },
+            "reply_to": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReplyReference"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "const": "main_input"
@@ -3821,6 +3860,16 @@
                 "null"
               ]
             },
+            "reply_to": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReplyReference"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "const": "chat"
@@ -3978,6 +4027,16 @@
               "anyOf": [
                 {
                   "$ref": "#/$defs/InputOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reply_to": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReplyReference"
                 },
                 {
                   "type": "null"

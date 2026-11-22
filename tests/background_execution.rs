@@ -348,6 +348,7 @@ async fn stopping_one_background_actor_drains_its_real_process_and_preserves_the
                 mode: InputMode::FollowUp,
                 context: None,
                 attachments: None,
+                reply_to: None,
             })
             .await
             .unwrap(),
@@ -393,6 +394,7 @@ async fn stopping_one_background_actor_drains_its_real_process_and_preserves_the
                 mode: InputMode::FollowUp,
                 context: None,
                 attachments: None,
+                reply_to: None,
             })
             .await
             .unwrap(),

@@ -194,6 +194,129 @@ private func inspectionJob(
   }
 }
 
+@MainActor @Test func replyTargetFlowsIntoSubmitAndTranscript() async throws {
+  let model = ChatModel()
+  try await withConnectedCoordinator(model) { fixture, directory in
+    await fixture.replyToHistory(
+      initial: .init(
+        messages: [
+          HistoryMessage(
+            continuation: false, entryId: "entry-1", finalChunk: true, role: .final,
+            text: "First paragraph.\nSecond paragraph from anchor.")
+        ],
+        nextCursor: nil,
+        pageComplete: true),
+      pages: [:])
+    await fixture.placeEachSubmit()
+    await model.reconnect(directory.profile)
+    try await waitUntil(description: "initial history ready") {
+      model.snapshots[directory.profile]?.connection == .connected
+        && !model.rows.isEmpty
+    }
+
+    let anchorRow = try #require(model.rows.first)
+    model.reply(to: anchorRow)
+    let target = try #require(model.replyTarget)
+    #expect(target.entryId == "entry-1")
+    #expect(target.role == .final)
+    #expect(target.excerpt.contains("First paragraph."))
+
+    // Control input `?` must preserve replyTarget and not attach replyTo.
+    model.draft = "?"
+    let controlSend = try #require(model.startSend())
+    await controlSend.value
+    #expect(model.replyTarget == target)
+
+    model.draft = "Follow-up referencing anchor"
+    let replySend = try #require(model.startSend())
+    await replySend.value
+    #expect(model.replyTarget == nil)
+
+    try await waitUntil(description: "follow-up submit received by fixture") {
+      await fixture.received().contains {
+        if case .submit(let value) = $0 { return value.text == "Follow-up referencing anchor" }
+        return false
+      }
+    }
+    let sent = await fixture.received().compactMap {
+      if case .submit(let value) = $0 { value } else { nil }
+    }
+    #expect(sent.last?.replyTo == target)
+    #expect(sent.last?.text == "Follow-up referencing anchor")
+    #expect(model.rows.last?.row.replyTo == target)
+
+    // Verify `?` control never carried replyTo.
+    let helpSubmit = sent.first { $0.text == "?" }
+    #expect(helpSubmit?.replyTo == nil)
+  }
+}
+
+@MainActor @Test func crossCoordinatorReplyRefusesExplicitlyWithoutSilentlyDroppingReference()
+  async throws
+{
+  let fixtureA = FixtureCoordinator()
+  let fixtureB = FixtureCoordinator()
+  let (listenerA, portA) = try await listen(fixtureA)
+  let (listenerB, portB) = try await listen(fixtureB)
+  defer {
+    listenerA.cancel()
+    listenerB.cancel()
+  }
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let profileA = CoordinatorProfile(
+    name: try TagName("Alpha"), address: try CoordinatorAddress(host: "100.64.1.2"))
+  let profileB = CoordinatorProfile(
+    name: try TagName("Beta"), address: try CoordinatorAddress(host: "100.64.1.3"))
+  let dirA = ProfileDirectory(profileA.id, applicationSupport: root, caches: root)
+  let dirB = ProfileDirectory(profileB.id, applicationSupport: root, caches: root)
+  let stamps = StampSource()
+  let sessionA = CoordinatorSession(
+    directory: dirA, address: profileA.address, pin: fixtureA.id, stamps: stamps,
+    transport: loopback(portA))
+  let sessionB = CoordinatorSession(
+    directory: dirB, address: profileB.address, pin: fixtureB.id, stamps: stamps,
+    transport: loopback(portB))
+  let model = ChatModel()
+  model.profiles = [profileA, profileB]
+  model.attach(Lane(id: profileA.id, session: sessionA))
+  model.attach(Lane(id: profileB.id, session: sessionB))
+  await model.setActive(true)
+  do {
+    try await waitUntil(description: "both coordinators connected") {
+      model.snapshots[profileA.id]?.connection == .connected
+        && model.snapshots[profileB.id]?.connection == .connected
+    }
+    let rowFromA = RowModel(
+      ChatRow(id: "a-1", entryID: "entry-a-1", role: .final, text: "Alpha original message"))
+    rowFromA.lane = profileA.id
+    model.reply(to: rowFromA)
+    #expect(model.pendingReply?.lane == profileA.id)
+
+    // Target Beta while replying to Alpha's message: must refuse explicitly and preserve draft + reply.
+    model.show(.one(profileB.id))
+    model.draft = "Cross-lane follow-up"
+    let refused = model.startSend()
+    #expect(refused == nil)
+    #expect(model.draft == "Cross-lane follow-up")
+    #expect(model.pendingReply?.reference.entryId == "entry-a-1")
+    #expect(model.reports.last?.contains("Alpha") == true)
+    #expect(
+      await fixtureB.received().filter { if case .submit = $0 { true } else { false } }.isEmpty)
+
+    await model.detach(profileA.id)
+    await model.detach(profileB.id)
+    await fixtureA.stop()
+    await fixtureB.stop()
+  } catch {
+    await model.detach(profileA.id)
+    await model.detach(profileB.id)
+    await fixtureA.stop()
+    await fixtureB.stop()
+    throw error
+  }
+}
+
 #if os(iOS) && AGENT_APP_HOST
   import CoreGraphics
   import SwiftUI

@@ -123,6 +123,7 @@ async fn repeated_control_c_detaches_while_admission_is_held_and_retains_its_ori
                                     entry_id: "saved-answer".into(), role: HistoryRole::Final,
                                     text: "The saved chief transcript is ready.".into(), continuation: false,
                                     final_chunk: true, tool: None, presentation: None, attachments: None,
+                                    reply_to: None,
                                 }], next_cursor: None, page_complete: true,
                             }],
                             RuntimeCommand::ConversationInput { conversation_id, input_id, input, mode, .. } => {
@@ -309,6 +310,7 @@ async fn known_chief_history_renders_while_its_observer_readiness_is_held() {
                                     entry_id: "saved-answer".into(), role: HistoryRole::Final,
                                     text: "Saved conversation text can appear before observation is ready.".into(), continuation: false,
                                     final_chunk: true, tool: None, presentation: None, attachments: None,
+                                    reply_to: None,
                                 }];
                                 if reads.fetch_add(1, Ordering::SeqCst) > 0 {
                                     messages.push(HistoryMessage {
@@ -317,6 +319,7 @@ async fn known_chief_history_renders_while_its_observer_readiness_is_held() {
                                         entry_id: "answer-during-attach".into(), role: HistoryRole::Final,
                                         text: "The entry committed during attachment remains visible.".into(), continuation: false,
                                         final_chunk: true, tool: None, presentation: None, attachments: None,
+                                        reply_to: None,
                                     });
                                 }
                                 vec![RuntimeEventKind::History { conversation_id, messages,
@@ -633,6 +636,7 @@ async fn recovery_connection(
                         final_chunk: true,
                         tool: None,
                         attachments: None,
+                        reply_to: None,
                     },
                 });
                 write_events(&mut writer, receipts).await.unwrap();
@@ -677,6 +681,7 @@ async fn recovery_connection(
                     final_chunk: true,
                     tool: None,
                     attachments: None,
+                    reply_to: None,
                 })
                 .collect();
             vec![RuntimeEventKind::History {
@@ -1186,6 +1191,7 @@ async fn chief_startup(mode: ChiefStartup) {
                                 continuation: false,
                                 final_chunk: true,
                                 tool: None,
+                                reply_to: None,
                             }],
                             next_cursor: None,
                             page_complete: true,
@@ -1673,6 +1679,7 @@ async fn exact_resume_renders_history_without_fetching_fuzzy_catalog_pages() {
                                 continuation: false,
                                 final_chunk: true,
                                 tool: None,
+                                reply_to: None,
                             }],
                             next_cursor: None,
                             page_complete: true,
@@ -1834,6 +1841,7 @@ async fn main_history(older: bool) {
                                     continuation: false,
                                     final_chunk: true,
                                     tool: None,
+                                    reply_to: None,
                                 },
                                 HistoryMessage {
                                     notice_details: None,
@@ -1851,6 +1859,7 @@ async fn main_history(older: bool) {
                                     continuation: false,
                                     final_chunk: true,
                                     tool: None,
+                                    reply_to: None,
                                 },
                             ],
                             next_cursor: if older {

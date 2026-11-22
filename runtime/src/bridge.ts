@@ -8,6 +8,10 @@ import type { RuntimeRequest } from "./generated/RuntimeRequest.js";
 import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import type { ErrorCode } from "./generated/ErrorCode.js";
+import type { AttachmentRef } from "./generated/AttachmentRef.js";
+import type { InputMode } from "./generated/InputMode.js";
+import type { InputOrigin } from "./generated/InputOrigin.js";
+import type { ReplyReference } from "./generated/ReplyReference.js";
 import { CoordinatorEnvironment, EnvironmentError } from "./environment.js";
 import { ConversationModels, ModelError, modelFailureMessage } from "./models.js";
 import { ChatGptAuth } from "./auth.js";
@@ -329,6 +333,14 @@ const activeCommands = new Set<number>();
 const interrupted = new Set<number>();
 const interrupts = new Map<number, Promise<void>>();
 const workers = new Map<number, { command: Extract<RuntimeCommand, { type: "run_task" }>; controller: AbortController }>();
+type TurnInput = {
+  input_id: string;
+  input: string;
+  mode: InputMode;
+  origin?: InputOrigin;
+  attachments?: AttachmentRef[];
+  reply_to?: ReplyReference;
+};
 type MainTurn = { conversation?: Conversation; accepting: boolean; admissions: number; wake?: () => void;
   info?: Extract<RuntimeEventKind, { type: "main_ready" }>;
   ready: Promise<boolean>; start(ready: boolean): void; inputs: { input_id?: string; submission: Submission }[] };
@@ -387,46 +399,52 @@ async function interrupt(id: number): Promise<void> {
   const operation = (async () => { await conversation.abort(BACKGROUND_CONTEXT); emit(id, { type: "interrupted" }); })();
   interrupts.set(id, operation); await operation;
 }
-function submitInput(id: number, command: Extract<RuntimeCommand, { type: "submit_input" }>, responseId = id): Promise<void> {
+function submitInput(id: number, input: TurnInput, responseId = id): Promise<void> {
   if (!activeCommands.has(id) || ending.has(id)) {
-    emit(responseId, { type: "input_rejected", input_id: command.input_id, message: "The turn ended before admission; retry this input." });
+    emit(responseId, { type: "input_rejected", input_id: input.input_id, message: "The turn ended before admission; retry this input." });
     return Promise.resolve();
   }
   const worker = workers.get(id), main = mainTurns.get(id);
   if (main !== undefined) main.admissions += 1;
   const operations = inputControls.get(id) ?? new Set<Promise<void>>(); inputControls.set(id, operations);
   const operation = (async () => {
-    validateInput(command.input, command.attachments);
+    validateInput(input.input, input.attachments);
     if (main !== undefined && !await main.ready) throw new TaskError("The turn could not start; this input was not accepted");
     const stopping = interrupts.get(id); await stopping;
     if (worker !== undefined) {
       if (worker.controller.signal.aborted) throw new TaskError("This worker is detaching");
-      await (await app()).tasks.input(worker.command, command.input, command.input_id, command.mode, command.attachments, command.origin);
+      await (await app()).tasks.input(worker.command, input.input, input.input_id, input.mode, input.attachments, input.origin);
     } else {
       if (main === undefined || !main.accepting || main.conversation === undefined) throw new TaskError("The turn has finished; this input was not accepted");
       if (interrupts.get(id) === stopping) {
         interrupts.delete(id); interrupted.delete(id); hostRequests.resumeRequest(id);
       }
       const application = await app();
-      const prepared = await application.attachments.input(command.input, command.attachments, application.executions.get(main.conversation.id.toString()).call, command.origin,
-        application.tasks.inference.imageLimits(application.executions.model(main.conversation.id.toString())));
+      const prepared = await application.attachments.input({
+        text: input.input,
+        ...(input.attachments === undefined ? {} : { attachments: input.attachments }),
+        call: application.executions.get(main.conversation.id.toString()).call,
+        ...(input.origin === undefined ? {} : { origin: input.origin }),
+        limits: application.tasks.inference.imageLimits(application.executions.model(main.conversation.id.toString())),
+        ...(input.reply_to === undefined ? {} : { replyTo: input.reply_to }),
+      });
       const conversation = main.conversation;
-      const submission = await application.attachments.admit(command.attachments, () => {
+      const submission = await application.attachments.admit(input.attachments, () => {
         if (!main.accepting || interrupted.has(id) || interrupts.get(id) !== undefined) return undefined;
-        return conversation.submit({ type: "input", ...prepared, requestId: command.input_id,
-          whenBusy: command.mode === "steer" ? "steer" : "followUp" }, BACKGROUND_CONTEXT);
+        return conversation.submit({ type: "input", ...prepared, requestId: input.input_id,
+          whenBusy: input.mode === "steer" ? "steer" : "followUp" }, BACKGROUND_CONTEXT);
       });
       if (submission === undefined) throw new TaskError("The turn stopped while attachments were being prepared; this input was not accepted");
       if (!main.accepting) {
         await main.conversation.abort(BACKGROUND_CONTEXT);
         throw new TaskError("The turn ended while this input was being saved; its original is retained");
       }
-      trackMainInput(main, { input_id: command.input_id, submission });
+      trackMainInput(main, { input_id: input.input_id, submission });
     }
-    if (responseId !== id) emit(id, { type: "input_accepted", input_id: command.input_id });
-    emit(responseId, { type: "input_accepted", input_id: command.input_id });
+    if (responseId !== id) emit(id, { type: "input_accepted", input_id: input.input_id });
+    emit(responseId, { type: "input_accepted", input_id: input.input_id });
   })().catch((error: unknown) => {
-    emit(responseId, { type: "input_rejected", input_id: command.input_id,
+    emit(responseId, { type: "input_rejected", input_id: input.input_id,
       message: error instanceof TaskError ? error.message : "Input could not be saved; its draft is retained" });
   }).finally(() => {
     if (main !== undefined) { main.admissions -= 1; main.wake?.(); }
@@ -447,7 +465,8 @@ async function handle(request: RuntimeRequest): Promise<void> {
   try {
     if (effective.type === "conversation_input" && effective.conversation_id === ROOT_CONVERSATION_ID.toString()) {
       effective = { type: "main_input", ...(effective.origin === undefined ? {} : { origin: effective.origin }), input_id: effective.input_id, input: effective.input, mode: effective.mode,
-        ...(effective.context === undefined ? {} : { context: effective.context }), ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }) };
+        ...(effective.context === undefined ? {} : { context: effective.context }), ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }),
+        ...(effective.reply_to === undefined ? {} : { reply_to: effective.reply_to }) };
     }
     if (effective.type === "main_input") {
       validateInput(effective.input, effective.attachments);
@@ -462,10 +481,18 @@ async function handle(request: RuntimeRequest): Promise<void> {
         reclaimedInput = await application.harness.submission(saved.id, BACKGROUND_CONTEXT);
         if (reclaimedInput === undefined) throw new TaskError("The saved input could not be recovered; its original is retained");
       }
+      const turnInput: TurnInput = {
+        input_id: effective.input_id,
+        input: effective.input,
+        mode: effective.mode,
+        ...(effective.origin === undefined ? {} : { origin: effective.origin }),
+        ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }),
+        ...(effective.reply_to === undefined ? {} : { reply_to: effective.reply_to }),
+      };
       const owner = [...mainTurns].find(([owner, turn]) => turn.accepting && !ending.has(owner))?.[0];
       if (owner !== undefined) {
         if (reclaimedInput !== undefined) return;
-        await submitInput(owner, { type: "submit_input", ...(effective.origin === undefined ? {} : { origin: effective.origin }), input_id: effective.input_id, input: effective.input, mode: effective.mode, ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }) }, id);
+        await submitInput(owner, turnInput, id);
         return;
       }
       const context = effective.context;
@@ -475,11 +502,12 @@ async function handle(request: RuntimeRequest): Promise<void> {
       const admittedOwner = [...mainTurns].find(([owner, turn]) => turn.accepting && !ending.has(owner))?.[0];
       if (admittedOwner !== undefined) {
         if (reclaimedInput !== undefined) return;
-        await submitInput(admittedOwner, { type: "submit_input", ...(effective.origin === undefined ? {} : { origin: effective.origin }), input_id: effective.input_id, input: effective.input, mode: effective.mode, ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }) }, id);
+        await submitInput(admittedOwner, turnInput, id);
         return;
       }
       effective = { type: "chat", ...(effective.origin === undefined ? {} : { origin: effective.origin }), input: effective.input, input_id: effective.input_id, instructions: context?.instructions ?? "", model: null,
-        origin_host_id: context?.origin_host_id ?? host.host_id ?? null, cwd: context?.cwd ?? host.cwd, hosts, ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }) };
+        origin_host_id: context?.origin_host_id ?? host.host_id ?? null, cwd: context?.cwd ?? host.cwd, hosts, ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }),
+        ...(effective.reply_to === undefined ? {} : { reply_to: effective.reply_to }) };
       activeCommands.add(id); mainTurns.set(id, mainTurn());
     }
     const command = effective;
@@ -909,8 +937,14 @@ async function handle(request: RuntimeRequest): Promise<void> {
             await retainMainInputs(harness, root, turn);
             let submission = reclaimedInput;
             if (submission === undefined) {
-              const prepared = await application.attachments.input(command.input, command.attachments, executions.get(root.id.toString()).call, command.origin,
-                application.tasks.inference.imageLimits(selected));
+              const prepared = await application.attachments.input({
+                text: command.input,
+                ...(command.attachments === undefined ? {} : { attachments: command.attachments }),
+                call: executions.get(root.id.toString()).call,
+                ...(command.origin === undefined ? {} : { origin: command.origin }),
+                limits: application.tasks.inference.imageLimits(selected),
+                ...(command.reply_to === undefined ? {} : { replyTo: command.reply_to }),
+              });
               submission = await application.attachments.admit(command.attachments, () => {
                 if (interrupted.has(id)) return undefined;
                 submissionAttempted = true;
@@ -1038,7 +1072,16 @@ try {
       });
       continue;
     }
-    if (request.command.type === "submit_input") { submitInput(mainViews.get(request.id)?.owner ?? request.id, request.command); continue; }
+    if (request.command.type === "submit_input") {
+      submitInput(mainViews.get(request.id)?.owner ?? request.id, {
+        input_id: request.command.input_id,
+        input: request.command.input,
+        mode: request.command.mode,
+        ...(request.command.origin === undefined ? {} : { origin: request.command.origin }),
+        ...(request.command.attachments === undefined ? {} : { attachments: request.command.attachments }),
+      });
+      continue;
+    }
     if (request.command.type === "host_reply") {
       hostRequests.reply(request.id, request.command.call_id, request.command.result);
       continue;

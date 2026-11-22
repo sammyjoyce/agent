@@ -18,8 +18,14 @@ extension View {
     #endif
   }
 
-  func messageTextActions(_ text: String) -> some View {
-    modifier(MessageTextActions(text: text))
+  func messageTextActions(
+    _ text: String,
+    onReply: (() -> Void)? = nil
+  ) -> some View {
+    modifier(
+      MessageTextActions(
+        text: text,
+        onReply: onReply))
   }
 }
 
@@ -30,12 +36,18 @@ private struct MessageTextActions: ViewModifier {
   }
 
   let text: String
+  let onReply: (() -> Void)?
   @State private var selection: Selection?
 
   func body(content: Content) -> some View {
     content
       .contentShape(Rectangle())
       .contextMenu {
+        if let onReply {
+          Button("Reply", systemImage: "arrowshape.turn.up.left") {
+            onReply()
+          }
+        }
         Button("Copy message", systemImage: "doc.on.doc") {
           #if os(iOS)
             UIPasteboard.general.string = text

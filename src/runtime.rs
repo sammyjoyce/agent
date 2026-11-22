@@ -919,6 +919,7 @@ process.stdin.on('data',chunk=>{
                     origin_host_id: None,
                     cwd: "/".into(),
                     hosts: vec![],
+                    reply_to: None,
                 })
                 .await
         });
@@ -1043,6 +1044,7 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
                     origin_host_id: None,
                     cwd: "/".into(),
                     hosts: vec![],
+                    reply_to: None,
                 })
                 .await
         });
@@ -1141,6 +1143,7 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{
                     origin_host_id: None,
                     cwd: "/".into(),
                     hosts: vec![],
+                    reply_to: None,
                 }),
                 admitted,
             })
@@ -1300,6 +1303,7 @@ createInterface({input:process.stdin}).on('line',line=>{
                 origin_host_id: None,
                 cwd: "/PRIVATE_WORKSPACE_SENTINEL".into(),
                 hosts: vec![],
+                reply_to: None,
             })
             .await
             .unwrap();

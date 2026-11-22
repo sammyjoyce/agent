@@ -3113,6 +3113,49 @@ final class HistoryInteractionTests: XCTestCase {
     }
     XCTAssertTrue(appliedBanner.waitForExistence(timeout: 10), app.debugDescription)
   }
+
+  func testReplyContextMenuPinsTargetAndSendsReplyReference() async throws {
+    executionTimeAllowance = 120
+    let peer = InteractionPeer()
+    addTeardownBlock { await peer.stop() }
+    let app = try await launchMessages(
+      [
+        .init(
+          continuation: false,
+          entryId: "main-2",
+          finalChunk: true,
+          role: .final,
+          text: "Option A is default; Option B isolates state cleanly.")
+      ],
+      peer: peer)
+
+    let answerText = app.staticTexts["Option A is default; Option B isolates state cleanly."]
+    XCTAssertTrue(answerText.waitForExistence(timeout: 10), app.debugDescription)
+
+    answerText.press(forDuration: 1.0)
+    let replyAction = action("Reply", app: app)
+    XCTAssertTrue(replyAction.waitForExistence(timeout: 5), app.debugDescription)
+    replyAction.tap()
+
+    let replyBanner = app.otherElements["replyTargetBanner"]
+    XCTAssertTrue(replyBanner.waitForExistence(timeout: 5), app.debugDescription)
+    XCTAssertTrue(app.staticTexts["Replying to Beep Boop"].exists)
+
+    let composer = editor(app)
+    composer.tap()
+    composer.typeText("Compare Option B details")
+    let send = app.buttons["Send message"]
+    XCTAssertTrue(send.wait(for: \.isEnabled, toEqual: true, timeout: 5))
+    send.tap()
+
+    try await eventually {
+      await peer.submitRequests().contains {
+        $0.text == "Compare Option B details" && $0.replyTo?.entryId == "main-2"
+      }
+    }
+    XCTAssertFalse(replyBanner.exists)
+    XCTAssertTrue(app.buttons["replyQuoteCard:main-2"].waitForExistence(timeout: 5))
+  }
 }
 
 @MainActor
