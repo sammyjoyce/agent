@@ -889,6 +889,17 @@ final class ChatModel {
   {
     try await onLane(lane) { try await $0.conversations(query: query, cursor: cursor) }
   }
+  func dreamsList(lane: ProfileID) async throws -> NativeEventDreamsList {
+    try await onLane(lane) { try await $0.dreamsList() }
+  }
+  func dreamsShow(_ run: String, lane: ProfileID) async throws -> DreamsRunDetail {
+    try await onLane(lane) { try await $0.dreamsShow(run) }
+  }
+  func dreamsApply(run: String, approve: String, lane: ProfileID) async throws
+    -> NativeEventDreamsApplied
+  {
+    try await onLane(lane) { try await $0.dreamsApply(run: run, approve: approve) }
+  }
   /// Reads the lane's conversation settings, or changes them. The value lands in the lane's
   /// snapshot through its session's own publish.
   func settings(change: ConversationChange? = nil, lane: ProfileID) async throws {

@@ -881,9 +881,13 @@ channel to an actor that holds one. Tests cover each link.
 - The executor reads the target repository and writes only under
   `<state_dir>/dreams/runs/`. Its checks are the operator's programs from
   private configuration.
-- `dreams apply` is in the `beep-boop` binary, which the coordinator library
-  cannot link. It applies only the patch whose outcome digest a human passed,
-  onto the unchanged base.
+- `dreams apply` runs on the coordinator's authenticated service boundary
+  (`src/service/boundary.rs`), outside Pi's runtime and tool surface so no
+  model or conversation tool can approve or apply a proposal. Both the local
+  `beep-boop dreams apply` CLI and any authorized paired device invoke the same
+  verification path: it applies only the patch whose sealed outcome digest the
+  approver passed onto the unchanged base, and refuses while the coordinator is
+  held after a restore until `backup release`.
 
 Dreams does not claim more than that. The main, triage and worker actors still
 hold same-user shells, so each of them can run `beep-boop dreams apply` or edit

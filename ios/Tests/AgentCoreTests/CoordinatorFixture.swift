@@ -52,6 +52,16 @@ actor FixtureCoordinator {
   func advertiseAcceptedInputOrigins(_ value: [String]?) { acceptedInputOrigins = value }
   private var workInspection: Bool?
   func advertiseWorkInspection(_ value: Bool?) { workInspection = value }
+  private var dreamsSupported: Bool?
+  func advertiseDreams(_ value: Bool?) { dreamsSupported = value }
+  private var dreamsSummaries: [DreamsRunSummary] = []
+  private var dreamsDetails: [String: DreamsRunDetail] = [:]
+  private var dreamsApplyRequests: [NativeRequestDreamsApply] = []
+  func serveDreams(summaries: [DreamsRunSummary], details: [DreamsRunDetail]) {
+    dreamsSummaries = summaries
+    dreamsDetails = Dictionary(uniqueKeysWithValues: details.map { ($0.run, $0) })
+  }
+  func appliedDreams() -> [NativeRequestDreamsApply] { dreamsApplyRequests }
   private var servedJobs: [ScheduledJobStatus] = []
   private var servedConversations: [SavedConversation] = []
   private var pageSize = 10
@@ -394,7 +404,8 @@ actor FixtureCoordinator {
             .init(
               acceptedInputOrigins: acceptedInputOrigins,
               conversationId: "fixture-root", conversationSettings: conversationSettings,
-              inputOrigins: inputOrigins, model: "fixture/model", workInspection: workInspection)),
+              dreams: dreamsSupported, inputOrigins: inputOrigins, model: "fixture/model",
+              workInspection: workInspection)),
           on: socket)
         if delaySnapshot { await withCheckedContinuation { release = $0 } }
         let placed = placedSubmits
@@ -451,6 +462,51 @@ actor FixtureCoordinator {
         let page = NativeEventConversations(
           items: Array(matches[start..<end]), nextCursor: end < matches.count ? "\(end)" : nil)
         try await emit(.conversations(page), on: socket)
+        try await emit(.done, on: socket)
+        return
+      case .dreamsList:
+        let pendingCount = dreamsSummaries.filter { $0.proposalStatus == .pending }.count
+        try await emit(
+          .dreamsList(.init(pendingCount: pendingCount, runs: dreamsSummaries)), on: socket)
+        try await emit(.done, on: socket)
+        return
+      case .dreamsShow(let request):
+        if let report = dreamsDetails[request.run] {
+          try await emit(.dreamsShow(.init(report: report)), on: socket)
+        } else {
+          try await emit(.failure(.init(message: "Unknown dreams run \(request.run)")), on: socket)
+        }
+        try await emit(.done, on: socket)
+        return
+      case .dreamsApply(let request):
+        dreamsApplyRequests.append(request)
+        guard var detail = dreamsDetails[request.run] else {
+          try await emit(.failure(.init(message: "Unknown dreams run \(request.run)")), on: socket)
+          try await emit(.done, on: socket)
+          return
+        }
+        guard detail.outcomeSha256 == request.approve else {
+          try await emit(.failure(.init(message: "Outcome digest mismatch")), on: socket)
+          try await emit(.done, on: socket)
+          return
+        }
+        let alreadyApplied = detail.proposalStatus == .applied
+        let commit = "1111222233334444555566667777888899990000"
+        detail.canApply = false
+        detail.proposalStatus = .applied
+        detail.statusDetail = "applied at 111122223333"
+        detail.outcomeLabel = "Proposed (applied)"
+        dreamsDetails[request.run] = detail
+        dreamsSummaries = dreamsSummaries.map { summary in
+          guard summary.run == request.run else { return summary }
+          var next = summary
+          next.proposalStatus = .applied
+          next.outcomeLabel = "Proposed (applied)"
+          return next
+        }
+        try await emit(
+          .dreamsApplied(.init(alreadyApplied: alreadyApplied, commit: commit, run: request.run)),
+          on: socket)
         try await emit(.done, on: socket)
         return
       case .inspect(let request):

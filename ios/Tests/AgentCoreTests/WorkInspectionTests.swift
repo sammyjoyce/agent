@@ -4,6 +4,25 @@ import Testing
 @testable import AgentCore
 @testable import AgentUI
 
+private struct WaitTimeoutError: Error, CustomStringConvertible {
+  let description: String
+}
+
+@MainActor private func waitUntil(
+  timeout: Duration = .seconds(10),
+  description: String,
+  condition: () async -> Bool
+) async throws {
+  let deadline = ContinuousClock.now + timeout
+  while await !condition() {
+    guard ContinuousClock.now < deadline else {
+      Issue.record("Timed out waiting for: \(description)")
+      throw WaitTimeoutError(description: description)
+    }
+    try await Task.sleep(for: .milliseconds(10))
+  }
+}
+
 private func inspectionJob(
   id: String = "example-review", state: JobExecutionState? = .completed,
   output: String? = "The retained review completed.\nNo repeated actions were needed.",
@@ -86,6 +105,93 @@ private func inspectionJob(
     ConversationInspectionView.relationships(for: parent, in: items).map(\.conversationId) == [
       "12", "11",
     ])
+}
+
+@MainActor @Test func dreamsCapabilityGatesRequestsAndConfirmedApplySendsOutcomeDigest()
+  async throws
+{
+  let summary = DreamsRunSummary(
+    coverageComplete: false,
+    outcomeLabel: "Proposed",
+    proposalStatus: .pending,
+    run: "2026-11-22T02-00-00Z",
+    windowEndMs: 1_798_797_600_000,
+    windowStartMs: 1_798_711_200_000)
+  let detail = DreamsRunDetail(
+    attemptsUsed: 1,
+    baseRevision: "0123456789abcdef0123456789abcdef01234567",
+    canApply: true,
+    checks: [
+      .init(
+        durationMs: 12, name: "format", output: "", passed: true, phase: "before", verdict: "ok")
+    ],
+    citedEvidence: [
+      .init(body: "Receipt from nightly task check", id: "rec-1", kind: "receipt", title: "Receipt")
+    ],
+    coverageComplete: false,
+    files: ["docs/notes.md"],
+    gaps: ["slack/workspace-example: token expired"],
+    outcomeLabel: "Proposed",
+    outcomeSha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    patch: "@@ -1 +1 @@\n-old\n+new\n",
+    patchSha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    proposalStatus: .pending,
+    rationaleOrNote: "Refresh stale nightly reminder note.",
+    receiptsCount: 1,
+    run: "2026-11-22T02-00-00Z",
+    statusDetail: "ready for operator review",
+    summariesCapturedAtMs: 1_798_797_605_000,
+    summariesCount: 2,
+    windowEndMs: 1_798_797_600_000,
+    windowStartMs: 1_798_711_200_000)
+
+  let unsupportedModel = ChatModel()
+  try await withConnectedCoordinator(unsupportedModel) { fixture, directory in
+    await fixture.advertiseDreams(false)
+    #expect(unsupportedModel.snapshots[directory.profile]?.dreamsSupported == false)
+    do {
+      _ = try await unsupportedModel.dreamsList(lane: directory.profile)
+      Issue.record("Expected unsupported coordinator to reject dreams_list")
+    } catch let error as CoordinatorRejection {
+      #expect(error.message.contains("Dreams"))
+    }
+  }
+
+  let supportedModel = ChatModel()
+  try await withConnectedCoordinator(supportedModel) { fixture, directory in
+    await fixture.serveDreams(summaries: [summary], details: [detail])
+    await fixture.advertiseDreams(true)
+    await supportedModel.reconnect(directory.profile)
+    try await waitUntil(description: "dreams capability advertised") {
+      supportedModel.snapshots[directory.profile]?.dreamsSupported == true
+    }
+    let list = try await supportedModel.dreamsList(lane: directory.profile)
+    #expect(list.pendingCount == 1)
+    #expect(list.runs == [summary])
+
+    let shown = try await supportedModel.dreamsShow("2026-11-22T02-00-00Z", lane: directory.profile)
+    #expect(shown == detail)
+
+    do {
+      _ = try await supportedModel.dreamsApply(
+        run: "2026-11-22T02-00-00Z", approve: "wrong-digest", lane: directory.profile)
+      Issue.record("Expected wrong outcome digest to fail")
+    } catch is CoordinatorRejection {}
+
+    let applied = try await supportedModel.dreamsApply(
+      run: "2026-11-22T02-00-00Z",
+      approve: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      lane: directory.profile)
+    #expect(!applied.alreadyApplied)
+    #expect(applied.commit.hasPrefix("111122223333"))
+    #expect(
+      await fixture.appliedDreams().last
+        == .init(
+          approve: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          run: "2026-11-22T02-00-00Z"))
+    let after = try await supportedModel.dreamsList(lane: directory.profile)
+    #expect(after.pendingCount == 0)
+  }
 }
 
 #if os(iOS) && AGENT_APP_HOST
@@ -321,6 +427,68 @@ private func inspectionJob(
         }.value
         #expect(await fixture.count() == 0)
         await model.detach(session.profile)
+      }
+    }
+
+    @MainActor @Test func dreamsListAndDetailViewsRenderCoverageChecksEvidenceAndEscapedPatch()
+      async throws
+    {
+      let summary = DreamsRunSummary(
+        coverageComplete: false,
+        outcomeLabel: "Proposed",
+        proposalStatus: .pending,
+        run: "2026-11-22T02-00-00Z",
+        windowEndMs: 1_798_797_600_000,
+        windowStartMs: 1_798_711_200_000)
+      let detail = DreamsRunDetail(
+        attemptsUsed: 1,
+        baseRevision: "0123456789abcdef0123456789abcdef01234567",
+        canApply: true,
+        checks: [
+          .init(
+            durationMs: 18, name: "format", output: "", passed: true, phase: "before",
+            verdict: "ok"),
+          .init(
+            durationMs: 42, name: "unit", output: "72 passed", passed: true, phase: "after",
+            verdict: "ok"),
+        ],
+        citedEvidence: [
+          .init(
+            body: "Receipt from nightly task check", id: "rec-1", kind: "receipt",
+            title: "Check receipt")
+        ],
+        coverageComplete: false,
+        files: ["docs/notes.md"],
+        gaps: ["slack/workspace-example: token expired"],
+        outcomeLabel: "Proposed",
+        outcomeSha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        patch: "@@ -1 +1 @@\n-old\n+new\n",
+        patchSha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        proposalStatus: .pending,
+        rationaleOrNote: "Refresh stale nightly reminder note\\x1b[31m.",
+        receiptsCount: 1,
+        run: "2026-11-22T02-00-00Z",
+        statusDetail: "ready for operator review",
+        summariesCapturedAtMs: 1_798_797_605_000,
+        summariesCount: 2,
+        windowEndMs: 1_798_797_600_000,
+        windowStartMs: 1_798_711_200_000)
+      let model = ChatModel()
+      try await withConnectedCoordinator(model) { fixture, directory in
+        await fixture.serveDreams(summaries: [summary], details: [detail])
+        await fixture.advertiseDreams(true)
+        await model.reconnect(directory.profile)
+        try await waitUntil(description: "dreams capability advertised for capture") {
+          model.snapshots[directory.profile]?.dreamsSupported == true
+        }
+        try await Self.captureWork(
+          NavigationStack { DreamsView(model: model, lane: directory.profile) },
+          name: "dreams-list")
+        try await Self.captureWork(
+          NavigationStack {
+            DreamsDetailView(model: model, lane: directory.profile, runID: detail.run)
+          },
+          name: "dreams-detail")
       }
     }
   }

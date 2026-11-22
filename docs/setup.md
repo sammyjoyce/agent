@@ -481,8 +481,9 @@ first instant. Source polling uses elapsed intervals through the same Pi timer.
 
 Dreams is one scheduled job that reads the coordinator's private runtime
 receipts and task summaries each night. It proposes at most one diff to a
-private Git repository, or it abstains. A proposal changes nothing until you
-approve that exact outcome with `beep-boop dreams apply`.
+private Git repository, or it abstains. A proposal changes nothing until an
+approver confirms that exact sealed outcome digest via `beep-boop dreams apply`
+or from any authorized paired device over the coordinator's service boundary.
 
 Point Dreams at a repository of guidance that your agents read, such as one of
 your `context_repositories`. Add the policy to the coordinator's private
@@ -564,8 +565,10 @@ and text that a model wrote are labeled and quoted. Control characters and
 Unicode format characters, such as bidirectional overrides and zero-width characters,
 are shown as escapes in that text and in the patch, so the patch you read is
 the patch that `apply` commits. Add `--json` for the typed record, which keeps
-the exact bytes. These commands read the
-coordinator's state directory, so run them on the coordinator's machine.
+the exact bytes. The CLI commands read the coordinator's local state directory
+directly; authorized paired devices can also browse runs, inspect sealed
+proposals and approve them over the coordinator's authenticated service boundary
+using the same digest, policy, base, clean-worktree and restore-hold checks.
 
 Read the patch before you approve it. The outcome digest, which `dreams show`
 prints as `Outcome sha256`, is the SHA-256 of the exact bytes of the sealed

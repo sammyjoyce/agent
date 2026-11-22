@@ -81,6 +81,7 @@ await import(pathToFileURL({}).href);
                     node: None,
                     background: None,
                 }),
+                None,
                 async {
                     let _ = stopped.await;
                     Ok(ShutdownReason::Signal(ShutdownSignal::Sigterm))

@@ -308,6 +308,155 @@ public struct ConversationSettings: Codable, Sendable, Equatable {
     }
 }
 
+public struct DreamsCheckItem: Codable, Sendable, Equatable {
+    public var `durationMs`: Int
+    public var `name`: String
+    public var `output`: String
+    public var `passed`: Bool
+    public var `phase`: String
+    public var `verdict`: String
+    public init(`durationMs`: Int, `name`: String, `output`: String, `passed`: Bool, `phase`: String, `verdict`: String) {
+        self.`durationMs` = `durationMs`
+        self.`name` = `name`
+        self.`output` = `output`
+        self.`passed` = `passed`
+        self.`phase` = `phase`
+        self.`verdict` = `verdict`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `durationMs` = "duration_ms"
+        case `name` = "name"
+        case `output` = "output"
+        case `passed` = "passed"
+        case `phase` = "phase"
+        case `verdict` = "verdict"
+    }
+}
+
+public struct DreamsEvidenceCite: Codable, Sendable, Equatable {
+    public var `body`: String
+    public var `id`: String
+    public var `kind`: String
+    public var `title`: String?
+    public init(`body`: String, `id`: String, `kind`: String, `title`: String? = nil) {
+        self.`body` = `body`
+        self.`id` = `id`
+        self.`kind` = `kind`
+        self.`title` = `title`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `body` = "body"
+        case `id` = "id"
+        case `kind` = "kind"
+        case `title` = "title"
+    }
+}
+
+public enum DreamsProposalStatus: String, Codable, Sendable, Equatable {
+    case `pending` = "pending"
+    case `applied` = "applied"
+    case `stale` = "stale"
+    case `targetDirty` = "target_dirty"
+    case `targetLocked` = "target_locked"
+    case `patchChanged` = "patch_changed"
+    case `policyChanged` = "policy_changed"
+}
+
+public struct DreamsRunDetail: Codable, Sendable, Equatable {
+    public var `attemptsUsed`: Int
+    public var `baseRevision`: String
+    public var `canApply`: Bool
+    public var `checks`: [DreamsCheckItem]
+    public var `citedEvidence`: [DreamsEvidenceCite]
+    public var `coverageComplete`: Bool
+    public var `files`: [String]
+    public var `gaps`: [String]
+    public var `outcomeLabel`: String
+    public var `outcomeSha256`: String?
+    public var `patch`: String?
+    public var `patchSha256`: String?
+    public var `proposalStatus`: DreamsProposalStatus?
+    public var `rationaleOrNote`: String?
+    public var `receiptsCount`: Int
+    public var `run`: String
+    public var `statusDetail`: String?
+    public var `summariesCapturedAtMs`: Int
+    public var `summariesCount`: Int
+    public var `windowEndMs`: Int
+    public var `windowStartMs`: Int
+    public init(`attemptsUsed`: Int, `baseRevision`: String, `canApply`: Bool, `checks`: [DreamsCheckItem], `citedEvidence`: [DreamsEvidenceCite], `coverageComplete`: Bool, `files`: [String], `gaps`: [String], `outcomeLabel`: String, `outcomeSha256`: String? = nil, `patch`: String? = nil, `patchSha256`: String? = nil, `proposalStatus`: DreamsProposalStatus? = nil, `rationaleOrNote`: String? = nil, `receiptsCount`: Int, `run`: String, `statusDetail`: String? = nil, `summariesCapturedAtMs`: Int, `summariesCount`: Int, `windowEndMs`: Int, `windowStartMs`: Int) {
+        self.`attemptsUsed` = `attemptsUsed`
+        self.`baseRevision` = `baseRevision`
+        self.`canApply` = `canApply`
+        self.`checks` = `checks`
+        self.`citedEvidence` = `citedEvidence`
+        self.`coverageComplete` = `coverageComplete`
+        self.`files` = `files`
+        self.`gaps` = `gaps`
+        self.`outcomeLabel` = `outcomeLabel`
+        self.`outcomeSha256` = `outcomeSha256`
+        self.`patch` = `patch`
+        self.`patchSha256` = `patchSha256`
+        self.`proposalStatus` = `proposalStatus`
+        self.`rationaleOrNote` = `rationaleOrNote`
+        self.`receiptsCount` = `receiptsCount`
+        self.`run` = `run`
+        self.`statusDetail` = `statusDetail`
+        self.`summariesCapturedAtMs` = `summariesCapturedAtMs`
+        self.`summariesCount` = `summariesCount`
+        self.`windowEndMs` = `windowEndMs`
+        self.`windowStartMs` = `windowStartMs`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `attemptsUsed` = "attempts_used"
+        case `baseRevision` = "base_revision"
+        case `canApply` = "can_apply"
+        case `checks` = "checks"
+        case `citedEvidence` = "cited_evidence"
+        case `coverageComplete` = "coverage_complete"
+        case `files` = "files"
+        case `gaps` = "gaps"
+        case `outcomeLabel` = "outcome_label"
+        case `outcomeSha256` = "outcome_sha256"
+        case `patch` = "patch"
+        case `patchSha256` = "patch_sha256"
+        case `proposalStatus` = "proposal_status"
+        case `rationaleOrNote` = "rationale_or_note"
+        case `receiptsCount` = "receipts_count"
+        case `run` = "run"
+        case `statusDetail` = "status_detail"
+        case `summariesCapturedAtMs` = "summaries_captured_at_ms"
+        case `summariesCount` = "summaries_count"
+        case `windowEndMs` = "window_end_ms"
+        case `windowStartMs` = "window_start_ms"
+    }
+}
+
+public struct DreamsRunSummary: Codable, Sendable, Equatable {
+    public var `coverageComplete`: Bool
+    public var `outcomeLabel`: String
+    public var `proposalStatus`: DreamsProposalStatus?
+    public var `run`: String
+    public var `windowEndMs`: Int
+    public var `windowStartMs`: Int
+    public init(`coverageComplete`: Bool, `outcomeLabel`: String, `proposalStatus`: DreamsProposalStatus? = nil, `run`: String, `windowEndMs`: Int, `windowStartMs`: Int) {
+        self.`coverageComplete` = `coverageComplete`
+        self.`outcomeLabel` = `outcomeLabel`
+        self.`proposalStatus` = `proposalStatus`
+        self.`run` = `run`
+        self.`windowEndMs` = `windowEndMs`
+        self.`windowStartMs` = `windowStartMs`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `coverageComplete` = "coverage_complete"
+        case `outcomeLabel` = "outcome_label"
+        case `proposalStatus` = "proposal_status"
+        case `run` = "run"
+        case `windowEndMs` = "window_end_ms"
+        case `windowStartMs` = "window_start_ms"
+    }
+}
+
 public enum ErrorCode: String, Codable, Sendable, Equatable {
     case `invalidRequest` = "invalid_request"
     case `authenticationRequired` = "authentication_required"
@@ -1108,14 +1257,16 @@ public struct NativeEventReady: Codable, Sendable, Equatable {
     public var `acceptedInputOrigins`: [String]?
     public var `conversationId`: String
     public var `conversationSettings`: Bool?
+    public var `dreams`: Bool?
     public var `inputOrigins`: Bool?
     public var `model`: String
     public var `workInspection`: Bool?
     public var `working`: Bool?
-    public init(`acceptedInputOrigins`: [String]? = nil, `conversationId`: String, `conversationSettings`: Bool? = nil, `inputOrigins`: Bool? = nil, `model`: String, `workInspection`: Bool? = nil, `working`: Bool? = nil) {
+    public init(`acceptedInputOrigins`: [String]? = nil, `conversationId`: String, `conversationSettings`: Bool? = nil, `dreams`: Bool? = nil, `inputOrigins`: Bool? = nil, `model`: String, `workInspection`: Bool? = nil, `working`: Bool? = nil) {
         self.`acceptedInputOrigins` = `acceptedInputOrigins`
         self.`conversationId` = `conversationId`
         self.`conversationSettings` = `conversationSettings`
+        self.`dreams` = `dreams`
         self.`inputOrigins` = `inputOrigins`
         self.`model` = `model`
         self.`workInspection` = `workInspection`
@@ -1125,6 +1276,7 @@ public struct NativeEventReady: Codable, Sendable, Equatable {
         case `acceptedInputOrigins` = "accepted_input_origins"
         case `conversationId` = "conversation_id"
         case `conversationSettings` = "conversation_settings"
+        case `dreams` = "dreams"
         case `inputOrigins` = "input_origins"
         case `model` = "model"
         case `workInspection` = "work_inspection"
@@ -1312,6 +1464,45 @@ public struct NativeEventNotifications: Codable, Sendable, Equatable {
     }
 }
 
+public struct NativeEventDreamsList: Codable, Sendable, Equatable {
+    public var `pendingCount`: Int
+    public var `runs`: [DreamsRunSummary]
+    public init(`pendingCount`: Int, `runs`: [DreamsRunSummary]) {
+        self.`pendingCount` = `pendingCount`
+        self.`runs` = `runs`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `pendingCount` = "pending_count"
+        case `runs` = "runs"
+    }
+}
+
+public struct NativeEventDreamsShow: Codable, Sendable, Equatable {
+    public var `report`: DreamsRunDetail
+    public init(`report`: DreamsRunDetail) {
+        self.`report` = `report`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `report` = "report"
+    }
+}
+
+public struct NativeEventDreamsApplied: Codable, Sendable, Equatable {
+    public var `alreadyApplied`: Bool
+    public var `commit`: String
+    public var `run`: String
+    public init(`alreadyApplied`: Bool, `commit`: String, `run`: String) {
+        self.`alreadyApplied` = `alreadyApplied`
+        self.`commit` = `commit`
+        self.`run` = `run`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `alreadyApplied` = "already_applied"
+        case `commit` = "commit"
+        case `run` = "run"
+    }
+}
+
 public struct NativeEventServiceStatus: Codable, Sendable, Equatable {
     public var `coordinatorId`: String
     public var `executablePath`: String?
@@ -1367,6 +1558,9 @@ public enum NativeEvent: Codable, Sendable, Equatable {
     case `disconnect`
     case `notifications`(NativeEventNotifications)
     case `done`
+    case `dreamsList`(NativeEventDreamsList)
+    case `dreamsShow`(NativeEventDreamsShow)
+    case `dreamsApplied`(NativeEventDreamsApplied)
     case `serviceStatus`(NativeEventServiceStatus)
     case `identity`(NativeEventIdentity)
     enum CodingKeys: String, CodingKey { case type }
@@ -1395,6 +1589,9 @@ public enum NativeEvent: Codable, Sendable, Equatable {
         case "disconnect": self = .`disconnect`
         case "notifications": self = .`notifications`(try NativeEventNotifications(from: decoder))
         case "done": self = .`done`
+        case "dreams_list": self = .`dreamsList`(try NativeEventDreamsList(from: decoder))
+        case "dreams_show": self = .`dreamsShow`(try NativeEventDreamsShow(from: decoder))
+        case "dreams_applied": self = .`dreamsApplied`(try NativeEventDreamsApplied(from: decoder))
         case "service_status": self = .`serviceStatus`(try NativeEventServiceStatus(from: decoder))
         case "identity": self = .`identity`(try NativeEventIdentity(from: decoder))
         default: throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unsupported protocol event: \(tag)"))
@@ -1466,6 +1663,15 @@ public enum NativeEvent: Codable, Sendable, Equatable {
             try value.encode(to: encoder)
         case .`done`:
             try tag.encode("done", forKey: .type)
+        case .`dreamsList`(let value):
+            try tag.encode("dreams_list", forKey: .type)
+            try value.encode(to: encoder)
+        case .`dreamsShow`(let value):
+            try tag.encode("dreams_show", forKey: .type)
+            try value.encode(to: encoder)
+        case .`dreamsApplied`(let value):
+            try tag.encode("dreams_applied", forKey: .type)
+            try value.encode(to: encoder)
         case .`serviceStatus`(let value):
             try tag.encode("service_status", forKey: .type)
             try value.encode(to: encoder)
@@ -1664,6 +1870,29 @@ public struct NativeRequestNotifications: Codable, Sendable, Equatable {
     }
 }
 
+public struct NativeRequestDreamsShow: Codable, Sendable, Equatable {
+    public var `run`: String
+    public init(`run`: String) {
+        self.`run` = `run`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `run` = "run"
+    }
+}
+
+public struct NativeRequestDreamsApply: Codable, Sendable, Equatable {
+    public var `approve`: String
+    public var `run`: String
+    public init(`approve`: String, `run`: String) {
+        self.`approve` = `approve`
+        self.`run` = `run`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `approve` = "approve"
+        case `run` = "run"
+    }
+}
+
 public enum NativeRequest: Codable, Sendable, Equatable {
     case `attachment`(NativeRequestAttachment)
     case `observe`(NativeRequestObserve)
@@ -1677,6 +1906,9 @@ public enum NativeRequest: Codable, Sendable, Equatable {
     case `toolDetails`(NativeRequestToolDetails)
     case `interrupt`
     case `notifications`(NativeRequestNotifications)
+    case `dreamsList`
+    case `dreamsShow`(NativeRequestDreamsShow)
+    case `dreamsApply`(NativeRequestDreamsApply)
     case `serviceStatus`
     case `identify`
     enum CodingKeys: String, CodingKey { case type }
@@ -1695,6 +1927,9 @@ public enum NativeRequest: Codable, Sendable, Equatable {
         case "tool_details": self = .`toolDetails`(try NativeRequestToolDetails(from: decoder))
         case "interrupt": self = .`interrupt`
         case "notifications": self = .`notifications`(try NativeRequestNotifications(from: decoder))
+        case "dreams_list": self = .`dreamsList`
+        case "dreams_show": self = .`dreamsShow`(try NativeRequestDreamsShow(from: decoder))
+        case "dreams_apply": self = .`dreamsApply`(try NativeRequestDreamsApply(from: decoder))
         case "service_status": self = .`serviceStatus`
         case "identify": self = .`identify`
         default: throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unsupported protocol event: \(tag)"))
@@ -1737,6 +1972,14 @@ public enum NativeRequest: Codable, Sendable, Equatable {
             try tag.encode("interrupt", forKey: .type)
         case .`notifications`(let value):
             try tag.encode("notifications", forKey: .type)
+            try value.encode(to: encoder)
+        case .`dreamsList`:
+            try tag.encode("dreams_list", forKey: .type)
+        case .`dreamsShow`(let value):
+            try tag.encode("dreams_show", forKey: .type)
+            try value.encode(to: encoder)
+        case .`dreamsApply`(let value):
+            try tag.encode("dreams_apply", forKey: .type)
             try value.encode(to: encoder)
         case .`serviceStatus`:
             try tag.encode("service_status", forKey: .type)

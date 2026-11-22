@@ -24,6 +24,9 @@ actor InteractionPeer {
   private var streamsOnSubmit = false
   private var commandValues: [SlashCommand] = []
   private var servedJobs: [ScheduledJobStatus] = []
+  private var dreamsSummaries: [DreamsRunSummary] = []
+  private var dreamsDetails: [String: DreamsRunDetail] = [:]
+  private var dreamsApplyRequests: [NativeRequestDreamsApply] = []
   private var retried: [String] = []
   private var submitCount = 0
   private var files: [String: Data] = [:]
@@ -82,6 +85,11 @@ actor InteractionPeer {
   func retriedJobs() -> [String] { retried }
   /// Advertises work inspection, and answers `jobs` and `retry_job` from these.
   func serve(jobs: [ScheduledJobStatus]) { servedJobs = jobs }
+  func serveDreams(summaries: [DreamsRunSummary], details: [DreamsRunDetail]) {
+    dreamsSummaries = summaries
+    dreamsDetails = Dictionary(uniqueKeysWithValues: details.map { ($0.run, $0) })
+  }
+  func dreamsApplies() -> [NativeRequestDreamsApply] { dreamsApplyRequests }
   func submitAttempts() -> Int { submitCount }
   /// Rejects each submit while set, as a coordinator that cannot take a message does.
   func rejectSubmits(_ value: Bool) { rejecting = value }
@@ -180,6 +188,7 @@ actor InteractionPeer {
             .init(
               acceptedInputOrigins: origins, conversationId: "fixture-root",
               conversationSettings: settingsValue == nil ? nil : true,
+              dreams: dreamsDetails.isEmpty && dreamsSummaries.isEmpty ? nil : true,
               inputOrigins: settingsValue == nil && origins == nil ? nil : true,
               model: "fixture/model",
               workInspection: servedJobs.isEmpty ? nil : true, working: working)), to: socket)
@@ -264,6 +273,48 @@ actor InteractionPeer {
           try await emit(.accepted(.init(inputId: request.inputId)), to: socket)
           if streamsOnSubmit { try await beginReply("More text streams after acknowledgement. ") }
         }
+        try await emit(.done, to: socket)
+      case .dreamsList:
+        let pendingCount = dreamsSummaries.filter { $0.proposalStatus == .pending }.count
+        try await emit(
+          .dreamsList(.init(pendingCount: pendingCount, runs: dreamsSummaries)), to: socket)
+        try await emit(.done, to: socket)
+      case .dreamsShow(let request):
+        if let report = dreamsDetails[request.run] {
+          try await emit(.dreamsShow(.init(report: report)), to: socket)
+        } else {
+          try await emit(.failure(.init(message: "Unknown dreams run \(request.run)")), to: socket)
+        }
+        try await emit(.done, to: socket)
+      case .dreamsApply(let request):
+        dreamsApplyRequests.append(request)
+        guard var detail = dreamsDetails[request.run] else {
+          try await emit(.failure(.init(message: "Unknown dreams run \(request.run)")), to: socket)
+          try await emit(.done, to: socket)
+          break
+        }
+        guard detail.outcomeSha256 == request.approve else {
+          try await emit(.failure(.init(message: "Outcome digest mismatch")), to: socket)
+          try await emit(.done, to: socket)
+          break
+        }
+        let alreadyApplied = detail.proposalStatus == .applied
+        let commit = "1111222233334444555566667777888899990000"
+        detail.canApply = false
+        detail.proposalStatus = .applied
+        detail.statusDetail = "applied at 111122223333"
+        detail.outcomeLabel = "Proposed (applied)"
+        dreamsDetails[request.run] = detail
+        dreamsSummaries = dreamsSummaries.map { summary in
+          guard summary.run == request.run else { return summary }
+          var next = summary
+          next.proposalStatus = .applied
+          next.outcomeLabel = "Proposed (applied)"
+          return next
+        }
+        try await emit(
+          .dreamsApplied(.init(alreadyApplied: alreadyApplied, commit: commit, run: request.run)),
+          to: socket)
         try await emit(.done, to: socket)
       default: try await emit(.done, to: socket)
       }

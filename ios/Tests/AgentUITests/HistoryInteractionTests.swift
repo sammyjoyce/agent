@@ -2996,6 +2996,123 @@ final class HistoryInteractionTests: XCTestCase {
       "Top visible transcript row \(topRow) collided with banner \(bannerFrame)")
     await peer.releaseObservations()
   }
+
+  func testDreamsBrowserDetailAndConfirmedApplyCommitFlow() async throws {
+    executionTimeAllowance = 120
+    let peer = InteractionPeer()
+    addTeardownBlock { await peer.stop() }
+    let summary = DreamsRunSummary(
+      coverageComplete: false,
+      outcomeLabel: "Proposed",
+      proposalStatus: .pending,
+      run: "2026-11-22T02-00-00Z",
+      windowEndMs: 1_798_797_600_000,
+      windowStartMs: 1_798_711_200_000)
+    let detail = DreamsRunDetail(
+      attemptsUsed: 1,
+      baseRevision: "0123456789abcdef0123456789abcdef01234567",
+      canApply: true,
+      checks: [
+        DreamsCheckItem(
+          durationMs: 18,
+          name: "format",
+          output: "",
+          passed: true,
+          phase: "before",
+          verdict: "ok"),
+        DreamsCheckItem(
+          durationMs: 42,
+          name: "unit",
+          output: "72 passed",
+          passed: true,
+          phase: "after",
+          verdict: "ok"),
+      ],
+      citedEvidence: [
+        DreamsEvidenceCite(
+          body: "Receipt from nightly task check",
+          id: "rec-1",
+          kind: "receipt",
+          title: "Check receipt")
+      ],
+      coverageComplete: false,
+      files: ["docs/notes.md"],
+      gaps: ["slack/workspace-example: token expired"],
+      outcomeLabel: "Proposed",
+      outcomeSha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      patch: "@@ -1 +1 @@\n-old\n+new\n",
+      patchSha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      proposalStatus: .pending,
+      rationaleOrNote: "Refresh stale nightly reminder note\\x1b[31m.",
+      receiptsCount: 1,
+      run: "2026-11-22T02-00-00Z",
+      statusDetail: "ready for operator review",
+      summariesCapturedAtMs: 1_798_797_605_000,
+      summariesCount: 2,
+      windowEndMs: 1_798_797_600_000,
+      windowStartMs: 1_798_711_200_000)
+    await peer.serveDreams(summaries: [summary], details: [detail])
+
+    let app = try await launchMessages(
+      [
+        .init(
+          continuation: false, entryId: "main-1", finalChunk: true, role: .assistant, text: "Ready."
+        )
+      ],
+      peer: peer)
+    XCTAssertTrue(app.staticTexts["Ready."].waitForExistence(timeout: 10))
+    app.buttons["Connection"].tap()
+    let dreamsLink = app.buttons["dreamsControlsLink"]
+    XCTAssertTrue(dreamsLink.waitForExistence(timeout: 10), app.debugDescription)
+    dreamsLink.tap()
+
+    let row = app.buttons["dreamsRunRow:2026-11-22T02-00-00Z"]
+    XCTAssertTrue(row.waitForExistence(timeout: 10), app.debugDescription)
+    XCTAssertTrue(app.staticTexts["Coverage incomplete"].exists)
+    row.tap()
+
+    XCTAssertTrue(
+      app.staticTexts["ready for operator review"].waitForExistence(timeout: 10),
+      app.debugDescription)
+
+    func scrollUpTo(_ element: XCUIElement) {
+      var remaining = 8
+      while !element.isHittable && remaining > 0 {
+        app.swipeUp()
+        remaining -= 1
+      }
+      XCTAssertTrue(element.waitForExistence(timeout: 3), app.debugDescription)
+    }
+
+    scrollUpTo(app.staticTexts["slack/workspace-example: token expired"])
+    scrollUpTo(app.staticTexts["Refresh stale nightly reminder note\\x1b[31m."])
+    scrollUpTo(app.staticTexts["After: unit"])
+    scrollUpTo(app.staticTexts["rec-1"])
+
+    let applyButton = app.buttons["dreamsApplyButton"]
+    scrollUpTo(applyButton)
+    applyButton.tap()
+
+    let confirm = app.buttons["Apply changes"]
+    XCTAssertTrue(confirm.waitForExistence(timeout: 5), app.debugDescription)
+    confirm.tap()
+
+    try await eventually {
+      await peer.dreamsApplies()
+        == [
+          .init(
+            approve: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            run: "2026-11-22T02-00-00Z")
+        ]
+    }
+    var downs = 0
+    let appliedBanner = app.staticTexts["Applied as commit 111122223333."]
+    while !appliedBanner.exists && downs < 8 {
+      app.swipeDown()
+      downs += 1
+    }
+    XCTAssertTrue(appliedBanner.waitForExistence(timeout: 10), app.debugDescription)
+  }
 }
 
 @MainActor

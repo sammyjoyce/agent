@@ -134,5 +134,8 @@
 {"type":"native","request":{"type":"notifications","request":{"type":"status","installation_id":"example"}}}
 {"type":"native","request":{"type":"notifications","request":{"type":"register","installation_id":"example","token":"example"}}}
 {"type":"native","request":{"type":"notifications","request":{"type":"unregister","installation_id":"example"}}}
+{"type":"native","request":{"type":"dreams_list"}}
+{"type":"native","request":{"type":"dreams_show","run":"example"}}
+{"type":"native","request":{"type":"dreams_apply","run":"example","approve":"example"}}
 {"type":"native","request":{"type":"service_status"}}
 {"type":"native","request":{"type":"identify"}}

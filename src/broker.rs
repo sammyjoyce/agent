@@ -42,6 +42,7 @@ pub struct Broker {
     executor: host::Executor,
     state: std::path::PathBuf,
     dreams: Option<crate::dreams::Dreams>,
+    dreams_available: bool,
     instructions: std::path::PathBuf,
     peers: Mutex<HashMap<String, Peer>>,
 }
@@ -52,14 +53,21 @@ impl Broker {
         state: &Path,
         rex: crate::rex::RexClient,
     ) -> Result<Self> {
-        Self::with_tailscale(bootstrap, state, crate::tailnet::Daemon::default(), rex)
+        Self::with_tailscale_and_dreams(
+            bootstrap,
+            state,
+            crate::tailnet::Daemon::default(),
+            rex,
+            None,
+        )
     }
 
-    pub fn with_tailscale(
+    pub fn with_tailscale_and_dreams(
         bootstrap: Option<&CoordinatorBootstrap>,
         state: &Path,
         daemon: crate::tailnet::Daemon,
         rex: crate::rex::RexClient,
+        explicit_dreams: Option<crate::dreams::DreamsPolicy>,
     ) -> Result<Self> {
         let local = bootstrap.and_then(|bootstrap| bootstrap.node.clone());
         if let Some(node) = &local {
@@ -86,19 +94,29 @@ impl Broker {
             let browser = config.as_ref().and_then(|config| config.browser.clone());
             executor = executor.with_browser(Path::new(runtime), browser);
         }
-        let dreams = config
-            .as_ref()
-            .map(crate::config::ClientConfig::dreams_policy)
-            .transpose()?
-            .flatten()
+        let policy = match explicit_dreams {
+            Some(policy) => Some(policy),
+            None => config
+                .as_ref()
+                .map(crate::config::ClientConfig::dreams_policy)
+                .transpose()?
+                .flatten(),
+        };
+        let dreams = policy
             .map(|policy| crate::dreams::Dreams::open(state, policy))
             .transpose()?;
+        let dreams_available = if dreams.is_some() {
+            true
+        } else {
+            !crate::dreams::DreamsStore::open(state)?.list()?.is_empty()
+        };
         Ok(Self {
             local,
             contexts,
             executor,
             state: state.to_path_buf(),
             dreams,
+            dreams_available,
             instructions: bootstrap
                 .and_then(|value| value.node.as_ref())
                 .and_then(|node| node.launch.instructions.as_ref())
@@ -110,6 +128,14 @@ impl Broker {
 
     pub fn state_dir(&self) -> &Path {
         &self.state
+    }
+
+    pub fn dreams_policy(&self) -> Option<&crate::dreams::DreamsPolicy> {
+        self.dreams.as_ref().map(crate::dreams::Dreams::policy)
+    }
+
+    pub fn dreams_available(&self) -> bool {
+        self.dreams_available
     }
 
     fn online(&self, peers: &HashMap<String, Peer>) -> Vec<String> {

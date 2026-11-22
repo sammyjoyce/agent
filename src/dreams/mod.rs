@@ -1,7 +1,11 @@
 //! Dreams: nightly, proposal-only review of private operational evidence.
-//! This library can review, propose and abstain. It cannot apply. Application
-//! lives in the beep-boop binary (src/dreams_cli.rs), which no library code links.
+//! `Dreams::execute` (the Pi host tool boundary) can only review, propose and
+//! abstain. Explicit operator-approved application lives in `dreams::apply`
+//! and is invoked only from the CLI (`src/dreams_cli.rs`) and coordinator
+//! service boundary (`src/service.rs`, never forwarded to Pi).
+pub mod apply;
 mod evidence;
+pub mod ops;
 mod policy;
 mod store;
 mod types;
@@ -101,6 +105,10 @@ pub struct Dreams {
 }
 
 impl Dreams {
+    pub fn policy(&self) -> &DreamsPolicy {
+        &self.policy
+    }
+
     /// Refuses a state directory inside the policy repository, where a
     /// proposal could otherwise edit its own evidence.
     pub fn open(state: &Path, policy: DreamsPolicy) -> Result<Self> {
