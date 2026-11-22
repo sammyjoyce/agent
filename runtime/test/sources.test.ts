@@ -567,7 +567,7 @@ test("actionable source decisions reach main with exact originals so a later yes
         return fauxAssistantMessage(fauxToolCall("link_source_events", { keys, task_id: task.id }), { stopReason: "toolUse" });
       },
       fauxAssistantMessage(fauxToolCall("record_task", { task_id: task.id, summary: proposal,
-        state: { state: "waiting", actor: "user", next_check: null } }), { stopReason: "toolUse" }),
+        state: { state: "waiting", actor: "user", next_check: null, target: "owner" } }), { stopReason: "toolUse" }),
       fauxAssistantMessage(fauxToolCall("notify", { keys, task_id: task.id, text: proposal }), { stopReason: "toolUse" }),
       fauxAssistantMessage("Decision recorded."),
     ]);
@@ -611,7 +611,7 @@ test("due task follow-ups use the same triage path and must advance their durabl
     const next_check = new Date(Date.now() + 3_600_000).toISOString();
     app.faux.setResponses([
       fauxAssistantMessage(fauxToolCall("record_task", { task_id: task.id, summary: "Checked the existing thread; awaiting the provider.",
-        state: { state: "waiting", actor: "provider", next_check } }), { stopReason: "toolUse" }),
+        state: { state: "waiting", actor: "provider", next_check, target: "external" } }), { stopReason: "toolUse" }),
       fauxAssistantMessage("Next check recorded."),
     ]);
     await app.triage();

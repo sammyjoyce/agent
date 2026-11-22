@@ -272,6 +272,8 @@ pub fn held_after_restore(command: &RuntimeCommand) -> Option<&'static str> {
         | RuntimeCommand::Interrupt
         | RuntimeCommand::HostReply { .. }
         | RuntimeCommand::Watch
+        | RuntimeCommand::WatchTaskGraph
+        | RuntimeCommand::DetachTaskGraph
         | RuntimeCommand::ConnectWorker { .. }
         | RuntimeCommand::Native { .. }
         | RuntimeCommand::ConversationUsage { .. }

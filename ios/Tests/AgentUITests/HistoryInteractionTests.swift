@@ -2997,6 +2997,82 @@ final class HistoryInteractionTests: XCTestCase {
     await peer.releaseObservations()
   }
 
+  func testActiveWorkStripAndReadOnlySheetNavigateToInspection() async throws {
+    executionTimeAllowance = 120
+    let peer = InteractionPeer()
+    await peer.serveActiveWork(
+      TaskGraphSnapshot(conversations: [], nodes: [], omitted: 0, work: []))
+    await peer.serveInspection(
+      "10",
+      messages: [
+        .init(
+          continuation: false, entryId: "inspected-1", finalChunk: true, role: .assistant,
+          text: "Retained worker inspection message.")
+      ])
+    addTeardownBlock { await peer.stop() }
+    let app = try await launchMessages(
+      [
+        .init(
+          continuation: false, entryId: "main-1", finalChunk: true, role: .assistant, text: "Ready."
+        )
+      ],
+      peer: peer)
+    XCTAssertTrue(app.staticTexts["Ready."].waitForExistence(timeout: 10))
+    let strip = app.buttons["activeWorkStrip"]
+    XCTAssertFalse(strip.exists, "Strip stays hidden when active work counts are zero")
+
+    let graph = TaskGraphSnapshot(
+      conversations: [],
+      nodes: [],
+      omitted: 2,
+      work: [
+        ActiveWorkItem(
+          children: [
+            ActiveWorkChild(
+              agentId: "review", conversationId: "12", detail: "read: src/protocol.rs",
+              host: "laptop", status: .running, title: "Reviewer", tools: ["read: src/protocol.rs"])
+          ],
+          conversationId: "10", detail: "exec: cargo test", host: "workstation", id: "task:1",
+          isJob: false, startedAt: 1_798_797_600_000, status: .running, title: "Build fix",
+          tools: ["exec: cargo test"]),
+        ActiveWorkItem(
+          conversationId: "11", detail: "Confirm rollout", id: "task:2", isJob: false,
+          startedAt: 1_798_797_601_000, status: .waitingOwner, title: "Deploy sign-off"),
+        ActiveWorkItem(
+          conversationId: "14", detail: nil, id: "task:2b", isJob: false,
+          startedAt: 1_798_797_601_500, status: .waitingOwner, title: "Approve budget"),
+        ActiveWorkItem(
+          conversationId: "13", detail: "Waiting on CI", id: "task:3", isJob: true,
+          startedAt: 1_798_797_602_000, status: .waitingExternal, title: "Nightly check"),
+      ])
+    try await peer.publish(.taskGraph(.init(graph: graph)))
+    XCTAssertTrue(strip.waitForExistence(timeout: 10))
+    XCTAssertTrue(
+      app.staticTexts["1 running · 2 needs you · 1 waiting · +2 more"].waitForExistence(timeout: 5))
+
+    strip.tap()
+    XCTAssertTrue(app.navigationBars["Active work"].waitForExistence(timeout: 5))
+    XCTAssertTrue(app.staticTexts["Running"].exists)
+    XCTAssertTrue(app.staticTexts["Waiting"].exists)
+    XCTAssertTrue(app.staticTexts["Build fix"].exists)
+    XCTAssertTrue(app.staticTexts["Reviewer"].exists)
+    XCTAssertTrue(app.staticTexts["Deploy sign-off"].exists)
+    XCTAssertTrue(app.staticTexts["Confirm rollout"].exists)
+    XCTAssertFalse(app.staticTexts["Needs your reply · Confirm rollout"].exists)
+    XCTAssertTrue(app.staticTexts["Approve budget"].exists)
+    XCTAssertTrue(app.staticTexts["Needs your reply"].exists)
+    XCTAssertTrue(app.staticTexts["Nightly check"].exists)
+    XCTAssertFalse(app.buttons["Send message"].isHittable)
+    XCTAssertFalse(app.buttons["Cancel"].isHittable)
+
+    let buildRow = app.buttons.matching(NSPredicate(format: "identifier ENDSWITH '-task:1'"))
+      .firstMatch
+    XCTAssertTrue(buildRow.waitForExistence(timeout: 5))
+    buildRow.tap()
+    XCTAssertTrue(
+      app.staticTexts["Retained worker inspection message."].waitForExistence(timeout: 10))
+  }
+
   func testDreamsBrowserDetailAndConfirmedApplyCommitFlow() async throws {
     executionTimeAllowance = 120
     let peer = InteractionPeer()

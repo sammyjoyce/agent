@@ -9,8 +9,11 @@ import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { defineTask, ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
 import { DEFAULT_MODEL } from "../src/models.js";
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import { fixtureModel } from "./model.js";
 import { validEvent } from "../src/protocol.js";
-import { readTaskGraph, TASK_GRAPH_BYTE_LIMIT, TASK_GRAPH_NODE_LIMIT } from "../src/task-graph.js";
+import { buildActiveWork } from "../src/active-work.js";
+import { readTaskGraph, TASK_GRAPH_BYTE_LIMIT, TASK_GRAPH_NODE_LIMIT, watchTaskGraph } from "../src/task-graph.js";
 import type { HostCommand } from "../src/generated/HostCommand.js";
 import type { HostResult } from "../src/generated/HostResult.js";
 import type { RuntimeCommand } from "../src/generated/RuntimeCommand.js";
@@ -127,7 +130,18 @@ test("the task graph request joins live generations and tool calls with main, ta
     assert.deepEqual(shape(work("agent")), scripted("exec"));
     assert.deepEqual(conversations.map((conversation) => conversation.actor.type).sort(), ["agent", "main", "task"],
       "A delegate with no live native work stays out of the graph");
-    assert.equal(nodes.every((node) => !node.background && !node.abort_requested && node.blocked === null && node.conversations.length === 0), true);
+    assert.equal(nodes.every((node) => !node.background && !node.abort_requested && node.blocked === null && node.conversations.length === 0
+      && typeof node.started_at === "number"), true);
+    const execNode = nodes.find((node) => node.kind.type === "tool" && node.kind.name === "exec");
+    assert.equal(execNode?.argument_summary, "sleep 600");
+    assert.ok(Array.isArray(response.graph.work));
+    assert.equal(response.graph.work.find((item) => item.id === "main")?.status, "running");
+    const boardWork = response.graph.work.find((item) => item.task_id === spawned.command.task_id);
+    assert.equal(boardWork?.status, "running");
+    assert.ok(boardWork?.tools?.includes("exec: sleep 600"));
+    assert.equal(boardWork?.children?.length, 1);
+    assert.equal(boardWork?.children?.[0]?.agent_id, subagent.command.agent_id);
+    assert.ok(boardWork?.children?.[0]?.tools.includes("exec: sleep 600"));
     assert.equal((await event(5, (event) => event.type === "done")).type, "done");
   } finally { lines.close(); child.stdin.end(); child.kill("SIGKILL"); await closed; await rm(directory, { recursive: true, force: true }); }
 });
@@ -164,23 +178,25 @@ test("the task graph shows sleeping, blocked and background work, keeps an idle 
       }
     })(), "The timer must reach its sleep");
     assert.ok(validEvent({ version: 1, id: 1, event: { type: "task_graph", graph } }), "The graph must satisfy the generated event schema");
+    assert.equal(typeof graph.nodes.find((node) => node.id === created.timer)?.started_at, "number");
+    assert.equal(graph.nodes.find((node) => node.id === created.parent)?.started_at, undefined);
     const blocked = { kind: { type: "other", name: "fixture.retired" }, owner: null, background: false, abort_requested: false,
       state: { status: "pending", phase: "run" }, blocked: "missing_task", conversations: [] };
-    assert.deepEqual(graph, {
-      nodes: [
-        { id: created.timer, kind: { type: "other", name: "fixture.timer" }, conversation_id: ROOT_CONVERSATION_ID.toString(), owner: null,
-          background: true, abort_requested: false, state: { status: "sleeping", phase: "wait", until: wake }, blocked: null, conversations: [] },
-        { ...blocked, id: created.agent, conversation_id: agent.conversation_id },
-        { ...blocked, id: created.parent, conversation_id: created.stray.toString() },
-      ],
-      conversations: [
-        { conversation_id: ROOT_CONVERSATION_ID.toString(), actor: { type: "main" } },
-        { conversation_id: task.conversation_id, actor: { type: "task", task_id: task.id, title: "Idle parent" } },
-        { conversation_id: agent.conversation_id, actor: { type: "agent", task_id: task.id, agent_id: "review", title: "Review", parent_conversation_id: task.conversation_id } },
-        { conversation_id: created.stray.toString(), actor: { type: "other" } },
-      ],
-      omitted: 0,
-    });
+    const normalizedNodes = graph.nodes.map(({ started_at: _started, argument_summary: _summary, ...rest }) => rest);
+    assert.deepEqual(normalizedNodes, [
+      { id: created.timer, kind: { type: "other", name: "fixture.timer" }, conversation_id: ROOT_CONVERSATION_ID.toString(), owner: null,
+        background: true, abort_requested: false, state: { status: "sleeping", phase: "wait", until: wake }, blocked: null, conversations: [] },
+      { ...blocked, id: created.agent, conversation_id: agent.conversation_id },
+      { ...blocked, id: created.parent, conversation_id: created.stray.toString() },
+    ]);
+    assert.deepEqual(graph.conversations, [
+      { conversation_id: ROOT_CONVERSATION_ID.toString(), actor: { type: "main" } },
+      { conversation_id: task.conversation_id, actor: { type: "task", task_id: task.id, title: "Idle parent" } },
+      { conversation_id: agent.conversation_id, actor: { type: "agent", task_id: task.id, agent_id: "review", title: "Review", parent_conversation_id: task.conversation_id } },
+      { conversation_id: created.stray.toString(), actor: { type: "other" } },
+    ]);
+    assert.equal(graph.omitted, 0);
+    assert.equal(graph.work?.some((item) => item.task_id === task.id && item.status === "waiting_external"), true);
 
     const taskConversation = await app.tasks.conversation(task.conversation_id);
     const nested = await app.session.commit(async (tx) => {
@@ -255,4 +271,209 @@ test("bridge rejects an oversized task-graph request without breaking subsequent
     const followUp = await collect(2);
     assert.deepEqual(followUp.map((event) => event.type), ["tasks", "done"]);
   } finally { lines.close(); child.stdin.end(); child.kill("SIGKILL"); await closed; await rm(directory, { recursive: true, force: true }); }
+});
+
+test("active work excludes idle background scheduler timers and prioritizes waiting_owner updates in watchTaskGraph", { timeout: 20_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-active-work-watch-"));
+  const app = await open(directory);
+  const scheduler = defineTask<null, { phase: "sleep" }, null>({
+    name: "agent.background", version: 1, initial: () => ({ phase: "sleep" }), abort: async () => {},
+    phases: {
+      sleep: async (task, runtime, context) => {
+        await runtime.commit(() => ({ status: "sleeping", until: Date.UTC(2100, 0, 1), checkpoint: task.state.checkpoint }), context);
+      },
+    },
+  });
+  app.registry.install({ name: "agent", tasks: [scheduler] });
+  let stopWatch: (() => Promise<void>) | undefined;
+  try {
+    const root = await app.session.root(BACKGROUND_CONTEXT);
+    const releaseMain = app.executions.bind(root.id.toString(), { model: fixtureModel, cwd: host.cwd, hosts: [], call: async () => ({ type: "written" }) });
+    try {
+      await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [app.tools.main] }, BACKGROUND_CONTEXT);
+      await app.session.commit((tx) => tx.createTask(scheduler, null,
+        { ownership: { kind: "conversation" }, conversationId: ROOT_CONVERSATION_ID, background: true }), BACKGROUND_CONTEXT);
+      app.session.resume();
+      await within((async () => {
+        for (;;) {
+          const graph = await readTaskGraph(app.tasks);
+          if (graph.nodes.some((node) => node.kind.type === "other" && node.kind.name === "agent.background" && node.state.status === "sleeping")) {
+            assert.deepEqual(graph.work, [], "Sleeping background scheduler tick must not appear as active work");
+            return;
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        }
+      })(), "Scheduler tick should sleep");
+
+      const snapshots: Array<{ workIds: string[]; statuses: string[] }> = [];
+      const errors: unknown[] = [];
+      stopWatch = await watchTaskGraph(app.tasks, (graph) => {
+        snapshots.push({ workIds: graph.work.map((item) => item.id), statuses: graph.work.map((item) => item.status) });
+      }, (error) => errors.push(error));
+
+      assert.equal(snapshots.length, 1);
+      assert.deepEqual(snapshots[0]?.workIds, []);
+
+      const externalTask = await app.tasks.create({ title: "External check", outcome: "Check external API", job_id: "job-1" });
+      const ownerTask = await app.tasks.create({ title: "Approve deploy", outcome: "Ship release" });
+
+      app.faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("record_task", {
+          task_id: externalTask.id,
+          summary: "Waiting for CI run",
+          state: { state: "waiting", actor: "GitHub Actions", next_check: null, target: "external" },
+        }), { stopReason: "toolUse" }),
+        fauxAssistantMessage(fauxToolCall("record_task", {
+          task_id: ownerTask.id,
+          summary: "Confirm production rollout",
+          state: { state: "waiting", actor: "Owner", next_check: null, target: "owner" },
+        }), { stopReason: "toolUse" }),
+        fauxAssistantMessage("Recorded waiting states."),
+      ]);
+      const waitSubmission = await root.submit({ type: "input", content: "Record waiting states." }, BACKGROUND_CONTEXT);
+      assert.equal((await waitSubmission.wait(BACKGROUND_CONTEXT)).status, "done");
+
+      await within((async () => {
+        for (;;) {
+          const latest = snapshots.at(-1);
+          if (latest !== undefined && latest.workIds.length === 2) break;
+          await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        }
+      })(), "watchTaskGraph must publish waiting_owner and waiting_external updates");
+
+      const latestGraph = await readTaskGraph(app.tasks);
+      assert.deepEqual(errors, []);
+      assert.equal(latestGraph.work[0]?.task_id, ownerTask.id, "waiting_owner must sort before waiting_external");
+      assert.equal(latestGraph.work[0]?.status, "waiting_owner");
+      assert.equal(latestGraph.work[0]?.detail, "Confirm production rollout");
+      assert.equal(latestGraph.work[1]?.task_id, externalTask.id);
+      assert.equal(latestGraph.work[1]?.status, "waiting_external");
+      assert.equal(latestGraph.work[1]?.is_job, true);
+
+      app.faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("record_task", {
+          task_id: ownerTask.id,
+          summary: "Approved and finished",
+          state: { state: "resolved", evidence: "Shipped" },
+        }), { stopReason: "toolUse" }),
+        fauxAssistantMessage("Resolved deploy approval."),
+      ]);
+      const resolveSubmission = await root.submit({ type: "input", content: "Resolve owner task." }, BACKGROUND_CONTEXT);
+      assert.equal((await resolveSubmission.wait(BACKGROUND_CONTEXT)).status, "done");
+
+      await within((async () => {
+        for (;;) {
+          if (snapshots.at(-1)?.workIds.length === 1) break;
+          await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        }
+      })(), "Resolved waiting task must leave active work");
+    } finally { releaseMain(); }
+  } finally {
+    await stopWatch?.();
+    await app.session.close(BACKGROUND_CONTEXT);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("buildActiveWork sorts running main first, waiting_owner before waiting_external, and leaves empty owner detail unset", () => {
+  const work = buildActiveWork(
+    [
+      {
+        id: 1,
+        conversation_id: "1",
+        owner: null,
+        background: false,
+        abort_requested: false,
+        state: { status: "running", phase: "request" },
+        blocked: null,
+        conversations: ["1"],
+        kind: { type: "tool", name: "exec" },
+        started_at: 2000,
+        argument_summary: "cargo test",
+      },
+      {
+        id: 2,
+        conversation_id: "10",
+        owner: null,
+        background: true,
+        abort_requested: false,
+        state: { status: "running", phase: "run" },
+        blocked: null,
+        conversations: ["10"],
+        kind: { type: "tool", name: "read_file" },
+        started_at: 1000,
+        argument_summary: "src/protocol.rs",
+      },
+      {
+        id: 3,
+        conversation_id: "1",
+        owner: null,
+        background: true,
+        abort_requested: false,
+        state: { status: "sleeping", phase: "sleep", until: Date.UTC(2100, 0, 1) },
+        blocked: null,
+        conversations: ["1"],
+        kind: { type: "other", name: "agent.background" },
+      },
+    ],
+    [
+      {
+        id: "task-run",
+        conversation_id: "10",
+        title: "Worker task",
+        outcome: "Run tests",
+        summary: "",
+        model: null,
+        state: { state: "open" },
+        worker: { state: "bound", allocation_id: "alloc-1", host, binding: { host_id: host.host_id ?? "h1", session_id: "s1", window_id: "w1", block_id: "b1", rex_instance_id: "r1" } },
+        sources: [],
+        pending: [],
+        agents: [],
+        started_at: 1000,
+        updated_at: 1000,
+      },
+      {
+        id: "task-owner-blank",
+        conversation_id: "20",
+        title: "Needs owner decision",
+        outcome: "Confirm ship",
+        summary: "   ",
+        model: null,
+        state: { state: "waiting", actor: "Owner", next_check: null, target: "owner" },
+        worker: { state: "unassigned" },
+        sources: [],
+        pending: [],
+        agents: [],
+        started_at: 3000,
+        updated_at: 3000,
+      },
+      {
+        id: "task-external",
+        conversation_id: "30",
+        title: "CI build",
+        outcome: "Wait for green",
+        summary: "Checks pending",
+        model: null,
+        state: { state: "waiting", actor: "GitHub Actions", next_check: null, target: "external" },
+        worker: { state: "unassigned" },
+        sources: [],
+        pending: [],
+        agents: [],
+        started_at: 2500,
+        updated_at: 2500,
+      },
+    ],
+    new Map([["1", { type: "main" }]]),
+  );
+
+  assert.deepEqual(work.map((item) => [item.id, item.status]), [
+    ["main", "running"],
+    ["task:task-run", "running"],
+    ["task:task-owner-blank", "waiting_owner"],
+    ["task:task-external", "waiting_external"],
+  ]);
+  assert.equal(work[0]?.detail, "exec: cargo test");
+  assert.equal(work[1]?.host, host.name);
+  assert.equal(work[2]?.detail, undefined, "Blank owner wait leaves detail unset so clients render Needs your reply once");
+  assert.equal(work[3]?.detail, "Waiting on GitHub Actions · Checks pending");
 });

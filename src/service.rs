@@ -1091,6 +1091,7 @@ mod tests {
                 request: NativeRequest::Observe {
                     input_ids: vec![],
                     source_status,
+                    task_graph: None,
                 },
             };
             write_frame(&mut socket, &command).await.unwrap();
@@ -1121,7 +1122,10 @@ mod tests {
         let mut socket = service.client().await;
         write_frame(
             &mut socket,
-            &RuntimeCommand::ObserveMain { input_ids: vec![] },
+            &RuntimeCommand::ObserveMain {
+                input_ids: vec![],
+                task_graph: None,
+            },
         )
         .await
         .unwrap();
@@ -1417,6 +1421,7 @@ mod tests {
             native(Observe {
                 input_ids: vec![],
                 source_status: None,
+                task_graph: None,
             })
         };
         let plain = exchange(service.client().await, &[observe()], false).await;
@@ -2354,7 +2359,7 @@ mod tests {
             let script = state.join("fixture.mjs");
             fs::write(
                 &script,
-                "import readline from 'node:readline';\nconst rl = readline.createInterface({ input: process.stdin });\nrl.on('line', (line) => {\n  const req = JSON.parse(line);\n  if (req.command.type === 'configure_coordinator' || req.command.type === 'set_connected_nodes' || req.command.type === 'run_background') {\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'done' } }) + '\\n');\n  } else if (req.command.type === 'observe_main') {\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'main_ready', conversation_id: '1', cwd: '/', model: { provider: 'openai', model_id: 'fixture', reasoning: null, fast: false } } }) + '\\n');\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'worker_idle' } }) + '\\n');\n  } else {\n    process.stderr.write('UNEXPECTED_RUNTIME_COMMAND:' + req.command.type + '\\n');\n  }\n});\n",
+                "import readline from 'node:readline';\nconst rl = readline.createInterface({ input: process.stdin });\nrl.on('line', (line) => {\n  const req = JSON.parse(line);\n  if (req.command.type === 'configure_coordinator' || req.command.type === 'set_connected_nodes' || req.command.type === 'run_background') {\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'done' } }) + '\\n');\n  } else if (req.command.type === 'observe_main') {\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'main_ready', conversation_id: '1', cwd: '/', model: { provider: 'openai', model_id: 'fixture', reasoning: null, fast: false } } }) + '\\n');\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'worker_idle' } }) + '\\n');\n  } else if (req.command.type === 'read_task_graph') {\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'task_graph', graph: { nodes: [], conversations: [], omitted: 0, work: [] } } }) + '\\n');\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'done' } }) + '\\n');\n  } else {\n    process.stderr.write('UNEXPECTED_RUNTIME_COMMAND:' + req.command.type + '\\n');\n  }\n});\n",
             )
             .unwrap();
             let (stop, stopped) = oneshot::channel::<()>();
@@ -2451,6 +2456,7 @@ mod tests {
                 request: NativeRequest::Observe {
                     input_ids: vec![],
                     source_status: None,
+                    task_graph: None,
                 },
             },
         )
@@ -2743,6 +2749,20 @@ mod tests {
             }
             other => panic!("Expected ServiceStatus event, got {other:?}"),
         }
+        assert!(matches!(events[1], NativeEvent::Done));
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn native_task_graph_delivers_snapshot_and_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let service = BoundaryService::start(state, None).await;
+
+        let events = service.request_events(NativeRequest::TaskGraph).await;
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], NativeEvent::TaskGraph { .. }));
         assert!(matches!(events[1], NativeEvent::Done));
 
         service.shutdown().await;

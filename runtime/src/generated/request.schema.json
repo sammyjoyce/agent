@@ -2370,6 +2370,12 @@
                 "null"
               ]
             },
+            "task_graph": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "type": {
               "type": "string",
               "const": "observe"
@@ -2379,6 +2385,19 @@
           "required": [
             "type",
             "input_ids"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "task_graph"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
           ]
         },
         {
@@ -3432,6 +3451,30 @@
           "properties": {
             "type": {
               "type": "string",
+              "const": "watch_task_graph"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "detach_task_graph"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
               "const": "source_states"
             }
           },
@@ -3573,6 +3616,12 @@
               "items": {
                 "type": "string"
               }
+            },
+            "task_graph": {
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "type": {
               "type": "string",

@@ -10,6 +10,7 @@ mod program_status;
 mod scrollback_links;
 mod shell;
 mod transcript;
+mod work;
 
 use crate::tui::{
     activity::{ActivityPanel, PanelAction, ToolDetailRequest},
@@ -107,6 +108,7 @@ enum Update {
         reply: tokio::sync::oneshot::Sender<Option<String>>,
     },
     ResetConversation(TuiInfo),
+    ClearTaskGraph,
     Stop,
 }
 
@@ -179,6 +181,9 @@ impl TuiHandle {
     }
     pub fn event(&self, event: RuntimeEventKind) -> Result<()> {
         self.send(Update::Event(Box::new(event)))
+    }
+    pub fn clear_task_graph(&self) -> Result<()> {
+        self.send(Update::ClearTaskGraph)
     }
     pub fn begin_history_replay(&self) -> Result<HistoryReplay> {
         self.history_replay(false)
@@ -701,6 +706,7 @@ struct State {
     info: TuiInfo,
     messages: Vec<Message>,
     activity: ActivityPanel,
+    work: work::WorkPanel,
     output: Output,
     row_ends: Vec<usize>,
     row_width: u16,
@@ -760,6 +766,7 @@ impl State {
             info,
             messages: Vec::new(),
             activity: ActivityPanel::default(),
+            work: work::WorkPanel::default(),
             output: Output::default(),
             row_ends: Vec::new(),
             row_width: 0,
@@ -1455,6 +1462,10 @@ impl State {
             },
             RuntimeEventKind::Goal { status } => self.update_goal_status(status),
             RuntimeEventKind::Task { task, .. } => self.update_task_status(&task),
+            RuntimeEventKind::TaskGraph { graph } => {
+                self.work.set_graph(graph);
+                self.changed = true;
+            }
             RuntimeEventKind::WorkerIdle => {
                 if self.working
                     && self.last_failure.is_none()
@@ -1704,14 +1715,27 @@ impl State {
                     PanelAction::PassThrough => {}
                     PanelAction::Consumed | PanelAction::Closed => return None,
                 }
+            } else if self.work.is_open() {
+                if self.work.input(&event) {
+                    self.changed = true;
+                    return None;
+                }
             } else if key.code == KeyCode::Char('t')
                 && key.modifiers.contains(KeyModifiers::CONTROL)
             {
+                self.work.close();
                 self.activity.open();
                 self.changed = true;
                 return None;
+            } else if key.code == KeyCode::Char('g')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                self.activity.close();
+                self.work.open();
+                self.changed = true;
+                return None;
             }
-        } else if self.activity.is_open() {
+        } else if self.has_panel_overlay() {
             return None;
         }
         self.sync_completion();
@@ -2139,6 +2163,11 @@ impl State {
             self.changed = false;
             return;
         }
+        if self.work.is_open() {
+            self.work.draw(frame, frame.area());
+            self.changed = false;
+            return;
+        }
         self.prepare_editor();
         let working_height = u16::from(self.status() != "Ready");
         let status_height = working_height + u16::from(self.source_warning.is_some());
@@ -2396,6 +2425,7 @@ impl State {
             markdown::plain(&self.info.cwd),
             Style::default().fg(Color::Green),
         ));
+        status.extend(self.work.footer_spans());
         frame.render_widget(Paragraph::new(Line::from(status)), areas[4]);
         let hint = if self.exiting {
             "ctrl+c again to force-close this client"
@@ -2564,38 +2594,15 @@ fn first_non_empty_line(text: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn blocked_kind_for_actor(actor: &str) -> Option<(program_status::BlockedKind, String)> {
-    let normalized = actor.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return None;
-    }
-    if normalized.contains("auth") || normalized.contains("login") || normalized.contains("signin")
-    {
-        return Some((
-            program_status::BlockedKind::Auth,
-            format!("Waiting for authentication ({})", actor.trim()),
-        ));
-    }
-    if normalized.contains("perm") || normalized.contains("approv") || normalized.contains("grant")
-    {
-        return Some((
-            program_status::BlockedKind::Permission,
-            format!("Waiting for permission ({})", actor.trim()),
-        ));
-    }
-    if matches!(
-        normalized.as_str(),
-        "user" | "owner" | "human" | "operator" | "question"
-    ) {
-        return Some((
-            program_status::BlockedKind::Question,
-            format!("Waiting on {}", actor.trim()),
-        ));
-    }
-    None
-}
-
 impl State {
+    pub(super) fn has_panel_overlay(&self) -> bool {
+        self.activity.is_open() || self.work.is_open()
+    }
+
+    pub(super) fn has_modal_overlay(&self) -> bool {
+        self.picker.is_some() || self.has_panel_overlay()
+    }
+
     fn set_cwd(&mut self, cwd: String) {
         self.info.cwd = cwd.clone();
         if cwd.is_empty() {
@@ -2612,13 +2619,24 @@ impl State {
 
     fn update_task_status(&mut self, task: &crate::protocol::TaskRecord) {
         match &task.state {
-            crate::protocol::TaskState::Waiting { actor, next_check } => {
-                self.waiting_on = blocked_kind_for_actor(actor).map(|(kind, mut msg)| {
-                    if let Some(next) = next_check {
-                        msg.push_str(&format!(" · next check {next}"));
-                    }
-                    (kind, msg)
-                });
+            crate::protocol::TaskState::Waiting {
+                actor,
+                next_check,
+                target,
+            } => {
+                let mut mapped = match target {
+                    Some(crate::protocol::TaskWaitTarget::Owner) => Some((
+                        program_status::BlockedKind::Question,
+                        format!("Waiting for input ({})", actor.trim()),
+                    )),
+                    Some(crate::protocol::TaskWaitTarget::External) | None => None,
+                };
+                if let Some((_, msg)) = &mut mapped
+                    && let Some(next) = next_check
+                {
+                    msg.push_str(&format!(" · next check {next}"));
+                }
+                self.waiting_on = mapped;
             }
             crate::protocol::TaskState::Open | crate::protocol::TaskState::Resolved { .. } => {
                 self.waiting_on = None;
@@ -2876,6 +2894,7 @@ enum Shortcut {
     Scroll,
     History,
     Activity,
+    Work,
     Recall,
     RemoveFile,
     Help,
@@ -2906,6 +2925,11 @@ impl Shortcut {
                 "Ctrl+T",
                 "activity",
                 "Expand reasoning, tool arguments and output",
+            ),
+            Self::Work => (
+                "Ctrl+G",
+                "work",
+                "Inspect running and waiting coordinator work",
             ),
             Self::Recall => (
                 "Up/Down",
@@ -3030,6 +3054,10 @@ fn run(
                 Ok(Update::ResetConversation(info)) => {
                     screen.reset()?;
                     state.reset_conversation(info);
+                }
+                Ok(Update::ClearTaskGraph) => {
+                    state.work.clear_graph();
+                    state.changed = true;
                 }
             }
             if updates_started.elapsed() >= Duration::from_millis(8) {
@@ -6519,6 +6547,7 @@ mod tests {
                         sources: vec![],
                         pending: vec![],
                         agents: vec![],
+                        started_at: None,
                         updated_at: 0,
                     },
                 })),
@@ -6565,11 +6594,13 @@ mod tests {
                         state: TaskState::Waiting {
                             actor: "user".into(),
                             next_check: None,
+                            target: Some(crate::protocol::TaskWaitTarget::Owner),
                         },
                         worker: WorkerState::Unassigned,
                         sources: vec![],
                         pending: vec![],
                         agents: vec![],
+                        started_at: None,
                         updated_at: 0,
                     },
                 })),
@@ -6678,5 +6709,72 @@ mod tests {
         let cleared = view.program_status_reports();
         assert_eq!(cleared.len(), 2);
         assert_eq!(cleared[0].state, ProgramState::Idle);
+    }
+
+    #[test]
+    fn task_graph_updates_footer_counts_and_ctrl_g_toggles_read_only_work_panel() {
+        let mut view = State::new(TuiInfo {
+            title: "Main agent".into(),
+            model: Some(ModelSelection::default()),
+            cwd: "/workspace".into(),
+        });
+        view.event(RuntimeEventKind::TaskGraph {
+            graph: crate::protocol::TaskGraphSnapshot {
+                nodes: vec![],
+                conversations: vec![],
+                omitted: 2,
+                work: vec![
+                    crate::protocol::ActiveWorkItem {
+                        id: "task:1".into(),
+                        task_id: Some("11111111-1111-4111-8111-111111111111".parse().unwrap()),
+                        conversation_id: "10".into(),
+                        title: "Index docs".into(),
+                        status: crate::protocol::ActiveWorkStatus::Running,
+                        host: Some("workstation".into()),
+                        is_job: false,
+                        detail: Some("exec: rg --files".into()),
+                        started_at: None,
+                        tools: Some(vec!["exec: rg --files".into()]),
+                        children: None,
+                    },
+                    crate::protocol::ActiveWorkItem {
+                        id: "task:2".into(),
+                        task_id: Some("22222222-2222-4222-8222-222222222222".parse().unwrap()),
+                        conversation_id: "11".into(),
+                        title: "Review change".into(),
+                        status: crate::protocol::ActiveWorkStatus::WaitingOwner,
+                        host: None,
+                        is_job: false,
+                        detail: Some("Confirm merge".into()),
+                        started_at: None,
+                        tools: None,
+                        children: None,
+                    },
+                ],
+            },
+        });
+        let footer: String = view
+            .work
+            .footer_spans()
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect();
+        assert!(
+            footer.contains("1 running · 1 needs you · +2 omitted"),
+            "{footer}"
+        );
+        assert!(
+            view.input(Event::Key(KeyEvent::new(
+                KeyCode::Char('g'),
+                KeyModifiers::CONTROL
+            )))
+            .is_none()
+        );
+        assert!(view.work.is_open());
+        assert!(
+            view.input(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+                .is_none()
+        );
+        assert!(!view.work.is_open());
     }
 }

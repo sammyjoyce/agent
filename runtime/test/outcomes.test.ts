@@ -129,7 +129,7 @@ test("legacy published task outcomes preserve provenance and remain quiet after 
   const directory = await mkdtemp(join(tmpdir(), "agent-outcomes-")); let app = await open(directory);
   try {
     for (const state of [{ state: "resolved", evidence: "Native check returned the requested result" },
-      { state: "waiting", actor: "supplier", next_check: "2099-01-01T00:00:00.000Z" }]) {
+      { state: "waiting", actor: "supplier", next_check: "2099-01-01T00:00:00.000Z", target: "external" }]) {
       const command = await app.prepare();
       app.faux.setResponses([
         fauxAssistantMessage(fauxToolCall("record_task", { summary: "Verified and recorded the next step", state }), { stopReason: "toolUse" }),
@@ -176,7 +176,7 @@ test("an empty final stays silent live and after reopening while preserving its 
   try {
     const command = await app.prepare("Collect remote diagnostics");
     const summary = "Coordinator: collect the last day's service logs from the remote worker, then continue this task with the evidence.";
-    const state = { state: "waiting", actor: "coordinator", next_check: new Date(Date.now() - 1000).toISOString() };
+    const state = { state: "waiting", actor: "coordinator", next_check: new Date(Date.now() - 1000).toISOString(), target: "external" as const };
     app.faux.setResponses([
       fauxAssistantMessage(fauxToolCall("record_task", { summary, state }), { stopReason: "toolUse" }),
       fauxAssistantMessage(""),
@@ -208,7 +208,7 @@ test("a due coordinator handoff collects remote evidence and continues the same 
   try {
     const command = await app.prepare("Review fleet diagnostics");
     const summary = "Coordinator: collect the remote worker's service log for the last day, then continue this task with the evidence.";
-    const state = { state: "waiting", actor: "coordinator", next_check: new Date(Date.now() - 1000).toISOString() };
+    const state = { state: "waiting", actor: "coordinator", next_check: new Date(Date.now() - 1000).toISOString(), target: "external" as const };
     let recorded = () => {};
     const ready = new Promise<void>((resolve) => { recorded = resolve; });
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -399,7 +399,7 @@ test("coordinator follow-through consumes an incomplete outcome without generati
     app.faux.setResponses([
       fauxAssistantMessage(fauxToolCall("link_source_events", { keys: pending.map((record) => record.key), task_id: command.task_id }), { stopReason: "toolUse" }),
       fauxAssistantMessage(fauxToolCall("record_task", { task_id: command.task_id, summary: "Waiting for the supplier's reply",
-        state: { state: "waiting", actor: "supplier", next_check: "2099-01-01T00:00:00.000Z" } }), { stopReason: "toolUse" }),
+        state: { state: "waiting", actor: "supplier", next_check: "2099-01-01T00:00:00.000Z", target: "external" } }), { stopReason: "toolUse" }),
       fauxAssistantMessage("Follow-up is recorded."),
     ]);
     await app.sources.triage(triage, (conversation) => app.executions.bind(conversation.id.toString(), {

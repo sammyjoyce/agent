@@ -17,7 +17,7 @@ import { ConversationModels, ModelError, modelFailureMessage } from "./models.js
 import { ChatGptAuth } from "./auth.js";
 import { validRequest, validEvent, validApnsConfig, errorEvent, invalidHostReply, protocolLines, ModelTurnError } from "./protocol.js";
 import { TaskError, TaskStore, type ActorExecution, type HostCall } from "./tasks.js";
-import { readTaskGraph } from "./task-graph.js";
+import { readTaskGraph, watchTaskGraph } from "./task-graph.js";
 import { HistoryStore } from "./history.js";
 import { HistoryImports } from "./importer.js";
 import { ConversationCatalog } from "./catalog.js";
@@ -124,7 +124,7 @@ function writeEvent(id: number, event: RuntimeEventKind): void {
   if (encoded.event !== event) {
     // End only the view that cannot receive its snapshot; model execution and
     // durable inputs retain their existing owner.
-    mainObservers.get(id)?.close(); conversationViews.detach(id); mainViews.get(id)?.finish();
+    mainObservers.get(id)?.close(); taskGraphObservers.get(id)?.close(); conversationViews.detach(id); mainViews.get(id)?.finish();
   }
   event = encoded.event;
   if (event.type === "main_ready" || event.type === "task_ready" || event.type === "conversation_ready" || event.type === "worker_ready" || event.type === "done") admissions.delete(id);
@@ -322,6 +322,11 @@ async function openApplication(): Promise<Application> {
 }
 let application: ReturnType<typeof openApplication> | undefined;
 function app(): ReturnType<typeof openApplication> { return application ??= openApplication(); }
+const MAIN_CAPABILITIES = {
+  ...INPUT_ORIGIN_CAPABILITIES,
+  conversation_settings: true,
+  active_work: true,
+} as const;
 let mainQueue = Promise.resolve();
 const activeConversations = new Map<number, import("@earendil-works/pi-durable").Conversation>();
 const conversationViews = new ConversationViews(async () => ({ ...await app(), inference }),
@@ -367,6 +372,7 @@ async function retainMainInputs(harness: Harness, root: Conversation, turn: Main
 const mainTurns = new Map<number, MainTurn>();
 const mainViews = new Map<number, { owner: number; live: boolean; finish(): void }>();
 const mainObservers = new Map<number, Observation>();
+const taskGraphObservers = new Map<number, Observation>();
 const inputControls = new Map<number, Set<Promise<void>>>();
 const ending = new Set<number>();
 
@@ -399,6 +405,19 @@ async function interrupt(id: number): Promise<void> {
   const operation = (async () => { await conversation.abort(BACKGROUND_CONTEXT); emit(id, { type: "interrupted" }); })();
   interrupts.set(id, operation); await operation;
 }
+function observeTaskGraph(
+  id: number,
+  observer: Observation,
+  tasks: TaskStore,
+  errorMessage: string,
+): Promise<() => Promise<void>> {
+  return watchTaskGraph(
+    tasks,
+    (graph) => observer.publish({ type: "task_graph", graph }),
+    () => failure(id, "internal", errorMessage),
+  );
+}
+
 function submitInput(id: number, input: TurnInput, responseId = id): Promise<void> {
   if (!activeCommands.has(id) || ending.has(id)) {
     emit(responseId, { type: "input_rejected", input_id: input.input_id, message: "The turn ended before admission; retry this input." });
@@ -732,6 +751,28 @@ async function handle(request: RuntimeRequest): Promise<void> {
       }
       case "list_tasks": emit(id, { type: "tasks", tasks: await (await app()).tasks.list() }); break;
       case "read_task_graph": emit(id, { type: "task_graph", graph: await readTaskGraph((await app()).tasks) }); break;
+      case "watch_task_graph": {
+        const observer = new Observation((event) => writeEvent(id, event));
+        taskGraphObservers.set(id, observer);
+        let stopGraph: (() => Promise<void>) | undefined;
+        try {
+          const application = await app();
+          if (observer.closed) break;
+          stopGraph = await observeTaskGraph(
+            id,
+            observer,
+            application.tasks,
+            "Active work updates could not be read; run `tasks graph` to inspect current work.",
+          );
+          if (!observer.open()) break;
+          await observer.finished;
+        } finally {
+          observer.close();
+          try { await stopGraph?.(); }
+          finally { taskGraphObservers.delete(id); }
+        }
+        break;
+      }
       case "list_resources": emit(id, { type: "resources", resources: await (await app()).resources.list() }); break;
       case "collect_resources": emit(id, { type: "resources", resources: await (await app()).resources.collect(command.host_id, (operation) => hostRequests.call(id, operation)) }); break;
       case "search_tasks": emit(id, { type: "tasks", tasks: await (await app()).tasks.search(command.query) }); break;
@@ -836,14 +877,15 @@ async function handle(request: RuntimeRequest): Promise<void> {
         mainObservers.set(id, observer);
         let stopNotices: (() => void) | undefined;
         let stopSources: (() => Promise<void>) | undefined;
+        let stopTaskGraph: (() => Promise<void>) | undefined;
         try {
           const application = await app();
           if (observer.closed) break;
           const root = await application.harness.root(BACKGROUND_CONTEXT);
           if (observer.closed) break;
           stopNotices = await watchMainNotices(application.harness, root, (event) => observer.publish(event));
-          observer.snapshot({ type: "main_ready", ...INPUT_ORIGIN_CAPABILITIES, conversation_settings: true, conversation_id: root.id.toString(),
-            model: await inference.legacy(root, await application.environment.model(null)), cwd: "" });
+          observer.snapshot({ type: "main_ready", ...MAIN_CAPABILITIES,
+            conversation_id: root.id.toString(), model: await inference.legacy(root, await application.environment.model(null)), cwd: "" });
           // Reconcile optimistic rows before history exposes their saved copies.
           // Page completion makes native clients ready, so receipts must precede it.
           const receiptWork = command.input_ids.length === 0 ? undefined : await inspectMainWork(application.harness, root);
@@ -853,6 +895,15 @@ async function handle(request: RuntimeRequest): Promise<void> {
           }
           if (observer.closed) break;
           for (const frame of await history(root, null, application.histories)) observer.snapshot(frame);
+          if (observer.closed) break;
+          if (command.task_graph === true) {
+            stopTaskGraph = await observeTaskGraph(
+              id,
+              observer,
+              application.tasks,
+              "Active work updates could not be read; inspect current work.",
+            );
+          }
           if (!observer.open()) break;
           stopSources = await application.sources.watchStates((sources) => observer.publish({ type: "sources", sources }),
             () => failure(id, "internal", "Integration status could not be read. Reconnect to check source coverage."));
@@ -865,7 +916,10 @@ async function handle(request: RuntimeRequest): Promise<void> {
         } finally {
           observer.close();
           try { await stopSources?.(); }
-          finally { stopNotices?.(); mainObservers.delete(id); }
+          finally {
+            try { await stopTaskGraph?.(); }
+            finally { stopNotices?.(); mainObservers.delete(id); }
+          }
         }
         break;
       }
@@ -931,7 +985,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
             executions.setModel(root.id.toString(), selected);
             if (interrupted.has(id)) { await interrupts.get(id); return; }
             if (turn === undefined) throw new TaskError("The main execution owner is unavailable");
-            turn.conversation = root; turn.info = { type: "main_ready", ...INPUT_ORIGIN_CAPABILITIES, conversation_settings: true, conversation_id: root.id.toString(), model: selected, cwd: command.cwd };
+            turn.conversation = root; turn.info = { type: "main_ready", ...MAIN_CAPABILITIES, conversation_id: root.id.toString(), model: selected, cwd: command.cwd };
             // One owner must retain every saved root input. Completing the
             // selected input can hand Pi directly to an older queued follow-up.
             await retainMainInputs(harness, root, turn);
@@ -1053,6 +1107,10 @@ try {
       mainObservers.get(request.id)?.close();
       continue;
     }
+    if (request.command.type === "detach_task_graph") {
+      taskGraphObservers.get(request.id)?.close();
+      continue;
+    }
     if (request.command.type === "detach_conversation") { conversationViews.detach(request.id); continue; }
     if (request.command.type === "interrupt") {
       // Done may already be buffered while Rust still owns the request and sends its last control.
@@ -1119,6 +1177,7 @@ try {
   stopBackground?.();
   conversationViews.close();
   for (const observer of mainObservers.values()) observer.close();
+  for (const observer of taskGraphObservers.values()) observer.close();
   for (const worker of workers.values()) worker.controller.abort();
   await Promise.allSettled(pending);
 } finally {

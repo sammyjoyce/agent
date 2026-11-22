@@ -57,6 +57,7 @@ fn ty(schema: &Value) -> Result<String> {
         Some("string") => "String".into(),
         Some("boolean") => "Bool".into(),
         Some("integer") => "Int".into(),
+        Some("number") => "Double".into(),
         Some("array") => format!(
             "[{}]",
             ty(schema.get("items").context("Missing array items")?)?
@@ -114,7 +115,7 @@ fn definition(name: &str, schema: &Value) -> Result<String> {
     }
     if matches!(
         schema.get("type").and_then(Value::as_str),
-        Some("string" | "integer" | "boolean" | "array")
+        Some("string" | "integer" | "number" | "boolean" | "array")
     ) {
         return Ok(format!("public typealias {name} = {}\n\n", ty(schema)?));
     }
@@ -297,6 +298,7 @@ pub fn samples(schema: &Value, root: &Value) -> Result<Vec<Value>> {
         Some("null") => vec![Value::Null],
         Some("boolean") => vec![Value::Bool(false), Value::Bool(true)],
         Some("integer") => vec![Value::from(1)],
+        Some("number") => vec![Value::from(1.0)],
         Some("string") => vec![Value::from(
             if schema.get("format").and_then(Value::as_str) == Some("uuid") {
                 "11111111-1111-4111-8111-111111111111"

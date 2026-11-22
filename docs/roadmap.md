@@ -246,14 +246,16 @@ branching conversations legible directly from the main chat.
        `JobExecution` already has `started_at`).
     5. Carry bounded tool-argument context in the task graph if rows should show
        more than bare tool names such as `exec`.
-  - **Open owner decisions.** Strip placement (under chat title vs. above
-    composer); whether open tasks with no live activity appear or stay omitted;
-    whether tapping a row opens read-only conversation inspection or does
-    nothing.
+  - **Decided.** Strip sits under the chat title; idle open tasks stay hidden;
+    tapping a row opens the read-only conversation inspection view (whether a
+    "needs you" row should later lead to an answer surface stays open and
+    read-only for now).
   - **Acceptance.** On a real iPhone against a coordinator with running and
     waiting work, strip counts match sheet rows and update live without refresh;
     the strip hides when idle or when connected to a coordinator without the
-    capability; no sheet control mutates task or job state.
+    capability; no sheet control mutates task or job state. *(Implemented and
+    verified via Rust, runtime, Core and Simulator XCUI tests; tick after
+    verification on a physical iPhone.)*
 
 ### Dreams review and approval on iPhone
 

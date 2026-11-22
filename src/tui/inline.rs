@@ -277,11 +277,7 @@ fn sync_program_status(
 
 impl State {
     fn viewport_height(&mut self, size: Size, top: u16) -> u16 {
-        if self.output.view == View::History
-            || self.help_open
-            || self.picker.is_some()
-            || self.activity.is_open()
-        {
+        if self.output.view == View::History || self.help_open || self.has_modal_overlay() {
             return size.height;
         }
         self.prepare_editor();
@@ -313,7 +309,7 @@ impl State {
         terminal: &mut Terminal<B>,
         ending: bool,
     ) -> std::result::Result<(), B::Error> {
-        if (self.picker.is_some() || self.activity.is_open()) && !ending {
+        if self.has_modal_overlay() && !ending {
             return Ok(());
         }
         if matches!(self.output.banner, Banner::Waiting) && !ending {
@@ -390,8 +386,7 @@ impl State {
 
     fn has_native_output(&self) -> bool {
         if self.output.collecting_history
-            || self.picker.is_some()
-            || self.activity.is_open()
+            || self.has_modal_overlay()
             || self.history_replay.is_some()
             || matches!(self.output.banner, Banner::Waiting)
         {

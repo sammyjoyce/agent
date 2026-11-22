@@ -189,6 +189,8 @@ actor FixtureCoordinator {
     /// The coordinator closes on an observe carrying `source_status`, as one built with identities
     /// but before source status, such as `0d8daa0`, does when it cannot parse it.
     case closedOnSourceStatus
+    /// The coordinator accepts `source_status`, but closes on `task_graph` (`deny_unknown_fields`).
+    case closedOnTaskGraph
     /// The network resets the socket.
     case reset
     /// Nothing arrives, and the socket stays open until the phone closes it, as on a stalled network.
@@ -386,6 +388,9 @@ actor FixtureCoordinator {
         case .closedOnSourceStatus where request.sourceStatus != nil:
           socket.cancel()
           return
+        case .closedOnTaskGraph where request.taskGraph != nil:
+          socket.cancel()
+          return
         case .reset:
           socket.forceCancel()
           return
@@ -396,7 +401,7 @@ actor FixtureCoordinator {
             }
           }
           return
-        case .closedOnSourceStatus, nil: break
+        case .closedOnSourceStatus, .closedOnTaskGraph, nil: break
         }
         observer = socket
         try await emit(

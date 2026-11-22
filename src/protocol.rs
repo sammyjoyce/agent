@@ -429,6 +429,8 @@ pub enum RuntimeCommand {
         node: AgentNode,
     },
     Watch,
+    WatchTaskGraph,
+    DetachTaskGraph,
     SourceStates,
     IngestSource {
         batch: SourceBatch,
@@ -453,6 +455,9 @@ pub enum RuntimeCommand {
     /// Long-lived, read-only observation of the existing root conversation.
     ObserveMain {
         input_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        task_graph: Option<bool>,
     },
     /// Owner-independent admission using Pi's durable request identity.
     MainInput {
@@ -849,6 +854,13 @@ pub struct AllocationDecision {
     pub reason: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskWaitTarget {
+    Owner,
+    External,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum TaskState {
@@ -856,6 +868,9 @@ pub enum TaskState {
     Waiting {
         actor: String,
         next_check: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        target: Option<TaskWaitTarget>,
     },
     Resolved {
         evidence: String,
@@ -879,6 +894,9 @@ pub struct TaskRecord {
     pub sources: Vec<SourceRef>,
     pub pending: Vec<TaskInput>,
     pub agents: Vec<TaskAgentRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub started_at: Option<u64>,
     #[ts(type = "number")]
     pub updated_at: u64,
 }
@@ -895,6 +913,9 @@ pub struct TaskAgentRecord {
     pub state: TaskAgentState,
     pub worker: WorkerState,
     pub pending: Vec<TaskInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub started_at: Option<u64>,
     #[ts(type = "number")]
     pub updated_at: u64,
 }
@@ -905,6 +926,57 @@ pub enum TaskAgentState {
     Open,
     Done,
     Failed { reason: String },
+}
+
+/// Summary status of one active work item for live chat UIs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ActiveWorkStatus {
+    Running,
+    WaitingOwner,
+    WaitingExternal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ActiveWorkChild {
+    pub agent_id: String,
+    pub conversation_id: String,
+    pub title: String,
+    pub status: ActiveWorkStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub detail: Option<String>,
+    pub tools: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ActiveWorkItem {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub task_id: Option<TaskId>,
+    pub conversation_id: String,
+    pub title: String,
+    pub status: ActiveWorkStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub host: Option<String>,
+    pub is_job: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub started_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub children: Option<Vec<ActiveWorkChild>>,
 }
 
 /// The coordinator's live Pi tasks at one moment, with the Beep Boop actor of each conversation.
@@ -920,6 +992,9 @@ pub struct TaskGraphSnapshot {
     pub conversations: Vec<TaskGraphConversation>,
     /// Live native tasks left out because the snapshot is bounded.
     pub omitted: u32,
+    /// Summarized running and waiting work rows for live chat UIs.
+    #[serde(default)]
+    pub work: Vec<ActiveWorkItem>,
 }
 
 /// One live Pi task. `id` and `owner` are Pi task IDs, never a Beep Boop `TaskId`.
@@ -941,6 +1016,12 @@ pub struct TaskGraphNode {
     /// Conversations this task owns in Pi. Delegate and agent conversations are not owned by a
     /// Pi task; their parent is `TaskGraphActor::Agent::parent_conversation_id`.
     pub conversations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub started_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub argument_summary: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
@@ -1091,6 +1172,9 @@ pub enum TaskOutcomeState {
     Waiting {
         actor: String,
         next_check: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        target: Option<TaskWaitTarget>,
     },
     Resolved {
         evidence: String,
@@ -1715,6 +1799,10 @@ pub enum RuntimeEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         conversation_settings: Option<bool>,
+        /// Advertised when the coordinator provides live task-graph / Active work updates.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        active_work: Option<bool>,
         conversation_id: String,
         model: ModelSelection,
         cwd: String,

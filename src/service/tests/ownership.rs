@@ -233,7 +233,10 @@ async fn observers_cannot_submit_input_through_their_connection() {
     let mut client = service.client().await;
     write_frame(
         &mut client,
-        &RuntimeCommand::ObserveMain { input_ids: vec![] },
+        &RuntimeCommand::ObserveMain {
+            input_ids: vec![],
+            task_graph: None,
+        },
     )
     .await
     .unwrap();

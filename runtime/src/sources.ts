@@ -17,6 +17,7 @@ import { NoticeContextPlacement } from "./notice_context.js";
 import { publishMainNotice, sourceReference, TaskError, TaskStore, type NoticePublication } from "./tasks.js";
 import { Executions } from "./tools.js";
 import { PartitionedRecords } from "./partitioned-records.js";
+import { watchDerived } from "./watch-derived.js";
 
 type Decision = { type: "task"; task_id: string } | { type: "dismissed"; reason: string };
 type StoredEvent = { key: string; event: SourceEvent; decision: Decision | null; outcome?: TaskOutcome; occurred_at?: number };
@@ -215,34 +216,24 @@ export class SourceJournal {
    * repeated failed polls must not publish the same warning again. */
   async watchStates(emit: (states: SourceState[]) => void, failed: (error: unknown) => void): Promise<() => Promise<void>> {
     await this.prepare();
-    let closed = false, previous: string | undefined, dirty = false, pending: Promise<void> | undefined;
-    const refresh = (): Promise<void> => {
-      if (closed) return Promise.resolve();
-      dirty = true;
-      return pending ??= (async () => {
-        try {
-          while (dirty && !closed) {
-            dirty = false;
-            const states = await this.states();
-            const identity = JSON.stringify(states.map(({ source, coverage, checked_at, last_completed_at, progress }) =>
-              ({ source, coverage, checked_at, last_completed_at, progress })));
-            if (closed) return;
-            if (identity !== previous) { previous = identity; emit(states); }
-          }
-        } catch (error) { dirty = false; throw error; }
-      })().finally(() => {
-        pending = undefined;
-        if (dirty && !closed) void refresh().catch((error: unknown) => { if (!closed) failed(error); });
-      });
-    };
-    const commits = this.session.observeCommits({ advance: (publication) => {
-      if (!publication.changes.some((change) => change.type === "document" && change.record.kind === Control.definition.kind)) return;
-      dirty = true;
-      if (pending === undefined) void refresh().catch((error: unknown) => { if (!closed) failed(error); });
-    }, end() {} });
-    const stop = () => commits.detach();
-    try { await refresh(); } catch (error) { closed = true; stop(); throw error; }
-    return async () => { closed = true; stop(); await pending; };
+    return watchDerived({
+      read: () => this.states(),
+      identity: (states) => JSON.stringify(states.map(({ source, coverage, checked_at, last_completed_at, progress }) =>
+        ({ source, coverage, checked_at, last_completed_at, progress }))),
+      subscribe: (schedule) => {
+        const commits = this.session.observeCommits({
+          advance: (publication) => {
+            if (publication.changes.some((change) => change.type === "document" && change.record.kind === Control.definition.kind)) {
+              schedule();
+            }
+          },
+          end() {},
+        });
+        return () => commits.detach();
+      },
+      emit,
+      failed,
+    });
   }
   async events(options: { keys?: readonly string[]; provider?: string; account?: string; thread_id?: string;
     query?: string; limit?: number; pending?: boolean } = {}): Promise<StoredEvent[]> {

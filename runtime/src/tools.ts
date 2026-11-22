@@ -19,6 +19,7 @@ import type { WorkerHost } from "./generated/WorkerHost.js";
 import type { SearchMode } from "./generated/SearchMode.js";
 import type { DelegationDecision } from "./generated/DelegationDecision.js";
 import type { InputMode } from "./generated/InputMode.js";
+import type { TaskWaitTarget } from "./generated/TaskWaitTarget.js";
 import type { TaskMessageSender } from "./generated/TaskMessageSender.js";
 import { TaskError, TaskStore, type HostCall, type SearchQuery } from "./tasks.js";
 import { importedSummary } from "./history.js";
@@ -95,10 +96,13 @@ function agentOutput(name: string, args: ToolCall["arguments"], sender: string, 
 const source = Type.Object({ provider: Type.String(), account: Type.String(), thread_id: Type.String() });
 const attachmentIds = Type.Optional(Type.Array(Type.String(), { maxItems: MAX_ATTACHMENTS }));
 const inputModes = { steer: "steer", follow_up: "follow_up" } satisfies Record<InputMode, InputMode>;
+const taskWaitTargets = { owner: "owner", external: "external" } satisfies Record<TaskWaitTarget, TaskWaitTarget>;
 const taskState = Type.Union([
   Type.Object({ state: Type.Literal("open") }),
   Type.Object({ state: Type.Literal("waiting"), actor: Type.String({ minLength: 1 }),
-    next_check: Type.Union([Type.String(), Type.Null()]) }),
+    next_check: Type.Union([Type.String(), Type.Null()]),
+    target: Type.Enum(taskWaitTargets,
+      { description: "Who must act next: 'owner' when waiting for the user's reply or decision, or 'external' when waiting on someone or something else." }) }),
   Type.Object({ state: Type.Literal("resolved"), evidence: Type.String({ minLength: 1 }) }),
 ]);
 

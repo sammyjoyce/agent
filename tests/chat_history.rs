@@ -139,6 +139,10 @@ async fn repeated_control_c_detaches_while_admission_is_held_and_retains_its_ori
                                 completed.send(input_id).unwrap();
                                 return;
                             }
+                            RuntimeCommand::WatchTaskGraph => {
+                                let _ = reader.next_frame().await;
+                                return;
+                            }
                             other => panic!("Closing cannot interrupt or resubmit coordinator work: {other:?}"),
                         };
                         write_events(&mut writer, events.into_iter().chain([RuntimeEventKind::Done])).await.unwrap();
@@ -324,6 +328,10 @@ async fn known_chief_history_renders_while_its_observer_readiness_is_held() {
                                 }
                                 vec![RuntimeEventKind::History { conversation_id, messages,
                                     next_cursor: None, page_complete: true }]
+                            }
+                            RuntimeCommand::WatchTaskGraph => {
+                                let _ = reader.next_frame().await;
+                                return;
                             }
                             other => panic!("Opening saved history cannot submit model input or read a catalog: {other:?}"),
                         };
@@ -729,6 +737,10 @@ async fn recovery_connection(
                 });
             }
             receipts
+        }
+        RuntimeCommand::WatchTaskGraph => {
+            let _ = reader.next_frame().await;
+            return;
         }
         other => panic!("Observer recovery unexpectedly requested {other:?}"),
     };
@@ -1226,7 +1238,7 @@ async fn chief_startup(mode: ChiefStartup) {
                             },
                         ]
                     }
-                    RuntimeCommand::Watch => {
+                    RuntimeCommand::Watch | RuntimeCommand::WatchTaskGraph => {
                         let _ = reader.next_frame().await;
                         return;
                     }
@@ -1684,6 +1696,10 @@ async fn exact_resume_renders_history_without_fetching_fuzzy_catalog_pages() {
                             next_cursor: None,
                             page_complete: true,
                         }]
+                    }
+                    RuntimeCommand::WatchTaskGraph => {
+                        let _ = read.next_frame().await;
+                        return;
                     }
                     other => panic!("Readonly resume unexpectedly requested {other:?}"),
                 };

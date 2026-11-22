@@ -58,7 +58,7 @@ for (const scenario of ["absent", "unknown", "wrong", "failed", "foreign"]) {
         fauxAssistantMessage(fauxToolCall("record_task", {
           summary: "Reviewed the earlier failure.",
           ...(scenario === "foreign" ? { task_id: task.id } : {}),
-          state: { state: "waiting", actor: "Upstream check", next_check: null },
+          state: { state: "waiting", actor: "Upstream check", next_check: null, target: "external" },
           ...(scenario === "absent" ? {} : { reconciles_input: scenario === "wrong" ? "other-unanswered"
             : scenario === "unknown" ? "unknown-request" : scheduledOccurrence.id }),
         }), { stopReason: "toolUse" }),
@@ -126,7 +126,7 @@ test("a retained terminal outbox item cannot abort a fresh explicit recovery aft
       context => {
         assert.ok(context.messages.some(message => message.role === "toolResult" && message.content.some(part => part.type === "text" && part.text.includes("performed once"))));
         return fauxAssistantMessage(fauxToolCall("record_task", { summary: "Verified the completed effect; no replay is needed.",
-          reconciles_input: scheduledOccurrence.id, state: { state: "waiting", actor: "Upstream check", next_check: null } }), { stopReason: "toolUse" });
+          reconciles_input: scheduledOccurrence.id, state: { state: "waiting", actor: "Upstream check", next_check: null, target: "external" } }), { stopReason: "toolUse" });
       },
       fauxAssistantMessage("The interrupted input is reconciled."),
     ]);
@@ -207,7 +207,7 @@ for (const recoveredState of ["waiting", "resolved"]) {
             message.content.some((part) => part.type === "text" && part.text.includes("performed once"))));
           return fauxAssistantMessage(fauxToolCall("record_task", { summary: "Verified the original effect occurred once.",
             ...(recoveredState === "waiting" ? { reconciles_input: occurrence.id } : {}),
-            state: recoveredState === "waiting" ? { state: "waiting", actor: "Upstream check", next_check: null }
+            state: recoveredState === "waiting" ? { state: "waiting", actor: "Upstream check", next_check: null, target: "external" }
               : { state: "resolved", evidence: "Read back the original effect receipt; no replay is needed." } }), { stopReason: "toolUse" });
         },
         async () => { recorded(); await finalGate; return fauxAssistantMessage("The original effect is verified."); },

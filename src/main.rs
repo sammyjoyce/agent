@@ -1542,6 +1542,47 @@ async fn watch(client: ClientContext<'_>, json: bool) -> Result<WatchGuard> {
     })))
 }
 
+async fn watch_task_graph(client: ClientContext<'_>, tui: TuiHandle) -> Result<WatchGuard> {
+    let mut wire = connection(client, false).await?;
+    write_command(&mut *wire.writer, &RuntimeCommand::WatchTaskGraph).await?;
+    Ok(WatchGuard(tokio::spawn(async move {
+        let _writer = wire.writer;
+        let _child = wire.child;
+        let mut reader = FrameReader::new(BufReader::new(wire.reader));
+        loop {
+            let frame = match reader.next_frame().await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = tui.notice(format!("Active work stream interrupted: {error}"));
+                    break;
+                }
+            };
+            let event = match decode_coordinator_event(&frame) {
+                Ok(event) => event,
+                Err(error) => {
+                    let _ = tui.notice(format!("Active work stream decode failed: {error}"));
+                    break;
+                }
+            };
+            match event {
+                RuntimeEventKind::TaskGraph { .. } => {
+                    if tui.event(event).is_err() {
+                        break;
+                    }
+                }
+                RuntimeEventKind::Failure { message, .. } => {
+                    let _ = tui.notice(format!("Active work updates unavailable: {message}"));
+                    break;
+                }
+                RuntimeEventKind::Done => break,
+                _ => {}
+            }
+        }
+        let _ = tui.clear_task_graph();
+    })))
+}
+
 fn use_tui(arguments: &Arguments) -> bool {
     !arguments.json
         && !arguments.no_tui
@@ -2912,6 +2953,15 @@ async fn chat_tui(
         ui.handle
             .event(RuntimeEventKind::ConversationSettings { settings })?;
         chat_view::open(client, &mut ui, chief).await?;
+        let _task_graph = match watch_task_graph(client, ui.handle.clone()).await {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                let _ = ui
+                    .handle
+                    .notice(format!("Live active work updates unavailable: {error}"));
+                None
+            }
+        };
         if let Some(prompt) = initial_prompt.clone() {
             if let Some(Ok(ChatCommand::Resume { query })) = ChatCommand::parse(&prompt) {
                 if chat_view::resume(client, &mut ui, query.join(" ")).await?

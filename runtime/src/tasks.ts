@@ -568,7 +568,11 @@ export class TaskStore {
     failure?: string): TaskOutcome {
     return { task_id: task.id, conversation_id: conversationId, entry_id: entryId, tool_call_id: callId,
       summary: task.summary, sources: task.sources.map((source) => ({ ...source })),
-      state: failure === undefined ? task.state.state === "open" ? { state: "progress" } : { ...task.state }
+      state: failure === undefined
+        ? task.state.state === "open" ? { state: "progress" }
+          : task.state.state === "waiting" ? { state: "waiting", actor: task.state.actor, next_check: task.state.next_check,
+              ...(task.state.target === undefined ? {} : { target: task.state.target }) }
+          : { ...task.state }
         : { state: "failed", reason: failure } };
   }
   async origin(conversation: Conversation, callId: string): Promise<EntryRecord> {
@@ -957,8 +961,9 @@ export class TaskStore {
     const previous = await this.taskIn(tx, id);
     if (previous !== undefined) return { id: previous.id };
     const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
+    const now = Date.now();
     const task: TaskRecord = { id, model: input.model ?? null, conversation_id: conversation.id.toString(), title: input.title.trim(), outcome: input.outcome.trim(),
-      summary: "", state: { state: "open" }, worker: { state: "unassigned" }, sources, pending: [], agents: [], updated_at: Date.now(),
+      summary: "", state: { state: "open" }, worker: { state: "unassigned" }, sources, pending: [], agents: [], started_at: now, updated_at: now,
       ...(input.scheduled_run === undefined ? {} : { scheduled_run: input.scheduled_run }) };
     const { value: saved } = await this.recordsStore.insertIn(tx, id, task); await this.indexTaskIn(tx, saved);
     if (this.isConfined(task)) (await tx.doc(ConfinedConversation, task.conversation_id, null)).confined = true;
@@ -1175,9 +1180,11 @@ export class TaskStore {
       const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
       const lineage = await tx.doc(NoticeLineage, parent.id);
       if (lineage.origin !== null) (await tx.doc(NoticeLineage, conversation.id)).origin = { ...lineage.origin };
+      const now = Date.now();
       task.agents.push({ id: input.id, model: selected, conversation_id: conversation.id.toString(), title: input.title.trim(),
         outcome: input.outcome.trim(), summary: "", state: { state: "open" }, worker: { state: "unassigned" },
-        pending: [{ id: input.inputId, content: input.input, ...(input.attachments === undefined ? {} : { attachments: input.attachments }) }], updated_at: Date.now() });
+        pending: [{ id: input.inputId, content: input.input, ...(input.attachments === undefined ? {} : { attachments: input.attachments }) }],
+        started_at: now, updated_at: now });
       await this.indexTaskIn(tx, task);
       task.state = { state: "open" };
       task.updated_at = Date.now();

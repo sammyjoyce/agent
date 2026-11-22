@@ -754,7 +754,7 @@ test("a task waiting on another actor is not continued until new input reopens i
     const task = await app.task("Waiting task");
     await app.goal(inTask(task.id), { type: "set", request_id: "set-wait", objective: "Ship after CI passes" });
     app.script([
-      call("record_task", { summary: "Waiting for CI", state: { state: "waiting", actor: "ci", next_check: null } }, "wait-ci"),
+      call("record_task", { summary: "Waiting for CI", state: { state: "waiting", actor: "ci", next_check: null, target: "external" } }, "wait-ci"),
       fauxAssistantMessage("Waiting for CI."),
     ]);
     await app.run(await app.command(task.id));

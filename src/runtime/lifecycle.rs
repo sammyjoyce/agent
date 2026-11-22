@@ -7,6 +7,7 @@ pub enum View {
     Main,
     MainObserver,
     Conversation,
+    TaskGraph,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +34,7 @@ impl RequestLifecycle {
             RuntimeCommand::AttachMain => Self::View(View::Main),
             RuntimeCommand::ObserveMain { .. } => Self::View(View::MainObserver),
             RuntimeCommand::AttachConversation { .. } => Self::View(View::Conversation),
+            RuntimeCommand::WatchTaskGraph => Self::View(View::TaskGraph),
             RuntimeCommand::RunBackground { .. } => Self::Background,
             RuntimeCommand::ImportChatGpt { .. } => Self::ClientHistory,
             RuntimeCommand::ConfigureCoordinator { .. }
@@ -44,6 +46,7 @@ impl RequestLifecycle {
             | RuntimeCommand::DetachWorker
             | RuntimeCommand::DetachMain
             | RuntimeCommand::DetachConversation
+            | RuntimeCommand::DetachTaskGraph
             | RuntimeCommand::Interrupt
             | RuntimeCommand::HostReply { .. }
             | RuntimeCommand::Watch
@@ -152,6 +155,7 @@ impl RequestLifecycle {
             Self::Worker { interactive: true } => Some(RuntimeCommand::DetachWorker),
             Self::View(View::Main | View::MainObserver) => Some(RuntimeCommand::DetachMain),
             Self::View(View::Conversation) => Some(RuntimeCommand::DetachConversation),
+            Self::View(View::TaskGraph) => Some(RuntimeCommand::DetachTaskGraph),
             _ => None,
         }
     }
