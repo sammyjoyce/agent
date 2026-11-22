@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 import Testing
 
@@ -95,6 +96,7 @@ private func takes(_ takes: [String]) -> ScriptedSpeech.Script {
 @MainActor private func withCar(
   _ script: ScriptedSpeech.Script, carplay: Bool = true, timings: CarTimings = .quick,
   protectedDataAvailable: @escaping @MainActor () -> Bool = { true },
+  decorateEngine: (SpeechEngine) -> SpeechEngine = { $0 },
   _ body: (CarRig) async throws -> Void
 ) async throws {
   try await withTwoFixtures { coordinators, workPeer, _, _ in
@@ -103,7 +105,7 @@ private func takes(_ takes: [String]) -> ScriptedSpeech.Script {
     let (work, _) = try await addWorkAndPersonal(coordinators)
     await coordinators.setActive(false)
     let speech = ScriptedSpeech(script)
-    let engine = speech.engine
+    let engine = decorateEngine(speech.engine)
     let spoken = SpokenLines()
     let car = CarConversation(
       coordinators: coordinators, engine: engine, speaker: spoken.speaker,
@@ -372,5 +374,152 @@ func anAudioInterruptionEndsTheConversationWithoutAWord(_ interruption: Interrup
       try await rig.ended(saying: 1)
     }
     #expect(await rig.submitted().isEmpty)
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func adversaryTheDriversReplyDoesNotAskThemToTouchThePhone() async throws {
+  let instruction = "Pick up your iPhone and tap the invented Ferns button."
+  try await withCar(takes([deploy, "Yes.", ""])) { rig in
+    await rig.peer.answerEachSubmit(instruction)
+    rig.car.begin(with: rig.work)
+    try await rig.ended(saying: 3)
+    let said = try #require(rig.spoken.lines.last)
+    print("LAST_SPOKEN=\(said)")
+    #expect(!said.contains("Pick up your iPhone"))
+  }
+}
+
+private final class HeldSessionActor: Sendable {
+  private let holding = DispatchSemaphore(value: 0)
+  private let release = DispatchSemaphore(value: 0)
+
+  func occupy(_ session: isolated CoordinatorSession) {
+    holding.signal()
+    release.wait()
+  }
+
+  func isHolding() -> Bool { holding.wait(timeout: .now()) == .success }
+  func open() { release.signal() }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func adversaryCancelBeforeTheSessionCanAdmitDoesNotSend() async throws {
+  try await withCar(takes([deploy])) { rig in
+    // The phone app being open holds Work's observer even if the car leaves.
+    await rig.coordinators.setActive(true)
+    await rig.peer.holdNextSubmitReply()
+    rig.spoken.holding = "Send to"
+    let run = rig.car.begin(with: rig.work)
+    try await eventually("the car reads back") { rig.spoken.lines.count == 2 }
+    let session = try #require(
+      rig.coordinators.chat.lanes.first { $0.id == rig.work.id }?.session)
+    let gate = HeldSessionActor()
+    defer { gate.open() }
+    let holding = Task.detached { await gate.occupy(session) }
+    try await eventually("Work's actor is busy") { gate.isHolding() }
+
+    rig.car.perform(.send, in: .confirming)
+    try await eventually("the confirmed send is about to reach Work's actor") {
+      rig.car.phase == .working
+    }
+    rig.car.perform(.cancel, in: .working)
+    let outbox = session.outboxURL
+    #expect(!FileManager.default.fileExists(atPath: outbox.path), "Cancel preceded admission")
+    gate.open()
+    await holding.value
+    await run.value
+
+    let saved =
+      FileManager.default.fileExists(atPath: outbox.path) ? try queuedRequests(outbox) : []
+    if !saved.isEmpty {
+      try await eventually("the canceled send reaches the coordinator") {
+        await rig.peer.count() == 1
+      }
+    }
+    print("OUTBOX=\(saved.map(\.text)); SUBMITS=\(await rig.submitted().map(\.text))")
+    #expect(saved.isEmpty)
+    #expect(await rig.submitted().isEmpty)
+    await rig.peer.releaseSubmitReply()
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func adversarySendButtonWorksWhileConfirmationTranscriptionFinishes() async throws {
+  try await withCar(takes([deploy, "Perhaps.", ""])) { rig in
+    await rig.peer.answerEachSubmit(finished)
+    rig.spoken.holding = "Send to"
+    rig.car.begin(with: rig.work)
+    try await eventually("the read-back began") { rig.spoken.lines.count == 2 }
+    rig.speech.hold()
+    defer { rig.speech.release() }
+    rig.spoken.holding = nil
+    try await eventually("the confirmation take is finalizing") {
+      rig.car.phase == .confirming && rig.speech.recordings == 2 && rig.speech.heldFinishes == 1
+    }
+
+    rig.car.perform(.send, in: .confirming)
+    rig.speech.release()
+    try await rig.ended(saying: 3)
+    let sent = await rig.submitted().map(\.text)
+    print("SENT_AFTER_SEND_PRESS=\(sent); LAST_SPOKEN=\(rig.spoken.lines.last ?? "")")
+    #expect(sent == [deploy])
+    #expect(rig.spoken.lines.last == finished)
+  }
+}
+
+@MainActor private final class HeldConfirmationFinish {
+  private var finishes = 0
+  private var waiting: CheckedContinuation<Void, Never>?
+  var isWaiting: Bool { waiting != nil }
+
+  func wrap(_ engine: SpeechEngine) -> SpeechEngine {
+    SpeechEngine(
+      model: engine.model, install: engine.install, prewarm: engine.prewarm, remove: engine.remove,
+      diskUsage: engine.diskUsage, onCellular: engine.onCellular, permission: engine.permission,
+      requestPermission: engine.requestPermission,
+      record: {
+        let recording = try await engine.record()
+        return Recording(
+          events: recording.events, finish: { try await self.finish(recording) },
+          cancel: recording.cancel)
+      })
+  }
+
+  func release() {
+    let continuation = waiting
+    waiting = nil
+    continuation?.resume()
+  }
+
+  private func finish(_ recording: Recording) async throws -> String {
+    finishes += 1
+    // Parakeet's real finish still has the microphone open for a short tail of audio.
+    if finishes == 2 { await withCheckedContinuation { waiting = $0 } }
+    return try await recording.finish()
+  }
+}
+
+@MainActor @Test(.timeLimit(.minutes(1)))
+func adversaryInterruptionWhileFinalizingConfirmationDoesNotSend() async throws {
+  let tail = HeldConfirmationFinish()
+  try await withCar(takes([deploy, "Yes.", ""]), decorateEngine: tail.wrap) { rig in
+    await rig.peer.answerEachSubmit(finished)
+    let run = rig.car.begin(with: rig.work)
+    defer { tail.release() }
+    try await eventually("confirmation finish began while the mic is still open") { tail.isWaiting }
+    #expect(rig.car.phase == .confirming)
+    rig.speech.interrupt()
+    let deadline = ContinuousClock.now + .milliseconds(300)
+    while rig.car.phase == .confirming && ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    tail.release()
+    await run.value
+
+    let sent = await rig.submitted().map(\.text)
+    print("SENT_AFTER_AUDIO_INTERRUPTION=\(sent); LAST_SPOKEN=\(rig.spoken.lines.last ?? "")")
+    #expect(sent.isEmpty)
+    #expect(rig.spoken.lines.count == 2)
   }
 }

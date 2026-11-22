@@ -292,6 +292,36 @@ func aLedgerThatCannotBeReadIsKeptUntilItCanBeMerged() async throws {
   }
 }
 
+/// A successful reread after unlock should also fix stamps in the first published rows.
+@Test(.timeLimit(.minutes(1)))
+func adversaryLedgerRereadUsesSavedStampsInThePublishedRows() async throws {
+  try await withProfile { fixture, directory, launch in
+    let receivedAt = 1_762_100_000.25
+    let earlier = Ledger(entries: ["kept": .init(receivedAt: receivedAt)], sends: [:])
+    try writePrivately(JSONEncoder().encode(earlier), to: directory.ledger)
+    let path = directory.ledger.path
+    try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: path)
+    defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path) }
+    await fixture.replyToHistory(
+      initial: .init(messages: [reply("kept", "Earlier invented reply")], pageComplete: true),
+      pages: [:])
+
+    let session = try await launch()
+    await session.connect()
+    _ = try await until(session) {
+      $0.connection == .connected && $0.rows.contains { $0.entryID == "kept" }
+    }
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+    try await fixture.liveMessage(reply("new", "New invented reply"))
+    let published = try await until(session) { $0.rows.contains { $0.entryID == "new" } }
+    let rowStamp = try #require(published.rows.first { $0.entryID == "kept" }?.receivedAt)
+    let diskStamp = try #require(try savedLedger(directory).entries["kept"]?.receivedAt)
+    print("PUBLISHED_KEPT_STAMP=\(rowStamp.timeIntervalSince1970); DISK_KEPT_STAMP=\(diskStamp)")
+    #expect(diskStamp == receivedAt)
+    #expect(rowStamp.timeIntervalSince1970 == receivedAt)
+  }
+}
+
 /// A restored item, which its coordinator refused, is discarded once its copy was sent instead. The
 /// ledger keeps that the item was withdrawn, after the outbox lets it go and across a relaunch, so
 /// its Send reads not sent here.
