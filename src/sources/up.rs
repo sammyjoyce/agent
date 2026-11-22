@@ -42,6 +42,10 @@ const TOO_MANY_HOLDS: &str =
 const LOOKUPS_PER_POLL: usize = 4;
 /// How far back a removed hold can pull the next window.
 const MAX_REACH_BACK_SECONDS: u64 = 60 * 86_400;
+/// One scan a day reads this far back again. Up can record a settlement as a
+/// new transaction with the creation time of the hold it replaces, after the
+/// scan that followed the removal of the hold.
+const REREAD_SECONDS: u64 = 14 * 86_400;
 const MAX_ID_BYTES: usize = 128;
 
 #[derive(Debug)]
@@ -75,7 +79,8 @@ impl UpSource {
         let key = self.key();
         let scope = feed::scope(&[&self.api.fingerprint()]);
         let begin = |_: &Holds, since: u64| (since, UpScan::default());
-        let mut checkpoint = match Checkpoint::load(saved, &key, &scope, now, begin)? {
+        let loaded = Checkpoint::load(saved, &key, &scope, now, REREAD_SECONDS, begin)?;
+        let mut checkpoint = match loaded {
             Turn::Rest(batch) => return Ok(batch),
             Turn::Scan(checkpoint) => checkpoint,
         };
@@ -1093,6 +1098,8 @@ mod tests {
         let (first, saved) = up.scan(None, NOW).await;
         let held = &first[0];
         assert_eq!(held.title, "Example Cafe: -12.50 AUD (held)");
+        // The daily reread, before the settlement, so the scan below reads one day.
+        let (_, saved) = up.scan(Some(&saved), NOW + 2 * DAY).await;
 
         up.world()
             .settle("example-transaction-1", "-13.10", NOW + 2 * DAY);
@@ -1182,7 +1189,7 @@ mod tests {
             "-180.00",
             NOW - 3 * DAY,
         ));
-        let later = NOW + 2 * DAY + SPACING;
+        let later = NOW + SPACING;
         let (second, saved) = up.scan(Some(&saved), later).await;
         assert_eq!(
             titles(&second),
@@ -1251,9 +1258,9 @@ mod tests {
         );
 
         up.world()
-            .settle("example-transaction-2", "-30.00", NOW + DAY);
+            .settle("example-transaction-2", "-30.00", NOW + HOUR);
         let mark = up.targets().len();
-        let (second, _) = up.scan(Some(&saved), NOW + DAY + SPACING).await;
+        let (second, _) = up.scan(Some(&saved), NOW + HOUR + SPACING).await;
 
         assert_eq!(titles(&second), ["Example Books: -30.00 AUD (settled)"]);
         assert_eq!(second[0].id, first[1].id);

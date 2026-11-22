@@ -2,7 +2,8 @@
 //!
 //! Three things live here, each with one owner:
 //!   `FeedCheckpoint`: the window, its first seven days, paging, resume,
-//!   restart, overlap and the spacing of scans.
+//!   restart, overlap, the daily reread, the spacing of scans and the check
+//!   of the clock against the saved times.
 //!   `FeedItem`: the only way to build an event. It derives the version from the text.
 //!   `FeedFailure`: the only way to build a failure batch. It owns every fixed sentence.
 //!
@@ -30,6 +31,13 @@ const FIRST_LOOKBACK_SECONDS: u64 = 7 * 86_400;
 const OVERLAP_SECONDS: u64 = 86_400;
 /// A finished scan is followed by this much rest, which bounds the requests of an idle feed.
 const SCAN_SPACING_SECONDS: u64 = 300;
+/// A saved time that is this far ahead of the clock was written under another
+/// clock. A lower bound in the future would exclude current items, so the feed
+/// stops and does not report coverage.
+const CLOCK_TOLERANCE_SECONDS: u64 = 300;
+/// One scan in this period reads the source's whole reread window again. It
+/// finds an item that the service lists late with an old creation time.
+const REREAD_EVERY_SECONDS: u64 = 86_400;
 /// A scan that uses this many poll calls is treated as a paging loop.
 const MAX_SCAN_PAGES: u32 = 200;
 const MAX_CURSOR_BYTES: usize = 2048;
@@ -45,6 +53,7 @@ pub(crate) struct FeedCheckpoint<P, S> {
     scope: String,
     owner: Option<String>,
     origin: u64,
+    reread_at: u64,
     pub(crate) scan: Scan<S>,
     pub(crate) kept: P,
 }
@@ -63,6 +72,10 @@ struct Saved<P, S> {
     /// Unix seconds. Set once, on the first poll, to now minus seven days.
     /// The feed never asks for, and never delivers, an item created before it.
     origin: u64,
+    /// Unix seconds when the last scan that read the whole reread window began.
+    /// A checkpoint from before the daily reread has no such field and is
+    /// refused, so its other fields are never read under new rules.
+    reread_at: u64,
     window: Window<S>,
     kept: P,
 }
@@ -175,13 +188,15 @@ where
     /// Parses the saved checkpoint, or makes the first one, and enters a scan.
     ///
     /// When no scan is in flight, `begin` chooses the lower bound and the `S`
-    /// of the new scan from `kept` and the default lower bound. The result is
-    /// never before the first poll's seven days.
+    /// of the new scan from `kept` and the default lower bound. Once a day the
+    /// new scan reads the last `reread_seconds` again. The result is never
+    /// before the first poll's seven days.
     pub(crate) fn load(
         saved: Option<&SourceCheckpoint>,
         key: &SourceKey,
         scope: &str,
         now: u64,
+        reread_seconds: u64,
         begin: impl FnOnce(&P, u64) -> (u64, S),
     ) -> Result<Turn<P, S>, FeedFailure> {
         let Some(checkpoint) = saved else {
@@ -193,6 +208,7 @@ where
                 scope: scope.to_owned(),
                 owner: None,
                 origin,
+                reread_at: now,
                 scan: Scan::first_page(now, since.max(origin), 0, state),
                 kept,
             }));
@@ -202,6 +218,15 @@ where
         if saved.account != key.account || saved.scope != scope {
             return Err(FeedFailure::ForeignCheckpoint);
         }
+        let latest = match &saved.window {
+            Window::Resting { since, .. } => *since,
+            Window::Scanning(scan) => scan.since.max(scan.started_at),
+        }
+        .max(saved.origin);
+        if latest > now.saturating_add(CLOCK_TOLERANCE_SECONDS) {
+            return Err(FeedFailure::ClockBehind);
+        }
+        let mut reread_at = saved.reread_at;
         let scan = match saved.window {
             Window::Scanning(scan) if scan.pages >= MAX_SCAN_PAGES => {
                 return Err(FeedFailure::Endless);
@@ -220,7 +245,14 @@ where
                 }));
             }
             Window::Resting { since, .. } => {
-                let (since, state) = begin(&saved.kept, since);
+                let (mut since, state) = begin(&saved.kept, since);
+                // A stamp in the future came from another clock, and is due as well.
+                let reread_is_due =
+                    now < reread_at || now >= reread_at.saturating_add(REREAD_EVERY_SECONDS);
+                if reread_is_due {
+                    reread_at = now;
+                    since = since.min(now.saturating_sub(reread_seconds));
+                }
                 Scan::first_page(now, since.max(saved.origin), 0, state)
             }
         };
@@ -229,6 +261,7 @@ where
             scope: saved.scope,
             owner: saved.owner,
             origin: saved.origin,
+            reread_at,
             scan,
             kept: saved.kept,
         }))
@@ -301,6 +334,7 @@ where
             scope: self.scope,
             owner: self.owner,
             origin: self.origin,
+            reread_at: self.reread_at,
             window,
             kept: self.kept,
         };
@@ -448,6 +482,8 @@ pub(crate) enum FeedFailure {
     Http(HttpFailure),
     /// The saved checkpoint does not parse, or has another account, scope or owner.
     ForeignCheckpoint,
+    /// The saved checkpoint holds a time that the clock has not reached.
+    ClockBehind,
     /// A cursor or page link that is too long, malformed, or outside the API.
     BadCursor,
     /// The scan used `MAX_SCAN_PAGES` poll calls.
@@ -504,6 +540,9 @@ impl FeedFailure {
             Self::ForeignCheckpoint => format!(
                 "{label} checkpoint belongs to another account or configuration; change the account label to start a fresh seven-day read."
             ),
+            Self::ClockBehind => format!(
+                "{label} checkpoint holds a time more than five minutes ahead of this computer's clock; check the clock. The source continues from this checkpoint when the clock is right. To start a fresh seven-day read instead, change the account label."
+            ),
             Self::BadCursor => {
                 format!(
                     "{label} sent a page link this source will not follow; checkpoint retained."
@@ -530,6 +569,8 @@ mod tests {
     use super::*;
 
     const NOW: u64 = 1_795_000_000;
+    const DAY: u64 = 86_400;
+    const REREAD: u64 = 14 * DAY;
 
     type Checkpoint = FeedCheckpoint<Vec<String>, Option<String>>;
 
@@ -541,7 +582,13 @@ mod tests {
     }
 
     fn scanning(saved: Option<&SourceCheckpoint>, now: u64) -> Checkpoint {
-        match Checkpoint::load(saved, &key(), "scope-a", now, |_, since| (since, None)) {
+        scanning_with_reread(saved, now, REREAD)
+    }
+
+    fn scanning_with_reread(saved: Option<&SourceCheckpoint>, now: u64, reread: u64) -> Checkpoint {
+        match Checkpoint::load(saved, &key(), "scope-a", now, reread, |_, since| {
+            (since, None)
+        }) {
             Ok(Turn::Scan(checkpoint)) => checkpoint,
             Ok(Turn::Rest(_)) => panic!("the feed rests"),
             Err(failure) => panic!("{}", failure.message("Example")),
@@ -549,7 +596,9 @@ mod tests {
     }
 
     fn refusal(saved: &SourceCheckpoint, key: &SourceKey, scope: &str) -> String {
-        match Checkpoint::load(Some(saved), key, scope, NOW, |_, since| (since, None)) {
+        match Checkpoint::load(Some(saved), key, scope, NOW, REREAD, |_, since| {
+            (since, None)
+        }) {
             Err(failure) => failure.message("Example"),
             Ok(_) => panic!("the checkpoint was accepted"),
         }
@@ -680,7 +729,7 @@ mod tests {
         let done = saved_after(scanning(None, NOW), Step::Done { floor: None }, NOW + 10);
         let saved = done.checkpoint.unwrap();
         let load = |now| {
-            Checkpoint::load(Some(&saved), &key(), "scope-a", now, |_, since| {
+            Checkpoint::load(Some(&saved), &key(), "scope-a", now, REREAD, |_, since| {
                 (since, None)
             })
         };
@@ -711,6 +760,7 @@ mod tests {
             &key(),
             "scope-a",
             now,
+            REREAD,
             |_, since| (since, None),
         ) {
             Ok(Turn::Scan(_)) => "scan".to_owned(),
@@ -744,6 +794,53 @@ mod tests {
             "the origin is ahead, and the feed does not report complete coverage"
         );
         assert_eq!(outcome(&resting, NOW + 1), "rest");
+    }
+
+    #[test]
+    fn one_scan_a_day_rereads_the_window_of_the_source_and_never_before_the_origin() {
+        let since_at = |saved: &SourceBatch, now: u64, reread: u64| {
+            scanning_with_reread(saved.checkpoint.as_ref(), now, reread)
+                .scan
+                .since
+        };
+        let done = |saved: &SourceBatch, now: u64, reread: u64| {
+            let scan = scanning_with_reread(saved.checkpoint.as_ref(), now, reread);
+            saved_after(scan, Step::Done { floor: None }, now)
+        };
+        let first = saved_after(scanning(None, NOW), Step::Done { floor: None }, NOW);
+        let origin = NOW - 7 * DAY;
+
+        assert_eq!(
+            since_at(&first, NOW + DAY - 1, REREAD),
+            NOW - OVERLAP_SECONDS,
+            "the first scan read the whole window, so no reread is due for a day"
+        );
+        assert_eq!(since_at(&first, NOW + DAY, REREAD), origin);
+        assert_eq!(since_at(&first, NOW + DAY, 3 * DAY), NOW - 2 * DAY);
+        assert_eq!(
+            since_at(&first, NOW + 40 * DAY, REREAD),
+            NOW - OVERLAP_SECONDS,
+            "a window that is already wider is kept"
+        );
+
+        let month = NOW + 30 * DAY;
+        let reread = done(&first, month, REREAD);
+        let narrow = done(&reread, month + 3_600, REREAD);
+        assert_eq!(
+            since_at(&narrow, month + DAY, REREAD),
+            month + DAY - REREAD,
+            "the day counts from the last reread, not from the last scan"
+        );
+        assert_eq!(since_at(&narrow, month + DAY, 90 * DAY), origin);
+
+        let unfinished = scanning_with_reread(narrow.checkpoint.as_ref(), month + DAY, REREAD);
+        let paged = saved_after(unfinished, Step::Next(None), month + DAY);
+        let finished = done(&paged, month + DAY + 60, REREAD);
+        assert_eq!(
+            since_at(&finished, month + DAY + 600, REREAD),
+            month + DAY - OVERLAP_SECONDS,
+            "a reread that took several polls is not repeated"
+        );
     }
 
     #[test]
