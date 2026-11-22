@@ -471,7 +471,10 @@ portability.
   workflows outgrow ordinary mail intake—such as Home Assistant repairs and
   state changes via its API, or MyChart and Ramp activity via existing CLIs—with
   all credentials kept in the configured private credential provider
-  ([architecture](architecture.md#integrations-and-scheduling)).
+  ([architecture](architecture.md#integrations-and-scheduling)). *(Implemented
+  only the opt-in `HomeAssistant` REST state-change adapter in `src/sources/`
+  and `src/config.rs`; Home Assistant repairs require its WebSocket API rather
+  than REST and remain open.)*
 - [x] **Cross-host worker transfer.** Offline workers currently retain their
   bound tasks until the host reconnects, and coordinator failover leaves host
   bindings unchanged. Support transferring an offline host's task to another

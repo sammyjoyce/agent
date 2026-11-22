@@ -79,7 +79,7 @@
         cargoLock.lockFile = ./Cargo.lock;
         cargoBuildFlags = ["--bin" "beep-boop"];
         nativeBuildInputs = [pkgs.makeWrapper];
-        nativeCheckInputs = [pkgs.nodejs_26 pkgs.git pkgs.lsof];
+        nativeCheckInputs = [pkgs.nodejs_26 pkgs.git pkgs.lsof pkgs.curl];
         AGENT_RUNTIME_PATH = "${runtime}/lib/beep-boop-runtime/dist/src/bridge.js";
         AGENT_SQLITE_VEC = "${pkgs.sqlite-vec}/lib/vec0${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
         preCheck = ''
@@ -99,7 +99,7 @@
             --set AGENT_LLAMA_SERVER "${embeddingRuntime}/bin/llama-server" \
             --set AGENT_EMBEDDING_MODEL "${embeddingModel}" \
             --set AGENT_SQLITE_VEC "${pkgs.sqlite-vec}/lib/vec0${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}" \
-            --prefix PATH : "${pkgs.lib.makeBinPath [pkgs.nodejs_26 pkgs.git pkgs.lsof pkgs.openssh]}" \
+            --prefix PATH : "${pkgs.lib.makeBinPath [pkgs.nodejs_26 pkgs.git pkgs.lsof pkgs.openssh pkgs.curl]}" \
             --suffix PATH : /run/current-system/sw/bin
         '';
       };
@@ -124,7 +124,7 @@
         libx11 libxext libxcomposite libxdamage libxfixes libxrandr
       ]);
       tools = {
-        packages = with pkgs; [cargo rustc rustfmt clippy nodejs_26 pkg-config git lsof actionlint unzip wrangler]
+        packages = with pkgs; [cargo rustc rustfmt clippy nodejs_26 pkg-config git curl lsof actionlint unzip wrangler]
           ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.procps];
         AGENT_SQLITE_VEC = "${pkgs.sqlite-vec}/lib/vec0${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
         shellHook = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''

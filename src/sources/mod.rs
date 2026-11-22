@@ -4,6 +4,7 @@
 pub mod calendar;
 pub mod github;
 pub mod google;
+pub mod home_assistant;
 pub mod messages;
 pub mod messages_read;
 pub mod slack;
@@ -274,6 +275,15 @@ pub enum SourceConfig {
         command: Vec<String>,
         account: String,
     },
+    /// Home Assistant REST `/api/states` intake using an explicit allowlist and credential helper.
+    HomeAssistant {
+        #[serde(default = "source_enabled")]
+        enabled: bool,
+        account: String,
+        url: String,
+        credential_command: Vec<String>,
+        entities: Vec<String>,
+    },
 }
 
 fn source_enabled() -> bool {
@@ -287,7 +297,48 @@ impl SourceConfig {
             | Self::GitHub { enabled, .. }
             | Self::GoogleCalendar { enabled, .. }
             | Self::Messages { enabled, .. }
-            | Self::Slack { enabled, .. } => *enabled,
+            | Self::Slack { enabled, .. }
+            | Self::HomeAssistant { enabled, .. } => *enabled,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if let Self::GitHub {
+            owner_filter: Some(filter),
+            ..
+        } = self
+        {
+            filter.validate()?;
+        }
+        if !self.enabled() {
+            return Ok(());
+        }
+        match self {
+            Self::Google { .. }
+            | Self::GitHub { .. }
+            | Self::GoogleCalendar { .. }
+            | Self::Messages { .. } => Ok(()),
+            Self::Slack {
+                command, account, ..
+            } => {
+                slack::SlackSource::new(command.clone(), account.clone())?;
+                Ok(())
+            }
+            Self::HomeAssistant {
+                account,
+                url,
+                credential_command,
+                entities,
+                ..
+            } => {
+                home_assistant::HomeAssistantSource::new(
+                    account.clone(),
+                    url.clone(),
+                    credential_command.clone(),
+                    entities.clone(),
+                )?;
+                Ok(())
+            }
         }
     }
 }
@@ -435,6 +486,27 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                     }
                 }
             }
+            SourceConfig::HomeAssistant {
+                account,
+                url,
+                credential_command,
+                entities,
+                ..
+            } => match home_assistant::HomeAssistantSource::new(
+                account.clone(),
+                url.clone(),
+                credential_command.clone(),
+                entities.clone(),
+            ) {
+                Ok(source) => sources.push(Box::new(source)),
+                Err(_) => failures.push(SourceBatch::unavailable(
+                    SourceKey {
+                        provider: "home_assistant".into(),
+                        account: account.clone(),
+                    },
+                    "Home Assistant source configuration is invalid; coverage is unknown",
+                )),
+            },
         }
     }
     SourceCatalog { sources, failures }
@@ -500,23 +572,52 @@ impl ReadOutput {
 }
 
 pub(crate) async fn read_command(argv: &[String]) -> Result<ReadOutput> {
+    read_command_inner(argv, None).await
+}
+
+pub(crate) async fn read_command_with_stdin(argv: &[String], stdin: &[u8]) -> Result<ReadOutput> {
+    read_command_inner(argv, Some(stdin)).await
+}
+
+async fn read_command_inner(argv: &[String], stdin: Option<&[u8]>) -> Result<ReadOutput> {
     let (program, args) = argv
         .split_first()
         .context("Source helper command is empty")?;
     ensure!(!program.is_empty(), "Source helper program is empty");
-    let output = host::run_process(host::ProcessRequest::new(
+    let mut request = host::ProcessRequest::new(
         program,
         args,
         Path::new("/"),
         Duration::from_secs(host::DEFAULT_TIMEOUT_SECONDS.into()),
         crate::runtime::MAX_FRAME_BYTES / 2,
-    )?)
-    .await?;
+    )?;
+    if let Some(bytes) = stdin {
+        request = request.with_stdin(bytes);
+    }
+    let output = host::run_process(request).await?;
     Ok(ReadOutput {
         exit_code: output.exit_code,
         stdout: output.stdout,
         truncated: output.truncated,
     })
+}
+
+pub(crate) fn parse_timestamp_ms(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return u64::try_from(parsed.timestamp_millis()).ok();
+    }
+    if let Ok(epoch) = trimmed.parse::<u64>() {
+        return Some(if epoch < 10_000_000_000 {
+            epoch.saturating_mul(1000)
+        } else {
+            epoch
+        });
+    }
+    None
 }
 
 fn now_seconds() -> Result<u64> {
@@ -635,6 +736,13 @@ mod tests {
                 enabled: false,
                 command: Vec::new(),
                 account: String::new(),
+            },
+            SourceConfig::HomeAssistant {
+                enabled: false,
+                account: String::new(),
+                url: String::new(),
+                credential_command: Vec::new(),
+                entities: Vec::new(),
             },
         ];
         let catalog = configured(&sources).await;
