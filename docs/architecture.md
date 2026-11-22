@@ -619,8 +619,8 @@ The [roadmap](roadmap.md) tracks the implementation and evaluation checklist.
 
 Home Assistant state changes and Up bank transactions are current opt-in
 sources. See [HTTP sources](setup.md#http-sources). Home Assistant repairs and
-failures are not read yet. They need its WebSocket API. Later sources may
-include MyChart notifications and Ramp activity through their existing CLIs.
+failures are not read yet. They need its WebSocket API. A Wise adapter for
+account activity is planned and not built.
 These are optional feeds; domain workflows such as Poshmark offers continue
 through ordinary mail intake. API credentials stay in the configured private
 credential provider.
