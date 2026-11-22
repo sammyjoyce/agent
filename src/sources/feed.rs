@@ -857,6 +857,134 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_time_ahead_of_the_clock_rewinds_to_the_reread_window_and_never_before_the_origin() {
+        let first = saved_after(scanning(None, NOW), Step::Done { floor: None }, NOW);
+        let origin = NOW - 7 * DAY;
+        let ran_ahead = |real: u64, ahead: u64| {
+            let scan = scanning(first.checkpoint.as_ref(), real + ahead);
+            saved_after(scan, Step::Done { floor: None }, real + ahead)
+        };
+
+        let soon = NOW + 3_600;
+        let rewound = scanning(ran_ahead(soon, 16 * DAY).checkpoint.as_ref(), soon + 600);
+        assert_eq!(rewound.scan.started_at, soon + 600, "a new scan starts now");
+        assert_eq!(
+            rewound.scan.since, origin,
+            "the reread window starts before the origin, so the origin is the lower bound"
+        );
+
+        let later = NOW + 40 * DAY;
+        let saved = ran_ahead(later, 30 * DAY);
+        let now = later + 600;
+        assert_eq!(
+            scanning(saved.checkpoint.as_ref(), now).scan.since,
+            now - REREAD,
+            "the lower bound is the reread window of the source"
+        );
+        assert_eq!(
+            scanning_with_reread(saved.checkpoint.as_ref(), now, 90 * DAY)
+                .scan
+                .since,
+            origin
+        );
+    }
+
+    #[test]
+    fn a_rewind_moves_the_origin_only_when_it_is_later_than_seven_days_before_the_clock() {
+        let covered_from = |checkpoint: &Checkpoint| {
+            let origin = checkpoint.scan.since;
+            assert!(checkpoint.covers(origin) && !checkpoint.covers(origin - 1));
+            origin
+        };
+        let done = |saved: Option<&SourceCheckpoint>, now: u64| {
+            saved_after(scanning(saved, now), Step::Done { floor: None }, now)
+        };
+
+        let first_under_a_clock_ahead = done(None, NOW + 14 * DAY);
+        let corrected = scanning(first_under_a_clock_ahead.checkpoint.as_ref(), NOW);
+        assert_eq!(
+            covered_from(&corrected),
+            NOW - 7 * DAY,
+            "an origin ahead of the clock becomes the clock's own first seven days"
+        );
+
+        let three_days_ahead = done(None, NOW + 3 * DAY);
+        let corrected = scanning(three_days_ahead.checkpoint.as_ref(), NOW);
+        assert_eq!(
+            covered_from(&corrected),
+            NOW - 7 * DAY,
+            "an origin four days back was written by a clock that ran ahead"
+        );
+
+        let first = done(None, NOW);
+        let ran_ahead = done(first.checkpoint.as_ref(), NOW + 16 * DAY);
+        let corrected = scanning(ran_ahead.checkpoint.as_ref(), NOW + 3_600);
+        assert_eq!(
+            covered_from(&corrected),
+            NOW - 7 * DAY,
+            "an origin that is seven days or more before the clock stays"
+        );
+    }
+
+    #[test]
+    fn a_rewind_drops_the_scan_in_flight_and_keeps_what_the_source_keeps() {
+        let mut first = scanning(None, NOW);
+        first.kept.push("kept between scans".into());
+        first.scan.state = Some("kept during the scan".into());
+        let cursor = Cursor::try_from("page-2".to_owned()).unwrap();
+        let paged = saved_after(first, Step::Next(Some(cursor)), NOW);
+
+        let moved_back = NOW - 3_600;
+        let rewound = scanning(paged.checkpoint.as_ref(), moved_back);
+        assert_eq!(rewound.scan.started_at, moved_back);
+        assert!(rewound.scan.cursor.is_none(), "the saved cursor is dropped");
+        assert_eq!(rewound.scan.state, None, "scan state ends with its scan");
+        assert_eq!(rewound.kept, ["kept between scans"]);
+    }
+
+    #[test]
+    fn after_a_rewind_the_reread_and_the_spacing_count_from_the_current_clock() {
+        let load = |saved: &SourceBatch, now: u64| {
+            Checkpoint::load(
+                saved.checkpoint.as_ref(),
+                &key(),
+                "scope-a",
+                now,
+                REREAD,
+                |_, since| (since, None),
+            )
+        };
+        let later = NOW + 40 * DAY;
+        let first = saved_after(scanning(None, NOW), Step::Done { floor: None }, NOW);
+        let ran_ahead = saved_after(
+            scanning(first.checkpoint.as_ref(), later + 16 * DAY),
+            Step::Done { floor: None },
+            later + 16 * DAY,
+        );
+
+        let rewound = scanning(ran_ahead.checkpoint.as_ref(), later);
+        let done = saved_after(rewound, Step::Done { floor: None }, later + 10);
+        assert!(
+            matches!(
+                load(&done, later + 10 + SCAN_SPACING_SECONDS - 1),
+                Ok(Turn::Rest(_))
+            ),
+            "the next scan waits for the spacing"
+        );
+        let since_at = |now: u64| scanning(done.checkpoint.as_ref(), now).scan.since;
+        assert_eq!(
+            since_at(later + 10 + SCAN_SPACING_SECONDS),
+            later - OVERLAP_SECONDS
+        );
+        assert_eq!(
+            since_at(later + DAY - 1),
+            later - OVERLAP_SECONDS,
+            "the rewind read the whole window, so no reread is due for a day"
+        );
+        assert_eq!(since_at(later + DAY), later + DAY - REREAD);
+    }
+
+    #[test]
     fn a_second_restart_is_visible_to_the_source() {
         let cursor = || Step::Next(Some(Cursor::try_from("page-2".to_owned()).unwrap()));
         let paged = saved_after(scanning(None, NOW), cursor(), NOW);

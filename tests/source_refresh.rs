@@ -898,6 +898,77 @@ async fn a_clock_behind_an_up_checkpoint_stops_the_real_poll_path_and_the_scan_r
     runtime.close().await.unwrap();
 }
 
+/// Refresh rounds until a scan completes. A page that reports a failure ends the test.
+async fn refresh_until_complete(runtime: &Runtime, config: &[SourceConfig]) -> Vec<AdmittedPage> {
+    let mut pages = Vec::new();
+    for _ in 0..4 {
+        let round = refresh_into_journal(runtime, config).await;
+        for page in &round {
+            assert!(
+                matches!(
+                    page.coverage,
+                    SourceCoverage::More | SourceCoverage::Complete
+                ),
+                "The source stopped: {:?}",
+                page.coverage
+            );
+        }
+        let complete = round.last().map(|page| &page.coverage) == Some(&SourceCoverage::Complete);
+        pages.extend(round);
+        if complete {
+            return pages;
+        }
+    }
+    panic!("The scan did not complete");
+}
+
+#[tokio::test]
+async fn an_up_feed_whose_clock_ran_ahead_reads_again_through_the_real_poll_path_and_the_journal_admits_each_item_once()
+ {
+    let up = FakeUp::start().await;
+    up.second_page_fails.store(false, Ordering::Relaxed);
+    let setup = UpSetup::new(&up);
+    let runtime = start_runtime(&setup.state);
+    let first_scan = refresh_until_complete(&runtime, &setup.config).await;
+    assert_eq!(
+        first_scan.iter().map(|page| page.new_events).sum::<u32>(),
+        3,
+        "the journal holds the three transactions"
+    );
+
+    save_as_written_by_a_clock_ahead(&runtime, 30 * 86_400).await;
+    let requests_before = up.requests().len();
+    let rewound = refresh_until_complete(&runtime, &setup.config).await;
+    let listings: Vec<String> = up.requests()[requests_before..]
+        .iter()
+        .filter(|target| target.starts_with("/transactions"))
+        .cloned()
+        .collect();
+    assert!(
+        listings[0].contains("filter[since]=") && !listings[0].contains("page[after]"),
+        "the poll after the clock ran ahead reads from a first page: {listings:?}"
+    );
+    assert_eq!(
+        rewound.iter().map(|page| page.sent_events).sum::<usize>(),
+        4,
+        "the three transactions are read again, and the held one is listed twice"
+    );
+    assert_eq!(
+        rewound.iter().map(|page| page.new_events).sum::<u32>(),
+        0,
+        "the journal admits no transaction a second time"
+    );
+
+    let requests_after = up.requests().len();
+    refresh_until_complete(&runtime, &setup.config).await;
+    assert_eq!(
+        up.requests().len(),
+        requests_after,
+        "the next round is inside the spacing, which counts from the current clock"
+    );
+    runtime.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn up_pages_enter_the_real_source_journal_once_and_a_failed_scan_resumes_at_its_saved_page() {
     let up = FakeUp::start().await;
