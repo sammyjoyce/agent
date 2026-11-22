@@ -50,7 +50,7 @@ final class StatusMonitor {
       "checkmark.circle.fill"
     case .versionMismatch, .binaryReplaced:
       "exclamationmark.triangle.fill"
-    case .binaryMissing:
+    case .binaryMissing, .serviceRunningWithoutStatus:
       "questionmark.circle"
     case .serviceStopped:
       "pause.circle"
@@ -103,6 +103,16 @@ struct StatusMenuView: View {
           labeledRow("Running binary", exe)
         }
         labeledRow("Coordinator", info.coordinatorID)
+      case .runningWithoutStatus(let reason):
+        labeledRow("Status", "Running, did not report its status")
+        Text(
+          "The service may be older than this app, or may be starting or stopping. Restart the service to bring it up to date."
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        Text(reason)
+          .font(.caption)
+          .foregroundStyle(.secondary)
       case .stopped(let reason):
         labeledRow("Status", "Stopped")
         Text(reason)
@@ -169,7 +179,7 @@ struct StatusMenuView: View {
       Text("Running service detected, but `beep-boop` CLI is not installed in PATH.")
         .font(.caption)
         .foregroundStyle(.secondary)
-    case .serviceStopped:
+    case .serviceStopped, .serviceRunningWithoutStatus:
       EmptyView()
     }
   }
@@ -178,7 +188,7 @@ struct StatusMenuView: View {
     switch alignment {
     case .upToDate: .green
     case .versionMismatch, .binaryReplaced: .orange
-    case .binaryMissing, .serviceStopped: .secondary
+    case .binaryMissing, .serviceStopped, .serviceRunningWithoutStatus: .secondary
     }
   }
 }

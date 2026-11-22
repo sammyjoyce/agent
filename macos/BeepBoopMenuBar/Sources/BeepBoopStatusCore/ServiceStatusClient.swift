@@ -38,11 +38,14 @@ public struct InstalledBinaryInfo: Equatable, Sendable {
 
 public enum ServiceRunningState: Equatable, Sendable {
   case running(RunningServiceInfo)
+  /// Something accepted the connection and gave no status, so a service process exists.
+  case runningWithoutStatus(reason: String)
   case stopped(reason: String)
 }
 
 public enum VersionAlignment: Equatable, Sendable {
   case serviceStopped
+  case serviceRunningWithoutStatus
   case binaryMissing
   case upToDate(version: String)
   case versionMismatch(installed: String, running: String)
@@ -77,6 +80,7 @@ public struct LocalServiceSnapshot: Equatable, Sendable {
 public struct ServiceStatusClient: Sendable {
   public static let socketFileName = "agent.sock"
   private static let versionCommandTimeoutSeconds: TimeInterval = 3
+  private static let socketTimeoutSeconds = 2
 
   public var stateDir: URL
   public var explicitBinaryPath: String?
@@ -132,7 +136,13 @@ public struct ServiceStatusClient: Sendable {
     running: ServiceRunningState,
     installed: InstalledBinaryInfo?
   ) -> VersionAlignment {
-    guard case .running(let service) = running else {
+    let service: RunningServiceInfo
+    switch running {
+    case .running(let info):
+      service = info
+    case .runningWithoutStatus:
+      return .serviceRunningWithoutStatus
+    case .stopped:
       return .serviceStopped
     }
     guard let installed else {
@@ -255,7 +265,7 @@ public struct ServiceStatusClient: Sendable {
     }
     defer { Darwin.close(fd) }
 
-    var tv = timeval(tv_sec: 2, tv_usec: 0)
+    var tv = timeval(tv_sec: Self.socketTimeoutSeconds, tv_usec: 0)
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
@@ -286,7 +296,7 @@ public struct ServiceStatusClient: Sendable {
     do {
       payload = try Self.encodeServiceStatusFrame()
     } catch {
-      return .stopped(reason: "Could not encode service status query")
+      return .runningWithoutStatus(reason: "Could not encode service status query")
     }
 
     let sent = payload.withUnsafeBytes { raw -> Int in
@@ -300,15 +310,19 @@ public struct ServiceStatusClient: Sendable {
       return total
     }
     guard sent == payload.count else {
-      return .stopped(reason: "Failed to write status query to service socket")
+      return .runningWithoutStatus(reason: "Failed to write status query to service socket")
     }
     Darwin.shutdown(fd, SHUT_WR)
 
     var buffer = Data()
     var chunk = [UInt8](repeating: 0, count: 4096)
+    var timedOut = false
     while buffer.count < 256 * 1024 {
       let readCount = Darwin.recv(fd, &chunk, chunk.count, 0)
-      if readCount <= 0 { break }
+      if readCount <= 0 {
+        timedOut = readCount < 0 && errno == EWOULDBLOCK
+        break
+      }
       buffer.append(contentsOf: chunk[0..<readCount])
       if let text = String(data: buffer, encoding: .utf8), text.contains("\"type\":\"done\"") {
         break
@@ -316,9 +330,10 @@ public struct ServiceStatusClient: Sendable {
     }
     guard let lines = String(data: buffer, encoding: .utf8)?.split(whereSeparator: \.isNewline)
     else {
-      return .stopped(reason: "Invalid UTF-8 response from service")
+      return .runningWithoutStatus(reason: "Invalid UTF-8 response from service")
     }
 
+    var answeredKnownEvent = false
     let decoder = JSONDecoder()
     for line in lines {
       guard let data = line.data(using: .utf8),
@@ -335,11 +350,21 @@ public struct ServiceStatusClient: Sendable {
             stateDir: status.stateDir
           ))
       case .failure(let failure):
-        return .stopped(reason: failure.message)
+        return .runningWithoutStatus(reason: failure.message)
       default:
-        continue
+        answeredKnownEvent = true
       }
     }
-    return .stopped(reason: "Coordinator did not return service_status (older service?)")
+    if timedOut {
+      return .runningWithoutStatus(
+        reason: "Service did not answer within \(Self.socketTimeoutSeconds) seconds")
+    }
+    if buffer.isEmpty {
+      return .runningWithoutStatus(reason: "Service closed the connection without an answer")
+    }
+    if !answeredKnownEvent {
+      return .runningWithoutStatus(reason: "Service answered with text that is not a known event")
+    }
+    return .runningWithoutStatus(reason: "Service answered without a status")
   }
 }
