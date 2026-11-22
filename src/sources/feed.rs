@@ -704,6 +704,49 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_time_more_than_five_minutes_ahead_of_the_clock_stops_the_feed_with_fixed_text() {
+        let clock = "Example checkpoint holds a time more than five minutes ahead of this computer's clock; check the clock. The source continues from this checkpoint when the clock is right. To start a fresh seven-day read instead, change the account label.";
+        let outcome = |saved: &SourceCheckpoint, now: u64| match Checkpoint::load(
+            Some(saved),
+            &key(),
+            "scope-a",
+            now,
+            |_, since| (since, None),
+        ) {
+            Ok(Turn::Scan(_)) => "scan".to_owned(),
+            Ok(Turn::Rest(_)) => "rest".to_owned(),
+            Err(failure) => failure.message("Example"),
+        };
+
+        let paging = saved_after(scanning(None, NOW), Step::Next(None), NOW)
+            .checkpoint
+            .unwrap();
+        assert_eq!(
+            outcome(&paging, NOW - 301),
+            clock,
+            "the scan start is ahead"
+        );
+        assert_eq!(outcome(&paging, NOW - 300), "scan");
+
+        let resting = saved_after(scanning(None, NOW), Step::Done { floor: None }, NOW)
+            .checkpoint
+            .unwrap();
+        let lower_bound = NOW - OVERLAP_SECONDS;
+        assert_eq!(
+            outcome(&resting, lower_bound - 301),
+            clock,
+            "the lower bound is ahead"
+        );
+        assert_eq!(outcome(&resting, lower_bound - 300), "scan");
+        assert_eq!(
+            outcome(&resting, NOW - 8 * 86_400),
+            clock,
+            "the origin is ahead, and the feed does not report complete coverage"
+        );
+        assert_eq!(outcome(&resting, NOW + 1), "rest");
+    }
+
+    #[test]
     fn restart_keeps_the_window_and_resets_the_scan_state() {
         let mut first = scanning(None, NOW);
         first.scan.state = Some("second listing".into());

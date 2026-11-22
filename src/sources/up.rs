@@ -622,7 +622,7 @@ mod tests {
             SourceConfig, SourceCoverage,
             http::testing::{
                 Canned, FakeApi, Seen, credential_script, curl_shim, failing_credential_script,
-                query_of, shim_runs,
+                proxied_curl, query_of, shim_runs,
             },
         },
     };
@@ -632,6 +632,11 @@ mod tests {
     const DAY: u64 = 86_400;
     const SPACING: u64 = 300;
     const TOKEN: &str = "example-up-token";
+    const SECOND_TOKEN: &str = "example-second-up-token";
+    const CLOCK: &str = "Up checkpoint holds a time more than five minutes ahead of this computer's clock; check the clock. The source continues from this checkpoint when the clock is right. To start a fresh seven-day read instead, change the account label.";
+    const REFUSED_AGAIN: &str =
+        "Up refused a saved page link for the second time in one scan; checkpoint retained.";
+    const UNREADABLE: &str = "Up sent a response this source cannot read; checkpoint retained.";
     const FOREIGN: &str = "Up checkpoint belongs to another account or configuration; change the account label to start a fresh seven-day read.";
     const REMOVED_TEXT: &str = "Status: hold removed\nUp no longer lists this held transaction. Up removes a hold when the merchant releases it, or when Up replaces it with a separate settled transaction.";
 
@@ -713,6 +718,10 @@ mod tests {
     struct World {
         rows: Vec<Row>,
         customer: &'static str,
+        /// The transactions of a second customer, whose token is `SECOND_TOKEN`.
+        second_customer: Option<Vec<Row>>,
+        /// What the credential command of the next adapter prints.
+        credential: &'static str,
         since_compares_settled_at: bool,
         page_size: usize,
         /// Answers a request before the account does, for a failure the account cannot produce.
@@ -731,7 +740,7 @@ mod tests {
             self.rows.retain(|row| row.id != id);
         }
 
-        fn listing(&self, seen: &Seen) -> Canned {
+        fn listing(&self, rows: &[Row], seen: &Seen) -> Canned {
             let since_text = seen.query("filter[since]");
             let since = since_text
                 .as_deref()
@@ -740,8 +749,7 @@ mod tests {
             let after: usize = seen
                 .query("page[after]")
                 .map_or(0, |offset| offset.parse().unwrap());
-            let mut rows: Vec<&Row> = self
-                .rows
+            let mut rows: Vec<&Row> = rows
                 .iter()
                 .filter(|row| status.as_deref().is_none_or(|status| row.status == status))
                 .filter(|row| {
@@ -806,6 +814,8 @@ mod tests {
             let world = Arc::new(Mutex::new(World {
                 rows,
                 customer: "example-customer-1",
+                second_customer: None,
+                credential: TOKEN,
                 since_compares_settled_at: false,
                 page_size: 100,
                 script: None,
@@ -816,18 +826,20 @@ mod tests {
                 if let Some(canned) = world.script.as_ref().and_then(|script| script(seen)) {
                     return canned;
                 }
-                if seen.bearer.as_deref() != Some(TOKEN) {
-                    return up_error(401, "Not Authorized");
-                }
+                let (customer, rows) = match (seen.bearer.as_deref(), &world.second_customer) {
+                    (Some(TOKEN), _) => (world.customer, &world.rows),
+                    (Some(SECOND_TOKEN), Some(rows)) => ("example-customer-2", rows),
+                    _ => return up_error(401, "Not Authorized"),
+                };
                 match seen.path() {
                     "/util/ping" => Canned::json(
                         200,
-                        json!({ "meta": { "id": world.customer, "statusEmoji": "⚡️" } }),
+                        json!({ "meta": { "id": customer, "statusEmoji": "⚡️" } }),
                     ),
-                    "/transactions" => world.listing(seen),
+                    "/transactions" => world.listing(rows, seen),
                     path => path
                         .strip_prefix("/transactions/")
-                        .and_then(|id| world.rows.iter().find(|row| row.id == id))
+                        .and_then(|id| rows.iter().find(|row| row.id == id))
                         .map_or_else(
                             || up_error(404, "Not Found"),
                             |row| Canned::json(200, json!({ "data": row.json() })),
@@ -852,12 +864,60 @@ mod tests {
 
         /// A new adapter, as the coordinator builds one for every page.
         fn source(&self) -> UpSource {
+            let token = self.world().credential;
             UpSource::new(
                 "everyday".into(),
                 Some(self.api.url.clone()),
-                credential_script(self.dir.path(), TOKEN),
+                credential_script(self.dir.path(), token),
             )
             .unwrap()
+        }
+
+        /// Polls from `saved` until a poll asks for a transactions listing, and
+        /// returns that poll's batch.
+        async fn poll_to_listing(&self, saved: Option<&SourceCheckpoint>, now: u64) -> SourceBatch {
+            let mut saved = saved.cloned();
+            loop {
+                let mark = self.targets().len();
+                let batch = self.poll(saved.as_ref(), now).await;
+                let listed = self
+                    .targets_since(mark)
+                    .iter()
+                    .any(|target| target.starts_with("/transactions?"));
+                if listed {
+                    return batch;
+                }
+                assert_eq!(batch.coverage, SourceCoverage::More);
+                saved = batch.checkpoint;
+            }
+        }
+
+        /// Polls a scan from `saved` until its next poll looks up the holds that
+        /// left the held listing. Returns the checkpoint for that poll.
+        async fn poll_to_lookups(&self, saved: &SourceCheckpoint, now: u64) -> SourceCheckpoint {
+            let mut saved = saved.clone();
+            loop {
+                let batch = self.poll(Some(&saved), now).await;
+                assert_eq!(batch.coverage, SourceCoverage::More);
+                saved = batch.checkpoint.unwrap();
+                let held_listing = self
+                    .targets()
+                    .last()
+                    .is_some_and(|target| target.contains("filter[status]=HELD"));
+                if held_listing {
+                    return saved;
+                }
+            }
+        }
+
+        /// The lower bound of the first recent listing requested since `mark`.
+        fn since_requested_after(&self, mark: usize) -> String {
+            let requested = self.targets_since(mark);
+            let recent = requested
+                .iter()
+                .find(|target| target.contains("filter[since]"))
+                .expect("no recent listing was requested");
+            since_of(recent)
         }
 
         async fn poll(&self, saved: Option<&SourceCheckpoint>, now: u64) -> SourceBatch {
@@ -1915,6 +1975,654 @@ mod tests {
             "the shim does refuse an argument it is told to refuse"
         );
         assert!(up.dir.path().join("refused").exists());
+    }
+
+    fn removals(events: &[SourceEvent]) -> Vec<&str> {
+        let mut removed: Vec<&str> = events
+            .iter()
+            .filter(|event| event.title.ends_with("(hold removed)"))
+            .map(|event| event.id.as_str())
+            .collect();
+        removed.sort_unstable();
+        removed
+    }
+
+    fn empty_page() -> Canned {
+        Canned::json(
+            200,
+            json!({ "data": [], "links": { "prev": null, "next": null } }),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_token_for_another_customer_between_two_pages_of_one_scan_is_refused_before_any_transaction_request()
+     {
+        let up = Harness::start(vec![held(
+            "example-transaction-1",
+            "Example Hotel",
+            "-200.00",
+            NOW - 3 * DAY,
+        )])
+        .await;
+        let (_, saved) = up.scan(None, NOW).await;
+        up.world().second_customer = Some(vec![settled(
+            "example-second-transaction-1",
+            "Example Pharmacy",
+            "-9.00",
+            NOW + DAY,
+        )]);
+
+        let later = NOW + 2 * DAY;
+        let first = up.poll(Some(&saved), later).await;
+        assert_eq!(first.coverage, SourceCoverage::More);
+        up.world().credential = SECOND_TOKEN;
+        let mut events = first.events;
+        let mut saved = first.checkpoint;
+        let mut last = first.coverage;
+        for _ in 0..10 {
+            let batch = up.poll(saved.as_ref(), later).await;
+            events.extend(batch.events);
+            last = batch.coverage;
+            if last != SourceCoverage::More {
+                break;
+            }
+            saved = batch.checkpoint;
+        }
+
+        assert!(
+            events
+                .iter()
+                .all(|event| event.id != "example-second-transaction-1"),
+            "a transaction of the second customer was delivered: {:?}",
+            titles(&events)
+        );
+        assert!(
+            removals(&events).is_empty(),
+            "a hold of the first customer was reported as removed"
+        );
+        assert_eq!(last, unavailable(FOREIGN));
+        let with_second_token: Vec<String> = up
+            .api
+            .seen()
+            .into_iter()
+            .filter(|seen| seen.bearer.as_deref() == Some(SECOND_TOKEN))
+            .map(|seen| seen.target)
+            .collect();
+        assert_eq!(
+            with_second_token,
+            ["/util/ping"],
+            "the second customer's token reads no transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proxy_in_the_environment_of_curl_receives_no_up_request() {
+        let proxy =
+            FakeApi::start(|_| Canned::json(200, json!({ "meta": { "id": "example-proxy" } })))
+                .await;
+        let up = Harness::start(Vec::new()).await;
+        let behind_proxy = proxied_curl(up.dir.path(), &proxy.url);
+
+        let batch = up.source().with_curl(behind_proxy).poll_at(None, NOW).await;
+
+        assert_eq!(
+            proxy.connections(),
+            0,
+            "the proxy received the request and its bearer token"
+        );
+        assert_eq!(batch.coverage, SourceCoverage::More);
+        assert!(!up.targets().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_proxy_in_the_environment_of_curl_cannot_remove_a_hold_with_its_own_404() {
+        let proxy = FakeApi::start(|_| {
+            Canned::json(
+                404,
+                json!({ "errors": [{
+                    "status": "404",
+                    "title": "Proxy Route Missing",
+                    "detail": "No upstream request was made."
+                }] }),
+            )
+        })
+        .await;
+        let up = Harness::start(vec![held(
+            "example-transaction-1",
+            "Example Hotel",
+            "-200.00",
+            NOW - 3 * DAY,
+        )])
+        .await;
+        let (_, saved) = up.scan(None, NOW).await;
+        up.script(|seen| (seen.path() == "/transactions").then(empty_page));
+        let later = NOW + 2 * DAY;
+        let lookups = up.poll_to_lookups(&saved, later).await;
+
+        let behind_proxy = proxied_curl(up.dir.path(), &proxy.url);
+        let batch = up
+            .source()
+            .with_curl(behind_proxy)
+            .poll_at(Some(&lookups), later)
+            .await;
+
+        assert!(
+            removals(&batch.events).is_empty(),
+            "the proxy's 404 removed a hold that Up still lists"
+        );
+        assert_eq!(proxy.connections(), 0);
+        assert_eq!(titles(&batch.events), ["Example Hotel: -200.00 AUD (held)"]);
+        assert_eq!(batch.coverage, SourceCoverage::Complete);
+    }
+
+    #[tokio::test]
+    async fn a_404_removes_a_hold_only_in_the_documented_envelope_whatever_its_title_and_detail_say()
+     {
+        let up = Harness::start(vec![held(
+            "example-transaction-1",
+            "Example Hotel",
+            "-200.00",
+            NOW - 3 * DAY,
+        )])
+        .await;
+        let (_, saved) = up.scan(None, NOW).await;
+        up.world().delete("example-transaction-1");
+        let later = NOW + 2 * DAY;
+        let lookups = up.poll_to_lookups(&saved, later).await;
+        let answer_lookups_with = |body: Value| {
+            up.script(move |seen| {
+                seen.path()
+                    .starts_with("/transactions/")
+                    .then(|| Canned::json(404, body.clone()))
+            });
+        };
+
+        let entry = |status: Value, title: Value, detail: Value| json!({ "status": status, "title": title, "detail": detail });
+        for other_form in [
+            json!({ "errors": [entry(json!(404), json!("Not Found"), json!("example"))] }),
+            json!({ "errors": [entry(json!("404"), json!(404), json!("example"))] }),
+            json!({ "errors": [entry(json!("404"), json!("Not Found"), json!(null))] }),
+            json!({ "errors": [
+                entry(json!("404"), json!("Not Found"), json!("example")),
+                entry(json!("500"), json!("Server Error"), json!("example")),
+            ] }),
+            json!([entry(json!("404"), json!("Not Found"), json!("example"))]),
+        ] {
+            answer_lookups_with(other_form);
+            let failed = up.poll(Some(&lookups), later).await;
+            assert_eq!(
+                failed.coverage,
+                unavailable("Up API returned HTTP 404; checkpoint retained.")
+            );
+            assert!(failed.events.is_empty(), "no hold is reported as removed");
+            assert!(failed.checkpoint.is_none());
+        }
+
+        answer_lookups_with(json!({ "errors": [{
+            "status": "404",
+            "title": "Example Title",
+            "detail": "An example detail that no document records.",
+            "source": { "parameter": "id" }
+        }] }));
+        let removed = up.poll(Some(&lookups), later).await;
+        assert_eq!(removed.coverage, SourceCoverage::Complete);
+        assert_eq!(removals(&removed.events), ["example-transaction-1"]);
+    }
+
+    #[tokio::test]
+    async fn a_404_on_a_saved_page_that_is_not_ups_error_body_fails_the_poll_and_does_not_restart_the_scan()
+     {
+        let up = Harness::start(vec![
+            settled("example-transaction-1", "Example Cafe", "-5.00", NOW - HOUR),
+            settled(
+                "example-transaction-2",
+                "Example Books",
+                "-7.00",
+                NOW - 2 * HOUR,
+            ),
+        ])
+        .await;
+        up.world().page_size = 1;
+        let first = up.poll_to_listing(None, NOW).await;
+        assert_eq!(first.coverage, SourceCoverage::More);
+        assert_eq!(first.events.len(), 1);
+
+        for (answer, message) in [
+            (
+                Canned::text(404, "<html>example proxy page</html>"),
+                "Up API returned HTTP 404; checkpoint retained.",
+            ),
+            (
+                Canned::json(410, json!({})),
+                "Up API returned HTTP 410; checkpoint retained.",
+            ),
+            (
+                up_error(500, "Server Error"),
+                "Up API returned HTTP 500; checkpoint retained.",
+            ),
+        ] {
+            let answer = Mutex::new(Some(answer));
+            up.script(move |seen| {
+                seen.query("page[after]")
+                    .and_then(|_| answer.lock().unwrap().take())
+            });
+            let failed = up.poll(first.checkpoint.as_ref(), NOW + 60).await;
+            assert_eq!(failed.coverage, unavailable(message));
+            assert!(failed.checkpoint.is_none());
+            assert!(failed.events.is_empty());
+        }
+
+        up.world().script = None;
+        let second = up.poll(first.checkpoint.as_ref(), NOW + 120).await;
+        assert_eq!(
+            titles(&second.events),
+            ["Example Books: -7.00 AUD (settled)"]
+        );
+        assert!(
+            up.targets().last().unwrap().contains("page[after]=1"),
+            "the scan continues at the saved page"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_refused_cursor_in_one_scan_fails_the_poll_with_fixed_text() {
+        let up = Harness::start(vec![
+            settled("example-transaction-1", "Example Cafe", "-5.00", NOW - HOUR),
+            settled(
+                "example-transaction-2",
+                "Example Books",
+                "-7.00",
+                NOW - 2 * HOUR,
+            ),
+        ])
+        .await;
+        up.world().page_size = 1;
+        let first = up.poll_to_listing(None, NOW).await;
+
+        up.script(|seen| {
+            seen.query("page[after]")
+                .is_some()
+                .then(|| up_error(410, "Gone"))
+        });
+        let restarted = up.poll(first.checkpoint.as_ref(), NOW + 60).await;
+        assert_eq!(restarted.coverage, SourceCoverage::More);
+        assert!(restarted.events.is_empty());
+        let again = up
+            .poll_to_listing(restarted.checkpoint.as_ref(), NOW + 60)
+            .await;
+        assert_eq!(again.coverage, SourceCoverage::More);
+        assert_eq!(titles(&again.events), ["Example Cafe: -5.00 AUD (settled)"]);
+
+        for attempt in 0..2 {
+            let refused = up
+                .poll(again.checkpoint.as_ref(), NOW + 120 + attempt)
+                .await;
+            assert_eq!(refused.coverage, unavailable(REFUSED_AGAIN));
+            assert!(refused.checkpoint.is_none());
+            assert!(refused.events.is_empty());
+        }
+
+        up.world().script = None;
+        let (rest, _) = up.scan(again.checkpoint.as_ref(), NOW + 180).await;
+        assert_eq!(
+            titles(&rest),
+            ["Example Books: -7.00 AUD (settled)"],
+            "the scan continues at the saved page when Up accepts the link again"
+        );
+    }
+
+    #[tokio::test]
+    async fn holds_that_left_do_not_count_against_the_cap() {
+        let rows: Vec<Row> = (0..MAX_HOLDS as u64)
+            .map(|number| {
+                held(
+                    &format!("example-hold-{number:03}"),
+                    "Example Hotel",
+                    "-1.00",
+                    NOW - DAY - number,
+                )
+            })
+            .collect();
+        let up = Harness::start(rows).await;
+        up.world().page_size = 600;
+        let (_, saved) = up.scan(None, NOW).await;
+
+        up.world().delete("example-hold-000");
+        up.world().delete("example-hold-001");
+        up.world()
+            .rows
+            .push(held("example-hold-new", "Example Motel", "-2.00", NOW));
+        let later = NOW + SPACING;
+        let mut saved = Some(saved);
+        let mut events = Vec::new();
+        for _ in 0..10 {
+            let batch = up.poll(saved.as_ref(), later).await;
+            events.extend(batch.events);
+            match batch.coverage {
+                SourceCoverage::More => saved = batch.checkpoint,
+                SourceCoverage::Complete => {
+                    saved = batch.checkpoint;
+                    break;
+                }
+                stopped => panic!("511 live holds stopped the scan: {stopped:?}"),
+            }
+        }
+        assert_eq!(
+            removals(&events),
+            ["example-hold-000", "example-hold-001"],
+            "the two holds that left are looked up and reported"
+        );
+
+        up.world().delete("example-hold-new");
+        let (events, _) = up.scan(saved.as_ref(), later + SPACING).await;
+        assert_eq!(
+            removals(&events),
+            ["example-hold-new"],
+            "the new hold was followed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_scan_under_a_clock_that_ran_ahead_is_a_visible_stop_after_the_clock_is_corrected()
+     {
+        let up = Harness::start(Vec::new()).await;
+        let (_, saved) = up.scan(None, NOW + 14 * DAY).await;
+        up.world().rows.push(settled(
+            "example-transaction-1",
+            "Example Cafe",
+            "-12.50",
+            NOW - HOUR,
+        ));
+        let mark = up.targets().len();
+
+        for attempt in 0..2 {
+            let stopped = up.poll(Some(&saved), NOW + attempt * SPACING).await;
+            assert_eq!(
+                stopped.coverage,
+                unavailable(CLOCK),
+                "a current transaction is outside a window that starts in the future"
+            );
+            assert!(stopped.checkpoint.is_none());
+            assert!(stopped.events.is_empty());
+        }
+        assert!(
+            up.targets_since(mark).is_empty(),
+            "no request is made while the clock is behind the checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clock_that_moves_backward_stops_the_poll_and_the_scan_continues_at_its_saved_page_when_the_clock_returns()
+     {
+        let up = Harness::start(vec![
+            settled("example-transaction-1", "Example Cafe", "-5.00", NOW - HOUR),
+            settled(
+                "example-transaction-2",
+                "Example Books",
+                "-7.00",
+                NOW - 2 * HOUR,
+            ),
+        ])
+        .await;
+        up.world().page_size = 1;
+        let first = up.poll_to_listing(None, NOW).await;
+        assert_eq!(first.coverage, SourceCoverage::More);
+        let mark = up.targets().len();
+
+        for moved_back in [HOUR, 30 * DAY] {
+            let stopped = up.poll(first.checkpoint.as_ref(), NOW - moved_back).await;
+            assert_eq!(stopped.coverage, unavailable(CLOCK));
+            assert!(stopped.checkpoint.is_none(), "the checkpoint is kept");
+            assert!(stopped.events.is_empty());
+        }
+        assert!(up.targets_since(mark).is_empty());
+
+        let resumed = up.poll(first.checkpoint.as_ref(), NOW + 60).await;
+        assert_eq!(resumed.coverage, SourceCoverage::More);
+        assert_eq!(
+            titles(&resumed.events),
+            ["Example Books: -7.00 AUD (settled)"]
+        );
+        assert!(
+            up.targets().last().unwrap().contains("page[after]=1"),
+            "the scan continues from the same checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_five_minute_spacing_starts_when_the_last_response_of_the_scan_arrives() {
+        let up = Harness::start(Vec::new()).await;
+        up.script(|seen| {
+            seen.query("filter[status]")
+                .map(|_| empty_page().delayed(std::time::Duration::from_millis(2_500)))
+        });
+        let source = up.source();
+        let mut saved = None;
+        let last_poll_began = loop {
+            let began = now_seconds().unwrap();
+            let batch = source.poll(saved.as_ref()).await.unwrap();
+            saved = batch.checkpoint;
+            match batch.coverage {
+                SourceCoverage::More => {}
+                SourceCoverage::Complete => break began,
+                stopped => panic!("the scan stopped: {stopped:?}"),
+            }
+        };
+        let ended = now_seconds().unwrap();
+        let mark = up.targets().len();
+
+        let early = up.poll(saved.as_ref(), last_poll_began + SPACING + 1).await;
+        assert_eq!(early.coverage, SourceCoverage::Complete);
+        assert!(
+            up.targets_since(mark).is_empty(),
+            "a scan started less than five minutes after the last response, which took two seconds"
+        );
+
+        up.world().script = None;
+        up.scan(saved.as_ref(), ended + SPACING).await;
+        assert!(!up.targets_since(mark).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_backdated_settlement_that_appears_after_the_reach_back_scan_is_found_by_the_daily_reread()
+     {
+        let up = Harness::start(vec![held(
+            "example-transaction-1",
+            "Example Hotel",
+            "-200.00",
+            NOW - 3 * DAY,
+        )])
+        .await;
+        let (_, saved) = up.scan(None, NOW).await;
+        up.world().delete("example-transaction-1");
+        let (removed, saved) = up.scan(Some(&saved), NOW + SPACING).await;
+        assert_eq!(removals(&removed), ["example-transaction-1"]);
+        let (reach_back, saved) = up.scan(Some(&saved), NOW + 2 * SPACING).await;
+        assert!(reach_back.is_empty());
+
+        up.world().rows.push(settled(
+            "example-transaction-2",
+            "Example Hotel",
+            "-180.00",
+            NOW - 3 * DAY,
+        ));
+        let (same_day, saved) = up.scan(Some(&saved), NOW + 3 * SPACING).await;
+        assert!(
+            same_day.is_empty(),
+            "the one-day window does not reach the old creation time"
+        );
+
+        let mark = up.targets().len();
+        let (next_day, _) = up.scan(Some(&saved), NOW + DAY).await;
+        assert_eq!(titles(&next_day), ["Example Hotel: -180.00 AUD (settled)"]);
+        assert_eq!(
+            up.since_requested_after(mark),
+            feed::utc(NOW - 7 * DAY),
+            "the reread never starts before the first poll's seven days"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_daily_reread_reads_fourteen_days_and_the_next_scan_of_that_day_reads_one() {
+        let up = Harness::start(Vec::new()).await;
+        let (_, saved) = up.scan(None, NOW).await;
+        let caught_up = NOW + 20 * DAY;
+        let (_, saved) = up.scan(Some(&saved), caught_up).await;
+        let (_, saved) = up.scan(Some(&saved), caught_up + SPACING).await;
+
+        let mark = up.targets().len();
+        let next_day = caught_up + DAY;
+        let (_, saved) = up.scan(Some(&saved), next_day).await;
+        assert_eq!(
+            up.since_requested_after(mark),
+            feed::utc(next_day - 14 * DAY)
+        );
+
+        let mark = up.targets().len();
+        up.scan(Some(&saved), next_day + SPACING).await;
+        assert_eq!(
+            up.since_requested_after(mark),
+            feed::utc(next_day - DAY),
+            "one reread a day"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_with_an_id_that_is_not_letters_digits_hyphens_and_underscores_is_unreadable_and_delivers_nothing()
+     {
+        let up = Harness::start(Vec::new()).await;
+        let good = settled("example-transaction-1", "Example Cafe", "-5.00", NOW - HOUR).json();
+        let page_with = |id: &str| {
+            let other = held(id, "Example Hotel", "-200.00", NOW - 2 * HOUR).json();
+            let page =
+                json!({ "data": [good.clone(), other], "links": { "prev": null, "next": null } });
+            up.script(move |seen| {
+                (seen.path() == "/transactions").then(|| Canned::json(200, page.clone()))
+            });
+        };
+
+        let too_long = "a".repeat(MAX_ID_BYTES + 1);
+        for id in [
+            "..", ".", "a/b", "a b", "a%2Fb", "a?b", "exämple", "", &too_long,
+        ] {
+            page_with(id);
+            let unreadable = up.poll_to_listing(None, NOW).await;
+            assert_eq!(unreadable.coverage, unavailable(UNREADABLE), "{id:?}");
+            assert!(unreadable.events.is_empty(), "{id:?}");
+            assert!(unreadable.checkpoint.is_none(), "{id:?}");
+        }
+        assert!(
+            up.targets()
+                .iter()
+                .all(|target| !target.starts_with("/transactions/")),
+            "no id reached a request path"
+        );
+
+        let longest = "a".repeat(MAX_ID_BYTES);
+        for id in [
+            "0f0e1d2c-3b4a-4958-8776-655443322110",
+            "Example_1",
+            &longest,
+        ] {
+            page_with(id);
+            let read = up.poll_to_listing(None, NOW).await;
+            assert_eq!(read.coverage, SourceCoverage::More, "{id:?}");
+            assert_eq!(read.events.len(), 2, "{id:?}");
+        }
+    }
+
+    /// The object in a checkpoint that holds the followed transactions, which
+    /// is the one with the followed transaction `id` as a key.
+    fn holds_of<'a>(checkpoint: &'a mut Value, id: &str) -> Option<&'a mut Value> {
+        if checkpoint.get(id).is_some() {
+            return Some(checkpoint);
+        }
+        checkpoint
+            .as_object_mut()?
+            .values_mut()
+            .find_map(|field| holds_of(field, id))
+    }
+
+    #[tokio::test]
+    async fn a_saved_checkpoint_with_more_holds_than_the_cap_or_a_field_outside_its_bound_is_refused_before_any_request()
+     {
+        let up = Harness::start(vec![held(
+            "example-transaction-1",
+            "Example Hotel",
+            "-200.00",
+            NOW - HOUR,
+        )])
+        .await;
+        let (_, saved) = up.scan(None, NOW).await;
+        let mut saved: Value = serde_json::from_str(&saved.value).unwrap();
+        let followed =
+            holds_of(&mut saved, "example-transaction-1").unwrap()["example-transaction-1"].clone();
+        let with_holds = |ids: Vec<String>, hold: &Value| {
+            let mut seeded = saved.clone();
+            *holds_of(&mut seeded, "example-transaction-1").unwrap() =
+                Value::Object(ids.into_iter().map(|id| (id, hold.clone())).collect());
+            SourceCheckpoint {
+                value: seeded.to_string(),
+            }
+        };
+        let numbered = |count: usize| -> Vec<String> {
+            (0..count)
+                .map(|number| format!("example-hold-{number:04}"))
+                .collect()
+        };
+        let mut long_summary = followed.clone();
+        long_summary["summary"] = json!("a".repeat(161));
+        let mut control_summary = followed.clone();
+        control_summary["summary"] = json!("Example\nHotel");
+        let mark = up.targets().len();
+
+        let no_credential = UpSource::new(
+            "everyday".into(),
+            Some(up.api.url.clone()),
+            failing_credential_script(up.dir.path()),
+        )
+        .unwrap();
+        for (case, seeded) in [
+            ("3,000 holds", with_holds(numbered(3_000), &followed)),
+            ("513 holds", with_holds(numbered(MAX_HOLDS + 1), &followed)),
+            ("a dot-segment id", with_holds(vec!["..".into()], &followed)),
+            (
+                "a long id",
+                with_holds(vec!["a".repeat(MAX_ID_BYTES + 1)], &followed),
+            ),
+            ("a long summary", with_holds(numbered(1), &long_summary)),
+            (
+                "a control character in a summary",
+                with_holds(numbered(1), &control_summary),
+            ),
+        ] {
+            let refused = no_credential.poll_at(Some(&seeded), NOW + SPACING).await;
+            assert_eq!(
+                refused.coverage,
+                unavailable(FOREIGN),
+                "{case}: the refusal comes before the credential command runs"
+            );
+            assert!(refused.checkpoint.is_none());
+        }
+        assert!(up.targets_since(mark).is_empty());
+
+        let at_the_cap = with_holds(numbered(MAX_HOLDS), &followed);
+        let read = up.poll(Some(&at_the_cap), NOW + SPACING).await;
+        assert_eq!(read.coverage, SourceCoverage::More, "512 holds are read");
+    }
+
+    #[test]
+    fn an_address_with_a_quote_is_refused_with_a_message_that_names_the_cause() {
+        let error = UpSource::new(
+            "everyday".into(),
+            Some("https://api.example.test/\"".into()),
+            vec!["example-secrets".into()],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Up URL must not contain white space, a control character, a double quote or a backslash"
+        );
     }
 
     /// A model of the runtime's source journal, with the two rules a poll

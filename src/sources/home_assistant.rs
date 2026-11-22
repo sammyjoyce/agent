@@ -262,7 +262,7 @@ mod tests {
 
     use super::*;
     use crate::sources::{
-        http::testing::{Canned, FakeApi, credential_script, curl_shim, shim_runs},
+        http::testing::{Canned, FakeApi, credential_script, curl_shim, proxied_curl, shim_runs},
         read_command,
     };
 
@@ -728,6 +728,54 @@ mod tests {
             dead_server.poll(None).await.unwrap().coverage,
             unavailable("Home Assistant API is unreachable; checkpoint retained.")
         );
+    }
+
+    #[tokio::test]
+    async fn a_proxy_in_the_environment_of_curl_receives_no_home_assistant_request() {
+        let proxy = FakeApi::start(|_| Canned::json(200, demo_leak_off())).await;
+        let server = FakeApi::start(|_| Canned::json(200, demo_leak_off())).await;
+        let dir = tempfile::tempdir().unwrap();
+        let source = HomeAssistantSource::new(
+            "home-example".into(),
+            server.url.clone(),
+            credential_script(dir.path(), "example-ha-token"),
+            vec![LEAK.into()],
+        )
+        .unwrap()
+        .with_curl(proxied_curl(dir.path(), &proxy.url));
+
+        let batch = source.poll(None).await.unwrap();
+
+        assert_eq!(
+            proxy.connections(),
+            0,
+            "the proxy received the request and its bearer token"
+        );
+        assert_eq!(batch.coverage, SourceCoverage::Complete);
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(server.seen().len(), 1);
+    }
+
+    #[test]
+    fn an_address_with_a_quote_or_a_backslash_is_refused_with_a_message_that_names_the_cause() {
+        for refused in [
+            "http://127.0.0.1:8123/\"",
+            "http://127.0.0.1:8123/\\",
+            "http://127.0.0.1:8123/a\u{7}b",
+        ] {
+            let error = HomeAssistantSource::new(
+                "home-example".into(),
+                refused.into(),
+                vec!["true".into()],
+                vec![LEAK.into()],
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Home Assistant URL must not contain white space, a control character, a double quote or a backslash",
+                "{refused:?}"
+            );
+        }
     }
 
     #[tokio::test]

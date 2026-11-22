@@ -5,14 +5,17 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use agent_cli::{
     background::{self, BackgroundRequest, BackgroundResponse},
     protocol::{HostResult, RuntimeCommand, RuntimeEventKind, SourceState},
     runtime::{MAX_FRAME_BYTES, OwnerClaim, Runtime},
-    sources::{Source, SourceConfig, SourceCoverage, slack::SlackSource},
+    sources::{
+        Source, SourceBatch, SourceCheckpoint, SourceConfig, SourceCoverage, SourceKey,
+        slack::SlackSource,
+    },
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -300,12 +303,17 @@ async fn local_helper_can_run_while_its_script_is_open_for_writing() {
 }
 
 const UP_TOKEN: &str = "example-up-token";
+const SECOND_UP_TOKEN: &str = "example-second-up-token";
+const UP_FOREIGN: &str = "Up checkpoint belongs to another account or configuration; change the account label to start a fresh seven-day read.";
+const UP_CLOCK: &str = "Up checkpoint holds a time more than five minutes ahead of this computer's clock; check the clock. The source continues from this checkpoint when the clock is right. To start a fresh seven-day read instead, change the account label.";
 
 /// An invented Up account on a loopback address. It has one held and two
-/// settled transactions and lists them one per page, newest first.
+/// settled transactions and lists them one per page, newest first. A second
+/// customer, with a token of its own, has two settled transactions.
 struct FakeUp {
     url: String,
-    requests: Arc<Mutex<Vec<String>>>,
+    /// The target and the bearer token of each request.
+    requests: Arc<Mutex<Vec<(String, String)>>>,
     second_page_fails: Arc<AtomicBool>,
     server: JoinHandle<()>,
 }
@@ -342,6 +350,20 @@ impl FakeUp {
                 now - 10_800,
             ),
         ];
+        let second_rows = [
+            up_transaction(
+                "example-second-transaction-2",
+                "SETTLED",
+                "Example Pharmacy",
+                now - 1_800,
+            ),
+            up_transaction(
+                "example-second-transaction-1",
+                "SETTLED",
+                "Example Pharmacy",
+                now - 5_400,
+            ),
+        ];
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -359,13 +381,20 @@ impl FakeUp {
                 }
                 let request = String::from_utf8_lossy(&request).into_owned();
                 let target = request.split(' ').nth(1).unwrap_or_default().to_owned();
-                let (status, body) =
-                    if request.contains(&format!("Authorization: Bearer {UP_TOKEN}\r\n")) {
-                        up_answer(&target, &origin, &rows, fails.load(Ordering::Relaxed))
-                    } else {
-                        up_error(401)
-                    };
-                seen.lock().unwrap().push(target);
+                let bearer = request
+                    .split("\r\n")
+                    .find_map(|line| line.strip_prefix("Authorization: Bearer "))
+                    .unwrap_or_default()
+                    .to_owned();
+                let fails = fails.load(Ordering::Relaxed);
+                let (status, body) = match bearer.as_str() {
+                    UP_TOKEN => up_answer(&target, &origin, "example-customer-1", &rows, fails),
+                    SECOND_UP_TOKEN => {
+                        up_answer(&target, &origin, "example-customer-2", &second_rows, fails)
+                    }
+                    _ => up_error(401),
+                };
+                seen.lock().unwrap().push((target, bearer));
                 let body = body.to_string();
                 let response = format!(
                     "HTTP/1.1 {status} Scripted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -383,7 +412,17 @@ impl FakeUp {
     }
 
     fn requests(&self) -> Vec<String> {
-        self.requests.lock().unwrap().clone()
+        let requests = self.requests.lock().unwrap();
+        requests.iter().map(|(target, _)| target.clone()).collect()
+    }
+
+    fn requests_with(&self, token: &str) -> Vec<String> {
+        let requests = self.requests.lock().unwrap();
+        requests
+            .iter()
+            .filter(|(_, bearer)| bearer == token)
+            .map(|(target, _)| target.clone())
+            .collect()
     }
 }
 
@@ -419,12 +458,18 @@ fn up_error(status: u16) -> (u16, Value) {
     )
 }
 
-fn up_answer(target: &str, origin: &str, rows: &[Value], second_page_fails: bool) -> (u16, Value) {
+fn up_answer(
+    target: &str,
+    origin: &str,
+    customer: &str,
+    rows: &[Value],
+    second_page_fails: bool,
+) -> (u16, Value) {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     match path {
         "/util/ping" => (
             200,
-            json!({ "meta": { "id": "example-customer-1", "statusEmoji": "ok" } }),
+            json!({ "meta": { "id": customer, "statusEmoji": "ok" } }),
         ),
         "/transactions" => {
             let held_only = query.contains("filter[status]=HELD");
@@ -512,8 +557,17 @@ struct AdmittedPage {
 /// read the journal's states, poll one page, admit it, and repeat while the
 /// poll returns a cursor.
 async fn refresh_into_journal(runtime: &Runtime, config: &[SourceConfig]) -> Vec<AdmittedPage> {
+    refresh_with_titles(runtime, config).await.0
+}
+
+/// `refresh_into_journal`, and the title of every event that the round sent to the journal.
+async fn refresh_with_titles(
+    runtime: &Runtime,
+    config: &[SourceConfig],
+) -> (Vec<AdmittedPage>, Vec<String>) {
     let mut cursor = None;
     let mut pages = Vec::new();
+    let mut titles = Vec::new();
     loop {
         let response = background::execute(BackgroundRequest::PollSources {
             sources: config.to_vec(),
@@ -537,6 +591,7 @@ async fn refresh_into_journal(runtime: &Runtime, config: &[SourceConfig]) -> Vec
         for read in reads {
             let coverage = read.batch.coverage.clone();
             let sent_events = read.batch.events.len();
+            titles.extend(read.batch.events.iter().map(|event| event.title.clone()));
             let (new_events, checkpoint_advanced) = ask(
                 runtime,
                 RuntimeCommand::IngestSource {
@@ -564,9 +619,283 @@ async fn refresh_into_journal(runtime: &Runtime, config: &[SourceConfig]) -> Vec
         }
         cursor = next;
         if cursor.is_none() {
-            return pages;
+            return (pages, titles);
         }
     }
+}
+
+/// A state directory, and an Up source whose credential command prints the
+/// token that `use_token` wrote last.
+struct UpSetup {
+    directory: tempfile::TempDir,
+    state: PathBuf,
+    config: [SourceConfig; 1],
+}
+
+impl UpSetup {
+    fn new(up: &FakeUp) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let credential = directory.path().join("credential");
+        let setup = Self {
+            config: [SourceConfig::Up {
+                enabled: true,
+                account: "everyday".into(),
+                credential_command: vec!["sh".into(), credential.to_str().unwrap().to_owned()],
+                url: Some(up.url.clone()),
+            }],
+            directory,
+            state,
+        };
+        setup.use_token(UP_TOKEN);
+        setup
+    }
+
+    fn use_token(&self, token: &str) {
+        fs::write(
+            self.directory.path().join("credential"),
+            format!("printf '%s' '{token}'\n"),
+        )
+        .unwrap();
+    }
+}
+
+fn page(
+    coverage: SourceCoverage,
+    sent_events: usize,
+    new_events: u32,
+    checkpoint_advanced: bool,
+) -> AdmittedPage {
+    AdmittedPage {
+        coverage,
+        sent_events,
+        new_events,
+        checkpoint_advanced,
+    }
+}
+
+fn up_unavailable(message: &str) -> SourceCoverage {
+    SourceCoverage::Unavailable {
+        message: message.into(),
+    }
+}
+
+async fn up_checkpoint(runtime: &Runtime) -> SourceCheckpoint {
+    journal_states(runtime)
+        .await
+        .into_iter()
+        .find(|state| state.source.provider == "up")
+        .and_then(|state| state.checkpoint)
+        .expect("The journal holds no Up checkpoint")
+}
+
+/// Every Unix time in a checkpoint is a number this large, and no count is.
+const EARLIEST_TIME: u64 = 1_000_000_000;
+
+fn latest_time(value: &Value) -> u64 {
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .filter(|time| *time >= EARLIEST_TIME)
+            .unwrap_or(0),
+        Value::Array(items) => items.iter().map(latest_time).max().unwrap_or(0),
+        Value::Object(fields) => fields.values().map(latest_time).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn move_times(value: &mut Value, seconds: u64) {
+    match value {
+        Value::Number(number) => {
+            if let Some(time) = number.as_u64().filter(|time| *time >= EARLIEST_TIME) {
+                *value = json!(time + seconds);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|item| move_times(item, seconds)),
+        Value::Object(fields) => fields
+            .values_mut()
+            .for_each(|field| move_times(field, seconds)),
+        _ => {}
+    }
+}
+
+/// Replaces the journal's Up checkpoint with the one a clock would have
+/// written that ran ahead, so that its latest time is `ahead` seconds after now.
+async fn save_as_written_by_a_clock_ahead(runtime: &Runtime, ahead: u64) -> SourceCheckpoint {
+    let saved = up_checkpoint(runtime).await;
+    let mut value: Value = serde_json::from_str(&saved.value).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let shift = now + ahead - latest_time(&value);
+    move_times(&mut value, shift);
+    let moved = SourceCheckpoint {
+        value: value.to_string(),
+    };
+    let advanced = ask(
+        runtime,
+        RuntimeCommand::IngestSource {
+            batch: SourceBatch {
+                source: SourceKey {
+                    provider: "up".into(),
+                    account: "everyday".into(),
+                },
+                events: Vec::new(),
+                checkpoint: Some(moved.clone()),
+                coverage: SourceCoverage::More,
+                progress: None,
+            },
+            expected_checkpoint: Some(saved),
+        },
+    )
+    .await
+    .into_iter()
+    .any(|event| {
+        matches!(
+            event,
+            RuntimeEventKind::SourceAdmitted {
+                checkpoint_advanced: true,
+                ..
+            }
+        )
+    });
+    assert!(advanced, "The journal did not take the moved checkpoint");
+    moved
+}
+
+#[tokio::test]
+async fn a_token_for_another_up_customer_after_a_restart_reads_no_transaction_into_the_real_journal()
+ {
+    let up = FakeUp::start().await;
+    let setup = UpSetup::new(&up);
+
+    let runtime = start_runtime(&setup.state);
+    let (first_round, first_titles) = refresh_with_titles(&runtime, &setup.config).await;
+    assert_eq!(
+        first_round.last().map(|page| &page.coverage),
+        Some(&up_unavailable(
+            "Up API returned HTTP 503; checkpoint retained."
+        )),
+        "the first customer's scan stops between two pages"
+    );
+    assert_eq!(first_titles, ["Example Hotel: -20.00 AUD (held)"]);
+    let saved = up_checkpoint(&runtime).await;
+    runtime.close().await.unwrap();
+
+    setup.use_token(SECOND_UP_TOKEN);
+    up.second_page_fails.store(false, Ordering::Relaxed);
+    let runtime = start_runtime(&setup.state);
+    let (pages, titles) = refresh_with_titles(&runtime, &setup.config).await;
+
+    assert!(
+        titles
+            .iter()
+            .all(|title| !title.contains("Example Pharmacy")),
+        "a transaction of the second customer was sent to the journal: {titles:?}"
+    );
+    assert!(
+        titles
+            .iter()
+            .all(|title| !title.ends_with("(hold removed)")),
+        "a hold of the first customer was reported as removed: {titles:?}"
+    );
+    assert_eq!(pages, [page(up_unavailable(UP_FOREIGN), 0, 0, false)]);
+    assert_eq!(
+        up.requests_with(SECOND_UP_TOKEN),
+        ["/util/ping"],
+        "the second customer's token reads no transaction"
+    );
+    assert_eq!(
+        up_checkpoint(&runtime).await,
+        saved,
+        "the first customer's checkpoint is kept"
+    );
+    runtime.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_up_checkpoint_with_a_time_in_the_future_stops_the_real_poll_path_and_is_never_complete()
+{
+    let up = FakeUp::start().await;
+    up.second_page_fails.store(false, Ordering::Relaxed);
+    let setup = UpSetup::new(&up);
+    let runtime = start_runtime(&setup.state);
+    let mut rounds = 0;
+    while refresh_into_journal(&runtime, &setup.config)
+        .await
+        .last()
+        .map(|page| &page.coverage)
+        != Some(&SourceCoverage::Complete)
+    {
+        rounds += 1;
+        assert!(rounds < 4, "The first scan did not complete");
+    }
+
+    let ahead = save_as_written_by_a_clock_ahead(&runtime, 30 * 86_400).await;
+    let requests_before = up.requests().len();
+    for _ in 0..2 {
+        assert_eq!(
+            refresh_into_journal(&runtime, &setup.config).await,
+            [page(up_unavailable(UP_CLOCK), 0, 0, false)],
+            "a window that starts in the future holds no current transaction"
+        );
+    }
+    assert_eq!(up.requests().len(), requests_before, "no request is made");
+    assert_eq!(up_checkpoint(&runtime).await, ahead);
+    runtime.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_clock_behind_an_up_checkpoint_stops_the_real_poll_path_and_the_scan_resumes_at_its_saved_page_when_the_clock_is_right()
+ {
+    /// Seconds between the stop and the time the clock is right again.
+    const WAIT: u64 = 12;
+    let up = FakeUp::start().await;
+    let setup = UpSetup::new(&up);
+    let runtime = start_runtime(&setup.state);
+    let first_round = refresh_into_journal(&runtime, &setup.config).await;
+    assert_eq!(
+        first_round.last().map(|page| &page.coverage),
+        Some(&up_unavailable(
+            "Up API returned HTTP 503; checkpoint retained."
+        )),
+        "the scan stops with its second page saved"
+    );
+    up.second_page_fails.store(false, Ordering::Relaxed);
+
+    let ahead = save_as_written_by_a_clock_ahead(&runtime, 300 + WAIT).await;
+    let requests_before = up.requests().len();
+    assert_eq!(
+        refresh_into_journal(&runtime, &setup.config).await,
+        [page(up_unavailable(UP_CLOCK), 0, 0, false)]
+    );
+    assert_eq!(up.requests().len(), requests_before, "no request is made");
+    assert_eq!(up_checkpoint(&runtime).await, ahead);
+
+    tokio::time::sleep(Duration::from_secs(WAIT + 1)).await;
+    let resumed = refresh_into_journal(&runtime, &setup.config).await;
+    assert_eq!(resumed[0], page(SourceCoverage::More, 1, 1, true));
+    assert_eq!(
+        resumed.last().map(|page| &page.coverage),
+        Some(&SourceCoverage::Complete)
+    );
+    let transactions: Vec<String> = up.requests()[requests_before..]
+        .iter()
+        .filter(|target| target.starts_with("/transactions"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        transactions,
+        [
+            "/transactions?page[after]=1&page[size]=1",
+            "/transactions?page[after]=2&page[size]=1",
+            "/transactions?filter[status]=HELD&page[size]=100",
+        ],
+        "the scan continues at the page of the kept checkpoint"
+    );
+    runtime.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -583,12 +912,6 @@ async fn up_pages_enter_the_real_source_journal_once_and_a_failed_scan_resumes_a
         credential_command: vec!["sh".into(), credential.to_str().unwrap().to_owned()],
         url: Some(up.url.clone()),
     }];
-    let page = |coverage, sent_events, new_events, checkpoint_advanced| AdmittedPage {
-        coverage,
-        sent_events,
-        new_events,
-        checkpoint_advanced,
-    };
     let failed = SourceCoverage::Unavailable {
         message: "Up API returned HTTP 503; checkpoint retained.".into(),
     };

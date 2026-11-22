@@ -344,7 +344,10 @@ pub(crate) mod testing {
     use std::{
         fs,
         path::Path,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -421,6 +424,7 @@ pub(crate) mod testing {
         body: String,
         location: Option<String>,
         hang: bool,
+        delay: Duration,
     }
 
     impl Canned {
@@ -434,7 +438,14 @@ pub(crate) mod testing {
                 body: body.to_owned(),
                 location: None,
                 hang: false,
+                delay: Duration::ZERO,
             }
+        }
+
+        /// Answers after `delay` of real time, as a slow server does.
+        pub(crate) fn delayed(mut self, delay: Duration) -> Self {
+            self.delay = delay;
+            self
         }
 
         pub(crate) fn redirect(location: &str) -> Self {
@@ -459,6 +470,7 @@ pub(crate) mod testing {
         /// "http://127.0.0.1:<port>", which both `UrlRule`s accept.
         pub(crate) url: String,
         seen: Arc<Mutex<Vec<Seen>>>,
+        connections: Arc<AtomicUsize>,
         server: JoinHandle<()>,
     }
 
@@ -471,13 +483,26 @@ pub(crate) mod testing {
             let seen = Arc::new(Mutex::new(Vec::new()));
             let handler = Arc::new(handler);
             let record = seen.clone();
+            let connections = Arc::new(AtomicUsize::new(0));
+            let accepted = connections.clone();
             let server = tokio::spawn(async move {
-                let mut connections = JoinSet::new();
+                let mut answers = JoinSet::new();
                 while let Ok((socket, _)) = listener.accept().await {
-                    connections.spawn(answer(socket, record.clone(), handler.clone()));
+                    accepted.fetch_add(1, Ordering::Relaxed);
+                    answers.spawn(answer(socket, record.clone(), handler.clone()));
                 }
             });
-            Self { url, seen, server }
+            Self {
+                url,
+                seen,
+                connections,
+                server,
+            }
+        }
+
+        /// How many connections the server accepted, with or without a request on them.
+        pub(crate) fn connections(&self) -> usize {
+            self.connections.load(Ordering::Relaxed)
         }
 
         /// Every request so far, in order.
@@ -538,6 +563,7 @@ pub(crate) mod testing {
             tokio::time::sleep(Duration::from_secs(600)).await;
             return;
         }
+        tokio::time::sleep(canned.delay).await;
         let location = canned
             .location
             .map(|location| format!("Location: {location}\r\n"))
@@ -592,6 +618,20 @@ pub(crate) mod testing {
         path.to_string_lossy().into_owned()
     }
 
+    /// A stand-in for `curl` that runs the real `curl` with every proxy
+    /// variable set to `proxy`. Only this child gets the variables, so no other
+    /// test sees them.
+    pub(crate) fn proxied_curl(dir: &Path, proxy: &str) -> String {
+        let path = dir.join("curl-behind-proxy");
+        write_executable(
+            &path,
+            &format!(
+                "#!/bin/sh\nunset no_proxy NO_PROXY\nexport http_proxy='{proxy}' https_proxy='{proxy}' all_proxy='{proxy}'\nexport HTTPS_PROXY='{proxy}' ALL_PROXY='{proxy}'\nexec curl \"$@\"\n"
+            ),
+        );
+        path.to_string_lossy().into_owned()
+    }
+
     /// How many times the shim ran the real `curl`.
     pub(crate) fn shim_runs(dir: &Path) -> usize {
         fs::read_to_string(dir.join("ran"))
@@ -605,7 +645,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        testing::{Canned, FakeApi, credential_script, failing_credential_script},
+        testing::{Canned, FakeApi, credential_script, failing_credential_script, proxied_curl},
         *,
     };
 
@@ -767,6 +807,26 @@ mod tests {
     }
 
     #[test]
+    fn an_address_that_cannot_be_quoted_is_refused_with_a_message_that_names_the_cause() {
+        for rule in [UrlRule::AnyHttp, UrlRule::HttpsOrLoopback] {
+            for refused in [
+                "http://127.0.0.1:8123/\"",
+                "http://127.0.0.1:8123/\\",
+                "http://127.0.0.1:8123/a b",
+                "http://127.0.0.1:8123/a\u{7}b",
+            ] {
+                assert_eq!(
+                    HttpApi::new("Example", refused, vec!["true".into()], rule)
+                        .unwrap_err()
+                        .to_string(),
+                    "Example URL must not contain white space, a control character, a double quote or a backslash",
+                    "{refused:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn debug_output_shows_neither_the_address_nor_the_credential_command() {
         let api = api(
             "https://private.example.test/v1",
@@ -810,6 +870,50 @@ mod tests {
             Some("2026-11-15T00:00:00Z")
         );
         assert_eq!(seen[0].bearer.as_deref(), Some("example-token"));
+    }
+
+    #[tokio::test]
+    async fn proxy_variables_in_the_environment_of_curl_are_ignored() {
+        let proxy = FakeApi::start(|_| Canned::json(200, json!({ "from": "proxy" }))).await;
+        let server = FakeApi::start(|_| Canned::json(200, json!({ "from": "server" }))).await;
+        let dir = tempfile::tempdir().unwrap();
+        let behind_proxy = proxied_curl(dir.path(), &proxy.url);
+        let api = api(&server.url, credential_script(dir.path(), "example-token"))
+            .with_curl(behind_proxy.clone());
+
+        let reply = api
+            .open()
+            .await
+            .unwrap()
+            .get(&Target::fixed("/transactions"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            proxy.connections(),
+            0,
+            "the proxy received the request and its bearer token"
+        );
+        assert_eq!(
+            reply.json::<serde_json::Value>().unwrap(),
+            json!({ "from": "server" })
+        );
+        assert_eq!(server.seen().len(), 1);
+
+        let control = read_command(&[
+            behind_proxy,
+            "-q".into(),
+            "-sS".into(),
+            format!("{}/control", server.url),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(control.exit_code, 0);
+        assert_eq!(
+            proxy.connections(),
+            1,
+            "without noproxy the same curl uses the proxy, so the check above can fail"
+        );
     }
 
     #[tokio::test]
