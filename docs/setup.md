@@ -846,6 +846,19 @@ arguments are the same for every request, so other local processes see no
 token, host or path. `curl` does not read the service user's `.curlrc` and does
 not follow a redirect.
 
+`curl` uses no proxy. It ignores `http_proxy`, `https_proxy`, `all_proxy` and
+their upper-case forms in the service's environment, so a proxy never receives
+the token. Every request goes directly to the configured address. On a host
+that reaches the server only through a proxy, these sources report that the API
+is unreachable or did not answer.
+
+The base address in `url` must not contain white space, a control character, a
+double quote or a backslash. Write such a character in its percent-encoded
+form, such as `%20` for a space. Otherwise Beep Boop refuses the configuration
+when it loads, with
+`URL must not contain white space, a control character, a double quote or a backslash`.
+This rule applies to Home Assistant and to Up.
+
 #### Credential command
 
 `credential_command` is a program and its arguments, as a list. Beep Boop runs
@@ -859,7 +872,7 @@ it without a shell, in `/`, with the service's environment.
   status message or in a log.
 - The command runs before each page that a source reads, and Beep Boop does not
   store the token between pages. Home Assistant reads one page per poll. An Up
-  scan reads three pages or more, so it runs the command three times or more.
+  scan reads two pages or more, so it runs the command twice or more.
 - The command must finish within 15 minutes and print less than 2 MiB.
 
 If the command breaks a rule, the source reports
@@ -927,21 +940,60 @@ account that the token's holder has.
 - A held transaction that Up deletes is reported once as `hold removed`. Up
   does not say whether the merchant released the hold or whether Up settled it
   as a separate transaction. A separate transaction is a separate event.
-- A scan is at least three requests: an identity check, the recent transactions
-  and the held transactions. Each further page of 100 transactions is one more
-  request. So is each held transaction that left Up's list.
-- A new scan starts five minutes or more after the last scan finished, whatever
-  `poll_interval_seconds` is. Between scans a poll sends no request, so the last
-  check that `beep-boop sources` shows can be up to five minutes newer than the
-  last request.
+- The source reports `hold removed` only when Up answers the lookup of that
+  transaction with HTTP 404 and an error body in Up's documented form. Any
+  other 404 is reported as `Up API returned HTTP 404` and the source keeps
+  following the transaction.
+- Each page starts with an identity check that uses the same token as the page.
+  If the token belongs to another Up customer, the source reads no transaction
+  with it and reports `Up checkpoint belongs to another account or configuration`.
+- A scan is at least four requests: an identity check and the recent
+  transactions, then an identity check and the held transactions. Each further
+  page of 100 transactions is two more requests. Held transactions that left
+  Up's list are looked up four at a time. Each group is one identity check and
+  one request per transaction.
+- A new scan starts five minutes or more after the last response of the
+  previous scan, whatever `poll_interval_seconds` is. Between scans a poll sends
+  no request, so the last check that `beep-boop sources` shows can be up to five
+  minutes newer than the last request. An idle source therefore sends four
+  requests per scan and at most 1,152 requests a day.
+- Once a day, one scan reads the last 14 days again, but nothing from before the
+  first poll's seven days. Up can settle a held transaction as a new
+  transaction that carries the creation time of the old one, and can list it
+  after the source reported `hold removed`. The reread finds that transaction.
+  It replaces one normal scan. It costs no extra request while the 14 days hold
+  fewer than 100 transactions, and two requests for each further 100.
+- If Up refuses a saved page link, the scan starts again once from its first
+  page. If Up refuses a link again in the same scan, the source reports
+  `Up refused a saved page link for the second time in one scan` and tries the
+  same page at each poll.
+- The source compares the times in its checkpoint with the clock. If a saved
+  time is more than five minutes ahead of the clock, the source sends no request
+  and reports
+  `Up checkpoint holds a time more than five minutes ahead of this computer's clock; check the clock.`
+  The message goes on to say what follows. The source keeps the checkpoint and
+  continues from it when the clock is right again. If the clock was ahead when
+  the source first ran, the checkpoint stays ahead. Then change `account` to
+  start a fresh seven-day read.
 
 Known limits:
 
 - A transaction that appears and disappears between two scans is not seen.
 - A held transaction that was created more than seven days before the first
   poll is neither reported nor followed.
+- A settlement that Up lists as a new transaction with an old creation time is
+  found by the daily reread, so it can arrive up to a day late. It is not seen
+  at all when Up lists it more than 14 days after that creation time, or when
+  that creation time is before the first poll's seven days.
+- The form of Up's 404 answer for a deleted transaction comes from Up's
+  documentation. It has not been checked against a real account.
 - The source follows at most 512 held transactions. With more, it reports
-  partial coverage and stops until Up lists fewer.
+  partial coverage and stops until Up lists fewer. A held transaction that left
+  Up does not count.
+- Up documents a UUID as the ID of a transaction. The source accepts an ID of 1
+  to 128 letters, digits, hyphens and underscores. A page with any other ID is
+  reported as `Up sent a response this source cannot read`, and nothing from
+  that page is delivered.
 - A change of category, tags or note is not an event.
 - The checkpoint belongs to one Up customer and one `account` label. To read
   another customer's transactions, use another label. Otherwise the source
