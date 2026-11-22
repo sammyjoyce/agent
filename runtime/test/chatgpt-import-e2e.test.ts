@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { join } from "node:path";
@@ -45,7 +46,7 @@ async function groupAlive(pid: number): Promise<boolean> {
     if (errorCode(error) === "ESRCH") return false;
     if (errorCode(error) !== "EPERM") throw error;
     // Darwin's killpg returns EPERM once only zombies remain, so ask ps for live members.
-    const { stdout } = await promisify(execFile)("/bin/ps", ["-ax", "-o", "pgid=,stat="]);
+    const { stdout } = await promisify(execFile)(existsSync("/bin/ps") ? "/bin/ps" : "ps", ["-ax", "-o", "pgid=,stat="]);
     return stdout.split("\n").some((line) => {
       const [group, state] = line.trim().split(/\s+/);
       return group === String(pid) && state !== undefined && !state.startsWith("Z");

@@ -9,13 +9,19 @@ import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type Message, type TranscriptContext } from "@earendil-works/pi-ai";
 import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { CoordinatorEnvironment } from "../src/environment.js";
 import type { HostCommand } from "../src/generated/HostCommand.js";
 import type { HostResult } from "../src/generated/HostResult.js";
+import type { ModelSelection } from "../src/generated/ModelSelection.js";
+import type { WorkerHost } from "../src/generated/WorkerHost.js";
 import { IMAGE_CHUNK_BYTES, MAX_IMAGE_READ_BYTES } from "../src/generated/image-read-limits.js";
+import { createGuidance } from "../src/guidance.js";
 import { readImageFile, type ReadFileCommand } from "../src/images.js";
 import { ConversationModels } from "../src/models.js";
+import { createSourceTools, SourceJournal } from "../src/sources.js";
 import { TaskStore } from "../src/tasks.js";
-import { createAppTools, Executions } from "../src/tools.js";
+import { createAppTools, Executions, HostRequests } from "../src/tools.js";
+import { runAdmitted } from "./fixtures/run-admitted.js";
 
 function storedPng(width: number, height: number): Buffer {
   const row = Buffer.concat([Buffer.of(0), Buffer.alloc(width * 3, 0x5a)]);
@@ -131,4 +137,201 @@ test("an image transfer ends without an image on any reply that does not continu
   const failed: HostResult = { type: "failed", message: "The file changed while it was read; read it again" };
   assert.deepEqual(await readImageFile(async () => failed, command, first, input),
     { output: [{ type: "text", text: JSON.stringify(failed) }], isError: true }, "A host failure reads as any failed host result");
+});
+
+test("triage and child agents read chunked images from a second machine through on_node", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-read-file-remote-"));
+  const registry = createRegistry(), models = createModels(), executions = new Executions();
+  const modelRef = { provider: "openai", modelId: "narrow" } as const;
+  const faux = fauxProvider({ provider: "openai", tokensPerSecond: 1_000_000,
+    models: [{ id: "narrow", input: ["text", "image"], inputLimits: { images: { resize: { maxWidth: 800 } } } }] });
+  models.setProvider(faux.provider);
+  const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+    { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  const inference = new ConversationModels(models);
+  const environment = new CoordinatorEnvironment(session);
+  const tasks = new TaskStore(session, inference);
+  const sources = new SourceJournal(session, tasks, executions);
+  await sources.prepare();
+  const tools = createAppTools(tasks, executions), sourceTools = createSourceTools(sources, executions), guidance = createGuidance(executions);
+  registry.install(guidance); registry.install(tools.host); registry.install(tools.main); registry.install(tools.agent);
+  registry.install(sourceTools.main);
+
+  const modelSelection: ModelSelection = { provider: "openai", model_id: "narrow", reasoning: null, fast: false };
+  const launch = { state_dir: null, runtime: null, config: null, instructions: null, model: null };
+  const remoteHost: WorkerHost = { name: "second-host", host_id: "22222222-2222-4222-8222-222222222222",
+    rex_server: null, coordinator: null, cwd: "/remote/work", agent_program: "/bin/agent" };
+  await environment.configure({
+    node: { host_id: "11111111-1111-4111-8111-111111111111", name: "local-host", rex_server: null, coordinator: null,
+      home_directory: "/local", agent_program: "/bin/agent", launch },
+    settings: { model: modelSelection, instructions: "Use invented remote fixtures.", context_repositories: [], sources: [] },
+  });
+  await environment.register({ host_id: remoteHost.host_id!, name: remoteHost.name, rex_server: null, coordinator: null,
+    home_directory: "/remote", agent_program: "/bin/agent", launch });
+  environment.setConnected([remoteHost.host_id!]);
+
+  const wide = storedPng(1200, 400);
+  assert.ok(wide.length > IMAGE_CHUNK_BYTES, "Fixture spans multiple chunks");
+  const fixture = host({ "/remote/work/triage-shot.png": wide, "/remote/work/child-shot.png": wide }, new Set());
+  const forwarded: Array<{ role: string; command: HostCommand }> = [];
+  const routedCall = (role: string) => async (command: HostCommand): Promise<HostResult> => {
+    forwarded.push({ role, command });
+    if (command.type === "reload_guidance") {
+      return { type: "shared_guidance", global: { text: "", sources: [] }, workflow_policy: "", context_repositories: [], context_sources: [] };
+    }
+    if (command.type === "project_guidance") return { type: "project_guidance", snapshot: { text: "", sources: [] } };
+    if (command.type === "spawn_worker" || command.type === "spawn_workspace_worker") {
+      return {
+        type: "spawned",
+        binding: {
+          host_id: remoteHost.host_id!,
+          session_id: "session:33333333-3333-4333-8333-333333333333",
+          window_id: "window:44444444-4444-4444-8444-444444444444",
+          block_id: "block:55555555-5555-4555-8555-555555555555",
+        },
+      };
+    }
+    if (command.type === "on_node") {
+      assert.equal(command.host_id, remoteHost.host_id);
+      if (command.command.type === "inspect_worker") {
+        return { type: "worker_presence", presence: { state: "present", running: true } };
+      }
+      return fixture.call(command.command);
+    }
+    return fixture.call(command);
+  };
+
+  try {
+    await sources.admit({
+      source: { provider: "mail", account: "example" },
+      checkpoint: null,
+      coverage: { status: "complete" },
+      events: [{ id: "evt-1", version: "v1", source: { provider: "mail", account: "example", thread_id: "thr-1" }, title: "Inspect", text: "Check shot" }],
+    }, null);
+    const pendingEvent = (await sources.events({ pending: true }))[0];
+    assert.ok(pendingEvent !== undefined);
+
+    const triageSeen: Extract<Message, { role: "toolResult" }>[] = [];
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("read_file", { path: "triage-shot.png" }), { stopReason: "toolUse" }),
+      (context) => {
+        triageSeen.push(toolResult(context));
+        return fauxAssistantMessage(fauxToolCall("dismiss_source_events", { keys: [pendingEvent.key], reason: "Reviewed remote image." }), { stopReason: "toolUse" });
+      },
+      fauxAssistantMessage("Triage finished."),
+    ]);
+    await sources.triage(
+      { type: "triage_sources", instructions: "Review.", model: modelSelection, cwd: remoteHost.cwd, hosts: [remoteHost] },
+      (conversation, model) => executions.bind(conversation.id.toString(), {
+        model, cwd: remoteHost.cwd, hosts: [remoteHost], default_host: remoteHost,
+        connectedHosts: async () => [remoteHost], role: "triage",
+        call: (operation) => routedCall("triage")(environment.route(operation, remoteHost)),
+      }),
+      [guidance, tools.host, tools.main, sourceTools.main],
+    );
+    assert.equal(triageSeen.length, 1);
+    const triageImage = triageSeen[0]!.content.find((part) => part.type === "image");
+    assert.ok(triageImage?.type === "image" && triageImage.mimeType === "image/png");
+    assert.equal(Buffer.from(triageImage.data, "base64").readUInt32BE(16), 800);
+
+    tasks.useActorExecution({
+      available: () => true,
+      extensions: (agentId) => agentId === undefined ? [guidance, tools.host, tools.agent] : [guidance, tools.host, tools.agent],
+      call: (operation, node) => routedCall("actor")(environment.route(operation, node)),
+      prepare: async () => {},
+      bind: (conversation, node, model) => executions.bind(conversation.id.toString(), {
+        model, cwd: node.cwd, hosts: [node], default_host: node, origin_host_id: node.host_id,
+        connectedHosts: async () => [node], role: "worker",
+        call: (operation) => routedCall("child-agent")(environment.route(operation, node)),
+      }),
+    });
+    const task = await tasks.create({ title: "Remote inspection", outcome: "Read remote child image", model: modelSelection });
+    await tasks.dispatch(task.id, remoteHost, routedCall("dispatch"));
+    const child = await tasks.createAgent(task.id, { id: "remote-child", title: "Child reader", outcome: "Read child-shot.png", input: "Read child-shot.png", inputId: "child-in-1" });
+    const childSeen: Extract<Message, { role: "toolResult" }>[] = [];
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("read_file", { path: "child-shot.png" }), { stopReason: "toolUse" }),
+      (context) => {
+        childSeen.push(toolResult(context));
+        return fauxAssistantMessage(fauxToolCall("report_result", { summary: "Inspected remote image." }), { stopReason: "toolUse" });
+      },
+      fauxAssistantMessage("Child finished."),
+    ]);
+    await runAdmitted(tasks, task.id, child.id);
+    assert.equal(childSeen.length, 1);
+    const childImage = childSeen[0]!.content.find((part) => part.type === "image");
+    assert.ok(childImage?.type === "image" && childImage.mimeType === "image/png");
+    assert.equal(Buffer.from(childImage.data, "base64").readUInt32BE(16), 800);
+
+    const onNodeReads = forwarded
+      .filter((entry): entry is { role: string; command: Extract<HostCommand, { type: "on_node" }> } =>
+        entry.command.type === "on_node" && entry.command.command.type === "read_file")
+      .map((entry) => {
+        const read = entry.command.command as ReadFileCommand;
+        return [entry.role, entry.command.host_id, read.path, read.image];
+      });
+    assert.deepEqual(onNodeReads, [
+      ["triage", remoteHost.host_id, "/remote/work/triage-shot.png", { type: "start" }],
+      ["triage", remoteHost.host_id, "/remote/work/triage-shot.png", { type: "next", at: IMAGE_CHUNK_BYTES, stamp: "version-1" }],
+      ["child-agent", remoteHost.host_id, "/remote/work/child-shot.png", { type: "start" }],
+      ["child-agent", remoteHost.host_id, "/remote/work/child-shot.png", { type: "next", at: IMAGE_CHUNK_BYTES, stamp: "version-1" }],
+    ]);
+  } finally {
+    await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("cancelling a slow chunked image transfer aborts without hanging or breaking later reads", { timeout: 10_000 }, async () => {
+  const png = storedPng(1200, 400);
+  assert.ok(png.length > IMAGE_CHUNK_BYTES, "Fixture spans two chunks");
+  const backing = host({ "/fixture/slow.png": png }, new Set());
+  const emitted: Array<{ request: number; call: string; command: HostCommand }> = [];
+  const cancelled: Array<{ request: number; call: string }> = [];
+  let stallNext = true;
+
+  const hostRequests = new HostRequests(
+    (request, call, command) => {
+      emitted.push({ request, call, command });
+      if (command.type === "on_node" && command.command.type === "read_file" &&
+          command.command.image?.type === "next" && stallNext) {
+        return; // Simulate a slow second chunk stuck on the remote host.
+      }
+      void backing.call(command.type === "on_node" ? command.command : command).then((reply) => hostRequests.reply(request, call, reply));
+    },
+    (request, call) => cancelled.push({ request, call }),
+  );
+
+  const command: ReadFileCommand = { type: "read_file", path: "/fixture/slow.png", offset: 0, limit: 64_000, image: { type: "start" } };
+  const route = (op: HostCommand): HostCommand => ({ type: "on_node", host_id: "22222222-2222-4222-8222-222222222222", command: op });
+  const input = { vision: true, limits: { maxWidth: 800, maxHeight: 800, maxBytes: 4_000_000 } };
+
+  const startedAt = Date.now();
+  const first = await hostRequests.call(1, route(command));
+  assert.equal(first.type, "image_chunk");
+  const readPromise = readImageFile((next) => hostRequests.call(1, route(next)), command, first, input);
+  await new Promise<void>((resolve) => setTimeout(resolve, 15));
+  assert.equal(emitted.length, 2, "Second chunk is in flight before cancellation");
+
+  hostRequests.cancelRequest(1);
+  await assert.rejects(readPromise, /File read was interrupted/);
+  assert.ok(Date.now() - startedAt < 2_000, "Cancelling a slow read releases immediately instead of waiting for host timeout");
+  assert.deepEqual(cancelled, [{ request: 1, call: emitted[1]!.call }]);
+
+  const controller = new AbortController();
+  const second = await hostRequests.call(2, route(command), controller.signal);
+  assert.equal(second.type, "image_chunk");
+  const abortedRead = readImageFile((next) => hostRequests.call(2, route(next), controller.signal), command, second, input);
+  await new Promise<void>((resolve) => setTimeout(resolve, 15));
+  controller.abort();
+  await assert.rejects(abortedRead, /File read was interrupted/);
+  assert.equal(cancelled.length, 2);
+
+  hostRequests.resumeRequest(1);
+  stallNext = false;
+  const recoveredFirst = await hostRequests.call(1, route(command));
+  assert.equal(recoveredFirst.type, "image_chunk");
+  const recovered = await readImageFile((next) => hostRequests.call(1, route(next)), command, recoveredFirst, input);
+  assert.equal(recovered.isError, undefined);
+  const image = recovered.output?.find((part) => part.type === "image");
+  assert.ok(image?.type === "image" && image.mimeType === "image/png");
 });

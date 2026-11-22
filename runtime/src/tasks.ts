@@ -4,6 +4,7 @@ import { AttachmentStore, validateInput } from "./attachments.js";
 import type { AttachmentRef } from "./generated/AttachmentRef.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AgentDoc, AssistantEntry, defineDoc, defineDocFamily, defineEntry, GenerationTask, InboxDoc, LiveDoc, ROOT_CONVERSATION_ID, ToolTask, type Conversation, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Extension, type Harness, type SettledSubmissionRecord, type Submission, type TaskId as NativeTaskId, type Tx } from "@earendil-works/pi-durable";
+import type { ImageLimits } from "@earendil-works/pi-durable/tools";
 import { EnvironmentError, type CoordinatorEnvironment } from "./environment.js";
 import { ConversationModels, DEFAULT_MODEL, ModelError, modelFailureMessage, savedHost, savedModel } from "./models.js";
 import { ModelTurnError } from "./protocol.js";
@@ -464,17 +465,18 @@ export class TaskStore {
     if (this.attachments === undefined) throw new TaskError("Attachment storage is unavailable");
     return this.attachments.references(ids);
   }
-  async openAttachment(id: string, call: HostCall): Promise<Awaited<ReturnType<AttachmentStore["input"]>>> {
+  async openAttachment(id: string, call: HostCall, limits?: ImageLimits): Promise<Awaited<ReturnType<AttachmentStore["input"]>>> {
     if (this.attachments === undefined) throw new TaskError("Attachment storage is unavailable");
-    return this.attachments.input("", await this.attachmentRefs([id]), call);
+    return this.attachments.input("", await this.attachmentRefs([id]), call, undefined, limits);
   }
-  private async prepareInput(conversation: Conversation, text: string, refs: readonly AttachmentRef[] | undefined, call?: HostCall, inputOrigin?: InputOrigin, sender?: TaskMessageSender): Promise<Awaited<ReturnType<AttachmentStore["input"]>>> {
+  private async prepareInput(conversation: Conversation, text: string, refs: readonly AttachmentRef[] | undefined, call?: HostCall, inputOrigin?: InputOrigin, sender?: TaskMessageSender, fallbackModel?: ModelSelection | null): Promise<Awaited<ReturnType<AttachmentStore["input"]>>> {
     let prepared: Awaited<ReturnType<AttachmentStore["input"]>>;
     if (refs === undefined || refs.length === 0) prepared = { content: text,
       ...(inputOrigin === undefined ? {} : { entry: { kind: "agent.input", data: { text, origin: inputOrigin } } }) };
     else {
       if (this.attachments === undefined || call === undefined) throw new TaskError("The attachment execution host is unavailable");
-      prepared = await this.attachments.input(text, refs, call, inputOrigin);
+      const activeModel = (await this.session.snapshot(AgentDoc, conversation.id, BACKGROUND_CONTEXT))?.model ?? fallbackModel ?? undefined;
+      prepared = await this.attachments.input(text, refs, call, inputOrigin, this.inference.imageLimits(activeModel));
     }
     const origin = (await this.session.snapshot(NoticeLineage, conversation.id, BACKGROUND_CONTEXT))?.origin;
     if (sender === undefined && (origin === undefined || origin === null)) return prepared;
@@ -1115,7 +1117,7 @@ export class TaskStore {
         // configuration. Explicit steering belongs to the active turn.
         if (input.scheduled !== undefined) { scheduled = true; continue; }
         if (scheduled && input.mode !== "steer") continue;
-        const prepared = await this.prepareInput(conversation, input.content, input.attachments, active.call, input.origin, input.sender);
+        const prepared = await this.prepareInput(conversation, input.content, input.attachments, active.call, input.origin, input.sender, this.actor(task, active.ref.agent_id).model ?? task.model);
         if (!admitting()) break;
         await conversation.submit({ type: "input", ...prepared, requestId: input.id,
           whenBusy: input.mode === "steer" ? "steer" : "followUp" }, BACKGROUND_CONTEXT);
@@ -2050,7 +2052,7 @@ export class TaskStore {
             if (observer.held === undefined) await observer.session.configured?.(conversation, task.title);
           }
         }
-        const prepared = await this.prepareInput(conversation, next.content, next.attachments, active.call, next.origin, next.sender);
+        const prepared = await this.prepareInput(conversation, next.content, next.attachments, active.call, next.origin, next.sender, selected);
         await this.reopenTurn(active);
         if (active.fenced || isAbortedJob(active)) break;
         const stopped = this.stoppedTurns.has(turnInHand); turnInHand = undefined;

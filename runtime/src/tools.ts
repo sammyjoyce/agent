@@ -106,7 +106,7 @@ export class HostRequests {
   private readonly cancelled = new Set<number>();
   private readonly pending = new Map<string, {
     request: number; resolve: (value: HostResult) => void; reject: (error: Error) => void;
-    timer: ReturnType<typeof setTimeout>; cancelled: boolean; cancellable: boolean; dispose(): void;
+    timer: ReturnType<typeof setTimeout>; cancelled: boolean; cancelReason?: string; dispose(): void;
   }>();
   private readonly gateWaitAbortsByRequest = new Map<AbortController, number>();
   /**
@@ -159,7 +159,9 @@ export class HostRequests {
         this.pending.delete(call); dispose();
         reject(new TaskError("The execution client did not confirm the operation; inspect its state before retrying"));
       }, timeout);
-      this.pending.set(call, { request, resolve, reject, timer, cancelled: false, cancellable: operation.type === "embed", dispose });
+      const cancelReason = operation.type === "embed" ? "History embedding was interrupted"
+        : operation.type === "read_file" ? "File read was interrupted" : undefined;
+      this.pending.set(call, { request, resolve, reject, timer, cancelled: false, ...(cancelReason === undefined ? {} : { cancelReason }), dispose });
       signal?.addEventListener("abort", aborted, { once: true });
       try { this.emit(request, call, command); }
       catch {
@@ -190,10 +192,10 @@ export class HostRequests {
     pending.cancelled = true;
     this.cancel(pending.request, call);
     // External effects retain their pending receipt until the host drains them.
-    // Embedding is read-only and can release its caller immediately.
-    if (pending.cancellable) {
+    // Embedding and file reads are read-only and can release callers immediately.
+    if (pending.cancelReason !== undefined) {
       clearTimeout(pending.timer); this.pending.delete(call); pending.dispose();
-      pending.reject(new TaskError("History embedding was interrupted"));
+      pending.reject(new TaskError(pending.cancelReason));
     }
   }
   resumeRequest(request: number): void { this.cancelled.delete(request); }
@@ -243,9 +245,12 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
 } {
   const host = defineExtension({ name: "host-tools", tools: [
     defineTool({ name: "read_attachment", description: "Read a user attachment by its stable attachment ID. Images use native image content; original files are materialized privately on this actor's execution host. Pass attachment IDs with delegation when another agent needs the files.",
-      parameters: Type.Object({ id: Type.String() }), async execute(args, api) {
-        const prepared = await tasks.openAttachment(args.id, executions.get(api.conversationId.toString()).call);
-        return { output: typeof prepared.content === "string" ? [{ type: "text", text: prepared.content }] : prepared.content };
+      parameters: Type.Object({ id: Type.String() }), async execute(args, api, context) {
+        const input = await imageInput(api, context);
+        const prepared = await tasks.openAttachment(args.id, executions.get(api.conversationId.toString()).call, input.limits);
+        const hasImage = Array.isArray(prepared.content) && prepared.content.some((part) => part.type === "image");
+        return { output: typeof prepared.content === "string" ? [{ type: "text", text: prepared.content }] : prepared.content,
+          ...(!input.vision && hasImage ? { diagnostics: [{ severity: "info", code: "image", message: "The current model does not support images; it sees a placeholder instead." }] } : {}) };
       } }),
     defineTool({ name: "exec", description: "Run a program and literal arguments. Main defaults to the coordinator; workers default to their owning host. Name a connected host for another machine.",
       parameters: Type.Object({ program: Type.String({ minLength: 1 }), args: Type.Array(Type.String()),
@@ -504,7 +509,9 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         return agentOutput("report_result", args, api.conversationId.toString(), await tasks.reportAgent(owner.task.id, owner.agent.id, args.summary, args.failure,
           { conversation_id: api.conversationId.toString(), call_id: api.callId }));
       } });
-  const worker = defineExtension({ name: "task-parent", tools: [record, searchTask, readTask, messageTask, continueAgent, spawnAgent, readAgents, waitAgents] });
+  const worker = defineExtension({ name: "task-parent",
+    namespace: { name: "tasks", description: "Search, inspect, record, and coordinate tasks and child agents." },
+    tools: [record, searchTask, readTask, messageTask, continueAgent, spawnAgent, readAgents, waitAgents] });
   const agent = defineExtension({ name: "task-agent", tools: [searchTask, readTask, messageTask, readAgents, reportResult] });
   // Pending actors may recover before their next configuration refresh.
   const legacy = defineExtension({ name: "task-worker", tools: [record, searchTask, readTask, messageTask, continueAgent, spawnAgent, readAgents, waitAgents, reportResult] });

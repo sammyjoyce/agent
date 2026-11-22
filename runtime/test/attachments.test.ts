@@ -99,6 +99,89 @@ test("attachments survive partial retries and restart, enforce immutable receipt
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
+test("attached images scale to the conversation model's configured image limits across main, tasks, and read_attachment", { timeout: 15_000 }, async () => {
+  const { capturePng, pngSize } = await import("./fixtures/png.js");
+  const directory = await mkdtemp(join(tmpdir(), "agent-attachment-limits-"));
+  const models = createModels();
+  const faux = fauxProvider({
+    provider: "openai",
+    models: [
+      {
+        id: "bounded-vision",
+        input: ["text", "image"],
+        inputLimits: { images: { resize: { maxWidth: 40, maxHeight: 40, maxBytes: 8_192 } } },
+      },
+    ],
+    tokensPerSecond: 1_000_000,
+  });
+  models.setProvider(faux.provider);
+  const registry = createRegistry();
+  const session = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+    { models, registry, identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  const inference = new ConversationModels(models), tasks = new TaskStore(session, inference);
+  const store = new AttachmentStore(new LocalFiles(directory)), executions = new Executions();
+  tasks.useAttachments(store);
+  const tools = createAppTools(tasks, executions);
+  registry.install(tools.host); registry.install(tools.main); registry.install(tools.worker);
+  const smallSelection = { provider: "openai" as const, model_id: "bounded-vision", reasoning: null, fast: false };
+  const largePng = capturePng(120, 80);
+  const call: HostCall = async (command) => {
+    if (command.type !== "attachment_write") return { type: "failed", message: `Unexpected ${command.type}` };
+    const bytes = Buffer.from(command.data_base64, "base64");
+    return { type: "attachment_written", next_offset: command.offset + bytes.length,
+      path: command.complete ? `/invented/host/${command.attachment.id}.png` : null };
+  };
+  try {
+    const ref = await upload(store, largePng, "wide.png", "image/png");
+    const root = await session.root(BACKGROUND_CONTEXT);
+    await inference.configure(root, smallSelection, { extensions: [tools.host, tools.main] });
+    const mainRelease = executions.bind(root.id.toString(), { model: smallSelection, cwd: "/workspace/example", hosts: [], call });
+    const scaled = await store.input("Main check", [ref], call, undefined, inference.imageLimits(smallSelection));
+    faux.setResponses([
+      (context) => {
+        const user = context.messages.findLast((message) => message.role === "user");
+        assert.ok(user && Array.isArray(user.content));
+        const img = user.content.find((part) => part.type === "image");
+        assert.ok(img?.type === "image");
+        const [width, height] = pngSize(Buffer.from(img.data, "base64"));
+        assert.ok(width <= 40 && height <= 40, `Expected <=40px main image, got ${width}x${height}`);
+        return fauxAssistantMessage(fauxToolCall("read_attachment", { id: ref.id }), { stopReason: "toolUse" });
+      },
+      (context) => {
+        const result = context.messages.findLast((message) => message.role === "toolResult" && message.toolName === "read_attachment");
+        assert.ok(result?.role === "toolResult");
+        const img = result.content.find((part) => part.type === "image");
+        assert.ok(img?.type === "image");
+        const [width, height] = pngSize(Buffer.from(img.data, "base64"));
+        assert.ok(width <= 40 && height <= 40, `Expected <=40px read_attachment image, got ${width}x${height}`);
+        return fauxAssistantMessage("Main checked both.");
+      },
+    ]);
+    await (await store.admit([ref], () => root.submit({ type: "input", ...scaled, requestId: randomUUID() }, BACKGROUND_CONTEXT)))?.wait(BACKGROUND_CONTEXT);
+    mainRelease();
+
+    const task = await tasks.create({ title: "Worker image limits", outcome: "Respect model image limits", model: smallSelection });
+    await tasks.dispatch(task.id, host, async () => ({ type: "spawned", binding }));
+    const saved = await tasks.get(task.id); assert.ok(saved.worker.state === "bound");
+    await tasks.enqueue(task.id, "Worker inspect image", randomUUID(), undefined, undefined, [ref]);
+    let workerImg: [number, number] | undefined;
+    faux.setResponses([
+      (context) => {
+        const user = context.messages.findLast((message) => message.role === "user");
+        assert.ok(user && Array.isArray(user.content));
+        const img = user.content.find((part) => part.type === "image");
+        assert.ok(img?.type === "image");
+        workerImg = pngSize(Buffer.from(img.data, "base64"));
+        return fauxAssistantMessage("Worker saw scaled image.");
+      },
+    ]);
+    await tasks.run({ type: "run_task", task_id: task.id, allocation_id: saved.worker.allocation_id, binding, instructions: "", model: smallSelection, cwd: host.cwd },
+      () => () => {}, [], call);
+    assert.ok(workerImg !== undefined && workerImg[0] <= 40 && workerImg[1] <= 40,
+      `Expected <=40px worker image, got ${JSON.stringify(workerImg)}`);
+  } finally { await tasks.detachActors(); await session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("upload quota reserves unfinished declared sizes before bytes arrive", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-attachment-quota-")); const store = new AttachmentStore(new LocalFiles(directory));
   try {

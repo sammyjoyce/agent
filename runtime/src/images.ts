@@ -1,4 +1,5 @@
 import type { Context } from "@earendil-works/chord/context";
+import type { MutableModels } from "@earendil-works/pi-ai";
 import type { ToolExecutionApi, ToolExecutionResult } from "@earendil-works/pi-durable";
 import { createNodePhotonImages } from "@earendil-works/pi-durable/images/node";
 import { DEFAULT_IMAGE_LIMITS, type ImageLimits, type ImageProcessor, type PreparedImage } from "@earendil-works/pi-durable/tools";
@@ -21,9 +22,10 @@ export async function prepareImage(bytes: Uint8Array, mimeType: string, limits: 
   return (await processor).prepare(Buffer.isBuffer(bytes) ? new Uint8Array(bytes) : bytes, mimeType, limits);
 }
 
-export async function imageInput(api: Pick<ToolExecutionApi, "agent" | "models">, context: Context): Promise<ImageInput> {
-  const ref = (await api.agent(context)).model;
-  const model = ref === undefined ? undefined : api.models.getModel(ref.provider, ref.modelId);
+/** Resolve vision capability and pixel/byte resize limits for a model reference. */
+export function modelImageInput(models: Pick<MutableModels, "getModel">, ref: { provider: string; modelId: string } | { provider: string; model_id: string } | undefined): ImageInput {
+  const modelId = ref === undefined ? undefined : "modelId" in ref ? ref.modelId : ref.model_id;
+  const model = ref === undefined || modelId === undefined ? undefined : models.getModel(ref.provider, modelId);
   const resize = model?.inputLimits?.images?.resize;
   return {
     vision: model?.input.includes("image") ?? true,
@@ -33,6 +35,10 @@ export async function imageInput(api: Pick<ToolExecutionApi, "agent" | "models">
       maxBytes: resize?.maxBytes ?? DEFAULT_IMAGE_LIMITS.maxBytes,
     },
   };
+}
+
+export async function imageInput(api: Pick<ToolExecutionApi, "agent" | "models">, context: Context): Promise<ImageInput> {
+  return modelImageInput(api.models, (await api.agent(context)).model);
 }
 
 export async function readImageFile(call: HostCall, command: ReadFileCommand, first: ImageChunk, input: ImageInput): Promise<ToolExecutionResult> {

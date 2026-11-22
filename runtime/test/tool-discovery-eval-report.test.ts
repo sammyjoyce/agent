@@ -140,17 +140,23 @@ test("the child-agent scenario passes when both answers state the seeded root ca
   })));
 });
 
-test("the child-agent oracle judges every root cause label, and each must state the seeded cause in a sentence without negation", () => {
+test("the child-agent oracle judges meaning, handles paraphrases, and rejects denials across clauses or later sentences", () => {
   for (const right of [SEEDED_CAUSE, ...RECORDED_CHILD_SUMMARIES,
     "The agent read the report.\n**Root cause:** The staging relay's TLS certificate had expired, so it rejected deploy uploads.",
-    "- Root cause: the TLS certificate on the staging relay was expired"]) {
+    "- Root cause: the TLS certificate on the staging relay was expired",
+    "Root cause: deploy uploads failed because the staging relay's SSL certificate had lapsed and was not renewed in time."]) {
     assert.equal(statesExpiredCertificateCause(right), true, right);
   }
   for (const wrong of [...DENIED_CAUSES, "An expired TLS certificate on the staging relay rejected every deploy upload.",
     "Root cause: a malformed environment variable. The certificate had expired earlier but was renewed.",
     "Root cause: an expired TLS certificate on the staging relay did not reject the uploads.",
     "Root cause: an expired TLS certificate on the staging relay.\nRoot cause: a full disk on the build host.",
-    "Not the root cause: an expired TLS certificate on the staging relay."]) {
+    "Not the root cause: an expired TLS certificate on the staging relay.",
+    "Root cause: an expired TLS certificate on the staging relay. Update: we ruled that out; the certificate was still valid.",
+    "Root cause: an expired TLS certificate on the staging relay. Correction: the certificate was not expired; DNS failed.",
+    "Root cause: DNS resolution failed instead of an expired TLS certificate.",
+    "Root cause: we excluded an expired TLS certificate as the culprit and found a bad route.",
+    "Root cause: discarded theory that an expired TLS certificate broke uploads; a full disk did."]) {
     assert.equal(statesExpiredCertificateCause(wrong), false, wrong);
   }
 });

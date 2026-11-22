@@ -43,7 +43,7 @@ async function lab(prefix: string, answer?: (command: HostCommand) => HostResult
     if (command.type === "reload_guidance") return { type: "shared_guidance", global: { text: "", sources: [] }, workflow_policy: "", context_repositories: [], context_sources: [] };
     if (command.type === "project_guidance") return { type: "project_guidance", snapshot: { text: "", sources: [] } };
     if (command.type === "exec") return { type: "process", exit_code: 0, stdout: "EXAMPLE_EXEC_OUTPUT", stderr: "", truncated: false };
-    if (command.type === "edit_file") return { type: "written" };
+    if (command.type === "write_file" || command.type === "edit_file") return { type: "written" };
     return { type: "failed", message: `The example host does not support ${command.type}` };
   }
   const open = (arm: DiscoveryArm, compaction?: CompactionSettings) =>
@@ -159,6 +159,10 @@ test("each arm offers its role surfaces with the always-direct tools and reports
     assert.ok(scripted.section > 0, `${role} code mode declares its tool section`);
     for (const name of ALWAYS_DIRECT) assert.equal(scripted.perTool[name], direct.perTool[name], `${role} keeps the ${name} declaration unchanged`);
   }
+  const prodWorker = sizeOf("production", "worker"), prodTriage = sizeOf("production", "triage");
+  assert.ok(prodWorker.section < prodTriage.section,
+    `production worker codemode section (${prodWorker.section}) must shrink below triage (${prodTriage.section})`);
+  assert.ok(prodWorker.section < 2000, `production worker codemode section (${prodWorker.section}) stays compact`);
 });
 
 test("an arm cannot defer finish_without_reply or read_file", async () => {
@@ -383,27 +387,88 @@ for (const identity of callerIdentities) for (const arm of ["direct", "codemode"
   });
 }
 
-test("a worker's code mode item in task history shows each command, edited path and the script's output", async () => {
-  const env = await lab("agent-tool-discovery-history-"), app = await env.open(DISCOVERY_ARMS.codemode);
-  try {
-    const turn = await startRole.worker(app, "Raise the HTTP retries.");
-    const code = `const found = JSON.parse(await tools.exec({ program: "grep", args: ["-n", "max_retries", "config/limits.toml"] })).stdout;
-await tools.edit_file({ path: "config/limits.toml", old: "max_retries = 3", new: "max_retries = 5" });
-return "Raised max_retries after grep printed " + found;`;
-    env.faux.setResponses([(input) => { assert.equal(offeredNames(input).includes("edit_file"), false); return script(code); }, done]);
-    await turn.run();
-    const conversation = await app.tasks.conversation((await ownTask(app)).conversation_id);
-    const items = (await history(conversation, null, new HistoryStore(app.session))).flatMap((page) => page.messages)
-      .filter((message) => message.tool?.name === "codemode" && message.tool.status === "finished");
+test("a worker's, triage's, and child agent's code mode nested exec, write_file, and edit_file calls become standalone history items", async () => {
+  const scriptFor = (includeEdit: boolean) => [
+    `const found = JSON.parse(await tools.exec({ program: "grep", args: ["-n", "max_retries", "config/limits.toml"] })).stdout;`,
+    `await tools.write_file({ path: "config/notes.txt", content: "updated" });`,
+    ...(includeEdit ? [`await tools.edit_file({ path: "config/limits.toml", old: "max_retries = 3", new: "max_retries = 5" });`] : []),
+    `return "Raised max_retries after grep printed " + found;`,
+  ].join("\n");
+
+  const checkNested = async (app: Awaited<ReturnType<Awaited<ReturnType<typeof lab>>["open"]>>, conversationId: string, expectEdit = true) => {
+    const conversation = await app.tasks.conversation(conversationId);
+    const all = (await history(conversation, null, new HistoryStore(app.session))).flatMap((page) => page.messages);
+    const command = all.find((message) => message.role === "tool" && message.presentation?.type === "command");
+    assert.ok(command?.tool !== undefined && command.presentation?.type === "command", "Nested exec appears as its own Command item");
+    assert.equal(command.tool.name, "exec");
+    assert.equal(command.tool.status, "finished");
+    assert.match(command.presentation.command ?? "", /grep -n max_retries config\/limits\.toml/u);
+    const writes = all.filter((message) => message.role === "tool" && message.presentation?.type === "file_changes");
+    assert.ok(writes.some((item) => item.tool?.name === "write_file" && item.presentation?.type === "file_changes" &&
+      item.presentation.changes.some((change) => change.path === "config/notes.txt" && change.operation === null)), "Nested write_file appears as its own File changes item");
+    if (expectEdit) {
+      assert.ok(writes.some((item) => item.tool?.name === "edit_file" && item.presentation?.type === "file_changes" &&
+        item.presentation.changes.some((change) => change.path === "config/limits.toml" && change.operation === "update")), "Nested edit_file appears as its own File changes item");
+    }
+    const commandDetails = await toolDetails(conversation, command.entry_id, command.tool.call_id, new HistoryStore(app.session));
+    assert.ok(commandDetails.type === "available" && commandDetails.name === "exec" && commandDetails.input.type === "text");
+    assert.match(commandDetails.input.text, /"grep"/u);
+
+    const items = all.filter((message) => message.tool?.name === "codemode" && message.tool.status === "finished");
     assert.equal(items.length, 1, "One finished code mode item");
     const [item] = items; assert.ok(item?.tool !== undefined);
-    assert.match(item.text, /grep -n max_retries config\/limits\.toml/u, "The item shows the command the script ran");
-    assert.match(item.text, /edit_file config\/limits\.toml/u, "The item shows the path the script edited");
-    assert.match(item.text, /Raised max_retries after grep printed EXAMPLE_EXEC_OUTPUT/u, "The item shows the script's output");
+    assert.equal(/grep -n max_retries/u.test(item.text), false, "Promoted exec is not duplicated inside the codemode body");
+    assert.equal(/edit_file config\/limits\.toml/u.test(item.text), false, "Promoted file change is not duplicated inside the codemode body");
+    assert.match(item.text, /Raised max_retries after grep printed EXAMPLE_EXEC_OUTPUT/u, "The codemode item keeps the script's output");
     const details = await toolDetails(conversation, item.entry_id, item.tool.call_id, new HistoryStore(app.session));
     assert.ok(details.type === "available" && details.input.type === "text");
-    assert.ok(details.input.text.includes("tools.edit_file"), "Inspecting the item shows the script");
-  } finally { await app.close(); await env.remove(); }
+    if (expectEdit) {
+      assert.ok(details.input.text.includes("tools.edit_file"), "Inspecting the codemode item shows the script");
+    }
+  };
+
+  const withRoleLab = async (run: (env: Awaited<ReturnType<typeof lab>>, app: Awaited<ReturnType<Awaited<ReturnType<typeof lab>>["open"]>>) => Promise<void>) => {
+    const env = await lab("agent-tool-discovery-history-");
+    try {
+      const app = await env.open(DISCOVERY_ARMS.production);
+      try { await run(env, app); } finally { await app.close(); }
+    } finally { await env.remove(); }
+  };
+
+  await withRoleLab(async (env, app) => {
+    const workerTurn = await startRole.worker(app, "Raise the HTTP retries.");
+    env.faux.setResponses([(input) => { assert.equal(offeredNames(input).includes("edit_file"), false); return script(scriptFor(true)); }, done]);
+    await workerTurn.run();
+    await checkNested(app, (await ownTask(app)).conversation_id);
+  });
+
+  await withRoleLab(async (env, app) => {
+    const agentTurn = await startRole.agent(app, "Verify config files via child agent.");
+    env.faux.setResponses([(input) => { assert.equal(offeredNames(input).includes("edit_file"), false); return script(scriptFor(true)); }, done]);
+    await agentTurn.run();
+    const agent = (await ownTask(app)).agents.find((candidate) => candidate.id === "example-agent");
+    assert.ok(agent !== undefined);
+    await checkNested(app, agent.conversation_id);
+  });
+
+  await withRoleLab(async (env, app) => {
+    const triageTurn = await startRole.triage(app, "Check workspace state via triage.");
+    const [pendingEvent] = await app.sources.events({ pending: true });
+    assert.ok(pendingEvent !== undefined);
+    const triageScript = [
+      scriptFor(false),
+      `await tools.dismiss_source_events({ keys: [${JSON.stringify(pendingEvent.key)}], reason: "The example needs no work." });`,
+    ].join("\n").replace("return ", "const summary = ") + "\nreturn summary;";
+    env.faux.setResponses([() => script(triageScript), done]);
+    await triageTurn.run();
+    const root = await app.session.root(BACKGROUND_CONTEXT);
+    const allConversations: string[] = [];
+    for await (const item of new HistoryStore(app.session).inventory()) {
+      if (item.conversation_id !== root.id.toString()) allConversations.push(item.conversation_id);
+    }
+    assert.equal(allConversations.length, 1, "Triage owns one dedicated native conversation");
+    await checkNested(app, allConversations[0]!, false);
+  });
 });
 
 test("a main script gets the same task and job results the direct calls return", async () => {

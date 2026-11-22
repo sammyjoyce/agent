@@ -100,17 +100,37 @@ export function piToolPresentation(call: NamedCall, sender: string): MessagePres
   if (call.name === "read_attachment") return { type: "media", operation: "attachment", status: null, path: null };
   return { type: "tool", namespace: null };
 }
-function scriptedCalls(details: unknown): string[] {
+const FIRST_CLASS_CODEMODE_TOOLS = new Set(["exec", "write_file", "edit_file"]);
+export type ScriptedNestedCall = {
+  readonly id: number;
+  readonly name: string;
+  readonly args: string;
+  readonly status: "running" | "ok" | "error" | "cancelled";
+  readonly durationMs?: number;
+  readonly error?: string;
+};
+/** Extract validated nested call records from code mode tool details. */
+export function codemodeNestedCalls(details: unknown): ScriptedNestedCall[] {
   return list(field(details, "calls")).flatMap((call) => {
-    const name = string(field(call, "name")), status = string(field(call, "status"));
-    if (name === null) return [];
+    const id = field(call, "id"), name = string(field(call, "name")), args = string(field(call, "args")), status = string(field(call, "status"));
+    if (typeof id !== "number" || !Number.isInteger(id) || id < 0 || name === null || args === null ||
+      (status !== "running" && status !== "ok" && status !== "error" && status !== "cancelled")) return [];
+    const durationMs = field(call, "durationMs"), error = string(field(call, "error"));
+    return [{ id, name, args, status,
+      ...(typeof durationMs === "number" && Number.isFinite(durationMs) ? { durationMs } : {}),
+      ...(error === null ? {} : { error }) }];
+  });
+}
+function parsedScriptedArgs(raw: string): unknown {
+  try { return JSON.parse(raw); } catch { return undefined; }
+}
+function scriptedCalls(details: unknown): string[] {
+  return codemodeNestedCalls(details).filter((call) => !FIRST_CLASS_CODEMODE_TOOLS.has(call.name)).map((call) => {
     // Pi cuts long argument previews, which then show only the tool name.
-    let parsed: unknown;
-    try { parsed = JSON.parse(string(field(call, "args")) ?? ""); } catch { parsed = undefined; }
-    const shown = piToolPresentation({ name, arguments: parsed }, "");
+    const shown = piToolPresentation({ name: call.name, arguments: parsedScriptedArgs(call.args) }, "");
     const heading = shown.type === "command" && shown.command !== undefined ? shown.command
-      : shown.type === "file_changes" && shown.changes.length > 0 ? `${name} ${shown.changes.map((change) => change.path).join(", ")}` : name;
-    return [bounded(heading, 1024) + (status === null ? "" : " · " + status)];
+      : shown.type === "file_changes" && shown.changes.length > 0 ? `${call.name} ${shown.changes.map((change) => change.path).join(", ")}` : call.name;
+    return bounded(heading, 1024) + " · " + call.status;
   });
 }
 function decodedOutput(result: ToolResultMessage): unknown {
@@ -163,6 +183,21 @@ function agentStates(value: unknown, includeState = true): AgentStatePresentatio
     const name = string(field(agent, "title"))?.trim();
     return [{ thread_id: id, ...(name ? { name: bounded(name, 1024) } : {}), state }];
   });
+}
+
+/** Project one native tool result plus any promoted nested code-mode Command / File changes items. */
+export function piToolResults(result: ToolResultMessage, sender: string, call?: ToolCall): MessageContent[] {
+  if (result.toolName !== "codemode") return [piToolResult(result, sender, call)];
+  const nested = codemodeNestedCalls(result.details)
+    .filter((item) => FIRST_CLASS_CODEMODE_TOOLS.has(item.name))
+    .map((item): MessageContent => {
+      const presentation = piToolPresentation({ name: item.name, arguments: parsedScriptedArgs(item.args) }, sender);
+      const shaped = presentation.type === "command" ? { ...presentation, duration_ms: milliseconds(item.durationMs) } : presentation;
+      const status = item.status === "ok" ? "finished" : item.status === "running" ? "running" : "failed";
+      return { role: "tool", text: item.error !== undefined ? bounded(item.error) : "", presentation: shaped,
+        tool: { call_id: `${result.toolCallId}/c${item.id}`, name: item.name, status } };
+    });
+  return [...nested, piToolResult(result, sender, call)];
 }
 
 /** Native result identity/status/timing are authoritative; bodies contain no heading prefixes. */

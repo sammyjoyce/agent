@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -19,6 +20,8 @@ import { MAX_SCREENSHOT_BYTES } from "../src/generated/screenshot-limits.js";
 const chrome = process.env.AGENT_TEST_CHROME;
 const skip = chrome === undefined && process.env.CI !== "true";
 
+const psCommand = existsSync("/bin/ps") ? "/bin/ps" : "ps";
+
 function object(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -31,7 +34,7 @@ async function groupAlive(group: number): Promise<boolean> {
     // Darwin's killpg filters zombies and returns EPERM when none remain
     // signalable. A denied probe does not mean the group is gone: keep waiting
     // for live members, leaving actual signal permission failures authoritative.
-    const { stdout } = await promisify(execFile)("/bin/ps", ["-ax", "-o", "pgid=,stat="]);
+    const { stdout } = await promisify(execFile)(psCommand, ["-ax", "-o", "pgid=,stat="]);
     for (const line of stdout.split("\n").filter(line => line.trim() !== "")) {
       const fields = line.trim().split(/\s+/);
       assert.ok(fields.length === 2 && /^\d+$/.test(fields[0]!), "Native group inspection must provide group and state");
@@ -51,7 +54,7 @@ test("owned Chrome group cleanup recognizes exited native children before their 
     const deadline = performance.now() + 3_000;
     let status = "";
     while (performance.now() < deadline) {
-      status = execFileSync("/bin/ps", ["-p", String(group), "-o", "stat="], { encoding: "utf8" }).trim();
+      status = execFileSync(psCommand, ["-p", String(group), "-o", "stat="], { encoding: "utf8" }).trim();
       if (status.startsWith("Z")) break;
     }
     assert.ok(status.startsWith("Z"), "The exact fixture child must have exited but remain unreaped");
@@ -73,7 +76,7 @@ test("a permission-limited native group probe preserves live membership", {
 }, async () => {
   // Probe only: signal 0 and ps cannot terminate or modify foreign processes.
   // A protected system group supplies the real EPERM boundary without mocks.
-  const { stdout } = await promisify(execFile)("/bin/ps", ["-ax", "-o", "pgid=,stat="]);
+  const { stdout } = await promisify(execFile)(psCommand, ["-ax", "-o", "pgid=,stat="]);
   const groups = [...new Set(stdout.split("\n").flatMap(line => {
     const [pgid, state] = line.trim().split(/\s+/);
     const group = Number(pgid);
@@ -487,7 +490,7 @@ document.addEventListener('focusin', event => {
     let exited = false;
     for (let attempt = 0; attempt < 100; attempt++) {
       try {
-        const state = execFileSync("/bin/ps", ["-p", String(helperPid), "-o", "stat="], { encoding: "utf8" }).trim();
+        const state = execFileSync(psCommand, ["-p", String(helperPid), "-o", "stat="], { encoding: "utf8" }).trim();
         exited = state.startsWith("Z");
       } catch (error) {
         if (!object(error) || error.status !== 1) throw error;

@@ -1,5 +1,5 @@
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
-import { defineExtension, wrapTool, type Extension } from "@earendil-works/pi-durable";
+import { defineExtension, wrapSection, wrapTool, type Extension } from "@earendil-works/pi-durable";
 import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
 import { createToolSearchExtension } from "@earendil-works/pi-durable/tool-search";
 import type { createBrowserTools } from "./browser.js";
@@ -40,7 +40,7 @@ export function withActorPolicies(toolsets: Toolsets, { responsePolicy, inputOri
 
 export type ToolSurface = {
   readonly deferred?: readonly string[];
-  readonly codemode?: { readonly keepDirect: readonly string[] };
+  readonly codemode?: { readonly keepDirect: readonly string[]; readonly inlineBudget?: number };
 };
 export type ToolSurfaces = Readonly<Partial<Record<ToolRole, ToolSurface>>>;
 
@@ -52,17 +52,19 @@ export const BROWSER_TOOLS: readonly string[] = ["browser_user_tabs", "browser_c
 export const CONTEXT_TOOLS: readonly string[] = ["read_context", "search_context"];
 
 const CHILD_DEFERRED: readonly string[] = [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "allocate_worktree", "read_resources", "read_source_events", "notify_user"];
+export const WORKER_CODEMODE_INLINE_BUDGET = 350;
 export const TOOL_SURFACES = {
   main: { deferred: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "read_resources", "collect_worktrees", "revoke_allocation",
     "read_source_events", "notify_user", "notify", "link_source_events", "dismiss_source_events"] },
   triage: { deferred: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "revoke_allocation"], codemode: { keepDirect: ["record_task"] } },
-  worker: { deferred: CHILD_DEFERRED, codemode: { keepDirect: ["record_task", "complete_goal"] } },
+  worker: { deferred: CHILD_DEFERRED, codemode: { keepDirect: ["record_task", "complete_goal"], inlineBudget: WORKER_CODEMODE_INLINE_BUDGET } },
   agent: { deferred: CHILD_DEFERRED, codemode: { keepDirect: [] } },
 } as const satisfies Record<ToolRole, ToolSurface>;
 
 export function createToolDiscovery() {
   const sandbox = new CodemodeSandbox();
   return { toolSearch: createToolSearchExtension(), codemode: createCodemodeExtension({ sandbox, models: false }),
+    codemodeForBudget: (inlineBudget: number) => createCodemodeExtension({ sandbox, models: false, inlineBudget }),
     close: () => sandbox.close() };
 }
 export type ToolDiscovery = ReturnType<typeof createToolDiscovery>;
@@ -85,9 +87,14 @@ export function applyToolSurfaces(toolsets: Toolsets, surfaces: ToolSurfaces, di
     const direct = surface.codemode === undefined ? undefined : new Set([...ALWAYS_DIRECT, ...surface.codemode.keepDirect]);
     const scripted = direct === undefined ? [] : tools.filter((tool) => !direct.has(tool.name) && (tool.callers ?? ["model", "tools"]).includes("model"));
     const wrapped = new Map([...deferred, ...scripted].map((tool) => [tool.name, tool]));
+    const budget = surface.codemode?.inlineBudget;
+    const budgetSection = budget === undefined ? undefined : discovery.codemodeForBudget(budget).sections?.find((item) => item.key === "codemode");
     // Stored agent configuration names this extension, so the name must stay stable.
-    const wrapper = defineExtension({ name: `tool-surface-${role}`, wraps: [...wrapped.values()].map((tool) => wrapTool(tool, (selected) => ({ ...selected,
-      ...(deferred.includes(tool) ? { deferred: true as const } : {}), ...(scripted.includes(tool) ? { callers: ["tools"] as const } : {}) }))) });
+    const wrapper = defineExtension({ name: `tool-surface-${role}`, wraps: [
+      ...[...wrapped.values()].map((tool) => wrapTool(tool, (selected) => ({ ...selected,
+        ...(deferred.includes(tool) ? { deferred: true as const } : {}), ...(scripted.includes(tool) ? { callers: ["tools"] as const } : {}) }))),
+      ...(budgetSection === undefined ? [] : [wrapSection("codemode", () => budgetSection)]),
+    ] });
     installed.push(wrapper);
     const searchable = deferred.some((tool) => direct === undefined || direct.has(tool.name));
     return [role, [...base, wrapper, ...(searchable ? [discovery.toolSearch] : []), ...(direct === undefined ? [] : [discovery.codemode])]];

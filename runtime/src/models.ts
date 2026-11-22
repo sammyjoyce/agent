@@ -3,6 +3,8 @@ import { getSupportedThinkingLevels, type Api, type AuthResult, type Model, type
 import { builtinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { MODEL_THINKING_LEVELS } from "@earendil-works/pi-ai/providers/model-schema";
 import { AgentDoc, LiveDoc, configure, defineDoc, ProviderDoc, type AgentChange, type Conversation, type Harness, type Registry, type Tx } from "@earendil-works/pi-durable";
+import type { ImageLimits } from "@earendil-works/pi-durable/tools";
+import { modelImageInput } from "./images.js";
 import { AuthError, type ChatGptAuth } from "./auth.js";
 import type { ModelProvider } from "./generated/ModelProvider.js";
 import type { ModelSelection } from "./generated/ModelSelection.js";
@@ -232,6 +234,10 @@ export class ConversationModels {
     if (selection.fast && !supportsFast(model)) {
       throw new ModelError(`Fast mode is unavailable for ${selection.provider}/${selection.model_id}.`);
     }
+  }
+  /** Resolve image resize limits for the given model selection or fallback to defaults. */
+  imageLimits(selection?: { provider: string; model_id: string } | { provider: string; modelId: string }): ImageLimits {
+    return modelImageInput(this.models, selection).limits;
   }
   async preflight(selection: ModelSelection): Promise<void> {
     if (this.models.getModel(selection.provider, selection.model_id) === undefined &&
