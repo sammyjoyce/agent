@@ -47,6 +47,14 @@ impl std::fmt::Display for PollFailure {
 }
 impl std::error::Error for PollFailure {}
 
+pub async fn full_disk_access_diagnostic() -> Option<String> {
+    crate::rex::personal_messages()
+        .full_disk_access_preflight()
+        .await
+        .ok()
+        .and_then(|status| status.warning_message())
+}
+
 fn failure_message(error: &anyhow::Error) -> String {
     if let Some(failure) = error.downcast_ref::<crate::rex::source::ReadFailure>() {
         failure.to_string()
@@ -632,8 +640,24 @@ impl Source for MessagesSource {
             self.finish_read(crate::rex::source::read_command(&argv).await, window)
         }
         .await;
-        Ok(result
-            .unwrap_or_else(|error| SourceBatch::unavailable(self.key(), failure_message(&error))))
+        match result {
+            Ok(batch) => Ok(batch),
+            Err(error) => {
+                let mut message = failure_message(&error);
+                if matches!(
+                    error.downcast_ref::<crate::rex::source::ReadFailure>(),
+                    Some(
+                        crate::rex::source::ReadFailure::Rex { .. }
+                            | crate::rex::source::ReadFailure::CommandExited(_)
+                    )
+                ) && let Some(warning) = full_disk_access_diagnostic().await
+                {
+                    message.push(' ');
+                    message.push_str(&warning);
+                }
+                Ok(SourceBatch::unavailable(self.key(), message))
+            }
+        }
     }
 }
 

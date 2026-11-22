@@ -673,6 +673,9 @@ async fn run(mut arguments: Arguments) -> Result<()> {
                 println!("{}", serde_json::to_string(&installed)?);
             } else {
                 println!("Messages reads configured through Rex Server");
+                if let Some(warning) = &installed.full_disk_access_warning {
+                    eprintln!("Warning: {warning}");
+                }
             }
             return Ok(());
         }
@@ -4897,12 +4900,19 @@ mod tests {
                 r#"#!/bin/sh
 set -eu
 [ -z "${REX_SESSION-}" ] && [ -z "${REX_BLOCK-}" ] && [ -z "${REX_CLIENT-}" ]
+for arg do
+  if [ "$arg" = "com.superlogical.terminal.format" ]; then
+    printf 'Error: stream response "control-1" failed: netapi: no handler for method "com.superlogical.terminal.format" (status=404 code=method_not_found)\n' >&2
+    exit 3
+  fi
+done
 [ "$1" = --autostart=false ] && [ "$2" = --timeout ] && [ "$3" = 8s ]
 [ "$4" = capture ] && [ "$5" = --session ] && [ "$6" = session:11111111-1111-4111-8111-111111111111 ]
 [ "$7" = --block ] && [ "$8" = block:33333333-3333-4333-8333-333333333333 ]
 [ "$9" = --format ]
 shift 9
 format=$1
+[ "$2" = --trim ]
 printf '%s\n' "$format" >> "$AGENT_TEST_FEEDBACK_CAPTURE_CALLS"
 oversize() {
   block=$(printf '%01024d' 0)

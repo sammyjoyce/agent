@@ -23,6 +23,8 @@ pub struct InstallOutcome {
     pub changed: bool,
     pub config_path: PathBuf,
     pub module_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_disk_access_warning: Option<String>,
 }
 
 pub async fn install(module_source: &str) -> Result<InstallOutcome> {
@@ -99,6 +101,7 @@ async fn install_at(
             changed: false,
             config_path: config_path.into(),
             module_path,
+            full_disk_access_warning: privacy_warning(client).await,
         });
     }
     fs::create_dir_all(directory).context("Could not create the Rex configuration directory")?;
@@ -177,7 +180,16 @@ async fn install_at(
         changed: true,
         config_path: config_path.into(),
         module_path,
+        full_disk_access_warning: privacy_warning(client).await,
     })
+}
+
+async fn privacy_warning(client: &RexClient) -> Option<String> {
+    client
+        .full_disk_access_preflight()
+        .await
+        .ok()
+        .and_then(|status| status.warning_message())
 }
 
 async fn verify_actions(client: &RexClient, expected_identity: &str) -> Result<()> {
