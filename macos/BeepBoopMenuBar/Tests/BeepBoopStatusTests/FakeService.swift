@@ -44,6 +44,25 @@ struct FakeService {
     return try start(replying: try line(status) + line(.done))
   }
 
+  /// Accepts `count` connections and closes each one without reading the request.
+  static func start(closingConnections count: Int) throws -> FakeService {
+    let service = try FakeService()
+    let listener = try service.bindSocket()
+    guard Darwin.listen(listener, 1) == 0 else {
+      Darwin.close(listener)
+      throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    Thread {
+      defer { Darwin.close(listener) }
+      for _ in 0..<count {
+        let connection = Darwin.accept(listener, nil, nil)
+        guard connection >= 0 else { return }
+        Darwin.close(connection)
+      }
+    }.start()
+    return service
+  }
+
   /// A socket file that nothing listens on, as a service leaves behind when it dies.
   static func stale() throws -> FakeService {
     let service = try FakeService()
