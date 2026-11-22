@@ -1312,6 +1312,28 @@ public struct NativeEventNotifications: Codable, Sendable, Equatable {
     }
 }
 
+public struct NativeEventServiceStatus: Codable, Sendable, Equatable {
+    public var `coordinatorId`: String
+    public var `executablePath`: String?
+    public var `pid`: Int
+    public var `stateDir`: String
+    public var `version`: String
+    public init(`coordinatorId`: String, `executablePath`: String? = nil, `pid`: Int, `stateDir`: String, `version`: String) {
+        self.`coordinatorId` = `coordinatorId`
+        self.`executablePath` = `executablePath`
+        self.`pid` = `pid`
+        self.`stateDir` = `stateDir`
+        self.`version` = `version`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `coordinatorId` = "coordinator_id"
+        case `executablePath` = "executable_path"
+        case `pid` = "pid"
+        case `stateDir` = "state_dir"
+        case `version` = "version"
+    }
+}
+
 public struct NativeEventIdentity: Codable, Sendable, Equatable {
     public var `coordinatorId`: String
     public init(`coordinatorId`: String) {
@@ -1345,6 +1367,7 @@ public enum NativeEvent: Codable, Sendable, Equatable {
     case `disconnect`
     case `notifications`(NativeEventNotifications)
     case `done`
+    case `serviceStatus`(NativeEventServiceStatus)
     case `identity`(NativeEventIdentity)
     enum CodingKeys: String, CodingKey { case type }
     public init(from decoder: any Decoder) throws {
@@ -1372,6 +1395,7 @@ public enum NativeEvent: Codable, Sendable, Equatable {
         case "disconnect": self = .`disconnect`
         case "notifications": self = .`notifications`(try NativeEventNotifications(from: decoder))
         case "done": self = .`done`
+        case "service_status": self = .`serviceStatus`(try NativeEventServiceStatus(from: decoder))
         case "identity": self = .`identity`(try NativeEventIdentity(from: decoder))
         default: throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unsupported protocol event: \(tag)"))
         }
@@ -1442,6 +1466,9 @@ public enum NativeEvent: Codable, Sendable, Equatable {
             try value.encode(to: encoder)
         case .`done`:
             try tag.encode("done", forKey: .type)
+        case .`serviceStatus`(let value):
+            try tag.encode("service_status", forKey: .type)
+            try value.encode(to: encoder)
         case .`identity`(let value):
             try tag.encode("identity", forKey: .type)
             try value.encode(to: encoder)
@@ -1650,6 +1677,7 @@ public enum NativeRequest: Codable, Sendable, Equatable {
     case `toolDetails`(NativeRequestToolDetails)
     case `interrupt`
     case `notifications`(NativeRequestNotifications)
+    case `serviceStatus`
     case `identify`
     enum CodingKeys: String, CodingKey { case type }
     public init(from decoder: any Decoder) throws {
@@ -1667,6 +1695,7 @@ public enum NativeRequest: Codable, Sendable, Equatable {
         case "tool_details": self = .`toolDetails`(try NativeRequestToolDetails(from: decoder))
         case "interrupt": self = .`interrupt`
         case "notifications": self = .`notifications`(try NativeRequestNotifications(from: decoder))
+        case "service_status": self = .`serviceStatus`
         case "identify": self = .`identify`
         default: throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unsupported protocol event: \(tag)"))
         }
@@ -1709,6 +1738,8 @@ public enum NativeRequest: Codable, Sendable, Equatable {
         case .`notifications`(let value):
             try tag.encode("notifications", forKey: .type)
             try value.encode(to: encoder)
+        case .`serviceStatus`:
+            try tag.encode("service_status", forKey: .type)
         case .`identify`:
             try tag.encode("identify", forKey: .type)
         }

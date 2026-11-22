@@ -40,6 +40,7 @@ pub struct Broker {
     local: Option<AgentNode>,
     contexts: ContextStore,
     executor: host::Executor,
+    state: std::path::PathBuf,
     dreams: Option<crate::dreams::Dreams>,
     instructions: std::path::PathBuf,
     peers: Mutex<HashMap<String, Peer>>,
@@ -96,6 +97,7 @@ impl Broker {
             local,
             contexts,
             executor,
+            state: state.to_path_buf(),
             dreams,
             instructions: bootstrap
                 .and_then(|value| value.node.as_ref())
@@ -104,6 +106,10 @@ impl Broker {
                 .unwrap_or(crate::instructions::default_path()?),
             peers: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub fn state_dir(&self) -> &Path {
+        &self.state
     }
 
     fn online(&self, peers: &HashMap<String, Peer>) -> Vec<String> {

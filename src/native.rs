@@ -80,6 +80,8 @@ pub enum NativeRequest {
     Notifications {
         request: crate::notifications::NotificationRequest,
     },
+    /// Coordinator service-boundary running status and version comparison. Never forwarded to Pi.
+    ServiceStatus,
     // Valid only as a connection's first frame; `service::handle` answers it
     // itself. Old coordinators close without a frame, which clients treat as
     // unidentified.
@@ -247,15 +249,31 @@ pub enum NativeEvent {
         status: crate::notifications::NotificationStatus,
     },
     Done,
+    ServiceStatus {
+        coordinator_id: String,
+        pid: u32,
+        version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        executable_path: Option<String>,
+        state_dir: String,
+    },
     // Older apps fail on unknown events, but they never send `Identify`.
     Identity {
         coordinator_id: String,
     },
 }
 
+/// Validated requests answered strictly at the coordinator service boundary, never forwarded to Pi.
+#[derive(Clone, Debug)]
+pub enum ServiceRequest {
+    ServiceStatus,
+}
+
 pub enum Operation {
     Runtime(Box<RuntimeCommand>),
     Local(NativeEvent),
+    Service(ServiceRequest),
 }
 
 pub fn commands() -> Vec<SlashCommand> {
@@ -343,6 +361,9 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
             }
         }
         NativeRequest::Interrupt => RuntimeCommand::MainInterrupt,
+        NativeRequest::ServiceStatus => {
+            return Ok(Operation::Service(ServiceRequest::ServiceStatus));
+        }
         NativeRequest::Identify => {
             anyhow::bail!("Identify must be the first request on a connection")
         }
@@ -637,7 +658,7 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        native::{NativeCommand, NativeEvent, NativeRequest, Operation, prepare},
+        native::{NativeCommand, NativeEvent, NativeRequest, Operation, ServiceRequest, prepare},
         protocol::{InputMode, RuntimeCommand, RuntimeEventKind},
     };
 
@@ -1448,6 +1469,7 @@ mod tests {
                 other => panic!("Unexpected goal request: {other:?}"),
             },
             Operation::Local(event) => panic!("Unexpected local reply: {event:?}"),
+            Operation::Service(service) => panic!("Unexpected service request: {service:?}"),
         };
         assert_eq!(
             replayed("7A0C2B9E-1D1F-4C3A-9A51-0F6A3D1C2B02"),
@@ -1568,6 +1590,14 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn service_status_prepares_as_a_service_boundary_operation() {
+        assert!(matches!(
+            prepare(NativeRequest::ServiceStatus).unwrap(),
+            Operation::Service(ServiceRequest::ServiceStatus)
+        ));
     }
 }
 

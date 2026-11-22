@@ -25,4 +25,4 @@ accepted_input_origins?: Array<string>, conversation_settings?: boolean, work_in
 /**
  * Additive to the legacy notice shape, so older observers still decode it.
  */
-settings?: NativeSettingsSnapshot, job_status?: NativeJobStatus, } | { "type": "failure", message: string, code?: ErrorCode, } | { "type": "idle" } | { "type": "disconnect" } | { "type": "notifications", status: NotificationStatus, } | { "type": "done" } | { "type": "identity", coordinator_id: string, };
+settings?: NativeSettingsSnapshot, job_status?: NativeJobStatus, } | { "type": "failure", message: string, code?: ErrorCode, } | { "type": "idle" } | { "type": "disconnect" } | { "type": "notifications", status: NotificationStatus, } | { "type": "done" } | { "type": "service_status", coordinator_id: string, pid: number, version: string, executable_path?: string, state_dir: string, } | { "type": "identity", coordinator_id: string, };
