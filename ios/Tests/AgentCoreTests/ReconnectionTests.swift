@@ -773,3 +773,102 @@ func establishedObservationSurvivesTurnFailureAndAdmitsTheNextInput() async thro
     #expect(await session.connect() == .superseded)
   }
 }
+
+@Test func liveThinkingWithConsecutiveBoldSummariesSeparatesAcrossStreamedChunks() {
+  var transcript = Transcript()
+  transcript.activity(.thinking(.init(text: "**Inspecting report status**")))
+  transcript.activity(.thinking(.init(text: "**Reviewing message text**")))
+  transcript.activity(.thinking(.init(text: "**Checking")))
+  transcript.activity(.thinking(.init(text: " details**")))
+  let row = transcript.rows.first
+  #expect(
+    row?.text
+      == "**Inspecting report status**\n\n**Reviewing message text**\n\n**Checking details**")
+  #expect(row?.blocks.count == 3)
+}
+
+@MainActor @Test
+func reconnectAndBoundedLatestHistoryRetainEarlierThinkingSummariesAndGroupIdentity() {
+  var transcript = Transcript()
+  // Live multi-step turn: steps 1 & 2 fall before the reconnect's bounded 20-entry latest page.
+  let steps = [
+    (summary: "**Summary 1**", callID: "c1", assistantEntry: "101", resultEntry: "102"),
+    (summary: "**Summary 2**", callID: "c2", assistantEntry: "103", resultEntry: "104"),
+    (summary: "**Summary 3**", callID: "c3", assistantEntry: "120", resultEntry: "121"),
+    (summary: "**Summary 4**", callID: "c4", assistantEntry: "124", resultEntry: "125"),
+  ]
+  for step in steps {
+    transcript.activity(.thinking(.init(text: step.summary)))
+    transcript.activity(.toolStarted(.init(callId: step.callID, name: "exec")))
+    transcript.message(
+      .init(
+        continuation: false, entryId: step.assistantEntry, finalChunk: true, role: .tool,
+        text: "", tool: .init(callId: step.callID, name: "exec", status: .running)))
+    transcript.message(
+      .init(
+        continuation: false, entryId: step.resultEntry, finalChunk: true, role: .tool,
+        text: "Output \(step.callID)",
+        tool: .init(callId: step.callID, name: "exec", status: .finished)))
+  }
+  transcript.activity(.toolStarted(.init(callId: "c5", name: "exec")))
+  transcript.message(
+    .init(
+      continuation: false, entryId: "126", finalChunk: true, role: .tool, text: "",
+      tool: .init(callId: "c5", name: "exec", status: .running)))
+  transcript.message(
+    .init(
+      continuation: false, entryId: "127", finalChunk: true, role: .tool, text: "Output c5",
+      tool: .init(callId: "c5", name: "exec", status: .finished)))
+  transcript.idle()
+
+  let initialItems = TranscriptItem.grouped(transcript.rows.map(RowModel.init))
+  #expect(initialItems.count == 1)
+  guard case .activity(let groupBefore)? = initialItems.first else {
+    Issue.record("Expected one grouped activity item")
+    return
+  }
+  #expect(groupBefore.summary == "5 tool calls · 4 summaries")
+  let initialID = groupBefore.id
+
+  // While reconnecting (`Connecting`), committed summaries stay present and stable.
+  transcript.reconnect()
+  let duringItems = TranscriptItem.grouped(
+    transcript.rows.map(RowModel.init), preserving: initialItems)
+  guard case .activity(let groupDuring)? = duringItems.first else {
+    Issue.record("Expected one grouped activity item during reconnect")
+    return
+  }
+  #expect(groupDuring.summary == "5 tool calls · 4 summaries")
+  #expect(groupDuring.id == initialID)
+
+  // Bounded reconnect page returns only steps 3..4 + tool 5 (steps 1..2 are older).
+  let page = NativeEventHistory(
+    messages: [
+      .init(
+        continuation: false, entryId: "120", finalChunk: true, role: .thinking,
+        text: "**Summary 3**"),
+      .init(
+        continuation: false, entryId: "121", finalChunk: true, role: .tool, text: "Output c3",
+        tool: .init(callId: "c3", name: "exec", status: .finished)),
+      .init(
+        continuation: false, entryId: "124", finalChunk: true, role: .thinking,
+        text: "**Summary 4**"),
+      .init(
+        continuation: false, entryId: "125", finalChunk: true, role: .tool, text: "Output c4",
+        tool: .init(callId: "c4", name: "exec", status: .finished)),
+      .init(
+        continuation: false, entryId: "127", finalChunk: true, role: .tool, text: "Output c5",
+        tool: .init(callId: "c5", name: "exec", status: .finished)),
+    ], nextCursor: "119", pageComplete: true)
+  transcript.history(page)
+
+  let afterItems = TranscriptItem.grouped(
+    transcript.rows.map(RowModel.init), preserving: duringItems)
+  #expect(afterItems.count == 1)
+  guard case .activity(let groupAfter)? = afterItems.first else {
+    Issue.record("Expected one grouped activity item after reconnect")
+    return
+  }
+  #expect(groupAfter.summary == "5 tool calls · 4 summaries")
+  #expect(groupAfter.id == initialID)
+}

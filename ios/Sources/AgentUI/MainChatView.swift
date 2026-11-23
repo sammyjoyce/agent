@@ -81,13 +81,73 @@ public struct MainChatView: View {
   }
   public var body: some View {
     NavigationStack(path: $opened) {
-      VStack(spacing: 0) {
+      chatBody
+        .navigationTitle("Beep Boop")
+        #if os(iOS)
+          .navigationBarTitleDisplayMode(.inline)
+          .toolbarBackground(Color(uiColor: .systemBackground), for: .navigationBar)
+          .toolbarBackground(.visible, for: .navigationBar)
+        #endif
+        .toolbar {
+          ToolbarItem(placement: .principal) {
+            if model.multiple && !inspecting {
+              ScopeMenu(model: model, badge: badge) { alertNotice = nil }
+            } else {
+              VStack(spacing: 1) {
+                Text(model.inspectedConversation?.title ?? "Beep Boop").font(.headline)
+                  .lineLimit(1)
+                Text(model.model.split(separator: "/").last.map(String.init) ?? model.model)
+                  .font(.caption).foregroundStyle(.primary.opacity(0.65)).lineLimit(1)
+              }.accessibilityElement(children: .combine)
+            }
+          }
+          ToolbarItem(placement: .primaryAction) {
+            if inspecting {
+              Button("Done") { dismiss() }.accessibilityIdentifier("closeWorkInspection")
+            } else {
+              Button("Connection", systemImage: "slider.horizontal.3") {
+                composerFocused = false
+                #if os(iOS)
+                  // The iOS draft is a UIKit text view, which focus state does not reach.
+                  UIApplication.shared.sendAction(
+                    #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                #endif
+                settings = true
+              }
+              .tint(.primary)
+            }
+          }
+        }
+        .navigationDestination(for: OpenedJob.self) { opened in
+          LaneScreen(model: model, lane: opened.job.profile) {
+            JobDetailView(jobID: opened.job.item, model: model, lane: opened.job.profile)
+          }
+        }
+    }
+    .preferredColorScheme(appearance.colorScheme)
+  }
+
+  @ViewBuilder
+  private var chatBody: some View {
+    VStack(spacing: 0) {
+      Group {
         if model.namesLanes {
-          ForEach(model.profiles) { profile in laneStatus(profile) }
+          let visibleProfiles = model.profiles.filter { laneState($0) != nil }
+          if !visibleProfiles.isEmpty {
+            VStack(spacing: 0) {
+              ForEach(visibleProfiles) { profile in laneStatus(profile) }
+            }
+            .background(.background)
+            .overlay(alignment: .bottom) { Divider() }
+          }
         } else if let shown = model.scope.coordinator,
           let profile = model.profiles.first(where: { $0.id == shown })
         {
-          laneStatus(profile)
+          if laneState(profile) != nil {
+            laneStatus(profile)
+              .background(.background)
+              .overlay(alignment: .bottom) { Divider() }
+          }
         } else if let status = connectionStatus {
           HStack(spacing: 8) {
             ProgressView().controlSize(.mini)
@@ -95,229 +155,193 @@ public struct MainChatView: View {
           }
           .frame(maxWidth: .infinity, alignment: .leading)
           .padding(.horizontal, 16).padding(.vertical, 8)
+          .background(.background)
+          .overlay(alignment: .bottom) { Divider() }
+          .accessibilityElement(children: .contain)
+          .accessibilityIdentifier("connectionStatusBanner")
         }
-        ForEach(model.sourceReports.filter { model.scope.shows($0.id) && $0.warning != nil }) {
-          report in
-          Button {
-            sourceDetails = true
-          } label: {
-            HStack {
-              Label {
-                model.namesLanes
-                  ? badge(report.id).title + Text(" \(report.warning ?? "")")
-                  : Text(report.warning ?? "")
-              } icon: {
-                Image(systemName: "exclamationmark.triangle")
-              }
-              Spacer(minLength: 8)
-              Image(systemName: "chevron.right").font(.caption)
+      }
+      .zIndex(1)
+      ForEach(model.sourceReports.filter { model.scope.shows($0.id) && $0.warning != nil }) {
+        report in
+        Button {
+          sourceDetails = true
+        } label: {
+          HStack {
+            Label {
+              model.namesLanes
+                ? badge(report.id).title + Text(" \(report.warning ?? "")")
+                : Text(report.warning ?? "")
+            } icon: {
+              Image(systemName: "exclamationmark.triangle")
             }
-            .font(.footnote).foregroundStyle(.primary)
+            Spacer(minLength: 8)
+            Image(systemName: "chevron.right").font(.caption)
+          }
+          .font(.footnote).foregroundStyle(.primary)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(.horizontal, 16).padding(.vertical, 8)
+          .frame(minHeight: 44)
+          .background(.orange.opacity(0.1), ignoresSafeAreaEdges: [])
+          .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("sourceCoverageWarning")
+        .accessibilityHint("Show source accounts and errors")
+      }
+      if inspecting, !relatedWork.isEmpty, let inspectRelated {
+        Menu("Related work", systemImage: "point.3.connected.trianglepath.dotted") {
+          ForEach(relatedWork, id: \.conversationId) { item in
+            Button("\(item.agentId == nil ? "Parent" : "Sub-agent"): \(item.title)") {
+              inspectRelated(item)
+            }
+          }
+        }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal).padding(
+          .vertical, 8
+        )
+        .accessibilityIdentifier("relatedWork")
+      }
+      if let alertNotice {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+          Text(alertNotice).frame(maxWidth: .infinity, alignment: .leading)
+          Button("Dismiss notification notice", systemImage: "xmark") {
+            self.alertNotice = nil
+          }.labelStyle(.iconOnly)
+        }
+        .font(.footnote).padding(.horizontal, 16).padding(.vertical, 8)
+        .accessibilityIdentifier("notificationNotice")
+      }
+      transcript.id(model.scope)
+      if let error = model.draftError {
+        VStack(alignment: .leading) {
+          Text(error).font(.callout).foregroundStyle(.red)
+          Button("Retry saving the unsent draft") {
+            Task {
+              if !model.draftReady {
+                await model.restoreDraft()
+              } else if model.pendingSharedImport {
+                await model.receiveSharedDrafts()
+              } else {
+                _ = await model.saveDraft()
+              }
+            }
+          }
+        }.padding(.horizontal)
+      }
+      if let error = composerError {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+          Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 16).padding(.vertical, 8)
-            .frame(minHeight: 44)
-            .background(.orange.opacity(0.1), ignoresSafeAreaEdges: [])
-            .contentShape(Rectangle())
+            .accessibilityLabel("Error. \(error)")
+          if !model.multiple, unpaired != nil || model.connection != .connected {
+            Button("Try again") { tryAgain() }.font(.callout)
           }
-          .buttonStyle(.plain)
-          .accessibilityIdentifier("sourceCoverageWarning")
-          .accessibilityHint("Show source accounts and errors")
         }
-        if inspecting, !relatedWork.isEmpty, let inspectRelated {
-          Menu("Related work", systemImage: "point.3.connected.trianglepath.dotted") {
-            ForEach(relatedWork, id: \.conversationId) { item in
-              Button("\(item.agentId == nil ? "Parent" : "Sub-agent"): \(item.title)") {
-                inspectRelated(item)
-              }
-            }
-          }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal).padding(
-            .vertical, 8
-          )
-          .accessibilityIdentifier("relatedWork")
-        }
-        if let alertNotice {
-          HStack(alignment: .firstTextBaseline, spacing: 12) {
-            Text(alertNotice).frame(maxWidth: .infinity, alignment: .leading)
-            Button("Dismiss notification notice", systemImage: "xmark") {
-              self.alertNotice = nil
-            }.labelStyle(.iconOnly)
-          }
-          .font(.footnote).padding(.horizontal, 16).padding(.vertical, 8)
-          .accessibilityIdentifier("notificationNotice")
-        }
-        transcript.id(model.scope)
-        if let error = model.draftError {
-          VStack(alignment: .leading) {
-            Text(error).font(.callout).foregroundStyle(.red)
-            Button("Retry saving the unsent draft") {
-              Task {
-                if !model.draftReady {
-                  await model.restoreDraft()
-                } else if model.pendingSharedImport {
-                  await model.receiveSharedDrafts()
-                } else {
-                  _ = await model.saveDraft()
-                }
-              }
-            }
-          }.padding(.horizontal)
-        }
-        if let error = composerError {
-          HStack(alignment: .firstTextBaseline, spacing: 12) {
-            Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
-              .frame(maxWidth: .infinity, alignment: .leading)
-              .accessibilityLabel("Error. \(error)")
-            if !model.multiple, unpaired != nil || model.connection != .connected {
-              Button("Try again") { tryAgain() }.font(.callout)
+        .padding(.horizontal).padding(.vertical, 8)
+      }
+    }
+    .background(.background)
+    .onscreenEntity(covered ? nil : .feed(of: model))
+    .safeAreaInset(edge: .bottom, spacing: 0) { if !inspecting { composer } }
+    .sheet(isPresented: $settings) {
+      connectionSettings.preferredColorScheme(appearance.colorScheme)
+    }
+    .sheet(isPresented: $sourceDetails) {
+      NavigationStack {
+        SourceDetailsView(model: model)
+          .toolbar {
+            ToolbarItem(placement: .confirmationAction) {
+              Button("Done") { sourceDetails = false }
             }
           }
-          .padding(.horizontal).padding(.vertical, 8)
-        }
+      }.preferredColorScheme(appearance.colorScheme)
+    }
+    .fileImporter(
+      isPresented: $importingFiles, allowedContentTypes: [.item], allowsMultipleSelection: true
+    ) { result in
+      switch result {
+      case .success(let urls): model.attach(urls: urls)
+      case .failure(let error): model.failure = error.localizedDescription
       }
-      .background(.background)
-      .onscreenEntity(covered ? nil : .feed(of: model))
-      .safeAreaInset(edge: .bottom, spacing: 0) { if !inspecting { composer } }
-      .navigationTitle("Beep Boop")
-      #if os(iOS)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(Color(uiColor: .systemBackground), for: .navigationBar)
-        .toolbarBackground(.visible, for: .navigationBar)
-      #endif
-      .toolbar {
-        ToolbarItem(placement: .principal) {
-          if model.multiple && !inspecting {
-            ScopeMenu(model: model, badge: badge) { alertNotice = nil }
-          } else {
-            VStack(spacing: 1) {
-              Text(model.inspectedConversation?.title ?? "Beep Boop").font(.headline).lineLimit(1)
-              Text(model.model.split(separator: "/").last.map(String.init) ?? model.model)
-                .font(.caption).foregroundStyle(.primary.opacity(0.65)).lineLimit(1)
-            }.accessibilityElement(children: .combine)
-          }
-        }
-        ToolbarItem(placement: .primaryAction) {
-          if inspecting {
-            Button("Done") { dismiss() }.accessibilityIdentifier("closeWorkInspection")
-          } else {
-            Button("Connection", systemImage: "slider.horizontal.3") {
-              composerFocused = false
-              #if os(iOS)
-                // The iOS draft is a UIKit text view, which focus state does not reach.
-                UIApplication.shared.sendAction(
-                  #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-              #endif
-              settings = true
-            }
-            .tint(.primary)
-          }
-        }
-      }
-      .sheet(isPresented: $settings) {
-        connectionSettings.preferredColorScheme(appearance.colorScheme)
-      }
-      .sheet(isPresented: $sourceDetails) {
-        NavigationStack {
-          SourceDetailsView(model: model)
-            .toolbar {
-              ToolbarItem(placement: .confirmationAction) {
-                Button("Done") { sourceDetails = false }
-              }
-            }
-        }.preferredColorScheme(appearance.colorScheme)
-      }
-      .navigationDestination(for: OpenedJob.self) { opened in
-        LaneScreen(model: model, lane: opened.job.profile) {
-          JobDetailView(jobID: opened.job.item, model: model, lane: opened.job.profile)
-        }
-      }
-      .fileImporter(
-        isPresented: $importingFiles, allowedContentTypes: [.item], allowsMultipleSelection: true
-      ) { result in
-        switch result {
-        case .success(let urls): model.attach(urls: urls)
-        case .failure(let error): model.failure = error.localizedDescription
-        }
-      }
-      .dropDestination(for: URL.self) { urls, _ in
-        guard !inspecting, !dictating, model.draftReady, !urls.isEmpty else { return false }
-        model.attach(urls: urls)
-        return true
-      }
-      #if os(iOS)
-        .quickLookPreview($model.previewURL)
-        .onChange(of: selectedPhoto) { _, photo in
-          guard let photo else { return }
-          let attaching = model.attach(photo: photo)
-          Task {
-            await attaching?.value
-            selectedPhoto = nil
-          }
-        }
-      #endif
-      .task {
-        guard let coordinators else { return }
-        await model.restoreDraft()
-        // With nothing saved, start on the Add form.
-        if coordinators.profiles.isEmpty { settings = true }
-      }
-      .onChange(of: scenePhase) { _, phase in
-        notifications?.mainVisible = mainVisible
+    }
+    .dropDestination(for: URL.self) { urls, _ in
+      guard !inspecting, !dictating, model.draftReady, !urls.isEmpty else { return false }
+      model.attach(urls: urls)
+      return true
+    }
+    #if os(iOS)
+      .quickLookPreview($model.previewURL)
+      .onChange(of: selectedPhoto) { _, photo in
+        guard let photo else { return }
+        let attaching = model.attach(photo: photo)
         Task {
-          // Attached sessions share the same scene lifecycle as configured ones. Saved
-          // coordinators follow the app's phase through `Coordinators`, not one scene's.
-          // Publish connection intent before file I/O can yield to a newer phase.
-          if coordinators == nil { await model.setActive(phase == .active) }
-          if phase == .active {
-            await model.receiveSharedDrafts()
-          } else {
-            _ = await model.saveDraft()
-          }
+          await attaching?.value
+          selectedPhoto = nil
         }
       }
-      .onAppear { notifications?.mainVisible = mainVisible }
-      .onDisappear { notifications?.mainVisible = .hidden }
-      .onChange(of: model.scope) { _, scope in
-        if pendingAlertLatest != scope { pendingAlertLatest = nil }
-        followsLatest = true
-        userScrolling = false
-        atTop = false
-        latestVisible = true
-        presentedLatest = false
-        visibleItem = nil
-        activityExpansion = ActivityExpansion()
-        if case .latest(_, scope: scope)? = historyRequest { return }
-        historyRequest = model.includesLatest ? nil : .latest(UUID(), scope: scope)
-      }
-      .onChange(of: settings) { _, _ in notifications?.mainVisible = mainVisible }
-      .onChange(of: sourceDetails) { _, _ in notifications?.mainVisible = mainVisible }
-      .onChange(of: opened) { _, _ in notifications?.mainVisible = mainVisible }
-      .onChange(of: latestVisible) { _, _ in notifications?.mainVisible = mainVisible }
-      .onChange(of: model.includesLatest) { _, _ in notifications?.mainVisible = mainVisible }
-      .onChange(of: model.connection) { _, connection in
-        guard connection == .connected, pendingAlertLatest == model.scope else { return }
-        pendingAlertLatest = nil
-        historyRequest = .latest(UUID(), scope: model.scope)
-      }
-      .onChange(of: notifications?.openRequest, initial: true) { _, request in
-        // The initial call runs again whenever the feed reappears, as after Back from an opened
-        // job, so each request is handled once.
-        guard let request, request != handledOpen else { return }
-        handledOpen = request
-        settings = false
-        sourceDetails = false
-        switch request.destination {
-        case .job(let job):
-          opened = [OpenedJob(job: job, request: request.id)]
-        case .feed(let notice):
-          opened = []
-          followsLatest = true
-          alertNotice = notice
-          pendingAlertLatest = model.connection == .connected ? nil : model.scope
-          historyRequest = .latest(UUID(), scope: model.scope)
+    #endif
+    .task {
+      guard let coordinators else { return }
+      await model.restoreDraft()
+      // With nothing saved, start on the Add form.
+      if coordinators.profiles.isEmpty { settings = true }
+    }
+    .onChange(of: scenePhase) { _, phase in
+      notifications?.mainVisible = mainVisible
+      Task {
+        // Attached sessions share the same scene lifecycle as configured ones. Saved
+        // coordinators follow the app's phase through `Coordinators`, not one scene's.
+        // Publish connection intent before file I/O can yield to a newer phase.
+        if coordinators == nil { await model.setActive(phase == .active) }
+        if phase == .active {
+          await model.receiveSharedDrafts()
+        } else {
+          _ = await model.saveDraft()
         }
       }
     }
-    .preferredColorScheme(appearance.colorScheme)
+    .onAppear { notifications?.mainVisible = mainVisible }
+    .onDisappear { notifications?.mainVisible = .hidden }
+    .onChange(of: model.scope) { _, scope in
+      if pendingAlertLatest != scope { pendingAlertLatest = nil }
+      followsLatest = true
+      userScrolling = false
+      atTop = false
+      latestVisible = true
+      presentedLatest = false
+      visibleItem = nil
+      activityExpansion = ActivityExpansion()
+      if case .latest(_, scope: scope)? = historyRequest { return }
+      historyRequest = model.includesLatest ? nil : .latest(UUID(), scope: scope)
+    }
+    .onChange(of: settings) { _, _ in notifications?.mainVisible = mainVisible }
+    .onChange(of: sourceDetails) { _, _ in notifications?.mainVisible = mainVisible }
+    .onChange(of: opened) { _, _ in notifications?.mainVisible = mainVisible }
+    .onChange(of: latestVisible) { _, _ in notifications?.mainVisible = mainVisible }
+    .onChange(of: model.includesLatest) { _, _ in notifications?.mainVisible = mainVisible }
+    .onChange(of: model.connection) { _, connection in
+      guard connection == .connected, pendingAlertLatest == model.scope else { return }
+      pendingAlertLatest = nil
+      historyRequest = .latest(UUID(), scope: model.scope)
+    }
+    .onChange(of: notifications?.openRequest, initial: true) { _, request in
+      // The initial call runs again whenever the feed reappears, as after Back from an opened
+      // job, so each request is handled once.
+      guard let request, request != handledOpen else { return }
+      handledOpen = request
+      settings = false
+      sourceDetails = false
+      switch request.destination {
+      case .job(let job):
+        opened = [OpenedJob(job: job, request: request.id)]
+      case .feed(let notice):
+        opened = []
+        followsLatest = true
+        alertNotice = notice
+        pendingAlertLatest = model.connection == .connected ? nil : model.scope
+        historyRequest = .latest(UUID(), scope: model.scope)
+      }
+    }
   }
   private var mainVisible: MainVisibility {
     scenePhase == .active && !covered
@@ -410,7 +434,9 @@ public struct MainChatView: View {
           .font(.footnote).accessibilityLabel("Try \(profile.name.description) again")
         }
       }
-      .padding(.horizontal, 16).padding(.vertical, 6)
+      .padding(.horizontal, 16).padding(.vertical, 8)
+      .accessibilityElement(children: .contain)
+      .accessibilityIdentifier("connectionStatusBanner")
     }
   }
   private var transcript: some View {
@@ -490,10 +516,11 @@ public struct MainChatView: View {
             }.frame(maxWidth: .infinity, alignment: .leading)
               .accessibilityLabel("Beep Boop is working")
           }
-          Color.clear.frame(height: 1).id(TranscriptControlAnchor.latest)
+          Color.clear.frame(height: 16).id(TranscriptControlAnchor.latest)
         }
         .scrollTargetLayout()
-        .padding().frame(maxWidth: 720).frame(maxWidth: .infinity)
+        .padding([.horizontal, .top]).frame(maxWidth: 720).frame(maxWidth: .infinity)
+        .overlay(alignment: .top) { if showsLatestBar { latestBarTapShield } }
       }
       .accessibilityIdentifier("transcript")
       .scrollDismissesKeyboard(.interactively)
@@ -569,6 +596,16 @@ public struct MainChatView: View {
       .onChange(of: model.revision) { _, _ in
         if followsLatest { scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom) }
       }
+      .onChange(of: activityExpansion.groups) { _, _ in
+        if followsLatest && !userScrolling {
+          Task { @MainActor in
+            await Task.yield()
+            if followsLatest && !userScrolling {
+              scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
+            }
+          }
+        }
+      }
       .onScrollGeometryChange(for: CGFloat.self) { geometry in
         geometry.containerSize.height
       } action: { old, new in
@@ -583,24 +620,51 @@ public struct MainChatView: View {
         followsLatest = true
         scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
       }
-      .overlay(alignment: .bottomTrailing) {
-        if (!latestVisible || !model.includesLatest) && !model.rows.isEmpty {
-          Button("Latest", systemImage: "arrow.down") {
-            followsLatest = true
-            historyRequest = .latest(UUID(), scope: model.scope)
-            if reduceMotion {
-              scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
-            } else {
-              withAnimation { scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom) }
+      .clipped()
+      .safeAreaInset(edge: .bottom, spacing: 0) {
+        if showsLatestBar {
+          HStack {
+            Spacer()
+            Button("Latest", systemImage: "arrow.down") {
+              followsLatest = true
+              historyRequest = .latest(UUID(), scope: model.scope)
+              if reduceMotion {
+                scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
+              } else {
+                withAnimation { scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom) }
+              }
             }
+            .accessibilityIdentifier("latest-messages")
+            .buttonStyle(.borderedProminent).tint(.primary)
+            .foregroundStyle(colorScheme == .dark ? Color.black : Color.white)
+            .clipShape(Capsule())
           }
-          .accessibilityIdentifier("latest-messages")
-          .buttonStyle(.borderedProminent).tint(.primary)
-          .foregroundStyle(colorScheme == .dark ? Color.black : Color.white)
-          .clipShape(Capsule()).padding()
+          .padding(.horizontal, 16)
+          .padding(.vertical, 8)
+          // A drag that starts on the bar scrolls the transcript under it.
+          .background { Rectangle().fill(.background).allowsHitTesting(false) }
+          .overlay(alignment: .top) { Divider().allowsHitTesting(false) }
         }
       }
     }
+  }
+  private var showsLatestBar: Bool {
+    (!latestVisible || !model.includesLatest) && !model.rows.isEmpty
+  }
+  /// Takes a tap on the Latest bar, which would otherwise reach a row that the bar hides. It lies
+  /// in the scroll content, from the lower edge of the visible transcript down, so a drag that
+  /// starts on it still scrolls. A view outside the scroll content that took the touch would stop
+  /// that drag.
+  private var latestBarTapShield: some View {
+    // Extra height only reaches further down, away from the visible transcript.
+    let tallerThanTheBar: CGFloat = 2000
+    let aboveTheFirstRow = -tallerThanTheBar
+    return Color.clear.frame(height: tallerThanTheBar).contentShape(Rectangle())
+      .onTapGesture {}
+      .accessibilityHidden(true)
+      .visualEffect { content, geometry in
+        content.offset(y: geometry.bounds(of: .scrollView)?.maxY ?? aboveTheFirstRow)
+      }
   }
   private func requestHistory() {
     guard historyRequest == nil, !model.loadingHistory, model.canLoadEarlier else { return }
@@ -622,10 +686,16 @@ public struct MainChatView: View {
         preview: { file in Task { await model.preview(file, lane: row.lane) } },
         badges: badges, implied: model.scope.coordinator)
     case .activity(let group):
+      let isLiveTailGroup =
+        followsLatest && group.id == model.transcriptItems.last?.id
+        && (group.running || model.busy)
       ActivityGroupView(
         group: group, expansion: $activityExpansion,
         details: { row in try await loadDetails(row, lane: group.lane) },
         onExpand: { followsLatest = false },
+        onExpandGroup: {
+          if !isLiveTailGroup { followsLatest = false }
+        },
         preview: { file in Task { await model.preview(file, lane: group.lane) } })
     }
   }
