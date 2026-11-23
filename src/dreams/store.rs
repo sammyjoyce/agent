@@ -33,6 +33,7 @@ const AFTER_FILE: &str = "after.json";
 const VERDICT_FILE: &str = "verdict.json";
 const OUTCOME_FILE: &str = "outcome.json";
 const APPLIED_FILE: &str = "applied.json";
+const APPLY_LOCK_FILE: &str = "apply.lock";
 
 pub(crate) enum Verdict<'a> {
     Accepted,
@@ -339,6 +340,18 @@ impl DreamsStore {
         self.seal_once(&view.id, OUTCOME_FILE, &sealed)
             .map(|sealed| sealed.outcome)
             .context("Could not seal the Dreams outcome")
+    }
+
+    pub(crate) fn apply_lock_file(&self) -> Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(self.root.join(APPLY_LOCK_FILE))
+            .context("Could not open the Dreams apply lock")
     }
 
     pub fn applied(&self, run: &RunId) -> Result<Option<AppliedRecord>> {

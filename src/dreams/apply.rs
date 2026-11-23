@@ -4,9 +4,10 @@
 //! boundary (`src/service.rs`). Never exposed to the Pi model runtime.
 
 use std::{
-    fmt, fs,
+    fmt, fs, io,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -20,6 +21,9 @@ use crate::dreams::{
 };
 
 pub const POLICY_CHANGED: &str = "Dreams policy changed since this proposal";
+
+const APPLY_LOCK_WAIT: Duration = Duration::from_secs(10);
+const APPLY_LOCK_POLL: Duration = Duration::from_millis(25);
 
 /// Caller- or state-level refusal (maps to `ErrorCode::InvalidRequest` on the wire).
 #[derive(Debug)]
@@ -649,12 +653,32 @@ async fn fast_forward(proposal: &Proposal, commit: &str) -> Result<()> {
     Ok(())
 }
 
+/// Takes the store's exclusive apply lock, which holds until the returned file
+/// is dropped or the process dies.
+async fn lock_applies(store: &DreamsStore) -> Result<fs::File> {
+    let lock = store.apply_lock_file()?;
+    let deadline = tokio::time::Instant::now() + APPLY_LOCK_WAIT;
+    while let Err(error) = fs2::FileExt::try_lock_exclusive(&lock) {
+        if error.kind() != io::ErrorKind::WouldBlock {
+            return Err(error).context("Could not lock the Dreams store for an apply");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow::Error::new(DreamsRejected(
+                "Another Dreams apply is running. Wait for it to finish, then apply again".into(),
+            )));
+        }
+        tokio::time::sleep(APPLY_LOCK_POLL).await;
+    }
+    Ok(lock)
+}
+
 pub async fn apply_proposal(
     store: &DreamsStore,
     policy: &DreamsPolicy,
     run: &RunId,
     approval: &ContentDigest,
 ) -> Result<ApplyOutcome> {
+    let _one_apply = lock_applies(store).await?;
     let view = store
         .read(run)?
         .ok_or_else(|| anyhow::Error::new(DreamsRejected(format!("Unknown Dreams run {run}"))))?;
@@ -712,5 +736,135 @@ pub async fn apply_proposal(
                 already_applied: false,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::Path, time::Duration};
+
+    use crate::dreams::{
+        ContentDigest, DreamsStore,
+        apply::{DreamsRejected, apply_proposal},
+        ops::test_support::{SampleProposal, git, write_sample_proposal},
+    };
+
+    const BEFORE: &str = "# Before\n";
+    const AFTER: &str = "# After one apply\n";
+
+    fn approval(state: &Path, sample: &SampleProposal) -> ContentDigest {
+        DreamsStore::open(state)
+            .unwrap()
+            .read(&sample.run)
+            .unwrap()
+            .unwrap()
+            .outcome_sha256
+            .unwrap()
+    }
+
+    fn assert_applied_once(repo: &Path, state: &Path, sample: &SampleProposal, base: &str) {
+        let head = git(repo, &["rev-parse", "HEAD"]);
+        assert_eq!(git(repo, &["rev-parse", "HEAD~1"]), base);
+        assert_eq!(git(repo, &["status", "--porcelain"]), "");
+        assert_eq!(fs::read_to_string(repo.join("AGENTS.md")).unwrap(), AFTER);
+        let record = DreamsStore::open(state)
+            .unwrap()
+            .applied(&sample.run)
+            .unwrap()
+            .expect("The apply is recorded");
+        assert_eq!(record.commit.as_str(), head.trim());
+    }
+
+    #[tokio::test]
+    async fn an_apply_refuses_while_another_holds_the_store_and_a_waiting_apply_runs_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, state) = (dir.path().join("repo"), dir.path().join("state"));
+        let sample = write_sample_proposal(&repo, &state, "lock-run", BEFORE, AFTER);
+        let approval = approval(&state, &sample);
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+        let other_apply = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(state.join("dreams/apply.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&other_apply).unwrap();
+
+        let store = DreamsStore::open(&state).unwrap();
+        let refused = apply_proposal(&store, &sample.policy, &sample.run, &approval)
+            .await
+            .expect_err("An apply must not run while another apply holds the store");
+        assert!(refused.is::<DreamsRejected>(), "{refused:#}");
+        assert!(
+            refused
+                .to_string()
+                .contains("Another Dreams apply is running"),
+            "{refused:#}"
+        );
+        assert_eq!(git(&repo, &["rev-parse", "HEAD"]), base);
+        assert_eq!(git(&repo, &["status", "--porcelain"]), "");
+        assert_eq!(fs::read_to_string(repo.join("AGENTS.md")).unwrap(), BEFORE);
+        assert!(store.applied(&sample.run).unwrap().is_none());
+
+        let waiting = tokio::spawn({
+            let (state, policy, run, approval) = (
+                state.clone(),
+                sample.policy.clone(),
+                sample.run.clone(),
+                approval.clone(),
+            );
+            async move {
+                let store = DreamsStore::open(&state).unwrap();
+                apply_proposal(&store, &policy, &run, &approval).await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(git(&repo, &["rev-parse", "HEAD"]), base);
+        fs2::FileExt::unlock(&other_apply).unwrap();
+        let applied = waiting.await.unwrap().unwrap();
+        assert!(!applied.already_applied);
+        assert_applied_once(&repo, &state, &sample, &base);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn several_applies_at_once_make_one_commit_and_tell_every_caller_that_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, state) = (dir.path().join("repo"), dir.path().join("state"));
+        let sample = write_sample_proposal(&repo, &state, "race-run", BEFORE, AFTER);
+        let approval = approval(&state, &sample);
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+
+        let callers: Vec<_> = (0..8)
+            .map(|_| {
+                let (state, policy, run, approval) = (
+                    state.clone(),
+                    sample.policy.clone(),
+                    sample.run.clone(),
+                    approval.clone(),
+                );
+                tokio::spawn(async move {
+                    let store = DreamsStore::open(&state).unwrap();
+                    apply_proposal(&store, &policy, &run, &approval).await
+                })
+            })
+            .collect();
+        let mut outcomes = Vec::new();
+        for caller in callers {
+            outcomes.push(caller.await.unwrap().expect("Every caller is answered"));
+        }
+
+        let head = git(&repo, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| !outcome.already_applied)
+                .count(),
+            1,
+            "One caller applies, and the others are told it is already applied"
+        );
+        assert!(outcomes.iter().all(|outcome| outcome.commit == head.trim()));
+        assert_eq!(git(&repo, &["rev-list", "--count", "HEAD"]).trim(), "2");
+        assert_applied_once(&repo, &state, &sample, &base);
     }
 }

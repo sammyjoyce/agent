@@ -591,6 +591,7 @@ refuses with one of these messages, without changing the repository:
 - `Dreams target has local changes in touched paths`
 - `Dreams target has a held Git index lock: <path>`
 - `Dreams run did not propose a change`
+- `Another Dreams apply is running`
 
 A local change is any difference in a touched path or its parent directories:
 content, file type, a deletion, or an executable bit. Apply reads the
@@ -601,6 +602,12 @@ target once and then writes. A process that writes to a touched path while
 apply runs can lose that change, and one that takes the Git index lock can
 make apply fail and leave `ORIG_HEAD` behind. Stop other writers to the target
 repository while apply runs.
+
+One apply runs at a time on a state directory, whether it comes from the
+command line or from a device. An apply that finds another one running waits
+for up to 10 seconds. If the other apply finishes in that time, the apply that
+waited reads its result and reports `already applied` for the same run. If
+not, it refuses with `Another Dreams apply is running`.
 
 A successful apply adds one commit with `Dreams-Run`, `Dreams-Base` and
 `Dreams-Patch-Sha256` trailers and fast-forwards the checked-out branch. The
