@@ -1,11 +1,12 @@
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use agent_cli::{
@@ -511,7 +512,32 @@ fn start_runtime(state: &Path) -> Runtime {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/dist/src/bridge.js")
         });
     assert!(bridge.is_file(), "Build the runtime before this test");
-    Runtime::start(&bridge, OwnerClaim::acquire(state, &bridge, None).unwrap()).unwrap()
+    // A child that another test starts can hold a copy of the released lock
+    // for a few milliseconds.
+    let deadline = Instant::now() + STATE_LOCK_RELEASE_LIMIT;
+    let claim = loop {
+        match OwnerClaim::acquire(state, &bridge, None) {
+            Err(error) if state_lock_is_held(&error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "The state directory lock was still held after {STATE_LOCK_RELEASE_LIMIT:?}: {error:#}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            claim => break claim.unwrap(),
+        }
+    };
+    Runtime::start(&bridge, claim).unwrap()
+}
+
+const STATE_LOCK_RELEASE_LIMIT: Duration = Duration::from_secs(5);
+
+fn state_lock_is_held(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|cause| cause.kind() == io::ErrorKind::WouldBlock)
+    })
 }
 
 async fn ask(runtime: &Runtime, command: RuntimeCommand) -> Vec<RuntimeEventKind> {
