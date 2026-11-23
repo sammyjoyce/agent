@@ -656,11 +656,14 @@ public struct MainChatView: View {
   /// starts on it still scrolls. A view outside the scroll content that took the touch would stop
   /// that drag.
   private var latestBarTapShield: some View {
-    Color.clear.containerRelativeFrame(.vertical).contentShape(Rectangle())
+    // Extra height only reaches further down, away from the visible transcript.
+    let tallerThanTheBar: CGFloat = 2000
+    let aboveTheFirstRow = -tallerThanTheBar
+    return Color.clear.frame(height: tallerThanTheBar).contentShape(Rectangle())
       .onTapGesture {}
       .accessibilityHidden(true)
       .visualEffect { content, geometry in
-        content.offset(y: geometry.bounds(of: .scrollView)?.maxY ?? 0)
+        content.offset(y: geometry.bounds(of: .scrollView)?.maxY ?? aboveTheFirstRow)
       }
   }
   private func requestHistory() {

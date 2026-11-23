@@ -2734,7 +2734,7 @@ final class HistoryInteractionTests: XCTestCase {
     XCTAssertFalse(latest.exists, "Expanding a live tail group should keep following the tail")
   }
 
-  func testLatestBarTakesATapOverAHiddenRowAndADragFromItStillScrolls() async throws {
+  private func latestBarMessages() -> [HistoryMessage] {
     var messages: [HistoryMessage] = []
     for index in 0..<30 {
       messages.append(
@@ -2748,7 +2748,11 @@ final class HistoryInteractionTests: XCTestCase {
           continuation: false, entryId: "bar-text-\(index)", finalChunk: true, role: .final,
           text: "Latest bar line \(index)."))
     }
-    let app = try await launchMessages(messages)
+    return messages
+  }
+
+  func testLatestBarTakesATapOverAHiddenRowAndADragFromItStillScrolls() async throws {
+    let app = try await launchMessages(latestBarMessages())
     let transcript = app.scrollViews["transcript"]
     XCTAssertTrue(transcript.waitForExistence(timeout: 10))
     let last = app.staticTexts["Latest bar line 29."]
@@ -2813,6 +2817,59 @@ final class HistoryInteractionTests: XCTestCase {
     latest.tap()
     XCTAssertTrue(latest.waitForNonExistence(timeout: 5))
     try await eventually(description: "the latest message after Latest") { last.isHittable }
+  }
+
+  func testLatestBarTakesTapsAtEveryHeightInLandscapeWithTheKeyboardUp() async throws {
+    let app = try await launchMessages(latestBarMessages())
+    defer { XCUIDevice.shared.orientation = .portrait }
+    let transcript = app.scrollViews["transcript"]
+    XCTAssertTrue(transcript.waitForExistence(timeout: 10))
+    let last = app.staticTexts["Latest bar line 29."]
+    try await eventually(description: "live tail") { last.isHittable }
+    drag(transcript, down: true)
+    drag(transcript, down: true)
+    let latest = app.buttons["latest-messages"]
+    XCTAssertTrue(latest.waitForExistence(timeout: 5))
+    let groups = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'activity:'"))
+    let opened = app.buttons.matching(
+      NSPredicate(format: "identifier BEGINSWITH 'activity-item:'"))
+    XCUIDevice.shared.orientation = .landscapeLeft
+    try await eventually(description: "the Latest bar in landscape") {
+      app.frame.width > app.frame.height && latest.exists && groups.firstMatch.exists
+    }
+    let groupX = groups.firstMatch.frame.minX + 40
+    let rowPitch = groups.element(boundBy: 1).frame.minY - groups.element(boundBy: 0).frame.minY
+    editor(app).tap()
+    let keyboard = app.keyboards.firstMatch
+    XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
+    try await eventually(description: "the Latest bar above the keyboard") {
+      latest.exists && latest.frame.maxY < keyboard.frame.minY
+    }
+    XCTAssertEqual(opened.count, 0)
+    let tapSpan = latest.frame.height + 12
+    for _ in 0...Int(rowPitch / tapSpan) {
+      let top = max(latest.frame.minY - 6, app.navigationBars.firstMatch.frame.maxY + 1)
+      for y in stride(from: top, to: latest.frame.maxY + 6, by: 6) {
+        app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: groupX, dy: y)).tap()
+        XCTAssertFalse(
+          opened.firstMatch.waitForExistence(timeout: 1),
+          "A tap \(y - latest.frame.minY) points under the top of the Latest button opened an "
+            + "activity group that the bar hides")
+      }
+      slowDrag(
+        transcript, by: -tapSpan,
+        from: app.coordinate(withNormalizedOffset: .zero).withOffset(
+          CGVector(dx: groupX, dy: latest.frame.midY)))
+      XCTAssertTrue(keyboard.exists, "The keyboard left, so the bar no longer hides the rows")
+    }
+
+    latest.tap()
+    XCTAssertTrue(latest.waitForNonExistence(timeout: 5))
+    // In landscape with the keyboard up, the title bar covers the last row at the tail.
+    XCUIDevice.shared.orientation = .portrait
+    try await eventually(description: "the latest message after Latest") {
+      last.isHittable && !latest.exists
+    }
   }
 
   func testLatestButtonDoesNotOverlapShellOutputOrDisclosureControls() async throws {
