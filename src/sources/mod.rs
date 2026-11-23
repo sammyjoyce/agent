@@ -2,12 +2,15 @@
 //! them only after admitting every returned event into its durable inbox.
 
 pub mod calendar;
+pub(crate) mod feed;
 pub mod github;
 pub mod google;
 pub mod home_assistant;
+pub(crate) mod http;
 pub mod messages;
 pub mod messages_read;
 pub mod slack;
+pub mod up;
 
 use std::{
     fmt::Debug,
@@ -284,6 +287,18 @@ pub enum SourceConfig {
         credential_command: Vec<String>,
         entities: Vec<String>,
     },
+    /// Up bank transactions from the Up API, with a personal access token
+    /// from `credential_command`. Read-only: the source sends GET requests only.
+    Up {
+        #[serde(default = "source_enabled")]
+        enabled: bool,
+        /// A label the owner chooses. Clients show it, so it must not be an account number.
+        account: String,
+        credential_command: Vec<String>,
+        /// API base address. Omitted means `https://api.up.com.au/api/v1`.
+        /// Must be https, or http on a loopback host.
+        url: Option<String>,
+    },
 }
 
 fn source_enabled() -> bool {
@@ -291,6 +306,24 @@ fn source_enabled() -> bool {
 }
 
 impl SourceConfig {
+    /// The `provider` value of every variant. It comes from the JSON schema,
+    /// so a new variant is listed without an edit here.
+    pub fn providers() -> Result<Vec<String>> {
+        let schema = serde_json::to_value(schemars::schema_for!(Self))?;
+        schema["oneOf"]
+            .as_array()
+            .context("The source schema lists no variants")?
+            .iter()
+            .map(|variant| {
+                variant
+                    .pointer("/properties/provider/const")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .context("A source variant has no provider value")
+            })
+            .collect()
+    }
+
     pub fn enabled(&self) -> bool {
         match self {
             Self::Google { enabled, .. }
@@ -298,7 +331,8 @@ impl SourceConfig {
             | Self::GoogleCalendar { enabled, .. }
             | Self::Messages { enabled, .. }
             | Self::Slack { enabled, .. }
-            | Self::HomeAssistant { enabled, .. } => *enabled,
+            | Self::HomeAssistant { enabled, .. }
+            | Self::Up { enabled, .. } => *enabled,
         }
     }
 
@@ -337,6 +371,15 @@ impl SourceConfig {
                     credential_command.clone(),
                     entities.clone(),
                 )?;
+                Ok(())
+            }
+            Self::Up {
+                account,
+                credential_command,
+                url,
+                ..
+            } => {
+                up::UpSource::new(account.clone(), url.clone(), credential_command.clone())?;
                 Ok(())
             }
         }
@@ -507,6 +550,23 @@ pub async fn configured(config: &[SourceConfig]) -> SourceCatalog {
                     "Home Assistant source configuration is invalid; coverage is unknown",
                 )),
             },
+            SourceConfig::Up {
+                account,
+                credential_command,
+                url,
+                ..
+            } => {
+                match up::UpSource::new(account.clone(), url.clone(), credential_command.clone()) {
+                    Ok(source) => sources.push(Box::new(source)),
+                    Err(_) => failures.push(SourceBatch::unavailable(
+                        SourceKey {
+                            provider: "up".into(),
+                            account: account.clone(),
+                        },
+                        "Up source configuration is invalid; coverage is unknown",
+                    )),
+                }
+            }
         }
     }
     SourceCatalog { sources, failures }
@@ -621,10 +681,13 @@ pub(crate) fn parse_timestamp_ms(value: &str) -> Option<u64> {
 }
 
 fn now_seconds() -> Result<u64> {
-    Ok(SystemTime::now()
+    Ok(unix_time()?.as_secs())
+}
+
+fn unix_time() -> Result<Duration> {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .context("System clock precedes the Unix epoch")?
-        .as_secs())
+        .context("System clock precedes the Unix epoch")
 }
 
 #[cfg(test)]
@@ -712,6 +775,19 @@ mod tests {
         assert_eq!(source.stdout.len(), MAX_FRAME_BYTES / 2);
     }
 
+    #[test]
+    fn every_configurable_provider_has_a_display_name() {
+        let providers = SourceConfig::providers().unwrap();
+        assert!(providers.contains(&"up".to_owned()));
+        for provider in providers {
+            assert_ne!(
+                crate::tui::source_display_name(&provider),
+                "Other source",
+                "{provider} needs a name in tui::source_display_name"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn disabled_sources_skip_discovery_and_account_setup() {
         let sources = vec![
@@ -743,6 +819,12 @@ mod tests {
                 url: String::new(),
                 credential_command: Vec::new(),
                 entities: Vec::new(),
+            },
+            SourceConfig::Up {
+                enabled: false,
+                account: String::new(),
+                credential_command: Vec::new(),
+                url: Some("http://bank.example.test".into()),
             },
         ];
         let catalog = configured(&sources).await;

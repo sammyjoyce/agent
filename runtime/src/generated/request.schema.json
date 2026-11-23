@@ -4850,6 +4850,43 @@
             "credential_command",
             "entities"
           ]
+        },
+        {
+          "description": "Up bank transactions from the Up API, with a personal access token\nfrom `credential_command`. Read-only: the source sends GET requests only.",
+          "type": "object",
+          "properties": {
+            "account": {
+              "description": "A label the owner chooses. Clients show it, so it must not be an account number.",
+              "type": "string"
+            },
+            "credential_command": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "provider": {
+              "type": "string",
+              "const": "up"
+            },
+            "url": {
+              "description": "API base address. Omitted means `https://api.up.com.au/api/v1`.\nMust be https, or http on a loopback host.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "provider",
+            "account",
+            "credential_command"
+          ]
         }
       ]
     },

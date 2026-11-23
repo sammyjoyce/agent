@@ -26,6 +26,19 @@ import Testing
   #expect(unavailable.lastCompleted == refreshing.lastCompleted)
 }
 
+@Test func everyConfigurableProviderHasADisplayName() throws {
+  let fixture = try #require(
+    Bundle.module.url(
+      forResource: "source-providers", withExtension: "json", subdirectory: "Fixtures"))
+  let providers = try JSONDecoder().decode([String].self, from: Data(contentsOf: fixture))
+  #expect(providers.contains("up"))
+  for provider in providers {
+    let state = SourceState(
+      checkedAt: 0, coverage: .complete, source: SourceKey(account: "fixture", provider: provider))
+    #expect(state.displayName != "Other source", "\(provider) needs a name in SourceStatus.swift")
+  }
+}
+
 @Test func unknownSlackProgressDoesNotInventHowMuchOfTheOldCursorWasRead() {
   let progress = SourceScanProgress(
     completed: nil, phase: .reading, total: 61_613, unit: .messages,

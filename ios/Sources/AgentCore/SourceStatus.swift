@@ -15,6 +15,8 @@ extension SourceState {
     case "github": "GitHub"
     case "slack": "Slack"
     case "messages": "Messages"
+    case "home_assistant": "Home Assistant"
+    case "up": "Up"
     case "task_outcomes": "Task outcomes"
     default: "Other source"
     }

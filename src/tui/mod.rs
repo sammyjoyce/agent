@@ -1285,14 +1285,7 @@ impl State {
                         crate::sources::SourceCoverage::Unavailable { .. } => "unavailable",
                         _ => return None,
                     };
-                    let name = match source.source.provider.as_str() {
-                        "google" => "Gmail",
-                        "google_calendar" => "Calendar",
-                        "github" => "GitHub",
-                        "slack" => "Slack",
-                        "messages" => "Messages",
-                        _ => "Other source",
-                    };
+                    let name = source_display_name(&source.source.provider);
                     Some(format!("{name} {status}"))
                 }).collect::<std::collections::BTreeSet<_>>();
                 self.source_warning = (!gaps.is_empty()).then(|| format!(
@@ -2516,6 +2509,21 @@ fn editor() -> TextArea<'static> {
     editor.set_placeholder_text("Ask Beep Boop to do anything");
     editor.set_placeholder_style(Style::default().add_modifier(Modifier::DIM));
     editor
+}
+
+/// The name a client shows for a source provider. The iPhone table is
+/// `displayName` in `ios/Sources/AgentCore/SourceStatus.swift`.
+pub(crate) fn source_display_name(provider: &str) -> &'static str {
+    match provider {
+        "google" => "Gmail",
+        "google_calendar" => "Calendar",
+        "github" => "GitHub",
+        "slack" => "Slack",
+        "messages" => "Messages",
+        "home_assistant" => "Home Assistant",
+        "up" => "Up",
+        _ => "Other source",
+    }
 }
 
 fn terminal_title(info: &TuiInfo) -> String {

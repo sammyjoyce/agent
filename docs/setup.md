@@ -716,6 +716,8 @@ internal task outcomes remain available.
 | `github` | Switchboard GitHub namespaces and `gh` |
 | `slack` | Configured read-only CLI command |
 | `messages` | Switchboard Messages namespaces, or local macOS `messages` |
+| `home_assistant` | `curl` and a credential command. See [HTTP sources](#http-sources). |
+| `up` | `curl` and a credential command. See [HTTP sources](#http-sources). |
 
 Omitting `namespaces` discovers all configured accounts for that provider. An
 explicit selection never falls back to another account. Slack additionally needs
@@ -831,6 +833,230 @@ another sender's receipt, a heartbeat or the writer's last line at shutdown. No 
 audit interval at an unbounded event rate. The writer also records a
 `heartbeat` receipt every five minutes, so an interval with no receipt at all
 means that nothing was written, not that nothing happened.
+
+### HTTP sources
+
+The `home_assistant` and `up` sources read an HTTP API with a bearer token. They
+need no provider CLI. A poll runs your `credential_command` and then `curl`, so
+`curl` must be on the service's PATH. Without it, the source reports
+`could not run curl; check that curl is on the service PATH.`
+
+`curl` gets the token and the request address on standard input. Its process
+arguments hold no token, host or path, so other local processes see none of
+them. `curl` does not read the service user's `.curlrc` and does not follow a
+redirect.
+
+`curl` uses no proxy. It ignores `http_proxy`, `https_proxy`, `all_proxy` and
+their upper-case forms in the service's environment, so a proxy never receives
+the token. Every request goes directly to the configured address. On a host
+that reaches the server only through a proxy, these sources report that the API
+is unreachable or did not answer.
+
+The base address in `url` must not contain white space, a control character, a
+double quote or a backslash. Write such a character in its percent-encoded
+form, such as `%20` for a space. Otherwise Beep Boop refuses the configuration
+when it loads, with
+`URL must not contain white space, a control character, a double quote or a backslash`.
+This rule applies to Home Assistant and to Up.
+
+#### Credential command
+
+`credential_command` is a program and its arguments, as a list. Beep Boop runs
+it without a shell, in `/`, with the service's environment.
+
+- The command must exit with status 0.
+- The token is the command's standard output, with the white space around it
+  removed. The token must not be empty. It must not hold a control character, a
+  double quote or a backslash.
+- Error output is not part of the token. No output of the command appears in a
+  status message or in a log.
+- The command runs before each page that a source reads, and Beep Boop does not
+  store the token between pages. Home Assistant reads one page per poll. An Up
+  scan reads two pages or more, so it runs the command twice or more.
+- The command must finish within 15 minutes and print less than 2 MiB.
+
+If the command breaks a rule, the source reports
+`credentials are unavailable; check credential_command.` and keeps its
+checkpoint.
+
+#### Home Assistant
+
+```toml
+[[sources]]
+provider = "home_assistant"
+account = "home"
+url = "http://homeassistant.example.test:8123"
+credential_command = ["/usr/local/bin/example-secrets", "read", "home-assistant-token"]
+entities = ["binary_sensor.example_leak", "light.example_*"]
+```
+
+- `account` is a label that you choose. Clients show it.
+- `url` is the base address of your Home Assistant server. The source accepts
+  `http` and `https`. With `http`, the token crosses your network in clear text.
+- The token is a Home Assistant long-lived access token.
+- `entities` is required. An entry is an exact entity ID, or a prefix that ends
+  in `*`. The source ignores every other entity.
+
+The source reads `GET /api/states` once per poll.
+
+- The first poll reports each listed entity once, as an initial observation. A
+  wide pattern such as `sensor.*` sends many events when you turn the source on.
+- After the first poll, a change of an entity's state or of its `last_changed`
+  time is one event. A change of attributes alone is not an event.
+
+Known limits:
+
+- The source sees the state at each poll. A state that an entity enters and
+  leaves between two polls is not reported.
+- Repairs and failed automations are not read. They need the Home Assistant
+  WebSocket API.
+
+#### Up
+
+```toml
+[[sources]]
+provider = "up"
+account = "everyday"
+credential_command = ["/usr/local/bin/example-secrets", "read", "up-token"]
+```
+
+- `account` is a label that you choose. Clients show it, so do not use an
+  account number.
+- The token is an Up personal access token. Generate it in the Up app under
+  **Data sharing**. Up allows one token at a time. If you generate a token for
+  another tool, this source reports `Up rejected the token` until your
+  credential provider holds the new token.
+- `url` is optional. It must be `https`, or `http` on a loopback host. The
+  default is `https://api.up.com.au/api/v1`.
+
+The source sends `GET` requests only. It reads the transactions of every
+account that the token's holder has.
+
+- The first poll reads the last seven days.
+- Each new transaction is one event. A change of status, such as held to
+  settled, is a new version of the same event. Source review decides what
+  reaches the main conversation, and it sends the event text, with merchant
+  names and amounts, to the model.
+- A held transaction that Up deletes is reported once as `hold removed`. Up
+  does not say whether the merchant released the hold or whether Up settled it
+  as a separate transaction. A separate transaction is a separate event.
+- The source reports `hold removed` only when Up answers the lookup of that
+  transaction with HTTP 404 and an error body in Up's documented form. Any
+  other 404 is reported as `Up API returned HTTP 404` and the source keeps
+  following the transaction.
+- Each page starts with an identity check that uses the same token as the page.
+  If the token belongs to another Up customer, the source reads no transaction
+  with it and reports `Up checkpoint belongs to another account or configuration`.
+- A scan is at least four requests: an identity check and the recent
+  transactions, then an identity check and the held transactions. Each further
+  page of 100 transactions is two more requests. Held transactions that left
+  Up's list are looked up four at a time. Each group is one identity check and
+  one request per transaction.
+- A new scan starts five minutes or more after the last response of the
+  previous scan, whatever `poll_interval_seconds` is. Between scans a poll sends
+  no request and repeats the result of the last scan, for up to five minutes.
+  So the last check that `beep-boop sources` shows can be up to five minutes
+  newer than the last request. An idle source therefore sends four requests per
+  scan and at most 1,152 requests a day.
+- Once a day, one scan reads the last 14 days again, but nothing from before the
+  first poll's seven days. Up can settle a held transaction as a new
+  transaction that carries the creation time of the old one, and can list it
+  after the source reported `hold removed`. The reread finds that transaction.
+  It replaces one normal scan. It costs no extra request while the 14 days hold
+  fewer than 100 transactions, and two requests for each further 100.
+- If Up refuses a saved page link, the scan starts again once from its first
+  page. If Up refuses a link again in the same scan, the source reports
+  `Up refused a saved page link for the second time in one scan` and tries the
+  same page at each poll.
+- Each page starts with a check of this computer's clock against Up's clock.
+  Up's clock is the `Date` header of Up's reply to the identity check. The
+  source reads that header with `curl` 7.83.0 or later. A poll reads the
+  computer's clock once, when the poll starts, and then counts the time that
+  passes. So a slow `credential_command` is not a wrong clock.
+  - If the two clocks differ by more than five minutes, the source reports
+    `This computer's clock differs from Up's clock by more than five minutes; check the clock. Checkpoint retained.`
+    Correct the computer's clock. The source then continues from the checkpoint
+    that it saved before the clock was wrong, however long ago that was.
+  - If Up's reply has no `Date` header, more than one, or one that is not in
+    the form `Mon, 23 Nov 2026 04:28:00 GMT`, the source reports
+    `Up's reply carried no usable Date header; checkpoint retained.`
+    Up sends one header in that form. Check `url`, and check what answers at
+    that address.
+  - In both cases the poll sends no further request, delivers no event and
+    saves nothing. The source does not report complete coverage. While the
+    check fails, a poll sends the identity check and no other request.
+  - The source checks the clock before it judges the token. With a wrong clock
+    and a refused token, it reports the clock.
+  - The two clocks may differ by up to five minutes. So the first poll's seven
+    days and the 14 days of the daily reread can start up to five minutes
+    later than they do by Up's clock.
+
+Known limits:
+
+- A transaction that appears and disappears between two scans is not seen.
+- A held transaction that was created more than seven days before the first
+  poll is neither reported nor followed.
+- A settlement that Up lists as a new transaction with an old creation time is
+  found by the daily reread, so it can arrive up to a day late. The reread
+  reaches back 14 days, and the next reread can be a day away. So count on the
+  reread only when Up lists the transaction within 13 days of that creation
+  time, and while the coordinator runs. The source can miss a transaction that
+  Up lists between 13 and 14 days after that creation time. It does not see a
+  transaction that Up lists later, or whose creation time is before the first
+  poll's seven days.
+- The form of Up's 404 answer for a deleted transaction comes from Up's
+  documentation. It has not been checked against a real account.
+- The source follows at most 512 held transactions. When one scan lists more,
+  the source reports partial coverage with
+  `Up lists more held transactions than the 512 this source follows`
+  and does not finish that scan. Each poll then reads the same page again. The
+  transactions on that page are still delivered as events. The source reads
+  no other new transaction and reports no `hold removed` until the scan
+  finishes.
+  - A held transaction that left Up before the scan started does not count. A
+    held transaction that leaves Up during the scan keeps its place until the
+    scan finishes. So at 512 held transactions the message can appear while Up
+    lists fewer than 512, and it can stay after Up's list gets shorter.
+  - The scan finishes when Up lists no held transaction that the scan has not
+    counted, for example when the newest held transaction settles. The next
+    scan reports the held transactions that left.
+  - To end the stop yourself, change `account`. A new label starts a fresh
+    seven-day read, and it helps only when Up lists 512 held transactions or
+    fewer. The transactions of the last seven days arrive again as new events.
+    The source reports no `hold removed` for a held transaction that left Up
+    under the old label.
+- Up documents a UUID as the ID of a transaction. The source accepts an ID of 1
+  to 128 letters, digits, hyphens and underscores. A page with any other ID is
+  reported as `Up sent a response this source cannot read`, and nothing from
+  that page is delivered.
+- A change of category, tags or note is not an event.
+- The checkpoint belongs to one Up customer and one `account` label. To read
+  another customer's transactions, use another label. Otherwise the source
+  reports
+  `Up checkpoint belongs to another account or configuration; change the account label to start a fresh seven-day read.`
+  The source reports the same message for a checkpoint that it does not
+  accept, and the message does not name the cause:
+  - A checkpoint that it cannot read.
+  - A checkpoint that a build from before the clock check wrote. The times in
+    it can be wrong by any amount.
+  - A checkpoint with a time more than one hour ahead of Up's clock, such as a
+    copy from a computer whose clock was wrong. The source reports it after
+    the clock check passes.
+
+  In each case the source reads no transaction and keeps the checkpoint. Change
+  `account` to start a fresh seven-day read. Do not wait for Up's clock to
+  reach a time that is ahead. The source would then accept the checkpoint and
+  read from a time that is too late.
+- `beep-boop sources --json` prints checkpoints. The Up checkpoint holds the
+  ID, the description and the amount of each held transaction that the source
+  follows.
+- Up publishes no rate limit. At an HTTP 429 the source reports
+  `Up rate limit reached`, ends that poll and keeps its checkpoint. It does not
+  wait longer before the next poll. Each later poll starts with the identity
+  check and then repeats the request that Up refused. So a poll sends one
+  request while Up refuses the identity check, two while Up refuses a list of
+  transactions, and up to five while Up refuses a lookup of a held transaction
+  that left Up's list.
 
 ### Scrawl feedback
 
