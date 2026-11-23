@@ -842,9 +842,9 @@ need no provider CLI. A poll runs your `credential_command` and then `curl`, so
 `could not run curl; check that curl is on the service PATH.`
 
 `curl` gets the token and the request address on standard input. Its process
-arguments are the same for every request, so other local processes see no
-token, host or path. `curl` does not read the service user's `.curlrc` and does
-not follow a redirect.
+arguments hold no token, host or path, so other local processes see none of
+them. `curl` does not read the service user's `.curlrc` and does not follow a
+redirect.
 
 `curl` uses no proxy. It ignores `http_proxy`, `https_proxy`, `all_proxy` and
 their upper-case forms in the service's environment, so a proxy never receives
@@ -954,9 +954,10 @@ account that the token's holder has.
   one request per transaction.
 - A new scan starts five minutes or more after the last response of the
   previous scan, whatever `poll_interval_seconds` is. Between scans a poll sends
-  no request, so the last check that `beep-boop sources` shows can be up to five
-  minutes newer than the last request. An idle source therefore sends four
-  requests per scan and at most 1,152 requests a day.
+  no request and repeats the result of the last scan, for up to five minutes.
+  So the last check that `beep-boop sources` shows can be up to five minutes
+  newer than the last request. An idle source therefore sends four requests per
+  scan and at most 1,152 requests a day.
 - Once a day, one scan reads the last 14 days again, but nothing from before the
   first poll's seven days. Up can settle a held transaction as a new
   transaction that carries the creation time of the old one, and can list it
@@ -967,21 +968,28 @@ account that the token's holder has.
   page. If Up refuses a link again in the same scan, the source reports
   `Up refused a saved page link for the second time in one scan` and tries the
   same page at each poll.
-- The source compares the times in its checkpoint with the clock. A saved time
-  that is more than five minutes ahead of the clock was saved under a clock that
-  showed another time. The source does not wait for the clock to reach that
-  time, and it reports no error. The same poll starts a new scan from the time
-  that the clock shows now.
-  - The new scan reads the last 14 days again, but nothing from before the
-    first poll's seven days.
-  - The first poll's seven days then start no later than seven days before the
-    time that the clock shows. If the clock was ahead when the source first
-    ran, the first scan after you correct the clock reads the seven days before
-    the present. If the clock moved back, the source can deliver older
-    transactions than before.
-  - A scan that the source had not finished is dropped. The source still
-    follows every held transaction that it followed before.
-  - A transaction that the source reads again is not a new event.
+- Each page starts with a check of this computer's clock against Up's clock.
+  Up's clock is the `Date` header of Up's reply to the identity check. The
+  source reads that header with `curl` 7.83.0 or later. A poll reads the
+  computer's clock once, when the poll starts, and then counts the time that
+  passes. So a slow `credential_command` is not a wrong clock.
+  - If the two clocks differ by more than five minutes, the source reports
+    `This computer's clock differs from Up's clock by more than five minutes; check the clock. Checkpoint retained.`
+    Correct the computer's clock. The source then continues from the checkpoint
+    that it saved before the clock was wrong, however long ago that was.
+  - If Up's reply has no `Date` header, more than one, or one that is not in
+    the form `Mon, 23 Nov 2026 04:28:00 GMT`, the source reports
+    `Up's reply carried no usable Date header; checkpoint retained.`
+    Up sends one header in that form. Check `url`, and check what answers at
+    that address.
+  - In both cases the poll sends no further request, delivers no event and
+    saves nothing. The source does not report complete coverage. While the
+    check fails, a poll sends the identity check and no other request.
+  - The source checks the clock before it judges the token. With a wrong clock
+    and a refused token, it reports the clock.
+  - The two clocks may differ by up to five minutes. So the first poll's seven
+    days and the 14 days of the daily reread can start up to five minutes
+    later than they do by Up's clock.
 
 Known limits:
 
@@ -996,11 +1004,6 @@ Known limits:
   Up lists between 13 and 14 days after that creation time. It does not see a
   transaction that Up lists later, or whose creation time is before the first
   poll's seven days.
-- A clock that is more than a day ahead can hide new transactions, because the
-  source then asks Up for transactions from a time that has not come. When the
-  clock is right again, the source reads the last 14 days. If the clock was
-  ahead for more than 14 days, a transaction from before those 14 days can be
-  missing.
 - The form of Up's 404 answer for a deleted transaction comes from Up's
   documentation. It has not been checked against a real account.
 - The source follows at most 512 held transactions. When one scan lists more,
@@ -1031,11 +1034,19 @@ Known limits:
   another customer's transactions, use another label. Otherwise the source
   reports
   `Up checkpoint belongs to another account or configuration; change the account label to start a fresh seven-day read.`
-  The source reports the same message for a checkpoint that it cannot read,
-  such as a checkpoint that a build from before the daily reread wrote. The
-  message does not name that cause. In both cases the source reads no
-  transaction and keeps the checkpoint. A checkpoint that the source cannot
-  read stays that way, so change `account` to start a fresh seven-day read.
+  The source reports the same message for a checkpoint that it does not
+  accept, and the message does not name the cause:
+  - A checkpoint that it cannot read.
+  - A checkpoint that a build from before the clock check wrote. The times in
+    it can be wrong by any amount.
+  - A checkpoint with a time more than one hour ahead of Up's clock, such as a
+    copy from a computer whose clock was wrong. The source reports it after
+    the clock check passes.
+
+  In each case the source reads no transaction and keeps the checkpoint. Change
+  `account` to start a fresh seven-day read. Do not wait for Up's clock to
+  reach a time that is ahead. The source would then accept the checkpoint and
+  read from a time that is too late.
 - `beep-boop sources --json` prints checkpoints. The Up checkpoint holds the
   ID, the description and the amount of each held transaction that the source
   follows.
