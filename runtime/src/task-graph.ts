@@ -174,6 +174,10 @@ export async function readTaskGraph(tasks: TaskStore): Promise<TaskGraphSnapshot
   return snapshot;
 }
 
+function shownToWatchers(graph: TaskGraphSnapshot): string {
+  return JSON.stringify([graph.work, graph.omitted]);
+}
+
 export async function watchTaskGraph(
   tasks: TaskStore,
   emit: (graph: TaskGraphSnapshot) => void,
@@ -181,7 +185,7 @@ export async function watchTaskGraph(
 ): Promise<() => Promise<void>> {
   return watchDerived({
     read: () => readTaskGraph(tasks),
-    identity: (graph) => JSON.stringify(graph),
+    identity: shownToWatchers,
     subscribe: async (schedule) => {
       const graphObs = await tasks.session.observeTaskGraph({
         advance() { schedule(); },

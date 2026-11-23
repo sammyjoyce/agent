@@ -21,6 +21,7 @@ import type { RuntimeEvent } from "../src/generated/RuntimeEvent.js";
 import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
 import type { TaskGraphActor } from "../src/generated/TaskGraphActor.js";
 import type { TaskGraphNode } from "../src/generated/TaskGraphNode.js";
+import type { TaskGraphSnapshot } from "../src/generated/TaskGraphSnapshot.js";
 import type { TaskRecord } from "../src/generated/TaskRecord.js";
 import type { WorkerRef } from "../src/generated/WorkerRef.js";
 import { binding, host, open, within } from "./delegation.js";
@@ -369,6 +370,92 @@ test("active work excludes idle background scheduler timers and prioritizes wait
         }
       })(), "Resolved waiting task must leave active work");
     } finally { releaseMain(); }
+  } finally {
+    await stopWatch?.();
+    await app.session.close(BACKGROUND_CONTEXT);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+async function until(reached: () => boolean | Promise<boolean>, message: string): Promise<void> {
+  await within((async () => {
+    while (!await reached()) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  })(), message);
+}
+const shownRows = (graph: TaskGraphSnapshot) => graph.work.map((item) => [item.title, item.status, item.detail]);
+const waitingOnOwner = (summary: string) => (record: TaskRecord) => {
+  record.summary = summary; record.state = { state: "waiting", actor: "Owner", next_check: null, target: "owner" };
+};
+
+test("watchTaskGraph sends nothing when a node changes and no row does, and one snapshot when a row changes", { timeout: 20_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-work-watch-rows-")); const app = await open(directory);
+  const retired = defineTask<null, { phase: "run" }, null>({ name: "fixture.retired", version: 1, initial: () => ({ phase: "run" }),
+    abort: async () => {}, phases: { run: async () => {} } });
+  let stopWatch: (() => Promise<void>) | undefined;
+  try {
+    await app.session.root(BACKGROUND_CONTEXT);
+    const task = await app.tasks.create({ title: "Board review", outcome: "Review the invented board" });
+    const conversation = await app.tasks.conversation(task.conversation_id);
+    const blockedNode = () => app.session.commit((tx) =>
+      tx.createTask(retired, null, { ownership: { kind: "conversation" }, conversationId: conversation.id }), BACKGROUND_CONTEXT);
+    await blockedNode();
+    app.session.resume();
+    const blockedRow = [["Board review", "waiting_external", "Worker update required"]];
+    await until(async () => JSON.stringify(shownRows(await readTaskGraph(app.tasks))) === JSON.stringify(blockedRow), "The task must show its blocked node");
+
+    const snapshots: TaskGraphSnapshot[] = []; const errors: unknown[] = [];
+    stopWatch = await watchTaskGraph(app.tasks, (graph) => snapshots.push(graph), (error) => errors.push(error));
+    assert.deepEqual(snapshots.map(shownRows), [blockedRow]);
+
+    await blockedNode();
+    await until(async () => (await readTaskGraph(app.tasks)).nodes.length === 2, "The second node must be live");
+    assert.deepEqual(snapshots.map(shownRows), [blockedRow], "A second blocked node changes the node list and no row, so nothing may be sent");
+
+    await app.tasks.update(task.id, waitingOnOwner("Approve the invented fee?"));
+    const ownerRow = [["Board review", "waiting_owner", "Approve the invented fee?"]];
+    await until(() => snapshots.length > 1, "A changed row must be sent");
+    assert.deepEqual(snapshots.map(shownRows), [blockedRow, ownerRow], "One changed row must send one snapshot");
+    assert.deepEqual(snapshots[1], await readTaskGraph(app.tasks), "A pushed snapshot must stay complete, with both nodes");
+    assert.deepEqual(errors, []);
+  } finally {
+    await stopWatch?.();
+    await app.session.close(BACKGROUND_CONTEXT);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("watchTaskGraph sends nothing to an idle coordinator while its scheduler ticks twice", { timeout: 20_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-work-watch-idle-")); const app = await open(directory);
+  let ticks = 0;
+  const scheduler = defineTask<null, { phase: "tick" }, null>({
+    name: "agent.background", version: 1, initial: () => ({ phase: "tick" }), abort: async () => {},
+    phases: {
+      tick: async (task, runtime, context) => {
+        ticks += 1;
+        await runtime.commit(() => ({ status: "sleeping", until: runtime.now() + 20, checkpoint: task.state.checkpoint }), context);
+      },
+    },
+  });
+  app.registry.install({ name: "agent", tasks: [scheduler] });
+  let stopWatch: (() => Promise<void>) | undefined;
+  try {
+    await app.session.root(BACKGROUND_CONTEXT);
+    await app.session.commit((tx) => tx.createTask(scheduler, null,
+      { ownership: { kind: "conversation" }, conversationId: ROOT_CONVERSATION_ID, background: true }), BACKGROUND_CONTEXT);
+    app.session.resume();
+    await until(() => ticks > 0, "The scheduler must start");
+
+    const snapshots: TaskGraphSnapshot[] = []; const errors: unknown[] = [];
+    stopWatch = await watchTaskGraph(app.tasks, (graph) => snapshots.push(graph), (error) => errors.push(error));
+    const watched = ticks;
+    await until(() => ticks >= watched + 3, "The scheduler must tick while the watch is open");
+    assert.deepEqual(snapshots.map(shownRows), [[]], "Scheduler ticks change no row, so only the first snapshot may be sent");
+
+    const task = await app.tasks.create({ title: "Deploy sign-off", outcome: "Approve the invented release" });
+    await app.tasks.update(task.id, waitingOnOwner("Approve release 2?"));
+    await until(() => snapshots.length > 1, "The watch must still send a changed row");
+    assert.deepEqual(snapshots.map(shownRows), [[], [["Deploy sign-off", "waiting_owner", "Approve release 2?"]]]);
+    assert.deepEqual(errors, []);
   } finally {
     await stopWatch?.();
     await app.session.close(BACKGROUND_CONTEXT);
