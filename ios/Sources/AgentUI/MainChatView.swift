@@ -238,10 +238,10 @@ public struct MainChatView: View {
         }
         .padding(.horizontal).padding(.vertical, 8)
       }
-      if !inspecting { composer }
     }
     .background(.background)
     .onscreenEntity(covered ? nil : .feed(of: model))
+    .safeAreaInset(edge: .bottom, spacing: 0) { if !inspecting { composer } }
     .sheet(isPresented: $settings) {
       connectionSettings.preferredColorScheme(appearance.colorScheme)
     }
@@ -443,183 +443,183 @@ public struct MainChatView: View {
     let starts = model.namesLanes ? TranscriptItem.runStarts(items) : []
     let badges = badges
     return ScrollViewReader { scroll in
-      VStack(spacing: 0) {
-        ScrollView {
-          LazyVStack(alignment: .leading, spacing: 18) {
-            // Pagination is section structure, not transcript content. Keep
-            // one lazy layout so explicit row targets remain discoverable.
-            Section {
-              if model.rows.isEmpty && model.shownHeld.isEmpty {
-                Text("No messages yet").font(.callout).foregroundStyle(.primary)
-                  .frame(maxWidth: .infinity).padding(.vertical, 32)
-              }
-              if let heldError = model.heldError {
-                Text(heldError).font(.callout).foregroundStyle(.red)
-                  .frame(maxWidth: .infinity, alignment: .leading)
-              }
-              ForEach(model.shownHeld) { message in
-                HeldMessageRow(
-                  message: message,
-                  restore: { Task { await model.restoreHeld(message) } },
-                  discard: { Task { await model.discardHeld(message) } }
-                )
-                .confirmationDialog(
-                  "Who should get this message?",
-                  isPresented: Binding(
-                    get: { model.asking?.id == message.id }, set: { if !$0 { model.stopAsking() } }),
-                  titleVisibility: .visible
-                ) {
-                  ForEach(model.heldChoices) { profile in
-                    Button(profile.name.description) {
-                      Task { await model.restoreHeld(message, for: profile.id) }
-                    }
+      ScrollView {
+        LazyVStack(alignment: .leading, spacing: 18) {
+          // Pagination is section structure, not transcript content. Keep
+          // one lazy layout so explicit row targets remain discoverable.
+          Section {
+            if model.rows.isEmpty && model.shownHeld.isEmpty {
+              Text("No messages yet").font(.callout).foregroundStyle(.primary)
+                .frame(maxWidth: .infinity).padding(.vertical, 32)
+            }
+            if let heldError = model.heldError {
+              Text(heldError).font(.callout).foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            ForEach(model.shownHeld) { message in
+              HeldMessageRow(
+                message: message,
+                restore: { Task { await model.restoreHeld(message) } },
+                discard: { Task { await model.discardHeld(message) } }
+              )
+              .confirmationDialog(
+                "Who should get this message?",
+                isPresented: Binding(
+                  get: { model.asking?.id == message.id }, set: { if !$0 { model.stopAsking() } }),
+                titleVisibility: .visible
+              ) {
+                ForEach(model.heldChoices) { profile in
+                  Button(profile.name.description) {
+                    Task { await model.restoreHeld(message, for: profile.id) }
                   }
-                } message: {
-                  Text(model.heldNote(message))
                 }
+              } message: {
+                Text(model.heldNote(message))
               }
-              ForEach(items) { item in
-                Group {
-                  if starts.contains(item.id), let lane = item.lane, let badge = badges[lane] {
-                    VStack(alignment: .leading, spacing: 6) {
-                      badge.title.font(.footnote).accessibilityLabel("From \(badge.name)")
-                      transcriptItem(item, badges: badges)
-                    }
-                  } else {
+            }
+            ForEach(items) { item in
+              Group {
+                if starts.contains(item.id), let lane = item.lane, let badge = badges[lane] {
+                  VStack(alignment: .leading, spacing: 6) {
+                    badge.title.font(.footnote).accessibilityLabel("From \(badge.name)")
                     transcriptItem(item, badges: badges)
                   }
-                }
-                .id(item.id)
-              }
-            } header: {
-              if model.canLoadEarlier {
-                Button {
-                  requestHistory()
-                } label: {
-                  HStack {
-                    if model.loadingHistory { ProgressView().controlSize(.small) }
-                    Text("Load earlier messages")
-                  }
-                }
-                .disabled(model.loadingHistory).frame(maxWidth: .infinity).padding(.vertical)
-                .id(TranscriptControlAnchor.earlier)
-                .onScrollVisibilityChange(threshold: 0.1) { visible in
-                  // Initial/live-tail layout is not an instruction to page backward.
-                  if visible && presentedLatest && !followsLatest { requestHistory() }
+                } else {
+                  transcriptItem(item, badges: badges)
                 }
               }
+              .id(item.id)
             }
-            if model.busy {
-              HStack(spacing: 8) {
-                ProgressView().controlSize(.mini)
-                Text("Working…").font(.footnote).foregroundStyle(.secondary)
-              }.frame(maxWidth: .infinity, alignment: .leading)
-                .accessibilityLabel("Beep Boop is working")
+          } header: {
+            if model.canLoadEarlier {
+              Button {
+                requestHistory()
+              } label: {
+                HStack {
+                  if model.loadingHistory { ProgressView().controlSize(.small) }
+                  Text("Load earlier messages")
+                }
+              }
+              .disabled(model.loadingHistory).frame(maxWidth: .infinity).padding(.vertical)
+              .id(TranscriptControlAnchor.earlier)
+              .onScrollVisibilityChange(threshold: 0.1) { visible in
+                // Initial/live-tail layout is not an instruction to page backward.
+                if visible && presentedLatest && !followsLatest { requestHistory() }
+              }
             }
-            Color.clear.frame(height: 16).id(TranscriptControlAnchor.latest)
           }
-          .scrollTargetLayout()
-          .padding([.horizontal, .top]).frame(maxWidth: 720).frame(maxWidth: .infinity)
-        }
-        .accessibilityIdentifier("transcript")
-        .scrollDismissesKeyboard(.interactively)
-        .scrollBounceBehavior(.always, axes: .vertical)
-        .defaultScrollAnchor(initialScrollTarget == nil ? .bottom : .top, for: .initialOffset)
-        // Keep the live bottom through keyboard and composer size changes.
-        .defaultScrollAnchor(followsLatest ? .bottom : nil, for: .sizeChanges)
-        .scrollPosition(
-          id: Binding(
-            // Keep the observed row binding stable when leaving the live tail. Switching from nil
-            // to an already-visible ID makes SwiftUI align that row's top, jumping across a tall
-            // message and stranding subsequent downward drags at the start of the transcript.
-            get: { visibleItem },
-            set: { item in
-              // Structural controls have no transcript row ID. Keep the real
-              // reading anchor when a paging control temporarily leads.
-              if let item { visibleItem = item }
-            }), anchor: .top
-        )
-        .task {
-          if let initialScrollTarget {
-            await Task.yield()
-            scroll.scrollTo(initialScrollTarget, anchor: .top)
+          if model.busy {
+            HStack(spacing: 8) {
+              ProgressView().controlSize(.mini)
+              Text("Working…").font(.footnote).foregroundStyle(.secondary)
+            }.frame(maxWidth: .infinity, alignment: .leading)
+              .accessibilityLabel("Beep Boop is working")
           }
+          Color.clear.frame(height: 16).id(TranscriptControlAnchor.latest)
         }
-        .task(id: historyRequest) {
-          guard let request = historyRequest else { return }
-          switch request {
-          case .earlier(_, let anchorID, let scope):
-            await model.history(anchorID: anchorID, in: scope)
-          case .latest(_, let scope): await model.latestHistory(in: scope)
-          }
-          if !Task.isCancelled { historyRequest = nil }
-        }
-        .onScrollPhaseChange { _, phase in
-          userScrolling = phase == .interacting || phase == .decelerating
-          if userScrolling {
-            followsLatest = latestVisible
-            if atTop { requestHistory() }
-          }
-        }
-        .onChange(of: followsLatest && !userScrolling) { _, following in
-          // Following the latest, code scrolls without updating the binding, so a row left there
-          // goes stale. A size change, such as the composer growing, would scroll back to it.
-          if following { visibleItem = nil }
-        }
-        .onScrollGeometryChange(for: TranscriptEdges.self) { geometry in
-          TranscriptEdges(
-            top: geometry.contentOffset.y + geometry.contentInsets.top <= 80,
-            latest: geometry.visibleRect.maxY >= geometry.contentSize.height - 1 / displayScale)
-        } action: { _, current in
-          atTop = current.top
-          latestVisible = current.latest
-          if current.latest && !model.rows.isEmpty { presentedLatest = true }
-          // Reflow preserves reading intent. A person's scroll can leave the
-          // live tail or return to it; explicit navigation sets its own intent.
-          if userScrolling { followsLatest = current.latest }
-        }
-        .onScrollGeometryChange(for: CGFloat.self) {
-          $0.containerSize.width
-        } action: { _, current in
-          transcriptWidth = current
-        }
-        .task(id: transcriptWidth) {
-          guard transcriptWidth > 0 else { return }
-          // Apply a width change outside the geometry callback.
-          // SwiftUI cancels an obsolete width request or a removed transcript.
+        .scrollTargetLayout()
+        .padding([.horizontal, .top]).frame(maxWidth: 720).frame(maxWidth: .infinity)
+      }
+      .accessibilityIdentifier("transcript")
+      .scrollDismissesKeyboard(.interactively)
+      .scrollBounceBehavior(.always, axes: .vertical)
+      .defaultScrollAnchor(initialScrollTarget == nil ? .bottom : .top, for: .initialOffset)
+      // Keep the live bottom through keyboard and composer size changes.
+      .defaultScrollAnchor(followsLatest ? .bottom : nil, for: .sizeChanges)
+      .scrollPosition(
+        id: Binding(
+          // Keep the observed row binding stable when leaving the live tail. Switching from nil
+          // to an already-visible ID makes SwiftUI align that row's top, jumping across a tall
+          // message and stranding subsequent downward drags at the start of the transcript.
+          get: { visibleItem },
+          set: { item in
+            // Structural controls have no transcript row ID. Keep the real
+            // reading anchor when a paging control temporarily leads.
+            if let item { visibleItem = item }
+          }), anchor: .top
+      )
+      .task {
+        if let initialScrollTarget {
           await Task.yield()
-          if !Task.isCancelled && followsLatest && !userScrolling {
-            scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
-          }
+          scroll.scrollTo(initialScrollTarget, anchor: .top)
         }
-        .onChange(of: model.revision) { _, _ in
-          if followsLatest { scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom) }
+      }
+      .task(id: historyRequest) {
+        guard let request = historyRequest else { return }
+        switch request {
+        case .earlier(_, let anchorID, let scope):
+          await model.history(anchorID: anchorID, in: scope)
+        case .latest(_, let scope): await model.latestHistory(in: scope)
         }
-        .onChange(of: activityExpansion.groups) { _, _ in
-          if followsLatest && !userScrolling {
-            Task { @MainActor in
-              await Task.yield()
-              if followsLatest && !userScrolling {
-                scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
-              }
-            }
-          }
+        if !Task.isCancelled { historyRequest = nil }
+      }
+      .onScrollPhaseChange { _, phase in
+        userScrolling = phase == .interacting || phase == .decelerating
+        if userScrolling {
+          followsLatest = latestVisible
+          if atTop { requestHistory() }
         }
-        .onScrollGeometryChange(for: CGFloat.self) { geometry in
-          geometry.containerSize.height
-        } action: { old, new in
-          // A taller composer, such as one opening the picker, makes the feed shorter. SwiftUI keeps
-          // its bottom in view for a short feed but not for a long one.
-          if new < old && followsLatest && !userScrolling {
-            scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
-          }
-        }
-        .onChange(of: handledOpen) { _, request in
-          guard case .feed? = request?.destination else { return }
-          followsLatest = true
+      }
+      .onChange(of: followsLatest && !userScrolling) { _, following in
+        // Following the latest, code scrolls without updating the binding, so a row left there
+        // goes stale. A size change, such as the composer growing, would scroll back to it.
+        if following { visibleItem = nil }
+      }
+      .onScrollGeometryChange(for: TranscriptEdges.self) { geometry in
+        TranscriptEdges(
+          top: geometry.contentOffset.y + geometry.contentInsets.top <= 80,
+          latest: geometry.visibleRect.maxY >= geometry.contentSize.height - 1 / displayScale)
+      } action: { _, current in
+        atTop = current.top
+        latestVisible = current.latest
+        if current.latest && !model.rows.isEmpty { presentedLatest = true }
+        // Reflow preserves reading intent. A person's scroll can leave the
+        // live tail or return to it; explicit navigation sets its own intent.
+        if userScrolling { followsLatest = current.latest }
+      }
+      .onScrollGeometryChange(for: CGFloat.self) {
+        $0.containerSize.width
+      } action: { _, current in
+        transcriptWidth = current
+      }
+      .task(id: transcriptWidth) {
+        guard transcriptWidth > 0 else { return }
+        // Apply a width change outside the geometry callback.
+        // SwiftUI cancels an obsolete width request or a removed transcript.
+        await Task.yield()
+        if !Task.isCancelled && followsLatest && !userScrolling {
           scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
         }
-        .clipped()
+      }
+      .onChange(of: model.revision) { _, _ in
+        if followsLatest { scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom) }
+      }
+      .onChange(of: activityExpansion.groups) { _, _ in
+        if followsLatest && !userScrolling {
+          Task { @MainActor in
+            await Task.yield()
+            if followsLatest && !userScrolling {
+              scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
+            }
+          }
+        }
+      }
+      .onScrollGeometryChange(for: CGFloat.self) { geometry in
+        geometry.containerSize.height
+      } action: { old, new in
+        // A taller composer, such as one opening the picker, makes the feed shorter. SwiftUI keeps
+        // its bottom in view for a short feed but not for a long one.
+        if new < old && followsLatest && !userScrolling {
+          scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
+        }
+      }
+      .onChange(of: handledOpen) { _, request in
+        guard case .feed? = request?.destination else { return }
+        followsLatest = true
+        scroll.scrollTo(TranscriptControlAnchor.latest, anchor: .bottom)
+      }
+      .clipped()
+      .safeAreaInset(edge: .bottom, spacing: 0) {
         if (!latestVisible || !model.includesLatest) && !model.rows.isEmpty {
           HStack {
             Spacer()
@@ -639,8 +639,9 @@ public struct MainChatView: View {
           }
           .padding(.horizontal, 16)
           .padding(.vertical, 8)
-          .background(.background)
-          .overlay(alignment: .top) { Divider() }
+          // A drag that starts on the bar scrolls the transcript under it.
+          .background { Rectangle().fill(.background).allowsHitTesting(false) }
+          .overlay(alignment: .top) { Divider().allowsHitTesting(false) }
         }
       }
     }
