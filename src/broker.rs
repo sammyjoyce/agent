@@ -42,6 +42,7 @@ pub struct Broker {
     executor: host::Executor,
     state: std::path::PathBuf,
     dreams: Option<crate::dreams::Dreams>,
+    dreams_source: crate::dreams::DreamsPolicySource,
     dreams_available: bool,
     instructions: std::path::PathBuf,
     peers: Mutex<HashMap<String, Peer>>,
@@ -59,6 +60,7 @@ impl Broker {
             crate::tailnet::Daemon::default(),
             rex,
             None,
+            crate::dreams::DreamsPolicySource::Unconfigured,
         )
     }
 
@@ -68,6 +70,7 @@ impl Broker {
         daemon: crate::tailnet::Daemon,
         rex: crate::rex::RexClient,
         explicit_dreams: Option<crate::dreams::DreamsPolicy>,
+        dreams_source: crate::dreams::DreamsPolicySource,
     ) -> Result<Self> {
         let local = bootstrap.and_then(|bootstrap| bootstrap.node.clone());
         if let Some(node) = &local {
@@ -116,6 +119,7 @@ impl Broker {
             executor,
             state: state.to_path_buf(),
             dreams,
+            dreams_source,
             dreams_available,
             instructions: bootstrap
                 .and_then(|value| value.node.as_ref())
@@ -130,8 +134,10 @@ impl Broker {
         &self.state
     }
 
-    pub fn dreams_policy(&self) -> Option<&crate::dreams::DreamsPolicy> {
-        self.dreams.as_ref().map(crate::dreams::Dreams::policy)
+    /// The Dreams policy for one request from a device, read from the
+    /// configuration now.
+    pub fn dreams_policy_now(&self) -> Result<Option<crate::dreams::DreamsPolicy>> {
+        self.dreams_source.load(&self.state)
     }
 
     pub fn dreams_available(&self) -> bool {

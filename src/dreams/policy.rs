@@ -75,6 +75,30 @@ pub struct DreamsPolicy {
     digest: PolicyDigest,
 }
 
+/// Where a coordinator reads the Dreams policy for a request from a device.
+/// It names the configuration and holds no policy, so each request is checked
+/// against the policy that the configuration gives at that time.
+#[derive(Clone, Debug)]
+pub enum DreamsPolicySource {
+    /// The private configuration that `--config` names, or the default one
+    /// without it, loaded as `beep-boop dreams` loads it.
+    Config(Option<PathBuf>),
+    Unconfigured,
+}
+
+impl DreamsPolicySource {
+    pub fn load(&self, state: &Path) -> Result<Option<DreamsPolicy>> {
+        let Self::Config(explicit) = self else {
+            return Ok(None);
+        };
+        let policy = crate::config::load(explicit.as_deref())?.dreams_policy()?;
+        if let Some(policy) = &policy {
+            policy.refuse_state_inside(state)?;
+        }
+        Ok(policy)
+    }
+}
+
 /// A small ASCII alphabet keeps a path free of controls, of the ignorable code
 /// points some file systems fold into `.git`, and of anything Git would quote
 /// in a patch header. `extra` admits the wildcard in a policy glob.

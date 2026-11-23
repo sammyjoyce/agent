@@ -21,7 +21,8 @@ pub use evidence::{
     review_summary,
 };
 pub use policy::{
-    CheckSpec, DreamsCheckFile, DreamsPolicy, DreamsPolicyFile, EditablePath, ProtectedPaths,
+    CheckSpec, DreamsCheckFile, DreamsPolicy, DreamsPolicyFile, DreamsPolicySource, EditablePath,
+    ProtectedPaths,
 };
 pub(crate) use store::DREAMS_DIRECTORY;
 pub use store::{AppliedRecord, DreamsStore, RunView};
@@ -105,10 +106,6 @@ pub struct Dreams {
 }
 
 impl Dreams {
-    pub fn policy(&self) -> &DreamsPolicy {
-        &self.policy
-    }
-
     /// Refuses a state directory inside the policy repository, where a
     /// proposal could otherwise edit its own evidence.
     pub fn open(state: &Path, policy: DreamsPolicy) -> Result<Self> {

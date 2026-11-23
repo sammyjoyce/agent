@@ -1031,6 +1031,7 @@ async fn run(mut arguments: Arguments) -> Result<()> {
             rex,
             bootstrap,
             dreams,
+            agent_cli::dreams::DreamsPolicySource::Config(arguments.config.clone()),
         )
         .await;
     }

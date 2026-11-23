@@ -6,6 +6,10 @@ use tokio::io::AsyncWrite;
 
 use crate::{
     broker::Broker,
+    dreams::{
+        apply::{DreamsRejected, POLICY_CHANGED},
+        ops,
+    },
     native::{NativeEvent, ServiceRequest},
     protocol::ErrorCode,
     runtime::Runtime,
@@ -33,23 +37,26 @@ pub(super) async fn handle<W: AsyncWrite + Unpin>(
                 state_dir: broker.state_dir().to_string_lossy().into_owned(),
             })
         }
-        ServiceRequest::DreamsList => {
-            crate::dreams::ops::native_list(broker.state_dir(), broker.dreams_policy())
-                .await
-                .map(|(runs, pending_count)| NativeEvent::DreamsList {
-                    runs,
-                    pending_count,
-                })
-                .map_err(classify_dreams_error)
+        ServiceRequest::DreamsList => async {
+            let policy = broker.dreams_policy_now()?;
+            let (runs, pending_count) =
+                ops::native_list(broker.state_dir(), policy.as_ref()).await?;
+            Ok(NativeEvent::DreamsList {
+                runs,
+                pending_count,
+            })
         }
-        ServiceRequest::DreamsShow { run } => {
-            crate::dreams::ops::native_show(broker.state_dir(), broker.dreams_policy(), &run)
-                .await
-                .map(|detail| NativeEvent::DreamsShow {
-                    report: Box::new(detail),
-                })
-                .map_err(classify_dreams_error)
+        .await
+        .map_err(classify_dreams_error),
+        ServiceRequest::DreamsShow { run } => async {
+            let policy = broker.dreams_policy_now()?;
+            let detail = ops::native_show(broker.state_dir(), policy.as_ref(), &run).await?;
+            Ok(NativeEvent::DreamsShow {
+                report: Box::new(detail),
+            })
         }
+        .await
+        .map_err(classify_dreams_error),
         ServiceRequest::DreamsApply { run, approve } => {
             if runtime.restore_held() {
                 Err((
@@ -57,22 +64,20 @@ pub(super) async fn handle<W: AsyncWrite + Unpin>(
                     "Dreams apply is held after a restore until `backup release`".into(),
                 ))
             } else {
-                match broker.dreams_policy() {
-                    None => Err((
-                        ErrorCode::InvalidRequest,
-                        "Dreams is not configured on this coordinator".into(),
-                    )),
-                    Some(policy) => {
-                        crate::dreams::ops::native_apply(broker.state_dir(), policy, &run, &approve)
-                            .await
-                            .map(|applied| NativeEvent::DreamsApplied {
-                                run: applied.run,
-                                commit: applied.commit,
-                                already_applied: applied.already_applied,
-                            })
-                            .map_err(classify_dreams_error)
-                    }
+                async {
+                    let policy = broker
+                        .dreams_policy_now()?
+                        .ok_or_else(|| DreamsRejected(POLICY_CHANGED.into()))?;
+                    let applied =
+                        ops::native_apply(broker.state_dir(), &policy, &run, &approve).await?;
+                    Ok(NativeEvent::DreamsApplied {
+                        run: applied.run,
+                        commit: applied.commit,
+                        already_applied: applied.already_applied,
+                    })
                 }
+                .await
+                .map_err(classify_dreams_error)
             }
         }
     };
@@ -94,7 +99,7 @@ pub(super) async fn handle<W: AsyncWrite + Unpin>(
 }
 
 fn classify_dreams_error(error: anyhow::Error) -> (ErrorCode, String) {
-    let code = if error.is::<crate::dreams::apply::DreamsRejected>() {
+    let code = if error.is::<DreamsRejected>() {
         ErrorCode::InvalidRequest
     } else {
         ErrorCode::Internal
