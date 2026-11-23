@@ -25,12 +25,25 @@ impl WorkCounts {
     }
 }
 
+/// Whether the coordinator's stream of active work reaches this terminal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkStream {
+    /// A stream is open, or the first one is being opened.
+    #[default]
+    Open,
+    /// The stream ended and the terminal is opening it again.
+    Lost,
+    /// The coordinator closed the stream without an answer, as one that predates active work does.
+    Unreported,
+}
+
 #[derive(Default)]
 pub(super) struct WorkPanel {
     open: bool,
     scroll: usize,
     page_height: u16,
     snapshot: Option<TaskGraphSnapshot>,
+    stream: WorkStream,
 }
 
 impl WorkPanel {
@@ -47,12 +60,24 @@ impl WorkPanel {
         self.open = false;
     }
 
-    pub(super) fn set_graph(&mut self, graph: TaskGraphSnapshot) {
-        self.snapshot = Some(graph);
+    pub(super) fn stream(&self) -> WorkStream {
+        self.stream
     }
 
-    pub(super) fn clear_graph(&mut self) {
-        self.snapshot = None;
+    pub(super) fn set_stream(&mut self, stream: WorkStream) {
+        if stream != WorkStream::Open {
+            self.snapshot = None;
+        }
+        self.stream = stream;
+    }
+
+    pub(super) fn set_graph(&mut self, graph: TaskGraphSnapshot) {
+        self.snapshot = Some(graph);
+        self.stream = WorkStream::Open;
+    }
+
+    pub(super) fn take_snapshot(&mut self) -> Option<TaskGraphSnapshot> {
+        self.snapshot.take()
     }
 
     pub(super) fn counts(&self) -> WorkCounts {
@@ -76,11 +101,18 @@ impl WorkPanel {
     }
 
     pub(super) fn footer_spans(&self) -> Vec<Span<'static>> {
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        if self.stream == WorkStream::Lost {
+            return vec![
+                Span::styled(" · ", dim),
+                Span::styled("active work unknown", dim),
+                Span::styled(" (Ctrl+G)", dim),
+            ];
+        }
         let counts = self.counts();
         if counts.is_empty() {
             return Vec::new();
         }
-        let dim = Style::default().add_modifier(Modifier::DIM);
         let mut spans = count_spans(counts, true);
         spans.push(Span::styled(" (Ctrl+G)", dim));
         spans
@@ -193,10 +225,11 @@ impl WorkPanel {
         let bold = Style::default().add_modifier(Modifier::BOLD);
         let counts = self.counts();
         let mut header = vec![Span::styled("Active work", bold)];
-        if counts.is_empty() {
-            header.push(Span::styled(" · idle", dim));
-        } else {
-            header.extend(count_spans(counts, false));
+        match self.stream {
+            WorkStream::Lost => header.push(Span::styled(" · unknown", dim)),
+            WorkStream::Unreported => header.push(Span::styled(" · not reported", dim)),
+            WorkStream::Open if counts.is_empty() => header.push(Span::styled(" · idle", dim)),
+            WorkStream::Open => header.extend(count_spans(counts, false)),
         }
         header.push(Span::styled(" · read-only", dim));
         frame.render_widget(Line::from(header), areas[0]);
@@ -227,7 +260,18 @@ impl WorkPanel {
         let dim = Style::default().add_modifier(Modifier::DIM);
         let bold = Style::default().add_modifier(Modifier::BOLD);
         let Some(snapshot) = &self.snapshot else {
-            return vec![Line::styled("Waiting for coordinator task graph…", dim)];
+            return vec![Line::styled(
+                match self.stream {
+                    WorkStream::Open => "Waiting for coordinator task graph…",
+                    WorkStream::Lost => {
+                        "The coordinator's active work stream ended. This terminal is opening it again; the rows return by themselves."
+                    }
+                    WorkStream::Unreported => {
+                        "This coordinator does not report active work. The rows appear after the coordinator is updated."
+                    }
+                },
+                dim,
+            )];
         };
         let work = &snapshot.work;
         if work.is_empty() && snapshot.omitted == 0 {
@@ -524,5 +568,96 @@ mod tests {
 
         assert!(panel.input(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))));
         assert!(!panel.is_open());
+    }
+
+    fn one_running_task() -> TaskGraphSnapshot {
+        TaskGraphSnapshot {
+            nodes: vec![],
+            conversations: vec![],
+            omitted: 0,
+            work: vec![ActiveWorkItem {
+                id: "task:run".into(),
+                task_id: Some("11111111-1111-4111-8111-111111111111".parse().unwrap()),
+                conversation_id: "10".into(),
+                title: "Fix protocol tests".into(),
+                status: ActiveWorkStatus::Running,
+                host: None,
+                is_job: false,
+                detail: None,
+                started_at: None,
+                tools: None,
+                children: None,
+            }],
+        }
+    }
+
+    fn footer(panel: &WorkPanel) -> String {
+        panel
+            .footer_spans()
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect()
+    }
+
+    fn drawn(panel: &mut WorkPanel) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        terminal
+            .draw(|frame| panel.draw_at(frame, frame.area(), 0))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for y in 0..8 {
+            for x in 0..80 {
+                rendered.push_str(buffer[(x, y)].symbol());
+            }
+            rendered.push('\n');
+        }
+        rendered
+    }
+
+    #[test]
+    fn a_lost_stream_replaces_the_counts_with_a_notice_until_the_next_snapshot() {
+        let mut panel = WorkPanel::default();
+        panel.set_graph(one_running_task());
+        assert_eq!(footer(&panel), " · 1 running (Ctrl+G)");
+
+        panel.set_stream(WorkStream::Lost);
+
+        assert_eq!(footer(&panel), " · active work unknown (Ctrl+G)");
+        assert_eq!(panel.counts(), WorkCounts::default());
+        let screen = drawn(&mut panel);
+        assert!(screen.contains("Active work · unknown"), "{screen}");
+        assert!(
+            screen.contains("The coordinator's active work stream ended."),
+            "{screen}"
+        );
+        assert!(!screen.contains("Fix protocol tests"), "{screen}");
+        assert!(!screen.contains("idle"), "{screen}");
+
+        panel.set_graph(one_running_task());
+
+        assert_eq!(footer(&panel), " · 1 running (Ctrl+G)");
+        assert!(drawn(&mut panel).contains("Fix protocol tests"));
+    }
+
+    #[test]
+    fn a_coordinator_without_the_stream_is_named_in_the_panel_and_adds_nothing_to_the_footer() {
+        let mut panel = WorkPanel::default();
+        let waiting = drawn(&mut panel);
+        assert!(
+            waiting.contains("Waiting for coordinator task graph…"),
+            "{waiting}"
+        );
+
+        panel.set_stream(WorkStream::Unreported);
+
+        assert_eq!(footer(&panel), "");
+        let screen = drawn(&mut panel);
+        assert!(screen.contains("Active work · not reported"), "{screen}");
+        assert!(
+            screen.contains("This coordinator does not report active work."),
+            "{screen}"
+        );
+        assert!(!screen.contains("Waiting for coordinator"), "{screen}");
     }
 }

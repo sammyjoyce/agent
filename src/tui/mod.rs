@@ -12,6 +12,8 @@ mod shell;
 mod transcript;
 mod work;
 
+pub use work::WorkStream;
+
 use crate::tui::{
     activity::{ActivityPanel, PanelAction, ToolDetailRequest},
     attachments::{ComposerFile, ComposerInput, dropped_files},
@@ -108,7 +110,7 @@ enum Update {
         reply: tokio::sync::oneshot::Sender<Option<String>>,
     },
     ResetConversation(TuiInfo),
-    ClearTaskGraph,
+    WorkStream(WorkStream),
     Stop,
 }
 
@@ -182,8 +184,8 @@ impl TuiHandle {
     pub fn event(&self, event: RuntimeEventKind) -> Result<()> {
         self.send(Update::Event(Box::new(event)))
     }
-    pub fn clear_task_graph(&self) -> Result<()> {
-        self.send(Update::ClearTaskGraph)
+    pub fn work_stream(&self, stream: WorkStream) -> Result<()> {
+        self.send(Update::WorkStream(stream))
     }
     pub fn begin_history_replay(&self) -> Result<HistoryReplay> {
         self.history_replay(false)
@@ -1650,7 +1652,13 @@ impl State {
         self.changed = true;
     }
     fn reset_conversation(&mut self, info: TuiInfo) {
+        let snapshot = self.work.take_snapshot();
+        let stream = self.work.stream();
         *self = Self::new(info);
+        if let Some(graph) = snapshot {
+            self.work.set_graph(graph);
+        }
+        self.work.set_stream(stream);
     }
     fn history_replay_page(&mut self, id: uuid::Uuid, events: Vec<RuntimeEventKind>) {
         if self.history_replay != Some(id) {
@@ -3055,8 +3063,8 @@ fn run(
                     screen.reset()?;
                     state.reset_conversation(info);
                 }
-                Ok(Update::ClearTaskGraph) => {
-                    state.work.clear_graph();
+                Ok(Update::WorkStream(stream)) => {
+                    state.work.set_stream(stream);
                     state.changed = true;
                 }
             }
@@ -6709,6 +6717,83 @@ mod tests {
         let cleared = view.program_status_reports();
         assert_eq!(cleared.len(), 2);
         assert_eq!(cleared[0].state, ProgramState::Idle);
+    }
+
+    fn one_running_task() -> crate::protocol::TaskGraphSnapshot {
+        crate::protocol::TaskGraphSnapshot {
+            nodes: vec![],
+            conversations: vec![],
+            omitted: 0,
+            work: vec![crate::protocol::ActiveWorkItem {
+                id: "task:1".into(),
+                task_id: Some("11111111-1111-4111-8111-111111111111".parse().unwrap()),
+                conversation_id: "10".into(),
+                title: "Index docs".into(),
+                status: crate::protocol::ActiveWorkStatus::Running,
+                host: None,
+                is_job: false,
+                detail: None,
+                started_at: None,
+                tools: None,
+                children: None,
+            }],
+        }
+    }
+
+    fn work_footer(view: &State) -> String {
+        view.work
+            .footer_spans()
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect()
+    }
+
+    fn resumed() -> TuiInfo {
+        TuiInfo {
+            title: "Board review".into(),
+            model: Some(ModelSelection::default()),
+            cwd: "/workspace".into(),
+        }
+    }
+
+    #[test]
+    fn a_conversation_reset_keeps_the_coordinator_work_snapshot() {
+        let mut view = state();
+        view.event(RuntimeEventKind::TaskGraph {
+            graph: one_running_task(),
+        });
+        view.push(super::Role::Notice, "Earlier conversation".into());
+
+        view.reset_conversation(resumed());
+
+        assert_eq!(view.info.title, "Board review");
+        assert!(view.messages.is_empty());
+        assert_eq!(work_footer(&view), " · 1 running (Ctrl+G)");
+        view.work.open();
+        let screen = rendered(&mut view, 80, 12);
+        assert!(screen.contains("Index docs"), "{screen}");
+    }
+
+    #[test]
+    fn a_conversation_reset_keeps_the_notice_of_a_lost_work_stream() {
+        let mut view = state();
+        view.event(RuntimeEventKind::TaskGraph {
+            graph: one_running_task(),
+        });
+        view.work.set_stream(super::WorkStream::Lost);
+
+        view.reset_conversation(resumed());
+
+        assert_eq!(work_footer(&view), " · active work unknown (Ctrl+G)");
+
+        view.work.set_stream(super::WorkStream::Unreported);
+        view.reset_conversation(resumed());
+        view.work.open();
+        let screen = rendered(&mut view, 80, 12);
+        assert!(
+            screen.contains("This coordinator does not report active work."),
+            "{screen}"
+        );
     }
 
     #[test]

@@ -45,7 +45,7 @@ use agent_cli::{
     },
     scrawl_feedback, service,
     tui::attachments::ComposerInput,
-    tui::{Tui, TuiHandle, TuiInfo, TuiInput},
+    tui::{Tui, TuiHandle, TuiInfo, TuiInput, WorkStream},
     usage,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -1542,45 +1542,101 @@ async fn watch(client: ClientContext<'_>, json: bool) -> Result<WatchGuard> {
     })))
 }
 
-async fn watch_task_graph(client: ClientContext<'_>, tui: TuiHandle) -> Result<WatchGuard> {
-    let mut wire = connection(client, false).await?;
-    write_command(&mut *wire.writer, &RuntimeCommand::WatchTaskGraph).await?;
-    Ok(WatchGuard(tokio::spawn(async move {
-        let _writer = wire.writer;
-        let _child = wire.child;
-        let mut reader = FrameReader::new(BufReader::new(wire.reader));
-        loop {
-            let frame = match reader.next_frame().await {
-                Ok(Some(frame)) => frame,
-                Ok(None) => break,
-                Err(error) => {
-                    let _ = tui.notice(format!("Active work stream interrupted: {error}"));
-                    break;
-                }
-            };
-            let event = match decode_coordinator_event(&frame) {
-                Ok(event) => event,
-                Err(error) => {
-                    let _ = tui.notice(format!("Active work stream decode failed: {error}"));
-                    break;
-                }
-            };
-            match event {
-                RuntimeEventKind::TaskGraph { .. } => {
-                    if tui.event(event).is_err() {
-                        break;
-                    }
-                }
-                RuntimeEventKind::Failure { message, .. } => {
-                    let _ = tui.notice(format!("Active work updates unavailable: {message}"));
-                    break;
-                }
-                RuntimeEventKind::Done => break,
-                _ => {}
+const WORK_WATCH_FIRST_PAUSE: Duration = Duration::from_secs(1);
+const WORK_WATCH_PAUSE_BOUND: Duration = Duration::from_secs(30);
+
+enum WorkWatchUpdate {
+    Graph(agent_cli::protocol::TaskGraphSnapshot),
+    Stream(WorkStream),
+    Notice(String),
+}
+
+fn watch_task_graph(client: ClientContext<'_>, tui: TuiHandle) -> WatchGuard {
+    let client = OwnedClient::new(client);
+    WatchGuard(tokio::spawn(async move {
+        let _ = keep_task_graph_watch(
+            || connection(client.context(), false),
+            sleep,
+            |update| match update {
+                WorkWatchUpdate::Graph(graph) => tui.event(RuntimeEventKind::TaskGraph { graph }),
+                WorkWatchUpdate::Stream(stream) => tui.work_stream(stream),
+                WorkWatchUpdate::Notice(text) => tui.notice(text),
+            },
+        )
+        .await;
+    }))
+}
+
+async fn keep_task_graph_watch<Opening, Pausing>(
+    mut open: impl FnMut() -> Opening,
+    mut pause: impl FnMut(Duration) -> Pausing,
+    mut show: impl FnMut(WorkWatchUpdate) -> Result<()>,
+) -> Result<()>
+where
+    Opening: Future<Output = Result<Wire>>,
+    Pausing: Future<Output = ()>,
+{
+    let mut wait = WORK_WATCH_FIRST_PAUSE;
+    let mut told = None;
+    loop {
+        let mut answered = false;
+        let (stream, reason) = match open().await {
+            Ok(wire) => {
+                read_task_graph_watch(wire, |graph| {
+                    answered = true;
+                    show(WorkWatchUpdate::Graph(graph))
+                })
+                .await?
             }
+            Err(error) => (
+                WorkStream::Lost,
+                Some(format!("Live active work updates unavailable: {error}")),
+            ),
+        };
+        if answered {
+            wait = WORK_WATCH_FIRST_PAUSE;
+            told = None;
         }
-        let _ = tui.clear_task_graph();
-    })))
+        show(WorkWatchUpdate::Stream(stream))?;
+        if let Some(text) = &reason
+            && told.as_ref() != Some(text)
+        {
+            show(WorkWatchUpdate::Notice(text.clone()))?;
+            told = reason;
+        }
+        pause(wait).await;
+        wait = (wait * 2).min(WORK_WATCH_PAUSE_BOUND);
+    }
+}
+
+async fn read_task_graph_watch(
+    mut wire: Wire,
+    mut graph: impl FnMut(agent_cli::protocol::TaskGraphSnapshot) -> Result<()>,
+) -> Result<(WorkStream, Option<String>)> {
+    let lost = |reason: String| Ok((WorkStream::Lost, Some(reason)));
+    if let Err(error) = write_command(&mut *wire.writer, &RuntimeCommand::WatchTaskGraph).await {
+        return lost(format!("Live active work updates unavailable: {error}"));
+    }
+    let mut reader = FrameReader::new(BufReader::new(wire.reader));
+    let mut unanswered = true;
+    loop {
+        let frame = match reader.next_frame().await {
+            Ok(Some(frame)) => frame,
+            Ok(None) if unanswered => return Ok((WorkStream::Unreported, None)),
+            Ok(None) => return Ok((WorkStream::Lost, None)),
+            Err(error) => return lost(format!("Active work stream interrupted: {error}")),
+        };
+        unanswered = false;
+        match decode_coordinator_event(&frame) {
+            Ok(RuntimeEventKind::TaskGraph { graph: snapshot }) => graph(snapshot)?,
+            Ok(RuntimeEventKind::Failure { message, .. }) => {
+                return lost(format!("Active work updates unavailable: {message}"));
+            }
+            Ok(RuntimeEventKind::Done) => return Ok((WorkStream::Lost, None)),
+            Ok(_) => {}
+            Err(error) => return lost(format!("Active work stream decode failed: {error}")),
+        }
+    }
 }
 
 fn use_tui(arguments: &Arguments) -> bool {
@@ -2723,6 +2779,39 @@ struct ClientContext<'a> {
     terminal: &'a RexClient,
 }
 
+struct OwnedClient {
+    config: ClientConfig,
+    coordinator: Option<String>,
+    script: PathBuf,
+    directory: PathBuf,
+    rex: RexClient,
+    terminal: RexClient,
+}
+
+impl OwnedClient {
+    fn new(client: ClientContext<'_>) -> Self {
+        Self {
+            config: client.config.clone(),
+            coordinator: client.coordinator.map(str::to_owned),
+            script: client.script.to_owned(),
+            directory: client.directory.to_owned(),
+            rex: client.rex.clone(),
+            terminal: client.terminal.clone(),
+        }
+    }
+
+    fn context(&self) -> ClientContext<'_> {
+        ClientContext {
+            config: &self.config,
+            coordinator: self.coordinator.as_deref(),
+            script: &self.script,
+            directory: &self.directory,
+            rex: &self.rex,
+            terminal: &self.terminal,
+        }
+    }
+}
+
 async fn prepare_attachments(client: ClientContext<'_>, input: &mut ComposerInput) -> Result<()> {
     use agent_cli::attachments::{MAX_ATTACHMENTS, WireEnvelope, exchange_chunk, upload_file};
     ensure!(
@@ -2953,15 +3042,7 @@ async fn chat_tui(
         ui.handle
             .event(RuntimeEventKind::ConversationSettings { settings })?;
         chat_view::open(client, &mut ui, chief).await?;
-        let _task_graph = match watch_task_graph(client, ui.handle.clone()).await {
-            Ok(guard) => Some(guard),
-            Err(error) => {
-                let _ = ui
-                    .handle
-                    .notice(format!("Live active work updates unavailable: {error}"));
-                None
-            }
-        };
+        let _task_graph = watch_task_graph(client, ui.handle.clone());
         if let Some(prompt) = initial_prompt.clone() {
             if let Some(Ok(ChatCommand::Resume { query })) = ChatCommand::parse(&prompt) {
                 if chat_view::resume(client, &mut ui, query.join(" ")).await?
@@ -4710,6 +4791,126 @@ mod tests {
 
     fn personal_rex() -> RexClient {
         RexClient::for_process(None).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_active_work_watch_opens_its_stream_again_with_growing_pauses_and_tells_the_view() {
+        use crate::{WorkWatchUpdate, keep_task_graph_watch};
+        use agent_cli::{
+            protocol::{ErrorCode, RuntimeEventKind, TaskGraphSnapshot},
+            runtime::{FrameReader, Wire},
+        };
+        use std::collections::VecDeque;
+        use tokio::io::{AsyncWriteExt, BufReader};
+
+        enum Coordinator {
+            Unreachable,
+            Answers(Vec<RuntimeEventKind>),
+        }
+        let snapshot = |omitted| RuntimeEventKind::TaskGraph {
+            graph: TaskGraphSnapshot {
+                nodes: vec![],
+                conversations: vec![],
+                omitted,
+                work: vec![],
+            },
+        };
+        let predates_the_stream = || Coordinator::Answers(Vec::new());
+        let mut coordinators = VecDeque::from([
+            Coordinator::Answers(vec![snapshot(1)]),
+            Coordinator::Unreachable,
+            Coordinator::Unreachable,
+            predates_the_stream(),
+            predates_the_stream(),
+            predates_the_stream(),
+            predates_the_stream(),
+            Coordinator::Answers(vec![
+                snapshot(2),
+                RuntimeEventKind::Failure {
+                    code: ErrorCode::InvalidRequest,
+                    message: "The task graph is too large to send".into(),
+                },
+            ]),
+            Coordinator::Answers(vec![snapshot(3)]),
+        ]);
+        let mut servers = Vec::new();
+        let mut pauses = Vec::new();
+        let mut shown = Vec::new();
+
+        let closed = keep_task_graph_watch(
+            || {
+                let events = match coordinators.pop_front().unwrap() {
+                    Coordinator::Unreachable => {
+                        return std::future::ready(Err(anyhow::anyhow!("Connection refused")));
+                    }
+                    Coordinator::Answers(events) => events,
+                };
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                servers.push(tokio::spawn(async move {
+                    let (reader, mut writer) = tokio::io::split(server);
+                    let mut reader = FrameReader::new(BufReader::new(reader));
+                    let command = reader.next_frame().await.unwrap().unwrap();
+                    for event in events {
+                        writer
+                            .write_all(&serde_json::to_vec(&event).unwrap())
+                            .await
+                            .unwrap();
+                        writer.write_all(b"\n").await.unwrap();
+                    }
+                    String::from_utf8(command).unwrap()
+                }));
+                let (reader, writer) = tokio::io::split(client);
+                std::future::ready(Ok(Wire {
+                    reader: Box::new(reader),
+                    writer: Box::new(writer),
+                    child: None,
+                }))
+            },
+            |pause| {
+                pauses.push(pause.as_secs());
+                std::future::ready(())
+            },
+            |update| {
+                shown.push(match update {
+                    WorkWatchUpdate::Graph(graph) if graph.omitted == 3 => {
+                        anyhow::bail!("The terminal interface is closed")
+                    }
+                    WorkWatchUpdate::Graph(graph) => format!("snapshot {}", graph.omitted),
+                    WorkWatchUpdate::Stream(stream) => format!("{stream:?}"),
+                    WorkWatchUpdate::Notice(text) => text,
+                });
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(closed.is_err(), "the watch must end when its view closes");
+        assert_eq!(pauses, [1, 2, 4, 8, 16, 30, 30, 1]);
+        assert_eq!(
+            shown,
+            [
+                "snapshot 1",
+                "Lost",
+                "Lost",
+                "Live active work updates unavailable: Connection refused",
+                "Lost",
+                "Unreported",
+                "Unreported",
+                "Unreported",
+                "Unreported",
+                "snapshot 2",
+                "Lost",
+                "Active work updates unavailable: The task graph is too large to send",
+            ]
+        );
+        assert!(coordinators.is_empty());
+        for server in servers {
+            assert_eq!(
+                server.await.unwrap(),
+                "{\"type\":\"watch_task_graph\"}\n",
+                "each new stream must ask for the task graph again"
+            );
+        }
     }
 
     #[tokio::test]

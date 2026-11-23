@@ -227,9 +227,11 @@ branching conversations legible directly from the main chat.
     **Job**), current tool or wait reason, and elapsed duration. No control
     starts, stops, retries or answers work; unstarted jobs stay on **Jobs and
     work**.
-  - **Terminal UI.** Full-screen panel with the same two groups and live tool
-    calls and child agents indented under running rows (panel prototyped), plus
-    live counts in the footer beside model and path (not yet prototyped).
+  - **Terminal UI.** Full-screen panel on Ctrl+G with the same two groups and
+    live tool calls and child agents indented under running rows, plus live
+    counts in the footer beside model and path (both built). When the stream
+    ends, the footer reads `active work unknown` until the terminal has opened
+    it again.
   - **Layouts set aside.** Separate page (leaves main chat), grouping by host
     (scatters owner-blocked work), past-hour timeline (`ScheduledJobStatus`
     keeps `last_run` only), and inline expanding panel (drops host/tool at one
