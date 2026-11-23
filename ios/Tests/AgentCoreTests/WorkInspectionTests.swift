@@ -241,8 +241,9 @@ private func inspectionJob(
     let sent = await fixture.received().compactMap {
       if case .submit(let value) = $0 { value } else { nil }
     }
-    #expect(sent.last?.replyTo == target)
-    #expect(sent.last?.text == "Follow-up referencing anchor")
+    let replySubmit = sent.first { $0.text == "Follow-up referencing anchor" }
+    #expect(replySubmit?.replyTo == target)
+    #expect(replySubmit?.text == "Follow-up referencing anchor")
     #expect(model.rows.last?.row.replyTo == target)
 
     // Verify `?` control never carried replyTo.
