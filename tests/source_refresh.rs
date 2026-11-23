@@ -755,8 +755,8 @@ fn move_times(value: &mut Value, seconds: u64) {
     }
 }
 
-/// Replaces the journal's Up checkpoint with the one a clock would have
-/// written that ran ahead, so that its latest time is `ahead` seconds after now.
+/// Replaces the journal's Up checkpoint with a copy from a computer whose
+/// clock ran ahead, so that its latest time is `ahead` seconds after now.
 async fn save_as_written_by_a_clock_ahead(runtime: &Runtime, ahead: u64) -> SourceCheckpoint {
     let saved = up_checkpoint(runtime).await;
     let mut value: Value = serde_json::from_str(&saved.value).unwrap();
@@ -851,7 +851,7 @@ async fn a_token_for_another_up_customer_after_a_restart_reads_no_transaction_in
 }
 
 #[tokio::test]
-async fn a_clock_behind_an_up_checkpoint_restarts_the_scan_in_flight_through_the_real_poll_path_and_the_journal_admits_its_first_page_once()
+async fn an_up_checkpoint_with_a_time_two_hours_ahead_of_ups_clock_is_refused_through_the_real_poll_path_and_the_journal_keeps_it()
  {
     let up = FakeUp::start().await;
     let setup = UpSetup::new(&up);
@@ -872,35 +872,20 @@ async fn a_clock_behind_an_up_checkpoint_restarts_the_scan_in_flight_through_the
     );
     up.second_page_fails.store(false, Ordering::Relaxed);
 
-    save_as_written_by_a_clock_ahead(&runtime, 3_600).await;
-    let requests_before = up.requests().len();
-    assert_eq!(
-        refresh_until_complete(&runtime, &setup.config).await,
-        [
-            page(SourceCoverage::More, 1, 0, true),
-            page(SourceCoverage::More, 1, 1, true),
-            page(SourceCoverage::More, 1, 1, true),
-            page(SourceCoverage::Complete, 1, 0, true),
-        ],
-        "the first page is read again and the journal admits its transaction once"
-    );
-    let transactions: Vec<String> = up.requests()[requests_before..]
-        .iter()
-        .filter(|target| target.starts_with("/transactions"))
-        .cloned()
-        .collect();
-    assert!(
-        transactions[0].starts_with("/transactions?filter[since]="),
-        "the scan starts again at its first page, in the same poll: {transactions:?}"
-    );
-    assert_eq!(
-        transactions[1..],
-        [
-            "/transactions?page[after]=1&page[size]=1",
-            "/transactions?page[after]=2&page[size]=1",
-            "/transactions?filter[status]=HELD&page[size]=100",
-        ]
-    );
+    let copied = save_as_written_by_a_clock_ahead(&runtime, 7_200).await;
+    for _ in 0..2 {
+        let requests_before = up.requests().len();
+        assert_eq!(
+            refresh_into_journal(&runtime, &setup.config).await,
+            [page(up_unavailable(UP_FOREIGN), 0, 0, false)]
+        );
+        assert_eq!(
+            up.requests()[requests_before..],
+            ["/util/ping"],
+            "the checkpoint is refused after the clock check and before any transaction is read"
+        );
+    }
+    assert_eq!(up_checkpoint(&runtime).await, copied);
     runtime.close().await.unwrap();
 }
 
@@ -926,53 +911,6 @@ async fn refresh_until_complete(runtime: &Runtime, config: &[SourceConfig]) -> V
         }
     }
     panic!("The scan did not complete");
-}
-
-#[tokio::test]
-async fn an_up_feed_whose_clock_ran_ahead_reads_again_through_the_real_poll_path_and_the_journal_admits_each_item_once()
- {
-    let up = FakeUp::start().await;
-    up.second_page_fails.store(false, Ordering::Relaxed);
-    let setup = UpSetup::new(&up);
-    let runtime = start_runtime(&setup.state);
-    let first_scan = refresh_until_complete(&runtime, &setup.config).await;
-    assert_eq!(
-        first_scan.iter().map(|page| page.new_events).sum::<u32>(),
-        3,
-        "the journal holds the three transactions"
-    );
-
-    save_as_written_by_a_clock_ahead(&runtime, 30 * 86_400).await;
-    let requests_before = up.requests().len();
-    let rewound = refresh_until_complete(&runtime, &setup.config).await;
-    let listings: Vec<String> = up.requests()[requests_before..]
-        .iter()
-        .filter(|target| target.starts_with("/transactions"))
-        .cloned()
-        .collect();
-    assert!(
-        listings[0].contains("filter[since]=") && !listings[0].contains("page[after]"),
-        "the poll after the clock ran ahead reads from a first page: {listings:?}"
-    );
-    assert_eq!(
-        rewound.iter().map(|page| page.sent_events).sum::<usize>(),
-        4,
-        "the three transactions are read again, and the held one is listed twice"
-    );
-    assert_eq!(
-        rewound.iter().map(|page| page.new_events).sum::<u32>(),
-        0,
-        "the journal admits no transaction a second time"
-    );
-
-    let requests_after = up.requests().len();
-    refresh_until_complete(&runtime, &setup.config).await;
-    assert_eq!(
-        up.requests().len(),
-        requests_after,
-        "the next round is inside the spacing, which counts from the current clock"
-    );
-    runtime.close().await.unwrap();
 }
 
 #[tokio::test]

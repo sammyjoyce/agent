@@ -2,8 +2,8 @@
 //!
 //! Three things live here, each with one owner:
 //!   `FeedCheckpoint`: the window, its first seven days, paging, resume,
-//!   restart, overlap, the daily reread, the spacing of scans and the rewind
-//!   when the clock is behind the saved times.
+//!   restart, overlap, the daily reread, the spacing of scans and the check
+//!   of the computer's clock against the service's clock.
 //!   `FeedItem`: the only way to build an event. It derives the version from the text.
 //!   `FeedFailure`: the only way to build a failure batch. It owns every fixed sentence.
 //!
@@ -36,15 +36,15 @@ const FIRST_LOOKBACK_SECONDS: u64 = 7 * 86_400;
 const OVERLAP_SECONDS: u64 = 86_400;
 /// A finished scan is followed by this much rest, which bounds the requests of an idle feed.
 const SCAN_SPACING_SECONDS: u64 = 300;
-/// A saved time that is this far ahead of the clock was written under another
-/// clock. A lower bound in the future would exclude current items, and a wait
-/// for the clock to reach it would leave a gap as long as the wait. So the feed
-/// starts again from the current clock and reads its reread window.
-///
-/// It is also how far the computer's clock may differ from the service's
-/// clock. Each scan reads from `OVERLAP_SECONDS` before the scan before it
-/// began, so a clock that is wrong by less opens no gap.
+/// How far the computer's clock may differ from the service's clock. Each
+/// scan reads from `OVERLAP_SECONDS` before the scan before it began, so a
+/// clock that is wrong by less opens no gap.
 const CLOCK_TOLERANCE_SECONDS: u64 = 300;
+/// A feed saves no time more than `CLOCK_TOLERANCE_SECONDS` plus
+/// `SCAN_SPACING_SECONDS` ahead of the service's clock. A saved time that is
+/// further ahead than this was copied from another computer or damaged, and
+/// a lower bound from it would exclude current items.
+const FAR_AHEAD_SECONDS: u64 = 3_600;
 /// One scan in this period reads the source's whole reread window again. It
 /// finds an item that the service lists late with an old creation time.
 const REREAD_EVERY_SECONDS: u64 = 86_400;
@@ -107,6 +107,8 @@ pub(crate) struct FeedCheckpoint<P, S> {
     owner: Option<String>,
     origin: u64,
     reread_at: u64,
+    /// The latest time in the checkpoint as it was saved.
+    latest_saved: Option<u64>,
     pub(crate) scan: Scan<S>,
     pub(crate) kept: P,
 }
@@ -122,9 +124,13 @@ struct Saved<P, S> {
     scope: String,
     /// What the service says about whose data the token reads, as a hash.
     owner: Option<String>,
-    /// Unix seconds. Set on the first poll to now minus seven days. It moves
-    /// only when the clock is behind the checkpoint, and then only earlier.
-    /// The feed never asks for, and never delivers, an item created before it.
+    /// Every time below was saved by a poll whose clock agreed with the
+    /// service's clock. A checkpoint from before that check has no such field
+    /// and is refused, because its times can be wrong by any amount.
+    clock: ClockMarker,
+    /// Unix seconds. Set on the first poll to now minus seven days, and never
+    /// changed. The feed never asks for, and never delivers, an item created
+    /// before it.
     origin: u64,
     /// Unix seconds when the last scan that read the whole reread window began.
     /// A checkpoint from before the daily reread has no such field and is
@@ -132,6 +138,12 @@ struct Saved<P, S> {
     reread_at: u64,
     window: Window<S>,
     kept: P,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ClockMarker {
+    Checked,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -247,9 +259,6 @@ where
     /// of the new scan from `kept` and the default lower bound. Once a day the
     /// new scan reads the last `reread_seconds` again. The result is never
     /// before the first poll's seven days.
-    ///
-    /// A saved time more than `CLOCK_TOLERANCE_SECONDS` ahead of `now` drops
-    /// the scan in flight and starts one that reads the last `reread_seconds`.
     pub(crate) fn load(
         saved: Option<&SourceCheckpoint>,
         key: &SourceKey,
@@ -269,6 +278,7 @@ where
                 owner: None,
                 origin,
                 reread_at: now,
+                latest_saved: None,
                 scan: Scan::first_page(now, since.max(origin), 0, state),
                 kept,
             }));
@@ -278,24 +288,14 @@ where
         if saved.account != key.account || saved.scope != scope {
             return Err(FeedFailure::ForeignCheckpoint);
         }
-        let latest = match &saved.window {
-            Window::Resting { since, .. } => *since,
+        let latest_saved = match &saved.window {
+            Window::Resting { since, not_before } => (*since).max(*not_before),
             Window::Scanning(scan) => scan.since.max(scan.started_at),
         }
-        .max(saved.origin);
-        let clock_is_behind = latest > now.saturating_add(CLOCK_TOLERANCE_SECONDS);
-        let mut origin = saved.origin;
+        .max(saved.origin)
+        .max(saved.reread_at);
         let mut reread_at = saved.reread_at;
         let scan = match saved.window {
-            // The saved times say nothing about what was read under this
-            // clock, so the window comes from the clock alone. An origin
-            // written by a clock that ran ahead would hide the seven days.
-            _ if clock_is_behind => {
-                origin = origin.min(now.saturating_sub(FIRST_LOOKBACK_SECONDS));
-                reread_at = now;
-                let (since, state) = begin(&saved.kept, now.saturating_sub(reread_seconds));
-                Scan::first_page(now, since.max(origin), 0, state)
-            }
             Window::Scanning(scan) if scan.pages >= MAX_SCAN_PAGES => {
                 return Err(FeedFailure::Endless);
             }
@@ -328,8 +328,9 @@ where
             account: saved.account,
             scope: saved.scope,
             owner: saved.owner,
-            origin,
+            origin: saved.origin,
             reread_at,
+            latest_saved: Some(latest_saved),
             scan,
             kept: saved.kept,
         }))
@@ -365,6 +366,10 @@ where
         let sent_at = sent_at.ok_or(FeedFailure::NoDate)?;
         if clock.now().abs_diff(sent_at) > CLOCK_TOLERANCE_SECONDS {
             return Err(FeedFailure::ClockDiffers);
+        }
+        let far_ahead = sent_at.saturating_add(FAR_AHEAD_SECONDS);
+        if self.latest_saved.is_some_and(|latest| latest > far_ahead) {
+            return Err(FeedFailure::ForeignCheckpoint);
         }
         Ok(CheckedClock(clock))
     }
@@ -422,6 +427,7 @@ where
             account: self.account,
             scope: self.scope,
             owner: self.owner,
+            clock: ClockMarker::Checked,
             origin: self.origin,
             reread_at: self.reread_at,
             window,
@@ -575,7 +581,9 @@ pub(crate) fn scope(parts: &[&str]) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FeedFailure {
     Http(HttpFailure),
-    /// The saved checkpoint does not parse, or has another account, scope or owner.
+    /// The saved checkpoint does not parse, has another account, scope or
+    /// owner, was saved before the clock check, or holds a time far ahead of
+    /// the service's clock.
     ForeignCheckpoint,
     NoDate,
     ClockDiffers,
@@ -872,57 +880,100 @@ mod tests {
         ));
         assert!(
             matches!(load(NOW - 86_400), Ok(Turn::Scan(_))),
-            "a clock that moved far back must not stop the feed"
+            "a clock that moved far back does not rest"
         );
     }
 
     #[test]
-    fn a_saved_time_more_than_five_minutes_ahead_of_the_clock_rewinds_the_feed_in_the_same_poll() {
-        let paging = saved_after(scanning(None, NOW), Step::Next(None), NOW)
+    fn a_clock_behind_the_saved_times_changes_no_scan_in_flight_and_no_origin() {
+        let mut first = scanning(None, NOW);
+        first.kept.push("kept between scans".into());
+        first.scan.state = Some("kept during the scan".into());
+        let cursor = Cursor::try_from("page-2".to_owned()).unwrap();
+        let paging = saved_after(first, Step::Next(Some(cursor.clone())), NOW)
             .checkpoint
             .unwrap();
-        assert_eq!(
-            scanning(Some(&paging), NOW - 301).scan.started_at,
-            NOW - 301,
-            "the scan start is ahead, so a new scan starts"
-        );
-        assert_eq!(
-            scanning(Some(&paging), NOW - 300).scan.started_at,
-            NOW,
-            "five minutes are tolerated, and the scan in flight continues"
-        );
+        for moved_back in [301, 3_600, 30 * DAY] {
+            let resumed = scanning(Some(&paging), NOW - moved_back);
+            assert_eq!(resumed.scan.started_at, NOW);
+            assert_eq!(resumed.scan.since, NOW - 7 * DAY);
+            assert_eq!(resumed.scan.cursor, Some(cursor.clone()));
+            assert_eq!(resumed.scan.state.as_deref(), Some("kept during the scan"));
+            assert_eq!(resumed.kept, ["kept between scans"]);
+            assert!(resumed.covers(NOW - 7 * DAY) && !resumed.covers(NOW - 7 * DAY - 1));
+        }
 
         let resting = saved_after(scanning(None, NOW), Step::Done { floor: None }, NOW)
             .checkpoint
             .unwrap();
-        let since_at = |now: u64| scanning(Some(&resting), now).scan.since;
-        let lower_bound = NOW - OVERLAP_SECONDS;
-        assert_eq!(
-            since_at(lower_bound - 301),
-            lower_bound - 301 - 7 * DAY,
-            "the lower bound is ahead, so the feed reads the seven days before the clock"
+        for moved_back in [2 * DAY, 9 * DAY, 30 * DAY] {
+            let next = scanning(Some(&resting), NOW - moved_back);
+            assert_eq!(
+                next.scan.since,
+                NOW - 7 * DAY,
+                "the lower bound is never later than the saved one, and never before the origin"
+            );
+            assert!(next.covers(NOW - 7 * DAY) && !next.covers(NOW - 7 * DAY - 1));
+        }
+    }
+
+    #[test]
+    fn a_saved_time_more_than_one_hour_ahead_of_the_services_clock_is_a_foreign_checkpoint() {
+        let resting = saved_after(scanning(None, NOW), Step::Done { floor: None }, NOW);
+        let paging = saved_after(scanning(None, NOW), Step::Next(None), NOW);
+        let latest_resting = NOW + SCAN_SPACING_SECONDS;
+        let latest_paging = NOW;
+        for (saved, latest) in [(&resting, latest_resting), (&paging, latest_paging)] {
+            let service = latest - FAR_AHEAD_SECONDS;
+            let agrees = |now: u64, sent_at: u64| {
+                scanning(saved.checkpoint.as_ref(), now)
+                    .check_clock(&poll_in_new_process_at(now), Some(sent_at))
+                    .map(|_| ())
+            };
+            assert_eq!(agrees(service, service), Ok(()));
+            assert_eq!(
+                agrees(service - 1, service - 1),
+                Err(FeedFailure::ForeignCheckpoint)
+            );
+            assert_eq!(
+                agrees(service - 30 * DAY, service - 30 * DAY),
+                Err(FeedFailure::ForeignCheckpoint)
+            );
+            assert_eq!(
+                agrees(service - 30 * DAY, service),
+                Err(FeedFailure::ClockDiffers),
+                "a clock that differs is reported first, because it explains a time that looks ahead"
+            );
+        }
+        let first = scanning(None, NOW);
+        assert!(
+            first
+                .check_clock(&poll_in_new_process_at(NOW), Some(NOW))
+                .is_ok()
         );
-        assert_eq!(
-            since_at(lower_bound - 300),
-            NOW - 7 * DAY,
-            "five minutes are tolerated, and the origin stays"
-        );
-        assert_eq!(
-            since_at(NOW - 8 * DAY),
-            NOW - 15 * DAY,
-            "the origin is ahead, and the feed reads and does not rest"
-        );
-        assert!(matches!(
-            Checkpoint::load(
-                Some(&resting),
-                &key(),
-                "scope-a",
-                &poll_in_new_process_at(NOW + 1),
-                REREAD,
-                |_, since| { (since, None) }
-            ),
-            Ok(Turn::Rest(_))
-        ));
+    }
+
+    #[test]
+    fn a_checkpoint_without_the_mark_of_a_checked_clock_is_refused() {
+        let saved = saved_after(scanning(None, NOW), Step::Done { floor: None }, NOW)
+            .checkpoint
+            .unwrap();
+        let marked: serde_json::Value = serde_json::from_str(&saved.value).unwrap();
+        assert_eq!(marked["clock"], "checked");
+
+        let mut unmarked = marked.clone();
+        unmarked.as_object_mut().unwrap().remove("clock");
+        let mut other_mark = marked;
+        other_mark["clock"] = "unchecked".into();
+        for value in [unmarked, other_mark] {
+            let saved = SourceCheckpoint {
+                value: value.to_string(),
+            };
+            assert_eq!(
+                refusal(&saved, &key(), "scope-a"),
+                "Example checkpoint belongs to another account or configuration; change the account label to start a fresh seven-day read."
+            );
+        }
     }
 
     #[test]
@@ -970,134 +1021,6 @@ mod tests {
             month + DAY - OVERLAP_SECONDS,
             "a reread that took several polls is not repeated"
         );
-    }
-
-    #[test]
-    fn a_saved_time_ahead_of_the_clock_rewinds_to_the_reread_window_and_never_before_the_origin() {
-        let first = saved_after(scanning(None, NOW), Step::Done { floor: None }, NOW);
-        let origin = NOW - 7 * DAY;
-        let ran_ahead = |real: u64, ahead: u64| {
-            let scan = scanning(first.checkpoint.as_ref(), real + ahead);
-            saved_after(scan, Step::Done { floor: None }, real + ahead)
-        };
-
-        let soon = NOW + 3_600;
-        let rewound = scanning(ran_ahead(soon, 16 * DAY).checkpoint.as_ref(), soon + 600);
-        assert_eq!(rewound.scan.started_at, soon + 600, "a new scan starts now");
-        assert_eq!(
-            rewound.scan.since, origin,
-            "the reread window starts before the origin, so the origin is the lower bound"
-        );
-
-        let later = NOW + 40 * DAY;
-        let saved = ran_ahead(later, 30 * DAY);
-        let now = later + 600;
-        assert_eq!(
-            scanning(saved.checkpoint.as_ref(), now).scan.since,
-            now - REREAD,
-            "the lower bound is the reread window of the source"
-        );
-        assert_eq!(
-            scanning_with_reread(saved.checkpoint.as_ref(), now, 90 * DAY)
-                .scan
-                .since,
-            origin
-        );
-    }
-
-    #[test]
-    fn a_rewind_moves_the_origin_only_when_it_is_later_than_seven_days_before_the_clock() {
-        let covered_from = |checkpoint: &Checkpoint| {
-            let origin = checkpoint.scan.since;
-            assert!(checkpoint.covers(origin) && !checkpoint.covers(origin - 1));
-            origin
-        };
-        let done = |saved: Option<&SourceCheckpoint>, now: u64| {
-            saved_after(scanning(saved, now), Step::Done { floor: None }, now)
-        };
-
-        let first_under_a_clock_ahead = done(None, NOW + 14 * DAY);
-        let corrected = scanning(first_under_a_clock_ahead.checkpoint.as_ref(), NOW);
-        assert_eq!(
-            covered_from(&corrected),
-            NOW - 7 * DAY,
-            "an origin ahead of the clock becomes the clock's own first seven days"
-        );
-
-        let three_days_ahead = done(None, NOW + 3 * DAY);
-        let corrected = scanning(three_days_ahead.checkpoint.as_ref(), NOW);
-        assert_eq!(
-            covered_from(&corrected),
-            NOW - 7 * DAY,
-            "an origin four days back was written by a clock that ran ahead"
-        );
-
-        let first = done(None, NOW);
-        let ran_ahead = done(first.checkpoint.as_ref(), NOW + 16 * DAY);
-        let corrected = scanning(ran_ahead.checkpoint.as_ref(), NOW + 3_600);
-        assert_eq!(
-            covered_from(&corrected),
-            NOW - 7 * DAY,
-            "an origin that is seven days or more before the clock stays"
-        );
-    }
-
-    #[test]
-    fn a_rewind_drops_the_scan_in_flight_and_keeps_what_the_source_keeps() {
-        let mut first = scanning(None, NOW);
-        first.kept.push("kept between scans".into());
-        first.scan.state = Some("kept during the scan".into());
-        let cursor = Cursor::try_from("page-2".to_owned()).unwrap();
-        let paged = saved_after(first, Step::Next(Some(cursor)), NOW);
-
-        let moved_back = NOW - 3_600;
-        let rewound = scanning(paged.checkpoint.as_ref(), moved_back);
-        assert_eq!(rewound.scan.started_at, moved_back);
-        assert!(rewound.scan.cursor.is_none(), "the saved cursor is dropped");
-        assert_eq!(rewound.scan.state, None, "scan state ends with its scan");
-        assert_eq!(rewound.kept, ["kept between scans"]);
-    }
-
-    #[test]
-    fn after_a_rewind_the_reread_and_the_spacing_count_from_the_current_clock() {
-        let load = |saved: &SourceBatch, now: u64| {
-            Checkpoint::load(
-                saved.checkpoint.as_ref(),
-                &key(),
-                "scope-a",
-                &poll_in_new_process_at(now),
-                REREAD,
-                |_, since| (since, None),
-            )
-        };
-        let later = NOW + 40 * DAY;
-        let first = saved_after(scanning(None, NOW), Step::Done { floor: None }, NOW);
-        let ran_ahead = saved_after(
-            scanning(first.checkpoint.as_ref(), later + 16 * DAY),
-            Step::Done { floor: None },
-            later + 16 * DAY,
-        );
-
-        let rewound = scanning(ran_ahead.checkpoint.as_ref(), later);
-        let done = saved_after(rewound, Step::Done { floor: None }, later + 10);
-        assert!(
-            matches!(
-                load(&done, later + 10 + SCAN_SPACING_SECONDS - 1),
-                Ok(Turn::Rest(_))
-            ),
-            "the next scan waits for the spacing"
-        );
-        let since_at = |now: u64| scanning(done.checkpoint.as_ref(), now).scan.since;
-        assert_eq!(
-            since_at(later + 10 + SCAN_SPACING_SECONDS),
-            later - OVERLAP_SECONDS
-        );
-        assert_eq!(
-            since_at(later + DAY - 1),
-            later - OVERLAP_SECONDS,
-            "the rewind read the whole window, so no reread is due for a day"
-        );
-        assert_eq!(since_at(later + DAY), later + DAY - REREAD);
     }
 
     #[test]

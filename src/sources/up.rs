@@ -2610,97 +2610,11 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_clock_that_moves_backward_restarts_the_scan_and_the_new_scan_continues_at_its_saved_page_when_the_clock_returns()
-     {
-        let up = Harness::start(vec![
-            settled("example-transaction-1", "Example Cafe", "-5.00", NOW - HOUR),
-            settled(
-                "example-transaction-2",
-                "Example Books",
-                "-7.00",
-                NOW - 2 * HOUR,
-            ),
-        ])
-        .await;
-        up.world().page_size = 1;
-        let first = up.poll_to_listing(None, NOW).await;
-        assert_eq!(first.coverage, SourceCoverage::More);
-
-        let mut restarted = None;
-        for moved_back in [30 * DAY, HOUR] {
-            let mark = up.targets().len();
-            let again = up.poll(first.checkpoint.as_ref(), NOW - moved_back).await;
-            assert_eq!(again.coverage, SourceCoverage::More);
-            assert_eq!(
-                content(&again.events),
-                content(&first.events),
-                "the first page is read again"
-            );
-            let requested = up.targets_since(mark);
-            assert_eq!(requested.len(), 2, "the poll reads Up: {requested:?}");
-            assert!(!requested[1].contains("page[after]"));
-            restarted = again.checkpoint;
-        }
-
-        let resumed = up.poll(restarted.as_ref(), NOW + 60).await;
-        assert_eq!(resumed.coverage, SourceCoverage::More);
-        assert_eq!(
-            titles(&resumed.events),
-            ["Example Books: -7.00 AUD (settled)"]
-        );
-        assert!(
-            up.targets().last().unwrap().contains("page[after]=1"),
-            "the scan that started under the clock that moved back continues at its saved page"
-        );
-    }
-
     fn versions(events: &[SourceEvent]) -> BTreeMap<&str, &str> {
         events
             .iter()
             .map(|event| (event.id.as_str(), event.version.as_str()))
             .collect()
-    }
-
-    #[tokio::test]
-    async fn a_transaction_created_after_a_scan_under_a_clock_that_ran_ahead_is_delivered_by_the_next_poll()
-     {
-        for ahead in [16 * DAY, 30 * DAY] {
-            let up = Harness::start(Vec::new()).await;
-            let (_, saved) = up.scan(None, NOW).await;
-            let (_, saved) = up.scan(Some(&saved), NOW + HOUR + ahead).await;
-
-            let corrected = NOW + 2 * HOUR;
-            up.world().rows.push(settled(
-                "example-transaction-1",
-                "Example Cafe",
-                "-12.50",
-                corrected + 60,
-            ));
-            let mark = up.targets().len();
-            let next = up.poll(Some(&saved), corrected + 120).await;
-            assert_eq!(
-                next.coverage,
-                SourceCoverage::More,
-                "the poll after a clock that ran {} days ahead reads Up",
-                ahead / DAY
-            );
-            assert_eq!(titles(&next.events), ["Example Cafe: -12.50 AUD (settled)"]);
-            assert_eq!(
-                up.since_requested_after(mark),
-                feed::utc(NOW - 7 * DAY),
-                "the poll reads its reread window again, from the origin at the earliest"
-            );
-
-            let (rest, saved) = up.scan(next.checkpoint.as_ref(), corrected + 120).await;
-            assert!(rest.is_empty());
-            let (repeat, _) = up.scan(Some(&saved), corrected + 120 + SPACING).await;
-            assert_eq!(
-                versions(&repeat),
-                versions(&next.events),
-                "the next scan reads the transaction again with an equal version"
-            );
-        }
     }
 
     #[tokio::test]
@@ -2830,44 +2744,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_clock_that_ran_ahead_for_longer_than_the_reread_hides_new_transactions_and_one_from_before_the_reread_stays_missing()
-     {
-        const AHEAD: u64 = 30 * DAY;
-        let up = Harness::start(Vec::new()).await;
-        let (_, saved) = up.scan(None, NOW).await;
-        let (_, mut saved) = up.scan(Some(&saved), NOW + DAY + AHEAD).await;
-
-        for (id, description, created) in [
-            ("example-transaction-1", "Example Cafe", NOW + 2 * DAY),
-            ("example-transaction-2", "Example Books", NOW + 7 * DAY),
-        ] {
-            up.world()
-                .rows
-                .push(settled(id, description, "-5.00", created));
-            let (hidden, next) = up.scan(Some(&saved), created + HOUR + AHEAD).await;
-            assert!(
-                hidden.is_empty(),
-                "under the clock that runs ahead, the source asks from a time that has not come"
-            );
-            saved = next;
-        }
-
-        let corrected = NOW + 20 * DAY;
-        let mark = up.targets().len();
-        let (events, _) = up.scan(Some(&saved), corrected).await;
-        assert_eq!(
-            up.since_requested_after(mark),
-            feed::utc(corrected - 14 * DAY)
-        );
-        assert_eq!(
-            titles(&events),
-            ["Example Books: -5.00 AUD (settled)"],
-            "the transaction from 18 days before the clock was corrected is missing"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_first_scan_under_a_clock_that_ran_ahead_is_followed_by_the_last_seven_days_when_the_clock_is_corrected()
+    async fn a_first_poll_under_a_clock_that_runs_ahead_saves_nothing_and_the_first_scan_after_the_correction_reads_seven_days()
      {
         let up = Harness::start(vec![
             settled(
@@ -2890,11 +2767,11 @@ mod tests {
             ),
         ])
         .await;
-        let (under_the_wrong_clock, saved) = up.scan(None, NOW + 14 * DAY).await;
-        assert!(under_the_wrong_clock.is_empty());
+        up.world().bank_time = Some(NOW);
+        assert_stopped(&up, None, NOW + 14 * DAY, CLOCK_DIFFERS).await;
 
         let mark = up.targets().len();
-        let (events, _) = up.scan(Some(&saved), NOW).await;
+        let (events, _) = up.scan(None, NOW).await;
         assert_eq!(
             titles(&events),
             [
@@ -2906,112 +2783,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_clock_that_moves_back_one_hour_between_two_scans_reads_each_item_again_with_an_equal_id_and_version()
-     {
-        let up = Harness::start(vec![
-            held(
-                "example-transaction-2",
-                "Example Hotel",
-                "-200.00",
-                NOW - 2 * HOUR,
-            ),
-            settled(
-                "example-transaction-1",
-                "Example Cafe",
-                "-5.00",
-                NOW - 3 * HOUR,
-            ),
-        ])
-        .await;
-        let (first, saved) = up.scan(None, NOW).await;
-        assert_eq!(versions(&first).len(), 2);
-
-        let moved_back = NOW - HOUR;
-        let (again, saved) = up.scan(Some(&saved), moved_back).await;
-        assert_eq!(versions(&again), versions(&first));
-
-        up.world().rows.push(settled(
-            "example-transaction-3",
-            "Example Books",
-            "-7.00",
-            moved_back + 60,
-        ));
-        let (next, _) = up.scan(Some(&saved), moved_back + SPACING).await;
-        let mut expected = versions(&first);
-        let books = next
-            .iter()
-            .find(|event| event.id == "example-transaction-3")
-            .expect("the feed delivers a new transaction after the clock moved back");
-        expected.insert(&books.id, &books.version);
-        assert_eq!(versions(&next), expected);
-    }
-
-    #[tokio::test]
-    async fn a_scan_in_flight_when_the_clock_moves_back_starts_again_and_its_saved_page_link_is_not_sent()
-     {
-        let up = Harness::start(vec![
-            settled(
-                "example-transaction-2",
-                "Example Cafe",
-                "-5.00",
-                NOW - 2 * HOUR,
-            ),
-            settled(
-                "example-transaction-1",
-                "Example Books",
-                "-7.00",
-                NOW - 3 * HOUR,
-            ),
-        ])
-        .await;
-        up.world().page_size = 1;
-        let first = up.poll_to_listing(None, NOW).await;
-        assert_eq!(first.coverage, SourceCoverage::More);
-        let saved = first.checkpoint.as_ref().unwrap();
-        assert!(
-            saved.value.contains("page[after]=1"),
-            "the scan in flight saved the link to its second page"
-        );
-
-        let mark = up.targets().len();
-        let (events, _) = up.scan(Some(saved), NOW - HOUR).await;
-        let listings: Vec<String> = up
-            .targets_since(mark)
-            .into_iter()
-            .filter(|target| target.starts_with("/transactions?"))
-            .collect();
-        assert!(
-            !listings[0].contains("page[after]"),
-            "the first request after the clock moved back is a first page, and not the saved link: {listings:?}"
-        );
-        assert_eq!(
-            titles(&events),
-            [
-                "Example Cafe: -5.00 AUD (settled)",
-                "Example Books: -7.00 AUD (settled)"
-            ]
-        );
-        assert_eq!(
-            content(&events[..1]),
-            content(&first.events),
-            "the transaction that the dropped scan delivered is read again with an equal version"
-        );
-    }
-
-    #[tokio::test]
-    async fn followed_holds_survive_a_rewind_and_a_hold_that_left_is_reported_once() {
+    async fn followed_holds_survive_a_stop_for_a_wrong_clock_and_a_hold_that_left_is_reported_once()
+    {
         let up = Harness::start(vec![
             held("example-hold-1", "Example Hotel", "-200.00", NOW - 2 * DAY),
             held("example-hold-2", "Example Motel", "-90.00", NOW - 3 * DAY),
         ])
         .await;
         let (_, saved) = up.scan(None, NOW).await;
-        let (_, saved) = up.scan(Some(&saved), NOW + 16 * DAY).await;
 
         up.world().delete("example-hold-2");
         let corrected = NOW + HOUR;
-        let (rewound, saved) = up.scan(Some(&saved), corrected).await;
-        assert_eq!(removals(&rewound), ["example-hold-2"]);
+        up.world().bank_time = Some(corrected - 60);
+        assert_stopped(&up, Some(&saved), corrected - 60 + 16 * DAY, CLOCK_DIFFERS).await;
+
+        up.world().bank_time = None;
+        let (after_the_stop, saved) = up.scan(Some(&saved), corrected).await;
+        assert_eq!(removals(&after_the_stop), ["example-hold-2"]);
 
         up.world().delete("example-hold-1");
         let (later, saved) = up.scan(Some(&saved), corrected + SPACING).await;
@@ -3025,7 +2813,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_hold_that_the_dropped_scan_had_listed_is_still_followed_after_the_rewind() {
+    async fn a_hold_that_a_scan_listed_before_a_stop_for_a_wrong_clock_is_still_followed_when_the_scan_continues()
+     {
         let up = Harness::start(vec![
             held("example-hold-1", "Example Hotel", "-200.00", NOW - 2 * HOUR),
             held("example-hold-2", "Example Motel", "-90.00", NOW - 3 * HOUR),
@@ -3041,17 +2830,21 @@ mod tests {
         );
 
         up.world().delete("example-hold-1");
-        let moved_back = NOW - HOUR;
-        let (rewound, saved) = up.scan(listed.checkpoint.as_ref(), moved_back).await;
-        let (next, saved) = up.scan(Some(&saved), moved_back + SPACING).await;
+        let real = NOW + SPACING + 60;
+        up.world().bank_time = Some(real);
+        assert_stopped(&up, listed.checkpoint.as_ref(), real - HOUR, CLOCK_DIFFERS).await;
+
+        up.world().bank_time = None;
+        let (continued, saved) = up.scan(listed.checkpoint.as_ref(), real + 60).await;
+        let (next, saved) = up.scan(Some(&saved), real + 60 + SPACING).await;
         assert_eq!(
-            removals(&[rewound, next].concat()),
+            removals(&[continued, next].concat()),
             ["example-hold-1"],
-            "the hold that the dropped scan had listed is looked up and reported once"
+            "the hold that the scan had listed is looked up and reported once"
         );
 
         up.world().delete("example-hold-2");
-        let (last, _) = up.scan(Some(&saved), moved_back + 2 * SPACING).await;
+        let (last, _) = up.scan(Some(&saved), real + 60 + 2 * SPACING).await;
         assert_eq!(removals(&last), ["example-hold-2"]);
     }
 
@@ -3312,7 +3105,7 @@ mod tests {
 
         let same_state_in_the_current_format = SourceCheckpoint {
             value: format!(
-                r#"{head}"reread_at":1795000000,"window":{{"resting":{{"since":1794913600,"not_before":1795000300}}}},"kept":{{"unseen":{{"example-transaction-1":{{"created_at":1794740800,"summary":"Example Hotel: -200.00 AUD"}}}},"seen":{{}}}}}}"#
+                r#"{head}"clock":"checked","reread_at":1795000000,"window":{{"resting":{{"since":1794913600,"not_before":1795000300}}}},"kept":{{"unseen":{{"example-transaction-1":{{"created_at":1794740800,"summary":"Example Hotel: -200.00 AUD"}}}},"seen":{{}}}}}}"#
             ),
         };
         let (events, _) = up
@@ -3674,6 +3467,66 @@ mod tests {
             .map(|day| format!("example-day-{day:02}"))
             .collect();
         assert_eq!(delivered, expected);
+    }
+
+    #[tokio::test]
+    async fn a_clock_that_swings_inside_the_five_minutes_during_a_scan_keeps_the_scan_and_what_it_learned_from_removed_holds()
+     {
+        let mut holds: Vec<Row> = (0..4)
+            .map(|number| {
+                held(
+                    &format!("example-hold-{number}"),
+                    "Example Hotel",
+                    "-200.00",
+                    NOW - HOUR + number,
+                )
+            })
+            .collect();
+        let up = Harness::start(holds.clone()).await;
+        let (_, saved) = up.scan(None, NOW).await;
+        holds.push(held(
+            "example-hold-4",
+            "Example Motel",
+            "-90.00",
+            NOW + 19 * DAY - HOUR,
+        ));
+        up.world().rows.push(holds[4].clone());
+        let (_, saved) = up.scan(Some(&saved), NOW + 19 * DAY).await;
+
+        let later = NOW + 20 * DAY;
+        for (number, hold) in holds.iter().enumerate() {
+            up.world().delete(&hold.id);
+            up.world().rows.push(settled(
+                &format!("example-settlement-{number}"),
+                "Example Hotel",
+                "-200.00",
+                hold.created,
+            ));
+        }
+        up.world().bank_time = Some(later);
+        let lookups = up.poll_to_lookups(&saved, later + 290).await;
+        let first_four = up.poll(Some(&lookups), later + 290).await;
+        assert_eq!(first_four.coverage, SourceCoverage::More);
+        assert_eq!(removals(&first_four.events).len(), 4);
+
+        let (last, saved) = up.scan(first_four.checkpoint.as_ref(), later - 200).await;
+        assert_eq!(removals(&last).len(), 1);
+
+        up.world().bank_time = None;
+        let (next, _) = up.scan(Some(&saved), later + 2 * SPACING).await;
+        let mut settlements: Vec<&str> = next.iter().map(|event| event.id.as_str()).collect();
+        settlements.sort_unstable();
+        assert_eq!(
+            settlements,
+            [
+                "example-settlement-0",
+                "example-settlement-1",
+                "example-settlement-2",
+                "example-settlement-3",
+                "example-settlement-4",
+            ],
+            "the next scan reads back to the oldest hold that the scan found removed"
+        );
     }
 
     #[tokio::test]
