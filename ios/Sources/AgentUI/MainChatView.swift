@@ -141,12 +141,13 @@ public struct MainChatView: View {
             .overlay(alignment: .bottom) { Divider() }
           }
         } else if let shown = model.scope.coordinator,
-          let profile = model.profiles.first(where: { $0.id == shown }),
-          laneState(profile) != nil
+          let profile = model.profiles.first(where: { $0.id == shown })
         {
-          laneStatus(profile)
-            .background(.background)
-            .overlay(alignment: .bottom) { Divider() }
+          if laneState(profile) != nil {
+            laneStatus(profile)
+              .background(.background)
+              .overlay(alignment: .bottom) { Divider() }
+          }
         } else if let status = connectionStatus {
           HStack(spacing: 8) {
             ProgressView().controlSize(.mini)

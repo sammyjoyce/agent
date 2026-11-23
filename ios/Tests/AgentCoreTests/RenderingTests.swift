@@ -1082,6 +1082,108 @@
       }
 
       @MainActor @Test(.timeLimit(.minutes(1)))
+      func aQuietCoordinatorShownAloneGetsNoBannerWhileAnotherPairs() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let suite = "one-scope-pairing-\(UUID())"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer {
+          defaults.removePersistentDomain(forName: suite)
+          try? FileManager.default.removeItem(at: root)
+        }
+        let workPeer = FixtureCoordinator()
+        let personalPeer = FixtureCoordinator()
+        let (workListener, workEndpoint) = try await listen(workPeer)
+        let (personalListener, personalEndpoint) = try await listen(personalPeer)
+        defer {
+          workListener.cancel()
+          personalListener.cancel()
+        }
+        let workAddress = try CoordinatorAddress(host: "100.64.1.2")
+        let personalAddress = try CoordinatorAddress(host: "100.64.1.3")
+        var work = CoordinatorProfile(name: try TagName("Work"), address: workAddress)
+        let personal = CoordinatorProfile(name: try TagName("Personal"), address: personalAddress)
+        work.pin = workPeer.id
+        try writePrivately(
+          JSONEncoder().encode(Coordinators.SavedProfiles(profiles: [work, personal])),
+          to: root.appending(path: "Agent/profiles.json"))
+        let reply = NativeEventHistory(
+          messages: [
+            .init(
+              continuation: false, entryId: "work-reply", finalChunk: true, role: .final,
+              text: "An invented Work reply")
+          ], nextCursor: nil, pageComplete: true)
+        await workPeer.replyToHistory(initial: reply, pages: [:])
+        await workPeer.replyToLatest(reply)
+        await personalPeer.holdNextIdentity()
+        let transport = CoordinatorTransport { address in
+          let endpoint = address == workAddress ? workEndpoint : personalEndpoint
+          return LineConnection(connection: NWConnection(to: endpoint, using: .tcp))
+        }
+        let notifications = AppNotifications(
+          defaults: defaults, applicationSupport: root, caches: root, transport: transport)
+        let coordinators = notifications.coordinators
+        let chat = coordinators.chat
+        await coordinators.setActive(true)
+        for _ in 0..<100 {
+          if chat.snapshots[work.id]?.connection == .connected, await personalPeer.identityHeld {
+            break
+          }
+          try await Task.sleep(for: .milliseconds(50))
+        }
+        chat.show(.one(work.id))
+        let host = UIHostingController(rootView: MainChatView(notifications: notifications))
+        let scene = try #require(
+          UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let previousWindow = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer {
+          window.isHidden = true
+          window.rootViewController = nil
+          previousWindow?.makeKey()
+        }
+        func views<Kind: UIView>(_ kind: Kind.Type, in view: UIView) -> [Kind] {
+          (view as? Kind).map { [$0] } ?? view.subviews.flatMap { views(kind, in: $0) }
+        }
+        for _ in 0..<100 {
+          host.view.layoutIfNeeded()
+          if chat.rows.contains(where: { $0.row.text == "An invented Work reply" }),
+            views(UIScrollView.self, in: host.view).contains(where: { $0.contentSize.height > 0 })
+          {
+            break
+          }
+          try await Task.sleep(for: .milliseconds(50))
+        }
+        try await Task.sleep(for: .milliseconds(500))
+        host.view.layoutIfNeeded()
+        #expect(chat.scope == .one(work.id))
+        #expect(chat.snapshots[work.id]?.connection == .connected)
+        #expect(coordinators.profiles.first { $0.id == personal.id }?.pin == nil)
+        #expect(coordinators.pairingError[personal.id] == nil)
+        #expect(await personalPeer.identityHeld, "Personal's pairing is not in flight")
+        let transcript = try #require(
+          views(UIScrollView.self, in: host.view).first { $0.contentSize.height > 0 })
+        let titleBar = try #require(views(UINavigationBar.self, in: host.view).first)
+        let feedTop =
+          transcript.convert(transcript.bounds, to: nil).minY + transcript.adjustedContentInset.top
+        let titleBarBottom = titleBar.convert(titleBar.bounds, to: nil).maxY
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 2
+        let image = UIGraphicsImageRenderer(size: host.view.bounds.size, format: format).image {
+          _ in
+          #expect(host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true))
+        }
+        Attachment.record(
+          try #require(image.cgImage), named: "one-scope-while-another-pairs", as: .png)
+        #expect(
+          abs(feedTop - titleBarBottom) < 1,
+          "The feed starts \(feedTop - titleBarBottom) points under the title bar, behind a banner")
+        await coordinators.setActive(false)
+        await personalPeer.releaseIdentity()
+      }
+
+      @MainActor @Test(.timeLimit(.minutes(1)))
       func aColdLaunchTapIsSeen() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         let suite = "cold-alert-\(UUID())"
