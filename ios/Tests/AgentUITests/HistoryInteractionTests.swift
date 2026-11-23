@@ -857,6 +857,30 @@ final class HistoryInteractionTests: XCTestCase {
     return try XCTUnwrap(
       nil as CGRect?, "No row came to rest across the height \(y)", file: file, line: line)
   }
+  private func screenIsBlank(in area: CGRect, of app: XCUIApplication) throws -> Bool {
+    let image = try XCTUnwrap(XCUIScreen.main.screenshot().image.cgImage)
+    let scale = CGFloat(image.width) / app.frame.width
+    var pixels = [UInt8](repeating: 0, count: image.width * image.height * 4)
+    let context = try XCTUnwrap(
+      CGContext(
+        data: &pixels, width: image.width, height: image.height, bitsPerComponent: 8,
+        bytesPerRow: image.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+    context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+    var darkest = [255, 255, 255]
+    var lightest = [0, 0, 0]
+    for y in Int(area.minY * scale)..<Int(area.maxY * scale) {
+      for x in Int(area.minX * scale)..<Int(area.maxX * scale) {
+        for channel in 0..<3 {
+          let value = Int(pixels[(y * image.width + x) * 4 + channel])
+          darkest[channel] = min(darkest[channel], value)
+          lightest[channel] = max(lightest[channel], value)
+        }
+      }
+    }
+    let faintestVisibleInk = 32
+    return zip(lightest, darkest).allSatisfy { $0 - $1 < faintestVisibleInk }
+  }
   func testLongSingleNoticeRemainsDraggableThroughKeyboardAndRevision() async throws {
     continueAfterFailure = true
     let peer = InteractionPeer()
@@ -2814,7 +2838,12 @@ final class HistoryInteractionTests: XCTestCase {
             text: String(decoding: try JSONEncoder().encode(output), as: UTF8.self),
             truncated: false)),
         status: .finished))
-    var messages = [
+    var messages = (1...14).map { index in
+      HistoryMessage(
+        continuation: false, entryId: "lead-\(index)", finalChunk: true, role: .final,
+        text: "Lead filler message \(index) that lets the shell card move down to the button.")
+    }
+    messages += [
       HistoryMessage(
         continuation: false, entryId: "e-shell", finalChunk: true,
         presentation: .command(.init(command: "printf test", durationMs: 5, exitCode: 0)),
@@ -2838,14 +2867,15 @@ final class HistoryInteractionTests: XCTestCase {
     let app = try await launchMessages(messages, toolDetails: ["shell-overlap": details])
     let transcript = app.scrollViews["transcript"]
     XCTAssertTrue(transcript.waitForExistence(timeout: 5))
-    for _ in 0..<6
-    where !app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'activity:'")).firstMatch
-      .exists
-    {
-      transcript.swipeDown()
+    try await eventually(description: "live tail") {
+      app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'Tail filler message 14 '"))
+        .firstMatch.isHittable
     }
     let firstGroup = feedButton("activity", row: "tool:shell-overlap", app: app)
-    XCTAssertTrue(firstGroup.waitForExistence(timeout: 5))
+    for _ in 0..<10 where !firstGroup.exists { slowDrag(transcript, by: 200) }
+    _ = try scroll(
+      transcript, until: { firstGroup.exists ? firstGroup.frame : nil },
+      liesAcross: transcript.frame.midY)
     firstGroup.tap()
     let shellItem = feedButton("activity-item", row: "tool:shell-overlap", app: app)
     XCTAssertTrue(shellItem.waitForExistence(timeout: 3))
@@ -2854,11 +2884,25 @@ final class HistoryInteractionTests: XCTestCase {
     XCTAssertTrue(shellText.waitForExistence(timeout: 5))
     let latest = app.buttons["latest-messages"]
     XCTAssertTrue(latest.waitForExistence(timeout: 5))
-    XCTAssertFalse(latest.frame.intersects(shellText.frame), "Latest pill overlapped shell output")
+    func screenBesideLatest() -> CGRect {
+      CGRect(
+        x: transcript.frame.minX, y: latest.frame.minY,
+        width: latest.frame.minX - 8 - transcript.frame.minX, height: latest.frame.height)
+    }
+    _ = try scroll(
+      transcript, until: { shellText.exists ? shellText.frame : nil },
+      liesAcross: latest.frame.midY)
+    XCTAssertTrue(
+      try screenIsBlank(in: screenBesideLatest(), of: app),
+      "Shell output is drawn at the height of the Latest button, which covers its line ends")
     let collapsedGroup = feedButton("activity", row: "tool:collapsed-call", app: app)
-    XCTAssertTrue(collapsedGroup.waitForExistence(timeout: 5), app.debugDescription)
-    XCTAssertFalse(
-      latest.frame.intersects(collapsedGroup.frame), "Latest pill overlapped disclosure row")
+    _ = try scroll(
+      transcript, until: { collapsedGroup.exists ? collapsedGroup.frame : nil },
+      liesAcross: latest.frame.midY)
+    XCTAssertTrue(
+      try screenIsBlank(in: screenBesideLatest(), of: app),
+      "A collapsed activity row is drawn at the height of the Latest button, which covers its "
+        + "disclosure control")
   }
 
   func testConnectionBannersStayClearOfScrolledTranscriptTopLine() async throws {

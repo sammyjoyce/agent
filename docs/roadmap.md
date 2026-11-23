@@ -124,8 +124,10 @@ outside this repository by evidence ID.
   collapsed activity rows and the right side of the bottom two lines inside an
   expanded `Shell` card. *Acceptance:* `↓ Latest` remains legible above the tail
   without overlapping `Shell` output text or row disclosure controls. *(Fix
-  implemented and verified via Simulator XCUI geometry test; tick after
-  verification on a physical iPhone.)*
+  implemented. A Simulator XCUI test moves `Shell` output and a collapsed
+  activity row to the height of `↓ Latest` and finds nothing drawn beside the
+  button; it fails without the fix. Tick after verification on a physical
+  iPhone.)*
 - [ ] **`UI-004` (Low-Medium, observed, `EVID-20261120-O1`) — Consecutive
   reasoning summaries concatenate with literal `****`.** Back-to-back bolded
   reasoning summaries in one activity group render inline on a single line with
@@ -139,8 +141,10 @@ outside this repository by evidence ID.
   sit flush against or overlap the top visible message line before shifting the
   feed on clear. *Acceptance:* Connection status banners reserve dedicated
   vertical space above the transcript with no text or spinner collision. *(Fix
-  implemented and verified via Simulator XCUI geometry test; tick after
-  verification on a physical iPhone.)*
+  implemented: the banner has an opaque background and a divider. The Simulator
+  does not show the collision, so the Simulator XCUI geometry test passes with
+  and without the change and does not verify the fix. The pass on a physical
+  iPhone decides; tick after it.)*
 - [ ] **`UI-006` and `UI-007` (Blocked device trials, `EVID-20261120-B3`,
   `EVID-20261120-BLOCK`) — Cold relaunch, scope switching and live-stream detail
   anchoring.** Complete the physical-iPhone checks interrupted when mirroring
