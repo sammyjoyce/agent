@@ -779,7 +779,7 @@ final class ComposerInteractionTests: XCTestCase {
     await work.toolDetails(["anchor-shell": details])
     defer { app.terminate() }
 
-    let scopeMenu = app.buttons["All coordinators"]
+    let scopeMenu = app.buttons["scopeMenu"]
     XCTAssertTrue(scopeMenu.waitForExistence(timeout: 5), app.debugDescription)
     scopeMenu.tap()
     let workOption = app.buttons["Work"]
