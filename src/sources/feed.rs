@@ -9,6 +9,11 @@
 //!
 //! A source supplies the request for a page, the parse of an item, and its text.
 
+use std::{
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
+
 use anyhow::{Result, ensure};
 use chrono::DateTime;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -35,6 +40,10 @@ const SCAN_SPACING_SECONDS: u64 = 300;
 /// clock. A lower bound in the future would exclude current items, and a wait
 /// for the clock to reach it would leave a gap as long as the wait. So the feed
 /// starts again from the current clock and reads its reread window.
+///
+/// It is also how far the computer's clock may differ from the service's
+/// clock. Each scan reads from `OVERLAP_SECONDS` before the scan before it
+/// began, so a clock that is wrong by less opens no gap.
 const CLOCK_TOLERANCE_SECONDS: u64 = 300;
 /// One scan in this period reads the source's whole reread window again. It
 /// finds an item that the service lists late with an old creation time.
@@ -48,6 +57,44 @@ pub(crate) const PAGE_SIZE: &str = "100";
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct ScanMemory {}
+
+pub(crate) type Monotonic<'a> = &'a (dyn Fn() -> Duration + Sync);
+
+pub(crate) fn process_clock() -> Duration {
+    static STARTED: LazyLock<Instant> = LazyLock::new(Instant::now);
+    STARTED.elapsed()
+}
+
+/// The time of one poll. The computer's clock is read once, when the poll
+/// starts. Every later time of the poll is that reading plus what has passed
+/// on the monotonic clock. So a clock that is set during a poll changes no
+/// time that the poll compares or saves, and a slow credential command does
+/// not look like a wrong clock.
+pub(crate) struct PollClock<'a> {
+    unix_time_at_start: Duration,
+    monotonic_at_start: Duration,
+    monotonic: Monotonic<'a>,
+}
+
+impl<'a> PollClock<'a> {
+    pub(crate) fn start(unix_time: Duration, monotonic: Monotonic<'a>) -> Self {
+        Self {
+            unix_time_at_start: unix_time,
+            monotonic_at_start: monotonic(),
+            monotonic,
+        }
+    }
+
+    fn now(&self) -> u64 {
+        let passed = (self.monotonic)().saturating_sub(self.monotonic_at_start);
+        self.unix_time_at_start.saturating_add(passed).as_secs()
+    }
+}
+
+/// A poll clock that agreed with the service's clock. Only `check_clock`
+/// makes one and `advance` needs one, so a poll under a clock that failed
+/// the check saves nothing.
+pub(crate) struct CheckedClock<'a>(&'a PollClock<'a>);
 
 /// The state of one feed while a scan runs.
 ///
@@ -207,10 +254,11 @@ where
         saved: Option<&SourceCheckpoint>,
         key: &SourceKey,
         scope: &str,
-        now: u64,
+        clock: &PollClock<'_>,
         reread_seconds: u64,
         begin: impl FnOnce(&P, u64) -> (u64, S),
     ) -> Result<Turn<P, S>, FeedFailure> {
+        let now = clock.now();
         let Some(checkpoint) = saved else {
             let origin = now.saturating_sub(FIRST_LOOKBACK_SECONDS);
             let kept = P::default();
@@ -306,14 +354,30 @@ where
         }
     }
 
+    /// Compares the computer's clock with `sent_at`, the time in the `Date`
+    /// header of a reply from the service. After a failure the poll must make
+    /// no further request.
+    pub(crate) fn check_clock<'c>(
+        &self,
+        clock: &'c PollClock<'c>,
+        sent_at: Option<u64>,
+    ) -> Result<CheckedClock<'c>, FeedFailure> {
+        let sent_at = sent_at.ok_or(FeedFailure::NoDate)?;
+        if clock.now().abs_diff(sent_at) > CLOCK_TOLERANCE_SECONDS {
+            return Err(FeedFailure::ClockDiffers);
+        }
+        Ok(CheckedClock(clock))
+    }
+
     /// Ends a successful poll call. The only place a feed checkpoint is serialized.
     pub(crate) fn advance(
         self,
         key: SourceKey,
         events: Vec<SourceEvent>,
         step: Step,
-        now: u64,
+        clock: &CheckedClock<'_>,
     ) -> Result<SourceBatch, Stop> {
+        let now = clock.0.now();
         let Scan {
             started_at,
             since,
@@ -513,6 +577,8 @@ pub(crate) enum FeedFailure {
     Http(HttpFailure),
     /// The saved checkpoint does not parse, or has another account, scope or owner.
     ForeignCheckpoint,
+    NoDate,
+    ClockDiffers,
     /// A cursor or page link that is too long, malformed, or outside the API.
     BadCursor,
     /// The scan used `MAX_SCAN_PAGES` poll calls.
@@ -569,6 +635,12 @@ impl FeedFailure {
             Self::ForeignCheckpoint => format!(
                 "{label} checkpoint belongs to another account or configuration; change the account label to start a fresh seven-day read."
             ),
+            Self::NoDate => {
+                format!("{label}'s reply carried no usable Date header; checkpoint retained.")
+            }
+            Self::ClockDiffers => format!(
+                "This computer's clock differs from {label}'s clock by more than five minutes; check the clock. Checkpoint retained."
+            ),
             Self::BadCursor => {
                 format!(
                     "{label} sent a page link this source will not follow; checkpoint retained."
@@ -592,6 +664,8 @@ impl FeedFailure {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
 
     const NOW: u64 = 1_795_000_000;
@@ -611,10 +685,19 @@ mod tests {
         scanning_with_reread(saved, now, REREAD)
     }
 
+    fn poll_in_new_process_at(now: u64) -> PollClock<'static> {
+        PollClock::start(Duration::from_secs(now), &|| Duration::ZERO)
+    }
+
     fn scanning_with_reread(saved: Option<&SourceCheckpoint>, now: u64, reread: u64) -> Checkpoint {
-        match Checkpoint::load(saved, &key(), "scope-a", now, reread, |_, since| {
-            (since, None)
-        }) {
+        match Checkpoint::load(
+            saved,
+            &key(),
+            "scope-a",
+            &poll_in_new_process_at(now),
+            reread,
+            |_, since| (since, None),
+        ) {
             Ok(Turn::Scan(checkpoint)) => checkpoint,
             Ok(Turn::Rest(_)) => panic!("the feed rests"),
             Err(failure) => panic!("{}", failure.message("Example")),
@@ -622,16 +705,26 @@ mod tests {
     }
 
     fn refusal(saved: &SourceCheckpoint, key: &SourceKey, scope: &str) -> String {
-        match Checkpoint::load(Some(saved), key, scope, NOW, REREAD, |_, since| {
-            (since, None)
-        }) {
+        match Checkpoint::load(
+            Some(saved),
+            key,
+            scope,
+            &poll_in_new_process_at(NOW),
+            REREAD,
+            |_, since| (since, None),
+        ) {
             Err(failure) => failure.message("Example"),
             Ok(_) => panic!("the checkpoint was accepted"),
         }
     }
 
     fn saved_after(checkpoint: Checkpoint, step: Step, now: u64) -> SourceBatch {
-        match checkpoint.advance(key(), Vec::new(), step, now) {
+        let clock = poll_in_new_process_at(now);
+        let checked = match checkpoint.check_clock(&clock, Some(now)) {
+            Ok(checked) => checked,
+            Err(failure) => panic!("{}", failure.message("Example")),
+        };
+        match checkpoint.advance(key(), Vec::new(), step, &checked) {
             Ok(batch) => batch,
             Err(stop) => panic!("{}", stop.failure.message("Example")),
         }
@@ -755,9 +848,14 @@ mod tests {
         let done = saved_after(scanning(None, NOW), Step::Done { floor: None }, NOW + 10);
         let saved = done.checkpoint.unwrap();
         let load = |now| {
-            Checkpoint::load(Some(&saved), &key(), "scope-a", now, REREAD, |_, since| {
-                (since, None)
-            })
+            Checkpoint::load(
+                Some(&saved),
+                &key(),
+                "scope-a",
+                &poll_in_new_process_at(now),
+                REREAD,
+                |_, since| (since, None),
+            )
         };
 
         match load(NOW + 10 + SCAN_SPACING_SECONDS - 1) {
@@ -819,7 +917,7 @@ mod tests {
                 Some(&resting),
                 &key(),
                 "scope-a",
-                NOW + 1,
+                &poll_in_new_process_at(NOW + 1),
                 REREAD,
                 |_, since| { (since, None) }
             ),
@@ -967,7 +1065,7 @@ mod tests {
                 saved.checkpoint.as_ref(),
                 &key(),
                 "scope-a",
-                now,
+                &poll_in_new_process_at(now),
                 REREAD,
                 |_, since| (since, None),
             )
@@ -1000,6 +1098,64 @@ mod tests {
             "the rewind read the whole window, so no reread is due for a day"
         );
         assert_eq!(since_at(later + DAY), later + DAY - REREAD);
+    }
+
+    #[test]
+    fn a_poll_keeps_one_reading_of_the_clock_and_adds_monotonic_time() {
+        let monotonic = AtomicU64::new(1_000);
+        let read = || Duration::from_secs(monotonic.load(Ordering::Relaxed));
+        let clock = PollClock::start(Duration::from_secs(NOW), &read);
+        let first = match Checkpoint::load(None, &key(), "scope-a", &clock, REREAD, |_, since| {
+            (since, None)
+        }) {
+            Ok(Turn::Scan(checkpoint)) => checkpoint,
+            _ => panic!("the first poll scans"),
+        };
+        assert_eq!(first.scan.started_at, NOW);
+
+        monotonic.store(1_890, Ordering::Relaxed);
+        let agrees = |sent_at| first.check_clock(&clock, sent_at).map(|_| ());
+        assert_eq!(agrees(None), Err(FeedFailure::NoDate));
+        assert_eq!(agrees(Some(NOW + 890 + 300)), Ok(()));
+        assert_eq!(agrees(Some(NOW + 890 - 300)), Ok(()));
+        assert_eq!(
+            agrees(Some(NOW + 890 + 301)),
+            Err(FeedFailure::ClockDiffers)
+        );
+        assert_eq!(
+            agrees(Some(NOW + 890 - 301)),
+            Err(FeedFailure::ClockDiffers)
+        );
+        assert_eq!(
+            agrees(Some(NOW)),
+            Err(FeedFailure::ClockDiffers),
+            "890 seconds passed since the poll read the clock"
+        );
+
+        let checked = first.check_clock(&clock, Some(NOW + 890)).unwrap();
+        monotonic.store(1_900, Ordering::Relaxed);
+        let Ok(done) = first.advance(key(), Vec::new(), Step::Done { floor: None }, &checked)
+        else {
+            panic!("the checkpoint is saved");
+        };
+        let rests_at = |now| {
+            matches!(
+                Checkpoint::load(
+                    done.checkpoint.as_ref(),
+                    &key(),
+                    "scope-a",
+                    &poll_in_new_process_at(now),
+                    REREAD,
+                    |_, since| (since, None),
+                ),
+                Ok(Turn::Rest(_))
+            )
+        };
+        assert!(
+            rests_at(NOW + 900 + SCAN_SPACING_SECONDS - 1),
+            "the spacing counts from the end of the poll, 900 monotonic seconds after its start"
+        );
+        assert!(!rests_at(NOW + 900 + SCAN_SPACING_SECONDS));
     }
 
     #[test]
@@ -1180,6 +1336,14 @@ mod tests {
             (
                 FeedFailure::ForeignCheckpoint,
                 "Example checkpoint belongs to another account or configuration; change the account label to start a fresh seven-day read.",
+            ),
+            (
+                FeedFailure::NoDate,
+                "Example's reply carried no usable Date header; checkpoint retained.",
+            ),
+            (
+                FeedFailure::ClockDiffers,
+                "This computer's clock differs from Example's clock by more than five minutes; check the clock. Checkpoint retained.",
             ),
             (
                 FeedFailure::BadCursor,

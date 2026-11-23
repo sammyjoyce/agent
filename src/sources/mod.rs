@@ -681,10 +681,13 @@ pub(crate) fn parse_timestamp_ms(value: &str) -> Option<u64> {
 }
 
 fn now_seconds() -> Result<u64> {
-    Ok(SystemTime::now()
+    Ok(unix_time()?.as_secs())
+}
+
+fn unix_time() -> Result<Duration> {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .context("System clock precedes the Unix epoch")?
-        .as_secs())
+        .context("System clock precedes the Unix epoch")
 }
 
 #[cfg(test)]

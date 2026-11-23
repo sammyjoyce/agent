@@ -26,9 +26,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::sources::{
     Source, SourceBatch, SourceCheckpoint, SourceEvent, SourceKey,
-    feed::{self, Cursor, FeedCheckpoint, FeedFailure, FeedItem, Step, Stop, Turn},
+    feed::{
+        self, CheckedClock, Cursor, FeedCheckpoint, FeedFailure, FeedItem, PollClock, Step, Stop,
+        Turn,
+    },
     http::{HttpApi, HttpFailure, Reply, Session, Target, UrlRule},
-    now_seconds, parse_timestamp_ms,
+    parse_timestamp_ms, unix_time,
 };
 
 const LABEL: &str = "Up";
@@ -53,9 +56,6 @@ const REREAD_SECONDS: u64 = 14 * 86_400;
 const MAX_ID_BYTES: usize = 128;
 const MAX_SUMMARY_CHARS: usize = 160;
 
-/// The time after the last response of a `poll` call.
-type Clock<'a> = &'a (dyn Fn() -> u64 + Sync);
-
 #[derive(Debug)]
 pub struct UpSource {
     account: String,
@@ -78,31 +78,16 @@ impl UpSource {
         Ok(Self { account, api })
     }
 
-    #[cfg(test)]
-    async fn poll_at(
-        &self,
-        saved: Option<&SourceCheckpoint>,
-        now: u64,
-        monotonic: Clock<'_>,
-        _scans: &feed::ScanMemory,
-    ) -> SourceBatch {
-        let began = monotonic();
-        let after_response = || now + monotonic().saturating_sub(began);
-        let step = self.step(saved, now, &after_response).await;
-        feed::settle(LABEL, self.key(), step)
-    }
-
     /// The identity check, and then one request or up to `LOOKUPS_PER_POLL` lookups.
     async fn step(
         &self,
         saved: Option<&SourceCheckpoint>,
-        now: u64,
-        clock: Clock<'_>,
+        clock: &PollClock<'_>,
     ) -> Result<SourceBatch, Stop> {
         let key = self.key();
         let scope = feed::scope(&[&self.api.fingerprint()]);
         let begin = |_: &Followed, since: u64| (since, UpScan::default());
-        let loaded = Checkpoint::load(saved, &key, &scope, now, REREAD_SECONDS, begin)?;
+        let loaded = Checkpoint::load(saved, &key, &scope, clock, REREAD_SECONDS, begin)?;
         let mut checkpoint = match loaded {
             Turn::Rest(batch) => return Ok(batch),
             Turn::Scan(checkpoint) => checkpoint,
@@ -110,9 +95,12 @@ impl UpSource {
         // The credential command runs for every `poll` call and can print the
         // token of another customer at any of them. So every call asks whose
         // token it holds before it reads a transaction with that token. Only
-        // a hash of the customer id is kept.
+        // a hash of the customer id is kept. The reply to the same request
+        // carries Up's clock, which this computer's clock must agree with
+        // before the poll reads or saves anything.
         let session = self.api.open().await?;
-        let (reply, _) = session.get_dated(&Target::fixed("/util/ping")).await?;
+        let (reply, sent_at) = session.get_dated(&Target::fixed("/util/ping")).await?;
+        let clock = &checkpoint.check_clock(clock, sent_at)?;
         let ping: Ping = reply.json()?;
         if ping.meta.id.is_empty() {
             return Err(HttpFailure::Unreadable.into());
@@ -150,7 +138,7 @@ impl UpSource {
                 } else {
                     Step::Next(None)
                 };
-                checkpoint.advance(key, events, step, clock())
+                checkpoint.advance(key, events, step, clock)
             }
         }
     }
@@ -161,7 +149,7 @@ impl UpSource {
         mut checkpoint: Checkpoint,
         first: Target,
         key: SourceKey,
-        clock: Clock<'_>,
+        clock: &CheckedClock<'_>,
     ) -> Result<SourceBatch, Stop> {
         let target = match &checkpoint.scan.cursor {
             Some(cursor) => saved_page(cursor)?,
@@ -176,7 +164,7 @@ impl UpSource {
             return if checkpoint.scan.restarted() {
                 Err(FeedFailure::Fixed(REFUSED_AGAIN).into())
             } else {
-                checkpoint.advance(key, Vec::new(), Step::Restart, clock())
+                checkpoint.advance(key, Vec::new(), Step::Restart, clock)
             };
         }
         let page: Page = reply.json()?;
@@ -185,7 +173,7 @@ impl UpSource {
             return Err(Stop::after(listed.events, failure));
         }
         match after_listing(&mut checkpoint, page.links.next.as_deref(), &self.api) {
-            Ok(step) => checkpoint.advance(key, listed.events, step, clock()),
+            Ok(step) => checkpoint.advance(key, listed.events, step, clock),
             Err(failure) => Err(Stop::after(listed.events, failure)),
         }
     }
@@ -213,11 +201,8 @@ impl Source for UpSource {
     }
 
     async fn poll(&self, checkpoint: Option<&SourceCheckpoint>) -> Result<SourceBatch> {
-        let now = now_seconds()?;
-        // The spacing of scans counts from the end of a scan, so the time is
-        // read again after the last response.
-        let after_response = || now_seconds().unwrap_or(now);
-        let step = self.step(checkpoint, now, &after_response).await;
+        let clock = PollClock::start(unix_time()?, &feed::process_clock);
+        let step = self.step(checkpoint, &clock).await;
         Ok(feed::settle(LABEL, self.key(), step))
     }
 }
@@ -765,6 +750,7 @@ mod tests {
             Arc, Mutex,
             atomic::{AtomicBool, AtomicU64, Ordering},
         },
+        time::Duration,
     };
 
     use serde_json::{Value, json};
@@ -780,6 +766,7 @@ mod tests {
                 Canned, FakeApi, Seen, credential_script, curl_shim, failing_credential_script,
                 proxied_curl, query_of, shim_runs,
             },
+            now_seconds,
         },
     };
 
@@ -796,6 +783,19 @@ mod tests {
     const CLOCK_DIFFERS: &str = "This computer's clock differs from Up's clock by more than five minutes; check the clock. Checkpoint retained.";
     const NO_DATE: &str = "Up's reply carried no usable Date header; checkpoint retained.";
     const REMOVED_TEXT: &str = "Status: hold removed\nUp no longer lists this held transaction. Up removes a hold when the merchant releases it, or when Up replaces it with a separate settled transaction.";
+
+    impl UpSource {
+        async fn poll_at(
+            &self,
+            saved: Option<&SourceCheckpoint>,
+            now: u64,
+            monotonic: feed::Monotonic<'_>,
+            _scans: &feed::ScanMemory,
+        ) -> SourceBatch {
+            let clock = PollClock::start(Duration::from_secs(now), monotonic);
+            feed::settle(LABEL, self.key(), self.step(saved, &clock).await)
+        }
+    }
 
     #[derive(Clone)]
     struct Row {
@@ -1154,8 +1154,8 @@ mod tests {
             saved: Option<&SourceCheckpoint>,
             now: u64,
         ) -> SourceBatch {
-            let monotonic = || self.monotonic.load(Ordering::Relaxed);
-            self.world().poll_began = Some((now, monotonic()));
+            let monotonic = || Duration::from_secs(self.monotonic.load(Ordering::Relaxed));
+            self.world().poll_began = Some((now, self.monotonic.load(Ordering::Relaxed)));
             let process = self.process.lock().unwrap().clone();
             source.poll_at(saved, now, &monotonic, &process).await
         }
@@ -2030,7 +2030,7 @@ mod tests {
         .unwrap();
 
         let unreachable = source
-            .poll_at(None, NOW, &|| 0, &ScanMemory::default())
+            .poll_at(None, NOW, &|| Duration::ZERO, &ScanMemory::default())
             .await;
 
         assert_eq!(
@@ -3060,7 +3060,7 @@ mod tests {
         let up = Harness::start(Vec::new()).await;
         up.script(|seen| {
             seen.query("filter[status]")
-                .map(|_| empty_page().delayed(std::time::Duration::from_millis(2_500)))
+                .map(|_| empty_page().delayed(Duration::from_millis(2_500)))
         });
         let source = up.source();
         let mut saved = None;
