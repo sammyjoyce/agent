@@ -60,6 +60,7 @@ public struct ChatSnapshot: Sendable {
   public var sources: [SourceState] = []
   public var settingsSupported = false
   public var workInspectionSupported = false
+  public var dreamsSupported = false
   public var settings: NativeSettingsSnapshot?
   public var error: String?
   /// The coordinator this profile's address answers as, while that is not its pin. The session
@@ -1294,6 +1295,7 @@ public actor CoordinatorSession {
     acceptedInputOrigins = []
     snapshot.settingsSupported = false
     snapshot.workInspectionSupported = false
+    snapshot.dreamsSupported = false
     snapshot.settings = nil
   }
 
@@ -1331,14 +1333,49 @@ public actor CoordinatorSession {
     return page
   }
 
+  public func dreamsList() async throws -> NativeEventDreamsList {
+    let event = try await dreamsControl(.dreamsList)
+    guard case .dreamsList(let list) = event else { throw ConnectionError.incompleteFrame }
+    return list
+  }
+
+  public func dreamsShow(_ run: String) async throws -> DreamsRunDetail {
+    let event = try await dreamsControl(.dreamsShow(.init(run: run)))
+    guard case .dreamsShow(let show) = event else { throw ConnectionError.incompleteFrame }
+    return show.report
+  }
+
+  public func dreamsApply(run: String, approve: String) async throws -> NativeEventDreamsApplied {
+    let event = try await dreamsControl(.dreamsApply(.init(approve: approve, run: run)))
+    guard case .dreamsApplied(let applied) = event else { throw ConnectionError.incompleteFrame }
+    return applied
+  }
+
   /// Each control owns a short-lived socket. It never enters the composer outbox
   /// or publishes control responses into the observed conversation.
   private func workControl(_ request: NativeRequest) async throws -> NativeEvent {
+    try await shortLivedControl(
+      request,
+      supported: snapshot.workInspectionSupported,
+      unsupportedMessage: "Update the coordinator to inspect scheduled jobs and saved work.")
+  }
+
+  private func dreamsControl(_ request: NativeRequest) async throws -> NativeEvent {
+    try await shortLivedControl(
+      request,
+      supported: snapshot.dreamsSupported,
+      unsupportedMessage: "Update the coordinator to inspect and apply Dreams proposals.")
+  }
+
+  private func shortLivedControl(
+    _ request: NativeRequest,
+    supported: Bool,
+    unsupportedMessage: String
+  ) async throws -> NativeEvent {
     guard snapshot.connection == .connected, actions.count + previewRequests.count < 32
     else { throw ConnectionError.closed }
-    guard snapshot.workInspectionSupported else {
-      throw CoordinatorRejection(
-        message: "Update the coordinator to inspect scheduled jobs and saved work.")
+    guard supported else {
+      throw CoordinatorRejection(message: unsupportedMessage)
     }
     let id = UUID()
     let generation = generation
@@ -1361,7 +1398,7 @@ public actor CoordinatorSession {
           case .notice(let notice) where notice.jobStatus != nil:
             guard result == nil else { throw ConnectionError.incompleteFrame }
             result = event
-          case .conversations:
+          case .conversations, .dreamsList, .dreamsShow, .dreamsApplied:
             guard result == nil else { throw ConnectionError.incompleteFrame }
             result = event
           case .done:
@@ -1603,6 +1640,7 @@ public actor CoordinatorSession {
       acceptedInputOrigins = Self.acceptedInputOrigins(value)
       snapshot.settingsSupported = value.conversationSettings == true
       snapshot.workInspectionSupported = value.workInspection == true
+      snapshot.dreamsSupported = value.dreams == true
       snapshot.model = value.model
       snapshot.busy = value.working ?? true
     case .working(let value):
@@ -1691,8 +1729,8 @@ public actor CoordinatorSession {
       snapshot.busy = false
       transcript.idle()
     // `VerifiedConnection` fails a socket that repeats `identity`, so it never arrives here.
-    case .attachment, .toolDetails, .conversations, .notifications, .serviceStatus, .disconnect,
-      .done, .identity:
+    case .attachment, .toolDetails, .conversations, .dreamsList, .dreamsShow, .dreamsApplied,
+      .notifications, .serviceStatus, .disconnect, .done, .identity:
       break
     }
     switch event {

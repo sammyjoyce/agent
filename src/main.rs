@@ -1021,6 +1021,7 @@ async fn run(mut arguments: Arguments) -> Result<()> {
                 jobs: startup_jobs(&config),
             }),
         };
+        let dreams = config.dreams_policy()?;
         return service::serve_configured(
             &script,
             claim,
@@ -1029,6 +1030,8 @@ async fn run(mut arguments: Arguments) -> Result<()> {
             daemon,
             rex,
             bootstrap,
+            dreams,
+            agent_cli::dreams::DreamsPolicySource::Config(arguments.config.clone()),
         )
         .await;
     }

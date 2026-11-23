@@ -257,10 +257,10 @@ branching conversations legible directly from the main chat.
 
 ### Dreams review and approval on iPhone
 
-- [ ] **Native iOS inspection and approval for [Dreams](setup.md#dreams).**
+- [x] **Native iOS inspection and approval for [Dreams](setup.md#dreams).**
   Browse nightly Dreams runs, inspect sealed proposals and approve them from the
-  iPhone app (today `dreams list`, `show` and `apply` exist only in the CLI
-  reading the coordinator's local state directory).
+  iPhone app. The CLI commands `dreams list`, `show` and `apply` remain, and
+  they read the coordinator's local state directory.
   - **Behavior.** List runs newest-first with window, coverage, outcome and
     proposal status (`pending`, `applied`, `stale`, `target_dirty`,
     `target_locked`, `patch_changed`, `policy_changed`). Opening a run shows
@@ -277,10 +277,11 @@ branching conversations legible directly from the main chat.
     generated Swift types. Keep Dreams reads and apply strictly on the
     authenticated coordinator boundary outside Pi's runtime and tool surface so
     no model or conversation tool can approve or apply a proposal.
+  - **Decided.** Remote approval is open to any authorized paired device over
+    the coordinator's service boundary (shipping alongside inspection).
   - **Open owner decisions.** Whether Dreams lives only under coordinator
     controls beside **Jobs and work** or also surfaces a notice when a nightly
-    run has a pending proposal, and whether to ship read-only inspection ahead
-    of remote apply.
+    run has a pending proposal.
 
 ### Targeted replies, sidechats and transcript fidelity
 

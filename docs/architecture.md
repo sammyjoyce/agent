@@ -881,13 +881,22 @@ channel to an actor that holds one. Tests cover each link.
 - The executor reads the target repository and writes only under
   `<state_dir>/dreams/runs/`. Its checks are the operator's programs from
   private configuration.
-- `dreams apply` is in the `beep-boop` binary, which the coordinator library
-  cannot link. It applies only the patch whose outcome digest a human passed,
-  onto the unchanged base.
+- Apply is outside Pi's runtime and tool surface, so no model or conversation
+  tool can approve or apply a proposal. `beep-boop dreams apply` works on the
+  state directory of the coordinator's machine and needs no running
+  coordinator. An authorized paired device sends its apply to the coordinator's
+  authenticated service boundary (`src/service/boundary.rs`). The command line
+  and the service use one engine (`src/dreams/apply.rs`). The engine applies
+  only the patch whose sealed outcome digest the approver passed, and only onto
+  the unchanged base. While the state directory is held after a restore, the
+  engine refuses an apply from the command line and from the service, until
+  `backup release`.
 
 Dreams does not claim more than that. The main, triage and worker actors still
 hold same-user shells, so each of them can run `beep-boop dreams apply` or edit
-the repository directly. A shell-bearing actor that reads a Dreams record reads
+the repository directly. The service gives every connection that it authorizes
+the same rights. So any machine that the service authorizes can send an apply
+with no person present, a worker's machine included. A shell-bearing actor that reads a Dreams record reads
 untrusted text, as it does with any email or web page. A check that executes an
 editable file runs proposed content before approval, so checks must treat
 candidate files as data. Approval is a digest typed by whoever runs the

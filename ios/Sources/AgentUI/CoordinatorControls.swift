@@ -32,6 +32,10 @@ struct CoordinatorControls: View {
   let model: ChatModel
   let lane: ProfileID
 
+  @State private var pendingDreams: Int?
+  @State private var dreamsRefresh = 0
+  @State private var hasLoadedDreamsBadge = false
+
   var body: some View {
     let snapshot = model.snapshots[lane]
     let connected = snapshot?.connection == .connected
@@ -41,6 +45,37 @@ struct CoordinatorControls: View {
       }
     } else if connected {
       Text("Update the coordinator to inspect scheduled jobs and saved work.").font(.footnote)
+    }
+    if snapshot?.dreamsSupported == true {
+      NavigationLink {
+        LaneScreen(model: model, lane: lane) { DreamsView(model: model, lane: lane) }
+      } label: {
+        HStack {
+          Text("Dreams")
+          if let pendingDreams, pendingDreams > 0 {
+            Spacer()
+            Text("\(pendingDreams) pending")
+              .font(.caption.weight(.semibold))
+              .foregroundStyle(.orange)
+          }
+        }
+      }
+      .accessibilityIdentifier("dreamsControlsLink")
+      .onAppear {
+        if hasLoadedDreamsBadge {
+          dreamsRefresh &+= 1
+        }
+        hasLoadedDreamsBadge = true
+      }
+      .task(id: dreamsRefresh) {
+        do {
+          pendingDreams = try await model.dreamsList(lane: lane).pendingCount
+        } catch is CancellationError {
+          return
+        } catch {
+          // Retain the last known badge count across transient refresh errors.
+        }
+      }
     }
     if snapshot?.settingsSupported == true {
       NavigationLink("Conversation settings") {

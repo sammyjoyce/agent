@@ -80,6 +80,15 @@ pub enum NativeRequest {
     Notifications {
         request: crate::notifications::NotificationRequest,
     },
+    /// Coordinator service-boundary Dreams review and explicit apply. Never forwarded to Pi.
+    DreamsList,
+    DreamsShow {
+        run: String,
+    },
+    DreamsApply {
+        run: String,
+        approve: String,
+    },
     /// Coordinator service-boundary running status and version comparison. Never forwarded to Pi.
     ServiceStatus,
     // Valid only as a connection's first frame; `service::handle` answers it
@@ -147,6 +156,77 @@ pub enum NativeJobStatus {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum DreamsProposalStatus {
+    Pending,
+    Applied,
+    Stale,
+    TargetDirty,
+    TargetLocked,
+    PatchChanged,
+    PolicyChanged,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct DreamsRunSummary {
+    pub run: String,
+    #[ts(type = "number")]
+    pub window_start_ms: u64,
+    #[ts(type = "number")]
+    pub window_end_ms: u64,
+    pub coverage_complete: bool,
+    pub outcome_label: String,
+    pub proposal_status: Option<DreamsProposalStatus>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct DreamsCheckItem {
+    pub name: String,
+    pub phase: String,
+    pub passed: bool,
+    pub verdict: String,
+    #[ts(type = "number")]
+    pub duration_ms: u64,
+    pub output: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct DreamsEvidenceCite {
+    pub id: String,
+    pub kind: String,
+    pub title: Option<String>,
+    pub body: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+pub struct DreamsRunDetail {
+    pub run: String,
+    #[ts(type = "number")]
+    pub window_start_ms: u64,
+    #[ts(type = "number")]
+    pub window_end_ms: u64,
+    pub coverage_complete: bool,
+    pub gaps: Vec<String>,
+    pub receipts_count: u32,
+    pub summaries_count: u32,
+    #[ts(type = "number")]
+    pub summaries_captured_at_ms: u64,
+    pub base_revision: String,
+    pub outcome_label: String,
+    pub outcome_sha256: Option<String>,
+    pub proposal_status: Option<DreamsProposalStatus>,
+    pub status_detail: Option<String>,
+    pub rationale_or_note: Option<String>,
+    pub files: Vec<String>,
+    pub patch: Option<String>,
+    pub patch_sha256: Option<String>,
+    pub attempts_used: u8,
+    pub can_apply: bool,
+    pub checks: Vec<DreamsCheckItem>,
+    pub cited_evidence: Vec<DreamsEvidenceCite>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NativeEvent {
@@ -176,6 +256,9 @@ pub enum NativeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         work_inspection: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        dreams: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         working: Option<bool>,
@@ -249,6 +332,18 @@ pub enum NativeEvent {
         status: crate::notifications::NotificationStatus,
     },
     Done,
+    DreamsList {
+        runs: Vec<DreamsRunSummary>,
+        pending_count: u32,
+    },
+    DreamsShow {
+        report: Box<DreamsRunDetail>,
+    },
+    DreamsApplied {
+        run: String,
+        commit: String,
+        already_applied: bool,
+    },
     ServiceStatus {
         coordinator_id: String,
         pid: u32,
@@ -267,9 +362,18 @@ pub enum NativeEvent {
 /// Validated requests answered strictly at the coordinator service boundary, never forwarded to Pi.
 #[derive(Clone, Debug)]
 pub enum ServiceRequest {
+    DreamsList,
+    DreamsShow {
+        run: crate::dreams::RunId,
+    },
+    DreamsApply {
+        run: crate::dreams::RunId,
+        approve: crate::dreams::ContentDigest,
+    },
     ServiceStatus,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum Operation {
     Runtime(Box<RuntimeCommand>),
     Local(NativeEvent),
@@ -361,6 +465,19 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
             }
         }
         NativeRequest::Interrupt => RuntimeCommand::MainInterrupt,
+        NativeRequest::DreamsList => return Ok(Operation::Service(ServiceRequest::DreamsList)),
+        NativeRequest::DreamsShow { run } => {
+            let run = crate::dreams::RunId::parse(&run)?;
+            return Ok(Operation::Service(ServiceRequest::DreamsShow { run }));
+        }
+        NativeRequest::DreamsApply { run, approve } => {
+            let run = crate::dreams::RunId::parse(&run)?;
+            let approve = crate::dreams::ContentDigest::parse(&approve)?;
+            return Ok(Operation::Service(ServiceRequest::DreamsApply {
+                run,
+                approve,
+            }));
+        }
         NativeRequest::ServiceStatus => {
             return Ok(Operation::Service(ServiceRequest::ServiceStatus));
         }
@@ -514,6 +631,7 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
                 accepted_input_origins: accepted.non_empty(),
                 conversation_settings: *conversation_settings,
                 work_inspection: Some(true),
+                dreams: None,
                 working: None,
                 conversation_id: conversation_id.clone(),
                 model: model_label(model),
@@ -529,6 +647,7 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
             accepted_input_origins: None,
             conversation_settings: None,
             work_inspection: None,
+            dreams: None,
             working: Some(*working),
             conversation_id: conversation.conversation_id.clone(),
             model: model_label(model),
@@ -1593,11 +1712,60 @@ mod tests {
     }
 
     #[test]
-    fn service_status_prepares_as_a_service_boundary_operation() {
+    fn dreams_and_service_status_prepare_as_service_boundary_operations() {
+        let valid_run = "0123456789abcdef";
+        let valid_digest = crate::dreams::ContentDigest::of(b"ok").as_str().to_owned();
+        assert!(matches!(
+            prepare(NativeRequest::DreamsList).unwrap(),
+            Operation::Service(ServiceRequest::DreamsList)
+        ));
+        assert!(matches!(
+            prepare(NativeRequest::DreamsShow {
+                run: valid_run.into(),
+            })
+            .unwrap(),
+            Operation::Service(ServiceRequest::DreamsShow { .. })
+        ));
+        assert!(matches!(
+            prepare(NativeRequest::DreamsApply {
+                run: valid_run.into(),
+                approve: valid_digest,
+            })
+            .unwrap(),
+            Operation::Service(ServiceRequest::DreamsApply { .. })
+        ));
         assert!(matches!(
             prepare(NativeRequest::ServiceStatus).unwrap(),
             Operation::Service(ServiceRequest::ServiceStatus)
         ));
+        assert!(
+            prepare(NativeRequest::DreamsShow {
+                run: "not-a-run-id".into(),
+            })
+            .is_err()
+        );
+        assert!(
+            prepare(NativeRequest::DreamsApply {
+                run: valid_run.into(),
+                approve: "not-a-digest".into(),
+            })
+            .is_err()
+        );
+        let main_ready = RuntimeEventKind::MainReady {
+            conversation_id: "1".into(),
+            cwd: "/".into(),
+            model: crate::models::ModelSelection::default(),
+            input_origins: Some(true),
+            accepted_input_origins: None,
+            conversation_settings: Some(true),
+        };
+        let Some(NativeEvent::Ready { dreams, .. }) = crate::native::project(&main_ready) else {
+            panic!("Expected NativeEvent::Ready");
+        };
+        assert_eq!(
+            dreams, None,
+            "Pi MainReady never advertises Dreams directly"
+        );
     }
 }
 

@@ -62,6 +62,7 @@ pub async fn relay(stream: UnixStream) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_configured(
     script: &Path,
     claim: OwnerClaim,
@@ -70,6 +71,8 @@ pub async fn serve_configured(
     daemon: crate::tailnet::Daemon,
     rex: crate::rex::RexClient,
     bootstrap: CoordinatorBootstrap,
+    dreams: Option<crate::dreams::DreamsPolicy>,
+    dreams_source: crate::dreams::DreamsPolicySource,
 ) -> Result<()> {
     serve_with_transport(
         script,
@@ -79,6 +82,8 @@ pub async fn serve_configured(
         daemon,
         rex,
         Some(bootstrap),
+        dreams,
+        dreams_source,
         shutdown_signal(),
     )
     .await
@@ -115,6 +120,8 @@ async fn serve_until(
         crate::tailnet::Daemon::default(),
         crate::rex::RexClient::for_process(None)?,
         None,
+        None,
+        crate::dreams::DreamsPolicySource::Unconfigured,
         shutdown,
     )
     .await
@@ -130,12 +137,23 @@ async fn serve_with_transport(
     daemon: crate::tailnet::Daemon,
     rex: crate::rex::RexClient,
     bootstrap: Option<CoordinatorBootstrap>,
+    dreams: Option<crate::dreams::DreamsPolicy>,
+    dreams_source: crate::dreams::DreamsPolicySource,
     shutdown: impl Future<Output = Result<ShutdownReason>>,
 ) -> Result<()> {
     let session = claim.pi_session();
     let state = claim.state().to_owned();
     let served = serve_owner(
-        script, claim, port, policy, daemon, rex, bootstrap, shutdown,
+        script,
+        claim,
+        port,
+        policy,
+        daemon,
+        rex,
+        bootstrap,
+        dreams,
+        dreams_source,
+        shutdown,
     )
     .await;
     if let (Err(error), Some(session)) = (&served, session)
@@ -176,6 +194,8 @@ async fn serve_owner(
     daemon: crate::tailnet::Daemon,
     rex: crate::rex::RexClient,
     bootstrap: Option<CoordinatorBootstrap>,
+    dreams: Option<crate::dreams::DreamsPolicy>,
+    dreams_source: crate::dreams::DreamsPolicySource,
     shutdown: impl Future<Output = Result<ShutdownReason>>,
 ) -> Result<()> {
     tokio::pin!(shutdown);
@@ -201,7 +221,14 @@ async fn serve_owner(
     } else {
         background
     };
-    let broker = match Broker::with_tailscale(bootstrap.as_ref(), state, daemon.clone(), rex) {
+    let broker = match Broker::with_tailscale_and_dreams(
+        bootstrap.as_ref(),
+        state,
+        daemon.clone(),
+        rex,
+        dreams,
+        dreams_source,
+    ) {
         Ok(broker) => Arc::new(broker),
         Err(error) => {
             owner.close().await?;
@@ -560,7 +587,15 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                     let written = if native {
                         match crate::native::project(&event) {
-                            Some(event) if !output_closed => write_client_frame(&mut writer, &event, &runtime).await,
+                            Some(mut projected) if !output_closed => {
+                                if matches!(&event, RuntimeEventKind::MainReady { .. })
+                                    && broker.dreams_available()
+                                    && let NativeEvent::Ready { dreams, .. } = &mut projected
+                                {
+                                    *dreams = Some(true);
+                                }
+                                write_client_frame(&mut writer, &projected, &runtime).await
+                            }
                             _ => Ok(()),
                         }
                     } else if !output_closed { write_client_frame(&mut writer, &event, &runtime).await } else { Ok(()) };
@@ -1607,10 +1642,9 @@ mod tests {
             .unwrap(),
         );
         let broker = Arc::new(
-            crate::broker::Broker::with_tailscale(
+            crate::broker::Broker::new(
                 None,
                 directory.path(),
-                crate::tailnet::Daemon::default(),
                 crate::rex::RexClient::for_process(None).unwrap(),
             )
             .unwrap(),
@@ -2105,6 +2139,7 @@ mod tests {
         let (server, peer) = listener.accept().await.unwrap();
         let denied_peer = peer;
         let rejected_runtime = runtime.clone();
+        let rejected_state = directory.path().to_owned();
         let rejected = tokio::spawn(async move {
             authenticated(
                 server,
@@ -2112,7 +2147,7 @@ mod tests {
                 Arc::new(
                     crate::broker::Broker::new(
                         None,
-                        std::path::Path::new("/tmp"),
+                        &rejected_state,
                         crate::rex::RexClient::for_process(None).unwrap(),
                     )
                     .unwrap(),
@@ -2136,6 +2171,7 @@ mod tests {
             .unwrap();
         let (server, peer) = listener.accept().await.unwrap();
         let options = socket2::SockRef::from(&server).try_clone().unwrap();
+        let allowed_state = directory.path().to_owned();
         let allowed_runtime = runtime.clone();
         let allowed = tokio::spawn(async move {
             authenticated(
@@ -2144,7 +2180,7 @@ mod tests {
                 Arc::new(
                     crate::broker::Broker::new(
                         None,
-                        std::path::Path::new("/tmp"),
+                        &allowed_state,
                         crate::rex::RexClient::for_process(None).unwrap(),
                     )
                     .unwrap(),
@@ -2305,8 +2341,13 @@ mod tests {
     }
 
     impl BoundaryService {
-        async fn start(state: PathBuf) -> Self {
+        async fn start(state: PathBuf, config_file: Option<PathBuf>) -> Self {
             fs::create_dir_all(&state).unwrap();
+            let dreams_source = match config_file {
+                Some(file) => crate::dreams::DreamsPolicySource::Config(Some(file)),
+                None => crate::dreams::DreamsPolicySource::Unconfigured,
+            };
+            let policy = dreams_source.load(&state).unwrap();
             let script = state.join("fixture.mjs");
             fs::write(
                 &script,
@@ -2324,6 +2365,8 @@ mod tests {
                     crate::tailnet::Daemon::default(),
                     crate::rex::RexClient::for_process(None).unwrap(),
                     None,
+                    policy,
+                    dreams_source,
                     async {
                         let _ = stopped.await;
                         Ok(ShutdownReason::Requested)
@@ -2380,10 +2423,304 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dreams_service_boundary_lists_shows_and_applies_without_touching_pi() {
+        use crate::dreams::ContentDigest;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let repo = dir.path().join("repo");
+        let sample = crate::dreams::ops::test_support::write_sample_proposal(
+            &repo,
+            &state,
+            "service-run-1",
+            "# Before\n",
+            "# After service apply\n",
+        );
+        let config = dir.path().join("config.toml");
+        fs::write(&config, dreams_config(&repo, "AGENTS.md")).unwrap();
+        let service = BoundaryService::start(state, Some(config)).await;
+
+        // Observe advertises dreams: Some(true) from service boundary.
+        let mut observe_sock = service.connect().await;
+        write_frame(
+            &mut observe_sock,
+            &RuntimeCommand::Native {
+                request: NativeRequest::Observe {
+                    input_ids: vec![],
+                    source_status: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let (obs_read, _obs_write) = observe_sock.into_split();
+        let mut obs_reader = FrameReader::new(BufReader::new(obs_read));
+        let advertised_dreams;
+        loop {
+            let frame = timeout(TEST_HANG_LIMIT, obs_reader.next_frame())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            match serde_json::from_slice::<NativeEvent>(&frame).unwrap() {
+                NativeEvent::Ready { dreams, .. } => {
+                    advertised_dreams = dreams;
+                    break;
+                }
+                NativeEvent::Commands { .. } => continue,
+                other => panic!("Unexpected observe event: {other:?}"),
+            }
+        }
+        assert_eq!(advertised_dreams, Some(true));
+        drop(_obs_write);
+        drop(obs_reader);
+
+        let list_events = service.request_events(NativeRequest::DreamsList).await;
+        assert!(matches!(
+            list_events.first(),
+            Some(NativeEvent::DreamsList {
+                pending_count: 1,
+                ..
+            })
+        ));
+
+        let show_events = service
+            .request_events(NativeRequest::DreamsShow {
+                run: sample.run.as_str().to_owned(),
+            })
+            .await;
+        let Some(NativeEvent::DreamsShow { report }) = show_events.into_iter().next() else {
+            panic!("Expected DreamsShow");
+        };
+        assert!(report.can_apply);
+        let approval = report.outcome_sha256.unwrap();
+
+        let bad_events = service
+            .request_events(NativeRequest::DreamsApply {
+                run: sample.run.as_str().to_owned(),
+                approve: ContentDigest::of(b"wrong").as_str().to_owned(),
+            })
+            .await;
+        assert!(matches!(
+            bad_events.first(),
+            Some(NativeEvent::Failure { .. })
+        ));
+
+        let ok_events = service
+            .request_events(NativeRequest::DreamsApply {
+                run: sample.run.as_str().to_owned(),
+                approve: approval,
+            })
+            .await;
+        assert!(matches!(
+            ok_events.first(),
+            Some(NativeEvent::DreamsApplied {
+                already_applied: false,
+                ..
+            })
+        ));
+        assert_eq!(
+            fs::read_to_string(repo.join("AGENTS.md")).unwrap(),
+            "# After service apply\n"
+        );
+
+        service.shutdown().await;
+    }
+
+    fn dreams_config(repository: &std::path::Path, editable: &str) -> String {
+        format!(
+            "[dreams]\nrepository = {repository:?}\neditable = [{editable:?}]\nwindow_hours = 24\n\n[[dreams.checks]]\nname = \"ok\"\nargv = [\"true\"]\ntimeout_seconds = 10\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn dreams_requests_use_the_policy_that_the_configuration_gives_now() {
+        use crate::{native::DreamsProposalStatus, protocol::ErrorCode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let repo = dir.path().join("repo");
+        let sample = crate::dreams::ops::test_support::write_sample_proposal(
+            &repo,
+            &state,
+            "service-policy-1",
+            "# Before\n",
+            "# After policy apply\n",
+        );
+        let config = dir.path().join("config.toml");
+        fs::write(&config, dreams_config(&repo, "AGENTS.md")).unwrap();
+        let service = BoundaryService::start(state, Some(config.clone())).await;
+        let run = sample.run.as_str().to_owned();
+        let list = || async {
+            service
+                .request_events(NativeRequest::DreamsList)
+                .await
+                .into_iter()
+                .next()
+                .unwrap()
+        };
+        let show = || async {
+            service
+                .request_events(NativeRequest::DreamsShow { run: run.clone() })
+                .await
+                .into_iter()
+                .next()
+                .unwrap()
+        };
+        let NativeEvent::DreamsShow { report } = show().await else {
+            panic!("Expected DreamsShow");
+        };
+        assert!(report.can_apply);
+        let approval = report.outcome_sha256.unwrap();
+        let apply = || async {
+            service
+                .request_events(NativeRequest::DreamsApply {
+                    run: run.clone(),
+                    approve: approval.clone(),
+                })
+                .await
+                .into_iter()
+                .next()
+                .unwrap()
+        };
+        let unchanged = || {
+            assert_eq!(
+                fs::read_to_string(repo.join("AGENTS.md")).unwrap(),
+                "# Before\n"
+            );
+            assert_eq!(
+                crate::dreams::ops::test_support::git(&repo, &["rev-list", "--count", "HEAD"])
+                    .trim(),
+                "1"
+            );
+        };
+
+        for narrowed_or_removed in [
+            dreams_config(&repo, "NOTES.md"),
+            "poll_interval_seconds = 60\n".to_owned(),
+        ] {
+            fs::write(&config, narrowed_or_removed).unwrap();
+            let NativeEvent::DreamsList {
+                runs,
+                pending_count,
+            } = list().await
+            else {
+                panic!("Expected DreamsList");
+            };
+            assert_eq!(pending_count, 0);
+            assert_eq!(
+                runs[0].proposal_status,
+                Some(DreamsProposalStatus::PolicyChanged)
+            );
+            let NativeEvent::DreamsShow { report } = show().await else {
+                panic!("Expected DreamsShow");
+            };
+            assert!(!report.can_apply);
+            let refused = apply().await;
+            assert!(
+                matches!(
+                    &refused,
+                    NativeEvent::Failure {
+                        code: Some(ErrorCode::InvalidRequest),
+                        message,
+                    } if message == crate::dreams::apply::POLICY_CHANGED
+                ),
+                "{refused:?}"
+            );
+            unchanged();
+        }
+
+        fs::write(&config, "[dreams\n").unwrap();
+        for answer in [list().await, show().await, apply().await] {
+            assert!(
+                matches!(
+                    &answer,
+                    NativeEvent::Failure { message, .. }
+                        if message.contains("Invalid agent TOML configuration")
+                ),
+                "{answer:?}"
+            );
+        }
+        unchanged();
+
+        fs::write(&config, dreams_config(&repo, "AGENTS.md")).unwrap();
+        assert!(matches!(
+            apply().await,
+            NativeEvent::DreamsApplied {
+                already_applied: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            fs::read_to_string(repo.join("AGENTS.md")).unwrap(),
+            "# After policy apply\n"
+        );
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dreams_apply_is_refused_while_restore_held_while_reads_stay_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let repo = dir.path().join("repo");
+        let sample = crate::dreams::ops::test_support::write_sample_proposal(
+            &repo,
+            &state,
+            "service-held-1",
+            "# Before\n",
+            "# After held apply\n",
+        );
+        fs::write(state.join("restore-hold.json"), "{}").unwrap();
+        let config = dir.path().join("config.toml");
+        fs::write(&config, dreams_config(&repo, "AGENTS.md")).unwrap();
+        let service = BoundaryService::start(state, Some(config)).await;
+
+        let list_events = service.request_events(NativeRequest::DreamsList).await;
+        assert!(matches!(
+            list_events.first(),
+            Some(NativeEvent::DreamsList {
+                pending_count: 1,
+                ..
+            })
+        ));
+
+        let show_events = service
+            .request_events(NativeRequest::DreamsShow {
+                run: sample.run.as_str().to_owned(),
+            })
+            .await;
+        let Some(NativeEvent::DreamsShow { report }) = show_events.into_iter().next() else {
+            panic!("Expected DreamsShow");
+        };
+        let approval = report.outcome_sha256.unwrap();
+
+        let apply_events = service
+            .request_events(NativeRequest::DreamsApply {
+                run: sample.run.as_str().to_owned(),
+                approve: approval,
+            })
+            .await;
+        assert!(matches!(
+            apply_events.first(),
+            Some(NativeEvent::Failure {
+                code: Some(crate::protocol::ErrorCode::CoordinatorUnavailable),
+                message,
+            }) if message.contains("backup release")
+        ));
+        assert_eq!(
+            fs::read_to_string(repo.join("AGENTS.md")).unwrap(),
+            "# Before\n"
+        );
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn service_status_reports_running_coordinator_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
-        let service = BoundaryService::start(state.clone()).await;
+        let service = BoundaryService::start(state.clone(), None).await;
 
         let events = service.request_events(NativeRequest::ServiceStatus).await;
         assert_eq!(events.len(), 2);

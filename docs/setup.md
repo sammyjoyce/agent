@@ -481,8 +481,9 @@ first instant. Source polling uses elapsed intervals through the same Pi timer.
 
 Dreams is one scheduled job that reads the coordinator's private runtime
 receipts and task summaries each night. It proposes at most one diff to a
-private Git repository, or it abstains. A proposal changes nothing until you
-approve that exact outcome with `beep-boop dreams apply`.
+private Git repository, or it abstains. A proposal changes nothing until an
+approver confirms that exact sealed outcome digest via `beep-boop dreams apply`
+or from any authorized paired device over the coordinator's service boundary.
 
 Point Dreams at a repository of guidance that your agents read, such as one of
 your `context_repositories`. Add the policy to the coordinator's private
@@ -564,8 +565,14 @@ and text that a model wrote are labeled and quoted. Control characters and
 Unicode format characters, such as bidirectional overrides and zero-width characters,
 are shown as escapes in that text and in the patch, so the patch you read is
 the patch that `apply` commits. Add `--json` for the typed record, which keeps
-the exact bytes. These commands read the
-coordinator's state directory, so run them on the coordinator's machine.
+the exact bytes. The CLI commands read the coordinator's local state directory
+directly. An authorized paired device can also browse runs, inspect a sealed
+proposal and approve it over the coordinator's authenticated service boundary.
+The service makes the same digest, policy, base, clean-worktree and
+restore-hold checks as the command line, and it reads the policy from the
+configuration for each request. While the state directory is held after a
+restore, the command line and the service both refuse an apply until
+`backup release`. `dreams list` and `dreams show` still work while held.
 
 Read the patch before you approve it. The outcome digest, which `dreams show`
 prints as `Outcome sha256`, is the SHA-256 of the exact bytes of the sealed
@@ -588,6 +595,8 @@ refuses with one of these messages, without changing the repository:
 - `Dreams target has local changes in touched paths`
 - `Dreams target has a held Git index lock: <path>`
 - `Dreams run did not propose a change`
+- `Another Dreams apply is running`
+- ``Dreams apply is held after a restore until `backup release` ``
 
 A local change is any difference in a touched path or its parent directories:
 content, file type, a deletion, or an executable bit. Apply reads the
@@ -598,6 +607,12 @@ target once and then writes. A process that writes to a touched path while
 apply runs can lose that change, and one that takes the Git index lock can
 make apply fail and leave `ORIG_HEAD` behind. Stop other writers to the target
 repository while apply runs.
+
+One apply runs at a time on a state directory, whether it comes from the
+command line or from a device. An apply that finds another one running waits
+for up to 10 seconds. If the other apply finishes in that time, the apply that
+waited reads its result and reports `already applied` for the same run. If
+not, it refuses with `Another Dreams apply is running`.
 
 A successful apply adds one commit with `Dreams-Run`, `Dreams-Base` and
 `Dreams-Patch-Sha256` trailers and fast-forwards the checked-out branch. The
@@ -1177,6 +1192,9 @@ run this work:
   a task's terminal starts, so no backed-up task turn resumes.
 - Worktree collection, both the collection that each registered worker requests
   on its own and `beep-boop resources collect`.
+
+A held store also refuses to apply a Dreams proposal, from
+`beep-boop dreams apply` and from a device.
 
 A held store is not a read-only copy. It serves history and attachments, and it
 runs chats and the other commands you send. A chat's tool calls run on hosts
