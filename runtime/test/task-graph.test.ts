@@ -525,7 +525,7 @@ test("buildActiveWork sorts running main first, waiting_owner before waiting_ext
         id: 2,
         conversation_id: "10",
         owner: null,
-        background: true,
+        background: false,
         abort_requested: false,
         state: { status: "running", phase: "run" },
         blocked: null,
