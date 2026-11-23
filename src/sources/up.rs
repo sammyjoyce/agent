@@ -201,7 +201,7 @@ impl Source for UpSource {
     }
 
     async fn poll(&self, checkpoint: Option<&SourceCheckpoint>) -> Result<SourceBatch> {
-        let clock = PollClock::start(unix_time()?, &feed::process_clock);
+        let clock = PollClock::start(unix_time()?, &feed::process_clock, feed::process_scans());
         let step = self.step(checkpoint, &clock).await;
         Ok(feed::settle(LABEL, self.key(), step))
     }
@@ -790,9 +790,9 @@ mod tests {
             saved: Option<&SourceCheckpoint>,
             now: u64,
             monotonic: feed::Monotonic<'_>,
-            _scans: &feed::ScanMemory,
+            scans: &feed::ScanMemory,
         ) -> SourceBatch {
-            let clock = PollClock::start(Duration::from_secs(now), monotonic);
+            let clock = PollClock::start(Duration::from_secs(now), monotonic, scans);
             feed::settle(LABEL, self.key(), self.step(saved, &clock).await)
         }
     }

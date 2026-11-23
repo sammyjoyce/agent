@@ -10,7 +10,8 @@
 //! A source supplies the request for a page, the parse of an item, and its text.
 
 use std::{
-    sync::LazyLock,
+    collections::HashMap,
+    sync::{LazyLock, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -53,10 +54,35 @@ const MAX_SCAN_PAGES: u32 = 200;
 const MAX_CURSOR_BYTES: usize = 2048;
 pub(crate) const PAGE_SIZE: &str = "100";
 
-/// What the coordinator process remembers about its feeds between polls.
-#[cfg(test)]
+/// What the coordinator process remembers about its feeds between polls: for
+/// each feed, when the process last finished a scan of it, or first polled it
+/// when it has finished none, on the monotonic clock.
+///
+/// A saved checkpoint cannot hold this, because a monotonic clock means
+/// nothing to another process. A poll rests only while less than
+/// `SCAN_SPACING_SECONDS` have passed since that moment. So a feed whose
+/// wall clock moved back or stands still does not repeat an old result for
+/// longer than that without a request that checks the clock.
 #[derive(Default)]
-pub(crate) struct ScanMemory {}
+pub(crate) struct ScanMemory(Mutex<HashMap<FeedName, Duration>>);
+
+impl ScanMemory {
+    fn lock(&self) -> MutexGuard<'_, HashMap<FeedName, Duration>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct FeedName {
+    provider: String,
+    account: String,
+    scope: String,
+}
+
+pub(crate) fn process_scans() -> &'static ScanMemory {
+    static SCANS: LazyLock<ScanMemory> = LazyLock::new(ScanMemory::default);
+    &SCANS
+}
 
 pub(crate) type Monotonic<'a> = &'a (dyn Fn() -> Duration + Sync);
 
@@ -74,15 +100,42 @@ pub(crate) struct PollClock<'a> {
     unix_time_at_start: Duration,
     monotonic_at_start: Duration,
     monotonic: Monotonic<'a>,
+    scans: &'a ScanMemory,
 }
 
 impl<'a> PollClock<'a> {
-    pub(crate) fn start(unix_time: Duration, monotonic: Monotonic<'a>) -> Self {
+    pub(crate) fn start(
+        unix_time: Duration,
+        monotonic: Monotonic<'a>,
+        scans: &'a ScanMemory,
+    ) -> Self {
         Self {
             unix_time_at_start: unix_time,
             monotonic_at_start: monotonic(),
             monotonic,
+            scans,
         }
+    }
+
+    /// Until the process finishes a scan of the feed, its first poll of the
+    /// feed stands for one.
+    fn begin_poll(&self, feed: &FeedName) {
+        let mut scans = self.scans.lock();
+        if !scans.contains_key(feed) {
+            scans.insert(feed.clone(), (self.monotonic)());
+        }
+    }
+
+    fn finished_a_scan(&self, feed: FeedName) {
+        self.scans.lock().insert(feed, (self.monotonic)());
+    }
+
+    fn scanned_lately(&self, feed: &FeedName) -> bool {
+        let spacing = Duration::from_secs(SCAN_SPACING_SECONDS);
+        let scans = self.scans.lock();
+        scans
+            .get(feed)
+            .is_some_and(|since| (self.monotonic)().saturating_sub(*since) < spacing)
     }
 
     fn now(&self) -> u64 {
@@ -202,7 +255,8 @@ impl From<Cursor> for String {
 
 /// What a poll call does after it loads the checkpoint.
 pub(crate) enum Turn<P, S> {
-    /// The last scan finished less than `SCAN_SPACING_SECONDS` ago. The source
+    /// The last scan finished less than `SCAN_SPACING_SECONDS` ago, by the
+    /// saved stamp and by the monotonic clock of this process. The source
     /// makes no request and returns this batch, which keeps the checkpoint.
     Rest(SourceBatch),
     Scan(FeedCheckpoint<P, S>),
@@ -268,6 +322,9 @@ where
         begin: impl FnOnce(&P, u64) -> (u64, S),
     ) -> Result<Turn<P, S>, FeedFailure> {
         let now = clock.now();
+        let feed = feed_name(key, scope);
+        clock.begin_poll(&feed);
+        let scanned_lately = clock.scanned_lately(&feed);
         let Some(checkpoint) = saved else {
             let origin = now.saturating_sub(FIRST_LOOKBACK_SECONDS);
             let kept = P::default();
@@ -302,7 +359,9 @@ where
             Window::Scanning(scan) => scan,
             // A stamp further ahead than the spacing was written by another clock.
             Window::Resting { not_before, .. }
-                if now < not_before && not_before - now <= SCAN_SPACING_SECONDS =>
+                if scanned_lately
+                    && now < not_before
+                    && not_before - now <= SCAN_SPACING_SECONDS =>
             {
                 return Ok(Turn::Rest(SourceBatch {
                     source: key.clone(),
@@ -383,6 +442,8 @@ where
         clock: &CheckedClock<'_>,
     ) -> Result<SourceBatch, Stop> {
         let now = clock.0.now();
+        let feed = feed_name(&key, &self.scope);
+        let scan_is_finished = matches!(step, Step::Done { .. });
         let Scan {
             started_at,
             since,
@@ -433,16 +494,27 @@ where
             window,
             kept: self.kept,
         };
-        match serde_json::to_string(&saved) {
-            Ok(value) => Ok(SourceBatch {
-                source: key,
-                events,
-                checkpoint: Some(SourceCheckpoint { value }),
-                coverage,
-                progress: None,
-            }),
-            Err(_) => Err(Stop::after(events, FeedFailure::Unsaved)),
+        let Ok(value) = serde_json::to_string(&saved) else {
+            return Err(Stop::after(events, FeedFailure::Unsaved));
+        };
+        if scan_is_finished {
+            clock.0.finished_a_scan(feed);
         }
+        Ok(SourceBatch {
+            source: key,
+            events,
+            checkpoint: Some(SourceCheckpoint { value }),
+            coverage,
+            progress: None,
+        })
+    }
+}
+
+fn feed_name(key: &SourceKey, scope: &str) -> FeedName {
+    FeedName {
+        provider: key.provider.clone(),
+        account: key.account.clone(),
+        scope: scope.to_owned(),
     }
 }
 
@@ -694,7 +766,11 @@ mod tests {
     }
 
     fn poll_in_new_process_at(now: u64) -> PollClock<'static> {
-        PollClock::start(Duration::from_secs(now), &|| Duration::ZERO)
+        PollClock::start(
+            Duration::from_secs(now),
+            &|| Duration::ZERO,
+            Box::leak(Box::default()),
+        )
     }
 
     fn scanning_with_reread(saved: Option<&SourceCheckpoint>, now: u64, reread: u64) -> Checkpoint {
@@ -1027,7 +1103,8 @@ mod tests {
     fn a_poll_keeps_one_reading_of_the_clock_and_adds_monotonic_time() {
         let monotonic = AtomicU64::new(1_000);
         let read = || Duration::from_secs(monotonic.load(Ordering::Relaxed));
-        let clock = PollClock::start(Duration::from_secs(NOW), &read);
+        let scans = ScanMemory::default();
+        let clock = PollClock::start(Duration::from_secs(NOW), &read, &scans);
         let first = match Checkpoint::load(None, &key(), "scope-a", &clock, REREAD, |_, since| {
             (since, None)
         }) {
@@ -1079,6 +1156,58 @@ mod tests {
             "the spacing counts from the end of the poll, 900 monotonic seconds after its start"
         );
         assert!(!rests_at(NOW + 900 + SCAN_SPACING_SECONDS));
+    }
+
+    #[test]
+    fn a_rest_ends_after_300_seconds_on_the_monotonic_clock_of_the_process_for_each_feed_alone() {
+        let monotonic = AtomicU64::new(1_000);
+        let read = || Duration::from_secs(monotonic.load(Ordering::Relaxed));
+        let finish = |scans: &ScanMemory, scope: &str| {
+            let clock = PollClock::start(Duration::from_secs(NOW), &read, scans);
+            let load = Checkpoint::load(None, &key(), scope, &clock, REREAD, |_, since| {
+                (since, None)
+            });
+            let Ok(Turn::Scan(first)) = load else {
+                panic!("the first poll scans");
+            };
+            let checked = first.check_clock(&clock, Some(NOW)).unwrap();
+            let done = first.advance(key(), Vec::new(), Step::Done { floor: None }, &checked);
+            done.ok().and_then(|batch| batch.checkpoint).unwrap()
+        };
+        let rests = |scans: &ScanMemory, scope: &str, saved: &SourceCheckpoint| {
+            let clock = PollClock::start(Duration::from_secs(NOW + 1), &read, scans);
+            let load = Checkpoint::load(Some(saved), &key(), scope, &clock, REREAD, |_, since| {
+                (since, None)
+            });
+            matches!(load, Ok(Turn::Rest(_)))
+        };
+
+        let process = ScanMemory::default();
+        let saved_a = finish(&process, "scope-a");
+        monotonic.store(1_200, Ordering::Relaxed);
+        let saved_b = finish(&process, "scope-b");
+        monotonic.store(1_299, Ordering::Relaxed);
+        assert!(rests(&process, "scope-a", &saved_a));
+        monotonic.store(1_300, Ordering::Relaxed);
+        assert!(
+            !rests(&process, "scope-a", &saved_a),
+            "the wall clock moved one second, and 300 seconds passed on the monotonic clock"
+        );
+        assert!(
+            rests(&process, "scope-b", &saved_b),
+            "the other feed finished its scan 100 seconds ago"
+        );
+
+        let restarted = ScanMemory::default();
+        monotonic.store(5_000, Ordering::Relaxed);
+        assert!(rests(&restarted, "scope-a", &saved_a));
+        monotonic.store(5_299, Ordering::Relaxed);
+        assert!(rests(&restarted, "scope-a", &saved_a));
+        monotonic.store(5_300, Ordering::Relaxed);
+        assert!(
+            !rests(&restarted, "scope-a", &saved_a),
+            "300 seconds after the first poll of the new process"
+        );
     }
 
     #[test]
