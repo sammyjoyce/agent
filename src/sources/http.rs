@@ -427,7 +427,7 @@ pub(crate) mod testing {
     pub(crate) struct Canned {
         status: u16,
         body: String,
-        location: Option<String>,
+        headers: Vec<(String, String)>,
         hang: bool,
         delay: Duration,
     }
@@ -441,10 +441,16 @@ pub(crate) mod testing {
             Self {
                 status,
                 body: body.to_owned(),
-                location: None,
+                headers: Vec::new(),
                 hang: false,
                 delay: Duration::ZERO,
             }
+        }
+
+        /// A name that is added twice is sent twice.
+        pub(crate) fn header(mut self, name: &str, value: &str) -> Self {
+            self.headers.push((name.to_owned(), value.to_owned()));
+            self
         }
 
         /// Answers after `delay` of real time, as a slow server does.
@@ -454,10 +460,7 @@ pub(crate) mod testing {
         }
 
         pub(crate) fn redirect(location: &str) -> Self {
-            Self {
-                location: Some(location.to_owned()),
-                ..Self::text(302, "")
-            }
+            Self::text(302, "").header("Location", location)
         }
 
         /// Accepts the request and never answers. Use with `HttpApi::with_max_time(1)`.
@@ -569,12 +572,13 @@ pub(crate) mod testing {
             return;
         }
         tokio::time::sleep(canned.delay).await;
-        let location = canned
-            .location
-            .map(|location| format!("Location: {location}\r\n"))
-            .unwrap_or_default();
+        let headers: String = canned
+            .headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect();
         let response = format!(
-            "HTTP/1.1 {} Scripted\r\nContent-Type: application/json\r\n{location}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {} Scripted\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
             canned.status,
             canned.body.len(),
             canned.body

@@ -44,6 +44,11 @@ const MAX_SCAN_PAGES: u32 = 200;
 const MAX_CURSOR_BYTES: usize = 2048;
 pub(crate) const PAGE_SIZE: &str = "100";
 
+/// What the coordinator process remembers about its feeds between polls.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ScanMemory {}
+
 /// The state of one feed while a scan runs.
 ///
 /// `P` is what the source keeps between scans. `S` is what it keeps during one

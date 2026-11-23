@@ -79,8 +79,17 @@ impl UpSource {
     }
 
     #[cfg(test)]
-    async fn poll_at(&self, saved: Option<&SourceCheckpoint>, now: u64) -> SourceBatch {
-        feed::settle(LABEL, self.key(), self.step(saved, now, &|| now).await)
+    async fn poll_at(
+        &self,
+        saved: Option<&SourceCheckpoint>,
+        now: u64,
+        monotonic: Clock<'_>,
+        _scans: &feed::ScanMemory,
+    ) -> SourceBatch {
+        let began = monotonic();
+        let after_response = || now + monotonic().saturating_sub(began);
+        let step = self.step(saved, now, &after_response).await;
+        feed::settle(LABEL, self.key(), step)
     }
 
     /// The identity check, and then one request or up to `LOOKUPS_PER_POLL` lookups.
@@ -749,9 +758,12 @@ fn describe_removed(id: TransactionId, hold: &Hold) -> FeedItem {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+    use std::{
+        collections::BTreeSet,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        },
     };
 
     use serde_json::{Value, json};
@@ -762,6 +774,7 @@ mod tests {
         protocol::{HostResult, SourceState},
         sources::{
             SourceConfig, SourceCoverage,
+            feed::ScanMemory,
             http::testing::{
                 Canned, FakeApi, Seen, credential_script, curl_shim, failing_credential_script,
                 proxied_curl, query_of, shim_runs,
@@ -779,6 +792,8 @@ mod tests {
         "Up refused a saved page link for the second time in one scan; checkpoint retained.";
     const UNREADABLE: &str = "Up sent a response this source cannot read; checkpoint retained.";
     const FOREIGN: &str = "Up checkpoint belongs to another account or configuration; change the account label to start a fresh seven-day read.";
+    const CLOCK_DIFFERS: &str = "This computer's clock differs from Up's clock by more than five minutes; check the clock. Checkpoint retained.";
+    const NO_DATE: &str = "Up's reply carried no usable Date header; checkpoint retained.";
     const REMOVED_TEXT: &str = "Status: hold removed\nUp no longer lists this held transaction. Up removes a hold when the merchant releases it, or when Up replaces it with a separate settled transaction.";
 
     #[derive(Clone)]
@@ -855,6 +870,21 @@ mod tests {
 
     type Script = Box<dyn Fn(&Seen) -> Option<Canned> + Send>;
 
+    enum Dates {
+        /// One header with the bank's time, as Up sends.
+        Single,
+        Missing,
+        Duplicated,
+        Text(&'static str),
+    }
+
+    fn http_date(seconds: u64) -> String {
+        chrono::DateTime::from_timestamp(i64::try_from(seconds).unwrap(), 0)
+            .unwrap()
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string()
+    }
+
     /// The state of the invented Up account. A test edits it between polls.
     struct World {
         rows: Vec<Row>,
@@ -867,9 +897,59 @@ mod tests {
         page_size: usize,
         /// Answers a request before the account does, for a failure the account cannot produce.
         script: Option<Script>,
+        /// The wall clock and the monotonic clock of the computer when the
+        /// poll in flight began. `None` for a poll on the real clocks.
+        poll_began: Option<(u64, u64)>,
+        /// The bank's clock when the poll in flight began. `None` when it
+        /// agrees with the computer's wall clock.
+        bank_time: Option<u64>,
+        /// Seconds that pass before each identity check reaches the bank, as
+        /// when the credential command is slow.
+        credential_seconds: u64,
+        dates: Dates,
     }
 
     impl World {
+        fn answer(&self, seen: &Seen) -> Canned {
+            if let Some(canned) = self.script.as_ref().and_then(|script| script(seen)) {
+                return canned;
+            }
+            let (customer, rows) = match (seen.bearer.as_deref(), &self.second_customer) {
+                (Some(TOKEN), _) => (self.customer, &self.rows),
+                (Some(SECOND_TOKEN), Some(rows)) => ("example-customer-2", rows),
+                _ => return up_error(401, "Not Authorized"),
+            };
+            match seen.path() {
+                "/util/ping" => Canned::json(
+                    200,
+                    json!({ "meta": { "id": customer, "statusEmoji": "⚡️" } }),
+                ),
+                "/transactions" => self.listing(rows, seen),
+                path => path
+                    .strip_prefix("/transactions/")
+                    .and_then(|id| rows.iter().find(|row| row.id == id))
+                    .map_or_else(
+                        || up_error(404, "Not Found"),
+                        |row| Canned::json(200, json!({ "data": row.json() })),
+                    ),
+            }
+        }
+
+        /// The bank's clock runs with the monotonic clock of the computer.
+        fn dated(&self, canned: Canned, monotonic: u64) -> Canned {
+            let bank = match self.poll_began {
+                Some((wall, began)) => self.bank_time.unwrap_or(wall) + (monotonic - began),
+                None => now_seconds().unwrap(),
+            };
+            let date = http_date(bank);
+            match self.dates {
+                Dates::Single => canned.header("Date", &date),
+                Dates::Missing => canned,
+                Dates::Duplicated => canned.header("Date", &date).header("Date", &date),
+                Dates::Text(text) => canned.header("Date", text),
+            }
+        }
+
         fn settle(&mut self, id: &str, amount: &'static str, at: u64) {
             let row = self.rows.iter_mut().find(|row| row.id == id).unwrap();
             row.status = "SETTLED";
@@ -948,6 +1028,10 @@ mod tests {
         api: FakeApi,
         world: Arc<Mutex<World>>,
         dir: tempfile::TempDir,
+        /// The monotonic clock of the computer, in seconds. It moves only in `pass`.
+        monotonic: Arc<AtomicU64>,
+        /// What the coordinator process remembers. `restart` forgets it.
+        process: Mutex<Arc<ScanMemory>>,
     }
 
     impl Harness {
@@ -960,39 +1044,37 @@ mod tests {
                 since_compares_settled_at: false,
                 page_size: 100,
                 script: None,
+                poll_began: None,
+                bank_time: None,
+                credential_seconds: 0,
+                dates: Dates::Single,
             }));
-            let account = world.clone();
+            let monotonic = Arc::new(AtomicU64::new(0));
+            let (account, clock) = (world.clone(), monotonic.clone());
             let api = FakeApi::start(move |seen| {
                 let world = account.lock().unwrap();
-                if let Some(canned) = world.script.as_ref().and_then(|script| script(seen)) {
-                    return canned;
+                if seen.path() == "/util/ping" {
+                    clock.fetch_add(world.credential_seconds, Ordering::Relaxed);
                 }
-                let (customer, rows) = match (seen.bearer.as_deref(), &world.second_customer) {
-                    (Some(TOKEN), _) => (world.customer, &world.rows),
-                    (Some(SECOND_TOKEN), Some(rows)) => ("example-customer-2", rows),
-                    _ => return up_error(401, "Not Authorized"),
-                };
-                match seen.path() {
-                    "/util/ping" => Canned::json(
-                        200,
-                        json!({ "meta": { "id": customer, "statusEmoji": "⚡️" } }),
-                    ),
-                    "/transactions" => world.listing(rows, seen),
-                    path => path
-                        .strip_prefix("/transactions/")
-                        .and_then(|id| rows.iter().find(|row| row.id == id))
-                        .map_or_else(
-                            || up_error(404, "Not Found"),
-                            |row| Canned::json(200, json!({ "data": row.json() })),
-                        ),
-                }
+                world.dated(world.answer(seen), clock.load(Ordering::Relaxed))
             })
             .await;
             Self {
                 api,
                 world,
                 dir: tempfile::tempdir().unwrap(),
+                monotonic,
+                process: Mutex::default(),
             }
+        }
+
+        /// Time passes on the monotonic clock. The wall clock is the `now` of the next poll.
+        fn pass(&self, seconds: u64) {
+            self.monotonic.fetch_add(seconds, Ordering::Relaxed);
+        }
+
+        fn restart(&self) {
+            *self.process.lock().unwrap() = Arc::default();
         }
 
         fn world(&self) -> std::sync::MutexGuard<'_, World> {
@@ -1062,7 +1144,19 @@ mod tests {
         }
 
         async fn poll(&self, saved: Option<&SourceCheckpoint>, now: u64) -> SourceBatch {
-            self.source().poll_at(saved, now).await
+            self.poll_with(&self.source(), saved, now).await
+        }
+
+        async fn poll_with(
+            &self,
+            source: &UpSource,
+            saved: Option<&SourceCheckpoint>,
+            now: u64,
+        ) -> SourceBatch {
+            let monotonic = || self.monotonic.load(Ordering::Relaxed);
+            self.world().poll_began = Some((now, monotonic()));
+            let process = self.process.lock().unwrap().clone();
+            source.poll_at(saved, now, &monotonic, &process).await
         }
 
         /// Polls until the scan completes. Returns its events and the last checkpoint.
@@ -1083,7 +1177,7 @@ mod tests {
             let mut saved = saved.cloned();
             let mut events = Vec::new();
             for _ in 0..40 {
-                let batch = source().poll_at(saved.as_ref(), now).await;
+                let batch = self.poll_with(&source(), saved.as_ref(), now).await;
                 events.extend(batch.events);
                 match batch.coverage {
                     SourceCoverage::More => saved = batch.checkpoint,
@@ -1519,7 +1613,7 @@ mod tests {
         let mut delivered = Vec::new();
         for _ in 0..2 {
             let adapter = up.source();
-            let batch = adapter.poll_at(saved.as_ref(), NOW).await;
+            let batch = up.poll_with(&adapter, saved.as_ref(), NOW).await;
             drop(adapter);
             assert_eq!(batch.coverage, SourceCoverage::More);
             delivered.extend(batch.events);
@@ -1689,7 +1783,7 @@ mod tests {
         )
         .unwrap();
         for source in [other_label, other_address] {
-            let refused = source.poll_at(Some(&saved), NOW + SPACING).await;
+            let refused = up.poll_with(&source, Some(&saved), NOW + SPACING).await;
             assert_eq!(
                 refused.coverage,
                 unavailable(FOREIGN),
@@ -1809,7 +1903,7 @@ mod tests {
         )
         .unwrap();
 
-        let refused = source.poll_at(None, NOW).await;
+        let refused = up.poll_with(&source, None, NOW).await;
 
         assert_eq!(
             refused.coverage,
@@ -1900,7 +1994,7 @@ mod tests {
         let up = Harness::start(Vec::new()).await;
         up.script(|_| Some(Canned::hang()));
 
-        let timed_out = up.source().with_max_time(1).poll_at(None, NOW).await;
+        let timed_out = up.poll_with(&up.source().with_max_time(1), None, NOW).await;
 
         assert_eq!(
             timed_out.coverage,
@@ -1934,7 +2028,9 @@ mod tests {
         )
         .unwrap();
 
-        let unreachable = source.poll_at(None, NOW).await;
+        let unreachable = source
+            .poll_at(None, NOW, &|| 0, &ScanMemory::default())
+            .await;
 
         assert_eq!(
             unreachable.coverage,
@@ -1961,7 +2057,9 @@ mod tests {
             failing_credential_script(up.dir.path()),
         )
         .unwrap();
-        let resting = no_credential.poll_at(Some(&saved), NOW + SPACING - 1).await;
+        let resting = up
+            .poll_with(&no_credential, Some(&saved), NOW + SPACING - 1)
+            .await;
 
         assert_eq!(resting.coverage, SourceCoverage::Complete);
         assert_eq!(resting.checkpoint.as_ref(), Some(&saved));
@@ -2155,7 +2253,9 @@ mod tests {
         assert!(!up.dir.path().join("refused").exists());
 
         let refusing = curl_shim(up.dir.path(), &["-K"]);
-        let refused = up.source().with_curl(refusing).poll_at(None, NOW).await;
+        let refused = up
+            .poll_with(&up.source().with_curl(refusing), None, NOW)
+            .await;
         assert_eq!(
             refused.coverage,
             unavailable("Up API is unreachable; checkpoint retained."),
@@ -2250,7 +2350,9 @@ mod tests {
         let up = Harness::start(Vec::new()).await;
         let behind_proxy = proxied_curl(up.dir.path(), &proxy.url);
 
-        let batch = up.source().with_curl(behind_proxy).poll_at(None, NOW).await;
+        let batch = up
+            .poll_with(&up.source().with_curl(behind_proxy), None, NOW)
+            .await;
 
         assert_eq!(
             proxy.connections(),
@@ -2288,9 +2390,7 @@ mod tests {
 
         let behind_proxy = proxied_curl(up.dir.path(), &proxy.url);
         let batch = up
-            .source()
-            .with_curl(behind_proxy)
-            .poll_at(Some(&lookups), later)
+            .poll_with(&up.source().with_curl(behind_proxy), Some(&lookups), later)
             .await;
 
         assert!(
@@ -3161,7 +3261,9 @@ mod tests {
                 with_holds(numbered(1), &control_summary),
             ),
         ] {
-            let refused = no_credential.poll_at(Some(&seeded), NOW + SPACING).await;
+            let refused = up
+                .poll_with(&no_credential, Some(&seeded), NOW + SPACING)
+                .await;
             assert_eq!(
                 refused.coverage,
                 unavailable(FOREIGN),
@@ -3199,7 +3301,9 @@ mod tests {
             let saved = SourceCheckpoint {
                 value: format!("{head}{rest}"),
             };
-            let refused = no_credential.poll_at(Some(&saved), NOW + SPACING).await;
+            let refused = up
+                .poll_with(&no_credential, Some(&saved), NOW + SPACING)
+                .await;
             assert_eq!(refused.coverage, unavailable(FOREIGN), "{rest}");
             assert!(refused.checkpoint.is_none());
         }
@@ -3402,6 +3506,419 @@ mod tests {
             up.targets_since(mark).is_empty(),
             "the next round is inside the spacing"
         );
+    }
+
+    async fn assert_stopped(
+        up: &Harness,
+        saved: Option<&SourceCheckpoint>,
+        now: u64,
+        message: &str,
+    ) {
+        let mark = up.targets().len();
+        let stopped = up.poll(saved, now).await;
+        assert_eq!(stopped.coverage, unavailable(message));
+        assert!(stopped.checkpoint.is_none(), "the poll saves nothing");
+        assert!(stopped.events.is_empty(), "the poll delivers no event");
+        assert_eq!(up.targets_since(mark), ["/util/ping"]);
+    }
+
+    /// The checkpoint with every Unix time `seconds` later, as a computer
+    /// whose clock ran ahead would have written it.
+    fn written_ahead(saved: &SourceCheckpoint, seconds: u64) -> SourceCheckpoint {
+        fn move_times(value: &mut Value, seconds: u64) {
+            match value {
+                Value::Number(number) => {
+                    if let Some(time) = number.as_u64().filter(|time| *time >= 1_000_000_000) {
+                        *value = json!(time + seconds);
+                    }
+                }
+                Value::Array(items) => items.iter_mut().for_each(|item| move_times(item, seconds)),
+                Value::Object(fields) => fields
+                    .values_mut()
+                    .for_each(|field| move_times(field, seconds)),
+                _ => {}
+            }
+        }
+        let mut value: Value = serde_json::from_str(&saved.value).unwrap();
+        move_times(&mut value, seconds);
+        SourceCheckpoint {
+            value: value.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_clock_that_steps_during_a_catch_up_scan_saves_nothing_and_every_transaction_arrives_once()
+     {
+        let up = Harness::start(vec![settled(
+            "example-before",
+            "Example Cafe",
+            "-5.00",
+            NOW - 200,
+        )])
+        .await;
+        let (first, saved) = up.scan(None, NOW).await;
+
+        let later = NOW + 20 * DAY;
+        for number in 0..150 {
+            up.world().rows.push(settled(
+                &format!("example-outage-{number:03}"),
+                "Example Books",
+                "-7.00",
+                NOW + DAY + number * (18 * DAY / 150),
+            ));
+        }
+        up.world().bank_time = Some(later);
+        assert_stopped(&up, Some(&saved), later + 70 * 60, CLOCK_DIFFERS).await;
+
+        up.world().bank_time = Some(later + 10);
+        let mark = up.targets().len();
+        let page = up.poll_to_listing(Some(&saved), later + 10).await;
+        assert_eq!(page.coverage, SourceCoverage::More);
+        assert_eq!(page.events.len(), 100);
+        assert_eq!(
+            up.since_requested_after(mark),
+            feed::utc(NOW - DAY),
+            "the catch-up scan reads from one day before the last scan, 21 days back"
+        );
+
+        for wrong in [later + 20 - 600, later + 20 + HOUR] {
+            up.world().bank_time = Some(later + 20);
+            assert_stopped(&up, page.checkpoint.as_ref(), wrong, CLOCK_DIFFERS).await;
+        }
+
+        up.world().bank_time = Some(later + 30);
+        let mark = up.targets().len();
+        let (rest, _) = up.scan(page.checkpoint.as_ref(), later + 30).await;
+        assert!(
+            up.targets_since(mark)[1].contains("page[after]=100"),
+            "the scan continues at its saved page with its saved lower bound"
+        );
+        let delivered = [first, page.events, rest].concat();
+        let admitted: BTreeSet<(&str, &str)> = delivered
+            .iter()
+            .map(|event| (event.id.as_str(), event.version.as_str()))
+            .collect();
+        assert_eq!(versions(&delivered).len(), 151, "every transaction arrives");
+        assert_eq!(admitted.len(), 151, "and each under one version");
+    }
+
+    #[tokio::test]
+    async fn one_poll_under_a_clock_set_in_the_past_delivers_no_old_transaction_and_the_origin_stays()
+     {
+        let up = Harness::start(vec![
+            settled("example-recent", "Example Cafe", "-5.00", NOW - HOUR),
+            settled("example-old-9", "Example Books", "-7.00", NOW - 9 * DAY),
+            settled("example-old-33", "Example Hotel", "-200.00", NOW - 33 * DAY),
+            settled(
+                "example-old-400",
+                "Example Hardware",
+                "-99.00",
+                NOW - 400 * DAY,
+            ),
+        ])
+        .await;
+        let (first, saved) = up.scan(None, NOW).await;
+        assert_eq!(titles(&first), ["Example Cafe: -5.00 AUD (settled)"]);
+
+        let real = NOW + HOUR;
+        up.world().bank_time = Some(real);
+        for in_the_past in [real - 9 * DAY, real - 30 * DAY, 1_000] {
+            assert_stopped(&up, Some(&saved), in_the_past, CLOCK_DIFFERS).await;
+        }
+
+        up.world().bank_time = None;
+        let (corrected, saved) = up.scan(Some(&saved), real + 600).await;
+        assert_eq!(titles(&corrected), ["Example Cafe: -5.00 AUD (settled)"]);
+        let mark = up.targets().len();
+        let (reread, _) = up.scan(Some(&saved), NOW + DAY + HOUR).await;
+        assert_eq!(
+            up.since_requested_after(mark),
+            feed::utc(NOW - 7 * DAY),
+            "the daily reread still starts at the first poll's seven days"
+        );
+        assert_eq!(titles(&reread), ["Example Cafe: -5.00 AUD (settled)"]);
+    }
+
+    #[tokio::test]
+    async fn a_clock_that_runs_ahead_for_sixteen_days_stops_the_source_and_every_transaction_arrives_after_the_correction()
+     {
+        const AHEAD: u64 = 16 * DAY;
+        let up = Harness::start(Vec::new()).await;
+        let (_, saved) = up.scan(None, NOW).await;
+
+        for day in 1..=16 {
+            let real = NOW + day * DAY;
+            up.world().rows.push(settled(
+                &format!("example-day-{day:02}"),
+                "Example Cafe",
+                "-5.00",
+                real - HOUR,
+            ));
+            up.world().bank_time = Some(real);
+            assert_stopped(&up, Some(&saved), real + AHEAD, CLOCK_DIFFERS).await;
+        }
+
+        let corrected = NOW + 17 * DAY;
+        up.world().bank_time = Some(corrected);
+        let mark = up.targets().len();
+        let (events, _) = up.scan(Some(&saved), corrected).await;
+        assert_eq!(
+            up.since_requested_after(mark),
+            feed::utc(NOW - DAY),
+            "the scan reads from the bound that the last checked scan saved"
+        );
+        let delivered: Vec<&str> = events.iter().map(|event| event.id.as_str()).collect();
+        let expected: Vec<String> = (1..=16)
+            .rev()
+            .map(|day| format!("example-day-{day:02}"))
+            .collect();
+        assert_eq!(delivered, expected);
+    }
+
+    #[tokio::test]
+    async fn a_reply_without_exactly_one_readable_date_header_ends_the_poll_and_saves_nothing() {
+        let up = Harness::start(vec![settled(
+            "example-transaction-1",
+            "Example Cafe",
+            "-5.00",
+            NOW - HOUR,
+        )])
+        .await;
+        let (_, saved) = up.scan(None, NOW).await;
+        for dates in [
+            Dates::Missing,
+            Dates::Duplicated,
+            Dates::Text(""),
+            Dates::Text("yesterday"),
+            Dates::Text("2026-11-18T11:06:40Z"),
+            Dates::Text("Wed, 18 Nov 2026 11:06:40"),
+        ] {
+            up.world().dates = dates;
+            assert_stopped(&up, None, NOW, NO_DATE).await;
+            assert_stopped(&up, Some(&saved), NOW + SPACING, NO_DATE).await;
+        }
+
+        up.world().dates = Dates::Text("Wed, 18 Nov 2026 11:06:40 GMT");
+        let read = up.poll(None, NOW).await;
+        assert_eq!(read.coverage, SourceCoverage::More);
+    }
+
+    #[tokio::test]
+    async fn the_clock_may_differ_from_ups_clock_by_five_minutes_and_by_no_second_more() {
+        let up = Harness::start(vec![settled(
+            "example-transaction-1",
+            "Example Cafe",
+            "-5.00",
+            NOW - HOUR,
+        )])
+        .await;
+        let (_, saved) = up.scan(None, NOW).await;
+
+        up.world().bank_time = Some(NOW);
+        for tolerated in [NOW + 300, NOW - 300] {
+            let read = up.poll(None, tolerated).await;
+            assert_eq!(read.coverage, SourceCoverage::More);
+            assert_eq!(titles(&read.events), ["Example Cafe: -5.00 AUD (settled)"]);
+        }
+        for wrong in [NOW + 301, NOW - 301] {
+            up.world().bank_time = Some(NOW);
+            assert_stopped(&up, None, wrong, CLOCK_DIFFERS).await;
+            up.world().bank_time = Some(NOW + SPACING);
+            assert_stopped(&up, Some(&saved), wrong + SPACING, CLOCK_DIFFERS).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_clock_is_checked_on_a_reply_with_an_error_status() {
+        let up = Harness::start(Vec::new()).await;
+        up.script(|seen| (seen.path() == "/util/ping").then(|| up_error(401, "Not Authorized")));
+        up.world().bank_time = Some(NOW);
+
+        assert_stopped(
+            &up,
+            None,
+            NOW + 300,
+            "Up rejected the token; it may be expired, revoked or replaced. Checkpoint retained.",
+        )
+        .await;
+        assert_stopped(&up, None, NOW + 301, CLOCK_DIFFERS).await;
+        up.world().dates = Dates::Missing;
+        assert_stopped(&up, None, NOW, NO_DATE).await;
+    }
+
+    #[tokio::test]
+    async fn a_credential_command_that_takes_longer_than_five_minutes_is_not_a_clock_failure() {
+        for seconds in [301, 890] {
+            let up = Harness::start(vec![settled(
+                "example-transaction-1",
+                "Example Cafe",
+                "-5.00",
+                NOW - HOUR,
+            )])
+            .await;
+            up.world().credential_seconds = seconds;
+            let (events, saved) = up.scan(None, NOW).await;
+            assert_eq!(titles(&events), ["Example Cafe: -5.00 AUD (settled)"]);
+
+            up.world().credential_seconds = 0;
+            let mark = up.targets().len();
+            let resting = up.poll(Some(&saved), NOW + seconds + SPACING - 1).await;
+            assert_eq!(resting.coverage, SourceCoverage::Complete);
+            assert!(
+                up.targets_since(mark).is_empty(),
+                "the spacing counts from the last response, {seconds} seconds after its poll began"
+            );
+            up.scan(Some(&saved), NOW + seconds + SPACING).await;
+            assert_eq!(up.targets_since(mark).len(), 4);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_that_an_earlier_build_wrote_is_refused_and_a_new_label_starts_a_fresh_read()
+     {
+        let up = Harness::start(vec![settled(
+            "example-transaction-1",
+            "Example Cafe",
+            "-5.00",
+            NOW - HOUR,
+        )])
+        .await;
+        let scope = feed::scope(&[&up.source().api.fingerprint()]);
+        let owner = feed::scope(&["everyday", "example-customer-1"]);
+        let head = format!(
+            r#"{{"account":"everyday","scope":"{scope}","owner":"{owner}","origin":1794395200,"reread_at":1795000000,"#
+        );
+        let from_an_earlier_build = [
+            r#""window":{"resting":{"since":1794913600,"not_before":1795000300}},"kept":{"unseen":{},"seen":{}}}"#,
+            r#""window":{"scanning":{"started_at":1795000000,"since":1794395200,"pages":1,"restarted":false,"cursor":null,"state":{"phase":"held","reach_back":null}}},"kept":{"unseen":{},"seen":{}}}"#,
+        ];
+        let no_credential = UpSource::new(
+            "everyday".into(),
+            Some(up.api.url.clone()),
+            failing_credential_script(up.dir.path()),
+        )
+        .unwrap();
+        for rest in from_an_earlier_build {
+            let saved = SourceCheckpoint {
+                value: format!("{head}{rest}"),
+            };
+            for now in [NOW + SPACING, NOW + 20 * DAY] {
+                let refused = up.poll_with(&no_credential, Some(&saved), now).await;
+                assert_eq!(refused.coverage, unavailable(FOREIGN), "{rest}");
+                assert!(refused.checkpoint.is_none());
+            }
+        }
+        assert!(up.targets().is_empty(), "no request is made");
+
+        let relabelled = UpSource::new(
+            "everyday-2".into(),
+            Some(up.api.url.clone()),
+            credential_script(up.dir.path(), TOKEN),
+        )
+        .unwrap();
+        let later = NOW + 20 * DAY;
+        let fresh = up.poll_with(&relabelled, None, later).await;
+        assert_eq!(fresh.coverage, SourceCoverage::More);
+        assert_eq!(up.since_requested_after(0), feed::utc(later - 7 * DAY));
+    }
+
+    #[tokio::test]
+    async fn a_saved_time_more_than_one_hour_ahead_of_ups_clock_is_refused_as_a_foreign_checkpoint()
+    {
+        let up = Harness::start(vec![settled(
+            "example-transaction-1",
+            "Example Cafe",
+            "-5.00",
+            NOW - HOUR,
+        )])
+        .await;
+        let (_, saved) = up.scan(None, NOW).await;
+        let latest_saved_time = NOW + SPACING;
+        let poll_at = NOW + 2 * SPACING;
+        let one_hour_ahead = poll_at + HOUR - latest_saved_time;
+
+        for ahead in [one_hour_ahead + 1, 16 * DAY] {
+            let copied = written_ahead(&saved, ahead);
+            assert_stopped(&up, Some(&copied), poll_at, FOREIGN).await;
+        }
+
+        let within_the_hour = written_ahead(&saved, one_hour_ahead);
+        let read = up.poll(Some(&within_the_hour), poll_at).await;
+        assert_eq!(read.coverage, SourceCoverage::More);
+        assert_eq!(titles(&read.events), ["Example Cafe: -5.00 AUD (settled)"]);
+    }
+
+    #[tokio::test]
+    async fn a_poll_after_the_wall_clock_moved_back_one_hour_does_not_rest() {
+        let up = Harness::start(Vec::new()).await;
+        let (_, saved) = up.scan(None, NOW).await;
+
+        up.pass(60);
+        up.world().bank_time = Some(NOW + 60);
+        assert_stopped(&up, Some(&saved), NOW + 60 - HOUR, CLOCK_DIFFERS).await;
+    }
+
+    #[tokio::test]
+    async fn under_a_wall_clock_that_stands_still_the_source_scans_again_after_300_seconds_of_monotonic_time()
+     {
+        let up = Harness::start(Vec::new()).await;
+        let (_, saved) = up.scan(None, NOW).await;
+        up.world().rows.push(settled(
+            "example-transaction-1",
+            "Example Cafe",
+            "-5.00",
+            NOW + 100,
+        ));
+
+        up.pass(299);
+        up.world().bank_time = Some(NOW + 299);
+        let mark = up.targets().len();
+        let resting = up.poll(Some(&saved), NOW).await;
+        assert_eq!(resting.coverage, SourceCoverage::Complete);
+        assert_eq!(resting.checkpoint.as_ref(), Some(&saved));
+        assert!(up.targets_since(mark).is_empty());
+
+        up.pass(1);
+        up.world().bank_time = Some(NOW + 300);
+        let scanning = up.poll(Some(&saved), NOW).await;
+        assert_eq!(scanning.coverage, SourceCoverage::More);
+        assert_eq!(
+            titles(&scanning.events),
+            ["Example Cafe: -5.00 AUD (settled)"],
+            "the clocks differ by 300 seconds, so this poll still reads"
+        );
+
+        up.pass(1);
+        up.world().bank_time = Some(NOW + 301);
+        assert_stopped(&up, scanning.checkpoint.as_ref(), NOW, CLOCK_DIFFERS).await;
+    }
+
+    #[tokio::test]
+    async fn after_a_restart_the_source_rests_for_at_most_300_seconds_of_monotonic_time() {
+        let up = Harness::start(Vec::new()).await;
+        let (_, saved) = up.scan(None, NOW).await;
+
+        up.pass(200);
+        up.restart();
+        let stood_still = NOW + 200;
+        for passed in [0, 299] {
+            up.pass(passed);
+            up.world().bank_time = Some(stood_still + passed);
+            let mark = up.targets().len();
+            let resting = up.poll(Some(&saved), stood_still).await;
+            assert_eq!(resting.coverage, SourceCoverage::Complete);
+            assert!(
+                up.targets_since(mark).is_empty(),
+                "{passed} seconds after the first poll of the new process"
+            );
+        }
+
+        up.pass(1);
+        up.world().bank_time = Some(stood_still + 300);
+        let mark = up.targets().len();
+        let scanning = up.poll(Some(&saved), stood_still).await;
+        assert_eq!(scanning.coverage, SourceCoverage::More);
+        assert_eq!(up.targets_since(mark).len(), 2);
     }
 
     fn parsed(row: &Row) -> Transaction {

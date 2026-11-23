@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -306,6 +306,7 @@ async fn local_helper_can_run_while_its_script_is_open_for_writing() {
 const UP_TOKEN: &str = "example-up-token";
 const SECOND_UP_TOKEN: &str = "example-second-up-token";
 const UP_FOREIGN: &str = "Up checkpoint belongs to another account or configuration; change the account label to start a fresh seven-day read.";
+const UP_CLOCK_DIFFERS: &str = "This computer's clock differs from Up's clock by more than five minutes; check the clock. Checkpoint retained.";
 
 /// An invented Up account on a loopback address. It has one held and two
 /// settled transactions and lists them one per page, newest first. A second
@@ -315,6 +316,9 @@ struct FakeUp {
     /// The target and the bearer token of each request.
     requests: Arc<Mutex<Vec<(String, String)>>>,
     second_page_fails: Arc<AtomicBool>,
+    /// Seconds that the bank's clock, which its `Date` header shows, is ahead
+    /// of this computer's clock. Negative when the computer's clock runs ahead.
+    bank_clock_ahead: Arc<AtomicI64>,
     server: JoinHandle<()>,
 }
 
@@ -368,7 +372,9 @@ impl FakeUp {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let second_page_fails = Arc::new(AtomicBool::new(true));
+        let bank_clock_ahead = Arc::new(AtomicI64::new(0));
         let (origin, seen, fails) = (url.clone(), requests.clone(), second_page_fails.clone());
+        let ahead = bank_clock_ahead.clone();
         let server = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let mut request = Vec::new();
@@ -396,8 +402,11 @@ impl FakeUp {
                 };
                 seen.lock().unwrap().push((target, bearer));
                 let body = body.to_string();
+                let date = (chrono::Utc::now()
+                    + chrono::Duration::seconds(ahead.load(Ordering::Relaxed)))
+                .format("%a, %d %b %Y %H:%M:%S GMT");
                 let response = format!(
-                    "HTTP/1.1 {status} Scripted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} Scripted\r\nDate: {date}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = socket.write_all(response.as_bytes()).await;
@@ -407,6 +416,7 @@ impl FakeUp {
             url,
             requests,
             second_page_fails,
+            bank_clock_ahead,
             server,
         }
     }
@@ -961,6 +971,108 @@ async fn an_up_feed_whose_clock_ran_ahead_reads_again_through_the_real_poll_path
         up.requests().len(),
         requests_after,
         "the next round is inside the spacing, which counts from the current clock"
+    );
+    runtime.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_up_source_whose_clock_runs_sixteen_days_ahead_saves_nothing_through_the_real_poll_path_and_the_journal_admits_every_transaction_after_the_correction()
+ {
+    let up = FakeUp::start().await;
+    up.second_page_fails.store(false, Ordering::Relaxed);
+    let setup = UpSetup::new(&up);
+    let runtime = start_runtime(&setup.state);
+
+    up.bank_clock_ahead.store(-16 * 86_400, Ordering::Relaxed);
+    for _ in 0..2 {
+        assert_eq!(
+            refresh_into_journal(&runtime, &setup.config).await,
+            [page(up_unavailable(UP_CLOCK_DIFFERS), 0, 0, false)],
+            "the source stops with the clock message and sends nothing to the journal"
+        );
+    }
+    assert_eq!(
+        up.requests(),
+        ["/util/ping", "/util/ping"],
+        "a poll under the wrong clock reads no transaction"
+    );
+    let saved = journal_states(&runtime)
+        .await
+        .into_iter()
+        .find(|state| state.source.provider == "up")
+        .and_then(|state| state.checkpoint);
+    assert_eq!(saved, None, "the journal holds no checkpoint");
+
+    up.bank_clock_ahead.store(0, Ordering::Relaxed);
+    let scan = refresh_until_complete(&runtime, &setup.config).await;
+    assert_eq!(
+        scan.iter().map(|page| page.new_events).sum::<u32>(),
+        3,
+        "the journal admits the three transactions after the correction"
+    );
+    runtime.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_clock_that_steps_during_an_up_scan_keeps_the_checkpoint_through_the_real_poll_path_and_the_scan_resumes_at_its_saved_page()
+ {
+    let up = FakeUp::start().await;
+    let setup = UpSetup::new(&up);
+    let runtime = start_runtime(&setup.state);
+    assert_eq!(
+        refresh_into_journal(&runtime, &setup.config).await,
+        [
+            page(SourceCoverage::More, 1, 1, true),
+            page(
+                up_unavailable("Up API returned HTTP 503; checkpoint retained."),
+                0,
+                0,
+                false
+            ),
+        ],
+        "the scan stops with its second page saved"
+    );
+    let saved = up_checkpoint(&runtime).await;
+    up.second_page_fails.store(false, Ordering::Relaxed);
+
+    for bank_clock_ahead in [600, -4_200] {
+        up.bank_clock_ahead
+            .store(bank_clock_ahead, Ordering::Relaxed);
+        let requests_before = up.requests().len();
+        assert_eq!(
+            refresh_into_journal(&runtime, &setup.config).await,
+            [page(up_unavailable(UP_CLOCK_DIFFERS), 0, 0, false)]
+        );
+        assert_eq!(up.requests()[requests_before..], ["/util/ping"]);
+        assert_eq!(
+            up_checkpoint(&runtime).await,
+            saved,
+            "the journal keeps the checkpoint of the scan in flight"
+        );
+    }
+
+    up.bank_clock_ahead.store(0, Ordering::Relaxed);
+    let requests_before = up.requests().len();
+    assert_eq!(
+        refresh_until_complete(&runtime, &setup.config).await,
+        [
+            page(SourceCoverage::More, 1, 1, true),
+            page(SourceCoverage::More, 1, 1, true),
+            page(SourceCoverage::Complete, 1, 0, true),
+        ],
+        "the journal admits each of the three transactions once"
+    );
+    assert_eq!(
+        up.requests()[requests_before..],
+        [
+            "/util/ping",
+            "/transactions?page[after]=1&page[size]=1",
+            "/util/ping",
+            "/transactions?page[after]=2&page[size]=1",
+            "/util/ping",
+            "/transactions?filter[status]=HELD&page[size]=100",
+        ],
+        "the scan continues at the page it saved before the clock stepped"
     );
     runtime.close().await.unwrap();
 }
