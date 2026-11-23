@@ -7,7 +7,7 @@ use tokio::io::AsyncWrite;
 use crate::{
     broker::Broker,
     dreams::{
-        apply::{DreamsRejected, POLICY_CHANGED},
+        apply::{DreamsHeld, DreamsRejected, POLICY_CHANGED},
         ops,
     },
     native::{NativeEvent, ServiceRequest},
@@ -57,29 +57,19 @@ pub(super) async fn handle<W: AsyncWrite + Unpin>(
         }
         .await
         .map_err(classify_dreams_error),
-        ServiceRequest::DreamsApply { run, approve } => {
-            if runtime.restore_held() {
-                Err((
-                    ErrorCode::CoordinatorUnavailable,
-                    "Dreams apply is held after a restore until `backup release`".into(),
-                ))
-            } else {
-                async {
-                    let policy = broker
-                        .dreams_policy_now()?
-                        .ok_or_else(|| DreamsRejected(POLICY_CHANGED.into()))?;
-                    let applied =
-                        ops::native_apply(broker.state_dir(), &policy, &run, &approve).await?;
-                    Ok(NativeEvent::DreamsApplied {
-                        run: applied.run,
-                        commit: applied.commit,
-                        already_applied: applied.already_applied,
-                    })
-                }
-                .await
-                .map_err(classify_dreams_error)
-            }
+        ServiceRequest::DreamsApply { run, approve } => async {
+            let policy = broker
+                .dreams_policy_now()?
+                .ok_or_else(|| DreamsRejected(POLICY_CHANGED.into()))?;
+            let applied = ops::native_apply(broker.state_dir(), &policy, &run, &approve).await?;
+            Ok(NativeEvent::DreamsApplied {
+                run: applied.run,
+                commit: applied.commit,
+                already_applied: applied.already_applied,
+            })
         }
+        .await
+        .map_err(classify_dreams_error),
     };
     match outcome {
         Ok(event) => super::write_client_frame(writer, &event, runtime).await?,
@@ -101,6 +91,8 @@ pub(super) async fn handle<W: AsyncWrite + Unpin>(
 fn classify_dreams_error(error: anyhow::Error) -> (ErrorCode, String) {
     let code = if error.is::<DreamsRejected>() {
         ErrorCode::InvalidRequest
+    } else if error.is::<DreamsHeld>() {
+        ErrorCode::CoordinatorUnavailable
     } else {
         ErrorCode::Internal
     };

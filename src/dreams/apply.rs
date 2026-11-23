@@ -21,6 +21,7 @@ use crate::dreams::{
 };
 
 pub const POLICY_CHANGED: &str = "Dreams policy changed since this proposal";
+pub const HELD_AFTER_RESTORE: &str = "Dreams apply is held after a restore until `backup release`";
 
 const APPLY_LOCK_WAIT: Duration = Duration::from_secs(10);
 const APPLY_LOCK_POLL: Duration = Duration::from_millis(25);
@@ -36,6 +37,19 @@ impl fmt::Display for DreamsRejected {
 }
 
 impl std::error::Error for DreamsRejected {}
+
+/// Refusal while the state directory waits for `backup release` (maps to
+/// `ErrorCode::CoordinatorUnavailable` on the wire).
+#[derive(Debug)]
+pub struct DreamsHeld;
+
+impl fmt::Display for DreamsHeld {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(HELD_AFTER_RESTORE)
+    }
+}
+
+impl std::error::Error for DreamsHeld {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -679,6 +693,9 @@ pub async fn apply_proposal(
     approval: &ContentDigest,
 ) -> Result<ApplyOutcome> {
     let _one_apply = lock_applies(store).await?;
+    if crate::backup::restore_hold_present(store.state_directory()) {
+        return Err(anyhow::Error::new(DreamsHeld));
+    }
     let view = store
         .read(run)?
         .ok_or_else(|| anyhow::Error::new(DreamsRejected(format!("Unknown Dreams run {run}"))))?;
@@ -825,6 +842,48 @@ mod tests {
         let applied = waiting.await.unwrap().unwrap();
         assert!(!applied.already_applied);
         assert_applied_once(&repo, &state, &sample, &base);
+    }
+
+    #[tokio::test]
+    async fn an_apply_that_waited_for_another_refuses_when_a_restore_hold_is_there_by_then() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, state) = (dir.path().join("repo"), dir.path().join("state"));
+        let sample = write_sample_proposal(&repo, &state, "held-run", BEFORE, AFTER);
+        let approval = approval(&state, &sample);
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+        let other_apply = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(state.join("dreams/apply.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&other_apply).unwrap();
+
+        let waiting = tokio::spawn({
+            let (state, policy, run) = (state.clone(), sample.policy.clone(), sample.run.clone());
+            async move {
+                let store = DreamsStore::open(&state).unwrap();
+                apply_proposal(&store, &policy, &run, &approval).await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        fs::write(state.join("restore-hold.json"), "{}").unwrap();
+        fs2::FileExt::unlock(&other_apply).unwrap();
+
+        let refused = waiting
+            .await
+            .unwrap()
+            .expect_err("An apply must not run on a state directory that is held after a restore");
+        assert_eq!(
+            refused.to_string(),
+            "Dreams apply is held after a restore until `backup release`"
+        );
+        assert_eq!(git(&repo, &["rev-parse", "HEAD"]), base);
+        assert_eq!(git(&repo, &["status", "--porcelain"]), "");
+        assert_eq!(fs::read_to_string(repo.join("AGENTS.md")).unwrap(), BEFORE);
+        let store = DreamsStore::open(&state).unwrap();
+        assert!(store.applied(&sample.run).unwrap().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

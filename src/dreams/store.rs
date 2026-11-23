@@ -47,6 +47,7 @@ pub(crate) enum ReviewSeal {
 }
 
 pub struct DreamsStore {
+    state: PathBuf,
     root: PathBuf,
 }
 
@@ -121,7 +122,14 @@ impl DreamsStore {
         private_directory(&root)
             .and_then(|()| private_directory(&root.join(RUNS_DIRECTORY)))
             .context("Dreams state is unavailable")?;
-        Ok(Self { root })
+        Ok(Self {
+            state: state.to_owned(),
+            root,
+        })
+    }
+
+    pub(crate) fn state_directory(&self) -> &Path {
+        &self.state
     }
 
     /// Whether `state` holds a stored run. It creates nothing and reads no run,

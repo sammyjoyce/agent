@@ -290,9 +290,15 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use agent_cli::serialized_spawn::SerializedSpawn;
-    use std::{fs, path::Path, process::Command};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+        process::Command,
+    };
 
     use agent_cli::{
+        config::ClientConfig,
         dreams::{
             Dreams, DreamsCheckFile, DreamsFileEdit, DreamsPolicy, DreamsPolicyFile, DreamsRequest,
             DreamsStore, DreamsTaskSummary, ProtectedPaths, RunId, SealedOutcome,
@@ -302,7 +308,9 @@ mod tests {
     };
     use tokio::sync::watch;
 
-    use crate::dreams_cli::{RunReport, apply_command, format_apply_message, render};
+    use crate::dreams_cli::{
+        DreamsAction, RunReport, apply_command, format_apply_message, render, run,
+    };
 
     fn git(repository: &Path, arguments: &[&str]) -> String {
         let output = Command::new("git")
@@ -321,10 +329,18 @@ mod tests {
         String::from_utf8(output.stdout).unwrap()
     }
 
-    #[tokio::test]
-    async fn a_proposed_new_file_applies_once_even_after_an_interrupted_apply_left_it_behind() {
-        let root = tempfile::tempdir().unwrap();
-        let base = root.path().canonicalize().unwrap();
+    const PLAYBOOK: &str = "# Build\n\nRun `make test`.\n";
+
+    struct ProposedPlaybook {
+        repository: PathBuf,
+        state: PathBuf,
+        policy_file: DreamsPolicyFile,
+        policy: DreamsPolicy,
+        head: String,
+        run: RunId,
+    }
+
+    async fn proposed_playbook(base: &Path) -> ProposedPlaybook {
         let (repository, state) = (base.join("guidance"), base.join("state"));
         fs::create_dir(&repository).unwrap();
         fs::create_dir(&state).unwrap();
@@ -339,20 +355,21 @@ mod tests {
         );
         let head = git(&repository, &["rev-parse", "HEAD"]);
         fs::write(base.join("check.sh"), "test -f playbooks/build.md\n").unwrap();
+        let policy_file = DreamsPolicyFile {
+            repository: repository.clone(),
+            editable: vec!["playbooks/*.md".into()],
+            window_hours: Some(1),
+            checks: vec![DreamsCheckFile {
+                name: "playbook-exists".into(),
+                argv: vec![
+                    "/bin/sh".into(),
+                    base.join("check.sh").to_string_lossy().into_owned(),
+                ],
+                timeout_seconds: 30,
+            }],
+        };
         let policy = DreamsPolicy::parse(
-            &DreamsPolicyFile {
-                repository: repository.clone(),
-                editable: vec!["playbooks/*.md".into()],
-                window_hours: Some(1),
-                checks: vec![DreamsCheckFile {
-                    name: "playbook-exists".into(),
-                    argv: vec![
-                        "/bin/sh".into(),
-                        base.join("check.sh").to_string_lossy().into_owned(),
-                    ],
-                    timeout_seconds: 30,
-                }],
-            },
+            &policy_file,
             &ProtectedPaths {
                 config: None,
                 job_directories: &[],
@@ -360,7 +377,6 @@ mod tests {
         )
         .unwrap();
         let dreams = Dreams::open(&state, policy.clone()).unwrap();
-        let playbook = "# Build\n\nRun `make test`.\n";
         for request in [
             DreamsRequest::Review {
                 run: "night".into(),
@@ -377,7 +393,7 @@ mod tests {
                 run: "night".into(),
                 edits: vec![DreamsFileEdit {
                     path: "playbooks/build.md".into(),
-                    content: playbook.into(),
+                    content: PLAYBOOK.into(),
                 }],
                 rationale: "Add\u{1b}[2K the missing playbook.".into(),
                 evidence: vec!["t:task-1@7".into()],
@@ -389,6 +405,27 @@ mod tests {
                 HostResult::Dreams { .. }
             ));
         }
+        ProposedPlaybook {
+            repository,
+            state,
+            policy_file,
+            policy,
+            head,
+            run: RunId::from_request("night").unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_proposed_new_file_applies_once_even_after_an_interrupted_apply_left_it_behind() {
+        let root = tempfile::tempdir().unwrap();
+        let ProposedPlaybook {
+            repository,
+            state,
+            policy,
+            head,
+            ..
+        } = proposed_playbook(&root.path().canonicalize().unwrap()).await;
+        let playbook = PLAYBOOK;
         let store = DreamsStore::open(&state).unwrap();
         let run = RunId::from_request("night").unwrap();
         let view = store.read(&run).unwrap().unwrap();
@@ -485,6 +522,68 @@ mod tests {
                 ))
             ),
             "A recorded apply stays applied without the policy, and Git is not consulted"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_refuses_while_held_after_a_restore_and_applies_after_the_release() {
+        let root = tempfile::tempdir().unwrap();
+        let ProposedPlaybook {
+            repository,
+            state,
+            policy_file,
+            head,
+            run: night,
+            ..
+        } = proposed_playbook(&root.path().canonicalize().unwrap()).await;
+        let config = ClientConfig {
+            dreams: Some(policy_file),
+            ..ClientConfig::default()
+        };
+        let store = DreamsStore::open(&state).unwrap();
+        let approval = store.read(&night).unwrap().unwrap().outcome_sha256.unwrap();
+        let apply = || {
+            run(
+                &state,
+                &config,
+                false,
+                DreamsAction::Apply {
+                    run: night.to_string(),
+                    approve: approval.to_string(),
+                },
+            )
+        };
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(state.join("restore-hold.json"), "{}").unwrap();
+
+        run(&state, &config, false, DreamsAction::List)
+            .await
+            .expect("A held state directory still lists its runs");
+        let show = DreamsAction::Show {
+            run: night.to_string(),
+        };
+        run(&state, &config, false, show)
+            .await
+            .expect("A held state directory still shows a run");
+        let refused = apply()
+            .await
+            .expect_err("The command line must not apply while held after a restore");
+        assert_eq!(
+            refused.to_string(),
+            "Dreams apply is held after a restore until `backup release`"
+        );
+        assert_eq!(git(&repository, &["rev-parse", "HEAD"]), head);
+        assert_eq!(git(&repository, &["status", "--porcelain"]), "");
+        assert!(!repository.join("playbooks").exists());
+        assert!(store.applied(&night).unwrap().is_none());
+
+        assert!(agent_cli::backup::release(&state).unwrap().was_held);
+        apply().await.unwrap();
+        assert_eq!(git(&repository, &["rev-parse", "HEAD~1"]), head);
+        assert_eq!(git(&repository, &["status", "--porcelain"]), "");
+        assert_eq!(
+            fs::read_to_string(repository.join("playbooks/build.md")).unwrap(),
+            PLAYBOOK
         );
     }
 

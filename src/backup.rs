@@ -221,8 +221,15 @@ pub(crate) fn release_locked(_lock: &WriterLock, state: &Path) -> Result<Release
 
 /// Whether a restored store still waits for `backup release`. The writer lock
 /// keeps `release` from changing the answer while the caller acts on it.
-/// Anything at the name, or an unreadable name, is a hold.
 pub fn restore_held(_owner: &WriterLock, state: &Path) -> bool {
+    restore_hold_present(state)
+}
+
+/// Whether a restored store still waits for `backup release`, for a caller
+/// that cannot take the writer lock. Anything at the name, or an unreadable
+/// name, is a hold. `release` can remove the hold after this answers, so act
+/// on the answer only to refuse.
+pub fn restore_hold_present(state: &Path) -> bool {
     !matches!(
         fs::symlink_metadata(state.join(RESTORE_HOLD_FILE)),
         Err(error) if error.kind() == io::ErrorKind::NotFound
