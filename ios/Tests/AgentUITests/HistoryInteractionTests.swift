@@ -834,6 +834,29 @@ final class HistoryInteractionTests: XCTestCase {
       withNormalizedOffset: CGVector(dx: 0.5, dy: down ? 0.65 : 0.3))
     start.press(forDuration: 0.05, thenDragTo: end)
   }
+  private func slowDrag(
+    _ transcript: XCUIElement, by distance: CGFloat, from start: XCUICoordinate? = nil
+  ) {
+    let start =
+      start ?? transcript.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.35))
+    start.press(
+      forDuration: 0.1, thenDragTo: start.withOffset(CGVector(dx: 0, dy: distance)),
+      withVelocity: .slow, thenHoldForDuration: 0.3)
+  }
+  private func scroll(
+    _ transcript: XCUIElement, until frame: () -> CGRect?, liesAcross y: CGFloat,
+    rowMargin: CGFloat = 8, file: StaticString = #filePath, line: UInt = #line
+  ) throws -> CGRect {
+    for _ in 0..<20 {
+      guard let row = frame() else { break }
+      let distance = y - row.midY
+      if abs(distance) <= row.height / 2 - rowMargin { return row }
+      // The first 10 points of a drag do not move the transcript.
+      slowDrag(transcript, by: max(-200, min(200, distance + (distance > 0 ? 10 : -10))))
+    }
+    return try XCTUnwrap(
+      nil as CGRect?, "No row came to rest across the height \(y)", file: file, line: line)
+  }
   func testLongSingleNoticeRemainsDraggableThroughKeyboardAndRevision() async throws {
     continueAfterFailure = true
     let peer = InteractionPeer()
@@ -2685,6 +2708,87 @@ final class HistoryInteractionTests: XCTestCase {
     }
     let latest = app.buttons["latest-messages"]
     XCTAssertFalse(latest.exists, "Expanding a live tail group should keep following the tail")
+  }
+
+  func testLatestBarTakesATapOverAHiddenRowAndADragFromItStillScrolls() async throws {
+    var messages: [HistoryMessage] = []
+    for index in 0..<30 {
+      messages.append(
+        HistoryMessage(
+          continuation: false, entryId: "bar-tool-\(index)", finalChunk: true,
+          presentation: .command(.init(command: "echo \(index)", durationMs: 2, exitCode: 0)),
+          role: .tool, text: "done \(index)",
+          tool: .init(callId: "bar-call-\(index)", name: "exec", status: .finished)))
+      messages.append(
+        HistoryMessage(
+          continuation: false, entryId: "bar-text-\(index)", finalChunk: true, role: .final,
+          text: "Latest bar line \(index)."))
+    }
+    let app = try await launchMessages(messages)
+    let transcript = app.scrollViews["transcript"]
+    XCTAssertTrue(transcript.waitForExistence(timeout: 10))
+    let last = app.staticTexts["Latest bar line 29."]
+    try await eventually(description: "live tail") { last.isHittable }
+    drag(transcript, down: true)
+    drag(transcript, down: true)
+    let latest = app.buttons["latest-messages"]
+    XCTAssertTrue(latest.waitForExistence(timeout: 5))
+    let groups = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'activity:'"))
+    let opened = app.buttons.matching(
+      NSPredicate(format: "identifier BEGINSWITH 'activity-item:'"))
+    func groupFrames() -> [CGRect] {
+      groups.allElementsBoundByIndex.map(\.frame).filter { !$0.isEmpty }
+    }
+    func onBar() -> XCUICoordinate {
+      app.coordinate(withNormalizedOffset: .zero).withOffset(
+        CGVector(dx: transcript.frame.minX + 60, dy: latest.frame.midY))
+    }
+    let level = latest.frame.midY
+    _ = try scroll(
+      transcript,
+      until: { groupFrames().min { abs($0.midY - level) < abs($1.midY - level) } },
+      liesAcross: level)
+    XCTAssertEqual(opened.count, 0)
+    onBar().tap()
+    XCTAssertFalse(
+      opened.firstMatch.waitForExistence(timeout: 2),
+      "A tap on the Latest bar opened the activity group that the bar hides")
+
+    let shown = try XCTUnwrap(
+      groupFrames().filter { $0.maxY < latest.frame.minY - 20 }.max { $0.minY < $1.minY })
+    app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: shown.midX, dy: shown.midY))
+      .tap()
+    try await eventually(description: "the group that shows above the Latest bar to open") {
+      opened.count == 1
+    }
+
+    let lines = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'Latest bar line '"))
+    let middle = transcript.frame.midY
+    let marker = app.staticTexts[
+      try XCTUnwrap(
+        lines.allElementsBoundByIndex.filter(\.isHittable)
+          .min { abs($0.frame.midY - middle) < abs($1.frame.midY - middle) }
+      ).label]
+    let before = marker.frame.minY
+    slowDrag(transcript, by: -150, from: onBar())
+    XCTAssertLessThan(
+      marker.frame.minY - before, -100, "A drag that starts on the Latest bar no longer scrolls")
+
+    editor(app).tap()
+    let keyboard = app.keyboards.firstMatch
+    XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
+    try await eventually(description: "the Latest bar above the keyboard") {
+      latest.exists && latest.frame.maxY < keyboard.frame.minY
+    }
+    slowDrag(transcript, by: 320, from: onBar())
+    XCTAssertTrue(
+      keyboard.waitForNonExistence(timeout: 5),
+      "A drag down that starts on the Latest bar no longer dismisses the keyboard")
+
+    XCTAssertTrue(latest.waitForExistence(timeout: 5))
+    latest.tap()
+    XCTAssertTrue(latest.waitForNonExistence(timeout: 5))
+    try await eventually(description: "the latest message after Latest") { last.isHittable }
   }
 
   func testLatestButtonDoesNotOverlapShellOutputOrDisclosureControls() async throws {

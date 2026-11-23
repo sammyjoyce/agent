@@ -520,6 +520,7 @@ public struct MainChatView: View {
         }
         .scrollTargetLayout()
         .padding([.horizontal, .top]).frame(maxWidth: 720).frame(maxWidth: .infinity)
+        .overlay(alignment: .top) { if showsLatestBar { latestBarTapShield } }
       }
       .accessibilityIdentifier("transcript")
       .scrollDismissesKeyboard(.interactively)
@@ -621,7 +622,7 @@ public struct MainChatView: View {
       }
       .clipped()
       .safeAreaInset(edge: .bottom, spacing: 0) {
-        if (!latestVisible || !model.includesLatest) && !model.rows.isEmpty {
+        if showsLatestBar {
           HStack {
             Spacer()
             Button("Latest", systemImage: "arrow.down") {
@@ -646,6 +647,21 @@ public struct MainChatView: View {
         }
       }
     }
+  }
+  private var showsLatestBar: Bool {
+    (!latestVisible || !model.includesLatest) && !model.rows.isEmpty
+  }
+  /// Takes a tap on the Latest bar, which would otherwise reach a row that the bar hides. It lies
+  /// in the scroll content, from the lower edge of the visible transcript down, so a drag that
+  /// starts on it still scrolls. A view outside the scroll content that took the touch would stop
+  /// that drag.
+  private var latestBarTapShield: some View {
+    Color.clear.containerRelativeFrame(.vertical).contentShape(Rectangle())
+      .onTapGesture {}
+      .accessibilityHidden(true)
+      .visualEffect { content, geometry in
+        content.offset(y: geometry.bounds(of: .scrollView)?.maxY ?? 0)
+      }
   }
   private func requestHistory() {
     guard historyRequest == nil, !model.loadingHistory, model.canLoadEarlier else { return }
