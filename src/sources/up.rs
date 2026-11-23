@@ -112,7 +112,8 @@ impl UpSource {
         // token it holds before it reads a transaction with that token. Only
         // a hash of the customer id is kept.
         let session = self.api.open().await?;
-        let ping: Ping = session.get(&Target::fixed("/util/ping")).await?.json()?;
+        let (reply, _) = session.get_dated(&Target::fixed("/util/ping")).await?;
+        let ping: Ping = reply.json()?;
         if ping.meta.id.is_empty() {
             return Err(HttpFailure::Unreadable.into());
         }

@@ -1,13 +1,17 @@
 //! One way to send a GET with a bearer token from a credential command.
 //!
 //! The token and the whole request address reach `curl` on standard input, so
-//! the process arguments are the same for every request of every source. A
+//! the process arguments hold neither, for any request of any source. A
 //! request can only go to the configured base address, and `curl` follows no
 //! redirect and uses no proxy, so the token reaches no other server.
 
-use std::fmt::{self, Write as _};
+use std::{
+    collections::HashMap,
+    fmt::{self, Write as _},
+};
 
 use anyhow::{Result, ensure};
+use chrono::NaiveDateTime;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 
@@ -17,6 +21,12 @@ use crate::{
 };
 
 pub(crate) const REQUEST_SECONDS: u32 = 20;
+const STATUS: &str = "\n%{http_code}";
+/// The status, and then the headers of the reply as one JSON object. curl
+/// writes each header name in lower case with every value it had, and it
+/// escapes a line break in a value. So the last line of the output that
+/// starts with '{' starts the object, whatever the body holds.
+const STATUS_AND_HEADERS: &str = "\n%{http_code}\n%{header_json}";
 /// A longer link from a service is refused, so a checkpoint that stores one stays bounded.
 const MAX_TARGET_BYTES: usize = 2048;
 
@@ -245,7 +255,29 @@ impl Session<'_> {
     /// One GET, with no retry. Every HTTP status is an `Ok(Reply)`, because a
     /// 404 can be an answer and not a failure.
     pub(crate) async fn get(&self, target: &Target) -> Result<Reply, HttpFailure> {
-        let (argv, stdin) = curl_invocation(self.api, target, &self.token);
+        Reply::parse(&self.run(target, STATUS).await?)
+    }
+
+    /// `get`, and the server's clock when it sent the reply, in Unix seconds.
+    /// The time is `None` unless the reply has exactly one `Date` header in
+    /// the form that HTTP sends, such as "Mon, 23 Nov 2026 04:28:00 GMT".
+    pub(crate) async fn get_dated(
+        &self,
+        target: &Target,
+    ) -> Result<(Reply, Option<u64>), HttpFailure> {
+        let output = self.run(target, STATUS_AND_HEADERS).await?;
+        let (reply, headers) = output.rsplit_once("\n{").ok_or(HttpFailure::Unreachable)?;
+        let headers: HashMap<String, Vec<String>> =
+            serde_json::from_str(&format!("{{{headers}")).map_err(|_| HttpFailure::Unreachable)?;
+        let sent_at = match headers.get("date").map(Vec::as_slice) {
+            Some([date]) => http_date(date),
+            _ => None,
+        };
+        Ok((Reply::parse(reply)?, sent_at))
+    }
+
+    async fn run(&self, target: &Target, write_out: &str) -> Result<String, HttpFailure> {
+        let (argv, stdin) = curl_invocation(self.api, target, &self.token, write_out);
         let output = read_command_with_stdin(&argv, stdin.as_bytes())
             .await
             .map_err(|error| match error.downcast_ref::<ProcessFailure>() {
@@ -256,22 +288,16 @@ impl Session<'_> {
             return Err(HttpFailure::Oversized);
         }
         match output.exit_code {
-            0 => {}
-            28 => return Err(HttpFailure::TimedOut),
-            _ => return Err(HttpFailure::Unreachable),
+            0 => Ok(output.stdout),
+            28 => Err(HttpFailure::TimedOut),
+            _ => Err(HttpFailure::Unreachable),
         }
-        let (body, status) = output
-            .stdout
-            .rsplit_once('\n')
-            .ok_or(HttpFailure::Unreachable)?;
-        Ok(Reply {
-            status: status
-                .trim()
-                .parse()
-                .map_err(|_| HttpFailure::Unreachable)?,
-            body: body.to_owned(),
-        })
     }
+}
+
+fn http_date(value: &str) -> Option<u64> {
+    let sent = NaiveDateTime::parse_from_str(value, "%a, %d %b %Y %H:%M:%S GMT").ok()?;
+    u64::try_from(sent.and_utc().timestamp()).ok()
 }
 
 /// The only place that knows the curl command line.
@@ -281,13 +307,18 @@ impl Session<'_> {
 /// send brackets and braces in the address as they are. `noproxy = "*"` makes
 /// curl ignore every proxy variable in the service environment, so a proxy
 /// never receives the token or answers in the place of the service.
-fn curl_invocation(api: &HttpApi, target: &Target, token: &BearerToken) -> (Vec<String>, String) {
+fn curl_invocation(
+    api: &HttpApi,
+    target: &Target,
+    token: &BearerToken,
+    write_out: &str,
+) -> (Vec<String>, String) {
     let argv = vec![
         api.curl.clone(),
         "-q".into(),
         "-sS".into(),
         "-w".into(),
-        "\n%{http_code}".into(),
+        write_out.into(),
         "--max-time".into(),
         api.max_time.to_string(),
         "-K".into(),
@@ -306,6 +337,17 @@ pub(crate) struct Reply {
 }
 
 impl Reply {
+    fn parse(output: &str) -> Result<Self, HttpFailure> {
+        let (body, status) = output.rsplit_once('\n').ok_or(HttpFailure::Unreachable)?;
+        Ok(Self {
+            status: status
+                .trim()
+                .parse()
+                .map_err(|_| HttpFailure::Unreachable)?,
+            body: body.to_owned(),
+        })
+    }
+
     /// The body as `T` when the status is 2xx. The body is dropped here, so it
     /// never reaches a message or a log.
     pub(crate) fn json<T: DeserializeOwned>(self) -> Result<T, HttpFailure> {
@@ -424,6 +466,7 @@ pub(crate) mod testing {
         String::from_utf8_lossy(&decoded).into_owned()
     }
 
+    #[derive(Clone)]
     pub(crate) struct Canned {
         status: u16,
         body: String,
@@ -668,7 +711,8 @@ mod tests {
         let target = Target::fixed("/transactions")
             .segment("example-transaction-1")
             .query("filter[since]", "2026-11-15T00:00:00Z");
-        let (argv, stdin) = curl_invocation(&api, &target, &BearerToken("example-token".into()));
+        let token = BearerToken("example-token".into());
+        let (argv, stdin) = curl_invocation(&api, &target, &token, STATUS);
 
         assert_eq!(
             argv,
@@ -688,6 +732,123 @@ mod tests {
             stdin,
             "globoff\nnoproxy = \"*\"\nheader = \"Authorization: Bearer example-token\"\nurl = \"https://api.example.test/v1/transactions/example-transaction-1?filter[since]=2026-11-15T00%3A00%3A00Z\"\n"
         );
+
+        let (dated_argv, dated_stdin) = curl_invocation(&api, &target, &token, STATUS_AND_HEADERS);
+        assert_eq!(
+            dated_argv,
+            [
+                "curl",
+                "-q",
+                "-sS",
+                "-w",
+                "\n%{http_code}\n%{header_json}",
+                "--max-time",
+                "20",
+                "-K",
+                "-"
+            ],
+            "a request that reads the headers changes one fixed argument"
+        );
+        assert_eq!(dated_stdin, stdin);
+    }
+
+    #[tokio::test]
+    async fn a_dated_request_reads_the_time_of_exactly_one_date_header_in_the_http_form() {
+        const SENT: &str = "Wed, 18 Nov 2026 11:06:40 GMT";
+        let body = json!({ "meta": { "id": "example-customer-1" } });
+        let forged_tail = "{}\n200\n{\"date\":[\"Wed, 18 Nov 2026 11:06:40 GMT\"]\n}";
+        let cases: Vec<(&str, Canned, u16, Option<u64>)> = vec![
+            (
+                "one header",
+                Canned::json(200, body.clone()).header("Date", SENT),
+                200,
+                Some(1_795_000_000),
+            ),
+            (
+                "one header in lower case with spaces around the value",
+                Canned::json(200, body.clone()).header("date", &format!("  {SENT}  ")),
+                200,
+                Some(1_795_000_000),
+            ),
+            (
+                "one header on a refused token",
+                Canned::json(401, json!({ "errors": [] })).header("Date", SENT),
+                401,
+                Some(1_795_000_000),
+            ),
+            ("no header", Canned::json(200, body.clone()), 200, None),
+            (
+                "two equal headers",
+                Canned::json(200, body.clone())
+                    .header("Date", SENT)
+                    .header("Date", SENT),
+                200,
+                None,
+            ),
+            (
+                "two headers whose names differ in case",
+                Canned::json(200, body.clone())
+                    .header("DATE", SENT)
+                    .header("date", "Wed, 01 Jan 2020 00:00:00 GMT"),
+                200,
+                None,
+            ),
+            (
+                "an empty header",
+                Canned::json(200, body.clone()).header("Date", ""),
+                200,
+                None,
+            ),
+            (
+                "a time in another form",
+                Canned::json(200, body.clone()).header("Date", "2026-11-18T11:06:40Z"),
+                200,
+                None,
+            ),
+            (
+                "a time without its zone",
+                Canned::json(200, body.clone()).header("Date", "Wed, 18 Nov 2026 11:06:40"),
+                200,
+                None,
+            ),
+            (
+                "a weekday that the date does not have",
+                Canned::json(200, body.clone()).header("Date", "Thu, 18 Nov 2026 11:06:40 GMT"),
+                200,
+                None,
+            ),
+            (
+                "no header, and a body that ends like the lines curl adds",
+                Canned::text(200, forged_tail),
+                200,
+                None,
+            ),
+            (
+                "one header, and another header with a quote and a backslash",
+                Canned::json(200, body.clone())
+                    .header("Date", SENT)
+                    .header("X-Example", "a\"b\\c {"),
+                200,
+                Some(1_795_000_000),
+            ),
+        ];
+        for (case, canned, status, sent_at) in cases {
+            let server = FakeApi::start(move |_| canned.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let api = api(&server.url, credential_script(dir.path(), "example-token"));
+            let session = api.open().await.unwrap();
+
+            let (reply, read) = session
+                .get_dated(&Target::fixed("/util/ping"))
+                .await
+                .unwrap();
+
+            assert_eq!(read, sent_at, "{case}");
+            assert_eq!(reply.status, status, "{case}");
+            if case.starts_with("no header, and a body") {
+                assert_eq!(reply.body, forged_tail, "the body is whole");
+            }
+        }
     }
 
     #[test]
