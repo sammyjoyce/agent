@@ -124,6 +124,13 @@ impl DreamsStore {
         Ok(Self { root })
     }
 
+    /// Whether `state` holds a stored run. It creates nothing and reads no run,
+    /// and a folder that cannot be listed holds none.
+    pub fn holds_runs(state: &Path) -> bool {
+        fs::read_dir(state.join(DREAMS_DIRECTORY).join(RUNS_DIRECTORY))
+            .is_ok_and(|mut runs| runs.next().is_some_and(|run| run.is_ok()))
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }

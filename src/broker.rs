@@ -108,11 +108,7 @@ impl Broker {
         let dreams = policy
             .map(|policy| crate::dreams::Dreams::open(state, policy))
             .transpose()?;
-        let dreams_available = if dreams.is_some() {
-            true
-        } else {
-            !crate::dreams::DreamsStore::open(state)?.list()?.is_empty()
-        };
+        let dreams_available = dreams.is_some() || crate::dreams::DreamsStore::holds_runs(state);
         Ok(Self {
             local,
             contexts,
@@ -627,13 +623,77 @@ mod tests {
         runtime::{FrameReader, OwnerClaim, Runtime},
         service::write_frame,
     };
-    use std::{fs, sync::Arc, time::Duration};
+    use std::{fs, os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
     use tokio::{
         io::{BufReader, DuplexStream, ReadHalf, WriteHalf},
         task::JoinHandle,
         time::timeout,
     };
     use uuid::Uuid;
+
+    fn broker_without_a_dreams_policy(state: &std::path::Path) -> anyhow::Result<Broker> {
+        Broker::new(
+            None,
+            state,
+            crate::rex::RexClient::for_process(None).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_broker_without_a_dreams_policy_creates_no_dreams_folder() {
+        let directory = tempfile::tempdir().unwrap();
+        let broker = broker_without_a_dreams_policy(directory.path()).unwrap();
+        assert!(!broker.dreams_available());
+        assert!(!directory.path().join("dreams").exists());
+    }
+
+    #[tokio::test]
+    async fn a_broker_without_a_dreams_policy_starts_with_a_file_where_the_dreams_folder_should_be()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("dreams"), "").unwrap();
+        let broker = broker_without_a_dreams_policy(directory.path()).unwrap();
+        assert!(!broker.dreams_available());
+    }
+
+    #[tokio::test]
+    async fn a_broker_without_a_dreams_policy_starts_with_a_read_only_dreams_folder() {
+        let directory = tempfile::tempdir().unwrap();
+        let dreams = directory.path().join("dreams");
+        fs::create_dir(&dreams).unwrap();
+        fs::set_permissions(&dreams, fs::Permissions::from_mode(0o500)).unwrap();
+        let broker = broker_without_a_dreams_policy(directory.path());
+        fs::set_permissions(&dreams, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!broker.unwrap().dreams_available());
+        assert!(!dreams.join("runs").exists());
+    }
+
+    #[tokio::test]
+    async fn a_broker_without_a_dreams_policy_starts_with_a_stored_run_that_a_list_refuses() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        let sample = crate::dreams::ops::test_support::write_sample_proposal(
+            &directory.path().join("repo"),
+            &state,
+            "unreadable-run",
+            "# Before\n",
+            "# After\n",
+        );
+        let review = state
+            .join("dreams/runs")
+            .join(sample.run.as_str())
+            .join("review/review.json");
+        let sealed = fs::read_to_string(&review).unwrap();
+        fs::write(&review, sealed.replace("req-1", "req-2")).unwrap();
+        assert!(
+            crate::dreams::DreamsStore::open(&state)
+                .unwrap()
+                .list()
+                .is_err()
+        );
+        let broker = broker_without_a_dreams_policy(&state).unwrap();
+        assert!(broker.dreams_available());
+    }
 
     #[tokio::test]
     async fn usage_stays_on_the_coordinator_and_rejects_an_unverified_account() {
