@@ -30,9 +30,6 @@ struct QuotedMessageBar<Trailing: View>: View {
 
   var body: some View {
     HStack(alignment: .top, spacing: 8) {
-      RoundedRectangle(cornerRadius: 2)
-        .fill(accentColor)
-        .frame(width: 3)
       VStack(alignment: .leading, spacing: 2) {
         Text(heading)
           .font(headingFont)
@@ -44,6 +41,14 @@ struct QuotedMessageBar<Trailing: View>: View {
             .lineLimit(lineLimit)
             .multilineTextAlignment(.leading)
         }
+      }
+      .padding(.leading, 11)
+      // An overlay is offered the size of the text. A shape beside the text in the stack would
+      // take every height that the container offers.
+      .overlay(alignment: .leading) {
+        RoundedRectangle(cornerRadius: 2)
+          .fill(accentColor)
+          .frame(width: 3)
       }
       trailing
     }
