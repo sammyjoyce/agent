@@ -566,9 +566,13 @@ Unicode format characters, such as bidirectional overrides and zero-width charac
 are shown as escapes in that text and in the patch, so the patch you read is
 the patch that `apply` commits. Add `--json` for the typed record, which keeps
 the exact bytes. The CLI commands read the coordinator's local state directory
-directly; authorized paired devices can also browse runs, inspect sealed
-proposals and approve them over the coordinator's authenticated service boundary
-using the same digest, policy, base, clean-worktree and restore-hold checks.
+directly. An authorized paired device can also browse runs, inspect a sealed
+proposal and approve it over the coordinator's authenticated service boundary.
+The service makes the same digest, policy, base, clean-worktree and
+restore-hold checks as the command line, and it reads the policy from the
+configuration for each request. While the state directory is held after a
+restore, the command line and the service both refuse an apply until
+`backup release`. `dreams list` and `dreams show` still work while held.
 
 Read the patch before you approve it. The outcome digest, which `dreams show`
 prints as `Outcome sha256`, is the SHA-256 of the exact bytes of the sealed
@@ -592,6 +596,7 @@ refuses with one of these messages, without changing the repository:
 - `Dreams target has a held Git index lock: <path>`
 - `Dreams run did not propose a change`
 - `Another Dreams apply is running`
+- ``Dreams apply is held after a restore until `backup release` ``
 
 A local change is any difference in a touched path or its parent directories:
 content, file type, a deletion, or an executable bit. Apply reads the
@@ -1187,6 +1192,9 @@ run this work:
   a task's terminal starts, so no backed-up task turn resumes.
 - Worktree collection, both the collection that each registered worker requests
   on its own and `beep-boop resources collect`.
+
+A held store also refuses to apply a Dreams proposal, from
+`beep-boop dreams apply` and from a device.
 
 A held store is not a read-only copy. It serves history and attachments, and it
 runs chats and the other commands you send. A chat's tool calls run on hosts

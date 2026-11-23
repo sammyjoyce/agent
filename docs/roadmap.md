@@ -259,8 +259,8 @@ branching conversations legible directly from the main chat.
 
 - [x] **Native iOS inspection and approval for [Dreams](setup.md#dreams).**
   Browse nightly Dreams runs, inspect sealed proposals and approve them from the
-  iPhone app (today `dreams list`, `show` and `apply` exist only in the CLI
-  reading the coordinator's local state directory).
+  iPhone app. The CLI commands `dreams list`, `show` and `apply` remain, and
+  they read the coordinator's local state directory.
   - **Behavior.** List runs newest-first with window, coverage, outcome and
     proposal status (`pending`, `applied`, `stale`, `target_dirty`,
     `target_locked`, `patch_changed`, `policy_changed`). Opening a run shows
