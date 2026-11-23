@@ -32,8 +32,8 @@ function workerHostName(worker: WorkerState): string | undefined {
   }
 }
 
-function isSchedulerTick(node: TaskGraphNode): boolean {
-  return node.kind.type === "other" && node.kind.name === "agent.background" && node.state.status === "sleeping";
+function isSchedulerNode(node: TaskGraphNode): boolean {
+  return node.kind.type === "other" && node.kind.name === "agent.background";
 }
 
 function isRunningLiveNode(node: TaskGraphNode): boolean {
@@ -206,7 +206,7 @@ export function buildActiveWork(
   records: readonly TaskRecord[],
   actors: ReadonlyMap<string, TaskGraphActor>,
 ): ActiveWorkItem[] {
-  const visibleNodes = nodes.filter((node) => !isSchedulerTick(node));
+  const visibleNodes = nodes.filter((node) => !isSchedulerNode(node));
   const nodesByConv = new Map<string, TaskGraphNode[]>();
   for (const node of visibleNodes) {
     const existing = nodesByConv.get(node.conversation_id);

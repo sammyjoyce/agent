@@ -21,6 +21,7 @@ import type { RuntimeEvent } from "../src/generated/RuntimeEvent.js";
 import type { RuntimeEventKind } from "../src/generated/RuntimeEventKind.js";
 import type { TaskGraphActor } from "../src/generated/TaskGraphActor.js";
 import type { TaskGraphNode } from "../src/generated/TaskGraphNode.js";
+import type { TaskRecord } from "../src/generated/TaskRecord.js";
 import type { WorkerRef } from "../src/generated/WorkerRef.js";
 import { binding, host, open, within } from "./delegation.js";
 import type { ModelQueue } from "./fixtures/coordinator-runtime.js";
@@ -373,6 +374,48 @@ test("active work excludes idle background scheduler timers and prioritizes wait
     await app.session.close(BACKGROUND_CONTEXT);
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+function liveNode(id: number, conversationId: string, kind: TaskGraphNode["kind"], state: TaskGraphNode["state"]): TaskGraphNode {
+  return { id, conversation_id: conversationId, owner: null, background: kind.type === "other", abort_requested: false, state, blocked: null,
+    conversations: [], kind, started_at: 1000 + id };
+}
+const schedulerNode = (id: number, state: TaskGraphNode["state"]) => liveNode(id, "1", { type: "other", name: "agent.background" }, state);
+const mainActor = new Map<string, TaskGraphActor>([["1", { type: "main" }]]);
+
+test("a scheduler node alone gives no active work row in any state", () => {
+  const states: TaskGraphNode["state"][] = [
+    { status: "running", phase: "tick" },
+    { status: "running", phase: "execute" },
+    { status: "pending", phase: "execute" },
+    { status: "waiting", phase: "execute", on: [], policy: "all_settled" },
+    { status: "sleeping", phase: "tick", until: Date.UTC(2100, 0, 1) },
+    { status: "completing", outcome: "completed" },
+  ];
+  for (const state of states) {
+    assert.deepEqual(buildActiveWork([schedulerNode(11, state)], [], mainActor), [],
+      "A scheduler node must give no row while it is " + JSON.stringify(state));
+  }
+});
+
+test("a running scheduler node beside a running job gives one active work row, the job", () => {
+  const job: TaskRecord = {
+    id: "task-nightly", conversation_id: "40", title: "Nightly count", outcome: "Count the invented stock", summary: "", model: null,
+    state: { state: "open" }, worker: { state: "unassigned" },
+    sources: [{ provider: "scheduled_jobs", account: "local", thread_id: "nightly-count" }],
+    pending: [], agents: [], started_at: 1500, updated_at: 1500,
+  };
+  const work = buildActiveWork(
+    [schedulerNode(11, { status: "running", phase: "execute" }), liveNode(12, "40", { type: "generation" }, { status: "running", phase: "stream" })],
+    [job], mainActor);
+  assert.deepEqual(work.map((item) => [item.id, item.status, item.is_job]), [["task:task-nightly", "running", true]]);
+});
+
+test("a turn of the main chat gives the Main row, timed from the turn and not from the scheduler", () => {
+  const work = buildActiveWork(
+    [schedulerNode(11, { status: "running", phase: "tick" }), liveNode(13, "1", { type: "generation" }, { status: "running", phase: "stream" })],
+    [], mainActor);
+  assert.deepEqual(work.map((item) => [item.id, item.title, item.status, item.started_at]), [["main", "Main", "running", 1013]]);
 });
 
 test("buildActiveWork sorts running main first, waiting_owner before waiting_external, and leaves empty owner detail unset", () => {
