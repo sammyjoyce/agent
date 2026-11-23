@@ -478,7 +478,12 @@ export class TaskStore {
   }
   async openAttachment(id: string, call: HostCall, limits?: ImageLimits): Promise<Awaited<ReturnType<AttachmentStore["input"]>>> {
     if (this.attachments === undefined) throw new TaskError("Attachment storage is unavailable");
-    return this.attachments.input("", await this.attachmentRefs([id]), call, undefined, limits);
+    return this.attachments.input({
+      text: "",
+      attachments: await this.attachmentRefs([id]),
+      call,
+      ...(limits === undefined ? {} : { limits }),
+    });
   }
   private async prepareInput(conversation: Conversation, text: string, refs: readonly AttachmentRef[] | undefined, call?: HostCall, inputOrigin?: InputOrigin, sender?: TaskMessageSender, fallbackModel?: ModelSelection | null): Promise<Awaited<ReturnType<AttachmentStore["input"]>>> {
     let prepared: Awaited<ReturnType<AttachmentStore["input"]>>;
@@ -487,7 +492,13 @@ export class TaskStore {
     else {
       if (this.attachments === undefined || call === undefined) throw new TaskError("The attachment execution host is unavailable");
       const activeModel = (await this.session.snapshot(AgentDoc, conversation.id, BACKGROUND_CONTEXT))?.model ?? fallbackModel ?? undefined;
-      prepared = await this.attachments.input(text, refs, call, inputOrigin, this.inference.imageLimits(activeModel));
+      prepared = await this.attachments.input({
+        text,
+        attachments: refs,
+        call,
+        ...(inputOrigin === undefined ? {} : { origin: inputOrigin }),
+        limits: this.inference.imageLimits(activeModel),
+      });
     }
     const origin = (await this.session.snapshot(NoticeLineage, conversation.id, BACKGROUND_CONTEXT))?.origin;
     if (sender === undefined && (origin === undefined || origin === null)) return prepared;

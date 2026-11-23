@@ -76,23 +76,23 @@ test("attachments survive partial retries and restart, enforce immutable receipt
     await assert.rejects(store.request({ ...request, id: randomUUID(), data_base64: "YQ" }), /encoding/);
     await assert.rejects(store.request({ ...request, id: randomUUID(), size_bytes: MAX_ATTACHMENT_BYTES + 1 }), /metadata/);
     const unavailable = await upload(store, Buffer.from("host offline"));
-    await assert.rejects(store.input("", [unavailable], async () => ({ type: "failed", message: "Host unavailable" })), /Host unavailable/);
+    await assert.rejects(store.input({ text: "", attachments: [unavailable], call: async () => ({ type: "failed", message: "Host unavailable" }) }), /Host unavailable/);
     await store.request({ type: "discard", id: unavailable.id });
     const invalidImage = await upload(store, Buffer.from("not an image"), "broken.png", "image/png");
-    await assert.rejects(store.input("", [invalidImage], async (command) => {
+    await assert.rejects(store.input({ text: "", attachments: [invalidImage], call: async (command) => {
       assert.ok(command.type === "attachment_write"); return { type: "attachment_written", next_offset: command.attachment.size_bytes, path: "/invented/private/broken.png" };
-    }), /image could not be prepared/);
+    } }), /image could not be prepared/);
     await store.request({ type: "discard", id: invalidImage.id });
     const readOnly = await upload(store, Buffer.from("Inspection does not admit input"));
-    await store.input("", [readOnly], async (command) => {
+    await store.input({ text: "", attachments: [readOnly], call: async (command) => {
       assert.ok(command.type === "attachment_write"); return { type: "attachment_written", next_offset: command.attachment.size_bytes, path: "/invented/private/read-only.txt" };
-    });
+    } });
     assert.equal(await store.admit([readOnly], () => undefined), undefined);
     await store.request({ type: "discard", id: readOnly.id });
     const vector = await upload(store, Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>'), "screen.svg", "image/svg+xml");
-    const original = await store.input("Inspect vector", [vector], async (command) => {
+    const original = await store.input({ text: "Inspect vector", attachments: [vector], call: async (command) => {
       assert.ok(command.type === "attachment_write"); return { type: "attachment_written", next_offset: command.attachment.size_bytes, path: "/invented/private/screen.svg" };
-    });
+    } });
     assert.ok(Array.isArray(original.content)); assert.equal(original.content.some((part) => part.type === "image"), false);
     assert.ok(original.content.some((part) => part.type === "text" && part.text.includes("/invented/private/screen.svg")));
     await store.request({ type: "discard", id: vector.id });
@@ -136,7 +136,7 @@ test("attached images scale to the conversation model's configured image limits 
     const root = await session.root(BACKGROUND_CONTEXT);
     await inference.configure(root, smallSelection, { extensions: [tools.host, tools.main] });
     const mainRelease = executions.bind(root.id.toString(), { model: smallSelection, cwd: "/workspace/example", hosts: [], call });
-    const scaled = await store.input("Main check", [ref], call, undefined, inference.imageLimits(smallSelection));
+    const scaled = await store.input({ text: "Main check", attachments: [ref], call, limits: inference.imageLimits(smallSelection) });
     faux.setResponses([
       (context) => {
         const user = context.messages.findLast((message) => message.role === "user");
@@ -305,7 +305,7 @@ test("Pi receives native images and delegation keeps immutable files on each act
       assert.ok(user.content.some((part) => part.type === "image" && part.mimeType === "image/png" && part.data.length > 0));
       return fauxAssistantMessage(fauxToolCall("delegate_task", { task_id: task.id, input: "", attachments: [image.id, file.id] }), { stopReason: "toolUse" });
     }, fauxAssistantMessage("Delegated the evidence.")]);
-    const prepared = await store.input("Review this screen", [image, file], mainCall);
+    const prepared = await store.input({ text: "Review this screen", attachments: [image, file], call: mainCall });
     const submission = await store.admit([image, file], () => root.submit({ type: "input", ...prepared, requestId: randomUUID() }, BACKGROUND_CONTEXT));
     assert.ok(submission); await submission.wait(BACKGROUND_CONTEXT); release();
     const saved = await tasks.get(task.id); assert.ok(saved.worker.state === "bound"); assert.deepEqual(saved.pending[0]?.attachments, [image, file]);

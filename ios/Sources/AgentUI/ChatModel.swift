@@ -311,9 +311,32 @@ final class ChatModel {
       }
     }
   }
+  struct PendingReply: Equatable, Sendable {
+    let reference: ReplyReference
+    let lane: ProfileID?
+  }
   var previewURL: URL?
   private(set) var preparingAttachments = false
   var mode: InputMode = .steer { didSet { draftChanged() } }
+  var pendingReply: PendingReply?
+  var replyTarget: ReplyReference? { pendingReply?.reference }
+  func reply(to row: RowModel) {
+    guard let entryID = row.row.entryID else { return }
+    let condensed =
+      row.row.text
+      .split(whereSeparator: \.isNewline)
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+      .joined(separator: " ")
+    let excerpt =
+      condensed.count > 160 ? String(condensed.prefix(159)) + "…" : condensed
+    pendingReply = PendingReply(
+      reference: ReplyReference(entryId: entryID, excerpt: excerpt, role: row.row.role),
+      lane: row.lane)
+  }
+  func clearReply() {
+    pendingReply = nil
+  }
   private(set) var draftReady: Bool
   private(set) var pendingSharedImport = false
   var draftError: String?
@@ -1134,6 +1157,17 @@ final class ChatModel {
     let original = source
     let addressedTo = DraftAddressing(destination: destination, restoredFrom: restoredFrom)
     let files = attachments
+    let isControl = CoordinatorSession.isControlInput(text)
+    if !isControl, let reply = pendingReply, let replyLane = reply.lane,
+      recipients != [replyLane]
+    {
+      report(
+        "Nothing was sent. Reply target belongs to \(name(replyLane)); address \(name(replyLane)) alone or clear the reply banner first."
+      )
+      return ignoreSend()
+    }
+    let reply = isControl ? nil : pendingReply
+    if !isControl { clearReply() }
     let submission = submission(
       ComposerInputIdentity(composerID: composerID), text: text, files: files, at: targets)
     sendsStarted += 1
@@ -1151,7 +1185,12 @@ final class ChatModel {
       var departing: [ControlDeparture] = []
       defer {
         admission = nil
-        if !admitted { putBack(text, of: sendOrder) }
+        if !admitted {
+          putBack(text, of: sendOrder)
+          if pendingReply == nil, let reply {
+            pendingReply = reply
+          }
+        }
         // A composer emptied during the Send kept whom its draft was for until now.
         forgetClearedSource()
       }
@@ -1160,7 +1199,8 @@ final class ChatModel {
       guard await saveDraft() else { return }
       admitted = await admit { [self] in
         let delivery = await deliver(
-          body, mode: mode, files: files, to: targets, receipt: submission.identity)
+          body, mode: mode, files: files, replyTo: reply?.reference, to: targets,
+          receipt: submission.identity)
         departing = delivery.departing
         return delivery.admitted
       }
@@ -1253,8 +1293,8 @@ final class ChatModel {
   /// copy that does not go releases only its own, so recovery offers the text again only when no
   /// recipient took it. Admitted once any recipient has the message or still will.
   private func deliver(
-    _ body: String, mode: InputMode, files: [LocalAttachment], to targets: [Target],
-    receipt: ComposerInputIdentity
+    _ body: String, mode: InputMode, files: [LocalAttachment], replyTo: ReplyReference?,
+    to targets: [Target], receipt: ComposerInputIdentity
   ) async -> (admitted: Bool, departing: [ControlDeparture]) {
     let recipients = targets.map(\.id)
     let sendID = UUID().uuidString
@@ -1266,7 +1306,7 @@ final class ChatModel {
       guard
         let input = await target.session.stage(
           body, mode: mode, files: files, sendID: sendID, recipients: recipients,
-          composer: receipt)
+          composer: receipt, replyTo: replyTo)
       else {
         for item in staged {
           await withdraw(item.input, from: item.target.session, lane: item.target.id)

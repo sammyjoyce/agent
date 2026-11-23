@@ -1,10 +1,27 @@
 import Foundation
 
 extension HistoryRole {
+  public var speakerLabel: String {
+    switch self {
+    case .user: "You"
+    case .notice: "Notice"
+    case .assistant, .final, .partialAnswer, .commentary: "Beep Boop"
+    case .thinking: "Reasoning"
+    case .tool: "Tool"
+    }
+  }
+
   var isAssistantText: Bool {
     switch self {
     case .assistant, .final, .partialAnswer, .commentary: true
     case .user, .notice, .thinking, .tool: false
+    }
+  }
+
+  public var canReply: Bool {
+    switch self {
+    case .user, .notice, .assistant, .final, .partialAnswer, .commentary: true
+    case .thinking, .tool: false
     }
   }
 
@@ -43,6 +60,7 @@ public struct ChatRow: Identifiable, Sendable, Equatable {
   public var inputOrigin: InputOrigin?
   public var noticeOrigin: NoticeOrigin?
   public var noticeDetails: NoticeDetails?
+  public var replyTo: ReplyReference?
 
   public var provenanceLabel: String? {
     if role == .user { return inputOrigin?.label }
@@ -72,7 +90,8 @@ public struct ChatRow: Identifiable, Sendable, Equatable {
     work: InputWorkState? = nil,
     inputID: String? = nil,
     attachments: [AttachmentRef] = [], inputOrigin: InputOrigin? = nil,
-    noticeOrigin: NoticeOrigin? = nil, noticeDetails: NoticeDetails? = nil
+    noticeOrigin: NoticeOrigin? = nil, noticeDetails: NoticeDetails? = nil,
+    replyTo: ReplyReference? = nil
   ) {
     self.id = id
     self.entryID = entryID
@@ -89,6 +108,7 @@ public struct ChatRow: Identifiable, Sendable, Equatable {
     self.inputOrigin = inputOrigin
     self.noticeOrigin = noticeOrigin
     self.noticeDetails = noticeDetails
+    self.replyTo = replyTo
   }
 }
 
@@ -167,7 +187,7 @@ struct Transcript: Sendable {
       ChatRow(
         id: "input:\(request.inputId)", role: .user, text: request.text, delivery: delivery,
         inputID: request.inputId, attachments: request.attachments ?? [],
-        inputOrigin: request.origin))
+        inputOrigin: request.origin, replyTo: request.replyTo))
     bound()
   }
   mutating func retirePending(_ inputID: String) {
@@ -420,6 +440,7 @@ struct Transcript: Sendable {
       storage[index].presentation = message.presentation ?? storage[index].presentation
       storage[index].noticeOrigin = message.noticeOrigin ?? storage[index].noticeOrigin
       storage[index].noticeDetails = message.noticeDetails ?? storage[index].noticeDetails
+      storage[index].replyTo = message.replyTo ?? storage[index].replyTo
       dirtyRows.insert(storage[index].id)
       for attachment in message.attachments ?? []
       where !storage[index].attachments.contains(where: { $0.id == attachment.id }) {
@@ -436,7 +457,7 @@ struct Transcript: Sendable {
           id: "entry:\(message.entryId):\(segment)", entryID: message.entryId, role: message.role,
           text: boundedText(body), presentation: message.presentation,
           attachments: message.attachments ?? [], noticeOrigin: message.noticeOrigin,
-          noticeDetails: message.noticeDetails))
+          noticeDetails: message.noticeDetails, replyTo: message.replyTo))
     }
     if !historical {
       if message.role.isAssistantText

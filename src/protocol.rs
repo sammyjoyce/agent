@@ -468,6 +468,9 @@ pub enum RuntimeCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         attachments: Option<Vec<crate::attachments::AttachmentRef>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reply_to: Option<ReplyReference>,
     },
     MainInterrupt,
     MainFeedback {
@@ -516,6 +519,9 @@ pub enum RuntimeCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         attachments: Option<Vec<crate::attachments::AttachmentRef>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reply_to: Option<ReplyReference>,
     },
     SearchTasks {
         query: String,
@@ -550,6 +556,9 @@ pub enum RuntimeCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         attachments: Option<Vec<crate::attachments::AttachmentRef>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reply_to: Option<ReplyReference>,
     },
     ConversationInterrupt {
         conversation_id: String,
@@ -1814,6 +1823,13 @@ pub struct NoticeSource {
     pub event_version: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+pub struct ReplyReference {
+    pub entry_id: String,
+    pub role: HistoryRole,
+    pub excerpt: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct HistoryMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1837,6 +1853,9 @@ pub struct HistoryMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub attachments: Option<Vec<crate::attachments::AttachmentRef>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub reply_to: Option<ReplyReference>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
@@ -1996,7 +2015,7 @@ pub enum ReviewStage {
     Finished,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryRole {
     User,
@@ -2444,6 +2463,7 @@ mod tests {
             notice_origin: None,
             presentation: None,
             attachments: None,
+            reply_to: None,
             entry_id: "result".into(),
             role: HistoryRole::Tool,
             text: "check failed".into(),

@@ -484,6 +484,7 @@ mod tests {
             final_chunk: true,
             tool,
             attachments: None,
+            reply_to: None,
         }
     }
     fn history(state: &mut State, messages: Vec<HistoryMessage>) {

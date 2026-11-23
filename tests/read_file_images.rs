@@ -548,6 +548,7 @@ async fn read_file_sends_host_images_natively_and_keeps_text_reads() {
                 mode: InputMode::FollowUp,
                 context: None,
                 attachments: None,
+                reply_to: None,
             })
             .await
             .unwrap(),

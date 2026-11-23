@@ -995,6 +995,7 @@ impl Watcher {
                 text: format!("/feedback -- {}", plan.description),
                 mode: InputMode::Steer,
                 attachments: Some(attachments),
+                reply_to: None,
             },
         };
         self.ledger.record(

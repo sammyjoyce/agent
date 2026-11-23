@@ -3113,6 +3113,121 @@ final class HistoryInteractionTests: XCTestCase {
     }
     XCTAssertTrue(appliedBanner.waitForExistence(timeout: 10), app.debugDescription)
   }
+
+  func testReplyBannerIsAsTallAsItsTextAndLeavesTheTranscriptInReach() async throws {
+    executionTimeAllowance = 120
+    var messages: [HistoryMessage] = []
+    for index in 0..<30 {
+      messages.append(
+        HistoryMessage(
+          continuation: false, entryId: "reply-tool-\(index)", finalChunk: true,
+          presentation: .command(.init(command: "echo \(index)", durationMs: 2, exitCode: 0)),
+          role: .tool, text: "done \(index)",
+          tool: .init(callId: "reply-call-\(index)", name: "exec", status: .finished)))
+      messages.append(
+        HistoryMessage(
+          continuation: false, entryId: "reply-text-\(index)", finalChunk: true, role: .final,
+          text: "Reply banner line \(index)."))
+    }
+    let app = try await launchMessages(messages)
+    let transcript = app.scrollViews["transcript"]
+    XCTAssertTrue(transcript.waitForExistence(timeout: 10))
+    let last = transcript.staticTexts["Reply banner line 29."]
+    try await eventually(description: "live tail") { last.isHittable }
+    last.press(forDuration: 1.0)
+    let replyAction = action("Reply", app: app)
+    XCTAssertTrue(replyAction.waitForExistence(timeout: 5))
+    replyAction.tap()
+
+    let banner = app.otherElements["replyTargetBanner"]
+    XCTAssertTrue(banner.waitForExistence(timeout: 5))
+    let heading = banner.staticTexts["Replying to Beep Boop"]
+    let excerpt = banner.staticTexts["Reply banner line 29."]
+    XCTAssertTrue(heading.exists)
+    XCTAssertTrue(excerpt.exists)
+    try await eventually(description: "the last row in reach above the reply banner") {
+      last.isHittable && last.frame.maxY <= banner.frame.minY
+    }
+    let textHeight = heading.frame.height + excerpt.frame.height
+    XCTAssertLessThanOrEqual(
+      banner.frame.height, 2 * textHeight,
+      "The reply banner is \(banner.frame.height) points tall for \(textHeight) points of text")
+
+    drag(transcript, down: true)
+    drag(transcript, down: true)
+    let latest = app.buttons["latest-messages"]
+    XCTAssertTrue(
+      latest.waitForExistence(timeout: 5),
+      "The reader could not leave the tail with a reply pinned")
+    XCTAssertLessThanOrEqual(latest.frame.maxY, banner.frame.minY)
+    let groups = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'activity:'"))
+    let opened = app.buttons.matching(
+      NSPredicate(format: "identifier BEGINSWITH 'activity-item:'"))
+    let level = latest.frame.midY
+    _ = try scroll(
+      transcript,
+      until: {
+        groups.allElementsBoundByIndex.map(\.frame).filter { !$0.isEmpty }
+          .min { abs($0.midY - level) < abs($1.midY - level) }
+      },
+      liesAcross: level)
+    XCTAssertEqual(opened.count, 0)
+    app.coordinate(withNormalizedOffset: .zero).withOffset(
+      CGVector(dx: transcript.frame.minX + 60, dy: latest.frame.midY)
+    ).tap()
+    XCTAssertFalse(
+      opened.firstMatch.waitForExistence(timeout: 2),
+      "A tap on the Latest bar opened the activity group that the bar hides")
+
+    latest.tap()
+    XCTAssertTrue(latest.waitForNonExistence(timeout: 5))
+    try await eventually(description: "the latest message after Latest") {
+      last.isHittable && last.frame.maxY <= banner.frame.minY
+    }
+  }
+
+  func testReplyContextMenuPinsTargetAndSendsReplyReference() async throws {
+    executionTimeAllowance = 120
+    let peer = InteractionPeer()
+    addTeardownBlock { await peer.stop() }
+    let app = try await launchMessages(
+      [
+        .init(
+          continuation: false,
+          entryId: "main-2",
+          finalChunk: true,
+          role: .final,
+          text: "Option A is default; Option B isolates state cleanly.")
+      ],
+      peer: peer)
+
+    let answerText = app.staticTexts["Option A is default; Option B isolates state cleanly."]
+    XCTAssertTrue(answerText.waitForExistence(timeout: 10), app.debugDescription)
+
+    answerText.press(forDuration: 1.0)
+    let replyAction = action("Reply", app: app)
+    XCTAssertTrue(replyAction.waitForExistence(timeout: 5), app.debugDescription)
+    replyAction.tap()
+
+    let replyBanner = app.otherElements["replyTargetBanner"]
+    XCTAssertTrue(replyBanner.waitForExistence(timeout: 5), app.debugDescription)
+    XCTAssertTrue(app.staticTexts["Replying to Beep Boop"].exists)
+
+    let composer = editor(app)
+    composer.tap()
+    composer.typeText("Compare Option B details")
+    let send = app.buttons["Send message"]
+    XCTAssertTrue(send.wait(for: \.isEnabled, toEqual: true, timeout: 5))
+    send.tap()
+
+    try await eventually {
+      await peer.submitRequests().contains {
+        $0.text == "Compare Option B details" && $0.replyTo?.entryId == "main-2"
+      }
+    }
+    XCTAssertFalse(replyBanner.exists)
+    XCTAssertTrue(app.buttons["replyQuoteCard:main-2"].waitForExistence(timeout: 5))
+  }
 }
 
 @MainActor

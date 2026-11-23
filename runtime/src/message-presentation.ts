@@ -1,6 +1,7 @@
 import type { HistoryMessage } from "./generated/HistoryMessage.js";
 import type { MessagePresentation } from "./generated/MessagePresentation.js";
 import type { AgentAction } from "./generated/AgentAction.js";
+import type { ReplyReference } from "./generated/ReplyReference.js";
 import type { ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
 import type { AgentStatePresentation } from "./generated/AgentStatePresentation.js";
 import { validEvent, validRequest } from "./protocol.js";
@@ -17,6 +18,30 @@ export function bounded(value: string, maximum = 32_768, suffix = "\n[Excerpt; f
   let end = maximum; const last = value.charCodeAt(end - 1);
   if (last >= 0xd800 && last <= 0xdbff) end -= 1;
   return value.slice(0, end) + suffix;
+}
+export function replyRoleLabel(role: ReplyReference["role"]): string {
+  switch (role) {
+    case "user": return "user";
+    case "notice": return "notice";
+    case "tool": return "tool";
+    case "thinking": return "reasoning";
+    case "assistant":
+    case "commentary":
+    case "final":
+    case "partial_answer":
+      return "assistant";
+    default: {
+      const unsupported: never = role;
+      return String(unsupported);
+    }
+  }
+}
+export function formatReplyContext(replyTo: ReplyReference): string {
+  const roleLabel = replyRoleLabel(replyTo.role);
+  const trimmed = replyTo.excerpt.trim();
+  return trimmed.length > 0
+    ? `[Replying to ${roleLabel} message ${replyTo.entry_id}: ${JSON.stringify(trimmed)}]\n\n`
+    : `[Replying to ${roleLabel} message ${replyTo.entry_id}]\n\n`;
 }
 export function outputPreview(value: string): string {
   const maximum = 32_768, suffix = "\n[Output preview truncated]";

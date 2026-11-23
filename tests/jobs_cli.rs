@@ -630,6 +630,7 @@ fn native_job_input_replay_reaches_one_durable_admission_after_restart() {
             input_id: input_id.clone(),
             text: text.to_owned(),
             mode: InputMode::Steer,
+            reply_to: None,
         })
         .unwrap() else {
             panic!("Native manual control must reach the job controller");

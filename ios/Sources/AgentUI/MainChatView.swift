@@ -551,7 +551,21 @@ public struct MainChatView: View {
         switch request {
         case .earlier(_, let anchorID, let scope):
           await model.history(anchorID: anchorID, in: scope)
-        case .latest(_, let scope): await model.latestHistory(in: scope)
+        case .latest(_, let scope):
+          await model.latestHistory(in: scope)
+        case .entry(_, let entryID, let scope):
+          guard scope == model.scope,
+            let target = model.transcriptItems.first(where: { item in
+              if case .message(let row) = item { return row.row.entryID == entryID }
+              return false
+            })
+          else { break }
+          followsLatest = false
+          if reduceMotion {
+            scroll.scrollTo(target.id, anchor: .center)
+          } else {
+            withAnimation { scroll.scrollTo(target.id, anchor: .center) }
+          }
         }
         if !Task.isCancelled { historyRequest = nil }
       }
@@ -679,11 +693,17 @@ public struct MainChatView: View {
   ) -> some View {
     switch item {
     case .message(let row):
+      let entryID = row.row.entryID
+      let canReply = model.inspectedConversation == nil && entryID != nil && row.row.role.canReply
       MessageRow(
         model: row, retry: { id in Task { await model.retry(id) } },
         restore: { id in Task { await model.restore(id) } },
         discard: { id in Task { await model.discard(id) } },
         preview: { file in Task { await model.preview(file, lane: row.lane) } },
+        onReply: canReply ? { model.reply(to: row) } : nil,
+        onTapReplyQuote: { targetEntryID in
+          historyRequest = .entry(UUID(), entryID: targetEntryID, scope: model.scope)
+        },
         badges: badges, implied: model.scope.coordinator)
     case .activity(let group):
       let isLiveTailGroup =
@@ -730,6 +750,28 @@ public struct MainChatView: View {
       #if os(iOS)
         if let dictation { DictationStatus(dictation: dictation, chat: model) }
       #endif
+      if let reply = model.replyTarget {
+        QuotedMessageBar(
+          heading: "Replying to \(reply.role.speakerLabel)",
+          excerpt: reply.excerpt,
+          accentColor: Color.accentColor,
+          lineLimit: 1
+        ) {
+          Spacer(minLength: 4)
+          Button("Cancel reply", systemImage: "xmark.circle.fill") {
+            model.clearReply()
+          }
+          .labelStyle(.iconOnly)
+          .foregroundStyle(.secondary)
+          .frame(minWidth: 36, minHeight: 36)
+          .accessibilityIdentifier("cancelReplyButton")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("replyTargetBanner")
+      }
       if !model.attachments.isEmpty {
         HStack {
           Text("Unsent attachments").font(.caption).foregroundStyle(.secondary)
@@ -1495,10 +1537,11 @@ private enum TranscriptControlAnchor: Hashable {
   case latest
 }
 
-/// A history load and the scope on screen when it was asked for.
+/// A history load or scroll request and the scope on screen when it was asked for.
 private enum HistoryNavigation: Hashable {
   case earlier(UUID, anchorID: String?, scope: FeedScope)
   case latest(UUID, scope: FeedScope)
+  case entry(UUID, entryID: String, scope: FeedScope)
 }
 
 struct MessageRow: View {
@@ -1507,6 +1550,8 @@ struct MessageRow: View {
   let restore: (String) -> Void
   let discard: (String) -> Void
   let preview: (AttachmentRef) -> Void
+  let onReply: (() -> Void)?
+  let onTapReplyQuote: ((String) -> Void)?
   /// Names and colors with two or more coordinators. Empty draws the one-coordinator row.
   let badges: [ProfileID: CoordinatorBadge]
   let implied: ProfileID?
@@ -1517,6 +1562,7 @@ struct MessageRow: View {
   init(
     model: RowModel, retry: @escaping (String) -> Void, restore: @escaping (String) -> Void,
     discard: @escaping (String) -> Void, preview: @escaping (AttachmentRef) -> Void = { _ in },
+    onReply: (() -> Void)? = nil, onTapReplyQuote: ((String) -> Void)? = nil,
     badges: [ProfileID: CoordinatorBadge] = [:], implied: ProfileID? = nil
   ) {
     self.model = model
@@ -1524,6 +1570,8 @@ struct MessageRow: View {
     self.restore = restore
     self.discard = discard
     self.preview = preview
+    self.onReply = onReply
+    self.onTapReplyQuote = onTapReplyQuote
     self.badges = badges
     self.implied = implied
   }
@@ -1553,7 +1601,7 @@ struct MessageRow: View {
     .padding(.leading, isUser && !typeSize.isAccessibilitySize ? 32 : 0)
     .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
     .accessibilityElement(children: .contain).accessibilityLabel(title)
-    .messageTextActions(model.row.text)
+    .messageTextActions(model.row.text, onReply: onReply)
   }
   /// Who a Send went to once every recipient placed it, else each recipient's own state with its
   /// own Check, or Restore and Discard. A recipient that is no longer saved reads as a removed
@@ -1650,6 +1698,27 @@ struct MessageRow: View {
         if let presentation = model.row.presentation {
           Text(presentation.activityTitle()).font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
+        }
+        if let reply = model.row.replyTo {
+          Button {
+            onTapReplyQuote?(reply.entryId)
+          } label: {
+            QuotedMessageBar(
+              heading: "Replying to \(reply.role.speakerLabel)",
+              excerpt: reply.excerpt,
+              accentColor: .secondary,
+              lineLimit: 2,
+              excerptColor: .secondary,
+              headingFont: .caption2.weight(.semibold)
+            ) {
+              EmptyView()
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+          }
+          .buttonStyle(.plain)
+          .accessibilityIdentifier("replyQuoteCard:\(reply.entryId)")
         }
         RichMessage(blocks: blocks)
       }

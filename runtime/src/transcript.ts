@@ -12,6 +12,7 @@ import type { HistoryBranch } from "./generated/HistoryBranch.js";
 import type { HistoryMessage } from "./generated/HistoryMessage.js";
 import type { HistoryRole } from "./generated/HistoryRole.js";
 import type { ModelActivity } from "./generated/ModelActivity.js";
+import type { ReplyReference } from "./generated/ReplyReference.js";
 import type { RuntimeEventKind } from "./generated/RuntimeEventKind.js";
 import type { ToolDetails } from "./generated/ToolDetails.js";
 import type { ToolDetailContent } from "./generated/ToolDetailContent.js";
@@ -118,20 +119,47 @@ function messageRows(entry: EntryRecord, message: MessageContent): HistoryMessag
   });
 }
 export function transcript(entry: EntryRecord): HistoryMessage[] { return nativeTranscript(entry); }
+function readInputMetadata(entry: EntryRecord): { attachments?: HistoryMessage["attachments"]; replyTo?: ReplyReference } {
+  if (entry.kind !== "agent.input" || !object(entry.data)) return {};
+  const hasAttachments = entry.data.attachments !== undefined;
+  const hasReplyTo = entry.data.reply_to !== undefined;
+  if (!hasAttachments && !hasReplyTo) return {};
+  const frame: unknown = {
+    version: 1,
+    id: 0,
+    event: {
+      type: "message",
+      message: {
+        entry_id: entry.id.toString(),
+        role: "user",
+        text: "",
+        continuation: false,
+        final_chunk: true,
+        ...(hasAttachments ? { attachments: entry.data.attachments } : {}),
+        ...(hasReplyTo ? { reply_to: entry.data.reply_to } : {}),
+      },
+    },
+  };
+  if (!validEvent(frame) || frame.event.type !== "message") {
+    throw new Error("Invalid durable input metadata");
+  }
+  return {
+    ...(frame.event.message.attachments === undefined ? {} : { attachments: frame.event.message.attachments }),
+    ...(frame.event.message.reply_to === undefined ? {} : { replyTo: frame.event.message.reply_to }),
+  };
+}
+
 function nativeTranscript(entry: EntryRecord, tools?: Map<string, ToolCall>): HistoryMessage[] {
   const messages: HistoryMessage[] = [];
-  let attachments: HistoryMessage["attachments"];
-  if (entry.kind === "agent.input" && object(entry.data) && entry.data.attachments !== undefined) {
-    const frame: unknown = { version: 1, id: 0, event: { type: "message", message: { entry_id: entry.id.toString(), role: "user", text: "", continuation: false, final_chunk: true, attachments: entry.data.attachments } } };
-    if (!validEvent(frame) || frame.event.type !== "message") throw new Error("Invalid durable input attachment metadata");
-    attachments = frame.event.message.attachments;
-  }
+  const { attachments, replyTo } = readInputMetadata(entry);
   const add = (role: HistoryRole, value: string) => {
     let continuation = false, offset = 0;
     for (const text of value.length === 0 && role === "user" && attachments !== undefined ? [""] : chunks(value)) {
       offset += text.length;
       messages.push({ entry_id: entry.id.toString(), role, text, continuation, final_chunk: offset === value.length,
-        ...(role === "user" && messages.length === 0 && attachments !== undefined ? { attachments } : {}) }); continuation = true;
+        ...(role === "user" && messages.length === 0 && attachments !== undefined ? { attachments } : {}),
+        ...(role === "user" && messages.length === 0 && replyTo !== undefined ? { reply_to: replyTo } : {}) });
+      continuation = true;
     }
   };
   if (entry.kind === "agent.notice_context") return messages;
@@ -149,7 +177,7 @@ function nativeTranscript(entry: EntryRecord, tools?: Map<string, ToolCall>): Hi
     return messages.map((message) => ({ ...message, ...(details === undefined ? {} : { notice_details: details }),
       ...(origin === undefined ? {} : { notice_origin: origin }) }));
   }
-  if (attachments !== undefined && object(entry.data) && typeof entry.data.text === "string") {
+  if ((attachments !== undefined || replyTo !== undefined) && object(entry.data) && typeof entry.data.text === "string") {
     add("user", entry.data.text); return messages;
   }
   if (TaskTransferEntry.is(entry)) {

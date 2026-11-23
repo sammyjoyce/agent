@@ -1808,6 +1808,7 @@ mod tests {
                     cwd: "/private/workspace".into(),
                     hosts: Vec::new(),
                 }),
+                reply_to: None,
             },
             RuntimeCommand::ConversationInput {
                 origin: None,
@@ -1817,6 +1818,7 @@ mod tests {
                 input: "Another private input body".into(),
                 mode: InputMode::FollowUp,
                 context: None,
+                reply_to: None,
             },
             RuntimeCommand::MainInterrupt,
             RuntimeCommand::ConversationInterrupt {
