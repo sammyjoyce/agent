@@ -28,6 +28,15 @@ const PINNED: Record<string, { readonly why: string; readonly calls: Readonly<Re
   "failover/checkpoint-store.ts": { why: "A checkpoint is downloaded into a new archive directory beside the state directory, and `backup restore` checks that archive before any file takes a name under a retained tree.",
     calls: { mkdir: 2, open: 1, writeFile: 1, rename: 1 } },
   "failover/ownership.ts": { why: "writeSync puts the fenced owner's last line on stderr before the exit that follows it, and writes no file.", calls: { write: 1 } },
+  // rex-sdk, vendored byte for byte. Its write-named calls send to Rex, not to files.
+  "vendor/rex-sdk/pi/rex-tool-operations.ts": { why: "Upstream's tool table: rex.server.tailscale.rename and rex.terminals.write, which call Rex. rex.ts offers neither rename nor tailscale.",
+    calls: { rename: 1, write: 1 } },
+  "vendor/rex-sdk/src/rex-control.ts": { why: "Frames on the Rex control socket.", calls: { write: 2 } },
+  "vendor/rex-sdk/src/rex-data-connection.ts": { why: "The handshake on a Rex data socket.", calls: { write: 1 } },
+  "vendor/rex-sdk/src/terminal-service.ts": { why: "writeLine sends text to a Rex terminal.", calls: { write: 1 } },
+  "vendor/rex-sdk/src/rex-tunnel-forward.ts": { why: "Upstream port forwarding writes to sockets. No Rex tool rex.ts offers reaches it.", calls: { write: 2 } },
+  "vendor/rex-sdk/src/rex-file-transfer.ts": { why: "Upstream file transfer: pasteFiles writes to a Rex stream, and downloadToFile renames a download into place. No Rex tool rex.ts offers reaches either, and the runtime provides no FileSystem service for downloadToFile.",
+    calls: { rename: 1, write: 1 } },
 };
 
 /** Receivers of a write-named method that write no file. */

@@ -23,6 +23,14 @@ const ALLOWED: readonly { file: string; use: string; why: string; only?: RegExp 
   { file: "auth.ts", use: "fetch(", why: "The OpenID exchange of a sign-in. It changes only this host's auth.json, which is not replicated." },
   { file: "failover/authority-client.ts", use: "fetch(", why: "The authority itself, which is what the owner gate asks." },
   { file: "protocol.ts", use: "node:net", why: "isIPv4 checks an address format and opens nothing.", only: /^import \{ isIPv4 \} from "node:net";$/ },
+  // rex-sdk, vendored. rex.ts dials only the coordinator's own Rex server, which Rust names, and only
+  // for task workers and agents. Each write waits at the owner gate before its request is sent.
+  { file: "vendor/rex-sdk/src/rex-control.ts", use: "WebSocket", why: "The Rex control connection. rex.ts gates each write on the owner gate; reads change nothing." },
+  { file: "vendor/rex-sdk/src/rex-control.ts", use: "node:net", why: "The Rex control connection over the local Unix socket, as above." },
+  { file: "vendor/rex-sdk/src/rex-data-connection.ts", use: "WebSocket", why: "A Rex terminal's output stream, which the read and wait tools open; it writes nothing to the terminal." },
+  { file: "vendor/rex-sdk/src/rex-errors.ts", use: "WebSocket", why: "A doc comment naming the WebSocket close code.", only: /^\/\*\* Creates a close failure from the WebSocket close code and reason\. \*\/$/ },
+  { file: "vendor/rex-sdk/src/rex-tunnel-forward.ts", use: "node:net", why: "Upstream port forwarding. No Rex tool rex.ts offers reaches it." },
+  { file: "vendor/rex-sdk/src/tunnel-service.ts", use: "node:net", why: "Upstream tunnels. No Rex tool rex.ts offers reaches them." },
 ];
 
 /** Files that do not run in the coordinator's Pi process, so they are not read. */

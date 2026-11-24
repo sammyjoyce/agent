@@ -32,6 +32,9 @@ const SAFE_UNDER_OVERLAP: Readonly<Record<string, string>> = {
   search_tasks: READS_A_HOST,
   read_context: `${READS_A_HOST} Only the coordinator's own host answers it.`,
   search_context: `${READS_A_HOST} Only the coordinator's own host answers it.`,
+  // rex.ts names its read-only operations "rex_" + the upstream name, so the scan sees the prefix.
+  rex_: "Every Rex read, mark and wait: it reads the actor's own Rex terminals and changes nothing there. A replayed wait's mark is from the earlier process, so it is refused. Rex splits, writes and closes are not replay-safe.",
+  rex_here: `${COMMITS} Clearing needs the uncertain write's id, and adopting a terminal reads the actor's Rex session.`,
 };
 
 test("every tool declared replay-safe is listed with the reason a second run beside the first duplicates nothing", async () => {

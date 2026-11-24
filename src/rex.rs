@@ -464,7 +464,9 @@ impl RexClient {
             // it could read differently gets no SDK at all.
             RexRoute::Private(endpoint) if endpoint.kind == EndpointKind::Unix => {
                 let path = endpoint.as_str().strip_prefix("unix://")?;
-                let plain = path.trim() == path
+                // Rust's trim and JavaScript's differ on U+FEFF; keep to ASCII.
+                let plain = path.is_ascii()
+                    && path.trim() == path
                     && !path.contains('%')
                     && !path.chars().any(char::is_control)
                     // Path::components() hides `.`, so read the segments.
@@ -1936,6 +1938,7 @@ esac
             "unix:///run/example/../rex.sock",
             "unix:///run/example/./rex.sock",
             "unix:///run/example/rex.sock ",
+            "unix:///run/example/rex.sock\u{feff}",
             "unix:///run/example/re\tx.sock",
             "ssh://example.invalid",
         ] {

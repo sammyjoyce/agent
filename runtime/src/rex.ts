@@ -57,6 +57,8 @@ const TERMINAL_FLAVOR = "com.superlogical.terminal.shell";
 /**
  * Every child's label ends with this and the id of the split that opened it. Tools refuse such a label, but a
  * program in a terminal can still relabel a block, so adoption also skips every block that existed before the split.
+ * A block that appears after the split and before adoption is trusted on its label; a program that could relabel it
+ * could already reach it through the Rex CLI.
  */
 const CHILD_LABEL = "beep-boop:";
 /** Failures reported before any request was sent, or by a server that refused it. Others leave a write uncertain. */
@@ -217,7 +219,7 @@ export function createRexTools({ harness, actors, gate, server = {}, makeLayer }
     const resolved = await actors(conversationId, context);
     const saved = await harness.snapshot(RexOwned, resolved.key, BACKGROUND_CONTEXT);
     const current = saved?.instance_id === resolved.binding.rex_instance_id;
-    return { ...resolved, children: current ? [...saved.children] : [], pending: current ? saved.pending.map((entry) => ({ ...entry, before: [...entry.before] })) : [],
+    return { ...resolved, children: current ? [...saved.children] : [], pending: current ? saved.pending.map((entry) => ({ ...entry, before: [...(entry.before ?? [])] })) : [],
       uncertain: current ? saved.uncertain : null };
   }
   /** The actor's record, reset when its terminal now belongs to another Rex instance. */
@@ -311,7 +313,7 @@ export function createRexTools({ harness, actors, gate, server = {}, makeLayer }
         const found = blocks.filter((block): block is Block & { blockId: string } => typeof block.blockId === "string"
           && typeof block.label === "string" && block.label.endsWith(CHILD_LABEL + entry.id) && block.flavor === TERMINAL_FLAVOR
           && block.hostId === caller.binding.host_id && block.blockId !== caller.binding.block_id && !doc.children.includes(block.blockId)
-          && !entry.before.includes(block.blockId))
+          && !(entry.before ?? []).includes(block.blockId))
           .slice(0, entry.terminals).map((block) => block.blockId);
         doc.children.push(...found);
         entry.terminals -= found.length;
