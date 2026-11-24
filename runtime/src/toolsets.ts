@@ -14,7 +14,7 @@ export type Toolsets = Record<ToolRole, readonly Extension[]>;
 export const TOOL_ROLES: readonly ToolRole[] = ["main", "sidechat", "triage", "worker", "agent"];
 
 /** Compose existing tools by actor ownership; execution guards remain on the tools. */
-export function createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools, goalTools, sidechatTools }: {
+export function createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools, goalTools, sidechatTools, rexTools }: {
   guidance: ReturnType<typeof createGuidance>;
   tools: ReturnType<typeof createAppTools>;
   sourceTools: ReturnType<typeof createSourceTools>;
@@ -23,14 +23,17 @@ export function createToolsets({ guidance, tools, sourceTools, resourceTools, br
   jobTools: ReturnType<typeof createJobTools>;
   goalTools: ReturnType<typeof createGoalTools>;
   sidechatTools?: Extension;
+  /** Task workers and their agents only; the tools check the caller's own Rex binding. */
+  rexTools?: Extension | undefined;
 }): Toolsets {
   const sidechats = sidechatTools === undefined ? [] : [sidechatTools];
+  const rex = rexTools === undefined ? [] : [rexTools];
   return {
     main: [guidance, tools.host, tools.main, ...sidechats, sourceTools.main, resourceTools.main, browserTools, jobTools],
     sidechat: [guidance, tools.host, tools.main, ...sidechats, sourceTools.main, resourceTools.main, browserTools, jobTools],
     triage: [guidance, tools.host, tools.main, ...sidechats, sourceTools.main, browserTools, jobTools],
-    worker: [guidance, tools.host, tools.worker, sourceTools.worker, resourceTools.worker, browserTools, goalTools],
-    agent: [guidance, tools.host, tools.agent, sourceTools.worker, resourceTools.worker, browserTools],
+    worker: [guidance, tools.host, tools.worker, sourceTools.worker, resourceTools.worker, browserTools, goalTools, ...rex],
+    agent: [guidance, tools.host, tools.agent, sourceTools.worker, resourceTools.worker, browserTools, ...rex],
   };
 }
 

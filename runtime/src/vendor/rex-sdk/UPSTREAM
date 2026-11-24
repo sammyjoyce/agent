@@ -1,0 +1,7 @@
+Vendored from https://github.com/dmmulroy/rex-sdk
+Commit: 55f8b98c28f2a8b525b24bc1a42bdf69511e4e0e
+Files: src/**/*.ts without tests or src/testing, and pi/rex-tool-{operations,marks,schemas,runtime}.ts, byte for byte.
+Not vendored: pi/index.ts and pi/rex-tool-search.ts (the Pi CLI extension and its registration of every operation).
+Runtime dependencies pinned in runtime/package.json: effect 4.1.0, ws 8.22.0.
+Verify: (cd runtime/src/vendor/rex-sdk && sha256sum -c SHA256SUMS)
+Update: copy the same files from a new commit, regenerate SHA256SUMS, update this file, and rerun the Rex lab (runtime/test/acceptance/rex-lab.ts).

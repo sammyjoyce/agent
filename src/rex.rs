@@ -451,6 +451,20 @@ impl RexClient {
         Ok(Self { route })
     }
 
+    /// The server the runtime's Rex SDK reaches: this process's own Rex, so
+    /// SDK calls land where its local workers run. `personal` keeps the SDK's
+    /// own selection, which follows `REX_SERVER` like the CLI. An SSH endpoint
+    /// has no SDK transport, so the runtime gets no Rex tools.
+    pub fn sdk_server(&self) -> Option<&str> {
+        match &self.route {
+            RexRoute::Personal => Some("personal"),
+            RexRoute::Private(endpoint) if endpoint.kind == EndpointKind::Unix => {
+                Some(endpoint.as_str())
+            }
+            RexRoute::Private(_) => None,
+        }
+    }
+
     pub fn is_private(&self) -> bool {
         matches!(self.route, RexRoute::Private(_))
     }

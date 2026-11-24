@@ -154,7 +154,7 @@ struct Pending {
 
 impl Runtime {
     pub fn start(script: &Path, claim: OwnerClaim) -> Result<Self> {
-        Self::start_with_notifications(script, claim, None, StartRecord::BestEffort)
+        Self::start_with_notifications(script, claim, None, StartRecord::BestEffort, None)
     }
 
     pub(crate) fn start_with_notifications(
@@ -162,6 +162,7 @@ impl Runtime {
         claim: OwnerClaim,
         apns: Option<&crate::notifications::ApnsConfig>,
         start_record: StartRecord,
+        rex_sdk_server: Option<&str>,
     ) -> Result<Self> {
         ensure!(
             script.is_file(),
@@ -203,6 +204,11 @@ impl Runtime {
         if let Some(config) = apns.filter(|_| !restore_held) {
             config.validate()?;
             command.env("AGENT_APNS_CONFIG", serde_json::to_string(config)?);
+        }
+        // Only the coordinator's own Rex server, never one inherited.
+        command.env_remove("AGENT_REX_SDK_SERVER");
+        if let Some(server) = rex_sdk_server {
+            command.env("AGENT_REX_SDK_SERVER", server);
         }
         command.env_remove("AGENT_FAILOVER");
         if let Some(session) = claim.pi_session() {
@@ -834,6 +840,7 @@ setInterval(()=>{},1000);
                 crate::runtime::OwnerClaim::acquire(state.path(), &script, None).unwrap(),
                 Some(&apns),
                 crate::runtime::StartRecord::BestEffort,
+                None,
             )
             .unwrap();
             let reported = state.path().join("apns");
@@ -1602,6 +1609,7 @@ createInterface({input:process.stdin}).on('line',line=>{
             OwnerClaim::acquire(state.path(), &script, None).unwrap(),
             None,
             StartRecord::RequiredByDreams,
+            None,
         ) else {
             panic!("A runtime whose log cannot record its start must not serve");
         };

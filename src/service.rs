@@ -214,6 +214,7 @@ async fn serve_owner(
         claim,
         config.as_ref().and_then(|config| config.apns.as_ref()),
         StartRecord::for_config(config.as_ref()),
+        rex.sdk_server(),
     )?;
     let background = if owner.restore_held() {
         eprintln!("{}", crate::backup::hold_notice(state));

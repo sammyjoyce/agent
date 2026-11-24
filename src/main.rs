@@ -3684,6 +3684,7 @@ fn tool_details_from_ui(
     }));
 }
 
+#[cfg(test)]
 async fn read_tool_details(
     client: ClientContext<'_>,
     request: &agent_cli::tui::activity::ToolDetailRequest,

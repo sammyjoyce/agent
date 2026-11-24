@@ -36,6 +36,7 @@ import { createSourceTools, SourceJournal } from "./sources.js";
 import { createResourceTools, ResourceStore } from "./resources.js";
 import { createSidechatTools, sidechatInstructions, SidechatStore } from "./sidechats.js";
 import { BrowserStore, createBrowserTools } from "./browser.js";
+import { createRexTools, rexServerFromEnv, taskRexActors, type RexTools } from "./rex.js";
 import { activity, history, toolDetails } from "./transcript.js";
 import type { SearchMode } from "./generated/SearchMode.js";
 import type { SidechatSummary } from "./generated/SidechatSummary.js";
@@ -195,7 +196,7 @@ function backgroundCall(command: import("./generated/HostCommand.js").HostComman
 
 type Application = TriageApplication & { stopInputDelivery(): void; harness: Harness; tasks: TaskStore; sidechats: SidechatStore; resources: ResourceStore; notifications: Notifications;
   histories: HistoryStore; catalog: ConversationCatalog; attachments: AttachmentStore; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler;
-  telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics; discovery: ToolDiscovery; serviceExecution: ActorExecution; goals: GoalStore };
+  telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics; discovery: ToolDiscovery; serviceExecution: ActorExecution; goals: GoalStore; rexTools: RexTools | undefined };
 async function openApplication(): Promise<Application> {
   const storage = await openStorage();
   const registry = createRegistry();
@@ -248,6 +249,10 @@ async function openApplication(): Promise<Application> {
   registry.install(resourceTools.main);
   registry.install(resourceTools.worker);
   registry.install(browserTools);
+  // Rust names the coordinator's own Rex server; without one, actors get no Rex tools.
+  const rexServer = rexServerFromEnv();
+  const rexTools = rexServer === undefined ? undefined : createRexTools({ harness, actors: taskRexActors(tasks, executions), gate: effectGate(ownership), server: rexServer });
+  if (rexTools !== undefined) registry.install(rexTools);
   const stopInputDelivery = watchInputDelivery(harness, (conversationId, event) => {
     let mirroredToObservers = false;
     for (const [id, conversation] of activeConversations) {
@@ -310,7 +315,7 @@ async function openApplication(): Promise<Application> {
   const goals = new GoalStore(harness, tasks, environment);
   const goalTools = createGoalTools(goals, executions); registry.install(goalTools);
   const responsePolicy = createMainResponsePolicy(harness); registry.install(responsePolicy);
-  const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance, tools, sidechatTools, sourceTools, resourceTools, browserTools, jobTools, goalTools }),
+  const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance, tools, sidechatTools, sourceTools, resourceTools, browserTools, jobTools, goalTools, rexTools }),
     { responsePolicy, inputOrigins }), TOOL_SURFACES, discovery);
   for (const extension of installed) registry.install(extension);
   const dreams = createDreamsTools(harness, tasks, executions); registry.install(dreams);
@@ -333,7 +338,7 @@ async function openApplication(): Promise<Application> {
   };
   tasks.useActorExecution(serviceExecution);
   if (await notifications.start()) harness.resume();
-  return { ...core, background, toolsets, startup, discovery, serviceExecution, goals };
+  return { ...core, background, toolsets, startup, discovery, serviceExecution, goals, rexTools };
   }); } catch (error) {
     await harness.close(BACKGROUND_CONTEXT).catch(() => {}); await discovery.close().catch(() => {}); await telemetry.close(); throw error;
   }
@@ -1424,6 +1429,7 @@ try {
           await opened.harness.close(BACKGROUND_CONTEXT);
           await opened.tasks.detachActors();
           await opened.discovery.close();
+          await opened.rexTools?.close();
           await opened.retrieval.close();
         }
         finally { await opened.telemetry.close(); }
