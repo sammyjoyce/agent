@@ -3721,8 +3721,8 @@ async fn read_tool_details_in(
 }
 
 /// How a coordinator exchange failed: the connection (retry or reattach) or
-/// the request itself. `exchange` and the observer loops produce it; history
-/// replay and the view only classify it.
+/// the request itself. `exchange` and the view's observer and control loops
+/// produce it; `json_error`, native usage and history replay classify it.
 #[derive(Debug)]
 pub(crate) enum ViewError {
     Coordinator(anyhow::Error),
